@@ -22,6 +22,7 @@ veomni/
 ├── models/             Model loading and patching
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
 │   ├── loader.py       Registry-based model loading (MODELING_REGISTRY, MODEL_CONFIG_REGISTRY)
+│   ├── checkpoint_manager.py  ModelCheckpointManager: DCP / HF / LoRA I/O
 │   ├── transformers/   Per-model patches (one subpackage per model family)
 │   └── diffusers/      Diffusion model families (Wan, LTX, Qwen-Image)
 ├── optim/              Optimizer and LR scheduler construction
@@ -110,6 +111,8 @@ BaseTrainer (ABC)
 - `build_optimizer()` / `build_lr_scheduler()` -> optimization
 - `train_step()` -> single training step (forward + backward + update)
 - `training_loop()` -> main loop with callbacks
+
+**Checkpointing**: callbacks own cadence (`ModelDcpCallback` / `ModelHfCallback` / `GlobalStateCallback` / `RootAssetsCallback`); `BaseTrainer.load` / `save_dcp` / `save_hf_or_lora` / `save_model_assets` fan out; `ModelCheckpointManager` (`veomni/models/checkpoint_manager.py`) owns DCP / HF / LoRA I/O, drain-async, `empty_cache`, barrier, and directory layout. Job cursor (dataloader, rng, meters) is not in DCP extra_state.
 
 Subclasses override specific methods (e.g., `compute_loss()`, custom data transforms) rather than the entire training loop.
 

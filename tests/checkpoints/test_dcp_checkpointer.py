@@ -982,11 +982,8 @@ class TestGlobalStepInflation:
         ),
         strict=True,
     )
-    @patch("veomni.trainer.callbacks.checkpoint_callback.build_checkpointer")
-    @patch("veomni.trainer.callbacks.checkpoint_callback.dist")
-    @patch("veomni.trainer.callbacks.checkpoint_callback.helper")
-    def test_epoch_end_no_phantom_save_after_stop_iteration(self, mock_helper, mock_dist, mock_build_ckpt):
-        from veomni.trainer.callbacks.checkpoint_callback import CheckpointerCallback
+    def test_epoch_end_no_phantom_save_after_stop_iteration(self):
+        from veomni.trainer.callbacks.checkpoint_callback import ModelDcpCallback
 
         trainer = MagicMock()
         trainer.args = SimpleNamespace(
@@ -1004,10 +1001,8 @@ class TestGlobalStepInflation:
             ),
             model=SimpleNamespace(accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"))),
         )
-        mock_build_ckpt.return_value = trainer.checkpointer
-        trainer.checkpointer.save_future = None
 
-        cb = CheckpointerCallback(trainer)
+        cb = ModelDcpCallback(trainer)
         cb.every_n_epochs = 1
 
         state = TrainerState(global_step=0)
@@ -1025,7 +1020,7 @@ class TestGlobalStepInflation:
         state.epoch = 0
         cb.on_epoch_end(state)
 
-        trainer.checkpointer.save.assert_not_called()
+        trainer.save_dcp.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -22,9 +22,10 @@ except Exception as _:
     from checkpoint_verification_utils import verify_dcp_to_hf_conversion
 from veomni.arguments import parse_args
 from veomni.data import build_dummy_dataset
+from veomni.models.checkpoint_manager import ModelCheckpointManager
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.trainer.callbacks.base import Callback, TrainerState
-from veomni.trainer.callbacks.checkpoint_callback import CheckpointerCallback, HuggingfaceCkptCallback
+from veomni.trainer.callbacks.checkpoint_callback import ModelDcpCallback, ModelHfCallback
 from veomni.utils import helper
 
 
@@ -116,45 +117,46 @@ class TrainerTest(BaseTrainer):
         self.train_steps = args.train_steps
 
     def _init_callbacks(self):
+        self.checkpoint = ModelCheckpointManager(self)
         self.environ_meter_callback = EnvironMeterCallbackTest(self)
-        self.checkpointer_callback = CheckpointerCallbackTest(self)
-        self.hf_ckpt_callback = HuggingfaceCkptCallbackTest(self)
+        self.dcp_callback = ModelDcpCallbackTest(self)
+        self.hf_ckpt_callback = ModelHfCallbackTest(self)
         self.check_callback = CheckCallback(self)
         self.state = TrainerState()
 
     def on_train_begin(self):
         self.environ_meter_callback.on_train_begin(self.state)
-        self.checkpointer_callback.on_train_begin(self.state)
+        self.dcp_callback.on_train_begin(self.state)
         self.hf_ckpt_callback.on_train_begin(self.state)
         self.check_callback.on_train_begin(self.state)
 
     def on_train_end(self):
         self.environ_meter_callback.on_train_end(self.state)
-        self.checkpointer_callback.on_train_end(self.state)
+        self.dcp_callback.on_train_end(self.state)
         self.hf_ckpt_callback.on_train_end(self.state)
         self.check_callback.on_train_end(self.state)
 
     def on_epoch_begin(self):
         self.environ_meter_callback.on_epoch_begin(self.state)
-        self.checkpointer_callback.on_epoch_begin(self.state)
+        self.dcp_callback.on_epoch_begin(self.state)
         self.hf_ckpt_callback.on_epoch_begin(self.state)
         self.check_callback.on_epoch_begin(self.state)
 
     def on_epoch_end(self):
         self.environ_meter_callback.on_epoch_end(self.state)
-        self.checkpointer_callback.on_epoch_end(self.state)
+        self.dcp_callback.on_epoch_end(self.state)
         self.hf_ckpt_callback.on_epoch_end(self.state)
         self.check_callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.checkpointer_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.dcp_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.hf_ckpt_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.check_callback.on_step_begin(self.state, micro_batches=micro_batches)
 
     def on_step_end(self, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs) -> None:
         self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.checkpointer_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.dcp_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.hf_ckpt_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.check_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
@@ -173,7 +175,7 @@ class EnvironMeterCallbackTest(Callback):
         self.trainer.environ_meter = FakeEnvironMeter()
 
 
-class CheckpointerCallbackTest(CheckpointerCallback):
+class ModelDcpCallbackTest(ModelDcpCallback):
     trainer: TrainerTest
 
     def on_step_end(self, state: TrainerState, **kwargs):
@@ -196,7 +198,7 @@ class CheckpointerCallbackTest(CheckpointerCallback):
         pass
 
 
-class HuggingfaceCkptCallbackTest(HuggingfaceCkptCallback):
+class ModelHfCallbackTest(ModelHfCallback):
     trainer: TrainerTest
 
     def on_step_end(self, state: TrainerState, **kwargs):
@@ -229,7 +231,7 @@ class CheckCallback(Callback):
             ), "HF checkpoint verification failed"
 
         self.trainer.args.train.checkpoint.load_path = self.trainer.dcp_weights_path
-        self.trainer.checkpointer_callback._load_checkpoint()
+        self.trainer.load()
 
         tied_weights_keys = None
         if hasattr(self.trainer.model, "_tied_weights_keys"):
