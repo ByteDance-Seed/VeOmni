@@ -803,10 +803,23 @@ class CheckpointConfig:
                 "the choice of directory: nothing is probed and free space is not checked, "
                 "so point it at a node-local filesystem that can hold every rank on the node "
                 "writing the model plus its optimizer state at once. Unset (default) writes "
-                "directly. Cannot be combined with `save_async`."
+                "directly. With `save_async` the copy to `output_dir` runs in the background, "
+                "so the staged checkpoint stays on the scratch disk until it finishes."
             )
         },
     )
+    save_async_timeout_seconds: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Collective timeout in seconds for the process group a `save_async` "
+                "checkpoint runs on, a positive integer. Must outlast the work, since the "
+                "ranks not writing wait on it for the whole duration. Unset (default) keeps "
+                "gloo's 30-minute default."
+            )
+        },
+    )
+
     dcp_save_to_lowest_rank: bool = field(
         default=False,
         metadata={
@@ -848,6 +861,17 @@ class CheckpointConfig:
         default=True,
         metadata={"help": "Save the huggingface format weights to the last checkpoint dir."},
     )
+
+    def __post_init__(self):
+        # The parser hands YAML values through untouched, so the type is checked here.
+        # ``bool`` is an ``int`` subclass: without this, a stray ``true`` would pass as a
+        # one-second timeout and abort the background save's first collective.
+        if self.save_async_timeout_seconds is not None and (
+            type(self.save_async_timeout_seconds) is not int or self.save_async_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                f"save_async_timeout_seconds must be a positive integer, got {self.save_async_timeout_seconds!r}."
+            )
 
 
 @dataclass

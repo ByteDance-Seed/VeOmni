@@ -18,8 +18,9 @@ import hashlib
 import os
 import shutil
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, Optional, Union
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import timedelta
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -488,20 +489,25 @@ class _Promotion:
         self.failed = False
 
 
-def _any_rank_failed(failed: bool) -> bool:
+def _any_rank_failed(failed: bool, group: Optional[Any] = None) -> bool:
     """Whether *any* rank hit an error, so every rank can agree on what to do next.
 
     MAX rather than SUM: one failure is enough, and SUM would overflow int32 on a
     large enough group.
+
+    ``group`` selects where the reduction runs. A background promotion passes its
+    own gloo group so its collectives are not interleaved into the training
+    stream; gloo reduces on CPU, so the device follows the backend.
     """
     if not dist.is_initialized():
         return failed
-    flag = torch.tensor([1 if failed else 0], dtype=torch.int32, device=get_device_type())
-    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    device = "cpu" if dist.get_backend(group) == "gloo" else get_device_type()
+    flag = torch.tensor([1 if failed else 0], dtype=torch.int32, device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
     return bool(flag.item())
 
 
-def _promotion_phase(state: _Promotion, work, *, participates: bool, always: bool = False) -> None:
+def _promotion_phase(state: _Promotion, work, *, participates: bool, group: Optional[Any] = None) -> None:
     """Run one phase on the ranks that take part, then let every rank agree on the result.
 
     The closing reduction is the phase's only collective and every rank reaches it
@@ -509,23 +515,24 @@ def _promotion_phase(state: _Promotion, work, *, participates: bool, always: boo
     that returned early would leave the others pairing up with the wrong one from
     then on and the save would hang instead of failing; one collective per phase
     keeps the counts equal by construction rather than by inspection.
-
-    ``always`` marks a phase that must run even after a failure -- cleanup.
     """
-    if participates and (always or not state.failed):
+    if participates and not state.failed:
         try:
             work()
         except BaseException as e:  # noqa: BLE001 - raised once every phase is done
             if state.error is None:
                 state.error = e
-    state.failed = _any_rank_failed(state.error is not None) or state.failed
+    state.failed = _any_rank_failed(state.error is not None, group) or state.failed
 
 
 _STAGE_ROOT = "veomni_ckpt_stage"
+# What DCP reads as "this checkpoint is complete".
+_DCP_METADATA = ".metadata"
 
 
-def _prepare_stage_dir(stage_dir: str, path: str) -> str:
-    """Create the empty staging directory for the run writing to ``path``.
+def _prepare_stage_dir(stage_dir: str, path: str, checkpoint_dir: str) -> str:
+    """Create the empty staging directory for the run writing to ``path``, and
+    retract the completion marker of whatever ``checkpoint_dir`` held before.
 
     One directory per run, shared by every checkpoint it writes and emptied
     first. That is also how a save killed part-way is cleaned up: its copy -- the
@@ -536,56 +543,62 @@ def _prepare_stage_dir(stage_dir: str, path: str) -> str:
     and this directory gets swept: two runs sharing a node must not land in the
     same place, or one would delete the other's staged data.
 
-    Only the node leader touches the filesystem; peers would race the sweep and
-    have no need to, since the reduction below is a collective. That reduction
-    also keeps a per-node failure -- a full or read-only scratch disk -- from
-    being seen by one rank alone, which would leave the rest waiting in
-    ``dcp.save`` on a collective that never arrives.
+    The old marker goes before this save writes anything into ``checkpoint_dir``,
+    ``extra_state`` included, so a reader never pairs the previous checkpoint
+    with new files; the promotion publishes the new marker once everything landed.
+
+    Only the node leader touches the staging directory and only the coordinator
+    the marker; the reduction below is a collective, so their work is done by the
+    time any rank leaves. It also keeps a per-node failure -- a full or read-only
+    scratch disk -- from being seen by one rank alone, which would leave the rest
+    waiting in ``dcp.save`` on a collective that never arrives.
     """
     stage_path = os.path.join(stage_dir, _STAGE_ROOT, _stage_key(path))
     error: Optional[BaseException] = None
-    if _local_rank() == 0:
-        try:
+    try:
+        if _local_rank() == 0:
             shutil.rmtree(stage_path, ignore_errors=True)
             os.makedirs(stage_path, exist_ok=True)
-        except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
-            error = e
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            stale_marker = os.path.join(checkpoint_dir, _DCP_METADATA)
+            if os.path.exists(stale_marker):
+                os.remove(stale_marker)
+    except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
+        error = e
     if _any_rank_failed(error is not None):
-        raise error or RuntimeError(f"another rank could not prepare a staging directory under {stage_dir}")
+        raise error or RuntimeError(f"another rank could not prepare to stage a checkpoint under {stage_dir}")
     return stage_path
 
 
-def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
+def _promote_staged_checkpoint(stage_path: str, final_path: str, group: Optional[Any] = None) -> None:
     """Copy a staged checkpoint to its destination, then drop the staged copy.
 
     The staging directory is node-local, so one rank per node copies all of it
     rather than each rank working out which files it wrote; that keeps this
     independent of DCP's file naming.
 
-    Four phases, each ending in a single collective (see ``_promotion_phase``),
-    with errors re-raised on every rank once every phase has run.
+    Two phases, each ending in a single collective (see ``_promotion_phase``): the
+    data, then ``.metadata`` -- published last and only if every rank's data
+    landed, so a reader sees a complete checkpoint or none. The previous marker is
+    already gone (see ``_prepare_stage_dir``). A phase's error is re-raised on
+    every rank once both have run; a failure of the group itself propagates as is.
 
-    ``.metadata`` is what DCP reads as "this checkpoint is complete". The
-    destination's old copy goes first, before anything is overwritten, and the
-    new one goes last and only if every rank's data landed -- so a reader sees
-    either the previous complete checkpoint or none, never a completion marker
-    over data that is only partly there.
+    ``group`` runs the reductions somewhere other than the default group, which is
+    what a background promotion needs: the training stream must not have a second
+    set of collectives interleaved into it.
+
+    The staged copy is dropped whatever happens: it is as large as the model plus
+    its optimizer state, and without a marker the destination reads as
+    incomplete, which it is.
     """
-    metadata_name = ".metadata"
     is_node_leader = _local_rank() == 0
     is_coordinator = (not dist.is_initialized()) or dist.get_rank() == 0
-    final_metadata = os.path.join(final_path, metadata_name)
+    final_metadata = os.path.join(final_path, _DCP_METADATA)
     state = _Promotion()
-
-    def drop_stale_marker() -> None:
-        """Stop advertising the previous checkpoint before overwriting its shards."""
-        os.makedirs(final_path, exist_ok=True)
-        if os.path.exists(final_metadata):
-            os.remove(final_metadata)
 
     def copy_this_nodes_files() -> None:
         """Copy every staged file on this node, except the completion marker."""
-        names = [n for n in sorted(os.listdir(stage_path)) if n != metadata_name]
+        names = [n for n in sorted(os.listdir(stage_path)) if n != _DCP_METADATA]
         os.makedirs(final_path, exist_ok=True)
 
         def _copy(name: str) -> None:
@@ -598,7 +611,7 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
 
     def publish_marker() -> None:
         """Publish the completion marker, or leave nothing behind if that fails."""
-        src = os.path.join(stage_path, metadata_name)
+        src = os.path.join(stage_path, _DCP_METADATA)
         if not os.path.exists(src):
             return
         try:
@@ -614,19 +627,12 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
                 logger.error(f"could not remove a partially written {final_metadata}", exc_info=True)
             raise
 
-    def drop_staged_copy() -> None:
-        """Free the scratch disk.
-
-        Runs after a failure too: the copy is as large as the model plus its
-        optimizer state, and nothing is lost by dropping it -- without a marker
-        the destination reads as incomplete, which it is.
-        """
-        shutil.rmtree(stage_path, ignore_errors=True)
-
-    _promotion_phase(state, drop_stale_marker, participates=is_coordinator)
-    _promotion_phase(state, copy_this_nodes_files, participates=is_node_leader)
-    _promotion_phase(state, publish_marker, participates=is_coordinator)
-    _promotion_phase(state, drop_staged_copy, participates=is_node_leader, always=True)
+    try:
+        _promotion_phase(state, copy_this_nodes_files, participates=is_node_leader, group=group)
+        _promotion_phase(state, publish_marker, participates=is_coordinator, group=group)
+    finally:
+        if is_node_leader:
+            shutil.rmtree(stage_path, ignore_errors=True)
 
     if state.error is not None:
         raise state.error
@@ -640,8 +646,10 @@ class DistributedCheckpointer(CheckpointerBase):
     """
 
     save_future: Optional[Any] = None
-    # Dedicated process group for async saves (created on first use)
-    _async_process_group: Optional[Any] = None
+    # What background saves share: the gloo group, created on first use, and the
+    # copy that has not landed yet.
+    _background_process_group: Optional[Any] = None
+    _pending_promotion: Optional[Tuple[Future, str]] = None
 
     @classmethod
     def save(
@@ -655,6 +663,7 @@ class DistributedCheckpointer(CheckpointerBase):
         save_to_lowest_rank: bool = False,
         parallel_state=None,
         stage_dir: Optional[str] = None,
+        save_async_timeout_seconds: Optional[int] = None,
     ) -> None:
         """
         save training state to distributed checkpoint
@@ -662,7 +671,10 @@ class DistributedCheckpointer(CheckpointerBase):
         args:
             path: path to save checkpoint
             state: state to save
-            save_async: whether to save asynchronously
+            save_async: return before the checkpoint is durable at ``path``. Without
+                ``stage_dir`` DCP writes in the background; with it the staging write
+                stays inline and the copy to ``path`` runs in the background.
+                ``wait_for_pending_save`` joins either.
             global_steps: step this checkpoint belongs to. Given, the checkpoint goes
                 into a per-step subdirectory of ``path`` and ``path`` identifies the run,
                 which is what ``stage_dir`` keys its staging directory on. Callers that
@@ -689,26 +701,33 @@ class DistributedCheckpointer(CheckpointerBase):
                 for a usable directory or check free space, and an unusable ``stage_dir``
                 fails the save rather than silently writing elsewhere. See
                 ``CheckpointConfig.stage_dir``.
+            save_async_timeout_seconds: collective timeout for the group a background
+                save runs on. It has to outlast the work, since the ranks not writing
+                wait on it for the whole duration. Unset keeps gloo's default.
         return:
             None
         """
         if "model" not in state:
             raise ValueError("Model must be provided to save a distributed checkpoint.")
 
-        # Rejected up front, before anything reaches disk. An async write is still
-        # running when save() returns and drops the staged copy; a caller-supplied
-        # writer already points somewhere, and ignoring stage_dir would write straight
-        # to the slow destination it was meant to avoid.
-        if stage_dir and save_async:
-            raise ValueError("stage_dir cannot be combined with save_async")
-
+        # Rejected before anything reaches disk: a caller-supplied writer already
+        # points somewhere, and redirecting it to the staging directory is not ours
+        # to do, while ignoring stage_dir would write straight to the slow
+        # destination it was meant to avoid.
         if stage_dir and storage_writer is not None:
             raise ValueError("stage_dir cannot be combined with an explicit storage_writer")
+
+        # A promotion still in flight is reading the staging directory emptied below.
+        if stage_dir:
+            cls._wait_for_promotion()
 
         # ``is not None`` rather than truthiness: step 0 is a step like any other, and
         # folding it onto ``path`` would write it over the run's own directory.
         checkpoint_dir = f"{path}/{_GLOBAL_STEP_PREFIX}{global_steps}" if global_steps is not None else path
         cls._create_checkpoint_dir(checkpoint_dir)
+
+        # Before extra_state: staging retracts the destination's old completion marker.
+        stage_path = _prepare_stage_dir(stage_dir, path, checkpoint_dir) if stage_dir else None
 
         # saving extra_state first to gurantee that every saved model/optimizer ckpts have their extra_state saved before them
         cls._save_extra_state(checkpoint_dir=checkpoint_dir, state=state)
@@ -724,8 +743,6 @@ class DistributedCheckpointer(CheckpointerBase):
                 load=False,
             )
 
-        stage_path = _prepare_stage_dir(stage_dir, path) if stage_dir else None
-
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(stage_path or checkpoint_dir)
 
@@ -733,18 +750,27 @@ class DistributedCheckpointer(CheckpointerBase):
             cls.execute_save(
                 save_state=save_state,
                 storage_writer=storage_writer,
-                save_async=save_async,
+                # A staged write goes to local disk and stays inline; with stage_dir,
+                # what save_async backgrounds is the copy to the destination.
+                save_async=save_async and stage_path is None,
                 save_to_lowest_rank=save_to_lowest_rank,
+                timeout_seconds=save_async_timeout_seconds,
             )
+            if stage_path is not None:
+                if save_async:
+                    cls._promote_in_background(stage_path, checkpoint_dir, save_async_timeout_seconds)
+                else:
+                    _promote_staged_checkpoint(stage_path, checkpoint_dir)
         except BaseException:
-            if stage_path is not None and _local_rank() == 0:
+            # Free the scratch disk, unless a background promotion took it over.
+            if stage_path is not None and cls._pending_promotion is None and _local_rank() == 0:
                 shutil.rmtree(stage_path, ignore_errors=True)
             raise
 
-        if stage_path is not None:
-            _promote_staged_checkpoint(stage_path, checkpoint_dir)
-
-        logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
+        if cls._pending_promotion is not None:
+            logger.info_rank0(f"Staged checkpoint for {checkpoint_dir}; copying it there in the background")
+        else:
+            logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 
     @classmethod
     def load(
@@ -809,15 +835,27 @@ class DistributedCheckpointer(CheckpointerBase):
 
     @classmethod
     def wait_for_pending_save(cls) -> None:
-        """Block until any pending async DCP save completes.
+        """Block until a checkpoint left running in the background has landed.
 
-        Safe to call when no save is pending (no-op).  Re-raises any
-        exception from the pending save after logging which rank saw it.
-        After completion, all ranks synchronize via a barrier so callers
-        can safely begin a new collective operation.
+        Two things can be outstanding: an async DCP write, and a staged checkpoint
+        being copied to its destination. Both are joined here, write first, so a
+        caller that is about to read the checkpoint or start its own collectives
+        finds neither still in progress.
 
-        This is the single entrypoint for all async-save coordination —
+        Safe to call when nothing is pending (no-op). Re-raises what the background
+        work raised, after logging which rank saw it.
+
+        This is the single entrypoint for all background-save coordination --
         prefer calling this over poking ``save_future`` directly.
+        """
+        cls._wait_for_async_write()
+        cls._wait_for_promotion()
+
+    @classmethod
+    def _wait_for_async_write(cls) -> None:
+        """Join an outstanding ``dcp.async_save``.
+
+        The closing barrier lets callers begin a new collective right after.
         """
         if cls.save_future is None:
             return
@@ -834,12 +872,75 @@ class DistributedCheckpointer(CheckpointerBase):
             dist.barrier()
 
     @classmethod
+    def _wait_for_promotion(cls) -> None:
+        """Join a checkpoint being copied to its destination in the background.
+
+        Unbounded on purpose: a per-rank deadline is not a collective, so a rank that
+        gave up early would pair with the wrong collective from then on. The group's
+        own timeout (``save_async_timeout_seconds``) is the deadline every rank hits
+        together. No barrier afterwards: the promotion ends in a reduction every rank
+        takes part in.
+        """
+        if cls._pending_promotion is None:
+            return
+        future, checkpoint_dir = cls._pending_promotion
+        # Cleared before the join so a failure is reported once, not again by the
+        # next caller.
+        cls._pending_promotion = None
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        try:
+            logger.info(f"[RANK {rank}] waiting for {checkpoint_dir} to finish promoting...")
+            future.result()
+        except BaseException:
+            logger.error(f"[RANK {rank}] promoting {checkpoint_dir} raised; propagating", exc_info=True)
+            raise
+
+    @classmethod
+    def _promote_in_background(cls, stage_path: str, final_path: str, timeout_seconds: Optional[int]) -> None:
+        """Hand the copy to a worker thread so the training loop resumes without it.
+
+        On the training thread, every rank not copying would wait on a collective for
+        the whole copy -- long enough on a slow destination to trip the NCCL
+        watchdog. The worker runs its collectives on the background gloo group
+        instead. ``save`` joins the previous promotion before staging, so only one
+        runs at a time.
+
+        Each promotion gets its own executor: ``submit`` queues the work before it
+        starts the thread, so a reused executor whose thread failed to start would
+        run that stale item ahead of the next promotion. A rank that cannot start
+        the worker raises out of ``save`` like any other rank-local failure; its
+        peers' promotions then fail on the group timeout without publishing a marker.
+        """
+        group = cls._get_background_process_group(timeout_seconds)
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="veomni-promote")
+        future = executor.submit(_promote_staged_checkpoint, stage_path, final_path, group)
+        # The worker thread exits once this promotion is done.
+        executor.shutdown(wait=False)
+        cls._pending_promotion = (future, final_path)
+
+    @classmethod
+    def _get_background_process_group(cls, timeout_seconds: Optional[int]) -> Optional[Any]:
+        """The gloo group background saves run their collectives on, created on first use.
+
+        Gloo keeps them out of the training stream and raises on timeout where NCCL
+        aborts the process. Creating a group is itself a collective, so this runs on
+        the training thread; ``timeout_seconds`` takes effect on the first call.
+        """
+        if cls._background_process_group is None and dist.is_initialized():
+            cls._background_process_group = dist.new_group(
+                backend="gloo",
+                timeout=timedelta(seconds=timeout_seconds) if timeout_seconds is not None else None,
+            )
+        return cls._background_process_group
+
+    @classmethod
     def execute_save(
         cls,
         save_state: Dict[str, Any],
         storage_writer: FileSystemWriter,
         save_async: bool,
         save_to_lowest_rank: bool = False,
+        timeout_seconds: Optional[int] = None,
     ) -> None:
         """Execute DCP save with optional async support.
 
@@ -848,16 +949,14 @@ class DistributedCheckpointer(CheckpointerBase):
         """
         planner = DefaultSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
         if save_async:
-            # Lazily create a dedicated Gloo process group for async DCP saves
-            if cls._async_process_group is None:
-                cls._async_process_group = dist.new_group(backend="gloo")
+            group = cls._get_background_process_group(timeout_seconds)
 
             cls.wait_for_pending_save()
 
             cls.save_future = dcp.async_save(
                 state_dict=save_state,
                 storage_writer=storage_writer,
-                process_group=cls._async_process_group,
+                process_group=group,
                 planner=planner,
             )
         else:

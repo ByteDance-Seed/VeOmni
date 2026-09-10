@@ -187,6 +187,7 @@ class CheckpointerCallback(Callback):
             save_to_lowest_rank=args.train.checkpoint.dcp_save_to_lowest_rank,
             parallel_state=self.parallel_state,
             stage_dir=args.train.checkpoint.stage_dir,
+            save_async_timeout_seconds=args.train.checkpoint.save_async_timeout_seconds,
         )
 
         # Empty cache and barrier
