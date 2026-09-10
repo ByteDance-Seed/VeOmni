@@ -68,11 +68,11 @@ def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
 # job-level schedule — batch sizes, steps, logging, checkpointing — which stays
 # singular no matter how many modules the model has.
 #
-# `model.*` is split so an omni module can reuse it without inheriting a
-# single-model loader's baggage:
-#   BaseModelArguments      model fields alone (model_path, config_path, lora_config, ops, …)
-#   └── ModelRuntimeArguments   + accelerator + optimizer — one training unit
-#       └── ModelArguments      + tokenizer/safetensor-index paths
+# `model.*` is split so an omni module reuses the same shape as the root:
+#   BaseModelArguments   identity (model_path, config_path, tokenizer/index, lora, ops, …)
+#   └── ModelArguments   + load flags, accelerator, optimizer
+# A tower that never tokenizes simply does not call those paths. Every unit
+# still needs `model_path` or `config_path`.
 #
 
 
@@ -606,9 +606,11 @@ class OffloadConfig:
         default=4.0,
         metadata={
             "help": (
-                "Maximum GB of free host buffers retained by async activation offload between steps, "
-                "counted once for the process rather than per offloaded module. "
-                "In-flight offloads may temporarily use more host memory. Set to 0 to disable reuse."
+                "Maximum GB of free host buffers retained between steps by one host-buffer "
+                "pool. Each `apply_async_activation_offload` call given only this limit owns "
+                "a pool of this size; pass the same `host_buffer_pool` to share one budget "
+                "across calls. Bounds the idle cache only; in-flight offloads may temporarily "
+                "use more. Set to 0 to disable reuse."
             )
         },
     )
@@ -689,18 +691,6 @@ class AcceleratorConfig:
         default="meta",
         metadata={
             "help": "Device to initialize model weights. 1. `cuda`: Init parameters on GPU. 2. `meta`: Init parameters on meta (required for FSDP2). 3. `npu`: Init parameters on Ascend NPU. 4. `mlu`: Init parameters on Cambricon MLU."
-        },
-    )
-    broadcast_model_weights_from_rank0: bool = field(
-        default=True,
-        metadata={
-            "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
-        },
-    )
-    ep_sharded_stream_load: bool = field(
-        default=False,
-        metadata={
-            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
         },
     )
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
@@ -785,15 +775,6 @@ class AcceleratorConfig:
                 "Use meta or an accelerator device."
             )
 
-        # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
-        # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
-        # instead of silently ignoring the flag.
-        assert not (self.ep_sharded_stream_load and self.broadcast_model_weights_from_rank0), (
-            "model.accelerator.ep_sharded_stream_load requires "
-            "model.accelerator.broadcast_model_weights_from_rank0=False "
-            "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
-        )
-
 
 @dataclass
 class CheckpointConfig:
@@ -810,6 +791,21 @@ class CheckpointConfig:
     save_async: bool = field(
         default=False,
         metadata={"help": "Whether to save checkpoint asynchronously."},
+    )
+    stage_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Write checkpoints under this directory and copy them to `output_dir` "
+                "afterwards, instead of writing straight to `output_dir`. Intended for a "
+                "destination far slower than local disk, where a direct write can block the "
+                "training loop long enough to trip the collective timeout. The caller owns "
+                "the choice of directory: nothing is probed and free space is not checked, "
+                "so point it at a node-local filesystem that can hold every rank on the node "
+                "writing the model plus its optimizer state at once. Unset (default) writes "
+                "directly. Cannot be combined with `save_async`."
+            )
+        },
     )
     dcp_save_to_lowest_rank: bool = field(
         default=False,
@@ -1279,6 +1275,20 @@ class OpsImplementationConfig:
             "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'eager' uses PyTorch."
         },
     )
+    qat_implementation: Literal["none", "fp8_blockwise"] = field(
+        default="none",
+        metadata={
+            "help": "Quantization-aware training recipe for DeepSeek V4. 'fp8_blockwise' makes training "
+            "see the rounding FP8 deployment will: the operands of every linear inference runs as a "
+            "true FP8 GEMM (128x128 weight tiles, 1x128 activation blocks, ue8m0 scales), the NoPE "
+            "channels of every attention KV entry inference caches in FP8 (1x64 blocks), both "
+            "sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path "
+            "(weights per the checkpoint's expert_dtype -- FP4 with 1x32 groups on V4-Flash, "
+            "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
+            "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
+            "recipe rather than a kernel backend, so it is not an OpSlot -- see veomni/ops/qat/."
+        },
+    )
 
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":
@@ -1440,16 +1450,40 @@ class OpsImplementationConfig:
                 "on CUDA. Install it or set the field to 'eager'."
             )
 
+        # ``qat_implementation`` selects a quantization recipe instead of a
+        # kernel backend, so no OpSlot resolution validates it. Its fake
+        # quantizers are the SM90-only TileLang kernels: without this check a
+        # CPU, NPU, ROCm or pre-SM90 host trains for a while and then raises
+        # inside the first fake-quant call.
+        if self.qat_implementation != "none":
+            import torch
+
+            from ..utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+
+            unsupported = torch.version.hip is not None or not IS_CUDA_AVAILABLE
+            if not unsupported:
+                # Reading the capability initializes CUDA, and parsing happens
+                # before the trainer calls ``set_device`` -- query this rank's
+                # own GPU so the early context does not land on device 0 for
+                # every rank. The count is NVML-based and needs no context.
+                local_rank = int(os.getenv("LOCAL_RANK", "0"))
+                device = local_rank if local_rank < torch.cuda.device_count() else 0
+                unsupported = get_gpu_compute_capability(device) < 90
+            if unsupported:
+                raise ValueError(
+                    f"qat_implementation={self.qat_implementation!r} requires an SM90 or later NVIDIA CUDA "
+                    f"GPU, because its fake quantizers are the DeepSeek V4 TileLang kernels. "
+                    f"Set it to 'none' to train in the model dtype."
+                )
+
 
 @dataclass
 class BaseModelArguments:
     """Model fields shared by every trainable unit, whole model or single module.
 
-    Deliberately excludes the tokenizer and index paths: an omni module is
-    addressed by its subfolder inside a composed checkpoint and never carries
-    its own tokenizer, so those belong on :class:`ModelArguments` alone.
-    ``config_path`` is here because every unit has to say where its architecture
-    is defined, even when that is just its own subfolder.
+    Paths live here: architecture (``config_path``), weights (``model_path``),
+    tokenizer, and the safetensor index. A tower may carry ``tokenizer_path``
+    without ever calling it; an independent module can point at its own index.
     """
 
     model_path: Optional[str] = field(
@@ -1459,6 +1493,17 @@ class BaseModelArguments:
     config_path: Optional[str] = field(
         default=None,
         metadata={"help": "Local path/HDFS path to the model config. Defaults to `model_path`."},
+    )
+    tokenizer_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Local path/HDFS path to the tokenizer. Defaults to `config_path`."},
+    )
+    safetensor_idx_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Local path/HDFS path to model.safetensors.index.json. "
+            "Defaults to `model_path`/model.safetensors.index.json."
+        },
     )
     model_config: Optional[Dict] = field(
         default_factory=dict,
@@ -1486,6 +1531,8 @@ class BaseModelArguments:
     _fqn_to_index_mapping_cache: ClassVar[Dict[str, Optional[Dict[str, int]]]] = {}
 
     def __post_init__(self):
+        if self.config_path is None and self.model_path is None:
+            raise ValueError("`config_path` must be specified when `model_path` is None.")
         # Localize here rather than in each owner: every subclass needs a
         # ``model_path`` that exists on disk before any loader touches it, and a
         # composed model resolves its module subfolders against this root.
@@ -1493,9 +1540,17 @@ class BaseModelArguments:
         self.config_path = _resolve_hdfs_path(self.config_path)
         if self.config_path is None:
             self.config_path = self.model_path
+        self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
+        # Resolved once here rather than in ``_safetensor_idx_path()``, which the
+        # ``fqn_to_index_mapping`` property calls on every access.
+        self.safetensor_idx_path = _resolve_hdfs_path(self.safetensor_idx_path)
+        if self.tokenizer_path is None:
+            self.tokenizer_path = self.config_path
 
     def _safetensor_idx_path(self) -> Optional[str]:
-        """Where to read the HF ``weight_map`` from. Overridden to allow an explicit path."""
+        """Honour an explicit index path, else the one under ``model_path``."""
+        if self.safetensor_idx_path is not None:
+            return self.safetensor_idx_path
         if self.model_path is None:
             return None
         return os.path.join(self.model_path, "model.safetensors.index.json")
@@ -1534,53 +1589,47 @@ class BaseModelArguments:
 
 
 @dataclass
-class ModelRuntimeArguments(BaseModelArguments):
-    """Everything one training unit needs: model fields + its own accelerator and optimizer.
+class ModelArguments(BaseModelArguments):
+    """model.* — One training unit: identity plus load policy, accelerator, optimizer.
 
-    This is the shape a per-module runtime consumes. An omni model builds one of
-    these per module and merges it over the model-level defaults, which is why
-    the pair is declared here rather than on :class:`ModelArguments`.
+    Root ``model.*`` and a per-module overlay share this class. An omni model
+    builds one of these per module and merges it over the model-level defaults.
+    Weight loading sits here rather than on :class:`AcceleratorConfig`: broadcast
+    vs per-rank streaming is how this unit's checkpoint is ingested, not a mesh
+    dimension.
     """
 
+    broadcast_model_weights_from_rank0: bool = field(
+        default=True,
+        metadata={
+            "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
+        },
+    )
+    ep_sharded_stream_load: bool = field(
+        default=False,
+        metadata={
+            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
+        },
+    )
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
-
-@dataclass
-class ModelArguments(ModelRuntimeArguments):
-    """model.* — One composed model, plus the paths its loaders resolve from."""
-
-    tokenizer_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "Local path/HDFS path to the tokenizer. Defaults to `config_path`."},
-    )
-    safetensor_idx_path: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "Local path/HDFS path to model.safetensors.index.json. "
-            "Defaults to `model_path`/model.safetensors.index.json."
-        },
-    )
-
     def __post_init__(self):
-        if self.config_path is None and self.model_path is None:
-            raise ValueError("`config_path` must be specified when `model_path` is None.")
-
-        # Download HDFS-hosted paths to a local cache before resolving defaults so
-        # that all downstream loaders (config/tokenizer/safetensors) see local paths.
-        # ``super()`` settles ``config_path``, which the tokenizer then falls back to.
         super().__post_init__()
-        self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
-        # Resolved once here rather than in ``_safetensor_idx_path()``, which the
-        # ``fqn_to_index_mapping`` property calls on every access.
-        self.safetensor_idx_path = _resolve_hdfs_path(self.safetensor_idx_path)
+        # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
+        # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
+        # instead of silently ignoring the flag.
+        assert not (self.ep_sharded_stream_load and self.broadcast_model_weights_from_rank0), (
+            "model.ep_sharded_stream_load requires "
+            "model.broadcast_model_weights_from_rank0=False "
+            "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
+        )
 
-        if self.tokenizer_path is None:
-            self.tokenizer_path = self.config_path
 
-    def _safetensor_idx_path(self) -> Optional[str]:
-        """Honour an explicit index path, else fall back to the one under ``model_path``."""
-        return self.safetensor_idx_path or super()._safetensor_idx_path()
+# VeOmniModelRuntime still types its unit as ModelRuntimeArguments. 1060
+# folded that class into ModelArguments (identity + load flags + accelerator +
+# optimizer); keep the name so runtime call sites do not churn in this merge.
+ModelRuntimeArguments = ModelArguments
 
 
 # ================================ Data Arguments ======================================
@@ -1664,6 +1713,15 @@ class DataArguments:
         default="mapping",
         metadata={"help": "Type of the datasets."},
     )
+    dataset_repeat: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Iterable-only. If True, replay the stream so one epoch can reach "
+                "train.max_steps when the dump is shorter. Mapping ignores this."
+            )
+        },
+    )
     multisource_datasets_type: str = field(
         default="interleave",
         metadata={"help": "Type of the datasets for multisource training."},
@@ -1680,16 +1738,9 @@ class DataArguments:
         default=None,
         metadata={"help": "Key to get text from the training data."},
     )
-    chat_template: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Chat template used to lay conversations out into training samples. "
-                "Leave unset for data that carries no conversation structure (plaintext, "
-                "diffusion) or for a model that formats prompts through its own processor "
-                "(Qwen-Omni)."
-            )
-        },
+    chat_template: str = field(
+        default="default",
+        metadata={"help": "Chat template to use."},
     )
     max_seq_len: int = field(
         default=2048,

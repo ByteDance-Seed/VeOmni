@@ -375,8 +375,8 @@ class VeOmniModelRuntime:
             enable_forward_prefetch=args.accelerator.fsdp_config.forward_prefetch,
             enable_fsdp_offload=args.accelerator.fsdp_config.offload,
             fsdp_offload_pin_memory=args.accelerator.fsdp_config.offload_pin_memory,
-            broadcast_model_weights_from_rank0=args.accelerator.broadcast_model_weights_from_rank0,
-            ep_sharded_stream_load=args.accelerator.ep_sharded_stream_load,
+            broadcast_model_weights_from_rank0=args.broadcast_model_weights_from_rank0,
+            ep_sharded_stream_load=args.ep_sharded_stream_load,
             max_load_broadcast_size=args.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
             compile_config=compile_config,
@@ -485,6 +485,7 @@ class VeOmniModelRuntime:
         self.optimizer = build_optimizer(
             self.model,
             lr=opt.lr,
+            betas=opt.betas,
             weight_decay=opt.weight_decay,
             fused=True,
             optimizer_type=opt.type,

@@ -282,6 +282,7 @@ class OpsImplementationConfig:
     dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = "eager"
     dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "tilelang"] = "eager"
     mhc_implementation: Literal["eager", "tilelang"] = "eager"
+    qat_implementation: Literal["none", "fp8_blockwise"] = "none"
 ```
 
 **Shipped today** (what is actually on `OpsImplementationConfig` as of this
@@ -302,6 +303,7 @@ PR — see `veomni/arguments/arguments_types.py`):
 | `dsa_indexer_implementation` | `eager`, `cudnn`, `tilelang` | GLM-DSA supports `cudnn`; DeepSeek V4 supports `tilelang`. Optimized implementations require compatible NVIDIA hardware. |
 | `dsa_attention_implementation` | `eager`, `flashmla_cudnn`, `tilelang` | GLM-DSA supports `flashmla_cudnn`; DeepSeek V4 supports `tilelang`. Optimized implementations require compatible NVIDIA hardware. |
 | `mhc_implementation` | `eager`, `tilelang` | DeepSeek V4 manifold-constrained Hyper-Connection pre/post/head kernels provided by the `tile-kernels` package. The three `OpSlot("mhc", variant)` instances share this selection and require NVIDIA SM90+ for `tilelang`. |
+| `qat_implementation` | `none`, `fp8_blockwise` | DeepSeek V4 fake-quantization recipe, not a kernel backend: it has no `OpSlot`, and the patched modeling helpers read it through an `OpsConfigSlot` to decide whether to route a tensor through `veomni/ops/qat/`. `fp8_blockwise` needs the TileLang quantizers, so `_validate_implementations` rejects it below NVIDIA CUDA SM90. |
 
 No preset field was shipped. Configure each `OpsImplementationConfig` field
 explicitly; unknown fields such as `preset` are invalid.

@@ -158,7 +158,11 @@ def test_ddp_rejects_cpu_init(world_size):
 def test_ep_sharded_stream_load_conflicts_with_broadcast(world_size):
     world_size(1)
     with pytest.raises(AssertionError, match="ep_sharded_stream_load requires"):
-        AcceleratorConfig(ep_sharded_stream_load=True, broadcast_model_weights_from_rank0=True)
+        ModelArguments(
+            config_path="dummy",
+            ep_sharded_stream_load=True,
+            broadcast_model_weights_from_rank0=True,
+        )
 
 
 def test_ddp_takes_broadcast_at_face_value(world_size, monkeypatch):
@@ -171,12 +175,9 @@ def test_ddp_takes_broadcast_at_face_value(world_size, monkeypatch):
     warnings = []
     monkeypatch.setattr(arguments_types.logger, "warning_rank0", lambda msg, *a, **k: warnings.append(msg))
 
-    acc = AcceleratorConfig(
-        broadcast_model_weights_from_rank0=True,
-        fsdp_config=FSDPConfig(fsdp_mode="ddp"),
-    )
+    args = ModelArguments(config_path="dummy", broadcast_model_weights_from_rank0=True)
 
-    assert acc.broadcast_model_weights_from_rank0 is True
+    assert args.broadcast_model_weights_from_rank0 is True
     assert not any("broadcast_model_weights_from_rank0" in msg for msg in warnings)
 
 
@@ -184,8 +185,6 @@ def test_ddp_takes_broadcast_at_face_value(world_size, monkeypatch):
     "name",
     [
         "init_device",
-        "broadcast_model_weights_from_rank0",
-        "ep_sharded_stream_load",
         "gradient_checkpointing",
         "torch_compile",
     ],
@@ -194,6 +193,22 @@ def test_moved_knobs_live_on_the_accelerator_and_not_on_training_arguments(name,
     world_size(1)
 
     assert hasattr(make_model_args().accelerator, name)
+    assert not hasattr(TrainingArguments(), name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "broadcast_model_weights_from_rank0",
+        "ep_sharded_stream_load",
+    ],
+)
+def test_load_flags_live_on_the_model_and_not_on_the_accelerator(name, world_size):
+    world_size(1)
+    args = make_model_args()
+
+    assert hasattr(args, name)
+    assert not hasattr(args.accelerator, name)
     assert not hasattr(TrainingArguments(), name)
 
 
@@ -230,15 +245,20 @@ def test_model_runtime_arguments_is_a_standalone_training_unit():
     ``config_path`` is among them because every unit has to say where its
     architecture is defined, even when that is just its own subfolder — the
     runtime reads it directly rather than asking the job to hand one over.
-    ``tokenizer_path`` and ``safetensor_idx_path`` are not: a module inside a
-    composed checkpoint is addressed by its subfolder, so inheriting those would
-    hand every module a tokenizer it has no use for.
+    ``tokenizer_path`` and ``safetensor_idx_path`` live here too: a tower that
+    never tokenizes simply does not call them, and an independent module can
+    point at its own index.
     """
     names = {f.name for f in dataclasses.fields(ModelRuntimeArguments)}
 
     assert {"model_path", "config_path", "model_config", "basic_modules", "lora_config"} <= names
     assert {"processor_config", "ops_implementation", "accelerator", "optimizer"} <= names
-    assert names.isdisjoint({"tokenizer_path", "safetensor_idx_path"})
+    assert {
+        "tokenizer_path",
+        "safetensor_idx_path",
+        "broadcast_model_weights_from_rank0",
+        "ep_sharded_stream_load",
+    } <= names
 
 
 def test_base_localizes_model_path_so_every_subclass_inherits_it(monkeypatch):

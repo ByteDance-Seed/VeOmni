@@ -283,8 +283,8 @@ def test_shared_host_buffer_pool_survives_repeated_application():
 
     A composed model applies offload one module at a time, and each call needs
     its own manager because ``layer_idx`` restarts at 0. The host limit bounds
-    pinned memory for the whole process, though, so the pool must outlive the
-    call that used it rather than being rebuilt per module.
+    pinned memory for one pool. Sharing that pool across calls keeps one budget;
+    omitting it (passing only a limit) would give each call its own pool.
     """
     thinker = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
     talker = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
@@ -510,7 +510,7 @@ def _run_async_offload_base_trainer_fsdp2_gc():
         TorchCompileConfig,
     )
     from veomni.distributed.parallel_state import init_parallel_state, use_parallel_state
-    from veomni.models.model_runtime import VeOmniModelRuntime
+    from veomni.trainer.base import BaseTrainer
 
     world_size = dist.get_world_size()
     init_parallel_state(
@@ -521,48 +521,49 @@ def _run_async_offload_base_trainer_fsdp2_gc():
         name="base",
     )
 
-    runtime = object.__new__(VeOmniModelRuntime)
-    runtime.model = _AsyncOffloadFSDPModel(device="meta")
-    runtime.model_name = "base"
-    runtime.args = SimpleNamespace(
-        lora_config=None,
-        fqn_to_index_mapping=None,
-        model_path=None,
-        basic_modules=[],
-        optimizer=OptimizerConfig(),
-        accelerator=SimpleNamespace(
-            offload_config=OffloadConfig(
-                enable_async_activation=True,
-                activation_offload_host_cache_limit_gb=0.01,
-            ),
-            fsdp_config=FSDPConfig(mixed_precision=MixedPrecisionConfig(enable=False)),
-            init_device="meta",
-            gradient_checkpointing=GradientCheckpointingConfig(enable=True),
+    trainer = object.__new__(BaseTrainer)
+    trainer.model = _AsyncOffloadFSDPModel(device="meta")
+    trainer.args = SimpleNamespace(
+        model=SimpleNamespace(
+            lora_config=None,
+            fqn_to_index_mapping=None,
+            model_path=None,
+            basic_modules=[],
+            optimizer=OptimizerConfig(),
             broadcast_model_weights_from_rank0=False,
             ep_sharded_stream_load=False,
-            torch_compile=TorchCompileConfig(enable=False),
+            accelerator=SimpleNamespace(
+                offload_config=OffloadConfig(
+                    enable_async_activation=True,
+                    activation_offload_host_cache_limit_gb=0.01,
+                ),
+                fsdp_config=FSDPConfig(mixed_precision=MixedPrecisionConfig(enable=False)),
+                init_device="meta",
+                gradient_checkpointing=GradientCheckpointingConfig(enable=True),
+                torch_compile=TorchCompileConfig(enable=False),
+            ),
         ),
-    )
-    runtime.train = SimpleNamespace(
-        checkpoint=SimpleNamespace(load_path=None),
+        train=SimpleNamespace(
+            checkpoint=SimpleNamespace(load_path=None),
+        ),
     )
 
     torch.manual_seed(0)
     with use_parallel_state("base"):
-        runtime.build_parallelized_model()
+        trainer._build_parallelized_model()
 
-    assert all(layer.gradient_checkpointing for layer in runtime.model.layers)
-    manager = runtime.model.layers[0]._veomni_offload_manager
+    assert all(layer.gradient_checkpointing for layer in trainer.model.layers)
+    manager = trainer.model.layers[0]._veomni_offload_manager
     hidden_states = torch.randn(2, 8, 16, device=get_device_type(), requires_grad=True)
     with use_parallel_state("base"):
-        output = runtime.model(hidden_states)
+        output = trainer.model(hidden_states)
     with use_parallel_state("base"):
         output.float().square().mean().backward()
 
     assert torch.isfinite(output).all()
     assert manager.host_buffer_pool.allocations > 0
     assert not manager.items
-    for parameter in runtime.model.parameters():
+    for parameter in trainer.model.parameters():
         if parameter.grad is not None:
             local_grad = parameter.grad.to_local() if hasattr(parameter.grad, "to_local") else parameter.grad
             assert torch.isfinite(local_grad).all()

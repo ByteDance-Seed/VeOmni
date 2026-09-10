@@ -58,6 +58,16 @@ class ModelDcpCallback(Callback):
         # grad-norm all-reduce).
         helper.empty_cache()
 
+    def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        """Block until an in-flight async save has finished before the run exits.
+
+        With ``save_async``, ``save_dcp`` returns as soon as ``dcp.async_save``
+        has been queued. ``wait_for_pending_save`` is the only place that future
+        is consumed; without this hook a run whose last save is also its only
+        save can exit 0 while a background write failed.
+        """
+        self.trainer.model.checkpoint.wait_for_pending_save()
+
     def on_step_end(self, state: TrainerState, **kwargs):
         if self.every_n_steps and state.global_step % self.every_n_steps == 0:
             self._save_checkpoint(state)

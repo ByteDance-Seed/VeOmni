@@ -279,8 +279,8 @@ def test_peft_ep_sharded_stream_load_matches_broadcast(tmp_path, fused_toy_base_
         stream_dir,
         extra_overrides=base_overrides
         + [
-            "--model.accelerator.broadcast_model_weights_from_rank0=False",
-            "--model.accelerator.ep_sharded_stream_load=True",
+            "--model.broadcast_model_weights_from_rank0=False",
+            "--model.ep_sharded_stream_load=True",
         ],
         nproc=nproc,
     )

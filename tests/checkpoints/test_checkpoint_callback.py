@@ -193,3 +193,24 @@ class TestModelHfCallbackLastSavedStep:
         trainer.save_hf_or_lora.reset_mock()
         cb.on_train_end(state)
         trainer.save_hf_or_lora.assert_not_called()
+
+
+@patch("veomni.trainer.callbacks.checkpoint_callback.helper")
+class TestModelDcpCallbackTrainEndWait:
+    """ModelDcpCallback.on_train_end must consume a pending async save."""
+
+    def test_train_end_waits_for_pending_async_save(self, mock_helper):
+        trainer = _make_mock_trainer(save_async=True)
+        cb = ModelDcpCallback(trainer)
+
+        cb.on_train_end(TrainerState(global_step=60))
+
+        trainer.model.checkpoint.wait_for_pending_save.assert_called_once_with()
+
+    def test_train_end_propagates_async_save_failure(self, mock_helper):
+        trainer = _make_mock_trainer(save_async=True)
+        trainer.model.checkpoint.wait_for_pending_save.side_effect = RuntimeError("HDFS write failed")
+        cb = ModelDcpCallback(trainer)
+
+        with pytest.raises(RuntimeError, match="HDFS write failed"):
+            cb.on_train_end(TrainerState(global_step=60))

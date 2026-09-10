@@ -371,8 +371,8 @@ model = build_parallelize_model(
     enable_reentrant=args.model.accelerator.gradient_checkpointing.enable_reentrant,
     early_stop=args.model.accelerator.gradient_checkpointing.early_stop,
     enable_forward_prefetch=args.model.accelerator.fsdp_config.forward_prefetch,
-    broadcast_model_weights_from_rank0=args.model.accelerator.broadcast_model_weights_from_rank0, # load model weights
-    ep_sharded_stream_load=args.model.accelerator.ep_sharded_stream_load,
+    broadcast_model_weights_from_rank0=args.model.broadcast_model_weights_from_rank0, # load model weights
+    ep_sharded_stream_load=args.model.ep_sharded_stream_load,
     max_load_broadcast_size=args.model.accelerator.fsdp_config.max_load_broadcast_size, # max load broadcast size
     # Muon's zero-comm expert layout is decided here, not by build_optimizer.
     muon_expert_zero_comm=args.model.optimizer.type == "muon" and args.model.optimizer.muon_expert_zero_comm,
@@ -389,7 +389,7 @@ model = build_parallelize_model(
 | `anyprecision_adamw` | Mixed-precision AdamW (Llama-recipes' AnyPrecisionAdamW). |
 | `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases and norms. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
 
-Muon-specific hyperparameters live under `model.optimizer.muon_*` (e.g. `muon_lr`, `muon_momentum`, `muon_adjust_lr_fn`); `lr` / `weight_decay` / `betas` / `eps` continue to drive the AdamW sibling group.
+Muon-specific hyperparameters live under `model.optimizer.muon_*` (e.g. `muon_lr`, `muon_momentum`, `muon_adjust_lr_fn`); `lr` / `weight_decay` / `betas` continue to drive the AdamW sibling group.
 
 Muon-specific knobs (only consulted when `optimizer.type == "muon"`):
 
@@ -527,6 +527,7 @@ from veomni.optim import build_lr_scheduler, build_optimizer
 optimizer = build_optimizer(
     model,
     lr=args.model.optimizer.lr,
+    betas=args.model.optimizer.betas,
     weight_decay=args.model.optimizer.weight_decay,
     optimizer_type=args.model.optimizer.type,
     # Hand over the config so optimizer-specific knobs (the muon_* fields) are
