@@ -1503,7 +1503,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -2038,146 +2503,279 @@
+@@ -2038,146 +2503,281 @@
          image_grid_thw=None,
          video_grid_thw=None,
          attention_mask=None,
@@ -1848,13 +1848,15 @@
 +                or self.rope_deltas is None
 +            ):
 +                delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
++                # Keep the per-video audio lengths separate from HF's global flag.
 +                position_ids, rope_deltas = self.get_rope_index(
-+                    input_ids,
-+                    image_grid_thw,
-+                    video_grid_thw,
-+                    attention_mask,
-+                    audio_feature_lengths,
-+                    video_second_per_grid,
++                    input_ids=input_ids,
++                    image_grid_thw=image_grid_thw,
++                    video_grid_thw=video_grid_thw,
++                    attention_mask=attention_mask,
++                    use_audio_in_video=use_audio_in_video,
++                    audio_seqlens=audio_feature_lengths,
++                    second_per_grids=video_second_per_grid,
 +                )
 +                rope_deltas = rope_deltas - delta0
 +                self.rope_deltas = rope_deltas
@@ -1877,7 +1879,7 @@
 
          outputs = self.model(
              attention_mask=attention_mask,
-@@ -2186,39 +2784,81 @@
+@@ -2186,39 +2786,81 @@
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
              output_router_logits=output_router_logits,
@@ -1975,7 +1977,7 @@
          )
 
      def _expand_inputs_for_generation(
-@@ -2284,1339 +2924,28 @@
+@@ -2284,1339 +2926,28 @@
 
          return position_ids
 
@@ -3337,7 +3339,7 @@
          )
 
 
-@@ -3661,138 +2990,87 @@
+@@ -3661,138 +2992,87 @@
          return hidden_states
 
 
@@ -3547,7 +3549,7 @@
 
      def disable_talker(self):
          if hasattr(self, "talker"):
-@@ -4136,19 +3414,67 @@
+@@ -4136,19 +3416,67 @@
 
          return thinker_result.sequences, talker_wavs
 

@@ -2626,13 +2626,14 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 or self.rope_deltas is None
             ):
                 delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
+                # Keep the per-video audio lengths separate from HF's global flag.
                 position_ids, rope_deltas = self.get_rope_index(
-                    input_ids,
-                    image_grid_thw,
-                    video_grid_thw,
-                    attention_mask,
-                    audio_feature_lengths,
-                    video_second_per_grid,
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attention_mask,
+                    audio_seqlens=audio_feature_lengths,
+                    second_per_grids=video_second_per_grid,
                 )
                 rope_deltas = rope_deltas - delta0
                 self.rope_deltas = rope_deltas

@@ -1475,7 +1475,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1918,113 +2466,188 @@
+@@ -1918,113 +2466,189 @@
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
          attention_mask: torch.Tensor | None = None,
@@ -1717,13 +1717,14 @@
 +                or self.rope_deltas is None
 +            ):
 +                delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
++                # Keep the per-video audio lengths separate from HF's global flag.
 +                position_ids, rope_deltas = self.get_rope_index(
-+                    input_ids,
-+                    image_grid_thw,
-+                    video_grid_thw,
-+                    attention_mask,
-+                    audio_feature_lengths,
-+                    video_second_per_grid,
++                    input_ids=input_ids,
++                    image_grid_thw=image_grid_thw,
++                    video_grid_thw=video_grid_thw,
++                    attention_mask=attention_mask,
++                    audio_seqlens=audio_feature_lengths,
++                    second_per_grids=video_second_per_grid,
 +                )
 +                rope_deltas = rope_deltas - delta0
 +                self.rope_deltas = rope_deltas
@@ -1742,7 +1743,7 @@
 
          outputs = self.model(
              attention_mask=attention_mask,
-@@ -2032,27 +2655,61 @@
+@@ -2032,27 +2656,61 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1814,7 +1815,7 @@
 
      def _expand_inputs_for_generation(
          self,
-@@ -2117,799 +2774,54 @@
+@@ -2117,799 +2775,54 @@
 
          return position_ids
 
@@ -2662,7 +2663,7 @@
 
 
  @use_kernel_forward_from_hub("rotary_pos_emb")
-@@ -2943,137 +2855,6 @@
+@@ -2943,137 +2856,6 @@
      `(x0, x2, ..., x1, x3, ...)` so the kernelized `apply_rotary_pos_emb` can be used.
      """
      return torch.cat((x[..., 0::2], x[..., 1::2]), dim=-1)
@@ -2800,7 +2801,7 @@
 
 
  class Qwen2_5OmniSnakeBeta(nn.Module):
-@@ -3295,405 +3076,10 @@
+@@ -3295,405 +3077,10 @@
          super().__init__(*args, **kwargs)
 
 
@@ -3210,7 +3211,7 @@
 
 
  ############################
-@@ -3720,22 +3106,74 @@
+@@ -3720,22 +3107,74 @@
          "Qwen2_5OmniToken2WavModel",
      ]
 
@@ -3295,7 +3296,7 @@
 
      def load_speakers(self, path):
          check_torch_load_is_safe()
-@@ -3797,285 +3235,71 @@
+@@ -3797,285 +3236,71 @@
 
          return model
 

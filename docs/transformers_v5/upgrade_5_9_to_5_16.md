@@ -22,7 +22,11 @@ and indexer-loss changes. VeOmni retains the scoring projection at
 The HF converter maps the new `indexer.scorer.weights_proj` name back to this
 layout, and the projection remains excluded from FP8 conversion. Omni RoPE
 helpers also accept the global audio/video flag used by HF generation while
-retaining the per-video placeholder convention for training.
+retaining the per-video placeholder convention for training. Thinker forwards
+pass RoPE arguments by keyword: adding the global flag before `audio_seqlens`
+otherwise shifts audio lengths and video timing into the wrong parameters.
+The upgrade contract tests exercise forward without precomputed `position_ids`,
+including multiple silent videos and the explicit global `False` mode.
 
 ## Finding the drift
 
