@@ -65,9 +65,10 @@ class Arguments(VeOmniArguments):
 
 ## Parallel State
 VeOmni uses PyTorch DeviceMesh to manage multidimensional parallel topologies.
-`init_parallel_state` registers a state under a logical name, while
-`use_parallel_state` scopes operations that need to resolve the current
-process groups. See [Local Parallel State Registry and Scoping](../design/local_parallel_state.md)
+`init_parallel_state_from_config` registers a state under a logical name from
+an `AcceleratorConfig`, while `use_parallel_state` scopes operations that need
+to resolve the current process groups. See
+[Local Parallel State Registry and Scoping](../design/local_parallel_state.md)
 for the registry, topology-cache, and teardown rules.
 
 More details about torch device mesh, you can refer to the [Getting Started with DeviceMesh](https://pytorch.org/tutorials/recipes/distributed_device_mesh.html).
@@ -78,25 +79,11 @@ More details about torch device mesh, you can refer to the [Getting Started with
 from veomni.distributed.parallel_state import (
     get_parallel_state,
     get_parallel_state_by_name,
-    init_parallel_state,
+    init_parallel_state_from_config,
     use_parallel_state,
 )
 
-init_parallel_state(
-    dp_size=args.model.accelerator.dp_size, # data parallel size
-    dp_replicate_size=args.model.accelerator.dp_replicate_size, # data parallel replicate size
-    dp_shard_size=args.model.accelerator.dp_shard_size, # data parallel shard degree
-    tp_size=args.model.accelerator.tp_size, # tensor parallel size
-    pp_size=args.model.accelerator.pp_size, # pipeline parallel size, not support now
-    cp_size=args.model.accelerator.cp_size, # context parallel size, not support now
-    ulysses_size=args.model.accelerator.ulysses_size, # ulysses parallel size
-    extra_parallel_sizes=args.model.accelerator.extra_parallel_sizes, # including expert parallel size
-    extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
-    extra_parallel_names=args.model.accelerator.extra_parallel_names,
-    dp_mode=args.model.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp" or "fsdp2"
-    async_enabled=args.model.accelerator.enable_async, # async ulysses
-    name="base",
-)
+init_parallel_state_from_config(args.model.accelerator, name="base")
 
 parallel_state = get_parallel_state()
 assert parallel_state is get_parallel_state_by_name("base")

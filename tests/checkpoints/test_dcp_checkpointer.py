@@ -21,7 +21,7 @@ import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
 
 from veomni.distributed import torch_parallelize
-from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
+from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import (
     build_parallelize_model,
     parallelize_model_ddp,
@@ -48,7 +48,7 @@ def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path):
     dist.init_process_group(backend, rank=rank, world_size=world_size)
 
     try:
-        init_parallel_state(dp_size=world_size, dp_mode="fsdp2")
+        _init_parallel_state(dp_size=world_size, dp_mode="fsdp2")
         mesh = get_parallel_state().dp_shard_mesh
 
         def build_model_and_optimizer():
