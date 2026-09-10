@@ -44,7 +44,8 @@ def test_deepseek_v4_indexer_preserves_model_and_optimizer_keys(backend):
     [("qwen2_5_omni", "Qwen2_5Omni"), ("qwen3_omni_moe", "Qwen3OmniMoe")],
 )
 def test_omni_generation_prepares_text_positions(family, prefix):
-    backend = "npu" if IS_NPU_AVAILABLE else "gpu"
+    # Qwen2.5-Omni uses one shared generated module on both accelerators.
+    backend = "npu" if IS_NPU_AVAILABLE and family == "qwen3_omni_moe" else "gpu"
     modeling = importlib.import_module(
         f"veomni.models.transformers.{family}.generated.patched_modeling_{family}_{backend}"
     )
