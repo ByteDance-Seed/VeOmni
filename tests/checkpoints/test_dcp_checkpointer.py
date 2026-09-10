@@ -1885,6 +1885,77 @@ class TestAsyncPromotion:
         finally:
             self._reset()
 
+    def test_a_peer_that_cannot_start_a_worker_stops_every_rank(self, tmp_path):
+        """Startup is rank-local, so the ranks that managed it must not go ahead alone.
+
+        A promotion whose reductions expect the whole group would wait out its timeout
+        for a peer that never started, while that peer returned from ``save`` and
+        skipped the barrier its caller runs next -- a hang instead of a failure.
+        """
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        self._reset()
+        try:
+            with (
+                patch.object(DistributedCheckpointer, "execute_save"),
+                patch.object(DistributedCheckpointer, "_create_storage_writer"),
+                patch.object(DistributedCheckpointer, "_save_extra_state"),
+                patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+                patch("veomni.checkpoint.dcp_checkpointer._prepare_stage_dir", return_value=str(tmp_path / "s")),
+                patch("veomni.checkpoint.dcp_checkpointer._promote_staged_checkpoint") as promote,
+                # This rank started fine; another rank did not.
+                patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=True),
+                pytest.raises(RuntimeError, match="another rank could not start"),
+            ):
+                DistributedCheckpointer.save(
+                    path=str(tmp_path / "ckpt"),
+                    state={"model": MagicMock()},
+                    save_async=True,
+                    global_steps=10,
+                    stage_dir=str(tmp_path / "stage"),
+                )
+
+            promote.assert_not_called()
+            assert DistributedCheckpointer._pending_promotion is None
+        finally:
+            self._reset()
+
+    def test_a_failed_submission_does_not_leave_the_executor_behind(self, tmp_path):
+        """submit() queues the work before it can fail to serve it.
+
+        Keeping that executor would let a later save inherit the orphaned item, which
+        would promote a checkpoint into a destination that has moved on.
+        """
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        self._reset()
+        executor = MagicMock()
+        executor.submit.side_effect = RuntimeError("can't start new thread")
+        DistributedCheckpointer._promotion_executor = executor
+        try:
+            with (
+                patch.object(DistributedCheckpointer, "execute_save"),
+                patch.object(DistributedCheckpointer, "_create_storage_writer"),
+                patch.object(DistributedCheckpointer, "_save_extra_state"),
+                patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+                patch("veomni.checkpoint.dcp_checkpointer._prepare_stage_dir", return_value=str(tmp_path / "s")),
+                patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False),
+                pytest.raises(RuntimeError, match="can't start new thread"),
+            ):
+                DistributedCheckpointer.save(
+                    path=str(tmp_path / "ckpt"),
+                    state={"model": MagicMock()},
+                    save_async=True,
+                    global_steps=10,
+                    stage_dir=str(tmp_path / "stage"),
+                )
+
+            executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+            assert DistributedCheckpointer._promotion_executor is None, "an unusable executor was kept"
+            assert DistributedCheckpointer._pending_promotion is None
+        finally:
+            self._reset()
+
     def test_unset_save_async_copies_inline(self, tmp_path):
         """Background promotion is opt-in; without it the copy stays where it was."""
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer

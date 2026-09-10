@@ -794,7 +794,10 @@ class DistributedCheckpointer(CheckpointerBase):
                 shutil.rmtree(stage_path, ignore_errors=True)
             raise
 
-        logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
+        if cls._pending_promotion is not None:
+            logger.info_rank0(f"Staged checkpoint for {checkpoint_dir}; copying it there in the background")
+        else:
+            logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 
     @classmethod
     def load(
@@ -938,9 +941,35 @@ class DistributedCheckpointer(CheckpointerBase):
         One worker, so two promotions never overlap on the same staging directory.
         """
         group = cls._get_background_process_group(timeout_seconds)
-        if cls._promotion_executor is None:
-            cls._promotion_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="veomni-promote")
-        future = cls._promotion_executor.submit(_promote_staged_checkpoint, stage_path, final_path, group)
+
+        # Getting a worker ready is rank-local and can fail on its own -- a thread
+        # limit, a process short of memory -- so every rank agrees before any of them
+        # hands work over. Submitting first would strand the ranks that succeeded on
+        # reductions expecting a peer that never started, while that peer went on to
+        # skip the barrier its caller runs after the save.
+        error: Optional[BaseException] = None
+        try:
+            if cls._promotion_executor is None:
+                executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="veomni-promote")
+                # Spawn the worker here rather than let the submit below do it, so the
+                # one call made after the group has committed cannot fail on thread
+                # creation.
+                executor.submit(int).result()
+                cls._promotion_executor = executor
+        except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
+            error = e
+        if _any_rank_failed(error is not None):
+            raise error or RuntimeError("another rank could not start a checkpoint promotion")
+
+        try:
+            future = cls._promotion_executor.submit(_promote_staged_checkpoint, stage_path, final_path, group)
+        except BaseException:
+            # submit() queues the work before it can fail, so the item may be sitting
+            # in a queue this process can no longer serve. Drop the executor rather
+            # than let a later save inherit it and promote the wrong checkpoint.
+            cls._promotion_executor.shutdown(wait=False, cancel_futures=True)
+            cls._promotion_executor = None
+            raise
         cls._pending_promotion = (future, final_path)
 
     @classmethod
