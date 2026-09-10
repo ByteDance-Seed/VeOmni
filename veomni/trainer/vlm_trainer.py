@@ -309,6 +309,7 @@ class VLMTrainer:
         self.base.optimizer = build_optimizer(
             self.base.model,
             lr=args.model.optimizer.lr,
+            betas=args.model.optimizer.betas,
             weight_decay=args.model.optimizer.weight_decay,
             fused=True,
             optimizer_type=args.model.optimizer.type,

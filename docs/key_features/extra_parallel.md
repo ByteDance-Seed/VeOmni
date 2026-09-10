@@ -2,7 +2,7 @@
 
 **Author**: Junncheng Wan
 
-> TL;DR: VeOmni now supports extra parallelism from v0.1.0; Simply try it out by setting `accelerator.fsdp_config.fsdp_mode` to `fsdp2`, `accelerator.extra_parallel_sizes` to a list of integers, `accelerator.extra_parallel_placement_innermost` to a list of bools, and `accelerator.extra_parallel_names` to a list of strings.
+> TL;DR: VeOmni now supports extra parallelism from v0.1.0; Simply try it out by setting `model.accelerator.fsdp_config.fsdp_mode` to `fsdp2`, `model.accelerator.extra_parallel_sizes` to a list of integers, `model.accelerator.extra_parallel_placement_innermost` to a list of bools, and `model.accelerator.extra_parallel_names` to a list of strings.
 
 
 ## Motivation
