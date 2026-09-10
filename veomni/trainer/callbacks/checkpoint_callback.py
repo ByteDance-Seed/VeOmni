@@ -21,6 +21,7 @@ import torch.distributed as dist
 from ...checkpoint import CheckpointerBase, build_checkpointer
 from ...models import save_model_assets
 from ...utils import helper
+from ...utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
 from ...utils.save_safetensor_utils import save_hf_safetensor, save_lora_adapter_with_dcp
 from .base import Callback, TrainerState
 
@@ -141,7 +142,9 @@ class CheckpointerCallback(Callback):
         """Save distributed checkpoint and optimizer state at each save_steps."""
         args: "VeOmniArguments" = self.trainer.args
 
-        save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
+        save_checkpoint_path = os.path.join(
+            args.train.checkpoint.save_path, f"{_GLOBAL_STEP_PREFIX}{state.global_step}"
+        )
 
         if hasattr(self.trainer, "data_iterator") and hasattr(self.trainer.data_iterator, "state_dict"):
             train_dataloader_state = self.trainer.data_iterator.state_dict()
@@ -176,8 +179,9 @@ class CheckpointerCallback(Callback):
         helper.empty_cache()
 
         self.trainer.checkpointer.save(
-            save_checkpoint_path,
+            args.train.checkpoint.save_path,
             ckpt_state,
+            global_steps=state.global_step,
             save_async=args.train.checkpoint.save_async,
             trainable_only=bool(getattr(args.model, "lora_config", None)),
             save_to_lowest_rank=args.train.checkpoint.dcp_save_to_lowest_rank,
@@ -237,7 +241,9 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
     def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
         """Save model in HuggingFace format."""
         args: "VeOmniArguments" = self.trainer.args
-        save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
+        save_checkpoint_path = os.path.join(
+            args.train.checkpoint.save_path, f"{_GLOBAL_STEP_PREFIX}{state.global_step}"
+        )
         if not os.path.exists(save_checkpoint_path):
             dist.barrier()
             super()._save_checkpoint(state)
@@ -274,7 +280,9 @@ class HFLoraCkptCallback(HuggingfaceCkptCallback):
     def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
         """Save LoRA checkpoint in HuggingFace format at train end."""
         args: "VeOmniArguments" = self.trainer.args
-        save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
+        save_checkpoint_path = os.path.join(
+            args.train.checkpoint.save_path, f"{_GLOBAL_STEP_PREFIX}{state.global_step}"
+        )
         if not os.path.exists(save_checkpoint_path):
             dist.barrier()
             CheckpointerCallback._save_checkpoint(self, state)
