@@ -159,12 +159,9 @@ jobs:
         # per-expert} bit-identical load + the per-expert->fused streaming bail.
         run: |
           uv run --frozen pytest -s -x tests/utils/test_moe_ep_sharded_load_matrix.py
-      - name: Run checkpoint callback unit tests
+      - name: Run checkpoint tests
         run: |
-          uv run --frozen pytest -s -x tests/checkpoints/test_checkpoint_callback.py tests/checkpoints/test_dcp_checkpointer.py
-      - name: Run e2e dcp save and load test
-        run: |
-          uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
+          uv run --frozen pytest -s -x tests/checkpoints/
       - name: Run distributed tests
         run: |
           uv run --frozen pytest -s -x tests/distributed/test_async_offload_unit.py
