@@ -26,6 +26,7 @@ import torch
 import torch.distributed as dist
 
 from ...utils import helper
+from ...utils.device import get_device_type
 from .base import Callback, TrainerState
 
 
@@ -96,6 +97,13 @@ class GlobalStateCallback(Callback):
         }
 
     def save_global_state(self, state: TrainerState) -> None:
+        # Drain a pending async DCP save first. CheckpointCallback returns while
+        # that write is still in flight; a cursor file that lands before the
+        # shards would resume a step whose weights never made it to disk.
+        checkpoint = getattr(self.trainer, "checkpoint", None)
+        if checkpoint is not None:
+            checkpoint.wait_for_pending_save()
+
         args: "VeOmniArguments" = self.trainer.args
         step_dir = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
         os.makedirs(step_dir, exist_ok=True)
@@ -111,7 +119,15 @@ class GlobalStateCallback(Callback):
             return None
 
         state_path = global_state_path(load_path, self.rank)
-        if not os.path.exists(state_path):
+        found = os.path.exists(state_path)
+        if dist.is_initialized():
+            flag = torch.tensor([int(found)], dtype=torch.int32, device=get_device_type())
+            dist.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+            found = bool(flag.item())
+            if not found:
+                logger.warning_rank0("Trainer state missing on at least one rank; resuming weights only.")
+                return None
+        elif not found:
             logger.warning(f"No trainer state at {state_path}; resuming weights only.")
             return None
 

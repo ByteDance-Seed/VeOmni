@@ -363,7 +363,21 @@ class TestGlobalStateCallbackJobState:
         assert "environ_meter" in global_state
         assert "torch_rng_state" in global_state
 
+    def test_save_waits_for_pending_dcp(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer(save_path=str(tmp_path))
+        trainer.train_dataloader = None
+        trainer.data_iterator = None
+        trainer.environ_meter.state_dict.return_value = {}
+        cb = GlobalStateCallback(trainer)
+
+        cb.save_global_state(TrainerState(global_step=10))
+
+        trainer.checkpoint.wait_for_pending_save.assert_called_once_with()
+        assert (tmp_path / "global_step_10" / "trainer_state_rank_0.pt").is_file()
+
     def test_load_restores_channel_loss_callback_state(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
         trainer = _make_mock_trainer()
         trainer.args.train.checkpoint.load_path = str(tmp_path)
         trainer.args.train.global_rank = 0
@@ -383,3 +397,34 @@ class TestGlobalStateCallbackJobState:
 
         trainer.channel_loss_callback.load_state_dict.assert_called_once_with(callback_state)
         assert trainer.state.global_step == 7
+
+    @patch("veomni.trainer.callbacks.global_state_callback.get_device_type", return_value="cpu")
+    def test_load_skips_when_any_rank_is_missing_state(self, mock_device, mock_dist, tmp_path):
+        """A missing cursor on one rank must not leave the others at a different step."""
+        mock_dist.is_initialized.return_value = True
+
+        def drop_presence(flag, op=None):
+            flag.zero_()
+
+        mock_dist.all_reduce.side_effect = drop_presence
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = str(tmp_path)
+        trainer.args.train.global_rank = 0
+        trainer.train_dataloader = None
+        torch.save(
+            {
+                "global_step": 7,
+                "train_dataloader": None,
+                "environ_meter": {},
+                "channel_loss_callback": {},
+                "torch_rng_state": torch.get_rng_state(),
+            },
+            tmp_path / "trainer_state_rank_0.pt",
+        )
+
+        cb = GlobalStateCallback(trainer)
+        assert cb.load_global_state() is None
+        trainer.channel_loss_callback.load_state_dict.assert_not_called()
+        assert trainer.state.global_step == 0
+        mock_dist.all_reduce.assert_called_once()
+        assert mock_dist.all_reduce.call_args.kwargs["op"] is torch.distributed.ReduceOp.MIN
