@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Qwen3VLMoeModel.__init__
+#      Construct generated towers and propagate the MoE implementation to text_config
 #    - method_override: Qwen3VLMoeTextRMSNorm.forward
 #      OpSlot guard for NPU fused RMSNorm (standard formulation)
 #    - method_override: Qwen3VLMoeVisionAttention.forward
@@ -80,7 +82,6 @@ from transformers.modeling_outputs import (
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.models.auto.modeling_auto import AutoModel
 from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
     Qwen3VLMoeConfig,
     Qwen3VLMoeTextConfig,
@@ -1657,7 +1658,7 @@ class Qwen3VLMoeCausalLMOutputWithPast(CausalLMOutputWithPast):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3VLMoeModel
-# Methods patched: get_image_features, get_placeholder_mask, forward
+# Methods patched: __init__, get_image_features, get_placeholder_mask, forward
 # ======================================================================
 
 
@@ -1668,12 +1669,11 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
     accepts_loss_kwargs = False
 
     def __init__(self, config):
+        config.text_config._moe_implementation = getattr(config, "_moe_implementation", "eager")
         super().__init__(config)
-        self.visual = AutoModel.from_config(config.vision_config)
-        self.language_model = AutoModel.from_config(config.text_config)
-        self.rope_deltas = None  # cache rope_deltas here
-
-        # Initialize weights and apply final processing
+        self.visual = Qwen3VLMoeVisionModel._from_config(config.vision_config)
+        self.language_model = Qwen3VLMoeTextModel._from_config(config.text_config)
+        self.rope_deltas = None
         self.post_init()
 
     def get_vision_position_ids(

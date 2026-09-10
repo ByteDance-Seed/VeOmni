@@ -36,6 +36,8 @@ from transformers.cache_utils import Cache
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     BaseModelOutputWithDeepstackFeatures,
     Qwen3VLMoeModelOutputWithPast,
+    Qwen3VLMoeTextModel,
+    Qwen3VLMoeVisionModel,
     load_balancing_loss_func,
 )
 from transformers.processing_utils import Unpack
@@ -75,6 +77,20 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_vl_moe_gpu.py",
     description="Qwen3-VL-MoE with VeOmni v5 compatibility (SP + async Ulysses + deepstack + fused MoE + fused loss)",
 )
+
+
+@config.override_method(
+    "Qwen3VLMoeModel.__init__",
+    description="Construct generated towers and propagate the MoE implementation to text_config",
+)
+def qwen3_vl_moe_model_init_patched(self, config):
+    config.text_config._moe_implementation = getattr(config, "_moe_implementation", "eager")
+    super().__init__(config)
+    self.visual = Qwen3VLMoeVisionModel._from_config(config.vision_config)
+    self.language_model = Qwen3VLMoeTextModel._from_config(config.text_config)
+    self.rope_deltas = None
+    self.post_init()
+
 
 # Reuse the same post-import block / helpers / imports that the qwen3_vl GPU
 # config already injects into its generated file. The shared body of all the

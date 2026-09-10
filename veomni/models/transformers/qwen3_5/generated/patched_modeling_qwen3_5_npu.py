@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Qwen3_5Model.__init__
+#      Construct generated vision and text towers instead of upstream AutoModel classes
 #    - method_override: Qwen3_5RMSNorm.forward
 #      Use fused rmsnorm to impl zero-centered rmsnorm (1+weight centered formulation)
 #    - function_replacement: apply_rotary_pos_emb
@@ -89,7 +91,6 @@ from transformers.modeling_outputs import (
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.models.auto.modeling_auto import AutoModel
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
@@ -1838,7 +1839,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5Model
-# Methods patched: get_image_features, get_placeholder_mask, forward
+# Methods patched: __init__, get_image_features, get_placeholder_mask, forward
 # ======================================================================
 
 
@@ -1851,11 +1852,9 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        self.visual = AutoModel.from_config(config.vision_config)
-        self.language_model = AutoModel.from_config(config.text_config)
-        self.rope_deltas = None  # cache rope_deltas here
-
-        # Initialize weights and apply final processing
+        self.visual = Qwen3_5VisionModel._from_config(config.vision_config)
+        self.language_model = Qwen3_5TextModel._from_config(config.text_config)
+        self.rope_deltas = None
         self.post_init()
 
     def get_vision_position_ids(

@@ -30,6 +30,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_model_forward_patched,
     qwen3_vl_model_get_image_features_patched,
     qwen3_vl_model_get_placeholder_mask_patched,
+    qwen3_vl_model_init_patched,
     qwen3_vl_rmsnorm_forward_patched,
     qwen3_vl_text_attention_forward_patched,
     qwen3_vl_text_deepstack_process_patched,
@@ -62,6 +63,12 @@ config.helpers.extend(gpu_config.helpers)
 # now superseded by ``Qwen3VLCausalLMOutputWithLogProbs`` for the FSDP2-safe
 # pre-backward unshard hook on ``lm_head``).
 config.drop_imported_names.update(gpu_config.drop_imported_names)
+
+config.override_method(
+    "Qwen3VLModel.__init__",
+    replacement=qwen3_vl_model_init_patched,
+    description="Construct generated vision and text towers instead of upstream AutoModel classes",
+)
 
 # ================================================================
 # Shared GPU patches (SP / deepstack / fused-CE / async Ulysses / ...)

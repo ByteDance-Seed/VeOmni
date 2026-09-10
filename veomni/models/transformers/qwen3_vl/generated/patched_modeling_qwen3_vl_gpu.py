@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Qwen3VLModel.__init__
+#      Construct generated vision and text towers instead of upstream AutoModel classes
 #    - method_override: Qwen3VLTextRMSNorm.forward
 #      OpSlot guard for Liger fused RMSNorm (standard formulation)
 #    - function_replacement: apply_rotary_pos_emb
@@ -70,7 +72,6 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.models.auto.modeling_auto import AutoModel
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
@@ -1497,7 +1498,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3VLModel
-# Methods patched: get_image_features, get_placeholder_mask, forward
+# Methods patched: __init__, get_image_features, get_placeholder_mask, forward
 # ======================================================================
 
 
@@ -1509,11 +1510,10 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        self.visual = AutoModel.from_config(config.vision_config)
-        self.language_model = AutoModel.from_config(config.text_config)
-        self.rope_deltas = None  # cache rope_deltas here
-
-        # Initialize weights and apply final processing
+        # AutoModel resolves to the upstream classes, bypassing the SP patches.
+        self.visual = Qwen3VLVisionModel._from_config(config.vision_config)
+        self.language_model = Qwen3VLTextModel._from_config(config.text_config)
+        self.rope_deltas = None
         self.post_init()
 
     def get_vision_position_ids(

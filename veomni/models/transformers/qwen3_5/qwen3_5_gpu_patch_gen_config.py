@@ -40,6 +40,8 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Model,
     Qwen3_5ModelOutputWithPast,
     Qwen3_5RMSNormGated,
+    Qwen3_5TextModel,
+    Qwen3_5VisionModel,
     apply_mask_to_padding_states,
     torch_chunk_gated_delta_rule,
 )
@@ -65,6 +67,19 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_5_gpu.py",
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
 )
+
+
+@config.override_method(
+    "Qwen3_5Model.__init__",
+    description="Construct generated vision and text towers instead of upstream AutoModel classes",
+)
+def qwen3_5_model_init_patched(self, config):
+    super().__init__(config)
+    self.visual = Qwen3_5VisionModel._from_config(config.vision_config)
+    self.language_model = Qwen3_5TextModel._from_config(config.text_config)
+    self.rope_deltas = None
+    self.post_init()
+
 
 config.add_import("copy", names=["copy"])
 config.add_import("functools", names=["partial"])

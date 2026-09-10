@@ -52,6 +52,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_model_forward,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_model_init_patched,
     qwen3_5_rmsnorm_forward_patched,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
@@ -68,6 +69,12 @@ config = PatchConfig(
     source_module="transformers.models.qwen3_5.modeling_qwen3_5",
     target_file="patched_modeling_qwen3_5_npu.py",
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
+)
+
+config.override_method(
+    "Qwen3_5Model.__init__",
+    replacement=qwen3_5_model_init_patched,
+    description="Construct generated vision and text towers instead of upstream AutoModel classes",
 )
 
 config.add_import("copy", names=["copy"])

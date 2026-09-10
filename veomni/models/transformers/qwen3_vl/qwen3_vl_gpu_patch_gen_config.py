@@ -36,6 +36,8 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     BaseModelOutputWithDeepstackFeatures,
     Qwen3VLModel,
     Qwen3VLModelOutputWithPast,
+    Qwen3VLTextModel,
+    Qwen3VLVisionModel,
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_vision,
     eager_attention_forward,
@@ -73,6 +75,20 @@ config = PatchConfig(
 # hook on ``lm_head`` and triggering ``setStorage … storage of size 0`` in
 # ``chunk_logprobs.backward`` (parallels VeOmni #731's qwen3_5_moe fix).
 config.drop_import_names("Qwen3VLCausalLMOutputWithPast")
+
+
+@config.override_method(
+    "Qwen3VLModel.__init__",
+    description="Construct generated vision and text towers instead of upstream AutoModel classes",
+)
+def qwen3_vl_model_init_patched(self, config):
+    super().__init__(config)
+    # AutoModel resolves to the upstream classes, bypassing the SP patches.
+    self.visual = Qwen3VLVisionModel._from_config(config.vision_config)
+    self.language_model = Qwen3VLTextModel._from_config(config.text_config)
+    self.rope_deltas = None
+    self.post_init()
+
 
 # Imports consumed by the helpers below + the patched methods need to be
 # emitted into the generated file. We use `add_post_import_block` (not

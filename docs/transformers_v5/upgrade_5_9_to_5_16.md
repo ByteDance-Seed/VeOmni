@@ -99,6 +99,16 @@ tensors. VeOmni needs the flat tensor for the SP all-to-all and indexes a single
 
 ### Qwen3.5 linear-attention plumbing
 
+The Qwen3-VL, Qwen3-VL-MoE and Qwen3.5 composite constructors now use
+`AutoModel.from_config` upstream. In generated modeling this still resolves
+to HuggingFace's original towers, silently bypassing VeOmni's vision and text
+patches. Override these constructors on GPU and NPU to instantiate the local
+generated classes with `_from_config`, as Qwen3.5-MoE already does. Without
+this, sequence-parallel image tokens meet unsharded position embeddings and
+fail with a shape mismatch. `test_generated_multimodal_children` checks the
+actual child classes through the model registry; the Qwen VLM e2e cases
+exercise their sequence-parallel forward and backward paths.
+
 - `causal_conv1d_fn` / `causal_conv1d_update` / `torch_chunk_gated_delta_rule` /
   `torch_recurrent_gated_delta_rule` are module-level torch implementations
   decorated with `@use_kernel_func_from_hub_with_fallback(...)`, no longer
