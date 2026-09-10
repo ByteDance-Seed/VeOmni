@@ -781,8 +781,8 @@ class TrainingArguments:
         # Context parallel (Ring-Attention) is supported as the ``cp`` half of USP
         # (Unified Sequence Parallelism, https://arxiv.org/abs/2405.07719). It
         # composes with Ulysses: the effective SP size is ``ulysses_size * cp_size``.
-        # Ring attention currently requires the causal, non-varlen path (no packing
-        # / cu_seqlens under ``cp``) and FA2 (flash-attn).
+        # The ring path is causal-only and supports dense or packed/varlen inputs
+        # through CUDA FlashAttention or Ascend torch_npu fusion attention.
 
         acc.dp_size = self.world_size // (acc.pp_size * acc.ulysses_size * acc.cp_size * acc.tp_size)
 

@@ -384,7 +384,7 @@ class SequenceParallelCollator(DataCollator):
         # sequence is split as: ``cp`` OUTER in zig-zag block order (for balanced
         # causal ring attention) and ``ulysses`` INNER as contiguous sub-chunks
         # (so the in-attention Ulysses all-to-all reassembles each cp region's
-        # full sequence). See ``sequence_parallel.data.zigzag_reorder`` and the
+        # full sequence). See ``sequence_parallel.ring_attention.layout`` and the
         # ring branch in ``veomni/ops/kernels/attention``.
         self.cp_size = ps.cp_size
         self.ulysses_size = ps.ulysses_size
@@ -420,11 +420,11 @@ class SequenceParallelCollator(DataCollator):
         attention stays balanced per document. Otherwise the whole sequence is
         treated as one document (dense zig-zag).
         """
-        from ..distributed.sequence_parallel.data import zigzag_reorder, zigzag_reorder_varlen
+        from ..distributed.sequence_parallel.ring_attention.layout import zigzag_reorder, zigzag_reorder_packed
 
         cu = self._cp_cu_seqlens
         if cu is not None and cu.numel() > 2:
-            reordered = zigzag_reorder_varlen(feature, cu, dim=dim, cp_size=self.cp_size)
+            reordered = zigzag_reorder_packed(feature, cu, dim=dim, cp_size=self.cp_size)
         else:
             reordered = zigzag_reorder(feature, dim=dim, cp_size=self.cp_size)
         cp_chunk = reordered.size(dim) // self.cp_size

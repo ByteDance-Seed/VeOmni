@@ -145,12 +145,12 @@ from veomni.distributed.sequence_parallel import (
 # now x is of shape [batch_size, seq_len/n, dim] on each sp rank
 
 # Step3 (part1): modify attention computation
-x = self.qkv(x) # [batch_size, seq_pad/n, dim]
-x = gather_seq_scatter_heads(x, seq_dim=1, head_dim=2) # [batch_size, seq_len, dim/n]
+x = self.qkv(x)  # [batch_size, seq_pad/n, dim]
+x = gather_seq_scatter_heads(x, seq_dim=1, head_dim=2)  # [batch_size, seq_len, dim/n]
 ...
 output = F.scaled_dot_product_attention(q, k, v, ...).reshape(...)
 ...
-output = gather_heads_scatter_seq(output, head_dim=2, seq_dim=1) # [batch_size, seq_pad/n, dim]
+output = gather_heads_scatter_seq(output, head_dim=2, seq_dim=1)  # [batch_size, seq_pad/n, dim]
 
 # Step3 (part2): reduce loss after model forward
 loss = loss_fct(logits, labels)
@@ -498,12 +498,12 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
   padding is coalesced into one aligned segment. The lower-level USP reorder
   helpers still validate the invariant and reject manually constructed
   unaligned batches.
-- **Flash-attention backend**: ring attention builds on a `flash_attn`
-  forward/backward pair, auto-selected at import time (see `FA_BACKEND` in
-  `ring_attention.py`): classic **FA2** (`flash_attn.flash_attn_interface`) on
-  Ampere/Hopper, or the **FA4** CuTe backend (`flash_attn.cute.interface`) on
-  Blackwell/GB200. FA3 is Hopper-only (no Blackwell kernel image) and is not
-  used by the ring path. Any one of these backends is sufficient.
+- **Attention backend**: CUDA uses a `flash_attn` forward/backward pair,
+  auto-selected at import time: classic **FA2** on Ampere/Hopper or the **FA4**
+  CuTe backend on Blackwell/GB200. Ascend uses
+  `torch_npu.npu_fusion_attention` / `npu_fusion_attention_grad`. Both dense
+  and packed paths select the backend from the active device. FA3 is not used
+  by Ring Attention.
 - **Divisibility**: `max_seq_len` must be divisible by `2 · ulysses_size · cp_size`
   (the collator pads up to this multiple automatically).
 - **Loss/data layout**: the `SequenceParallelCollator` lays sequences out
@@ -514,12 +514,21 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
 
 ### Implementation Map
 
-- Ring kernel: `veomni/distributed/sequence_parallel/ring_attention.py`
+- Unified Ring entry and CUDA backend:
+  `veomni/distributed/sequence_parallel/ring_attention/__init__.py` and
+  `veomni/distributed/sequence_parallel/ring_attention/gpu.py`
   (`zigzag_ring_flash_attn_func` for dense, `zigzag_ring_flash_attn_varlen_func`
-  for packed, online-softmax `update_out_and_lse`, `RingComm`).
-- Data layout: `veomni/distributed/sequence_parallel/data.py`
-  (`zigzag_reorder` / `zigzag_undo` for dense, `zigzag_reorder_varlen` /
+  for packed and online-softmax `update_out_and_lse`). Shared P2P communication
+  lives in `veomni/distributed/sequence_parallel/ring_attention/comm.py`.
+- Ascend Ring backend:
+  `veomni/distributed/sequence_parallel/ring_attention/npu.py` (fixed-shape and
+  packed `torch_npu` fusion attention, softmax max/sum merge, explicit
+  forward/backward RNG state). Packed APIs use standard leading-zero cumulative
+  offsets such as `[0, 6, 10]`; conversion to the endpoint list expected by
+  `torch_npu` happens only at the operator boundary.
+- Data layout: `veomni/distributed/sequence_parallel/ring_attention/layout.py`
+  (`zigzag_reorder` / `zigzag_undo` for fixed-shape inputs, `zigzag_reorder_packed` /
   `local_cu_seqlens` for packed) and `SequenceParallelCollator._usp_slice`.
-- Attention integration: the ring branch in
-  `veomni/ops/kernels/attention/__init__.py` runs after the Ulysses all-to-all.
+- Attention integration: `ring_attention(...)` runs after the Ulysses all-to-all;
+  `veomni/ops/kernels/attention/__init__.py` only delegates to that entry.
 - Mesh: `init_parallel_state()` builds `[ulysses, cp]` and flattens `sp`.

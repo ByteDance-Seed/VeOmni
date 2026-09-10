@@ -17,7 +17,7 @@ veomni/
 │   ├── parallel_plan.py    ParallelPlan for ExtraParallel (EP, embedding shard)
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
-│   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
+│   └── sequence_parallel/  Ulysses plus the ring_attention/ package for USP (CUDA FA2/FA4 and Ascend torch_npu)
 ├── models/             Model loading and patching
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
 │   ├── loader.py       Registry-based model loading (MODELING_REGISTRY, MODEL_CONFIG_REGISTRY)
@@ -142,7 +142,12 @@ VeOmni uses FSDP2 exclusively.
    - `fully_shard()` on EP modules with `ep_fsdp` submesh (Shard(1) for hidden dim)
    - `fully_shard()` on each transformer block with `fsdp_mesh`
    - `fully_shard()` on root model
-4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention; the FSDP shard mesh fuses with SP mesh (`dp_shard_sp`)
+4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all
+   (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention.
+   When CP is enabled, the Ulysses-local head shard runs zig-zag Ring Attention
+   over the CP group. CUDA uses FA2/FA4 low-level kernels and Ascend uses
+   `torch_npu.npu_fusion_attention`; the FSDP shard mesh fuses with SP mesh
+   (`dp_shard_sp`).
 5. EP token routing is in model MoE code + `moe_layer.py` using `ep_group` from `ParallelState`
 
 ## Config Structure

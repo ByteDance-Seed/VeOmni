@@ -24,7 +24,7 @@ rank ever holding the whole sequence.
 Causal load balancing uses the zig-zag layout: the global sequence is split
 into ``2 * cp_size`` blocks and rank ``r`` owns blocks ``r`` and
 ``2*cp_size-1-r``. Every ring step then does a constant amount of work. The
-matching data reordering lives in ``.data.zigzag_reorder`` / ``.data.zigzag_
+matching data reordering lives in ``.layout.zigzag_reorder`` / ``.layout.zigzag_
 undo`` and is applied by the collator before slicing.
 
 The Ulysses half (all-to-all head/seq exchange) is orthogonal: USP first does
@@ -37,11 +37,11 @@ import inspect
 from typing import Optional, Tuple
 
 import torch
-import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-from .comm import get_context_parallel_group
+from ..comm import get_context_parallel_group
+from .comm import RingComm
 
 
 # Flash-attention backend selection for the ring kernels.
@@ -108,7 +108,8 @@ __all__ = [
     "zigzag_ring_flash_attn_func",
     "zigzag_ring_flash_attn_varlen_func",
     "update_out_and_lse",
-    "RingComm",
+    "forward",
+    "packed_forward",
 ]
 
 
@@ -222,40 +223,6 @@ def update_out_and_lse(
         out[slice_], lse[slice_] = slice_out, slice_lse
         return out, lse
     return _update_out_and_lse(out, lse, block_out, block_lse)
-
-
-class RingComm:
-    """P2P ring communicator over a context-parallel process group.
-
-    ``send_recv`` posts an ``isend`` to the next rank and an ``irecv`` from the
-    previous rank; ``commit``/``wait`` drain the batch so a ring step can overlap
-    the K/V transfer with the local FlashAttention compute.
-    """
-
-    def __init__(self, group: ProcessGroup):
-        self.group = group
-        self.rank = dist.get_rank(group)
-        self.world_size = dist.get_world_size(group)
-        self.send_rank = dist.get_global_rank(group, (self.rank + 1) % self.world_size)
-        self.recv_rank = dist.get_global_rank(group, (self.rank - 1) % self.world_size)
-        self._ops = []
-        self._reqs = None
-
-    def send_recv(self, to_send: Tensor, recv_tensor: Optional[Tensor] = None) -> Tensor:
-        res = torch.empty_like(to_send) if recv_tensor is None else recv_tensor
-        self._ops.append(dist.P2POp(dist.isend, to_send.contiguous(), self.send_rank, group=self.group))
-        self._ops.append(dist.P2POp(dist.irecv, res, self.recv_rank, group=self.group))
-        return res
-
-    def commit(self):
-        self._reqs = dist.batch_isend_irecv(self._ops)
-
-    def wait(self):
-        if self._reqs is not None:
-            for req in self._reqs:
-                req.wait()
-        self._ops = []
-        self._reqs = None
 
 
 # --------------------------------------------------------------------------- #
@@ -551,7 +518,7 @@ def zigzag_ring_flash_attn_func(
     """Balanced (zig-zag) causal ring attention.
 
     ``q/k/v`` are ``(b, 2*local, h, d)`` laid out so that dim-1 concatenates the
-    two zig-zag blocks the rank owns (see ``.data.zigzag_reorder``).
+    two zig-zag blocks the rank owns (see ``.layout.zigzag_reorder``).
     """
     if not _FA_AVAILABLE:
         raise RuntimeError("zigzag_ring_flash_attn_func requires a flash-attn backend (FA2 or FA4) to be installed.")
@@ -565,7 +532,7 @@ def zigzag_ring_flash_attn_func(
 #                                                                              #
 # Packed sequences hold several documents back-to-back. Under USP each document #
 # is INDEPENDENTLY zig-zag split across the ``cp`` group (see                  #
-# ``.data.zigzag_reorder_varlen``): rank ``r`` holds, for every document, that  #
+# ``.layout.zigzag_reorder_packed``): rank ``r`` holds, for every document, that  #
 # document's blocks ``r`` and ``2*cp-1-r`` concatenated. The local packed shard #
 # therefore has, per document, a ``front half`` (block r) and a ``back half``  #
 # (block 2*cp-1-r). ``cu_seqlens`` here are the LOCAL per-rank document offsets #
@@ -930,10 +897,49 @@ def zigzag_ring_flash_attn_varlen_func(
     every document, this rank's two zig-zag block halves. ``cu_seqlens`` are the
     LOCAL per-rank document offsets and every document's local length must be
     even (its global length divisible by ``2 * cp_size``). See
-    ``.data.zigzag_reorder_varlen``.
+    ``.layout.zigzag_reorder_packed``.
     """
     if not _FA_AVAILABLE:
         raise RuntimeError("zigzag_ring_flash_attn_varlen_func requires a flash-attn backend (FA2 or FA4).")
     assert causal, "zigzag ring attention is only defined for causal attention"
     group = get_context_parallel_group() if group is None else group
     return _ZigzagRingVarlenFlashAttn.apply(group, q, k, v, cu_seqlens, max_seqlen, softmax_scale)
+
+
+def forward(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = True,
+    group: Optional[ProcessGroup] = None,
+    dropout_p: float = 0.0,
+) -> Tensor:
+    """Run balanced causal Ring Attention on fixed-shape CUDA tensors."""
+    del dropout_p  # The CUDA Ring backend currently preserves its zero-dropout behavior.
+    return zigzag_ring_flash_attn_func(q, k, v, softmax_scale=softmax_scale, causal=causal, group=group)
+
+
+def packed_forward(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+    softmax_scale: Optional[float] = None,
+    causal: bool = True,
+    group: Optional[ProcessGroup] = None,
+    dropout_p: float = 0.0,
+) -> Tensor:
+    """Run balanced causal Ring Attention on packed CUDA tensors."""
+    del dropout_p  # The CUDA Ring backend currently preserves its zero-dropout behavior.
+    return zigzag_ring_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        max_seqlen,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        group=group,
+    )
