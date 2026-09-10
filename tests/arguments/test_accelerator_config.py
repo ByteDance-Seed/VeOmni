@@ -14,13 +14,9 @@
 
 """Tests for the self-resolving, model-scoped ``AcceleratorConfig``.
 
-Two coupled changes are pinned here. ``AcceleratorConfig`` used to depend on
-``TrainingArguments._validate_accelerator()`` to fill in
-``dp_size``/``dp_replicate_size``/``dp_shard_size`` and to check the init-device
-rules, so any instance built elsewhere was half-initialized; that resolution now
-lives in ``AcceleratorConfig.__post_init__``. And ``accelerator``/``optimizer``
-now hang off ``model``, not ``train``, because both are per-model decisions — an
-omni model gives each module its own pair.
+``dp_size`` / ``dp_replicate_size`` / ``dp_shard_size`` and the init-device
+rules resolve in ``AcceleratorConfig.__post_init__``. ``accelerator`` and
+``optimizer`` hang off ``model``, not ``train``.
 
 Run:
     pytest -v tests/arguments/test_accelerator_config.py
@@ -38,7 +34,6 @@ from veomni.arguments.arguments_types import (
     DataArguments,
     FSDPConfig,
     ModelArguments,
-    ModelRuntimeArguments,
     OptimizerConfig,
     TrainingArguments,
     VeOmniArguments,
@@ -166,11 +161,7 @@ def test_ep_sharded_stream_load_conflicts_with_broadcast(world_size):
 
 
 def test_ddp_takes_broadcast_at_face_value(world_size, monkeypatch):
-    """DDP loads weights itself now, so the flag applies verbatim under it.
-
-    It used to warn that the flag was fsdp2-only, which held only while the DDP
-    path loaded nothing at all.
-    """
+    """DDP loads weights itself, so the flag applies verbatim under it."""
     world_size(1)
     warnings = []
     monkeypatch.setattr(arguments_types.logger, "warning_rank0", lambda msg, *a, **k: warnings.append(msg))
@@ -239,17 +230,9 @@ def test_batch_config_follows_a_model_level_ulysses_override(world_size):
     assert args.train.global_batch_size == args.train.micro_batch_size * 4
 
 
-def test_model_runtime_arguments_is_a_standalone_training_unit():
-    """What an omni module inherits: model fields + its own accelerator/optimizer.
-
-    ``config_path`` is among them because every unit has to say where its
-    architecture is defined, even when that is just its own subfolder — the
-    runtime reads it directly rather than asking the job to hand one over.
-    ``tokenizer_path`` and ``safetensor_idx_path`` live here too: a tower that
-    never tokenizes simply does not call them, and an independent module can
-    point at its own index.
-    """
-    names = {f.name for f in dataclasses.fields(ModelRuntimeArguments)}
+def test_model_arguments_is_a_training_unit():
+    """Identity, load flags, accelerator, and optimizer share one class."""
+    names = {f.name for f in dataclasses.fields(ModelArguments)}
 
     assert {"model_path", "config_path", "model_config", "basic_modules", "lora_config"} <= names
     assert {"processor_config", "ops_implementation", "accelerator", "optimizer"} <= names
@@ -272,19 +255,19 @@ def test_base_localizes_model_path_so_every_subclass_inherits_it(monkeypatch):
     monkeypatch.setattr("veomni.utils.fs.copy_to_local", fake_copy_to_local)
     monkeypatch.setattr("veomni.utils.fs.is_non_local", lambda p: str(p).startswith("hdfs://"))
 
-    runtime = ModelRuntimeArguments(model_path="hdfs://ns/ckpt/vision")
+    runtime = ModelArguments(model_path="hdfs://ns/ckpt/vision")
 
     assert seen == ["hdfs://ns/ckpt/vision"]
     assert runtime.model_path == "/local/cache/vision"
 
 
 def test_base_settles_config_path_so_a_module_inherits_it(monkeypatch):
-    """A module points at its own architecture; only the tokenizer belongs to the model."""
+    """config_path defaults to model_path unless set explicitly."""
     monkeypatch.setattr("veomni.utils.fs.copy_to_local", lambda path, **kw: f"/local/cache/{path.rsplit('/', 1)[-1]}")
     monkeypatch.setattr("veomni.utils.fs.is_non_local", lambda p: str(p).startswith("hdfs://"))
 
-    derived = ModelRuntimeArguments(model_path="hdfs://ns/ckpt/vision")
-    explicit = ModelRuntimeArguments(model_path="/ckpt/vision", config_path="hdfs://ns/cfg/vit_cfg")
+    derived = ModelArguments(model_path="hdfs://ns/ckpt/vision")
+    explicit = ModelArguments(model_path="/ckpt/vision", config_path="hdfs://ns/cfg/vit_cfg")
 
     assert derived.config_path == "/local/cache/vision"
     assert explicit.config_path == "/local/cache/vit_cfg"
@@ -323,7 +306,7 @@ def _write_index(tmp_path, weight_map):
 def test_index_mapping_is_derived_from_model_path_without_an_explicit_path(tmp_path, index_cache):
     _write_index(tmp_path, {"layer.weight": "model-00001-of-00002.safetensors"})
 
-    runtime = ModelRuntimeArguments(model_path=str(tmp_path))
+    runtime = ModelArguments(model_path=str(tmp_path))
 
     assert runtime.fqn_to_index_mapping == {"layer.weight": 1}
 
@@ -337,8 +320,8 @@ def test_index_mapping_is_parsed_once_across_modules_sharing_a_checkpoint(tmp_pa
     real = ctl.parse_fqn_to_index_mapping_from_json
     monkeypatch.setattr(ctl, "parse_fqn_to_index_mapping_from_json", lambda p: (parses.append(p), real(p))[1])
 
-    first = ModelRuntimeArguments(model_path=str(tmp_path))
-    second = ModelRuntimeArguments(model_path=str(tmp_path))
+    first = ModelArguments(model_path=str(tmp_path))
+    second = ModelArguments(model_path=str(tmp_path))
 
     assert first.fqn_to_index_mapping == second.fqn_to_index_mapping
     assert len(parses) == 1
@@ -354,7 +337,7 @@ def test_index_mapping_is_not_read_until_asked_for(tmp_path, index_cache, monkey
     )
     _write_index(tmp_path, {"layer.weight": "model-00001-of-00002.safetensors"})
 
-    ModelRuntimeArguments(model_path=str(tmp_path))
+    ModelArguments(model_path=str(tmp_path))
 
 
 def test_model_arguments_honours_an_explicit_index_path(tmp_path, index_cache):
@@ -403,16 +386,11 @@ def test_a_checkpoint_without_an_index_still_warns(tmp_path, index_cache, monkey
     assert any("single file instead of sharded" in msg for msg in warnings)
 
 
-def test_model_arguments_extends_the_runtime_shape():
-    assert issubclass(ModelArguments, ModelRuntimeArguments)
-    assert issubclass(ModelRuntimeArguments, BaseModelArguments)
-
-
 def test_the_runtime_pair_is_declared_once_for_subclasses_to_inherit():
     """An omni module/model args class should not have to re-declare either field."""
     assert {"accelerator", "optimizer"}.isdisjoint({f.name for f in dataclasses.fields(BaseModelArguments)})
 
-    own = ModelRuntimeArguments.__dataclass_fields__
+    own = ModelArguments.__dataclass_fields__
     assert own["accelerator"].name == "accelerator"
     assert own["optimizer"].name == "optimizer"
 

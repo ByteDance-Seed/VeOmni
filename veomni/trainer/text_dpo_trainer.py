@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..arguments import ModelRuntimeArguments, VeOmniArguments
+from ..arguments import ModelArguments, VeOmniArguments
 from ..data import build_data_transform
 from ..data.data_collator import PostCollator
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
@@ -127,7 +127,7 @@ class VeOmniDPOArguments(VeOmniArguments):
     """Root config for DPO training — extends VeOmniArguments with DPO hyperparameters."""
 
     dpo_config: DPOConfig = field(default_factory=DPOConfig)
-    reference_model: Optional[ModelRuntimeArguments] = field(
+    reference_model: Optional[ModelArguments] = field(
         default=None,
         metadata={
             "help": (
@@ -152,7 +152,7 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
 
     def __init__(
         self,
-        args: ModelRuntimeArguments,
+        args: ModelArguments,
         model_name: str = "reference",
         *,
         train,

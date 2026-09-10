@@ -76,10 +76,8 @@ def test_a_text_template_is_built_from_the_tokenizer(monkeypatch):
 
 @pytest.mark.parametrize("no_template", [None, ""])
 def test_naming_no_template_leaves_the_job_without_one(no_template, monkeypatch):
-    """Naming none is the default, and is how a job says its data needs no
-    template: plaintext with no conversation to lay out, or a Qwen-Omni model
-    that formats prompts through its own processor. Both used to be branches
-    inside a trainer, keyed on ``data_type`` and on ``model_type``."""
+    """Naming none is the default: data with no conversation to lay out, or a
+    model that formats prompts through its own processor."""
     runtime = _stub_runtime(no_template, processor=_Processor(_VisionTokenizer()))
 
     _build(runtime, monkeypatch)
@@ -101,13 +99,7 @@ def test_a_model_with_no_preprocessor_warns_instead_of_failing_the_build(monkeyp
 @pytest.mark.parametrize("template_name", ["qwen3vl", "chatml"])
 @pytest.mark.parametrize("native", [NATIVE_TEMPLATE, None])
 def test_building_a_template_never_writes_to_the_tokenizer(template_name, native, monkeypatch):
-    """The exported preprocessor keeps describing the prompt format its own
-    authors published, not the one this job happened to train with.
-
-    A tokenizer carrying *no* template is the case that catches a regression:
-    the stamping this replaced was guarded on the template having jinja to
-    give, so only an empty tokenizer shows an unguarded write.
-    """
+    """The exported preprocessor keeps the checkpoint's jinja."""
     tokenizer = _VisionTokenizer(native)
     processor = _Processor(tokenizer)
     runtime = _stub_runtime(template_name, processor=processor, tokenizer=tokenizer)

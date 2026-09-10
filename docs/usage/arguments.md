@@ -119,7 +119,7 @@ DPO-specific hyperparameters, accessed via `dpo_config.*`.
 Root config: `VeOmniDPOArguments` (extends `VeOmniArguments`).
 
 * `DPOConfig` — `dpo_config.*`
-* `reference_model` — optional `ModelRuntimeArguments` for the frozen reference. Omit to reuse `model`. This is a full config (same shape as `model`), not a partial overlay.
+* `reference_model` — optional `ModelArguments` for the frozen reference. Omit to reuse `model`. This is a full config (same shape as `model`), not a partial overlay.
 
 ---
 
@@ -167,9 +167,7 @@ own `safetensor_idx_path`.
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule for this model. |
 | accelerator | `AcceleratorConfig` | — | Parallelism, sharding, and placement for this model. |
 
-`processor_config` is to the preprocessor what `model_config` is to the architecture: its keys are forwarded to `AutoProcessor.from_pretrained`, overriding what the checkpoint ships. Leave it empty and the repository's own `preprocessor_config.json` is authoritative.
-
-Use it only for something the repository genuinely gets wrong for your run. Image resolution is **not** such a case — resize through `data.mm_configs` (`image_max_pixels`, `video_max_pixels`, `scale_factor`, ...), which caps the pixels before the processor ever sees them. Setting a pixel budget in both places gives you two caps whose minimum wins, which is how the budget written in a config ends up silently ignored.
+`processor_config` is to the preprocessor what `model_config` is to the architecture: its keys are forwarded to `AutoProcessor.from_pretrained`, overriding what the checkpoint ships. Leave it empty and the repository's own `preprocessor_config.json` is authoritative. Pixel budgets belong in `data.mm_configs`.
 
 ```yaml
 model:
@@ -737,7 +735,7 @@ derived argument groups below.
 | average_log_prob | `bool` | `False` | If `True`, average log probs per token instead of summing. |
 | refer_model_precision | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype used to load the frozen reference model. |
 
-`reference_model.*` — optional full `ModelRuntimeArguments` for the frozen reference. Omit the block to reuse `model`. To use a different checkpoint, set the whole model-level block (paths and any accelerator that should differ):
+`reference_model.*` — optional full `ModelArguments` for the frozen reference. Omit the block to reuse `model`. To use a different checkpoint, set the whole model-level block (paths and any accelerator that should differ):
 
 ```yaml
 reference_model:

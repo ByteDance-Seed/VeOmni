@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from torch.optim.lr_scheduler import LRScheduler
     from torch.optim.optimizer import Optimizer
 
-    from ..arguments import ModelRuntimeArguments, TrainingArguments
+    from ..arguments import ModelArguments, TrainingArguments
     from ..data.chat_template import ChatTemplate
     from ..trainer.callbacks import TrainerState
     from .checkpoint_manager import ModelCheckpointManager
@@ -106,7 +106,7 @@ class VeOmniModelRuntime:
     trainer calls :meth:`build_lr_scheduler` later.
     """
 
-    args: "ModelRuntimeArguments"
+    args: "ModelArguments"
     model_name: str
     model: Optional[torch.nn.Module] = None
     model_config: PretrainedConfig = PretrainedConfig()
@@ -125,7 +125,7 @@ class VeOmniModelRuntime:
 
     def __init__(
         self,
-        args: "ModelRuntimeArguments",
+        args: "ModelArguments",
         model_name: str = "base",
         *,
         train: "TrainingArguments",
@@ -221,14 +221,12 @@ class VeOmniModelRuntime:
         Also assembles :attr:`model_assets`, the sidecars an export writes beside
         this model's weights, and :attr:`chat_template` when the job named one.
         The config is always among the sidecars; the preprocessor joins it if
-        there was one to load. The chat template is absent from that list by
-        design: it is a *choice about the data*, not a property of the
-        checkpoint, and an export writes what the checkpoint is.
+        there was one to load. The chat template is not in that list and is not
+        written onto the tokenizer: it is a data-layout choice, so an export
+        keeps the checkpoint's jinja.
 
-        ``processor_config`` overrides what the repository ships, the way
-        ``model_config`` does for the architecture — a pixel budget, say. It is
-        a job-level knob rather than a runtime hook because the value belongs to
-        the run, not to the model class.
+        ``processor_config`` is forwarded as kwargs to ``build_processor``, the
+        way ``model_config`` overrides the architecture.
 
         Which preprocessor it is follows from what the checkpoint actually
         holds, not from a declaration the model makes about itself.
@@ -246,9 +244,9 @@ class VeOmniModelRuntime:
         latents) overrides this to load nothing.
 
         A path with no preprocessor to load is not fatal here — a toy config
-        used to exercise the training loop on synthetic batches has none, and
-        never asks for one. The warning names the path, and a job that does read
-        text fails where it reads it.
+        exercising the training loop on synthetic batches has none, and never
+        asks for one. The warning names the path, and a job that does read text
+        fails where it reads it.
 
         The template is the third thing a model needs before it can read text:
         the tokenizer says how a string becomes ids, the processor how pixels

@@ -1626,12 +1626,6 @@ class ModelArguments(BaseModelArguments):
         )
 
 
-# VeOmniModelRuntime still types its unit as ModelRuntimeArguments. 1060
-# folded that class into ModelArguments (identity + load flags + accelerator +
-# optimizer); keep the name so runtime call sites do not churn in this merge.
-ModelRuntimeArguments = ModelArguments
-
-
 # ================================ Data Arguments ======================================
 #
 # Hierarchy:
