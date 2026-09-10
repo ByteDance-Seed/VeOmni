@@ -89,6 +89,13 @@ needed" without a reason is what the reviewer is looking for.
 
 ## Guidance
 
+- A standalone Transformers layer can allocate parameters with `torch.empty`
+  that only the enclosing `PreTrainedModel.post_init()` initializes. Initialize
+  these in the fixture before any rank broadcast; setting a seed does not
+  initialize empty storage. DeepSeek-V4 attention needs both `sinks` and the
+  compressor/indexer `position_bias` initialized. Poisoning fresh floating-point
+  allocations with NaN in a CPU fixture test catches this without depending on
+  which values a GPU allocator happens to recycle.
 - Do not add a test whose only assertion is that the code imports, unless import
   side effects are the thing that broke (model registration is a real example).
 - One new `pytest.param` on an existing table is worth more than a new file with
