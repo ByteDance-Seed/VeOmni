@@ -906,7 +906,7 @@ class DistributedCheckpointer(CheckpointerBase):
         a rank that gave up while its peers were still copying would run ahead and
         pair with the wrong collective from then on, turning a slow copy into a
         corrupt one. The deadline that is safe is the promotion group's own timeout,
-        which every rank hits together -- see ``promote_timeout_seconds``.
+        which every rank hits together -- see ``save_async_timeout_seconds``.
 
         No barrier afterwards: the promotion's last phase ends in a reduction every
         rank takes part in, so returning from here already means all of them have.
