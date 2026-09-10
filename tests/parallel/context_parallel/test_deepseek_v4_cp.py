@@ -194,10 +194,10 @@ def _init_cp_attention(
 
     from transformers import AutoConfig
 
-    from veomni.distributed.parallel_state import init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
-    init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
@@ -445,7 +445,7 @@ def _run_compressor_cp(
     row all-gather, and running it is the only way to drive them. Its selection
     is then observable through ``block_bias``, which is scattered from it.
     """
-    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
@@ -462,7 +462,7 @@ def _run_compressor_cp(
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
 
-    init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
@@ -591,7 +591,7 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
     local. The packed layout is what forces it to shard the compression metadata
     it is handed, which is global.
     """
-    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
@@ -608,7 +608,7 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
 
-    init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
     # The TileLang kernel is the production scorer and the only one with a query
     # partitioning of its own; the eager scorer is covered by the CSA layer test.
     dsv4.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
@@ -1180,7 +1180,7 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
     ``test_deepseek_v4_cp_collator_shards_contiguously_by_cp_rank`` pins that the
     collator really produces these three things.
     """
-    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
@@ -1196,7 +1196,7 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
 
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
-    init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
     if tilelang:
         # The model forward withholds the dense mask only for bf16 CUDA tensors
         # with the TileLang attention selected, so this is the arm that reaches
@@ -1291,7 +1291,7 @@ def _run_cp_collator_contract(rank: int, world_size: int, init_file: str) -> Non
     CP-only mesh flattens ``sp`` onto ``cp``.
     """
     from veomni.data.data_collator import SequenceParallelCollator
-    from veomni.distributed.parallel_state import clear_parallel_state, get_parallel_state, init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, get_parallel_state
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
@@ -1302,7 +1302,7 @@ def _run_cp_collator_contract(rank: int, world_size: int, init_file: str) -> Non
         rank=rank,
         world_size=world_size,
     )
-    init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
 
     state = get_parallel_state()
     assert (state.sp_size, state.sp_rank) == (state.cp_size, state.cp_rank), (

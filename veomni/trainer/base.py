@@ -59,7 +59,7 @@ from ..data.data_transform import build_data_transform
 from ..distributed.async_offload import apply_async_activation_offload, reset_async_activation_offload
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.offloading import build_activation_offloading_context
-from ..distributed.parallel_state import clear_parallel_state, init_parallel_state, use_parallel_state
+from ..distributed.parallel_state import clear_parallel_state, init_parallel_state_from_config, use_parallel_state
 from ..distributed.torch_compile import CompileConfig, mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
@@ -382,21 +382,7 @@ class BaseTrainer(Stateful, ABC):
 
     def register_parallel_state(self, name: str = "base"):
         """Register this trainer's ParallelState under ``name`` in the registry."""
-        init_parallel_state(
-            dp_size=self.args.model.accelerator.dp_size,
-            dp_replicate_size=self.args.model.accelerator.dp_replicate_size,
-            dp_shard_size=self.args.model.accelerator.dp_shard_size,
-            tp_size=self.args.model.accelerator.tp_size,
-            pp_size=self.args.model.accelerator.pp_size,
-            cp_size=self.args.model.accelerator.cp_size,
-            ulysses_size=self.args.model.accelerator.ulysses_size,
-            extra_parallel_sizes=self.args.model.accelerator.extra_parallel_sizes,
-            extra_parallel_placement_innermost=self.args.model.accelerator.extra_parallel_placement_innermost,
-            extra_parallel_names=self.args.model.accelerator.extra_parallel_names,
-            dp_mode=self.args.model.accelerator.fsdp_config.fsdp_mode,
-            async_enabled=self.args.model.accelerator.enable_async,
-            name=name,
-        )
+        init_parallel_state_from_config(self.args.model.accelerator, name=name)
 
     def _build_model(self):
         logger.info_rank0("Build model")

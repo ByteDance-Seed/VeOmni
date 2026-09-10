@@ -32,7 +32,7 @@ if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backen
 
 from torch.testing._internal.common_utils import run_tests
 
-from veomni.distributed.parallel_state import clear_parallel_state, get_parallel_state, init_parallel_state
+from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, get_parallel_state
 from veomni.models.transformers.wan.modeling_wan import SelfAttention, precompute_freqs_cis
 
 from .utils import SequenceParallelTest
@@ -47,7 +47,7 @@ class WanSelfAttentionUlyssesTest(SequenceParallelTest):
     def test_sync_path_matches_non_sp_reference(self):
         group = self._get_process_group()
         try:
-            init_parallel_state(
+            _init_parallel_state(
                 dp_size=1,
                 ulysses_size=self.world_size,
                 device_type=get_device_type(),

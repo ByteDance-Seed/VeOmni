@@ -509,11 +509,11 @@ def _run_async_offload_base_trainer_fsdp2_gc():
         OptimizerConfig,
         TorchCompileConfig,
     )
-    from veomni.distributed.parallel_state import init_parallel_state, use_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, use_parallel_state
     from veomni.trainer.base import BaseTrainer
 
     world_size = dist.get_world_size()
-    init_parallel_state(
+    _init_parallel_state(
         dp_size=world_size,
         dp_shard_size=world_size,
         dp_mode="fsdp2",
