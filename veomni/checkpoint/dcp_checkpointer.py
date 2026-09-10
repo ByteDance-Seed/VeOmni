@@ -456,22 +456,21 @@ def restore_extra_parallel_dim(
 def _local_rank() -> int:
     """This process's rank within its node, as set by the elastic launcher.
 
-    Used to elect one rank per node for the node-local staging work; defaults to
-    0 so single-process runs still take the leader path.
+    Elects one rank per node for the node-local staging work; defaults to 0 so
+    single-process runs still take the leader path.
     """
     value = os.environ.get("LOCAL_RANK", "0")
     return int(value) if value.isdigit() else 0
 
 
-def _stage_key(checkpoint_dir: str) -> str:
-    """Directory name that isolates one destination's staged files from another's.
+def _stage_key(path: str) -> str:
+    """Directory name that isolates one run's staged files from another's.
 
-    Two jobs writing different destinations can share a node, and the same job can
-    be retried, so the key must not collide. Separator substitution would: it maps
-    ``/tmp/a_b/c`` and ``/tmp/a/b_c`` onto the same name. A digest of the absolute
-    path cannot, and the readable prefix keeps the directory identifiable on disk.
+    Substituting separators would collide -- it maps ``/tmp/a_b/c`` and
+    ``/tmp/a/b_c`` onto one name -- so the name is a digest of the absolute path,
+    prefixed with the basename to stay identifiable on disk.
     """
-    absolute = os.path.abspath(checkpoint_dir)
+    absolute = os.path.abspath(path)
     digest = hashlib.sha256(absolute.encode("utf-8")).hexdigest()[:16]
     return f"{os.path.basename(absolute) or 'ckpt'}-{digest}"
 
@@ -479,9 +478,9 @@ def _stage_key(checkpoint_dir: str) -> str:
 class _Promotion:
     """Failure state shared by the phases of one promotion.
 
-    ``error`` is what this rank saw; ``failed`` is what the whole group saw. They
-    differ because the work is split across ranks -- one leader per node copies
-    that node's files -- so a failure starts out visible to a single rank.
+    ``error`` is what this rank saw, ``failed`` what the whole group saw: the work
+    is split across ranks -- one leader per node copies that node's files -- so a
+    failure starts out visible to a single rank.
     """
 
     def __init__(self) -> None:
@@ -505,12 +504,11 @@ def _any_rank_failed(failed: bool) -> bool:
 def _promotion_phase(state: _Promotion, work, *, participates: bool, always: bool = False) -> None:
     """Run one phase on the ranks that take part, then let every rank agree on the result.
 
-    The closing reduction is the phase's only collective and every rank reaches
-    it on every path, including the failing one. That is the whole point:
-    collectives are untagged, so a rank that returned early would leave the
-    others pairing up with the wrong one from then on, and the save would hang
-    instead of failing. Keeping exactly one collective per phase makes the count
-    equal by construction rather than by inspection.
+    The closing reduction is the phase's only collective and every rank reaches it
+    on every path, including the failing one. Collectives are untagged, so a rank
+    that returned early would leave the others pairing up with the wrong one from
+    then on and the save would hang instead of failing; one collective per phase
+    keeps the counts equal by construction rather than by inspection.
 
     ``always`` marks a phase that must run even after a failure -- cleanup.
     """
@@ -526,42 +524,29 @@ def _promotion_phase(state: _Promotion, work, *, participates: bool, always: boo
 _STAGE_ROOT = "veomni_ckpt_stage"
 
 
-def _stage_run_root(stage_dir: str, checkpoint_dir: str) -> str:
-    """Directory holding every staged checkpoint of one run, and nothing else.
+def _prepare_stage_dir(stage_dir: str, path: str) -> str:
+    """Create the empty staging directory for the run writing to ``path``.
 
-    Keyed on the destination the run writes to, so two runs sharing a node and a
-    ``stage_dir`` -- which is often something generic like /tmp -- never land in
-    the same place. That matters because this directory gets swept: keying it any
-    more coarsely would let one run delete another's staged data.
+    One directory per run, shared by every checkpoint it writes and emptied
+    first. That is also how a save killed part-way is cleaned up: its copy -- the
+    size of the model plus its optimizer state -- is left exactly where the next
+    save clears it, instead of stranded under a key naming its own step.
+
+    Keyed on ``path`` because ``stage_dir`` is often something generic like /tmp
+    and this directory gets swept: two runs sharing a node must not land in the
+    same place, or one would delete the other's staged data.
+
+    Only the node leader touches the filesystem; peers would race the sweep and
+    have no need to, since the reduction below is a collective. That reduction
+    also keeps a per-node failure -- a full or read-only scratch disk -- from
+    being seen by one rank alone, which would leave the rest waiting in
+    ``dcp.save`` on a collective that never arrives.
     """
-    return os.path.join(stage_dir, _STAGE_ROOT, _stage_key(os.path.dirname(os.path.abspath(checkpoint_dir))))
-
-
-def _prepare_stage_dir(stage_dir: str, checkpoint_dir: str) -> str:
-    """Create an empty staging directory for one checkpoint, agreed by every rank.
-
-    Clears the whole run root rather than just this checkpoint's directory. A
-    save killed part-way -- by a hang detector, a failover, a preemption --
-    leaves a copy the size of the model plus its optimizer state under a key
-    naming *its* step, and removing only the current key would strand it; the
-    next save on that node then asks for the same space again on a disk already
-    short of it.
-
-    Only the node leader touches the filesystem. Sweeping under peers that are
-    creating directories in the same place would race, and there is no need for
-    them to: the reduction below is a collective, so by the time any rank leaves
-    this function the leader's work is done and visible.
-
-    That reduction is also what keeps a per-node failure -- a full or read-only
-    scratch disk -- from being seen by one rank alone, which would leave the rest
-    waiting in ``dcp.save`` on a collective that never arrives.
-    """
-    run_root = _stage_run_root(stage_dir, checkpoint_dir)
-    stage_path = os.path.join(run_root, _stage_key(checkpoint_dir))
+    stage_path = os.path.join(stage_dir, _STAGE_ROOT, _stage_key(path))
     error: Optional[BaseException] = None
     if _local_rank() == 0:
         try:
-            shutil.rmtree(run_root, ignore_errors=True)
+            shutil.rmtree(stage_path, ignore_errors=True)
             os.makedirs(stage_path, exist_ok=True)
         except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
             error = e
@@ -573,19 +558,18 @@ def _prepare_stage_dir(stage_dir: str, checkpoint_dir: str) -> str:
 def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
     """Copy a staged checkpoint to its destination, then drop the staged copy.
 
-    The staging directory is node-local and shared by every rank on the node, so
-    one rank per node copies all of it rather than each rank working out which
-    files it wrote; that keeps this independent of DCP's file naming.
+    The staging directory is node-local, so one rank per node copies all of it
+    rather than each rank working out which files it wrote; that keeps this
+    independent of DCP's file naming.
 
-    Four phases, each ending in a single collective (see ``_promotion_phase``).
-    Errors are collected and re-raised only once every phase has run, on every
-    rank rather than only where the failure happened.
+    Four phases, each ending in a single collective (see ``_promotion_phase``),
+    with errors re-raised on every rank once every phase has run.
 
     ``.metadata`` is what DCP reads as "this checkpoint is complete". The
     destination's old copy goes first, before anything is overwritten, and the
-    new one goes last and only if every rank's data landed -- so a reader
-    arriving at any point sees either the previous complete checkpoint, or none,
-    never a completion marker over data that is only partly there.
+    new one goes last and only if every rank's data landed -- so a reader sees
+    either the previous complete checkpoint or none, never a completion marker
+    over data that is only partly there.
     """
     metadata_name = ".metadata"
     is_node_leader = _local_rank() == 0
@@ -633,10 +617,9 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
     def drop_staged_copy() -> None:
         """Free the scratch disk.
 
-        The staged copy is as large as the model plus its optimizer state, so
-        keeping it after a failure would strand that space for every later run on
-        this node. Nothing is lost: without a marker the destination reads as
-        incomplete, which it is, and the next save overwrites it.
+        Runs after a failure too: the copy is as large as the model plus its
+        optimizer state, and nothing is lost by dropping it -- without a marker
+        the destination reads as incomplete, which it is.
         """
         shutil.rmtree(stage_path, ignore_errors=True)
 
@@ -697,28 +680,26 @@ class DistributedCheckpointer(CheckpointerBase):
                 checkpoint. Note this only consolidates *replicated* data: unique shards from
                 expert/tensor/pipeline parallelism are never deduplicated and remain distributed.
                 See ``CheckpointConfig.dcp_save_to_lowest_rank``.
-            stage_dir: write the checkpoint under this directory and copy it to ``path``
-                afterwards, instead of writing straight to ``path``. Intended for a
-                destination far slower than local disk. The caller owns the choice: this
-                does not probe for a usable directory or check free space, and an
-                unusable ``stage_dir`` fails the save rather than silently writing
-                elsewhere. See ``CheckpointConfig.stage_dir``.
+            stage_dir: write the checkpoint here and copy it to ``path`` afterwards,
+                instead of writing straight to ``path``. Intended for a destination far
+                slower than local disk. The caller owns the choice: this does not probe
+                for a usable directory or check free space, and an unusable ``stage_dir``
+                fails the save rather than silently writing elsewhere. See
+                ``CheckpointConfig.stage_dir``.
         return:
             None
         """
         if "model" not in state:
             raise ValueError("Model must be provided to save a distributed checkpoint.")
 
+        # Rejected up front, before anything reaches disk. An async write is still
+        # running when save() returns and drops the staged copy; a caller-supplied
+        # writer already points somewhere, and ignoring stage_dir would write straight
+        # to the slow destination it was meant to avoid.
         if stage_dir and save_async:
-            # The staged copy is deleted as soon as save() returns, which for an async
-            # save is before the write has finished. Reject the pair up front, before
-            # anything has been created on disk, rather than silently dropping one.
             raise ValueError("stage_dir cannot be combined with save_async")
 
         if stage_dir and storage_writer is not None:
-            # A caller-supplied writer already points somewhere; redirecting it to the
-            # staging directory is not ours to do, and ignoring stage_dir would write
-            # straight to the slow destination the caller was trying to avoid.
             raise ValueError("stage_dir cannot be combined with an explicit storage_writer")
 
         checkpoint_dir = f"{path}/{_GLOBAL_STEP_PREFIX}{global_steps}" if global_steps else path
@@ -738,7 +719,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 load=False,
             )
 
-        stage_path = _prepare_stage_dir(stage_dir, checkpoint_dir) if stage_dir else None
+        stage_path = _prepare_stage_dir(stage_dir, path) if stage_dir else None
 
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(stage_path or checkpoint_dir)
