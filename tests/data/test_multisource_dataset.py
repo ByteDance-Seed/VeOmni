@@ -202,7 +202,7 @@ class TrainerTest(BaseTrainer):
         self.model.train()
 
     def _build_optimizer(self):
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.args.train.optimizer.lr)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.args.model.optimizer.lr)
 
     def _build_lr_scheduler(self):
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lambda _: 1.0)
@@ -845,7 +845,7 @@ def build_command():
         "--data.datasets_type=iterable",
         "--train.global_batch_size=8",
         "--train.micro_batch_size=2",
-        "--train.accelerator.fsdp_config.fsdp_mode=ddp",
+        "--model.accelerator.fsdp_config.fsdp_mode=ddp",
         "--train.checkpoint.manager=dcp",
         "--train.checkpoint.output_dir=.tests/cache",
         "--train.dyn_bsz=true",

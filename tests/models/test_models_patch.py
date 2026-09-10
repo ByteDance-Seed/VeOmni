@@ -313,7 +313,7 @@ class TrainerTest(BaseTrainer):
             batch["position_ids"] = batch["position_ids"].transpose(0, 1).contiguous()
 
         loss, loss_dict, _ = super().forward_backward_step(batch)
-        grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
+        grad_norm = veomni_clip_grad_norm(self.model, args.model.optimizer.max_grad_norm)
 
         _release_device_memory()
         print_device_mem_info(f"[Memory Info] after model {model_name} train_one_step:")
@@ -492,18 +492,21 @@ def test_models_patch_fwd_bwd(
     # this the public ``OpsImplementationConfig()`` defaults (liger_kernel /
     # fused_triton / triton) would fail validation on NPU before the test
     # even runs.
-    model_config = ModelArguments(config_path=config_path, ops_implementation=make_eager_ops_config())
-    data_config = DataArguments(train_path="")
-    training_config = TrainingArguments(
-        checkpoint=CheckpointConfig(output_dir="./test_models_patch"),
+    model_config = ModelArguments(
+        config_path=config_path,
+        ops_implementation=make_eager_ops_config(),
         accelerator=AcceleratorConfig(
+            init_device=get_device_type(),
             fsdp_config=FSDPConfig(
                 fsdp_mode="ddp",
                 mixed_precision=MixedPrecisionConfig(enable=False),
             ),
         ),
+    )
+    data_config = DataArguments(train_path="")
+    training_config = TrainingArguments(
+        checkpoint=CheckpointConfig(output_dir="./test_models_patch"),
         enable_full_determinism=True,
-        init_device=get_device_type(),
     )
 
     trainer_config = VeOmniArguments(

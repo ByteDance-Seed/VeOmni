@@ -21,8 +21,8 @@ Run (4 GPUs):
         --data.train_path dummy \\
         --data.max_seq_len 128 \\
         --train.checkpoint.output_dir /tmp/test_lora_saveload \\
-        --train.accelerator.fsdp_config.fsdp_mode fsdp2 \\
-        --train.init_device meta \\
+        --model.accelerator.fsdp_config.fsdp_mode fsdp2 \\
+        --model.accelerator.init_device meta \\
         --train.global_batch_size 4 \\
         --train.micro_batch_size 1 \\
         --train.max_steps 3 \\

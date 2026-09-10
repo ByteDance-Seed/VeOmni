@@ -12,16 +12,16 @@ model:
     lora_modules:
       - q_proj
       - v_proj
+  accelerator:
+    init_device: meta
+    fsdp_config:
+      fsdp_mode: fsdp2
 
 data:
   train_path: dummy
   max_seq_len: 128
 
 train:
-  accelerator:
-    fsdp_config:
-      fsdp_mode: fsdp2
-  init_device: meta
   global_batch_size: 4
   micro_batch_size: 1
   max_steps: 3
