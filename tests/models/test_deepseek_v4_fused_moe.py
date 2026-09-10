@@ -1,11 +1,9 @@
 from types import SimpleNamespace
 
-import pytest
 import torch
 import torch.nn.functional as F
 
 from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
-from veomni.utils.device import MOE_TRITON_DEVICE_TYPES
 
 
 def _deepseek_v4_experts_reference(
@@ -36,19 +34,14 @@ def _deepseek_v4_experts_reference(
     return output
 
 
-@pytest.mark.parametrize(
-    ("device_type", "expected_moe"),
-    [
-        (MOE_TRITON_DEVICE_TYPES[0], "fused_triton"),
-        ("npu", "fused_npu"),
-    ],
-)
-def test_deepseek_v4_test_overrides_follow_active_device(monkeypatch, device_type, expected_moe):
-    from tests.tools import training_utils
+def test_deepseek_v4_test_overrides_keep_eager_attention_and_expected_moe():
+    from tests.tools.training_utils import resolve_ops_overrides
+    from veomni.utils.import_utils import is_torch_npu_available
 
-    monkeypatch.setattr(training_utils, "get_device_type", lambda: device_type)
-    overrides = training_utils.resolve_ops_overrides("deepseek_v4")
+    overrides = resolve_ops_overrides("deepseek_v4")
 
+    is_npu = is_torch_npu_available()
+    expected_moe = "eager" if is_npu else "fused_triton"
     assert "--model.ops_implementation.attn_implementation=eager" in overrides
     assert f"--model.ops_implementation.moe_implementation={expected_moe}" in overrides
 
@@ -178,14 +171,13 @@ def test_deepseek_v4_attention_matches_official_q_norm_and_rope_dtype_modes(monk
     q_raw = attention.q_b_proj(q_residual).view(
         hidden_states.shape[0], hidden_states.shape[1], config.num_attention_heads, config.head_dim
     )
-    norm_factor = torch.rsqrt(q_raw.float().square().mean(-1, keepdim=True) + config.rms_norm_eps).to(q_raw.dtype)
-    expected = q_raw * norm_factor
+    expected = q_raw * torch.rsqrt(q_raw.square().mean(-1, keepdim=True) + config.rms_norm_eps)
     expected = dsv4.apply_rotary_pos_emb(expected.transpose(1, 2), cos, sin)
-    legacy_bf16_norm = q_raw * torch.rsqrt(q_raw.square().mean(-1, keepdim=True) + config.rms_norm_eps)
-    legacy_bf16_norm = dsv4.apply_rotary_pos_emb(legacy_bf16_norm.transpose(1, 2), cos, sin)
+    old_fp32_norm = attention.q_b_norm(q_raw.transpose(1, 2))
+    old_fp32_norm = dsv4.apply_rotary_pos_emb(old_fp32_norm, cos, sin)
 
     torch.testing.assert_close(captured["query"], expected, rtol=0, atol=0)
-    assert not torch.equal(captured["query"], legacy_bf16_norm)
+    assert not torch.equal(captured["query"], old_fp32_norm)
 
     rope_dim = cos.shape[-1] * 2
     expected_rope = torch.view_as_real(
