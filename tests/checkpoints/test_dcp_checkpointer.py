@@ -1455,10 +1455,11 @@ class TestStageDirValidation:
         assert (someone_elses / "important.bin").exists(), "swept outside our own root"
 
     def test_only_the_node_leader_touches_the_filesystem(self, tmp_path):
-        """Peers sweeping and creating in the same place would race with the leader.
+        """Peers sweeping or creating in the same place would race with the leader.
 
         They do not need to: the reduction is a collective, so the leader's work
-        is done and visible by the time any rank leaves.
+        is done and visible by the time any rank leaves. Checks both halves --
+        a peer neither creates the directory nor removes what the leader made.
         """
         import os as _os
 
@@ -1472,6 +1473,13 @@ class TestStageDirValidation:
             with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0):
                 assert _prepare_stage_dir(str(tmp_path), "/remote/ckpt/global_step_10") == path
             assert _os.path.isdir(path), "the leader must have created it"
+
+            marker = _os.path.join(path, "written_by_the_leader")
+            with open(marker, "w") as f:
+                f.write("x")
+            with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=3):
+                _prepare_stage_dir(str(tmp_path), "/remote/ckpt/global_step_10")
+            assert _os.path.exists(marker), "a peer swept the leader's directory"
 
     def test_a_concurrent_run_sharing_stage_dir_is_not_swept(self, tmp_path):
         """stage_dir is often generic (/tmp); two runs on one node must not collide."""
