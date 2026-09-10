@@ -830,7 +830,8 @@ class TrainingArguments:
         default=None,
         metadata={
             "help": (
-                "Timeout for collective operations on the default process group. Unset "
+                "Timeout in seconds for collective operations on the default process group, a "
+                "positive integer. Unset "
                 "(default) keeps torch's own per-backend default, which is 10 minutes for "
                 "NCCL. A collective that outlives it is treated as a hang: the NCCL "
                 "watchdog aborts the process and the run restarts. Raise it when a step "
@@ -873,8 +874,14 @@ class TrainingArguments:
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
             )
 
-        if self.dist_timeout_seconds is not None and self.dist_timeout_seconds <= 0:
-            raise ValueError(f"dist_timeout_seconds must be positive, got {self.dist_timeout_seconds}.")
+        # The parser hands YAML values through untouched, so the type is checked here.
+        # ``bool`` is an ``int`` subclass: without this, ``dist_timeout_seconds: true``
+        # would pass as a one-second timeout, which aborts the first collective -- the
+        # opposite of what this setting is for.
+        if self.dist_timeout_seconds is not None and (
+            type(self.dist_timeout_seconds) is not int or self.dist_timeout_seconds <= 0
+        ):
+            raise ValueError(f"dist_timeout_seconds must be a positive integer, got {self.dist_timeout_seconds!r}.")
 
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))

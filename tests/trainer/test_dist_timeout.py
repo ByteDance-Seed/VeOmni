@@ -25,5 +25,15 @@ class TestDistTimeout:
     def test_non_positive_is_rejected_at_parse_time(self, seconds):
         """Torch reads a non-positive timeout as "expire immediately", which aborts the
         first collective. Rejecting it here fails the run before it reserves any GPU."""
-        with pytest.raises(ValueError, match="must be positive"):
+        with pytest.raises(ValueError, match="must be a positive integer"):
+            TrainingArguments(dist_timeout_seconds=seconds)
+
+    @pytest.mark.parametrize("seconds", [True, 1800.5, "1800"])
+    def test_non_integer_is_rejected_at_parse_time(self, seconds):
+        """The parser hands YAML values through untouched, so anything can arrive here.
+
+        ``True`` is the one that has to be caught rather than tolerated: ``bool`` is an
+        ``int`` subclass and it survives a positive-value check as a one-second timeout.
+        """
+        with pytest.raises(ValueError, match="must be a positive integer"):
             TrainingArguments(dist_timeout_seconds=seconds)
