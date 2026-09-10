@@ -15,6 +15,10 @@
 #      Disable autocast around fp32 router linear for VeRL actor/rollout parity
 #    - method_override: DeepseekV3MoE.forward
 #      Report top-k indices to the MoE load-balance monitor
+#    - method_override: DeepseekV3ForCausalLM.__init__
+#      Construct checkpoint-compatible DeepSeek-V3 MTP modules when enabled
+#    - method_override: DeepseekV3ForCausalLM.configure_mtp_training
+#      Configure runtime-only DeepSeek-V3 MTP training state
 #    - method_override: DeepseekV3ForCausalLM.forward
 #      OpSlot guard for fused cross entropy in DeepseekV3ForCausalLM.forward
 #    - method_override: DeepseekV3ForCausalLM.get_parallel_plan
@@ -50,6 +54,9 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.utils.generic import is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
+from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor
+from veomni.distributed.sequence_parallel.comm import get_unified_sequence_parallel_group
+
 # Additional imports for patches
 from veomni.ops import fused_moe_forward
 
@@ -63,6 +70,34 @@ from veomni.utils.moe_monitor import record_router_indices
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
+
+
+# ======================================================================
+# [HELPERS] Module-level helpers injected via config.add_helper
+# ======================================================================
+
+
+def _shift_mtp_inputs(input_ids, labels, position_ids, depth):
+    """Build local MTP inputs/targets while preserving packed and SP boundaries."""
+    full_input_ids = gather_outputs(input_ids, gather_dim=-1)
+    full_labels = gather_outputs(labels, gather_dim=-1)
+    full_position_ids = gather_outputs(position_ids, gather_dim=-1)
+    if full_position_ids.dim() == 3:
+        boundary_position_ids = full_position_ids[:, 0, :]
+    else:
+        boundary_position_ids = full_position_ids
+
+    target_offset = depth if get_unified_sequence_parallel_group() is not None else depth + 1
+    future_input_ids = F.pad(full_input_ids[..., depth:], (0, depth), value=0)
+    mtp_labels = F.pad(full_labels[..., target_offset:], (0, target_offset), value=-100)
+    target_position_ids = F.pad(boundary_position_ids[..., depth + 1 :], (0, depth + 1), value=-1)
+    contiguous = target_position_ids == boundary_position_ids + depth + 1
+    mtp_labels = mtp_labels.masked_fill(~contiguous, -100)
+
+    return (
+        slice_input_tensor(future_input_ids, dim=-1, padding=False),
+        slice_input_tensor(mtp_labels, dim=-1, padding=False),
+    )
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -631,6 +666,25 @@ class DeepseekV3DecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
+# ======================================================================
+# [HELPERS AFTER] DeepseekV3DecoderLayer
+# ======================================================================
+
+
+class DeepseekV3MultiTokenPredictor(DeepseekV3DecoderLayer):
+    """One DeepSeek-V3 multi-token prediction module."""
+
+    def __init__(self, config, layer_idx):
+        super().__init__(config, layer_idx)
+        self.enorm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+
+    def forward(self, hidden_states, future_embeddings, **kwargs):
+        hidden_states = self.eh_proj(torch.cat((self.enorm(future_embeddings), self.hnorm(hidden_states)), dim=-1))
+        return super().forward(hidden_states, **kwargs)
+
+
 @auto_docstring
 class DeepseekV3PreTrainedModel(PreTrainedModel):
     config: DeepseekV3Config
@@ -738,7 +792,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] DeepseekV3ForCausalLM
-# Methods patched: forward, get_parallel_plan
+# Methods patched: __init__, configure_mtp_training, forward, get_parallel_plan
 # ======================================================================
 
 
@@ -749,13 +803,28 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config):
-        super().__init__(config)
+        DeepseekV3PreTrainedModel.__init__(self, config)
         self.model = DeepseekV3Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        # Initialize weights and apply final processing
+        num_mtp_layers = (
+            getattr(config, "num_nextn_predict_layers", 0) if getattr(config, "_veomni_enable_mtp", False) else 0
+        )
+        if num_mtp_layers:
+            # parallelize_model_fsdp2 uses these exact class names to select
+            # independently sharded decoder blocks before applying root FSDP.
+            self._no_split_modules = [*self._no_split_modules, "DeepseekV3MultiTokenPredictor"]
+        for depth in range(num_mtp_layers):
+            layer_idx = config.num_hidden_layers + depth
+            predictor = DeepseekV3MultiTokenPredictor(config, layer_idx)
+            self.model.layers.append(predictor)
+
         self.post_init()
+        self._mtp_training_enabled = False
+        self._mtp_loss_weight = 0.1
+        for predictor in self.model.layers[self.config.num_hidden_layers :]:
+            predictor.requires_grad_(False)
 
     # ================================================================
     # Patch: DeepseekV3ForCausalLM.forward
@@ -831,6 +900,52 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
                     logits = None
         else:
             logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        # MTP is a training objective. The public checkpoint stores its modules
+        # immediately after the main decoder layers (for V3: model.layers.61).
+        # Each depth consumes the previous depth's state plus the corresponding
+        # future token, then predicts the following token.
+        if loss is not None and getattr(self, "_mtp_training_enabled", False):
+            if input_ids is None:
+                raise ValueError("DeepSeek-V3 MTP training requires input_ids; inputs_embeds alone are insufficient.")
+            if position_ids is None:
+                raise ValueError("DeepSeek-V3 MTP training requires position_ids to protect packed-sample boundaries.")
+
+            mtp_loss = hidden_states.new_zeros(())
+            mtp_hidden_states = hidden_states
+            causal_mask = create_causal_mask(
+                config=self.model.config,
+                inputs_embeds=mtp_hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=None,
+                position_ids=position_ids,
+            )
+            position_embeddings = self.model.rotary_emb(mtp_hidden_states, position_ids=position_ids)
+            for depth, predictor in enumerate(self.model.layers[self.config.num_hidden_layers :], start=1):
+                future_input_ids, mtp_labels = _shift_mtp_inputs(input_ids, labels, position_ids, depth)
+                mtp_hidden_states = predictor(
+                    mtp_hidden_states,
+                    self.model.embed_tokens(future_input_ids),
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                    past_key_values=None,
+                    use_cache=False,
+                    **kwargs,
+                )
+                depth_loss, _, _ = self.loss_function(
+                    logits=None,
+                    labels=mtp_labels,
+                    shift_labels=mtp_labels,
+                    vocab_size=self.config.vocab_size,
+                    hidden_states=self.model.norm(mtp_hidden_states),
+                    weights=self.lm_head.weight,
+                    **kwargs,
+                )
+                mtp_loss = mtp_loss + depth_loss
+
+            mtp_loss_weight = self._mtp_loss_weight
+            loss = loss + mtp_loss_weight * mtp_loss / self.config.num_nextn_predict_layers
         # --- Patch.1 ---
 
         return CausalLMOutputWithLogProbs(
@@ -841,6 +956,15 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def configure_mtp_training(self, enabled, loss_weight):
+        num_mtp_layers = len(self.model.layers) - self.config.num_hidden_layers
+        if enabled and num_mtp_layers <= 0:
+            raise ValueError("DeepSeek-V3 MTP training requires MTP modules to be enabled at model construction.")
+        self._mtp_training_enabled = enabled
+        self._mtp_loss_weight = loss_weight
+        for predictor in self.model.layers[self.config.num_hidden_layers :]:
+            predictor.requires_grad_(enabled)
 
     # ================================================================
     # Patch: DeepseekV3ForCausalLM.get_parallel_plan
