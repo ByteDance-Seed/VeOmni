@@ -45,7 +45,7 @@ from ..distributed.parallel_state import get_parallel_state
 from ..optim.optimizer import restore_optimizer_param_group_defaults
 from ..utils import logging
 from ..utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
-from ..utils.device import empty_cache, synchronize
+from ..utils.device import empty_cache, get_device_type, synchronize
 from .checkpointer import CheckpointerBase
 
 
@@ -476,6 +476,73 @@ def _stage_key(checkpoint_dir: str) -> str:
     return f"{os.path.basename(absolute) or 'ckpt'}-{digest}"
 
 
+class _Promotion:
+    """Failure state shared by the phases of one promotion.
+
+    ``error`` is what this rank saw; ``failed`` is what the whole group saw. They
+    differ because the work is split across ranks -- one leader per node copies
+    that node's files -- so a failure starts out visible to a single rank.
+    """
+
+    def __init__(self) -> None:
+        self.error: Optional[BaseException] = None
+        self.failed = False
+
+
+def _any_rank_failed(failed: bool) -> bool:
+    """Whether *any* rank hit an error, so every rank can agree on what to do next.
+
+    MAX rather than SUM: one failure is enough, and SUM would overflow int32 on a
+    large enough group.
+    """
+    if not dist.is_initialized():
+        return failed
+    flag = torch.tensor([1 if failed else 0], dtype=torch.int32, device=get_device_type())
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    return bool(flag.item())
+
+
+def _promotion_phase(state: _Promotion, work, *, participates: bool, always: bool = False) -> None:
+    """Run one phase on the ranks that take part, then let every rank agree on the result.
+
+    The closing reduction is the phase's only collective and every rank reaches
+    it on every path, including the failing one. That is the whole point:
+    collectives are untagged, so a rank that returned early would leave the
+    others pairing up with the wrong one from then on, and the save would hang
+    instead of failing. Keeping exactly one collective per phase makes the count
+    equal by construction rather than by inspection.
+
+    ``always`` marks a phase that must run even after a failure -- cleanup.
+    """
+    if participates and (always or not state.failed):
+        try:
+            work()
+        except BaseException as e:  # noqa: BLE001 - raised once every phase is done
+            if state.error is None:
+                state.error = e
+    state.failed = _any_rank_failed(state.error is not None) or state.failed
+
+
+def _prepare_stage_dir(stage_dir: str, checkpoint_dir: str) -> str:
+    """Create an empty staging directory for one checkpoint, agreed by every rank.
+
+    A scratch disk fills or goes read-only per node, so the ranks that could not
+    prepare one must not be the only ones to stop: the rest would go on into
+    ``dcp.save`` and wait on a collective that never arrives. Everyone agrees
+    here, before any of that starts.
+    """
+    stage_path = os.path.join(stage_dir, _stage_key(checkpoint_dir))
+    error: Optional[BaseException] = None
+    try:
+        shutil.rmtree(stage_path, ignore_errors=True)  # leftovers from a crashed run
+        os.makedirs(stage_path, exist_ok=True)
+    except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
+        error = e
+    if _any_rank_failed(error is not None):
+        raise error or RuntimeError(f"another rank could not prepare a staging directory under {stage_dir}")
+    return stage_path
+
+
 def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
     """Copy a staged checkpoint to its destination, then drop the staged copy.
 
@@ -483,78 +550,78 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
     one rank per node copies all of it rather than each rank working out which
     files it wrote; that keeps this independent of DCP's file naming.
 
-    Runs as four barrier-separated phases, and every rank enters every barrier
-    whether or not its own phase did any work or raised. A rank that bailed out
-    early on failure would leave the others waiting on a collective that never
-    comes -- barriers are untagged, so one rank skipping a barrier makes every
-    later one pair up wrongly and the save hangs instead of failing. Failures are
-    therefore recorded and re-raised only once all collectives are done.
+    Four phases, each ending in a single collective (see ``_promotion_phase``).
+    Errors are collected and re-raised only once every phase has run, on every
+    rank rather than only where the failure happened.
 
-    ``.metadata`` is what DCP reads as "this checkpoint is complete", so the
-    destination's old copy is removed before anything is written and the new one
-    is copied last. A reader arriving mid-promotion then sees no metadata rather
-    than the previous checkpoint's metadata over half-replaced data.
+    ``.metadata`` is what DCP reads as "this checkpoint is complete". The
+    destination's old copy goes first, before anything is overwritten, and the
+    new one goes last and only if every rank's data landed -- so a reader
+    arriving at any point sees either the previous complete checkpoint, or none,
+    never a completion marker over data that is only partly there.
     """
     metadata_name = ".metadata"
     is_node_leader = _local_rank() == 0
     is_coordinator = (not dist.is_initialized()) or dist.get_rank() == 0
     final_metadata = os.path.join(final_path, metadata_name)
-    error: Optional[BaseException] = None
+    state = _Promotion()
 
-    def _barrier() -> None:
-        """Synchronise every rank between promotion phases.
+    def drop_stale_marker() -> None:
+        """Stop advertising the previous checkpoint before overwriting its shards."""
+        os.makedirs(final_path, exist_ok=True)
+        if os.path.exists(final_metadata):
+            os.remove(final_metadata)
 
-        A no-op outside distributed runs, so the same code path covers both.
+    def copy_this_nodes_files() -> None:
+        """Copy every staged file on this node, except the completion marker."""
+        names = [n for n in sorted(os.listdir(stage_path)) if n != metadata_name]
+        os.makedirs(final_path, exist_ok=True)
+
+        def _copy(name: str) -> None:
+            """Copy one staged file to the destination, preserving its name."""
+            shutil.copyfile(os.path.join(stage_path, name), os.path.join(final_path, name))
+
+        if names:
+            with ThreadPoolExecutor(max_workers=min(16, len(names))) as pool:
+                list(pool.map(_copy, names))
+
+    def publish_marker() -> None:
+        """Publish the completion marker, or leave nothing behind if that fails."""
+        src = os.path.join(stage_path, metadata_name)
+        if not os.path.exists(src):
+            return
+        try:
+            shutil.copyfile(src, final_metadata)
+        except BaseException:
+            # copyfile creates the destination before writing it, so a failure
+            # can leave a truncated marker -- worse than none, since DCP would
+            # read it as a complete checkpoint.
+            try:
+                if os.path.exists(final_metadata):
+                    os.remove(final_metadata)
+            except OSError:
+                logger.error(f"could not remove a partially written {final_metadata}", exc_info=True)
+            raise
+
+    def drop_staged_copy() -> None:
+        """Free the scratch disk.
+
+        The staged copy is as large as the model plus its optimizer state, so
+        keeping it after a failure would strand that space for every later run on
+        this node. Nothing is lost: without a marker the destination reads as
+        incomplete, which it is, and the next save overwrites it.
         """
-        if dist.is_initialized():
-            dist.barrier()
-
-    # Phase 1: invalidate the destination before it is touched.
-    if is_coordinator:
-        try:
-            os.makedirs(final_path, exist_ok=True)
-            if os.path.exists(final_metadata):
-                os.remove(final_metadata)
-        except BaseException as e:  # noqa: BLE001 - re-raised after the barriers
-            error = e
-    _barrier()
-
-    # Phase 2: one rank per node copies that node's staged files.
-    if is_node_leader and error is None:
-        try:
-            names = [n for n in sorted(os.listdir(stage_path)) if n != metadata_name]
-            os.makedirs(final_path, exist_ok=True)
-
-            def _copy(name: str) -> None:
-                """Copy one staged file to the destination, preserving its name."""
-                shutil.copyfile(os.path.join(stage_path, name), os.path.join(final_path, name))
-
-            if names:
-                with ThreadPoolExecutor(max_workers=min(16, len(names))) as pool:
-                    list(pool.map(_copy, names))
-        except BaseException as e:  # noqa: BLE001 - re-raised after the barriers
-            error = e
-    _barrier()
-
-    # Phase 3: the completion marker goes last, once every node's data has landed.
-    if is_coordinator and error is None:
-        try:
-            src = os.path.join(stage_path, metadata_name)
-            if os.path.exists(src):
-                shutil.copyfile(src, final_metadata)
-        except BaseException as e:  # noqa: BLE001 - re-raised after the barriers
-            error = e
-    _barrier()
-
-    # Phase 4: the staged copy is as large as the model plus its optimizer state,
-    # so drop it even when promotion failed rather than filling the scratch disk
-    # for every later run on this node.
-    if is_node_leader:
         shutil.rmtree(stage_path, ignore_errors=True)
-    _barrier()
 
-    if error is not None:
-        raise error
+    _promotion_phase(state, drop_stale_marker, participates=is_coordinator)
+    _promotion_phase(state, copy_this_nodes_files, participates=is_node_leader)
+    _promotion_phase(state, publish_marker, participates=is_coordinator)
+    _promotion_phase(state, drop_staged_copy, participates=is_node_leader, always=True)
+
+    if state.error is not None:
+        raise state.error
+    if state.failed:
+        raise RuntimeError("checkpoint promotion failed on another rank; no completion marker was written")
 
 
 class DistributedCheckpointer(CheckpointerBase):
@@ -644,11 +711,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 load=False,
             )
 
-        stage_path = None
-        if stage_dir:
-            stage_path = os.path.join(stage_dir, _stage_key(checkpoint_dir))
-            shutil.rmtree(stage_path, ignore_errors=True)  # drop leftovers from a crashed run
-            os.makedirs(stage_path, exist_ok=True)
+        stage_path = _prepare_stage_dir(stage_dir, checkpoint_dir) if stage_dir else None
 
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(stage_path or checkpoint_dir)
