@@ -16,6 +16,7 @@ from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
     DeepseekV4CheckpointTensorConverter,
     _dequantize_scaled_weight,
 )
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts/deepseek_v4/merge_dcp_to_deepseek.py"
@@ -154,7 +155,7 @@ def test_assets_drop_mtp_and_replace_template(tmp_path):
     assert not (output / "generation_config.json").exists()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="DeepSeek quantization needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek quantization needs CUDA")
 @pytest.mark.parametrize("format_name", ["v4-flash", "v4-flash-base"])
 @pytest.mark.parametrize(
     "name", ["model.layers.0.mlp.experts.0.gate_proj.weight", "model.layers.0.self_attn.q_a_proj.weight"]
@@ -165,7 +166,7 @@ def test_gpu_quantization_round_trip(format_name, name):
     converter = DeepseekV4CheckpointTensorConverter(256)
     native = converter.export_name(name)
     torch.manual_seed(7)
-    source = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    source = torch.randn(128, 128, device=get_device_type(), dtype=torch.bfloat16)
     original = source.clone()
     exported = dict(converter.export_tensor(name, source, target.weight_map, target.expert_dtype()))
     weight = exported[native]
