@@ -12,7 +12,7 @@ from torch import nn
 
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 from veomni.distributed.parallel_plan import ParallelPlan
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models.module_utils import load_model_weights, rank0_load_and_broadcast_weights
 from veomni.utils import helper
@@ -218,7 +218,7 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
     get_torch_device().set_device(args.train.local_rank)
     dist.init_process_group(backend=args.test.backend)
 
-    init_parallel_state(
+    _init_parallel_state(
         dp_size=args.model.accelerator.dp_size,
         dp_replicate_size=args.model.accelerator.dp_replicate_size,
         dp_shard_size=args.model.accelerator.dp_shard_size,
@@ -453,7 +453,7 @@ def run_load_weights_test(args: Arguments) -> None:
     get_torch_device().set_device(args.train.local_rank)
     dist.init_process_group(backend=args.test.backend)
 
-    init_parallel_state(
+    _init_parallel_state(
         dp_size=args.model.accelerator.dp_size,
         dp_replicate_size=args.model.accelerator.dp_replicate_size,
         dp_shard_size=args.model.accelerator.dp_shard_size,

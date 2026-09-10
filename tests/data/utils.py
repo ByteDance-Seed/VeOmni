@@ -8,7 +8,7 @@ import torch.nn as nn
 from datasets import Dataset as HuggingFaceDataset
 from torch.utils.data import Dataset, IterableDataset
 
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.trainer.callbacks import GlobalStateCallback, TrainerState
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
@@ -46,7 +46,7 @@ def setup_test_distributed(args):
             rank=int(os.environ["RANK"]),
         )
 
-    parallel_state = init_parallel_state(
+    parallel_state = _init_parallel_state(
         dp_size=args.model.accelerator.dp_size,
         dp_replicate_size=args.model.accelerator.dp_replicate_size,
         dp_shard_size=args.model.accelerator.dp_shard_size,

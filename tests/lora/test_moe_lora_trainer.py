@@ -226,7 +226,7 @@ class _LogDictSaveCallback(Callback):
         Using the trainer's parallel state instead of a hand-rolled
         ``dp_group`` lookup so this stays correct under FSDP1/FSDP2 +
         SP combinations (``dp_group`` already excludes SP/EP/PP per
-        ``init_parallel_state``).
+        ``_init_parallel_state``).
         """
         if not (dist.is_available() and dist.is_initialized()):
             return value

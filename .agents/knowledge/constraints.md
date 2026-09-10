@@ -35,7 +35,7 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
 VeOmni uses FSDP2 exclusively. FSDP1 has been removed.
 
 Core entry points:
-- `veomni/distributed/parallel_state.py` — `init_parallel_state()`, `ParallelState` dataclass
+- `veomni/distributed/parallel_state.py` — `init_parallel_state_from_config()`, `ParallelState` dataclass
 - `veomni/distributed/torch_parallelize.py` — `build_parallelize_model()`, `parallelize_model_fsdp2()`
 - `veomni/distributed/parallel_plan.py` — `ParallelPlan`, `SpecInfo`
 
@@ -47,7 +47,7 @@ Core entry points:
    - When SP is enabled, the FSDP shard mesh fuses with the SP mesh (`dp_shard_sp`) so sequence-parallel ranks co-shard via FSDP.
    - Gradient clipping: `veomni/distributed/fsdp2/clip_grad_norm.py` — handles DTensor grads and ExtraParallel param groups.
 
-6. **Device mesh initialization (`init_parallel_state()`)**
+6. **Device mesh initialization (`init_parallel_state_from_config()`)**
    - Builds a global `DeviceMesh` with named dimensions: `pp`, `dp_replicate`, `dp_shard`, `ulysses`, `cp`, `tp` (each included only if size > 1).
    - Flattens subviews for common usage: `dp` (all data-parallel), `sp` (ulysses+cp), `dp_shard_sp` (FSDP shard × SP), `dp_sp` (for loss/grad sync across SP+DP).
    - For each ExtraParallel name (e.g. `ep`), builds a `[para_size × para_fsdp_size]` submesh via `init_para_mesh_matrix()`.
@@ -62,8 +62,8 @@ Core entry points:
    - Async variants in `async_ulysses*.py` for DiT and pipelined QKV/output projections.
    - Data slicing: `veomni/distributed/sequence_parallel/data.py` — `sp_pad_and_slice()`, `slice_input_tensor()`, `gather_outputs()`.
    - Loss reduction: `reduce_sequence_parallel_loss()` in `loss.py` aggregates across SP ranks (optional `group=` arg; defaults to the current state's unified SP group).
-   - Process groups: `comm.py` has NO group globals. Its getters (`get_ulysses_sequence_parallel_group`, `get_unified_sequence_parallel_group`, `get_context_parallel_group`, `get_data_parallel_group`) resolve from the *current* `ParallelState`'s device mesh (`get_parallel_state().{ulysses,sp,cp,dp}_group`) — exactly how `fsdp_group` already worked. `set_ulysses_sequence_parallel_group(group)` survives ONLY as a unit-test injection seam (`_ULYSSES_SP_GROUP_OVERRIDE`, `None` in production); no production code calls it. Meshless SP is unsupported — `ParallelState.__post_init__` raises if `sp_enabled and device_mesh is None`; always build via `init_parallel_state`.
-   - Local parallel state: `BaseTrainer._setup()` calls `init_parallel_state(name="base")` **before** seed/determinism env vars (`NCCL_DETERMINISTIC`, etc.). Initialization caches by topology and registers under `name`; duplicate name → warn and return existing. Trainers do not store the ParallelState object or name — use `use_parallel_state("base")` / `get_parallel_state_by_name("base")`. `clear_parallel_state()` after `destroy_process_group()`.
+   - Process groups: `comm.py` has NO group globals. Its getters (`get_ulysses_sequence_parallel_group`, `get_unified_sequence_parallel_group`, `get_context_parallel_group`, `get_data_parallel_group`) resolve from the *current* `ParallelState`'s device mesh (`get_parallel_state().{ulysses,sp,cp,dp}_group`) — exactly how `fsdp_group` already worked. `set_ulysses_sequence_parallel_group(group)` survives ONLY as a unit-test injection seam (`_ULYSSES_SP_GROUP_OVERRIDE`, `None` in production); no production code calls it. Meshless SP is unsupported — `ParallelState.__post_init__` raises if `sp_enabled and device_mesh is None`; always build via `init_parallel_state_from_config`.
+   - Local parallel state: `BaseTrainer._setup()` calls `init_parallel_state_from_config(args.model.accelerator, name="base")` **before** seed/determinism env vars (`NCCL_DETERMINISTIC`, etc.). Initialization caches by topology and registers under `name`; duplicate name → warn and return existing. Trainers do not store the ParallelState object or name — use `use_parallel_state("base")` / `get_parallel_state_by_name("base")`. `clear_parallel_state()` after `destroy_process_group()`. Tests that need a topology no job config can express call `_init_parallel_state` directly.
    - **Build scope**: `_setup()` (registers `"base"`) → one `with use_parallel_state("base"):` around the whole build sequence. Do NOT re-wrap individual build helpers.
    - **Run scope (per-op, not whole `train_step`)**: each ambient-dependent op gets its own wrap with `"base"` — `model` forward, `postforward`/`mean_global_loss`, `loss.backward()`, `veomni_clip_grad_norm`. When an API takes explicit `group=`, pass `get_parallel_state_by_name("base").sp_group` and skip ambient.
    - **Callbacks**: cache `Callback.parallel_state` at construction (ChannelLossComputer too). Hook dispatch must not depend on ambient ParallelState.
@@ -96,7 +96,7 @@ Core entry points:
    - Weight sharding: `ParallelPlan` in `parallel_plan.py` defines which expert parameters get `Shard(0)` on the EP mesh. `ParallelPlan.apply()` wraps matching params as DTensors and redistributes to local shards.
    - Token routing: `veomni/distributed/moe/moe_layer.py` — `preprocess()` computes dispatch counts, `token_pre_all2all()` / `tokens_post_all2all()` exchange tokens between EP ranks via `all_to_all` / `all_to_all_async` in `moe/comm.py`.
    - Expert computation: `EPGroupGemm` runs fused expert MLP on grouped tokens per rank.
-   - Device mesh: `init_parallel_state()` builds `[ep × ep_fsdp]` submesh; accessed via `ParallelState.extra_parallel_mesh("ep")`, `ep_group`, `ep_rank`.
+   - Device mesh: `init_parallel_state_from_config()` builds `[ep × ep_fsdp]` submesh; accessed via `ParallelState.extra_parallel_mesh("ep")`, `ep_group`, `ep_rank`.
    - In FSDP2: expert modules get `fully_shard()` on the `ep_fsdp` submesh with `Shard(1)` placement so hidden-dim sharding composes with EP's dim-0 sharding.
 
 ## Data Pipeline
