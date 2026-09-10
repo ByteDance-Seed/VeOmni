@@ -29,7 +29,7 @@ from torch.utils.checkpoint import noop_context_fn
 from ..arguments import MixedPrecisionConfig
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
 from ..utils import logging
-from ..utils.device import IS_NPU_AVAILABLE, get_device_type
+from ..utils.device import IS_NPU_AVAILABLE, get_device_id, get_device_type
 from .checkpoint import CheckpointFunction
 from .parallel_plan import ParallelPlan, get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
@@ -48,42 +48,102 @@ def _reset_hf_initialized_flag(module: nn.Module) -> None:
 
 
 def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) -> None:
-    """Materialize parameters without discarding config-derived buffers.
+    """Materialize parameters while preserving buffer alias groups.
+
+    ``Module.to_empty()`` replaces each registered buffer independently, which
+    breaks aliases. Record every registration before materialization and bind
+    each original alias group to one materialized tensor afterwards.
 
     ``init_empty_weights()`` patches ``register_parameter`` only, so a
     meta-initialized model still holds real buffer values -- and ``to_empty()``
-    replaces every one of them with uninitialized memory. Snapshot them across it
-    instead, on the random-init path as much as the resume path: distributed
-    checkpoints restore ``state_dict()``, which excludes ``persistent=False``,
-    and HF's ``_init_weights`` recomputes a rope table only for a module that
+    replaces every one of them with uninitialized memory. Distributed
+    checkpoints do not restore groups containing only nonpersistent buffers, so
+    preserve their config-derived values. If a group has any persistent
+    registration, the checkpoint is authoritative and will populate the shared
+    materialized tensor during the subsequent DCP load.
+
+    HF's ``_init_weights`` recomputes a rope table only for a module that
     exposes ``original_inv_freq``. Buffers outside that shape -- Gemma3's
-    per-layer-type ``{type}_inv_freq`` and its ``embed_scale``, the Omni audio
-    tower's sinusoidal ``positional_embedding`` -- have nothing else to restore
-    them. Persistent buffers are left to whichever loader runs next.
+    per-layer-type ``{type}_inv_freq`` and its ``embed_scale`` -- have nothing
+    else to restore them unless they are snapshotted here.
     """
-    buffers = []
+
+    buffer_groups: dict[int, list[tuple[nn.Module, str]]] = {}
+    preserved_nonpersistent_buffers: dict[int, torch.Tensor] = {}
     for module in model.modules():
-        for name in module._non_persistent_buffers_set:
-            buffer = module._buffers.get(name)
+        for name, buffer in module._buffers.items():
             if buffer is None:
                 continue
-            if buffer.is_meta:
-                # A buffer derived from a parameter (``self.weight.detach()``) is
-                # on meta like the parameter, and holds nothing to copy out of.
-                # No model does this today; say so rather than let ``to_empty()``
-                # leave uninitialized memory behind unannounced.
-                logger.warning_rank0(
-                    f"Non-persistent buffer {name!r} on {type(module).__name__} is on meta and cannot be "
-                    "preserved across materialization; it will hold uninitialized memory unless init_weights() sets it."
-                )
-                continue
-            buffers.append((module, name, buffer.detach().clone()))
+            buffer_id = id(buffer)
+            buffer_groups.setdefault(buffer_id, []).append((module, name))
+
+    for buffer_id, registrations in buffer_groups.items():
+        module, name = registrations[0]
+        buffer = module._buffers[name]
+        if not all(name in module._non_persistent_buffers_set for module, name in registrations):
+            continue
+        if buffer.is_meta:
+            # A buffer derived from a parameter (``self.weight.detach()``) is
+            # on meta like the parameter, and holds nothing to copy out of.
+            # No model does this today; say so rather than let ``to_empty()``
+            # leave uninitialized memory behind unannounced.
+            logger.warning_rank0(
+                f"Non-persistent buffer {name!r} on {type(module).__name__} is on meta and cannot be "
+                "preserved across materialization; it will hold uninitialized memory unless init_weights() sets it."
+            )
+            continue
+        preserved_nonpersistent_buffers[buffer_id] = buffer.detach().clone()
 
     model.to_empty(device=device)
 
-    for module, name, buffer in buffers:
-        materialized_buffer = module._buffers[name]
-        materialized_buffer.copy_(buffer.to(device=materialized_buffer.device, dtype=materialized_buffer.dtype))
+    for buffer_id, registrations in buffer_groups.items():
+        module, name = registrations[0]
+        canonical_buffer = module._buffers[name]
+        snapshot = preserved_nonpersistent_buffers.get(buffer_id)
+        if snapshot is not None:
+            canonical_buffer.copy_(snapshot.to(device=canonical_buffer.device, dtype=canonical_buffer.dtype))
+        for module, name in registrations:
+            module._buffers[name] = canonical_buffer
+
+
+@torch.no_grad()
+def _move_model_buffers_to_device(model: nn.Module, device: torch.device) -> tuple[int, int]:
+    """Move registered buffers without moving CPU-offloaded parameters.
+
+    PyTorch's ``Module._apply`` replaces buffer tensor objects during device
+    conversion, so external references are not guaranteed to retain object
+    identity. This helper follows that contract while memoizing by object
+    identity so multiple registrations of the same buffer remain aliased. The
+    byte count is based on each buffer's local storage, which is the actual
+    memory moved for a DTensor rather than its global logical shape.
+    Tensor subclasses such as DTensor keep their type through ``Tensor.to``.
+    """
+
+    moved_count = 0
+    moved_bytes = 0
+    moved_by_id: dict[int, torch.Tensor] = {}
+    for module in model.modules():
+        for name, buffer in module._buffers.items():
+            if buffer is None:
+                continue
+            buffer_id = id(buffer)
+            if buffer_id in moved_by_id:
+                module._buffers[name] = moved_by_id[buffer_id]
+                continue
+            if buffer.device == device:
+                moved_by_id[buffer_id] = buffer
+                continue
+
+            moved_count += 1
+            local_buffer = buffer
+            to_local = getattr(buffer, "to_local", None)
+            if callable(to_local):
+                local_buffer = to_local()
+            moved_bytes += local_buffer.numel() * local_buffer.element_size()
+            moved_buffer = buffer.to(device=device)
+            moved_by_id[buffer_id] = moved_buffer
+            module._buffers[name] = moved_buffer
+    return moved_count, moved_bytes
 
 
 def _has_extra_parallel_plan(model: nn.Module) -> bool:
@@ -226,20 +286,6 @@ def _veomni_shard_placement_fn(param: "nn.Parameter") -> Optional[Shard]:
     dim = getattr(param, "_veomni_fsdp_shard_dim", None)
     return Shard(dim) if dim is not None else None
 
-
-def _move_buffers_to_device(model: nn.Module, device: str) -> None:
-    """Place every buffer on ``device``.
-
-    ``CPUOffloadPolicy`` only offloads parameters, gradients and optimizer states:
-    ``fully_shard`` puts buffers on the FSDP device once at wrap time and never stages
-    them again. Meta init defers that move, so a CPU materialization leaves buffers such
-    as the DeepSeek-V4 hash-router ``tid2eid`` table or rotary ``inv_freq`` on CPU while
-    the activations are on the accelerator.
-    """
-    for module in model.modules():
-        for name, buffer in module._buffers.items():
-            if buffer is not None and buffer.device.type != device:
-                module._buffers[name] = buffer.to(device)
 
 
 def _can_shard_extra_parallel_dim0(
@@ -686,7 +732,15 @@ def parallelize_model_fsdp2(
     )
 
     if materialize_device == "cpu":
-        _move_buffers_to_device(model, get_device_type())
+        device_type = get_device_type()
+        compute_device = (
+            torch.device(device_type, get_device_id()) if device_type != "cpu" else torch.device(device_type)
+        )
+        moved_buffers, moved_buffer_bytes = _move_model_buffers_to_device(model, compute_device)
+        logger.info_rank0(
+            "FSDP2 CPU offload kept registered buffers on the compute device: "
+            f"moved_buffers={moved_buffers}, moved_bytes={moved_buffer_bytes}."
+        )
 
     # Register grad norm clipping method for FSDP2
     from .fsdp2 import clip_grad_norm as clip_grad_norm_fn
