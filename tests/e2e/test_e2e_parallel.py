@@ -9,10 +9,10 @@ import torch
 import yaml
 
 from veomni.models.auto import build_foundation_model
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability, get_torch_device
 from veomni.utils.import_utils import is_diffusers_available, is_quack_gemm_available
 
-from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
+from ..tools import DummyDataset, ParallelConfig, build_torchrun_cmd, compare_metrics, print_comparison_table
 from ..tools.training_utils import make_eager_ops_config
 from .utils import prepare_exec_cmd
 
@@ -54,6 +54,27 @@ _DEEPSEEK_V4_TILELANG_TRAINING_ARGS = [
     "--model.ops_implementation.dsa_indexer_implementation=tilelang",
     "--model.ops_implementation.dsa_attention_implementation=tilelang",
     "--model.ops_implementation.mhc_implementation=tilelang",
+]
+
+_QWEN4_EXP_CONFIG = "./tests/toy_config/qwen4_exp_toy/config.json"
+_ACCELERATOR = get_torch_device()
+_QWEN4_EXP_GDN_IMPL = "npu" if IS_NPU_AVAILABLE else "fla"
+_QWEN4_EXP_TRAINING_ARGS = [
+    "--model.ops_implementation.attn_implementation=eager",
+    "--model.ops_implementation.cross_entropy_loss_implementation=eager",
+    "--model.ops_implementation.rms_norm_implementation=eager",
+    "--model.ops_implementation.swiglu_mlp_implementation=eager",
+    "--model.ops_implementation.rotary_pos_emb_implementation=eager",
+    "--model.ops_implementation.rotary_pos_emb_vision_implementation=eager",
+    "--model.ops_implementation.load_balancing_loss_implementation=eager",
+    f"--model.ops_implementation.rms_norm_gated_implementation={_QWEN4_EXP_GDN_IMPL}",
+    f"--model.ops_implementation.causal_conv1d_implementation={_QWEN4_EXP_GDN_IMPL}",
+    f"--model.ops_implementation.chunk_gated_delta_rule_implementation={_QWEN4_EXP_GDN_IMPL}",
+    "--train.accelerator.extra_parallel_names=ple",
+    "--train.accelerator.extra_parallel_sizes=2",
+    "--train.accelerator.extra_parallel_placement_innermost=false",
+    "--train.broadcast_model_weights_from_rank0=false",
+    "--train.ep_sharded_stream_load=true",
 ]
 
 
@@ -588,6 +609,55 @@ def test_qwen3vl_lora_smoke(dummy_qwen3vl_dataset, tmp_path):
         for result in results.values()
         for values in result.values()
     )
+
+
+@pytest.mark.skipif(
+    not _ACCELERATOR.is_available() or _ACCELERATOR.device_count() < 2,
+    reason="Qwen4-Exp VLM SFT pipeline smoke requires two CUDA or NPU devices",
+)
+def test_qwen4_exp_training_smoke(tmp_path):
+    """Exercise toy Qwen4-Exp VLM SFT with PLE=2, EP=2, and SP=1."""
+    model_path = tmp_path / "model"
+    output_dir = tmp_path / "output"
+    _materialize_weights_dir(_QWEN4_EXP_CONFIG, str(model_path), save_original_format=False)
+
+    dummy_dataset = DummyDataset(
+        num_samples=8,
+        seq_len=64,
+        dataset_type="qwen4exp",
+        cache_name=f"qwen4_exp_pipeline_{tmp_path.name}",
+    )
+    try:
+        cmd = build_torchrun_cmd(
+            script="tests/train_scripts/train_vlm_test.py",
+            config_path=_QWEN4_EXP_CONFIG,
+            model_path=str(model_path),
+            train_path=dummy_dataset.save_path,
+            output_dir=str(output_dir),
+            parallel_config=ParallelConfig(sp_size=1, ep_size=2, fsdp_mode="fsdp2"),
+            nproc=2,
+            extra_args=[
+                *_QWEN4_EXP_TRAINING_ARGS,
+                "--data.max_seq_len=64",
+                "--data.dataloader.num_workers=0",
+                "--train.global_batch_size=4",
+                "--train.gradient_checkpointing.enable=false",
+                "--train.optimizer.lr=0.01",
+            ],
+            model_name="qwen4_exp",
+        )
+        env = dict(os.environ)
+        if IS_NPU_AVAILABLE:
+            env.setdefault("HCCL_HOST_SOCKET_PORT_RANGE", "auto")
+            env.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", "auto")
+        subprocess.run(cmd, check=True, env=env)
+
+        with open(output_dir / "log_dict.json") as f:
+            result = json.load(f)
+        assert result
+        assert all(values and torch.isfinite(torch.tensor(values)).all() for values in result.values())
+    finally:
+        dummy_dataset.clean_cache()
 
 
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", qwen2omni_test_cases)

@@ -28,10 +28,10 @@
       "full_attention"
     ],
     "linear_conv_kernel_dim": 4,
-    "linear_key_head_dim": 8,
+    "linear_key_head_dim": 64,
     "linear_num_key_heads": 2,
     "linear_num_value_heads": 4,
-    "linear_value_head_dim": 8,
+    "linear_value_head_dim": 64,
     "make_ngram_vocab_size_divisible_by": 16,
     "mamba_ssm_dtype": "float32",
     "max_position_embeddings": 128,
