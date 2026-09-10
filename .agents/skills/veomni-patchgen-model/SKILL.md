@@ -313,11 +313,9 @@ generated `patched_modeling_*.py`, giving reviewers a self-documenting diff
 against the upstream HF source.
 
 ```python
-# ================================================================
 # Patch: <Class>.<method>
 # 1. <what changed> — <why>
 # 2. <next change>  — <why>
-# ================================================================
 @config.override_method("<Class>.<method>", description="...")
 def <name>_patched(self, ...):
     ...
@@ -695,8 +693,8 @@ category too, since most of the expensive, silent failures live there.
   generated file will emit
   `class Foo(...): ...\n    def forward(...): ...` — invalid Python — and
   `import` will fail with `IndentationError: unexpected indent`. In transformers
-  4.57.3, 8 modeling files use this inline form: llama, mistral, nemotron,
-  persimmon, phimoe, qwen2_moe, stablelm, jetmoe. When migrating any of these
+  5.16.1, 9 modeling files use this inline form: llama, mistral, nemotron,
+  persimmon, phimoe, qwen2_moe, stablelm, jetmoe, openai_privacy_filter. When migrating any of these
   via `override_method` on a synthetic class (e.g.
   `LlamaForSequenceClassification`), verify the generated file imports cleanly
   before declaring victory.
