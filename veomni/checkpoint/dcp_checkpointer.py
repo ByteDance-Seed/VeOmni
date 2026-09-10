@@ -518,7 +518,9 @@ def _promotion_phase(
     then on and the save would hang instead of failing; one collective per phase
     keeps the counts equal by construction rather than by inspection.
 
-    ``always`` marks a phase that must run even after a failure -- cleanup.
+    ``always`` marks a phase that must run even after a failure -- cleanup. That
+    holds for a failure of the group itself too, which is why the reduction is
+    guarded rather than left to propagate.
     """
     if participates and (always or not state.failed):
         try:
@@ -526,7 +528,16 @@ def _promotion_phase(
         except BaseException as e:  # noqa: BLE001 - raised once every phase is done
             if state.error is None:
                 state.error = e
-    state.failed = _any_rank_failed(state.error is not None, group) or state.failed
+    try:
+        state.failed = _any_rank_failed(state.error is not None, group) or state.failed
+    except BaseException as e:  # noqa: BLE001 - raised once every phase is done
+        # The group itself is gone -- a timeout, a peer that died. Letting that
+        # escape here would skip the phases after it, and one of those frees the
+        # scratch disk. Record it and carry on: the later reductions fail the same
+        # way and are caught the same way, so every phase still runs.
+        if state.error is None:
+            state.error = e
+        state.failed = True
 
 
 _STAGE_ROOT = "veomni_ckpt_stage"

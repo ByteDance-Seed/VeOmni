@@ -1872,6 +1872,17 @@ class TestAsyncPromotion:
             self._reset()
 
 
+def staged_pair(tmp_path):
+    """A staged checkpoint and the destination it would be promoted to."""
+    stage_path = str(tmp_path / "stage")
+    final_path = str(tmp_path / "final")
+    os.makedirs(stage_path, exist_ok=True)
+    for name in ("__0_0.distcp", ".metadata"):
+        with open(os.path.join(stage_path, name), "w") as f:
+            f.write(name)
+    return stage_path, final_path
+
+
 class TestAsyncPromotionAcrossRanks:
     """The background promotion, run for real on four ranks.
 
@@ -1903,6 +1914,37 @@ class TestAsyncPromotionAcrossRanks:
         assert all(o != "completed" for o in outcomes), outcomes
         assert "destination is full" in outcomes[0]
         assert os.listdir(os.path.join(base, "final")) == [], "a checkpoint was published after a failed copy"
+
+    def test_a_group_failure_still_frees_the_scratch_disk(self, tmp_path):
+        """A timeout kills the group, and the phase that frees the disk comes after.
+
+        Letting the reduction's own exception propagate would skip that phase and
+        strand a model-plus-optimizer-sized copy -- the exact thing staging cleanup
+        exists to prevent. Observed on a real four-rank run before the fix.
+        """
+        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
+
+        stage_path, final_path = staged_pair(tmp_path)
+        calls = []
+
+        def reduction(failed, group=None):
+            calls.append(failed)
+            if len(calls) >= 2:
+                raise RuntimeError("Timed out waiting 5000ms for recv operation to complete")
+            return failed
+
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True),
+            patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=reduction),
+            patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
+            pytest.raises(RuntimeError, match="Timed out"),
+        ):
+            _promote_staged_checkpoint(stage_path, final_path)
+
+        assert not os.path.exists(stage_path), "the staged copy outlived a broken group"
+        assert not os.path.exists(os.path.join(final_path, ".metadata")), "published an incomplete checkpoint"
+        assert len(calls) == 4, f"a phase was skipped: {calls}"
 
     def test_a_rank_that_outlives_the_group_timeout_fails_instead_of_hanging(self, tmp_path):
         """The deadline lives in the process group, not in the join.
