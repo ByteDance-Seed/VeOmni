@@ -264,7 +264,7 @@ def test_wait_d2h_finished_preserves_offset_zero_set_alias():
     assert alias._base is None
     assert alias.storage_offset() == 0
 
-    manager = OffloadManager(host_cache_limit_bytes=1 << 20)
+    manager = OffloadManager(PinnedBufferPool(max_cached_bytes=1 << 20))
     swap = SwapTensor(original, "0_0", manager.host_buffer_pool)
     swap.launch_d2h(manager.swap_stream)
     swap.wait_d2h_finished()
@@ -276,6 +276,52 @@ def test_wait_d2h_finished_preserves_offset_zero_set_alias():
 
 def test_async_offload_rejects_cpu_tensors():
     assert not base_check_fn(torch.ones(4))
+
+
+def test_shared_host_buffer_pool_survives_repeated_application():
+    """The per-module application path must not multiply the configured limit.
+
+    A composed model applies offload one module at a time, and each call needs
+    its own manager because ``layer_idx`` restarts at 0. The host limit bounds
+    pinned memory for the whole process, though, so the pool must outlive the
+    call that used it rather than being rebuilt per module.
+    """
+    thinker = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+    talker = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+    pool = PinnedBufferPool(max_cached_bytes=1 << 20)
+
+    apply_async_activation_offload(thinker, ["0", "1"], host_buffer_pool=pool)
+    apply_async_activation_offload(talker, ["0", "1"], host_buffer_pool=pool)
+
+    offloaded = [thinker[0], thinker[1], talker[0], talker[1]]
+    assert len({id(module._veomni_offload_manager) for module in offloaded}) == 2
+    assert all(module._veomni_offload_manager.host_buffer_pool is pool for module in offloaded)
+
+
+def test_apply_async_activation_offload_builds_a_pool_when_given_a_limit():
+    model = nn.Sequential(nn.Linear(4, 4))
+
+    apply_async_activation_offload(model, ["0"], host_cache_limit_bytes=1 << 20)
+
+    assert model[0]._veomni_offload_manager.host_buffer_pool.max_cached_bytes == 1 << 20
+
+
+def test_offload_manager_rejects_a_non_pool_argument():
+    """Fail at wiring time, not from inside the pack hook on the first forward."""
+    with pytest.raises(TypeError, match="PinnedBufferPool"):
+        OffloadManager(1 << 20)
+
+
+def test_apply_async_activation_offload_rejects_a_limit_and_a_pool_together():
+    model = nn.Sequential(nn.Linear(4, 4))
+
+    with pytest.raises(ValueError, match="not both"):
+        apply_async_activation_offload(
+            model,
+            ["0"],
+            host_cache_limit_bytes=1 << 20,
+            host_buffer_pool=PinnedBufferPool(),
+        )
 
 
 def test_pinned_buffer_pool_reuses_matching_layout():
@@ -350,7 +396,7 @@ def test_async_offload_manager_resets_at_step_boundary():
 def test_unpack_swap_tensor_survives_repeated_access():
     """PyTorch may unpack the same saved tensor twice (``retain_graph=True``)."""
     device = torch.device(get_device_type())
-    manager = OffloadManager(host_cache_limit_bytes=1 << 20)
+    manager = OffloadManager(PinnedBufferPool(max_cached_bytes=1 << 20))
     original = torch.randn(8, 8, device=device)
     expected = original.detach().cpu().clone()
     swap = SwapTensor(original, "0_0", manager.host_buffer_pool)
