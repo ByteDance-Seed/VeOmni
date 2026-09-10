@@ -193,6 +193,13 @@ config does not patch the attention forward at all, and any future DSA family.
 - Locked GPU environment sync, `uv lock --check`, `make quality`, and both
   documentation path checks pass.
 - All 29 patchgen configs regenerate and pass the drift check.
+- After restoring the generated Qwen child models, all 13 HF/VeOmni
+  forward/backward parity cases pass with a 40 GiB allocator limit (31.78 GiB
+  peak). Reference weights stay on CPU between modes, and the DeepSeek-V4
+  reference translates HF's scorer key while retaining strict loading.
+- The restored towers pass all 52 implicit-sync/logits checks and 30 VLM
+  freezing, LoRA and log-probability checks. Upgrade import/compatibility
+  tests are now explicitly listed in both unit-test workflows.
 - Generated imports, call-site signatures, implicit-sync checks, and bitwise
   logits parity: 111 passed, 1 skipped because `torch_npu` is unavailable.
   All 34 logits cases pass.
@@ -219,9 +226,11 @@ These results describe the original migration before the final patch bump.
   before the migration).
 - `pytest tests/models/test_generated_modeling_imports.py` — 29 pass, 1 skipped
   (needs `torch_npu`).
-- `pytest tests/models/test_model_forward_no_implicit_sync.py` — clean after
-  dropping three allowlist entries whose upstream sync sites are gone. This gate
-  fails on *stale* entries by design, so it needs attention on every bump.
+- `pytest tests/models/test_model_forward_no_implicit_sync.py` initially
+  passed after dropping three allowlist entries. Those sites were hidden by
+  the `AutoModel` constructor regression, rather than removed upstream.
+  Restoring the generated towers makes them observable again; the final
+  5.16.1 fix restores their original fallback/position-copy classifications.
 - `pytest tests/checkpoints/` — clean; the DeepSeek save/load cases are what
   surfaced the missing MLA value padding.
 - `make quality` — clean.
