@@ -269,14 +269,16 @@ class TrainerTest(BaseTrainer):
         self._build_lr_scheduler()
         print_device_mem_info(f"[Memory Info] after building model {model_name}:")
 
-        # Sync weights — every model that test_models_patch covers ships a
-        # patchgen layout that matches HF's in-memory state dict, so a
-        # straight ``load_state_dict`` is sufficient. When loading from a real
-        # on-disk HF safetensors checkpoint, the per-expert → fused merge
-        # still happens, but at the runtime-converter layer (e.g.
-        # ``DeepseekV3CheckpointTensorConverter``); that path is exercised by
-        # ``test_logits_bitwise_equal_v5_via_loader`` in
-        # ``test_models_logits_equal.py``.
+        # HF 5.16 nests the V4 scoring head under ``scorer``. VeOmni keeps
+        # the original key for native model/optimizer checkpoint compatibility.
+        # Translate only this in-memory naming difference, retaining strict
+        # loading and the untouched HF snapshot for subsequent reference modes.
+        # On-disk checkpoint conversion is covered by the converter/loader tests.
+        if model_name == "deepseek_v4" and model_mode.modeling_backend == "veomni":
+            state_dict = {
+                key.replace(".indexer.scorer.weights_proj.", ".indexer.weights_proj."): value
+                for key, value in state_dict.items()
+            }
         self.model.load_state_dict(state_dict)
 
         if self.model_config.model_type in ["qwen2_5_omni", "qwen3_omni_moe"]:
