@@ -153,17 +153,16 @@ def apply_rotary_pos_emb_patched(
     return rope(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
-# ── Vision Rotary Positional Embedding (always call rope_vision) ─────────────
+# ── Vision Rotary Positional Embedding (call rope full with rank-3 layout) ───
 
 
 @config.replace_function(
     "apply_rotary_pos_emb_vision",
-    description="Always call rope_vision full VeomniOp",
+    description="Call rope full VeomniOp with rank-3 vision layout",
 )
 def apply_rotary_pos_emb_vision_patched(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    del position_ids, unsqueeze_dim
-    rope = VeomniOp("rope_vision", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-    return rope(q, k, cos, sin)
+    rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
+    return rope(q, k, cos, sin, position_ids, unsqueeze_dim)
 
 
 # ================================================================

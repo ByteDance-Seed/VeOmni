@@ -1157,7 +1157,10 @@ class OpsImplementationConfig:
     )
     rotary_pos_emb_vision_implementation: str = field(
         default="eager",
-        metadata={"help": "Rotary positional embedding in vision part. 'npu' | 'eager' (default)."},
+        metadata={
+            "help": "Rank-3 vision layout for full rotary positional embedding. "
+            "Uses the same 'rope' op with an independent implementation choice: 'npu' | 'eager' (default)."
+        },
     )
     load_balancing_loss_implementation: str = field(
         default="triton",

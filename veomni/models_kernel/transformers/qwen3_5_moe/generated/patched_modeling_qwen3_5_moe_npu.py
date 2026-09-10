@@ -16,7 +16,7 @@
 #    - function_replacement: apply_rotary_pos_emb
 #      Always call rope partial VeomniOp
 #    - function_replacement: apply_rotary_pos_emb_vision
-#      Always call rope_vision full VeomniOp
+#      Call rope full VeomniOp with rank-3 vision layout
 #    - method_override: Qwen3_5MoeModel.__init__
 #      Propagate _moe_implementation from top-level config to text_config
 #    - method_override: Qwen3_5MoeSparseMoeBlock.forward
@@ -1269,13 +1269,13 @@ class Qwen3_5MoeVisionPatchMerger(nn.Module):
 
 # ======================================================================
 # [PATCHED FUNCTION] apply_rotary_pos_emb_vision
-# Reason: Always call rope_vision full VeomniOp
+# Reason: Call rope full VeomniOp with rank-3 vision layout
 # Source: veomni.models_kernel.transformers.qwen3_5.qwen3_5_npu_patch_gen_config
 # ======================================================================
 def apply_rotary_pos_emb_vision(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    rope = VeomniOp("rope_vision", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
+    rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
     return rope(q, k, cos, sin)
 
 

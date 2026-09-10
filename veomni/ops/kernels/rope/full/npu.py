@@ -30,17 +30,25 @@ def forward(
     position_ids: Tensor | None = None,
     unsqueeze_dim: int = 1,
 ) -> tuple[tuple[Tensor, Tensor], SavedState]:
-    """NPU fused full RoPE, with eager fallback for trainable tables."""
+    """NPU fused full RoPE for text and rank-3 vision layouts."""
     if q.numel() == 0 or k.numel() == 0 or cos.requires_grad or sin.requires_grad:
         return _eager.forward(q, k, cos, sin, position_ids, unsqueeze_dim)
 
     import torch_npu
 
+    if _eager._is_vision_layout(q, k, cos, sin):
+        q_in, k_in = q.unsqueeze(0), k.unsqueeze(0)
+        cos_u = cos.unsqueeze(0).unsqueeze(2).float()
+        sin_u = sin.unsqueeze(0).unsqueeze(2).float()
+        q_embed = torch_npu.npu_rotary_mul(q_in, cos_u, sin_u).squeeze(0).to(q.dtype)
+        k_embed = torch_npu.npu_rotary_mul(k_in, cos_u, sin_u).squeeze(0).to(k.dtype)
+        return (q_embed, k_embed), SavedState((cos, sin), _eager._Meta(False, -2, False, True))
+
     cos_u = cos.unsqueeze(unsqueeze_dim)
     sin_u = sin.unsqueeze(unsqueeze_dim)
     q_embed = torch_npu.npu_rotary_mul(q, cos_u, sin_u).to(q.dtype)
     k_embed = torch_npu.npu_rotary_mul(k, cos_u, sin_u).to(k.dtype)
-    return (q_embed, k_embed), SavedState((cos, sin), _eager._Meta(False, unsqueeze_dim, False))
+    return (q_embed, k_embed), SavedState((cos, sin), _eager._Meta(False, unsqueeze_dim, False, False))
 
 
 def backward(

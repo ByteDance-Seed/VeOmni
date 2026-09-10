@@ -28,5 +28,4 @@ from . import moe_experts as _moe_experts  # noqa: F401
 from . import moe_experts_lora as _moe_experts_lora  # noqa: F401
 from . import rms_norm as _rms_norm  # noqa: F401
 from . import rope as _rope  # noqa: F401
-from . import rope_vision as _rope_vision  # noqa: F401
 from . import swiglu_mlp as _swiglu_mlp  # noqa: F401

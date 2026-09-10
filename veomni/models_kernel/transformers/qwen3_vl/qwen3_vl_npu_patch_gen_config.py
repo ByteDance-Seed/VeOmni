@@ -160,5 +160,5 @@ config.replace_function(
 config.replace_function(
     "apply_rotary_pos_emb_vision",
     replacement=apply_rotary_pos_emb_vision_patched,
-    description="Always call rope_vision full VeomniOp",
+    description="Call rope full VeomniOp with rank-3 vision layout",
 )

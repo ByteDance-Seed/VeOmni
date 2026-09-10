@@ -172,7 +172,7 @@ config.replace_function(
 config.replace_function(
     "apply_rotary_pos_emb_vision",
     replacement=apply_rotary_pos_emb_vision,
-    description="Always call rope_vision full VeomniOp",
+    description="Call rope full VeomniOp with rank-3 vision layout",
 )
 
 # ── Propagate _moe_implementation from top-level config to text_config ────────

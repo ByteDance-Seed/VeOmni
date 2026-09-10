@@ -60,7 +60,7 @@
 +#    - function_replacement: apply_rotary_pos_emb
 +#      Always call rope full VeomniOp
 +#    - function_replacement: apply_rotary_pos_emb_vision
-+#      Always call rope_vision full VeomniOp
++#      Call rope full VeomniOp with rank-3 vision layout
 +#    - class_replacement: Qwen3VLMoeTextExperts
 +#      Drop @use_experts_implementation and always call moe_experts VeomniOp
 +#    - method_override: Qwen3VLMoeModel.forward
@@ -585,7 +585,7 @@
 
          attn_output, attn_weights = attention_interface(
              self,
-@@ -410,18 +720,22 @@
+@@ -410,18 +720,21 @@
          return (position_ids.unsqueeze(-1) * self.inv_freq).flatten(1)
 
 
@@ -603,14 +603,13 @@
 -    return q_embed, k_embed
 +# ======================================================================
 +# [PATCHED FUNCTION] apply_rotary_pos_emb_vision
-+# Reason: Always call rope_vision full VeomniOp
++# Reason: Call rope full VeomniOp with rank-3 vision layout
 +# Source: veomni.models_kernel.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config
 +# ======================================================================
-+# ── Vision Rotary Positional Embedding (always call rope_vision) ─────────────
++# ── Vision Rotary Positional Embedding (call rope full with rank-3 layout) ───
 +def apply_rotary_pos_emb_vision(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-+    del position_ids, unsqueeze_dim
-+    rope = VeomniOp("rope_vision", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-+    return rope(q, k, cos, sin)
++    rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
++    return rope(q, k, cos, sin, position_ids, unsqueeze_dim)
 +
 +
 +# ======================================================================
@@ -620,7 +619,7 @@
 
 
  class Qwen3VLMoeVisionAttention(nn.Module):
-@@ -438,10 +752,19 @@
+@@ -438,10 +751,19 @@
          self.attention_dropout = 0.0
          self.is_causal = False
 
@@ -640,7 +639,7 @@
          rotary_pos_emb: torch.Tensor | None = None,
          position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
          **kwargs,
-@@ -457,13 +780,12 @@
+@@ -457,13 +779,12 @@
          key_states = key_states.transpose(0, 1).unsqueeze(0)
          value_states = value_states.transpose(0, 1).unsqueeze(0)
 
@@ -658,7 +657,7 @@
              attn_output, _ = attention_interface(
                  self,
                  query_states,
-@@ -480,12 +802,10 @@
+@@ -480,12 +801,10 @@
                  **kwargs,
              )
          else:
@@ -671,7 +670,7 @@
              attn_outputs = [
                  attention_interface(
                      self,
-@@ -520,6 +840,12 @@
+@@ -520,6 +839,12 @@
          return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
 
 
@@ -684,7 +683,7 @@
  class Qwen3VLMoeVisionBlock(GradientCheckpointingLayer):
      def __init__(self, config, attn_implementation: str = "sdpa") -> None:
          super().__init__()
-@@ -528,24 +854,41 @@
+@@ -528,24 +853,41 @@
          self.attn = Qwen3VLMoeVisionAttention(config=config)
          self.mlp = Qwen3VLMoeVisionMLP(config=config)
 
@@ -728,7 +727,7 @@
              rotary_pos_emb=rotary_pos_emb,
              position_embeddings=position_embeddings,
              **kwargs,
-@@ -601,6 +944,12 @@
+@@ -601,6 +943,12 @@
          return x
 
 
@@ -741,7 +740,7 @@
  class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
      config: Qwen3VLMoeVisionConfig
      input_modalities = ("image", "video")
-@@ -648,69 +997,246 @@
+@@ -648,69 +996,246 @@
 
          self.post_init()
 
@@ -1034,7 +1033,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -722,11 +1248,88 @@
+@@ -722,11 +1247,88 @@
 
          merged_hidden_states = self.merger(hidden_states)
 
@@ -1123,7 +1122,7 @@
 
 
  class Qwen3VLMoeTextRotaryEmbedding(nn.Module):
-@@ -818,6 +1421,12 @@
+@@ -818,6 +1420,12 @@
              idx = slice(offset, length, 3)
              freqs_t[..., idx] = freqs[dim, ..., idx]
          return freqs_t
@@ -1136,7 +1135,7 @@
 
 
  @auto_docstring(
-@@ -935,9 +1544,23 @@
+@@ -935,9 +1543,23 @@
              past_key_values=past_key_values,
          )
 
@@ -1160,7 +1159,7 @@
          visual_pos_masks = visual_pos_masks.to(hidden_states.device)
          visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
          hidden_states = hidden_states.clone()
-@@ -1000,6 +1623,12 @@
+@@ -1000,6 +1622,12 @@
      rope_deltas: torch.LongTensor | None = None
      router_logits: tuple[torch.FloatTensor] | None = None
      aux_loss: torch.FloatTensor | None = None
@@ -1173,7 +1172,7 @@
 
 
  @auto_docstring
-@@ -1188,6 +1817,13 @@
+@@ -1188,6 +1816,13 @@
          # Same implementation as for images
          return self.get_image_features(pixel_values_videos, video_grid_thw, **kwargs)
 
@@ -1187,7 +1186,7 @@
      @accepts_precomputed_kwargs(modality="image")
      @can_return_tuple
      @auto_docstring
-@@ -1196,10 +1832,8 @@
+@@ -1196,10 +1831,8 @@
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -1199,7 +1198,7 @@
          image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
              The temporal, height and width of feature shape of each image in LLM.
          """
-@@ -1207,52 +1841,31 @@
+@@ -1207,52 +1840,31 @@
          vision_output: BaseModelOutputWithDeepstackFeatures = self.visual(
              pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs
          )
@@ -1269,7 +1268,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1304,6 +1917,16 @@
+@@ -1304,6 +1916,16 @@
              position_ids = None
          return position_ids
 
@@ -1286,7 +1285,7 @@
      @auto_docstring
      @can_return_tuple
      def forward(
-@@ -1317,10 +1940,12 @@
+@@ -1317,10 +1939,12 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1300,7 +1299,7 @@
          image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
-@@ -1332,39 +1957,167 @@
+@@ -1332,39 +1956,167 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1484,7 +1483,7 @@
              visual_pos_masks = image_mask | video_mask
              deepstack_visual_embeds = []
              image_mask_joint = image_mask[visual_pos_masks]
-@@ -1374,25 +2127,63 @@
+@@ -1374,25 +2126,63 @@
                  embed_joint[image_mask_joint, :] = img_embed
                  embed_joint[video_mask_joint, :] = vid_embed
                  deepstack_visual_embeds.append(embed_joint)
@@ -1553,7 +1552,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1400,13 +2191,18 @@
+@@ -1400,13 +2190,18 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1573,7 +1572,7 @@
              rope_deltas=self.rope_deltas,
          )
 
-@@ -1493,17 +2289,35 @@
+@@ -1493,17 +2288,35 @@
      return overall_loss * num_experts
 
 
@@ -1610,7 +1609,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -1536,6 +2350,11 @@
+@@ -1536,6 +2349,11 @@
          """
          return self.model.get_image_features(pixel_values, image_grid_thw, **kwargs)
 
@@ -1622,7 +1621,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -1549,100 +2368,59 @@
+@@ -1549,100 +2367,59 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1750,7 +1749,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1650,7 +2428,8 @@
+@@ -1650,7 +2427,8 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
@@ -1760,7 +1759,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -1876,6 +2655,59 @@
+@@ -1876,6 +2654,59 @@
 
          return input_ids, model_kwargs
 

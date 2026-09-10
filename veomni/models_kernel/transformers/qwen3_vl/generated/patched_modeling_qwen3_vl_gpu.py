@@ -16,7 +16,7 @@
 #    - function_replacement: apply_rotary_pos_emb
 #      Always call rope full VeomniOp
 #    - function_replacement: apply_rotary_pos_emb_vision
-#      Always call rope_vision full VeomniOp
+#      Call rope full VeomniOp with rank-3 vision layout
 #    - method_override: Qwen3VLVisionAttention.forward
 #      Use precomputed max_seqlen passed from outer forward to hoist CPU-GPU sync out of the layer loop
 #    - method_override: Qwen3VLVisionBlock.forward
@@ -412,14 +412,13 @@ def rotate_half(x):
 
 # ======================================================================
 # [PATCHED FUNCTION] apply_rotary_pos_emb_vision
-# Reason: Always call rope_vision full VeomniOp
+# Reason: Call rope full VeomniOp with rank-3 vision layout
 # Source: veomni.models_kernel.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config
 # ======================================================================
-# ── Vision Rotary Positional Embedding (always call rope_vision) ─────────────
+# ── Vision Rotary Positional Embedding (call rope full with rank-3 layout) ───
 def apply_rotary_pos_emb_vision(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    del position_ids, unsqueeze_dim
-    rope = VeomniOp("rope_vision", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-    return rope(q, k, cos, sin)
+    rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
+    return rope(q, k, cos, sin, position_ids, unsqueeze_dim)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:

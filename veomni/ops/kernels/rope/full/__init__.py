@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""full RoPE implementations (rotate every channel)."""
+"""Full RoPE implementations for text and rank-3 vision layouts."""

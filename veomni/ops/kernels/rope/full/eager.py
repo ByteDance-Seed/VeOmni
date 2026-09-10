@@ -31,6 +31,7 @@ class _Meta:
     empty: bool
     unsqueeze_dim: int
     table_gradients: bool
+    compute_in_fp32: bool
 
 
 def _rotate_half(x: Tensor) -> Tensor:
@@ -54,6 +55,11 @@ def _collapse_table_gradient(grad: Tensor, expanded: Tensor, table: Tensor, unsq
     return grad.sum_to_size(expanded.shape).squeeze(unsqueeze_dim).to(table.dtype)
 
 
+def _is_vision_layout(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> bool:
+    """Whether tensors use the HF vision ``[S, H, D]`` / ``[S, D]`` layout."""
+    return q.ndim == 3 and k.ndim == 3 and cos.ndim == 2 and sin.ndim == 2
+
+
 def forward(
     q: Tensor,
     k: Tensor,
@@ -66,20 +72,29 @@ def forward(
 
     ``position_ids`` is retained for compatibility; the supplied tables are
     already position-selected, so it does not participate in the math.
-    ``unsqueeze_dim`` broadcasts the tables onto the head axis. Empty
-    inputs are returned unchanged.
+    ``unsqueeze_dim`` broadcasts the tables onto the head axis. Rank-3
+    ``[S, H, D]`` inputs with rank-2 tables use the HF vision behavior:
+    the head axis is inferred and the rotation is evaluated in FP32 before
+    casting back. Empty inputs are returned unchanged.
     """
     del position_ids
+    vision_layout = _is_vision_layout(q, k, cos, sin)
+    broadcast_dim = -2 if vision_layout else unsqueeze_dim
     if q.numel() == 0 or k.numel() == 0:
-        return (q, k), SavedState((cos, sin), _Meta(True, unsqueeze_dim, False))
+        return (q, k), SavedState((cos, sin), _Meta(True, broadcast_dim, False, vision_layout))
 
-    cos_u = cos.unsqueeze(unsqueeze_dim)
-    sin_u = sin.unsqueeze(unsqueeze_dim)
+    q_compute = q.float() if vision_layout else q
+    k_compute = k.float() if vision_layout else k
+    cos_u = cos.unsqueeze(broadcast_dim)
+    sin_u = sin.unsqueeze(broadcast_dim)
+    if vision_layout:
+        cos_u = cos_u.float()
+        sin_u = sin_u.float()
     table_gradients = cos.requires_grad or sin.requires_grad
     tensors = (q, k, cos, sin) if table_gradients else (cos, sin)
-    return (_apply(q, cos_u, sin_u), _apply(k, cos_u, sin_u)), SavedState(
-        tensors, _Meta(False, unsqueeze_dim, table_gradients)
-    )
+    q_embed = _apply(q_compute, cos_u, sin_u).to(q.dtype) if vision_layout else _apply(q_compute, cos_u, sin_u)
+    k_embed = _apply(k_compute, cos_u, sin_u).to(k.dtype) if vision_layout else _apply(k_compute, cos_u, sin_u)
+    return (q_embed, k_embed), SavedState(tensors, _Meta(False, broadcast_dim, table_gradients, vision_layout))
 
 
 def backward(
@@ -98,19 +113,29 @@ def backward(
         cos, sin = saved.tensors
     cos_u = cos.unsqueeze(meta.unsqueeze_dim)
     sin_u = sin.unsqueeze(meta.unsqueeze_dim)
-    dq = _grad_x(grad_q, cos_u, sin_u)
-    dk = _grad_x(grad_k, cos_u, sin_u)
+    grad_q_compute = grad_q.float() if meta.compute_in_fp32 else grad_q
+    grad_k_compute = grad_k.float() if meta.compute_in_fp32 else grad_k
+    if meta.compute_in_fp32:
+        cos_u = cos_u.float()
+        sin_u = sin_u.float()
+    dq = _grad_x(grad_q_compute, cos_u, sin_u)
+    dk = _grad_x(grad_k_compute, cos_u, sin_u)
+    if meta.compute_in_fp32:
+        dq = dq.to(grad_q.dtype)
+        dk = dk.to(grad_k.dtype)
     if not meta.table_gradients:
         return dq, dk, None, None, None, None
 
+    q_compute = q.float() if meta.compute_in_fp32 else q
+    k_compute = k.float() if meta.compute_in_fp32 else k
     grad_cos = None
     if cos.requires_grad:
-        grad_cos = _collapse_table_gradient(grad_q * q, cos_u, cos, meta.unsqueeze_dim) + _collapse_table_gradient(
-            grad_k * k, cos_u, cos, meta.unsqueeze_dim
-        )
+        grad_cos = _collapse_table_gradient(
+            grad_q_compute * q_compute, cos_u, cos, meta.unsqueeze_dim
+        ) + _collapse_table_gradient(grad_k_compute * k_compute, cos_u, cos, meta.unsqueeze_dim)
     grad_sin = None
     if sin.requires_grad:
         grad_sin = _collapse_table_gradient(
-            grad_q * _rotate_half(q), sin_u, sin, meta.unsqueeze_dim
-        ) + _collapse_table_gradient(grad_k * _rotate_half(k), sin_u, sin, meta.unsqueeze_dim)
+            grad_q_compute * _rotate_half(q_compute), sin_u, sin, meta.unsqueeze_dim
+        ) + _collapse_table_gradient(grad_k_compute * _rotate_half(k_compute), sin_u, sin, meta.unsqueeze_dim)
     return dq, dk, grad_cos, grad_sin, None, None

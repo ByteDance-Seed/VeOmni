@@ -32,6 +32,7 @@ class _Meta:
     unsqueeze_dim: int
     eager_empty: bool = False
     eager_table_gradients: bool = False
+    eager_compute_in_fp32: bool = False
 
 
 def _to_liger_layout(q: Tensor, k: Tensor, unsqueeze_dim: int) -> tuple[Tensor, Tensor]:
@@ -61,15 +62,29 @@ def forward(
     ``unsqueeze_dim`` is the HF broadcast axis and therefore the q/k layout:
     ``1`` is ``[B, H, S, D]``, ``2`` is ``[B, S, H, D]``. Liger only speaks
     ``[B, H, S, D]``, so ``2`` is transposed in and out. Any other value,
-    empty input, or trainable rotary table falls back to the eager pair.
+    rank-3 vision input, empty input, or trainable rotary table falls back
+    to the eager pair.
     """
-    if q.numel() == 0 or k.numel() == 0 or unsqueeze_dim not in (1, 2) or cos.requires_grad or sin.requires_grad:
+    if (
+        _eager._is_vision_layout(q, k, cos, sin)
+        or q.numel() == 0
+        or k.numel() == 0
+        or unsqueeze_dim not in (1, 2)
+        or cos.requires_grad
+        or sin.requires_grad
+    ):
         output, saved = _eager.forward(q, k, cos, sin, position_ids, unsqueeze_dim)
         eager_meta = saved.metadata
         assert isinstance(eager_meta, _eager._Meta)
         return output, SavedState(
             saved.tensors,
-            _Meta(True, unsqueeze_dim, eager_meta.empty, eager_meta.table_gradients),
+            _Meta(
+                True,
+                eager_meta.unsqueeze_dim,
+                eager_meta.empty,
+                eager_meta.table_gradients,
+                eager_meta.compute_in_fp32,
+            ),
         )
 
     from liger_kernel.ops.rope import rope_forward
@@ -92,7 +107,12 @@ def backward(
             grad_output,
             SavedState(
                 saved.tensors,
-                _eager._Meta(meta.eager_empty, meta.unsqueeze_dim, meta.eager_table_gradients),
+                _eager._Meta(
+                    meta.eager_empty,
+                    meta.unsqueeze_dim,
+                    meta.eager_table_gradients,
+                    meta.eager_compute_in_fp32,
+                ),
             ),
         )
 

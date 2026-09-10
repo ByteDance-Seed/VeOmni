@@ -38,7 +38,7 @@ from tests.ops.tol import (
     ROPE_NPU_PROD_FP16_ATOL,
     ROPE_NPU_RTOL,
 )
-from veomni.ops import resolve_op
+from veomni.ops import OP_REGISTRY, resolve_op
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
@@ -62,6 +62,11 @@ def _clone_qk(q: Tensor, k: Tensor) -> tuple[Tensor, Tensor]:
 def _assert_pair(left: tuple[Tensor, Tensor], right: tuple[Tensor, Tensor], *, atol: float, rtol: float) -> None:
     assert torch.allclose(left[0], right[0], atol=atol, rtol=rtol)
     assert torch.allclose(left[1], right[1], atol=atol, rtol=rtol)
+
+
+def test_vision_layout_uses_full_rope_family():
+    assert OP_REGISTRY.list_registered("rope_vision", "full") == []
+    assert {"eager", "liger_kernel", "npu"} <= set(OP_REGISTRY.list_registered("rope", "full"))
 
 
 def test_full_eager_matches_hf():
@@ -106,18 +111,19 @@ def test_partial_eager_matches_hf():
     assert torch.allclose(k_e.grad, k_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-def test_vision_eager_matches_hf():
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+def test_vision_eager_matches_hf(dtype: torch.dtype):
     torch.manual_seed(0)
-    q = torch.randn(16, 8, 64, dtype=torch.float32, requires_grad=True)
-    k = torch.randn(16, 8, 64, dtype=torch.float32, requires_grad=True)
-    cos = torch.randn(16, 64, dtype=torch.float32)
-    sin = torch.randn(16, 64, dtype=torch.float32)
+    q = torch.randn(16, 8, 64, dtype=dtype, requires_grad=True)
+    k = torch.randn(16, 8, 64, dtype=dtype, requires_grad=True)
+    cos = torch.randn(16, 64, dtype=dtype)
+    sin = torch.randn(16, 64, dtype=dtype)
 
     q_h, k_h = _clone_qk(q, k)
     out_h = hf_vision_rope(q_h, k_h, cos, sin)
 
     q_e, k_e = _clone_qk(q, k)
-    out_e = resolve_op("rope_vision", "full", "eager").wrapper(q_e, k_e, cos, sin)
+    out_e = resolve_op("rope", "full", "eager").wrapper(q_e, k_e, cos, sin)
     _assert_pair(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     go = (torch.randn_like(out_e[0]), torch.randn_like(out_e[1]))
@@ -156,7 +162,7 @@ def test_eager_rope_table_gradients_match_hf(kind: str, cos_requires_grad: bool,
         cos = torch.randn(4, 8)
         sin = torch.randn(4, 8)
         reference = hf_vision_rope
-        op = resolve_op("rope_vision", "full", "eager").wrapper
+        op = resolve_op("rope", "full", "eager").wrapper
         attrs = {}
 
     q_h, k_h = _clone_qk(q, k)
@@ -189,7 +195,7 @@ def test_eager_rope_fixed_tables_do_not_save_inputs(kind: str):
         k = torch.randn(4, 2, 8, requires_grad=True)
         cos = torch.randn(4, 8)
         sin = torch.randn(4, 8)
-        output = resolve_op("rope_vision", "full", "eager").wrapper(q, k, cos, sin)
+        output = resolve_op("rope", "full", "eager").wrapper(q, k, cos, sin)
     else:
         head_dim = 8 if kind == "full" else 12
         q = torch.randn(2, 3, 4, head_dim, requires_grad=True)
@@ -215,7 +221,7 @@ def test_rope_accepts_compatible_optional_arguments(kind: str):
         k = torch.randn(4, 2, 8)
         cos = torch.randn(4, 8)
         sin = torch.randn(4, 8)
-        op = resolve_op("rope_vision", "full", "eager").wrapper
+        op = resolve_op("rope", "full", "eager").wrapper
 
     expected = op(q, k, cos, sin)
     keyword = op(q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=1)
@@ -239,8 +245,6 @@ def test_fused_rope_rows_fall_back_for_trainable_tables_before_vendor_import():
     from veomni.ops.kernels.rope.full import npu as full_npu
     from veomni.ops.kernels.rope.partial import eager as partial_eager
     from veomni.ops.kernels.rope.partial import npu as partial_npu
-    from veomni.ops.kernels.rope_vision.full import eager as vision_eager
-    from veomni.ops.kernels.rope_vision.full import npu as vision_npu
 
     position_ids = torch.arange(4).unsqueeze(0)
     q = torch.randn(2, 3, 4, 8)
@@ -262,8 +266,22 @@ def test_fused_rope_rows_fall_back_for_trainable_tables_before_vendor_import():
     k_vision = torch.randn(4, 2, 8)
     cos_vision = torch.randn(4, 8, requires_grad=True)
     sin_vision = torch.randn(4, 8)
-    expected, _ = vision_eager.forward(q_vision, k_vision, cos_vision, sin_vision, position_ids, 1)
-    actual, _ = vision_npu.forward(q_vision, k_vision, cos_vision, sin_vision, position_ids, 1)
+    expected, _ = full_eager.forward(q_vision, k_vision, cos_vision, sin_vision, position_ids, 1)
+    for module in (full_liger, full_npu):
+        actual, _ = module.forward(q_vision, k_vision, cos_vision, sin_vision, position_ids, 1)
+        _assert_pair(actual, expected, atol=0.0, rtol=0.0)
+
+
+def test_full_liger_falls_back_for_vision_layout_before_vendor_import():
+    from veomni.ops.kernels.rope.full import eager as full_eager
+    from veomni.ops.kernels.rope.full import liger_kernel as full_liger
+
+    q = torch.randn(4, 3, 8)
+    k = torch.randn(4, 2, 8)
+    cos = torch.randn(4, 8)
+    sin = torch.randn(4, 8)
+    expected, _ = full_eager.forward(q, k, cos, sin)
+    actual, _ = full_liger.forward(q, k, cos, sin)
     _assert_pair(actual, expected, atol=0.0, rtol=0.0)
 
 
@@ -354,8 +372,8 @@ def test_rope_npu_matches_eager(variant: str):
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU vision RoPE needs NPU")
 def test_vision_npu_matches_eager():
-    eager = resolve_op("rope_vision", "full", "eager").wrapper
-    other = resolve_op("rope_vision", "full", "npu").wrapper
+    eager = resolve_op("rope", "full", "eager").wrapper
+    other = resolve_op("rope", "full", "npu").wrapper
     torch.manual_seed(0)
     q = torch.randn(16, 8, 64, device="npu", dtype=torch.bfloat16)
     k = torch.randn(16, 8, 64, device="npu", dtype=torch.bfloat16)

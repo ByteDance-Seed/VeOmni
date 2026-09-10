@@ -42,8 +42,7 @@ device first, followed by a device-agnostic row.
 | `attention` | `standard` | `eager`, `sdpa`, FlashAttention/FlexAttention/MagiAttention/SageAttention names, `native-sparse` |
 | `async_ulysses_qkv`, `async_ulysses_o` | `standard`, `dit` | `eager` orchestration |
 | `rms_norm` | `standard`, `unweighted`, `qwen3_5` | `eager`, `liger_kernel`, `npu`, and `triton` where supported |
-| `rope` | `full`, `partial`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `npu`, and `triton` where supported |
-| `rope_vision` | `full` | `eager`, `npu` |
+| `rope` | `full`, `partial`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
 | `swiglu_mlp` | `standard` | `eager`, `liger_kernel` |
 | `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `fused_npu`, `fused_mlu` as supported by the variant |
 | `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |

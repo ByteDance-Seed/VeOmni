@@ -14,10 +14,10 @@
 
 """RoPE kernel family.
 
-Variants: ``full`` (rotate every channel), ``partial`` (rotate a prefix),
-``deepseek_v4`` (trailing interleaved slice), and ``wan`` (complex multiply
-by freqs). Each variant registers an eager row plus optional CUDA / NPU
-adapters.
+Variants: ``full`` (rotate every channel for text or rank-3 vision layouts),
+``partial`` (rotate a prefix), ``deepseek_v4`` (trailing interleaved slice),
+and ``wan`` (complex multiply by freqs). Each variant registers an eager row
+plus optional CUDA / NPU adapters.
 """
 
 from ...platform import GpuKernelRequirement, NpuKernelRequirement
@@ -43,7 +43,7 @@ register_op(
     "eager",
     full_eager.forward,
     full_eager.backward,
-    description="PyTorch rotary embedding over every channel",
+    description="PyTorch rotary embedding over every channel, including rank-3 vision layout",
 )
 
 register_op(
@@ -52,7 +52,7 @@ register_op(
     "liger_kernel",
     full_liger.forward,
     full_liger.backward,
-    description="Liger Kernel rotary embedding over every channel",
+    description="Liger Kernel rotary embedding over every channel with eager vision fallback",
     requirement=_GPU,
 )
 
@@ -62,7 +62,7 @@ register_op(
     "npu",
     full_npu.forward,
     full_npu.backward,
-    description="torch_npu rotary embedding over every channel",
+    description="torch_npu rotary embedding over every channel, including rank-3 vision layout",
     requirement=NpuKernelRequirement(),
 )
 

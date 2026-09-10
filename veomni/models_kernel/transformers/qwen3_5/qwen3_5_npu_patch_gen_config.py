@@ -189,12 +189,12 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
 @config.replace_function(
     "apply_rotary_pos_emb_vision",
-    description="Always call rope_vision full VeomniOp",
+    description="Call rope full VeomniOp with rank-3 vision layout",
 )
 def apply_rotary_pos_emb_vision(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    rope = VeomniOp("rope_vision", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
+    rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
     return rope(q, k, cos, sin)
 
 

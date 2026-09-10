@@ -16,7 +16,7 @@
 #    - function_replacement: apply_rotary_pos_emb
 #      Always call rope partial VeomniOp
 #    - function_replacement: apply_rotary_pos_emb_vision
-#      Always call rope_vision full VeomniOp
+#      Call rope full VeomniOp with rank-3 vision layout
 #    - method_override: Qwen3_5GatedDeltaNet.__init__
 #      Use device-agnostic get_device_id() for FusedRMSNormGated init
 #    - method_override: Qwen3_5GatedDeltaNet._get_local_conv1d_weight
@@ -1143,13 +1143,13 @@ class Qwen3_5VisionPatchMerger(nn.Module):
 
 # ======================================================================
 # [PATCHED FUNCTION] apply_rotary_pos_emb_vision
-# Reason: Always call rope_vision full VeomniOp
+# Reason: Call rope full VeomniOp with rank-3 vision layout
 # Source: veomni.models_kernel.transformers.qwen3_5.qwen3_5_npu_patch_gen_config
 # ======================================================================
 def apply_rotary_pos_emb_vision(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    rope = VeomniOp("rope_vision", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
+    rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
     return rope(q, k, cos, sin)
 
 

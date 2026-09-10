@@ -38,7 +38,7 @@ _FIELD_TO_OP = {
     "rms_norm_gated_implementation": "rms_norm_gated",
     "rms_norm_implementation": "rms_norm",
     "rotary_pos_emb_implementation": "rope",
-    "rotary_pos_emb_vision_implementation": "rope_vision",
+    "rotary_pos_emb_vision_implementation": "rope",
     "swiglu_mlp_implementation": "swiglu_mlp",
 }
 
