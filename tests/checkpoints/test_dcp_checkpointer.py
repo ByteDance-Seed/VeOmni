@@ -1845,6 +1845,46 @@ class TestAsyncPromotion:
         finally:
             self._reset()
 
+    def test_a_promotion_that_never_starts_still_frees_the_scratch_disk(self, tmp_path):
+        """Handing the copy over is what transfers ownership of the staged directory.
+
+        If starting the worker fails -- the group cannot be created, the thread
+        cannot be spawned -- nobody owns it, and the model plus its optimizer state
+        would sit on the scratch disk until some later save happened to sweep it.
+        """
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        self._reset()
+        stage_path = tmp_path / "stage" / "run"
+        stage_path.mkdir(parents=True)
+        (stage_path / "__0_0.distcp").write_text("staged")
+
+        try:
+            with (
+                patch.object(DistributedCheckpointer, "execute_save"),
+                patch.object(DistributedCheckpointer, "_create_storage_writer"),
+                patch.object(DistributedCheckpointer, "_save_extra_state"),
+                patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+                patch("veomni.checkpoint.dcp_checkpointer._prepare_stage_dir", return_value=str(stage_path)),
+                patch.object(
+                    DistributedCheckpointer,
+                    "_promote_in_background",
+                    side_effect=RuntimeError("could not start the worker"),
+                ),
+                pytest.raises(RuntimeError, match="could not start the worker"),
+            ):
+                DistributedCheckpointer.save(
+                    path=str(tmp_path / "ckpt"),
+                    state={"model": MagicMock()},
+                    save_async=True,
+                    global_steps=10,
+                    stage_dir=str(tmp_path / "stage"),
+                )
+
+            assert not stage_path.exists(), "the staged copy was left with nobody owning it"
+        finally:
+            self._reset()
+
     def test_unset_save_async_copies_inline(self, tmp_path):
         """Background promotion is opt-in; without it the copy stays where it was."""
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer

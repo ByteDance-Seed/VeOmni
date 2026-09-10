@@ -779,16 +779,20 @@ class DistributedCheckpointer(CheckpointerBase):
                 save_to_lowest_rank=save_to_lowest_rank,
                 timeout_seconds=save_async_timeout_seconds,
             )
+            if stage_path is not None:
+                if save_async:
+                    cls._promote_in_background(stage_path, checkpoint_dir, save_async_timeout_seconds)
+                else:
+                    _promote_staged_checkpoint(stage_path, checkpoint_dir)
         except BaseException:
-            if stage_path is not None and _local_rank() == 0:
+            # Free the scratch disk unless a background promotion got as far as
+            # starting, in which case that promotion owns the staged copy and drops
+            # it itself. Handing it over is the only way out of this block that
+            # leaves the directory in use: the wait at the top of save() cleared any
+            # earlier one, so a handle here can only be the one just submitted.
+            if stage_path is not None and cls._pending_promotion is None and _local_rank() == 0:
                 shutil.rmtree(stage_path, ignore_errors=True)
             raise
-
-        if stage_path is not None:
-            if save_async:
-                cls._promote_in_background(stage_path, checkpoint_dir, save_async_timeout_seconds)
-            else:
-                _promote_staged_checkpoint(stage_path, checkpoint_dir)
 
         logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 
