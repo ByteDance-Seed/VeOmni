@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Trainer-layer callbacks that schedule model checkpoint I/O.
+"""Trainer-layer callback that schedules model checkpoint I/O.
 
-These own the every-N-steps / epochs cadence and nothing else. *What* is written
+This owns the every-N-steps / epochs cadence and nothing else. *What* is written
 is :meth:`BaseTrainer.save_dcp` / :meth:`~BaseTrainer.save_hf_or_lora` /
 :meth:`~BaseTrainer.load`. *How* belongs to
 :class:`~veomni.models.checkpoint_manager.ModelCheckpointManager`.
+
+DCP and HF/LoRA share this callback because they share a manager; each format
+still has its own cadence knobs and its own last-saved step so a DCP write
+does not suppress an HF export or the reverse.
 
 Job-level state — where the dataloader is, the rng, the meters — is not written
 here. It has its own schedule and its own files, in
@@ -37,15 +41,20 @@ if TYPE_CHECKING:
 logger = helper.create_logger(__name__)
 
 
-class ModelDcpCallback(Callback):
-    """Schedule the resumable checkpoint via :meth:`BaseTrainer.load` / ``save_dcp``."""
+class CheckpointCallback(Callback):
+    """Schedule DCP resume I/O and the HF / LoRA export for this trainer."""
 
     def __init__(self, trainer: "BaseTrainer"):
         super().__init__(trainer)
         args: "VeOmniArguments" = self.trainer.args
-        self.every_n_steps = args.train.checkpoint.save_steps
-        self.every_n_epochs = args.train.checkpoint.save_epochs
-        self._last_saved_step: int = -1
+        ckpt = args.train.checkpoint
+        self.dcp_every_n_steps = ckpt.save_steps
+        self.dcp_every_n_epochs = ckpt.save_epochs
+        self.save_hf_weights = ckpt.save_hf_weights
+        self.hf_every_n_steps = ckpt.hf_save_steps
+        self.hf_every_n_epochs = ckpt.hf_save_epochs
+        self._last_dcp_step: int = -1
+        self._last_hf_step: int = -1
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         self.trainer.load()
@@ -53,41 +62,9 @@ class ModelDcpCallback(Callback):
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         self.trainer.checkpoint.wait_for_pending_save()
-
-    def on_step_end(self, state: TrainerState, **kwargs):
-        if self.every_n_steps and state.global_step % self.every_n_steps == 0:
-            self._save_checkpoint(state)
-
-    def on_epoch_end(self, state: TrainerState, **kwargs):
-        if self.every_n_epochs and (state.epoch + 1) % self.every_n_epochs == 0:
-            if state.global_step != self._last_saved_step:
-                self._save_checkpoint(state)
-            else:
-                logger.info_rank0(
-                    f"Skipping duplicate checkpoint save at epoch_end (global_step {state.global_step} "
-                    f"already saved at step_end)."
-                )
-
-    def _save_checkpoint(self, state: TrainerState):
-        self.trainer.save_dcp(state)
-        self._last_saved_step = state.global_step
-
-
-class ModelHfCallback(Callback):
-    """Schedule the HF / LoRA export; the manager picks which format it writes."""
-
-    def __init__(self, trainer: "BaseTrainer"):
-        super().__init__(trainer)
-        args: "VeOmniArguments" = self.trainer.args
-        self.save_hf_weights = args.train.checkpoint.save_hf_weights
-        self.every_n_steps = args.train.checkpoint.hf_save_steps
-        self.every_n_epochs = args.train.checkpoint.hf_save_epochs
-        self._last_saved_step: int = -1
-
-    def on_train_end(self, state: TrainerState, **kwargs):
         if self.save_hf_weights:
-            if state.global_step != self._last_saved_step:
-                self._save_checkpoint(state, stage="train_end")
+            if state.global_step != self._last_hf_step:
+                self._save_hf(state, stage="train_end")
             else:
                 logger.info_rank0(
                     f"Skipping duplicate HF checkpoint save at train_end (global_step {state.global_step} "
@@ -95,22 +72,36 @@ class ModelHfCallback(Callback):
                 )
 
     def on_step_end(self, state: TrainerState, **kwargs):
-        if self.save_hf_weights and self.every_n_steps and state.global_step % self.every_n_steps == 0:
-            self._save_checkpoint(state)
+        if self.dcp_every_n_steps and state.global_step % self.dcp_every_n_steps == 0:
+            self._save_dcp(state)
+        if self.save_hf_weights and self.hf_every_n_steps and state.global_step % self.hf_every_n_steps == 0:
+            self._save_hf(state)
 
     def on_epoch_end(self, state: TrainerState, **kwargs):
-        if self.save_hf_weights and self.every_n_epochs and (state.epoch + 1) % self.every_n_epochs == 0:
-            if state.global_step != self._last_saved_step:
-                self._save_checkpoint(state)
+        if self.dcp_every_n_epochs and (state.epoch + 1) % self.dcp_every_n_epochs == 0:
+            if state.global_step != self._last_dcp_step:
+                self._save_dcp(state)
+            else:
+                logger.info_rank0(
+                    f"Skipping duplicate checkpoint save at epoch_end (global_step {state.global_step} "
+                    f"already saved at step_end)."
+                )
+        if self.save_hf_weights and self.hf_every_n_epochs and (state.epoch + 1) % self.hf_every_n_epochs == 0:
+            if state.global_step != self._last_hf_step:
+                self._save_hf(state)
             else:
                 logger.info_rank0(
                     f"Skipping duplicate HF checkpoint save at epoch_end (global_step {state.global_step} "
                     f"already saved at step_end)."
                 )
 
-    def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
+    def _save_dcp(self, state: TrainerState):
+        self.trainer.save_dcp(state)
+        self._last_dcp_step = state.global_step
+
+    def _save_hf(self, state: TrainerState, stage: str = "step_end"):
         self.trainer.save_hf_or_lora(state, stage=stage)
-        self._last_saved_step = state.global_step
+        self._last_hf_step = state.global_step
 
 
-__all__ = ["ModelDcpCallback", "ModelHfCallback"]
+__all__ = ["CheckpointCallback"]

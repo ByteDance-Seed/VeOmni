@@ -983,7 +983,7 @@ class TestGlobalStepInflation:
         strict=True,
     )
     def test_epoch_end_no_phantom_save_after_stop_iteration(self):
-        from veomni.trainer.callbacks.checkpoint_callback import ModelDcpCallback
+        from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
 
         trainer = MagicMock()
         trainer.args = SimpleNamespace(
@@ -996,14 +996,17 @@ class TestGlobalStepInflation:
                     load_path=None,
                     manager="dcp",
                     dcp_save_to_lowest_rank=False,
+                    save_hf_weights=False,
+                    hf_save_steps=0,
+                    hf_save_epochs=0,
                 ),
                 global_rank=0,
             ),
             model=SimpleNamespace(accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"))),
         )
 
-        cb = ModelDcpCallback(trainer)
-        cb.every_n_epochs = 1
+        cb = CheckpointCallback(trainer)
+        cb.dcp_every_n_epochs = 1
 
         state = TrainerState(global_step=0)
         batches = iter([])

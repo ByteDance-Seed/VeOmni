@@ -151,8 +151,7 @@ VeOmni includes several built-in callbacks:
 - **[WandbTraceCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/trace_callback.py)**: Logs metrics to wandb.
 - **[ProfileTraceCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/trace_callback.py)**: Handles profiling.
 - **[ChannelLossCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/channel_loss_callback.py)**: Logs detached per-channel causal-LM loss metrics when `train.channel_loss.enable=true`.
-- **[ModelDcpCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/checkpoint_callback.py)**: Saves resumable model checkpoints.
-- **[ModelHfCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/checkpoint_callback.py)**: Exports HuggingFace / LoRA weights.
+- **[CheckpointCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/checkpoint_callback.py)**: Saves resumable DCP checkpoints and exports HuggingFace / LoRA weights.
 - **[GlobalStateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/global_state_callback.py)**: Saves job-level state (dataloader cursor, rng, meters).
 - **[RootAssetsCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/global_state_callback.py)**: Exports the config / tokenizer sidecars.
 - **[EvaluateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/evaluate_callback.py)**: Runs evaluation on the validation set.

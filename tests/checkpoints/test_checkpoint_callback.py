@@ -14,14 +14,13 @@ import torch
 from veomni.models.checkpoint_manager import ModelCheckpointManager
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import (
-    ModelDcpCallback,
-    ModelHfCallback,
+    CheckpointCallback,
 )
 from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 
 
 def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
-    """Build a minimal mock trainer for ModelDcpCallback / manager tests."""
+    """Build a minimal mock trainer for CheckpointCallback / manager tests."""
     checkpoint_cfg = SimpleNamespace(
         save_path=save_path,
         save_steps=5,
@@ -66,34 +65,34 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
 
 
 @patch("veomni.trainer.callbacks.checkpoint_callback.helper")
-class TestModelDcpCallbackLastSavedStep:
-    """Tests for ModelDcpCallback._last_saved_step placement."""
+class TestCheckpointCallbackDcpLastSavedStep:
+    """Tests for CheckpointCallback DCP _last_dcp_step placement."""
 
     def test_last_saved_step_updated_after_successful_save(self, mock_helper):
         trainer = _make_mock_trainer()
-        cb = ModelDcpCallback(trainer)
+        cb = CheckpointCallback(trainer)
         state = TrainerState(global_step=10)
 
-        assert cb._last_saved_step == -1
-        cb._save_checkpoint(state)
-        assert cb._last_saved_step == 10
+        assert cb._last_dcp_step == -1
+        cb._save_dcp(state)
+        assert cb._last_dcp_step == 10
 
     def test_last_saved_step_not_updated_on_save_failure(self, mock_helper):
         trainer = _make_mock_trainer()
         trainer.save_dcp.side_effect = RuntimeError("disk full")
-        cb = ModelDcpCallback(trainer)
+        cb = CheckpointCallback(trainer)
         state = TrainerState(global_step=10)
 
         with pytest.raises(RuntimeError, match="disk full"):
-            cb._save_checkpoint(state)
-        assert cb._last_saved_step == -1
+            cb._save_dcp(state)
+        assert cb._last_dcp_step == -1
 
     def test_the_dcp_save_carries_no_job_level_state(self, mock_helper):
         """Job state has its own writer; a model checkpoint only holds the model."""
         trainer = _make_mock_trainer()
-        cb = ModelDcpCallback(trainer)
+        cb = CheckpointCallback(trainer)
 
-        cb._save_checkpoint(TrainerState(global_step=10))
+        cb._save_dcp(TrainerState(global_step=10))
 
         trainer.save_dcp.assert_called_once()
         assert trainer.save_dcp.call_args.args == (TrainerState(global_step=10),)
@@ -102,35 +101,37 @@ class TestModelDcpCallbackLastSavedStep:
     def test_epoch_end_retries_after_failed_save(self, mock_helper):
         """If save fails at step_end, epoch_end should still attempt to save (not skip)."""
         trainer = _make_mock_trainer()
-        cb = ModelDcpCallback(trainer)
-        cb.every_n_steps = 5
-        cb.every_n_epochs = 1
+        trainer.args.train.checkpoint.save_hf_weights = False
+        cb = CheckpointCallback(trainer)
+        cb.dcp_every_n_steps = 5
+        cb.dcp_every_n_epochs = 1
 
         state = TrainerState(global_step=5, epoch=0)
 
         trainer.save_dcp.side_effect = RuntimeError("disk full")
         with pytest.raises(RuntimeError):
             cb.on_step_end(state)
-        assert cb._last_saved_step == -1
+        assert cb._last_dcp_step == -1
 
         trainer.save_dcp.side_effect = None
         trainer.save_dcp.reset_mock()
 
         cb.on_epoch_end(state)
         assert trainer.save_dcp.call_count == 1
-        assert cb._last_saved_step == 5
+        assert cb._last_dcp_step == 5
 
     def test_epoch_end_skips_after_successful_step_save(self, mock_helper):
         """If save succeeds at step_end, epoch_end should skip duplicate save."""
         trainer = _make_mock_trainer()
-        cb = ModelDcpCallback(trainer)
-        cb.every_n_steps = 5
-        cb.every_n_epochs = 1
+        trainer.args.train.checkpoint.save_hf_weights = False
+        cb = CheckpointCallback(trainer)
+        cb.dcp_every_n_steps = 5
+        cb.dcp_every_n_epochs = 1
 
         state = TrainerState(global_step=5, epoch=0)
 
         cb.on_step_end(state)
-        assert cb._last_saved_step == 5
+        assert cb._last_dcp_step == 5
 
         trainer.save_dcp.reset_mock()
         cb.on_epoch_end(state)
@@ -138,58 +139,62 @@ class TestModelDcpCallbackLastSavedStep:
 
 
 @patch("veomni.trainer.callbacks.checkpoint_callback.helper")
-class TestModelHfCallbackLastSavedStep:
-    """Tests for ModelHfCallback._last_saved_step placement."""
+class TestCheckpointCallbackHfLastSavedStep:
+    """Tests for CheckpointCallback HF _last_hf_step placement."""
 
     def test_last_saved_step_updated_after_successful_hf_save(self, mock_helper):
         trainer = _make_mock_trainer()
-        cb = ModelHfCallback(trainer)
+        cb = CheckpointCallback(trainer)
         state = TrainerState(global_step=10)
 
-        assert cb._last_saved_step == -1
-        cb._save_checkpoint(state)
-        assert cb._last_saved_step == 10
+        assert cb._last_hf_step == -1
+        cb._save_hf(state)
+        assert cb._last_hf_step == 10
 
     def test_last_saved_step_not_updated_on_hf_save_failure(self, mock_helper):
         trainer = _make_mock_trainer()
         trainer.save_hf_or_lora.side_effect = RuntimeError("conversion failed")
-        cb = ModelHfCallback(trainer)
+        cb = CheckpointCallback(trainer)
         state = TrainerState(global_step=10)
 
         with pytest.raises(RuntimeError, match="conversion failed"):
-            cb._save_checkpoint(state)
-        assert cb._last_saved_step == -1
+            cb._save_hf(state)
+        assert cb._last_hf_step == -1
 
     def test_train_end_retries_after_failed_hf_save(self, mock_helper):
         """If HF save fails at step_end, train_end should still attempt to save."""
         trainer = _make_mock_trainer()
-        cb = ModelHfCallback(trainer)
-        cb.every_n_steps = 5
+        trainer.args.train.checkpoint.save_steps = 0
+        cb = CheckpointCallback(trainer)
+        cb.dcp_every_n_steps = 0
+        cb.hf_every_n_steps = 5
 
         state = TrainerState(global_step=5, epoch=0)
 
         trainer.save_hf_or_lora.side_effect = RuntimeError("conversion failed")
         with pytest.raises(RuntimeError):
             cb.on_step_end(state)
-        assert cb._last_saved_step == -1
+        assert cb._last_hf_step == -1
 
         trainer.save_hf_or_lora.side_effect = None
         trainer.save_hf_or_lora.reset_mock()
 
         cb.on_train_end(state)
         assert trainer.save_hf_or_lora.call_count == 1
-        assert cb._last_saved_step == 5
+        assert cb._last_hf_step == 5
 
     def test_train_end_skips_after_successful_step_save(self, mock_helper):
         """If HF save succeeds at step_end, train_end should skip."""
         trainer = _make_mock_trainer()
-        cb = ModelHfCallback(trainer)
-        cb.every_n_steps = 5
+        trainer.args.train.checkpoint.save_steps = 0
+        cb = CheckpointCallback(trainer)
+        cb.dcp_every_n_steps = 0
+        cb.hf_every_n_steps = 5
 
         state = TrainerState(global_step=5, epoch=0)
 
         cb.on_step_end(state)
-        assert cb._last_saved_step == 5
+        assert cb._last_hf_step == 5
 
         trainer.save_hf_or_lora.reset_mock()
         cb.on_train_end(state)
@@ -197,12 +202,13 @@ class TestModelHfCallbackLastSavedStep:
 
 
 @patch("veomni.trainer.callbacks.checkpoint_callback.helper")
-class TestModelDcpCallbackTrainEndWait:
-    """ModelDcpCallback.on_train_end must consume a pending async save."""
+class TestCheckpointCallbackTrainEndWait:
+    """CheckpointCallback.on_train_end must consume a pending async save."""
 
     def test_train_end_waits_for_pending_async_save(self, mock_helper):
         trainer = _make_mock_trainer(save_async=True)
-        cb = ModelDcpCallback(trainer)
+        trainer.args.train.checkpoint.save_hf_weights = False
+        cb = CheckpointCallback(trainer)
 
         cb.on_train_end(TrainerState(global_step=60))
 
@@ -210,8 +216,9 @@ class TestModelDcpCallbackTrainEndWait:
 
     def test_train_end_propagates_async_save_failure(self, mock_helper):
         trainer = _make_mock_trainer(save_async=True)
+        trainer.args.train.checkpoint.save_hf_weights = False
         trainer.checkpoint.wait_for_pending_save.side_effect = RuntimeError("HDFS write failed")
-        cb = ModelDcpCallback(trainer)
+        cb = CheckpointCallback(trainer)
 
         with pytest.raises(RuntimeError, match="HDFS write failed"):
             cb.on_train_end(TrainerState(global_step=60))
@@ -219,7 +226,8 @@ class TestModelDcpCallbackTrainEndWait:
     def test_train_end_waits_even_without_async(self, mock_helper):
         """The call is unconditional; wait_for_pending_save is a no-op when nothing is pending."""
         trainer = _make_mock_trainer(save_async=False)
-        cb = ModelDcpCallback(trainer)
+        trainer.args.train.checkpoint.save_hf_weights = False
+        cb = CheckpointCallback(trainer)
 
         cb.on_train_end(TrainerState(global_step=60))
 

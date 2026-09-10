@@ -161,8 +161,7 @@ jobs:
           uv run --frozen pytest -s -x tests/utils/test_moe_ep_sharded_load_matrix.py
       - name: Run checkpoint callback unit tests
         run: |
-          uv run --frozen pytest -s -x tests/checkpoints/test_checkpoint_callback.py
-          uv run --frozen pytest -s -x tests/checkpoints/test_dcp_checkpointer.py
+          uv run --frozen pytest -s -x tests/checkpoints/test_checkpoint_callback.py tests/checkpoints/test_dcp_checkpointer.py
       - name: Run e2e dcp save and load test
         run: |
           uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py

@@ -79,11 +79,10 @@ from ..utils.model_utils import pretty_print_trainable_parameters
 from .callbacks import (
     RESERVED_TRAINING_METRIC_NAMES,
     ChannelLossCallback,
+    CheckpointCallback,
     EnvironMeterCallback,
     EvaluateCallback,
     GlobalStateCallback,
-    ModelDcpCallback,
-    ModelHfCallback,
     MoERouterMonitorCallback,
     ProfileTraceCallback,
     RootAssetsCallback,
@@ -660,9 +659,8 @@ class BaseTrainer(Stateful, ABC):
         self.wandb_callback = WandbTraceCallback(self)
         self.profile_callback = ProfileTraceCallback(self)
         self.root_assets_callback = RootAssetsCallback(self)
-        self.dcp_callback = ModelDcpCallback(self)
+        self.checkpoint_callback = CheckpointCallback(self)
         self.global_state_callback = GlobalStateCallback(self)
-        self.hf_ckpt_callback = ModelHfCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self.moe_monitor_callback = MoERouterMonitorCallback(self)
         self.channel_loss_callback = ChannelLossCallback(self)
@@ -688,9 +686,8 @@ class BaseTrainer(Stateful, ABC):
             self.wandb_callback,
             self.profile_callback,
             self.root_assets_callback,
-            self.dcp_callback,
+            self.checkpoint_callback,
             self.global_state_callback,
-            self.hf_ckpt_callback,
             self.evaluate_callback,
             self.moe_monitor_callback,
         ]
