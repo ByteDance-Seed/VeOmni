@@ -53,8 +53,6 @@ class TextTrainer:
         self.base._build_training_context()
         self.base._init_callbacks()
 
-    # ── Trainer build functions ────────────────────────────────
-
     def _build_data_transform(self):
         args: VeOmniArguments = self.base.args
         self.base.data_transform = build_data_transform(
@@ -64,8 +62,6 @@ class TextTrainer:
             max_seq_len=args.data.max_seq_len,
             text_keys=args.data.text_keys,
         )
-
-    # ── Trainer callback hooks ────────────────────────────────
 
     def on_train_begin(self):
         self.base.on_train_begin()
@@ -84,8 +80,6 @@ class TextTrainer:
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
         self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=aux_metrics)
-
-    # ── Trainer train step functions ────────────────────────────────
 
     def train_step(
         self,
@@ -141,8 +135,6 @@ class TextTrainer:
             grad_norm=grad_norm,
             aux_metrics=mean_aux_metrics(total_aux_metrics, num_micro_steps),
         )
-
-    # ── Trainer train loop ────────────────────────────────
 
     def train(self):
         args: VeOmniArguments = self.base.args

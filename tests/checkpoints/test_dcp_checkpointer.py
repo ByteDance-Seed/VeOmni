@@ -21,7 +21,7 @@ import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
 
 from veomni.distributed import torch_parallelize
-from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
+from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import (
     build_parallelize_model,
     parallelize_model_ddp,
@@ -48,7 +48,7 @@ def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path):
     dist.init_process_group(backend, rank=rank, world_size=world_size)
 
     try:
-        init_parallel_state(dp_size=world_size, dp_mode="fsdp2")
+        _init_parallel_state(dp_size=world_size, dp_mode="fsdp2")
         mesh = get_parallel_state().dp_shard_mesh
 
         def build_model_and_optimizer():
@@ -982,10 +982,7 @@ class TestGlobalStepInflation:
         ),
         strict=True,
     )
-    @patch("veomni.trainer.callbacks.checkpoint_callback.build_checkpointer")
-    @patch("veomni.trainer.callbacks.checkpoint_callback.dist")
-    @patch("veomni.trainer.callbacks.checkpoint_callback.helper")
-    def test_epoch_end_no_phantom_save_after_stop_iteration(self, mock_helper, mock_dist, mock_build_ckpt):
+    def test_epoch_end_no_phantom_save_after_stop_iteration(self):
         from veomni.trainer.callbacks.checkpoint_callback import ModelDcpCallback
 
         trainer = MagicMock()
@@ -1004,8 +1001,6 @@ class TestGlobalStepInflation:
             ),
             model=SimpleNamespace(accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"))),
         )
-        mock_build_ckpt.return_value = trainer.checkpointer
-        trainer.checkpointer.save_future = None
 
         cb = ModelDcpCallback(trainer)
         cb.every_n_epochs = 1
@@ -1025,7 +1020,7 @@ class TestGlobalStepInflation:
         state.epoch = 0
         cb.on_epoch_end(state)
 
-        trainer.checkpointer.save.assert_not_called()
+        trainer.save_dcp.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

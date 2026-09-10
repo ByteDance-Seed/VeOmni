@@ -36,6 +36,7 @@ def _make_config(load_path=None):
         save_async=False,
         dcp_save_to_lowest_rank=False,
         load_path=load_path,
+        stage_dir=None,
     )
 
 
@@ -126,6 +127,16 @@ class TestWhatRidesAlongWithTheWeights:
             manager.save_dcp(TrainerState(global_step=10))
 
         assert set(manager.checkpointer.save.call_args.args[1]["extra_state"]) == {"lr_scheduler"}
+
+    def test_save_forwards_stage_dir(self, make_manager):
+        manager = make_manager()
+        manager.config.stage_dir = "/local/stage"
+        manager.runtime.lr_scheduler.state_dict.return_value = {}
+
+        with patch("veomni.models.checkpoint_manager.dist"), patch("veomni.models.checkpoint_manager.helper"):
+            manager.save_dcp(TrainerState(global_step=10))
+
+        assert manager.checkpointer.save.call_args.kwargs["stage_dir"] == "/local/stage"
 
 
 class TestExport:

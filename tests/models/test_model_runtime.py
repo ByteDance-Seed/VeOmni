@@ -311,6 +311,7 @@ class TestWhatTheRuntimeAsksTheModel:
         # The escape hatch for models the generic GPU-materializing loader has no
         # hook for — a MoE backbone streaming EP-sharded experts to CPU, say.
         wrapped = nn.Linear(1, 1)
+        wrapped.eval()
         seen = {}
 
         class SelfWrapping(nn.Module):
@@ -323,9 +324,10 @@ class TestWhatTheRuntimeAsksTheModel:
         runtime = unbuilt_runtime(args, train=train_args())
         runtime.model = SelfWrapping()
 
-        runtime.build_parallelized_model()
+        runtime.build_parallelize_model()
 
         assert runtime.model is wrapped
+        assert runtime.model.training
         assert seen == {"weights_path": "somewhere", "args": args}
 
     def test_an_ordinary_model_leaves_the_generic_path_alone(self, monkeypatch):
@@ -339,7 +341,7 @@ class TestWhatTheRuntimeAsksTheModel:
         runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"), train=train_args())
         runtime.model = nn.Linear(1, 1)
 
-        runtime.build_parallelized_model()
+        runtime.build_parallelize_model()
 
         assert runtime.model is generically_wrapped
 

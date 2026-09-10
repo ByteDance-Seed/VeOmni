@@ -309,8 +309,6 @@ class BaseTrainer(Stateful, ABC):
         self._build_training_context()
         self._init_callbacks()
 
-    # ── Trainer distributed setup ────────────────────────────────
-
     @staticmethod
     def setup_distributed(args: VeOmniArguments) -> torch.device:
         """Init process group, device, seed, and register the job's ParallelState.
@@ -372,8 +370,6 @@ class BaseTrainer(Stateful, ABC):
         synchronize()
         dist.destroy_process_group()
         clear_parallel_state()
-
-    # ── Trainer build functions ────────────────────────────────
 
     def build_model_runtime(self, model_name: str = "base") -> VeOmniModelRuntime:
         """Build this job's model under ``model_name``'s ParallelState.
@@ -521,8 +517,6 @@ class BaseTrainer(Stateful, ABC):
         ]
         self.state = TrainerState()
 
-    # ── Trainer checkpoint functions ────────────────────────────────
-
     def load(self) -> None:
         """Resume this job's model.
 
@@ -541,8 +535,6 @@ class BaseTrainer(Stateful, ABC):
     def save_hf_or_lora(self, state: TrainerState, stage: str = "step_end") -> None:
         """Export this job's weights in whichever format the model was trained in."""
         self.model.save_hf_or_lora(state, stage=stage)
-
-    # ── Trainer callback hooks ────────────────────────────────
 
     def on_train_begin(self):
         for callback in self._callbacks:
@@ -569,8 +561,6 @@ class BaseTrainer(Stateful, ABC):
             callback.on_step_end(
                 self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=aux_metrics
             )
-
-    # ── Trainer train step functions ────────────────────────────────
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass.
@@ -766,8 +756,6 @@ class BaseTrainer(Stateful, ABC):
             grad_norm=grad_norm,
             aux_metrics=mean_aux_metrics(total_aux_metrics, num_micro_steps),
         )
-
-    # ── Trainer train loop ────────────────────────────────
 
     def train(self):
         args: VeOmniArguments = self.args

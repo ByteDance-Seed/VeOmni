@@ -111,23 +111,19 @@ BaseTrainer (ABC)                     job: data, train_step, loop, callbacks
         ModelCheckpointManager
 ```
 
-Who subclasses it:
+What holds a `BaseTrainer`:
 
 ```
-BaseTrainer (ABC)
-├── TextTrainer             -> tasks/train_text.py
-├── VLMTrainer              -> tasks/train_vlm.py
-├── DitTrainer              -> tasks/train_dit.py
-├── TextDPOTrainer          -> tasks/train_text_dpo.py
-└── BaseRLTrainer (ABC)
-    ├── (text RL)           -> tasks/train_text_rl.py
-    └── (VLM RL)            -> tasks/train_vlm_rl.py
+TextTrainer / VLMTrainer / DiTTrainer / TextDPOTrainer  compose `self.base`
+BaseRLTrainer (ABC)  subclasses BaseTrainer
+├── (text RL)           -> tasks/train_text_rl.py
+└── (VLM RL)            -> tasks/train_vlm_rl.py
 ```
 
 `VeOmniModelRuntime` contributes the model-bound half. `setup()` runs on construction — registering the mesh, then building over it:
 - `build_model()` -> meta-init through the registry-aware loader
 - `freeze_model()` / `setup_lora()` -> trainable surface
-- `build_parallelized_model()` -> FSDP2/DDP wrap + weight load
+- `build_parallelize_model()` -> FSDP2/DDP wrap + weight load
 - `build_optimizer()` -> optimization
 - `build_model_assets()` -> the preprocessor this model reads inputs through, the `model_assets` sidecars an export writes beside its weights, and `chat_template` when the job named one
 
@@ -165,7 +161,7 @@ That file is written **per rank**, `trainer_state_rank_{N}.pt`, where V2 writes 
 
 Subclasses override specific methods (e.g., `compute_loss()`, custom data transforms) rather than the entire training loop. Note that `TextTrainer`, `VLMTrainer`, `DiTTrainer` and `TextDPOTrainer` *compose* a `BaseTrainer` in `self.base` rather than subclassing it, and drive the build steps one at a time (constraint 24).
 
-**Parallel-state scoping**: `BaseTrainer.setup_distributed(args)` registers `"base"` before seed/determinism — it is a staticmethod because everything it does is job-level and runs before any model exists (a model then derives its own mesh in `VeOmniModelRuntime.setup()`); its `__init__` then scopes the model build to that mesh, so the trainer's remaining build steps need no scope of their own. Run time uses **per-op** wraps with `"base"` (forward / postforward / backward / clip). The inherited `parallel_state` property is a by-name registry lookup, never a stored state object, so the registry stays the single source of truth. See `.agents/knowledge/constraints.md` §7 and `docs/design/local_parallel_state.md`.
+**Parallel-state scoping**: `BaseTrainer.setup_distributed(args)` registers `"base"` before seed/determinism — it is a staticmethod because everything it does is job-level and runs before any model exists (a model then derives its own mesh in `VeOmniModelRuntime.setup()`); its `__init__` then scopes the model build to that mesh, so the trainer's remaining build steps need no scope of their own. Run time uses **per-op** wraps with this model's name (`"base"`, or `"policy"` / `"reference"` on DPO). The inherited `parallel_state` property is a by-name registry lookup, never a stored state object, so the registry stays the single source of truth. See `.agents/knowledge/constraints.md` §7 and `docs/design/local_parallel_state.md`.
 
 ## Data Flow
 

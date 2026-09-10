@@ -109,8 +109,6 @@ class VeOmniVLMArguments(VeOmniArguments):
 class VLMModelRuntime(VeOmniModelRuntime):
     """A VLM: encoder-aware build, tower freezing, and a separate ViT learning rate."""
 
-    # ── Model runtime build functions ────────────────────────────────
-
     def build_model(self):
         args: VLMMModelArguments = self.args
         logger.info_rank0("Build model")
@@ -192,8 +190,6 @@ class VLMModelRuntime(VeOmniModelRuntime):
         pretty_print_trainable_parameters(self.model)
         helper.print_device_mem_info("VRAM usage after building model")
 
-    # ── Model runtime optimizer & lr_scheduler build functions ────────────────────────────────
-
     def build_optimizer(self, param_groups=None):
         if param_groups is not None:
             return super().build_optimizer(param_groups=param_groups)
@@ -241,8 +237,6 @@ class VLMTrainer:
         self.base._build_training_context()
         self.base._init_callbacks()
 
-    # ── Trainer build functions ────────────────────────────────
-
     def build_model_runtime(self) -> VLMModelRuntime:
         """Build (and own) this job's VLM. Override to swap in another runtime."""
         return VLMModelRuntime(
@@ -288,8 +282,6 @@ class VLMTrainer:
             metadata_collate_func=metadata_collate_func,
         )
 
-    # ── Trainer callback hooks ────────────────────────────────
-
     def on_train_begin(self):
         self.base.on_train_begin()
 
@@ -307,8 +299,6 @@ class VLMTrainer:
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
         self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=aux_metrics)
-
-    # ── Trainer train step functions ────────────────────────────────
 
     def train_step(
         self,
@@ -364,8 +354,6 @@ class VLMTrainer:
             grad_norm=grad_norm,
             aux_metrics=mean_aux_metrics(total_aux_metrics, num_micro_steps),
         )
-
-    # ── Trainer train loop ────────────────────────────────
 
     def train(self):
         args: VeOmniVLMArguments = self.base.args

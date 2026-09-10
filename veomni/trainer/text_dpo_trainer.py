@@ -172,7 +172,7 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
         with use_parallel_state(self.model_name):
             self.build_model()
             self.model.requires_grad_(False)
-            self.build_parallelized_model()
+            self.build_parallelize_model()
             self.model.eval()
 
     @property
@@ -239,8 +239,6 @@ class TextDPOTrainer:
     def save_hf_or_lora(self, state, stage: str = "step_end") -> None:
         self.policy_model.save_hf_or_lora(state, stage=stage)
 
-    # ── Trainer build functions ────────────────────────────────
-
     def _build_data_transform(self):
         args: VeOmniDPOArguments = self.base.args
         self.base.data_transform = build_data_transform(
@@ -275,8 +273,6 @@ class TextDPOTrainer:
         # Each DPO preference pair is packed as two consecutive causal-LM
         # segments (chosen, rejected) but carries one source metadata entry.
         self.base.on_step_begin(micro_batches=micro_batches, source_repeat=2)
-
-    # ── Trainer train step functions ────────────────────────────────
 
     @staticmethod
     def dpo_loss(
@@ -485,8 +481,6 @@ class TextDPOTrainer:
         total_loss_dict = {key: value / num_micro_steps for key, value in total_loss_dict.items()}
 
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
-
-    # ── Trainer train loop ────────────────────────────────
 
     def train(self):
         args: VeOmniDPOArguments = self.base.args

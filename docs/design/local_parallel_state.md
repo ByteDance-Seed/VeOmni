@@ -37,7 +37,7 @@ from veomni.distributed.parallel_state import (
     use_parallel_state,
 )
 
-accelerator = AcceleratorConfig(dp_shard_size=4, ulysses_size=2)
+accelerator = AcceleratorConfig(dp_shard_size=4, ulysses_size=2)  # needs WORLD_SIZE=8
 init_parallel_state_from_accelerator(accelerator, name="base")
 
 base_state = get_parallel_state_by_name("base")

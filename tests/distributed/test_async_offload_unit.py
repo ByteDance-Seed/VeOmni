@@ -509,11 +509,11 @@ def _run_async_offload_base_trainer_fsdp2_gc():
         OptimizerConfig,
         TorchCompileConfig,
     )
-    from veomni.distributed.parallel_state import init_parallel_state, use_parallel_state
-    from veomni.trainer.base import BaseTrainer
+    from veomni.distributed.parallel_state import _init_parallel_state, use_parallel_state
+    from veomni.models.model_runtime import VeOmniModelRuntime
 
     world_size = dist.get_world_size()
-    init_parallel_state(
+    _init_parallel_state(
         dp_size=world_size,
         dp_shard_size=world_size,
         dp_mode="fsdp2",
@@ -521,49 +521,48 @@ def _run_async_offload_base_trainer_fsdp2_gc():
         name="base",
     )
 
-    trainer = object.__new__(BaseTrainer)
-    trainer.model = _AsyncOffloadFSDPModel(device="meta")
-    trainer.args = SimpleNamespace(
-        model=SimpleNamespace(
-            lora_config=None,
-            fqn_to_index_mapping=None,
-            model_path=None,
-            basic_modules=[],
-            optimizer=OptimizerConfig(),
-            broadcast_model_weights_from_rank0=False,
-            ep_sharded_stream_load=False,
-            accelerator=SimpleNamespace(
-                offload_config=OffloadConfig(
-                    enable_async_activation=True,
-                    activation_offload_host_cache_limit_gb=0.01,
-                ),
-                fsdp_config=FSDPConfig(mixed_precision=MixedPrecisionConfig(enable=False)),
-                init_device="meta",
-                gradient_checkpointing=GradientCheckpointingConfig(enable=True),
-                torch_compile=TorchCompileConfig(enable=False),
+    runtime = object.__new__(VeOmniModelRuntime)
+    runtime.model = _AsyncOffloadFSDPModel(device="meta")
+    runtime.model_name = "base"
+    runtime.args = SimpleNamespace(
+        lora_config=None,
+        fqn_to_index_mapping=None,
+        model_path=None,
+        basic_modules=[],
+        optimizer=OptimizerConfig(),
+        broadcast_model_weights_from_rank0=False,
+        ep_sharded_stream_load=False,
+        accelerator=SimpleNamespace(
+            offload_config=OffloadConfig(
+                enable_async_activation=True,
+                activation_offload_host_cache_limit_gb=0.01,
             ),
+            fsdp_config=FSDPConfig(mixed_precision=MixedPrecisionConfig(enable=False)),
+            init_device="meta",
+            gradient_checkpointing=GradientCheckpointingConfig(enable=True),
+            torch_compile=TorchCompileConfig(enable=False),
         ),
-        train=SimpleNamespace(
-            checkpoint=SimpleNamespace(load_path=None),
-        ),
+    )
+    runtime.train = SimpleNamespace(
+        checkpoint=SimpleNamespace(load_path=None),
     )
 
     torch.manual_seed(0)
     with use_parallel_state("base"):
-        trainer._build_parallelized_model()
+        runtime.build_parallelize_model()
 
-    assert all(layer.gradient_checkpointing for layer in trainer.model.layers)
-    manager = trainer.model.layers[0]._veomni_offload_manager
+    assert all(layer.gradient_checkpointing for layer in runtime.model.layers)
+    manager = runtime.model.layers[0]._veomni_offload_manager
     hidden_states = torch.randn(2, 8, 16, device=get_device_type(), requires_grad=True)
     with use_parallel_state("base"):
-        output = trainer.model(hidden_states)
+        output = runtime.model(hidden_states)
     with use_parallel_state("base"):
         output.float().square().mean().backward()
 
     assert torch.isfinite(output).all()
     assert manager.host_buffer_pool.allocations > 0
     assert not manager.items
-    for parameter in trainer.model.parameters():
+    for parameter in runtime.model.parameters():
         if parameter.grad is not None:
             local_grad = parameter.grad.to_local() if hasattr(parameter.grad, "to_local") else parameter.grad
             assert torch.isfinite(local_grad).all()

@@ -47,7 +47,6 @@ if TYPE_CHECKING:
     from ..trainer.callbacks import TrainerState
     from .checkpoint_manager import ModelCheckpointManager
 
-
 logger = logging.get_logger(__name__)
 
 
@@ -139,12 +138,10 @@ class VeOmniModelRuntime:
         with use_parallel_state(self.model_name):
             self.build_model()
             self.freeze_model()
-            self.build_parallelized_model()
+            self.build_parallelize_model()
             self.build_optimizer()
         self.build_model_assets()
         self.build_checkpoint()
-
-    # ── Base model runtime functions ────────────────────────────────
 
     def __getattr__(self, name: str) -> Any:
         """Forward unshadowed :class:`torch.nn.Module` APIs to the wrapped model."""
@@ -160,8 +157,6 @@ class VeOmniModelRuntime:
         ``trainer.model(**batch)`` — it has to be spelled out.
         """
         return self.model(*args, **kwargs)
-
-    # ── Model runtime property accessors ────────────────────────────────
 
     def setup(self) -> None:
         """Build this model's device mesh and register it under :attr:`model_name`.
@@ -196,8 +191,6 @@ class VeOmniModelRuntime:
         from ..utils.checkpoint_utils import should_skip_hf_weight_load
 
         return should_skip_hf_weight_load(self.train.checkpoint.load_path, self.args.lora_config)
-
-    # ── Model runtime build functions ────────────────────────────────
 
     def build_model(self) -> None:
         """Meta-init the model from its config via the registry-aware loader."""
@@ -295,7 +288,7 @@ class VeOmniModelRuntime:
 
         self.chat_template = build_chat_template(self.chat_template_name, preprocessor)
 
-    def build_parallelized_model(self) -> None:
+    def build_parallelize_model(self) -> None:
         """FSDP2/DDP-wrap the model and load its weights.
 
         The wrap preserves ``requires_grad`` (the shard inherits it) and the
@@ -328,6 +321,7 @@ class VeOmniModelRuntime:
             )
             if parallelized_model is not None:
                 self.model = parallelized_model
+                self.model.train()
                 logger.info_rank0("Built customized parallelized model.")
                 return
 
@@ -353,13 +347,13 @@ class VeOmniModelRuntime:
                 "skipping HF weight materialization before checkpoint restore."
             )
 
+        from ..distributed import torch_parallelize
         from ..distributed.torch_compile import CompileConfig
-        from ..distributed.torch_parallelize import build_parallelize_model
 
         compile_config = CompileConfig(
             **{field.name: getattr(args.accelerator.torch_compile, field.name) for field in fields(CompileConfig)}
         )
-        self.model = build_parallelize_model(
+        self.model = torch_parallelize.build_parallelize_model(
             self.model,
             init_device=args.accelerator.init_device,
             weights_path=args.model_path,
@@ -464,7 +458,6 @@ class VeOmniModelRuntime:
         pretty_print_trainable_parameters(self.model)
         helper.print_device_mem_info("VRAM usage after building model")
 
-    # ── Model runtime optimizer & lr_scheduler build functions ────────────────────────────────
     def build_optimizer(self, param_groups: Optional[List[Dict[str, Any]]] = None) -> None:
         """Build the optimizer over this model's still-trainable params.
 
@@ -520,7 +513,6 @@ class VeOmniModelRuntime:
         with use_parallel_state(self.model_name):
             return veomni_clip_grad_norm(self.model, max_norm)
 
-    # ── Model runtime checkpoint build functions ────────────────────────────────
     def build_checkpoint(self) -> None:
         """Attach the component that checkpoints this model.
 

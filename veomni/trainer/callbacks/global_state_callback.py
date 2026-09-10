@@ -123,7 +123,7 @@ class GlobalStateCallback(Callback):
 
         state_path = global_state_path(load_path, self.rank)
         if not os.path.exists(state_path):
-            logger.warning_rank0(f"No trainer state at {state_path}; resuming weights only.")
+            logger.warning(f"No trainer state at {state_path}; resuming weights only.")
             return None
 
         global_state = torch.load(state_path, map_location="cpu", weights_only=False)

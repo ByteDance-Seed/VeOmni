@@ -201,8 +201,8 @@ VeOmni LoRA training uses FSDP2 with `init_device: meta`. Weight loading goes th
 1. **Base-model weights**: loaded via `rank0_load_and_broadcast_weights` or
    `load_model_weights` — the standard FSDP2 path, unchanged for LoRA.
 
-2. **Adapter weights** (resume only): `build_parallelized_model` passes `adapter_path`
-   to `build_parallelize_model`, which — for a `VeOmniLoraModel` — calls the native
+2. **Adapter weights** (resume only): `build_parallelize_model` passes `adapter_path`
+   to the FSDP2/DDP wrap, which — for a `VeOmniLoraModel` — calls the native
    `veomni.lora.weight_loading.load_lora_weights` (all-ranks read) or
    `rank0_load_and_broadcast_lora_weights` (rank-0 reads then broadcasts). Both read the
    PEFT-format adapter file natively (safetensors / torch, **no `peft` import**) and remap

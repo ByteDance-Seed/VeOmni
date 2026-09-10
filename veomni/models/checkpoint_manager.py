@@ -163,6 +163,7 @@ class ModelCheckpointManager:
             trainable_only=self.trainable_only,
             save_to_lowest_rank=self.config.dcp_save_to_lowest_rank,
             parallel_state=self.runtime.parallel_state,
+            stage_dir=self.config.stage_dir,
         )
         helper.empty_cache()
         dist.barrier()

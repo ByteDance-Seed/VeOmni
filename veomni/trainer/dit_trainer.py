@@ -190,8 +190,6 @@ class DiTModelRuntime(VeOmniModelRuntime):
 
     condition_model: PreTrainedModel = None
 
-    # ── Model runtime property accessors ────────────────────────────────
-
     @property
     def training_task(self) -> str:
         return self.train.training_task
@@ -199,8 +197,6 @@ class DiTModelRuntime(VeOmniModelRuntime):
     @property
     def trains_the_dit(self) -> bool:
         return self.training_task in ("offline_training", "online_training")
-
-    # ── Model runtime build functions ────────────────────────────────
 
     def build_model(self):
         logger.info_rank0("Build model")
@@ -252,10 +248,10 @@ class DiTModelRuntime(VeOmniModelRuntime):
         if self.trains_the_dit:
             super().freeze_model()
 
-    def build_parallelized_model(self) -> None:
+    def build_parallelize_model(self) -> None:
         """``offline_embedding`` builds no DiT, so there is nothing to wrap."""
         if self.trains_the_dit:
-            super().build_parallelized_model()
+            super().build_parallelize_model()
 
     def build_model_assets(self) -> None:
         """A DiT reads latents, not text — there is no preprocessor to load.
@@ -266,12 +262,22 @@ class DiTModelRuntime(VeOmniModelRuntime):
         """
         self.model_assets = [self.model_config] if self.trains_the_dit else []
 
-    # ── Model runtime optimizer & lr_scheduler build functions ────────────────────────────────
-
     def build_optimizer(self, param_groups=None) -> None:
         """``offline_embedding`` trains nothing, so there is nothing to optimize."""
         if self.trains_the_dit:
             super().build_optimizer(param_groups=param_groups)
+
+    def load(self) -> None:
+        if self.trains_the_dit:
+            super().load()
+
+    def save_dcp(self, state) -> None:
+        if self.trains_the_dit:
+            super().save_dcp(state)
+
+    def save_hf_or_lora(self, state, stage: str = "step_end") -> None:
+        if self.trains_the_dit:
+            super().save_hf_or_lora(state, stage=stage)
 
 
 class DiTTrainer:
@@ -320,8 +326,6 @@ class DiTTrainer:
 
         self.base._init_callbacks()
 
-    # ── Trainer property accessors ────────────────────────────────
-
     @property
     def condition_model(self) -> PreTrainedModel:
         return self.base.model.condition_model
@@ -329,8 +333,6 @@ class DiTTrainer:
     @property
     def trains_the_dit(self) -> bool:
         return self.base.model.trains_the_dit
-
-    # ── Trainer build functions ────────────────────────────────
 
     def build_model_runtime(self) -> DiTModelRuntime:
         """Build (and own) this job's DiT. Override to swap in another runtime."""
@@ -454,8 +456,6 @@ class DiTTrainer:
         else:
             self.base.train_dataloader = None
 
-    # ── Trainer callback hooks ────────────────────────────────
-
     def on_train_begin(self):
         self.base.on_train_begin()
 
@@ -473,8 +473,6 @@ class DiTTrainer:
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
         self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=aux_metrics)
-
-    # ── Trainer train step functions ────────────────────────────────
 
     def preforward(self, micro_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass."""
@@ -595,8 +593,6 @@ class DiTTrainer:
             self.base.model.optimizer.zero_grad()
 
         self.on_step_end(loss=total_loss, loss_dict=dict(total_loss_dict), grad_norm=grad_norm)
-
-    # ── Trainer train loop ────────────────────────────────
 
     def train(self):
         args = self.base.args
