@@ -557,13 +557,17 @@ distinct from the first emission.
 | activation_gpu_limit | `float` | `0.0` | GB of activations allowed to remain on GPU. |
 | enable_async_activation | `bool` | `False` | Enable async activation offload via stream-based D2H/H2D. Mutually exclusive with `enable_activation`. When `activation_offload_modules` is empty, targets are discovered from `model._no_split_modules`; missing or unmatched model metadata fails closed. |
 | activation_offload_modules | `List[str]` | `[]` | Optional module name patterns for async offload, overriding `_no_split_modules` auto-discovery. Supports segment-aware glob (`model.layers.*` matches direct children only) and `{*}` for sequential groups (`model.layers.{*}`). |
-| activation_offload_host_cache_limit_gb | `float` | `4.0` | Maximum GB of free host buffers retained between steps, counted once for the process rather than per offloaded module. Bounds the idle cache only — in-flight offloads may temporarily exceed it. Set to `0` to disable reuse. |
+| activation_offload_host_cache_limit_gb | `float` | `4.0` | Idle-cache cap of **one** host-buffer pool, in GB. The trainer applies offload once with this limit, so it is the cap for that call. Each extra `apply_async_activation_offload` given only this limit gets its own pool (caps add); pass the same `host_buffer_pool` to share one cap. Bounds the idle cache only — in-flight offloads may temporarily exceed it. Set to `0` to disable reuse. |
 
 Async activation offload is enabled for CUDA/NPU tensors only; CPU tensors pass
 through unchanged. Only private, dense, contiguous activations are swapped so
 shared-storage views are never resized. Host buffers are pooled, keyed by shape,
-stride, and dtype, and evicted by least-recently-used layout to enforce
-`activation_offload_host_cache_limit_gb`. The manager is reset at every training-step
+stride, and dtype, and evicted by least-recently-used layout to enforce the
+pool's `max_cached_bytes`. Passing `host_cache_limit_bytes` (the trainer path)
+builds one pool of that size for that `apply_async_activation_offload` call.
+A caller that applies more than once may pass the same `host_buffer_pool` so
+several schedules share the cap, or omit it so each call owns a pool and the
+caps add. The manager is reset at every training-step
 boundary, including before a step after a failed forward/backward, so stale
 autograd keys cannot affect the next step. The path wraps selected module instances
 and is not intended to be captured by `torch.compile`.

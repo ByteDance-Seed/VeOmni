@@ -283,8 +283,8 @@ def test_shared_host_buffer_pool_survives_repeated_application():
 
     A composed model applies offload one module at a time, and each call needs
     its own manager because ``layer_idx`` restarts at 0. The host limit bounds
-    pinned memory for the whole process, though, so the pool must outlive the
-    call that used it rather than being rebuilt per module.
+    pinned memory for one pool. Sharing that pool across calls keeps one budget;
+    omitting it (passing only a limit) would give each call its own pool.
     """
     thinker = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
     talker = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))

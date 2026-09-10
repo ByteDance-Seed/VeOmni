@@ -316,10 +316,9 @@ class OffloadManager:
     second set's first layer, mid-step.
 
     The host pool is the opposite: its buffers are keyed by layout alone and are
-    fungible across schedules, and the limit it enforces is a property of the
-    process rather than of any one schedule. It is therefore injected rather
-    than owned, so a composed model can apply offload per module without
-    multiplying the configured limit by the module count.
+    fungible across schedules. A manager never creates the pool; the caller
+    injects it. One pool can be shared by several managers (one idle-cache
+    budget) or each ``apply`` can supply its own (budgets add).
     """
 
     def __init__(self, host_buffer_pool: PinnedBufferPool):
@@ -586,8 +585,8 @@ def async_offload_modules(modules, *, host_buffer_pool: PinnedBufferPool, prefet
     of resetting, so the second pass produces ``"0_1"``, ``"1_1"``, … rather
     than repeating ``"0_0"``, ``"1_0"``, ….
 
-    ``host_buffer_pool`` is keyword-only and supplied by the caller so that
-    several matched sets can draw on one host-memory budget; see
+    ``host_buffer_pool`` is keyword-only and supplied by the caller, who may
+    share one pool across matched sets or give each set its own; see
     ``OffloadManager``.
     """
     manager = OffloadManager(host_buffer_pool)
@@ -687,16 +686,17 @@ def apply_async_activation_offload(
         intermediate activations stay on GPU.
 
     Several patterns in one call share a manager and a pool already, so
-    ``host_cache_limit_bytes`` is all a single model needs. ``host_buffer_pool``
-    is for the caller that applies offload more than once -- a composed model
-    configured per module, or a second model such as a DPO reference -- where
-    building a pool per call would multiply the configured limit by the call
-    count. The two are mutually exclusive.
+    ``host_cache_limit_bytes`` is all a single apply needs: it builds a pool of
+    that size for this call alone. ``host_buffer_pool`` shares one budget
+    across several apply calls -- a composed model configured per module, or a
+    second model such as a DPO reference. Passing only the limit to each call
+    gives each its own pool and the limits add. The two arguments are mutually
+    exclusive.
 
     Sharing a pool is not free: its LRU is global and keyed by layout, so
     schedules with unlike activation shapes can evict each other and fall back
-    to fresh pinned allocations. Scale the limit with the number of schedules
-    rather than reusing the single-model value.
+    to fresh pinned allocations. Scale a shared limit with the number of
+    schedules rather than reusing the single-apply value.
 
     ``reset_async_activation_offload`` walks one root, so a caller that offloads
     several roots owes it a call per root.
