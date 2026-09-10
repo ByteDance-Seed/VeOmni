@@ -675,11 +675,14 @@ class BaseTrainer(Stateful, ABC):
             self.tqdm_callback,
             self.channel_loss_callback,
             self.wandb_callback,
-            self.profile_callback,
             self.checkpointer_callback,
             self.hf_ckpt_callback,
             self.evaluate_callback,
             self.moe_monitor_callback,
+            # Profile schedules use absolute global steps, so initialize them
+            # after checkpoint restore. Keep this callback last so its detached
+            # NPU sidecar wait cannot delay a later callback collective.
+            self.profile_callback,
         ]
         self.state = TrainerState()
 
