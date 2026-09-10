@@ -338,6 +338,9 @@ magi-to-hstu-cuda = { MAX_JOBS = "8" }
 [tool.setuptools.dynamic]
 version = {attr = "veomni._version.__version__"}
 
+[tool.setuptools.package-data]
+"veomni.models.transformers.deepseek_v4" = ["formats/*.json", "formats/LICENSE"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 # patchgen-pkg* — sibling project, not bundled into the veomni wheel.
