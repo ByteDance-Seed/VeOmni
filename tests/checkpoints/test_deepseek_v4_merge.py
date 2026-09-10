@@ -12,6 +12,7 @@ import torch
 from safetensors.torch import load_file, save_file
 from torch.distributed.checkpoint import save as dcp_save
 
+from veomni.models.transformers.deepseek_v4 import checkpoint_export as merge
 from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
     DeepseekV4CheckpointTensorConverter,
     _dequantize_scaled_weight,
@@ -19,10 +20,10 @@ from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
-_SCRIPT = Path(__file__).resolve().parents[2] / "scripts/deepseek_v4/merge_dcp_to_deepseek.py"
+_SCRIPT = Path(__file__).resolve().parents[2] / "scripts/merge_dcp_to_hf.py"
 _spec = importlib.util.spec_from_file_location("dsv4_merge", _SCRIPT)
-merge = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(merge)
+cli = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(cli)
 
 
 @pytest.mark.parametrize(
@@ -59,7 +60,8 @@ def tiny_target():
     return target
 
 
-def test_dcp_to_native_and_resume(tmp_path, monkeypatch):
+@pytest.mark.parametrize("workers", [1, 2])
+def test_dcp_to_native_and_resume(tmp_path, monkeypatch, workers):
     target = tiny_target()
     source = {
         "model.model.layers.0.mlp.gate.tid2eid": torch.arange(8, dtype=torch.int64).reshape(4, 2),
@@ -71,6 +73,17 @@ def test_dcp_to_native_and_resume(tmp_path, monkeypatch):
     output = tmp_path / "out"
     dcp_save(source, checkpoint_id=checkpoint)
     monkeypatch.setattr(merge, "OutputFormat", lambda name: target)
+    commands = []
+
+    def launch_worker(command):
+        commands.append(command)
+        assert Path(command[1]) == _SCRIPT
+        with monkeypatch.context() as worker_patch:
+            worker_patch.setattr(sys, "argv", command[1:])
+            cli.main()
+        return SimpleNamespace(wait=lambda: 0)
+
+    monkeypatch.setattr(merge.subprocess, "Popen", launch_worker)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -85,9 +98,11 @@ def test_dcp_to_native_and_resume(tmp_path, monkeypatch):
             "--device",
             "cpu",
             "--skip-assets",
+            "--workers",
+            str(workers),
         ],
     )
-    merge.main()
+    cli.main()
     path = output / "layer.safetensors"
     result = load_file(path)
     torch.testing.assert_close(result["layers.0.ffn.gate.tid2eid"], source["model.model.layers.0.mlp.gate.tid2eid"])
@@ -95,13 +110,14 @@ def test_dcp_to_native_and_resume(tmp_path, monkeypatch):
     index = json.loads((output / merge.INDEX_NAME).read_text())
     assert index["metadata"]["total_size"] == 72
     assert index["weight_map"] == target.weight_map
+    assert len(commands) == (workers if workers > 1 else 0)
     before = path.stat().st_mtime_ns
-    merge.main()
+    cli.main()
     assert path.stat().st_mtime_ns == before
     with path.open("r+b") as fh:
         fh.truncate(path.stat().st_size - 1)
     assert not merge.shard_is_complete(output, path.name, target)
-    merge.main()
+    cli.main()
     assert merge.shard_is_complete(output, path.name, target)
     result["layers.0.attn_norm.weight"] = result["layers.0.attn_norm.weight"].float()
     save_file(result, path)
@@ -182,3 +198,73 @@ def test_gpu_quantization_round_trip(format_name, name):
 def test_training_template_extensions():
     template = "{% for m in messages %}{% generation %}{{ m.content }}{% endgeneration %}{% break %}{% endfor %}"
     assert merge.resolve_custom_template(template) == template
+
+
+@pytest.mark.parametrize("format_args", [[], ["--format", "hf"]])
+def test_legacy_hf_cli_defaults(tmp_path, monkeypatch, format_args):
+    checkpoint = tmp_path / "dcp"
+    tensors = {
+        "model.model.norm.weight": torch.arange(4, dtype=torch.float32),
+        "model.model.table": torch.arange(6, dtype=torch.int64).reshape(3, 2),
+        "optimizer.momentum": torch.ones(4),
+    }
+    dcp_save(tensors, checkpoint_id=checkpoint)
+    monkeypatch.setattr(sys, "argv", [str(_SCRIPT), "--load-dir", str(checkpoint), "--shard-size", "10", *format_args])
+    cli.main()
+    output = checkpoint / "hf_ckpt"
+    index = json.loads((output / merge.INDEX_NAME).read_text())
+    assert index["metadata"]["total_size"] == 56
+    assert set(index["weight_map"]) == {"model.norm.weight", "model.table"}
+    assert len(set(index["weight_map"].values())) == 2
+    actual = {}
+    for filename in set(index["weight_map"].values()):
+        actual.update(load_file(output / filename))
+    torch.testing.assert_close(actual["model.norm.weight"], tensors["model.model.norm.weight"].bfloat16())
+    torch.testing.assert_close(actual["model.table"], tensors["model.model.table"])
+
+
+@pytest.mark.parametrize("mode", ["auto", "lora"])
+def test_legacy_lora_cli(tmp_path, monkeypatch, mode):
+    checkpoint = tmp_path / "dcp"
+    key = "base_model.model.layer.lora_A.default.weight"
+    dcp_save(
+        {"model." + key: torch.ones(2, 4), "model.model.layer.weight": torch.zeros(4, 4)}, checkpoint_id=checkpoint
+    )
+    adapter = tmp_path / "adapter.json"
+    adapter.write_text('{"peft_type": "LORA", "r": 2}')
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [str(_SCRIPT), "--load-dir", str(checkpoint), "--mode", mode, "--adapter-config-path", str(adapter)],
+    )
+    cli.main()
+    output = checkpoint / "hf_ckpt"
+    tensors = load_file(output / "adapter_model.safetensors")
+    assert list(tensors) == [key]
+    assert tensors[key].dtype == torch.bfloat16
+    assert (output / "adapter_config.json").read_text() == adapter.read_text()
+    assert not (output / merge.INDEX_NAME).exists()
+
+
+def test_legacy_single_shard_pytorch_export(tmp_path):
+    checkpoint = tmp_path / "dcp"
+    dcp_save({"model.model.norm.weight": torch.ones(4)}, checkpoint_id=checkpoint)
+    cli.save_model_weights(tmp_path / "out", checkpoint, safe_serialization=False, save_dtype=None)
+    output = torch.load(tmp_path / "out/pytorch_model.bin", weights_only=True)
+    assert output["model.norm.weight"].dtype == torch.float32
+    assert not (tmp_path / "out/pytorch_model.bin.index.json").exists()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--format", "hf", "--workers", "2"],
+        ["--format", "v4-flash", "--mode", "lora"],
+        ["--format", "v4-flash-base", "--shard-size", "123"],
+    ],
+)
+def test_incompatible_cli_options_rejected(monkeypatch, options):
+    monkeypatch.setattr(sys, "argv", [str(_SCRIPT), "--load-dir", "/unused", *options])
+    with pytest.raises(SystemExit) as err:
+        cli.main()
+    assert err.value.code == 2

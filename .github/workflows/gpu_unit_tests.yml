@@ -163,6 +163,7 @@ jobs:
         run: |
           uv run --frozen pytest -s -x tests/checkpoints/test_checkpoint_callback.py
           uv run --frozen pytest -s -x tests/checkpoints/test_dcp_checkpointer.py
+          uv run --frozen pytest -s -x tests/checkpoints/test_deepseek_v4_merge.py
       - name: Run e2e dcp save and load test
         run: |
           uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py

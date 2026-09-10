@@ -19,8 +19,6 @@ resolved from pinned Hugging Face releases (or the local HF cache). MTP is omitt
 because VeOmni does not train it. See docs/usage/deepseek_v4_merge.md.
 """
 
-import argparse
-import gc
 import json
 import math
 import os
@@ -30,24 +28,22 @@ import struct
 import subprocess
 import sys
 import time
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 from huggingface_hub import hf_hub_download
 from jinja2 import TemplateSyntaxError
-from safetensors.torch import save_file
-from torch.distributed.checkpoint import FileSystemReader
-from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from transformers.utils.chat_template_utils import _compile_jinja_template
 
+from veomni.checkpoint.conversion import CachedFileSystemReader, export_shards, write_index
 from veomni.checkpoint.dcp_checkpointer import _normalize_key
 from veomni.models.checkpoint_tensor_loading import _process_moe_params
 from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
     DeepseekV4CheckpointTensorConverter,
 )
 from veomni.utils import helper
-from veomni.utils.device import empty_cache
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
 
 
 logger = helper.create_logger(__name__)
@@ -113,19 +109,6 @@ class OutputFormat:
 
     def num_experts(self) -> int:
         return self.config["n_routed_experts"]
-
-
-class CachedFileSystemReader(FileSystemReader):
-    """``FileSystemReader`` that reads ``.metadata`` once instead of per load call."""
-
-    def __init__(self, path):
-        super().__init__(path)
-        self._cached_metadata = None
-
-    def read_metadata(self):
-        if self._cached_metadata is None:
-            self._cached_metadata = super().read_metadata()
-        return self._cached_metadata
 
 
 def representative_native_key(converter: DeepseekV4CheckpointTensorConverter, hf_key: str) -> str:
@@ -277,15 +260,6 @@ def validate_source_group(metadata, keys, converter, target, shard):
         )
 
 
-def load_source_tensors(reader: CachedFileSystemReader, metadata, keys: Dict[str, str]) -> Dict[str, torch.Tensor]:
-    state_dict = OrderedDict()
-    for dcp_key in keys.values():
-        tensor_meta = metadata.state_dict_metadata[dcp_key]
-        state_dict[dcp_key] = torch.empty(tensor_meta.size, dtype=tensor_meta.properties.dtype)
-    dcp_load(state_dict, storage_reader=reader, no_dist=True)
-    return state_dict
-
-
 def convert_group(
     keys: Dict[str, str],
     source: Dict[str, torch.Tensor],
@@ -368,14 +342,6 @@ def shard_is_complete(out_dir: str, shard: str, target: OutputFormat) -> bool:
         return os.path.getsize(path) == 8 + header_len + data_end
     except (OSError, ValueError, KeyError, struct.error, json.JSONDecodeError):
         return False
-
-
-def write_shard(out_dir: str, shard: str, tensors: Dict[str, torch.Tensor], target: OutputFormat) -> int:
-    """Write one shard, mirroring the target's ``__metadata__`` so headers stay comparable."""
-    path = os.path.join(out_dir, shard)
-    save_file(tensors, path + ".tmp", metadata=target.shard_metadata.get(shard))
-    os.replace(path + ".tmp", path)
-    return os.path.getsize(path)
 
 
 def write_chat_template(out_dir: str, chat_template: str) -> None:
@@ -470,30 +436,18 @@ def write_assets(target: OutputFormat, out_dir: str, assets: Dict[str, str], cha
         fh.write("\n")
 
 
-def write_index(target: OutputFormat, out_dir: str) -> None:
-    index = {
-        "metadata": {"total_size": sum(target.tensor_nbytes(key) for key in target.weight_map)},
-        "weight_map": target.weight_map,
-    }
-    path = os.path.join(out_dir, INDEX_NAME)
-    with open(path + ".tmp", "w", encoding="utf-8") as fh:
-        json.dump(index, fh, indent=2, sort_keys=True)
-        fh.write("\n")
-    os.replace(path + ".tmp", path)
-
-
 def worker_device(base: torch.device, rank: int) -> str:
     """Spread workers over the visible CUDA devices, starting from ``base``.
 
     One layer's quantization needs tens of GB of device memory, so co-locating every worker on
     ``--device`` would only trade the read bottleneck for an OOM.
     """
-    if base.type != "cuda" or torch.cuda.device_count() <= 1:
+    if not IS_CUDA_AVAILABLE or base.type != get_device_type() or get_torch_device().device_count() <= 1:
         return str(base)
-    return f"cuda:{((base.index or 0) + rank) % torch.cuda.device_count()}"
+    return f"cuda:{((base.index or 0) + rank) % get_torch_device().device_count()}"
 
 
-def run_conversion_workers(workers: int, device: torch.device) -> None:
+def run_conversion_workers(workers: int, device: torch.device, entrypoint: str, argv: list[str]) -> None:
     """Re-invoke this script in ``workers`` subprocesses, each taking every ``workers``-th shard.
 
     Shards are independent — each reads its own DCP slices and writes its own output file — and
@@ -506,8 +460,8 @@ def run_conversion_workers(workers: int, device: torch.device) -> None:
         assigned = worker_device(device, rank)
         command = [
             sys.executable,
-            os.path.abspath(__file__),
-            *sys.argv[1:],
+            os.path.abspath(entrypoint),
+            *argv,
             # Trailing flags win in argparse, so these override whatever the parent was given.
             "--worker-index",
             str(rank),
@@ -525,65 +479,8 @@ def run_conversion_workers(workers: int, device: torch.device) -> None:
         raise RuntimeError(f"conversion workers {failed} failed with exit codes {codes}")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Convert a VeOmni DeepSeek-V4 DCP checkpoint to DeepSeek native FP4/FP8 safetensors"
-    )
-    parser.add_argument("--load-dir", required=True, help="DCP checkpoint directory (global_step_N)")
-    parser.add_argument("--save-dir", required=True, help="Output directory")
-    parser.add_argument(
-        "--format",
-        required=True,
-        choices=("v4-flash", "v4-flash-base"),
-        help="Official output layout: V4-Flash FP4 experts or V4-Flash-Base FP8 experts",
-    )
-    parser.add_argument("--device", default="cuda:0", help="Device used for the quantization kernels")
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=1,
-        help="Convert shards in this many subprocesses. Reading the DCP shards dominates the "
-        "runtime (~26 GB read per ~4 GB written), so the speedup comes from issuing concurrent "
-        "reads; each worker holds one layer in host memory and gets its own CUDA device",
-    )
-    # Set by --workers on the subprocesses it spawns; not meant to be passed by hand.
-    parser.add_argument("--worker-index", type=int, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--worker-count", type=int, default=1, help=argparse.SUPPRESS)
-    parser.add_argument(
-        "--ep-size",
-        type=int,
-        default=1,
-        help="Expert-parallel size of the training run. Pass this when the checkpoint was saved "
-        "with muon_expert_zero_comm, which makes EP and FSDP both shard the expert dim and "
-        "leaves it block-transposed in the checkpoint; the matching ep_fsdp size is read off "
-        "the DCP metadata. Leave at 1 for checkpoints whose experts are not Shard(0).",
-    )
-    parser.add_argument(
-        "--layers",
-        default=None,
-        help="Optional layer subset for smoke tests, e.g. '0,1,42' or '0-3'",
-    )
-    parser.add_argument(
-        "--custom-template",
-        default=None,
-        help=f"Jinja chat template to store as {CHAT_TEMPLATE_NAME} in the output directory, given "
-        "either as a path or as the template text itself. DeepSeek base releases ship none, so pass "
-        "the template the model was fine-tuned with to make apply_chat_template and vLLM's server "
-        "mode reproduce the training-time prompt. ",
-    )
-    parser.add_argument(
-        "--skip-assets",
-        action="store_true",
-        help="Do not download or write config/tokenizer assets; the weight index is still written",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Rewrite shards that already exist; by default complete shards are skipped so an "
-        "interrupted run can resume",
-    )
-    args = parser.parse_args()
-
+def merge_checkpoint(args, parser, *, entrypoint: str, argv: list[str]) -> None:
+    """Export native V4 weights using the shared DCP shard pipeline."""
     # The template is written alongside the copied assets, which both of these turn off.
     if args.custom_template is not None and (args.skip_assets or args.layers):
         parser.error(f"--custom-template writes {CHAT_TEMPLATE_NAME}, so it conflicts with --skip-assets/--layers")
@@ -676,14 +573,12 @@ def main() -> None:
     is_worker = args.worker_index is not None
     if is_worker:
         assigned = [group for index, group in enumerate(groups) if index % args.worker_count == args.worker_index]
-        tag = f"w{args.worker_index} "
     else:
         assigned = groups
-        tag = ""
 
     if args.workers > 1 and not is_worker:
         # The parent converts nothing itself; it only fans out and then finalizes the output.
-        run_conversion_workers(args.workers, device)
+        run_conversion_workers(args.workers, device, entrypoint, argv)
         assigned = []
         total_bytes = sum(
             os.path.getsize(os.path.join(args.save_dir, shard))
@@ -691,37 +586,24 @@ def main() -> None:
             if os.path.isfile(os.path.join(args.save_dir, shard))
         )
 
-    for position, (shard, keys) in enumerate(assigned, start=1):
-        step = time.time()
-        if not args.overwrite and shard_is_complete(args.save_dir, shard, target):
-            logger.info(f"[{tag}{position}/{len(assigned)}] {shard}: already complete, skipping")
-            continue
-
-        source = load_source_tensors(reader, metadata, keys)
-        read_bytes = sum(t.numel() * t.element_size() for t in source.values())
-        loaded = time.time()
-
+    def transform(keys, source):
         tensors = convert_group(keys, source, converter, target, expert_dtype, device, args.ep_size, ep_fsdp_size)
-        del source
-        gc.collect()
-
         validate_against_target(tensors, target)
+        shard = target.shard_of(representative_native_key(converter, next(iter(keys))))
         expected = set(target.keys_by_shard[shard])
         if set(tensors) != expected:
-            missing = sorted(expected - set(tensors))[:5]
-            extra = sorted(set(tensors) - expected)[:5]
-            raise ValueError(f"{shard}: key mismatch vs target (missing {missing}, extra {extra})")
+            raise ValueError(f"{shard}: key mismatch vs target")
+        return tensors
 
-        written = write_shard(args.save_dir, shard, tensors, target)
-        total_bytes += written
-        del tensors
-        gc.collect()
-        empty_cache()
-
-        logger.info(
-            f"[{tag}{position}/{len(assigned)}] {shard}: read {read_bytes / 1e9:.1f} GB in {loaded - step:.0f}s, "
-            f"wrote {written / 1e9:.2f} GB, total {time.time() - step:.0f}s"
-        )
+    export_shards(
+        assigned,
+        reader,
+        args.save_dir,
+        transform,
+        shard_metadata=target.shard_metadata,
+        skip_shard=None if args.overwrite else lambda shard: shard_is_complete(args.save_dir, shard, target),
+    )
+    total_bytes += sum(os.path.getsize(os.path.join(args.save_dir, shard)) for shard, _ in assigned)
 
     if is_worker:
         logger.info(f"worker {args.worker_index}: done, {total_bytes / 1e9:.1f} GB")
@@ -730,10 +612,6 @@ def main() -> None:
     if wanted is None:
         if not args.skip_assets:
             write_assets(target, args.save_dir, assets, custom_template)
-        write_index(target, args.save_dir)
+        write_index(args.save_dir, target.weight_map, sum(target.tensor_nbytes(k) for k in target.weight_map))
 
     logger.info(f"done: {total_bytes / 1e9:.1f} GB in {(time.time() - started) / 60:.1f} min -> {args.save_dir}")
-
-
-if __name__ == "__main__":
-    main()

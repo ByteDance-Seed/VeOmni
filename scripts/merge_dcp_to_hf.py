@@ -1,17 +1,15 @@
 import argparse
-import gc
-import json
 import os
 import shutil
-from collections import OrderedDict
+import sys
 from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import torch
-from safetensors.torch import save_file
 from transformers import AutoConfig, AutoProcessor
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 
-from veomni.checkpoint.dcp_checkpointer import _get_sharding_plan, _process_shard
+from veomni.checkpoint.conversion import CachedFileSystemReader, export_shards, hf_tensors, write_index
+from veomni.checkpoint.dcp_checkpointer import _get_sharding_plan
 from veomni.utils import helper
 
 
@@ -66,14 +64,12 @@ def save_lora_adapter_weights(
         )
 
     logger.info(f"Found {len(lora_keys)} LoRA tensors; loading and re-saving as adapter_model.safetensors")
-    processed_dict = _process_shard(lora_keys, checkpoint_path, save_dtype)
-
-    save_path = os.path.join(output_dir, "adapter_model.safetensors")
-    save_file(processed_dict, save_path, metadata={"format": "pt"})
-    del processed_dict
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    export_shards(
+        [("adapter_model.safetensors", lora_keys)],
+        CachedFileSystemReader(checkpoint_path),
+        output_dir,
+        lambda keys, source: hf_tensors(keys, source, save_dtype),
+    )
 
     if adapter_config_path is not None:
         adapter_config_path = str(adapter_config_path)
@@ -118,10 +114,8 @@ def save_model_weights(
         logger.warning("No model weights found! Check if checkpoint path is correct and contains 'model.' keys.")
         return
 
-    # Process each shard
-    weight_map = OrderedDict()
+    groups = []
     num_shards = len(shards)
-
     for shard_idx, shard_keys in enumerate(shards):
         weights_name = SAFE_WEIGHTS_NAME if safe_serialization else WEIGHTS_NAME
         if num_shards == 1:
@@ -129,37 +123,18 @@ def save_model_weights(
         else:
             prefix, extension = weights_name.rsplit(".", maxsplit=1)
             filename = f"{prefix}-{shard_idx + 1:05d}-of-{num_shards:05d}.{extension}"
+        groups.append((filename, shard_keys))
 
-        save_path = os.path.join(output_dir, filename)
-        logger.info(f"Processing shard {shard_idx + 1}/{num_shards}: {filename} ({len(shard_keys)} tensors)")
-
-        processed_dict = _process_shard(shard_keys, checkpoint_path, save_dtype)
-
-        # Save shard
-        if safe_serialization:
-            save_file(processed_dict, save_path, metadata={"format": "pt"})
-        else:
-            torch.save(processed_dict, save_path)
-
-        del processed_dict
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        for hf_key in shard_keys.keys():
-            weight_map[hf_key] = filename
-
-    # Save index file for multi-shard checkpoints
+    weight_map, total_size = export_shards(
+        groups,
+        CachedFileSystemReader(checkpoint_path),
+        output_dir,
+        lambda keys, source: hf_tensors(keys, source, save_dtype),
+        safe_serialization=safe_serialization,
+    )
     if num_shards > 1:
-        index = {
-            "metadata": {"total_size": total_size},
-            "weight_map": weight_map,
-        }
         index_file = SAFE_WEIGHTS_INDEX_NAME if safe_serialization else WEIGHTS_INDEX_NAME
-        with open(os.path.join(output_dir, index_file), "w", encoding="utf-8") as f:
-            content = json.dumps(index, indent=2, sort_keys=True) + "\n"
-            f.write(content)
-        logger.info(f"Saved index file to {index_file}")
+        write_index(output_dir, weight_map, total_size, index_file)
 
     logger.info("Weight conversion complete.")
 
@@ -243,10 +218,55 @@ def main():
             "copied next to adapter_model.safetensors so the adapter is loadable as-is."
         ),
     )
+    parser.add_argument(
+        "--format",
+        choices=("hf", "v4-flash", "v4-flash-base"),
+        default="hf",
+        help="Output format (default: hf preserves the existing HF/LoRA export)",
+    )
+    v4 = parser.add_argument_group("DeepSeek V4 export options")
+    v4.add_argument("--device", default="cuda:0", help="Device for V4 quantization kernels")
+    v4.add_argument("--workers", type=int, default=1, help="Number of V4 shard conversion workers")
+    v4.add_argument(
+        "--ep-size",
+        type=int,
+        default=1,
+        help="EP size for muon_expert_zero_comm checkpoints; leave at 1 for hidden-dimension FSDP shards",
+    )
+    v4.add_argument("--layers", help="Layer subset for smoke tests, e.g. 0,2-3 (no assets or index)")
+    v4.add_argument("--custom-template", help="Training-time chat template: file path or inline Jinja")
+    v4.add_argument("--skip-assets", action="store_true", help="Skip V4 config/tokenizer assets, still write index")
+    v4.add_argument("--overwrite", action="store_true", help="Rewrite complete V4 output shards")
+    v4.add_argument("--worker-index", type=int, default=None, help=argparse.SUPPRESS)
+    v4.add_argument("--worker-count", type=int, default=1, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     load_dir = args.load_dir
     save_dir = os.path.join(load_dir, "hf_ckpt") if args.save_dir is None else args.save_dir
+    if args.format != "hf":
+        if args.mode == "lora" or args.adapter_config_path is not None or args.model_assets_dir is not None:
+            parser.error("V4 formats do not accept --mode lora, --adapter-config-path or --model-assets-dir")
+        if args.shard_size != 2_000_000_000:
+            parser.error("V4 formats use release shard layouts; --shard-size applies only to hf")
+        from veomni.models.transformers.deepseek_v4.checkpoint_export import merge_checkpoint
+
+        args.save_dir = save_dir
+        merge_checkpoint(args, parser, entrypoint=__file__, argv=sys.argv[1:])
+        return
+    v4_only = (
+        args.workers != 1
+        or args.ep_size != 1
+        or args.layers is not None
+        or args.custom_template is not None
+        or args.skip_assets
+        or args.overwrite
+        or args.worker_index is not None
+        or args.worker_count != 1
+        or args.device != "cuda:0"
+    )
+    if v4_only:
+        parser.error("V4 export options require --format v4-flash or v4-flash-base")
+
     model_assets_dir = args.model_assets_dir
     shard_size = args.shard_size
 

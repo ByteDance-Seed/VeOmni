@@ -8,6 +8,7 @@ This document describes VeOmni's architecture for AI coding agents. Read this to
 veomni/
 ├── arguments/          CLI argument parsing (VeOmniArguments dataclass)
 ├── checkpoint/         DCP-based distributed checkpoint save/load
+│   └── conversion.py   Shared offline DCP reader, shard export loop and index writer
 ├── data/               Data pipeline: datasets, collators, transforms, dynamic batching
 │   ├── multimodal/     Vision, audio, video preprocessing and chat templates
 │   └── diffusion/      Diffusion model data loading
@@ -203,3 +204,12 @@ Distributed tests (`tests/parallel/`, `tests/e2e/`) may require multiple GPUs an
 | DiT | `tasks/train_dit.py` | `DitTrainer` |
 | Inference (text) | `tasks/infer/infer_text.py` | N/A |
 | Inference (VLM) | `tasks/infer/infer_qwen2_vl.py` | N/A |
+
+### Offline Checkpoint Export
+
+`scripts/merge_dcp_to_hf.py` is the unified offline CLI. `--format hf` (default)
+preserves HF/LoRA export; `v4-flash` / `v4-flash-base` select DeepSeek native layouts.
+All formats share `veomni/checkpoint/conversion.py` for DCP reads and output writes.
+DeepSeek-specific planning, validation, quantization and asset handling live in
+`veomni/models/transformers/deepseek_v4/checkpoint_export.py`; bundled schemas ship
+as package data under that model's `formats/` directory.

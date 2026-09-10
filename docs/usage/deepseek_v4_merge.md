@@ -1,9 +1,12 @@
 # Export DeepSeek V4 checkpoints
 
+Use the existing merge entrypoint with `--format v4-flash` or `--format v4-flash-base`.
+The default `--format hf` preserves generic HF export and LoRA auto-detection.
+
 Convert a full VeOmni DCP checkpoint to DeepSeek's native inference safetensors:
 
 ```bash
-python scripts/deepseek_v4/merge_dcp_to_deepseek.py \
+python scripts/merge_dcp_to_hf.py \
     --load-dir /path/to/checkpoints/global_step_2585 \
     --save-dir /path/to/checkpoints/global_step_2585/hf_ckpt \
     --format v4-flash \
@@ -58,7 +61,7 @@ without assets or a complete model index; use a separate directory for smoke tes
 
 ## Schema provenance
 
-The JSON files under `scripts/deepseek_v4/formats/` contain config and safetensors
+The JSON files under `veomni/models/transformers/deepseek_v4/formats/` contain config and safetensors
 header metadata, with repeated layers/expert entries represented as templates.
 They include no model weights. Schemas were checked against every non-MTP shard
 and the official weight index at these immutable revisions:
@@ -66,7 +69,7 @@ and the official weight index at these immutable revisions:
 - [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/tree/60d8d70770c6776ff598c94bb586a859a38244f1)
 - [DeepSeek-V4-Flash-Base](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Base/tree/8855555deef230a27a21a8d6f294b7b7497759b6)
 
-The upstream MIT license is included in `scripts/deepseek_v4/formats/LICENSE`.
+The upstream MIT license is included in `veomni/models/transformers/deepseek_v4/formats/LICENSE`.
 To refresh a preset, read the new release's config, weight index and safetensors
 headers, remove MTP entries, deduplicate identical layer/expert schemas, then verify
 the expanded key/dtype/shape/shard map against every source header before updating
