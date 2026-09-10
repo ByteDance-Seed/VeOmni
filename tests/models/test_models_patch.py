@@ -1,4 +1,3 @@
-import copy
 import functools
 import gc
 import importlib
@@ -248,8 +247,8 @@ class TrainerTest(BaseTrainer):
             self.args.model.ops_implementation.rotary_pos_emb_implementation = "liger_kernel"
             # qwen3_5 / qwen3_5_moe have a large vocab and the fused Liger
             # cross-entropy materializes the full [B, S, V] logits buffer
-            # (~5 GiB on the toy config), which OOMs on shared L20 runners
-            # where another job is still holding part of the card. Use
+            # (~5 GiB on the toy config), which leaves little room for
+            # activations and gradients on the L20 CI runners. Use
             # chunk_loss for those two models — it processes the vocab in
             # chunks so peak allocation stays modest; the other liger ops
             # (rms_norm / rotary / swiglu) are still exercised.
@@ -519,7 +518,9 @@ def test_models_patch_fwd_bwd(
 
     trainer = TrainerTest(hf_model_modes[0], trainer_config)
 
-    state_dict = copy.deepcopy(trainer.model.state_dict())
+    # Keep the immutable reference off the accelerator while each mode holds
+    # its own model, gradients and activations (Qwen3.5 has a full-size vocab).
+    state_dict = {key: value.detach().to("cpu", copy=True) for key, value in trainer.model.state_dict().items()}
 
     del trainer.model, trainer.optimizer, trainer.lr_scheduler
 
