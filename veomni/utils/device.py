@@ -142,6 +142,31 @@ def is_sm90_or_above() -> bool:
     """Check if the current CUDA device has SM90+ capability."""
     return get_gpu_compute_capability() >= 90
 
+def create_stream(device=None, priority: int = 0) -> Any:
+    """Create a device stream (CUDA/NPU‑agnostic)."""
+    return get_torch_device().Stream(device=device, priority=priority)
+
+
+def create_event(enable_timing: bool = False, blocking: bool = False) -> Any:
+    """Create a device event (CUDA/NPU‑agnostic)."""
+    return get_torch_device().Event(enable_timing=enable_timing, blocking=blocking)
+
+
+def get_current_stream(device=None) -> Any:
+    """Get the current device stream."""
+    if device is None:
+        return get_torch_device().current_stream()
+    return get_torch_device().current_stream(device=device)
+
+
+def switch_to_stream(stream: Any) -> Any:
+    """Set the given stream as the current compute stream; returns the previous stream."""
+    return get_torch_device().set_stream(stream)
+
+
+def switch_to_specified_stream(stream: Any) -> Any:
+    """Context manager to switch to a specified device stream."""
+    return get_torch_device().stream(stream)
 
 def create_stream(device: torch.device | None = None, priority: int = 0) -> Any:
     """Create a device stream (CUDA/NPU-agnostic)."""

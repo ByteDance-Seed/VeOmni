@@ -561,6 +561,10 @@ class BaseTrainer(Stateful, ABC):
         if args.model.fqn_to_index_mapping is not None:
             kwargs["fqn_to_index_mapping"] = args.model.fqn_to_index_mapping
 
+        kwargs["enable_async_activation_offload"] = (
+            args.train.accelerator.offload_config.enable_async_activation_offload
+        )
+
         # A full non-LoRA resume already contains model weights. Skip the HF
         # materialization pass to avoid a second peak (HF load then checkpoint
         # overwrite) that can OOM large MoE jobs. LoRA resumes still need the HF base.
@@ -632,15 +636,25 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_training_context(self):
         """Build training context for distributed training."""
-        offload_config = _resolve_offload_config(self.args)
+        offload_config = self.args.train.accelerator.offload_config
 
-        # Async activation offload uses per-module saved_tensors_hooks (applied
-        # before FSDP sharding), so the global fwd/bwd contexts are nullcontext.
-        if offload_config.enable_async_activation:
-            from contextlib import nullcontext
+        # Async activation offload uses a global saved_tensors_hooks context
+        # that wraps the entire forward pass, correctly intercepting tensors
+        # saved by checkpoint's _NoopSaveInputs (non-reentrant) or
+        # CheckpointFunction (reentrant) before run_function is entered.
+        if offload_config.enable_async_activation_offload:
+            from ..distributed.async_offloading import (
+                build_async_activation_offloading_context,
+                register_delayed_release_hooks,
+            )
 
-            self.model_fwd_context, self.model_bwd_context = nullcontext(), nullcontext()
+            self.model_fwd_context, self.model_bwd_context = build_async_activation_offloading_context(
+                enable_async_activation_offload=True,
+            )
+            
+            register_delayed_release_hooks(self.model, self.model_fwd_context)
             return
+
         self.model_fwd_context, self.model_bwd_context = build_activation_offloading_context(
             offload_config.enable_activation,
             self.args.train.gradient_checkpointing.enable,

@@ -1,0 +1,59 @@
+model:
+  model_path: Wan2.2-I2V-A14B-Diffusers/transformer
+  condition_model_path: Wan2.2-I2V-A14B-Diffusers
+  config_path: VeOmni/configs/model_configs/wan/wan2.2_i2v_14b.json
+  ops_implementation:
+    # Wan's RoPE has a non‑standard signature (rope_apply takes a single
+    # tensor plus freqs/head_dim kwargs) so the framework's default
+    # liger_kernel RoPE cannot drop in. Pin to eager explicitly until a
+    # Wan‑specific liger wrapper exists.
+    rotary_pos_emb_implementation: eager
+
+data:
+  train_path: Tom-and-Jerry-VideoGeneration-Dataset-parquet
+  source_name: Tom-and-Jerry-VideoGeneration-Dataset
+  mm_configs:
+    fps: 12
+    max_frames: 100
+train:
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  dyn_bsz: false
+  init_device: meta
+  num_train_epochs: 20
+  training_task: online_training
+  gradient_checkpointing:
+    enable: true
+    debug: false
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: true
+      forward_prefetch: false
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: bfloat16
+        buffer_dtype: bfloat16
+    offload_config:
+      enable_activation: false
+      activation_gpu_limit: 0.0
+      enable_async_activation_offload: true
+  checkpoint:
+    output_dir: Wan2.2-I2V-14B
+    save_hf_weights: false
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  wandb:
+    enable: false
+    project: veomni_dit
+    name: Wan2.2-I2V-14B
+ 
