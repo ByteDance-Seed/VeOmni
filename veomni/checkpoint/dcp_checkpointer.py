@@ -53,6 +53,7 @@ logger = logging.get_logger(__name__)
 
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 _EXTRA_STATE_DIR = "extra_state"
+_LR_SCHEDULER_KEY = "lr_scheduler"
 
 
 class _ModelStrictLoadPlanner(DefaultLoadPlanner):
@@ -710,8 +711,8 @@ class DistributedCheckpointer(CheckpointerBase):
         checkpoint_dir = f"{path}/{_GLOBAL_STEP_PREFIX}{global_steps}" if global_steps is not None else path
         cls._create_checkpoint_dir(checkpoint_dir)
 
-        # saving extra_state first to gurantee that every saved model/optimizer ckpts have their extra_state saved before them
-        cls._save_extra_state(checkpoint_dir=checkpoint_dir, state=state)
+        # Sidecar first so a model/optimizer write is never missing its scheduler.
+        cls._save_lr_scheduler(checkpoint_dir=checkpoint_dir, state=state)
 
         save_state = {
             "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
@@ -760,7 +761,7 @@ class DistributedCheckpointer(CheckpointerBase):
         load training state from distributed checkpoint
         args:
             path: path to load checkpoint
-            state: state to load, "model" are required,  "optimizer" and "extra_state" are optional
+            state: state to load, "model" is required; "optimizer" and "lr_scheduler" are optional
             process_group: process group for loading checkpoint
             storage_reader: storage reader backend for dcp.load. If None, will use FileSystemReader
             trainable_only: when True, ``set_model_state_dict`` runs in non-strict
@@ -801,7 +802,7 @@ class DistributedCheckpointer(CheckpointerBase):
             planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
         )
 
-        cls._load_extra_state(checkpoint_dir=checkpoint_dir, state=state)
+        cls._load_lr_scheduler(checkpoint_dir=checkpoint_dir, state=state)
 
         logger.info_rank0(f"Loaded checkpoint from {checkpoint_dir}")
 
@@ -894,31 +895,35 @@ class DistributedCheckpointer(CheckpointerBase):
         )
 
     @classmethod
-    def _save_extra_state(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
-        """Save extra_state to checkpoint directory."""
-        if "extra_state" not in state:
-            logger.warning_rank0("extra_state not found in state, skipping extra_state save")
+    def _save_lr_scheduler(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
+        """Pickle ``lr_scheduler.state_dict`` into the per-rank extra_state sidecar."""
+        if _LR_SCHEDULER_KEY not in state:
+            logger.warning_rank0("lr_scheduler not found in state, skipping lr_scheduler save")
+            return
+        lr_scheduler = state[_LR_SCHEDULER_KEY]
+        if lr_scheduler is None:
             return
 
         extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
         os.makedirs(extra_state_dir, exist_ok=True)
         extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
-        torch.save(
-            state["extra_state"],
-            extra_state_path,
-        )
+        torch.save(lr_scheduler.state_dict(), extra_state_path)
 
     @classmethod
-    def _load_extra_state(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
-        """Load extra_state from checkpoint directory."""
-        if "extra_state" not in state:
-            logger.warning_rank0("extra_state not found in state, skipping extra_state load")
+    def _load_lr_scheduler(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
+        """Load the extra_state sidecar into ``lr_scheduler``."""
+        if _LR_SCHEDULER_KEY not in state:
+            logger.warning_rank0("lr_scheduler not found in state, skipping lr_scheduler load")
+            return
+        lr_scheduler = state[_LR_SCHEDULER_KEY]
+        if lr_scheduler is None:
             return
 
-        extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
-        os.makedirs(extra_state_dir, exist_ok=True)
-        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
-        state["extra_state"] = torch.load(extra_state_path, weights_only=False)
+        extra_state_path = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
+        if not os.path.exists(extra_state_path):
+            logger.warning_rank0(f"lr_scheduler sidecar not found at {extra_state_path}, skipping")
+            return
+        lr_scheduler.load_state_dict(torch.load(extra_state_path, weights_only=False))
 
 
 def get_dtype_size(dtype: torch.dtype) -> int:

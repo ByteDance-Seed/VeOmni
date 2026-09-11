@@ -25,7 +25,7 @@ DCP and HF/LoRA share this callback because they share a manager; each format
 still has its own cadence knobs and its own last-saved step so a DCP write
 does not suppress an HF export or the reverse.
 
-Job-level state — where the dataloader is, the rng, the meters — is not written
+Job-level global_state — where the dataloader is, the rng, the meters — is not written
 here. It has its own schedule and its own files, in
 :mod:`~veomni.trainer.callbacks.global_state_callback`.
 """
@@ -61,7 +61,6 @@ class CheckpointCallback(Callback):
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         self.trainer.model.save_model_assets()
         self.trainer.load()
-        self.trainer.model.checkpoint.restore_legacy_job_state(self.trainer)
         helper.empty_cache()
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:

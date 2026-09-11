@@ -12,12 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Checkpoint/resume for one :class:`~veomni.models.model_runtime.VeOmniModelRuntime`."""
+"""Checkpoint/resume for one :class:`~veomni.models.model_runtime.VeOmniModelRuntime`.
+
+Two blobs, two owners:
+
+* **lr_scheduler** — this model's scheduler. Passed to DCP like the optimizer;
+  the checkpointer pickles ``state_dict`` under ``extra_state/extra_state_rank_*.pt``.
+* **global_state** — the job cursor (step, dataloader, rng, meters), written by
+  :class:`~veomni.trainer.callbacks.global_state_callback.GlobalStateCallback`
+  as ``trainer_state_rank_*.pt``.
+"""
 
 import os
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Optional
 
-import torch
 import torch.distributed as dist
 
 from ..checkpoint import CheckpointerBase, build_checkpointer
@@ -26,7 +34,6 @@ from ..utils import helper
 
 if TYPE_CHECKING:
     from ..arguments import CheckpointConfig
-    from ..trainer.base import BaseTrainer
     from ..trainer.callbacks import TrainerState
     from .model_runtime import VeOmniModelRuntime
 
@@ -51,7 +58,8 @@ class ModelCheckpointManager:
     On-disk layout for a single-model job::
 
         <save_path>/global_step_{N}/
-        ├── __0_0.distcp …     # DCP shards {model, optimizer, extra_state}
+        ├── __0_0.distcp …     # DCP shards {model, optimizer}
+        ├── extra_state/       # lr_scheduler
         └── hf_ckpt/           # HF safetensors export
 
     A subclass managing one module of a multi-module model sets
@@ -71,7 +79,6 @@ class ModelCheckpointManager:
         self.runtime = runtime
         self.config = config
         self._last_saved_step: int = -1
-        self._legacy_job_state: Optional[Dict[str, Any]] = None
         # This runtime's mesh, looked up by name at construction — not the
         # ambient get_parallel_state(). build_checkpoint() runs outside the
         # runtime's use_parallel_state scope, so ambient is still "base" while
@@ -115,106 +122,50 @@ class ModelCheckpointManager:
             return None
         return os.path.join(load_path, self.checkpoint_subfolder) if self.checkpoint_subfolder else load_path
 
-    def _extra_state(self, state: "TrainerState") -> Dict[str, Any]:
-        """Model-bound state to store beside the weights."""
-        lr_scheduler = self.runtime.lr_scheduler
-        return {"lr_scheduler": None if lr_scheduler is None else lr_scheduler.state_dict()}
-
-    def _load_extra_state(self, extra_state: Dict[str, Any]) -> None:
-        """Restore the model-bound half of ``extra_state``; the caller takes the rest."""
-        lr_state = extra_state.get("lr_scheduler")
-        lr_scheduler = self.runtime.lr_scheduler
-        if lr_state is not None and lr_scheduler is not None:
-            lr_scheduler.load_state_dict(lr_state)
-
-        # Pre-split DCP extra_state also held the job cursor. New writes do not;
-        # GlobalStateCallback owns that file. Stash the old blob so the trainer
-        # can restore a mid-job resume from a CheckpointerCallback checkpoint.
-        if "global_step" not in extra_state:
-            self._legacy_job_state = None
-            return
-        logger.warning_rank0(
-            "DCP extra_state still contains job-level keys (global_step, dataloader, "
-            "rng). Restoring them for compatibility with checkpoints written before "
-            "GlobalStateCallback; new saves keep only lr_scheduler here."
-        )
-        self._legacy_job_state = extra_state
-
-    def restore_legacy_job_state(self, trainer: "BaseTrainer") -> None:
-        """Apply a pre-split extra_state job cursor onto ``trainer``, if one loaded."""
-        extra_state = self._legacy_job_state
-        if extra_state is None or "global_step" not in extra_state:
-            return
-        self._legacy_job_state = None
-
-        args = trainer.args
-        global_step = extra_state["global_step"]
-        trainer.state.global_step = global_step
-        trainer.start_epoch = global_step // args.train_steps
-        trainer.start_step = global_step % args.train_steps
-
-        channel_loss_state = extra_state.get("channel_loss_callback")
-        channel_loss_callback = getattr(trainer, "channel_loss_callback", None)
-        if channel_loss_state is not None and channel_loss_callback is not None:
-            channel_loss_callback.load_state_dict(channel_loss_state)
-
-        if trainer.train_dataloader is not None and extra_state.get("train_dataloader") is not None:
-            trainer.train_dataloader.load_state_dict(extra_state["train_dataloader"])
-
-        environ_meter = getattr(trainer, "environ_meter", None)
-        if environ_meter is not None and extra_state.get("environ_meter") is not None:
-            environ_meter.load_state_dict(extra_state["environ_meter"])
-
-        rng_state = extra_state.get("torch_rng_state")
-        if rng_state is not None:
-            torch.set_rng_state(rng_state)
-        if trainer.start_step == 0 and trainer.train_dataloader is not None:
-            iter(trainer.train_dataloader)
-
     def wait_for_pending_save(self) -> None:
         """Block until any in-flight async save completes."""
         self.checkpointer.wait_for_pending_save()
 
     def load(self) -> None:
-        """Restore model, optimizer and this model's own extra state from ``load_path``."""
+        """Restore model, optimizer and lr_scheduler from ``load_path``."""
         load_dir = self.load_dir()
         if load_dir is None:
             return
 
         self.wait_for_pending_save()
-        state: Dict[str, Any] = {
-            "model": self.runtime.model,
-            "optimizer": self.runtime.optimizer,
-            "extra_state": {},
-        }
         self.checkpointer.load(
             load_dir,
-            state,
+            {
+                "model": self.runtime.model,
+                "optimizer": self.runtime.optimizer,
+                "lr_scheduler": self.runtime.lr_scheduler,
+            },
             trainable_only=self.trainable_only,
             parallel_state=self.parallel_state,
         )
-        self._load_extra_state(state["extra_state"])
         dist.barrier()
         logger.info_rank0(f"Load distributed checkpoint from {load_dir} successfully!")
 
     def save_dcp(self, state: "TrainerState") -> None:
-        """Write model, optimizer and this model's extra state for ``state.global_step``.
+        """Write model, optimizer and lr_scheduler for ``state.global_step``.
 
-        Only model-bound state goes in here. Job-level state — where the
-        dataloader is, the rng — has its own writer, because with several models
-        in one job there is one such record but N of these checkpoints.
+        global_state — where the dataloader is, the rng — is a separate file,
+        because with several models in one job there is one such record but N
+        of these checkpoints.
 
         Staging keys off the run root plus ``global_steps``, not a path that
         already contains the step: folding the step in gives each save a fresh
         staging directory, and a kill mid-write strands a copy no later save
         clears.
         """
-        extra_state = self._extra_state(state)
-
         helper.empty_cache()
         self.checkpointer.save(
             self.config.save_path,
-            {"model": self.runtime.model, "optimizer": self.runtime.optimizer, "extra_state": extra_state},
+            {
+                "model": self.runtime.model,
+                "optimizer": self.runtime.optimizer,
+                "lr_scheduler": self.runtime.lr_scheduler,
+            },
             global_steps=state.global_step,
             save_async=self.config.save_async,
             trainable_only=self.trainable_only,

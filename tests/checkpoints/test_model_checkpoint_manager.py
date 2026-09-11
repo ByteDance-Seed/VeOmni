@@ -92,46 +92,40 @@ class TestResume:
         assert manager.load() is None
         manager.checkpointer.load.assert_not_called()
 
-    def test_resume_restores_the_models_own_scheduler(self, make_manager):
+    def test_resume_forwards_the_models_own_scheduler(self, make_manager):
         manager = make_manager(load_path="/ckpt/checkpoints/global_step_7")
-
-        def fake_load(path, state, **kwargs):
-            state["extra_state"] = {"lr_scheduler": {"last_epoch": 7}}
-
-        manager.checkpointer.load.side_effect = fake_load
 
         with patch("veomni.models.checkpoint_manager.dist"):
             manager.load()
 
-        manager.runtime.lr_scheduler.load_state_dict.assert_called_once_with({"last_epoch": 7})
+        assert manager.checkpointer.load.call_args.args[1]["lr_scheduler"] is manager.runtime.lr_scheduler
 
 
 class TestWhatRidesAlongWithTheWeights:
     def test_a_model_always_stores_its_own_scheduler(self, make_manager):
         manager = make_manager()
-        manager.runtime.lr_scheduler.state_dict.return_value = {"last_epoch": 3}
 
         with patch("veomni.models.checkpoint_manager.dist"), patch("veomni.models.checkpoint_manager.helper"):
             manager.save_dcp(TrainerState(global_step=10))
 
-        assert manager.checkpointer.save.call_args.args[1]["extra_state"] == {"lr_scheduler": {"last_epoch": 3}}
+        assert manager.checkpointer.save.call_args.args[1]["lr_scheduler"] is manager.runtime.lr_scheduler
 
     def test_nothing_job_level_rides_along(self, make_manager):
         """Job state has its own writer. With one model per module there is one
         dataloader cursor but N of these checkpoints, so a cursor stored here
         would be written N times over — and read back N times on resume."""
         manager = make_manager()
-        manager.runtime.lr_scheduler.state_dict.return_value = {"last_epoch": 3}
 
         with patch("veomni.models.checkpoint_manager.dist"), patch("veomni.models.checkpoint_manager.helper"):
             manager.save_dcp(TrainerState(global_step=10))
 
-        assert set(manager.checkpointer.save.call_args.args[1]["extra_state"]) == {"lr_scheduler"}
+        saved = manager.checkpointer.save.call_args.args[1]
+        assert set(saved) == {"model", "optimizer", "lr_scheduler"}
+        assert saved["lr_scheduler"] is manager.runtime.lr_scheduler
 
     def test_save_forwards_stage_dir(self, make_manager):
         manager = make_manager()
         manager.config.stage_dir = "/local/stage"
-        manager.runtime.lr_scheduler.state_dict.return_value = {}
 
         with patch("veomni.models.checkpoint_manager.dist"), patch("veomni.models.checkpoint_manager.helper"):
             manager.save_dcp(TrainerState(global_step=10))
@@ -140,7 +134,6 @@ class TestWhatRidesAlongWithTheWeights:
 
     def test_save_uses_the_runtime_mesh_not_the_ambient_one(self, make_manager):
         manager = make_manager()
-        manager.runtime.lr_scheduler.state_dict.return_value = {}
 
         with patch("veomni.models.checkpoint_manager.dist"), patch("veomni.models.checkpoint_manager.helper"):
             manager.save_dcp(TrainerState(global_step=10))

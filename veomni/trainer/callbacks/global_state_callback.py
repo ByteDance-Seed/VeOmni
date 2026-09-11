@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Job-level checkpoint callback, as distinct from per-model checkpoint I/O.
+"""Job-level checkpoint callback: **global_state**, as distinct from lr_scheduler.
 
-Nothing here belongs to a model: where the dataloader is, the rng, the metric
-meters. Model weights, optimizer, HF/LoRA export, and the tokenizer/config
-sidecars are scheduled by :mod:`~veomni.trainer.callbacks.checkpoint_callback`.
+* **lr_scheduler** — one model's scheduler. Passed to DCP like the optimizer
+  by :class:`~veomni.models.checkpoint_manager.ModelCheckpointManager`.
+* **global_state** — the job cursor (step, dataloader, rng, meters), this file.
+  Written per rank as ``trainer_state_rank_{N}.pt``.
+
+Model weights, optimizer, HF/LoRA export, and the tokenizer/config sidecars
+are scheduled by :mod:`~veomni.trainer.callbacks.checkpoint_callback`.
 """
 
 import os
@@ -78,7 +82,7 @@ class GlobalStateCallback(Callback):
                 self.save_global_state(state)
 
     def state_dict(self, state: TrainerState) -> Dict[str, Any]:
-        """The job-level state to persist for this step."""
+        """The global_state blob to persist for this step."""
         if hasattr(self.trainer, "data_iterator") and hasattr(self.trainer.data_iterator, "state_dict"):
             train_dataloader_state = self.trainer.data_iterator.state_dict()
         elif self.trainer.train_dataloader is not None:
@@ -98,7 +102,7 @@ class GlobalStateCallback(Callback):
         }
 
     def save_global_state(self, state: TrainerState) -> None:
-        """Write this rank's job state beside the step's model checkpoint."""
+        """Write this rank's global_state beside the step's model checkpoint."""
         # Drain a pending async DCP save first. CheckpointCallback returns while
         # that write is still in flight; a cursor file that lands before the
         # shards would resume a step whose weights never made it to disk.
@@ -113,7 +117,7 @@ class GlobalStateCallback(Callback):
         self._last_saved_step = state.global_step
 
     def load_global_state(self) -> Optional[Dict[str, Any]]:
-        """Restore this rank's job state from ``load_path``, if there is one."""
+        """Restore this rank's global_state from ``load_path``, if there is one."""
         args: "VeOmniArguments" = self.trainer.args
         load_path = args.train.checkpoint.load_path
         if load_path is None:
@@ -133,6 +137,16 @@ class GlobalStateCallback(Callback):
             return None
 
         global_state = torch.load(state_path, map_location="cpu", weights_only=False)
+        self._apply_global_state(global_state)
+        logger.info_rank0(
+            f"Restored global_state from {state_path} "
+            f"(global_step={self.trainer.state.global_step}, "
+            f"start_epoch={self.trainer.start_epoch}, start_step={self.trainer.start_step})."
+        )
+        return global_state
+
+    def _apply_global_state(self, global_state: Dict[str, Any]) -> None:
+        """Write a global_state blob onto the trainer."""
         self.trainer.state.global_step = global_state["global_step"]
         self._restore_position(global_state)
 
@@ -145,17 +159,17 @@ class GlobalStateCallback(Callback):
         if self.trainer.train_dataloader is not None and global_state.get("train_dataloader") is not None:
             self.trainer.train_dataloader.load_state_dict(global_state["train_dataloader"])
 
-        self.trainer.environ_meter.load_state_dict(global_state["environ_meter"])
-        torch.set_rng_state(global_state["torch_rng_state"])
+        environ_meter = getattr(self.trainer, "environ_meter", None)
+        meter_state = global_state.get("environ_meter")
+        if environ_meter is not None and meter_state is not None:
+            environ_meter.load_state_dict(meter_state)
+
+        rng_state = global_state.get("torch_rng_state")
+        if rng_state is not None:
+            torch.set_rng_state(rng_state)
         if self.trainer.start_step == 0 and self.trainer.train_dataloader is not None:
             # If resume at the end of epoch, clear resume state and prefetch data
             iter(self.trainer.train_dataloader)
-
-        logger.info_rank0(
-            f"Restored trainer state from {state_path} (global_step={self.trainer.state.global_step}, "
-            f"start_epoch={self.trainer.start_epoch}, start_step={self.trainer.start_step})."
-        )
-        return global_state
 
     def _restore_position(self, global_state: Dict[str, Any]) -> None:
         """Place the resumed run back in the epoch/step grid.

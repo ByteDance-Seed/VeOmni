@@ -20,7 +20,7 @@ emit, then validates both resume paths bit-exact (modulo bf16 storage):
 
     1. Writer subprocess
        - DCP shards under ``<output_dir>/checkpoints/global_step_<S>/``
-         (model + optimizer + extra_state -- the format ``BaseTrainer``
+         (model + optimizer + lr_scheduler -- the format ``BaseTrainer``
          resumes via ``train.checkpoint.load_path``).
        - HF-format LoRA adapter under ``<output_dir>/global_step_<S>/``
          (``adapter_model.safetensors`` + ``adapter_config.json``; the MoE mode +

@@ -268,11 +268,11 @@ class TestAllowPartialLoad:
         model._fqn2spec_info = None
         optimizer = MagicMock()
 
-        state = {"model": model, "optimizer": optimizer, "extra_state": {}}
+        state = {"model": model, "optimizer": optimizer, "lr_scheduler": MagicMock()}
 
         mock_dcp.load = MagicMock()
 
-        with patch.object(DistributedCheckpointer, "_load_extra_state"):
+        with patch.object(DistributedCheckpointer, "_load_lr_scheduler"):
             with patch.object(DistributedCheckpointer, "_create_storage_reader") as mock_reader:
                 mock_reader.return_value = MagicMock()
                 DistributedCheckpointer.load(path="/fake", state=state)
@@ -1065,47 +1065,42 @@ class TestNormalizeKey:
 
 
 # ---------------------------------------------------------------------------
-# Extra state save/load roundtrip
+# lr_scheduler sidecar save/load roundtrip
 # ---------------------------------------------------------------------------
 
 
 @patch("veomni.checkpoint.dcp_checkpointer.dist")
-class TestExtraStateSaveLoad:
+class TestLrSchedulerSaveLoad:
     def test_roundtrip(self, mock_dist, tmp_path):
         mock_dist.get_rank.return_value = 0
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
-        original_state = {
-            "extra_state": {
-                "global_step": 42,
-                "lr_scheduler": {"last_epoch": 10, "base_lrs": [1e-4]},
-                "torch_rng_state": torch.get_rng_state(),
-            }
-        }
+        saved_scheduler = MagicMock()
+        saved_scheduler.state_dict.return_value = {"last_epoch": 10, "base_lrs": [1e-4]}
+        DistributedCheckpointer._save_lr_scheduler(str(tmp_path), {"lr_scheduler": saved_scheduler})
 
-        DistributedCheckpointer._save_extra_state(str(tmp_path), original_state)
+        loaded_scheduler = MagicMock()
+        DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": loaded_scheduler})
 
-        loaded_state = {"extra_state": {}}
-        DistributedCheckpointer._load_extra_state(str(tmp_path), loaded_state)
+        loaded_scheduler.load_state_dict.assert_called_once_with({"last_epoch": 10, "base_lrs": [1e-4]})
 
-        assert loaded_state["extra_state"]["global_step"] == 42
-        assert loaded_state["extra_state"]["lr_scheduler"]["last_epoch"] == 10
-        torch.testing.assert_close(
-            loaded_state["extra_state"]["torch_rng_state"],
-            original_state["extra_state"]["torch_rng_state"],
-        )
-
-    def test_missing_extra_state_key_save(self, mock_dist, tmp_path):
+    def test_missing_lr_scheduler_key_save(self, mock_dist, tmp_path):
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
         state = {"model": MagicMock()}
-        DistributedCheckpointer._save_extra_state(str(tmp_path), state)
+        DistributedCheckpointer._save_lr_scheduler(str(tmp_path), state)
 
-    def test_missing_extra_state_key_load(self, mock_dist, tmp_path):
+    def test_missing_lr_scheduler_key_load(self, mock_dist, tmp_path):
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
         state = {"model": MagicMock()}
-        DistributedCheckpointer._load_extra_state(str(tmp_path), state)
+        DistributedCheckpointer._load_lr_scheduler(str(tmp_path), state)
+
+    def test_none_scheduler_is_a_no_op(self, mock_dist, tmp_path):
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        DistributedCheckpointer._save_lr_scheduler(str(tmp_path), {"lr_scheduler": None})
+        DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": None})
 
 
 class TestPromoteStagedCheckpoint:
@@ -1530,7 +1525,7 @@ class TestStageDirValidation:
         with (
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,
             patch.object(DistributedCheckpointer, "_create_storage_writer") as create_writer,
-            patch.object(DistributedCheckpointer, "_save_extra_state"),
+            patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
             patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
             patch("veomni.checkpoint.dcp_checkpointer._prepare_stage_dir") as prepare,
             patch("veomni.checkpoint.dcp_checkpointer._promote_staged_checkpoint") as promote,

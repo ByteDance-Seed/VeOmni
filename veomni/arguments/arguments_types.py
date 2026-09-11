@@ -1043,7 +1043,7 @@ class TrainingArguments:
                 logger.warning("load_checkpoint_path should be under output_dir.")
 
         # output_dir/
-        # ├── checkpoints/          # DCP training checkpoints (model + optimizer + extra_state)
+        # ├── checkpoints/          # DCP training checkpoints (model + optimizer + lr_scheduler)
         # │   ├── global_step_100/
         # │   └── global_step_200/
         # │       └── hf_ckpt/      # HF safetensors saved under the last checkpoint folder

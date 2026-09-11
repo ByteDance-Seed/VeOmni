@@ -1,8 +1,8 @@
 """Unit tests for checkpoint cadence, manager save contract, and job-level state.
 
 Validates that ``_last_saved_step`` is only updated AFTER the save succeeds, that
-DCP save keys staging on the run-root path plus ``global_steps``, that extra_state
-is model-bound only, and that job-level state lives on ``GlobalStateCallback``.
+the manager forwards ``lr_scheduler`` like the optimizer, and that global_state
+lives on ``GlobalStateCallback``.
 """
 
 from types import SimpleNamespace
@@ -214,12 +214,11 @@ class TestCheckpointCallbackTrainBegin:
         order = []
         trainer.model.save_model_assets.side_effect = lambda: order.append("assets")
         trainer.load.side_effect = lambda: order.append("load")
-        trainer.model.checkpoint.restore_legacy_job_state.side_effect = lambda *_: order.append("legacy")
         cb = CheckpointCallback(trainer)
 
         cb.on_train_begin(TrainerState())
 
-        assert order == ["assets", "load", "legacy"]
+        assert order == ["assets", "load"]
         mock_helper.empty_cache.assert_called_once_with()
 
 
@@ -266,8 +265,8 @@ class TestModelCheckpointManagerSaveContract:
     gets a fresh staging directory per step, and a save killed part-way then
     strands a model-plus-optimizer-sized copy that no later save clears.
 
-    extra_state is model-bound only: the dataloader cursor, rng, and meters
-    belong to ``GlobalStateCallback``.
+    The manager forwards this model's lr_scheduler like the optimizer; the
+    dataloader cursor, rng, and meters belong to ``GlobalStateCallback``.
     """
 
     def test_the_step_reaches_save_instead_of_being_folded_into_the_path(
@@ -306,46 +305,30 @@ class TestModelCheckpointManagerSaveContract:
         call = manager.checkpointer.save.call_args
         assert f"{call.args[0]}/{_GLOBAL_STEP_PREFIX}{call.kwargs['global_steps']}" == "/remote/run/global_step_10"
 
-    def test_extra_state_is_only_the_scheduler(self, mock_helper, mock_dist, mock_build_ckpt):
+    def test_save_forwards_lr_scheduler_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
         trainer = _make_mock_trainer()
         mock_build_ckpt.return_value = MagicMock()
         manager = ModelCheckpointManager(trainer.model, trainer.args.train.checkpoint)
 
         manager.save_dcp(TrainerState(global_step=10))
 
-        extra_state = manager.checkpointer.save.call_args.args[1]["extra_state"]
-        assert set(extra_state) == {"lr_scheduler"}
-        assert extra_state["lr_scheduler"] == {"lr": 1e-4}
+        saved = manager.checkpointer.save.call_args.args[1]
+        assert saved["lr_scheduler"] is trainer.model.lr_scheduler
+        assert saved["optimizer"] is trainer.model.optimizer
 
-    def test_legacy_extra_state_restores_the_job_cursor(self, mock_helper, mock_dist, mock_build_ckpt):
-        """Checkpoints written by CheckpointerCallback still resume the cursor."""
+    def test_load_forwards_lr_scheduler_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
         trainer = _make_mock_trainer()
-        trainer.args.train.checkpoint.load_path = "/tmp/old_ckpt"
-        trainer.train_dataloader = MagicMock()
+        trainer.args.train.checkpoint.load_path = "/tmp/ckpt"
         mock_checkpointer = MagicMock()
         mock_build_ckpt.return_value = mock_checkpointer
 
-        def load_checkpoint(path, state, **kwargs):
-            state["extra_state"] = {
-                "global_step": 7,
-                "lr_scheduler": {"lr": 1e-5},
-                "train_dataloader": {"cursor": 3},
-                "environ_meter": {"tokens": 1},
-                "channel_loss_callback": {"source_registry": [(1, "train/a")]},
-                "torch_rng_state": torch.get_rng_state(),
-            }
-
-        mock_checkpointer.load.side_effect = load_checkpoint
         manager = ModelCheckpointManager(trainer.model, trainer.args.train.checkpoint)
         manager.load()
-        manager.restore_legacy_job_state(trainer)
 
-        assert trainer.state.global_step == 7
-        assert trainer.start_epoch == 0
-        assert trainer.start_step == 7
-        trainer.model.lr_scheduler.load_state_dict.assert_called_once_with({"lr": 1e-5})
-        trainer.train_dataloader.load_state_dict.assert_called_once_with({"cursor": 3})
-        trainer.channel_loss_callback.load_state_dict.assert_called_once_with({"source_registry": [(1, "train/a")]})
+        loaded = mock_checkpointer.load.call_args.args[1]
+        assert loaded["lr_scheduler"] is trainer.model.lr_scheduler
+        assert loaded["optimizer"] is trainer.model.optimizer
+        assert trainer.state.global_step == 0
         assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is trainer.model.parallel_state
 
     def test_save_uses_the_runtime_mesh_not_the_ambient_one(self, mock_helper, mock_dist, mock_build_ckpt):
@@ -362,7 +345,7 @@ class TestModelCheckpointManagerSaveContract:
 
 @patch("veomni.trainer.callbacks.global_state_callback.dist")
 class TestGlobalStateCallbackJobState:
-    """Job-level state — dataloader, rng, meters, channel-loss — is not in DCP extra_state."""
+    """global_state — dataloader, rng, meters, channel-loss — is not in the DCP sidecar."""
 
     def test_state_dict_includes_channel_loss_callback_state(self, mock_dist):
         trainer = _make_mock_trainer()
