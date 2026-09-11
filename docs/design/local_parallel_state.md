@@ -79,9 +79,9 @@ error.
 Current built-in trainers register the main topology as `"base"` during
 `BaseTrainer.setup_distributed()`, which runs before any model is built. That
 registration also makes `"base"` the global state, so the dataloader, scheduler
-and callbacks read it ambiently with no scope of their own. The one scope during
-build belongs to `VeOmniModelRuntime.setup()`, which wraps everything
-model-bound (meta-init, freeze, parallelize, optimizer) in
+and callbacks read it ambiently with no scope of their own. `VeOmniModelRuntime.setup()`
+only registers that model's mesh. The build scope is `VeOmniModelRuntime.__init__()`,
+which wraps meta-init, freeze, parallelize, and optimizer in
 `use_parallel_state(<its own name>)` — a no-op for a single-model job, and the
 mechanism by which sibling modules each build over their own mesh. At run time,
 only operations that depend on ambient groups are scoped: model forward,

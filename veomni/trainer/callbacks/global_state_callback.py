@@ -102,10 +102,7 @@ class GlobalStateCallback(Callback):
         # Drain a pending async DCP save first. CheckpointCallback returns while
         # that write is still in flight; a cursor file that lands before the
         # shards would resume a step whose weights never made it to disk.
-        runtime = getattr(self.trainer, "model", None)
-        checkpoint = getattr(runtime, "checkpoint", None)
-        if checkpoint is not None and hasattr(checkpoint, "wait_for_pending_save"):
-            checkpoint.wait_for_pending_save()
+        self.trainer.model.checkpoint.wait_for_pending_save()
 
         args: "VeOmniArguments" = self.trainer.args
         step_dir = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")

@@ -214,11 +214,12 @@ class TestCheckpointCallbackTrainBegin:
         order = []
         trainer.model.save_model_assets.side_effect = lambda: order.append("assets")
         trainer.load.side_effect = lambda: order.append("load")
+        trainer.model.checkpoint.restore_legacy_job_state.side_effect = lambda *_: order.append("legacy")
         cb = CheckpointCallback(trainer)
 
         cb.on_train_begin(TrainerState())
 
-        assert order == ["assets", "load"]
+        assert order == ["assets", "load", "legacy"]
         mock_helper.empty_cache.assert_called_once_with()
 
 
@@ -255,7 +256,6 @@ class TestCheckpointCallbackTrainEndWait:
         trainer.model.checkpoint.wait_for_pending_save.assert_called_once_with()
 
 
-@patch("veomni.models.checkpoint_manager.get_parallel_state")
 @patch("veomni.models.checkpoint_manager.build_checkpointer")
 @patch("veomni.models.checkpoint_manager.dist")
 @patch("veomni.models.checkpoint_manager.helper")
@@ -271,7 +271,7 @@ class TestModelCheckpointManagerSaveContract:
     """
 
     def test_the_step_reaches_save_instead_of_being_folded_into_the_path(
-        self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps, tmp_path
+        self, mock_helper, mock_dist, mock_build_ckpt, tmp_path
     ):
         from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
 
@@ -292,7 +292,7 @@ class TestModelCheckpointManagerSaveContract:
 
         assert staged[0] == staged[1], "each step staged somewhere different"
 
-    def test_the_logged_destination_is_the_one_save_writes(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
+    def test_the_logged_destination_is_the_one_save_writes(self, mock_helper, mock_dist, mock_build_ckpt):
         """The manager names the step directory for its log and its HF export, while
         ``save`` builds the same directory from ``path`` and ``global_steps``."""
         from veomni.checkpoint.dcp_checkpointer import _GLOBAL_STEP_PREFIX
@@ -306,7 +306,7 @@ class TestModelCheckpointManagerSaveContract:
         call = manager.checkpointer.save.call_args
         assert f"{call.args[0]}/{_GLOBAL_STEP_PREFIX}{call.kwargs['global_steps']}" == "/remote/run/global_step_10"
 
-    def test_extra_state_is_only_the_scheduler(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
+    def test_extra_state_is_only_the_scheduler(self, mock_helper, mock_dist, mock_build_ckpt):
         trainer = _make_mock_trainer()
         mock_build_ckpt.return_value = MagicMock()
         manager = ModelCheckpointManager(trainer.model, trainer.args.train.checkpoint)
@@ -317,7 +317,7 @@ class TestModelCheckpointManagerSaveContract:
         assert set(extra_state) == {"lr_scheduler"}
         assert extra_state["lr_scheduler"] == {"lr": 1e-4}
 
-    def test_legacy_extra_state_restores_the_job_cursor(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
+    def test_legacy_extra_state_restores_the_job_cursor(self, mock_helper, mock_dist, mock_build_ckpt):
         """Checkpoints written by CheckpointerCallback still resume the cursor."""
         trainer = _make_mock_trainer()
         trainer.args.train.checkpoint.load_path = "/tmp/old_ckpt"
@@ -346,7 +346,18 @@ class TestModelCheckpointManagerSaveContract:
         trainer.model.lr_scheduler.load_state_dict.assert_called_once_with({"lr": 1e-5})
         trainer.train_dataloader.load_state_dict.assert_called_once_with({"cursor": 3})
         trainer.channel_loss_callback.load_state_dict.assert_called_once_with({"source_registry": [(1, "train/a")]})
-        assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is mock_get_ps.return_value
+        assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is trainer.model.parallel_state
+
+    def test_save_uses_the_runtime_mesh_not_the_ambient_one(self, mock_helper, mock_dist, mock_build_ckpt):
+        """build_checkpoint runs outside use_parallel_state, so ambient is still ``base``."""
+        trainer = _make_mock_trainer()
+        mock_build_ckpt.return_value = MagicMock()
+        manager = ModelCheckpointManager(trainer.model, trainer.args.train.checkpoint)
+
+        manager.save_dcp(TrainerState(global_step=10))
+
+        assert manager.parallel_state is trainer.model.parallel_state
+        assert manager.checkpointer.save.call_args.kwargs["parallel_state"] is trainer.model.parallel_state
 
 
 @patch("veomni.trainer.callbacks.global_state_callback.dist")

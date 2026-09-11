@@ -21,7 +21,6 @@ import torch
 import torch.distributed as dist
 
 from ..checkpoint import CheckpointerBase, build_checkpointer
-from ..distributed.parallel_state import get_parallel_state
 from ..utils import helper
 
 
@@ -73,9 +72,11 @@ class ModelCheckpointManager:
         self.config = config
         self._last_saved_step: int = -1
         self._legacy_job_state: Optional[Dict[str, Any]] = None
-        # Cached at construction, same as Callback.parallel_state: later save/load
-        # must not depend on whichever mesh is ambient.
-        self.parallel_state = get_parallel_state()
+        # This runtime's mesh, looked up by name at construction — not the
+        # ambient get_parallel_state(). build_checkpoint() runs outside the
+        # runtime's use_parallel_state scope, so ambient is still "base" while
+        # a DPO policy or an Omni module is registered under its own name.
+        self.parallel_state = runtime.parallel_state
         self.checkpointer: CheckpointerBase = build_checkpointer(
             ckpt_manager=config.manager,
             dist_backend=runtime.args.accelerator.fsdp_config.fsdp_mode,

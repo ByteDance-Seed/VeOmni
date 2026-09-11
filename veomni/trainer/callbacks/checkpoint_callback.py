@@ -30,27 +30,17 @@ here. It has its own schedule and its own files, in
 :mod:`~veomni.trainer.callbacks.global_state_callback`.
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from ...utils import helper
 from .base import Callback, TrainerState
 
 
 if TYPE_CHECKING:
-    from ...models.checkpoint_manager import ModelCheckpointManager
     from ..base import BaseTrainer, VeOmniArguments
 
 
 logger = helper.create_logger(__name__)
-
-
-def _runtime_checkpoint(trainer: "BaseTrainer") -> Optional["ModelCheckpointManager"]:
-    """The manager on this job's model, or ``None`` when the trainer has no runtime."""
-    runtime = getattr(trainer, "model", None)
-    checkpoint = getattr(runtime, "checkpoint", None)
-    if checkpoint is not None and hasattr(checkpoint, "wait_for_pending_save"):
-        return checkpoint
-    return None
 
 
 class CheckpointCallback(Callback):
@@ -71,15 +61,11 @@ class CheckpointCallback(Callback):
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         self.trainer.model.save_model_assets()
         self.trainer.load()
-        checkpoint = _runtime_checkpoint(self.trainer)
-        if checkpoint is not None:
-            checkpoint.restore_legacy_job_state(self.trainer)
+        self.trainer.model.checkpoint.restore_legacy_job_state(self.trainer)
         helper.empty_cache()
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
-        checkpoint = _runtime_checkpoint(self.trainer)
-        if checkpoint is not None:
-            checkpoint.wait_for_pending_save()
+        self.trainer.model.checkpoint.wait_for_pending_save()
         if self.save_hf_weights:
             if state.global_step != self._last_hf_step:
                 self._save_hf(state, stage="train_end")

@@ -41,6 +41,26 @@ logger = logging.get_logger(__name__)
 _NON_MODEL_KEYS = set()
 
 
+def _assert_matching_dpo_parallelism(policy_acc, reference_acc) -> None:
+    """Fail before build when the reference would gather a different token partition.
+
+    ``SequenceParallelCollator`` slices the packed batch with the policy SP size.
+    ``concatenated_forward`` then gathers with each runtime's own ParallelState.
+    A reference whose ``ulysses_size * cp_size`` or ``dp_size`` differs from the
+    policy would gather a different partition and split it with the policy's
+    ``seq_lens``.
+    """
+    policy_sp = policy_acc.ulysses_size * policy_acc.cp_size
+    reference_sp = reference_acc.ulysses_size * reference_acc.cp_size
+    if (policy_sp, policy_acc.dp_size) != (reference_sp, reference_acc.dp_size):
+        raise ValueError(
+            "DPO reference accelerator topology must match the policy: "
+            f"policy has ulysses_size*cp_size={policy_sp}, dp_size={policy_acc.dp_size}; "
+            f"reference has ulysses_size*cp_size={reference_sp}, dp_size={reference_acc.dp_size}. "
+            "SequenceParallelCollator slices the packed batch with the policy SP size."
+        )
+
+
 def _build_dpo_labels_list(
     all_labels: torch.Tensor,
     seq_lens: List[int],
@@ -262,8 +282,10 @@ class TextDPOTrainer:
         the policy's ``model`` is reused.
         """
         args: VeOmniDPOArguments = self.base.args
+        reference_args = args.reference_model or args.model
+        _assert_matching_dpo_parallelism(args.model.accelerator, reference_args.accelerator)
         return DPOReferenceModelRuntime(
-            args.reference_model or args.model,
+            reference_args,
             "reference",
             train=args.train,
             torch_dtype=args.dpo_config.refer_model_precision,

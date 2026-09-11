@@ -42,10 +42,7 @@ def _make_config(load_path=None):
 
 @pytest.fixture
 def make_manager():
-    with (
-        patch("veomni.models.checkpoint_manager.build_checkpointer") as build,
-        patch("veomni.models.checkpoint_manager.get_parallel_state"),
-    ):
+    with patch("veomni.models.checkpoint_manager.build_checkpointer") as build:
         build.return_value = MagicMock()
 
         def _make(cls=ModelCheckpointManager, *, lora_config=None, load_path=None):
@@ -140,6 +137,16 @@ class TestWhatRidesAlongWithTheWeights:
             manager.save_dcp(TrainerState(global_step=10))
 
         assert manager.checkpointer.save.call_args.kwargs["stage_dir"] == "/local/stage"
+
+    def test_save_uses_the_runtime_mesh_not_the_ambient_one(self, make_manager):
+        manager = make_manager()
+        manager.runtime.lr_scheduler.state_dict.return_value = {}
+
+        with patch("veomni.models.checkpoint_manager.dist"), patch("veomni.models.checkpoint_manager.helper"):
+            manager.save_dcp(TrainerState(global_step=10))
+
+        assert manager.parallel_state is manager.runtime.parallel_state
+        assert manager.checkpointer.save.call_args.kwargs["parallel_state"] is manager.runtime.parallel_state
 
 
 class TestExport:
