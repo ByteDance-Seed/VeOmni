@@ -1179,6 +1179,43 @@ class TestPromoteStagedCheckpoint:
                 _promote_staged_checkpoint(stage_path, final_path)
         assert order[-1] == ".metadata"
 
+    def test_nested_sidecar_is_copied_before_metadata(self, tmp_path):
+        """``extra_state/`` is one level down; listdir+copyfile would skip it or raise."""
+        import shutil as _shutil
+
+        from veomni.checkpoint.dcp_checkpointer import (
+            _EXTRA_STATE_DIR,
+            _EXTRA_STATE_FORMAT,
+            _promote_staged_checkpoint,
+        )
+
+        stage_path = tmp_path / "stage"
+        final_path = tmp_path / "final"
+        extra = stage_path / _EXTRA_STATE_DIR
+        extra.mkdir(parents=True)
+        (stage_path / "__0_0.distcp").write_text("weights")
+        (stage_path / ".metadata").write_text("meta")
+        sidecar = extra / _EXTRA_STATE_FORMAT.format(0)
+        sidecar.write_text("scheduler-v2")
+
+        order = []
+        real_copy = _shutil.copyfile
+
+        def spy(src, dst):
+            """Record each copied relative path, then perform the real copy."""
+            order.append(os.path.relpath(dst, str(final_path)))
+            return real_copy(src, dst)
+
+        with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False):
+            with patch("veomni.checkpoint.dcp_checkpointer.shutil.copyfile", side_effect=spy):
+                _promote_staged_checkpoint(str(stage_path), str(final_path))
+
+        sidecar_rel = os.path.join(_EXTRA_STATE_DIR, _EXTRA_STATE_FORMAT.format(0))
+        assert sidecar_rel in order
+        assert order[-1] == ".metadata"
+        assert order.index(sidecar_rel) < order.index(".metadata")
+        assert (final_path / sidecar_rel).read_text() == "scheduler-v2"
+
     def test_stale_metadata_is_removed_before_any_data_is_copied(self, staged):
         """Overwriting in place must not leave the old marker over half-new data."""
         import shutil as _shutil
@@ -1511,6 +1548,55 @@ class TestStageDirValidation:
             with patch("veomni.checkpoint.dcp_checkpointer.os.makedirs", side_effect=OSError("No space left")):
                 with pytest.raises(OSError, match="No space left"):
                     _prepare_stage_dir(str(tmp_path), "/remote/ckpt")
+
+    def test_failed_staged_overwrite_does_not_change_previous_scheduler(self, tmp_path):
+        """A failed staged save must not mutate the live checkpoint's scheduler.
+
+        ``.metadata`` still advertises the previous checkpoint until promotion.
+        Writing the new extra_state sidecar into the destination first would let
+        a resume load the old model and optimizer with the new scheduler; a
+        failed ``dcp.save`` would leave the same mix. The sidecar has to live
+        under ``stage_path`` until promotion copies the nested tree.
+        """
+        from veomni.checkpoint.dcp_checkpointer import (
+            _EXTRA_STATE_DIR,
+            _EXTRA_STATE_FORMAT,
+            DistributedCheckpointer,
+        )
+
+        final = tmp_path / "ckpt"
+        step_dir = final / "global_step_10"
+        extra = step_dir / _EXTRA_STATE_DIR
+        extra.mkdir(parents=True)
+        (step_dir / ".metadata").write_text("previous")
+        (step_dir / "__0_0.distcp").write_text("old-weights")
+        sidecar = extra / _EXTRA_STATE_FORMAT.format(0)
+        previous = {"last_epoch": 10, "base_lrs": [1e-4]}
+        torch.save(previous, sidecar)
+
+        new_scheduler = MagicMock()
+        new_scheduler.state_dict.return_value = {"last_epoch": 99, "base_lrs": [1e-3]}
+
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
+            patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=lambda failed: failed),
+            patch.object(DistributedCheckpointer, "execute_save", side_effect=OSError("dcp write failed")),
+            patch.object(DistributedCheckpointer, "_create_storage_writer"),
+            patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+        ):
+            with pytest.raises(OSError, match="dcp write failed"):
+                DistributedCheckpointer.save(
+                    path=str(final),
+                    state={"model": MagicMock(), "lr_scheduler": new_scheduler},
+                    save_async=False,
+                    global_steps=10,
+                    stage_dir=str(tmp_path / "stage"),
+                )
+
+        assert torch.load(sidecar, weights_only=False) == previous
+        assert (step_dir / ".metadata").read_text() == "previous"
 
     def test_unset_stage_dir_writes_straight_to_the_destination(self, tmp_path):
         """Staging is opt-in: unset, nothing about the write changes.

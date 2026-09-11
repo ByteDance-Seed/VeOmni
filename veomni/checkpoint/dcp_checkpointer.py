@@ -571,6 +571,10 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
     new one goes last and only if every rank's data landed -- so a reader sees
     either the previous complete checkpoint or none, never a completion marker
     over data that is only partly there.
+
+    Nested sidecars (``extra_state/``) are copied in the data phase, before
+    ``.metadata`` is published. They must not be written into a still-valid
+    destination while the previous marker is up.
     """
     metadata_name = ".metadata"
     is_node_leader = _local_rank() == 0
@@ -585,13 +589,28 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
             os.remove(final_metadata)
 
     def copy_this_nodes_files() -> None:
-        """Copy every staged file on this node, except the completion marker."""
-        names = [n for n in sorted(os.listdir(stage_path)) if n != metadata_name]
+        """Copy every staged file on this node, except the completion marker.
+
+        Sidecars live one directory down (``extra_state/``), so this walks the
+        tree rather than copying only the top-level names DCP writes.
+        """
         os.makedirs(final_path, exist_ok=True)
 
-        def _copy(name: str) -> None:
-            """Copy one staged file to the destination, preserving its name."""
-            shutil.copyfile(os.path.join(stage_path, name), os.path.join(final_path, name))
+        names: list[str] = []
+        for dirpath, _dirnames, filenames in os.walk(stage_path):
+            for filename in filenames:
+                rel = os.path.relpath(os.path.join(dirpath, filename), stage_path)
+                if rel == metadata_name:
+                    continue
+                names.append(rel)
+        names.sort()
+
+        def _copy(rel: str) -> None:
+            """Copy one staged file to the destination, preserving its relative path."""
+            src = os.path.join(stage_path, rel)
+            dst = os.path.join(final_path, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(src, dst)
 
         if names:
             with ThreadPoolExecutor(max_workers=min(16, len(names))) as pool:
@@ -686,7 +705,9 @@ class DistributedCheckpointer(CheckpointerBase):
                 See ``CheckpointConfig.dcp_save_to_lowest_rank``.
             stage_dir: write the checkpoint here and copy it to ``path`` afterwards,
                 instead of writing straight to ``path``. Intended for a destination far
-                slower than local disk. The caller owns the choice: this does not probe
+                slower than local disk. The lr_scheduler sidecar is written under the
+                staging directory too and copied with the shards, before ``.metadata``
+                is published. The caller owns the choice: this does not probe
                 for a usable directory or check free space, and an unusable ``stage_dir``
                 fails the save rather than silently writing elsewhere. See
                 ``CheckpointConfig.stage_dir``.
@@ -711,9 +732,6 @@ class DistributedCheckpointer(CheckpointerBase):
         checkpoint_dir = f"{path}/{_GLOBAL_STEP_PREFIX}{global_steps}" if global_steps is not None else path
         cls._create_checkpoint_dir(checkpoint_dir)
 
-        # Sidecar first so a model/optimizer write is never missing its scheduler.
-        cls._save_lr_scheduler(checkpoint_dir=checkpoint_dir, state=state)
-
         save_state = {
             "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
         }
@@ -725,7 +743,16 @@ class DistributedCheckpointer(CheckpointerBase):
                 load=False,
             )
 
+        # Prepare staging before the sidecar. Writing extra_state into a still-
+        # valid destination would pair a new scheduler with the previous model
+        # and optimizer: ``.metadata`` stays up until promotion, and a failed
+        # staged save would leave the same mix.
         stage_path = _prepare_stage_dir(stage_dir, path) if stage_dir else None
+
+        # Sidecar first so a model/optimizer write is never missing its scheduler.
+        # All ranks write their own extra_state_rank_{N}.pt; the node leader
+        # copies the nested tree during promotion.
+        cls._save_lr_scheduler(checkpoint_dir=stage_path or checkpoint_dir, state=state)
 
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(stage_path or checkpoint_dir)

@@ -165,6 +165,11 @@ Core files:
 17. **Checkpoint save/load requires all ranks to participate**
     - DCP operations are collective — all ranks must call save/load simultaneously.
     - Calling checkpoint operations from only rank 0 causes deadlocks.
+    - When ``stage_dir`` is set, every rank still writes its ``extra_state_rank_{N}.pt``
+      sidecar (into the staging directory, not the live destination) and every rank
+      still enters each promotion collective. The sidecar is copied with the DCP
+      shards, before ``.metadata`` is published. Writing it into the destination
+      first would pair a new scheduler with a still-valid previous ``.metadata``.
 
 18. **Distributed HF safetensors consolidation must support non-floating tensors**
     - PyTorch 2.9–2.11 computes consolidated tensor byte sizes with `torch.finfo`, which crashes for valid integer and boolean buffers such as DeepSeek V4 `tid2eid`.
