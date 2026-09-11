@@ -15,8 +15,11 @@
 """Job-level checkpoint callback, as distinct from per-model checkpoint I/O.
 
 Nothing here belongs to a model: where the dataloader is, the rng, the metric
-meters. Model weights, optimizer, HF/LoRA export, and the tokenizer/config
-sidecars are scheduled by :mod:`~veomni.trainer.callbacks.checkpoint_callback`.
+meters. Written per rank as ``trainer_state_rank_{N}.pt``. The model's
+``lr_scheduler`` is a separate ``lr_scheduler.pt`` next to the DCP shards
+(see ``docs/usage/checkpoint.md``). Model weights, optimizer, HF/LoRA export,
+and the tokenizer/config sidecars are scheduled by
+:mod:`~veomni.trainer.callbacks.checkpoint_callback`.
 """
 
 import os

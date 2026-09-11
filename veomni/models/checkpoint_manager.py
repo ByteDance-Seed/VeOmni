@@ -12,12 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Checkpoint/resume for one trainer-owned model."""
+"""Checkpoint/resume for one trainer-owned model.
+
+Two blobs, two owners:
+
+* **lr_scheduler** — this model's scheduler. Passed to DCP like the optimizer;
+  the checkpointer pickles ``state_dict`` as a single ``lr_scheduler.pt``.
+* **global_state** — the job cursor (step, dataloader, rng, meters), written by
+  :class:`~veomni.trainer.callbacks.global_state_callback.GlobalStateCallback`
+  as ``trainer_state_rank_*.pt``.
+
+On-disk layout: ``docs/usage/checkpoint.md``.
+"""
 
 import os
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Optional
 
-import torch
 import torch.distributed as dist
 
 from ..checkpoint import CheckpointerBase, build_checkpointer
@@ -51,8 +61,11 @@ class ModelCheckpointManager:
     On-disk layout for a single-model job::
 
         <save_path>/global_step_{N}/
-        ├── __0_0.distcp …     # DCP shards {model, optimizer, extra_state}
-        └── hf_ckpt/           # HF safetensors export
+        ├── __0_0.distcp …     # DCP shards {model, optimizer}
+        ├── lr_scheduler.pt    # replicated scheduler
+        ├── trainer_state_rank_{R}.pt  # job cursor (written by GlobalStateCallback)
+        ├── adapter_config.json / adapter_model.safetensors  # LoRA export
+        └── hf_ckpt/           # full-model HF safetensors export
 
     A subclass managing one module of a multi-module model sets
     :attr:`checkpoint_subfolder` so every artifact nests one level deeper.
@@ -85,12 +98,8 @@ class ModelCheckpointManager:
         return os.path.join(step_dir, self.checkpoint_subfolder) if self.checkpoint_subfolder else step_dir
 
     def save_dir(self, state: "TrainerState") -> str:
-        """Where this step's DCP shards live."""
+        """Where this step's DCP shards (and LoRA adapter export) live."""
         return self._step_dir(self.config.save_path, state)
-
-    def output_dir(self, state: "TrainerState") -> str:
-        """Where user-facing exports (LoRA adapters) live."""
-        return self._step_dir(self.config.output_dir, state)
 
     def hf_export_dir(self, state: "TrainerState") -> str:
         """Where this step's safetensors export lives."""
@@ -102,91 +111,43 @@ class ModelCheckpointManager:
             return None
         return os.path.join(load_path, self.checkpoint_subfolder) if self.checkpoint_subfolder else load_path
 
-    def _extra_state(self, state: "TrainerState") -> Dict[str, Any]:
-        """Model-bound state to store beside the weights."""
-        lr_scheduler = self.trainer.lr_scheduler
-        return {"lr_scheduler": None if lr_scheduler is None else lr_scheduler.state_dict()}
-
-    def _load_extra_state(self, extra_state: Dict[str, Any]) -> None:
-        lr_state = extra_state.get("lr_scheduler")
-        lr_scheduler = self.trainer.lr_scheduler
-        if lr_state is not None and lr_scheduler is not None:
-            lr_scheduler.load_state_dict(lr_state)
-
-        # Pre-split DCP extra_state also held the job cursor. New writes do not;
-        # GlobalStateCallback owns that file. Restore the old blob so a mid-job
-        # resume from a CheckpointerCallback checkpoint does not silently restart
-        # at step 0 with restored weights.
-        if "global_step" not in extra_state:
-            return
-        logger.warning_rank0(
-            "DCP extra_state still contains job-level keys (global_step, dataloader, "
-            "rng). Restoring them for compatibility with checkpoints written before "
-            "GlobalStateCallback; new saves keep only lr_scheduler here."
-        )
-        self._restore_legacy_job_state(extra_state)
-
-    def _restore_legacy_job_state(self, extra_state: Dict[str, Any]) -> None:
-        args = self.trainer.args
-        global_step = extra_state["global_step"]
-        self.trainer.state.global_step = global_step
-        self.trainer.start_epoch = global_step // args.train_steps
-        self.trainer.start_step = global_step % args.train_steps
-
-        channel_loss_state = extra_state.get("channel_loss_callback")
-        channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
-        if channel_loss_state is not None and channel_loss_callback is not None:
-            channel_loss_callback.load_state_dict(channel_loss_state)
-
-        if self.trainer.train_dataloader is not None and extra_state.get("train_dataloader") is not None:
-            self.trainer.train_dataloader.load_state_dict(extra_state["train_dataloader"])
-
-        environ_meter = getattr(self.trainer, "environ_meter", None)
-        if environ_meter is not None and extra_state.get("environ_meter") is not None:
-            environ_meter.load_state_dict(extra_state["environ_meter"])
-
-        rng_state = extra_state.get("torch_rng_state")
-        if rng_state is not None:
-            torch.set_rng_state(rng_state)
-        if self.trainer.start_step == 0 and self.trainer.train_dataloader is not None:
-            iter(self.trainer.train_dataloader)
-
     def wait_for_pending_save(self) -> None:
         self.checkpointer.wait_for_pending_save()
 
     def load(self) -> None:
+        """Restore model, optimizer and lr_scheduler from ``load_path``."""
         load_dir = self.load_dir()
         if load_dir is None:
             return
 
         self.wait_for_pending_save()
-        state: Dict[str, Any] = {
-            "model": self.trainer.model,
-            "optimizer": self.trainer.optimizer,
-            "extra_state": {},
-        }
         self.checkpointer.load(
             load_dir,
-            state,
+            {
+                "model": self.trainer.model,
+                "optimizer": self.trainer.optimizer,
+                "lr_scheduler": self.trainer.lr_scheduler,
+            },
             trainable_only=self.trainable_only,
             parallel_state=self.parallel_state,
         )
-        self._load_extra_state(state["extra_state"])
         dist.barrier()
         logger.info_rank0(f"Load distributed checkpoint from {load_dir} successfully!")
 
     def save_dcp(self, state: "TrainerState") -> None:
-        """Write model, optimizer and this model's extra state for ``state.global_step``.
+        """Write model, optimizer and lr_scheduler for ``state.global_step``.
 
         Only model-bound state goes in here. Job-level state — where the
         dataloader is, the rng — has its own writer.
         """
-        extra_state = self._extra_state(state)
-
         helper.empty_cache()
         self.checkpointer.save(
             self.config.save_path,
-            {"model": self.trainer.model, "optimizer": self.trainer.optimizer, "extra_state": extra_state},
+            {
+                "model": self.trainer.model,
+                "optimizer": self.trainer.optimizer,
+                "lr_scheduler": self.trainer.lr_scheduler,
+            },
             global_steps=state.global_step,
             save_async=self.config.save_async,
             trainable_only=self.trainable_only,
@@ -239,7 +200,7 @@ class ModelCheckpointManager:
         self._prepare_export(state, stage)
         save_lora_adapter_with_dcp(
             model=self.trainer.model,
-            save_path=self.output_dir(state),
+            save_path=self.save_dir(state),
             adapter_name=adapter_name,
         )
         helper.empty_cache()

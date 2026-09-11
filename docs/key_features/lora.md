@@ -87,7 +87,7 @@ model:
     rank: 64
     alpha: 32
     lora_modules: [q_proj, k_proj, v_proj, o_proj]
-    lora_adapter: ./exp/my_run/global_step_500   # HF adapter dir to resume from
+    lora_adapter: ./exp/my_run/checkpoints/global_step_500   # HF adapter dir to resume from
 ```
 
 ---
@@ -256,13 +256,17 @@ Output structure for each checkpoint:
 ```
 <output_dir>/
 ├── checkpoints/
-│   └── global_step_N/          ← DCP checkpoint (resume training)
+│   └── global_step_N/          ← DCP + LoRA adapter (one directory per step)
 │       ├── __0_0.distcp
-│       └── .metadata
-└── global_step_N/              ← HF adapter (inference / resume)
-    ├── adapter_config.json     ← PEFT-format; MoE mode in its `veomni_lora` block
-    └── adapter_model.safetensors
+│       ├── .metadata
+│       ├── lr_scheduler.pt
+│       ├── trainer_state_rank_{R}.pt
+│       ├── adapter_config.json     ← PEFT-format; MoE mode in its `veomni_lora` block
+│       └── adapter_model.safetensors
+└── model_assets/
 ```
+
+Full file-by-file contract: [Checkpoint layout](../usage/checkpoint.md).
 
 Load still accepts a PEFT `adapter_model.bin` (`load_adapter_state_dict` prefers
 safetensors, then falls back to `.bin`). VeOmni's own export is safetensors so the
@@ -410,10 +414,12 @@ Both modes work with FSDP2 + EP. EP requires a fused forward path:
 A MoE-LoRA run writes only the two standard PEFT artefacts — **no sidecar**:
 
 ```
-<output_dir>/global_step_N/
+<output_dir>/checkpoints/global_step_N/
 ├── adapter_config.json     # PEFT-format; MoE mode/rank/alpha in its `veomni_lora` block
-└── adapter_model.safetensors  # PEFT-format — both linear LoRA and MoE-LoRA tensors
+└── adapter_model.safetensors
 ```
+
+(Same `global_step_N` directory as the DCP shards. See [Checkpoint layout](../usage/checkpoint.md).)
 
 A stock-PEFT adapter that only has `adapter_model.bin` still loads: `from_pretrained`
 uses the same fallback.
@@ -593,7 +599,7 @@ checkpoints remain auto-detected through `train.checkpoint.load_path: auto`.
 ```yaml
 model:
   lora_config:
-    lora_adapter: ./exp/qwen3_moe_lora/global_step_500
+    lora_adapter: ./exp/qwen3_moe_lora/checkpoints/global_step_500
 ```
 
 ```shell
@@ -658,7 +664,7 @@ bash train.sh tasks/train_dit.py configs/dit/qwen_image_lora.yaml \
     --train.num_train_epochs 3
 ```
 
-`CheckpointCallback` writes the trained adapter to `${output_dir}/global_step_${step}/{adapter_config.json, adapter_model.safetensors}`, which is the standard PEFT format consumable by `PeftModel.from_pretrained` and `diffusers`' `pipeline.transformer.load_lora_adapter` (the adapter keys carry the `base_model.model.` prefix expected by `peft`). Loading a PEFT-trained adapter still accepts `adapter_model.bin`.
+`CheckpointCallback` writes the trained adapter to `${output_dir}/checkpoints/global_step_${step}/{adapter_config.json, adapter_model.safetensors}`, which is the standard PEFT format consumable by `PeftModel.from_pretrained` and `diffusers`' `pipeline.transformer.load_lora_adapter` (the adapter keys carry the `base_model.model.` prefix expected by `peft`). Loading a PEFT-trained adapter still accepts `adapter_model.bin`.
 
 ---
 

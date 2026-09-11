@@ -112,7 +112,7 @@ BaseTrainer (ABC)
 - `train_step()` -> single training step (forward + backward + update)
 - `training_loop()` -> main loop with callbacks
 
-**Checkpointing**: `CheckpointCallback` owns cadence for DCP, HF/LoRA, and the one-shot tokenizer/config sidecars; `GlobalStateCallback` owns the job cursor; `BaseTrainer.load` / `save_dcp` / `save_hf_or_lora` / `save_model_assets` fan out; `ModelCheckpointManager` (`veomni/models/checkpoint_manager.py`) owns DCP / HF / LoRA I/O, drain-async, `empty_cache`, barrier, and directory layout. Job cursor (dataloader, rng, meters) is not in DCP extra_state.
+**Checkpointing**: `CheckpointCallback` owns cadence for DCP, HF/LoRA, and the one-shot tokenizer/config sidecars; `GlobalStateCallback` owns the job cursor; `BaseTrainer.load` / `save_dcp` / `save_hf_or_lora` / `save_model_assets` fan out; `ModelCheckpointManager` (`veomni/models/checkpoint_manager.py`) owns DCP / HF / LoRA I/O, drain-async, `empty_cache`, barrier, and directory layout. The scheduler is a single `lr_scheduler.pt` next to the DCP shards; the job cursor is `trainer_state_rank_{R}.pt`. On-disk layout: `docs/usage/checkpoint.md`.
 
 Subclasses override specific methods (e.g., `compute_loss()`, custom data transforms) rather than the entire training loop.
 
