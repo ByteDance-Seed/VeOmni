@@ -62,7 +62,7 @@ _EXPECTED_QAT = {
 }
 _EXPECTED_PLAIN = {
     "DeepseekV4Attention.forward": set(),
-    "DeepseekV4Indexer.forward": {"weights_proj", "kv_proj", "gate_proj"},
+    "DeepseekV4Indexer.forward": {"scorer.weights_proj", "kv_proj", "gate_proj"},
     "DeepseekV4HCACompressor.forward": {"kv_proj", "gate_proj"},
     "DeepseekV4CSACompressor.forward": {"kv_proj", "gate_proj"},
     "DeepseekV4MLP.forward": set(),
@@ -151,9 +151,10 @@ def _projection_calls(module, qualname):
                 f"{qualname}: veomni_qat_linear must be handed a submodule of self, got {ast.dump(operand)}"
             )
             quantized.add(operand.attr)
-        elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "self":
-            if func.attr.endswith("_proj"):
-                plain.add(func.attr)
+        elif isinstance(func, ast.Attribute) and func.attr.endswith("_proj"):
+            path = ast.unparse(func)
+            if path.startswith("self."):
+                plain.add(path.removeprefix("self."))
     return quantized, plain
 
 

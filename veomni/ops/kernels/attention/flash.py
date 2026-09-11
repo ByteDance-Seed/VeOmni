@@ -197,6 +197,19 @@ def flash_attention_forward(
             " Please set your attention to `eager` if you want any of these features."
         )
 
+    # Sparse-attention models (DeepSeek Sparse Attention: GLM-MoE-DSA,
+    # DeepSeek-V3.2) hand their top-k selection down as `indices=`, expecting a
+    # flash-mla kernel to consume it. This wrapper cannot, and silently dropping
+    # it would run *dense* attention with the sparsity discarded — a wrong
+    # training objective with no error. Reject it instead.
+    if kwargs.get("indices") is not None:
+        raise ValueError(
+            "VeOmni's flash-attention path cannot consume the sparse `indices` handed down by a "
+            "DSA model — running it would silently discard the top-k selection and compute dense "
+            f"attention. Use 'eager'/'sdpa' (which fold the selection into the mask) or a flash-mla "
+            f"kernel. Got _attn_implementation={module.config._attn_implementation!r}."
+        )
+
     # This is before the transpose
     seq_len = query.shape[2]
 
@@ -275,6 +288,26 @@ def flash_attention_forward(
             f"unknown attn_implementation for veomni flash_attention with SP support: {module.config._attn_implementation}"
         )
 
+    # Flash attention requires query and value to share a head dim. MLA models
+    # (DeepSeek-V3/V4) have ``v_head_dim < qk_head_dim``, so pad ``value`` up to
+    # the query head dim and crop the output back below. GLM-MoE-DSA is also MLA
+    # but never reaches here — its patched forward rejects any implementation
+    # other than eager / sdpa / flash-mla.
+    #
+    # transformers <= 5.9 did this inside each MLA model's ``forward``; 5.16 moved
+    # it into HF's ``integrations/flash_attention.py`` wrapper — which this
+    # function replaces — so VeOmni has to carry it. Padding here (rather than
+    # before the Ulysses all-to-all) keeps the padded columns out of the
+    # collective.
+    head_dim, v_head_dim = query.shape[-1], value.shape[-1]
+    if v_head_dim > head_dim:
+        raise ValueError(
+            f"value head dim ({v_head_dim}) exceeds query head dim ({head_dim}); flash attention "
+            "cannot be padded to match. Check the model's qk/v head-dim configuration."
+        )
+    if v_head_dim < head_dim:
+        value = torch.nn.functional.pad(value, [0, head_dim - v_head_dim])
+
     attn_output = _flash_attention_forward(
         query,
         key,
@@ -292,6 +325,9 @@ def flash_attention_forward(
         layer_idx=module.layer_idx if hasattr(module, "layer_idx") else None,
         **kwargs,
     )
+
+    if v_head_dim < head_dim:
+        attn_output = attn_output[..., :v_head_dim]
 
     # Ulysses patch
     if ulysses_enabled and not skip_ulysses:
