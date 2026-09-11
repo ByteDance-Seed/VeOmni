@@ -47,7 +47,6 @@ from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerB
 from transformers.modeling_outputs import ModelOutput
 
 from ..arguments import OffloadConfig, VeOmniArguments, save_args
-from ..checkpoint import CheckpointerBase
 from ..data import (
     DistributedDataloader,
     build_dataloader,
@@ -63,6 +62,7 @@ from ..distributed.parallel_state import clear_parallel_state, init_parallel_sta
 from ..distributed.torch_compile import CompileConfig, mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
+from ..models.checkpoint_manager import ModelCheckpointManager
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..optim import build_lr_scheduler, build_optimizer
 from ..utils import helper, logging
@@ -79,11 +79,10 @@ from ..utils.model_utils import pretty_print_trainable_parameters
 from .callbacks import (
     RESERVED_TRAINING_METRIC_NAMES,
     ChannelLossCallback,
-    CheckpointerCallback,
+    CheckpointCallback,
     EnvironMeterCallback,
     EvaluateCallback,
-    HFLoraCkptCallback,
-    HuggingfaceCkptCallback,
+    GlobalStateCallback,
     MoERouterMonitorCallback,
     ProfileTraceCallback,
     TqdmCallback,
@@ -288,7 +287,7 @@ class BaseTrainer(Stateful, ABC):
     step_train_metrics: Dict[str, Any]  # loss, grad_norm, lr, etc
 
     # Checkpointer
-    checkpointer: CheckpointerBase  # see in checkpoint_callback.CheckpointerCallback
+    checkpoint: ModelCheckpointManager
 
     # Callback system
     state: TrainerState
@@ -639,39 +638,63 @@ class BaseTrainer(Stateful, ABC):
 
     def _init_callbacks(self):
         """Initialize callbacks."""
+        self.checkpoint = ModelCheckpointManager(self)
         self.environ_meter_callback = EnvironMeterCallback(self)
         self.tqdm_callback = TqdmCallback(self)
         self.wandb_callback = WandbTraceCallback(self)
         self.profile_callback = ProfileTraceCallback(self)
-        self.checkpointer_callback = CheckpointerCallback(self)
-        if self.args.model.lora_config:
-            self.hf_ckpt_callback = HFLoraCkptCallback(self)
-        else:
-            self.hf_ckpt_callback = HuggingfaceCkptCallback(self)
+        self.checkpoint_callback = CheckpointCallback(self)
+        self.global_state_callback = GlobalStateCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self.moe_monitor_callback = MoERouterMonitorCallback(self)
         self.channel_loss_callback = ChannelLossCallback(self)
         # Ordered dispatch list. Callbacks own their ParallelState explicitly:
         # each captured it at construction (``Callback.parallel_state``), and
         # ChannelLossComputer receives that same cached state. Shared objects
-        # (EnvironMeter, DCP checkpointer) are handed the state directly, so
-        # no ambient ``use_parallel_state`` scope is needed around hook dispatch.
+        # (EnvironMeter) are handed the state directly. The checkpoint manager
+        # caches ParallelState at construction the same way, so save/load do
+        # not depend on ambient.
         #
         # ``channel_loss_callback`` is ordered after the meter (which resets
         # ``step_*_metrics`` in ``on_step_end``) and before ``wandb`` (which
         # logs them), so its per-source metrics survive into the logged payload.
+        #
+        # Weights first, then the cursor: at resume the DCP load frees its
+        # materialization buffers before the dataloader prefetches, and at
+        # save a crash between the two leaves weights whose trainer state is
+        # merely absent, which resumes with a warning.
         self._callbacks = [
             self.environ_meter_callback,
             self.tqdm_callback,
             self.channel_loss_callback,
             self.wandb_callback,
             self.profile_callback,
-            self.checkpointer_callback,
-            self.hf_ckpt_callback,
+            self.checkpoint_callback,
+            self.global_state_callback,
             self.evaluate_callback,
             self.moe_monitor_callback,
         ]
         self.state = TrainerState()
+
+    def load(self) -> None:
+        """Resume this job's model weights and optimizer."""
+        self.checkpoint.load()
+
+    def save_dcp(self, state: TrainerState) -> None:
+        """Write this job's resumable checkpoint for ``state.global_step``."""
+        self.checkpoint.save_dcp(state)
+
+    def save_hf_or_lora(self, state: TrainerState, stage: str = "step_end") -> None:
+        """Export this job's weights in whichever format the model was trained in."""
+        self.checkpoint.save_hf_or_lora(state, stage=stage)
+
+    def save_model_assets(self) -> None:
+        from ..models.module_utils import save_model_assets as _save_model_assets
+
+        args: VeOmniArguments = self.args
+        if args.train.global_rank == 0:
+            _save_model_assets(args.train.checkpoint.model_assets_dir, self.model_assets)
+        dist.barrier()
 
     def on_train_begin(self):
         for callback in self._callbacks:
