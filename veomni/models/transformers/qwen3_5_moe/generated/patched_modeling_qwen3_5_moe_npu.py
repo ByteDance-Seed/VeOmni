@@ -39,8 +39,6 @@
 #      Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator
 #    - method_override: Qwen3_5MoeForConditionalGeneration.__init__
 #      Build the MTP head when enabled
-#    - method_override: Qwen3_5MoeForConditionalGeneration.get_extra_collate_infos
-#      Declare the MTP label collate rule
 #    - class_replacement: Qwen3_5MoeExperts
 #      Remove @use_experts_implementation decorator and add VeOmni fused MoE dispatch path
 #    - method_override: Qwen3_5MoeGatedDeltaNet.__init__
@@ -906,7 +904,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 raise RuntimeError(
                     "Varlen Qwen3.5 GatedDeltaNet training requires a non-eager "
                     "chunk_gated_delta_rule backend. On GPU, set the implementation to 'fla' or "
-                    "'flash_qla'; on NPU, set it to 'fla_npu' or 'npu'."
+                    "'flash_qla'; on NPU, set it to 'fla' or 'npu'."
                 )
             else:
                 # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
@@ -2118,8 +2116,6 @@ class Qwen3_5MoeCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Moe
         ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """
 
-    loss_dict: dict[str, torch.Tensor] | None = None
-
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5MoeTextModel
@@ -3065,7 +3061,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5MoeForConditionalGeneration
-# Methods patched: get_position_id_func, get_metadata_collate_func, __init__, get_extra_collate_infos, forward, get_parallel_plan
+# Methods patched: get_position_id_func, get_metadata_collate_func, __init__, forward, get_parallel_plan
 # ======================================================================
 
 
@@ -3265,9 +3261,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
                 if loss_dict is not None:
                     loss_dict["foundation_loss"] = loss
 
-        return Qwen3_5MoeCausalLMOutputWithLogProbs(
+        output = Qwen3_5MoeCausalLMOutputWithLogProbs(
             loss=loss,
-            loss_dict=loss_dict,
             aux_loss=aux_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
@@ -3277,6 +3272,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
             rope_deltas=outputs.rope_deltas,
             fused_linear_aux=fused_linear_aux,
         )
+        if loss_dict is not None:
+            output.loss = loss_dict
+        return output
 
     def prepare_inputs_for_generation(
         self,
@@ -3518,12 +3516,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         # add_helper) — a bare function reference is picklable for the DataLoader
         # workers; the Qwen3.5-VL-MoE ViT formula needs no model config.
         return collate_multimodal_metadata  # noqa: F821 defined via add_helper
-
-    def get_extra_collate_infos(self):
-        """Declare the packing rule for MoE MTP labels when enabled."""
-        if self.mtp is None:
-            return {}
-        return {"mtp_labels": (-1, True, IGNORE_INDEX, 1)}  # noqa: F821
 
     # ── Expert parallel plan ─────────────────────────────────────────────────────
     def get_parallel_plan(self):

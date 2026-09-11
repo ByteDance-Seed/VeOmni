@@ -73,7 +73,6 @@ from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config imp
     qwen3_5_moe_causal_lm_get_parallel_plan_patched,
     qwen3_5_moe_forcausallm_forward_patched,
     qwen3_5_moe_forconditional_generation_forward_patched,
-    qwen3_5_moe_forconditional_generation_get_extra_collate_infos,
     qwen3_5_moe_forconditional_generation_get_metadata_collate_func,
     qwen3_5_moe_forconditional_generation_get_position_id_func,
     qwen3_5_moe_forconditional_generation_init_patched,
@@ -298,12 +297,6 @@ config.override_method(
     "Qwen3_5MoeForConditionalGeneration.__init__",
     replacement=qwen3_5_moe_forconditional_generation_init_patched,
     description="Build the MTP head when enabled",
-)
-
-config.override_method(
-    "Qwen3_5MoeForConditionalGeneration.get_extra_collate_infos",
-    replacement=qwen3_5_moe_forconditional_generation_get_extra_collate_infos,
-    description="Declare the MTP label collate rule",
 )
 
 

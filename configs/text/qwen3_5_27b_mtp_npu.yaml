@@ -5,9 +5,9 @@ model:
     rms_norm_implementation: npu
     rotary_pos_emb_implementation: npu
     cross_entropy_loss_implementation: chunk_loss
-    rms_norm_gated_implementation: fla_npu
-    causal_conv1d_implementation: fla_npu
-    chunk_gated_delta_rule_implementation: fla_npu
+    rms_norm_gated_implementation: fla
+    causal_conv1d_implementation: fla
+    chunk_gated_delta_rule_implementation: fla
   model_config:
     text_config:
       mtp_loss_weight: 0.3

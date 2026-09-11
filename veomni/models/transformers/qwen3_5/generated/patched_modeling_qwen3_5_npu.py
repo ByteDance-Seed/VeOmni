@@ -49,8 +49,6 @@
 #      Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator
 #    - method_override: Qwen3_5ForConditionalGeneration.__init__
 #      Build the MTP head when text_config.mtp_loss_weight is set
-#    - method_override: Qwen3_5ForConditionalGeneration.get_extra_collate_infos
-#      Declare the MTP label collate rule for the VeOmni collator
 #    - method_override: Qwen3_5ForConditionalGeneration.forward
 #      Support fused cross entropy path in Qwen3_5ForConditionalGeneration.forward
 #
@@ -823,7 +821,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 raise RuntimeError(
                     "Varlen Qwen3.5 GatedDeltaNet training requires a non-eager "
                     "chunk_gated_delta_rule backend. On GPU, set the implementation to 'fla' or "
-                    "'flash_qla'; on NPU, set it to 'fla_npu' or 'npu'."
+                    "'flash_qla'; on NPU, set it to 'fla' or 'npu'."
                 )
             else:
                 # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
@@ -2707,19 +2705,12 @@ class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Causal
         (``log_probs`` / ``entropy``; plus ``distillation_losses`` /
         ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
         ``None`` on the plain loss path; populated when ``return_log_probs=True``.
-    loss_dict (`dict[str, torch.Tensor]`, *optional*):
-        Per-head losses when more than one head is supervised (MTP). Mirrors the
-        GPU config — see there for why this cannot live in ``loss`` itself
-        (``ModelOutput.__post_init__`` scatters a dict first field and deletes
-        ``loss`` when every other field is None).
     """
-
-    loss_dict: dict[str, torch.Tensor] | None = None
 
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5ForConditionalGeneration
-# Methods patched: get_position_id_func, get_metadata_collate_func, __init__, get_extra_collate_infos, forward
+# Methods patched: get_position_id_func, get_metadata_collate_func, __init__, forward
 # ======================================================================
 
 
@@ -2884,9 +2875,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             weight = _mtp_loss_weight(self.config.text_config)  # noqa: F821 defined via add_helper
             loss_dict = {"foundation_loss": loss, "mtp_loss": weight * mtp_loss}
 
-        return Qwen3_5CausalLMOutputWithLogProbs(
+        output = Qwen3_5CausalLMOutputWithLogProbs(
             loss=loss,
-            loss_dict=loss_dict,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
@@ -2894,6 +2884,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             rope_deltas=outputs.rope_deltas,
             fused_linear_aux=fused_linear_aux,
         )
+        if loss_dict is not None:
+            output.loss = loss_dict
+        return output
 
     def prepare_inputs_for_generation(
         self,
@@ -3135,12 +3128,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         # add_helper) — a bare function reference is picklable for the DataLoader
         # workers; the Qwen3.5-VL ViT formula needs no model config.
         return collate_multimodal_metadata  # noqa: F821 defined via add_helper
-
-    def get_extra_collate_infos(self):
-        """Declare the packing rule for MTP labels when the head is enabled."""
-        if self.mtp is None:
-            return {}
-        return {"mtp_labels": (-1, True, IGNORE_INDEX, 1)}  # noqa: F821
 
 
 class Qwen3_5TextForSequenceClassification(GenericForSequenceClassification, Qwen3_5PreTrainedModel):

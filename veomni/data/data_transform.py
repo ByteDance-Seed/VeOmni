@@ -86,7 +86,6 @@ def process_plaintext_example(
                 "input_ids": torch.tensor(input_ids),
                 "attention_mask": torch.tensor([1] * len(input_ids)),
                 "labels": torch.tensor(input_ids),
-                "position_ids": torch.arange(len(input_ids), dtype=torch.long),
             }
         )
 
@@ -114,10 +113,7 @@ def process_conversation_example(
         raise ValueError(f"text_keys must be a string or a list of strings, but got {type(text_keys)}")
 
     tokenized_example = chat_template.encode_messages(text_example, max_seq_len=max_seq_len)
-    tokenized_example = {k: torch.as_tensor(v) for k, v in tokenized_example.items()}
-    tokenized_example.setdefault(
-        "position_ids", torch.arange(tokenized_example["input_ids"].size(-1), dtype=torch.long)
-    )
+    tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
     return [tokenized_example]
 
 

@@ -9,7 +9,7 @@
   - [🔍 How the MTP head works](#-how-the-mtp-head-works)
   - [Plumbing](#plumbing)
     - [The MTP label row](#the-mtp-label-row)
-    - [Why `loss_dict` and not `loss`](#why-loss_dict-and-not-loss)
+    - [Loss dictionary contract](#loss-dictionary-contract)
     - [`mtp_context`](#mtp_context)
   - [💾 Checkpoints](#-checkpoints)
   - [📉 Cost](#-cost)
@@ -134,17 +134,16 @@ internal shift.
 
 The row is built on the **per-sample encode path**, before the sample reaches
 `MainCollator`: `ChatTemplate.encode_messages` adds it for conversation and
-Qwen-VL samples, while `process_plaintext_example` adds it after constructing
-plain-text labels. That ordering is the whole point: shifting by two inside an
-already-packed row would pull the next sample's first tokens into the tail of the
-current one. Doing every depth shift per sample makes that impossible by
-construction, so no `cu_seq_lens` boundary arithmetic is needed.
-
-`mtp_labels` is registered via `get_extra_collate_infos()` as
+Qwen-VL samples. Plain-text transforms do not currently synthesize MTP rows,
+so MTP-enabled SFT should use one of the conversation transforms. Building
+every depth shift per sample is important: shifting by two inside an already-
+packed row would pull the next sample's first tokens into the tail of the
+current one.
+`mtp_labels` is part of `DEFAULT_DATA_COLLATE_INFO` with the rule
 `(-1, True, IGNORE_INDEX, 1)`. The depth dimension is retained while samples are
-concatenated along the final sequence dimension. Registration matters beyond SP:
-`pad_to_length` pads every `pack_dim == -1` key with its `sp_pad_value`, so an
-unregistered row would be left short. Registration also makes `count_loss_token`
+concatenated along the final sequence dimension. This default rule matters
+beyond SP: `pad_to_length` pads every `pack_dim == -1` key with its `sp_pad_value`,
+so an unregistered row would be left short. It also makes `count_loss_token`
 emit `mtp_tokens` for free (it derives `{prefix}_tokens` from any `*_labels` key).
 The model flattens batch and depth for one fused loss call, so `mtp_tokens` is the
 exact denominator across all valid depth targets, including under gradient
@@ -154,19 +153,15 @@ accumulation.
 model config. When MTP is disabled, the depth is zero and no extra batch key is
 emitted, so it cannot leak into `model.forward`.
 
-### Why `loss_dict` and not `loss`
+### Loss dictionary contract
 
-Per-head losses travel in a dedicated `loss_dict` field. They **cannot** go in
-`loss`: it is field 0 of the output dataclass, and on the fused-loss path every
-other field is `None`, so `ModelOutput.__post_init__` scatters a dict first field
-into standalone attributes and deletes `loss` — leaving `outputs.loss is None`.
+Per-head losses are returned in `output.loss` as a dictionary with
+`foundation_loss` and `mtp_loss` entries. The model assigns this dictionary
+after constructing the output object, and the trainer's loss utilities preserve
+the keys for token-normalized reduction and logging.
 
-Nor can the dict be wrapped in an opaque object: `ModelOutput`'s pytree flattening
-walks `output.values()`, and FSDP2's pre-backward unshard hook depends on the loss
-tensors being reachable there. Hiding them reintroduces
-`setStorage … storage of size 0` in the fused-linear backward.
-
-`tests/trainer/test_multi_head_loss.py` pins both behaviours.
+The individual tensors remain reachable through the regular `ModelOutput` pytree,
+which is required by FSDP2's pre-backward unshard hook.
 
 ### `mtp_context`
 
@@ -239,7 +234,7 @@ MTP per step (median, +3.9%). Peak memory increased from 43.95GB to 44.89GB (+2.
 
 ## Supporting MTP for a new model
 
-The trainer-side loss plumbing (`loss_dict` in `postforward` and
+The trainer-side loss plumbing (`output.loss` dictionaries and
 `count_loss_token`'s `{prefix}_tokens`) is model-agnostic. Per model you need,
 in its patch config:
 
@@ -250,13 +245,12 @@ in its patch config:
    `mtp_context`.
 3. `__init__` overridden to construct the module under the FQN the checkpoint uses,
    plus the SP/EP asserts.
-4. `get_extra_collate_infos` returning the `mtp_labels` packing rule. Ensure
-   the model's `ChatTemplate.encode_messages` (and, for plaintext data,
-   `process_plaintext_example`) constructs the labels before packing.
+4. Ensure the model's `ChatTemplate.encode_messages` constructs the MTP rows
+   before packing. The shared `DEFAULT_DATA_COLLATE_INFO` already contains the
+   `mtp_labels` packing rule.
 5. `forward` extended with an explicit `mtp_labels` parameter (never left in
-   `**kwargs`, which would leak it into the attention and CE kernels) returning
-   `loss_dict`.
+   `**kwargs`, which would leak it into the attention and CE kernels) assigning
+   the per-head dictionary to `output.loss`.
 
-Note `config.modify_init()` looks like the natural fit for step 3 but is **dead
-API**: `PatchType.INIT_MODIFICATION` has no implementation in patchgen's codegen, so
+Note `config.modify_init()` looks like the natural fit for step 3 but is a **dead API**: `PatchType.INIT_MODIFICATION` has no implementation in patchgen's codegen, so
 the patch is silently dropped. Use `override_method("<Class>.__init__")`.

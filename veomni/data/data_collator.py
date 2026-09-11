@@ -138,6 +138,7 @@ class DataCollateInfo:
 DEFAULT_DATA_COLLATE_INFO: Dict[str, DataCollateInfo] = {
     "input_ids": DataCollateInfo(-1, True, 0, 1),
     "labels": DataCollateInfo(-1, True, IGNORE_INDEX, 1),
+    "mtp_labels": DataCollateInfo(-1, True, IGNORE_INDEX, 1),
     "attention_mask": DataCollateInfo(-1, False, 1, 1),
     "position_ids": DataCollateInfo(-1, False, 0, 1),
     "pixel_values": DataCollateInfo(0, True, 0, 4),

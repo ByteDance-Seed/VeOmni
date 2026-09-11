@@ -47,7 +47,7 @@ def test_mtp_labels_pack_on_the_sequence_dim_without_crossing_samples(monkeypatc
     for feature in features:
         add_mtp_labels(feature, num_depths=2)
 
-    collator = m.MainCollator(data_collate_info={"mtp_labels": (-1, True, IGNORE_INDEX, 1)})
+    collator = m.MainCollator()
     out = collator(features)
 
     expected = torch.tensor(

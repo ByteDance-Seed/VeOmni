@@ -43,8 +43,6 @@
 #      Support fused cross entropy path in Qwen3_5ForCausalLM.forward
 #    - method_override: Qwen3_5ForConditionalGeneration.__init__
 #      Build the MTP head when text_config.mtp_loss_weight is set
-#    - method_override: Qwen3_5ForConditionalGeneration.get_extra_collate_infos
-#      Declare the MTP label collate rule for the VeOmni collator
 #    - method_override: Qwen3_5ForConditionalGeneration.get_position_id_func
 #      Expose get_position_id_func to pre-computes position IDs per sample during data preprocessing in worker processes.
 #    - method_override: Qwen3_5ForConditionalGeneration.get_metadata_collate_func
@@ -2716,16 +2714,12 @@ class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Causal
         (``log_probs`` / ``entropy``; plus ``distillation_losses`` /
         ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
         ``None`` on the plain loss path; populated when ``return_log_probs=True``.
-    loss_dict (`dict[str, torch.Tensor]`, *optional*):
-        Per-head losses used by ``BaseTrainer.postforward``.
     """
-
-    loss_dict: dict[str, torch.Tensor] | None = None
 
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5ForConditionalGeneration
-# Methods patched: __init__, get_extra_collate_infos, get_position_id_func, get_metadata_collate_func, forward
+# Methods patched: __init__, get_position_id_func, get_metadata_collate_func, forward
 # ======================================================================
 
 
@@ -2890,9 +2884,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             weight = _mtp_loss_weight(self.config.text_config)  # noqa: F821 defined via add_helper
             loss_dict = {"foundation_loss": loss, "mtp_loss": weight * mtp_loss}
 
-        return Qwen3_5CausalLMOutputWithLogProbs(
+        output = Qwen3_5CausalLMOutputWithLogProbs(
             loss=loss,
-            loss_dict=loss_dict,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
@@ -2900,6 +2893,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             rope_deltas=outputs.rope_deltas,
             fused_linear_aux=fused_linear_aux,
         )
+        if loss_dict is not None:
+            output.loss = loss_dict
+        return output
 
     def prepare_inputs_for_generation(
         self,
@@ -3123,12 +3119,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             model_kwargs["encoder_outputs"] = _expand_dict_for_generation(model_kwargs["encoder_outputs"])
 
         return input_ids, model_kwargs
-
-    def get_extra_collate_infos(self):
-        """Declare the packing rule for MTP labels when the head is enabled."""
-        if self.mtp is None:
-            return {}
-        return {"mtp_labels": (-1, True, IGNORE_INDEX, 1)}  # noqa: F821
 
     def get_position_id_func(self):
         fake_config = copy(self.config)

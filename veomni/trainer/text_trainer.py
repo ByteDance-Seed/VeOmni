@@ -19,7 +19,6 @@ import torch
 
 from ..arguments import VeOmniArguments
 from ..data import (
-    MainCollator,
     build_chat_template,
     build_data_transform,
 )
@@ -62,7 +61,7 @@ class TextTrainer:
             self._build_data_transform()
 
             self.base._build_dataset()
-            self._build_collate_fn()
+            self.base._build_collate_fn()
             self.base._build_dataloader()
             self.base._build_parallelized_model()
             self.base._build_optimizer()
@@ -83,21 +82,12 @@ class TextTrainer:
 
     def _build_data_transform(self):
         args: VeOmniArguments = self.base.args
-        transform_kwargs = {
-            "tokenizer": self.base.tokenizer,
-            "chat_template": self.base.chat_template,
-            "max_seq_len": args.data.max_seq_len,
-            "text_keys": args.data.text_keys,
-        }
-        self.base.data_transform = build_data_transform(args.data.data_type, **transform_kwargs)
-
-    def _build_collate_fn(self):
-        model = self.base.model
-        get_extra_infos = getattr(model, "get_extra_collate_infos", None)
-        self.base.collate_fn = MainCollator(
-            pad_to_length=self.base.args.train.pad_to_length,
-            seq_classification=self.base.args.data.data_type == "classification",
-            data_collate_info=get_extra_infos() if get_extra_infos is not None else {},
+        self.base.data_transform = build_data_transform(
+            args.data.data_type,
+            tokenizer=self.base.tokenizer,
+            chat_template=self.base.chat_template,
+            max_seq_len=args.data.max_seq_len,
+            text_keys=args.data.text_keys,
         )
 
     def on_train_begin(self):

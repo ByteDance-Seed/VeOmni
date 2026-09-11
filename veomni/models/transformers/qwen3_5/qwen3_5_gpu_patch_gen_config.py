@@ -1650,11 +1650,7 @@ class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Causal
         (``log_probs`` / ``entropy``; plus ``distillation_losses`` /
         ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
         ``None`` on the plain loss path; populated when ``return_log_probs=True``.
-    loss_dict (`dict[str, torch.Tensor]`, *optional*):
-        Per-head losses used by ``BaseTrainer.postforward``.
     """
-
-    loss_dict: dict[str, torch.Tensor] | None = None
 
 
 @config.add_helper_after("Qwen3_5ModelOutputWithPast")
@@ -1802,17 +1798,6 @@ def qwen3_5_forconditional_generation_init_patched(self, config):
 
 
 @config.override_method(
-    "Qwen3_5ForConditionalGeneration.get_extra_collate_infos",
-    description="Declare the MTP label collate rule for the VeOmni collator",
-)
-def qwen3_5_forconditional_generation_get_extra_collate_infos(self):
-    """Declare the packing rule for MTP labels when the head is enabled."""
-    if self.mtp is None:
-        return {}
-    return {"mtp_labels": (-1, True, IGNORE_INDEX, 1)}  # noqa: F821
-
-
-@config.override_method(
     "Qwen3_5ForConditionalGeneration.get_position_id_func",
     description="Expose get_position_id_func to pre-computes position IDs per sample during data preprocessing in worker processes.",
 )
@@ -1946,9 +1931,8 @@ def qwen3_5_forconditional_generation_forward_patched(
         weight = _mtp_loss_weight(self.config.text_config)  # noqa: F821 defined via add_helper
         loss_dict = {"foundation_loss": loss, "mtp_loss": weight * mtp_loss}
 
-    return Qwen3_5CausalLMOutputWithLogProbs(
+    output = Qwen3_5CausalLMOutputWithLogProbs(
         loss=loss,
-        loss_dict=loss_dict,
         logits=logits,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
@@ -1956,3 +1940,6 @@ def qwen3_5_forconditional_generation_forward_patched(
         rope_deltas=outputs.rope_deltas,
         fused_linear_aux=fused_linear_aux,
     )
+    if loss_dict is not None:
+        output.loss = loss_dict
+    return output

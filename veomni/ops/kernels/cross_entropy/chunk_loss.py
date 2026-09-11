@@ -98,21 +98,8 @@ def chunk_loss_function(
     **kwargs,
 ) -> torch.Tensor:
     sp_enabled = get_parallel_state().sp_enabled
-    explicit_shift = shift_labels is not None
-
-    if explicit_shift:
-        if shift_labels.ndim != labels.ndim or shift_labels.shape[:1] != labels.shape[:1]:
-            raise ValueError(
-                "shift_labels must have the same batch dimension and rank as labels; "
-                f"got labels.shape={tuple(labels.shape)}, shift_labels.shape={tuple(shift_labels.shape)}"
-            )
-        if hidden_states.ndim < 2 or shift_labels.shape[-1] != hidden_states.shape[-2]:
-            raise ValueError(
-                "shift_labels sequence length must match hidden_states; "
-                f"got shift_labels.shape={tuple(shift_labels.shape)}, "
-                f"hidden_states.shape={tuple(hidden_states.shape)}"
-            )
-        labels = shift_labels.contiguous()
+    if shift_labels is not None:
+        labels = shift_labels
     elif not sp_enabled:
         labels = labels[..., 1:].contiguous()
         hidden_states = hidden_states[..., :-1, :].contiguous()

@@ -367,7 +367,6 @@ def test_qwen3vl_emits_one_video_placeholder_per_processor_token(num_frames, num
 
     emitted = int((encoded["input_ids"] == TYPE2INDEX["input"]["video"]).sum())
     assert emitted == num_video_tokens
->>>>>>> upstream/main
 
 
 @pytest.mark.parametrize("num_frames, num_video_tokens", [(8, 65), (17, 100), (16, 1)])

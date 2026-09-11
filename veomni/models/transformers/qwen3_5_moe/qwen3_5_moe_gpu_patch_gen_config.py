@@ -578,8 +578,6 @@ class Qwen3_5MoeCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Moe
         ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """
 
-    loss_dict: dict[str, torch.Tensor] | None = None
-
 
 @config.add_helper_after("Qwen3_5MoeModelOutputWithPast")
 @dataclass
@@ -1160,17 +1158,6 @@ def qwen3_5_moe_forconditional_generation_init_patched(self, config):
 
 
 @config.override_method(
-    "Qwen3_5MoeForConditionalGeneration.get_extra_collate_infos",
-    description="Declare the MTP label collate rule",
-)
-def qwen3_5_moe_forconditional_generation_get_extra_collate_infos(self):
-    """Declare the packing rule for MoE MTP labels when enabled."""
-    if self.mtp is None:
-        return {}
-    return {"mtp_labels": (-1, True, IGNORE_INDEX, 1)}  # noqa: F821
-
-
-@config.override_method(
     "Qwen3_5MoeForConditionalGeneration.forward",
     description="Support fused cross entropy path in Qwen3_5MoeForConditionalGeneration.forward",
 )
@@ -1314,9 +1301,8 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
             if loss_dict is not None:
                 loss_dict["foundation_loss"] = loss
 
-    return Qwen3_5MoeCausalLMOutputWithLogProbs(
+    output = Qwen3_5MoeCausalLMOutputWithLogProbs(
         loss=loss,
-        loss_dict=loss_dict,
         aux_loss=aux_loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
@@ -1326,6 +1312,9 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
         rope_deltas=outputs.rope_deltas,
         fused_linear_aux=fused_linear_aux,
     )
+    if loss_dict is not None:
+        output.loss = loss_dict
+    return output
 
 
 # ── Expert parallel plan ─────────────────────────────────────────────────────

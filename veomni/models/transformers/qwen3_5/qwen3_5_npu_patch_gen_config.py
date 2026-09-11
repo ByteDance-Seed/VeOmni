@@ -49,7 +49,6 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     mm_token_type_ids_from_input_ids,
     qwen3_5_forcausallm_forward_patched,
     qwen3_5_forconditional_generation_forward_patched,
-    qwen3_5_forconditional_generation_get_extra_collate_infos,
     qwen3_5_forconditional_generation_get_metadata_collate_func,
     qwen3_5_forconditional_generation_get_position_id_func,
     qwen3_5_forconditional_generation_init_patched,
@@ -397,7 +396,7 @@ def qwen3_5_gated_deltanet_forward_patched(
             raise RuntimeError(
                 "Varlen Qwen3.5 GatedDeltaNet training requires a non-eager "
                 "chunk_gated_delta_rule backend. On GPU, set the implementation to 'fla' or "
-                "'flash_qla'; on NPU, set it to 'fla_npu' or 'npu'."
+                "'flash_qla'; on NPU, set it to 'fla' or 'npu'."
             )
         else:
             # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
@@ -889,13 +888,6 @@ config.override_method(
 
 
 config.override_method(
-    "Qwen3_5ForConditionalGeneration.get_extra_collate_infos",
-    replacement=qwen3_5_forconditional_generation_get_extra_collate_infos,
-    description="Declare the MTP label collate rule for the VeOmni collator",
-)
-
-
-config.override_method(
     "Qwen3_5ForConditionalGeneration.forward",
     replacement=qwen3_5_forconditional_generation_forward_patched,
     description="Support fused cross entropy path in Qwen3_5ForConditionalGeneration.forward",
@@ -914,11 +906,4 @@ class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Causal
         (``log_probs`` / ``entropy``; plus ``distillation_losses`` /
         ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
         ``None`` on the plain loss path; populated when ``return_log_probs=True``.
-    loss_dict (`dict[str, torch.Tensor]`, *optional*):
-        Per-head losses when more than one head is supervised (MTP). Mirrors the
-        GPU config — see there for why this cannot live in ``loss`` itself
-        (``ModelOutput.__post_init__`` scatters a dict first field and deletes
-        ``loss`` when every other field is None).
     """
-
-    loss_dict: dict[str, torch.Tensor] | None = None

@@ -307,22 +307,21 @@ def test_qwen3_5_moe_mtp_outputs_keep_auxiliary_fields():
         mtp_context=context,
     )
     loss_dict = {"foundation_loss": torch.tensor(1.0), "mtp_loss": torch.tensor(0.5)}
-    causal_output = modeling.Qwen3_5MoeCausalLMOutputWithLogProbs(loss_dict=loss_dict)
+    causal_output = modeling.Qwen3_5MoeCausalLMOutputWithLogProbs()
+    causal_output.loss = loss_dict
 
     assert model_output.mtp_context is context
     assert model_output.router_logits is router_logits
-    assert causal_output.loss_dict == loss_dict
+    assert causal_output.loss == loss_dict
 
 
 def test_qwen3_5_moe_parallel_plan_covers_mtp_experts():
     plan = get_parallel_plan()
     patterns = plan.extra_parallel_plan["ep"]
-    no_shard_patterns = plan.extra_parallel_fsdp_no_shard_module["ep"]
 
     for prefix in ("model.language_model.layers.0", "mtp.layers.0"):
         assert any(check_fqn_match(pattern, f"{prefix}.mlp.experts.gate_up_proj") for pattern in patterns)
         assert any(check_fqn_match(pattern, f"{prefix}.mlp.experts.down_proj") for pattern in patterns)
-        assert any(check_fqn_match(pattern, f"{prefix}.mlp.experts") for pattern in no_shard_patterns)
 
 
 def test_qwen3_5_moe_registry_attaches_checkpoint_converter():

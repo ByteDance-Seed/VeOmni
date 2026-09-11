@@ -1174,7 +1174,7 @@ class OpsImplementationConfig:
         default="fla",
         metadata={
             "help": "Gated RMSNorm implementation (Qwen3.5 GatedDeltaNet `self.norm`). "
-            "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU or MLU). "
+            "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'eager' uses the HuggingFace Qwen3_5RMSNormGated. "
             "'npu' uses the VeOmni NPUFusedRMSNormGated."
         },
@@ -1183,7 +1183,7 @@ class OpsImplementationConfig:
         default="fla",
         metadata={
             "help": "Varlen depthwise causal conv1d implementation (Qwen3.5 GatedDeltaNet pre-mixer). "
-            "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU or MLU). "
+            "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'eager' leaves causal_conv1d_fn unset; the varlen training path then raises "
             "because no torch fallback handles cu_seqlens. "
             "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
@@ -1195,7 +1195,7 @@ class OpsImplementationConfig:
         default="fla",
         metadata={
             "help": "Chunk gated delta-rule kernel for Qwen3.5 linear attention. "
-            "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU or MLU). "
+            "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'flash_qla' uses QwenLM FlashQLA (ships under the gpu extra, Hopper SM90 only — "
             "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "

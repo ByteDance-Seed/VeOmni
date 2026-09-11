@@ -15,10 +15,6 @@ def get_parallel_plan():
             "ep": ep_plan,
         }
     )
-    parallel_plan.extra_parallel_fsdp_no_shard_module["ep"] = {
-        "model.language_model.layers.*.mlp.experts",
-        "mtp.layers.*.mlp.experts",
-    }
     return parallel_plan
 
 
