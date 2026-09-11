@@ -261,7 +261,7 @@ def flash_attention_forward(
             "veomni_flash_attention_2_with_sp": "fa2",
             "veomni_flash_attention_4_with_sp": "fa4",
         }.get(module.config._attn_implementation)
-        if expected_backend is None or FA_BACKEND != expected_backend:
+        if cp_state.device_type != "npu" and (expected_backend is None or FA_BACKEND != expected_backend):
             raise NotImplementedError(
                 f"USP ring backend {FA_BACKEND!r} does not match the requested attention implementation "
                 f"{module.config._attn_implementation!r}. Install the matching low-level backend."
@@ -349,56 +349,21 @@ def flash_attention_forward(
     if getattr(cp_state, "cp_enabled", False) and not skip_ulysses:
         if target_dtype is not None:
             query, key, value = (tensor.to(target_dtype) for tensor in (query, key, value))
-        from ....distributed.sequence_parallel.data import local_cu_seqlens
-        from ....distributed.sequence_parallel.ring_attention import (
-            zigzag_ring_flash_attn_func,
-            zigzag_ring_flash_attn_varlen_func,
-        )
+        from ....distributed.sequence_parallel.ring_attention import ring_attention
 
-        if not is_causal:
-            raise NotImplementedError("context-parallel (cp_size>1) ring attention requires causal attention")
-        if attention_mask is not None:
-            raise NotImplementedError(
-                "context-parallel (cp_size>1) ring attention does not support explicit attention masks"
-            )
-        # ``cu_seq_lens_q`` (when present) is computed by the collator on the FULL
-        # (pre-slice) packed position_ids, so it describes the whole sequence
-        # across the ``cp`` group. A single ``[0, S]`` segment is a plain
-        # (non-packed) sequence and takes the dense ring path; multiple segments
-        # are genuinely packed documents and take the varlen ring path, where
-        # each document is zig-zag split independently across ``cp`` (see
-        # ``SequenceParallelCollator`` / ``sequence_parallel.data``).
-        cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
-        is_packed = cu_seq_lens_q is not None and cu_seq_lens_q.numel() > 2
-        # query/key/value are (b, s, h, d) here (already transposed for FA).
-        if is_packed:
-            # Derive the per-rank LOCAL document offsets for this cp-region: every
-            # document is split evenly across ``cp`` so each local document length
-            # is ``doc_len // cp_size``. ``varlen`` FA wants ``(total, h, d)``.
-            local_cu = local_cu_seqlens(cu_seq_lens_q.to(torch.int32), cp_state.cp_size)
-            seqlens = local_cu[1:] - local_cu[:-1]
-            local_max = int(seqlens.max().item()) if seqlens.numel() else 0
-            q3, k3, v3 = query.squeeze(0), key.squeeze(0), value.squeeze(0)
-            attn_output = zigzag_ring_flash_attn_varlen_func(
-                q3,
-                k3,
-                v3,
-                local_cu,
-                local_max,
-                softmax_scale=scaling,
-                causal=True,
-                group=cp_state.cp_group,
-            )
-            attn_output = attn_output.unsqueeze(0)
-        else:
-            attn_output = zigzag_ring_flash_attn_func(
-                query,
-                key,
-                value,
-                softmax_scale=scaling,
-                causal=True,
-                group=cp_state.cp_group,
-            )
+        attn_output = ring_attention(
+            query,
+            key,
+            value,
+            group=cp_state.cp_group,
+            cp_size=cp_state.cp_size,
+            device_type=cp_state.device_type,
+            cu_seqlens=kwargs.get("cu_seq_lens_q"),
+            attention_mask=attention_mask,
+            softmax_scale=scaling,
+            dropout_p=dropout,
+            causal=is_causal,
+        )
     else:
         attn_output = _flash_attention_forward(
             query,
