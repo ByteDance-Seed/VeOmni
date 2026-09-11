@@ -98,8 +98,8 @@ it contained changed once:
 | After the split, before this layout | **Only** `lr_scheduler.state_dict()`. The job cursor moved to `trainer_state_rank_{R}.pt` beside the shards. The per-rank `extra_state` files were leftover: the scheduler is replicated, so every rank wrote the same pickle. |
 
 There is no loader for `extra_state/`. A directory that only has
-`extra_state_rank_*.pt` will skip the scheduler (and, for the mixed-bag era,
-will not restore the job cursor from that pickle either). Re-run from the
+`extra_state_rank_*.pt` fails resume if a scheduler is expected: the load
+raises rather than silently restarting the LR at step 0. Re-run from the
 HuggingFace / adapter export, or convert the pickle yourself.
 
 ## Related pages

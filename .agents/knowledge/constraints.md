@@ -168,8 +168,10 @@ Core files:
       still joins the save reduction and the promotion collectives. When
       ``stage_dir`` is set, the sidecar is written under the staging directory
       and copied with the DCP shards, before ``.metadata`` is published.
-      Writing it into the destination first would pair a new scheduler with a
-      still-valid previous ``.metadata``.
+      Without ``stage_dir``, the sidecar is written only after ``dcp.save``
+      succeeds so a failed overwrite cannot leave a new scheduler under the
+      previous ``.metadata``. A resume that expects a scheduler and finds no
+      ``lr_scheduler.pt`` raises — older ``extra_state/`` pickles are not loaded.
     - ``trainer_state_rank_{R}.pt`` stays per-rank: the dataloader cursor and RNG
       are rank-local. Changing world size still requires a matching cursor file
       per rank. On-disk layout: ``docs/usage/checkpoint.md``.

@@ -705,8 +705,10 @@ class DistributedCheckpointer(CheckpointerBase):
             stage_dir: write the checkpoint here and copy it to ``path`` afterwards,
                 instead of writing straight to ``path``. Intended for a destination far
                 slower than local disk. The lr_scheduler sidecar is a single
-                ``lr_scheduler.pt`` written under the staging directory and copied
-                with the shards, before ``.metadata`` is published. The caller owns
+                ``lr_scheduler.pt``. With staging it is written under the staging
+                directory and copied with the shards, before ``.metadata`` is
+                published; without staging it is written only after ``dcp.save``
+                succeeds. The caller owns
                 the choice: this does not probe
                 for a usable directory or check free space, and an unusable ``stage_dir``
                 fails the save rather than silently writing elsewhere. See
@@ -743,16 +745,17 @@ class DistributedCheckpointer(CheckpointerBase):
                 load=False,
             )
 
-        # Prepare staging before the sidecar. Writing ``lr_scheduler.pt`` into a
-        # still-valid destination would pair a new scheduler with the previous
-        # model and optimizer: ``.metadata`` stays up until promotion, and a
-        # failed staged save would leave the same mix.
+        # Prepare staging before DCP. The sidecar lives under staging and is
+        # copied with the shards, before ``.metadata`` is published: writing it
+        # into a still-valid destination would pair a new scheduler with the
+        # previous model and optimizer.
         stage_path = _prepare_stage_dir(stage_dir, path) if stage_dir else None
-
-        # Sidecar first so a model/optimizer write is never missing its scheduler.
-        # Rank 0 writes the single replicated file; every rank still enters the
-        # reduction so a write failure cannot leave peers inside ``dcp.save``.
-        cls._save_lr_scheduler(checkpoint_dir=stage_path or checkpoint_dir, state=state)
+        if stage_path is not None:
+            cls._save_lr_scheduler(checkpoint_dir=stage_path, state=state)
+        elif save_async:
+            # Async ``execute_save`` returns before DCP finishes, so the sidecar
+            # has to go out first. ``stage_dir`` is rejected with ``save_async``.
+            cls._save_lr_scheduler(checkpoint_dir=checkpoint_dir, state=state)
 
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(stage_path or checkpoint_dir)
@@ -771,6 +774,13 @@ class DistributedCheckpointer(CheckpointerBase):
 
         if stage_path is not None:
             _promote_staged_checkpoint(stage_path, checkpoint_dir)
+        elif not save_async:
+            # Unstaged sync: write the sidecar only after DCP succeeds so a
+            # failed overwrite cannot leave a new scheduler under the previous
+            # ``.metadata``. Rank 0 writes; every rank still enters the
+            # reduction so a write failure cannot leave peers inside a later
+            # collective.
+            cls._save_lr_scheduler(checkpoint_dir=checkpoint_dir, state=state)
 
         logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 
@@ -956,8 +966,11 @@ class DistributedCheckpointer(CheckpointerBase):
 
         lr_scheduler_path = os.path.join(checkpoint_dir, _LR_SCHEDULER_FILENAME)
         if not os.path.exists(lr_scheduler_path):
-            logger.warning_rank0(f"lr_scheduler sidecar not found at {lr_scheduler_path}, skipping")
-            return
+            raise FileNotFoundError(
+                f"lr_scheduler sidecar not found at {lr_scheduler_path}. "
+                "This layout writes lr_scheduler.pt next to the DCP shards "
+                "(see docs/usage/checkpoint.md). Older extra_state/ pickles are not loaded."
+            )
         lr_scheduler.load_state_dict(torch.load(lr_scheduler_path, weights_only=False))
 
 

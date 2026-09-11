@@ -1128,6 +1128,15 @@ class TestLrSchedulerSaveLoad:
         DistributedCheckpointer._save_lr_scheduler(str(tmp_path), {"lr_scheduler": None})
         DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": None})
 
+    def test_missing_sidecar_raises_when_scheduler_is_expected(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        loaded = MagicMock()
+        with pytest.raises(FileNotFoundError, match="lr_scheduler sidecar"):
+            DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": loaded})
+        loaded.load_state_dict.assert_not_called()
+
 
 class TestPromoteStagedCheckpoint:
     """`stage_dir` promotion: a staged checkpoint becomes visible only once complete.
@@ -1613,6 +1622,47 @@ class TestStageDirValidation:
                     save_async=False,
                     global_steps=10,
                     stage_dir=str(tmp_path / "stage"),
+                )
+
+        assert torch.load(sidecar, weights_only=False) == previous
+        assert (step_dir / ".metadata").read_text() == "previous"
+
+    def test_failed_unstaged_overwrite_does_not_change_previous_scheduler(self, tmp_path):
+        """A failed unstaged save must not mutate the live checkpoint's scheduler.
+
+        Without ``stage_dir`` the destination is the write target. Writing the
+        new sidecar before ``dcp.save`` would leave it under the previous
+        ``.metadata`` if that write failed.
+        """
+        from veomni.checkpoint.dcp_checkpointer import _LR_SCHEDULER_FILENAME, DistributedCheckpointer
+
+        final = tmp_path / "ckpt"
+        step_dir = final / "global_step_10"
+        step_dir.mkdir(parents=True)
+        (step_dir / ".metadata").write_text("previous")
+        (step_dir / "__0_0.distcp").write_text("old-weights")
+        sidecar = step_dir / _LR_SCHEDULER_FILENAME
+        previous = {"last_epoch": 10, "base_lrs": [1e-4]}
+        torch.save(previous, sidecar)
+
+        new_scheduler = MagicMock()
+        new_scheduler.state_dict.return_value = {"last_epoch": 99, "base_lrs": [1e-3]}
+
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
+            patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=lambda failed: failed),
+            patch.object(DistributedCheckpointer, "execute_save", side_effect=OSError("dcp write failed")),
+            patch.object(DistributedCheckpointer, "_create_storage_writer"),
+            patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+        ):
+            with pytest.raises(OSError, match="dcp write failed"):
+                DistributedCheckpointer.save(
+                    path=str(final),
+                    state={"model": MagicMock(), "lr_scheduler": new_scheduler},
+                    save_async=False,
+                    global_steps=10,
                 )
 
         assert torch.load(sidecar, weights_only=False) == previous
