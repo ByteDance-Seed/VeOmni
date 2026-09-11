@@ -165,13 +165,15 @@ Core files:
     - DCP operations are collective — all ranks must call save/load simultaneously.
     - Calling checkpoint operations from only rank 0 causes deadlocks.
     - ``lr_scheduler.pt`` is replicated: rank 0 writes the file, but every rank
-      still joins the save reduction and the promotion collectives. When
-      ``stage_dir`` is set, the sidecar is written under the staging directory
-      and copied with the DCP shards, before ``.metadata`` is published.
-      Without ``stage_dir``, the sidecar is written only after ``dcp.save``
-      succeeds so a failed overwrite cannot leave a new scheduler under the
-      previous ``.metadata``. A resume that expects a scheduler and finds no
-      ``lr_scheduler.pt`` raises — older ``extra_state/`` pickles are not loaded.
+      still joins the save reduction and the promotion collectives. Sidecar and
+      DCP shards are always written off the live step directory — under
+      ``stage_dir`` when set, otherwise a ``global_step_{N}.inprogress`` sibling
+      — and copied before ``.metadata`` is published. ``save_async`` returns
+      from ``save()`` without promoting; ``wait_for_pending_save()`` waits for
+      the future and then promotes, or discards the sibling on failure so the
+      published checkpoint is unchanged. A resume that expects a scheduler and
+      finds no ``lr_scheduler.pt`` raises — older ``extra_state/`` pickles are
+      not loaded.
     - ``trainer_state_rank_{R}.pt`` stays per-rank: the dataloader cursor and RNG
       are rank-local. Changing world size still requires a matching cursor file
       per rank. On-disk layout: ``docs/usage/checkpoint.md``.

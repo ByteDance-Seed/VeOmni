@@ -803,7 +803,9 @@ class CheckpointConfig:
                 "the choice of directory: nothing is probed and free space is not checked, "
                 "so point it at a node-local filesystem that can hold every rank on the node "
                 "writing the model plus its optimizer state at once. Unset (default) writes "
-                "directly. Cannot be combined with `save_async`."
+                "to a `global_step_{N}.inprogress` sibling of the destination and copies it "
+                "into place after DCP finishes (`save_async` promotes from "
+                "`wait_for_pending_save`). Cannot be combined with `save_async`."
             )
         },
     )

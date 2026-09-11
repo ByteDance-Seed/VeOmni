@@ -739,6 +739,7 @@ class TestWaitForPendingSave:
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
         DistributedCheckpointer.save_future = None
+        DistributedCheckpointer._pending_promote = None
 
     def test_noop_when_no_pending_save(self):
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
@@ -1479,6 +1480,12 @@ class TestPromoteStagedCheckpoint:
 
 
 class TestStageDirValidation:
+    def teardown_method(self):
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        DistributedCheckpointer.save_future = None
+        DistributedCheckpointer._pending_promote = None
+
     def test_every_checkpoint_of_a_run_reuses_one_emptied_directory(self, tmp_path):
         """A killed save strands a model-plus-optimizer-sized copy on the scratch disk.
 
@@ -1625,9 +1632,9 @@ class TestStageDirValidation:
     def test_failed_unstaged_overwrite_does_not_change_previous_scheduler(self, tmp_path):
         """A failed unstaged save must not mutate the live checkpoint's scheduler.
 
-        Without ``stage_dir`` the destination is the write target. Writing the
-        new sidecar before ``dcp.save`` would leave it under the previous
-        ``.metadata`` if that write failed.
+        Without ``stage_dir``, shards and the sidecar land in ``*.inprogress``.
+        A failed ``dcp.save`` discards that sibling; the published
+        ``.metadata`` and ``lr_scheduler.pt`` stay as they were.
         """
         from veomni.checkpoint.dcp_checkpointer import _LR_SCHEDULER_FILENAME, DistributedCheckpointer
 
@@ -1663,17 +1670,112 @@ class TestStageDirValidation:
         assert torch.load(sidecar, weights_only=False) == previous
         assert (step_dir / ".metadata").read_text() == "previous"
 
-    def test_unset_stage_dir_writes_straight_to_the_destination(self, tmp_path):
-        """Staging is opt-in: unset, nothing about the write changes.
+    def test_sidecar_serialization_failure_does_not_change_previous_scheduler(self, tmp_path):
+        """A failed ``torch.save`` of the sidecar must not publish a new checkpoint.
 
-        DCP is pointed at the destination itself, and neither the staging directory
-        nor the promotion is reached -- so no scratch disk is touched and no extra
-        collective is issued.
+        Sidecar and DCP both write under ``*.inprogress``; promotion is the
+        only path that touches the live ``.metadata``.
         """
-        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+        from veomni.checkpoint.dcp_checkpointer import _LR_SCHEDULER_FILENAME, DistributedCheckpointer
 
         final = tmp_path / "ckpt"
+        step_dir = final / "global_step_10"
+        step_dir.mkdir(parents=True)
+        (step_dir / ".metadata").write_text("previous")
+        (step_dir / "__0_0.distcp").write_text("old-weights")
+        sidecar = step_dir / _LR_SCHEDULER_FILENAME
+        previous = {"last_epoch": 10, "base_lrs": [1e-4]}
+        torch.save(previous, sidecar)
+
+        new_scheduler = MagicMock()
+        new_scheduler.state_dict.return_value = {"last_epoch": 99, "base_lrs": [1e-3]}
+
         with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
+            patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=lambda failed: failed),
+            patch("veomni.checkpoint.dcp_checkpointer.torch.save", side_effect=OSError("sidecar write failed")),
+            patch.object(DistributedCheckpointer, "execute_save") as execute_save,
+            patch.object(DistributedCheckpointer, "_create_storage_writer"),
+            patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+        ):
+            with pytest.raises(OSError, match="sidecar write failed"):
+                DistributedCheckpointer.save(
+                    path=str(final),
+                    state={"model": MagicMock(), "lr_scheduler": new_scheduler},
+                    save_async=False,
+                    global_steps=10,
+                )
+
+        execute_save.assert_not_called()
+        assert torch.load(sidecar, weights_only=False) == previous
+        assert (step_dir / ".metadata").read_text() == "previous"
+
+    def test_failed_async_dcp_does_not_change_previous_scheduler(self, tmp_path):
+        """A failed ``save_future`` must not promote the inprogress sidecar.
+
+        ``save()`` returns before DCP finishes; promotion waits in
+        ``wait_for_pending_save``. Failure discards the sibling and leaves
+        the published checkpoint as it was.
+        """
+        from veomni.checkpoint.dcp_checkpointer import _LR_SCHEDULER_FILENAME, DistributedCheckpointer
+
+        final = tmp_path / "ckpt"
+        step_dir = final / "global_step_10"
+        step_dir.mkdir(parents=True)
+        (step_dir / ".metadata").write_text("previous")
+        (step_dir / "__0_0.distcp").write_text("old-weights")
+        sidecar = step_dir / _LR_SCHEDULER_FILENAME
+        previous = {"last_epoch": 10, "base_lrs": [1e-4]}
+        torch.save(previous, sidecar)
+
+        new_scheduler = MagicMock()
+        new_scheduler.state_dict.return_value = {"last_epoch": 99, "base_lrs": [1e-3]}
+
+        def fail_async_save(*args, **kwargs):
+            future = MagicMock()
+            future.result.side_effect = OSError("async dcp failed")
+            DistributedCheckpointer.save_future = future
+
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
+            patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=lambda failed: failed),
+            patch.object(DistributedCheckpointer, "execute_save", side_effect=fail_async_save),
+            patch.object(DistributedCheckpointer, "_create_storage_writer"),
+            patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+        ):
+            DistributedCheckpointer.save(
+                path=str(final),
+                state={"model": MagicMock(), "lr_scheduler": new_scheduler},
+                save_async=True,
+                global_steps=10,
+            )
+            with pytest.raises(OSError, match="async dcp failed"):
+                DistributedCheckpointer.wait_for_pending_save()
+
+        assert torch.load(sidecar, weights_only=False) == previous
+        assert (step_dir / ".metadata").read_text() == "previous"
+        assert DistributedCheckpointer._pending_promote is None
+
+    def test_unset_stage_dir_writes_to_inprogress_then_promotes(self, tmp_path):
+        """Without ``stage_dir``, DCP still does not write the live step directory.
+
+        Shards and ``lr_scheduler.pt`` land in ``global_step_N.inprogress`` and
+        ``_promote_staged_checkpoint`` publishes them, sidecar before ``.metadata``.
+        """
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer, _inprogress_dir
+
+        final = tmp_path / "ckpt"
+        step_dir = final / "global_step_10"
+        inprogress = _inprogress_dir(str(step_dir))
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
+            patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=lambda failed: failed),
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,
             patch.object(DistributedCheckpointer, "_create_storage_writer") as create_writer,
             patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
@@ -1688,10 +1790,55 @@ class TestStageDirValidation:
                 global_steps=10,
             )
 
-        assert create_writer.call_args.args[0] == str(final / "global_step_10")
+        assert create_writer.call_args.args[0] == inprogress
         assert execute_save.call_args.kwargs["storage_writer"] is create_writer.return_value
         prepare.assert_not_called()
-        promote.assert_not_called()
+        promote.assert_called_once()
+        assert promote.call_args.args == (inprogress, str(step_dir))
+        assert promote.call_args.kwargs["node_local"] is False
+
+    def test_async_unstaged_save_promotes_after_wait_not_inside_save(self, tmp_path):
+        """``save_async`` must not wait or promote inside ``save()``.
+
+        Training overlaps the DCP write; ``wait_for_pending_save`` is the
+        atomic publish.
+        """
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer, _inprogress_dir
+
+        final = tmp_path / "ckpt"
+        step_dir = final / "global_step_10"
+        inprogress = _inprogress_dir(str(step_dir))
+
+        def succeed_async(*args, **kwargs):
+            future = MagicMock()
+            future.result.return_value = None
+            DistributedCheckpointer.save_future = future
+
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
+            patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=lambda failed: failed),
+            patch.object(DistributedCheckpointer, "execute_save", side_effect=succeed_async),
+            patch.object(DistributedCheckpointer, "_create_storage_writer"),
+            patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
+            patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+            patch("veomni.checkpoint.dcp_checkpointer._promote_staged_checkpoint") as promote,
+        ):
+            DistributedCheckpointer.save(
+                path=str(final),
+                state={"model": MagicMock()},
+                save_async=True,
+                global_steps=10,
+            )
+            promote.assert_not_called()
+            DistributedCheckpointer.wait_for_pending_save()
+
+        promote.assert_called_once()
+        assert promote.call_args.args == (inprogress, str(step_dir))
+        assert promote.call_args.kwargs["node_local"] is False
+        assert DistributedCheckpointer._pending_promote is None
+        assert DistributedCheckpointer.save_future is None
 
     def test_stage_dir_with_explicit_storage_writer_is_rejected(self, tmp_path):
         """Silently ignoring stage_dir would write to the slow destination it was avoiding."""
@@ -1705,6 +1852,20 @@ class TestStageDirValidation:
                 save_async=False,
                 storage_writer=MagicMock(),
                 stage_dir=str(tmp_path / "stage"),
+            )
+        assert not final.exists()
+
+    def test_explicit_storage_writer_without_stage_dir_is_rejected(self, tmp_path):
+        """A caller writer would send DCP to a different path than the sidecar."""
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        final = tmp_path / "ckpt"
+        with pytest.raises(ValueError, match="explicit storage_writer"):
+            DistributedCheckpointer.save(
+                path=str(final),
+                state={"model": MagicMock()},
+                save_async=False,
+                storage_writer=MagicMock(),
             )
         assert not final.exists()
 
