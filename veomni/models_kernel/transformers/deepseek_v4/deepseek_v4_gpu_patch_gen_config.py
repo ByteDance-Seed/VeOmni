@@ -36,6 +36,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4CSACache,
     DeepseekV4HCACache,
+    DeepseekV4IndexerScorer,
     apply_rotary_pos_emb,
 )
 from transformers.processing_utils import Unpack
@@ -66,9 +67,17 @@ from veomni.models_kernel.utils.op_utils import (
     linear_bias,
     resolve_moe_impl,
     resolve_op_impl,
+    resolve_qat_impl,
 )
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
+from veomni.ops.qat import (
+    fp4_fake_quant_weight,
+    fp8_fake_quant_act,
+    fp8_fake_quant_act_prefix,
+    fp8_fake_quant_stacked_weight,
+    qat_linear,
+)
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs, MoeModelOutputWithIndexerKL
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
@@ -94,11 +103,23 @@ config = PatchConfig(
     description="DeepseekV4 with VeomniOp RMS / RoPE / SwiGLU / MoE / mHC / DSA / fused loss",
 )
 
+config.add_import("typing", names=["Optional"])
+
 config.add_import("functools", names=["partial"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models_kernel.utils.op_utils",
-    names=["empty_bias", "linear_bias", "resolve_op_impl", "resolve_moe_impl"],
+    names=["empty_bias", "linear_bias", "resolve_op_impl", "resolve_moe_impl", "resolve_qat_impl"],
+)
+config.add_import(
+    "veomni.ops.qat",
+    names=[
+        "fp4_fake_quant_weight",
+        "fp8_fake_quant_act",
+        "fp8_fake_quant_act_prefix",
+        "fp8_fake_quant_stacked_weight",
+        "qat_linear",
+    ],
 )
 config.add_import(
     "veomni.models_kernel.loss_utils",
@@ -373,6 +394,38 @@ def deepseek_v4_decoder_layer_forward_patched(
     return output
 
 
+@config.add_helper
+def veomni_qat_linear(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Run a deployment FP8 GEMM recipe when DeepSeek-V4 QAT is enabled."""
+    return qat_linear(linear, x, enabled=resolve_qat_impl() == "fp8_blockwise")
+
+
+@config.add_helper
+def veomni_qat_fake_quant_kv(kv: torch.Tensor, rope_features: int) -> torch.Tensor:
+    """Fake-quantize cached NoPE channels while preserving the RoPE tail."""
+    if resolve_qat_impl() != "fp8_blockwise" or kv.numel() == 0:
+        return kv
+    return fp8_fake_quant_act_prefix(kv, kv.shape[-1] - rope_features, block_size=64)
+
+
+@config.add_helper
+def veomni_qat_fake_quant_act(x: torch.Tensor) -> torch.Tensor:
+    """Fake-quantize a complete activation in 1x128 blocks."""
+    if resolve_qat_impl() != "fp8_blockwise" or x.numel() == 0:
+        return x
+    return fp8_fake_quant_act(x, block_size=128)
+
+
+@config.add_helper
+def veomni_qat_fake_quant_expert_weight(weight: torch.Tensor, expert_dtype: str) -> torch.Tensor:
+    """Fake-quantize routed expert weights using the checkpoint's dtype."""
+    if resolve_qat_impl() != "fp8_blockwise":
+        return weight
+    if expert_dtype == "fp4":
+        return fp4_fake_quant_weight(weight)
+    return fp8_fake_quant_stacked_weight(weight)
+
+
 # ================================================================
 # Patch: packed compressed-attention windows
 # 1. Keep every HCA/CSA compression window within one packed sequence.
@@ -465,6 +518,7 @@ def deepseek_v4_hca_compressor_forward_patched(
         )
         if cp_enabled:
             compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
+        compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
         compressed_kv = compressed.unsqueeze(1)
         candidates = CompressedCandidates(
             range_starts=rate_metadata["range_starts"],
@@ -515,6 +569,7 @@ def deepseek_v4_hca_compressor_forward_patched(
         compressed = cache_layer.update_compressor_states("compressor", compressed)
     if cp_enabled:
         compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
+    compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
     compressed_kv = compressed.unsqueeze(1)
 
     compressed_len = compressed_kv.shape[2]
@@ -615,6 +670,7 @@ def deepseek_v4_csa_compressor_forward_patched(
         )
         if cp_enabled:
             compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
+        compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
         compressed_kv = compressed.unsqueeze(1)
         # The indexer gets the global metadata next to a local shard on purpose: it
         # summarises the same windows through its own projections, so it does its
@@ -698,6 +754,7 @@ def deepseek_v4_csa_compressor_forward_patched(
         compressed = cache_layer.update_compressor_states("compressor", compressed)
     if cp_enabled:
         compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
+    compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
     compressed_kv = compressed.unsqueeze(1)
     indexer_output = self.indexer(
         hidden_states,
@@ -729,15 +786,13 @@ def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config") -> None:
     self.num_heads = config.index_n_heads
     self.head_dim = config.index_head_dim
     self.index_topk = config.index_topk
-    self.softmax_scale = self.head_dim**-0.5
-    self.weights_scaling = self.num_heads**-0.5
     self.kv_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
     self.gate_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
     self.position_bias = nn.Parameter(torch.empty(self.compress_rate, 2 * self.head_dim))
     self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
     self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
-    self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
     self.rotary_emb = DeepseekV4RotaryEmbedding(config)
+    self.scorer = DeepseekV4IndexerScorer(config)
     self.veomni_dsa_indexer = VeomniOp(
         "dsa_indexer",
         "deepseek_v4",
@@ -915,12 +970,16 @@ def deepseek_v4_indexer_forward_patched(
 
     if cp_enabled:
         compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
+    compressed = veomni_qat_fake_quant_act(compressed)
     compressed_kv = compressed if cache_layer is None else cache_layer.update_compressor_states("indexer", compressed)
 
     cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
-    q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
+    q = veomni_qat_linear(self.q_b_proj, q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
     q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
-    weights = self.weights_proj(hidden_states).float() * (self.weights_scaling * self.softmax_scale)
+    q = veomni_qat_fake_quant_act(q)
+    weights = self.scorer.weights_proj(hidden_states).float() * (
+        self.scorer.weights_scaling * self.scorer.softmax_scale
+    )
     compressed_len = compressed_kv.shape[1]
     top_k = min(self.index_topk, max(compressed_len, 1))
 
@@ -1054,13 +1113,14 @@ def deepseek_v4_attention_forward_patched(
     hidden_shape = (*input_shape, -1, self.head_dim)
     cos, sin = position_embeddings[self.rope_layer_type]
 
-    q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
-    q = self.q_b_norm(self.q_b_proj(q_residual).view(*hidden_shape))
+    q_residual = self.q_a_norm(veomni_qat_linear(self.q_a_proj, hidden_states))
+    q = self.q_b_norm(veomni_qat_linear(self.q_b_proj, q_residual).view(*hidden_shape))
     q = q.transpose(1, 2)
     q = apply_rotary_pos_emb(q, cos, sin)
 
-    kv = self.kv_norm(self.kv_proj(hidden_states)).view(*hidden_shape).transpose(1, 2)
+    kv = self.kv_norm(veomni_qat_linear(self.kv_proj, hidden_states)).view(*hidden_shape).transpose(1, 2)
     kv = apply_rotary_pos_emb(kv, cos, sin)
+    kv = veomni_qat_fake_quant_kv(kv, self.config.qk_rope_head_dim)
 
     if past_key_values is not None:
         kv = past_key_values.update(kv, kv, self.layer_idx)[0]
@@ -1250,8 +1310,8 @@ def deepseek_v4_attention_forward_patched(
 
     attn_output = apply_rotary_pos_emb(attn_output.transpose(1, 2), cos, -sin).transpose(1, 2)
     grouped = attn_output.reshape(*input_shape, self.config.o_groups, -1)
-    grouped = self.o_a_proj(grouped).flatten(2)
-    output = self.o_b_proj(grouped)
+    grouped = veomni_qat_linear(self.o_a_proj, grouped).flatten(2)
+    output = veomni_qat_linear(self.o_b_proj, grouped)
     if build_indexer_loss:
         return output, attn_weights, indexer_kl, indexer_uniform
     return output, attn_weights
@@ -1608,6 +1668,7 @@ class PatchedDeepseekV4Experts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
         self.limit = config.swiglu_limit
+        self.expert_dtype = getattr(config, "expert_dtype", "fp8")
         self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
 
     def forward(
@@ -1616,15 +1677,18 @@ class PatchedDeepseekV4Experts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        unused = empty_bias(self.gate_up_proj)
+        hidden_states = veomni_qat_fake_quant_act(hidden_states)
+        down_proj = veomni_qat_fake_quant_expert_weight(self.down_proj, self.expert_dtype)
+        gate_up_proj = veomni_qat_fake_quant_expert_weight(self.gate_up_proj, self.expert_dtype)
+        unused = empty_bias(gate_up_proj)
         return self.veomni_moe(
             hidden_states,
             top_k_weights.to(hidden_states.dtype),
             top_k_index,
             unused,
             unused,
-            self.down_proj,
-            self.gate_up_proj,
+            down_proj,
+            gate_up_proj,
             num_experts=self.num_experts,
             swiglu_limit=self.limit,
         )
@@ -1656,6 +1720,10 @@ def deepseek_v4_mlp_init_patched(self, config):
     description="Always call the local swiglu_mlp VeomniOp",
 )
 def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
+    if resolve_qat_impl() == "fp8_blockwise":
+        gate = veomni_qat_linear(self.gate_proj, x).clamp(max=self.limit)
+        up = veomni_qat_linear(self.up_proj, x).clamp(min=-self.limit, max=self.limit)
+        return veomni_qat_linear(self.down_proj, self.act_fn(gate) * up)
     return self.veomni_swiglu_mlp(
         x,
         self.gate_proj.weight,

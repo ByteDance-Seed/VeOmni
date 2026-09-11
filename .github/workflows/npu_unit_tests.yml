@@ -159,6 +159,8 @@ jobs:
         run: |
           uv run --frozen pytest -v -s -x tests/models_kernel
           uv run --frozen pytest -v -s -x tests/models/test_model_registry.py
+          uv run --frozen pytest -v -s -x tests/models_kernel/test_generated_modeling_imports.py
+          uv run --frozen pytest -v -s -x tests/models_kernel/test_transformers_upgrade_compat.py
           uv run --frozen pytest -v -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -v -s -x tests/models/test_padded_packed_loss.py
           uv run --frozen pytest -v -s -x tests/models/test_vlm_trainer.py
@@ -174,13 +176,9 @@ jobs:
         # it runs on NPU via hccl).
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_moe_ep_sharded_load_matrix.py
-      - name: Run checkpoint callback unit tests
+      - name: Run checkpoint tests
         run: |
-          uv run --frozen pytest -v -s -x tests/checkpoints/test_checkpoint_callback.py
-          uv run --frozen pytest -v -s -x tests/checkpoints/test_dcp_checkpointer.py
-      - name: Run e2e dcp save and load test
-        run: |
-          uv run --frozen pytest -v -s -x tests/checkpoints/test_trainer_saveload.py
+          uv run --frozen pytest -v -s -x tests/checkpoints/
       - name: Run distributed tests (dummy_forward)
         run: |
           uv run --frozen pytest -v -s -x tests/distributed/test_async_offload_unit.py

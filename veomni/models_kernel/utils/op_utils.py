@@ -54,6 +54,12 @@ def resolve_moe_impl() -> str:
     return resolve_op_impl("moe_implementation")
 
 
+def resolve_qat_impl() -> str:
+    """Return the active model-level quantization recipe, or ``none``."""
+    cfg = get_ops_config()
+    return "none" if cfg is None else getattr(cfg, "qat_implementation", "none")
+
+
 def empty_bias(weight: Tensor) -> Tensor:
     """Empty unused-layout bias for a Linear that has ``bias=None``."""
     return weight.new_empty(0)

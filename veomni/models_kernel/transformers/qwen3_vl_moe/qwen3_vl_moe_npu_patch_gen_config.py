@@ -44,6 +44,7 @@ from veomni.models_kernel.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_c
     qwen3_vl_moe_for_conditional_generation_init_patched,
     qwen3_vl_moe_get_parallel_plan_patched,
     qwen3_vl_moe_model_forward_patched,
+    qwen3_vl_moe_model_init_patched,
 )
 from veomni.models_kernel.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config import (
     config as gpu_config,
@@ -67,6 +68,12 @@ config.helpers.extend(gpu_config.helpers)
 # now superseded by ``Qwen3VLMoeCausalLMOutputWithLogProbs`` for the FSDP2-safe
 # pre-backward unshard hook on ``lm_head``).
 config.drop_imported_names.update(gpu_config.drop_imported_names)
+
+config.override_method(
+    "Qwen3VLMoeModel.__init__",
+    replacement=qwen3_vl_moe_model_init_patched,
+    description="Construct generated towers and propagate the MoE implementation to text_config",
+)
 
 
 # ================================================================

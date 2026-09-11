@@ -76,7 +76,7 @@ def train_step(self, data_iterator):
         # ... losses summed, aux metrics averaged ...
 
     # Optimization
-    grad_norm = veomni_clip_grad_norm(self.model, self.args.train.optimizer.max_grad_norm)
+    grad_norm = veomni_clip_grad_norm(self.model, self.args.model.optimizer.max_grad_norm)
     self.optimizer.step()
     self.lr_scheduler.step()
     self.optimizer.zero_grad()
@@ -151,8 +151,8 @@ VeOmni includes several built-in callbacks:
 - **[WandbTraceCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/trace_callback.py)**: Logs metrics to wandb.
 - **[ProfileTraceCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/trace_callback.py)**: Handles profiling.
 - **[ChannelLossCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/channel_loss_callback.py)**: Logs detached per-channel causal-LM loss metrics when `train.channel_loss.enable=true`.
-- **[CheckpointerCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/checkpoint_callback.py)**: Saves training checkpoints.
-- **[HuggingfaceCkptCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/checkpoint_callback.py)**: Saves HuggingFace checkpoints.
+- **[CheckpointCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/checkpoint_callback.py)**: Saves resumable DCP checkpoints, exports HuggingFace / LoRA weights, and writes the config / tokenizer sidecars.
+- **[GlobalStateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/global_state_callback.py)**: Saves job-level state (dataloader cursor, rng, meters).
 - **[EvaluateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/evaluate_callback.py)**: Runs evaluation on the validation set.
 
 ### Custom Callbacks
@@ -216,7 +216,7 @@ To implement a specific training task (like VLM training), you should subclass `
    def build_param_groups(self):
        return [
            {"params": vit_params, "lr": self.args.train.vit_lr},
-           {"params": other_params, "lr": self.args.train.optimizer.lr}
+           {"params": other_params, "lr": self.args.model.optimizer.lr}
        ]
    ```
 

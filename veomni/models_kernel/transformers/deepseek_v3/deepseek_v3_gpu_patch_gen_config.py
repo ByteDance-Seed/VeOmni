@@ -164,8 +164,8 @@ def deepseek_v3_mlp_forward_patched(self, x):
     )
 
 
-@config.replace_class("DeepseekV3NaiveMoe", description="Always call moe_experts VeomniOp on v5 gate_up_proj weights")
-class PatchedDeepseekV3NaiveMoe(nn.Module):
+@config.replace_class("DeepseekV3Experts", description="Always call moe_experts VeomniOp on v5 gate_up_proj weights")
+class PatchedDeepseekV3Experts(nn.Module):
     """Collection of expert weights stored as 3D tensors."""
 
     def __init__(self, config):
@@ -202,10 +202,29 @@ class PatchedDeepseekV3NaiveMoe(nn.Module):
     description="Disable autocast around fp32 router linear for VeRL actor/rollout parity",
 )
 def deepseek_v3_topk_router_forward_patched(self, hidden_states):
-    hidden_states = hidden_states.view(-1, self.config.hidden_size)
+    hidden_states = hidden_states.view(-1, self.hidden_dim)
     with torch.autocast(device_type=hidden_states.device.type, enabled=False):
         router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
-    return router_logits
+    scores = router_logits.sigmoid()
+    scores_for_choice = scores + self.e_score_correction_bias
+    group_scores = (
+        scores_for_choice.view(-1, self.num_group, self.num_experts // self.num_group).topk(2, dim=-1)[0].sum(dim=-1)
+    )
+    group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1)
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(-1, self.num_group, self.num_experts // self.num_group)
+        .reshape(-1, self.num_experts)
+    )
+    scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
+    topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
+    topk_weights = scores.gather(1, topk_indices)
+    if self.norm_topk_prob:
+        topk_weights /= topk_weights.sum(dim=-1, keepdim=True) + 1e-20
+    topk_weights = topk_weights * self.routed_scaling_factor
+    return router_logits, topk_weights, topk_indices
 
 
 @config.override_method(
@@ -215,8 +234,7 @@ def deepseek_v3_topk_router_forward_patched(self, hidden_states):
 def deepseek_v3_moe_forward_patched(self, hidden_states):
     residuals = hidden_states
     orig_shape = hidden_states.shape
-    router_logits = self.gate(hidden_states)
-    topk_indices, topk_weights = self.route_tokens_to_experts(router_logits)
+    _, topk_weights, topk_indices = self.gate(hidden_states)
     record_router_indices(self.gate, topk_indices)
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
     hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)

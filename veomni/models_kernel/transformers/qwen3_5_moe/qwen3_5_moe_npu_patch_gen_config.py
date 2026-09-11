@@ -28,7 +28,6 @@ from veomni.models_kernel.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config impo
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
-    qwen3_5_text_model_update_linear_attn_mask,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_rot_pos_emb,
@@ -103,27 +102,6 @@ config.add_import(
     "veomni.models_kernel.loss_utils",
     names=["ForCausalLMLoss", "load_balancing_loss"],
 )
-config.drop_import_names(
-    "FusedRMSNormGated",
-    "causal_conv1d_fn",
-    "causal_conv1d_update",
-    "chunk_gated_delta_rule",
-    "fused_recurrent_gated_delta_rule",
-)
-config.add_post_import_block(
-    """
-    # NPU has no fla/flash_qla backend registered today; selecting a
-    # non-eager linear-attention impl raises at VeomniOp construct
-    # time. These None placeholders preserve the upstream HF top-level
-    # `is_fast_path_available = all((causal_conv1d_fn, ...))`.
-    FusedRMSNormGated = None
-    causal_conv1d_fn = None
-    causal_conv1d_update = None
-    chunk_gated_delta_rule = None
-    fused_recurrent_gated_delta_rule = None
-    """
-)
-
 # Dummy definitions for names that exist in the generated file's scope but not here.
 # The patchgen only extracts the function body; these are resolved at codegen time.
 gather_seq_scatter_heads = None
@@ -297,13 +275,6 @@ config.override_method(
     description="Support varlen flash linear attention and Ulysses SP in Qwen3_5MoeGatedDeltaNet.forward",
 )
 
-config.override_method(
-    "Qwen3_5MoeTextModel._update_linear_attn_mask",
-    replacement=qwen3_5_text_model_update_linear_attn_mask,
-    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
-)
-
-
 # ── DecoderLayer forward (NPU: plumb precomputed varlen metadata to GDN) ───────
 
 
@@ -337,7 +308,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
     linear_attn_chunk_indices_list = kwargs.pop("chunk_indices_list_q", None)
 
     # Token Mixer
-    if self.layer_type == "linear_attention":
+    if self.block_type == "linear_attention":
         # Modification: pass linear-attention cu_seqlens + precomputed metadata through to GatedDeltaNet.forward.
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
@@ -349,7 +320,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
             chunk_indices=linear_attn_chunk_indices,
             chunk_indices_list=linear_attn_chunk_indices_list,
         )
-    elif self.layer_type == "full_attention":
+    elif self.block_type == "full_attention":
         # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,

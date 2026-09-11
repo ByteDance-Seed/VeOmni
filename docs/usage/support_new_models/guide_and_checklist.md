@@ -4,7 +4,7 @@
 - [qwen3_vl_example.md](./qwen3_vl_example.md) — VLM + MoE (image/video, deepstack, EP)
 - [qwen3_omni_moe_example.md](./qwen3_omni_moe_example.md) — Omni-modal MoE (image/video/audio, talker)
 
-> **Scope note:** VeOmni now pins `transformers==5.9.0` and ships
+> **Scope note:** VeOmni now pins `transformers==5.16.1` and ships
 > patchgen-generated modeling files under
 > `veomni/models_kernel/transformers/<model>/generated/`. The runtime monkey-patch
 > flow this document was originally written for has been retired. The high-level
@@ -14,7 +14,7 @@
 > happening in `<model>_gpu_patch_gen_config.py`. For step-by-step
 > instructions on the patchgen flow, see
 > [the patchgen design guide](../../design/patchgen.md) and
-> the `veomni-migrate-transformers-v5` agent skill.
+> the `veomni-patchgen-model` agent skill.
 
 ---
 
@@ -117,7 +117,7 @@ decorators such as `replace_class`, `override_method`, and
 the checked-in `generated/*.py` and `generated/*.diff` files with `patchgen`.
 Never edit generated files directly, and do not add runtime monkey-patch
 helpers. See the [patchgen design guide](../../design/patchgen.md) and
-`veomni-migrate-transformers-v5` skill for the complete workflow.
+`veomni-patchgen-model` skill for the complete workflow.
 
 ### Step 5: Define Expert Parallelism Plan (`parallel_plan.py`, MoE only)
 

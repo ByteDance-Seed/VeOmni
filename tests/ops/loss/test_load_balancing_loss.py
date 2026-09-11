@@ -254,22 +254,25 @@ def test_triton_uses_less_peak_memory_than_hf(num_experts, top_k, num_layers, ba
     pytest.importorskip("triton")
     torch.manual_seed(0)
     base = torch.randn(num_layers, batch_size * seq_len, num_experts, device="cuda")
-    layers = tuple(base[i] for i in range(num_layers))
-    concatenated = base.reshape(-1, num_experts)
+    layers = tuple(base[i].detach().requires_grad_(True) for i in range(num_layers))
+    concatenated = base.reshape(-1, num_experts).detach().requires_grad_(True)
     triton = resolve_op("load_balancing_loss", "standard", "triton").wrapper
     empty_mask = _empty_mask("cuda")
 
-    triton(concatenated[:32], empty_mask, top_k=top_k)
+    hf_load_balancing_loss(layers, num_experts, top_k)
+    triton(concatenated, empty_mask, top_k=top_k)
     torch.cuda.synchronize()
 
+    baseline = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
     hf_load_balancing_loss(layers, num_experts, top_k)
     torch.cuda.synchronize()
-    hf_peak = torch.cuda.max_memory_allocated()
+    hf_peak = torch.cuda.max_memory_allocated() - baseline
 
+    baseline = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
     triton(concatenated, empty_mask, top_k=top_k)
     torch.cuda.synchronize()
-    triton_peak = torch.cuda.max_memory_allocated()
+    triton_peak = torch.cuda.max_memory_allocated() - baseline
 
     assert triton_peak < hf_peak

@@ -11,7 +11,7 @@
 -# original forms to accommodate minor architectural differences compared
 -# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
 +#  Source: transformers.models.llama.modeling_llama
-+#  Based on: transformers==5.9.0
++#  Based on: transformers==5.16.1
  #
 -# Licensed under the Apache License, Version 2.0 (the "License");
 -# you may not use this file except in compliance with the License.
@@ -53,7 +53,6 @@
 +
 +# Additional imports for patches
 +from functools import partial
- from typing import Optional
 
  import torch
  from torch import nn
@@ -61,7 +60,7 @@
 -from ...activations import ACT2FN
 -from ...cache_utils import Cache, DynamicCache
 -from ...generation import GenerationMixin
--from ...integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub, use_kernelized_func
+-from ...integrations import use_kernel_forward_from_hub, use_kernelized_func
 -from ...masking_utils import create_causal_mask
 -from ...modeling_layers import (
 +from transformers.activations import ACT2FN
@@ -85,6 +84,7 @@
 -from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 -from ...processing_utils import Unpack
 -from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
+-from ...utils.deprecation import deprecate_kwarg
 -from ...utils.generic import maybe_autocast, merge_with_config_defaults
 -from ...utils.output_capturing import capture_outputs
 -from .configuration_llama import LlamaConfig
@@ -93,6 +93,7 @@
 +from transformers.models.llama.configuration_llama import LlamaConfig
 +from transformers.processing_utils import Unpack
 +from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
++from transformers.utils.deprecation import deprecate_kwarg
 +from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 +from transformers.utils.output_capturing import capture_outputs
 +
@@ -133,11 +134,11 @@
 
      def extra_repr(self):
          return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-@@ -142,35 +166,31 @@
+@@ -134,35 +158,31 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
--@use_kernel_func_from_hub("rotary_pos_emb")
+-@use_kernel_forward_from_hub("rotary_pos_emb")
 -def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 -    """Applies Rotary Position Embedding to the query and key tensors.
 -
@@ -190,7 +191,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -178,10 +198,18 @@
+@@ -170,10 +190,18 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -211,7 +212,7 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -221,6 +249,12 @@
+@@ -213,6 +241,12 @@
      return attn_output, attn_weights
 
 
@@ -224,7 +225,7 @@
  @use_kernelized_func(apply_rotary_pos_emb)
  class LlamaAttention(nn.Module):
      """Multi-headed attention from 'Attention Is All You Need' paper"""
-@@ -269,11 +303,7 @@
+@@ -261,11 +295,7 @@
          if past_key_values is not None:
              key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
@@ -237,7 +238,7 @@
              self,
              query_states,
              key_states,
-@@ -425,6 +455,12 @@
+@@ -417,6 +447,12 @@
          )
 
 
@@ -250,7 +251,7 @@
  @auto_docstring
  class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -436,8 +472,9 @@
+@@ -429,8 +465,9 @@
          self.model = LlamaModel(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -262,7 +263,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -451,55 +488,105 @@
+@@ -444,55 +481,105 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,

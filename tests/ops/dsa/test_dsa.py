@@ -108,12 +108,21 @@ def _hf_dsv4_indexer_scores(
     return index_scores, top_k_indices
 
 
-def _hf_glm_indexer_indices(q: Tensor, k: Tensor, w: Tensor, top_k: int, sm_scale: float) -> Tensor:
+def _hf_glm_indexer_indices(
+    q: Tensor,
+    k: Tensor,
+    w: Tensor,
+    top_k: int,
+    sm_scale: float,
+    position_ids: Tensor,
+) -> Tensor:
     """Oracle from ``GlmMoeDsaIndexer.forward`` (transformers glm_moe_dsa)."""
     scores = torch.einsum("bshd,btd->bsht", q.float(), k.float()) * sm_scale
     scores = F.relu(scores)
     index_scores = torch.einsum("bsht,bsh->bst", scores, w.float())
-    return index_scores.topk(min(top_k, index_scores.shape[-1]), dim=-1).indices.to(torch.long)
+    future = torch.arange(k.shape[1], device=k.device).view(1, 1, -1) > position_ids.unsqueeze(-1)
+    index_scores = index_scores.masked_fill(future, float("-inf"))
+    return index_scores.topk(min(top_k, index_scores.shape[-1]), dim=-1).indices.to(torch.int32)
 
 
 def test_dsa_package_does_not_import_tilelang_eagerly():
@@ -356,9 +365,18 @@ def test_dsa_indexer_glm_eager_matches_hf():
     q = torch.randn(batch, seq_len, heads, dim)
     k = torch.randn(batch, kv_len, dim)
     w = torch.randn(batch, seq_len, heads)
+    position_ids = torch.arange(seq_len).expand(batch, -1)
     sm_scale = 0.5
-    hf = _hf_glm_indexer_indices(q, k, w, topk, sm_scale)
-    ours = resolve_op("dsa_indexer", "glm", "eager").wrapper(q, k, w, topk, ratio=1, sm_scale=sm_scale)
+    hf = _hf_glm_indexer_indices(q, k, w, topk, sm_scale, position_ids)
+    ours = resolve_op("dsa_indexer", "glm", "eager").wrapper(
+        q,
+        k,
+        w,
+        topk,
+        ratio=1,
+        sm_scale=sm_scale,
+        position_ids=position_ids,
+    )
     torch.testing.assert_close(ours, hf)
 
 

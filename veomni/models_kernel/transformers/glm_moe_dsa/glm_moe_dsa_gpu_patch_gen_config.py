@@ -63,7 +63,9 @@ config.add_import(
     "veomni.models_kernel.loss_utils",
     names=["ForCausalLMLoss"],
 )
-apply_rotary_pos_emb = None  # noqa: E305  resolved from the generated modeling file
+apply_rotary_pos_emb_interleave = None  # noqa: E305  resolved from the generated modeling file
+yarn_apply_mscale = None
+GlmMoeDsaRMSNorm = None
 
 
 @config.override_method(
@@ -87,7 +89,6 @@ def glm_moe_dsa_indexer_init_patched(self, config: "GlmMoeDsaConfig", layer_idx:
     self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
     self.weights_proj = nn.Linear(self.hidden_size, self.n_heads, bias=False)
     self.softmax_scale = self.head_dim**-0.5
-    self.register_buffer("_cached_keys", None, persistent=False)
     self.veomni_dsa_indexer = VeomniOp(
         "dsa_indexer",
         "glm",
@@ -105,45 +106,39 @@ def glm_moe_dsa_indexer_forward_patched(
     q_resid: torch.Tensor,
     position_embeddings: tuple[torch.Tensor, torch.Tensor],
     attention_mask: torch.Tensor | None,
-    use_cache: bool = False,
-) -> torch.LongTensor:
+    position_ids: torch.Tensor,
+    past_key_values: Cache | None = None,
+) -> torch.Tensor:
     batch_size, seq_len, _ = hidden_states.shape
     cos, sin = position_embeddings
 
     q = self.wq_b(q_resid)
     q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)
-    q_pe, q_nope = torch.split(q, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
-    q_pe = apply_rotary_pos_emb(q_pe, cos, sin, unsqueeze_dim=2)
-    q = torch.cat([q_pe, q_nope], dim=-1)
+    q_rot, q_pass = torch.split(q, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
 
-    k = self.k_norm(self.wk(hidden_states))
-    k_pe, k_nope = torch.split(k, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
-    k_pe = apply_rotary_pos_emb(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2).squeeze(2)
-    k = torch.cat([k_pe, k_nope], dim=-1)
+    k = self.k_norm(self.wk(hidden_states)).unsqueeze(2)
+    k_rot, k_pass = torch.split(k, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
 
-    if seq_len > 1:
-        self._cached_keys = None
+    q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin, unsqueeze_dim=2)
+    q = torch.cat([q_rot, q_pass], dim=-1)
+    k = torch.cat([k_rot, k_pass], dim=-1).squeeze(2)
 
-    if use_cache:
-        if self._cached_keys is not None:
-            k_cached = torch.cat([self._cached_keys, k], dim=1)
-        else:
-            k_cached = k
-        self._cached_keys = k_cached
-    else:
-        k_cached = k
+    if past_key_values is not None:
+        k = past_key_values.update_indexer(k, self.layer_idx)
 
-    weights = self.weights_proj(hidden_states).float() * (self.n_heads**-0.5)
+    weights = self.weights_proj(hidden_states.to(self.weights_proj.weight.dtype)).float() * (self.n_heads**-0.5)
     return self.veomni_dsa_indexer(
         q,
-        k_cached,
-        weights,
+        k,
+        weights.to(q.dtype),
         self.index_topk,
         ratio=1,
         qhead_per_kv_head=self.n_heads,
         sm_scale=self.softmax_scale,
         attention_mask=attention_mask,
-    )
+        position_ids=position_ids,
+        use_cache=past_key_values is not None,
+    ).to(torch.int32)
 
 
 @config.override_method(
@@ -167,12 +162,22 @@ def glm_moe_dsa_attention_init_patched(self, config: GlmMoeDsaConfig, layer_idx:
 
     self.is_causal = True
 
-    if self.q_lora_rank is None:
-        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
-    else:
-        self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
-        self.q_a_layernorm = GlmMoeDsaRMSNorm(config.q_lora_rank)
-        self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
+    self.q_proj = (
+        nn.Linear(config.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
+        if self.q_lora_rank is None
+        else None
+    )
+    self.q_a_proj = (
+        nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
+        if self.q_lora_rank is not None
+        else None
+    )
+    self.q_a_layernorm = GlmMoeDsaRMSNorm(config.q_lora_rank) if self.q_lora_rank is not None else None
+    self.q_b_proj = (
+        nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
+        if self.q_lora_rank is not None
+        else None
+    )
 
     self.kv_a_proj_with_mqa = nn.Linear(
         config.hidden_size,
@@ -190,12 +195,9 @@ def glm_moe_dsa_attention_init_patched(self, config: GlmMoeDsaConfig, layer_idx:
         config.hidden_size,
         bias=config.attention_bias,
     )
-    self.scaling = self.qk_head_dim ** (-0.5)
-    self.indexer = GlmMoeDsaIndexer(config, layer_idx)
+    self.scaling = yarn_apply_mscale(config.rope_parameters, self.qk_head_dim ** (-0.5))
     self.skip_topk = config.indexer_types[layer_idx] == "shared"
-    self.next_skip_topk = (
-        config.indexer_types[layer_idx + 1] == "shared" if layer_idx < len(config.indexer_types) - 1 else False
-    )
+    self.indexer = None if self.skip_topk else GlmMoeDsaIndexer(config, layer_idx)
     self.register_buffer("_cached_k_pe", None, persistent=False)
     self.register_buffer("_cached_kv", None, persistent=False)
     self.veomni_dsa_attention = VeomniOp(
@@ -215,6 +217,7 @@ def glm_moe_dsa_attention_forward_patched(
     position_embeddings: tuple[torch.Tensor, torch.Tensor],
     attention_mask: torch.Tensor | None,
     past_key_values: Cache | None = None,
+    position_ids: torch.Tensor | None = None,
     prev_topk_indices: torch.Tensor | None = None,
     **kwargs: Unpack[FlashAttentionKwargs],
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
@@ -229,11 +232,13 @@ def glm_moe_dsa_attention_forward_patched(
         query_states = self.q_b_proj(q_resid)
     query_states = query_states.view(batch_size, seq_length, -1, self.qk_head_dim).transpose(1, 2)
     q_nope, q_pe = torch.split(query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-    q_pe = apply_rotary_pos_emb(q_pe, cos, sin, unsqueeze_dim=1)
 
     compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
     k_compressed, k_pe = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
     k_compressed = self.kv_a_layernorm(k_compressed)
+    k_pe = k_pe.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
+
+    q_pe, k_pe = apply_rotary_pos_emb_interleave(q_pe, k_pe, cos, sin)
 
     kv_expanded = self.kv_b_proj(k_compressed)
     kv_expanded = kv_expanded.view(batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
@@ -241,8 +246,6 @@ def glm_moe_dsa_attention_forward_patched(
     k_nope = k_nope.transpose(1, 2)
     value_states = value_states.transpose(1, 2)
 
-    k_pe = k_pe.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
-    k_pe = apply_rotary_pos_emb(k_pe, cos, sin, unsqueeze_dim=1)
     k_pe_mqa = k_pe
     k_pe = k_pe.expand(-1, k_nope.shape[1], -1, -1)
 
@@ -250,7 +253,7 @@ def glm_moe_dsa_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    if not self.skip_topk or prev_topk_indices is None:
+    if self.indexer is not None:
         indexer_mask = (
             attention_mask[:, 0, :, :]
             if attention_mask is not None and attention_mask.dim() == 4
@@ -263,9 +266,12 @@ def glm_moe_dsa_attention_forward_patched(
             q_resid,
             position_embeddings,
             indexer_mask,
-            use_cache=past_key_values is not None,
+            position_ids,
+            past_key_values=past_key_values,
         )
     else:
+        if prev_topk_indices is None:
+            raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")
         topk_indices = prev_topk_indices
 
     kv_b_weight = self.kv_b_proj.weight.contiguous().view(
@@ -296,11 +302,14 @@ def glm_moe_dsa_attention_forward_patched(
         topk_indices,
         softmax_scale=self.scaling,
         attention_mask=attention_mask,
+        use_cache=past_key_values is not None,
+        training=self.training,
+        attention_dropout=self.attention_dropout,
     )
     attn_output = torch.einsum("bshr,hvr->bshv", compressed_attn_output, value_weight)
     attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
     attn_output = self.o_proj(attn_output)
-    return attn_output, None, topk_indices if self.next_skip_topk else None
+    return attn_output, None, topk_indices
 
 
 @config.override_method(

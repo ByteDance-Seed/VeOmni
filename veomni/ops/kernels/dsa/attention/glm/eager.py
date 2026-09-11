@@ -38,6 +38,9 @@ def wrapper(
     *,
     softmax_scale: float | None = None,
     attention_mask: Tensor | None = None,
+    use_cache: bool = False,
+    training: bool = False,
+    attention_dropout: float = 0.0,
 ) -> Tensor:
     """Official GLM eager attention on the FlashMLA packed face.
 
@@ -46,6 +49,7 @@ def wrapper(
     ``attention_mask`` is the official additive causal / padding mask,
     broadcastable to ``[B, 1, S, T]``.
     """
+    del use_cache, training, attention_dropout
     query = torch.cat((q_nope_absorbed, q_pe), dim=-1)
     key = torch.cat((kv_cache.squeeze(2), k_pe.squeeze(2)), dim=-1)
     value = kv_cache.squeeze(2)

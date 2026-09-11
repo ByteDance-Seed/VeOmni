@@ -238,7 +238,7 @@ The generated file includes:
     #  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
     # ==============================================================================
     #  Source: transformers.models.qwen3.modeling_qwen3
-    #  Based on: transformers==5.9.0
+    #  Based on: transformers==5.16.1
     #
     #  Patches applied:
     #    - class_replacement: Qwen3RMSNorm

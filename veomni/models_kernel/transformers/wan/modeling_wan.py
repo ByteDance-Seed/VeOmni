@@ -71,6 +71,30 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+def _trim_kv_tail_padding(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Trim the additive tail-padding mask for backends without mask support."""
+    if attention_mask is None:
+        return query_states, key_states, value_states, 0
+
+    seq_len = key_states.shape[-2]
+    valid_len = int((attention_mask.reshape(-1) == 0).sum().item())
+    pad_size = seq_len - valid_len
+    if pad_size <= 0:
+        return query_states, key_states, value_states, 0
+
+    return (
+        query_states[..., :valid_len, :],
+        key_states[..., :valid_len, :],
+        value_states[..., :valid_len, :],
+        pad_size,
+    )
+
+
 def sinusoidal_embedding_1d(dim, position):
     sinusoid = torch.outer(
         position.type(torch.float64),
@@ -156,6 +180,21 @@ class AttentionModule(nn.Module):
 
         attention_mask = kwargs.pop("attention_mask", None)
 
+        trim_tail_padding = self.veomni_attn.impl in {
+            "flash_attention_3",
+            "veomni_flash_attention_3",
+            "veomni_sage_attention",
+        }
+        pad_size = 0
+        if trim_tail_padding:
+            query_states, key_states, value_states, pad_size = _trim_kv_tail_padding(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+            )
+            attention_mask = None
+
         deterministic = kwargs.get("deterministic", None)
         if deterministic is None:
             deterministic = os.environ.get("FLASH_ATTENTION_DETERMINISTIC", "0") == "1"
@@ -179,6 +218,9 @@ class AttentionModule(nn.Module):
 
         if isinstance(attn_output, tuple):
             attn_output = attn_output[0]
+
+        if pad_size > 0:
+            attn_output = nn.functional.pad(attn_output, (0, 0, 0, 0, 0, pad_size))
 
         attn_output = rearrange(attn_output, "b s n d -> b s (n d)")
         return attn_output

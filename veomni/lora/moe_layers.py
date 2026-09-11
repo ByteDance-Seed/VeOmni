@@ -867,6 +867,29 @@ class LoraIndependentExperts(nn.Module):
         if not any(p.is_meta for n, p in self.named_parameters() if _is_lora_param_name(n)):
             self.reset_lora_parameters()
 
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        loaded_scaling = state_dict.get(prefix + "lora_scaling")
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        if loaded_scaling is not None and loaded_scaling.numel() == 1 and not loaded_scaling.is_meta:
+            self._lora_scale_value = loaded_scaling.to(dtype=self.lora_scaling.dtype).item()
+
     # ── PEFT-compatible accessors (same surface as LoraSharedExperts) ──────
 
     def _get_lora_container(self, role: str, param_name: str, adapter_name: str | None = None) -> _LoraParam3D:

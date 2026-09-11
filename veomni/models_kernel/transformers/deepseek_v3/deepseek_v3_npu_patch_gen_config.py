@@ -22,7 +22,7 @@ the installed ops config. No local ``triton_bmm`` on NPU.
 """
 
 from veomni.models_kernel.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config import (
-    PatchedDeepseekV3NaiveMoe,
+    PatchedDeepseekV3Experts,
     apply_rotary_pos_emb_patched,
     deepseek_v3_forcausallm_forward_patched,
     deepseek_v3_forcausallm_init_patched,
@@ -83,8 +83,8 @@ config.override_method(
     description="Always call the local swiglu_mlp VeomniOp",
 )
 config.replace_class(
-    "DeepseekV3NaiveMoe",
-    replacement=PatchedDeepseekV3NaiveMoe,
+    "DeepseekV3Experts",
+    replacement=PatchedDeepseekV3Experts,
     description="Always call moe_experts VeomniOp on v5 gate_up_proj weights",
 )
 config.override_method(

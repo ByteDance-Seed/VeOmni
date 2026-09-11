@@ -53,27 +53,6 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # Multimodal RoPE has no NPU backend in the Qwen-VL family.
     "qwen2vl": {"rotary_pos_emb_implementation": "eager"},
     "qwen25vl": {"rotary_pos_emb_implementation": "eager"},
-    # The legacy qwen2 / qwen3_moe / llama3.1 / qwen2_5_omni modeling path
-    # does not expose compatible NPU RMSNorm/RoPE handles. Pin both to eager
-    # until those tests move to models_kernel.
-    "qwen2": {
-        "rms_norm_implementation": "eager",
-        "rotary_pos_emb_implementation": "eager",
-    },
-    "qwen3_moe": {
-        "rms_norm_implementation": "eager",
-        "rotary_pos_emb_implementation": "eager",
-    },
-    "llama3.1": {
-        "rms_norm_implementation": "eager",
-        "rotary_pos_emb_implementation": "eager",
-    },
-    # qwen2_5_omni inherits the same legacy-model gap; multimodal RoPE has no
-    # NPU backend either, so pinning both keeps its thinker path eager on NPU.
-    "qwen2_5_omni": {
-        "rms_norm_implementation": "eager",
-        "rotary_pos_emb_implementation": "eager",
-    },
 }
 
 # GPU per-model overrides for models whose patched ops disable a default
@@ -260,7 +239,7 @@ def build_torchrun_cmd(
         # less GPU memory required on the L20 (44 GiB) runners.
         "--train.global_batch_size=8",
         "--train.micro_batch_size=1",
-        f"--train.init_device={init_device}",
+        f"--model.accelerator.init_device={init_device}",
         "--train.bsz_warmup_ratio=0",
         "--train.num_train_epochs=1",
         "--train.checkpoint.save_epochs=0",
@@ -277,9 +256,9 @@ def build_torchrun_cmd(
     if parallel_config is not None:
         cmd.extend(
             [
-                f"--train.accelerator.fsdp_config.fsdp_mode={parallel_config.fsdp_mode}",
-                f"--train.accelerator.ulysses_size={parallel_config.sp_size}",
-                f"--train.accelerator.ep_size={parallel_config.ep_size}",
+                f"--model.accelerator.fsdp_config.fsdp_mode={parallel_config.fsdp_mode}",
+                f"--model.accelerator.ulysses_size={parallel_config.sp_size}",
+                f"--model.accelerator.ep_size={parallel_config.ep_size}",
             ]
         )
 

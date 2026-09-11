@@ -31,9 +31,9 @@ def _require_tilelang_cuda():
         pytest.skip("DeepSeek V4 TileLang kernels require SM90 or later")
 
 
-def test_tilelang_act_quant_shapes_scales_and_inplace():
+def test_tilelang_act_quant_shapes_scales_and_dequant():
     _require_tilelang_cuda()
-    from veomni.models_kernel.transformers.deepseek_v4.act_quant import act_quant
+    from veomni.ops.qat.quant import act_quant
 
     torch.manual_seed(2)
     x = torch.randn(3, 256, device=DEVICE, dtype=torch.bfloat16)
@@ -51,9 +51,7 @@ def test_tilelang_act_quant_shapes_scales_and_inplace():
     actual_dequantized = (quantized.float() * scales.repeat_interleave(128, dim=-1)).to(torch.bfloat16)
     torch.testing.assert_close(actual_dequantized, expected_dequantized, rtol=0, atol=0)
 
-    inplace = x.clone()
-    result = act_quant(inplace, block_size=128, inplace=True)
-    assert result.data_ptr() == inplace.data_ptr()
+    result = act_quant(x, block_size=128, dequant=True)
     torch.testing.assert_close(result, expected_dequantized, rtol=0, atol=0)
 
     x_mx = x.clone()
@@ -70,6 +68,33 @@ def test_tilelang_act_quant_shapes_scales_and_inplace():
     expanded_scales_mx = expected_scales_mx.repeat_interleave(128, dim=-1)
     expected_quantized_mx = (x_mx.float() / expanded_scales_mx).clamp(-448, 448).to(torch.float8_e4m3fn)
     torch.testing.assert_close(quantized_mx.float(), expected_quantized_mx.float(), rtol=0, atol=0)
+
+
+def test_tilelang_act_quant_dequant_fuses_the_round_trip():
+    _require_tilelang_cuda()
+    from veomni.ops.qat.quant import act_quant
+
+    torch.manual_seed(2)
+    x = torch.randn(3, 256, device=DEVICE, dtype=torch.bfloat16)
+    x[0].zero_()
+
+    for scale_fmt in (None, "ue8m0"):
+        quantized, scales = act_quant(x, block_size=128, scale_fmt=scale_fmt)
+        expected = (quantized.float() * scales.repeat_interleave(128, dim=-1)).to(torch.bfloat16)
+        original = x.clone()
+        result = act_quant(x, block_size=128, scale_fmt=scale_fmt, dequant=True)
+
+        assert result.dtype == torch.bfloat16
+        assert torch.equal(result, expected)
+        assert result.data_ptr() != x.data_ptr()
+        assert torch.equal(x, original)
+
+    transposed = torch.randn(256, 3, device=DEVICE, dtype=torch.bfloat16).t()
+    assert not transposed.is_contiguous()
+    assert torch.equal(
+        act_quant(transposed, block_size=128, scale_fmt="ue8m0", dequant=True),
+        act_quant(transposed.contiguous(), block_size=128, scale_fmt="ue8m0", dequant=True),
+    )
 
 
 def _fp8_weight_quant_reference(x, block_size=128, round_scale=False):
@@ -113,7 +138,7 @@ def _tiles_above_amax_floor():
 
 def test_tilelang_fp8_weight_quant_matches_reference():
     _require_tilelang_cuda()
-    from veomni.models_kernel.transformers.deepseek_v4.act_quant import fp8_weight_quant
+    from veomni.ops.qat.quant import fp8_weight_quant
 
     x = _weight_quant_test_input()
     quantized, scales = fp8_weight_quant(x, block_size=128)
@@ -141,7 +166,7 @@ def test_tilelang_fp8_weight_quant_matches_reference():
 
 def test_tilelang_fp8_weight_quant_round_trip_and_non_contiguous_input():
     _require_tilelang_cuda()
-    from veomni.models_kernel.transformers.deepseek_v4.act_quant import fp8_weight_quant
+    from veomni.ops.qat.quant import fp8_weight_quant
 
     x = _weight_quant_test_input()
     quantized, scales = fp8_weight_quant(x, block_size=128)
@@ -163,7 +188,7 @@ def test_tilelang_fp8_weight_quant_round_trip_and_non_contiguous_input():
 
 def test_tilelang_fp8_weight_quant_ue8m0_matches_reference():
     _require_tilelang_cuda()
-    from veomni.models_kernel.transformers.deepseek_v4.act_quant import fp8_weight_quant
+    from veomni.ops.qat.quant import fp8_weight_quant
 
     x = _weight_quant_test_input()
     quantized, scales = fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu)
@@ -191,7 +216,7 @@ def test_tilelang_fp8_weight_quant_ue8m0_matches_reference():
 def test_tilelang_fp8_weight_quant_scale_fmt_and_scale_dtype_are_orthogonal():
     """scale_fmt decides how the scale is computed, scale_dtype only how it is stored."""
     _require_tilelang_cuda()
-    from veomni.models_kernel.transformers.deepseek_v4.act_quant import fp8_weight_quant
+    from veomni.ops.qat.quant import fp8_weight_quant
 
     x = _weight_quant_test_input()
     _, exact_scales = fp8_weight_quant(x, block_size=128)
@@ -211,7 +236,7 @@ def test_tilelang_fp8_weight_quant_scale_fmt_and_scale_dtype_are_orthogonal():
 def test_tilelang_fp8_weight_quant_ue8m0_keeps_exact_power_of_two_scale():
     """An amax that already divides to a power of two must not gain a binade."""
     _require_tilelang_cuda()
-    from veomni.models_kernel.transformers.deepseek_v4.act_quant import fp8_weight_quant
+    from veomni.ops.qat.quant import fp8_weight_quant
 
     x = torch.zeros(128, 128, device=DEVICE, dtype=torch.bfloat16)
     x[3, 5] = 56.0  # 448 * 2**-3, exact in BF16, so ceil(log2(amax / 448)) == -3
@@ -224,7 +249,7 @@ def test_tilelang_fp8_weight_quant_ue8m0_keeps_exact_power_of_two_scale():
 
 def test_tilelang_fp8_weight_quant_ue8m0_round_trip():
     _require_tilelang_cuda()
-    from veomni.models_kernel.transformers.deepseek_v4.act_quant import fp8_weight_quant
+    from veomni.ops.qat.quant import fp8_weight_quant
 
     x = _weight_quant_test_input()
     quantized, scales = fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu)
@@ -238,9 +263,36 @@ def test_tilelang_fp8_weight_quant_ue8m0_round_trip():
     assert ((dequantized - x.float()).abs() <= tolerance).all()
 
 
+def test_tilelang_fp8_weight_quant_dequant_fuses_the_round_trip():
+    _require_tilelang_cuda()
+    from veomni.ops.qat.quant import fp8_weight_quant
+
+    x = _weight_quant_test_input()
+    rows, cols = x.shape
+
+    for scale_fmt in (None, "ue8m0"):
+        quantized, scales = fp8_weight_quant(x, block_size=128, scale_fmt=scale_fmt)
+        tiles = quantized.float().view(rows // 128, 128, cols // 128, 128)
+        expected = (tiles * scales[:, None, :, None]).view(rows, cols).to(torch.bfloat16)
+        original = x.clone()
+        result = fp8_weight_quant(x, block_size=128, scale_fmt=scale_fmt, dequant=True)
+
+        assert result.dtype == torch.bfloat16
+        assert torch.equal(result, expected)
+        assert result.data_ptr() != x.data_ptr()
+        assert torch.equal(x, original)
+
+    transposed = x.t().contiguous().t()
+    assert not transposed.is_contiguous()
+    assert torch.equal(
+        fp8_weight_quant(transposed, block_size=128, scale_fmt="ue8m0", dequant=True),
+        fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0", dequant=True),
+    )
+
+
 def test_tilelang_fp8_weight_quant_rejects_unsupported_inputs():
     _require_tilelang_cuda()
-    from veomni.models_kernel.transformers.deepseek_v4.act_quant import fp8_weight_quant
+    from veomni.ops.qat.quant import fp8_weight_quant
 
     with pytest.raises(AssertionError, match="2D weight"):
         fp8_weight_quant(torch.empty(2, 128, 128, device=DEVICE, dtype=torch.bfloat16))

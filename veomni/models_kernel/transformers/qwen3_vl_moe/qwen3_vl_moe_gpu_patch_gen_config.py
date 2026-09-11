@@ -76,6 +76,20 @@ config = PatchConfig(
     description="Qwen3-VL-MoE with VeOmni v5 patches and VeomniOp replacements",
 )
 
+
+@config.override_method(
+    "Qwen3VLMoeModel.__init__",
+    description="Construct generated towers and propagate the MoE implementation to text_config",
+)
+def qwen3_vl_moe_model_init_patched(self, config):
+    config.text_config._moe_implementation = getattr(config, "_moe_implementation", "eager")
+    super().__init__(config)
+    self.visual = Qwen3VLMoeVisionModel._from_config(config.vision_config)
+    self.language_model = Qwen3VLMoeTextModel._from_config(config.text_config)
+    self.rope_deltas = None
+    self.post_init()
+
+
 # Reuse the same post-import block / helpers / imports that the qwen3_vl GPU
 # config already injects into its generated file. The shared body of all the
 # reused VLM patches depends on these helpers (`rot_pos_ids`,

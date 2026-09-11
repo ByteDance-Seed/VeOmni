@@ -9,7 +9,7 @@ Validates:
 import os
 import random
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -127,6 +127,7 @@ class _TinyQwen3_5Config:
     hidden_act: str = "silu"
     rms_norm_eps: float = 1e-6
     dtype: torch.dtype = torch.bfloat16
+    layer_types: list[str] = field(default_factory=lambda: ["linear_attention"])
 
 
 def _assert_forward_deterministic(
@@ -215,12 +216,12 @@ def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str, bsz
         world_size=world_size,
     )
 
-    from veomni.distributed.parallel_state import init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.models_kernel.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
         Qwen3_5GatedDeltaNet,
     )
 
-    init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
+    _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
     # Spawned workers do not inherit the process-global config installed by the
     # parent fixture, so install the same FLA selections in each child.
     _install_fla_kernel_config()
@@ -340,12 +341,12 @@ def _run_gated_deltanet_sp_determinism(rank: int, world_size: int, init_file: st
         world_size=world_size,
     )
 
-    from veomni.distributed.parallel_state import init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.models_kernel.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
         Qwen3_5GatedDeltaNet,
     )
 
-    init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
+    _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
     _install_fla_kernel_config()
 
     _set_deterministic(42)

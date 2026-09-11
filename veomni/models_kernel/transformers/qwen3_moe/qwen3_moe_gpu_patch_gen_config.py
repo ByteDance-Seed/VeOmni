@@ -53,6 +53,8 @@ config = PatchConfig(
     description="Qwen3Moe with VeOmni patches and VeomniOp replacements",
 )
 
+config.add_import("typing", names=["Optional"])
+
 # Surface ``MoeCausalLMOutputWithLogProbs`` so the patched ``forward`` can return
 # per-token log-probs / entropy as constructor fields. Mutating ``output.log_probs``
 # / ``output.entropy`` after constructing ``MoeCausalLMOutputWithPast`` would

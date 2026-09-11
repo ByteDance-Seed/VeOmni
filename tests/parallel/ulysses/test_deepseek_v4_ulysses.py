@@ -68,10 +68,10 @@ def _run_deepseek_v4_attention_sp_fw_bw(
 
     from transformers import AutoConfig
 
-    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
     from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
-    init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
+    _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
@@ -209,12 +209,13 @@ def _run_deepseek_v4_indexer_sp_equivalence(rank: int, world_size: int, init_fil
 
     from transformers import AutoConfig
 
-    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
     from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models_kernel.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+    from veomni.ops.config import set_ops_config
 
-    init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
-    dsv4.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+    _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
+    set_ops_config(SimpleNamespace(dsa_indexer_implementation="tilelang"))
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(1)

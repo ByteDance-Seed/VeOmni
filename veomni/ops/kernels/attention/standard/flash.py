@@ -81,6 +81,12 @@ def flash_attention_forward(
             " Please set your attention to `eager` if you want any of these features."
         )
 
+    if kwargs.get("indices") is not None:
+        raise ValueError(
+            "VeOmni flash attention cannot consume sparse `indices`; ignoring them would compute dense "
+            "attention with the wrong objective. Use eager/SDPA with a sparse mask or a DSA-specific backend."
+        )
+
     # This is before the transpose
     seq_len = query.shape[2]
 
@@ -157,6 +163,17 @@ def flash_attention_forward(
     else:
         raise ValueError(f"unknown attn_implementation for veomni_flash_attention: {impl}")
 
+    # MLA models can use a smaller value head than their Q/K head. Transformers
+    # handles this in its stock wrapper; this replacement must preserve it.
+    head_dim, value_head_dim = query.shape[-1], value.shape[-1]
+    if value_head_dim > head_dim:
+        raise ValueError(
+            f"value head dim ({value_head_dim}) exceeds query head dim ({head_dim}); "
+            "flash attention cannot pad it to a compatible shape."
+        )
+    if value_head_dim < head_dim:
+        value = torch.nn.functional.pad(value, (0, head_dim - value_head_dim))
+
     attn_output = _flash_attention_forward(
         query,
         key,
@@ -174,6 +191,9 @@ def flash_attention_forward(
         layer_idx=module.layer_idx if hasattr(module, "layer_idx") else None,
         **kwargs,
     )
+
+    if value_head_dim < head_dim:
+        attn_output = attn_output[..., :value_head_dim]
 
     # Ulysses patch
     if ulysses_enabled:

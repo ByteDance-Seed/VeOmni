@@ -40,6 +40,8 @@ def wrapper(
     qhead_per_kv_head: int | None = None,
     sm_scale: float = 1.0,
     attention_mask: Tensor | None = None,
+    position_ids: Tensor | None = None,
+    use_cache: bool = False,
 ) -> Tensor:
     """Official GLM indexer scores. Same face as cuDNN ``indexer_select_topk``.
 
@@ -49,14 +51,20 @@ def wrapper(
     applies causality through ``attention_mask``, not ``ratio``.
     ``qhead_per_kv_head`` is unused.
     """
-    del ratio, qhead_per_kv_head
+    del ratio, qhead_per_kv_head, use_cache
     if k.dim() == 4:
         k = k.squeeze(2)
     # Copied from GlmMoeDsaIndexer.forward (transformers glm_moe_dsa).
-    scores = torch.einsum("bshd,btd->bsht", q.float(), k.float()) * sm_scale
+    scores = torch.matmul(q.float(), k.transpose(-1, -2).float().unsqueeze(1)) * sm_scale
     scores = F.relu(scores)
-    index_scores = torch.einsum("bsht,bsh->bst", scores, w.float())
+    index_scores = torch.matmul(w.float().unsqueeze(-2), scores).squeeze(-2)
     if attention_mask is not None:
         index_scores = index_scores + attention_mask
+    else:
+        if position_ids is None:
+            raise ValueError("position_ids is required when attention_mask is None.")
+        key_positions = torch.arange(index_scores.shape[-1], device=index_scores.device)
+        causal = key_positions[None, None, :] > position_ids[:, :, None]
+        index_scores = index_scores.masked_fill(causal, float("-inf"))
     top_k = min(int(top_k), index_scores.shape[-1])
-    return index_scores.topk(top_k, dim=-1).indices.to(torch.long)
+    return index_scores.topk(top_k, dim=-1).indices.to(torch.int32)

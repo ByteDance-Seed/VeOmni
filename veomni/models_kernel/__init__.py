@@ -28,6 +28,7 @@ from .auto import (
     check_context_parallel_supported,
     check_model_build_prerequisites,
 )
+from .checkpoint import ModelCheckpointManager
 from .checkpoint.weights import (
     init_empty_weights,
     load_model_weights,
@@ -48,6 +49,7 @@ __all__ = [
     "MODEL_CONFIG_REGISTRY",
     "MODEL_PROCESSOR_REGISTRY",
     "MODELING_REGISTRY",
+    "ModelCheckpointManager",
     "build_config",
     "build_foundation_model",
     "build_processor",

@@ -202,6 +202,47 @@ def test_flash_attention_forwards_fa4_sinks_and_sliding_window(monkeypatch):
     assert captured["layer_idx"] == 7
 
 
+def test_flash_attention_rejects_sparse_indices(monkeypatch):
+    monkeypatch.setattr(flash_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
+    query = torch.randn(1, 2, 3, 4, dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="sparse `indices`"):
+        flash_backend.flash_attention_forward(
+            _FakeAttentionModule("veomni_flash_attention_2"),
+            query,
+            query,
+            query,
+            attention_mask=None,
+            indices=torch.zeros(1, 1, dtype=torch.int32),
+        )
+
+
+def test_flash_attention_pads_and_restores_mla_value_head_dim(monkeypatch):
+    captured = {}
+
+    def fake_flash(query, key, value, attention_mask, **kwargs):
+        captured["value"] = value
+        return value + 1
+
+    monkeypatch.setattr(flash_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", fake_flash)
+    query = torch.randn(1, 2, 3, 8, dtype=torch.float16)
+    key = torch.randn(1, 2, 3, 8, dtype=torch.float16)
+    value = torch.randn(1, 2, 3, 4, dtype=torch.float16)
+
+    output, _ = flash_backend.flash_attention_forward(
+        _FakeAttentionModule("veomni_flash_attention_2"),
+        query,
+        key,
+        value,
+        attention_mask=None,
+    )
+
+    assert captured["value"].shape == (1, 3, 2, 8)
+    assert output.shape == (1, 3, 2, 4)
+    torch.testing.assert_close(output, value.transpose(1, 2) + 1)
+
+
 def test_gpt_oss_attention_passes_learnable_sinks_through_hf_dict():
     from transformers import GptOssConfig
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS

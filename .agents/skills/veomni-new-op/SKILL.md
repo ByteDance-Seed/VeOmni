@@ -66,7 +66,7 @@ Use these separate mechanisms only when their semantics require them:
 
    ```python
    from veomni.ops import register_op
-   from veomni.ops.requirement import CudaKernelRequirement
+   from veomni.ops.platform import GpuKernelRequirement, NvidiaGpuPlatform
 
    register_op("example", "standard", "eager", wrapper=eager_example)
    register_op(
@@ -75,7 +75,7 @@ Use these separate mechanisms only when their semantics require them:
        "triton",
        forward=triton_forward,
        backward=triton_backward,
-       requirement=CudaKernelRequirement(min_cc=80),
+       requirement=GpuKernelRequirement(platforms=(NvidiaGpuPlatform(min_cc=80),)),
    )
    ```
 
@@ -103,6 +103,9 @@ Use these separate mechanisms only when their semantics require them:
 2. Put consumer-specific normalization and model wiring tests under
    `tests/models_kernel/` instead of duplicating them in the raw-kernel suite.
 3. Run the family tests plus the registry and documentation guards:
+
+   The GPU job runs `tests/ops/` wholesale. The NPU job enumerates ops files,
+   so add an NPU workflow entry when the new tests must run on Ascend.
 
    ```bash
    pytest -q tests/ops/<kernel_name>/ tests/ops/base/

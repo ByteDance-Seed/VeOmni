@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -133,6 +134,15 @@ def _init_every_position_bias(model: torch.nn.Module) -> None:
                 torch.nn.init.normal_(module.position_bias, std=0.02)
 
 
+def _init_attention_parameters(layer) -> None:
+    # A bare Attention skips PreTrainedModel.post_init(): sinks is allocated
+    # with torch.empty. Match the model's zero initialization before broadcast;
+    # otherwise allocator contents can make both baseline and CP outputs NaN.
+    torch.nn.init.zeros_(layer.sinks)
+    if layer.compressor is not None:
+        _init_position_bias(layer.compressor)
+
+
 def _make_forward(layer, rotary):
     """The attention call every test shares: both rope variants, then the layer."""
 
@@ -162,6 +172,7 @@ def _init_cp_attention(
     batch_size: int = 1,
     sample_slices=None,
     dtype: torch.dtype = torch.float32,
+    dsa_attention_impl: str = "eager",
 ):
     """Enter the process group, build the shared layer, and return the fixture.
 
@@ -194,10 +205,12 @@ def _init_cp_attention(
 
     from transformers import AutoConfig
 
-    from veomni.distributed.parallel_state import init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.ops.config import set_ops_config
 
-    init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    set_ops_config(SimpleNamespace(dsa_attention_implementation=dsa_attention_impl))
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
@@ -207,8 +220,7 @@ def _init_cp_attention(
     layer = dsv4.DeepseekV4Attention(config, layer_idx=layer_idx).to(device=device_type, dtype=dtype)
     if not with_compressor:
         layer.compressor = None
-    else:
-        _init_position_bias(layer.compressor)
+    _init_attention_parameters(layer)
     _broadcast_module(layer)
     layer.train()
 
@@ -305,6 +317,16 @@ def _stub_sparse_attn_tilelang(query: torch.Tensor, *_args, **_kwargs) -> torch.
     return torch.zeros_like(query)
 
 
+class _StubTileLangDsaAttention:
+    """TileLang-shaped handle used to exercise candidate building on pre-SM90 GPUs."""
+
+    impl = "tilelang"
+
+    def __call__(self, query: torch.Tensor, *_args, **_kwargs) -> torch.Tensor:
+        """Return a shape-compatible output without launching the hardware kernel."""
+        return _stub_sparse_attn_tilelang(query)
+
+
 def _run_attention_cp_sparse_indices(rank: int, world_size: int, init_file: str, seq_len: int) -> None:
     """The compact candidates a shard builds must be the global build's own rows.
 
@@ -321,10 +343,18 @@ def _run_attention_cp_sparse_indices(rank: int, world_size: int, init_file: str,
     """
     from veomni.distributed.parallel_state import clear_parallel_state
 
-    dsv4, _, _forward, full_hidden, full_position_ids, full_mask = _init_cp_attention(
-        rank, world_size, init_file, seq_len, with_compressor=False, dtype=torch.bfloat16
+    dsv4, layer, _forward, full_hidden, full_position_ids, full_mask = _init_cp_attention(
+        rank,
+        world_size,
+        init_file,
+        seq_len,
+        with_compressor=False,
+        dtype=torch.bfloat16,
     )
-    dsv4.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+    # Keep the production registry's SM90 requirement intact. This test only
+    # needs a handle whose implementation name selects compact candidates and a
+    # shape-compatible callable in place of the actual TileLang launch.
+    layer.veomni_dsa_attention = _StubTileLangDsaAttention()
 
     built = []
     build_indices = dsv4.build_sparse_attention_indices
@@ -339,7 +369,6 @@ def _run_attention_cp_sparse_indices(rank: int, world_size: int, init_file: str,
     with (
         torch.no_grad(),
         patch(f"{_PATCHED_MODULE}.build_sparse_attention_indices", _record),
-        patch(f"{_PATCHED_MODULE}.sparse_attn_tilelang", _stub_sparse_attn_tilelang),
     ):
         no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
         with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
@@ -445,7 +474,7 @@ def _run_compressor_cp(
     row all-gather, and running it is the only way to drive them. Its selection
     is then observable through ``block_bias``, which is scattered from it.
     """
-    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
@@ -462,7 +491,7 @@ def _run_compressor_cp(
     from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models_kernel.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
 
-    init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
@@ -591,7 +620,7 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
     local. The packed layout is what forces it to shard the compression metadata
     it is handed, which is global.
     """
-    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
@@ -607,11 +636,12 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
 
     from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models_kernel.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+    from veomni.ops.config import set_ops_config
 
-    init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
     # The TileLang kernel is the production scorer and the only one with a query
     # partitioning of its own; the eager scorer is covered by the CSA layer test.
-    dsv4.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+    set_ops_config(SimpleNamespace(dsa_indexer_implementation="tilelang"))
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
@@ -745,12 +775,38 @@ def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int, 
     layer = dsv4.DeepseekV4Attention(config, layer_idx=layer_idx)
     if not with_compressor:
         layer.compressor = None
+    _init_attention_parameters(layer)
 
     hidden = torch.randn(1, local_len, config.hidden_size)
     position_ids = torch.arange(local_len).view(1, -1)
     full_mask = _build_causal_mask(local_len * cp_size, config.sliding_window, "cpu", torch.float32)
     rotary = dsv4.DeepseekV4RotaryEmbedding(config)
     return config, _make_forward(layer, rotary), hidden, position_ids, full_mask
+
+
+@pytest.mark.parametrize("with_compressor,layer_idx", [(False, 0), (True, 0), (True, 3)])
+def test_attention_fixture_initializes_empty_parameters(monkeypatch, with_compressor, layer_idx):
+    """Recycled allocator contents must not decide whether CP fixtures produce NaNs."""
+    original_empty = torch.empty
+
+    def poisoned_empty(*args, **kwargs):
+        tensor = original_empty(*args, **kwargs)
+        if tensor.is_floating_point():
+            tensor.fill_(float("nan"))
+        return tensor
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(torch, "empty", poisoned_empty)
+        _, forward, hidden, positions, mask = _build_local_attention(
+            with_compressor, local_len=128, cp_size=1, layer_idx=layer_idx
+        )
+    hidden.requires_grad_(True)
+    no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
+    with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+        output = forward(hidden, positions, mask)
+        assert torch.isfinite(output).all()
+        output.sum().backward()
+    assert torch.isfinite(hidden.grad).all()
 
 
 # The three modules that compress windows, and the role each names in its
@@ -1180,7 +1236,7 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
     ``test_deepseek_v4_cp_collator_shards_contiguously_by_cp_rank`` pins that the
     collator really produces these three things.
     """
-    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
@@ -1195,15 +1251,15 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
     from transformers import AutoConfig
 
     from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.ops.config import set_ops_config
 
-    init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
     if tilelang:
         # The model forward withholds the dense mask only for bf16 CUDA tensors
         # with the TileLang attention selected, so this is the arm that reaches
         # the compact-candidate path -- and the only place the TileLang indexer
         # runs inside a CSA layer under CP.
-        dsv4.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
-        dsv4.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+        set_ops_config(SimpleNamespace(dsa_attention_implementation="tilelang", dsa_indexer_implementation="tilelang"))
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
@@ -1226,9 +1282,7 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
     # pass that never entered the kernel it exists to exercise.
     counts = dict.fromkeys(("sparse_attn_tilelang", "v4_lighting_indexer"), 0)
 
-    def _counted(name):
-        real = getattr(dsv4, name)
-
+    def _counted(name, real):
         def wrapper(*args, **kwargs):
             counts[name] += 1
             return real(*args, **kwargs)
@@ -1240,10 +1294,26 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
 
     local_len = seq_len // world_size
     begin = rank * local_len
-    with (
-        patch(f"{_PATCHED_MODULE}.sparse_attn_tilelang", _counted("sparse_attn_tilelang")),
-        patch(f"{_PATCHED_MODULE}.v4_lighting_indexer", _counted("v4_lighting_indexer")),
-    ):
+    with ExitStack() as stack:
+        if tilelang:
+            from veomni.ops import resolve_op
+
+            attention_entry = resolve_op("dsa_attention", "deepseek_v4", "tilelang")
+            indexer_entry = resolve_op("dsa_indexer", "deepseek_v4", "tilelang")
+            stack.enter_context(
+                patch.object(
+                    attention_entry,
+                    "wrapper",
+                    _counted("sparse_attn_tilelang", attention_entry.wrapper),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    indexer_entry,
+                    "wrapper",
+                    _counted("v4_lighting_indexer", indexer_entry.wrapper),
+                )
+            )
         # Baseline: the whole packed batch with the parallel state stubbed out.
         no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
         with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
@@ -1291,7 +1361,7 @@ def _run_cp_collator_contract(rank: int, world_size: int, init_file: str) -> Non
     CP-only mesh flattens ``sp`` onto ``cp``.
     """
     from veomni.data.data_collator import SequenceParallelCollator
-    from veomni.distributed.parallel_state import clear_parallel_state, get_parallel_state, init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, get_parallel_state
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
@@ -1302,7 +1372,7 @@ def _run_cp_collator_contract(rank: int, world_size: int, init_file: str) -> Non
         rank=rank,
         world_size=world_size,
     )
-    init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
 
     state = get_parallel_state()
     assert (state.sp_size, state.sp_rank) == (state.cp_size, state.cp_rank), (

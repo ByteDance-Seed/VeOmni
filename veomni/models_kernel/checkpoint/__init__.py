@@ -29,6 +29,7 @@ from .convert import (
     resolve_fqn_to_index_mapping_for_save,
     shard_index_from_filename,
 )
+from .manager import ModelCheckpointManager
 from .moe_map import (
     PER_EXPERT_SPLIT_TO_FUSED_PATTERN,
     convert_per_expert_fqn_mapping_to_fused,
@@ -47,6 +48,7 @@ __all__ = [
     "CheckpointTensorConverter",
     "ConvertedCheckpointTensor",
     "FqnToIndexMappingConverter",
+    "ModelCheckpointManager",
     "PER_EXPERT_SPLIT_TO_FUSED_PATTERN",
     "checkpoint_converter_is_dim0_zero_pad",
     "convert_per_expert_fqn_mapping_to_fused",

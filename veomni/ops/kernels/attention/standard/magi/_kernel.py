@@ -115,7 +115,7 @@ def _prepare_cutlass(device: torch.device) -> dict[str, object]:
     except (ImportError, OSError, RuntimeError) as error:
         raise ImportError(
             "VeOmni `magi_attention` on SM90 requires MagiAttention's precompiled CUTLASS FFA backend. "
-            "Run `uv sync --extra gpu --dev`, then `bash scripts/kernel/install_magi_sm90.sh`."
+            "Run `uv sync --extra gpu --extra magi --dev`, then `bash scripts/kernel/install_magi_sm90.sh`."
         ) from error
 
     build_flags = CONFIG.get("build_flags", {})

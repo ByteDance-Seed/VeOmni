@@ -117,7 +117,7 @@ def _fa4_cuda_attention_forward(
     except ImportError as error:
         raise ImportError(
             "VeOmni `magi_attention` requires the optional `magi-attention` package. "
-            "Install VeOmni with the `gpu` extra."
+            "Install VeOmni with `--extra gpu --extra magi`."
         ) from error
 
     attn_arg = get_or_prepare_attn_arg(

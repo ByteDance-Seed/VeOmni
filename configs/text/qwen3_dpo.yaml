@@ -12,6 +12,20 @@ model:
   model_path: ./Qwen3-0.6B
   ops_implementation:
     attn_implementation: flash_attention_2
+  optimizer:
+    type: adamw
+    lr: 5.0e-7
+    lr_decay_style: cosine
+    lr_warmup_ratio: 0.1
+    max_grad_norm: 1.0
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
 
 data:
   train_path: ./ultrafeedback_binarized
@@ -19,26 +33,12 @@ data:
   chat_template: chatml
   max_seq_len: 2048
   train_size: 20000000
+  dyn_bsz_buffer_size: 200
 
 train:
-  accelerator:
-    fsdp_config:
-      fsdp_mode: fsdp2
-      mixed_precision:
-        enable: true
-  gradient_checkpointing:
-    enable: true
   global_batch_size: 8
   micro_batch_size: 1
-  dyn_bsz_buffer_size: 200
-  optimizer:
-    type: adamw
-    lr: 5.0e-7
-    lr_decay_style: cosine
-    lr_warmup_ratio: 0.1
-    max_grad_norm: 1.0
   num_train_epochs: 1
-  init_device: meta
   checkpoint:
     output_dir: Qwen3-0.6B-dpo-ultrafeedback
     manager: dcp

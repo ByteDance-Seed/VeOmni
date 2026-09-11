@@ -72,6 +72,12 @@ descriptions, hardware requirements, and package requirements; an
 implementation registered for multiple devices therefore appears more than
 once.
 
+MagiAttention is optional and can be installed with:
+
+```bash
+uv sync --extra gpu --extra magi --dev
+```
+
 ## Registering an op
 
 Each row provides either:

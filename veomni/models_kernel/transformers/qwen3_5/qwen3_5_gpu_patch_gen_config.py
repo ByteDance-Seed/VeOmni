@@ -40,10 +40,9 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5ModelOutputWithPast,
     Qwen3_5RMSNormGated,
     apply_mask_to_padding_states,
-    torch_chunk_gated_delta_rule,
 )
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, logging
+from transformers.utils import TransformersKwargs
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import sp_pad_and_slice
@@ -58,14 +57,24 @@ from veomni.utils.model_outputs import (  # noqa: F401  consumed by in-config da
 )
 
 
-logger = logging.get_logger(__name__)
-
-
 config = PatchConfig(
     source_module="transformers.models.qwen3_5.modeling_qwen3_5",
     target_file="patched_modeling_qwen3_5_gpu.py",
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
 )
+
+
+@config.override_method(
+    "Qwen3_5Model.__init__",
+    description="Construct generated vision and text towers instead of upstream AutoModel classes",
+)
+def qwen3_5_model_init_patched(self, config):
+    super().__init__(config)
+    self.visual = Qwen3_5VisionModel._from_config(config.vision_config)
+    self.language_model = Qwen3_5TextModel._from_config(config.text_config)
+    self.rope_deltas = None
+    self.post_init()
+
 
 config.add_import("copy", names=["copy"])
 config.add_import("functools", names=["partial"])
@@ -104,33 +113,6 @@ config.add_import(
     "veomni.models_kernel.loss_utils",
     names=["ForCausalLMLoss"],
 )
-config.drop_import_names(
-    "FusedRMSNormGated",
-    "causal_conv1d_fn",
-    "causal_conv1d_update",
-    "chunk_gated_delta_rule",
-    "fused_recurrent_gated_delta_rule",
-)
-config.add_post_import_block(
-    """
-    # Selection of FusedRMSNormGated / causal_conv1d / chunk_gated_delta_rule
-    # used to come from `try: from fla.modules import ... except ImportError`
-    # at module import time. GatedDeltaNet constructs VeomniOp handles
-    # instead. These None placeholders only exist so:
-    #   (1) the upstream HF module-level
-    #       `is_fast_path_available = all((causal_conv1d_fn, ...))`
-    #       resolves to False (legacy warning behaviour preserved); and
-    #   (2) the decode-only `*_update` / `fused_recurrent_*` paths, which raise
-    #       NotImplementedError in our patched forward, still satisfy the
-    #       `<fla_name> or <torch_fallback>` assignments in __init__.
-    FusedRMSNormGated = None
-    causal_conv1d_fn = None
-    causal_conv1d_update = None
-    chunk_gated_delta_rule = None
-    fused_recurrent_gated_delta_rule = None
-    """
-)
-
 # True in GPU generated files, False in NPU. Read by qwen3_5_vision_model_forward
 # (Patch.5) to gate the host sync: the int hand-off to flash_attn_varlen_func
 # only pays off when Qwen3_5VisionAttention.forward has been patched to consume
@@ -143,12 +125,8 @@ config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = True")
 # Dummy definitions for names that exist in the generated file's scope but not here.
 # The patchgen only extracts the function body; these are resolved at codegen time.
 Qwen3_5GatedDeltaNet = None
-causal_conv1d_update = None  # decode-only; placeholder set in post-import block above
-torch_causal_conv1d_update = None
-torch_chunk_gated_delta_rule = None  # noqa: F811 — also imported above for the forward patch
-fused_recurrent_gated_delta_rule = None  # decode-only; placeholder set in post-import block above
+causal_conv1d_update = None
 torch_recurrent_gated_delta_rule = None
-is_fast_path_available = None
 gather_seq_scatter_heads = None
 gather_heads_scatter_seq = None
 gather_outputs = None
@@ -222,7 +200,7 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
     # instantiate once and copy inv_dt in init_weights of PretrainedModel
     self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
 
-    A = torch.empty(self.num_v_heads).uniform_(0, 16)
+    A = torch.empty(self.num_v_heads).uniform_(0.01, 16)
     self.A_log = nn.Parameter(torch.log(A))
 
     self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
@@ -243,18 +221,14 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
     )
 
     self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+    self.layer_type = config.layer_types[layer_idx]
 
-    # Decode-only aliases stay on the torch / None fallbacks. The precomputed
-    # state path still raises NotImplementedError.
-    self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
-    self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
-
-    if not is_fast_path_available:
-        logger.warning_once(
-            "The fast path is not available because one of the required library is not installed. Falling back to "
-            "torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and"
-            " https://github.com/Dao-AILab/causal-conv1d"
-        )
+    # Transformers 5.16 exposes the decode fallbacks as module-level torch
+    # implementations instead of optional FLA imports. The precomputed-state
+    # branch below is still intentionally unsupported, but keep the attributes
+    # aligned with upstream for callers that inspect the module.
+    self.causal_conv1d_update = causal_conv1d_update
+    self.recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
 
     self.in_proj_qkv = nn.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
     self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
@@ -482,42 +456,6 @@ def qwen3_5_gated_deltanet_forward_patched(
 
 
 @config.override_method(
-    "Qwen3_5TextModel._update_linear_attn_mask",
-    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
-)
-def qwen3_5_text_model_update_linear_attn_mask(self, attention_mask, cache_position):
-    """
-    Build the attention mask passed to the linear-attention (gated DeltaNet) layers.
-
-    Upstream returns ``None`` — disabling the per-token zeroing in ``apply_mask_to_padding_states``
-    — when ``cache_position[0] > 0`` (a cached forward) or ``torch.all(attention_mask == 1)`` (the
-    batch has no padding). Both predicates read a 0-D GPU tensor and force an implicit ``.item()``
-    / host-device sync on *every* forward, which serialises the host against the device in
-    VeOmni's otherwise sync-free training step.
-
-    We keep the cached-forward branch — it is a correctness guard, not just an optimization:
-    ``apply_mask_to_padding_states`` does ``hidden_states * attention_mask[:, :, None]``, and in a
-    cached forward the 2-D ``attention_mask`` spans ``past + current`` tokens while ``hidden_states``
-    only covers the current chunk, so the shapes wouldn't broadcast (or would broadcast wrongly for
-    a 1-token decode step). But we detect it host-side from tensor shapes — ``attention_mask`` has
-    ``shape[-1] == past + current`` whereas ``cache_position`` has ``shape[-1] == current`` — rather
-    than reading ``cache_position[0]``, so no sync.
-
-    The all-ones short-circuit is the one we drop: returning the all-ones mask makes
-    ``apply_mask_to_padding_states`` a no-op multiply, so it is equivalent to upstream's ``None``
-    while avoiding the ``torch.all`` reduction + sync. A genuinely padded mask is still returned and
-    correctly zeroed.
-    """
-    if attention_mask is None:
-        return None
-    # Cached forward (decode / continuation): see docstring — shapes wouldn't line up in
-    # apply_mask_to_padding_states, and upstream returns None here. Detected from shapes only.
-    if cache_position is not None and attention_mask.shape[-1] != cache_position.shape[-1]:
-        return None
-    return attention_mask
-
-
-@config.override_method(
     "Qwen3_5DecoderLayer.forward",
     description="Extract and pass cu_seq_lens_q for varlen linear attention in Qwen3_5DecoderLayer.forward",
 )
@@ -544,7 +482,7 @@ def qwen3_5_decoder_layer_forward_patched(
     linear_attn_cu_seq_lens_q = kwargs.pop("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
 
     # Token Mixer
-    if self.layer_type == "linear_attention":
+    if self.block_type == "linear_attention":
         # Modification: pass linear-attention cu_seqlens through to Qwen3_5GatedDeltaNet.forward.
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
@@ -553,7 +491,7 @@ def qwen3_5_decoder_layer_forward_patched(
             attention_mask=attention_mask,
             cu_seq_lens_q=linear_attn_cu_seq_lens_q,
         )
-    elif self.layer_type == "full_attention":
+    elif self.block_type == "full_attention":
         # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
@@ -1393,18 +1331,20 @@ def qwen3_5_forcausallm_forward_patched(
 @config.add_helper_after("Qwen3_5CausalLMOutputWithPast")
 @dataclass
 class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5CausalLMOutputWithPast):
-    r"""
-    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
-        Language modeling loss (for next-token prediction).
-    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
-        Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
-        The rope index difference between sequence length and multimodal rope.
-    fused_linear_aux (`FusedLinearAuxOutput`, *optional*):
-        Per-token tensors produced by the fused-linear loss path
-        (``log_probs`` / ``entropy``; plus ``distillation_losses`` /
-        ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
-        ``None`` on the plain loss path; populated when ``return_log_probs=True``.
+    r"""Language-model output with multimodal RoPE and fused-loss auxiliaries.
+
+    Args:
+        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+            Language modeling loss (for next-token prediction).
+        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+            The rope index difference between sequence length and multimodal rope.
+        fused_linear_aux (`FusedLinearAuxOutput`, *optional*):
+            Per-token tensors produced by the fused-linear loss path
+            (``log_probs`` / ``entropy``; plus ``distillation_losses`` /
+            ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
+            ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """
 
 
@@ -1576,6 +1516,11 @@ def qwen3_5_forconditional_generation_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen3_5CausalLMOutputWithLogProbs:
+    r"""
+    cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+        Indices depicting the position of the input sequence tokens in the sequence. Retained in the
+        signature for callers that pass it positionally; transformers 5.16 moved it into `**kwargs`.
+    """
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,

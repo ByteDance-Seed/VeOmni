@@ -82,7 +82,7 @@ tests/
 │   └── train_dit_test.py                # Test trainer for DiT models
 │
 ├── checkpoints/                    # Checkpoint save/load
-│   ├── test_checkpoint_callback.py          # Callback _last_saved_step correctness
+│   ├── test_checkpoint_callback.py          # CheckpointCallback cadence + manager contract
 │   ├── test_trainer_saveload.py             # DCP + HF checkpoint save/load (8 GPUs)
 │   ├── checkpoint_verification_utils.py     # DCP-to-HF conversion verification
 │   └── utils.py                             # Command/config builders for ckpt tests

@@ -50,6 +50,8 @@ config = PatchConfig(
     description="Qwen2 with VeomniOp-based GPU kernel replacements",
 )
 
+config.add_import("typing", names=["Optional"])
+
 config.add_import("functools", names=["partial"])
 config.add_import(
     "veomni.utils.model_outputs",

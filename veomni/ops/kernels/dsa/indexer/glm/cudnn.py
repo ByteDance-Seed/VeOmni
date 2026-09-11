@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import torch
 from torch import Tensor
 
 
@@ -29,6 +30,8 @@ def wrapper(
     qhead_per_kv_head: int | None = None,
     sm_scale: float = 1.0,
     attention_mask: Tensor | None = None,
+    position_ids: Tensor | None = None,
+    use_cache: bool = False,
 ) -> Tensor:
     """cuDNN FE indexer top-k. Same face as the eager row.
 
@@ -37,8 +40,11 @@ def wrapper(
     cuDNN applies causality through ``ratio`` but cannot represent an
     additional padding or additive mask.
     """
+    del position_ids
     if attention_mask is not None:
         raise ValueError("cuDNN GLM sparse-attention indexer does not support attention_mask.")
+    if use_cache:
+        raise ValueError("cuDNN GLM sparse-attention indexer does not support KV cache.")
 
     from ....vendor.flashmla_cudnn import indexer_select_topk
 
@@ -50,4 +56,4 @@ def wrapper(
         ratio=ratio,
         qhead_per_kv_head=qhead_per_kv_head,
         sm_scale=sm_scale,
-    )
+    ).to(torch.int32)
