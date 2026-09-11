@@ -1,20 +1,5 @@
 # Long-Sequence Training Using Ulysses
 
-## Table of Contents
-
-- [VeOmni Long-Sequence Training Using Ulysses](#veomni-long-sequence-training-using-ulysses)
-  - [Table of Contents](#table-of-contents)
-  - [📚 Overview](#-overview)
-  - [🚀 Quick Start](#-quick-start)
-  - [🔍 Dive into Ulysses Sequence Parallelism](#-dive-into-ulysses-sequence-parallelism)
-    - [What is all\_to\_all?](#what-is-all_to_all)
-    - [DeepSpeed-Ulysses](#deepspeed-ulysses)
-    - [Communication Analysis](#communication-analysis)
-  - [⚙️ Core API](#️-core-api)
-  - [🛠️ Support Ulysses for a New Model](#️-support-ulysses-for-a-new-model)
-  - [🧩 Implementation Details: Data Pipeline and Model Interaction](#-implementation-details-data-pipeline-and-model-interaction)
-  - [🔧 Linear Attention Ulysses (GatedDeltaNet)](#-linear-attention-ulysses-gateddeltanet)
-
 ## 📚 Overview
 In this tutorial, we introduce the implementation of DeepSpeed-Ulysses for efficient long-sequence training in VeOmni. The Ulysses method optimizes memory usage by splitting both the input tensor and intermediate activations along the sequence dimension. This innovative approach significantly enhances memory efficiency, enabling the training of models with longer sequence lengths.
 
@@ -27,7 +12,7 @@ To enable Ulysses, users can specify the `accelerator.ulysses_size` parameter in
 bash train.sh tasks/train_vlm.py configs/multimodal/qwen25_vl/qwen25_vl.yaml \
     --model.model_path YOUR_MODEL_PATH \
     --data.train_path YOUR_DATA_PATH \
-    --train.accelerator.ulysses_size 4
+    --model.accelerator.ulysses_size 4
 ```
 
 Currently, we have supported Ulysses on the following models:
@@ -346,8 +331,8 @@ Notice: Async Ulysses works when `accelerator.ulysses_size > 1`.
 
 ```shell
 bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
-    --train.accelerator.ulysses_size 4 \
-    --train.accelerator.enable_async true
+    --model.accelerator.ulysses_size 4 \
+    --model.accelerator.enable_async true
 ```
 
 
@@ -472,8 +457,8 @@ owns blocks `r` and `2·cp_size-1-r`.
 bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
     --model.model_path YOUR_MODEL_PATH \
     --data.train_path YOUR_DATA_PATH \
-    --train.accelerator.ulysses_size 8 \
-    --train.accelerator.cp_size 4          # effective SP size = 32
+    --model.accelerator.ulysses_size 8 \
+    --model.accelerator.cp_size 4          # effective SP size = 32
 ```
 
 ### Choosing `ulysses_size` vs `cp_size`
@@ -498,18 +483,18 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
   padding is coalesced into one aligned segment. The lower-level USP reorder
   helpers still validate the invariant and reject manually constructed
   unaligned batches.
-- **Attention backend**: CUDA uses a `flash_attn` forward/backward pair,
-  auto-selected at import time: classic **FA2** on Ampere/Hopper or the **FA4**
-  CuTe backend on Blackwell/GB200. Ascend uses
-  `torch_npu.npu_fusion_attention` / `npu_fusion_attention_grad`. Both dense
-  and packed paths select the backend from the active device. FA3 is not used
-  by Ring Attention.
-- **FA2 backward determinism**: dense and packed CUDA Ring paths honor
-  `FLASH_ATTENTION_DETERMINISTIC=1`, which `train.enable_full_determinism=true`
-  sets during trainer setup. Unset or `0` keeps the faster non-deterministic
-  backward. Deterministic FA2 backward uses more memory and may be slower;
-  this does not guarantee bitwise equality between different USP topologies
-  and does not change the FA4 or NPU backend behavior.
+- **Flash-attention backend**: ring attention builds on a `flash_attn`
+  forward/backward pair, auto-selected at import time (FA2 when installed, otherwise FA4) (see `FA_BACKEND` in
+  `ring_attention/gpu.py`): classic **FA2** (`flash_attn.flash_attn_interface`) on
+  Ampere/Hopper, or the **FA4** CuTe backend (`flash_attn.cute.interface`) on
+  Blackwell/GB200. FA3 is Hopper-only (no Blackwell kernel image) and is not
+  used by the ring path. Ascend dispatches to `torch_npu.npu_fusion_attention`
+  and its backward operator through the VeOmni FlashAttention 2 adapter.
+- **CUDA backward determinism**: dense and packed FA2/FA4 Ring paths honor
+  `FLASH_ATTENTION_DETERMINISTIC=1`, set by `train.enable_full_determinism=true`.
+  Unset or `0` keeps the non-deterministic backward. This can use more memory
+  and be slower; it does not imply bitwise equality across USP topologies.
+  NPU backend behavior is unchanged.
 - **Divisibility**: `max_seq_len` must be divisible by `2 · ulysses_size · cp_size`
   (the collator pads up to this multiple automatically).
 - **Loss/data layout**: the `SequenceParallelCollator` lays sequences out
@@ -535,6 +520,24 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
 - Data layout: `veomni/distributed/sequence_parallel/ring_attention/layout.py`
   (`zigzag_reorder` / `zigzag_undo` for fixed-shape inputs, `zigzag_reorder_packed` /
   `local_cu_seqlens` for packed) and `SequenceParallelCollator._usp_slice`.
-- Attention integration: `ring_attention(...)` runs after the Ulysses all-to-all;
-  `veomni/ops/kernels/attention/__init__.py` only delegates to that entry.
-- Mesh: `init_parallel_state()` builds `[ulysses, cp]` and flattens `sp`.
+- Attention integration: the ring branch in
+  `veomni/ops/kernels/attention/flash.py` runs after the Ulysses all-to-all.
+- Mesh: `init_parallel_state_from_config()` builds `[ulysses, cp]` and flattens `sp`.
+
+### USP integration with model-specific CP
+
+Set `model.accelerator.cp_layout: zigzag` for USP. The default `contiguous`
+layout preserves DeepSeek V4's model-specific CP and does not allow combining
+CP with Ulysses. This release enables USP for Qwen3 causal text training with
+VeOmni FlashAttention 2 or 4 on CUDA, or the FlashAttention 2 adapter on Ascend. RL/DPO, multimodal packing, sliding-window attention,
+softcap, attention sinks, and nonzero attention dropout are unsupported and
+rejected. Other models require a separate compatibility check before enabling USP.
+
+BF16 Ring changes attention reduction and rounding order. Training-equivalence
+tests use numerical tolerances; they do not guarantee identical gradients across
+CP sizes. Fixed-weight Qwen3-8B diagnostics have shown substantial gradient
+differences even when scalar losses are close. Deterministic execution within
+one topology does not imply invariance across topologies.
+
+NPU kernel tests are wired into Ascend CI; this integration has not been
+validated on local NPU hardware.

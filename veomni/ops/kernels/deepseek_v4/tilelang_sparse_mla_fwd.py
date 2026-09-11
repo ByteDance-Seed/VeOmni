@@ -25,6 +25,8 @@ import tilelang
 import torch
 from tilelang import language as T
 
+from ....utils.device import get_torch_device
+
 
 @tilelang.jit(
     out_idx=[-2, -1],
@@ -42,10 +44,24 @@ def sparse_mqa_fwd(
     num_stages=0,
     threads=256,
 ):
-    # The bounds-safe indirect gather depends on per-iteration register indices.
-    # TileLang 0.1.9 cannot legally software-pipeline that dependency, so keep
-    # this loop unpipelined (num_stages=0).
-    assert num_stages == 0, "bounds-safe sparse gathers do not support software pipelining"
+    # ``num_stages >= 1`` pipelines the KV gather, and that is only legal because the
+    # gather takes its row index straight from ``Indices`` in global memory. This is
+    # load-bearing: if the index ever comes from a register fragment again -- as it did
+    # before the clamp rewrite -- TileLang's IsPureCopyStmt puts the gather in stage 0
+    # while the loop writing that fragment lands in a later stage, and the pipeliner dies
+    # on `Check failed: src_info.stage <= dst_info.stage (1 vs. 0)`. Only the gather's own
+    # index matters; the ``mask`` fragment is fine where it is, since it and its consumer
+    # both stay in the compute stage.
+    #
+    # It stays off by default: enabling it cost 5% of a production step. An isolated
+    # benchmark of this kernel had predicted a win, and why it was wrong matters more
+    # than its numbers -- in training every gather slowed by 46-69%, including the
+    # compress-ratio-4 layers whose working set that benchmark measured a 19% gain on.
+    # The commit/wait only pays for itself if the gather is HBM-bound, and no isolated
+    # measurement reproduced the cache and bandwidth state of a real step. So re-enable
+    # this on an end-to-end measurement, never on a microbenchmark. Nothing plumbs the
+    # parameter to a config, so opting in is a source change by construction.
+    assert num_stages >= 0, f"num_stages must be non-negative, got {num_stages}"
     assert dim == tilelang.math.next_power_of_2(dim), f"dim must be power of 2, got {dim}"
     assert topk % block_I == 0, f"topk ({topk}) must be divisible by block_I ({block_I})"
     if sm_scale is None:
@@ -81,6 +97,35 @@ def sparse_mqa_fwd(
 
     H_per_block = padded_H if REPLICATE_H == 1 else 64
 
+    # Every stage past the first double-buffers the BI x D KV tile, so the depth is
+    # bounded by shared memory rather than by anything in the algorithm -- and by
+    # block_I and dim too, which is why the shipped depth is checked as well and not
+    # only the opt-in ones.
+    #
+    # O_shared and Lse_shared are deliberately absent from the sum: TileLang merges
+    # them into buffers that are dead by the time the output accumulates, so they cost
+    # nothing on top. Measured across heads in {8, 16, 64}, block_I in {64, 128} and
+    # depths 0-2, the launch requests exactly this sum plus 2048 B of inter-buffer
+    # alignment -- adding O_shared would over-count by ~32% and falsely reject depths
+    # that run today. The 2048 stays out because it is TileLang's own padding rule
+    # rather than ours; leaving the sum a lower bound means it can only under-reject,
+    # and a depth that slips through still fails loudly at launch naming its bytes.
+    smem_lower_bound = (
+        H_per_block * D * 2  # Q_shared, bf16
+        + H_per_block * BI * 2  # S_shared, bf16
+        + max(num_stages, 1) * BI * D * 2  # KV_shared, one buffer per stage
+    )
+    # Every kernel here is CUDA-only, so the device-agnostic helper reads as more
+    # portable than it is -- but it stays: `device-api-check` rejects a vendor-namespaced
+    # device reference under veomni/ unless `veomni/utils/device.py` has no equivalent,
+    # and here it does. Reaching this line already implies an accelerator anyway, since
+    # the module imports tilelang at import time and only a compiling kernel gets here.
+    smem_limit = get_torch_device().get_device_properties(None).shared_memory_per_block_optin
+    assert smem_lower_bound <= smem_limit, (
+        f"num_stages={num_stages} at block_I={block_I}, dim={dim} needs at least "
+        f"{smem_lower_bound} B of shared memory per block, above this device's {smem_limit} B"
+    )
+
     @T.prim_func
     def main(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
@@ -96,7 +141,6 @@ def sparse_mqa_fwd(
             O_shared = T.alloc_shared([H_per_block, D], dtype)
             Lse_shared = T.alloc_shared([H_per_block], accum_dtype)
             mask = T.alloc_fragment([BI], "bool")
-            safe_indices = T.alloc_fragment([BI], indices_dtype)
 
             acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
             acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
@@ -124,10 +168,20 @@ def sparse_mqa_fwd(
                     mask[bi_i] = (
                         Indices[b_i, s_i, i_i * BI + bi_i] >= 0 and Indices[b_i, s_i, i_i * BI + bi_i] < seq_len_kv
                     )
-                    safe_indices[bi_i] = T.if_then_else(mask[bi_i], Indices[b_i, s_i, i_i * BI + bi_i], 0)
 
+                # Read the row index straight from global memory and clamp it, instead of
+                # going through a register fragment. A fragment index would tie this copy
+                # to the fragment's inferred layout, which collapses the whole tile onto
+                # the handful of threads that own the BI axis; reading Indices directly
+                # lets layout inference pick a coalesced whole-CTA copy instead.
+                # Clamping is equivalent to substituting row 0: out-of-range candidates
+                # have their scores pre-set to -inf below, which absorbs the finite QK
+                # product from whichever real row is fetched here, so their softmax
+                # weight is exactly zero and they contribute nothing to the PV GEMM.
                 for bi_i, d_i in T.Parallel(BI, D):
-                    KV_shared[bi_i, d_i] = KV[b_i, safe_indices[bi_i], d_i]
+                    KV_shared[bi_i, d_i] = KV[
+                        b_i, T.max(T.min(Indices[b_i, s_i, i_i * BI + bi_i], seq_len_kv - 1), 0), d_i
+                    ]
 
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
@@ -191,6 +245,8 @@ def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I
     batch, seq_len, heads, dim = q.shape
     _, seq_len_kv, kv_dim = kv.shape
     assert kv_dim == dim
+    # The gather clamps candidate rows into [0, seq_len_kv - 1], which needs a row to exist.
+    assert seq_len_kv > 0, "kv must have at least one row"
     _, _, topk = topk_idxs.shape
 
     # Pad topk to next multiple of block_I (kernel requires divisibility)

@@ -138,8 +138,8 @@ class TextDPOTrainer:
     reference_model: PreTrainedModel
 
     def __init__(self, args: VeOmniDPOArguments):
-        if args.train.chunk_mbs_config.enable:
-            raise ValueError("ChunkMBS is not supported by the DPO trainer yet.")
+        if args.model.accelerator.cp_size > 1 and args.model.accelerator.cp_layout == "zigzag":
+            raise NotImplementedError("DPO does not support USP zigzag CP; set cp_size=1.")
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
@@ -196,8 +196,15 @@ class TextDPOTrainer:
             config_path=args.model.config_path,
             weights_path=args.model.model_path,
             torch_dtype=args.dpo_config.refer_model_precision,
-            init_device=args.train.init_device,
+            init_device=args.model.accelerator.init_device,
             ops_implementation=args.model.ops_implementation,
+            # The same overrides the policy model is built with. Without this the
+            # reference reads only ``config.json`` and the two architectures can
+            # diverge on anything set under ``model_config`` -- which is where a
+            # model-level training objective such as DeepSeek-V4's
+            # ``dsa_indexer_loss`` is switched off, so the policy would honour the
+            # override and its reference would not.
+            config_kwargs=args.model.model_config,
         )
 
         self.reference_model.requires_grad_(False)
@@ -208,20 +215,21 @@ class TextDPOTrainer:
 
         self.reference_model = build_parallelize_model(
             self.reference_model,
-            init_device=args.train.init_device,
+            init_device=args.model.accelerator.init_device,
             weights_path=args.model.model_path,
-            enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
+            enable_reshard_after_forward=args.model.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=MixedPrecisionConfig(enable=False),  # In reference model, we will not use mixed precision
             enable_gradient_checkpointing=False,
             basic_modules=list(
                 set(getattr(self.reference_model, "_no_split_modules", None) or []) | set(args.model.basic_modules)
             ),
             enable_reentrant=False,
-            enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
-            enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
-            broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
+            enable_forward_prefetch=args.model.accelerator.fsdp_config.forward_prefetch,
+            enable_fsdp_offload=args.model.accelerator.fsdp_config.offload,
+            fsdp_offload_pin_memory=args.model.accelerator.fsdp_config.offload_pin_memory,
+            broadcast_model_weights_from_rank0=args.model.broadcast_model_weights_from_rank0,
             cpu_load_param_name=cpu_load_param_name,
-            max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
+            max_load_broadcast_size=args.model.accelerator.fsdp_config.max_load_broadcast_size,
         )
         self.reference_model.eval()
         helper.print_device_mem_info("VRAM usage after building reference model")
@@ -404,8 +412,8 @@ class TextDPOTrainer:
         # segments (chosen, rejected) but carries one source metadata entry.
         self.base.on_step_begin(micro_batches=micro_batches, source_repeat=2)
 
-    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
+        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=aux_metrics)
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         args: VeOmniDPOArguments = self.base.args
@@ -413,9 +421,10 @@ class TextDPOTrainer:
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
+        self.base._reset_async_activation_offload_if_enabled()
         self.on_step_begin(micro_batches=micro_batches)
 
-        synchronize()
+        self.base.sync_before_train_step()
 
         total_loss = 0.0
         total_loss_dict: Dict[str, float] = defaultdict(float)
@@ -424,6 +433,7 @@ class TextDPOTrainer:
         for micro_step, micro_batch in enumerate(micro_batches):
             mark_compile_step_begin(getattr(self.base.model, "_veomni_compile_uses_cuda_graphs", False))
             self.base.model_reshard(micro_step, num_micro_steps)
+            self.base._configure_hsdp_allreduce(micro_step, num_micro_steps)
             loss, loss_dict = self.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
@@ -431,11 +441,21 @@ class TextDPOTrainer:
                 total_loss_dict[k] += v.item()
 
         with use_parallel_state("base"):
-            grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+            grad_norm = veomni_clip_grad_norm(self.base.model, args.model.optimizer.max_grad_norm)
 
         self.base.optimizer.step()
         self.base.lr_scheduler.step()
         self.base.optimizer.zero_grad()
+
+        # The other trainers may report the sum of their micro batches' losses
+        # because ``mean_global_loss`` has already scaled each one by its share of
+        # the step's tokens, so the sum is the step's mean. Nothing above carries
+        # that weight: ``forward_backward_step`` builds ``loss_dict`` out of plain
+        # per-micro-batch means, so the sums are averaged here instead. Reporting
+        # them raw scaled every value by ``gradient_accumulation_steps`` -- most
+        # visibly ``reward_accuracy``, a fraction of pairs that read above 1.
+        total_loss /= num_micro_steps
+        total_loss_dict = {key: value / num_micro_steps for key, value in total_loss_dict.items()}
 
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 

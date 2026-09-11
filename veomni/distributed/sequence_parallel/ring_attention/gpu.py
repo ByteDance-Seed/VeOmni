@@ -93,7 +93,8 @@ if not _FA_AVAILABLE:
         _fa4_fwd_params = inspect.signature(_fa4_fwd).parameters
         _fa4_bwd_params = inspect.signature(_fa4_bwd).parameters
         _fa4_ok = all(p in _fa4_fwd_params for p in ("return_lse", "cu_seqlens_q", "max_seqlen_q")) and all(
-            p in _fa4_bwd_params for p in ("dq", "dk", "dv", "cu_seqlens_q", "max_seqlen_q", "window_size_left")
+            p in _fa4_bwd_params
+            for p in ("dq", "dk", "dv", "cu_seqlens_q", "max_seqlen_q", "window_size_left", "deterministic")
         )
         if _fa4_ok:
             _FA_AVAILABLE = True
@@ -117,7 +118,7 @@ __all__ = [
 def _fa_forward(q, k, v, softmax_scale, causal, dropout_p=0.0):
     """Dense low-level FA forward returning ``(out, lse)`` with ``lse`` as ``(b, h, s)``."""
     if FA_BACKEND == "fa4":
-        out, lse = _fa4_fwd(
+        out, lse, *_ = _fa4_fwd(
             q,
             k,
             v,
@@ -160,6 +161,7 @@ def _fa_backward(dout, q, k, v, out, lse, softmax_scale, causal, dropout_p=0.0):
             causal=causal,
             window_size_left=-1,
             window_size_right=-1,
+            deterministic=os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") == "1",
             dq=dq,
             dk=dk,
             dv=dv,
@@ -392,6 +394,7 @@ def _zigzag_ring_backward(group, dout, q, k, v, out, lse, softmax_scale):
                 causal=causal,
                 window_size_left=-1,
                 window_size_right=-1,
+                deterministic=os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") == "1",
                 dq=dq_b[:, :sq],
                 dk=dk_b[:, :skv],
                 dv=dv_b[:, :skv],
@@ -543,7 +546,7 @@ def zigzag_ring_flash_attn_func(
 def _fa_varlen_forward(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale, causal):
     """Varlen low-level FA forward returning ``(out, lse)`` with ``lse`` as ``(h, total)``."""
     if FA_BACKEND == "fa4":
-        out, lse = _fa4_fwd(
+        out, lse, *_ = _fa4_fwd(
             q,
             k,
             v,
@@ -595,6 +598,7 @@ def _fa_varlen_backward(dout, q, k, v, out, lse, dq, dk, dv, cu_q, cu_k, max_q, 
             cu_seqlens_k=cu_k,
             max_seqlen_q=max_q,
             max_seqlen_k=max_k,
+            deterministic=os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") == "1",
             dq=dq,
             dk=dk,
             dv=dv,
@@ -917,7 +921,8 @@ def forward(
     dropout_p: float = 0.0,
 ) -> Tensor:
     """Run balanced causal Ring Attention on fixed-shape CUDA tensors."""
-    del dropout_p  # The CUDA Ring backend currently preserves its zero-dropout behavior.
+    if dropout_p:
+        raise NotImplementedError("CUDA Ring Attention does not support nonzero dropout.")
     return zigzag_ring_flash_attn_func(q, k, v, softmax_scale=softmax_scale, causal=causal, group=group)
 
 
@@ -933,7 +938,8 @@ def packed_forward(
     dropout_p: float = 0.0,
 ) -> Tensor:
     """Run balanced causal Ring Attention on packed CUDA tensors."""
-    del dropout_p  # The CUDA Ring backend currently preserves its zero-dropout behavior.
+    if dropout_p:
+        raise NotImplementedError("CUDA Ring Attention does not support nonzero dropout.")
     return zigzag_ring_flash_attn_varlen_func(
         q,
         k,

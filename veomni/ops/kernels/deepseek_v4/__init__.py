@@ -40,11 +40,25 @@ def sparse_attn_tilelang(
     attn_sink: torch.Tensor,
     topk_idxs: torch.Tensor,
     sm_scale: float | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> "torch.Tensor | tuple[torch.Tensor, torch.Tensor]":
     _require_tilelang_sm90()
     from .tilelang_sparse_mla import sparse_attn_tilelang as impl
 
-    return impl(q, kv, attn_sink, topk_idxs, sm_scale)
+    return impl(q, kv, attn_sink, topk_idxs, sm_scale, return_lse)
+
+
+def sparse_mqa_target_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    lse: torch.Tensor,
+    sm_scale: float | None = None,
+) -> torch.Tensor:
+    _require_tilelang_sm90()
+    from .tilelang_sparse_mla_target import sparse_mqa_target_fwd_interface
+
+    return sparse_mqa_target_fwd_interface(q, kv, topk_idxs, lse, sm_scale)
 
 
 def v4_lighting_indexer(
@@ -77,12 +91,23 @@ def act_quant(
     block_size: int = 128,
     scale_fmt: str | None = None,
     scale_dtype: torch.dtype = torch.float32,
-    inplace: bool = False,
+    dequant: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     _require_tilelang_sm90()
-    from .act_quant import act_quant as impl
+    from .quant import act_quant as impl
 
-    return impl(x, block_size, scale_fmt, scale_dtype, inplace)
+    return impl(x, block_size, scale_fmt, scale_dtype, dequant)
+
+
+def fp4_act_quant(
+    x: torch.Tensor,
+    block_size: int = 32,
+    dequant: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    _require_tilelang_sm90()
+    from .quant import fp4_act_quant as impl
+
+    return impl(x, block_size, dequant)
 
 
 def linear_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -91,4 +116,25 @@ def linear_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return impl(x, weight)
 
 
-__all__ = ["act_quant", "linear_bf16_fp32", "sparse_attn_tilelang", "v4_lighting_indexer"]
+def fp8_weight_quant(
+    x: torch.Tensor,
+    block_size: int = 128,
+    scale_fmt: str | None = None,
+    scale_dtype: torch.dtype = torch.float32,
+    dequant: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    _require_tilelang_sm90()
+    from .quant import fp8_weight_quant as impl
+
+    return impl(x, block_size, scale_fmt, scale_dtype, dequant)
+
+
+__all__ = [
+    "act_quant",
+    "fp4_act_quant",
+    "fp8_weight_quant",
+    "linear_bf16_fp32",
+    "sparse_attn_tilelang",
+    "sparse_mqa_target_fwd",
+    "v4_lighting_indexer",
+]

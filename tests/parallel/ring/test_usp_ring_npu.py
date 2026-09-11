@@ -209,6 +209,7 @@ class NPUUSPAttentionTest(MultiProcessTestCase):
         )
         mesh[("ulysses", "cp")]._flatten(mesh_dim_name="sp")
         PS._PARALLEL_STATE = PS.ParallelState(
+            cp_layout="zigzag",
             dp_size=1,
             dp_replicate_size=1,
             dp_shard_size=1,

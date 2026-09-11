@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Verify the training determinism switch reaches each low-level FA2 backward."""
+"""Verify the training determinism switch reaches each low-level FA2/FA4 backward."""
 
 import pytest
 import torch
@@ -37,23 +37,25 @@ class _LocalRingComm:
         pass
 
 
+@pytest.mark.parametrize("backend", ["fa2", "fa4"])
 @pytest.mark.parametrize("path", ["dense", "zigzag", "varlen"])
 @pytest.mark.parametrize("setting", [None, "0", "1"])
-def test_fa2_backward_honors_determinism(monkeypatch, path, setting):
+def test_backward_honors_determinism(monkeypatch, path, setting, backend):
     if setting is None:
         monkeypatch.delenv("FLASH_ATTENTION_DETERMINISTIC", raising=False)
     else:
         # Set after module import, just as trainer setup sets the environment.
         monkeypatch.setenv("FLASH_ATTENTION_DETERMINISTIC", setting)
-    monkeypatch.setattr(ring_gpu, "FA_BACKEND", "fa2")
+    monkeypatch.setattr(ring_gpu, "FA_BACKEND", backend)
     monkeypatch.setattr(ring_gpu, "RingComm", _LocalRingComm)
     calls = []
 
-    def backward(**kwargs):
+    def backward(*args, **kwargs):
         calls.append(kwargs["deterministic"])
         for name in ("dq", "dk", "dv"):
             kwargs[name].zero_()
 
+    monkeypatch.setattr(ring_gpu, "_fa4_bwd", backward, raising=False)
     monkeypatch.setattr(ring_gpu, "_flash_attn_backward", backward, raising=False)
     monkeypatch.setattr(ring_gpu, "_flash_attn_varlen_backward", backward, raising=False)
     q = torch.zeros(1, 8, 2, 4)

@@ -36,11 +36,21 @@ logger = logging.get_logger(__name__)
 
 
 class OpsConfigSlot:
-    """A module-level config value bound from ``OpsImplementationConfig``."""
+    """A module-level kernel-selection value bound from ``OpsImplementationConfig``.
 
-    def __init__(self, field_name: str, default: str = "eager"):
+    Holds one of the ``*_implementation`` strings, so an unbound slot reads
+    ``"eager"`` -- the universal fallback, and the right answer for a slot nobody
+    bound.
+
+    Deliberately narrow. A per-model training objective belongs on that model's
+    config, not here: these slots are module-level globals, so two models sharing
+    a generated modeling module share the slot, and the second ``bind`` decides for
+    both.
+    """
+
+    def __init__(self, field_name: str):
         self.field_name = field_name
-        self._value = default
+        self._value = "eager"
 
     def bind(self, ops_config: Any) -> None:
         self._value = getattr(ops_config, self.field_name)

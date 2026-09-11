@@ -278,6 +278,7 @@ class USPAttentionE2ETest(MultiProcessTestCase):
             tp_size=1,
             pp_size=1,
             cp_size=CP,
+            cp_layout="zigzag",
             ulysses_size=ULYSSES,
             device_type=get_device_type(),
             device_mesh=mesh,

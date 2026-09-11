@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import veomni.distributed.sequence_parallel.ring_attention as ring_attention_module
+from veomni.utils.device import get_device_type
 
 
 def test_ring_attention_routes_fixed_shape_input(monkeypatch):
@@ -37,7 +38,7 @@ def test_ring_attention_routes_fixed_shape_input(monkeypatch):
         query,
         group=object(),
         cp_size=2,
-        device_type="cuda",
+        device_type=get_device_type(),
     )
 
     assert output is query
@@ -64,7 +65,7 @@ def test_ring_attention_routes_packed_input_with_local_offsets(monkeypatch):
         group=object(),
         cp_size=2,
         cu_seqlens=full_cu_seqlens,
-        device_type="cuda",
+        device_type=get_device_type(),
     )
 
     assert output.shape == query.shape
@@ -91,5 +92,5 @@ def test_ring_attention_validates_supported_inputs(causal, attention_mask, match
             cp_size=2,
             attention_mask=attention_mask,
             causal=causal,
-            device_type="cuda",
+            device_type=get_device_type(),
         )

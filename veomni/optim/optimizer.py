@@ -15,7 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -31,7 +31,11 @@ from torch.optim.optimizer import Optimizer
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
-from .muon import DistributedMuon, split_muon_adamw_params
+from .muon import DistributedMuon, infer_head_block_counts, split_muon_adamw_params
+
+
+if TYPE_CHECKING:
+    from ..arguments import OptimizerConfig
 
 
 def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
@@ -330,6 +334,34 @@ class MultiOptimizer(Optimizer, Stateful):
 
         return merged
 
+    def _sparse_state_dict(
+        self,
+    ) -> Dict[str, Any]:
+        """Return a flattened optimizer state dict without materializing state.
+
+        Unlike ``state_dict()``, this skips sub-optimizers whose ``.state`` is
+        still empty.  PyTorch's ``get_optimizer_state_dict`` would otherwise
+        call ``_init_optim_state`` and synthesize default state for every
+        parameter owned by that sub-optimizer (e.g. an unused MoE expert on
+        this rank), bloating the checkpoint.
+        """
+        merged: Dict[str, Any] = {}
+        for name in self.key_names:
+            opt = self.optimizers_dict.get(name)
+            if not opt.state:
+                continue
+            sd = get_optimizer_state_dict(self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True))
+            overlap = set(merged.keys()) & set(sd.keys())
+            if overlap:
+                raise KeyError(
+                    f"Key clash detected while merging state dict for optimizer '{name}': {', '.join(sorted(overlap))}"
+                )
+            else:
+                logger.info_rank0("No clashes when merging MultiOptimizer state dicts")
+            merged.update(sd)
+
+        return merged
+
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         # Feed the same merged flattened dict to each sub-optimizer; PyTorch will
         # pick out only the entries for parameters that belong to that optimizer.
@@ -397,6 +429,33 @@ def get_parameter_names(model, forbidden_layer_types, forbidden_param_names):
     return result
 
 
+def _collect_muon_kwargs(optimizer_cfg: "OptimizerConfig") -> Dict[str, Any]:
+    """Pull Muon-specific hyperparameters out of ``OptimizerConfig``.
+
+    ``lr`` is forwarded unresolved (``None`` when unset) so that the Muon-vs-AdamW
+    LR policy lives in one place, ``_build_muon_with_adamw``. It is coerced here
+    because YAML resolves exponent literals without a decimal point (``3e-4``) to
+    a string, which would otherwise reach the LR scheduler untouched.
+    """
+    return {
+        "lr": None if optimizer_cfg.muon_lr is None else float(optimizer_cfg.muon_lr),
+        "momentum": optimizer_cfg.muon_momentum,
+        "nesterov": optimizer_cfg.muon_nesterov,
+        "weight_decay": optimizer_cfg.muon_weight_decay,
+        "ns_steps": optimizer_cfg.muon_ns_steps,
+        "ns_coefficients": tuple(optimizer_cfg.muon_ns_coefficients),
+        "eps": optimizer_cfg.muon_eps,
+        "adjust_lr_fn": optimizer_cfg.muon_adjust_lr_fn,
+        "ns_implementation": optimizer_cfg.muon_ns_implementation,
+        "gram_ns_reset_iterations": tuple(optimizer_cfg.muon_gram_ns_reset_iterations),
+        # Resolved against the model in _build_muon_with_adamw, not ctor kwargs.
+        "head_group_size": int(optimizer_cfg.muon_head_group_size),
+        "head_split_modules": tuple(optimizer_cfg.muon_head_split_modules),
+        # Surface for startup summary only; not a DistributedMuon ctor kwarg.
+        "expert_zero_comm": bool(optimizer_cfg.muon_expert_zero_comm),
+    }
+
+
 def build_optimizer(
     model: "nn.Module",
     lr: float = 1e-3,
@@ -409,8 +468,21 @@ def build_optimizer(
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
     muon_kwargs: Optional[Dict[str, Any]] = None,
+    optimizer_config: Optional["OptimizerConfig"] = None,
 ) -> "torch.optim.Optimizer":
+    """Build the optimizer.
+
+    ``optimizer_config`` lets callers hand over the whole ``OptimizerConfig`` so
+    that optimizer-specific knobs (currently Muon's ``muon_*`` fields) are read
+    here rather than unpacked by every trainer. It does *not* supply ``lr``,
+    ``weight_decay`` or the ``no_decay_*`` lists — those stay explicit arguments,
+    because callers such as the VLM trainer drive the AdamW side from their own
+    param groups. ``muon_kwargs`` overrides the config key by key, for callers
+    that build Muon without an ``OptimizerConfig`` at all.
+    """
     if optimizer_type == "muon":
+        if optimizer_config is not None:
+            muon_kwargs = {**_collect_muon_kwargs(optimizer_config), **(muon_kwargs or {})}
         if param_groups is not None:
             logger.warning_rank0(
                 "build_optimizer(optimizer_type='muon') ignores the provided "
@@ -491,6 +563,30 @@ def _is_extra_parallel_param(p: torch.nn.Parameter, extra_parallel_names: Sequen
     return None
 
 
+def _muon_param_groups(
+    params: List[torch.nn.Parameter],
+    head_blocks_by_param: Dict[int, int],
+) -> Union[List[torch.nn.Parameter], List[Dict[str, Any]]]:
+    """Split ``params`` into one Muon param group per head-block count.
+
+    Groups are emitted in ascending block order so every rank iterates them in
+    the same order: the all-to-all pairing in ``DistributedMuon`` is
+    position-based.
+    """
+    if not head_blocks_by_param:
+        return list(params)
+
+    by_blocks: Dict[int, List[torch.nn.Parameter]] = {}
+    for p in params:
+        by_blocks.setdefault(head_blocks_by_param.get(id(p), 1), []).append(p)
+    # The unsplit group stays free of ``head_blocks`` so its DCP state dict keys
+    # match a run with head splitting disabled.
+    return [
+        {"params": group_params} if blocks == 1 else {"params": group_params, "head_blocks": blocks}
+        for blocks, group_params in sorted(by_blocks.items())
+    ]
+
+
 def _build_muon_with_adamw(
     model: "nn.Module",
     lr: float,
@@ -508,16 +604,27 @@ def _build_muon_with_adamw(
     dict keys and grad-clipping metadata stay keyed by mesh.
     """
     muon_kwargs = dict(muon_kwargs or {})
-    # Summary-only keys collected by the trainer; not DistributedMuon ctor args.
+    # Summary-only keys; not DistributedMuon ctor args.
     expert_zero_comm = bool(muon_kwargs.pop("expert_zero_comm", False))
-    adamw_lr = float(muon_kwargs.pop("adamw_lr", lr))
-    muon_lr_explicit = bool(
-        muon_kwargs.pop("muon_lr_explicit", "lr" in muon_kwargs and muon_kwargs.get("lr") is not None)
-    )
-    if muon_kwargs.get("lr") is None:
+    adamw_lr = float(lr)
+    head_group_size = int(muon_kwargs.pop("head_group_size", 0) or 0)
+    head_split_modules = tuple(muon_kwargs.pop("head_split_modules", None) or ())
+    if head_group_size < 0:
+        raise ValueError(f"muon_head_group_size must be >= 0 (0 disables head splitting), got {head_group_size}")
+    if head_group_size >= 1 and not head_split_modules:
+        raise ValueError(
+            f"muon_head_group_size={head_group_size} requires muon_head_split_modules: there is no "
+            "default list, because which attention projections benefit from head splitting depends "
+            "on the architecture. List the modules to split as leaf names or dotted path suffixes, "
+            "e.g. ['self_attn.q_b_proj'] for DeepSeek V4/V3 MLA up-projections or "
+            "['q_proj', 'k_proj', 'v_proj'] for GQA attention."
+        )
+    # The single owner of the Muon-vs-AdamW LR policy: an unset Muon LR either
+    # inherits the AdamW LR (match_rms_adamw) or takes the Moonlight-style 25x.
+    muon_lr_explicit = muon_kwargs.get("lr") is not None
+    if not muon_lr_explicit:
         adjust_lr_fn = muon_kwargs.get("adjust_lr_fn", "match_rms_adamw")
-        muon_kwargs["lr"] = float(adamw_lr) if adjust_lr_fn == "match_rms_adamw" else 25.0 * float(adamw_lr)
-        muon_lr_explicit = False
+        muon_kwargs["lr"] = adamw_lr if adjust_lr_fn == "match_rms_adamw" else 25.0 * adamw_lr
     muon_params, adamw_params, muon_names, adamw_names = split_muon_adamw_params(
         model,
         no_decay_modules=no_decay_modules,
@@ -528,6 +635,24 @@ def _build_muon_with_adamw(
             "Muon optimizer was selected but the model has no eligible 2D/3D parameters. "
             "Falling back to AdamW would be silent so we raise instead."
         )
+
+    head_blocks_by_param: Dict[int, int] = {}
+    head_split_names: List[str] = []
+    if head_group_size >= 1:
+        blocks_by_fqn = infer_head_block_counts(model, head_group_size, head_split_modules)
+        muon_name_set = set(muon_names)
+        param_by_name = dict(model.named_parameters())
+        for fqn, blocks in sorted(blocks_by_fqn.items()):
+            if fqn not in muon_name_set:  # routed to AdamW, nothing to scope
+                continue
+            head_blocks_by_param[id(param_by_name[fqn])] = blocks
+            head_split_names.append(fqn)
+        if not head_split_names:
+            logger.warning_rank0(
+                f"[Muon] muon_head_group_size={head_group_size} matched no attention projection; "
+                f"every param stays on full-matrix Muon. Check muon_head_split_modules="
+                f"{list(head_split_modules)} against this architecture's attention module names."
+            )
 
     extra_parallel_aware = _should_build_extra_parallel_aware(model)
     parallel_state = get_parallel_state() if extra_parallel_aware else None
@@ -580,6 +705,15 @@ def _build_muon_with_adamw(
         f"expert_zero_comm={expert_zero_comm} "
         "(applied at FSDP parallelize; see [muon_expert_zero_comm] logs)."
     )
+    if head_split_names:
+        blocks_hist: Dict[int, int] = {}
+        for blocks in head_blocks_by_param.values():
+            blocks_hist[blocks] = blocks_hist.get(blocks, 0) + 1
+        logger.info_rank0(
+            f"[Muon] head split: {len(head_split_names)} param(s) orthogonalized in blocks of "
+            f"{head_group_size} head(s); {{blocks: params}}={dict(sorted(blocks_hist.items()))}; "
+            f"first few: {head_split_names[:3]}."
+        )
     if extra_parallel_aware:
         for para in extra_parallel_names:
             logger.info_rank0(
@@ -590,7 +724,7 @@ def _build_muon_with_adamw(
 
     def _make_muon(params: List[torch.nn.Parameter]) -> DistributedMuon:
         return DistributedMuon(
-            params,
+            _muon_param_groups(params, head_blocks_by_param),
             lr=muon_kwargs.get("lr", 2e-2),
             weight_decay=muon_kwargs.get("weight_decay", 0.0),
             momentum=muon_kwargs.get("momentum", 0.95),
