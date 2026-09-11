@@ -85,7 +85,7 @@ def test_vlm_lora_preserves_vision_adapters_when_vit_is_frozen():
         freeze_vit=True,
     )
 
-    runtime.freeze_model()
+    runtime._freeze_model_module()
 
     # ``is_veomni_lora_model`` is an isinstance check, so unwrap the runtime handle.
     model = runtime.model
@@ -107,7 +107,7 @@ def test_llm_only_lora_freezes_entire_vlm_visual_tower():
         freeze_vit=False,
     )
 
-    runtime.freeze_model()
+    runtime._freeze_model_module()
 
     visual = _get_vlm_visual_module(runtime.model)
     assert all(not param.requires_grad for param in visual.parameters())
@@ -118,7 +118,7 @@ def test_production_multimodal_lora_configs_have_trainable_adapters(yaml_path, c
     lora_config = yaml.safe_load(Path(yaml_path).read_text())["model"]["lora_config"]
     runtime = _build_meta_runtime(config_path, lora_config)
 
-    runtime.freeze_model()
+    runtime._freeze_model_module()
 
     assert _trainable_lora_names(runtime.model)
     assert runtime.model.base_model.wrapped_dense
@@ -154,7 +154,7 @@ def test_omni_lora_ignores_tower_freeze_flags():
     )
     runtime = _make_runtime(model, args, SimpleNamespace(model_type="qwen3_omni_moe"))
 
-    runtime.freeze_model()
+    runtime._freeze_model_module()
 
     wrapped = runtime.model
     assert any(param.requires_grad for param in wrapped.text_proj.parameters())
@@ -182,7 +182,7 @@ def test_omni_freeze_vit_without_vision_lora(lora_config, merger_trainable):
         SimpleNamespace(model_type="qwen3_omni_moe"),
     )
 
-    runtime.freeze_model()
+    runtime._freeze_model_module()
 
     visual = runtime.model.thinker.visual
     assert all(not param.requires_grad for param in visual.proj.parameters())

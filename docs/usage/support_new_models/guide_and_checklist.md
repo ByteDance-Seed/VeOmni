@@ -14,7 +14,7 @@
 > happening in `<model>_gpu_patch_gen_config.py`. For step-by-step
 > instructions on the patchgen flow, see
 > [the patchgen design guide](../../design/patchgen.md) and
-> the `veomni-migrate-transformers-v5` agent skill.
+> the `veomni-patchgen-model` agent skill.
 
 ---
 
@@ -147,7 +147,7 @@ Add `process_sample_your_model()` to [veomni/data/data_transform.py](../../../ve
 
 ### Step 8: Hook into the Trainer
 
-Edit [veomni/trainer/vlm_trainer.py](../../../veomni/trainer/vlm_trainer.py). Prefer model hooks (`get_extra_collate_infos`, `get_metadata_collate_func`) and `VLMModelRuntime` overrides (`build_model`, `freeze_model`, `build_optimizer`) over adding a `model_type` branch on the trainer. Wire a new data transform in `_build_data_transform` if the shared registry does not already cover it.
+Edit [veomni/trainer/vlm_trainer.py](../../../veomni/trainer/vlm_trainer.py). Prefer model hooks (`get_extra_collate_infos`, `get_metadata_collate_func`) and `VLMModelRuntime` overrides (`_build_model`, `_freeze_model_module`, `_build_optimizer`) over adding a `model_type` branch on the trainer. Wire a new data transform in `_build_data_transform` if the shared registry does not already cover it.
 
 ### Step 9: Add a Config File
 
@@ -217,7 +217,7 @@ For implementation details of each patch, refer to the example docs.
 - [ ] Toy config in `tests/toy_config/your_model_toy/`
 - [ ] `DummyYourModelDataset` in `veomni/data/dummy_dataset.py` (multimodal)
 - [ ] `MODEL_TO_DATASET` entry in `tests/models/utils.py`
-- [ ] `pytest.param` in `test_cases` in `tests/models/test_models_patch.py` (Level 1)
+- [ ] `pytest.param` in `TEST_CASES` in `tests/models/test_models_patch.py` (Level 1)
 - [ ] Test case + fixture + test function in `tests/e2e/test_e2e_parallel.py` (Level 2)
 - [ ] For VLM models, add the toy config to the `freeze_vit` smoke test list in `tests/models/test_vlm_trainer.py`
 

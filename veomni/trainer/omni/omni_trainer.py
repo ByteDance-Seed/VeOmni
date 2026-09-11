@@ -19,8 +19,8 @@ Unlike single-model trainers (BaseTrainer / VLMTrainer), OmniModel is a
 vqvae / text_encoder / llama).  Each sub-model is backed by its **own**
 :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime` — a
 :class:`~veomni.models.model_runtime.VeOmniModelRuntime` subclass, so it inherits
-the whole per-model build sequence (``build_model`` / ``setup_lora`` /
-``build_parallelized_model`` / ``build_optimizer`` / ``build_lr_scheduler``) and
+the whole per-model build sequence (``_build_model`` / ``_setup_lora`` /
+``_build_parallelized_model`` / ``_build_optimizer`` / ``_build_lr_scheduler``) and
 gives that module its own FSDP2 unit, optimizer, lr-scheduler, **checkpoint
 callback** and on-disk snapshot.
 
@@ -35,8 +35,8 @@ cascade into every module-trainer so each runs its own checkpoint save/resume.
 Division of labour
 ------------------
 * :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime` (per
-  module): ``build_model`` → ``freeze_model`` (freeze + LoRA) →
-  ``build_parallelized_model`` (FSDP2 wrap + weight load) → ``build_checkpoint``
+  module): ``_build_model`` → ``_freeze_model_module`` (freeze + LoRA) →
+  ``_build_parallelized_model`` (FSDP2 wrap + weight load) → ``build_checkpoint``
   (its own per-module DCP manager).  Optimizer is built inside each
   :class:`ModuleRuntime` at compose time; lr-scheduler is built in
   :meth:`OmniTrainer._build_multi_lr_scheduler` once ``train_steps`` is known from the dataset.
@@ -66,7 +66,7 @@ from ...data import SeedOmniCollator, build_dataloader, build_dataset
 from ...data.data_transform import build_data_transform
 from ...distributed.clip_grad_norm import omni_clip_grad_norm
 from ...distributed.offloading import build_activation_offloading_context
-from ...distributed.parallel_state import init_parallel_state_from_accelerator
+from ...distributed.parallel_state import init_parallel_state_from_config
 from ...models.seed_omni.accelerator import OmniModelRuntime
 from ...models.seed_omni.accelerator.module_runtime import ModuleRuntime
 from ...models.seed_omni.processing_omni import OmniProcessor
@@ -302,7 +302,7 @@ class OmniTrainer:
 
         logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
 
-        init_parallel_state_from_accelerator(args.model.accelerator, name="base")
+        init_parallel_state_from_config(args.model.accelerator, name="base")
 
         helper.set_seed(args.train.seed, args.train.enable_full_determinism)
         helper.enable_high_precision_for_bf16()
@@ -429,12 +429,12 @@ class OmniTrainer:
     def _build_multi_lr_scheduler(self) -> None:
         """Build per-module lr-schedulers and wrap them in :class:`MultiLRScheduler`.
 
-        ``build_lr_scheduler`` no-ops for a fully-frozen module, so such modules
+        ``_build_lr_scheduler`` no-ops for a fully-frozen module, so such modules
         contribute no entry to the wrapper.
         """
         total_steps = self.args.train_steps * self.args.train.num_train_epochs
         for module_runtime in self.model.module_runtimes.values():
-            module_runtime.build_lr_scheduler(total_steps)
+            module_runtime._build_lr_scheduler(total_steps)
         lr_schedulers = {
             name: module_runtime.lr_scheduler
             for name, module_runtime in self.model.module_runtimes.items()

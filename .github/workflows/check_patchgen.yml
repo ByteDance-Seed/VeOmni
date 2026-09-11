@@ -45,13 +45,7 @@ jobs:
 
       - name: Sync patchgen environment
         run: |
-          # Patchgen is CPU-only. These MagiAttention packages build CUDA
-          # extensions during sync but are not needed for drift checks.
-          uv sync --extra gpu --dev \
-            --no-install-package magi-attention \
-            --no-install-package create-block-mask-cuda \
-            --no-install-package flash-attn-cute \
-            --no-install-package magi-to-hstu-cuda
+          uv sync --extra gpu --dev
 
       - name: Check patchgen drift
         run: uv run --no-sync patchgen --check

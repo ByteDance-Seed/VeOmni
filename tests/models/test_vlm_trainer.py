@@ -52,6 +52,6 @@ def test_freeze_vit_on_vlm_model(config_path, freeze_vit):
     runtime.model = model
     runtime.model_config = model.config
 
-    runtime.freeze_model()
+    runtime._freeze_model_module()
 
     assert all(param.requires_grad is not freeze_vit for param in visual.parameters())

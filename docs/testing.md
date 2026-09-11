@@ -49,8 +49,11 @@ tests/
 ├── parallel/                       # Parallelism primitives
 │   ├── ulysses/                    # Sequence parallelism (Ulysses)
 │   │   ├── test_ulysses.py             # Basic SP attention (4+ GPUs)
-│   │   ├── test_async_ulysses.py       # Async overlapping comm (4+ GPUs)
-│   │   ├── test_async_ulysses_dit.py   # DiT + async SP
+│   │   ├── test_async_ulysses.py       # Dense async SP parity (4+ GPUs)
+│   │   ├── test_async_ulysses_dit.py   # DiT async SP parity (4+ GPUs)
+│   │   ├── test_async_ulysses_grad.py  # Dense async projection grad shapes and bias-index guards
+│   │   ├── test_op_wrapper.py          # No-autograd RMSNorm/RoPE wrappers for async Functions
+│   │   ├── test_backward.py            # Shared async linear/LayerNorm/repeat-KV units
 │   │   ├── test_qwen3_5_gated_deltanet_ulysses.py  # Gated DeltaNet + SP
 │   │   ├── test_slice_input_tensor.py  # Input slicing utilities
 │   │   ├── test_all_gather.py          # All-gather collective ops
@@ -76,7 +79,7 @@ tests/
 │   └── train_dit_test.py                # Test trainer for DiT models
 │
 ├── checkpoints/                    # Checkpoint save/load
-│   ├── test_checkpoint_callback.py          # Callback _last_saved_step correctness
+│   ├── test_checkpoint_callback.py          # CheckpointCallback cadence + manager contract
 │   ├── test_trainer_saveload.py             # DCP + HF checkpoint save/load (8 GPUs)
 │   ├── checkpoint_verification_utils.py     # DCP-to-HF conversion verification
 │   └── utils.py                             # Command/config builders for ckpt tests
@@ -285,8 +288,11 @@ NVIDIA GPU for kernel execution.
 | Test | Purpose | GPU |
 |---|---|---|
 | `test_ulysses.py` | Basic Ulysses SP attention | 4+ |
-| `test_async_ulysses.py` | Async overlapping communication | 4+ |
-| `test_async_ulysses_dit.py` | DiT + async SP | 4+ |
+| `test_async_ulysses.py` | Dense async Ulysses forward/backward parity | 4+ |
+| `test_async_ulysses_dit.py` | DiT async Ulysses forward/backward parity | 4+ |
+| `test_async_ulysses_grad.py` | Dense async projection grad shapes and frozen-weight bias grads | CPU |
+| `test_op_wrapper.py` | No-autograd RMSNorm/RoPE wrappers selected by `ops_implementation` | CUDA for Liger cases; eager cases use the active device |
+| `test_backward.py` | Shared linear, LayerNorm, and repeated-KV backward units | CUDA for fused LayerNorm; remaining cases use the active device |
 | `test_qwen3_5_gated_deltanet_ulysses.py` | Gated DeltaNet + SP | 4+ |
 | `test_slice_input_tensor.py` | SP input slicing utilities | CPU |
 | `test_all_gather.py` | All-gather collective ops | multi |
@@ -351,7 +357,7 @@ pytest → test_models_patch_fwd_bwd(config, is_moe, ...)
   → prepare_model_modes(is_moe) → [(HF, eager), (HF, fa2), (VeOmni, fa2_sp), ...]
   → for each mode:
       apply_ops_config(mode-specific OpsImplementationConfig)
-      BaseTrainer.build_model() → build_foundation_model(config, ops_implementation=...)
+      VeOmniModelRuntime._build_model() → build_foundation_model(config, ops_implementation=...)
       TrainerTest.forward_backward_step(dummy_batch)
       → record loss, grad_norm
   → compare_multi_items(all_results, rtol, atol)

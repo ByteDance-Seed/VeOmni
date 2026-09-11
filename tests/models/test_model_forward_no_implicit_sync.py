@@ -49,8 +49,8 @@ turning a 0-D GPU scalar into a Python int (``.item()`` / ``int(t)``),
 slicing with a GPU tensor, calling ``repeat_interleave(GPU_repeats)``,
 ``if gpu_tensor:``, etc. Invisible during compute-heavy steps; expensive
 under SP/EP and small micro-batches, and can cascade into NCCL watchdog
-timeouts. See the ``debug-cuda-sync`` skill for the manual investigation
-flow against real weights.
+timeouts. See ``/veomni-debug`` for the manual investigation flow against
+real weights.
 
 This test is the *unit-level ratchet*: it runs on toy configs (so only
 catches sync sites reachable from a tiny forward) and is cheap enough

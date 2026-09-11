@@ -58,10 +58,16 @@ def _janus_args(*, modules_override: dict | None = None) -> OmniArguments:
 def test_accelerator_config_has_seed_omni_v2_fields_with_expected_defaults():
     acc = AcceleratorConfig()
     assert acc.init_device == "meta"
-    assert acc.broadcast_model_weights_from_rank0 is True
-    assert acc.ep_sharded_stream_load is False
     assert isinstance(acc.gradient_checkpointing, GradientCheckpointingConfig)
     assert isinstance(acc.torch_compile, TorchCompileConfig)
+    assert not hasattr(acc, "broadcast_model_weights_from_rank0")
+    assert not hasattr(acc, "ep_sharded_stream_load")
+
+
+def test_module_runtime_arguments_inherit_weight_load_knobs():
+    args = OmniModuleRuntimeArguments(model_path="/tmp/model")
+    assert args.broadcast_model_weights_from_rank0 is True
+    assert args.ep_sharded_stream_load is False
 
 
 def test_validate_omni_accelerator_accepts_defaults():
@@ -85,7 +91,11 @@ def test_ddp_cpu_init_is_enforced_at_construction():
 
 def test_ep_sharded_stream_load_with_broadcast_is_enforced_at_construction():
     with pytest.raises(AssertionError, match="ep_sharded_stream_load"):
-        AcceleratorConfig(ep_sharded_stream_load=True, broadcast_model_weights_from_rank0=True)
+        OmniModuleRuntimeArguments(
+            model_path="/tmp/model",
+            ep_sharded_stream_load=True,
+            broadcast_model_weights_from_rank0=True,
+        )
 
 
 def test_validate_omni_accelerator_bans_torch_compile():
@@ -98,7 +108,8 @@ def test_omni_arguments_post_init_validates_the_top_level_default():
     with pytest.raises(ValueError, match="torch_compile"):
         OmniArguments(
             model=OmniModelRuntimeArguments(
-                accelerator=AcceleratorConfig(torch_compile=TorchCompileConfig(enable=True))
+                model_path="/tmp/janus",
+                accelerator=AcceleratorConfig(torch_compile=TorchCompileConfig(enable=True)),
             ),
             data=OmniDataArguments(train_path=""),
             infer=OmniInferArguments(),
@@ -108,6 +119,7 @@ def test_omni_arguments_post_init_validates_the_top_level_default():
 def test_build_module_runtime_args_merges_per_module_gradient_checkpointing_override():
     """Global `model.accelerator.gradient_checkpointing` is the base; per-module YAML can override."""
     global_args = OmniModuleRuntimeArguments(
+        model_path="/tmp/model",
         accelerator=AcceleratorConfig(gradient_checkpointing=GradientCheckpointingConfig(enable=True)),
     )
     modules = build_module_runtime_args(
@@ -120,6 +132,24 @@ def test_build_module_runtime_args_merges_per_module_gradient_checkpointing_over
     )
     assert modules["module_a"].accelerator.gradient_checkpointing.enable is False
     assert modules["module_b"].accelerator.gradient_checkpointing.enable is True
+
+
+def test_build_module_runtime_args_merges_per_module_weight_load_override():
+    """Global `model.broadcast_*` is the base; a per-module overlay can override it."""
+    global_args = OmniModuleRuntimeArguments(
+        model_path="/tmp/model",
+        broadcast_model_weights_from_rank0=True,
+    )
+    modules = build_module_runtime_args(
+        global_args,
+        "/tmp/model",
+        {
+            "module_a": {"broadcast_model_weights_from_rank0": False},
+            "module_b": {"model_path": "module_b"},
+        },
+    )
+    assert modules["module_a"].broadcast_model_weights_from_rank0 is False
+    assert modules["module_b"].broadcast_model_weights_from_rank0 is True
 
 
 def test_resolve_omni_model_accepts_valid_per_module_accelerator_override():
@@ -152,14 +182,14 @@ def veomni_caplog(caplog):
 def test_resolve_omni_model_for_inference_forces_eager_without_broadcast_warning(veomni_caplog):
     """`for_inference=True` forces `fsdp_mode=eager` per module (for modules that don't already
     pin their own `fsdp_mode`, e.g. `janus_text_encoder`); `broadcast_model_weights_from_rank0`
-    must be forced off alongside it so `_validate_omni_accelerator` does not warn for every module
-    in the common single-process eager-inference default (see `_resolve_default_accelerator`).
+    is forced off alongside it so the eager default does not inherit a rank0-broadcast load
+    policy that cannot run without a wrap (see `_resolve_default_accelerator`).
     """
     args = _janus_args()
     with veomni_caplog.at_level("WARNING"):
         modules = args.resolve_model(for_inference=True).modules
     assert modules["janus_text_encoder"].accelerator.fsdp_config.fsdp_mode == "eager"
-    assert modules["janus_text_encoder"].accelerator.broadcast_model_weights_from_rank0 is False
+    assert modules["janus_text_encoder"].broadcast_model_weights_from_rank0 is False
     assert "broadcast_model_weights_from_rank0" not in veomni_caplog.text
 
 

@@ -13,7 +13,7 @@ This guide walks through **training** and **inference** for MiniMax H3 FL2VA (fi
 2. [Data Format](#2-data-format)
 3. [Training (Two Stages, Step by Step)](#3-training-two-stages-step-by-step)
 4. [Training Config Notes](#4-training-config-notes)
-5. [Inference](#5-inference-step-by-step)
+5. [Inference](#5-inference)
 6. [Inference Config Notes](#6-inference-config-notes)
 
 ---
@@ -45,7 +45,7 @@ dataset/my_data/
 
 The following 4 columns are **required**, with fixed column names:
 
-```csv
+```text
 video,prompt,input_audio,frame_rate
 video.mp4,"A girl is very happy, she is speaking in english.",video.mp4,24
 ```
@@ -65,8 +65,6 @@ video.mp4,"A girl is very happy, she is speaking in english.",video.mp4,24
 | Resolution | **480x832** (height x width) | Must be divisible by the VAE downsampling factor |
 | Frame rate | 24 | `fps: 24` in the config; audio latent length is computed as `num_frames/24*40` |
 | Audio | 32kHz stereo | Audio is resampled to 32kHz automatically; videos without audio fail during training |
-
----
 
 ## 3. Training (Two Stages, Step by Step)
 
@@ -124,7 +122,7 @@ model:
 data:
   train_path: dataset/minimax-h3-demo/minimax_h3/MiniMax-H3-FL2VA/metadata.csv
   data_transform: minimax_h3_online         # Stage 1 encodes raw video online
-  datasets_type: minimax_h3_online
+  datasets_type: mapping
   dataloader:
     num_workers: 0                          # Stage 1 is encode-heavy; use 0 workers to avoid memory contention
     drop_last: false
@@ -140,7 +138,7 @@ data:
 
 **Important**:
 
-- `train_path` must point to the **metadata.csv file**, not a directory, otherwise you get `png files are not supported`
+- `train_path` must point to the **metadata.csv file** (or a directory that contains it). Directories are scanned for `parquet` / `json` / `csv` / `arrow` files only, so leftover images or `veomni_cli.yaml` are ignored.
 - When changing data, `fps/min_frames/max_frames/height/width` must match the actual video parameters; the frame count must satisfy `(N-5) % 17 == 0`
 - `offline_embedding_save_dir` must match Stage 2's `data.train_path`
 
@@ -172,10 +170,9 @@ model:
 data:
   train_path: output/minimax_h3_fl2va_embedding    # output dir of Stage 1
   data_transform: dit_offline
-  datasets_type: minimax_h3_offline
+  datasets_type: iterable
   shuffle: false
-  mm_configs:
-    repeat: 100                             # dataset repeat count (must be > 1 for small datasets)
+  dataset_repeat: true
 
 train:
   training_task: offline_training
@@ -259,5 +256,3 @@ video, audio = pipe(
 **Important**:
 
 - `num_frames` must satisfy `(N-5) % 17 == 0`, otherwise the Video VAE raises an error
-
----

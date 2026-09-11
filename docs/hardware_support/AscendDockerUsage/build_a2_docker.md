@@ -20,17 +20,17 @@ You can find the latest official Ascend CANN images at: [Ascend Hub](https://www
 
 ```bash
 # for arm
-docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-910b-ubuntu22.04-py3.11
+docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-910b-ubuntu22.04-py3.12
 
 # for x86
-docker pull --platform=amd64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-910b-ubuntu22.04-py3.11
+docker pull --platform=amd64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-910b-ubuntu22.04-py3.12
 ```
 
 ## Step 2: Build the Custom Image
 
 Build the GDN-ready VeOmni Ascend A2 image using
-`Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.x86` for x86 or
-`Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.arm` for ARM64. These Dockerfiles include
+`Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86` for x86 or
+`Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm` for ARM64. These Dockerfiles include
 `torch-npu==2.10.0.post2`, `triton-ascend`, and `fla_npu`.
 
 The existing `Dockerfile.ascend_9.0.0_a2.x86` and `Dockerfile.ascend_9.0.0_a2.arm` remain available for
@@ -49,7 +49,7 @@ docker build \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \
   -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.x86 \
+  -f docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86 \
   .
 ```
 
@@ -62,7 +62,7 @@ docker build \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \
   -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.arm \
+  -f docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm \
   .
 ```
 
@@ -72,7 +72,7 @@ For x86:
 ```bash
 docker build \
   -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.x86 \
+  -f docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86 \
   .
 ```
 
@@ -80,14 +80,14 @@ For ARM64:
 ```bash
 docker build \
   -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.arm \
+  -f docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm \
   .
 ```
 
 ### Image Components
 The built image includes:
-- Ubuntu 22.04 with Python 3.11
-- Ascend CANN 9.0.0 runtime
+- Ubuntu 22.04 with Python 3.12
+- Ascend CANN 9.1.0 runtime
 - VeOmni framework with NPU support
 - torch-npu 2.10.0.post2, triton-ascend, and fla_npu for GDN
 - TorchCodec for efficient video processing
@@ -233,7 +233,7 @@ docker stop ascend-a2-container && docker rm ascend-a2-container
 | Dependency Manager | uv | pip |
 | Virtual Environment | Required | Not Required |
 | Activation Command | `source /app/.venv/bin/activate` | N/A |
-| Installation Command | `uv sync --locked --all-packages --extra npu --dev` | `pip install -e .[npu_aarch64]` |
+| Installation Command | `uv sync --system-certs --python 3.12 --locked --extra npu` | `pip install -e .[npu_aarch64]` |
 
 ### Device Access
 The container requires access to all Ascend devices for proper functionality. The `--device` flags in the run command grant access to these devices.
@@ -249,14 +249,14 @@ Update the proxy settings in both the build and run commands to match your envir
 
 ### Dockerfile Details
 
-#### x86 Dockerfile (Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.x86)
+#### x86 Dockerfile (Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86)
 1. Sets up the Ubuntu 22.04 base with Ascend CANN
 2. Configures system dependencies and development tools
 3. Installs and configures `uv` for dependency management
 4. Uses `uv` to install VeOmni framework with NPU support
 5. Sets up the virtual environment
 
-#### ARM64 Dockerfile (Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.arm)
+#### ARM64 Dockerfile (Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm)
 1. Sets up the Ubuntu 22.04 base with Ascend CANN
 2. Configures system dependencies and development tools
 3. Uses `pip` to install VeOmni framework with NPU support

@@ -20,7 +20,7 @@ A single ``base.yaml`` drives both
 
 The model blocks extend :mod:`veomni.arguments.arguments_types`: both
 :class:`OmniModuleRuntimeArguments` and :class:`OmniModelRuntimeArguments`
-subclass ``ModelRuntimeArguments``, so the model fields, the ``accelerator`` /
+subclass ``ModelArguments``, so the model fields, the ``accelerator`` /
 ``optimizer`` pair, HDFS localization and the cached ``fqn_to_index_mapping`` are
 declared once and shared with the V1 ``ModelArguments``. Only ``data`` /
 ``train`` / ``infer`` are Omni's own.
@@ -60,11 +60,10 @@ from ..utils import logging
 from ..utils.fs import is_non_local
 from .arguments_types import (
     AcceleratorConfig,
-    BaseModelArguments,
     ChannelLossConfig,
     CheckpointConfig,
     DataloaderConfig,
-    ModelRuntimeArguments,
+    ModelArguments,
     ProfileConfig,
     WandbConfig,
     _resolve_hdfs_path,
@@ -86,10 +85,10 @@ def _hf_module_model_config(model_config: dict | None) -> dict:
 
 
 @dataclass
-class OmniModuleRuntimeArguments(ModelRuntimeArguments):
+class OmniModuleRuntimeArguments(ModelArguments):
     """Per-module runtime — one module's slice of a composed Omni model.
 
-    ``ModelRuntimeArguments`` already is a complete training unit: the model
+    ``ModelArguments`` already is a complete training unit: the model
     fields plus this module's own ``accelerator`` and ``optimizer``, with
     ``model_path`` localized and ``fqn_to_index_mapping`` parsed lazily and cached
     per index path (several modules routinely share one checkpoint). All this adds
@@ -142,7 +141,7 @@ DEFAULT_SCENARIO = "default"
 
 
 @dataclass
-class OmniModelRuntimeArguments(ModelRuntimeArguments):
+class OmniModelRuntimeArguments(ModelArguments):
     """One composed Omni model — a training unit plus the modules it decomposes into.
 
     YAML supplies the inherited ``model_path``, ``model_config``,
@@ -302,12 +301,10 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
         known = ", ".join(generation_graphs)
         raise KeyError(f"Unknown infer_type {infer_type!r}; expected one of: {known}.")
 
-    shared_fields = {f.name for f in fields(BaseModelArguments)}
+    shared_fields = {f.name for f in fields(ModelArguments)}
     model_kwargs = {name: getattr(model_runtime, name) for name in shared_fields}
     return OmniModelRuntimeArguments(
         **model_kwargs,
-        accelerator=model_runtime.accelerator,
-        optimizer=model_runtime.optimizer,
         modules=modules,
         training_graphs=training_graphs,
         generation_graphs=generation_graphs,
@@ -332,11 +329,6 @@ def build_omni_model_runtime(
     optimizer: Any = None,
 ) -> OmniModelRuntimeArguments:
     """Build a resolved :class:`OmniModelRuntimeArguments` from launcher YAML paths (tests / export)."""
-    if accelerator is None:
-        accelerator = global_args.accelerator
-    if optimizer is None:
-        optimizer = global_args.optimizer
-
     # Localize before splitting into modules, the order `resolve_omni_model` gets for
     # free from `BaseModelArguments.__post_init__`. Joining subfolders onto a remote
     # root instead would let each module localize `<remote_root>/<module>` separately:
@@ -360,13 +352,15 @@ def build_omni_model_runtime(
         known = ", ".join(generation_graphs)
         raise KeyError(f"Unknown infer_type {infer_type!r}; expected one of: {known}.")
 
-    shared_fields = {f.name for f in fields(BaseModelArguments)}
+    shared_fields = {f.name for f in fields(ModelArguments)}
     model_kwargs = {name: getattr(global_args, name) for name in shared_fields if name != "model_path"}
+    if accelerator is not None:
+        model_kwargs["accelerator"] = accelerator
+    if optimizer is not None:
+        model_kwargs["optimizer"] = optimizer
     return OmniModelRuntimeArguments(
         model_path=str(model_path),
         **model_kwargs,
-        accelerator=accelerator,
-        optimizer=optimizer,
         modules=modules,
         training_graphs=training_graphs,
         generation_graphs=generation_graphs,
@@ -428,14 +422,10 @@ def _normalize_module_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
 
 def _to_module_global_args(model_runtime: OmniModelRuntimeArguments) -> OmniModuleRuntimeArguments:
     """Project omni-model defaults onto :class:`OmniModuleRuntimeArguments` for per-module merging."""
-    shared_fields = {f.name for f in fields(BaseModelArguments)}
+    shared_fields = {f.name for f in fields(ModelArguments)}
     model_kwargs = {name: getattr(model_runtime, name) for name in shared_fields}
     model_kwargs["model_config"] = _hf_module_model_config(model_kwargs.get("model_config"))
-    return OmniModuleRuntimeArguments(
-        **model_kwargs,
-        accelerator=model_runtime.accelerator,
-        optimizer=model_runtime.optimizer,
-    )
+    return OmniModuleRuntimeArguments(**model_kwargs)
 
 
 def _resolve_graph_type(
@@ -534,14 +524,14 @@ def _resolve_default_accelerator(
     infer_modules_overrides: dict[str, Any] | None,
 ) -> dict[str, Any]:
     # `broadcast_model_weights_from_rank0` is only meaningful for `fsdp2`; forcing it off here
-    # alongside `fsdp_mode: eager` avoids a spurious `_validate_omni_accelerator` warning on every
-    # module for the common single-process eager-inference default.
+    # alongside `fsdp_mode: eager` keeps the common single-process eager-inference default
+    # from inheriting a rank0-broadcast load policy that cannot run without a wrap.
     eager_by_module = {
         name: {
+            "broadcast_model_weights_from_rank0": False,
             "accelerator": {
                 "fsdp_config": {"fsdp_mode": "eager"},
-                "broadcast_model_weights_from_rank0": False,
-            }
+            },
         }
         for name in train_modules_config
     }
@@ -882,11 +872,12 @@ class OmniTrainingArguments:
 def _validate_omni_accelerator(accelerator: AcceleratorConfig) -> None:
     """Checks an ``AcceleratorConfig`` cannot make for itself, for the Omni launcher.
 
-    Everything self-contained — the init-device rules, the ``ep_sharded_stream_load``
-    /``broadcast_model_weights_from_rank0`` exclusion — now runs in
-    ``AcceleratorConfig.__post_init__``, so it holds for a config built anywhere and is
-    not repeated here. What is left is the V2-only ``torch_compile`` ban (V1 supports it,
-    with its own validation in ``VeOmniArguments``).
+    Mesh self-checks (``init_device`` vs ``fsdp_mode`` / ``ep_size``) run in
+    ``AcceleratorConfig.__post_init__``; the ``ep_sharded_stream_load`` /
+    ``broadcast_model_weights_from_rank0`` exclusion runs in
+    ``ModelArguments.__post_init__``. Neither is repeated here. What is left is the
+    V2-only ``torch_compile`` ban (V1 supports it, with its own validation in
+    ``VeOmniArguments``).
 
     Called once for the top-level default (``model.accelerator``, at ``OmniArguments.__post_init__``
     time, before modules are resolved) and once per module (in :func:`resolve_omni_model`, after

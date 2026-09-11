@@ -166,6 +166,7 @@ def test_build_module_runtime_args_merges_module_optimizer():
     from veomni.arguments.omni_arguments_types import OmniModuleRuntimeArguments
 
     global_args = OmniModuleRuntimeArguments(
+        model_path="/tmp/janus",
         optimizer=OptimizerConfig(lr=1e-4, weight_decay=0.01),
     )
     modules = build_module_runtime_args(

@@ -12,8 +12,8 @@ class VLMRLTrainer(VLMTrainer):
         self.base = BaseRLTrainer.__new__(BaseRLTrainer)
         self.base.args = args
 
-        self.base.device = self.base.setup_distributed(args)  # registers ParallelState("base") before seed
-        self.base.model = self.build_model_runtime()
+        self.base.device = self.base._setup(args)  # registers ParallelState("base") before seed
+        self.base.model = self._build_model_runtime()
 
         # rewrite build_data_transform to support multimodal transform
         self._build_data_transform()
@@ -24,7 +24,7 @@ class VLMRLTrainer(VLMTrainer):
         self._build_collate_fn()
 
         self.base._build_dataloader()
-        self.base.build_lr_scheduler()
+        self.base._build_lr_scheduler()
         self.base._build_training_context()
         self.base._init_callbacks()
 

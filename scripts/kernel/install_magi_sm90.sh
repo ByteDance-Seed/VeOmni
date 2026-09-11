@@ -5,8 +5,9 @@
 # hdim128 bucket, and arbitrary masks requiring nfunc 1, 3, or 5. Command-line
 # options can request a different upstream build matrix.
 #
-# Run this after `uv sync --extra gpu --dev`. A later exact `uv sync` removes
-# the overlay, so rerun this script before the SM90 validation.
+# Run this after `uv sync --extra gpu --extra magi --dev`. A later exact
+# `uv sync` without `--extra magi` removes the overlay, so rerun this
+# script before the SM90 validation.
 
 set -euo pipefail
 
@@ -233,13 +234,13 @@ if [[ "${PRINT_CONFIG}" == "TRUE" ]]; then
 fi
 
 if [[ ! -x "${PYTHON}" ]]; then
-  echo "Missing ${PYTHON}. Run 'uv sync --extra gpu --dev' first." >&2
+  echo "Missing ${PYTHON}. Run 'uv sync --extra gpu --extra magi --dev' first." >&2
   exit 1
 fi
 
-for package in torch flash_attn_cute; do
+for package in torch flash_attn_cute magi_attention; do
   if ! "${PYTHON}" -c "import ${package}" >/dev/null 2>&1; then
-    echo "Missing ${package}. Run 'uv sync --extra gpu --dev' before this script." >&2
+    echo "Missing ${package}. Run 'uv sync --extra gpu --extra magi --dev' before this script." >&2
     exit 1
   fi
 done

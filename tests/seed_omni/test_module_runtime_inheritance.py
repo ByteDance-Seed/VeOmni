@@ -44,6 +44,20 @@ def test_module_runtime_is_a_model_runtime():
     assert issubclass(ModuleRuntime, VeOmniModelRuntime)
 
 
+def test_omni_runtime_arguments_are_model_arguments():
+    from veomni.arguments import ModelArguments, OmniModelRuntimeArguments, OmniModuleRuntimeArguments
+
+    assert issubclass(OmniModuleRuntimeArguments, ModelArguments)
+    assert issubclass(OmniModelRuntimeArguments, ModelArguments)
+
+
+def test_module_checkpoint_manager_is_a_model_checkpoint_manager():
+    from veomni.models.checkpoint_manager import ModelCheckpointManager
+    from veomni.models.seed_omni.utils.checkpoint import OmniModuleCheckpointManager
+
+    assert issubclass(OmniModuleCheckpointManager, ModelCheckpointManager)
+
+
 def test_module_name_is_the_base_model_name():
     """One identity: the ParallelState registry key, the checkpoint subdir, the graph node."""
     runtime = _unbuilt()
@@ -59,7 +73,7 @@ def test_module_name_is_read_only_so_the_two_names_cannot_diverge():
     "member",
     [
         "setup",  # a module's mesh is built from its accelerator like any model's
-        "setup_lora",
+        "_setup_lora",
         "parallel_state",
     ],
 )
@@ -70,12 +84,12 @@ def test_shared_build_steps_are_not_reimplemented(member):
 @pytest.mark.parametrize(
     "method",
     [
-        "build_model",  # config lives beside the module's weights, not at the omni root
-        "build_model_assets",  # bound onto the model, because the graph calls the module
-        "freeze_model",  # the report has to name which module it describes
-        "build_parallelized_model",  # a custom runtime may own the wrap
-        "build_optimizer",  # frozen modules get none; scoped to the module's mesh
-        "build_lr_scheduler",
+        "_build_model",  # config lives beside the module's weights, not at the omni root
+        "_build_model_assets",  # bound onto the model, because the graph calls the module
+        "_freeze_model_module",  # the report has to name which module it describes
+        "_build_parallelized_model",  # a custom runtime may own the wrap
+        "_build_optimizer",  # frozen modules get none; scoped to the module's mesh
+        "_build_lr_scheduler",
         "build_checkpoint",  # per-module manager, absent when frozen
         "clip_grad_norm",  # returns this module's norm; the orchestrator combines
         "skip_hf_weight_load",
@@ -110,7 +124,7 @@ def test_build_model_reads_the_modules_own_directory(monkeypatch):
             fsdp_config=SimpleNamespace(mixed_precision=SimpleNamespace(enable=False)),
         ),
     )
-    runtime.build_model()
+    runtime._build_model()
 
     assert captured["config_path"] == "/tmp/hf-model"
 
@@ -125,7 +139,7 @@ def test_a_frozen_module_builds_no_optimizer():
     runtime = _unbuilt(nn.Linear(2, 2).requires_grad_(False))
     runtime.optimizer = _UNSET
 
-    runtime.build_optimizer()
+    runtime._build_optimizer()
 
     assert runtime.optimizer is _UNSET, "the builder must return before touching the optimizer"
 
@@ -134,7 +148,7 @@ def test_a_frozen_module_builds_no_lr_scheduler():
     runtime = _unbuilt(nn.Linear(2, 2).requires_grad_(False))
     runtime.lr_scheduler = _UNSET
 
-    runtime.build_lr_scheduler(total_steps=100)
+    runtime._build_lr_scheduler(total_steps=100)
 
     assert runtime.lr_scheduler is _UNSET
 

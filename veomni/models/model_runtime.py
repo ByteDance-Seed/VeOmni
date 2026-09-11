@@ -42,12 +42,11 @@ if TYPE_CHECKING:
     from torch.optim.lr_scheduler import LRScheduler
     from torch.optim.optimizer import Optimizer
 
-    from ..arguments import ModelRuntimeArguments, TrainingArguments
+    from ..arguments import ModelArguments, TrainingArguments
     from ..arguments.arguments_types import AcceleratorConfig
     from ..data.chat_template import ChatTemplate
     from ..trainer.callbacks import TrainerState
     from .checkpoint_manager import ModelCheckpointManager
-
 
 logger = logging.get_logger(__name__)
 
@@ -66,7 +65,7 @@ class VeOmniModelRuntime:
 
     This is a *model handle*, not a trainer base class. A trainer holds one
     (``trainer.model``) the way :class:`~veomni.trainer.omni.omni_trainer.OmniTrainer`
-    holds an ``OmniModelRuntime``, and drives it as ``self.model.build_model()``,
+    holds an ``OmniModelRuntime``, and drives it as ``self.model._build_model()``,
     ``self.model.save_dcp(...)``. The wrapped :class:`torch.nn.Module`
     lives at :attr:`model`; every other module API is forwarded by
     :meth:`__getattr__`, so ``trainer.model.parameters()`` and
@@ -85,7 +84,7 @@ class VeOmniModelRuntime:
     (meta-init, FSDP2/TP/EP wrap, weight load, EP-aware optimizer) reads the
     ambient :class:`ParallelState`, and the only place that can be scoped once,
     for every caller, is inside the runtime that owns the mesh. A trainer is then
-    free of it: ``self.model = self.build_model_runtime()`` and the job-level
+    free of it: ``self.model = self._build_model_runtime()`` and the job-level
     steps that follow need no scope of their own.
 
     Construction takes this model's *own* arguments — not the job's — plus the
@@ -104,10 +103,10 @@ class VeOmniModelRuntime:
 
     The lr scheduler is the one piece deliberately left out: it needs
     ``total_steps``, which is only known once the dataset has been built, so the
-    trainer calls :meth:`build_lr_scheduler` later.
+    trainer calls :meth:`_build_lr_scheduler` later.
     """
 
-    args: "ModelRuntimeArguments"
+    args: "ModelArguments"
     model_name: str
     model: Optional[torch.nn.Module] = None
     model_config: PretrainedConfig = PretrainedConfig()
@@ -126,7 +125,7 @@ class VeOmniModelRuntime:
 
     def __init__(
         self,
-        args: "ModelRuntimeArguments",
+        args: "ModelArguments",
         model_name: str = "base",
         *,
         train: "TrainingArguments",
@@ -138,14 +137,12 @@ class VeOmniModelRuntime:
         self.chat_template_name = chat_template_name
         self.setup()
         with use_parallel_state(self.model_name):
-            self.build_model()
-            self.freeze_model()
-            self.build_parallelized_model()
-            self.build_optimizer()
-        self.build_model_assets()
+            self._build_model()
+            self._freeze_model_module()
+            self._build_parallelized_model()
+            self._build_optimizer()
+        self._build_model_assets()
         self.build_checkpoint()
-
-    # ── Base model runtime functions ────────────────────────────────
 
     def __getattr__(self, name: str) -> Any:
         """Forward unshadowed :class:`torch.nn.Module` APIs to the wrapped model."""
@@ -162,8 +159,6 @@ class VeOmniModelRuntime:
         """
         return self.model(*args, **kwargs)
 
-    # ── Model runtime property accessors ────────────────────────────────
-
     @property
     def mesh_accelerator(self) -> "AcceleratorConfig":
         """The accelerator config that decides mesh, init device and wrap.
@@ -179,13 +174,13 @@ class VeOmniModelRuntime:
         """Build this model's device mesh and register it under :attr:`model_name`.
 
         The process group itself is job-bound and must already be initialised by
-        :meth:`BaseTrainer.setup_distributed`; this only derives the model's own
+        :meth:`BaseTrainer._setup`; this only derives the model's own
         mesh from :attr:`mesh_accelerator`, which is why sibling models in one job
         can hold different ones.
         """
-        from ..distributed.parallel_state import init_parallel_state_from_accelerator
+        from ..distributed.parallel_state import init_parallel_state_from_config
 
-        init_parallel_state_from_accelerator(self.mesh_accelerator, self.model_name)
+        init_parallel_state_from_config(self.mesh_accelerator, self.model_name)
 
     @property
     def parallel_state(self):
@@ -209,9 +204,7 @@ class VeOmniModelRuntime:
 
         return should_skip_hf_weight_load(self.train.checkpoint.load_path, self.args.lora_config)
 
-    # ── Model runtime build functions ────────────────────────────────
-
-    def build_model(self) -> None:
+    def _build_model(self) -> None:
         """Meta-init the model from its config via the registry-aware loader."""
         from .auto import build_foundation_model
 
@@ -227,20 +220,18 @@ class VeOmniModelRuntime:
         )
         self.model_config = self.model.config
 
-    def build_model_assets(self) -> None:
+    def _build_model_assets(self) -> None:
         """Load the preprocessor this model reads its inputs through.
 
         Also assembles :attr:`model_assets`, the sidecars an export writes beside
         this model's weights, and :attr:`chat_template` when the job named one.
         The config is always among the sidecars; the preprocessor joins it if
-        there was one to load. The chat template is absent from that list by
-        design: it is a *choice about the data*, not a property of the
-        checkpoint, and an export writes what the checkpoint is.
+        there was one to load. The chat template is not in that list and is not
+        written onto the tokenizer: it is a data-layout choice, so an export
+        keeps the checkpoint's jinja.
 
-        ``processor_config`` overrides what the repository ships, the way
-        ``model_config`` does for the architecture — a pixel budget, say. It is
-        a job-level knob rather than a runtime hook because the value belongs to
-        the run, not to the model class.
+        ``processor_config`` is forwarded as kwargs to ``build_processor``, the
+        way ``model_config`` overrides the architecture.
 
         Which preprocessor it is follows from what the checkpoint actually
         holds, not from a declaration the model makes about itself.
@@ -258,9 +249,9 @@ class VeOmniModelRuntime:
         latents) overrides this to load nothing.
 
         A path with no preprocessor to load is not fatal here — a toy config
-        used to exercise the training loop on synthetic batches has none, and
-        never asks for one. The warning names the path, and a job that does read
-        text fails where it reads it.
+        exercising the training loop on synthetic batches has none, and never
+        asks for one. The warning names the path, and a job that does read text
+        fails where it reads it.
 
         The template is the third thing a model needs before it can read text:
         the tokenizer says how a string becomes ids, the processor how pixels
@@ -309,14 +300,30 @@ class VeOmniModelRuntime:
 
         self.chat_template = build_chat_template(self.chat_template_name, preprocessor)
 
-    def build_parallelized_model(self) -> None:
+    def _build_parallelized_model(self) -> None:
         """FSDP2/DDP-wrap the model and load its weights.
 
         The wrap preserves ``requires_grad`` (the shard inherits it) and the
         loader writes weights in place, so a freeze applied in
-        :meth:`freeze_model` survives and is not re-asserted here.
+        :meth:`_freeze_model_module` survives and is not re-asserted here.
         """
         args = self.args
+
+        # Apply async activation offload BEFORE FSDP2 sharding.
+        # Uses per-instance __call__ patching so that async_save_on_cpu is
+        # OUTER to the checkpoint boundary pushed by GradientCheckpointingLayer,
+        # matching MindSpeed-MM's GC+async offload behavior: hidden_states
+        # inputs are offloaded to CPU (via _NoopSaveInputs), while intermediate
+        # activations are handled by GC recomputation (via _checkpoint_hook).
+        offload_config = args.accelerator.offload_config
+        if offload_config.enable_async_activation:
+            from ..distributed.async_offload import apply_async_activation_offload
+
+            apply_async_activation_offload(
+                self.model,
+                offload_config.activation_offload_modules,
+                host_cache_limit_bytes=int(offload_config.activation_offload_host_cache_limit_gb * 1024**3),
+            )
 
         # Customized parallelize model.
         customized_parallelize_model_function = getattr(self.model, "build_parallelize_model", None)
@@ -326,6 +333,7 @@ class VeOmniModelRuntime:
             )
             if parallelized_model is not None:
                 self.model = parallelized_model
+                self.model.train()
                 logger.info_rank0("Built customized parallelized model.")
                 return
 
@@ -351,13 +359,13 @@ class VeOmniModelRuntime:
                 "skipping HF weight materialization before checkpoint restore."
             )
 
+        from ..distributed import torch_parallelize
         from ..distributed.torch_compile import CompileConfig
-        from ..distributed.torch_parallelize import build_parallelize_model
 
         compile_config = CompileConfig(
             **{field.name: getattr(args.accelerator.torch_compile, field.name) for field in fields(CompileConfig)}
         )
-        self.model = build_parallelize_model(
+        self.model = torch_parallelize.build_parallelize_model(
             self.model,
             init_device=args.accelerator.init_device,
             weights_path=args.model_path,
@@ -371,8 +379,8 @@ class VeOmniModelRuntime:
             enable_forward_prefetch=args.accelerator.fsdp_config.forward_prefetch,
             enable_fsdp_offload=args.accelerator.fsdp_config.offload,
             fsdp_offload_pin_memory=args.accelerator.fsdp_config.offload_pin_memory,
-            broadcast_model_weights_from_rank0=args.accelerator.broadcast_model_weights_from_rank0,
-            ep_sharded_stream_load=args.accelerator.ep_sharded_stream_load,
+            broadcast_model_weights_from_rank0=args.broadcast_model_weights_from_rank0,
+            ep_sharded_stream_load=args.ep_sharded_stream_load,
             max_load_broadcast_size=args.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
             compile_config=compile_config,
@@ -380,7 +388,7 @@ class VeOmniModelRuntime:
         )
         self.model.train()
 
-    def setup_lora(self) -> None:
+    def _setup_lora(self) -> None:
         """Wrap :attr:`model` with the PEFT-free :class:`veomni.lora.VeOmniLoraModel`.
 
         A single native path handles both dense ``nn.Linear`` LoRA
@@ -454,7 +462,7 @@ class VeOmniModelRuntime:
             "LoRA configuration produced no trainable adapters. Select at least one Linear or MoE target."
         )
 
-    def freeze_model(self) -> None:
+    def _freeze_model_module(self) -> None:
         """Let the model freeze itself, apply LoRA, and report what is left trainable.
 
         Order matters: LoRA runs second because it is authoritative — it freezes
@@ -466,15 +474,14 @@ class VeOmniModelRuntime:
         if callable(freeze_model_function):
             freeze_model_function()
 
-        self.setup_lora()
+        self._setup_lora()
 
         from ..utils.model_utils import pretty_print_trainable_parameters
 
         pretty_print_trainable_parameters(self.model)
         helper.print_device_mem_info("VRAM usage after building model")
 
-    # ── Model runtime optimizer & lr_scheduler build functions ────────────────────────────────
-    def build_optimizer(self, param_groups: Optional[List[Dict[str, Any]]] = None) -> None:
+    def _build_optimizer(self, param_groups: Optional[List[Dict[str, Any]]] = None) -> None:
         """Build the optimizer over this model's still-trainable params.
 
         A distributed optimizer (Muon) reads ``get_parallel_state()`` at build
@@ -502,7 +509,7 @@ class VeOmniModelRuntime:
             optimizer_config=opt,
         )
 
-    def build_lr_scheduler(self, total_steps: int) -> None:
+    def _build_lr_scheduler(self, total_steps: int) -> None:
         """Build the lr-scheduler over ``total_steps``.
 
         Takes the step count rather than reading it off a training config: it
@@ -529,7 +536,6 @@ class VeOmniModelRuntime:
         with use_parallel_state(self.model_name):
             return veomni_clip_grad_norm(self.model, max_norm)
 
-    # ── Model runtime checkpoint build functions ────────────────────────────────
     def build_checkpoint(self) -> None:
         """Attach the component that checkpoints this model.
 

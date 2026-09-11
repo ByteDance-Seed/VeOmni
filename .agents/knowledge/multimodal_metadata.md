@@ -11,11 +11,14 @@ metadata values per step from GPU tensors:
 - mrope `position_ids` + `rope_deltas` (per-sample variable-shape mrope algorithm)
 - ViT `cu_seqlens` + `max_seqlen` (from `image_grid_thw`)
 
-Each derivation costs 1+ host↔device syncs (see `debug-cuda-sync` skill for the
-inventory). Moving the derivation off the GPU critical path — into the **collator**,
-which runs in CPU dataloader workers — eliminates the syncs entirely and lets the
-model forward consume CPU-int / CPU-tensor values that are batched up onto the
-device by the normal trainer `.to(device)` step.
+Each derivation costs 1+ host↔device syncs. Moving the derivation off the GPU
+critical path — into the **collator**, which runs in CPU dataloader workers —
+eliminates the syncs entirely and lets the model forward consume CPU-int /
+CPU-tensor values that are batched up onto the device by the normal trainer
+`.to(device)` step.
+
+`tests/models/test_model_forward_no_implicit_sync.py` is the regression gate: it
+asserts the wired models' forwards stay sync-free.
 
 ## The derivation is model-owned, not framework-generic
 

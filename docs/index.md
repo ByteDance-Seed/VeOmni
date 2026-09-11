@@ -33,6 +33,7 @@ usage/support_new_models/guide_and_checklist.md
 usage/support_new_models/qwen3_vl_example.md
 usage/support_new_models/qwen3_omni_moe_example.md
 usage/support_new_models/dit_model_guide.md
+usage/checkpoint.md
 usage/checkpoint_conversion.md
 usage/trainer.md
 usage/agent_workflow.md
@@ -51,8 +52,11 @@ hardware_support/precision_analysis.md
 hardware_support/profiling_analysis.md
 hardware_support/AscendDockerUsage/build_a2_docker.md
 hardware_support/AscendDockerUsage/build_a3_docker.md
+hardware_support/AscendDockerUsage/overview.md
+hardware_support/AscendDockerUsage/supported_tags.md
 hardware_support/FAQ.md
 hardware_support/rocm/README.md
+hardware_support/mlu/README.md
 ```
 
 ```{toctree}
@@ -65,6 +69,7 @@ examples/qwen3_moe.md
 examples/qwen3_vl.md
 examples/qwen3_omni_moe.md
 examples/qwen3_omni_offline_av.md
+examples/minimax_h3.md
 examples/wan2.1.md
 examples/wan2.1_I2V_1.3B.md
 examples/ltx-2.3.md
@@ -107,6 +112,8 @@ design/local_parallel_state.md
 design/patchgen.md
 design/unified_kernel_registry.md
 design/verl_topk_distill_integration.md
+design/deepseek_v4_context_parallel.md
+design/deepseek_v4_indexer_loss.md
 ```
 
 ```{toctree}

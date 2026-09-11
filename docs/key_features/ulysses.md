@@ -1,20 +1,5 @@
 # Long-Sequence Training Using Ulysses
 
-## Table of Contents
-
-- [VeOmni Long-Sequence Training Using Ulysses](#veomni-long-sequence-training-using-ulysses)
-  - [Table of Contents](#table-of-contents)
-  - [📚 Overview](#-overview)
-  - [🚀 Quick Start](#-quick-start)
-  - [🔍 Dive into Ulysses Sequence Parallelism](#-dive-into-ulysses-sequence-parallelism)
-    - [What is all\_to\_all?](#what-is-all_to_all)
-    - [DeepSpeed-Ulysses](#deepspeed-ulysses)
-    - [Communication Analysis](#communication-analysis)
-  - [⚙️ Core API](#️-core-api)
-  - [🛠️ Support Ulysses for a New Model](#️-support-ulysses-for-a-new-model)
-  - [🧩 Implementation Details: Data Pipeline and Model Interaction](#-implementation-details-data-pipeline-and-model-interaction)
-  - [🔧 Linear Attention Ulysses (GatedDeltaNet)](#-linear-attention-ulysses-gateddeltanet)
-
 ## 📚 Overview
 In this tutorial, we introduce the implementation of DeepSpeed-Ulysses for efficient long-sequence training in VeOmni. The Ulysses method optimizes memory usage by splitting both the input tensor and intermediate activations along the sequence dimension. This innovative approach significantly enhances memory efficiency, enabling the training of models with longer sequence lengths.
 

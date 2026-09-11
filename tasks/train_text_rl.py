@@ -12,8 +12,8 @@ class TextRLTrainer(TextTrainer):
         self.base = BaseRLTrainer.__new__(BaseRLTrainer)
         self.base.args = args
 
-        self.base.device = self.base.setup_distributed(args)  # registers ParallelState("base") before seed
-        self.base.model = self.base.build_model_runtime()
+        self.base.device = self.base._setup(args)  # registers ParallelState("base") before seed
+        self.base.model = self.base._build_model_runtime()
 
         # rewrite build_data_transform to support conversation dataset
         self._build_data_transform()
@@ -21,7 +21,7 @@ class TextRLTrainer(TextTrainer):
         self.base._build_dataset()
         self.base._build_collate_fn()
         self.base._build_dataloader()
-        self.base.build_lr_scheduler()
+        self.base._build_lr_scheduler()
         self.base._build_training_context()
         self.base._init_callbacks()
 

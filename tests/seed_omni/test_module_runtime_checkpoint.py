@@ -62,7 +62,7 @@ def test_without_resume_path_hf_weights_are_always_loaded() -> None:
 
 def test_parallelize_forwards_module_skip_decision(monkeypatch: pytest.MonkeyPatch) -> None:
     parallelize = MagicMock(side_effect=lambda model, **kwargs: model)
-    # ``VeOmniModelRuntime.build_parallelized_model`` imports the builder inside
+    # ``VeOmniModelRuntime._build_parallelized_model`` imports the builder inside
     # the call, so the patch has to land on the defining module.
     monkeypatch.setattr(
         "veomni.distributed.torch_parallelize.build_parallelize_model",
@@ -78,10 +78,10 @@ def test_parallelize_forwards_module_skip_decision(monkeypatch: pytest.MonkeyPat
         fqn_to_index_mapping=None,
         basic_modules=[],
         optimizer=SimpleNamespace(type="adamw", muon_expert_zero_comm=False),
+        broadcast_model_weights_from_rank0=False,
+        ep_sharded_stream_load=False,
         accelerator=SimpleNamespace(
             init_device="meta",
-            broadcast_model_weights_from_rank0=False,
-            ep_sharded_stream_load=False,
             torch_compile=CompileConfig(),
             gradient_checkpointing=SimpleNamespace(enable=False, enable_reentrant=False, early_stop=True),
             fsdp_config=SimpleNamespace(
@@ -92,9 +92,10 @@ def test_parallelize_forwards_module_skip_decision(monkeypatch: pytest.MonkeyPat
                 offload_pin_memory=False,
                 max_load_broadcast_size=20.0,
             ),
+            offload_config=SimpleNamespace(enable_async_activation=False),
         ),
     )
 
-    runtime.build_parallelized_model()
+    runtime._build_parallelized_model()
 
     assert parallelize.call_args.kwargs["should_skip_hf_weight_load"] is False

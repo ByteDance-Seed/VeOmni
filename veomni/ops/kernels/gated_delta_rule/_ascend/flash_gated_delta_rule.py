@@ -19,10 +19,6 @@ from typing import Dict, Optional
 import torch
 import torch_npu
 
-# Load-bearing despite being unused: importing fla_npu registers the fused
-# torch.ops.npu.* GDN ops this file dispatches to. Do not prune.
-import fla_npu  # noqa: F401
-
 from .triton_core.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .triton_core.l2norm import l2norm_bwd, l2norm_fwd
 from .triton.cumsum import chunk_local_cumsum
@@ -34,6 +30,32 @@ if is_arch35():
     from .triton_core.solve_tril import solve_tril
 else:
     from .triton.solve_tril import solve_tril
+
+
+def _ensure_fla_npu_registered() -> None:
+    """Import ``fla_npu`` for its ``torch.ops.npu.*`` GDN op registration side
+    effect. Deferred off module top so that ``precompute_varlen_metadata`` (and
+    the other fla_npu-free helpers here) can be imported on NPU images that
+    only install ``fla_npu`` for the ``npu_ascendc`` backend.
+
+    Idempotent — Python caches the module in ``sys.modules`` on first import,
+    so calling this at every dispatch site is essentially free. Re-raises a
+    missing ``fla_npu`` as an actionable ``RuntimeError`` naming the backend,
+    matching the message ``_npu_ascendc_chunk_gated_delta_rule_factory`` used
+    to raise at bind time before this import moved off module top.
+    """
+    try:
+        import fla_npu  # noqa: F401
+    except ModuleNotFoundError as e:
+        if e.name != "fla_npu":
+            raise
+        raise RuntimeError(
+            "chunk_gated_delta_rule 'npu_ascendc' backend requires the 'fla_npu' package, "
+            "which is not installed. Install fla_npu manually on NPU "
+            "(https://github.com/flashserve/flash-linear-attention-npu), or set "
+            "chunk_gated_delta_rule_implementation to 'npu' (vendored Triton) or 'eager'."
+        ) from e
+
 
 _disable_compile = getattr(getattr(torch, "compiler", None), "disable", lambda fn: fn)
 _DEFAULT_VARLEN_CHUNK_SIZES = (16, 32, 64, 128, 608 * 2)
@@ -179,6 +201,8 @@ def flash_chunk_gated_delta_rule_fwd(
     chunk_indices_list: Optional[Dict[str, Optional[list[int]]]] = None,
     chunk_size: int = 64,
 ):
+    _ensure_fla_npu_registered()
+
     g = chunk_local_cumsum(
         g,
         chunk_size=chunk_size,
@@ -281,6 +305,8 @@ def flash_chunk_gated_delta_rule_bwd(
     chunk_indices_list: Optional[Dict[str, Optional[list[int]]]] = None,
     chunk_size: int = 64,
 ):
+    _ensure_fla_npu_registered()
+
     g = g.transpose(1, 2).contiguous()
     beta = beta.transpose(1, 2).contiguous().float()
 

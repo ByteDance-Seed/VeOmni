@@ -66,10 +66,10 @@ class ModuleRuntime(VeOmniModelRuntime):
     does differently from a standalone model:
 
     * its config lives beside its weights, not at the composed checkpoint root
-      (:meth:`build_model`);
+      (:meth:`_build_model`);
     * its preprocessor is bound onto the model itself rather than held by the
       runtime, because the graph calls the module and the module needs it
-      (:meth:`build_model_assets`);
+      (:meth:`_build_model_assets`);
     * it may be **fully frozen**, in which case it has no optimizer, no
       lr-scheduler and no checkpoint at all (:attr:`has_trainable_parameters`);
     * it can be built **for inference**, including a single-process eager path
@@ -130,21 +130,21 @@ class ModuleRuntime(VeOmniModelRuntime):
                 self._defer_parallelize = args.accelerator.fsdp_config.fsdp_scope == "model"
                 self.setup()
                 with self._scoped():
-                    self.build_model()
-                    self.build_model_assets()
-                    self.build_parallelized_model()
+                    self._build_model()
+                    self._build_model_assets()
+                    self._build_parallelized_model()
                 self.model.eval()
         else:
             self._defer_parallelize = args.accelerator.fsdp_config.fsdp_scope == "model"
             self.setup()
             with self._scoped():
-                self.build_model()
-                self.build_model_assets()
-                self.freeze_model()
-                self.build_parallelized_model()
+                self._build_model()
+                self._build_model_assets()
+                self._freeze_model_module()
+                self._build_parallelized_model()
                 if not self._defer_parallelize:
                     self._scope_recompute_to_parallel_state()
-                    self.build_optimizer()
+                    self._build_optimizer()
                     self.build_checkpoint()
 
     @property
@@ -213,11 +213,11 @@ class ModuleRuntime(VeOmniModelRuntime):
             **overrides,
         ).eval()
         self.model_config = self.model.config
-        self.build_model_assets()
+        self._build_model_assets()
 
     # ── Build (model, assets, parallelize) ────────────────────────────────────
 
-    def build_model(self) -> None:
+    def _build_model(self) -> None:
         """Meta-init this module's sub-model from the config beside its weights.
 
         Unlike a standalone model, a module reads ``model_path`` rather than
@@ -240,7 +240,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         )
         self.model_config = self.model.config
 
-    def build_model_assets(self) -> None:
+    def _build_model_assets(self) -> None:
         """Bind this module's preprocessor onto the model itself.
 
         A standalone runtime keeps the tokenizer/processor beside the model
@@ -284,7 +284,7 @@ class ModuleRuntime(VeOmniModelRuntime):
             return
         logger.info_rank0(f"ModuleRuntime '{label}': bound module assets.")
 
-    def freeze_model(self) -> None:
+    def _freeze_model_module(self) -> None:
         """Freeze + LoRA this module, heading the base's report with its name.
 
         Which parameters freeze is the *module's* decision (``JanusVqvae`` freezes
@@ -296,7 +296,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         VRAM line per module instead of two.
         """
         logger.info_rank0(f"ModuleRuntime '{self.module_name}': freeze + LoRA")
-        super().freeze_model()
+        super()._freeze_model_module()
 
     def on_lora_matched_nothing(self) -> None:
         """A module the LoRA config did not target simply stays frozen.
@@ -326,7 +326,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         When this returns a module, that module is used verbatim — the override
         owns FSDP/DDP wrap, weight load, param offload, gradient checkpointing,
         and mixed precision. When it returns ``None`` (the default here), the
-        generic :meth:`VeOmniModelRuntime.build_parallelized_model` path runs.
+        generic :meth:`VeOmniModelRuntime._build_parallelized_model` path runs.
 
         This is the *runtime's* hook, which is why it carries the ``customized_``
         prefix: a **model** that wants to own its own wrap declares
@@ -338,7 +338,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         del weights_path, args, kwargs
         return None
 
-    def build_parallelized_model(self) -> None:
+    def _build_parallelized_model(self) -> None:
         """FSDP2/DDP-wrap this module and load its weights, unless a runtime owns it.
 
         A **custom runtime subclass** may fully own parallelize + weight-load by
@@ -364,7 +364,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         if customized_model is not None:
             self.model = customized_model
             return
-        super().build_parallelized_model()
+        super()._build_parallelized_model()
 
     def finish_deferred_parallelize(self, *, for_inference: bool = False) -> None:
         """Optimizer / checkpoint / GC recompute after the parent OmniModel wrap.
@@ -381,7 +381,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         else:
             with self._scoped():
                 self._scope_recompute_to_parallel_state()
-                self.build_optimizer()
+                self._build_optimizer()
                 self.build_checkpoint()
 
     # ── Parallel state (per-module device mesh) ────────────────────────────────
@@ -462,7 +462,7 @@ class ModuleRuntime(VeOmniModelRuntime):
 
         return True
 
-    def build_optimizer(self, param_groups: Optional[List[dict]] = None) -> None:
+    def _build_optimizer(self, param_groups: Optional[List[dict]] = None) -> None:
         """Build this module's optimizer, scoped to its own ParallelState.
 
         A distributed optimizer (Muon) reads ``get_parallel_state()`` at build
@@ -472,9 +472,9 @@ class ModuleRuntime(VeOmniModelRuntime):
         if not self.has_trainable_parameters:
             return
         with self._scoped():
-            super().build_optimizer(param_groups)
+            super()._build_optimizer(param_groups)
 
-    def build_lr_scheduler(self, total_steps: int) -> None:
+    def _build_lr_scheduler(self, total_steps: int) -> None:
         """Build this module's lr-scheduler over ``total_steps``.
 
         The orchestrator (:meth:`~veomni.trainer.omni.omni_trainer.OmniTrainer._build_multi_lr_scheduler`)
@@ -485,7 +485,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         if not self.has_trainable_parameters:
             return
         with self._scoped():
-            super().build_lr_scheduler(total_steps)
+            super()._build_lr_scheduler(total_steps)
 
     def clip_grad_norm(self, max_norm: Optional[float] = None, norm_type: float = 2.0) -> float:
         """Clip this module's grads under its own parallelism; return the module norm.

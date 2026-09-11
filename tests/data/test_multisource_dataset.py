@@ -95,7 +95,7 @@ class TrainerTest(BaseTrainer):
     multisource_names = ["dataset_a", "dataset_b"]
     multisource_weights = [0.5, 0.5]
 
-    def setup_distributed(self, args):
+    def _setup(self, args):
         device, _ = setup_test_distributed(args)
 
         self.multisource_datasets = [DummyDataset(size=100, dataset_name=name) for name in self.multisource_names]
@@ -135,7 +135,7 @@ class TrainerTest(BaseTrainer):
         self.args.data.shuffle = False
         return device
 
-    def build_model_runtime(self):
+    def _build_model_runtime(self):
         return FakeModelRuntime(self.args.model, train=self.args.train)
 
     def _build_data_transform(self):
@@ -190,7 +190,7 @@ class TrainerTest(BaseTrainer):
             prefetch_factor=args.data.dataloader.prefetch_factor,
         )
 
-    def build_lr_scheduler(self):
+    def _build_lr_scheduler(self):
         self.model.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.model.optimizer, lambda _: 1.0)
 
     def _build_training_context(self):

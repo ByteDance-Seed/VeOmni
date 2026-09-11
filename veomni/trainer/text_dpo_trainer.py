@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..arguments import ModelRuntimeArguments, VeOmniArguments
+from ..arguments import ModelArguments, VeOmniArguments
 from ..data import build_data_transform
 from ..data.data_collator import PostCollator
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
@@ -39,6 +39,26 @@ from .base import BaseTrainer, VeOmniIter
 logger = logging.get_logger(__name__)
 
 _NON_MODEL_KEYS = set()
+
+
+def _assert_matching_dpo_parallelism(policy_acc, reference_acc) -> None:
+    """Fail before build when the reference would gather a different token partition.
+
+    ``SequenceParallelCollator`` slices the packed batch with the policy SP size.
+    ``concatenated_forward`` then gathers with each runtime's own ParallelState.
+    A reference whose ``ulysses_size * cp_size`` or ``dp_size`` differs from the
+    policy would gather a different partition and split it with the policy's
+    ``seq_lens``.
+    """
+    policy_sp = policy_acc.ulysses_size * policy_acc.cp_size
+    reference_sp = reference_acc.ulysses_size * reference_acc.cp_size
+    if (policy_sp, policy_acc.dp_size) != (reference_sp, reference_acc.dp_size):
+        raise ValueError(
+            "DPO reference accelerator topology must match the policy: "
+            f"policy has ulysses_size*cp_size={policy_sp}, dp_size={policy_acc.dp_size}; "
+            f"reference has ulysses_size*cp_size={reference_sp}, dp_size={reference_acc.dp_size}. "
+            "SequenceParallelCollator slices the packed batch with the policy SP size."
+        )
 
 
 def _build_dpo_labels_list(
@@ -127,7 +147,7 @@ class VeOmniDPOArguments(VeOmniArguments):
     """Root config for DPO training — extends VeOmniArguments with DPO hyperparameters."""
 
     dpo_config: DPOConfig = field(default_factory=DPOConfig)
-    reference_model: Optional[ModelRuntimeArguments] = field(
+    reference_model: Optional[ModelArguments] = field(
         default=None,
         metadata={
             "help": (
@@ -152,7 +172,7 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
 
     def __init__(
         self,
-        args: ModelRuntimeArguments,
+        args: ModelArguments,
         model_name: str = "reference",
         *,
         train,
@@ -170,9 +190,9 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
         self._torch_dtype = torch_dtype
         self.setup()
         with use_parallel_state(self.model_name):
-            self.build_model()
+            self._build_model()
             self.model.requires_grad_(False)
-            self.build_parallelized_model()
+            self._build_parallelized_model()
             self.model.eval()
 
     @property
@@ -180,7 +200,7 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
         """A policy resume does not carry reference weights; always materialize HF."""
         return False
 
-    def build_model(self) -> None:
+    def _build_model(self) -> None:
         from ..models.auto import build_foundation_model
 
         args = self.args
@@ -207,8 +227,8 @@ class TextDPOTrainer:
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        self.base.device = self.base.setup_distributed(args)  # registers ParallelState("base") before seed
-        self.policy_model = self.build_policy_model_runtime()
+        self.base.device = self.base._setup(args)  # registers ParallelState("base") before seed
+        self.policy_model = self._build_policy_model_runtime()
 
         self._build_data_transform()
 
@@ -216,11 +236,11 @@ class TextDPOTrainer:
         self.base._build_collate_fn()
         self.base._build_dataloader()
         self._build_postforward()
-        self.policy_model.build_lr_scheduler(args.train_steps * args.train.num_train_epochs)
+        self.policy_model._build_lr_scheduler(args.train_steps * args.train.num_train_epochs)
         self.base._build_training_context()
         self.base._init_callbacks(self)
 
-        self.reference_model = self.build_reference_model_runtime()
+        self.reference_model = self._build_reference_model_runtime()
 
     @property
     def model(self):
@@ -239,8 +259,6 @@ class TextDPOTrainer:
     def save_hf_or_lora(self, state, stage: str = "step_end") -> None:
         self.policy_model.save_hf_or_lora(state, stage=stage)
 
-    # ── Trainer build functions ────────────────────────────────
-
     def _build_data_transform(self):
         args: VeOmniDPOArguments = self.base.args
         self.base.data_transform = build_data_transform(
@@ -253,19 +271,21 @@ class TextDPOTrainer:
     def _build_postforward(self):
         self.post_forward = PostCollator()
 
-    def build_policy_model_runtime(self) -> VeOmniModelRuntime:
+    def _build_policy_model_runtime(self) -> VeOmniModelRuntime:
         """Build the trainable policy under ParallelState ``"policy"``."""
-        return self.base.build_model_runtime(model_name="policy")
+        return self.base._build_model_runtime(model_name="policy")
 
-    def build_reference_model_runtime(self) -> DPOReferenceModelRuntime:
+    def _build_reference_model_runtime(self) -> DPOReferenceModelRuntime:
         """Build the frozen reference as its own runtime.
 
         ``reference_model`` is a full model-level config when set; otherwise
         the policy's ``model`` is reused.
         """
         args: VeOmniDPOArguments = self.base.args
+        reference_args = args.reference_model or args.model
+        _assert_matching_dpo_parallelism(args.model.accelerator, reference_args.accelerator)
         return DPOReferenceModelRuntime(
-            args.reference_model or args.model,
+            reference_args,
             "reference",
             train=args.train,
             torch_dtype=args.dpo_config.refer_model_precision,
@@ -275,8 +295,6 @@ class TextDPOTrainer:
         # Each DPO preference pair is packed as two consecutive causal-LM
         # segments (chosen, rejected) but carries one source metadata entry.
         self.base.on_step_begin(micro_batches=micro_batches, source_repeat=2)
-
-    # ── Trainer train step functions ────────────────────────────────
 
     @staticmethod
     def dpo_loss(
@@ -449,6 +467,7 @@ class TextDPOTrainer:
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
+        self.base._reset_async_activation_offload_if_enabled()
         self.on_step_begin(micro_batches=micro_batches)
 
         self.base.sync_before_train_step()
@@ -473,9 +492,17 @@ class TextDPOTrainer:
         self.policy_model.lr_scheduler.step()
         self.policy_model.optimizer.zero_grad()
 
-        self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
+        # The other trainers may report the sum of their micro batches' losses
+        # because ``mean_global_loss`` has already scaled each one by its share of
+        # the step's tokens, so the sum is the step's mean. Nothing above carries
+        # that weight: ``forward_backward_step`` builds ``loss_dict`` out of plain
+        # per-micro-batch means, so the sums are averaged here instead. Reporting
+        # them raw scaled every value by ``gradient_accumulation_steps`` -- most
+        # visibly ``reward_accuracy``, a fraction of pairs that read above 1.
+        total_loss /= num_micro_steps
+        total_loss_dict = {key: value / num_micro_steps for key, value in total_loss_dict.items()}
 
-    # ── Trainer train loop ────────────────────────────────
+        self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 
     def train(self):
         args: VeOmniDPOArguments = self.base.args

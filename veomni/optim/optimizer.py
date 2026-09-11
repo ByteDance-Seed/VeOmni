@@ -334,6 +334,34 @@ class MultiOptimizer(Optimizer, Stateful):
 
         return merged
 
+    def _sparse_state_dict(
+        self,
+    ) -> Dict[str, Any]:
+        """Return a flattened optimizer state dict without materializing state.
+
+        Unlike ``state_dict()``, this skips sub-optimizers whose ``.state`` is
+        still empty.  PyTorch's ``get_optimizer_state_dict`` would otherwise
+        call ``_init_optim_state`` and synthesize default state for every
+        parameter owned by that sub-optimizer (e.g. an unused MoE expert on
+        this rank), bloating the checkpoint.
+        """
+        merged: Dict[str, Any] = {}
+        for name in self.key_names:
+            opt = self.optimizers_dict.get(name)
+            if not opt.state:
+                continue
+            sd = get_optimizer_state_dict(self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True))
+            overlap = set(merged.keys()) & set(sd.keys())
+            if overlap:
+                raise KeyError(
+                    f"Key clash detected while merging state dict for optimizer '{name}': {', '.join(sorted(overlap))}"
+                )
+            else:
+                logger.info_rank0("No clashes when merging MultiOptimizer state dicts")
+            merged.update(sd)
+
+        return merged
+
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         # Feed the same merged flattened dict to each sub-optimizer; PyTorch will
         # pick out only the entries for parameters that belong to that optimizer.
@@ -587,8 +615,9 @@ def _build_muon_with_adamw(
         raise ValueError(
             f"muon_head_group_size={head_group_size} requires muon_head_split_modules: there is no "
             "default list, because which attention projections benefit from head splitting depends "
-            "on the architecture. List the leaf module names to split, e.g. ['q_b_proj'] for "
-            "DeepSeek V4/V3 MLA up-projections or ['q_proj', 'k_proj', 'v_proj'] for GQA attention."
+            "on the architecture. List the modules to split as leaf names or dotted path suffixes, "
+            "e.g. ['self_attn.q_b_proj'] for DeepSeek V4/V3 MLA up-projections or "
+            "['q_proj', 'k_proj', 'v_proj'] for GQA attention."
         )
     # The single owner of the Muon-vs-AdamW LR policy: an unset Muon LR either
     # inherits the AdamW LR (match_rms_adamw) or takes the Moonlight-style 25x.

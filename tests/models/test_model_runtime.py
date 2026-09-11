@@ -33,7 +33,6 @@ from veomni.arguments import (
     AcceleratorConfig,
     FSDPConfig,
     ModelArguments,
-    ModelRuntimeArguments,
 )
 from veomni.distributed.parallel_state import (
     _init_parallel_state,
@@ -107,7 +106,7 @@ def test_a_runtime_builds_and_optimizes_a_model_without_a_trainer(single_rank_gr
     assert runtime.model is not None
     assert runtime.model_config is runtime.model.config
 
-    runtime.build_lr_scheduler(total_steps=10)
+    runtime._build_lr_scheduler(total_steps=10)
 
     assert runtime.optimizer is not None
     assert runtime.lr_scheduler is not None
@@ -162,7 +161,7 @@ def test_a_lora_free_config_leaves_the_model_untouched(single_rank_group):
     runtime = make_runtime()
 
     before = runtime.model
-    runtime.setup_lora()
+    runtime._setup_lora()
 
     assert runtime.model is before
 
@@ -193,25 +192,24 @@ class TestHowATrainerHoldsItsModel:
 
         monkeypatch.setattr(VeOmniModelRuntime, "__init__", record_only)
 
-        runtime = trainer.build_model_runtime()
+        runtime = trainer._build_model_runtime()
 
         assert isinstance(runtime, VeOmniModelRuntime)
         assert runtime.args is args.model, "the runtime is handed its own slice, not the job"
         assert runtime.model_name == "base"
-        assert trainer.build_model_runtime("policy").model_name == "policy"
+        assert trainer._build_model_runtime("policy").model_name == "policy"
         assert runtime.train is args.train, "and the job-wide half it still needs"
         assert runtime.chat_template_name == "chatml", (
             "including which chat template to build, since only the runtime holds the preprocessor to build it from"
         )
 
     def test_a_trainer_is_not_itself_a_model_runtime(self):
-        # The regression this guards: BaseTrainer used to *inherit* the runtime,
-        # which made every model method look like a trainer method.
+        # BaseTrainer composes a runtime; it is not one.
         assert not issubclass(BaseTrainer, VeOmniModelRuntime)
 
     def test_optimizer_and_scheduler_live_on_the_runtime_not_the_trainer(self):
         trainer = BaseTrainer.__new__(BaseTrainer)
-        trainer.model = unbuilt_runtime(ModelRuntimeArguments(model_path="somewhere"))
+        trainer.model = unbuilt_runtime(ModelArguments(model_path="somewhere"))
 
         trainer.model.optimizer = "optimizer"
         trainer.model.lr_scheduler = "scheduler"
@@ -223,7 +221,7 @@ class TestHowATrainerHoldsItsModel:
         assert not hasattr(BaseTrainer, "model_config")
 
     def test_a_standalone_runtime_defaults_to_the_single_model_name(self):
-        args = ModelRuntimeArguments(model_path="somewhere")
+        args = ModelArguments(model_path="somewhere")
         runtime = unbuilt_runtime(args)
 
         assert runtime.args is args
@@ -231,23 +229,23 @@ class TestHowATrainerHoldsItsModel:
 
     def test_a_named_runtime_carries_its_own_name(self):
         # Sibling models in one job register their meshes under distinct names.
-        runtime = unbuilt_runtime(ModelRuntimeArguments(model_path="somewhere"), name="audio")
+        runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"), name="audio")
 
         assert runtime.model_name == "audio"
 
     def test_a_fresh_run_still_materializes_hf_weights(self):
-        runtime = unbuilt_runtime(ModelRuntimeArguments(model_path="somewhere"), train=train_args())
+        runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"), train=train_args())
 
         assert runtime.skip_hf_weight_load is False
 
     def test_a_full_resume_skips_the_second_memory_peak(self):
-        runtime = unbuilt_runtime(ModelRuntimeArguments(model_path="somewhere"), train=train_args(load_path="/ckpt"))
+        runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"), train=train_args(load_path="/ckpt"))
 
         assert runtime.skip_hf_weight_load is True
 
     def test_a_lora_resume_still_needs_the_hf_base(self):
         runtime = unbuilt_runtime(
-            ModelRuntimeArguments(model_path="somewhere", lora_config={"rank": 8}),
+            ModelArguments(model_path="somewhere", lora_config={"rank": 8}),
             train=train_args(load_path="/ckpt"),
         )
 
@@ -260,7 +258,7 @@ class TestWhereTheLoaderReadsTheConfigFrom:
     def test_a_module_falls_back_to_its_weights_folder(self):
         # A module inside a composed checkpoint is addressed by its own subfolder,
         # so it never configures a config path separately.
-        assert ModelRuntimeArguments(model_path="somewhere").config_path == "somewhere"
+        assert ModelArguments(model_path="somewhere").config_path == "somewhere"
 
     def test_a_whole_model_honours_a_separate_config_path(self):
         # Toy-config runs rely on this: architecture from a local json, weights
@@ -287,25 +285,21 @@ class TestHowAJobOverridesItsPreprocessor:
         monkeypatch.setattr("veomni.models.auto.build_processor", fake_build_processor)
 
     def test_a_run_can_resize_what_the_repository_ships(self, monkeypatch):
-        # A pixel budget belongs to the run, not to the model class: the same
-        # checkpoint is trained at different resolutions by different jobs.
         seen = {}
         self._record_loader(monkeypatch, seen)
         size = {"shortest_edge": 3136, "longest_edge": 602112}
         runtime = unbuilt_runtime(ModelArguments(model_path="somewhere", processor_config={"size": size}))
 
-        runtime.build_model_assets()
+        runtime._build_model_assets()
 
         assert seen == {"path": "somewhere", "kwargs": {"size": size}}
 
     def test_a_run_that_overrides_nothing_leaves_the_repository_alone(self, monkeypatch):
-        # No kwargs at all, so the preprocessor the repository ships is
-        # authoritative — nothing silently narrows it behind the job's back.
         seen = {}
         self._record_loader(monkeypatch, seen)
         runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"))
 
-        runtime.build_model_assets()
+        runtime._build_model_assets()
 
         assert seen["kwargs"] == {}
 
@@ -317,6 +311,7 @@ class TestWhatTheRuntimeAsksTheModel:
         # The escape hatch for models the generic GPU-materializing loader has no
         # hook for — a MoE backbone streaming EP-sharded experts to CPU, say.
         wrapped = nn.Linear(1, 1)
+        wrapped.eval()
         seen = {}
 
         class SelfWrapping(nn.Module):
@@ -325,13 +320,14 @@ class TestWhatTheRuntimeAsksTheModel:
                 seen["args"] = args
                 return wrapped
 
-        args = ModelRuntimeArguments(model_path="somewhere")
+        args = ModelArguments(model_path="somewhere")
         runtime = unbuilt_runtime(args, train=train_args())
         runtime.model = SelfWrapping()
 
-        runtime.build_parallelized_model()
+        runtime._build_parallelized_model()
 
         assert runtime.model is wrapped
+        assert runtime.model.training
         assert seen == {"weights_path": "somewhere", "args": args}
 
     def test_an_ordinary_model_leaves_the_generic_path_alone(self, monkeypatch):
@@ -342,10 +338,10 @@ class TestWhatTheRuntimeAsksTheModel:
             "veomni.distributed.torch_parallelize.build_parallelize_model",
             lambda model, **kwargs: generically_wrapped,
         )
-        runtime = unbuilt_runtime(ModelRuntimeArguments(model_path="somewhere"), train=train_args())
+        runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"), train=train_args())
         runtime.model = nn.Linear(1, 1)
 
-        runtime.build_parallelized_model()
+        runtime._build_parallelized_model()
 
         assert runtime.model is generically_wrapped
 
@@ -361,10 +357,10 @@ class TestWhatTheRuntimeAsksTheModel:
             def freeze_model(self):
                 self.frozen = True
 
-        runtime = unbuilt_runtime(ModelRuntimeArguments(model_path="somewhere"))
+        runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"))
         runtime.model = SelfFreezing()
 
-        runtime.freeze_model()
+        runtime._freeze_model_module()
 
         assert runtime.model.frozen is True
 
@@ -375,10 +371,10 @@ class TestWhatTheRuntimeAsksTheModel:
             def setup_lora(self, lora_config):
                 return wrapped
 
-        runtime = unbuilt_runtime(ModelRuntimeArguments(model_path="somewhere", lora_config={"rank": 8}))
+        runtime = unbuilt_runtime(ModelArguments(model_path="somewhere", lora_config={"rank": 8}))
         runtime.model = SelfAdapting()
 
-        runtime.setup_lora()
+        runtime._setup_lora()
 
         assert runtime.model is wrapped
 
@@ -397,13 +393,13 @@ class TestWhatTheRuntimeAsksTheModel:
             def customized_setup_lora(self, lora_config):
                 raise AssertionError("the prefixed name is the runtime's, not the model's")
 
-        args = ModelRuntimeArguments(
+        args = ModelArguments(
             model_path="somewhere",
             lora_config={"rank": 8, "alpha": 16, "lora_modules": ["proj"]},
         )
         runtime = unbuilt_runtime(args)
         runtime.model = PrefixedByMistake()
 
-        runtime.setup_lora()
+        runtime._setup_lora()
 
         assert isinstance(runtime.model, VeOmniLoraModel)

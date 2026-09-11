@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -90,6 +91,46 @@ def _attention_model(**kwargs) -> nn.Module:
     model = nn.Module()
     model.embed_tokens = nn.Embedding(8, 32)
     model.self_attn = _FakeAttention(**kwargs)
+    return model
+
+
+_TOY_CONFIG_ROOT = Path(__file__).resolve().parents[1] / "toy_config"
+
+
+def _dsv4_csa_attention_model() -> nn.Module:
+    """A real ``DeepseekV4Attention`` on a CSA layer, so the nesting is the real one.
+
+    What the nested-name rule keys on is that the indexer sits at
+    ``self_attn.compressor.indexer`` while naming a projection the enclosing MLA also
+    names; a synthetic stand-in would pin a hand-built path instead of the shipped one.
+
+    ``index_n_heads`` / ``index_head_dim`` are raised to the 4-layer checkpoint's
+    64 x 128 (the toy config ships 8 x 128) so the indexer's head count differs from
+    the main attention's 8 and one assertion can tell the two apart.
+    """
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    config = AutoConfig.from_pretrained(str(_TOY_CONFIG_ROOT / "deepseek_v4_toy"))
+    config.index_n_heads = 64
+    config.index_head_dim = 128
+    torch.manual_seed(0)
+    model = nn.Module()
+    model.self_attn = modeling.DeepseekV4Attention(config, config.layer_types.index("compressed_sparse_attention"))
+    return model
+
+
+def _glm_dsa_attention_model() -> nn.Module:
+    """A real ``GlmMoeDsaAttention``, whose indexer names ``wq_b`` and never collides."""
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.glm_moe_dsa.generated import patched_modeling_glm_moe_dsa_gpu as modeling
+
+    config = AutoConfig.from_pretrained(str(_TOY_CONFIG_ROOT / "glm_moe_dsa_toy"))
+    torch.manual_seed(0)
+    model = nn.Module()
+    model.self_attn = modeling.GlmMoeDsaAttention(config, 0)
     return model
 
 
@@ -730,6 +771,167 @@ class TestHeadSplitInference:
 
         blocks = infer_head_block_counts(model, head_group_size=1, module_names=("wq_b",))
         assert blocks == {"indexer.wq_b.weight": 4}
+
+    @pytest.mark.parametrize("head_group_size", [1, 2, 8, 16])
+    def test_bare_name_selecting_two_nested_projections_is_rejected(self, head_group_size):
+        """DeepSeek-V4's MLA and the DSA indexer *inside* it both name their
+        up-projection ``q_b_proj``, and the indexer's own ``num_heads``/``head_dim``
+        resolve its 8192 rows to 64 x 128 -- so a bare ``[q_b_proj]`` would split both,
+        at different block counts, with nothing in the config saying so. Picking a
+        winner would silently decide the update math, so the entry is refused and the
+        two qualified forms are named.
+
+        Parametrized over ``head_group_size`` because the pair has to stay visible when
+        one side stops splitting: at 8 the MLA's 8 heads collapse to a single block and
+        at 16 they are not divisible at all, and in both cases the indexer alone would
+        otherwise be split -- the inversion of what the entry asks for.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            infer_head_block_counts(
+                _dsv4_csa_attention_model(), head_group_size=head_group_size, module_names=("q_b_proj",)
+            )
+
+        message = str(excinfo.value)
+        assert "self_attn.q_b_proj (8 heads)" in message
+        assert "self_attn.compressor.indexer.q_b_proj (64 heads)" in message
+        # The fix has to be copy-pasteable, not just described.
+        assert "'self_attn.q_b_proj'" in message and "'indexer.q_b_proj'" in message
+
+    def test_qualified_entries_address_each_projection(self):
+        """A dotted suffix picks exactly one of the two, and listing both splits both."""
+        mla_only = infer_head_block_counts(
+            _dsv4_csa_attention_model(), head_group_size=1, module_names=("self_attn.q_b_proj",)
+        )
+        assert mla_only == {"self_attn.q_b_proj.weight": 8}
+
+        indexer_only = infer_head_block_counts(
+            _dsv4_csa_attention_model(), head_group_size=1, module_names=("indexer.q_b_proj",)
+        )
+        assert indexer_only == {"self_attn.compressor.indexer.q_b_proj.weight": 64}
+
+        # Any depth of suffix works, not just one segment.
+        deeper = infer_head_block_counts(
+            _dsv4_csa_attention_model(), head_group_size=1, module_names=("compressor.indexer.q_b_proj",)
+        )
+        assert deeper == {"self_attn.compressor.indexer.q_b_proj.weight": 64}
+
+        both = infer_head_block_counts(
+            _dsv4_csa_attention_model(),
+            head_group_size=1,
+            module_names=("self_attn.q_b_proj", "indexer.q_b_proj"),
+        )
+        assert both == {"self_attn.q_b_proj.weight": 8, "self_attn.compressor.indexer.q_b_proj.weight": 64}
+
+    @pytest.mark.parametrize("entries", [("q_b_proj", "self_attn.q_b_proj"), ("q_b_proj", "indexer.q_b_proj")])
+    def test_supplementing_a_bare_entry_does_not_make_it_unambiguous(self, entries):
+        """Adding one of the suggested entries instead of replacing the bare one still fails.
+
+        The check is per pair of selected sites rather than per entry precisely for this:
+        the likely reaction to the error is to *add* the qualified name, and a per-entry
+        rule would then find one site under each entry, form no pair, and split both in
+        silence. Both orders of qualification behave the same, so there is no spelling
+        that is accidentally safe.
+        """
+        with pytest.raises(ValueError, match="is ambiguous"):
+            infer_head_block_counts(_dsv4_csa_attention_model(), head_group_size=1, module_names=entries)
+
+    def test_repeated_collisions_are_counted_once(self):
+        """Per-layer repeats collapse into one error that says how many sites match."""
+        model = nn.Module()
+        model.layers = nn.ModuleList([_dsv4_csa_attention_model().self_attn for _ in range(3)])
+
+        with pytest.raises(ValueError) as excinfo:
+            infer_head_block_counts(model, head_group_size=1, module_names=("q_b_proj",))
+
+        message = str(excinfo.value)
+        assert "layers.0.q_b_proj (8 heads)" in message
+        assert "repeats in 2 other module(s)" in message
+
+    def test_sibling_matches_stay_selected_together(self):
+        """Only *nested* matches are refused; two towers sharing a name are not.
+
+        Mirrors Qwen2.5-Omni, where ``Qwen2_5OmniAttention`` and
+        ``Qwen2_5OmniAudioAttention`` both name a ``q_proj``: neither encloses the
+        other, so ``[q_proj]`` unambiguously means both and must keep working.
+        """
+        model = nn.Module()
+        model.thinker = _FakeAttention()
+        model.audio_tower = _FakeAttention(hidden=32, num_heads=4, num_kv_heads=4, head_dim=8)
+
+        blocks = infer_head_block_counts(model, head_group_size=1, module_names=("q_proj",))
+        assert blocks == {"thinker.q_proj.weight": 8, "audio_tower.q_proj.weight": 4}
+
+        # And a qualified entry narrows to one tower, which a leaf-name matcher cannot do.
+        one_tower = infer_head_block_counts(model, head_group_size=1, module_names=("audio_tower.q_proj",))
+        assert one_tower == {"audio_tower.q_proj.weight": 4}
+
+    def test_entries_match_whole_path_segments_only(self):
+        """``q_b_proj`` must not select ``xq_b_proj``: suffixes break on dots."""
+        attn = nn.Module()
+        attn.num_heads = 8
+        attn.head_dim = 16
+        attn.xq_b_proj = nn.Linear(64, 8 * 16, bias=False)
+        model = nn.Module()
+        model.self_attn = attn
+
+        assert infer_head_block_counts(model, head_group_size=1, module_names=("q_b_proj",)) == {}
+
+    def test_glm_dsa_needs_no_qualification(self):
+        """GLM MoE DSA's names never collide, so both bare entries stay usable.
+
+        Its indexer calls its up-projection ``wq_b`` while the attention around it uses
+        ``q_b_proj``. Built from the real classes, because a synthetic stand-in would
+        pass no matter what the shipped modules are named.
+        """
+        model = _glm_dsa_attention_model()
+
+        assert infer_head_block_counts(model, head_group_size=1, module_names=("wq_b",)) == {
+            "self_attn.indexer.wq_b.weight": 4
+        }
+        assert infer_head_block_counts(model, head_group_size=1, module_names=("q_b_proj",)) == {
+            "self_attn.q_b_proj.weight": 8
+        }
+
+    def test_head_split_modules_thread_from_the_optimizer_config(self):
+        """Qualified entries have to survive the production build path.
+
+        Head-split inference runs at optimizer construction from ``OptimizerConfig``
+        via ``build_optimizer(optimizer_config=...)``, so that is what decides the
+        update; a test against ``infer_head_block_counts`` alone would pass with the
+        field unwired.
+        """
+        from veomni.arguments.arguments_types import OptimizerConfig
+        from veomni.optim import build_optimizer
+
+        model = _dsv4_csa_attention_model()
+
+        def _q_b_proj_blocks(*entries: str) -> dict:
+            cfg = OptimizerConfig(
+                type="muon",
+                lr=1e-4,
+                muon_head_group_size=1,
+                muon_head_split_modules=list(entries),
+                muon_ns_implementation="std",
+            )
+            opt = build_optimizer(model, lr=cfg.lr, optimizer_type=cfg.type, optimizer_config=cfg)
+            names = {id(p): n for n, p in model.named_parameters()}
+            return {
+                names[id(p)]: int(group.get("head_blocks", 1))
+                for group in opt.optimizers_dict["muon"].param_groups
+                for p in group["params"]
+                if names[id(p)].endswith("q_b_proj.weight")
+            }
+
+        assert _q_b_proj_blocks("self_attn.q_b_proj") == {
+            "self_attn.q_b_proj.weight": 8,
+            "self_attn.compressor.indexer.q_b_proj.weight": 1,
+        }
+        assert _q_b_proj_blocks("self_attn.q_b_proj", "indexer.q_b_proj") == {
+            "self_attn.q_b_proj.weight": 8,
+            "self_attn.compressor.indexer.q_b_proj.weight": 64,
+        }
+        with pytest.raises(ValueError, match="is ambiguous"):
+            _q_b_proj_blocks("q_b_proj")
 
 
 class TestHeadSplitUpdate:

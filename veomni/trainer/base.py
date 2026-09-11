@@ -43,7 +43,7 @@ from torch.utils.checkpoint import set_checkpoint_debug_enabled
 from torch.utils.data import Dataset
 from transformers.modeling_outputs import ModelOutput
 
-from ..arguments import VeOmniArguments, save_args
+from ..arguments import OffloadConfig, VeOmniArguments, save_args
 from ..data import (
     DistributedDataloader,
     build_dataloader,
@@ -51,10 +51,11 @@ from ..data import (
 )
 from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
+from ..distributed.async_offload import reset_async_activation_offload
 from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import (
     clear_parallel_state,
-    init_parallel_state_from_accelerator,
+    init_parallel_state_from_config,
     use_parallel_state,
 )
 from ..distributed.torch_compile import mark_compile_step_begin
@@ -70,15 +71,14 @@ from ..utils.device import (
 )
 from ..utils.loss_utils import count_loss_token, mean_global_loss, reduce_global_loss_token
 from .callbacks import (
+    RESERVED_TRAINING_METRIC_NAMES,
     ChannelLossCallback,
+    CheckpointCallback,
     EnvironMeterCallback,
     EvaluateCallback,
     GlobalStateCallback,
-    ModelDcpCallback,
-    ModelHfCallback,
     MoERouterMonitorCallback,
     ProfileTraceCallback,
-    RootAssetsCallback,
     TqdmCallback,
     TrainerState,
     WandbTraceCallback,
@@ -193,6 +193,29 @@ class VeOmniIter:
         return {}
 
 
+def _resolve_offload_config(args) -> OffloadConfig:
+    """Return activation-offload config, or the disabled defaults if a stub omitted it."""
+    accelerator = getattr(getattr(args, "model", None), "accelerator", None)
+    config = getattr(accelerator, "offload_config", None)
+    return config if config is not None else OffloadConfig()
+
+
+def mean_aux_metrics(total_aux_metrics: Dict[str, float], num_micro_steps: int) -> Dict[str, float]:
+    """Reduce accumulated ``aux_metrics`` to the mean over a step's micro batches.
+
+    Losses may be summed across micro batches because ``mean_global_loss`` has
+    already weighted each by its share of the step's tokens. An auxiliary metric
+    carries no such weight, so it is averaged instead: for a per-token metric that
+    is the step's per-token mean when the micro batches hold equal token counts,
+    and unlike a token-share weighting it assumes nothing about which denominator
+    the metric used. Shared by the trainers that keep their own accumulation loop
+    so none of them can reduce it differently.
+    """
+    if not total_aux_metrics:
+        return {}
+    return {key: value / num_micro_steps for key, value in total_aux_metrics.items()}
+
+
 class BaseTrainer(Stateful, ABC):
     """
     Base trainer class for distributed model training.
@@ -270,24 +293,22 @@ class BaseTrainer(Stateful, ABC):
         """
 
         self.args: VeOmniArguments = args
-        self.device = self.setup_distributed(args)
+        self.device = self._setup(args)
         # Builds the model: meta-init, freeze, parallelize and optimizer all run
         # under the mesh the runtime registered, so nothing below needs a scope.
-        self.model = self.build_model_runtime()
+        self.model = self._build_model_runtime()
         # build dataset and dataloader
         self._build_data_transform()
         self._build_dataset()
         self._build_collate_fn()
         self._build_dataloader()
         # The dataset fixes train_steps, which the schedule needs.
-        self.build_lr_scheduler()
+        self._build_lr_scheduler()
         self._build_training_context()
         self._init_callbacks()
 
-    # ── Trainer distributed setup ────────────────────────────────
-
     @staticmethod
-    def setup_distributed(args: VeOmniArguments) -> torch.device:
+    def _setup(args: VeOmniArguments) -> torch.device:
         """Init process group, device, seed, and register the job's ParallelState.
 
         Everything here is job-level and runs before any model exists, so it
@@ -309,7 +330,7 @@ class BaseTrainer(Stateful, ABC):
 
         # Register ParallelState before seed/determinism env vars. Mesh creation
         # must not run under NCCL_DETERMINISTIC=1 on some GPU platforms (L20).
-        init_parallel_state_from_accelerator(args.model.accelerator, name="base")
+        init_parallel_state_from_config(args.model.accelerator, name="base")
 
         # Set random seed
         helper.set_seed(args.train.seed, args.train.enable_full_determinism)
@@ -348,9 +369,7 @@ class BaseTrainer(Stateful, ABC):
         dist.destroy_process_group()
         clear_parallel_state()
 
-    # ── Trainer build functions ────────────────────────────────
-
-    def build_model_runtime(self, model_name: str = "base") -> VeOmniModelRuntime:
+    def _build_model_runtime(self, model_name: str = "base") -> VeOmniModelRuntime:
         """Build this job's model under ``model_name``'s ParallelState.
 
         Defaults to ``"base"`` — the single-model name. A trainer that holds
@@ -369,13 +388,13 @@ class BaseTrainer(Stateful, ABC):
             chat_template_name=self.args.data.chat_template,
         )
 
-    def build_lr_scheduler(self):
+    def _build_lr_scheduler(self):
         """Size the run, then let the model schedule over it.
 
         The step count is job-bound — it needs the dataset length and the epoch
         count — so the model takes the number rather than deriving it.
         """
-        self.model.build_lr_scheduler(self.args.train_steps * self.args.train.num_train_epochs)
+        self.model._build_lr_scheduler(self.args.train_steps * self.args.train.num_train_epochs)
 
     def _build_data_transform(self):
         self.data_transform = build_data_transform(
@@ -437,10 +456,19 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_training_context(self):
         """Build training context for distributed training."""
+        offload_config = _resolve_offload_config(self.args)
+
+        # Async activation offload uses per-module saved_tensors_hooks (applied
+        # before FSDP sharding), so the global fwd/bwd contexts are nullcontext.
+        if offload_config.enable_async_activation:
+            from contextlib import nullcontext
+
+            self.model_fwd_context, self.model_bwd_context = nullcontext(), nullcontext()
+            return
         self.model_fwd_context, self.model_bwd_context = build_activation_offloading_context(
-            self.args.model.accelerator.offload_config.enable_activation,
+            offload_config.enable_activation,
             self.args.model.accelerator.gradient_checkpointing.enable,
-            self.args.model.accelerator.offload_config.activation_gpu_limit,
+            offload_config.activation_gpu_limit,
         )
 
     def _init_callbacks(self, trainer=None):
@@ -450,12 +478,8 @@ class BaseTrainer(Stateful, ABC):
         self.tqdm_callback = TqdmCallback(trainer)
         self.wandb_callback = WandbTraceCallback(trainer)
         self.profile_callback = ProfileTraceCallback(trainer)
-        self.root_assets_callback = RootAssetsCallback(trainer)
-        self.dcp_callback = ModelDcpCallback(trainer)
+        self.checkpoint_callback = CheckpointCallback(trainer)
         self.global_state_callback = GlobalStateCallback(trainer)
-        # One callback, both export formats: a model that trains only adapters
-        # writes the adapter, and the model is what knows.
-        self.hf_ckpt_callback = ModelHfCallback(trainer)
         self.evaluate_callback = EvaluateCallback(trainer)
         self.moe_monitor_callback = MoERouterMonitorCallback(trainer)
         self.channel_loss_callback = ChannelLossCallback(trainer)
@@ -474,20 +498,17 @@ class BaseTrainer(Stateful, ABC):
             self.channel_loss_callback,
             self.wandb_callback,
             self.profile_callback,
-            self.root_assets_callback,
             # Weights first, then the cursor: at resume the DCP load frees its
             # materialization buffers before the dataloader prefetches, and at
             # save a crash between the two leaves weights whose trainer state is
-            # merely absent, which resumes with a warning.
-            self.dcp_callback,
+            # merely absent, which resumes with a warning. Assets + DCP + HF
+            # share CheckpointCallback so the sidecar export runs before load.
+            self.checkpoint_callback,
             self.global_state_callback,
-            self.hf_ckpt_callback,
             self.evaluate_callback,
             self.moe_monitor_callback,
         ]
         self.state = TrainerState()
-
-    # ── Trainer checkpoint functions ────────────────────────────────
 
     def load(self) -> None:
         """Resume this job's model.
@@ -507,8 +528,6 @@ class BaseTrainer(Stateful, ABC):
     def save_hf_or_lora(self, state: TrainerState, stage: str = "step_end") -> None:
         """Export this job's weights in whichever format the model was trained in."""
         self.model.save_hf_or_lora(state, stage=stage)
-
-    # ── Trainer callback hooks ────────────────────────────────
 
     def on_train_begin(self):
         for callback in self._callbacks:
@@ -530,11 +549,11 @@ class BaseTrainer(Stateful, ABC):
         for callback in self._callbacks:
             callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
 
-    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
+    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
         for callback in self._callbacks:
-            callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-
-    # ── Trainer train step functions ────────────────────────────────
+            callback.on_step_end(
+                self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=aux_metrics
+            )
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass.
@@ -560,8 +579,17 @@ class BaseTrainer(Stateful, ABC):
 
     def postforward(
         self, outputs: ModelOutput, micro_batch: Dict[str, torch.Tensor]
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Postprocess model outputs after forward pass."""
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Postprocess model outputs after forward pass.
+
+        Returns the backward scalar, the losses behind it, and any diagnostics the
+        forward asked to have logged. The diagnostics travel in their own dict
+        because ``loss_dict`` carries a reduction contract they do not share:
+        ``mean_global_loss`` has already scaled each loss by its share of the
+        step's tokens, so summing that dict is the last step of a global token
+        mean. A metric folded in would inherit that summation, and anything later
+        taking ``sum(loss_dict.values())`` would train on it.
+        """
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
             outputs.loss,
             self.micro_batch_token_len,
@@ -569,11 +597,34 @@ class BaseTrainer(Stateful, ABC):
             getattr(self, "global_micro_batches_token_len", None),
         )
         loss = torch.stack(list(loss_dict.values())).sum()
-        return loss, loss_dict
+        aux_metrics: Dict[str, torch.Tensor] = {}
+        # ``getattr`` rather than attribute access: most model outputs in the repo
+        # have no such field.
+        reported = getattr(outputs, "aux_metrics", None)
+        if reported:
+            # Separate dicts keep a metric out of the objective, but not out of the
+            # ``training/`` namespace that ``EnvironMeterCallback`` publishes both
+            # of them into, where every consumer keys on the name alone. A clash
+            # there is silent in either direction: it overwrites the loss or
+            # callback-owned metric it shadows, or is itself overwritten and never
+            # reported -- see ``RESERVED_TRAINING_METRIC_NAMES``.
+            collisions = sorted(reported.keys() & (loss_dict.keys() | RESERVED_TRAINING_METRIC_NAMES))
+            if collisions:
+                raise ValueError(
+                    f"aux_metrics keys {collisions} are already reported under "
+                    f"training/. Loss keys {sorted(loss_dict.keys())} and the names "
+                    f"callbacks own {sorted(RESERVED_TRAINING_METRIC_NAMES)} are "
+                    "reserved: rename the auxiliary metric."
+                )
+            # Detach here so a metric that still carries a graph cannot keep it
+            # alive for the step; ``train_step`` reduces the values across micro
+            # batches.
+            aux_metrics = {key: value.detach() for key, value in reported.items()}
+        return loss, loss_dict, aux_metrics
 
     def forward_backward_step(
         self, micro_batch: dict[str, torch.Tensor]
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         channel_loss_callback = getattr(self, "channel_loss_callback", None)
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
@@ -597,7 +648,7 @@ class BaseTrainer(Stateful, ABC):
                 outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
             with use_parallel_state("base"):
-                loss, loss_dict = self.postforward(outputs, micro_batch)
+                loss, loss_dict, aux_metrics = self.postforward(outputs, micro_batch)
 
             with (
                 use_parallel_state("base"),
@@ -607,7 +658,7 @@ class BaseTrainer(Stateful, ABC):
                 loss.backward()
 
             del micro_batch
-            return loss, loss_dict
+            return loss, loss_dict, aux_metrics
 
     def model_reshard(self, micro_step: int, num_micro_steps: int, model=None):
         """Reshard model after backward pass."""
@@ -636,6 +687,10 @@ class BaseTrainer(Stateful, ABC):
             elif micro_step == num_micro_steps - 1:
                 model.set_requires_all_reduce(True)
 
+    def _reset_async_activation_offload_if_enabled(self):
+        if _resolve_offload_config(self.args).enable_async_activation:
+            reset_async_activation_offload(self.model)
+
     def sync_before_train_step(self):
         if self.args.train.sync_each_train_step:
             synchronize()
@@ -648,6 +703,7 @@ class BaseTrainer(Stateful, ABC):
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
+        self._reset_async_activation_offload_if_enabled()
         self.on_step_begin(micro_batches=micro_batches)
 
         # Forward and backward for each micro batch
@@ -655,6 +711,7 @@ class BaseTrainer(Stateful, ABC):
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
+        total_aux_metrics = defaultdict(float)
 
         # token num for fixed_ce_loss in postforward
         self.micro_batches_token_len = count_loss_token(micro_batches)
@@ -667,13 +724,16 @@ class BaseTrainer(Stateful, ABC):
             self._configure_hsdp_allreduce(micro_step, num_micro_steps)
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
+            aux_metrics: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
             self.micro_batch_token_len = count_loss_token(micro_batch)
-            loss, loss_dict = self.forward_backward_step(micro_batch)
+            loss, loss_dict, aux_metrics = self.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
+            for k, v in aux_metrics.items():
+                total_aux_metrics[k] += v.item()
 
         # Gradient clipping (reads FSDP/EP groups from this model's ParallelState)
         grad_norm = self.model.clip_grad_norm()
@@ -683,9 +743,12 @@ class BaseTrainer(Stateful, ABC):
         self.model.lr_scheduler.step()
         self.model.optimizer.zero_grad()
 
-        self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
-
-    # ── Trainer train loop ────────────────────────────────
+        self.on_step_end(
+            loss=total_loss,
+            loss_dict=total_loss_dict,
+            grad_norm=grad_norm,
+            aux_metrics=mean_aux_metrics(total_aux_metrics, num_micro_steps),
+        )
 
     def train(self):
         args: VeOmniArguments = self.args

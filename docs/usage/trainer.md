@@ -68,8 +68,8 @@ def train_step(self, data_iterator):
     self.on_step_begin(micro_batches=micro_batches)
 
     for micro_step, micro_batch in enumerate(micro_batches):
-        loss, loss_dict = self.forward_backward_step(micro_batch)
-        # ... accumulation ...
+        loss, loss_dict, aux_metrics = self.forward_backward_step(micro_batch)
+        # ... losses summed, aux metrics averaged ...
 
     grad_norm = self.model.clip_grad_norm()
     self.model.optimizer.step()
@@ -86,6 +86,53 @@ The `forward_backward_step` allows for customization of the forward and backward
 - `preforward`: Moves data to the correct device.
 - `postforward`: Computes the final loss from model outputs.
 
+### Auxiliary Metrics (`outputs.aux_metrics`)
+
+A forward can report diagnostics alongside the losses by returning an
+`aux_metrics` dict on its model output. They travel in their own channel the whole
+way — `postforward` returns `(loss, loss_dict, aux_metrics)`, `train_step` reduces
+the two dicts differently, and `on_step_end` passes `aux_metrics` to callbacks
+beside `grad_norm` — so no summation of losses can reach a metric. It is
+`EnvironMeterCallback` that finally publishes both under the same prefix, as
+`training/<key>`, which is the name that reaches wandb.
+
+Keeping them out of `loss_dict` is the point: every entry there is pre-weighted by
+its share of the step's tokens, so summing the dict is meaningful, and anything
+that sums it — `postforward` building the backward scalar today, any other caller
+tomorrow — would train on a metric folded in.
+
+The contract:
+
+- **Values are detached scalar tensors.** `postforward` calls `.detach()` on the
+  way out, so a metric that still carries a graph does not keep it alive for the
+  step. Anything reported must reduce to a scalar, since the reporting path only
+  ever calls `.item()` on it.
+- **Reported as the mean over the step's micro batches.** Losses are summed across
+  micro batches because `mean_global_loss` has already scaled each by its share of
+  the step's tokens; a metric carries no such scaling, so `train_step` averages it
+  via `mean_aux_metrics` instead. Emit a key on every micro batch of a step, or on
+  none — a key present in only some micro batches is averaged over all of them.
+  Values are also averaged across the FSDP group before they are logged.
+- **Names already reported under `training/` are reserved.** Separate dicts do not
+  separate the published namespace, where every consumer keys on the name alone
+  and both collision directions are silent, so a colliding key raises
+  `ValueError`. Two groups are reserved:
+    - Every key in `loss_dict`, i.e. the losses this step produced. Otherwise the
+      auxiliary value would surface as `training/<loss name>`, a loss curve
+      reading someone else's number, while the backward scalar stayed correct.
+    - The names `EnvironMeterCallback` publishes itself, listed in
+      `RESERVED_TRAINING_METRIC_NAMES`: `total_loss`, `avg_effective_len`, and
+      `avg_sample_seq_len` are assigned before the merge, so an auxiliary metric
+      would overwrite them; `grad_norm` and `lr` are assigned after it, so they
+      would overwrite the auxiliary metric and drop it silently. Extend that set
+      when adding a metric to the callback.
+- **Do not route metrics through `mean_global_loss`.** It applies token / FSDP /
+  SP scaling for gradients, which is not a logging semantic. That also means the
+  `*_loss` suffix convention it relies on is irrelevant here.
+
+Most model outputs have no such field; `postforward` reads it with `getattr`, so
+models that do not report metrics are unaffected.
+
 ## Callbacks
 
 The Trainer uses a callback system to decouple logging, checkpointing, and evaluation from the core training loop.
@@ -99,10 +146,10 @@ VeOmni includes several built-in callbacks:
 - **[WandbTraceCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/trace_callback.py)**: Logs metrics to wandb.
 - **[ProfileTraceCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/trace_callback.py)**: Handles profiling.
 - **[ChannelLossCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/channel_loss_callback.py)**: Logs detached per-channel causal-LM loss metrics when `train.channel_loss.enable=true`.
-- **[ModelDcpCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/checkpoint_callback.py)**: Saves resumable model checkpoints.
-- **[ModelHfCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/checkpoint_callback.py)**: Exports HuggingFace / LoRA weights.
-- **[GlobalStateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/global_state_callback.py)**: Saves job-level state (dataloader cursor, rng, meters).
-- **[RootAssetsCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/global_state_callback.py)**: Exports the config / tokenizer sidecars.
+- **[CheckpointCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/checkpoint_callback.py)**: Saves resumable DCP checkpoints, exports HuggingFace / LoRA weights, and writes the config / tokenizer sidecars.
+- **[GlobalStateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/global_state_callback.py)**: Saves global_state (dataloader cursor, rng, meters) as `trainer_state_rank_{N}.pt`, separate from the DCP `lr_scheduler.pt`.
+
+On-disk layout for both (current vs previous `extra_state/`): [Checkpoint layout](checkpoint.md).
 - **[EvaluateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/evaluate_callback.py)**: Runs evaluation on the validation set.
 
 ### Custom Callbacks
@@ -127,16 +174,16 @@ To implement a specific training task (like VLM training), compose a `BaseTraine
 
 ### Key Methods to Override
 
-1. **`build_model_runtime(self)`**:
-   Return the runtime that owns this job's model. Auxiliary components — tokenizer, processor, chat template — are built there rather than on the trainer, so override `VeOmniModelRuntime.build_model_assets` on a runtime subclass if a model needs different ones.
+1. **`_build_model_runtime(self)`**:
+   Return the runtime that owns this job's model. Auxiliary components — tokenizer, processor, chat template — are built there rather than on the trainer, so override `VeOmniModelRuntime._build_model_assets` on a runtime subclass if a model needs different ones.
    ```python
-   def build_model_runtime(self) -> MyModelRuntime:
+   def _build_model_runtime(self) -> MyModelRuntime:
        return MyModelRuntime(
            self.args.model, "base", train=self.args.train, chat_template_name=self.args.data.chat_template
        )
    ```
 
-2. **`VeOmniModelRuntime.freeze_model` / `build_optimizer`**:
+2. **`VeOmniModelRuntime._freeze_model_module` / `_build_optimizer`**:
    Freeze towers or split parameter groups on the runtime. `VLMModelRuntime` freezes ViT / audio and gives visual params a separate `vit_lr`.
 
 3. **`_build_data_transform(self)`**:

@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch.distributed as dist
 
-from ....checkpoint import CheckpointerBase, build_checkpointer
+from ....models.checkpoint_manager import ModelCheckpointManager
 from ....utils import helper, logging
 from ....utils.save_safetensor_utils import save_hf_safetensor, save_lora_adapter_with_dcp
 from ..accelerator.dispatch import unwrap_module_chain
@@ -37,42 +37,24 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
-class OmniModuleCheckpointManager:
+class OmniModuleCheckpointManager(ModelCheckpointManager):
     """Own DCP / HF / LoRA save-load for one :class:`ModuleRuntime`.
 
-    On-disk layout::
-
-        <save_path>/global_step_{N}/
-        ├── <module_a>/        # DCP {model, optimizer, extra_state={lr_scheduler}} (+ hf export)
-        ├── <module_b>/        # …
-        └── trainer_state.pt   # global (orchestrator-owned)
+    A :class:`~veomni.models.checkpoint_manager.ModelCheckpointManager` whose
+    artifacts nest under ``<save_path>/global_step_N/<module>/``. Offline-cache
+    partial DCP and the extra_state lr-scheduler payload are the only omni
+    differences; path helpers, last-saved-step tracking, and the checkpointer
+    itself come from the base.
     """
 
     def __init__(self, runtime: ModuleRuntime) -> None:
-        self.runtime = runtime
-        self.module_name = runtime.module_name
+        super().__init__(runtime, runtime.train.checkpoint)
         self.checkpoint_subfolder = runtime.module_name
-        args: OmniModuleRuntimeArguments = runtime.args
-        ckpt = runtime.train.checkpoint
-        self._last_saved_step: int = -1
-        self.checkpointer: CheckpointerBase = build_checkpointer(
-            dist_backend=args.accelerator.fsdp_config.fsdp_mode,
-            ckpt_manager=ckpt.manager,
-        )
-
-    @property
-    def last_saved_step(self) -> int:
-        return self._last_saved_step
+        self.module_name = runtime.module_name
 
     @property
     def args(self) -> OmniModuleRuntimeArguments:
         return self.runtime.args
-
-    @property
-    def parallel_state(self):
-        return self.runtime.parallel_state
-
-    # ── Path helpers ──────────────────────────────────────────────────────────
 
     def _global_step_root(self, state: TrainerState) -> str:
         return os.path.join(self.runtime.train.checkpoint.save_path, f"global_step_{state.global_step}")

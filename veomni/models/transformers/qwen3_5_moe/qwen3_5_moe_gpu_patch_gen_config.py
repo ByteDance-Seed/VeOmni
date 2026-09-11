@@ -1103,3 +1103,13 @@ def qwen3_5_moe_get_parallel_plan_patched(self):
     from ..parallel_plan import get_parallel_plan as _get_parallel_plan
 
     return _get_parallel_plan()
+
+
+@config.override_method(
+    "Qwen3_5MoeForCausalLM.get_parallel_plan",
+    description="Register Qwen3_5MoeForCausalLM expert parallel plan for v5 generated modeling",
+)
+def qwen3_5_moe_causal_lm_get_parallel_plan_patched(self):
+    from ..parallel_plan import get_causal_lm_parallel_plan as _get_causal_lm_parallel_plan
+
+    return _get_causal_lm_parallel_plan()

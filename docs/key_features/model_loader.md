@@ -1,14 +1,5 @@
 # Adding a New Model to VeOmni
 
-## 🔖 Table of Contents
-
-- [Adding a New Model to VeOmni](#adding-a-new-model-to-veomni)
-  - [🔖 Table of Contents](#🔖-table-of-contents)
-  - [📚 Overview](#📚-overview)
-  - [🔍 Model Registry System](#🔍-model-registry-system)
-  - [🛠️ Add Your Own Model](#🛠️-add-your-own-model)
-
-
 ## 📚 Overview
 In this tutorial, we will guide you through the process of adding a new model to VeOmni. We use a registry-based system to manage different model implementations.
 

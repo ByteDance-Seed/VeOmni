@@ -235,12 +235,19 @@ class TestKernelSpecValidation:
 
     def test_all_registered_specs_have_hardware_requirement(self):
         """Every registered spec must have a non-None hardware requirement."""
+        allowed_device_types = ("gpu", "npu", "mlu", "any")
         for (op_name, variant), bucket in KERNEL_REGISTRY._specs.items():
             for impl_name, spec in bucket.items():
                 assert spec.hardware is not None, (
                     f"Spec for ({op_name}, {variant}, {impl_name}) is missing hardware requirement"
                 )
-                assert spec.hardware.device_type in ("gpu", "npu", "any"), (
+                # ``device_type`` is either a single string ("gpu"/"npu"/"mlu"/"any")
+                # or a list of them (e.g. ["gpu", "mlu"] for kernels that run on
+                # multiple accelerator families). Every element must be allowed.
+                device_types = spec.hardware.device_type
+                if isinstance(device_types, str):
+                    device_types = [device_types]
+                assert all(dt in allowed_device_types for dt in device_types), (
                     f"Spec for ({op_name}, {variant}, {impl_name}) has unexpected device_type "
                     f"{spec.hardware.device_type!r}"
                 )

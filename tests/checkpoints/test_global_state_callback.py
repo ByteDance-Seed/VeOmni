@@ -13,7 +13,6 @@ import torch
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.global_state_callback import (
     GlobalStateCallback,
-    RootAssetsCallback,
     global_state_path,
 )
 
@@ -110,11 +109,3 @@ def test_position_is_derived_from_the_step_grid(tmp_path):
     cb._restore_position({"global_step": 70})
 
     assert (trainer.start_epoch, trainer.start_step) == (2, 10)
-
-
-def test_root_assets_are_exported_once_at_train_begin(tmp_path):
-    trainer = _make_mock_trainer(str(tmp_path))
-
-    RootAssetsCallback(trainer).on_train_begin(TrainerState())
-
-    trainer.model.save_model_assets.assert_called_once_with()

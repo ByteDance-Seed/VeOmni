@@ -155,8 +155,8 @@ _RELOCATED_KEYS = {
     "train.accelerator": "model.accelerator",
     "train.optimizer": "model.optimizer",
     "train.init_device": "model.accelerator.init_device",
-    "train.broadcast_model_weights_from_rank0": "model.accelerator.broadcast_model_weights_from_rank0",
-    "train.ep_sharded_stream_load": "model.accelerator.ep_sharded_stream_load",
+    "train.broadcast_model_weights_from_rank0": "model.broadcast_model_weights_from_rank0",
+    "train.ep_sharded_stream_load": "model.ep_sharded_stream_load",
     "train.gradient_checkpointing": "model.accelerator.gradient_checkpointing",
     "train.torch_compile": "model.accelerator.torch_compile",
 }

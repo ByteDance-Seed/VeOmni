@@ -25,7 +25,7 @@ from ..distributed.torch_compile import mark_compile_step_begin
 from ..utils import helper
 from ..utils.device import synchronize
 from ..utils.loss_utils import count_loss_token, reduce_global_loss_token
-from .base import BaseTrainer, VeOmniIter
+from .base import BaseTrainer, VeOmniIter, mean_aux_metrics
 
 
 logger = helper.create_logger(__name__)
@@ -40,8 +40,8 @@ class TextTrainer:
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        self.base.device = self.base.setup_distributed(args)  # registers ParallelState("base") before seed
-        self.base.model = self.base.build_model_runtime()
+        self.base.device = self.base._setup(args)  # registers ParallelState("base") before seed
+        self.base.model = self.base._build_model_runtime()
 
         # rewrite build_data_transform to support conversation dataset
         self._build_data_transform()
@@ -49,11 +49,9 @@ class TextTrainer:
         self.base._build_dataset()
         self.base._build_collate_fn()
         self.base._build_dataloader()
-        self.base.build_lr_scheduler()
+        self.base._build_lr_scheduler()
         self.base._build_training_context()
         self.base._init_callbacks()
-
-    # ── Trainer build functions ────────────────────────────────
 
     def _build_data_transform(self):
         args: VeOmniArguments = self.base.args
@@ -64,8 +62,6 @@ class TextTrainer:
             max_seq_len=args.data.max_seq_len,
             text_keys=args.data.text_keys,
         )
-
-    # ── Trainer callback hooks ────────────────────────────────
 
     def on_train_begin(self):
         self.base.on_train_begin()
@@ -82,10 +78,8 @@ class TextTrainer:
     def on_step_begin(self, micro_batches=None):
         self.base.on_step_begin(micro_batches=micro_batches)
 
-    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-
-    # ── Trainer train step functions ────────────────────────────────
+    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
+        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=aux_metrics)
 
     def train_step(
         self,
@@ -95,6 +89,7 @@ class TextTrainer:
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
+        self.base._reset_async_activation_offload_if_enabled()
         self.on_step_begin(micro_batches=micro_batches)
 
         # Forward and backward for each micro batch
@@ -102,6 +97,7 @@ class TextTrainer:
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
+        total_aux_metrics = defaultdict(float)
 
         # token num for fixed_ce_loss in postforward
         self.base.micro_batches_token_len = count_loss_token(micro_batches)
@@ -114,13 +110,16 @@ class TextTrainer:
             self.base._configure_hsdp_allreduce(micro_step, num_micro_steps)
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
+            aux_metrics: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
             self.base.micro_batch_token_len = count_loss_token(micro_batch)
-            loss, loss_dict = self.base.forward_backward_step(micro_batch)
+            loss, loss_dict, aux_metrics = self.base.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
+            for k, v in aux_metrics.items():
+                total_aux_metrics[k] += v.item()
 
         # Gradient clipping (reads FSDP/EP groups from current ParallelState)
         grad_norm = self.base.model.clip_grad_norm()
@@ -130,9 +129,12 @@ class TextTrainer:
         self.base.model.lr_scheduler.step()
         self.base.model.optimizer.zero_grad()
 
-        self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
-
-    # ── Trainer train loop ────────────────────────────────
+        self.on_step_end(
+            loss=total_loss,
+            loss_dict=total_loss_dict,
+            grad_norm=grad_norm,
+            aux_metrics=mean_aux_metrics(total_aux_metrics, num_micro_steps),
+        )
 
     def train(self):
         args: VeOmniArguments = self.base.args

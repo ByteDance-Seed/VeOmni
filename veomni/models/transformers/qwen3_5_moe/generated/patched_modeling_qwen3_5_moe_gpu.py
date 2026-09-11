@@ -53,6 +53,8 @@
 #      Support fused cross entropy path in Qwen3_5MoeForConditionalGeneration.forward
 #    - method_override: Qwen3_5MoeForConditionalGeneration.get_parallel_plan
 #      Register Qwen3_5Moe expert parallel plan for v5 generated modeling
+#    - method_override: Qwen3_5MoeForCausalLM.get_parallel_plan
+#      Register Qwen3_5MoeForCausalLM expert parallel plan for v5 generated modeling
 #
 # ==============================================================================
 
@@ -2672,7 +2674,7 @@ def load_balancing_loss_func(
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5MoeForCausalLM
-# Methods patched: forward
+# Methods patched: forward, get_parallel_plan
 # ======================================================================
 
 
@@ -2824,6 +2826,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
             router_logits=outputs.router_logits,
             fused_linear_aux=fused_linear_aux,
         )
+
+    def get_parallel_plan(self):
+        from ..parallel_plan import get_causal_lm_parallel_plan as _get_causal_lm_parallel_plan
+
+        return _get_causal_lm_parallel_plan()
 
 
 # ======================================================================

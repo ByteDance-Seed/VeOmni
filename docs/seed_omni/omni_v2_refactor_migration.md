@@ -189,12 +189,14 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
   (never `None`). Use the `is_dummy(item)` helper.
 - Source lives on `item.source`, **not** `meta["source"]`.
 
-### 3.6 `init_device` / `gradient_checkpointing` / `torch_compile` / `broadcast_model_weights_from_rank0` / `ep_sharded_stream_load` moved: `train.*` → `model.accelerator.*` (per-module)
-- **Breaking, no back-compat shim.** These five knobs used to live on the global
-  `OmniTrainingArguments` (`train.*`); they now live on `AcceleratorConfig`
-  (`model.accelerator.*` at the top level, or `model.model_config.modules.<name>.accelerator.*`
-  per module) — the same shared dataclass V1 `TrainingArguments.accelerator` uses, so per-module
-  override support comes for free from the existing `accelerator:` deep-merge path.
+### 3.6 `init_device` / `gradient_checkpointing` / `torch_compile` moved to `model.accelerator.*`; weight-load knobs to `model.*`
+- **Breaking, no back-compat shim.** Mesh knobs (`init_device`, `gradient_checkpointing`,
+  `torch_compile`) used to live on the global `OmniTrainingArguments` (`train.*`); they now
+  live on `AcceleratorConfig` (`model.accelerator.*` at the top level, or
+  `model.model_config.modules.<name>.accelerator.*` per module) — the same shared dataclass
+  V1 uses, so per-module override support comes for free from the existing `accelerator:`
+  deep-merge path. Weight-load knobs live on `ModelArguments` itself (`model.*` / the
+  per-module overlay), not on `AcceleratorConfig`.
 - Before:
   ```yaml
   train:
@@ -223,6 +225,10 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
             gradient_checkpointing:
               enable: false   # this module skips gradient checkpointing; others keep it on
   ```
+- Weight-load knobs (`broadcast_model_weights_from_rank0`, `ep_sharded_stream_load`)
+  live on `ModelArguments` itself (`model.*` / per-module overlay), not on
+  `AcceleratorConfig` — they describe how this unit's checkpoint is ingested, not a
+  mesh dimension.
 - Self-contained validation (`init_device` vs `fsdp_mode`/`ep_size`) runs in
   `AcceleratorConfig.__post_init__`. The blanket `torch_compile.enable` ban is Omni-only
   (`_validate_omni_accelerator` in `veomni/arguments/omni_arguments_types.py`), run once against
@@ -230,15 +236,10 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
   not just the global default.
 - The default all-eager accelerator for inference (`resolve_model(for_inference=True)` /
   `_resolve_default_accelerator`) also forces `broadcast_model_weights_from_rank0: False` per
-  module alongside `fsdp_mode: eager`, since broadcast-from-rank0 is meaningless without FSDP2 —
-  this avoids a spurious `_validate_omni_accelerator` warning on every module for the common
-  eager-inference path.
-- `AcceleratorConfig` now carries these same-named fields for both V1 (currently unused; V1 is
-  expected to be refactored onto the same `model.accelerator.*`-driven args eventually, at which
-  point they become active there too) and V2 (active today). No compatibility guard is added for
-  configs still on the old `train.*` schema — an un-migrated config silently falls back to
-  `AcceleratorConfig`'s defaults for these five fields (via `_instantiate_recursive`'s normal
-  unknown-key-drop behavior), same as any other hard break with no shim.
+  module alongside `fsdp_mode: eager`, since broadcast-from-rank0 is meaningless without FSDP2.
+- `ModelArguments` carries the weight-load knobs for both V1 and V2. No compatibility
+  guard is added for configs still on the old `train.*` schema — an un-migrated config
+  is rejected by the relocated-key parser rather than silently falling back.
 
 ## 4. Mechanical merge recipe (for an agent)
 

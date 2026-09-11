@@ -15,7 +15,7 @@ First, pull the Huawei Ascend CANN base image. **Note: This image is for ARM64 a
 You can find the latest official Ascend CANN images at: [Ascend Hub](https://www.hiascend.com/developer/ascendhub/detail/17da20d1c2b6493cb38765adeba85884)
 
 ```bash
-docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-a3-ubuntu22.04-py3.11
+docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-a3-ubuntu22.04-py3.12
 ```
 
 ## Step 2: Build the Custom Image
@@ -32,7 +32,7 @@ docker build \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \
   -t ascend-a3-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_a3 \
+  -f docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_a3 \
   .
 ```
 
@@ -40,14 +40,14 @@ Without proxy (simplified):
 ```bash
 docker build \
   -t ascend-a3-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_a3 \
+  -f docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_a3 \
   .
 ```
 
 ### Image Components
 The built image includes:
-- Ubuntu 22.04 with Python 3.11
-- Ascend CANN 9.0.0 runtime
+- Ubuntu 22.04 with Python 3.12
+- Ascend CANN 9.1.0 runtime
 - VeOmni framework with NPU support
 - torch-npu 2.10.0.post2, triton-ascend, and fla_npu for GDN
 - TorchCodec for efficient video processing
