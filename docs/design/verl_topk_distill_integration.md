@@ -12,9 +12,9 @@ Add two kwargs to the model `forward`; the wrapper routes them through
 to the kernel:
 
 ```python
-teacher_topk_ids: torch.Tensor  # [B, L, K] int64 (dense)
-teacher_topk_log_probs: torch.Tensor  # [B, L, K] fp32
-log_prob_min_clamp: float | None = None  # optional, matches DistillationLossConfig
+teacher_topk_ids: torch.Tensor          # [B, L, K] int64 (dense)
+teacher_topk_log_probs: torch.Tensor    # [B, L, K] fp32
+log_prob_min_clamp: float | None = None # optional, matches DistillationLossConfig
 ```
 
 When `return_log_probs=True`, the output dataclass exposes a single
@@ -54,7 +54,9 @@ existing `use_fused_kernels and use_remove_padding` block of
 `VeOmniEngineWithLMHead.prepare_model_inputs`:
 
 ```python
-distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
+distillation_use_topk = tu.get_non_tensor_data(
+    data=micro_batch, key="distillation_use_topk", default=False
+)
 if distillation_use_topk:
     teacher_logprobs = micro_batch["teacher_logprobs"]
     teacher_ids = micro_batch["teacher_ids"]

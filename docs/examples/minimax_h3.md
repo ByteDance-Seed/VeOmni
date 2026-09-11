@@ -217,7 +217,7 @@ pipe = MiniMaxH3Pipeline.from_pretrained(
     condition_model_cfg={
         "base_model_path": "pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA",
         "use_keyframe_condition": True,
-        "keyframe_indices": [0, -1],  # first and last frames
+        "keyframe_indices": [0, -1],       # first and last frames
     },
     transformer_config_path="pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer/config.json",
     transformer_weights_path="pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer",
@@ -239,22 +239,16 @@ Call parameters:
 # t2va
 video, audio = pipe(
     prompt=prompt,
-    height=480,
-    width=832,
-    num_frames=124,  # frame count must satisfy (N-5) % 17 == 0
-    num_inference_steps=50,
-    seed=0,  # fewer steps = faster; fixed seed = reproducible
+    height=480, width=832, num_frames=124,   # frame count must satisfy (N-5) % 17 == 0
+    num_inference_steps=50, seed=0,          # fewer steps = faster; fixed seed = reproducible
 )
 
 # fl2va
 video, audio = pipe(
     prompt=prompt,
-    height=832,
-    width=480,
-    num_frames=124,
-    num_inference_steps=50,
-    seed=0,
-    keyframes=[first_frame, last_frame],  # images must exist, otherwise FileNotFoundError
+    height=832, width=480, num_frames=124,
+    num_inference_steps=50, seed=0,
+    keyframes=[first_frame, last_frame],     # images must exist, otherwise FileNotFoundError
     keyframe_indices=[0, -1],
 )
 ```

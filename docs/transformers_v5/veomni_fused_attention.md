@@ -90,8 +90,8 @@ to the pinned Transformers/PyTorch FlexAttention adapter.
 
 ```python
 MagiAttentionMask(
-    q_ranges=...,  # int32 [num_ranges, 2]
-    k_ranges=...,  # int32 [num_ranges, 2]
+    q_ranges=...,       # int32 [num_ranges, 2]
+    k_ranges=...,       # int32 [num_ranges, 2]
     attn_type_map=...,  # optional int32 [num_ranges]
 )
 ```

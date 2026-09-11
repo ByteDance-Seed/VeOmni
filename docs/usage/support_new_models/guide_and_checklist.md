@@ -59,11 +59,9 @@ touch veomni/models/transformers/your_model_name/parallel_plan.py               
 ```python
 from ...loader import MODELING_REGISTRY
 
-
 @MODELING_REGISTRY.register("your_model_type")
 def register_modeling(architecture: str):
     from transformers.models.your_model import YourModelForCausalLM
-
     return YourModelForCausalLM
 ```
 
@@ -71,27 +69,21 @@ def register_modeling(architecture: str):
 ```python
 from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
 
-
 @MODEL_CONFIG_REGISTRY.register("your_model_type")
 def register_config():
     from .configuration_your_model import YourModelConfig, apply_veomni_patch
-
     apply_veomni_patch()
     return YourModelConfig
-
 
 @MODELING_REGISTRY.register("your_model_type")
 def register_modeling(architecture: str):
     from .modeling_your_model import YourModelForCausalLM, apply_veomni_patch
-
     apply_veomni_patch()
     return YourModelForCausalLM
-
 
 @MODEL_PROCESSOR_REGISTRY.register("YourModelProcessor")  # exact class name from processor_config.json
 def register_processor():
     from .processing_your_model import YourModelProcessor, apply_veomni_patch
-
     apply_veomni_patch()
     return YourModelProcessor
 ```
@@ -120,7 +112,6 @@ import transformers.models.your_model.modeling_your_model as hf_your_model
 
 # ... define patches ...
 
-
 def apply_veomni_patch():
     hf_your_model.YourClass.method = patched_method
 ```
@@ -133,11 +124,10 @@ Which patches to apply depends on model type (see checklist below). For implemen
 from torch.distributed._tensor import Shard
 from ....distributed.parallel_plan import ParallelPlan
 
-
 def get_parallel_plan():
     ep_plan = {
         "model.layers.*.mlp.experts.gate_proj": Shard(0),
-        "model.layers.*.mlp.experts.up_proj": Shard(0),
+        "model.layers.*.mlp.experts.up_proj":   Shard(0),
         "model.layers.*.mlp.experts.down_proj": Shard(0),
     }
     return ParallelPlan(extra_parallel_plan={"ep": ep_plan})
@@ -254,12 +244,12 @@ For implementation details of each patch, refer to the example docs.
 from veomni.distributed.parallel_state import get_parallel_state
 
 from veomni.distributed.sequence_parallel import (
-    gather_heads_scatter_seq,  # (bs, seq, h//sp) → (bs, seq//sp, h)
-    gather_outputs,  # all-gather along a dim (no autograd)
-    gather_seq_scatter_heads,  # (bs, seq//sp, h) → (bs, seq, h//sp)
-    slice_input_tensor,  # slice along a dim for this SP rank
-    sp_pad_and_slice,  # pad to multiple of pad_scale, then slice
-    unpad_tensor,  # remove padding from a tensor
+    gather_heads_scatter_seq,   # (bs, seq, h//sp) → (bs, seq//sp, h)
+    gather_outputs,             # all-gather along a dim (no autograd)
+    gather_seq_scatter_heads,   # (bs, seq//sp, h) → (bs, seq, h//sp)
+    slice_input_tensor,         # slice along a dim for this SP rank
+    sp_pad_and_slice,           # pad to multiple of pad_scale, then slice
+    unpad_tensor,               # remove padding from a tensor
 )
 from veomni.distributed.sequence_parallel.ulysses import _Gather  # all-gather with autograd
 
@@ -267,9 +257,9 @@ from veomni.ops import fused_moe_forward
 from veomni.ops.kernels.cross_entropy import ForCausalLMLoss
 
 from veomni.utils.constants import (
-    AUDIO_INPUT_INDEX,  # placeholder token ID for audio in input_ids
-    IGNORE_INDEX,  # -100, label mask value
-    IMAGE_INPUT_INDEX,  # placeholder token ID for images in input_ids
-    VIDEO_INPUT_INDEX,  # placeholder token ID for videos in input_ids
+    AUDIO_INPUT_INDEX,   # placeholder token ID for audio in input_ids
+    IGNORE_INDEX,        # -100, label mask value
+    IMAGE_INPUT_INDEX,   # placeholder token ID for images in input_ids
+    VIDEO_INPUT_INDEX,   # placeholder token ID for videos in input_ids
 )
 ```

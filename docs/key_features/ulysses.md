@@ -130,12 +130,12 @@ from veomni.distributed.sequence_parallel import (
 # now x is of shape [batch_size, seq_len/n, dim] on each sp rank
 
 # Step3 (part1): modify attention computation
-x = self.qkv(x)  # [batch_size, seq_pad/n, dim]
-x = gather_seq_scatter_heads(x, seq_dim=1, head_dim=2)  # [batch_size, seq_len, dim/n]
+x = self.qkv(x) # [batch_size, seq_pad/n, dim]
+x = gather_seq_scatter_heads(x, seq_dim=1, head_dim=2) # [batch_size, seq_len, dim/n]
 ...
 output = F.scaled_dot_product_attention(q, k, v, ...).reshape(...)
 ...
-output = gather_heads_scatter_seq(output, head_dim=2, seq_dim=1)  # [batch_size, seq_pad/n, dim]
+output = gather_heads_scatter_seq(output, head_dim=2, seq_dim=1) # [batch_size, seq_pad/n, dim]
 
 # Step3 (part2): reduce loss after model forward
 loss = loss_fct(logits, labels)

@@ -74,26 +74,23 @@ if they implement the same variant.
 ```python
 # veomni/ops/kernel_registry.py
 
-
 @dataclass(frozen=True)
 class HardwareRequirement:
-    device_type: str  # "cuda" | "npu"
-    min_compute_capability: int | None = None  # e.g. 70, 80, 90
+    device_type: str                              # "cuda" | "npu"
+    min_compute_capability: int | None = None     # e.g. 70, 80, 90
 
     def is_satisfied(self) -> bool:
         """Check against current runtime hardware."""
         ...
 
-
 @dataclass(frozen=True)
 class KernelSpec:
-    name: str  # e.g. "liger", "triton_group_gemm"
-    op_name: str  # e.g. "rms_norm"
-    variant: str  # e.g. "standard"
-    factory: callable  # () -> callable  (lazy import)
+    name: str              # e.g. "liger", "triton_group_gemm"
+    op_name: str           # e.g. "rms_norm"
+    variant: str           # e.g. "standard"
+    factory: callable      # () -> callable  (lazy import)
     hardware: HardwareRequirement
     description: str = ""
-
 
 class KernelRegistry:
     """Global registry of kernel implementations.
@@ -132,18 +129,24 @@ class KernelRegistry:
         specs = self._specs.get(key, {})
         if impl_name not in specs:
             available = ["eager"] + list(specs.keys())
-            raise KeyError(f"No kernel '{impl_name}' for op='{op_name}', variant='{variant}'. Available: {available}")
+            raise KeyError(
+                f"No kernel '{impl_name}' for op='{op_name}', variant='{variant}'. "
+                f"Available: {available}"
+            )
         spec = specs[impl_name]
         if not spec.hardware.is_satisfied():
             raise RuntimeError(
-                f"Kernel '{impl_name}' requires {spec.hardware} but current hardware does not satisfy it."
+                f"Kernel '{impl_name}' requires {spec.hardware} "
+                f"but current hardware does not satisfy it."
             )
         return spec.factory()
 
     def list_available(self, op_name: str, variant: str) -> list[str]:
         key = (op_name, variant)
-        return ["eager"] + [name for name, spec in self._specs.get(key, {}).items() if spec.hardware.is_satisfied()]
-
+        return ["eager"] + [
+            name for name, spec in self._specs.get(key, {}).items()
+            if spec.hardware.is_satisfied()
+        ]
 
 KERNEL_REGISTRY = KernelRegistry()
 ```
@@ -156,101 +159,77 @@ imported by `veomni/ops/__init__.py`.
 from .kernel_registry import KERNEL_REGISTRY, KernelSpec, HardwareRequirement
 
 # -- rms_norm (standard) --
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="liger",
-        op_name="rms_norm",
-        variant="standard",
-        factory=lambda: __import__("liger_kernel.transformers.rms_norm", fromlist=["LigerRMSNorm"]).LigerRMSNorm,
-        hardware=HardwareRequirement("cuda"),
-    )
-)
+KERNEL_REGISTRY.register(KernelSpec(
+    name="liger",
+    op_name="rms_norm", variant="standard",
+    factory=lambda: __import__(
+        "liger_kernel.transformers.rms_norm", fromlist=["LigerRMSNorm"]
+    ).LigerRMSNorm,
+    hardware=HardwareRequirement("cuda"),
+))
 # Note: no liger for rms_norm variant="qwen3_5" — only "eager" is available.
 
 # -- apply_rotary_pos_emb (full) --
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="liger",
-        op_name="apply_rotary_pos_emb",
-        variant="full",
-        factory=lambda: (
-            __import__("liger_kernel.transformers.rope", fromlist=["liger_rotary_pos_emb"]).liger_rotary_pos_emb
-        ),
-        hardware=HardwareRequirement("cuda"),
-    )
-)
+KERNEL_REGISTRY.register(KernelSpec(
+    name="liger",
+    op_name="apply_rotary_pos_emb", variant="full",
+    factory=lambda: __import__(
+        "liger_kernel.transformers.rope", fromlist=["liger_rotary_pos_emb"]
+    ).liger_rotary_pos_emb,
+    hardware=HardwareRequirement("cuda"),
+))
 # Note: no liger for variant="partial" — only "eager" is available.
 
 # -- swiglu_mlp --
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="liger",
-        op_name="swiglu_mlp",
-        variant="standard",
-        factory=lambda: __import__("liger_kernel.transformers.swiglu", fromlist=["LigerSwiGLUMLP"]).LigerSwiGLUMLP,
-        hardware=HardwareRequirement("cuda"),
-    )
-)
+KERNEL_REGISTRY.register(KernelSpec(
+    name="liger",
+    op_name="swiglu_mlp", variant="standard",
+    factory=lambda: __import__(
+        "liger_kernel.transformers.swiglu", fromlist=["LigerSwiGLUMLP"]
+    ).LigerSwiGLUMLP,
+    hardware=HardwareRequirement("cuda"),
+))
 
 # -- moe_experts --
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="triton_group_gemm",
-        op_name="moe_experts",
-        variant="standard",
-        factory=lambda: (
-            __import__(
-                "veomni.ops.fused_moe.group_gemm", fromlist=["group_gemm_fused_moe_forward"]
-            ).group_gemm_fused_moe_forward
-        ),
-        hardware=HardwareRequirement("cuda", min_compute_capability=70),
-    )
-)
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="quack_cutlass",
-        op_name="moe_experts",
-        variant="standard",
-        factory=lambda: (
-            __import__(
-                "veomni.ops.fused_moe.quack_gemm", fromlist=["quack_gemm_fused_moe_forward"]
-            ).quack_gemm_fused_moe_forward
-        ),
-        hardware=HardwareRequirement("cuda", min_compute_capability=90),
-    )
-)
+KERNEL_REGISTRY.register(KernelSpec(
+    name="triton_group_gemm",
+    op_name="moe_experts", variant="standard",
+    factory=lambda: __import__(
+        "veomni.ops.fused_moe.group_gemm", fromlist=["group_gemm_fused_moe_forward"]
+    ).group_gemm_fused_moe_forward,
+    hardware=HardwareRequirement("cuda", min_compute_capability=70),
+))
+KERNEL_REGISTRY.register(KernelSpec(
+    name="quack_cutlass",
+    op_name="moe_experts", variant="standard",
+    factory=lambda: __import__(
+        "veomni.ops.fused_moe.quack_gemm", fromlist=["quack_gemm_fused_moe_forward"]
+    ).quack_gemm_fused_moe_forward,
+    hardware=HardwareRequirement("cuda", min_compute_capability=90),
+))
 
 # -- cross_entropy_loss (split by task to avoid mixing causal-LM label
 #    shifting with sequence-classification token-level labels) --
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="liger_kernel",
-        op_name="cross_entropy_loss",
-        variant="causal",
-        factory=_liger_fused_ce_causal_factory,  # partial(ForCausalLMLoss, cross_entropy_fn=liger)
-        hardware=HardwareRequirement("cuda"),
-    )
-)
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="liger_kernel",
-        op_name="cross_entropy_loss",
-        variant="seq_cls",
-        factory=_liger_fused_ce_seq_cls_factory,  # partial(ForSequenceClassificationLoss, cross_entropy_fn=liger)
-        hardware=HardwareRequirement("cuda"),
-    )
-)
+KERNEL_REGISTRY.register(KernelSpec(
+    name="liger_kernel",
+    op_name="cross_entropy_loss", variant="causal",
+    factory=_liger_fused_ce_causal_factory,   # partial(ForCausalLMLoss, cross_entropy_fn=liger)
+    hardware=HardwareRequirement("cuda"),
+))
+KERNEL_REGISTRY.register(KernelSpec(
+    name="liger_kernel",
+    op_name="cross_entropy_loss", variant="seq_cls",
+    factory=_liger_fused_ce_seq_cls_factory,  # partial(ForSequenceClassificationLoss, cross_entropy_fn=liger)
+    hardware=HardwareRequirement("cuda"),
+))
 # NPU chunk-loss backs the causal variant only; chunk_loss hard-codes the
 # `labels[..., 1:]` shift so ForSequenceClassification stays on eager.
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="npu",
-        op_name="cross_entropy_loss",
-        variant="causal",
-        factory=_npu_chunk_loss_causal_factory,  # chunk_loss_function (handles SP reduction internally)
-        hardware=HardwareRequirement("npu"),
-    )
-)
+KERNEL_REGISTRY.register(KernelSpec(
+    name="npu",
+    op_name="cross_entropy_loss", variant="causal",
+    factory=_npu_chunk_loss_causal_factory,   # chunk_loss_function (handles SP reduction internally)
+    hardware=HardwareRequirement("npu"),
+))
 ```
 
 **Internal registration** (in an internal package, never in OSS):
@@ -259,15 +238,12 @@ KERNEL_REGISTRY.register(
 # internal_kernels/register.py
 from veomni.ops.kernel_registry import KERNEL_REGISTRY, KernelSpec, HardwareRequirement
 
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="internal_fast_rmsnorm",
-        op_name="rms_norm",
-        variant="standard",
-        factory=lambda: ...,
-        hardware=HardwareRequirement("cuda", min_compute_capability=80),
-    )
-)
+KERNEL_REGISTRY.register(KernelSpec(
+    name="internal_fast_rmsnorm",
+    op_name="rms_norm", variant="standard",
+    factory=lambda: ...,
+    hardware=HardwareRequirement("cuda", min_compute_capability=80),
+))
 ```
 
 Users select via YAML:
@@ -287,11 +263,8 @@ class OpsImplementationConfig:
 
     # Attention (existing — unchanged)
     attn_implementation: Literal[
-        "eager",
-        "sdpa",
-        "flash_attention_2",
-        "flash_attention_3",
-        "flash_attention_4",
+        "eager", "sdpa",
+        "flash_attention_2", "flash_attention_3", "flash_attention_4",
         "native-sparse",
     ] = "flash_attention_2"
 
@@ -345,7 +318,6 @@ if-else. This keeps the diff from upstream HF minimal.
 ```python
 # veomni/ops/dispatch.py
 
-
 class OpSlot:
     """A slot for an optional kernel replacement.
 
@@ -353,7 +325,6 @@ class OpSlot:
     imported. Starts unbound (_kernel = None). build_foundation_model()
     later calls .bind() to resolve a kernel from the registry.
     """
-
     def __init__(self, op_name: str, variant: str):
         self.op_name = op_name
         self.variant = variant
@@ -414,7 +385,6 @@ module-global lookup does the work.
 ```python
 # veomni/models/auto.py
 
-
 def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig):
     """Find all OpSlot instances in the module and bind them."""
     for name, obj in vars(modeling_module).items():
@@ -424,8 +394,7 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig):
             # prefix that registry entries don't — translate here.
             if obj.op_name == "moe_experts":
                 impl_name = (
-                    "eager"
-                    if ops_config.moe_implementation == "eager"
+                    "eager" if ops_config.moe_implementation == "eager"
                     else ops_config.moe_implementation.removeprefix("fused_")
                 )
             else:
@@ -480,7 +449,6 @@ config.add_post_import_block("""
 veomni_apply_rotary_pos_emb = OpSlot("apply_rotary_pos_emb", "partial")
 """)
 
-
 # Add guard at top of function — body is original HF code
 @config.replace_function("apply_rotary_pos_emb")
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
@@ -498,7 +466,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     q_embed = torch.cat([q_embed, q_pass], dim=-1)
     k_embed = torch.cat([k_embed, k_pass], dim=-1)
     return q_embed, k_embed
-
 
 # Attention.forward: NO PATCH — call site stays as HF original:
 #   query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -552,7 +519,6 @@ Same pattern — early-return guard at the top of the method.
 
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 
-
 class Qwen3_5MoeExperts(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -561,26 +527,38 @@ class Qwen3_5MoeExperts(nn.Module):
     def forward(self, hidden_states, top_k_index, top_k_weights):
         # +++ veomni: kernel dispatch (2 lines added) +++
         if veomni_moe_experts_forward.use_non_eager_impl:
-            return veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
+            return veomni_moe_experts_forward(
+                self, hidden_states, top_k_index, top_k_weights
+            )
         # --- original HF code below, unchanged ---
         final_hidden_states = torch.zeros_like(hidden_states)
         with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = torch.nn.functional.one_hot(
+                top_k_index, num_classes=self.num_experts
+            )
             expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+            expert_hit = torch.greater(
+                expert_mask.sum(dim=(-1, -2)), 0
+            ).nonzero()
         for expert_idx in expert_hit:
             expert_idx = expert_idx[0]
             if expert_idx == self.num_experts:
                 continue
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
-            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            gate, up = nn.functional.linear(
+                current_state, self.gate_up_proj[expert_idx]
+            ).chunk(2, dim=-1)
             current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            current_hidden_states = nn.functional.linear(
+                current_hidden_states, self.down_proj[expert_idx]
+            )
+            current_hidden_states = (
+                current_hidden_states
+                * top_k_weights[token_idx, top_k_pos, None]
+            )
             final_hidden_states.index_add_(
-                0,
-                token_idx,
+                0, token_idx,
                 current_hidden_states.to(final_hidden_states.dtype),
             )
         return final_hidden_states
@@ -702,14 +680,13 @@ veomni_seq_cls_loss   = OpSlot("cross_entropy_loss", "seq_cls")
 ```python
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 
-
 # Original HF function — UNCHANGED
 def load_balancing_loss_func(gate_logits, num_experts, top_k, attention_mask=None):
     if gate_logits is None or not isinstance(gate_logits, tuple):
         return 0
     ...
 
-    # Call site in ForCausalLM/ForConditionalGeneration.forward:
+# Call site in ForCausalLM/ForConditionalGeneration.forward:
     # +++ veomni: kernel dispatch +++
     if veomni_load_balancing_loss.use_non_eager_impl:
         aux_loss = veomni_load_balancing_loss(outputs.router_logits, ...)

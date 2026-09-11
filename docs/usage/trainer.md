@@ -162,12 +162,10 @@ You can create custom callbacks by inheriting from [`Callback`](https://github.c
 ```python
 from veomni.trainer.callbacks import Callback
 
-
 class MyCustomCallback(Callback):
     def on_step_end(self, state, **kwargs):
         if state.global_step % 100 == 0:
             print(f"Step {state.global_step}: Custom action executed.")
-
 
 # In your trainer
 trainer.add_callback(MyCustomCallback(trainer))
@@ -201,7 +199,7 @@ To implement a specific training task (like VLM training), you should subclass `
    Provide configuration for the data collator, such as which dimensions to pack or pad.
    ```python
    def build_data_collate_info(self):
-       return {"input_features": (0, True, 0, 1)}  # Example for VLM
+       return {"input_features": (0, True, 0, 1)} # Example for VLM
    ```
 
 5. **`freeze_module(self)`**:
@@ -218,7 +216,7 @@ To implement a specific training task (like VLM training), you should subclass `
    def build_param_groups(self):
        return [
            {"params": vit_params, "lr": self.args.train.vit_lr},
-           {"params": other_params, "lr": self.args.model.optimizer.lr},
+           {"params": other_params, "lr": self.args.model.optimizer.lr}
        ]
    ```
 
@@ -230,7 +228,6 @@ You can also extend the configuration arguments to support your custom trainer s
 @dataclass
 class MyTrainingArguments(TrainingArguments):
     freeze_vit: bool = field(default=False, metadata={"help": "Freeze ViT"})
-
 
 @dataclass
 class Arguments(VeOmniArguments):

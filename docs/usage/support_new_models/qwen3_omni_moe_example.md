@@ -27,7 +27,6 @@ class YourModelConfig(_HFYourModelConfig):
         kwargs.pop("tie_word_embeddings", None)
         super().__init__(tie_word_embeddings=False, **kwargs)
 
-
 def apply_veomni_patch():
     hf_config_module.YourModelConfig = YourModelConfig
 ```
@@ -141,21 +140,27 @@ sp_enabled = self.training and get_parallel_state().sp_enabled
 sp_group = get_parallel_state().sp_group if sp_enabled else None
 
 if sp_enabled:
-    inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=sp_group)
+    inputs_embeds = gather_outputs(
+        inputs_embeds, gather_dim=1, group=sp_group
+    )
 
 # Step 2: Same transform on image/video/audio embeddings, then fill back
 if pixel_values is not None:
     image_embeds = self.get_image_features(pixel_values, image_grid_thw)
     if sp_enabled:
         # (seq//sp, hidden) → (seq, hidden//sp)
-        image_embeds = gather_outputs(image_embeds, gather_dim=0, group=sp_group)
+        image_embeds = gather_outputs(
+            image_embeds, gather_dim=0, group=sp_group
+        )
     inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 # repeat for video, audio...
 
 # Step 3: Restore SP layout
 # (bs, seq, hidden//sp) → (bs, seq//sp, hidden)
 if sp_enabled:
-    inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=sp_group)
+    inputs_embeds = slice_input_tensor(
+        inputs_embeds, dim=1, group=sp_group
+    )
 ```
 
 > **Why this works:** `masked_scatter` places image tokens exactly at positions where `image_mask` is True. When both `inputs_embeds` and `image_embeds` are in `(seq, hidden//sp)` layout, every rank covers the entire sequence (scattered along the hidden dimension), so the fill-back is position-correct.
@@ -178,14 +183,16 @@ if sp_enabled and pixel_values is not None:
     seq_len = image_mask.shape[1]  # image_mask is (bs, seq, ...)
 
     # All-gather: (seq//sp, hidden) → (seq, hidden)
-    deepstack_embeds = [_Gather.apply(sp_group, embed, 0, False) for embed in deepstack_embeds]
+    deepstack_embeds = [
+        _Gather.apply(sp_group, embed, 0, False) for embed in deepstack_embeds
+    ]
 
-    image_mask_1d = image_mask[..., 0]  # (bs, seq)
+    image_mask_1d = image_mask[..., 0]     # (bs, seq)
     seq_per_rank = seq_len // sp_size
-    rank_start = sp_rank * seq_per_rank
-    rank_mask = image_mask_1d[:, rank_start : rank_start + seq_per_rank]
-    offset = image_mask_1d[:, :rank_start].sum().item()
-    n_tokens = rank_mask.sum().item()
+    rank_start   = sp_rank * seq_per_rank
+    rank_mask    = image_mask_1d[:, rank_start : rank_start + seq_per_rank]
+    offset       = image_mask_1d[:, :rank_start].sum().item()
+    n_tokens     = rank_mask.sum().item()
 
     deepstack_embeds = [e[offset : offset + n_tokens] for e in deepstack_embeds]
 ```
@@ -205,7 +212,7 @@ class YourModelExperts(nn.Module):
         hidden_size = config.hidden_size
         # Shape: (num_experts, out_dim, in_dim)
         self.gate_proj = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
-        self.up_proj = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
+        self.up_proj   = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
         self.down_proj = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
 
     def forward(self, hidden_states, routing_weights, selected_experts, num_experts):
@@ -244,7 +251,7 @@ def custom_init_weights(self, module):
     super(HFPreTrainedModel, self)._init_weights(module)
     if isinstance(module, YourModelExperts):
         nn.init.normal_(module.gate_proj, std=self.config.initializer_range)
-        nn.init.normal_(module.up_proj, std=self.config.initializer_range)
+        nn.init.normal_(module.up_proj,   std=self.config.initializer_range)
         nn.init.normal_(module.down_proj, std=self.config.initializer_range)
 ```
 
@@ -278,9 +285,8 @@ outputs = self.language_model(..., **kwargs)
 max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
 
 for blk in self.blocks:
-    hidden_states = blk(
-        hidden_states, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings, max_seqlen=max_seqlen
-    )
+    hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens,
+                        position_embeddings=position_embeddings, max_seqlen=max_seqlen)
 ```
 
 ---
@@ -326,13 +332,11 @@ from types import SimpleNamespace
 
 from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 
-
 def get_position_id(main_func, self, **kwargs):
     """Must be a module-level function (not a method) for multiprocessing pickle."""
     position_ids, rope_deltas = main_func(self, **kwargs)  # (dim, 1, L), (1, 1)
     assert position_ids.shape[1] == 1
     return {"position_ids": position_ids.squeeze(1), "rope_deltas": rope_deltas.squeeze(0)}
-
 
 class YourModel(hf_your_model.YourModel):
     def get_position_id_func(self):
@@ -343,7 +347,9 @@ class YourModel(hf_your_model.YourModel):
         fake_model = SimpleNamespace(
             config=fake_config,
             spatial_merge_size=self.spatial_merge_size,
-            get_llm_pos_ids_for_vision=partial(hf_your_model.YourClass.get_llm_pos_ids_for_vision, None),
+            get_llm_pos_ids_for_vision=partial(
+                hf_your_model.YourClass.get_llm_pos_ids_for_vision, None
+            ),
         )
         return partial(get_position_id, hf_your_model.YourClass.get_rope_index, fake_model)
 ```
@@ -403,15 +409,13 @@ elif task_type == "your_model":
 Add to `TEST_CASES` in [tests/models/test_models_patch.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/tests/models/test_models_patch.py):
 
 ```python
-(
-    pytest.param(
-        "./tests/toy_config/your_model_toy",
-        is_moe,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="your_model_type",  # must match model_type in config.json
-    ),
-)
+pytest.param(
+    "./tests/toy_config/your_model_toy",
+    is_moe,
+    _DEFAULT_RTOL,
+    _DEFAULT_ATOL,
+    id="your_model_type",   # must match model_type in config.json
+),
 ```
 
 Also add `MODEL_TO_DATASET` entry and (for omni models) `parse_token_id_from_config` branch to [tests/models/utils.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/tests/models/utils.py):
@@ -450,7 +454,6 @@ your_model_test_cases = [
     ),
 ]
 
-
 @pytest.fixture(scope="session")
 def dummy_your_model_dataset():
     dummy_dataset = DummyDataset(seq_len=2048, dataset_type="your_dataset_key")
@@ -458,11 +461,12 @@ def dummy_your_model_dataset():
     yield train_path
     del dummy_dataset
 
-
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", your_model_test_cases)
-def test_your_model_parallel_align(model_name, config_path, is_moe, rtol, atol, dummy_your_model_dataset):
+def test_your_model_parallel_align(
+    model_name, config_path, is_moe, rtol, atol, dummy_your_model_dataset
+):
     main(
-        task_name="train_vlm_test",  # or "train_text_test" for text-only
+        task_name="train_vlm_test",   # or "train_text_test" for text-only
         model_name=model_name,
         config_path=config_path,
         is_moe=is_moe,

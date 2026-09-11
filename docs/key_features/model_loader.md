@@ -55,11 +55,9 @@ Here's a complete example of adding a new model:
 
 from transformers import PreTrainedModel, PretrainedConfig
 
-
 class YourCustomConfig(PretrainedConfig):
     model_type = "your_custom_model"
     architectures = ["YourCustomModel"]
-
 
 class YourCustomModel(PreTrainedModel):
     config_class = YourCustomConfig
@@ -68,8 +66,8 @@ class YourCustomModel(PreTrainedModel):
         super().__init__(config)
         # Initialize your model components
 
-    def forward(self, input_ids, **kwargs): ...
-
+    def forward(self, input_ids, **kwargs):
+        ...
 
 # Register your model
 ModelClass = YourCustomModel

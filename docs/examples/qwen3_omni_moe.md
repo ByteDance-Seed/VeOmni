@@ -9,17 +9,16 @@ Modify the `sharegpt4v_instruct_gpt4-vision_cap100k.json` and genrate `sharegpt4
 
 ```python
 import json
-
-with open("sharegpt4v_instruct_gpt4-vision_cap100k.json", "r", encoding="utf-8") as f:
+with open('sharegpt4v_instruct_gpt4-vision_cap100k.json', 'r', encoding='utf-8') as f:
     data = json.load(f)
 filtered_data = []
 for item in data:
-    if item.get("image", "").startswith("coco"):
+    if item.get('image', '').startswith('coco'):
         new_item = item.copy()
-        image_path = new_item.pop("image")
-        new_item["images"] = [image_path]
+        image_path = new_item.pop('image')
+        new_item['images'] = [image_path]
         filtered_data.append(new_item)
-with open("sharegpt4v_instruct_gpt4-vision_cap100k_coco.json", "w", encoding="utf-8") as f:
+with open('sharegpt4v_instruct_gpt4-vision_cap100k_coco.json', 'w', encoding='utf-8') as f:
     json.dump(filtered_data, f, ensure_ascii=False, indent=4)
 ```
 
@@ -63,16 +62,15 @@ Modify the `0_30_s_academic_mc_v0_1_qa_processed.json` and generate `video.json`
 
 ```python
 import json
-
-with open("0_30_s_academic_mc_v0_1_qa_processed.json", "r", encoding="utf-8") as f:
+with open('0_30_s_academic_mc_v0_1_qa_processed.json', 'r', encoding='utf-8') as f:
     data = json.load(f)
 new_data = []
 for item in data:
     new_item = item.copy()
-    image_path = new_item.pop("video")
-    new_item["videos"] = [image_path]
-    new_data.append(new_item)
-with open("video.json", "w", encoding="utf-8") as f:
+    image_path = new_item.pop('video')
+    new_item['videos'] = [image_path]
+    new_data.append(new_item)  
+with open('video.json', 'w', encoding='utf-8') as f:
     json.dump(new_data, f, ensure_ascii=False, indent=4)
 ```
 

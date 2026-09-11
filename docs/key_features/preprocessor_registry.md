@@ -24,6 +24,7 @@ This registry manages preprocessor functions, not dataset classes.
 Add your preprocessor to [`veomni/data/multimodal/preprocess.py`](../../veomni/data/multimodal/preprocess.py):
 
 ```python
+
 @PREPROCESSOR_REGISTRY.register("my_custom_source")
 def my_custom_source_preprocessor(conversations, **kwargs):
     """
@@ -107,10 +108,16 @@ Your preprocessor must follow VeOmni's interleaved conversation format:
 
 ```python
 # Input: Your data source's raw format (flexible)
-conversations = [{"from": "human", "value": "<image> What is this?"}, {"from": "gpt", "value": "A cat."}]
+conversations = [
+    {"from": "human", "value": "<image> What is this?"},
+    {"from": "gpt", "value": "A cat."}
+]
 
 # Output: VeOmni's standardized format (strict)
-constructed_conversation = [["user", ("image", None), ("text", "What is this?")], ["assistant", ("text", "A cat.")]]
+constructed_conversation = [
+    ["user", ("image", None), ("text", "What is this?")],
+    ["assistant", ("text", "A cat.")]
+]
 ```
 
 ### Supported Modalities
@@ -146,9 +153,15 @@ For an example of a preprocessor registered under multiple names, see [`sharegpt
 def adaptive_preprocessor(conversations, mode="caption", **kwargs):
     """Preprocessor with different modes"""
     if mode == "caption":
-        return [["user", ("image", None), ("text", "Describe this image.")], ["assistant", ("text", conversations)]]
+        return [
+            ["user", ("image", None), ("text", "Describe this image.")],
+            ["assistant", ("text", conversations)]
+        ]
     elif mode == "generation":
-        return [["user", ("text", conversations)], ["assistant", ("image", None)]]
+        return [
+            ["user", ("text", conversations)],
+            ["assistant", ("image", None)]
+        ]
 ```
 
 Use in config:
@@ -167,14 +180,20 @@ data:
 ```python
 import random
 
-
 @PREPROCESSOR_REGISTRY.register("random_prompt_source")
 def random_prompt_preprocessor(conversations, **kwargs):
     """Preprocessor with randomized prompts"""
-    prompts = ["Describe this image in detail.", "What do you see in this image?", "Please analyze this image."]
+    prompts = [
+        "Describe this image in detail.",
+        "What do you see in this image?",
+        "Please analyze this image."
+    ]
     prompt = random.choice(prompts)
 
-    return [["user", ("image", None), ("text", prompt)], ["assistant", ("text", conversations)]]
+    return [
+        ["user", ("image", None), ("text", prompt)],
+        ["assistant", ("text", conversations)]
+    ]
 ```
 
 ### Handling Multiple Formats
@@ -185,12 +204,15 @@ def flexible_format_preprocessor(conversations, **kwargs):
     """Handle different input formats"""
     if isinstance(conversations, str):
         # Simple caption format
-        return [["user", ("image", None)], ["assistant", ("text", conversations)]]
+        return [
+            ["user", ("image", None)],
+            ["assistant", ("text", conversations)]
+        ]
     elif isinstance(conversations, dict):
         # Structured format
         return [
             ["user", ("image", None), ("text", conversations["question"])],
-            ["assistant", ("text", conversations["answer"])],
+            ["assistant", ("text", conversations["answer"])]
         ]
     elif isinstance(conversations, list):
         # Standard ShareGPT format
@@ -215,8 +237,8 @@ The following functions are available directly from the `veomni.data.multimodal`
 
 ```python
 from veomni.data.multimodal import (
-    PREPROCESSOR_REGISTRY,  # Preprocessor registry
-    conv_preprocess,  # Preprocess function
+    PREPROCESSOR_REGISTRY,          # Preprocessor registry
+    conv_preprocess,                # Preprocess function
 )
 ```
 
@@ -251,11 +273,17 @@ def test_custom_source_preprocessor():
     from veomni.data.multimodal import conv_preprocess
 
     # Test your preprocessor
-    test_conversations = [{"from": "human", "value": "<image> What is this?"}, {"from": "gpt", "value": "A cat."}]
+    test_conversations = [
+        {"from": "human", "value": "<image> What is this?"},
+        {"from": "gpt", "value": "A cat."}
+    ]
     # Assuming my_custom_source_preprocessor is defined as in the Quick Start
     result = conv_preprocess("my_custom_source", test_conversations)
 
-    assert result == [["user", ("image", None), ("text", "What is this?")], ["assistant", ("text", "A cat.")]]
+    assert result == [
+        ["user", ("image", None), ("text", "What is this?")],
+        ["assistant", ("text", "A cat.")]
+    ]
 ```
 
 ## Troubleshooting
