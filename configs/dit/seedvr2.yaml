@@ -1,0 +1,61 @@
+# Supervised paired restoration, NOT the unpublished official adversarial training.
+# Convert weights and prepare trusted paired embeddings first; see the model guide.
+model:
+  model_path: pretrained_models/SeedVR2-3B-VeOmni
+  config_path: pretrained_models/SeedVR2-3B-VeOmni/config.json
+  condition_model_path: pretrained_models/SeedVR2-3B-VeOmni/condition
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    moe_implementation: eager
+    load_balancing_loss_implementation: eager
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    betas: [0.9, 0.999]
+    lr_decay_style: constant
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.01
+  accelerator:
+    init_device: meta
+    ulysses_size: 1
+    gradient_checkpointing:
+      enable: true
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        cast_forward_inputs: false
+data:
+  train_path: output/seedvr2_pairs
+  data_type: diffusion
+  source_name: seedvr2
+  data_transform: dit_offline
+  datasets_type: iterable
+  dataset_repeat: true
+  log_sample: false
+  text_keys: text
+  dataloader:
+    type: native
+    num_workers: 0
+    drop_last: true
+train:
+  training_task: offline_training
+  global_batch_size: 16
+  micro_batch_size: 1
+  dyn_bsz: false
+  seed: 666
+  num_train_epochs: 1
+  max_steps: 20
+  checkpoint:
+    output_dir: output/seedvr2_sft
+    save_steps: 10
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
