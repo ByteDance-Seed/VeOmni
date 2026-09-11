@@ -32,7 +32,7 @@ python scripts/merge_dcp_to_hf.py \
 
 | Argument | Type | Required | Default | Description |
 |----------|------|----------|---------|-------------|
-| `--load-dir` | str | Yes | - | Directory containing the DCP checkpoint |
+| `--load-dir` | str | Yes | - | A `global_step_{N}` directory (DCP shards and `.metadata`) |
 | `--save-dir` | str | No | `<load-dir>/hf_ckpt` | Output directory for HuggingFace format checkpoint |
 | `--model-assets-dir` | str | No | None | Directory containing model config and processor (e.g., tokenizer) |
 | `--shard-size` | int | No | 2000000000 | Maximum shard size in bytes (default: 2GB) |
@@ -43,16 +43,16 @@ python scripts/merge_dcp_to_hf.py \
 
 ```bash
 python scripts/merge_dcp_to_hf.py \
-    --load-dir checkpoints/my_model/dcp_checkpoint
+    --load-dir checkpoints/my_model/global_step_200
 ```
 
-Output will be saved to: `checkpoints/my_model/dcp_checkpoint/hf_ckpt`
+Output will be saved to: `checkpoints/my_model/global_step_200/hf_ckpt`
 
 ### Convert with Custom Output Directory
 
 ```bash
 python scripts/merge_dcp_to_hf.py \
-    --load-dir checkpoints/my_model/dcp_checkpoint \
+    --load-dir checkpoints/my_model/global_step_200 \
     --save-dir hf_models/my_model
 ```
 
@@ -60,7 +60,7 @@ python scripts/merge_dcp_to_hf.py \
 
 ```bash
 python scripts/merge_dcp_to_hf.py \
-    --load-dir checkpoints/my_model/dcp_checkpoint \
+    --load-dir checkpoints/my_model/global_step_200 \
     --save-dir hf_models/my_model \
     --model-assets-dir pretrained_models/qwen3-8b
 ```
@@ -71,7 +71,7 @@ This will copy the model configuration and tokenizer from `pretrained_models/qwe
 
 ```bash
 python scripts/merge_dcp_to_hf.py \
-    --load-dir checkpoints/my_model/dcp_checkpoint \
+    --load-dir checkpoints/my_model/global_step_200 \
     --shard-size 5000000000
 ```
 

@@ -230,10 +230,11 @@ infix (PEFT convention — e.g. `lora_A.weight`), whereas the live model stores 
 
 `CheckpointCallback` decides *when* to save and calls `trainer.save_dcp`, which lands in
 `ModelCheckpointManager` (`veomni/models/checkpoint_manager.py`). That writes the
-full distributed state (model + optimizer + extra state) via PyTorch DCP. For LoRA training
-the DCP stores the trainable adapter parameters, optimizer state, and model-bound extra
-state; the base model is loaded separately from `model.model_path`. Job-level state
-(dataloader cursor, rng, meters) is written separately by `GlobalStateCallback`.
+distributed model and optimizer via PyTorch DCP, plus a replicated `lr_scheduler.pt`
+beside the shards. For LoRA training the DCP stores only the trainable adapter
+parameters and optimizer state; the frozen base is reloaded from `model.model_path`.
+Job-level state (dataloader cursor, rng, meters) is written separately by
+`GlobalStateCallback` as `trainer_state_rank_{R}.pt`.
 
 ### HF LoRA adapter (inference artifact)
 

@@ -1064,11 +1064,6 @@ class TestNormalizeKey:
         )
 
 
-# ---------------------------------------------------------------------------
-# lr_scheduler sidecar save/load roundtrip
-# ---------------------------------------------------------------------------
-
-
 @patch("veomni.checkpoint.dcp_checkpointer.dist")
 class TestLrSchedulerSaveLoad:
     def test_roundtrip(self, mock_dist, tmp_path):
