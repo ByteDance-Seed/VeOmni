@@ -1,4 +1,3 @@
-import copy
 import functools
 import gc
 import importlib
@@ -248,8 +247,8 @@ class TrainerTest(BaseTrainer):
             self.args.model.ops_implementation.rotary_pos_emb_implementation = "liger_kernel"
             # qwen3_5 / qwen3_5_moe have a large vocab and the fused Liger
             # cross-entropy materializes the full [B, S, V] logits buffer
-            # (~5 GiB on the toy config), which OOMs on shared L20 runners
-            # where another job is still holding part of the card. Use
+            # (~5 GiB on the toy config), which leaves little room for
+            # activations and gradients on the L20 CI runners. Use
             # chunk_loss for those two models — it processes the vocab in
             # chunks so peak allocation stays modest; the other liger ops
             # (rms_norm / rotary / swiglu) are still exercised.
@@ -269,14 +268,6 @@ class TrainerTest(BaseTrainer):
         self._build_lr_scheduler()
         print_device_mem_info(f"[Memory Info] after building model {model_name}:")
 
-        # Sync weights — every model that test_models_patch covers ships a
-        # patchgen layout that matches HF's in-memory state dict, so a
-        # straight ``load_state_dict`` is sufficient. When loading from a real
-        # on-disk HF safetensors checkpoint, the per-expert → fused merge
-        # still happens, but at the runtime-converter layer (e.g.
-        # ``DeepseekV3CheckpointTensorConverter``); that path is exercised by
-        # ``test_logits_bitwise_equal_v5_via_loader`` in
-        # ``test_models_logits_equal.py``.
         self.model.load_state_dict(state_dict)
 
         if self.model_config.model_type in ["qwen2_5_omni", "qwen3_omni_moe"]:
@@ -312,8 +303,8 @@ class TrainerTest(BaseTrainer):
         if batch["position_ids"].dim() == 3 and batch["position_ids"].shape[1] == 3:
             batch["position_ids"] = batch["position_ids"].transpose(0, 1).contiguous()
 
-        loss, loss_dict = super().forward_backward_step(batch)
-        grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
+        loss, loss_dict, _ = super().forward_backward_step(batch)
+        grad_norm = veomni_clip_grad_norm(self.model, args.model.optimizer.max_grad_norm)
 
         _release_device_memory()
         print_device_mem_info(f"[Memory Info] after model {model_name} train_one_step:")
@@ -328,8 +319,8 @@ class TrainerTest(BaseTrainer):
 _DEFAULT_RTOL = 1e-2
 _DEFAULT_ATOL = 1e-2
 
-# Models without a patchgen path are not covered here. Migrate them via
-# ``/veomni-migrate-transformers-v5`` to bring them back into this list.
+# Models without a patchgen path are not covered here. Add one via
+# ``/veomni-patchgen-model`` to bring them back into this list.
 TEST_CASES = [
     pytest.param(
         "./tests/toy_config/llama31_toy/config.json",
@@ -464,13 +455,11 @@ def test_models_patch_fwd_bwd(
     # compressor concatenation. The default FA-based mode grid would fail at
     # ``TrainerTest(hf_model_modes[0])`` with
     # ``ValueError: DeepseekV4ForCausalLM does not support Flash Attention 2``.
-    # Keep attention eager, but exercise VeOmni's default GPU MoE path: the
-    # DeepSeek-V4 experts patch forwards ``swiglu_limit`` into the fused kernel.
-    # NPU fused MoE still raises for that clamp, so NPU keeps the eager MoE
-    # baseline until ``fused_npu`` implements ``swiglu_limit``.
+    # Keep attention eager, but exercise the clamp-aware fused MoE path on each
+    # backend: DeepSeek-V4 forwards ``swiglu_limit`` into fused_triton/fused_npu.
     if case_id == "deepseek_v4":
         hf_model_modes = [ModelMode("hf", "eager")]
-        moe_impl = "eager" if IS_NPU_AVAILABLE else "fused_triton"
+        moe_impl = "fused_npu" if get_device_type() == "npu" else "fused_triton"
         veomni_model_modes = [ModelMode("veomni", "eager", moe_implementation=moe_impl)]
 
     # Qwen3.5 compatibility:
@@ -494,18 +483,21 @@ def test_models_patch_fwd_bwd(
     # this the public ``OpsImplementationConfig()`` defaults (liger_kernel /
     # fused_triton / triton) would fail validation on NPU before the test
     # even runs.
-    model_config = ModelArguments(config_path=config_path, ops_implementation=make_eager_ops_config())
-    data_config = DataArguments(train_path="")
-    training_config = TrainingArguments(
-        checkpoint=CheckpointConfig(output_dir="./test_models_patch"),
+    model_config = ModelArguments(
+        config_path=config_path,
+        ops_implementation=make_eager_ops_config(),
         accelerator=AcceleratorConfig(
+            init_device=get_device_type(),
             fsdp_config=FSDPConfig(
                 fsdp_mode="ddp",
                 mixed_precision=MixedPrecisionConfig(enable=False),
             ),
         ),
+    )
+    data_config = DataArguments(train_path="")
+    training_config = TrainingArguments(
+        checkpoint=CheckpointConfig(output_dir="./test_models_patch"),
         enable_full_determinism=True,
-        init_device=get_device_type(),
     )
 
     trainer_config = VeOmniArguments(
@@ -516,7 +508,9 @@ def test_models_patch_fwd_bwd(
 
     trainer = TrainerTest(hf_model_modes[0], trainer_config)
 
-    state_dict = copy.deepcopy(trainer.model.state_dict())
+    # Keep the immutable reference off the accelerator while each mode holds
+    # its own model, gradients and activations (Qwen3.5 has a full-size vocab).
+    state_dict = {key: value.detach().to("cpu", copy=True) for key, value in trainer.model.state_dict().items()}
 
     del trainer.model, trainer.optimizer, trainer.lr_scheduler
 

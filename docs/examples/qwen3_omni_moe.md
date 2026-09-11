@@ -119,7 +119,7 @@ python3 scripts/download_hf_model.py \
     --local_dir .
 ```
 
-## Start training on GPU
+## Start training on GPU/NPU
 
 ```shell
 bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_omni/qwen3_omni.yaml \

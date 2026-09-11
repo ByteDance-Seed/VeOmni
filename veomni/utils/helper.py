@@ -41,6 +41,7 @@ from . import logging
 from .count_flops import VeomniFlopsCounter
 from .device import (
     IS_CUDA_AVAILABLE,
+    IS_MLU_AVAILABLE,
     IS_NPU_AVAILABLE,
     get_device_type,
     get_torch_device,
@@ -78,6 +79,7 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from ..distributed.parallel_state import ParallelState
+    from ..lora import VeOmniLoraConfig
 
 
 logger = logging.get_logger(__name__)
@@ -206,8 +208,12 @@ class EnvironMeter:
         # for internal use
         if VALID_CONFIG_TYPE is not None and isinstance(config, VALID_CONFIG_TYPE):
             self.estimate_flops = FlopsCounter(config).estimate_flops
+            self.supports_lora_flops = False
         else:
-            self.estimate_flops = VeomniFlopsCounter(config).estimate_flops
+            flops_counter = VeomniFlopsCounter(config)
+            self.estimate_flops = flops_counter.estimate_flops
+            self.supports_lora_flops = True
+        self._warned_unsupported_lora_flops = False
 
         if self.gc_steps > 0:
             gc.disable()
@@ -241,13 +247,35 @@ class EnvironMeter:
         else:  # dit diffusers model
             self.batch_seqlens.extend(_compute_wan_seqlens(micro_batch))
 
-    def step(self, delta_time: float, global_step: int) -> Dict[str, Any]:
-        if len(self.images_seqlens) > 0:
-            flops_achieved, flops_promised = self.estimate_flops(
-                self.batch_seqlens, delta_time, images_seqlens=self.images_seqlens
-            )
-        else:
-            flops_achieved, flops_promised = self.estimate_flops(self.batch_seqlens, delta_time)
+    def step(
+        self,
+        delta_time: float,
+        global_step: int,
+        lora_config: Optional["VeOmniLoraConfig"] = None,
+        freeze_vit: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        flops_kwargs = {}
+        if self.images_seqlens:
+            flops_kwargs["images_seqlens"] = self.images_seqlens
+        lora_flops_unavailable = lora_config is not None and not self.supports_lora_flops
+        if lora_config is not None:
+            if self.supports_lora_flops:
+                flops_kwargs["lora_config"] = lora_config
+            elif not self._warned_unsupported_lora_flops:
+                logger.warning_rank0(
+                    "LoRA FLOPs are unavailable because the configured FLOP counter does not accept "
+                    "VeOmniLoraConfig. Returning zero FLOPs so training can continue."
+                )
+                self._warned_unsupported_lora_flops = True
+        if freeze_vit is not None and self.supports_lora_flops:
+            flops_kwargs["freeze_vit"] = freeze_vit
+        flops_achieved, flops_promised = self.estimate_flops(
+            self.batch_seqlens,
+            delta_time,
+            **flops_kwargs,
+        )
+        if lora_flops_unavailable:
+            flops_achieved = 0
         flops_achieved, batch_tokens, real_global_batch_size = all_reduce(
             (flops_achieved, sum(self.batch_seqlens), len(self.batch_seqlens)),
             op="sum",
@@ -421,6 +449,10 @@ def enable_high_precision_for_bf16():
         torch.npu.matmul.allow_tf32 = False
         torch.npu.matmul.allow_bf16_reduced_precision_reduction = False
 
+    if IS_MLU_AVAILABLE:
+        torch.backends.mlu.matmul.allow_tf32 = False
+        torch.backends.mlu.matmul.allow_bf16_reduced_precision_reduction = False
+
 
 def enable_full_determinism(seed: int):
     """
@@ -451,6 +483,10 @@ def enable_full_determinism(seed: int):
     if IS_NPU_AVAILABLE:
         torch.npu.manual_seed(seed)
         torch.npu.manual_seed_all(seed)
+
+    if IS_MLU_AVAILABLE:
+        torch.mlu.manual_seed(seed)
+        torch.mlu.manual_seed_all(seed)
 
 
 def set_seed(seed: int, full_determinism: bool = False) -> None:
@@ -531,7 +567,7 @@ def empty_cache() -> None:
     """
     gc.collect()
 
-    if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
+    if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE or IS_MLU_AVAILABLE:
         from veomni.utils.device import empty_cache
 
         empty_cache()
@@ -673,7 +709,7 @@ def create_profiler(
     global_rank: int,
 ):
     """
-    Creates a profiler to record the CPU and CUDA activities. Default export to trace.json.
+    Creates a profiler to record the CPU and CUDA / MLU activities. Default export to trace.json.
     Profile steps in [start_step, end_step).
 
     When is_npu_available = True, the profiler will be created as torch_npu.profiler.
@@ -707,7 +743,7 @@ def create_profiler(
             nonlocal npu_trace_handler
             npu_trace_handler(p)
             trace_file = p.prof_if.prof_path
-        elif IS_CUDA_AVAILABLE:
+        elif IS_CUDA_AVAILABLE or IS_MLU_AVAILABLE:
             p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
 
@@ -746,6 +782,10 @@ def create_profiler(
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
             data_simplification=False,
         )
+    elif IS_MLU_AVAILABLE:
+        profiler_module = torch.profiler
+        activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.MLU]
+        experimental_config = None
     else:
         profiler_module = torch.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.CUDA]

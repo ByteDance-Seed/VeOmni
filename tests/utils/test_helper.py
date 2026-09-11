@@ -2,18 +2,90 @@ import os
 import random
 import subprocess
 from dataclasses import dataclass, field
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 from transformers import Qwen2Config
 
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments, parse_args
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import _init_parallel_state
+from veomni.lora import VeOmniLoraConfig
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
 logger = helper.create_logger(__name__)
+
+
+def test_environ_meter_passes_supported_lora_config(monkeypatch):
+    calls = []
+
+    class FakeFlopsCounter:
+        supports_lora = True
+
+        def __init__(self, config):
+            self.config = config
+
+        def estimate_flops(self, batch_seqlens, delta_time, **kwargs):
+            calls.append((batch_seqlens, delta_time, kwargs))
+            return 1.0, 2.0
+
+    fake_device = SimpleNamespace(
+        max_memory_allocated=lambda: 0,
+        max_memory_reserved=lambda: 0,
+        memory_stats=lambda: {"num_alloc_retries": 0},
+    )
+    fake_memory = SimpleNamespace(used=0, available=0, percent=0)
+    monkeypatch.setattr(helper, "VeomniFlopsCounter", FakeFlopsCounter)
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda: 1)
+    monkeypatch.setattr(helper, "all_reduce", lambda values, **kwargs: values)
+    monkeypatch.setattr(helper, "get_torch_device", lambda: fake_device)
+    monkeypatch.setattr(helper.psutil, "virtual_memory", lambda: fake_memory)
+
+    meter = helper.EnvironMeter(
+        config=SimpleNamespace(model_type="qwen3"),
+        global_batch_size=1,
+        empty_cache_steps=0,
+        parallel_state=SimpleNamespace(dp_group=None),
+    )
+    meter.batch_seqlens = [12, 5]
+    meter.images_seqlens = [16]
+    lora_config = VeOmniLoraConfig(r=8, target_modules=["q_proj"])
+
+    meter.step(
+        delta_time=0.5,
+        global_step=1,
+        lora_config=lora_config,
+        freeze_vit=True,
+    )
+
+    assert calls == [
+        (
+            [12, 5],
+            0.5,
+            {
+                "images_seqlens": [16],
+                "lora_config": lora_config,
+                "freeze_vit": True,
+            },
+        )
+    ]
+
+    calls.clear()
+    meter.supports_lora_flops = False
+    meter.batch_seqlens = [7]
+    with patch("veomni.utils.helper.logger.warning_rank0") as warning:
+        metrics = meter.step(delta_time=0.25, global_step=2, lora_config=lora_config, freeze_vit=True)
+
+        meter.batch_seqlens = [8]
+        meter.step(delta_time=0.25, global_step=3, lora_config=lora_config)
+
+    assert calls == [([7], 0.25, {}), ([8], 0.25, {})]
+    assert metrics["flops_achieved(T)"] == 0
+    assert metrics["mfu"] == 0
+    warning.assert_called_once()
 
 
 @dataclass
@@ -30,19 +102,19 @@ def run_environ_meter(args):
     dist.init_process_group(backend=get_dist_comm_backend(), world_size=world_size, rank=rank)
 
     config = Qwen2Config()
-    init_parallel_state(
-        dp_size=args.train.accelerator.dp_size,
-        dp_replicate_size=args.train.accelerator.dp_replicate_size,
-        dp_shard_size=args.train.accelerator.dp_shard_size,
-        tp_size=args.train.accelerator.tp_size,
-        pp_size=args.train.accelerator.pp_size,
-        cp_size=args.train.accelerator.cp_size,
-        ulysses_size=args.train.accelerator.ulysses_size,
-        extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes,
-        extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
-        extra_parallel_names=args.train.accelerator.extra_parallel_names,
-        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
-        async_enabled=args.train.accelerator.enable_async,
+    _init_parallel_state(
+        dp_size=args.model.accelerator.dp_size,
+        dp_replicate_size=args.model.accelerator.dp_replicate_size,
+        dp_shard_size=args.model.accelerator.dp_shard_size,
+        tp_size=args.model.accelerator.tp_size,
+        pp_size=args.model.accelerator.pp_size,
+        cp_size=args.model.accelerator.cp_size,
+        ulysses_size=args.model.accelerator.ulysses_size,
+        extra_parallel_sizes=args.model.accelerator.extra_parallel_sizes,
+        extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
+        extra_parallel_names=args.model.accelerator.extra_parallel_names,
+        dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
+        async_enabled=args.model.accelerator.enable_async,
     )
 
     # Test update()

@@ -246,6 +246,8 @@ def test_reorder_varlen_requires_divisible_document():
 
 @dataclass
 class _FakeState:
+    cp_layout = "zigzag"
+
     cp_size: int
     ulysses_size: int
     cp_rank: int
@@ -395,3 +397,13 @@ def test_unaligned_document_raises_actionable_error(monkeypatch):
     position_ids = torch.tensor([[*range(8), *range(6)]])
     with pytest.raises(ValueError, match="divisible by 2.cp_size"):
         collator._compute_cp_cu_seqlens({"position_ids": position_ids})
+
+
+def test_contiguous_cp_keeps_original_token_order(monkeypatch):
+    state = _FakeState(cp_size=2, ulysses_size=1, cp_rank=0, ulysses_rank=0)
+    state.cp_layout = "contiguous"
+    monkeypatch.setattr("veomni.data.data_collator.get_parallel_state", lambda: state)
+    collator = SequenceParallelCollator()
+    tokens = torch.arange(16)
+    assert torch.equal(collator.sp_slice("input_ids", tokens), tokens[:8])
+    assert PackingCollator().cp_size == 1

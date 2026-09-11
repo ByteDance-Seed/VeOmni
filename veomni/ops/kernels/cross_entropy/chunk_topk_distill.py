@@ -123,13 +123,16 @@ class _ChunkedLinearTopkDistill(torch.autograd.Function):
         orig_hidden_shape = hidden_states.shape
         K = teacher_topk_ids.shape[-1]
 
+        # ``autograd.Function.forward`` runs with grad mode disabled. If
+        # ``reshape`` must copy a non-contiguous input, the copy does not retain
+        # ``requires_grad``. Capture the output requirement before flattening.
+        out_requires_grad = hidden_states.requires_grad or weight.requires_grad
         h_2d = hidden_states.reshape(-1, hidden_states.size(-1))
         l_1d = labels.reshape(-1)
         ids_2d = teacher_topk_ids.reshape(-1, K)
         tlp_2d = teacher_topk_log_probs.reshape(-1, K)
         T = l_1d.shape[0]
 
-        out_requires_grad = h_2d.requires_grad or weight.requires_grad
         log_probs = torch.zeros(T, device=h_2d.device, dtype=torch.float32, requires_grad=out_requires_grad)
         entropy = torch.zeros(T, device=h_2d.device, dtype=torch.float32, requires_grad=out_requires_grad)
         distill = torch.zeros(T, device=h_2d.device, dtype=torch.float32, requires_grad=out_requires_grad)
@@ -226,8 +229,10 @@ class _ChunkedLinearTopkDistill(torch.autograd.Function):
         dentropy_1d = dentropy.reshape(-1).float() if dentropy is not None else None
         ddistill_1d = ddistill.reshape(-1).float() if ddistill is not None else None
 
-        dhidden = torch.zeros_like(h_2d) if h_2d.requires_grad else None
-        dweight = torch.zeros_like(weight) if weight.requires_grad else None
+        # Saved tensors may have different ``requires_grad`` flags after a
+        # reshape copy. Gate gradients on the original Function inputs.
+        dhidden = torch.zeros_like(h_2d) if ctx.needs_input_grad[0] else None
+        dweight = torch.zeros_like(weight) if ctx.needs_input_grad[1] else None
 
         for chunk_start in range(0, T, ctx.chunk_size):
             chunk_end = min(chunk_start + ctx.chunk_size, T)

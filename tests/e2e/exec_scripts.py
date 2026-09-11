@@ -35,8 +35,8 @@ def qwen3_0p6b_base_tulu_sft_no_reshard_script():
         "--train.enable_full_determinism true",
         "--train.num_train_epochs 1",
         "--train.max_steps 20",
-        "--train.accelerator.fsdp_config.reshard_after_forward false",
-        "--train.accelerator.fsdp_config.reshard_after_backward false",
+        "--model.accelerator.fsdp_config.reshard_after_forward false",
+        "--model.accelerator.fsdp_config.reshard_after_backward false",
         "--train.wandb.enable false $@ 2>&1",
     ]
 

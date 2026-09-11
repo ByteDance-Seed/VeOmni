@@ -27,7 +27,6 @@ def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, tor
         batches = [batches]
     token_len = {
         "foundation_tokens": torch.tensor(0),
-        "image_decoder_tokens": torch.tensor(0),
     }
 
     def _count(obj):
@@ -38,9 +37,6 @@ def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, tor
                 if key.endswith("_labels"):
                     token_name = key.split("_labels")[0]
                     token_len[f"{token_name}_tokens"] = torch.sum(obj[key] != IGNORE_INDEX)  # image generation tokens
-
-            if "image_output_mask" in obj:
-                token_len["image_decoder_tokens"] += torch.sum(obj["image_output_mask"])  # image generation tokens
         elif isinstance(obj, (list, tuple)):
             for item in obj:
                 _count(item)
@@ -55,6 +51,7 @@ def mean_global_loss(
     losses: Union[dict[str, torch.Tensor], torch.Tensor],
     micro_batch_token_len: dict[str, torch.Tensor],
     micro_batches_token_len: dict[str, torch.Tensor],
+    global_micro_batches_token_len: dict[str, float] | None = None,
 ):
     """Calcuate the global mean loss. Avg on all_reduced_token_num instead of on dp_size.
     - cur_losses[key] = cur_loss * cur_token_num / global_batches_token_num * get_parallel_state().fsdp_size
@@ -72,7 +69,10 @@ def mean_global_loss(
         if get_parallel_state().sp_enabled:
             cur_token_len = all_reduce(cur_token_len.item(), op="sum", group=get_parallel_state().sp_group)
 
-        all_reduced_len = all_reduce((micro_batches_token_len[f"{loss_name}_tokens"].item()), op="sum")
+        if global_micro_batches_token_len is None:
+            all_reduced_len = all_reduce((micro_batches_token_len[f"{loss_name}_tokens"].item()), op="sum")
+        else:
+            all_reduced_len = global_micro_batches_token_len[f"{loss_name}_tokens"]
 
         if all_reduced_len != 0:
             cur_loss = cur_loss * cur_token_len / all_reduced_len * get_parallel_state().fsdp_size
@@ -88,3 +88,8 @@ def mean_global_loss(
         loss_dict[key] = cur_loss
 
     return loss_dict
+
+
+def reduce_global_loss_token(micro_batches_token_len: dict[str, torch.Tensor]) -> dict[str, float]:
+    """All-reduce per-step loss-token denominators once for reuse across micro-batches."""
+    return {key: all_reduce(value.item(), op="sum") for key, value in micro_batches_token_len.items()}

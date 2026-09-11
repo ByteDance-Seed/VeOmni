@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import io
+from fractions import Fraction
 from io import BytesIO
 from typing import ByteString, List, Optional, Tuple, Union
 
+import av
 import numpy as np
 import torch
 
@@ -200,3 +202,94 @@ def save_audio_tensor_to_file(
     import soundfile as sf
 
     sf.write(output_path, audio, samplerate=sample_rate)
+
+
+def convert_to_stereo(audio_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Convert audio to stereo.
+    Supports [C, T] or [B, C, T]. Duplicate mono, keep stereo.
+    """
+    if audio_tensor.size(-2) == 1:
+        return audio_tensor.repeat(1, 2, 1) if audio_tensor.dim() == 3 else audio_tensor.repeat(2, 1)
+    return audio_tensor
+
+
+def _resample_audio(
+    container: av.container.Container, audio_stream: av.audio.AudioStream, frame_in: av.AudioFrame
+) -> None:
+    cc = audio_stream.codec_context
+
+    # Use the encoder's format/layout/rate as the *target*
+    target_format = cc.format or "fltp"  # AAC → usually fltp
+    target_layout = cc.layout or "stereo"
+    target_rate = cc.sample_rate or frame_in.sample_rate
+
+    audio_resampler = av.audio.resampler.AudioResampler(
+        format=target_format,
+        layout=target_layout,
+        rate=target_rate,
+    )
+
+    audio_next_pts = 0
+    for rframe in audio_resampler.resample(frame_in):
+        if rframe.pts is None:
+            rframe.pts = audio_next_pts
+        audio_next_pts += rframe.samples
+        # Keep the resampler-assigned sample_rate (the target rate), not the
+        # input frame's rate: the encoder/muxer stamps packets from it.
+        container.mux(audio_stream.encode(rframe))
+
+    # Drain the resampler so tail samples are not dropped.
+    for rframe in audio_resampler.resample(None):
+        if rframe.pts is None:
+            rframe.pts = audio_next_pts
+        audio_next_pts += rframe.samples
+        container.mux(audio_stream.encode(rframe))
+
+    # flush audio encoder
+    for packet in audio_stream.encode():
+        container.mux(packet)
+
+
+def _write_audio(
+    container: av.container.Container,
+    audio_stream: av.audio.AudioStream,
+    samples: torch.Tensor,
+    audio_sample_rate: int,
+) -> None:
+    if samples.ndim == 1:
+        samples = samples.unsqueeze(0)
+    samples = convert_to_stereo(samples)
+    assert samples.ndim == 2 and samples.shape[0] == 2, "audio samples must be [C, S] or [S], C must be 1 or 2"
+    samples = samples.T
+    # Convert to int16 packed for ingestion; resampler converts to encoder fmt.
+    if samples.dtype != torch.int16:
+        samples = torch.clip(samples, -1.0, 1.0)
+        samples = (samples * 32767.0).to(torch.int16)
+
+    frame_in = av.AudioFrame.from_ndarray(
+        samples.contiguous().reshape(1, -1).cpu().numpy(),
+        format="s16",
+        layout="stereo",
+    )
+    frame_in.sample_rate = audio_sample_rate
+
+    _resample_audio(container, audio_stream, frame_in)
+
+
+def _prepare_audio_stream(container: av.container.Container, audio_sample_rate: int) -> av.audio.AudioStream:
+    """
+    Prepare the audio stream for writing.
+    """
+    audio_stream = container.add_stream("aac")
+    supported_sample_rates = audio_stream.codec_context.codec.audio_rates
+    if supported_sample_rates:
+        best_rate = min(supported_sample_rates, key=lambda x: abs(x - audio_sample_rate))
+        if best_rate != audio_sample_rate:
+            print(f"Using closest supported audio sample rate: {best_rate}")
+    else:
+        best_rate = audio_sample_rate
+    audio_stream.codec_context.sample_rate = best_rate
+    audio_stream.codec_context.layout = "stereo"
+    audio_stream.codec_context.time_base = Fraction(1, best_rate)
+    return audio_stream

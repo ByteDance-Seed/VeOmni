@@ -160,10 +160,11 @@ class USPTrainingEquivalenceE2ETest(MultiProcessTestCase):
         os.environ["LOCAL_RANK"] = str(self.rank)
 
         PS.clear_parallel_state()
-        usp_state = PS.init_parallel_state(
+        usp_state = PS._init_parallel_state(
             dp_size=1,
             dp_shard_size=1,
             cp_size=CP_SIZE,
+            cp_layout="zigzag",
             ulysses_size=ULYSSES_SIZE,
             device_type=get_device_type(),
             name="usp_e2e",

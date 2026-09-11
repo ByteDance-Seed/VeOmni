@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import math
 import os
 import random
 import traceback
@@ -23,7 +24,6 @@ import numpy as np
 import torch
 from datasets import IterableDataset as HFIterableDataset
 from datasets import interleave_datasets, load_dataset
-from datasets.distributed import split_dataset_by_node
 from huggingface_hub import hf_hub_download
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
@@ -52,20 +52,47 @@ def build_dataset(dataset_name: str, **kwargs) -> "Dataset":
 
 
 class MappingDataset(Dataset):
-    def __init__(self, data: "Dataset", transform: Optional[Callable] = None):
+    """Map every global index to a reproducible sample.
+
+    The first pass keeps source order. Each later cycle uses ``seed + cycle``
+    without changing global RNG state, so the mapping is independent of access
+    order and worker-local dataset state. Only the most recently used later
+    cycle is cached to bound per-worker memory; non-monotonic reads remain
+    correct but may rebuild a cycle permutation.
+    """
+
+    def __init__(self, data: "Dataset", transform: Optional[Callable] = None, seed: int = 42):
         self._data = data
         self._transform = transform
-        self.indices = list(range(len(self._data)))
-        self.data_len = len(self.indices)
+        self.seed = seed
+        self.data_len = len(self._data)
+        self._current_cycle: Optional[int] = None
+        self._cycle_indices: Optional[List[int]] = None
 
     def __len__(self) -> int:
         return self.data_len
 
+    def _get_mapped_index(self, index: int) -> int:
+        if self.data_len == 0:
+            raise IndexError("Cannot index an empty dataset")
+        if index < -self.data_len:
+            raise IndexError(f"Index {index} out of range for dataset of length {self.data_len}")
+        if index < 0:
+            return self.data_len + index
+        if index < self.data_len:
+            return index
+
+        cycle, index = divmod(index, self.data_len)
+        cycle_indices = self._cycle_indices
+        if cycle != self._current_cycle or cycle_indices is None:
+            cycle_indices = list(range(self.data_len))
+            random.Random(self.seed + cycle).shuffle(cycle_indices)
+            self._current_cycle = cycle
+            self._cycle_indices = cycle_indices
+        return cycle_indices[index]
+
     def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
-        if index >= len(self.indices):
-            random.shuffle(self.indices)
-            index = index % len(self.indices)
-        mapped_idx = self.indices[index]
+        mapped_idx = self._get_mapped_index(index)
         if self._transform is not None:
             return self._transform(self._data[mapped_idx])
         else:
@@ -85,13 +112,66 @@ class IterativeDataset(IterableDataset):
                 yield sample
 
     def load_state_dict(self, state_dict):
-        self._data.load_state_dict(state_dict["dataset"])
+        inner = state_dict.get("dataset")
+        if inner is not None and hasattr(self._data, "load_state_dict"):
+            self._data.load_state_dict(inner)
 
     def state_dict(self):
-        return {"dataset": self._data.state_dict()}
+        if hasattr(self._data, "state_dict"):
+            return {"dataset": self._data.state_dict()}
+        return {"dataset": None}
 
     def set_epoch(self, epoch: int):
-        self._data.set_epoch(epoch)
+        if hasattr(self._data, "set_epoch"):
+            self._data.set_epoch(epoch)
+
+
+class ShardedIterableDataset(IterableDataset):
+    """Row-level DP shard. One pass drops an incomplete last round.
+
+    ``repeat=True`` replays so training can reach ``max_steps`` on a short dump.
+    """
+
+    def __init__(self, dataset, dp_rank: int = 0, dp_size: int = 1, repeat: bool = False, seed: int = 42):
+        self._dataset = dataset
+        self._dp_rank = dp_rank
+        self._dp_size = dp_size
+        self._repeat = repeat
+        self._seed = seed
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self._epoch = epoch
+
+    def __iter__(self):
+        worker_info = get_worker_info()
+        worker_id = 0 if worker_info is None else worker_info.id
+        num_workers = 1 if worker_info is None else worker_info.num_workers
+        index = 0
+        pending: List[Any] = []
+        pass_i = 0
+        while True:
+            n_before = index
+            if hasattr(self._dataset, "set_epoch"):
+                self._dataset.set_epoch(self._seed + self._epoch + pass_i)
+            for sample in self._dataset:
+                if index % self._dp_size == self._dp_rank and (index // self._dp_size) % num_workers == worker_id:
+                    pending.append(sample)
+                index += 1
+                if index % self._dp_size == 0:
+                    yield from pending
+                    pending = []
+            produced = index - n_before
+            if produced == 0 or not self._repeat:
+                return
+            # Drop an incomplete last DP round so it cannot leak into the next pass.
+            pending = []
+            remainder = index % self._dp_size
+            if remainder:
+                index += self._dp_size - remainder
+            if produced < self._dp_size:
+                return
+            pass_i += 1
 
 
 class InterleavedIterableDataset(IterativeDataset):
@@ -117,14 +197,8 @@ class InterleavedIterableDataset(IterativeDataset):
 
 
 class InterleavedMappingDataset(MappingDataset):
-    def __init__(self, data: "Dataset", transform: Optional[Callable] = None):
-        super().__init__(data, transform)
-
     def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
-        if index >= len(self.indices):
-            random.shuffle(self.indices)
-            index = index % len(self.indices)
-        mapped_idx = self.indices[index]
+        mapped_idx = self._get_mapped_index(index)
         if self._transform is not None:
             sample = self._data[mapped_idx]
             ds_idx = sample["ds_idx"]
@@ -820,6 +894,181 @@ class WeightedMultiSourceDataset(IterableDataset):
         self._just_resumed = True
 
 
+class _MapStyleSamplerWrapper(IterableDataset):
+    """Internal wrapper that re-creates the sampler for a map-style dataset.
+
+    This is *not* a general-purpose dataset and is not meant to be used directly.
+    It exists only for one internal path: ``DynamicBatchingSizeDataset``
+    (``dyn_bsz_runtime="worker"``) accepts iterable upstreams only, so a map-style
+    dataset gets wrapped into an ``IterableDataset`` *before* the sampler decision in
+    ``build_native_dataloader`` and silently loses the ``StatefulDistributedSampler``
+    that would otherwise shard it. This wrapper puts that sampler back, inline, on top
+    of the map-style dataset:
+
+    1. Rank split: indices are deterministically shuffled with ``seed + epoch`` and
+       partitioned across ``num_replicas`` with the exact same padding and
+       strided-slice scheme as ``torch.utils.data.DistributedSampler``.
+    2. Worker split: inside each DataLoader worker, the rank's indices are further
+       strided-sliced by ``worker_id`` so that workers read disjoint samples with
+       balanced counts (difference <= 1).
+    3. Resume: the number of yielded samples is tracked per worker and exposed via
+       ``state_dict()`` / ``load_state_dict()``, composing with ``StatefulDataLoader``
+       per-worker snapshots (the same ``num_workers`` must be used on resume). On
+       resume the iterator skips the already-consumed prefix of the same
+       deterministic permutation.
+
+    It also implements the ``get_item()`` / ``output_index_for_resume`` protocol
+    required by ``DynamicBatchingSizeDataset(save_by_idx=True)``: yielded resume
+    indices are *global* dataset indices, so buffered samples are refetched in O(1)
+    on resume, independent of epoch or permutation.
+
+    Note:
+        With ``save_by_idx=True``, ``dataset[idx]`` must be deterministic: resume
+        rebuilds the buffer by re-fetching saved indices, so the same index must
+        yield the same sample(s). A transform expanding one index into a ``list`` is
+        fine (``DynamicBatchingSizeDataset`` tracks the sub-index), as long as that
+        expansion is reproducible.
+
+    Attributes:
+        dataset: The underlying map-style dataset (must support ``len()`` and
+            integer indexing).
+        num_replicas: Number of data-parallel ranks.
+        rank: This process's data-parallel rank.
+        shuffle: Whether to shuffle indices with ``seed + epoch`` each epoch.
+        seed: Base random seed shared by all ranks.
+    """
+
+    def __init__(
+        self,
+        dataset: "Dataset",
+        num_replicas: int = 1,
+        rank: int = 0,
+        shuffle: bool = True,
+        seed: int = 0,
+    ) -> None:
+        if num_replicas <= 0:
+            raise ValueError(f"num_replicas must be positive, got {num_replicas}")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(f"Invalid rank {rank}, rank should be in the interval [0, {num_replicas - 1}]")
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        self._dataset_size = len(self.dataset)
+        # Set by DynamicBatchingSizeDataset.save_by_idx; when True, yield (sample, global_idx).
+        self.output_index_for_resume = False
+
+        self.num_samples = math.ceil(self._dataset_size / self.num_replicas)
+        self.total_size = self.num_samples * self.num_replicas
+
+        self._yielded = 0
+        # When resumed from a checkpoint, __iter__ keeps the restored _yielded instead of
+        # resetting it to 0, mirroring DynamicBatchingSizeDataset's resume handling.
+        self._just_resumed = False
+
+    def __len__(self) -> int:
+        """Number of samples assigned to this rank (across all of its workers)."""
+        return self.num_samples
+
+    def _rank_indices(self) -> torch.Tensor:
+        """Compute this rank's global indices, mirroring ``DistributedSampler.__iter__``."""
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(self._dataset_size, generator=g)
+        else:
+            indices = torch.arange(self._dataset_size)
+
+        # Pad by wrapping around so every rank gets the same number of samples.
+        padding_size = self.total_size - len(indices)
+        if padding_size > 0:
+            if padding_size <= len(indices):
+                padding = indices[:padding_size]
+            else:
+                padding = indices.repeat(math.ceil(padding_size / len(indices)))[:padding_size]
+            indices = torch.cat((indices, padding))
+        assert len(indices) == self.total_size
+
+        return indices[self.rank : self.total_size : self.num_replicas]
+
+    def __iter__(self):
+        if not self._just_resumed:
+            self._yielded = 0
+        else:
+            self._just_resumed = False
+            if hasattr(self.dataset, "_just_resumed"):
+                self.dataset._just_resumed = False
+
+        return self._iter()
+
+    def _iter(self):
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+        # Strided worker split keeps per-worker counts balanced (difference <= 1).
+        indices = self._rank_indices()[worker_id::num_workers].tolist()
+        if self._yielded > len(indices):
+            raise RuntimeError(
+                f"Restored yielded count {self._yielded} exceeds this worker's {len(indices)} assigned samples."
+            )
+
+        for idx in indices[self._yielded :]:
+            self._yielded += 1
+            sample = self.dataset[idx]
+            if self.output_index_for_resume:
+                yield sample, int(idx)
+            else:
+                yield sample
+
+    def get_item(self, idx: int):
+        """Refetch a sample by global dataset index (used by ``save_by_idx`` resume)."""
+        return self.dataset[idx]
+
+    def _sampler_fingerprint(self) -> Dict[str, Any]:
+        return {
+            "num_replicas": self.num_replicas,
+            "seed": self.seed,
+            "dataset_size": self._dataset_size,
+            "shuffle": self.shuffle,
+        }
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "epoch": self.epoch,
+            "yielded": self._yielded,
+            **self._sampler_fingerprint(),
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        missing_keys = self._sampler_fingerprint().keys() - state_dict.keys()
+        if missing_keys:
+            raise RuntimeError(
+                f"Cannot restore _MapStyleSamplerWrapper: checkpoint is missing sampler fingerprint fields "
+                f"{sorted(missing_keys)}."
+            )
+
+        mismatches = []
+        for key, current_value in self._sampler_fingerprint().items():
+            checkpoint_value = state_dict[key]
+            if checkpoint_value != current_value:
+                mismatches.append(f"{key}: checkpoint={checkpoint_value!r}, current={current_value!r}")
+        if mismatches:
+            raise RuntimeError(
+                f"Cannot restore _MapStyleSamplerWrapper with a different sampler setup: {'; '.join(mismatches)}"
+            )
+
+        self.epoch = state_dict["epoch"]
+        self._yielded = state_dict["yielded"]
+        self._just_resumed = True
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+        if hasattr(self.dataset, "set_epoch") and callable(self.dataset.set_epoch):
+            self.dataset.set_epoch(epoch)
+
+
 class DynamicBatchingSizeDataset(IterableDataset):
     """Dynamic batching dataset that yields micro batches based on token count.
 
@@ -955,21 +1204,13 @@ class DynamicBatchingSizeDataset(IterableDataset):
             self.dataset.output_index_for_resume = value
 
     def __iter__(self):
-        """Iterate over the dataset and yield dynamically batched micro batches.
+        """
+        Iterate over the dataset and yield dynamically batched micro batches.
 
         Buffers samples from the underlying dataset and yields micro batches when
         the buffer contains enough samples and tokens. Each yielded batch is collated
         using the dynamic_batching_collate_fn.
-
-        Yields:
-            Collated micro batch when buffer conditions are met.
-
-        Raises:
-            Exception: Re-raises any exception other than StopIteration encountered
-                during iteration.
         """
-        self._data_iter = iter(self.dataset)
-
         if not self._just_resumed:
             # Clear buffer state on new iteration unless we just resumed from a checkpoint,
             # in which case we want to keep the buffer contents.
@@ -977,8 +1218,15 @@ class DynamicBatchingSizeDataset(IterableDataset):
             self._buffer_of_output_index = []
             self._buffer_token_count = 0
             self._buffer_physical_token_count = 0
+            if hasattr(self.dataset, "_just_resumed"):
+                self.dataset._just_resumed = False
         else:
             self._just_resumed = False
+
+        return self._iter()
+
+    def _iter(self):
+        self._data_iter = iter(self.dataset)
 
         while True:
             try:
@@ -1212,7 +1460,6 @@ class DynamicBatchingSizeDataset(IterableDataset):
         assert self._buffer_physical_token_count == sum(
             item[2] if len(item) > 2 else item[1] for item in self._buffer
         ), "buffer_physical_token_count does not match the sum of physical lengths in buffer"
-        del state_dict["buffer"]
 
         if "dynamic_batch_upstream_dataset_state" in state_dict:
             self.dataset.load_state_dict(state_dict["dynamic_batch_upstream_dataset_state"])
@@ -1232,6 +1479,34 @@ class DynamicBatchingSizeDataset(IterableDataset):
             self.dataset.set_epoch(epoch)
 
 
+# HuggingFace `load_dataset` loader names. `jsonl` is loaded as `json`.
+_DATA_FILE_EXTENSIONS = ("parquet", "jsonl", "json", "csv", "arrow")
+_HF_LOADER_BY_EXT = {
+    "parquet": "parquet",
+    "jsonl": "json",
+    "json": "json",
+    "csv": "csv",
+    "arrow": "arrow",
+}
+
+
+def _local_data_extension(path: str) -> str:
+    return os.path.splitext(path)[-1][1:].lower()
+
+
+def _collect_local_data_files(root: str) -> list[str]:
+    collected = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
+        for filename in sorted(filenames):
+            if filename.startswith("."):
+                continue
+            if _local_data_extension(filename) not in _DATA_FILE_EXTENSIONS:
+                continue
+            collected.append(os.path.join(dirpath, filename))
+    return collected
+
+
 def get_data_files(train_path):
     data_files = []
     data_paths = train_path.split(",")
@@ -1240,23 +1515,42 @@ def get_data_files(train_path):
             if not isdir(data_path):
                 raise FileNotFoundError(f"Dataset {data_path} not exists.")
 
-            for filename in listdir(data_path):
+            for filename in sorted(listdir(data_path)):
+                if _local_data_extension(filename) not in _DATA_FILE_EXTENSIONS:
+                    continue
                 from ..utils.helper import get_cache_dir
 
                 data_files.append(hf_hub_download(data_path, os.path.split(filename)[-1], cache_dir=get_cache_dir()))
 
         elif os.path.isdir(data_path):
-            data_files.extend([os.path.join(data_path, fn) for fn in sorted(os.listdir(data_path))])
+            data_files.extend(_collect_local_data_files(data_path))
         elif os.path.isfile(data_path):
             data_files.append(data_path)
         else:
             raise FileNotFoundError(f"Dataset {data_path} not exists.")
-    file_extenstion = os.path.splitext(data_files[0])[-1][1:]
-    if file_extenstion not in ["parquet", "jsonl", "json", "csv", "arrow"]:
-        raise ValueError(f"{file_extenstion} files are not supported.")
 
-    file_extenstion = "json" if file_extenstion == "jsonl" else file_extenstion
-    return data_files, file_extenstion
+    if not data_files:
+        raise FileNotFoundError(
+            f"No supported data files ({', '.join(_DATA_FILE_EXTENSIONS)}) found under {train_path}."
+        )
+
+    loader_names = {_HF_LOADER_BY_EXT.get(_local_data_extension(path)) for path in data_files}
+    if None in loader_names:
+        bad = [path for path in data_files if _local_data_extension(path) not in _DATA_FILE_EXTENSIONS]
+        raise ValueError(f"{_local_data_extension(bad[0])} files are not supported.")
+    if len(loader_names) != 1:
+        raise ValueError(f"Mixed data file types under {train_path}: {sorted(loader_names)}")
+
+    return data_files, loader_names.pop()
+
+
+def _shard_iterable(dataset, dataset_repeat: bool, seed: int, split_by_node: bool):
+    dp_rank, dp_size = 0, 1
+    if split_by_node:
+        parallel_state = get_parallel_state()
+        dp_rank = parallel_state.dp_rank
+        dp_size = parallel_state.dp_size
+    return ShardedIterableDataset(dataset, dp_rank=dp_rank, dp_size=dp_size, repeat=dataset_repeat, seed=seed)
 
 
 @DATASET_REGISTRY.register("mapping")
@@ -1264,6 +1558,7 @@ def build_mapping_dataset(
     train_path: str,
     transform: Optional[Callable] = None,
     namespace: Literal["train", "test"] = "train",
+    seed: int = 42,
     source_name: Optional[str] = None,
     **kwargs,
 ) -> "Dataset":
@@ -1273,6 +1568,7 @@ def build_mapping_dataset(
         train_path (str): data path
         transform (Optional[Callable]): transform function
         namespace (Literal["train", "test"]): dataset namespace
+        seed (int): random seed
         source_name (Optional[str]): source name
     Returns:
         Dataset: mapping dataset
@@ -1284,7 +1580,7 @@ def build_mapping_dataset(
 
     if transform:
         transform = partial(transform, source_name=source_name)
-    return MappingDataset(data=dataset, transform=transform)
+    return MappingDataset(data=dataset, transform=transform, seed=seed)
 
 
 @DATASET_REGISTRY.register("iterable")
@@ -1296,6 +1592,7 @@ def build_iterable_dataset(
     source_name: Optional[str] = None,
     split_by_node: bool = True,
     shuffle: bool = True,
+    dataset_repeat: bool = False,
     **kwargs,
 ) -> "IterableDataset":
     """
@@ -1306,6 +1603,9 @@ def build_iterable_dataset(
         namespace (Literal["train", "test"]): dataset namespace
         seed (int): random seed
         source_name (Optional[str]): source name
+        split_by_node (bool): shard the stream across DP ranks
+        shuffle (bool): shuffle examples with a streaming buffer
+        dataset_repeat (bool): if True, replay so training can reach max_steps; if False, one pass ends the epoch
     Returns:
         IterableDataset: iterative dataset
     """
@@ -1315,9 +1615,8 @@ def build_iterable_dataset(
     if shuffle:
         dataset = dataset.shuffle(seed=seed, buffer_size=10_000)
 
-    if split_by_node:
-        parallel_state = get_parallel_state()
-        dataset = split_dataset_by_node(dataset, parallel_state.dp_rank, parallel_state.dp_size)
+    if dataset_repeat or split_by_node:
+        dataset = _shard_iterable(dataset, bool(dataset_repeat), seed, split_by_node)
 
     if transform:
         transform = partial(transform, source_name=source_name)
@@ -1369,15 +1668,17 @@ def build_interleave_dataset(
             return dataset.map(trans_example)
 
         for idx, source in enumerate(sources):
-            dataset = build_iterable_dataset(source, namespace=namespace, seed=seed, split_by_node=False)
+            dataset = build_iterable_dataset(
+                source, namespace=namespace, seed=seed, split_by_node=False, dataset_repeat=False
+            )
             ds = dataset._data
             ds = add_ds_idx_to_iterable(ds, idx, source_names[idx])
             datasets.append(ds)
 
         interleave_dataset = interleave_datasets(datasets=datasets, probabilities=weights, seed=seed)
-        # split dataset by node
-        parallel_state = get_parallel_state()
-        interleave_dataset = split_dataset_by_node(interleave_dataset, parallel_state.dp_rank, parallel_state.dp_size)
+        interleave_dataset = _shard_iterable(
+            interleave_dataset, bool(kwargs.get("dataset_repeat", False)), seed, split_by_node=True
+        )
 
         interleave_dataset = InterleavedIterableDataset(
             interleave_dataset,
@@ -1395,6 +1696,7 @@ def build_interleave_dataset(
         interleave_dataset = InterleavedMappingDataset(
             interleave_datasets(datasets=datasets, probabilities=weights, seed=seed),
             transform=transform,
+            seed=seed,
         )
     else:
         raise ValueError(f"Unsupported datasets_type: {datasets_type}")
@@ -1530,6 +1832,7 @@ def build_weighted_multisource_dataset(
             transform=transform,
             split_by_node=split_by_node,
             shuffle=shuffle,
+            dataset_repeat=bool(kwargs.get("dataset_repeat", False)),
         )
         for source in sources
     ]

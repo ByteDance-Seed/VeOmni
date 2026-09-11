@@ -83,6 +83,23 @@ def rearrange_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rerange_typ
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False, attn_mask=None):
     # bs, head_cont, seq, head_dim = q.shape
 
+    if attn_mask is not None:
+        # flash_attn_func (FA2/FA3) does not accept an arbitrary attention mask, so fall
+        # back to scaled_dot_product_attention, which supports an additive mask. Note that
+        # supplying a mask rules out SDPA's flash backend, so this uses the memory-efficient
+        # kernel (or the math fallback) instead. The flash-attn path below is for the
+        # mask-less case only.
+        if causal:
+            # scaled_dot_product_attention cannot take both `attn_mask` and `is_causal`, so
+            # merge a lower-triangular causal bias into the additive mask to preserve the
+            # caller's causal intent. No in-tree caller passes a mask with causal=True; this
+            # is defensive for future callers.
+            if attn_mask.dtype == torch.bool:
+                attn_mask = torch.zeros_like(attn_mask, dtype=q.dtype).masked_fill_(~attn_mask, float("-inf"))
+            causal_bias = torch.triu(torch.full_like(attn_mask, float("-inf")), diagonal=1)
+            attn_mask = attn_mask + causal_bias
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+
     if FLASH_ATTN_3_AVAILABLE or FLASH_ATTN_2_AVAILABLE:
         rerange_type_seq_head = "b n s d -> b s n d"
         rerange_type_head_seq = "b s n d -> b n s d"
@@ -235,7 +252,7 @@ class FluxJointAttention(torch.nn.Module):
         k = torch.concat([k_b, k_a], dim=2)
         v = torch.concat([v_b, v_a], dim=2)
         q, k = self.apply_rope(q, k, image_rotary_emb)
-        hidden_states = flash_attention(q, k, v, causal=True, attn_mask=attn_mask)
+        hidden_states = flash_attention(q, k, v, causal=False, attn_mask=attn_mask)
 
         if get_parallel_state().ulysses_enabled:
             hidden_states = gather_heads_scatter_seq(hidden_states, seq_dim=2, head_dim=1)
@@ -385,7 +402,7 @@ class FluxSingleTransformerBlock(torch.nn.Module):
 
         q, k = self.apply_rope(q, k, image_rotary_emb)
 
-        hidden_states = flash_attention(q, k, v, causal=True, attn_mask=attn_mask)
+        hidden_states = flash_attention(q, k, v, causal=False, attn_mask=attn_mask)
 
         if get_parallel_state().ulysses_enabled:
             hidden_states = gather_heads_scatter_seq(hidden_states, seq_dim=2, head_dim=1)

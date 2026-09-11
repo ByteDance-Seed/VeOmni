@@ -116,7 +116,7 @@ __all__ = [
 def _fa_forward(q, k, v, softmax_scale, causal, dropout_p=0.0):
     """Dense low-level FA forward returning ``(out, lse)`` with ``lse`` as ``(b, h, s)``."""
     if FA_BACKEND == "fa4":
-        out, lse = _fa4_fwd(
+        out, lse, *_ = _fa4_fwd(
             q,
             k,
             v,
@@ -542,7 +542,7 @@ def zigzag_ring_flash_attn_func(
 def _fa_varlen_forward(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale, causal):
     """Varlen low-level FA forward returning ``(out, lse)`` with ``lse`` as ``(h, total)``."""
     if FA_BACKEND == "fa4":
-        out, lse = _fa4_fwd(
+        out, lse, *_ = _fa4_fwd(
             q,
             k,
             v,
@@ -916,7 +916,8 @@ def forward(
     dropout_p: float = 0.0,
 ) -> Tensor:
     """Run balanced causal Ring Attention on fixed-shape CUDA tensors."""
-    del dropout_p  # The CUDA Ring backend currently preserves its zero-dropout behavior.
+    if dropout_p:
+        raise NotImplementedError("CUDA Ring Attention does not support nonzero dropout.")
     return zigzag_ring_flash_attn_func(q, k, v, softmax_scale=softmax_scale, causal=causal, group=group)
 
 
@@ -932,7 +933,8 @@ def packed_forward(
     dropout_p: float = 0.0,
 ) -> Tensor:
     """Run balanced causal Ring Attention on packed CUDA tensors."""
-    del dropout_p  # The CUDA Ring backend currently preserves its zero-dropout behavior.
+    if dropout_p:
+        raise NotImplementedError("CUDA Ring Attention does not support nonzero dropout.")
     return zigzag_ring_flash_attn_varlen_func(
         q,
         k,

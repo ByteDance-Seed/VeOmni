@@ -210,11 +210,10 @@ class Qwen3VLEncoderDataBalance:
 
     @staticmethod
     def rank_table_mapping(rank_table: list, dp_rank: int) -> Tuple[list, list]:
-        # Validate rank_table before stacking
+        # Each entry is already a per-rank tensor from the sorting algo; validate it is non-empty before slicing.
         for i, rt in enumerate(rank_table):
-            assert len(rt) > 0, f"rank_table[{i}] is empty (expected non-empty tensor list)"
+            assert rt.numel() > 0, f"rank_table[{i}] is empty (expected a non-empty tensor)"
 
-        rank_table = [torch.stack(rt) for rt in rank_table]
         rank_table_for_current_rank = [rt[rt[:, 0] == dp_rank][:, 1] for rt in rank_table]
 
         return rank_table_for_current_rank, rank_table

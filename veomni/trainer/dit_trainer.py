@@ -25,6 +25,10 @@ from datasets import Dataset
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
+from veomni.data.multimodal.dit import (
+    data_transform as _data_transform_register,  # noqa: F401  (import side effect: registers dit_offline / dit_online / minimax_h3_online transforms)
+)
+
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import build_data_transform, build_dataloader
 from ..data.data_collator import DataCollator
@@ -145,6 +149,17 @@ class DiTDataArguments(DataArguments):
         default=True,
         metadata={"help": "Whether or not to shuffle the dataset."},
     )
+    data_transform: Optional[str] = field(
+        default="dit_online",
+        metadata={
+            "help": "Override the DATA_TRANSFORM_REGISTRY transform name. "
+            "When None, DiTTrainer picks dit_offline/dit_online by training_task."
+        },
+    )
+    log_sample: bool = field(
+        default=True,
+        metadata={"help": "Whether to print the first micro batch example to the log."},
+    )
 
 
 @dataclass
@@ -178,8 +193,6 @@ class DiTTrainer:
     offline_embedding_saver: OfflineEmbeddingSaver = None
 
     def __init__(self, args: VeOmniDiTArguments):
-        if getattr(getattr(args.train, "chunk_mbs_config", None), "enable", False):
-            raise ValueError("train.chunk_mbs_config is not supported by DiTTrainer.")
         if args.train.channel_loss.enable:
             raise ValueError(
                 "train.channel_loss is only supported by causal-LM trainers; DiTTrainer uses diffusion objectives."
@@ -191,6 +204,7 @@ class DiTTrainer:
         # ``base._setup`` registers ParallelState; DiT then recomputes
         # dataloader_batch_size from ``dp_size``.
         self._setup()
+        self.base.LOG_SAMPLE = args.data.log_sample
 
         # All build steps read the current ParallelState via ``get_parallel_state()``
         # (meta-init, FSDP2/EP wrap + weight load, optimizer, SP data pipeline), so
@@ -278,8 +292,8 @@ class DiTTrainer:
             self.base.model = build_foundation_model(
                 config_path=args.model.config_path,
                 weights_path=args.model.model_path,
-                torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
-                init_device=args.train.init_device,
+                torch_dtype="float32" if args.model.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
+                init_device=args.model.accelerator.init_device,
                 ops_implementation=args.model.ops_implementation,
                 config_kwargs=model_config,
             )
@@ -322,11 +336,12 @@ class DiTTrainer:
 
     def _build_data_transform(self):
         args: VeOmniDiTArguments = self.base.args
+        logger.info(f"args.data.data_transform: {args.data.data_transform}, training_task: {self.training_task}")
         if self.training_task == "offline_training":
             self.base.data_transform = build_data_transform("dit_offline")
         else:
             self.base.data_transform = build_data_transform(
-                "dit_online",
+                args.data.data_transform,
                 **args.data.mm_configs,
             )
 
@@ -396,6 +411,8 @@ class DiTTrainer:
                 drop_last=args.data.dataloader.drop_last,
                 pin_memory=args.data.dataloader.pin_memory,
                 prefetch_factor=args.data.dataloader.prefetch_factor,
+                persistent_workers=args.data.dataloader.persistent_workers,
+                in_order=args.data.dataloader.in_order,
                 seed=args.train.seed,
                 collate_fn=DiTDataCollator(),
                 save_steps=args.train.checkpoint.save_steps,
@@ -418,8 +435,8 @@ class DiTTrainer:
     def on_step_begin(self, micro_batches=None):
         self.base.on_step_begin(micro_batches=micro_batches)
 
-    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
+        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=aux_metrics)
 
     def preforward(self, micro_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass."""
@@ -444,7 +461,7 @@ class DiTTrainer:
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
         loss_dict: Dict[str, torch.Tensor] = outputs.loss
-        loss_dict = {k: v / self.base.args.train.micro_batch_size for k, v in loss_dict.items()}
+        loss_dict = {k: v / self.base.num_micro_batches for k, v in loss_dict.items()}
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
 
@@ -508,9 +525,10 @@ class DiTTrainer:
             else:
                 micro_batches = next(data_iterator)
 
+        self.base._reset_async_activation_offload_if_enabled()
         self.on_step_begin(micro_batches=micro_batches)
 
-        synchronize()
+        self.base.sync_before_train_step()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(float)
@@ -521,6 +539,7 @@ class DiTTrainer:
         for micro_step, micro_batch in enumerate(micro_batches):
             if self.training_task != "offline_embedding":
                 self.base.model_reshard(micro_step, num_micro_batches)
+                self.base._configure_hsdp_allreduce(micro_step, num_micro_batches)
 
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
@@ -534,7 +553,7 @@ class DiTTrainer:
 
         if self.training_task != "offline_embedding":
             with use_parallel_state("base"):
-                grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+                grad_norm = veomni_clip_grad_norm(self.base.model, args.model.optimizer.max_grad_norm)
             self.base.optimizer.step()
             self.base.lr_scheduler.step()
             self.base.optimizer.zero_grad()

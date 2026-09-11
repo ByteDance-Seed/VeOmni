@@ -135,12 +135,6 @@ class ChannelLossComputer:
                 if isinstance(nxt, torch.nn.Module) and nxt is not cur:
                     cur = nxt
                     continue
-            is_seed_omni = any(cls.__name__ == "SeedOmniModel" for cls in type(cur).__mro__)
-            if is_seed_omni:
-                nxt = getattr(cur, "foundation", None)
-                if isinstance(nxt, torch.nn.Module) and nxt is not cur:
-                    cur = nxt
-                    continue
             if cls_name.startswith("Peft"):
                 nxt = getattr(cur, "base_model", None)
                 if isinstance(nxt, torch.nn.Module):
@@ -163,15 +157,6 @@ class ChannelLossComputer:
             return
 
         host = self._resolve_loss_fn_host(model)
-        if host is not None and any(
-            cls.__name__ == "Qwen3MoeFoundationModel"
-            and ".seed_omni.foundation.qwen3_moe_foundation." in cls.__module__
-            for cls in type(host).__mro__
-        ):
-            raise ValueError(
-                "train.channel_loss does not support SeedOmni Qwen3MoeFoundationModel because it "
-                "computes causal-LM loss directly instead of using loss_function or a loss OpSlot."
-            )
         if host is None or not hasattr(host, "loss_function"):
             logger.warning_rank0(
                 "Channel loss: could not locate model.loss_function "
