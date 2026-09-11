@@ -195,7 +195,8 @@ def test_eager_matches_swiglu_limit():
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger SwiGLU needs a GPU")
 @pytest.mark.parametrize("hidden, intermediate", [(64, 128), (128, 256)])
-def test_liger_matches_eager(hidden: int, intermediate: int):
+@pytest.mark.parametrize("swiglu_limit", [None, 1.0])
+def test_liger_matches_eager(hidden: int, intermediate: int, swiglu_limit: float | None):
     pytest.importorskip("liger_kernel")
     eager = resolve_op("swiglu_mlp", "standard", "eager").wrapper
     other = resolve_op("swiglu_mlp", "standard", "liger_kernel").wrapper
@@ -209,8 +210,8 @@ def test_liger_matches_eager(hidden: int, intermediate: int):
     mlp_o = _tiny_qwen3_mlp(hidden, intermediate).to(device="cuda", dtype=torch.bfloat16)
     mlp_e.load_state_dict(mlp.state_dict())
     mlp_o.load_state_dict(mlp.state_dict())
-    out_e = eager(*_mlp_args(mlp_e, x_e))
-    out_o = other(*_mlp_args(mlp_o, x_o))
+    out_e = eager(*_mlp_args(mlp_e, x_e), swiglu_limit=swiglu_limit)
+    out_o = other(*_mlp_args(mlp_o, x_o), swiglu_limit=swiglu_limit)
     assert torch.allclose(out_e, out_o, atol=SWIGLU_FUSED_ATOL, rtol=SWIGLU_FUSED_RTOL)
 
     go = torch.randn_like(out_e)
@@ -219,3 +220,21 @@ def test_liger_matches_eager(hidden: int, intermediate: int):
     assert torch.allclose(x_e.grad, x_o.grad, atol=SWIGLU_FUSED_GRAD_ATOL, rtol=SWIGLU_FUSED_GRAD_RTOL)
     for param_e, param_o in zip(mlp_e.parameters(), mlp_o.parameters(), strict=True):
         assert torch.allclose(param_e.grad, param_o.grad, atol=SWIGLU_FUSED_GRAD_ATOL, rtol=SWIGLU_FUSED_GRAD_RTOL)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger SwiGLU needs a GPU")
+def test_liger_swiglu_limit_keeps_fused_activation_in_fp32():
+    """Keep the clamped tensors in FP32 until fused SiLU-mul completes."""
+    pytest.importorskip("liger_kernel")
+    torch.manual_seed(3)
+    mlp = _tiny_qwen3_mlp().to(device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(2, 16, mlp.hidden_size, device="cuda", dtype=torch.bfloat16)
+    entry = resolve_op("swiglu_mlp", "standard", "liger_kernel")
+    assert entry.forward is not None
+
+    output, saved = entry.forward(*_mlp_args(mlp, x), swiglu_limit=1.0)
+    saved_gate, saved_up = saved.tensors[-2:]
+
+    assert output.dtype == torch.bfloat16
+    assert saved_gate.dtype == torch.float32
+    assert saved_up.dtype == torch.float32

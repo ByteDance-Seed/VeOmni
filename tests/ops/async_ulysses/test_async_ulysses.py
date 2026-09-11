@@ -157,6 +157,38 @@ def test_registered_eager_rows() -> None:
         resolve_op("async_ulysses_qkv", "bagel", "eager")
 
 
+def test_standard_qkv_rejects_nondivisible_kv_heads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reject KV-head layouts that cannot scatter evenly across Ulysses ranks."""
+    module = _eager_module("async_ulysses_qkv", "standard")
+    monkeypatch.setattr(module, "get_ulysses_sequence_parallel_world_size", lambda: 4)
+
+    def unexpected_collective(*args, **kwargs):
+        pytest.fail("head validation must run before the first collective")
+
+    monkeypatch.setattr(module, "all_to_all_tensor", unexpected_collective)
+    head_dim = 2
+    hidden_states = torch.randn(1, 2, 8)
+    weights = _qkv_weights(8, 12 * head_dim, 6 * head_dim, bias=False, requires_grad=False)
+
+    with pytest.raises(
+        ValueError,
+        match=r"num_key_value_heads \(6\) must be divisible by ulysses_size \(4\)",
+    ):
+        module.forward(
+            hidden_states,
+            *weights,
+            None,
+            None,
+            None,
+            None,
+            seq_dimension=1,
+            head_dimension=2,
+            unpadded_dim_size=2,
+            head_dim=head_dim,
+            group=object(),
+        )
+
+
 @pytest.mark.parametrize("norm_type", [None, "rmsnorm"])
 def test_standard_qkv_matches_sequential(monkeypatch: pytest.MonkeyPatch, norm_type: str | None) -> None:
     _mock_identity_comm(monkeypatch)

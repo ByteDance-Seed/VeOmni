@@ -85,6 +85,8 @@ def forward(
             )
         need_repeat_kv = True
         n_repeat = ulysses_size // num_kv_heads
+    elif num_kv_heads % ulysses_size != 0:
+        raise ValueError(f"num_key_value_heads ({num_kv_heads}) must be divisible by ulysses_size ({ulysses_size})")
 
     # Launch Q/K/V all-to-all as soon as each projection is ready.
     q = F.linear(hidden_states, q_weight, q_bias)

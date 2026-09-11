@@ -19,6 +19,8 @@ from collections.abc import Callable
 import torch
 from torch import Tensor
 
+from ..helper import require_all
+
 
 def packed_mask_function(
     *,
@@ -84,8 +86,10 @@ def _validated_cu_seqlens(cu_seqlens: Tensor, length: int, device: torch.device)
     if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
         raise ValueError(f"cu_seqlens must have shape [n_seg + 1], got {tuple(cu_seqlens.shape)}")
     cu_seqlens = cu_seqlens.to(device=device)
-    if int(cu_seqlens[0]) != 0 or int(cu_seqlens[-1]) != length:
-        raise ValueError(f"cu_seqlens must run from 0 to {length}, got {cu_seqlens.tolist()}")
+    require_all(
+        (cu_seqlens[:1] == 0) & (cu_seqlens[-1:] == length),
+        f"cu_seqlens must run from 0 to {length}",
+    )
     return cu_seqlens
 
 

@@ -64,13 +64,12 @@ def forward(
         gate = gate.float()
         up = up.float()
     gate_c, up_c = _eager.clamp_gate_up(gate, up, swiglu_limit)
-    if gate_c.dtype != x.dtype:
-        gate_c = gate_c.to(dtype=x.dtype)
-        up_c = up_c.to(dtype=x.dtype)
 
     from liger_kernel.ops.swiglu import swiglu_forward
 
     saved_gate, saved_up, hidden = swiglu_forward(gate_c.contiguous(), up_c.contiguous())
+    if hidden.dtype != x.dtype:
+        hidden = hidden.to(dtype=x.dtype)
     output = _eager.linear(hidden, down_w, down_b)
     return output, SavedState(
         (x, gate_w, gate_b, up_w, up_b, down_w, down_b, gate, up, hidden, saved_gate, saved_up),
@@ -92,6 +91,8 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
 
     from liger_kernel.ops.swiglu import swiglu_backward
 
+    if grad_hidden.dtype != saved_gate.dtype:
+        grad_hidden = grad_hidden.to(dtype=saved_gate.dtype)
     grad_gate_c, grad_up_c = swiglu_backward(saved_gate, saved_up, grad_hidden.contiguous())
     if meta.swiglu_limit is not None:
         grad_gate = _eager.unclamp_gate(grad_gate_c.to(dtype=gate.dtype), gate, meta.swiglu_limit).to(dtype=x.dtype)
