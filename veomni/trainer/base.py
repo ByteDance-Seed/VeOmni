@@ -55,7 +55,7 @@ from ..distributed.async_offload import reset_async_activation_offload
 from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import (
     clear_parallel_state,
-    init_parallel_state_from_accelerator,
+    init_parallel_state_from_config,
     use_parallel_state,
 )
 from ..distributed.torch_compile import mark_compile_step_begin
@@ -73,14 +73,12 @@ from ..utils.loss_utils import count_loss_token, mean_global_loss, reduce_global
 from .callbacks import (
     RESERVED_TRAINING_METRIC_NAMES,
     ChannelLossCallback,
+    CheckpointCallback,
     EnvironMeterCallback,
     EvaluateCallback,
     GlobalStateCallback,
-    ModelDcpCallback,
-    ModelHfCallback,
     MoERouterMonitorCallback,
     ProfileTraceCallback,
-    RootAssetsCallback,
     TqdmCallback,
     TrainerState,
     WandbTraceCallback,
@@ -332,7 +330,7 @@ class BaseTrainer(Stateful, ABC):
 
         # Register ParallelState before seed/determinism env vars. Mesh creation
         # must not run under NCCL_DETERMINISTIC=1 on some GPU platforms (L20).
-        init_parallel_state_from_accelerator(args.model.accelerator, name="base")
+        init_parallel_state_from_config(args.model.accelerator, name="base")
 
         # Set random seed
         helper.set_seed(args.train.seed, args.train.enable_full_determinism)
@@ -480,12 +478,8 @@ class BaseTrainer(Stateful, ABC):
         self.tqdm_callback = TqdmCallback(trainer)
         self.wandb_callback = WandbTraceCallback(trainer)
         self.profile_callback = ProfileTraceCallback(trainer)
-        self.root_assets_callback = RootAssetsCallback(trainer)
-        self.dcp_callback = ModelDcpCallback(trainer)
+        self.checkpoint_callback = CheckpointCallback(trainer)
         self.global_state_callback = GlobalStateCallback(trainer)
-        # One callback, both export formats: a model that trains only adapters
-        # writes the adapter, and the model is what knows.
-        self.hf_ckpt_callback = ModelHfCallback(trainer)
         self.evaluate_callback = EvaluateCallback(trainer)
         self.moe_monitor_callback = MoERouterMonitorCallback(trainer)
         self.channel_loss_callback = ChannelLossCallback(trainer)
@@ -504,14 +498,13 @@ class BaseTrainer(Stateful, ABC):
             self.channel_loss_callback,
             self.wandb_callback,
             self.profile_callback,
-            self.root_assets_callback,
             # Weights first, then the cursor: at resume the DCP load frees its
             # materialization buffers before the dataloader prefetches, and at
             # save a crash between the two leaves weights whose trainer state is
-            # merely absent, which resumes with a warning.
-            self.dcp_callback,
+            # merely absent, which resumes with a warning. Assets + DCP + HF
+            # share CheckpointCallback so the sidecar export runs before load.
+            self.checkpoint_callback,
             self.global_state_callback,
-            self.hf_ckpt_callback,
             self.evaluate_callback,
             self.moe_monitor_callback,
         ]

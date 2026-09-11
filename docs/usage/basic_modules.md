@@ -65,7 +65,7 @@ class Arguments(VeOmniArguments):
 
 ## Parallel State
 VeOmni uses PyTorch DeviceMesh to manage multidimensional parallel topologies.
-`init_parallel_state_from_accelerator` registers a state under a logical name,
+`init_parallel_state_from_config` registers a state under a logical name,
 while `use_parallel_state` scopes operations that need to resolve the current
 process groups. The topology comes straight off `model.accelerator`, so no call
 site restates it. See [Local Parallel State Registry and Scoping](../design/local_parallel_state.md)
@@ -79,13 +79,13 @@ More details about torch device mesh, you can refer to the [Getting Started with
 from veomni.distributed.parallel_state import (
     get_parallel_state,
     get_parallel_state_by_name,
-    init_parallel_state_from_accelerator,
+    init_parallel_state_from_config,
     use_parallel_state,
 )
 
 # Reads dp / tp / pp / cp / ulysses / extra-parallel sizes, the FSDP mode and
 # async ulysses off the config; see `model.accelerator.*` for each knob.
-init_parallel_state_from_accelerator(args.model.accelerator, name="base")
+init_parallel_state_from_config(args.model.accelerator, name="base")
 
 parallel_state = get_parallel_state()
 assert parallel_state is get_parallel_state_by_name("base")

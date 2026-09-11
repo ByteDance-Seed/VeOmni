@@ -24,7 +24,7 @@ from veomni.arguments import parse_args
 from veomni.data import build_dummy_dataset
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.trainer.callbacks.base import Callback, TrainerState
-from veomni.trainer.callbacks.checkpoint_callback import ModelDcpCallback, ModelHfCallback
+from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
 from veomni.utils import helper
 
 
@@ -114,45 +114,38 @@ class TrainerTest(BaseTrainer):
 
     def _init_callbacks(self):
         self.environ_meter_callback = EnvironMeterCallbackTest(self)
-        self.dcp_callback = ModelDcpCallbackTest(self)
-        self.hf_ckpt_callback = ModelHfCallbackTest(self)
+        self.checkpoint_callback = CheckpointCallbackTest(self)
         self.check_callback = CheckCallback(self)
         self.state = TrainerState()
 
     def on_train_begin(self):
         self.environ_meter_callback.on_train_begin(self.state)
-        self.dcp_callback.on_train_begin(self.state)
-        self.hf_ckpt_callback.on_train_begin(self.state)
+        self.checkpoint_callback.on_train_begin(self.state)
         self.check_callback.on_train_begin(self.state)
 
     def on_train_end(self):
         self.environ_meter_callback.on_train_end(self.state)
-        self.dcp_callback.on_train_end(self.state)
-        self.hf_ckpt_callback.on_train_end(self.state)
+        self.checkpoint_callback.on_train_end(self.state)
         self.check_callback.on_train_end(self.state)
 
     def on_epoch_begin(self):
         self.environ_meter_callback.on_epoch_begin(self.state)
-        self.dcp_callback.on_epoch_begin(self.state)
-        self.hf_ckpt_callback.on_epoch_begin(self.state)
+        self.checkpoint_callback.on_epoch_begin(self.state)
         self.check_callback.on_epoch_begin(self.state)
 
     def on_epoch_end(self):
         self.environ_meter_callback.on_epoch_end(self.state)
-        self.dcp_callback.on_epoch_end(self.state)
-        self.hf_ckpt_callback.on_epoch_end(self.state)
+        self.checkpoint_callback.on_epoch_end(self.state)
         self.check_callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.dcp_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.hf_ckpt_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.checkpoint_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.check_callback.on_step_begin(self.state, micro_batches=micro_batches)
 
     def on_step_end(self, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs) -> None:
         self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.dcp_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.hf_ckpt_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.checkpoint_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.check_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
 
@@ -170,7 +163,7 @@ class EnvironMeterCallbackTest(Callback):
         self.trainer.environ_meter = FakeEnvironMeter()
 
 
-class ModelDcpCallbackTest(ModelDcpCallback):
+class CheckpointCallbackTest(CheckpointCallback):
     trainer: TrainerTest
 
     def on_step_end(self, state: TrainerState, **kwargs):
@@ -180,35 +173,22 @@ class ModelDcpCallbackTest(ModelDcpCallback):
         if state.epoch == 0:
             self.trainer.golden_model_sd = copy.deepcopy(self.trainer.model.state_dict())
             self.trainer.golden_optim_sd = copy.deepcopy(self.trainer.model.optimizer.state_dict())
-            self._save_checkpoint(state)
+            self._save_dcp(state)
             self.trainer.dcp_weights_path = os.path.join(
                 self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}"
             )
             self.trainer.dcp_global_step = state.global_step
+            dtypes_before_hf_save = capture_param_dtypes(self.trainer.model)
+            self._save_hf(state)
+            assert_param_dtypes_unchanged(self.trainer.model, dtypes_before_hf_save)
+            self.trainer.hf_weights_path = os.path.join(
+                self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}", "hf_ckpt"
+            )
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         pass
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
-        pass
-
-
-class ModelHfCallbackTest(ModelHfCallback):
-    trainer: TrainerTest
-
-    def on_step_end(self, state: TrainerState, **kwargs):
-        pass
-
-    def on_epoch_end(self, state: TrainerState, **kwargs):
-        state.global_step = self.trainer.dcp_global_step
-        dtypes_before_hf_save = capture_param_dtypes(self.trainer.model)
-        self._save_checkpoint(state)
-        assert_param_dtypes_unchanged(self.trainer.model, dtypes_before_hf_save)
-        self.trainer.hf_weights_path = os.path.join(
-            self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}", "hf_ckpt"
-        )
-
-    def on_train_end(self, state: TrainerState, **kwargs):
         pass
 
 

@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Job-level checkpoint callbacks, as distinct from per-model checkpoint I/O.
+"""Job-level checkpoint callback, as distinct from per-model checkpoint I/O.
 
 Nothing here belongs to a model: where the dataloader is, the rng, the metric
-meters. The sidecars an export needs are the model's; :class:`RootAssetsCallback`
-only decides *when*. Model weights and optimizers are scheduled by
-:mod:`~veomni.trainer.callbacks.checkpoint_callback`.
+meters. Model weights, optimizer, HF/LoRA export, and the tokenizer/config
+sidecars are scheduled by :mod:`~veomni.trainer.callbacks.checkpoint_callback`.
 """
 
 import os
@@ -27,6 +26,7 @@ import torch
 import torch.distributed as dist
 
 from ...utils import helper
+from ...utils.device import get_device_type
 from .base import Callback, TrainerState
 
 
@@ -41,13 +41,6 @@ _GLOBAL_STATE_FORMAT = "trainer_state_rank_{}.pt"
 
 def global_state_path(root: str, rank: int) -> str:
     return os.path.join(root, _GLOBAL_STATE_FORMAT.format(rank))
-
-
-class RootAssetsCallback(Callback):
-    """Export the config / tokenizer / processor sidecars once, at train begin."""
-
-    def on_train_begin(self, state: TrainerState, **kwargs) -> None:
-        self.trainer.model.save_model_assets()
 
 
 class GlobalStateCallback(Callback):
@@ -106,6 +99,14 @@ class GlobalStateCallback(Callback):
 
     def save_global_state(self, state: TrainerState) -> None:
         """Write this rank's job state beside the step's model checkpoint."""
+        # Drain a pending async DCP save first. CheckpointCallback returns while
+        # that write is still in flight; a cursor file that lands before the
+        # shards would resume a step whose weights never made it to disk.
+        runtime = getattr(self.trainer, "model", None)
+        checkpoint = getattr(runtime, "checkpoint", None)
+        if checkpoint is not None and hasattr(checkpoint, "wait_for_pending_save"):
+            checkpoint.wait_for_pending_save()
+
         args: "VeOmniArguments" = self.trainer.args
         step_dir = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
         os.makedirs(step_dir, exist_ok=True)
@@ -122,7 +123,15 @@ class GlobalStateCallback(Callback):
             return None
 
         state_path = global_state_path(load_path, self.rank)
-        if not os.path.exists(state_path):
+        found = os.path.exists(state_path)
+        if dist.is_initialized():
+            flag = torch.tensor([int(found)], dtype=torch.int32, device=get_device_type())
+            dist.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+            found = bool(flag.item())
+            if not found:
+                logger.warning_rank0("Trainer state missing on at least one rank; resuming weights only.")
+                return None
+        elif not found:
             logger.warning(f"No trainer state at {state_path}; resuming weights only.")
             return None
 
@@ -166,4 +175,4 @@ class GlobalStateCallback(Callback):
         self.trainer.start_step = global_step % args.train_steps
 
 
-__all__ = ["GlobalStateCallback", "RootAssetsCallback", "global_state_path"]
+__all__ = ["GlobalStateCallback", "global_state_path"]

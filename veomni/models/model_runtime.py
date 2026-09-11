@@ -166,9 +166,9 @@ class VeOmniModelRuntime:
         mesh from its accelerator config, which is why sibling models in one job
         can hold different ones.
         """
-        from ..distributed.parallel_state import init_parallel_state_from_accelerator
+        from ..distributed.parallel_state import init_parallel_state_from_config
 
-        init_parallel_state_from_accelerator(self.args.accelerator, self.model_name)
+        init_parallel_state_from_config(self.args.accelerator, self.model_name)
 
     @property
     def parallel_state(self):

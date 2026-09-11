@@ -114,7 +114,7 @@ class ParallelState:
         if self.sp_enabled and self.device_mesh is None:
             raise ValueError(
                 "A sequence-parallel ParallelState must be built with a device mesh "
-                "(use init_parallel_state_from_accelerator); meshless sequence-parallel init "
+                "(use init_parallel_state_from_config); meshless sequence-parallel init "
                 "is no longer supported."
             )
 
@@ -480,7 +480,7 @@ def _init_parallel_state(
     Private: every parallelism knob here also lives on
     :class:`~veomni.arguments.AcceleratorConfig`, so a second mapping restated
     at a call site is a second place to keep in sync. Production code goes
-    through :func:`init_parallel_state_from_accelerator`. Tests call this
+    through :func:`init_parallel_state_from_config`. Tests call this
     directly to build a topology no job config can express — a CPU mesh, or a
     rank layout unrelated to ``WORLD_SIZE``.
 
@@ -687,7 +687,7 @@ def _init_parallel_state(
     return parallel_state
 
 
-def init_parallel_state_from_accelerator(accelerator: "AcceleratorConfig", name: Optional[str]) -> "ParallelState":
+def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Optional[str]) -> "ParallelState":
     """Build the mesh an :class:`AcceleratorConfig` describes and register it as ``name``.
 
     Every parallelism knob already lives on the config, so a caller that has one

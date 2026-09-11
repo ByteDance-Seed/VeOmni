@@ -12,97 +12,77 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Trainer-layer callbacks that schedule model checkpoint I/O.
+"""Trainer-layer callback that schedules model checkpoint I/O.
 
-These own the every-N-steps / epochs cadence and nothing else. *What* is written
-is :meth:`BaseTrainer.save_dcp` / :meth:`~BaseTrainer.save_hf_or_lora` /
-:meth:`~BaseTrainer.load`, which fan out to the model handles; *how* belongs to
-each model's :class:`~veomni.models.checkpoint_manager.ModelCheckpointManager`.
+This owns the every-N-steps / epochs cadence and the one-shot sidecar export.
+*What* is written is :meth:`BaseTrainer.save_dcp` /
+:meth:`~BaseTrainer.save_hf_or_lora` / :meth:`~BaseTrainer.load`, which fan
+out to the model handles, plus :meth:`VeOmniModelRuntime.save_model_assets`.
+*How* belongs to each model's
+:class:`~veomni.models.checkpoint_manager.ModelCheckpointManager`.
+
+DCP and HF/LoRA share this callback because they share a manager; each format
+still has its own cadence knobs and its own last-saved step so a DCP write
+does not suppress an HF export or the reverse.
 
 Job-level state — where the dataloader is, the rng, the meters — is not written
 here. It has its own schedule and its own files, in
 :mod:`~veomni.trainer.callbacks.global_state_callback`.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from ...utils import helper
 from .base import Callback, TrainerState
 
 
 if TYPE_CHECKING:
+    from ...models.checkpoint_manager import ModelCheckpointManager
     from ..base import BaseTrainer, VeOmniArguments
 
 
 logger = helper.create_logger(__name__)
 
 
-class ModelDcpCallback(Callback):
-    """Schedule the resumable checkpoint via :meth:`BaseTrainer.load` / ``save_dcp``."""
+def _runtime_checkpoint(trainer: "BaseTrainer") -> Optional["ModelCheckpointManager"]:
+    """The manager on this job's model, or ``None`` when the trainer has no runtime."""
+    runtime = getattr(trainer, "model", None)
+    checkpoint = getattr(runtime, "checkpoint", None)
+    if checkpoint is not None and hasattr(checkpoint, "wait_for_pending_save"):
+        return checkpoint
+    return None
+
+
+class CheckpointCallback(Callback):
+    """Schedule DCP / HF / LoRA I/O and the one-shot tokenizer/config export."""
 
     def __init__(self, trainer: "BaseTrainer"):
         super().__init__(trainer)
         args: "VeOmniArguments" = self.trainer.args
-        self.every_n_steps = args.train.checkpoint.save_steps
-        self.every_n_epochs = args.train.checkpoint.save_epochs
-        # Tracked per callback rather than read off the model: the DCP and HF
-        # callbacks save on independent cadences, and each one's "did I already
-        # save this step?" answer has to be about its own writes.
-        self._last_saved_step: int = -1
+        ckpt = args.train.checkpoint
+        self.dcp_every_n_steps = ckpt.save_steps
+        self.dcp_every_n_epochs = ckpt.save_epochs
+        self.save_hf_weights = ckpt.save_hf_weights
+        self.hf_every_n_steps = ckpt.hf_save_steps
+        self.hf_every_n_epochs = ckpt.hf_save_epochs
+        self._last_dcp_step: int = -1
+        self._last_hf_step: int = -1
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+        self.trainer.model.save_model_assets()
         self.trainer.load()
-        # Free transient buffers from DCP materialization before the first train
-        # step. Large MoE resumes are often near GPU capacity; leftover allocator
-        # fragments after load can OOM the first NCCL collective (e.g. the
-        # grad-norm all-reduce).
+        checkpoint = _runtime_checkpoint(self.trainer)
+        if checkpoint is not None:
+            checkpoint.restore_legacy_job_state(self.trainer)
         helper.empty_cache()
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
-        """Block until an in-flight async save has finished before the run exits.
-
-        With ``save_async``, ``save_dcp`` returns as soon as ``dcp.async_save``
-        has been queued. ``wait_for_pending_save`` is the only place that future
-        is consumed; without this hook a run whose last save is also its only
-        save can exit 0 while a background write failed.
-        """
-        self.trainer.model.checkpoint.wait_for_pending_save()
-
-    def on_step_end(self, state: TrainerState, **kwargs):
-        if self.every_n_steps and state.global_step % self.every_n_steps == 0:
-            self._save_checkpoint(state)
-
-    def on_epoch_end(self, state: TrainerState, **kwargs):
-        if self.every_n_epochs and (state.epoch + 1) % self.every_n_epochs == 0:
-            if state.global_step != self._last_saved_step:
-                self._save_checkpoint(state)
-            else:
-                logger.info_rank0(
-                    f"Skipping duplicate checkpoint save at epoch_end (global_step {state.global_step} "
-                    f"already saved at step_end)."
-                )
-
-    def _save_checkpoint(self, state: TrainerState):
-        """Save distributed checkpoint and optimizer state at each save_steps."""
-        self.trainer.save_dcp(state)
-        self._last_saved_step = state.global_step
-
-
-class ModelHfCallback(Callback):
-    """Schedule the HF / LoRA export; the model picks which format it writes."""
-
-    def __init__(self, trainer: "BaseTrainer"):
-        super().__init__(trainer)
-        args: "VeOmniArguments" = self.trainer.args
-        self.save_hf_weights = args.train.checkpoint.save_hf_weights
-        self.every_n_steps = args.train.checkpoint.hf_save_steps
-        self.every_n_epochs = args.train.checkpoint.hf_save_epochs
-        self._last_saved_step: int = -1
-
-    def on_train_end(self, state: TrainerState, **kwargs):
+        checkpoint = _runtime_checkpoint(self.trainer)
+        if checkpoint is not None:
+            checkpoint.wait_for_pending_save()
         if self.save_hf_weights:
-            if state.global_step != self._last_saved_step:
-                self._save_checkpoint(state, stage="train_end")
+            if state.global_step != self._last_hf_step:
+                self._save_hf(state, stage="train_end")
             else:
                 logger.info_rank0(
                     f"Skipping duplicate HF checkpoint save at train_end (global_step {state.global_step} "
@@ -110,23 +90,36 @@ class ModelHfCallback(Callback):
                 )
 
     def on_step_end(self, state: TrainerState, **kwargs):
-        if self.save_hf_weights and self.every_n_steps and state.global_step % self.every_n_steps == 0:
-            self._save_checkpoint(state)
+        if self.dcp_every_n_steps and state.global_step % self.dcp_every_n_steps == 0:
+            self._save_dcp(state)
+        if self.save_hf_weights and self.hf_every_n_steps and state.global_step % self.hf_every_n_steps == 0:
+            self._save_hf(state)
 
     def on_epoch_end(self, state: TrainerState, **kwargs):
-        if self.save_hf_weights and self.every_n_epochs and (state.epoch + 1) % self.every_n_epochs == 0:
-            if state.global_step != self._last_saved_step:
-                self._save_checkpoint(state)
+        if self.dcp_every_n_epochs and (state.epoch + 1) % self.dcp_every_n_epochs == 0:
+            if state.global_step != self._last_dcp_step:
+                self._save_dcp(state)
+            else:
+                logger.info_rank0(
+                    f"Skipping duplicate checkpoint save at epoch_end (global_step {state.global_step} "
+                    f"already saved at step_end)."
+                )
+        if self.save_hf_weights and self.hf_every_n_epochs and (state.epoch + 1) % self.hf_every_n_epochs == 0:
+            if state.global_step != self._last_hf_step:
+                self._save_hf(state)
             else:
                 logger.info_rank0(
                     f"Skipping duplicate HF checkpoint save at epoch_end (global_step {state.global_step} "
                     f"already saved at step_end)."
                 )
 
-    def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
-        """Export the weights, in HF safetensors or PEFT layout as the model requires."""
+    def _save_dcp(self, state: TrainerState):
+        self.trainer.save_dcp(state)
+        self._last_dcp_step = state.global_step
+
+    def _save_hf(self, state: TrainerState, stage: str = "step_end"):
         self.trainer.save_hf_or_lora(state, stage=stage)
-        self._last_saved_step = state.global_step
+        self._last_hf_step = state.global_step
 
 
-__all__ = ["ModelDcpCallback", "ModelHfCallback"]
+__all__ = ["CheckpointCallback"]

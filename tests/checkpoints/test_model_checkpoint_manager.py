@@ -42,7 +42,10 @@ def _make_config(load_path=None):
 
 @pytest.fixture
 def make_manager():
-    with patch("veomni.models.checkpoint_manager.build_checkpointer") as build:
+    with (
+        patch("veomni.models.checkpoint_manager.build_checkpointer") as build,
+        patch("veomni.models.checkpoint_manager.get_parallel_state"),
+    ):
         build.return_value = MagicMock()
 
         def _make(cls=ModelCheckpointManager, *, lora_config=None, load_path=None):

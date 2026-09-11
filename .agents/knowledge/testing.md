@@ -10,6 +10,7 @@ A test that passes locally is not necessarily a test CI runs.
 | Path | How CI picks it up |
 |------|--------------------|
 | `tests/data/` | whole directory, in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
+| `tests/checkpoints/` | whole directory, in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
 | `tests/ops/` | whole directory in `gpu_unit_tests.yml`; NPU runs only a few named files |
 | `tests/parallel/context_parallel/` | whole directory, `gpu_unit_tests.yml` only |
 | everything else | **one `pytest` line per file**, listed in `gpu_unit_tests.yml`, and separately in `npu_unit_tests.yml` when it should run on Ascend |

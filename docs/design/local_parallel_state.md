@@ -10,7 +10,7 @@ use different sequence-parallel groups while preserving the simple
 
 | API | Purpose |
 |-----|---------|
-| `init_parallel_state_from_accelerator(accelerator, name)` | Build the topology an `AcceleratorConfig` describes, register it under `name`, and establish the first state as the ambient default. |
+| `init_parallel_state_from_config(accelerator, name)` | Build the topology an `AcceleratorConfig` describes, register it under `name`, and establish the first state as the ambient default. |
 | `get_parallel_state_by_name(name)` | Retrieve a registered state without changing the ambient state. |
 | `use_parallel_state(name_or_state)` | Temporarily make a registered name or `ParallelState` object ambient, then restore the previous state on exit. |
 | `get_parallel_state()` | Return the current ambient state; before initialization it returns a single-process state and logs a warning. |
@@ -33,12 +33,12 @@ described there rather than restated at the call site:
 from veomni.arguments import AcceleratorConfig
 from veomni.distributed.parallel_state import (
     get_parallel_state_by_name,
-    init_parallel_state_from_accelerator,
+    init_parallel_state_from_config,
     use_parallel_state,
 )
 
 accelerator = AcceleratorConfig(dp_shard_size=4, ulysses_size=2)  # needs WORLD_SIZE=8
-init_parallel_state_from_accelerator(accelerator, name="base")
+init_parallel_state_from_config(accelerator, name="base")
 
 base_state = get_parallel_state_by_name("base")
 
@@ -56,8 +56,8 @@ Register each logical module on every rank, in the same order, before its first
 scoped operation. For an eight-rank process group:
 
 ```python
-init_parallel_state_from_accelerator(thinker_args.accelerator, name="thinker")
-init_parallel_state_from_accelerator(talker_args.accelerator, name="talker")
+init_parallel_state_from_config(thinker_args.accelerator, name="thinker")
+init_parallel_state_from_config(talker_args.accelerator, name="talker")
 
 with use_parallel_state("thinker"):
     thinker_output = thinker(batch)

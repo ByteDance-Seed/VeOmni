@@ -128,7 +128,7 @@ original model, so every LoRA parameter FQN and every saved adapter key carries 
 `generate` are unchanged. After wrapping, the base model is fully frozen and only the LoRA
 parameters (dense `LoraLinear` and MoE-LoRA, if any) have `requires_grad=True`.
 
-`BaseTrainer._init_callbacks()` registers one `ModelHfCallback` either way. The export format
+`BaseTrainer._init_callbacks()` registers one `CheckpointCallback` either way. The export format
 is the model's decision, not the callback's: a model that trains only adapters exports the
 adapter, so there is nothing for a LoRA-specific callback to do.
 
@@ -228,17 +228,18 @@ infix (PEFT convention — e.g. `lora_A.weight`), whereas the live model stores 
 
 ### DCP checkpoint (training state)
 
-`ModelDcpCallback` decides *when* to save and calls `trainer.save_dcp`, which fans out to
+`CheckpointCallback` decides *when* to save and calls `trainer.save_dcp`, which fans out to
 `trainer.model.save_dcp` and lands in `ModelCheckpointManager`
-(`veomni/models/checkpoint_manager.py`), which saves the
+(`veomni/models/checkpoint_manager.py`). That writes the
 full distributed state (model + optimizer + extra state) via PyTorch DCP. For LoRA training
-this includes both base-model parameters **and** adapter parameters; the optimizer state only
-covers the trainable adapter parameters.
+the DCP stores the trainable adapter parameters, optimizer state, and model-bound extra
+state; the base model is loaded separately from `model.model_path`. Job-level state
+(dataloader cursor, rng, meters) is written separately by `GlobalStateCallback`.
 
 ### HF LoRA adapter (inference artifact)
 
-`ModelHfCallback` drives `trainer.save_hf_or_lora`. The format is the model's decision, not
-the callback's: a model that trains only adapters exports the adapter, via
+`CheckpointCallback` also drives `trainer.save_hf_or_lora`. The format is the model's decision,
+not the callback's: a model that trains only adapters exports the adapter, via
 `save_lora_adapter_with_dcp` (`veomni/utils/save_safetensor_utils.py`), which:
 
 1. Extracts adapter-only tensors via `veomni.lora.state_dict.get_lora_state_dict`
@@ -651,7 +652,7 @@ bash train.sh tasks/train_dit.py configs/dit/qwen_image_lora.yaml \
     --train.num_train_epochs 3
 ```
 
-`ModelHfCallback` writes the trained adapter to `${output_dir}/global_step_${step}/{adapter_config.json, adapter_model.{bin,safetensors}}`, which is the standard PEFT format consumable by `PeftModel.from_pretrained` and `diffusers`' `pipeline.transformer.load_lora_adapter` (the adapter keys carry the `base_model.model.` prefix expected by `peft`).
+`CheckpointCallback` writes the trained adapter to `${output_dir}/global_step_${step}/{adapter_config.json, adapter_model.safetensors}`, which is the standard PEFT format consumable by `PeftModel.from_pretrained` and `diffusers`' `pipeline.transformer.load_lora_adapter` (the adapter keys carry the `base_model.model.` prefix expected by `peft`). Loading a PEFT-trained adapter still accepts `adapter_model.bin`.
 
 ---
 

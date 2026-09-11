@@ -17,14 +17,17 @@
 import os
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+import torch
 import torch.distributed as dist
 
 from ..checkpoint import CheckpointerBase, build_checkpointer
+from ..distributed.parallel_state import get_parallel_state
 from ..utils import helper
 
 
 if TYPE_CHECKING:
     from ..arguments import CheckpointConfig
+    from ..trainer.base import BaseTrainer
     from ..trainer.callbacks import TrainerState
     from .model_runtime import VeOmniModelRuntime
 
@@ -69,6 +72,10 @@ class ModelCheckpointManager:
         self.runtime = runtime
         self.config = config
         self._last_saved_step: int = -1
+        self._legacy_job_state: Optional[Dict[str, Any]] = None
+        # Cached at construction, same as Callback.parallel_state: later save/load
+        # must not depend on whichever mesh is ambient.
+        self.parallel_state = get_parallel_state()
         self.checkpointer: CheckpointerBase = build_checkpointer(
             ckpt_manager=config.manager,
             dist_backend=runtime.args.accelerator.fsdp_config.fsdp_mode,
@@ -119,6 +126,50 @@ class ModelCheckpointManager:
         if lr_state is not None and lr_scheduler is not None:
             lr_scheduler.load_state_dict(lr_state)
 
+        # Pre-split DCP extra_state also held the job cursor. New writes do not;
+        # GlobalStateCallback owns that file. Stash the old blob so the trainer
+        # can restore a mid-job resume from a CheckpointerCallback checkpoint.
+        if "global_step" not in extra_state:
+            self._legacy_job_state = None
+            return
+        logger.warning_rank0(
+            "DCP extra_state still contains job-level keys (global_step, dataloader, "
+            "rng). Restoring them for compatibility with checkpoints written before "
+            "GlobalStateCallback; new saves keep only lr_scheduler here."
+        )
+        self._legacy_job_state = extra_state
+
+    def restore_legacy_job_state(self, trainer: "BaseTrainer") -> None:
+        """Apply a pre-split extra_state job cursor onto ``trainer``, if one loaded."""
+        extra_state = self._legacy_job_state
+        if extra_state is None or "global_step" not in extra_state:
+            return
+        self._legacy_job_state = None
+
+        args = trainer.args
+        global_step = extra_state["global_step"]
+        trainer.state.global_step = global_step
+        trainer.start_epoch = global_step // args.train_steps
+        trainer.start_step = global_step % args.train_steps
+
+        channel_loss_state = extra_state.get("channel_loss_callback")
+        channel_loss_callback = getattr(trainer, "channel_loss_callback", None)
+        if channel_loss_state is not None and channel_loss_callback is not None:
+            channel_loss_callback.load_state_dict(channel_loss_state)
+
+        if trainer.train_dataloader is not None and extra_state.get("train_dataloader") is not None:
+            trainer.train_dataloader.load_state_dict(extra_state["train_dataloader"])
+
+        environ_meter = getattr(trainer, "environ_meter", None)
+        if environ_meter is not None and extra_state.get("environ_meter") is not None:
+            environ_meter.load_state_dict(extra_state["environ_meter"])
+
+        rng_state = extra_state.get("torch_rng_state")
+        if rng_state is not None:
+            torch.set_rng_state(rng_state)
+        if trainer.start_step == 0 and trainer.train_dataloader is not None:
+            iter(trainer.train_dataloader)
+
     def wait_for_pending_save(self) -> None:
         """Block until any in-flight async save completes."""
         self.checkpointer.wait_for_pending_save()
@@ -139,7 +190,7 @@ class ModelCheckpointManager:
             load_dir,
             state,
             trainable_only=self.trainable_only,
-            parallel_state=self.runtime.parallel_state,
+            parallel_state=self.parallel_state,
         )
         self._load_extra_state(state["extra_state"])
         dist.barrier()
@@ -151,24 +202,29 @@ class ModelCheckpointManager:
         Only model-bound state goes in here. Job-level state — where the
         dataloader is, the rng — has its own writer, because with several models
         in one job there is one such record but N of these checkpoints.
+
+        Staging keys off the run root plus ``global_steps``, not a path that
+        already contains the step: folding the step in gives each save a fresh
+        staging directory, and a kill mid-write strands a copy no later save
+        clears.
         """
-        save_path = self.save_dir(state)
         extra_state = self._extra_state(state)
 
         helper.empty_cache()
         self.checkpointer.save(
-            save_path,
+            self.config.save_path,
             {"model": self.runtime.model, "optimizer": self.runtime.optimizer, "extra_state": extra_state},
+            global_steps=state.global_step,
             save_async=self.config.save_async,
             trainable_only=self.trainable_only,
             save_to_lowest_rank=self.config.dcp_save_to_lowest_rank,
-            parallel_state=self.runtime.parallel_state,
+            parallel_state=self.parallel_state,
             stage_dir=self.config.stage_dir,
         )
         helper.empty_cache()
         dist.barrier()
         self._last_saved_step = state.global_step
-        logger.info_rank0(f"Distributed checkpoint saved at {save_path} successfully!")
+        logger.info_rank0(f"Distributed checkpoint saved at {self.save_dir(state)} successfully!")
 
     def _prepare_export(self, state: "TrainerState", stage: str) -> str:
         """Guarantee a DCP checkpoint exists for this step, then quiesce for export.
@@ -204,8 +260,8 @@ class ModelCheckpointManager:
             save_checkpoint_path=save_path,
             model=self.runtime.model,
             fqn_to_index_mapping=self.runtime.args.fqn_to_index_mapping,
-            is_rank_0=self.runtime.parallel_state.global_rank == 0,
-            parallel_state=self.runtime.parallel_state,
+            is_rank_0=self.parallel_state.global_rank == 0,
+            parallel_state=self.parallel_state,
         )
         helper.empty_cache()
         dist.barrier()

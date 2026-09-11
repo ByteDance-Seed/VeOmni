@@ -12,7 +12,7 @@ veomni/
 │   ├── multimodal/     Vision, audio, video preprocessing and chat templates
 │   └── diffusion/      Diffusion model data loading
 ├── distributed/        All parallelism strategies
-│   ├── parallel_state.py   init_parallel_state_from_accelerator(), ParallelState, mesh setup
+│   ├── parallel_state.py   init_parallel_state_from_config(), ParallelState, mesh setup
 │   ├── torch_parallelize.py  build_parallelize_model(), parallelize_model_fsdp2()
 │   ├── parallel_plan.py    ParallelPlan for ExtraParallel (EP, embedding shard)
 │   ├── async_offload.py    Async activation offload (SwapTensor, OffloadManager, async_save_on_cpu)
@@ -25,6 +25,7 @@ veomni/
 │   ├── model_runtime.py  VeOmniModelRuntime: the model-bound half of a job
 │   │                   (build, freeze/LoRA, parallelize, optimizer,
 │   │                   lr-scheduler, grad clip, its own ParallelState)
+│   ├── checkpoint_manager.py  ModelCheckpointManager: DCP / HF / LoRA I/O (runtime-owned)
 │   ├── transformers/   Per-model patches (one subpackage per model family)
 │   └── diffusers/      Diffusion model families (Wan, LTX, Qwen-Image)
 ├── optim/              Optimizer and LR scheduler construction
@@ -146,11 +147,11 @@ It is usable on its own, with no trainer at all (see `tests/models/test_model_ru
 
 Checkpointing is split three ways, mirroring SeedOmni V2's `OmniModuleDcpCallback` -> `OmniTrainer.save_dcp` -> `OmniModelRuntime`:
 
-- **When** — `ModelDcpCallback` / `ModelHfCallback` (`veomni/trainer/callbacks/checkpoint_callback.py`). They own the every-N-steps/epochs cadence and call nothing but the trainer.
+- **When** — `CheckpointCallback` (`veomni/trainer/callbacks/checkpoint_callback.py`). It owns the every-N-steps/epochs cadence for DCP, HF/LoRA, and the one-shot tokenizer/config sidecars, and calls nothing but the trainer / model handles.
 - **What** — `BaseTrainer.load()` / `save_dcp()` / `save_hf_or_lora()`, one line each, fanning out to `self.model.<same name>()`. A trainer holding a second model (a DPO reference, a distillation teacher) extends the fan-out here without the callbacks learning about it.
 - **How** — `VeOmniModelRuntime` forwards to its `ModelCheckpointManager`, which owns the *ordering* (drain async saves, `empty_cache` around the DCP write, barrier, then export) — the part previously duplicated between the V1 callbacks and V2's per-module manager. A multi-module model subclasses it and sets `checkpoint_subfolder` to nest every artifact under the module name.
 
-Only model-bound state (the lr scheduler) travels in a model checkpoint. Job-level state — the dataloader cursor, the rng, the meters — belongs to `GlobalStateCallback` / `RootAssetsCallback` (`veomni/trainer/callbacks/global_state_callback.py`) and gets its own file, because with several models in one job there is one such record but N model checkpoints.
+Only model-bound state (the lr scheduler) travels in a model checkpoint. Job-level state — the dataloader cursor, the rng, the meters — belongs to `GlobalStateCallback` (`veomni/trainer/callbacks/global_state_callback.py`) and gets its own file, because with several models in one job there is one such record but N model checkpoints.
 
 That file is written **per rank**, `trainer_state_rank_{N}.pt`, where V2 writes a single rank-0 `trainer_state.pt`. The cursor in it is rank-local by construction: iterable datasets are `split_dataset_by_node`-sharded on `dp_rank` (`veomni/data/dataset.py:1509`), the multisource sampler filters on `_global_sample_idx % dp_size == dp_rank` (`:596`), and Energon takes `dp_rank` in its `WorkerConfig` (`:1645`). Restoring one rank's cursor everywhere makes every rank resume on rank 0's shard — replaying that slice and skipping the rest. Only the map-style path is rank-agnostic, which is why the single-file version looks correct until an iterable dataset resumes.
 
@@ -161,7 +162,7 @@ That file is written **per rank**, `trainer_state_rank_{N}.pt`, where V2 writes 
 
 Subclasses override specific methods (e.g., `compute_loss()`, custom data transforms) rather than the entire training loop. Note that `TextTrainer`, `VLMTrainer`, `DiTTrainer` and `TextDPOTrainer` *compose* a `BaseTrainer` in `self.base` rather than subclassing it, and drive the build steps one at a time (constraint 24).
 
-**Parallel-state scoping**: `BaseTrainer.setup_distributed(args)` registers `"base"` before seed/determinism — it is a staticmethod because everything it does is job-level and runs before any model exists (a model then derives its own mesh in `VeOmniModelRuntime.setup()`); its `__init__` then scopes the model build to that mesh, so the trainer's remaining build steps need no scope of their own. Run time uses **per-op** wraps with this model's name (`"base"`, or `"policy"` / `"reference"` on DPO). The inherited `parallel_state` property is a by-name registry lookup, never a stored state object, so the registry stays the single source of truth. See `.agents/knowledge/constraints.md` §7 and `docs/design/local_parallel_state.md`.
+**Parallel-state scoping**: `BaseTrainer.setup_distributed(args)` registers `"base"` via `init_parallel_state_from_config` before seed/determinism — it is a staticmethod because everything it does is job-level and runs before any model exists (a model then derives its own mesh in `VeOmniModelRuntime.setup()`); its `__init__` then scopes the model build to that mesh, so the trainer's remaining build steps need no scope of their own. Run time uses **per-op** wraps with this model's name (`"base"`, or `"policy"` / `"reference"` on DPO). The inherited `parallel_state` property is a by-name registry lookup, never a stored state object, so the registry stays the single source of truth. See `.agents/knowledge/constraints.md` §7 and `docs/design/local_parallel_state.md`.
 
 ## Data Flow
 
@@ -201,7 +202,7 @@ YAML Config -> VeOmniArguments -> Trainer
 
 VeOmni uses FSDP2 exclusively.
 
-1. `init_parallel_state_from_accelerator()` -> global `DeviceMesh` with named dims (`dp_shard`, `ulysses`, `cp`, etc.) + per-ExtraParallel submeshes (`[ep × ep_fsdp]`)
+1. `init_parallel_state_from_config()` -> global `DeviceMesh` with named dims (`dp_shard`, `ulysses`, `cp`, etc.) + per-ExtraParallel submeshes (`[ep × ep_fsdp]`)
 2. Model-specific `parallel_plan.py` -> define EP/embedding weight sharding via `ParallelPlan`
 3. `build_parallelize_model()` -> `parallelize_model_fsdp2()`:
    - `ParallelPlan.apply()` wraps EP/embedding params as DTensors on para mesh

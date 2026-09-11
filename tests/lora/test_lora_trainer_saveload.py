@@ -40,7 +40,7 @@ from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dummy_dataset
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import Callback, TrainerState
-from veomni.trainer.callbacks.checkpoint_callback import ModelDcpCallback, ModelHfCallback
+from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
 from veomni.utils import helper
 
 
@@ -81,11 +81,11 @@ class _EnvironMeterCallbackTest(Callback):
 
 
 # ---------------------------------------------------------------------------
-# Custom ModelDcpCallback
+# Custom CheckpointCallback
 # ---------------------------------------------------------------------------
 
 
-class _LoraModelDcpCallback(ModelDcpCallback):
+class _LoraCheckpointCallback(CheckpointCallback):
     trainer: "LoraTrainerSaveLoadTest"
 
     # Do not load on train_begin (no prior checkpoint).
@@ -117,7 +117,7 @@ class _LoraModelDcpCallback(ModelDcpCallback):
             assert self.trainer.golden_base, "No frozen base parameters found in model!"
             self.trainer.canary_name = next(iter(self.trainer.golden_base.keys()))
 
-            self._save_checkpoint(state)
+            self._save_dcp(state)
             self.trainer.dcp_ckpt_path = os.path.join(
                 self.trainer.args.train.checkpoint.save_path,
                 f"global_step_{state.global_step}",
@@ -140,22 +140,6 @@ class _LoraModelDcpCallback(ModelDcpCallback):
             )
             assert any("lora_" in k for k in model_keys), f"DCP contains no LoRA tensors: {model_keys[:5]}"
             logger.info_rank0(f"[test] DCP holds {len(model_keys)} model tensors, all LoRA (no frozen base leaked).")
-
-
-# ---------------------------------------------------------------------------
-# Stub HF LoRA callback (no saves during this test)
-# ---------------------------------------------------------------------------
-
-
-class _NoopModelHfCallback(ModelHfCallback):
-    def on_step_end(self, state: TrainerState, **kwargs) -> None:
-        pass
-
-    def on_epoch_end(self, state: TrainerState, **kwargs) -> None:
-        pass
-
-    def on_train_end(self, state: TrainerState, **kwargs) -> None:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -209,13 +193,16 @@ class _LoraCheckCallback(Callback):
 
 
 class LoraTrainerSaveLoadTest(BaseTrainer):
-    # Set in _LoraModelDcpCallback.on_step_end
+    # Set in _LoraCheckpointCallback.on_step_end
     golden_lora: Dict[str, torch.Tensor]
     golden_base: Dict[str, torch.Tensor]
     canary_name: str
     dcp_ckpt_path: str
 
     # -- dataset / asset overrides -----------------------------------------
+
+    def _build_model_assets(self) -> None:
+        self.model_assets = [self.model_config]
 
     def _build_data_transform(self) -> None:
         pass
@@ -230,45 +217,38 @@ class LoraTrainerSaveLoadTest(BaseTrainer):
 
     def _init_callbacks(self) -> None:
         self.environ_meter_callback = _EnvironMeterCallbackTest(self)
-        self.dcp_callback = _LoraModelDcpCallback(self)
-        self.hf_ckpt_callback = _NoopModelHfCallback(self)
+        self.checkpoint_callback = _LoraCheckpointCallback(self)
         self.check_callback = _LoraCheckCallback(self)
         self.state = TrainerState()
 
     def on_train_begin(self) -> None:
         self.environ_meter_callback.on_train_begin(self.state)
-        self.dcp_callback.on_train_begin(self.state)
-        self.hf_ckpt_callback.on_train_begin(self.state)
+        self.checkpoint_callback.on_train_begin(self.state)
         self.check_callback.on_train_begin(self.state)
 
     def on_train_end(self) -> None:
         self.environ_meter_callback.on_train_end(self.state)
-        self.dcp_callback.on_train_end(self.state)
-        self.hf_ckpt_callback.on_train_end(self.state)
+        self.checkpoint_callback.on_train_end(self.state)
         self.check_callback.on_train_end(self.state)
 
     def on_epoch_begin(self) -> None:
         self.environ_meter_callback.on_epoch_begin(self.state)
-        self.dcp_callback.on_epoch_begin(self.state)
-        self.hf_ckpt_callback.on_epoch_begin(self.state)
+        self.checkpoint_callback.on_epoch_begin(self.state)
         self.check_callback.on_epoch_begin(self.state)
 
     def on_epoch_end(self) -> None:
         self.environ_meter_callback.on_epoch_end(self.state)
-        self.dcp_callback.on_epoch_end(self.state)
-        self.hf_ckpt_callback.on_epoch_end(self.state)
+        self.checkpoint_callback.on_epoch_end(self.state)
         self.check_callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches: Optional[List[Dict[str, Any]]] = None, **kwargs) -> None:
         self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.dcp_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.hf_ckpt_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.checkpoint_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.check_callback.on_step_begin(self.state, micro_batches=micro_batches)
 
     def on_step_end(self, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs) -> None:
         self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.dcp_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.hf_ckpt_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.checkpoint_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.check_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
 

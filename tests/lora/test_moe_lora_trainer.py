@@ -13,8 +13,8 @@
 # limitations under the License.
 r"""End-to-end trainer-driven save/load/resume test for MoE-LoRA on Qwen3-MoE.
 
-Drives ``BaseTrainer`` with the **real** :class:`~veomni.trainer.callbacks.checkpoint_callback.ModelDcpCallback`
-+ :class:`~veomni.trainer.callbacks.checkpoint_callback.ModelHfCallback`
+Drives ``BaseTrainer`` with the **real** :class:`~veomni.trainer.callbacks.checkpoint_callback.CheckpointCallback`
++ :class:`~veomni.trainer.callbacks.global_state_callback.GlobalStateCallback`
 so the writer subprocess produces both checkpoint formats production runs
 emit, then validates both resume paths bit-exact (modulo bf16 storage):
 
@@ -31,13 +31,14 @@ emit, then validates both resume paths bit-exact (modulo bf16 storage):
          (full-tensor LoRA dumps gathered on rank 0).
 
     2. DCP resume subprocess: ``--train.checkpoint.load_path=<DCP>`` ->
-       :meth:`ModelDcpCallback._load_checkpoint` (model + optimizer
-       + RNG + dataloader state) -> continue to the same ``max_steps``
+       :meth:`BaseTrainer.load` (model + optimizer) and
+       :meth:`GlobalStateCallback.load_global_state` (step counter + RNG +
+       dataloader state) -> continue to the same ``max_steps``
        -> end-state snapshot **bit-exact** vs the writer's end-state.
 
     3. LoRA-adapter resume subprocess:
        ``model.lora_config.lora_adapter=<adapter>`` ->
-       :meth:`BaseTrainer.setup_lora` resume branch
+       :meth:`BaseTrainer._setup_lora` resume branch
        (:meth:`veomni.lora.VeOmniLoraModel.from_pretrained`, which rebuilds the
        MoE wrappers from the ``veomni_lora`` block in adapter_config.json) ->
        the FSDP2 adapter-load path inside :func:`build_parallelize_model` ->
@@ -83,7 +84,7 @@ from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dummy_dataset
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import Callback, TrainerState
-from veomni.trainer.callbacks.checkpoint_callback import ModelDcpCallback, ModelHfCallback
+from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
 from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 from veomni.utils import helper
 
@@ -247,7 +248,7 @@ class _LogDictSaveCallback(Callback):
         self, state: TrainerState, loss: float, loss_dict: dict[str, float], grad_norm: float, **kwargs
     ) -> None:
         # ``loss`` is already a Python float (``total_loss += loss.item()``).
-        # ``grad_norm`` comes from ``VeOmniModelRuntime.clip_grad_norm`` and is a
+        # ``grad_norm`` comes from ``veomni_clip_grad_norm`` and is a
         # ``Tensor`` -- coerce so the json dump succeeds.
         self.log_dict["loss"].append(self._dp_avg(loss))
         self.log_dict["grad_norm"].append(float(grad_norm) if grad_norm is not None else 0.0)
@@ -266,11 +267,13 @@ class _LogDictSaveCallback(Callback):
 class MoeLoraTrainer(BaseTrainer):
     """Minimal trainer subclass for the round-trip test.
 
-    Real :class:`ModelDcpCallback` + :class:`ModelHfCallback` drive
-    DCP + HF LoRA writes per production logic. ``_SnapshotCallback`` runs
-    after both so its ``pre`` snapshot captures any state the checkpoint
-    callbacks loaded.
+    Real :class:`CheckpointCallback` drives DCP + HF LoRA writes per production
+    logic. ``_SnapshotCallback`` runs after it so its ``pre`` snapshot captures
+    any state the checkpoint callback loaded.
     """
+
+    def _build_model_assets(self) -> None:
+        self.model_assets = [self.model_config]
 
     def _build_data_transform(self) -> None:
         pass
@@ -283,64 +286,51 @@ class MoeLoraTrainer(BaseTrainer):
 
     def _init_callbacks(self) -> None:
         self.environ_meter_callback = _EnvironMeterCallbackTest(self)
-        # ModelDcpCallback drives the DCP save+load path; the
+        # CheckpointCallback drives DCP save+load and the HF LoRA export; the
         # ``train.checkpoint.load_path`` resume case in the resume test
         # depends on its ``on_train_begin`` reload hook.
-        self.dcp_callback = ModelDcpCallback(self)
+        self.checkpoint_callback = CheckpointCallback(self)
         # The weights come back from DCP but the step counter does not: it is
         # job state, so the resumed run needs this to know it is at step 2 and
         # owes 2 more steps rather than 4.
         self.global_state_callback = GlobalStateCallback(self)
-        # ModelHfCallback emits the HF-format LoRA adapter (adapter_model.safetensors
-        # + adapter_config.json with the veomni_lora MoE block) at every
-        # save_step. It also
-        # extends DCP saves but no-ops if the DCP dir already exists, so
-        # pairing it with ModelDcpCallback yields exactly one DCP
-        # write + one LoRA HF write per save_step.
-        self.hf_ckpt_callback = ModelHfCallback(self)
         self.snapshot_callback = _SnapshotCallback(self)
         self.log_dict_callback = _LogDictSaveCallback(self)
         self.state = TrainerState()
 
     def on_train_begin(self) -> None:
         self.environ_meter_callback.on_train_begin(self.state)
-        self.dcp_callback.on_train_begin(self.state)
+        self.checkpoint_callback.on_train_begin(self.state)
         self.global_state_callback.on_train_begin(self.state)
-        self.hf_ckpt_callback.on_train_begin(self.state)
-        # Snapshot last so it sees state the checkpoint/HF callbacks loaded.
+        # Snapshot last so it sees state the checkpoint callback loaded.
         self.snapshot_callback.on_train_begin(self.state)
 
     def on_train_end(self) -> None:
         self.environ_meter_callback.on_train_end(self.state)
-        self.dcp_callback.on_train_end(self.state)
+        self.checkpoint_callback.on_train_end(self.state)
         self.global_state_callback.on_train_end(self.state)
-        self.hf_ckpt_callback.on_train_end(self.state)
         self.snapshot_callback.on_train_end(self.state)
         self.log_dict_callback.on_train_end(self.state)
 
     def on_epoch_begin(self) -> None:
         self.environ_meter_callback.on_epoch_begin(self.state)
-        self.dcp_callback.on_epoch_begin(self.state)
+        self.checkpoint_callback.on_epoch_begin(self.state)
         self.global_state_callback.on_epoch_begin(self.state)
-        self.hf_ckpt_callback.on_epoch_begin(self.state)
 
     def on_epoch_end(self) -> None:
         self.environ_meter_callback.on_epoch_end(self.state)
-        self.dcp_callback.on_epoch_end(self.state)
+        self.checkpoint_callback.on_epoch_end(self.state)
         self.global_state_callback.on_epoch_end(self.state)
-        self.hf_ckpt_callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches: list[dict[str, Any]] | None = None, **kwargs) -> None:
         self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.dcp_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.checkpoint_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.global_state_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.hf_ckpt_callback.on_step_begin(self.state, micro_batches=micro_batches)
 
     def on_step_end(self, loss: float, loss_dict: dict[str, float], grad_norm: float, **kwargs) -> None:
         self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.dcp_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.checkpoint_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.global_state_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.hf_ckpt_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.log_dict_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
 
@@ -656,8 +646,8 @@ def test_save_load_resume_round_trip(tmp_path, toy_base_dir, mode):
     _assert_writer_artifacts_exist(writer_dir, mode)
 
     # ── 2. DCP resume ──────────────────────────────────────────────────
-    # Load step 2 DCP shard; ModelDcpCallback bumps global_step to 2
-    # inside _load_checkpoint and the trainer continues for the remaining
+    # Load step 2 DCP shard; GlobalStateCallback bumps global_step to 2
+    # and the trainer continues for the remaining
     # 2 steps. Different output_dir keeps the resumer's saves from
     # clobbering the writer.
     #
@@ -676,7 +666,7 @@ def test_save_load_resume_round_trip(tmp_path, toy_base_dir, mode):
 
     # ── 3. LoRA-adapter resume ─────────────────────────────────────────
     # Load the writer's final-step HF LoRA adapter via
-    # ``model.lora_config.lora_adapter`` -> ``setup_lora`` resume branch
+    # ``model.lora_config.lora_adapter`` -> ``_setup_lora`` resume branch
     # -> ``VeOmniLoraModel.from_pretrained`` (rebuilds MoE wrappers from the
     # ``veomni_lora`` block in adapter_config.json) -> FSDP2 adapter-load path
     # inside ``build_parallelize_model``. The resumer's pre-train snapshot is

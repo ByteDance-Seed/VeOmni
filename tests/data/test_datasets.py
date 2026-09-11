@@ -447,7 +447,7 @@ def test_map_style_sampler_wrapper_resume():
             next_epoch_dataloader.load_state_dict(epoch_boundary_state)
             iter(
                 next_epoch_dataloader
-            )  # check _load_checkpoint() of checkpoint_callback.py for more details on why we need to call iter() when the checkpoint is saved at the epoch boundary
+            )  # check GlobalStateCallback.load_global_state for more details on why we need to call iter() when the checkpoint is saved at the epoch boundary
             next_epoch_dataloader.set_epoch(3)
             next_epoch_batches = list(next_epoch_dataloader)
 
