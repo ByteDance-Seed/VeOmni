@@ -77,7 +77,7 @@ error.
 ## Trainer lifecycle
 
 Current built-in trainers register the main topology as `"base"` during
-`BaseTrainer.setup_distributed()`, which runs before any model is built. That
+`BaseTrainer._setup()`, which runs before any model is built. That
 registration also makes `"base"` the global state, so the dataloader, scheduler
 and callbacks read it ambiently with no scope of their own. `VeOmniModelRuntime.setup()`
 only registers that model's mesh. The build scope is `VeOmniModelRuntime.__init__()`,

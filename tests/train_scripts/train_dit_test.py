@@ -49,7 +49,7 @@ class TestDiTModelRuntime(DiTModelRuntime):
     def _build_condition_model(self, condition_model_type: str) -> None:
         self.condition_model = None
 
-    def freeze_model(self) -> None:
+    def _freeze_model_module(self) -> None:
         pass
 
 
@@ -66,7 +66,7 @@ class TestDiTTrainer(DiTTrainer):
         super().__init__(args)
         self.base._log_callback = LogDictSaveCallback(self.base)
 
-    def build_model_runtime(self) -> TestDiTModelRuntime:
+    def _build_model_runtime(self) -> TestDiTModelRuntime:
         return TestDiTModelRuntime(self.base.args.model, "base", train=self.base.args.train)
 
     def _build_data_transform(self) -> None:

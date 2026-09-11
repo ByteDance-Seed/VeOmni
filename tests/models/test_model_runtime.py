@@ -106,7 +106,7 @@ def test_a_runtime_builds_and_optimizes_a_model_without_a_trainer(single_rank_gr
     assert runtime.model is not None
     assert runtime.model_config is runtime.model.config
 
-    runtime.build_lr_scheduler(total_steps=10)
+    runtime._build_lr_scheduler(total_steps=10)
 
     assert runtime.optimizer is not None
     assert runtime.lr_scheduler is not None
@@ -161,7 +161,7 @@ def test_a_lora_free_config_leaves_the_model_untouched(single_rank_group):
     runtime = make_runtime()
 
     before = runtime.model
-    runtime.setup_lora()
+    runtime._setup_lora()
 
     assert runtime.model is before
 
@@ -192,12 +192,12 @@ class TestHowATrainerHoldsItsModel:
 
         monkeypatch.setattr(VeOmniModelRuntime, "__init__", record_only)
 
-        runtime = trainer.build_model_runtime()
+        runtime = trainer._build_model_runtime()
 
         assert isinstance(runtime, VeOmniModelRuntime)
         assert runtime.args is args.model, "the runtime is handed its own slice, not the job"
         assert runtime.model_name == "base"
-        assert trainer.build_model_runtime("policy").model_name == "policy"
+        assert trainer._build_model_runtime("policy").model_name == "policy"
         assert runtime.train is args.train, "and the job-wide half it still needs"
         assert runtime.chat_template_name == "chatml", (
             "including which chat template to build, since only the runtime holds the preprocessor to build it from"
@@ -290,7 +290,7 @@ class TestHowAJobOverridesItsPreprocessor:
         size = {"shortest_edge": 3136, "longest_edge": 602112}
         runtime = unbuilt_runtime(ModelArguments(model_path="somewhere", processor_config={"size": size}))
 
-        runtime.build_model_assets()
+        runtime._build_model_assets()
 
         assert seen == {"path": "somewhere", "kwargs": {"size": size}}
 
@@ -299,7 +299,7 @@ class TestHowAJobOverridesItsPreprocessor:
         self._record_loader(monkeypatch, seen)
         runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"))
 
-        runtime.build_model_assets()
+        runtime._build_model_assets()
 
         assert seen["kwargs"] == {}
 
@@ -324,7 +324,7 @@ class TestWhatTheRuntimeAsksTheModel:
         runtime = unbuilt_runtime(args, train=train_args())
         runtime.model = SelfWrapping()
 
-        runtime.build_parallelize_model()
+        runtime._build_parallelized_model()
 
         assert runtime.model is wrapped
         assert runtime.model.training
@@ -341,7 +341,7 @@ class TestWhatTheRuntimeAsksTheModel:
         runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"), train=train_args())
         runtime.model = nn.Linear(1, 1)
 
-        runtime.build_parallelize_model()
+        runtime._build_parallelized_model()
 
         assert runtime.model is generically_wrapped
 
@@ -360,7 +360,7 @@ class TestWhatTheRuntimeAsksTheModel:
         runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"))
         runtime.model = SelfFreezing()
 
-        runtime.freeze_model()
+        runtime._freeze_model_module()
 
         assert runtime.model.frozen is True
 
@@ -374,7 +374,7 @@ class TestWhatTheRuntimeAsksTheModel:
         runtime = unbuilt_runtime(ModelArguments(model_path="somewhere", lora_config={"rank": 8}))
         runtime.model = SelfAdapting()
 
-        runtime.setup_lora()
+        runtime._setup_lora()
 
         assert runtime.model is wrapped
 
@@ -400,6 +400,6 @@ class TestWhatTheRuntimeAsksTheModel:
         runtime = unbuilt_runtime(args)
         runtime.model = PrefixedByMistake()
 
-        runtime.setup_lora()
+        runtime._setup_lora()
 
         assert isinstance(runtime.model, VeOmniLoraModel)

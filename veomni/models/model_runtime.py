@@ -64,7 +64,7 @@ class VeOmniModelRuntime:
 
     This is a *model handle*, not a trainer base class. A trainer holds one
     (``trainer.model``) the way :class:`~veomni.trainer.omni.omni_trainer.OmniTrainer`
-    holds an ``OmniModelRuntime``, and drives it as ``self.model.build_model()``,
+    holds an ``OmniModelRuntime``, and drives it as ``self.model._build_model()``,
     ``self.model.save_dcp(...)``. The wrapped :class:`torch.nn.Module`
     lives at :attr:`model`; every other module API is forwarded by
     :meth:`__getattr__`, so ``trainer.model.parameters()`` and
@@ -83,7 +83,7 @@ class VeOmniModelRuntime:
     (meta-init, FSDP2/TP/EP wrap, weight load, EP-aware optimizer) reads the
     ambient :class:`ParallelState`, and the only place that can be scoped once,
     for every caller, is inside the runtime that owns the mesh. A trainer is then
-    free of it: ``self.model = self.build_model_runtime()`` and the job-level
+    free of it: ``self.model = self._build_model_runtime()`` and the job-level
     steps that follow need no scope of their own.
 
     Construction takes this model's *own* arguments — not the job's — plus the
@@ -102,7 +102,7 @@ class VeOmniModelRuntime:
 
     The lr scheduler is the one piece deliberately left out: it needs
     ``total_steps``, which is only known once the dataset has been built, so the
-    trainer calls :meth:`build_lr_scheduler` later.
+    trainer calls :meth:`_build_lr_scheduler` later.
     """
 
     args: "ModelArguments"
@@ -136,11 +136,11 @@ class VeOmniModelRuntime:
         self.chat_template_name = chat_template_name
         self.setup()
         with use_parallel_state(self.model_name):
-            self.build_model()
-            self.freeze_model()
-            self.build_parallelize_model()
-            self.build_optimizer()
-        self.build_model_assets()
+            self._build_model()
+            self._freeze_model_module()
+            self._build_parallelized_model()
+            self._build_optimizer()
+        self._build_model_assets()
         self.build_checkpoint()
 
     def __getattr__(self, name: str) -> Any:
@@ -162,7 +162,7 @@ class VeOmniModelRuntime:
         """Build this model's device mesh and register it under :attr:`model_name`.
 
         The process group itself is job-bound and must already be initialised by
-        :meth:`BaseTrainer.setup_distributed`; this only derives the model's own
+        :meth:`BaseTrainer._setup`; this only derives the model's own
         mesh from its accelerator config, which is why sibling models in one job
         can hold different ones.
         """
@@ -192,7 +192,7 @@ class VeOmniModelRuntime:
 
         return should_skip_hf_weight_load(self.train.checkpoint.load_path, self.args.lora_config)
 
-    def build_model(self) -> None:
+    def _build_model(self) -> None:
         """Meta-init the model from its config via the registry-aware loader."""
         from .auto import build_foundation_model
 
@@ -208,7 +208,7 @@ class VeOmniModelRuntime:
         )
         self.model_config = self.model.config
 
-    def build_model_assets(self) -> None:
+    def _build_model_assets(self) -> None:
         """Load the preprocessor this model reads its inputs through.
 
         Also assembles :attr:`model_assets`, the sidecars an export writes beside
@@ -288,12 +288,12 @@ class VeOmniModelRuntime:
 
         self.chat_template = build_chat_template(self.chat_template_name, preprocessor)
 
-    def build_parallelize_model(self) -> None:
+    def _build_parallelized_model(self) -> None:
         """FSDP2/DDP-wrap the model and load its weights.
 
         The wrap preserves ``requires_grad`` (the shard inherits it) and the
         loader writes weights in place, so a freeze applied in
-        :meth:`freeze_model` survives and is not re-asserted here.
+        :meth:`_freeze_model_module` survives and is not re-asserted here.
         """
         args = self.args
 
@@ -376,7 +376,7 @@ class VeOmniModelRuntime:
         )
         self.model.train()
 
-    def setup_lora(self) -> None:
+    def _setup_lora(self) -> None:
         """Wrap :attr:`model` with the PEFT-free :class:`veomni.lora.VeOmniLoraModel`.
 
         A single native path handles both dense ``nn.Linear`` LoRA
@@ -439,7 +439,7 @@ class VeOmniModelRuntime:
                 "LoRA configuration produced no trainable adapters. Select at least one Linear or MoE target."
             )
 
-    def freeze_model(self) -> None:
+    def _freeze_model_module(self) -> None:
         """Let the model freeze itself, apply LoRA, and report what is left trainable.
 
         Order matters: LoRA runs second because it is authoritative — it freezes
@@ -451,14 +451,14 @@ class VeOmniModelRuntime:
         if callable(freeze_model_function):
             freeze_model_function()
 
-        self.setup_lora()
+        self._setup_lora()
 
         from ..utils.model_utils import pretty_print_trainable_parameters
 
         pretty_print_trainable_parameters(self.model)
         helper.print_device_mem_info("VRAM usage after building model")
 
-    def build_optimizer(self, param_groups: Optional[List[Dict[str, Any]]] = None) -> None:
+    def _build_optimizer(self, param_groups: Optional[List[Dict[str, Any]]] = None) -> None:
         """Build the optimizer over this model's still-trainable params.
 
         A distributed optimizer (Muon) reads ``get_parallel_state()`` at build
@@ -486,7 +486,7 @@ class VeOmniModelRuntime:
             optimizer_config=opt,
         )
 
-    def build_lr_scheduler(self, total_steps: int) -> None:
+    def _build_lr_scheduler(self, total_steps: int) -> None:
         """Build the lr-scheduler over ``total_steps``.
 
         Takes the step count rather than reading it off a training config: it

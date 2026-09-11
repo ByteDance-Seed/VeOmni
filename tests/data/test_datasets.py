@@ -69,7 +69,7 @@ class TrainerTest(BaseTrainer):
         self.check_callback = CheckCallback(self)
         self.state = TrainerState()
 
-    def build_model_runtime(self):
+    def _build_model_runtime(self):
         return FakeModelRuntime(self.args.model, train=self.args.train)
 
     def _build_data_transform(self):

@@ -93,14 +93,14 @@ model:
 
 ## 2. LoRA Initialization in the Model Runtime
 
-LoRA wrapping happens in `VeOmniModelRuntime.setup_lora()`, called from `freeze_model()`.
-Every trainer inherits both, so `BaseTrainer.setup_lora()` reaches the same code.
+LoRA wrapping happens in `VeOmniModelRuntime._setup_lora()`, called from `_freeze_model_module()`.
+Every trainer inherits both, so `BaseTrainer` reaches the same code through the runtime.
 A single native path wraps the model with `VeOmniLoraModel`, handling dense `nn.Linear`
 LoRA, MoE expert LoRA, and the two combined:
 
 ```python
 # veomni/models/model_runtime.py
-def setup_lora(self):
+def _setup_lora(self):
     lora_config = self.args.lora_config
     if not bool(lora_config):
         return
@@ -307,7 +307,7 @@ model:
 The mapping is driven by a per-model `_convert_lora_targets_to_parameters` hook
 (registered in the model's `__init__.py`) plus
 `veomni.lora.resolve_fused_moe_lora_targets`, invoked by
-`BaseTrainer.setup_lora` before the adapter is built. It is a **no-op on dense
+`VeOmniModelRuntime._setup_lora` before the adapter is built. It is a **no-op on dense
 models and on models without the hook**, so `gate_proj` / `up_proj` /
 `down_proj` there stay ordinary `nn.Linear` LoRA targets.
 

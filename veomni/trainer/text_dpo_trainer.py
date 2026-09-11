@@ -190,9 +190,9 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
         self._torch_dtype = torch_dtype
         self.setup()
         with use_parallel_state(self.model_name):
-            self.build_model()
+            self._build_model()
             self.model.requires_grad_(False)
-            self.build_parallelize_model()
+            self._build_parallelized_model()
             self.model.eval()
 
     @property
@@ -200,7 +200,7 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
         """A policy resume does not carry reference weights; always materialize HF."""
         return False
 
-    def build_model(self) -> None:
+    def _build_model(self) -> None:
         from ..models.auto import build_foundation_model
 
         args = self.args
@@ -227,8 +227,8 @@ class TextDPOTrainer:
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        self.base.device = self.base.setup_distributed(args)  # registers ParallelState("base") before seed
-        self.policy_model = self.build_policy_model_runtime()
+        self.base.device = self.base._setup(args)  # registers ParallelState("base") before seed
+        self.policy_model = self._build_policy_model_runtime()
 
         self._build_data_transform()
 
@@ -236,11 +236,11 @@ class TextDPOTrainer:
         self.base._build_collate_fn()
         self.base._build_dataloader()
         self._build_postforward()
-        self.policy_model.build_lr_scheduler(args.train_steps * args.train.num_train_epochs)
+        self.policy_model._build_lr_scheduler(args.train_steps * args.train.num_train_epochs)
         self.base._build_training_context()
         self.base._init_callbacks(self)
 
-        self.reference_model = self.build_reference_model_runtime()
+        self.reference_model = self._build_reference_model_runtime()
 
     @property
     def model(self):
@@ -271,11 +271,11 @@ class TextDPOTrainer:
     def _build_postforward(self):
         self.post_forward = PostCollator()
 
-    def build_policy_model_runtime(self) -> VeOmniModelRuntime:
+    def _build_policy_model_runtime(self) -> VeOmniModelRuntime:
         """Build the trainable policy under ParallelState ``"policy"``."""
-        return self.base.build_model_runtime(model_name="policy")
+        return self.base._build_model_runtime(model_name="policy")
 
-    def build_reference_model_runtime(self) -> DPOReferenceModelRuntime:
+    def _build_reference_model_runtime(self) -> DPOReferenceModelRuntime:
         """Build the frozen reference as its own runtime.
 
         ``reference_model`` is a full model-level config when set; otherwise

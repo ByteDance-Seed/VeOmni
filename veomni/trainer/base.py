@@ -293,22 +293,22 @@ class BaseTrainer(Stateful, ABC):
         """
 
         self.args: VeOmniArguments = args
-        self.device = self.setup_distributed(args)
+        self.device = self._setup(args)
         # Builds the model: meta-init, freeze, parallelize and optimizer all run
         # under the mesh the runtime registered, so nothing below needs a scope.
-        self.model = self.build_model_runtime()
+        self.model = self._build_model_runtime()
         # build dataset and dataloader
         self._build_data_transform()
         self._build_dataset()
         self._build_collate_fn()
         self._build_dataloader()
         # The dataset fixes train_steps, which the schedule needs.
-        self.build_lr_scheduler()
+        self._build_lr_scheduler()
         self._build_training_context()
         self._init_callbacks()
 
     @staticmethod
-    def setup_distributed(args: VeOmniArguments) -> torch.device:
+    def _setup(args: VeOmniArguments) -> torch.device:
         """Init process group, device, seed, and register the job's ParallelState.
 
         Everything here is job-level and runs before any model exists, so it
@@ -369,7 +369,7 @@ class BaseTrainer(Stateful, ABC):
         dist.destroy_process_group()
         clear_parallel_state()
 
-    def build_model_runtime(self, model_name: str = "base") -> VeOmniModelRuntime:
+    def _build_model_runtime(self, model_name: str = "base") -> VeOmniModelRuntime:
         """Build this job's model under ``model_name``'s ParallelState.
 
         Defaults to ``"base"`` — the single-model name. A trainer that holds
@@ -388,13 +388,13 @@ class BaseTrainer(Stateful, ABC):
             chat_template_name=self.args.data.chat_template,
         )
 
-    def build_lr_scheduler(self):
+    def _build_lr_scheduler(self):
         """Size the run, then let the model schedule over it.
 
         The step count is job-bound — it needs the dataset length and the epoch
         count — so the model takes the number rather than deriving it.
         """
-        self.model.build_lr_scheduler(self.args.train_steps * self.args.train.num_train_epochs)
+        self.model._build_lr_scheduler(self.args.train_steps * self.args.train.num_train_epochs)
 
     def _build_data_transform(self):
         self.data_transform = build_data_transform(

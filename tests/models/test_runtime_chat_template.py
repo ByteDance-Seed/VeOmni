@@ -52,7 +52,7 @@ def _build(runtime, monkeypatch):
         raise FileNotFoundError(path)
 
     monkeypatch.setattr("veomni.models.auto.build_processor", _fail)
-    VeOmniModelRuntime.build_model_assets(runtime)
+    VeOmniModelRuntime._build_model_assets(runtime)
 
 
 @pytest.mark.parametrize("template_name", ["qwen2vl", "qwen3vl"])

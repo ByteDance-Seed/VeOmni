@@ -198,7 +198,7 @@ class DiTModelRuntime(VeOmniModelRuntime):
     def trains_the_dit(self) -> bool:
         return self.training_task in ("offline_training", "online_training")
 
-    def build_model(self):
+    def _build_model(self):
         logger.info_rank0("Build model")
         args: DiTModelArguments = self.args
         # Apply ops config eagerly so the condition model (built below via
@@ -242,18 +242,18 @@ class DiTModelRuntime(VeOmniModelRuntime):
             self.condition_model.to(get_device_type())
             logger.info_rank0("Condition model loaded.")
 
-    def freeze_model(self):
+    def _freeze_model_module(self):
         self.condition_model.requires_grad_(False)
 
         if self.trains_the_dit:
-            super().freeze_model()
+            super()._freeze_model_module()
 
-    def build_parallelize_model(self) -> None:
+    def _build_parallelized_model(self) -> None:
         """``offline_embedding`` builds no DiT, so there is nothing to wrap."""
         if self.trains_the_dit:
-            super().build_parallelize_model()
+            super()._build_parallelized_model()
 
-    def build_model_assets(self) -> None:
+    def _build_model_assets(self) -> None:
         """A DiT reads latents, not text — there is no preprocessor to load.
 
         That leaves the config, and only a run that trains the DiT has one worth
@@ -262,10 +262,10 @@ class DiTModelRuntime(VeOmniModelRuntime):
         """
         self.model_assets = [self.model_config] if self.trains_the_dit else []
 
-    def build_optimizer(self, param_groups=None) -> None:
+    def _build_optimizer(self, param_groups=None) -> None:
         """``offline_embedding`` trains nothing, so there is nothing to optimize."""
         if self.trains_the_dit:
-            super().build_optimizer(param_groups=param_groups)
+            super()._build_optimizer(param_groups=param_groups)
 
     def load(self) -> None:
         if self.trains_the_dit:
@@ -300,12 +300,12 @@ class DiTTrainer:
         self.base.args = args
 
         # rewrite _setup, setup arguments for dit training.
-        # ``base.setup_distributed`` registers ParallelState; DiT then recomputes
+        # ``base._setup`` registers ParallelState; DiT then recomputes
         # dataloader_batch_size from ``dp_size``.
         self._setup()
         # Builds the condition model and, unless this is an embedding-only run,
         # the DiT itself along with its optimizer.
-        self.base.model = self.build_model_runtime()
+        self.base.model = self._build_model_runtime()
         self.base.LOG_SAMPLE = args.data.log_sample
 
         # rewrite _build_data_transform, build data transform for offline or online dit data
@@ -321,7 +321,7 @@ class DiTTrainer:
         self._build_dataloader()
 
         if self.trains_the_dit:
-            self.base.build_lr_scheduler()
+            self.base._build_lr_scheduler()
             self.base._build_training_context()
 
         self.base._init_callbacks()
@@ -334,14 +334,14 @@ class DiTTrainer:
     def trains_the_dit(self) -> bool:
         return self.base.model.trains_the_dit
 
-    def build_model_runtime(self) -> DiTModelRuntime:
+    def _build_model_runtime(self) -> DiTModelRuntime:
         """Build (and own) this job's DiT. Override to swap in another runtime."""
         return DiTModelRuntime(self.base.args.model, "base", train=self.base.args.train)
 
     def _setup(self):
         args: VeOmniDiTArguments = self.base.args
         # registers ParallelState("base") before seed
-        self.base.device = self.base.setup_distributed(args)
+        self.base.device = self.base._setup(args)
         args.train.dyn_bsz = False
         args.train.micro_batch_size = 1
         # dataloader_batch_size was computed in __post_init__ when dyn_bsz was still True

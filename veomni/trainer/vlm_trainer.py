@@ -109,7 +109,7 @@ class VeOmniVLMArguments(VeOmniArguments):
 class VLMModelRuntime(VeOmniModelRuntime):
     """A VLM: encoder-aware build, tower freezing, and a separate ViT learning rate."""
 
-    def build_model(self):
+    def _build_model(self):
         args: VLMMModelArguments = self.args
         logger.info_rank0("Build model")
         self.model = build_foundation_model(
@@ -149,7 +149,7 @@ class VLMModelRuntime(VeOmniModelRuntime):
             enable_reshard_after_forward=accelerator.fsdp_config.reshard_after_forward,
         )
 
-    def freeze_model(self):
+    def _freeze_model_module(self):
         train_args: VLMTrainingArguments = self.train
         model_config = self.model_config
         lora_enabled = bool(self.args.lora_config)
@@ -158,7 +158,7 @@ class VLMModelRuntime(VeOmniModelRuntime):
             self.model.disable_talker()
 
         if lora_enabled:
-            self.setup_lora()
+            self._setup_lora()
 
         visual = self.model.thinker.visual if is_omni else _get_vlm_visual_module(self.model)
 
@@ -190,9 +190,9 @@ class VLMModelRuntime(VeOmniModelRuntime):
         pretty_print_trainable_parameters(self.model)
         helper.print_device_mem_info("VRAM usage after building model")
 
-    def build_optimizer(self, param_groups=None):
+    def _build_optimizer(self, param_groups=None):
         if param_groups is not None:
-            return super().build_optimizer(param_groups=param_groups)
+            return super()._build_optimizer(param_groups=param_groups)
 
         vit_params, other_params = [], []
         for name, param in self.model.named_parameters():
@@ -211,7 +211,7 @@ class VLMModelRuntime(VeOmniModelRuntime):
         if other_params:
             param_groups.append({"params": other_params, "lr": self.args.optimizer.lr})
 
-        return super().build_optimizer(param_groups=param_groups)
+        return super()._build_optimizer(param_groups=param_groups)
 
 
 class VLMTrainer:
@@ -221,8 +221,8 @@ class VLMTrainer:
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        self.base.device = self.base.setup_distributed(args)  # registers ParallelState("base") before seed
-        self.base.model = self.build_model_runtime()
+        self.base.device = self.base._setup(args)  # registers ParallelState("base") before seed
+        self.base.model = self._build_model_runtime()
 
         # rewrite build_data_transform to support multimodal transform
         self._build_data_transform()
@@ -233,11 +233,11 @@ class VLMTrainer:
         self._build_collate_fn()
 
         self.base._build_dataloader()
-        self.base.build_lr_scheduler()
+        self.base._build_lr_scheduler()
         self.base._build_training_context()
         self.base._init_callbacks()
 
-    def build_model_runtime(self) -> VLMModelRuntime:
+    def _build_model_runtime(self) -> VLMModelRuntime:
         """Build (and own) this job's VLM. Override to swap in another runtime."""
         return VLMModelRuntime(
             self.base.args.model,

@@ -257,10 +257,10 @@ class TrainerTest(BaseTrainer):
             self.args.model.ops_implementation.rotary_pos_emb_implementation = "eager"
             self.args.model.ops_implementation.cross_entropy_loss_implementation = "eager"
 
-        self.model.build_model()
+        self.model._build_model()
         self._verify_opslot_state(model_mode)
-        self.model.build_optimizer()
-        self.build_lr_scheduler()
+        self.model._build_optimizer()
+        self._build_lr_scheduler()
         print_device_mem_info(f"[Memory Info] after building model {model_name}:")
 
         # Sync weights — every model that test_models_patch covers ships a

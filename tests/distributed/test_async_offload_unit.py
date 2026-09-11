@@ -549,7 +549,7 @@ def _run_async_offload_base_trainer_fsdp2_gc():
 
     torch.manual_seed(0)
     with use_parallel_state("base"):
-        runtime.build_parallelize_model()
+        runtime._build_parallelized_model()
 
     assert all(layer.gradient_checkpointing for layer in runtime.model.layers)
     manager = runtime.model.layers[0]._veomni_offload_manager

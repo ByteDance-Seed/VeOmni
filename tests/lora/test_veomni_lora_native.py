@@ -146,7 +146,7 @@ def test_model_runtime_rejects_lora_without_trainable_adapters():
     runtime.model = Toy()
 
     with pytest.raises(ValueError, match="no trainable adapters"):
-        runtime.setup_lora()
+        runtime._setup_lora()
 
 
 @pytest.mark.parametrize("is_trainable", [True, False])
@@ -158,11 +158,11 @@ def test_model_runtime_validates_resumed_adapter(tmp_path, is_trainable):
     runtime.model = Toy()
 
     if is_trainable:
-        runtime.setup_lora()
+        runtime._setup_lora()
         assert any(param.requires_grad for param in runtime.parameters())
     else:
         with pytest.raises(ValueError, match="no trainable adapters"):
-            runtime.setup_lora()
+            runtime._setup_lora()
 
 
 def test_init_is_noop():

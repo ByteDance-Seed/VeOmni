@@ -372,7 +372,7 @@ class FakeModelRuntime(VeOmniModelRuntime):
     through ``build_foundation_model`` would make them slow and network-bound.
     """
 
-    def build_model(self) -> None:
+    def _build_model(self) -> None:
         self.model = FakeModel().to(get_device_type())
         self.model_config = PretrainedConfig()
 
