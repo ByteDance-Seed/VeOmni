@@ -626,7 +626,7 @@ and is not intended to be captured by `torch.compile`.
 
 ### CheckpointConfig
 
-`train.checkpoint.*` — Checkpoint saving and loading.
+`train.checkpoint.*` — Checkpoint saving and loading. On-disk layout: [Checkpoint layout](checkpoint.md).
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |

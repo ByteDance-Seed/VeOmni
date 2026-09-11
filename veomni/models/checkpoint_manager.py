@@ -17,10 +17,12 @@
 Two blobs, two owners:
 
 * **lr_scheduler** — this model's scheduler. Passed to DCP like the optimizer;
-  the checkpointer pickles ``state_dict`` under ``extra_state/extra_state_rank_*.pt``.
+  the checkpointer pickles ``state_dict`` as a single ``lr_scheduler.pt``.
 * **global_state** — the job cursor (step, dataloader, rng, meters), written by
   :class:`~veomni.trainer.callbacks.global_state_callback.GlobalStateCallback`
   as ``trainer_state_rank_*.pt``.
+
+On-disk layout: ``docs/usage/checkpoint.md``.
 """
 
 import os
@@ -59,8 +61,10 @@ class ModelCheckpointManager:
 
         <save_path>/global_step_{N}/
         ├── __0_0.distcp …     # DCP shards {model, optimizer}
-        ├── extra_state/       # lr_scheduler
-        └── hf_ckpt/           # HF safetensors export
+        ├── lr_scheduler.pt    # replicated scheduler
+        ├── trainer_state_rank_{R}.pt  # job cursor (written by GlobalStateCallback)
+        ├── adapter_config.json / adapter_model.safetensors  # LoRA export
+        └── hf_ckpt/           # full-model HF safetensors export
 
     A subclass managing one module of a multi-module model sets
     :attr:`checkpoint_subfolder` so every artifact nests one level deeper.
@@ -104,12 +108,8 @@ class ModelCheckpointManager:
         return os.path.join(step_dir, self.checkpoint_subfolder) if self.checkpoint_subfolder else step_dir
 
     def save_dir(self, state: "TrainerState") -> str:
-        """Where this step's DCP shards live."""
+        """Where this step's DCP shards (and LoRA adapter export) live."""
         return self._step_dir(self.config.save_path, state)
-
-    def output_dir(self, state: "TrainerState") -> str:
-        """Where user-facing exports (LoRA adapters) live."""
-        return self._step_dir(self.config.output_dir, state)
 
     def hf_export_dir(self, state: "TrainerState") -> str:
         """Where this step's safetensors export lives."""
@@ -227,7 +227,7 @@ class ModelCheckpointManager:
 
         save_lora_adapter_with_dcp(
             model=self.runtime.model,
-            save_path=self.output_dir(state),
+            save_path=self.save_dir(state),
             adapter_name=adapter_name,
         )
         helper.empty_cache()

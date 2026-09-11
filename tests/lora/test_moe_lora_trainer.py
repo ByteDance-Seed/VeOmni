@@ -22,7 +22,7 @@ emit, then validates both resume paths bit-exact (modulo bf16 storage):
        - DCP shards under ``<output_dir>/checkpoints/global_step_<S>/``
          (model + optimizer + lr_scheduler -- the format ``BaseTrainer``
          resumes via ``train.checkpoint.load_path``).
-       - HF-format LoRA adapter under ``<output_dir>/global_step_<S>/``
+       - HF-format LoRA adapter in the same directory
          (``adapter_model.safetensors`` + ``adapter_config.json``; the MoE mode +
          rank/alpha VeOmni's wrappers need to re-install themselves on resume
          live in the ``veomni_lora`` block of ``adapter_config.json``) -- the
@@ -585,7 +585,7 @@ def _writer_adapter_path(writer_dir: str, save_step: int = 4) -> str:
     Uses the *final* step's adapter so the resumer's pre-snapshot can be
     compared directly against the writer's post-snapshot.
     """
-    return os.path.join(writer_dir, f"global_step_{save_step}")
+    return os.path.join(writer_dir, "checkpoints", f"global_step_{save_step}")
 
 
 def _assert_writer_artifacts_exist(writer_dir: str, mode: str, *, final_step: int = 4) -> None:

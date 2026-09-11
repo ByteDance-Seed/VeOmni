@@ -331,6 +331,22 @@ class TestModelCheckpointManagerSaveContract:
         assert trainer.state.global_step == 0
         assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is trainer.model.parallel_state
 
+    def test_save_lora_writes_the_adapter_beside_the_dcp_shards(
+        self, mock_helper, mock_dist, mock_build_ckpt, tmp_path
+    ):
+        """LoRA export lives under checkpoints/global_step_N, same parent as DCP and hf_ckpt."""
+        trainer = _make_mock_trainer(save_path=str(tmp_path / "checkpoints"))
+        mock_build_ckpt.return_value = MagicMock()
+        manager = ModelCheckpointManager(trainer.model, trainer.args.train.checkpoint)
+        state = TrainerState(global_step=10)
+        (tmp_path / "checkpoints" / "global_step_10").mkdir(parents=True)
+
+        with patch("veomni.utils.save_safetensor_utils.save_lora_adapter_with_dcp") as save_adapter:
+            manager.save_lora(state)
+
+        assert save_adapter.call_args.kwargs["save_path"] == str(tmp_path / "checkpoints" / "global_step_10")
+        assert save_adapter.call_args.kwargs["save_path"] == manager.save_dir(state)
+
     def test_save_uses_the_runtime_mesh_not_the_ambient_one(self, mock_helper, mock_dist, mock_build_ckpt):
         """build_checkpoint runs outside use_parallel_state, so ambient is still ``base``."""
         trainer = _make_mock_trainer()

@@ -1043,11 +1043,12 @@ class TrainingArguments:
                 logger.warning("load_checkpoint_path should be under output_dir.")
 
         # output_dir/
-        # ├── checkpoints/          # DCP training checkpoints (model + optimizer + lr_scheduler)
+        # ├── checkpoints/          # DCP: model + optimizer + lr_scheduler.pt + trainer_state
         # │   ├── global_step_100/
         # │   └── global_step_200/
         # │       └── hf_ckpt/      # HF safetensors saved under the last checkpoint folder
         # └── model_assets/
+        # See docs/usage/checkpoint.md.
         ckpt.save_path = os.path.join(ckpt.output_dir, "checkpoints")
         ckpt.model_assets_dir = os.path.join(ckpt.output_dir, "model_assets")
 

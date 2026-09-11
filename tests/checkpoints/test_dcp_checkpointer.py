@@ -1072,31 +1072,57 @@ class TestNormalizeKey:
 @patch("veomni.checkpoint.dcp_checkpointer.dist")
 class TestLrSchedulerSaveLoad:
     def test_roundtrip(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
         mock_dist.get_rank.return_value = 0
-        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+        from veomni.checkpoint.dcp_checkpointer import (
+            _LR_SCHEDULER_FILENAME,
+            DistributedCheckpointer,
+        )
 
         saved_scheduler = MagicMock()
         saved_scheduler.state_dict.return_value = {"last_epoch": 10, "base_lrs": [1e-4]}
         DistributedCheckpointer._save_lr_scheduler(str(tmp_path), {"lr_scheduler": saved_scheduler})
+
+        assert (tmp_path / _LR_SCHEDULER_FILENAME).is_file()
+        assert {p.name for p in tmp_path.iterdir()} == {_LR_SCHEDULER_FILENAME}
 
         loaded_scheduler = MagicMock()
         DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": loaded_scheduler})
 
         loaded_scheduler.load_state_dict.assert_called_once_with({"last_epoch": 10, "base_lrs": [1e-4]})
 
+    def test_only_rank_zero_writes(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = True
+        mock_dist.get_rank.return_value = 3
+        from veomni.checkpoint.dcp_checkpointer import (
+            _LR_SCHEDULER_FILENAME,
+            DistributedCheckpointer,
+        )
+
+        saved_scheduler = MagicMock()
+        saved_scheduler.state_dict.return_value = {"last_epoch": 10}
+        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=lambda failed: failed):
+            DistributedCheckpointer._save_lr_scheduler(str(tmp_path), {"lr_scheduler": saved_scheduler})
+
+        saved_scheduler.state_dict.assert_not_called()
+        assert not (tmp_path / _LR_SCHEDULER_FILENAME).exists()
+
     def test_missing_lr_scheduler_key_save(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
         state = {"model": MagicMock()}
         DistributedCheckpointer._save_lr_scheduler(str(tmp_path), state)
 
     def test_missing_lr_scheduler_key_load(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
         state = {"model": MagicMock()}
         DistributedCheckpointer._load_lr_scheduler(str(tmp_path), state)
 
     def test_none_scheduler_is_a_no_op(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
         DistributedCheckpointer._save_lr_scheduler(str(tmp_path), {"lr_scheduler": None})
@@ -1180,23 +1206,19 @@ class TestPromoteStagedCheckpoint:
         assert order[-1] == ".metadata"
 
     def test_nested_sidecar_is_copied_before_metadata(self, tmp_path):
-        """``extra_state/`` is one level down; listdir+copyfile would skip it or raise."""
+        """A nested file is copied with the shards, before ``.metadata`` is published."""
         import shutil as _shutil
 
-        from veomni.checkpoint.dcp_checkpointer import (
-            _EXTRA_STATE_DIR,
-            _EXTRA_STATE_FORMAT,
-            _promote_staged_checkpoint,
-        )
+        from veomni.checkpoint.dcp_checkpointer import _LR_SCHEDULER_FILENAME, _promote_staged_checkpoint
 
         stage_path = tmp_path / "stage"
         final_path = tmp_path / "final"
-        extra = stage_path / _EXTRA_STATE_DIR
-        extra.mkdir(parents=True)
+        nested = stage_path / "nested"
+        nested.mkdir(parents=True)
         (stage_path / "__0_0.distcp").write_text("weights")
         (stage_path / ".metadata").write_text("meta")
-        sidecar = extra / _EXTRA_STATE_FORMAT.format(0)
-        sidecar.write_text("scheduler-v2")
+        (stage_path / _LR_SCHEDULER_FILENAME).write_text("scheduler-v2")
+        (nested / "sidecar.pt").write_text("nested")
 
         order = []
         real_copy = _shutil.copyfile
@@ -1210,11 +1232,14 @@ class TestPromoteStagedCheckpoint:
             with patch("veomni.checkpoint.dcp_checkpointer.shutil.copyfile", side_effect=spy):
                 _promote_staged_checkpoint(str(stage_path), str(final_path))
 
-        sidecar_rel = os.path.join(_EXTRA_STATE_DIR, _EXTRA_STATE_FORMAT.format(0))
-        assert sidecar_rel in order
+        nested_rel = os.path.join("nested", "sidecar.pt")
+        assert _LR_SCHEDULER_FILENAME in order
+        assert nested_rel in order
         assert order[-1] == ".metadata"
-        assert order.index(sidecar_rel) < order.index(".metadata")
-        assert (final_path / sidecar_rel).read_text() == "scheduler-v2"
+        assert order.index(_LR_SCHEDULER_FILENAME) < order.index(".metadata")
+        assert order.index(nested_rel) < order.index(".metadata")
+        assert (final_path / _LR_SCHEDULER_FILENAME).read_text() == "scheduler-v2"
+        assert (final_path / nested_rel).read_text() == "nested"
 
     def test_stale_metadata_is_removed_before_any_data_is_copied(self, staged):
         """Overwriting in place must not leave the old marker over half-new data."""
@@ -1553,24 +1578,19 @@ class TestStageDirValidation:
         """A failed staged save must not mutate the live checkpoint's scheduler.
 
         ``.metadata`` still advertises the previous checkpoint until promotion.
-        Writing the new extra_state sidecar into the destination first would let
+        Writing the new ``lr_scheduler.pt`` into the destination first would let
         a resume load the old model and optimizer with the new scheduler; a
         failed ``dcp.save`` would leave the same mix. The sidecar has to live
-        under ``stage_path`` until promotion copies the nested tree.
+        under ``stage_path`` until promotion copies it with the shards.
         """
-        from veomni.checkpoint.dcp_checkpointer import (
-            _EXTRA_STATE_DIR,
-            _EXTRA_STATE_FORMAT,
-            DistributedCheckpointer,
-        )
+        from veomni.checkpoint.dcp_checkpointer import _LR_SCHEDULER_FILENAME, DistributedCheckpointer
 
         final = tmp_path / "ckpt"
         step_dir = final / "global_step_10"
-        extra = step_dir / _EXTRA_STATE_DIR
-        extra.mkdir(parents=True)
+        step_dir.mkdir(parents=True)
         (step_dir / ".metadata").write_text("previous")
         (step_dir / "__0_0.distcp").write_text("old-weights")
-        sidecar = extra / _EXTRA_STATE_FORMAT.format(0)
+        sidecar = step_dir / _LR_SCHEDULER_FILENAME
         previous = {"last_epoch": 10, "base_lrs": [1e-4]}
         torch.save(previous, sidecar)
 

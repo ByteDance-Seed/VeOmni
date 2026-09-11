@@ -64,7 +64,7 @@ class TestWhereArtifactsLand:
 
         assert manager.save_dir(state) == "/ckpt/checkpoints/global_step_42"
         assert manager.hf_export_dir(state) == "/ckpt/checkpoints/global_step_42/hf_ckpt"
-        assert manager.output_dir(state) == "/ckpt/global_step_42"
+        # LoRA adapter export shares save_dir with the DCP shards, not a sibling of checkpoints/.
 
     def test_a_module_subfolder_nests_every_artifact_one_level_deeper(self, make_manager):
         """The hook a multi-module model overrides; each module owns its own directory."""
@@ -73,7 +73,6 @@ class TestWhereArtifactsLand:
 
         assert manager.save_dir(state) == "/ckpt/checkpoints/global_step_42/vision_encoder"
         assert manager.hf_export_dir(state) == "/ckpt/checkpoints/global_step_42/vision_encoder/hf_ckpt"
-        assert manager.output_dir(state) == "/ckpt/global_step_42/vision_encoder"
 
     def test_resume_reads_the_load_path_as_given(self, make_manager):
         assert (
@@ -217,3 +216,17 @@ class TestFormatSelection:
 
     def test_a_full_run_checkpoints_everything(self, make_manager):
         assert make_manager().trainable_only is False
+
+    def test_lora_adapter_export_lands_in_the_dcp_step_directory(self, make_manager):
+        manager = make_manager(lora_config={"rank": 8})
+        state = TrainerState(global_step=10)
+
+        with (
+            patch("veomni.models.checkpoint_manager.dist"),
+            patch.object(manager, "_prepare_export", return_value=manager.save_dir(state)),
+            patch("veomni.utils.save_safetensor_utils.save_lora_adapter_with_dcp") as save_adapter,
+        ):
+            manager.save_lora(state)
+
+        assert save_adapter.call_args.kwargs["save_path"] == manager.save_dir(state)
+        assert save_adapter.call_args.kwargs["save_path"] == "/ckpt/checkpoints/global_step_10"

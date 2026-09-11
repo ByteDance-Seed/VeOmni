@@ -15,7 +15,8 @@
 """Job-level checkpoint callback: **global_state**, as distinct from lr_scheduler.
 
 * **lr_scheduler** — one model's scheduler. Passed to DCP like the optimizer
-  by :class:`~veomni.models.checkpoint_manager.ModelCheckpointManager`.
+  by :class:`~veomni.models.checkpoint_manager.ModelCheckpointManager` as
+  ``lr_scheduler.pt``.
 * **global_state** — the job cursor (step, dataloader, rng, meters), this file.
   Written per rank as ``trainer_state_rank_{N}.pt``.
 

@@ -51,9 +51,8 @@ from .checkpointer import CheckpointerBase
 
 logger = logging.get_logger(__name__)
 
-_EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
-_EXTRA_STATE_DIR = "extra_state"
 _LR_SCHEDULER_KEY = "lr_scheduler"
+_LR_SCHEDULER_FILENAME = "lr_scheduler.pt"
 
 
 class _ModelStrictLoadPlanner(DefaultLoadPlanner):
@@ -572,8 +571,9 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
     either the previous complete checkpoint or none, never a completion marker
     over data that is only partly there.
 
-    Nested sidecars (``extra_state/``) are copied in the data phase, before
-    ``.metadata`` is published. They must not be written into a still-valid
+    Nested files are copied in the data phase, before ``.metadata`` is
+    published. The lr_scheduler sidecar is a single replicated file
+    (``lr_scheduler.pt``); it must not be written into a still-valid
     destination while the previous marker is up.
     """
     metadata_name = ".metadata"
@@ -591,8 +591,7 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
     def copy_this_nodes_files() -> None:
         """Copy every staged file on this node, except the completion marker.
 
-        Sidecars live one directory down (``extra_state/``), so this walks the
-        tree rather than copying only the top-level names DCP writes.
+        Walks the tree so a nested sidecar directory is copied, not skipped.
         """
         os.makedirs(final_path, exist_ok=True)
 
@@ -705,9 +704,10 @@ class DistributedCheckpointer(CheckpointerBase):
                 See ``CheckpointConfig.dcp_save_to_lowest_rank``.
             stage_dir: write the checkpoint here and copy it to ``path`` afterwards,
                 instead of writing straight to ``path``. Intended for a destination far
-                slower than local disk. The lr_scheduler sidecar is written under the
-                staging directory too and copied with the shards, before ``.metadata``
-                is published. The caller owns the choice: this does not probe
+                slower than local disk. The lr_scheduler sidecar is a single
+                ``lr_scheduler.pt`` written under the staging directory and copied
+                with the shards, before ``.metadata`` is published. The caller owns
+                the choice: this does not probe
                 for a usable directory or check free space, and an unusable ``stage_dir``
                 fails the save rather than silently writing elsewhere. See
                 ``CheckpointConfig.stage_dir``.
@@ -743,15 +743,15 @@ class DistributedCheckpointer(CheckpointerBase):
                 load=False,
             )
 
-        # Prepare staging before the sidecar. Writing extra_state into a still-
-        # valid destination would pair a new scheduler with the previous model
-        # and optimizer: ``.metadata`` stays up until promotion, and a failed
-        # staged save would leave the same mix.
+        # Prepare staging before the sidecar. Writing ``lr_scheduler.pt`` into a
+        # still-valid destination would pair a new scheduler with the previous
+        # model and optimizer: ``.metadata`` stays up until promotion, and a
+        # failed staged save would leave the same mix.
         stage_path = _prepare_stage_dir(stage_dir, path) if stage_dir else None
 
         # Sidecar first so a model/optimizer write is never missing its scheduler.
-        # All ranks write their own extra_state_rank_{N}.pt; the node leader
-        # copies the nested tree during promotion.
+        # Rank 0 writes the single replicated file; every rank still enters the
+        # reduction so a write failure cannot leave peers inside ``dcp.save``.
         cls._save_lr_scheduler(checkpoint_dir=stage_path or checkpoint_dir, state=state)
 
         if storage_writer is None:
@@ -923,22 +923,30 @@ class DistributedCheckpointer(CheckpointerBase):
 
     @classmethod
     def _save_lr_scheduler(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
-        """Pickle ``lr_scheduler.state_dict`` into the per-rank extra_state sidecar."""
-        if _LR_SCHEDULER_KEY not in state:
-            logger.warning_rank0("lr_scheduler not found in state, skipping lr_scheduler save")
-            return
-        lr_scheduler = state[_LR_SCHEDULER_KEY]
-        if lr_scheduler is None:
-            return
+        """Pickle ``lr_scheduler.state_dict`` into a single ``lr_scheduler.pt``.
 
-        extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
-        os.makedirs(extra_state_dir, exist_ok=True)
-        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
-        torch.save(lr_scheduler.state_dict(), extra_state_path)
+        The scheduler is replicated across ranks, so only rank 0 writes. Every
+        rank still joins the reduction afterwards: a failed write must not let
+        peers enter the DCP collective alone.
+        """
+        error: Optional[BaseException] = None
+        is_writer = (not dist.is_initialized()) or dist.get_rank() == 0
+        if is_writer:
+            try:
+                if _LR_SCHEDULER_KEY not in state:
+                    logger.warning_rank0("lr_scheduler not found in state, skipping lr_scheduler save")
+                else:
+                    lr_scheduler = state[_LR_SCHEDULER_KEY]
+                    if lr_scheduler is not None:
+                        torch.save(lr_scheduler.state_dict(), os.path.join(checkpoint_dir, _LR_SCHEDULER_FILENAME))
+            except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
+                error = e
+        if _any_rank_failed(error is not None):
+            raise error or RuntimeError("another rank could not save lr_scheduler")
 
     @classmethod
     def _load_lr_scheduler(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
-        """Load the extra_state sidecar into ``lr_scheduler``."""
+        """Load ``lr_scheduler.pt`` into ``lr_scheduler``. Every rank reads the same file."""
         if _LR_SCHEDULER_KEY not in state:
             logger.warning_rank0("lr_scheduler not found in state, skipping lr_scheduler load")
             return
@@ -946,11 +954,11 @@ class DistributedCheckpointer(CheckpointerBase):
         if lr_scheduler is None:
             return
 
-        extra_state_path = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
-        if not os.path.exists(extra_state_path):
-            logger.warning_rank0(f"lr_scheduler sidecar not found at {extra_state_path}, skipping")
+        lr_scheduler_path = os.path.join(checkpoint_dir, _LR_SCHEDULER_FILENAME)
+        if not os.path.exists(lr_scheduler_path):
+            logger.warning_rank0(f"lr_scheduler sidecar not found at {lr_scheduler_path}, skipping")
             return
-        lr_scheduler.load_state_dict(torch.load(extra_state_path, weights_only=False))
+        lr_scheduler.load_state_dict(torch.load(lr_scheduler_path, weights_only=False))
 
 
 def get_dtype_size(dtype: torch.dtype) -> int:

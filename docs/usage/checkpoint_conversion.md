@@ -1,6 +1,8 @@
 # Checkpoint Conversion
 
-This guide explains how to convert VeOmni's Distributed Checkpoint (DCP) format to HuggingFace format using the `merge_dcp_to_hf.py` script.
+This guide explains how to convert VeOmni's Distributed Checkpoint (DCP) format to HuggingFace format using the `scripts/merge_dcp_to_hf.py` script.
+
+`--load-dir` is a `global_step_{N}` directory (the DCP shards and `.metadata`). The scheduler sidecar and job cursor next to those shards are not part of the HuggingFace export. For the full training-run tree, see [Checkpoint layout](checkpoint.md).
 
 ## Overview
 
