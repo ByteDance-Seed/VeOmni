@@ -37,6 +37,8 @@ from torch import Tensor
 
 def _extract_topk_scores(logits: Tensor, topk_indices: Tensor) -> Tensor:
     """Gather scores at ``topk_indices``. Invalid ids become ``-inf``."""
+    if logits.shape[-1] == 0:
+        return logits.new_full(topk_indices.shape, float("-inf")) + logits.sum() * 0
     valid = (topk_indices >= 0) & (topk_indices < logits.shape[-1])
     safe = topk_indices.clamp(min=0, max=max(logits.shape[-1] - 1, 0)).to(torch.int64)
     scores = torch.gather(logits, dim=-1, index=safe)
@@ -98,10 +100,10 @@ def wrapper(
     if topk_indices is not None:
         return _extract_topk_scores(index_scores, topk_indices), topk_indices
 
-    top_k = min(topk, max(compressed_len, 1))
+    top_k = min(topk, compressed_len)
     if compressed_len == 0:
-        top_k_indices = index_scores.topk(top_k, dim=-1).indices.to(torch.int32)
-        return _extract_topk_scores(index_scores, top_k_indices), top_k_indices
+        empty_indices = torch.empty(index_scores.shape, device=index_scores.device, dtype=torch.int32)
+        return index_scores, empty_indices
 
     top_k_indices = index_scores.topk(top_k, dim=-1).indices
     if causal_threshold is not None:

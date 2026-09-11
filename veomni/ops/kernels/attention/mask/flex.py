@@ -20,13 +20,11 @@ import torch
 from torch.nn.attention.flex_attention import BlockMask
 from transformers.masking_utils import (
     ALL_MASK_ATTENTION_FUNCTIONS,
-    and_masks,
     causal_mask_function,
-    packed_sequence_mask_function,
 )
 
 from ..ulysses import effective_sequence_lengths, should_apply_ulysses
-from .sdpa import _packed_segment_ids
+from .packed import packed_mask_function
 
 
 def flex_attention_mask_builder(
@@ -76,18 +74,15 @@ def flex_attention_mask_builder(
         q_offset = kv_offset = 0
 
     if cu_seqlens is not None:
-        mask_function = and_masks(
-            mask_function,
-            packed_sequence_mask_function(
-                _packed_segment_ids(
-                    batch_size=batch_size,
-                    q_length=q_length,
-                    kv_length=kv_length,
-                    cu_seqlens=cu_seqlens,
-                    cu_seqlens_k=cu_seqlens_k,
-                    device=device,
-                )
-            ),
+        mask_function = packed_mask_function(
+            mask_function=mask_function,
+            q_length=q_length,
+            kv_length=kv_length,
+            q_offset=q_offset,
+            kv_offset=kv_offset,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_k=cu_seqlens_k,
+            device=device,
         )
 
     return ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"](

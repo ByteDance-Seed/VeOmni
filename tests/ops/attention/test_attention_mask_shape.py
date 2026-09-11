@@ -193,6 +193,28 @@ def test_sdpa_packed_cached_aligns_with_hf_builder():
     torch.testing.assert_close(shaped, built)
 
 
+@pytest.mark.parametrize("impl", ("sdpa", "flex_attention"))
+def test_packed_cached_uses_independent_query_and_key_segments(impl):
+    """Cross-length packed masks align each query with its paired key segment."""
+    shaped = packed_causal_mask(
+        3,
+        6,
+        impl=impl,
+        device="cpu",
+        cu_seqlens=torch.tensor([0, 2, 3]),
+        cu_seqlens_k=torch.tensor([0, 4, 6]),
+    )
+    visible = shaped[0, 0] if impl == "sdpa" else flex_visible(shaped, 3, 6)
+    expected = torch.tensor(
+        [
+            [True, True, True, False, False, False],
+            [True, True, True, True, False, False],
+            [False, False, False, False, True, True],
+        ]
+    )
+    torch.testing.assert_close(visible, expected)
+
+
 @pytest.mark.parametrize("impl", ("flex_attention", "veomni_flex_attention"))
 def test_flex_causal_aligns_with_hf_builder(impl):
     built = flex_attention_mask_builder(1, 4, 4, device="cpu")

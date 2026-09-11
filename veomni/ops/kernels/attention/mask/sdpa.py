@@ -24,11 +24,11 @@ from transformers.masking_utils import (
     ALL_MASK_ATTENTION_FUNCTIONS,
     and_masks,
     causal_mask_function,
-    packed_sequence_mask_function,
     sliding_window_overlay,
 )
 
 from ..ulysses import effective_sequence_lengths, should_apply_ulysses
+from .packed import packed_mask_function
 
 
 def sdpa_attention_mask_builder(
@@ -83,18 +83,15 @@ def sdpa_attention_mask_builder(
     if sliding_window is not None:
         mask_function = and_masks(mask_function, sliding_window_overlay(sliding_window))
     if cu_seqlens is not None:
-        mask_function = and_masks(
-            mask_function,
-            packed_sequence_mask_function(
-                _packed_segment_ids(
-                    batch_size=batch_size,
-                    q_length=q_length,
-                    kv_length=kv_length,
-                    cu_seqlens=cu_seqlens,
-                    cu_seqlens_k=cu_seqlens_k,
-                    device=device,
-                )
-            ),
+        mask_function = packed_mask_function(
+            mask_function=mask_function,
+            q_length=q_length,
+            kv_length=kv_length,
+            q_offset=q_offset,
+            kv_offset=kv_offset,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_k=cu_seqlens_k,
+            device=device,
         )
 
     if q_length != kv_length:
@@ -110,34 +107,3 @@ def sdpa_attention_mask_builder(
         attention_mask=attention_mask,
         **kwargs,
     )
-
-
-def _packed_segment_ids(
-    *,
-    batch_size: int,
-    q_length: int,
-    kv_length: int,
-    cu_seqlens: Tensor,
-    cu_seqlens_k: Tensor | None,
-    device: torch.device | str,
-) -> Tensor:
-    """``[batch, kv_length]`` segment ids for HF ``packed_sequence_mask_function``.
-
-    Query indices are global (``q_offset`` already applied by the SDPA builder),
-    so packed ids follow the key sequence. ``cu_seqlens_k`` is required when
-    ``q_length != kv_length``.
-    """
-    if cu_seqlens_k is None and q_length != kv_length:
-        raise ValueError("packed SDPA with q_length != kv_length requires cu_seqlens_k")
-    packed_cu = cu_seqlens if cu_seqlens_k is None else cu_seqlens_k
-    return _segment_ids(packed_cu, kv_length, torch.device(device)).unsqueeze(0).expand(batch_size, -1)
-
-
-def _segment_ids(cu_seqlens: Tensor, length: int, device: torch.device) -> Tensor:
-    """Expand cumulative sequence lengths into one segment id per token."""
-    if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
-        raise ValueError(f"cu_seqlens must have shape [n_seg + 1], got {tuple(cu_seqlens.shape)}")
-    cu_seqlens = cu_seqlens.to(device=device)
-    if int(cu_seqlens[0]) != 0 or int(cu_seqlens[-1]) != length:
-        raise ValueError(f"cu_seqlens must run from 0 to {length}, got {cu_seqlens.tolist()}")
-    return torch.bucketize(torch.arange(length, device=device), cu_seqlens[1:], right=True)

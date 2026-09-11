@@ -104,7 +104,7 @@ def _hf_dsv4_indexer_scores(
         invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
         top_k_indices = torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
         return index_scores, top_k_indices
-    top_k_indices = index_scores.topk(min(topk, max(compressed_len, 1)), dim=-1).indices
+    top_k_indices = index_scores.topk(min(topk, compressed_len), dim=-1).indices
     return index_scores, top_k_indices
 
 
@@ -319,6 +319,34 @@ def test_dsa_indexer_deepseek_v4_eager_matches_hf():
     hf_topk_scores = torch.gather(hf_scores, dim=-1, index=safe)
     hf_topk_scores = torch.where(valid, hf_topk_scores, float("-inf"))
     torch.testing.assert_close(ours_scores, hf_topk_scores, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+
+@pytest.mark.parametrize("packed", (False, True))
+def test_dsa_indexer_deepseek_v4_eager_empty_compressed_kv(packed):
+    """Sequences shorter than the compression window return empty selections."""
+    seq_len, batch, heads, dim = 3, 2, 2, 4
+    q = torch.randn(seq_len, batch, heads, dim, requires_grad=True)
+    k = torch.empty(0, batch, dim, requires_grad=True)
+    weights = torch.randn(seq_len, batch, heads, requires_grad=True)
+    ranges = torch.zeros(seq_len, dtype=torch.int32) if packed else None
+
+    scores, indices = resolve_op("dsa_indexer", "deepseek_v4", "eager").wrapper(
+        q,
+        k,
+        weights,
+        4,
+        2,
+        cu_seqlen_ks=ranges,
+        cu_seqlen_ke=ranges,
+    )
+
+    assert scores.shape == (batch, seq_len, 0)
+    assert indices.shape == (batch, seq_len, 0)
+    assert indices.dtype == torch.int32
+    scores.sum().backward()
+    assert q.grad is not None
+    assert k.grad is not None
+    assert weights.grad is not None
 
 
 def test_dsa_indexer_glm_eager_matches_hf():
