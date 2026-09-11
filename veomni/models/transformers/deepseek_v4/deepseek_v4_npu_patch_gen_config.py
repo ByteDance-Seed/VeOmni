@@ -112,7 +112,6 @@ from .deepseek_v4_gpu_patch_gen_config import (
     deepseek_v4_indexer_forward_patched,
     deepseek_v4_mlp_forward_patched,
     deepseek_v4_model_forward_patched,
-    deepseek_v4_pretrained_init,
     deepseek_v4_rms_norm_forward_patched,
     deepseek_v4_rotary_embedding_forward_patched,
     deepseek_v4_topk_router_forward_patched,
@@ -415,9 +414,7 @@ def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config") -> None:
     self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
     self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
     self.rotary_emb = DeepseekV4RotaryEmbedding(config)
-    self.softmax_scale = config.index_head_dim**-0.5
-    self.weights_scaling = config.index_n_heads**-0.5
-    self.weights_proj = nn.Linear(config.hidden_size, config.index_n_heads, bias=False)
+    self.scorer = DeepseekV4IndexerScorer(config)
     self.position_bias._veomni_fsdp_shard_dim = 1
 
 
@@ -689,10 +686,3 @@ def deepseek_v4_csa_compressor_forward_patched(
         block_bias = None
     result = (compressed_kv, block_bias)
     return (*result, top_k_indices) if return_topk_indices else result
-
-
-config.override_method(
-    "DeepseekV4PreTrainedModel.__init__",
-    replacement=deepseek_v4_pretrained_init,
-    description="Keep the checkpoint-compatible scorer out of FP8 conversion",
-)

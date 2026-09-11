@@ -1328,7 +1328,9 @@ def deepseek_v4_indexer_forward_patched(
     # `weights_proj` stays unquantized: it produces one score per head, so its
     # [index_n_heads, hidden_size] weight has too few rows to tile at 128 in the
     # first place, and inference keeps it BF16.
-    weights = self.weights_proj(hidden_states).float() * (self.weights_scaling * self.softmax_scale)
+    weights = self.scorer.weights_proj(hidden_states).float() * (
+        self.scorer.weights_scaling * self.scorer.softmax_scale
+    )
     compressed_len = compressed_kv.shape[1]
     top_k = min(self.index_topk, compressed_len)
 
@@ -1442,8 +1444,8 @@ def deepseek_v4_indexer_forward_patched(
     # that no test can exercise is worse than none: it reads as the protection while
     # the one doing the work sits elsewhere.
     scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))
-    scores = F.relu(scores) * self.softmax_scale
-    eager_weights = self.weights_proj(hidden_states).float() * self.weights_scaling
+    scores = F.relu(scores) * self.scorer.softmax_scale
+    eager_weights = self.scorer.weights_proj(hidden_states).float() * self.scorer.weights_scaling
     index_scores = (scores * eager_weights.unsqueeze(-1)).sum(dim=2)
     if compressed_len > 0:
         entry_indices = torch.arange(compressed_len, device=index_scores.device)
@@ -2634,31 +2636,3 @@ def deepseek_v4_get_parallel_plan_patched(self):
     from ..parallel_plan import get_parallel_plan as _get_parallel_plan
 
     return _get_parallel_plan()
-
-
-@config.override_method(
-    "DeepseekV4Indexer.__init__", description="Preserve VeOmni model and optimizer checkpoint parameter names"
-)
-def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config") -> None:
-    nn.Module.__init__(self)
-    self.compress_rate = config.compress_rates["compressed_sparse_attention"]
-    self.num_heads = config.index_n_heads
-    self.head_dim = config.index_head_dim
-    self.index_topk = config.index_topk
-    self.kv_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
-    self.gate_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
-    self.position_bias = nn.Parameter(torch.empty(self.compress_rate, 2 * self.head_dim))
-    self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-    self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
-    self.rotary_emb = DeepseekV4RotaryEmbedding(config)
-    self.softmax_scale = config.index_head_dim**-0.5
-    self.weights_scaling = config.index_n_heads**-0.5
-    self.weights_proj = nn.Linear(config.hidden_size, config.index_n_heads, bias=False)
-
-
-@config.override_method(
-    "DeepseekV4PreTrainedModel.__init__", description="Keep the checkpoint-compatible scorer out of FP8 conversion"
-)
-def deepseek_v4_pretrained_init(self, config):
-    super().__init__(config)
-    self._keep_in_fp32_modules = [name.replace(".indexer.scorer.", ".indexer.") for name in self._keep_in_fp32_modules]

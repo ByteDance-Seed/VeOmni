@@ -17,7 +17,9 @@ _TOY_CONFIGS = Path(__file__).parents[1] / "toy_config"
 
 
 @pytest.mark.parametrize("backend", ["gpu", "npu"])
-def test_deepseek_v4_indexer_preserves_model_and_optimizer_keys(backend):
+def test_deepseek_v4_indexer_matches_hf_model_and_optimizer_keys(backend):
+    from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Indexer
+
     modeling = importlib.import_module(
         f"veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_{backend}"
     )
@@ -29,15 +31,19 @@ def test_deepseek_v4_indexer_preserves_model_and_optimizer_keys(backend):
         "gate_proj.weight",
         "kv_norm.weight",
         "q_b_proj.weight",
-        "weights_proj.weight",
+        "scorer.weights_proj.weight",
     }
     assert set(indexer.state_dict()) == expected
+    reference = DeepseekV4Indexer(config)
+    indexer.load_state_dict(reference.state_dict(), strict=True)
     optimizer = torch.optim.AdamW(indexer.parameters())
     state = get_optimizer_state_dict(indexer, optimizer)
     assert set(state["param_groups"][0]["params"]) == expected
+    reference_state = get_optimizer_state_dict(reference, torch.optim.AdamW(reference.parameters()))
+    assert state["param_groups"] == reference_state["param_groups"]
     model = modeling.DeepseekV4PreTrainedModel(config)
-    assert "self_attn.compressor.indexer.weights_proj" in model._keep_in_fp32_modules
-    assert all(".indexer.scorer." not in name for name in model._keep_in_fp32_modules)
+    assert "self_attn.compressor.indexer.scorer.weights_proj" in model._keep_in_fp32_modules
+    assert "self_attn.compressor.indexer.weights_proj" not in model._keep_in_fp32_modules
 
 
 def _make_omni_thinker(family, prefix):

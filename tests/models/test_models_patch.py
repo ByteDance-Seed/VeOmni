@@ -20,7 +20,6 @@ from veomni.arguments import (
 )
 from veomni.data.data_collator import MainCollator
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
-from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import convert_deepseek_v4_checkpoint_key
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.utils.device import IS_NPU_AVAILABLE, empty_cache, get_device_type, synchronize
 from veomni.utils.env import get_env
@@ -269,12 +268,6 @@ class TrainerTest(BaseTrainer):
         self._build_lr_scheduler()
         print_device_mem_info(f"[Memory Info] after building model {model_name}:")
 
-        # HF 5.16 nests the V4 scoring head under ``scorer``. VeOmni keeps
-        # the original key for native model/optimizer checkpoint compatibility.
-        # Reuse the runtime converter's key mapping for this in-memory snapshot,
-        # retaining strict loading and the untouched snapshot for HF modes.
-        if model_name == "deepseek_v4" and model_mode.modeling_backend == "veomni":
-            state_dict = {convert_deepseek_v4_checkpoint_key(key): value for key, value in state_dict.items()}
         self.model.load_state_dict(state_dict)
 
         if self.model_config.model_type in ["qwen2_5_omni", "qwen3_omni_moe"]:

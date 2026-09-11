@@ -17,10 +17,9 @@ those updates into both GPU and NPU outputs. The shared HF loading code also
 restores standalone tensor-parallel arguments for backward compatibility.
 
 The upgrade includes the current main-branch DeepSeek-V4 QAT, context-parallel,
-and indexer-loss changes. VeOmni retains the scoring projection at
-`indexer.weights_proj` so existing DCP model and optimizer keys remain stable.
-The HF converter maps the new `indexer.scorer.weights_proj` name back to this
-layout, and the projection remains excluded from FP8 conversion. Omni RoPE
+and indexer-loss changes. VeOmni uses HF's current scoring projection key,
+`indexer.scorer.weights_proj`. The checkpoint converter maps older weight keys
+to this layout, and the projection remains excluded from FP8 conversion. Omni RoPE
 helpers also accept the global audio/video flag used by HF generation while
 retaining the per-video placeholder convention for training. Thinker forwards
 pass RoPE arguments by keyword: adding the global flag before `audio_seqlens`
@@ -158,11 +157,23 @@ overrides were rebuilt on the new bodies while keeping the fp32-router
 
 `softmax_scale`, `weights_scaling` and `weights_proj` moved off
 `DeepseekV4Indexer` into a `DeepseekV4IndexerScorer` submodule reachable as
-`self.scorer`. The final VeOmni patches keep these attributes on the indexer to preserve
-existing DCP model and optimizer keys. Both GPU and NPU constructors create the scoring projection directly on
-the indexer.
-The checkpoint converter accepts both the new HF scorer key and the existing
-VeOmni key.
+`self.scorer`. Both GPU and NPU modeling follow this upstream hierarchy;
+the eager and TileLang indexer paths read the projection and scales from the
+scorer. HF reference weights load strictly without a test-only key rewrite.
+
+The checkpoint converter maps original inference keys and older VeOmni
+`indexer.weights_proj` keys to `indexer.scorer.weights_proj`, and leaves the
+current HF key unchanged. Export maps the new key back to the original
+inference checkpoint format. This key change also affects optimizer state:
+an older DCP checkpoint needs migration of both model and optimizer keys before
+resume. The safetensors converter does not migrate DCP optimizer state.
+
+The key audit covered constructor assignments in all 29 generated GPU/NPU
+modules. Meta-device model instances matched HF parameter keys in 28 modules
+(the supported text path for Gemma 3 and thinker paths for Omni). The remaining
+Qwen3-Omni NPU module requires `torch_npu` to import and was checked statically.
+No other model was found to retain obsolete parameter names for compatibility;
+existing MoE checkpoint layout conversions remain in the checkpoint layer.
 
 ### MLA value padding for flash attention
 
@@ -212,8 +223,8 @@ config does not patch the attention forward at all, and any future DSA family.
 - All 29 patchgen configs regenerate and pass the drift check.
 - After restoring the generated Qwen child models, all 13 HF/VeOmni
   forward/backward parity cases pass with a 40 GiB allocator limit (31.78 GiB
-  peak). Reference weights stay on CPU between modes, and the DeepSeek-V4
-  reference translates HF's scorer key while retaining strict loading.
+  peak). Reference weights stay on CPU between modes. DeepSeek-V4 uses HF's
+  scorer key and strict loading directly.
 - The restored towers pass all 52 implicit-sync/logits checks and 30 VLM
   freezing, LoRA and log-probability checks. Upgrade import/compatibility
   tests are now explicitly listed in both unit-test workflows.
@@ -223,7 +234,7 @@ config does not patch the attention forward at all, and any future DSA family.
 - Checkpoint converter, QAT, indexer loss, and upgrade compatibility: 265 passed.
   The new contracts cover GPU/NPU model and optimizer names, FP8 exclusions,
   and Omni text/silent-video generation positions.
-- DeepSeek-V4 CP/Ulysses: 43 passed; after preserving the indexer keys, all
+- DeepSeek-V4 CP/Ulysses: 43 passed; all
   5 focused indexer parallel cases pass again.
 - The broad model suite retains three failures reproduced with the original
   5.16.0 commit: the DeepSeek-V4 q-norm reference assertion and two Flux

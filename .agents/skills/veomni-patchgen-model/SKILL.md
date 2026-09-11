@@ -208,6 +208,12 @@ Drop phases that don't apply (e.g. Phase 3 for non-MoE models).
    `name_map={"Qwen3_5": "Qwen3_5Moe"}`. Prefer reuse over copy-paste when the
    upstream classes are structural duplicates with only a name-prefix
    difference.
+8. Compare upstream and VeOmni parameter keys, including constructor overrides
+   and nested modules. For any mismatch, follow
+   [the user-decision rule in veomni-new-model](../veomni-new-model/SKILL.md#checkpoint-key-conflicts-require-a-user-decision)
+   before choosing a model rename or checkpoint conversion. This also applies
+   to refreshes and dependency upgrades. A resolution already authorized in
+   the current task does not require another confirmation.
 
 **Validation**: you have a concrete list of patches to apply, the reference
 model directory to mirror, and the backend/category decision pinned down.

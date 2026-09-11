@@ -452,6 +452,53 @@ class TestDeepseekV4ConverterCanHandle:
 
 
 class TestDeepseekV4ConverterConvert:
+    @pytest.mark.parametrize("target_model_prefix", ["model.", ""])
+    @pytest.mark.parametrize("source_model_prefix", ["model.", ""])
+    @pytest.mark.parametrize(
+        "source_suffix",
+        [
+            "attn.indexer.weights_proj.weight",
+            "self_attn.compressor.indexer.weights_proj.weight",
+            "self_attn.compressor.indexer.scorer.weights_proj.weight",
+        ],
+    )
+    def test_scorer_checkpoint_keys_load_into_current_model(
+        self, target_model_prefix, source_model_prefix, source_suffix
+    ):
+        source = f"{source_model_prefix}layers.2.{source_suffix}"
+        target = f"{target_model_prefix}layers.2.self_attn.compressor.indexer.scorer.weights_proj.weight"
+        weight = torch.randn(4, 8)
+        converter = DeepseekV4CheckpointTensorConverter(
+            num_experts=NUM_EXPERTS, target_model_prefix=target_model_prefix
+        )
+        result = maybe_convert_checkpoint_tensor(source, weight, converter)
+        assert result.name == target
+        assert result.tensor is weight
+        assert maybe_convert_checkpoint_tensor(target, result.tensor, converter).name == target
+        assert convert_deepseek_v4_fqn_to_index_mapping({source: 3}, target_model_prefix=target_model_prefix) == {
+            target: 3
+        }
+        assert converter.finalize() == []
+
+    @pytest.mark.parametrize("target_model_prefix", ["model.", ""])
+    def test_scorer_export_round_trips_through_inference_format(self, monkeypatch, target_model_prefix):
+        from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as module
+
+        source = "layers.2.attn.indexer.weights_proj.weight"
+        target = f"{target_model_prefix}layers.2.self_attn.compressor.indexer.scorer.weights_proj.weight"
+        weight = torch.randn(4, 8, dtype=torch.bfloat16)
+        model = SimpleNamespace(config=SimpleNamespace(expert_dtype="fp8"), _veomni_fqn_to_index_mapping={source: 1})
+        # Supply the gathered parameter stream; exercise the real export mapping.
+        monkeypatch.setattr(module, "export_weights", lambda model: iter([(target, weight)]))
+        converter = DeepseekV4CheckpointTensorConverter(
+            num_experts=NUM_EXPERTS, target_model_prefix=target_model_prefix
+        )
+        exported = dict(converter.export_weights(model))
+        assert set(exported) == {source}
+        restored = maybe_convert_checkpoint_tensor(source, exported[source], converter)
+        assert restored.name == target
+        assert torch.equal(restored.tensor, weight)
+
     def test_dequantizes_block_scaled_fp8_weight(self):
         weight = _to_fp8(torch.arange(16, dtype=torch.float32).reshape(4, 4))
         scale = torch.tensor([[1.0, 2.0], [4.0, 8.0]])
@@ -500,11 +547,11 @@ class TestDeepseekV4ConverterConvert:
             ("model.norm.weight", "model.norm.weight"),
             (
                 "model.layers.2.self_attn.compressor.indexer.weights_proj.weight",
-                "model.layers.2.self_attn.compressor.indexer.weights_proj.weight",
+                "model.layers.2.self_attn.compressor.indexer.scorer.weights_proj.weight",
             ),
             (
                 "model.layers.2.self_attn.compressor.indexer.scorer.weights_proj.weight",
-                "model.layers.2.self_attn.compressor.indexer.weights_proj.weight",
+                "model.layers.2.self_attn.compressor.indexer.scorer.weights_proj.weight",
             ),
             ("hc_head_fn", "model.hc_head.hc_fn"),
             ("model.hc_head_fn", "model.hc_head.hc_fn"),
@@ -524,7 +571,7 @@ class TestDeepseekV4ConverterConvert:
             ),
             (
                 "layers.2.attn.indexer.weights_proj.weight",
-                "model.layers.2.self_attn.compressor.indexer.weights_proj.weight",
+                "model.layers.2.self_attn.compressor.indexer.scorer.weights_proj.weight",
             ),
             ("layers.2.ffn.gate.bias", "model.layers.2.mlp.gate.e_score_correction_bias"),
             ("layers.2.ffn.gate.tid2eid", "model.layers.2.mlp.gate.tid2eid"),
