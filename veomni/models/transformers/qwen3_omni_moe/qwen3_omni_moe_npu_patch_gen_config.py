@@ -28,6 +28,7 @@ config.target_file = "patched_modeling_qwen3_omni_moe_npu.py"
 config.description = "Qwen3OmniMoe with NPU"
 
 config.add_import("torch_npu", names=["npu_rotary_mul"])
+config.add_import("torch_npu", names=["npu_rms_norm"])
 
 
 @config.replace_function("apply_rotary_pos_emb_vision", description="Replace with the fusion operator on Ascend.")
@@ -41,3 +42,14 @@ def apply_rotary_pos_emb_vision(
     k_embed = npu_rotary_mul(k.float(), cos, sin, rotary_mode="half").to(k.dtype)
 
     return q_embed, k_embed
+
+
+@config.override_method(
+    "Qwen3OmniMoeThinkerTextRMSNorm.forward",
+    description="NPU fused RMSNorm -- reduces pow+mean+rsqrt to single npu_rms_norm call",
+)
+def qwen3_omni_moe_thinker_text_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    """NPU optimized implementation for RMSNorm"""
+    input_dtype = hidden_states.dtype
+    out_fp32 = npu_rms_norm(hidden_states.float(), self.weight.float(), epsilon=self.variance_epsilon)[0]
+    return out_fp32.to(input_dtype)

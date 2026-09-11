@@ -65,6 +65,7 @@ Run:
 from __future__ import annotations
 
 import warnings
+from unittest import mock
 
 import pytest
 import torch
@@ -74,9 +75,11 @@ from veomni.lora.moe_layers import (
     _LORA_SPEC_KEYS,
     LoraIndependentExperts,
     LoraSharedExperts,
+    _group_routing_assignments,
     apply_independent_moe_lora,
     apply_shared_moe_lora,
 )
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 from .utils import (
     build_toy,
@@ -129,6 +132,42 @@ _MODE_CASES = [
     pytest.param("shared", id="shared"),
     pytest.param("independent", id="independent"),
 ]
+
+_GPU_DEVICE = get_device_type()
+
+
+@pytest.mark.parametrize(
+    ("top_k_index", "num_experts"),
+    [
+        (torch.tensor([[3], [1], [3], [0]]), 5),
+        (torch.tensor([[2, 1], [2, 2], [0, 1], [2, 0]]), 4),
+        (torch.randint(0, 64, (257, 8), generator=torch.Generator().manual_seed(0)), 64),
+    ],
+)
+def test_group_routing_assignments_matches_one_hot_reference(top_k_index, num_experts):
+    expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=num_experts).permute(2, 1, 0)
+    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+    expected = []
+    for expert_idx in expert_hit:
+        expert_idx = expert_idx[0]
+        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+        expected.append((int(expert_idx), top_k_pos, token_idx))
+
+    actual = list(_group_routing_assignments(top_k_index, num_experts))
+
+    assert len(actual) == len(expected)
+    for actual_group, expected_group in zip(actual, expected, strict=True):
+        assert actual_group[0] == expected_group[0]
+        assert torch.equal(actual_group[1], expected_group[1])
+        assert torch.equal(actual_group[2], expected_group[2])
+
+
+def test_group_routing_assignments_skips_padding_expert():
+    top_k_index = torch.tensor([[0, 3], [3, 1]])
+
+    actual = list(_group_routing_assignments(top_k_index, num_experts=3))
+
+    assert [expert_idx for expert_idx, _, _ in actual] == [0, 1]
 
 
 def _select_yaml_then_build(toy_dir: str):
@@ -243,6 +282,133 @@ def test_eager_forward_no_op_at_init(toy_dir: str, mode: str):
     assert diff == 0.0, f"{toy_dir}/{mode}: LoRA must be no-op at init, got max|delta|={diff}"
 
 
+def test_independent_eager_gate_up_accumulates_with_addmm(monkeypatch):
+    """Independent eager gate/up LoRA should accumulate into the split base outputs."""
+    model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
+    patterns = lora_cfg["target_parameters"]
+    sample_fqn, exp = find_first_matching_module(model, experts_module_globs(patterns))
+    p0 = next(exp.parameters())
+    _apply(
+        "independent",
+        model,
+        target_parameter_patterns=patterns,
+        r=lora_cfg["rank"],
+        lora_alpha=lora_cfg["alpha"],
+        freeze_base_model=True,
+    )
+    wrapper = model.get_submodule(sample_fqn)
+    hidden_states = torch.randn(4, exp.hidden_dim, dtype=p0.dtype, device=p0.device)
+    top_k_index = torch.zeros(4, 1, dtype=torch.long, device=p0.device)
+    top_k_weights = torch.ones(4, 1, dtype=p0.dtype, device=p0.device)
+    calls = []
+    original_addmm = torch.addmm
+
+    def recording_addmm(input, mat1, mat2, *, beta=1, alpha=1, out=None):
+        calls.append((input.shape, mat1.shape, mat2.shape, alpha))
+        return original_addmm(input, mat1, mat2, beta=beta, alpha=alpha, out=out)
+
+    monkeypatch.setattr(torch, "addmm", recording_addmm)
+    wrapper(hidden_states, top_k_index, top_k_weights)
+
+    assert len(calls) == 2
+    assert all(call[0][-1] == exp.intermediate_dim for call in calls)
+    assert all(call[3] == wrapper._lora_scale_value for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("device", "dtype", "rtol", "atol"),
+    [
+        pytest.param("cpu", torch.float64, 1e-12, 1e-12, id="cpu-fp64"),
+        pytest.param(
+            _GPU_DEVICE,
+            torch.float16,
+            2e-3,
+            2e-3,
+            id="gpu-fp16",
+            marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="GPU is unavailable"),
+        ),
+        pytest.param(
+            _GPU_DEVICE,
+            torch.bfloat16,
+            2e-2,
+            2e-2,
+            id="gpu-bf16",
+            marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="GPU is unavailable"),
+        ),
+    ],
+)
+def test_gate_up_addmm_matches_nonzero_reference_and_gradients(device, dtype, rtol, atol):
+    """The accumulated form must preserve nonzero LoRA values and gradients."""
+    torch.manual_seed(0)
+    shapes = ((3, 7), (10, 7), (2, 7), (5, 2), (2, 7), (5, 2))
+    reference_inputs = [torch.randn(shape, dtype=dtype, device=device, requires_grad=True) for shape in shapes]
+    candidate_inputs = [value.detach().clone().requires_grad_() for value in reference_inputs]
+    scale = 1 / 3
+
+    x, weight, a_gate, b_gate, a_up, b_up = reference_inputs
+    gate_delta = torch.nn.functional.linear(torch.nn.functional.linear(x, a_gate), b_gate) * scale
+    up_delta = torch.nn.functional.linear(torch.nn.functional.linear(x, a_up), b_up) * scale
+    reference = torch.nn.functional.linear(x, weight) + torch.cat((gate_delta, up_delta), dim=-1)
+
+    x, weight, a_gate, b_gate, a_up, b_up = candidate_inputs
+    gate, up = torch.nn.functional.linear(x, weight).chunk(2, dim=-1)
+    gate = torch.addmm(gate, torch.nn.functional.linear(x, a_gate), b_gate.T, alpha=scale)
+    up = torch.addmm(up, torch.nn.functional.linear(x, a_up), b_up.T, alpha=scale)
+    candidate = torch.cat((gate, up), dim=-1)
+
+    output_grad = torch.randn_like(reference)
+    reference_grads = torch.autograd.grad(reference, reference_inputs, output_grad)
+    candidate_grads = torch.autograd.grad(candidate, candidate_inputs, output_grad)
+    torch.testing.assert_close(candidate, reference, rtol=rtol, atol=atol)
+    for candidate_grad, reference_grad in zip(candidate_grads, reference_grads, strict=True):
+        torch.testing.assert_close(candidate_grad, reference_grad, rtol=rtol, atol=atol)
+
+
+def test_independent_scale_cache_tracks_loaded_state():
+    """Loading the persistent scale buffer must also update the hot-path float cache."""
+    model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
+    patterns = lora_cfg["target_parameters"]
+    sample_fqn, _ = find_first_matching_module(model, experts_module_globs(patterns))
+    _apply(
+        "independent",
+        model,
+        target_parameter_patterns=patterns,
+        r=lora_cfg["rank"],
+        lora_alpha=lora_cfg["alpha"],
+        freeze_base_model=True,
+    )
+    wrapper = model.get_submodule(sample_fqn)
+    state_dict = wrapper.state_dict()
+    loaded_scaling = torch.tensor(1 / 3, dtype=torch.float64)
+    state_dict["lora_scaling"] = loaded_scaling
+    wrapper.load_state_dict(state_dict)
+
+    assert wrapper._lora_scale_value == wrapper.lora_scaling.item()
+    assert wrapper._lora_scale_value != loaded_scaling.item()
+
+
+def test_independent_scale_cache_load_is_meta_safe():
+    """Scale cache loading must not read from an unmaterialized destination buffer."""
+    model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
+    patterns = lora_cfg["target_parameters"]
+    sample_fqn, _ = find_first_matching_module(model, experts_module_globs(patterns))
+    _apply(
+        "independent",
+        model,
+        target_parameter_patterns=patterns,
+        r=lora_cfg["rank"],
+        lora_alpha=lora_cfg["alpha"],
+        freeze_base_model=True,
+    )
+    wrapper = model.get_submodule(sample_fqn).to("meta")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        wrapper.load_state_dict({"lora_scaling": torch.tensor(1.75)}, strict=False)
+
+    assert wrapper.lora_scaling.is_meta
+    assert wrapper._lora_scale_value == 1.75
+
+
 @pytest.mark.parametrize("mode", _MODE_CASES)
 @pytest.mark.parametrize("toy_dir", _MODEL_CASES)
 def test_backward_isolates_to_lora_params(toy_dir: str, mode: str):
@@ -294,6 +460,55 @@ def test_backward_isolates_to_lora_params(toy_dir: str, mode: str):
         f"{toy_dir}/{mode}: expected at least 3 lora_B params with grad "
         f"(gate + up + down halves), got {n_lora_with_grad}"
     )
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_eager_forward_does_not_materialize_one_hot_routing(mode: str):
+    model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
+    patterns = lora_cfg["target_parameters"]
+    sample_fqn, experts = find_first_matching_module(model, experts_module_globs(patterns))
+    _apply(
+        mode,
+        model,
+        target_parameter_patterns=patterns,
+        r=lora_cfg["rank"],
+        lora_alpha=lora_cfg["alpha"],
+        freeze_base_model=True,
+    )
+    wrapper = model.get_submodule(sample_fqn)
+    parameter = next(wrapper.parameters())
+    hidden_states = torch.randn(8, experts.hidden_dim, dtype=parameter.dtype, device=parameter.device)
+    top_k_index = torch.randint(0, experts.num_experts, (8, 2), device=parameter.device)
+    top_k_weights = torch.softmax(torch.randn(8, 2, dtype=torch.float32, device=parameter.device), dim=-1).to(
+        parameter.dtype
+    )
+
+    with mock.patch.object(torch.nn.functional, "one_hot", side_effect=AssertionError("one-hot routing used")):
+        wrapper(hidden_states, top_k_index, top_k_weights)
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_eager_forward_skips_padding_expert(mode: str):
+    model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
+    patterns = lora_cfg["target_parameters"]
+    sample_fqn, experts = find_first_matching_module(model, experts_module_globs(patterns))
+    _apply(
+        mode,
+        model,
+        target_parameter_patterns=patterns,
+        r=lora_cfg["rank"],
+        lora_alpha=lora_cfg["alpha"],
+        freeze_base_model=True,
+    )
+    wrapper = model.get_submodule(sample_fqn)
+    parameter = next(wrapper.parameters())
+    hidden_states = torch.randn(2, experts.hidden_dim, dtype=parameter.dtype, device=parameter.device)
+    top_k_index = torch.tensor([[0, experts.num_experts], [1, 0]], device=parameter.device)
+    top_k_weights = torch.softmax(torch.randn(2, 2, dtype=torch.float32, device=parameter.device), dim=-1).to(
+        parameter.dtype
+    )
+
+    wrapper(hidden_states, top_k_index, top_k_weights)
 
 
 # ---------------------------------------------------------------------------

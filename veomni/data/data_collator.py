@@ -229,7 +229,7 @@ class PackingCollator(DataCollator):
     def __post_init__(self):
         parallel_state = get_parallel_state()
         self.sp_enabled = parallel_state.sp_enabled
-        self.cp_size = getattr(parallel_state, "cp_size", 1)
+        self.cp_size = parallel_state.cp_size if getattr(parallel_state, "cp_layout", "contiguous") == "zigzag" else 1
 
     def _pad_position_ids(self, position_ids: torch.Tensor, dim: int, pad_size: int) -> torch.Tensor:
         """Extend positions monotonically so CP alignment pads are not segment starts."""
@@ -386,7 +386,7 @@ class SequenceParallelCollator(DataCollator):
         # (so the in-attention Ulysses all-to-all reassembles each cp region's
         # full sequence). See ``sequence_parallel.data.zigzag_reorder`` and the
         # ring branch in ``veomni/ops/kernels/attention``.
-        self.cp_size = ps.cp_size
+        self.cp_size = ps.cp_size if getattr(ps, "cp_layout", "contiguous") == "zigzag" else 1
         self.ulysses_size = ps.ulysses_size
         self.cp_rank = ps.cp_rank
         self.ulysses_rank = ps.ulysses_rank

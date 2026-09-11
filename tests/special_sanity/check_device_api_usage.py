@@ -40,10 +40,16 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/models/auto.py",
     "veomni/models/loader.py",
     "veomni/models/module_utils.py",
-    "veomni/models/seed_omni/auto.py",
     "veomni/models/transformers/flux/encode_flux.py",
     "veomni/arguments/arguments_types.py",
     "veomni/ops/kernels/moe/_kernels/utils/device.py",
+    # Magi FA4 is an intrinsically CUDA-only backend. It uses CUDA device
+    # contexts and cuda.bindings.runtime for the per-device stack limit, which
+    # has no device-agnostic equivalent.
+    "veomni/ops/kernels/attention/magi/_fa4_cuda.py",
+    # The consolidated Magi contract suite directly mocks the CUDA-only FA4
+    # backend and its runtime bindings.
+    "tests/ops/test_magi_attention_contract.py",
     "tests/special_sanity/check_device_api_usage.py",
     "tests/tools/common_utils.py",
     # Implicit-CUDA-sync gate. Calls ``torch.cuda.{get,set}_sync_debug_mode``

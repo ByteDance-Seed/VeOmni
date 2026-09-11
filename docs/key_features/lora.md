@@ -8,9 +8,10 @@ significantly reduced GPU memory.
 LoRA is implemented by VeOmni's **own** stack, `veomni.lora` — a PEFT-free
 [`peft.PeftModel`](https://huggingface.co/docs/peft) replacement (`VeOmniLoraModel` /
 `VeOmniLoraConfig`). It supports PEFT's main features, adds MoE-LoRA and EP-LoRA, and is
-FSDP2-native. Crucially it stays **format-compatible** with PEFT: it reads and writes
-standard `adapter_config.json` + `adapter_model.{safetensors,bin}` files, so adapters
-train-here / load-there interchangeably with stock `peft`.
+FSDP2-native. Crucially it stays **format-compatible** with PEFT: VeOmni writes
+`adapter_config.json` + `adapter_model.safetensors`, and loads either that or a
+legacy PEFT `adapter_model.bin`, so adapters train-here / load-there interchangeably
+with stock `peft`.
 
 ---
 
@@ -127,15 +128,67 @@ original model, so every LoRA parameter FQN and every saved adapter key carries 
 `generate` are unchanged. After wrapping, the base model is fully frozen and only the LoRA
 parameters (dense `LoraLinear` and MoE-LoRA, if any) have `requires_grad=True`.
 
-`BaseTrainer._init_callbacks()` automatically selects `HFLoraCkptCallback`
-instead of `HuggingfaceCkptCallback` when `lora_config` is set:
+`BaseTrainer._init_callbacks()` registers one `CheckpointCallback` either way. The export format
+is the trainer's decision from `lora_config`, not a separate callback class: a run that trains
+only adapters exports the adapter, so there is nothing for a LoRA-specific callback to do.
 
-```python
-if self.args.model.lora_config:
-    self.hf_ckpt_callback = HFLoraCkptCallback(self)
-else:
-    self.hf_ckpt_callback = HuggingfaceCkptCallback(self)
-```
+### 2.1 LoRA MFU and FLOPs accounting
+
+`EnvironMeterCallback` passes the effective `VeOmniLoraConfig` from the wrapped model to
+`VeomniFlopsCounter`, so the reported FLOPs and MFU reflect the work performed by LoRA
+training instead of using the full-fine-tuning estimate. Full-fine-tuning accounting is
+unchanged when no LoRA config is present.
+
+LoRA FLOPs estimation currently supports only the Qwen-family model types registered in
+`LORA_MODULES_BY_MODEL_TYPE`. An unsupported model or LoRA target emits a warning and
+reports zero achieved FLOPs and zero MFU rather than interrupting training or reporting a
+misleading value. `scripts/profile/compare_lora_flops.py` exercises this path against real
+Hugging Face Qwen configs and compares full fine-tuning with several LoRA target sets and
+ranks.
+
+`VLMTrainer` uses the same native LoRA setup, FSDP2 loading, and adapter checkpoint path as
+the text trainer. During LoRA training, the LoRA configuration determines which adapters
+and optional bias parameters are trainable:
+
+- `freeze_vit` and `freeze_audio_tower` are ignored. They control only full tuning.
+- Vision and audio modules explicitly matched by `target_modules` remain trainable.
+- With the default `bias: none`, untargeted towers remain frozen and do not participate
+  in backward. Other bias policies explicitly opt additional bias parameters into training.
+- Full merger or audio-projection weights that are normally retained by the non-LoRA freeze
+  policy are not trained in LoRA mode, because those full weights are not part of the
+  exported adapter.
+
+Qwen3-VL vision adapters may target `qkv`, `proj`, `linear_fc1`, and `linear_fc2`;
+language targets such as `q_proj` and `v_proj` can be used in the same config.
+
+For Qwen VLM configurations, vision-tower accounting uses the vision-token sequence lengths
+collected from the current batch and follows this logic:
+
+1. If the batch has no vision tokens, ViT FLOPs are zero.
+2. If the batch has vision tokens but no vision parameter is trainable, the ViT is treated
+   as frozen and only its forward-pass FLOPs are counted.
+3. If a supported ViT module has a trainable adapter, the tower uses the existing coarse
+   forward/backward estimate and includes matched LoRA work.
+4. If only vision biases are trainable (for example, `bias: all` with language-only adapter
+   targets), base forward/input-gradient work is counted without adapter FLOPs.
+
+The estimator intentionally uses the framework's existing 2x/4x/6x approximation rather
+than reconstructing the exact autograd graph: 2x is forward-only, 4x includes activation
+gradients through frozen weights, and 6x includes trainable-weight or adapter work.
+During full fine-tuning, `freeze_vit: true` selects the forward-only 2x estimate for the
+entire vision tower. During LoRA training the flag is ignored and adapter targets determine
+the estimate. This intentionally treats Omni's trainable merger as part of the frozen tower.
+
+The native LoRA implementation currently adapts two kinds of weights:
+
+- `nn.Linear` modules selected through `target_modules`.
+- Fused routed-MoE expert weights, represented as 3-D `nn.Parameter`s and selected through
+  `target_parameters`.
+
+The MoE experts are not `nn.Embedding` layers. The FLOPs estimator counts adapter work for
+both supported categories above. Within the ViT, only matched linear layers receive LoRA
+FLOPs; non-linear projections such as Qwen's `Conv3d` patch embedding are not supported LoRA
+targets. Adding a convolution name to `target_modules` does not adapt it.
 
 ---
 
@@ -175,20 +228,24 @@ infix (PEFT convention — e.g. `lora_A.weight`), whereas the live model stores 
 
 ### DCP checkpoint (training state)
 
-`CheckpointerCallback._save_checkpoint` saves the full distributed state (model + optimizer +
-extra state) via PyTorch DCP. For LoRA training this includes both base-model parameters
-**and** adapter parameters; the optimizer state only covers the trainable adapter parameters.
+`CheckpointCallback` decides *when* to save and calls `trainer.save_dcp`, which lands in
+`ModelCheckpointManager` (`veomni/models/checkpoint_manager.py`). That writes the
+full distributed state (model + optimizer + extra state) via PyTorch DCP. For LoRA training
+the DCP stores the trainable adapter parameters, optimizer state, and model-bound extra
+state; the base model is loaded separately from `model.model_path`. Job-level state
+(dataloader cursor, rng, meters) is written separately by `GlobalStateCallback`.
 
 ### HF LoRA adapter (inference artifact)
 
-`HFLoraCkptCallback._save_checkpoint` calls `save_lora_adapter_with_dcp`
+`CheckpointCallback` also drives `trainer.save_hf_or_lora`. When `lora_config` is set the manager
+exports the adapter via `save_lora_adapter_with_dcp`
 (`veomni/utils/save_safetensor_utils.py`), which:
 
 1. Extracts adapter-only tensors via `veomni.lora.state_dict.get_lora_state_dict`
    (PEFT on-disk key format).
 2. Restores the EP shard dim on `Shard()`-placed LoRA tensors so DCP gathers the full
    `[E, ...]` shape, then saves with `dcp.save` in parallel to a temporary DCP directory.
-3. Consolidates on rank 0 into `adapter_model.bin` and writes `adapter_config.json` via
+3. Consolidates on rank 0 into `adapter_model.safetensors` and writes `adapter_config.json` via
    `VeOmniLoraModel.get_lora_config().save_pretrained` — which embeds any MoE metadata
    (`target_parameters` + `veomni_lora.moe_mode`) directly in the config. **No separate
    sidecar.**
@@ -204,8 +261,12 @@ Output structure for each checkpoint:
 │       └── .metadata
 └── global_step_N/              ← HF adapter (inference / resume)
     ├── adapter_config.json     ← PEFT-format; MoE mode in its `veomni_lora` block
-    └── adapter_model.bin
+    └── adapter_model.safetensors
 ```
+
+Load still accepts a PEFT `adapter_model.bin` (`load_adapter_state_dict` prefers
+safetensors, then falls back to `.bin`). VeOmni's own export is safetensors so the
+EP-sharded MoE-LoRA reader can stream per-expert rows.
 
 ---
 
@@ -307,16 +368,17 @@ DeepSeek-V3 also exposes **shared experts** (`mlp.shared_experts.{gate,up,down}_
 implemented as plain `nn.Linear`. Add them to `lora_modules` if you want PEFT to LoRA them
 too — they are orthogonal to the MoE-LoRA on the routed experts.
 
-### 5.3 Forward path: fused triton vs eager
+### 5.3 MoE-LoRA forward backends
 
 Each MoE-LoRA wrapper dispatches based on `model.ops_implementation.moe_implementation`:
 
 | `moe_implementation` | non-EP | EP | Notes |
 |---|---|---|---|
-| `fused_triton` | fused triton kernel | fused triton kernel | Recommended for training. |
-| `eager` | eager loop (reference) | not supported (raises) | Reference / fallback for NPU and Quack. |
+| `fused_triton` | fused Triton kernel | fused Triton kernel | Recommended on GPU. |
+| `fused_npu` | NPU GroupGEMM | NPU GroupGEMM | Recommended on Ascend NPU. |
+| `eager` | eager loop (reference) | not supported (raises) | Portable reference path. |
 
-The fused path lives in `veomni/lora/ops/moe_group_gemm.py` and reuses the same
+The fused GPU path lives in `veomni/lora/ops/moe_group_gemm.py` and reuses the same
 `group_gemm_same_nk` / `group_gemm_same_mn` primitives (from `veomni/ops/kernels/moe/_kernels/`)
 as the non-LoRA MoE forward, so it inherits the same EP `all-to-all` dispatch pipeline. The
 LoRA fused pointers are bound by `veomni.ops.kernels.moe.apply_veomni_fused_moe_patch` via
@@ -324,7 +386,10 @@ LoRA fused pointers are bound by `veomni.ops.kernels.moe.apply_veomni_fused_moe_
 
 ### 5.4 Expert Parallelism (EP)
 
-When `train.accelerator.ep_size > 1`, base experts are sharded along the expert dim by
+Both `fused_triton` and `fused_npu` support the EP path; `fused_npu` uses the
+Ascend GroupGEMM implementation in `veomni/lora/ops/npu_moe_group_gemm.py`.
+
+When `model.accelerator.ep_size > 1`, base experts are sharded along the expert dim by
 `ParallelPlan` (`Shard(0)` on `gate_up_proj` / `down_proj`). MoE-LoRA tracks this layout:
 
 - **Independent mode**: LoRA tensors are 3-D `[E, ...]` and are EP-sharded along the
@@ -337,7 +402,8 @@ When `train.accelerator.ep_size > 1`, base experts are sharded along the expert 
   `_collect_ep_replicated_lora_param_ids` in `veomni/optim/optimizer.py` — to skip the
   EP all-reduce for these replicated params so the global grad-norm matches EP=1.
 
-Both modes work with FSDP2 + EP. EP is only supported on the `fused_triton` forward path.
+Both modes work with FSDP2 + EP. EP requires a fused forward path:
+`fused_triton` on GPU or `fused_npu` on Ascend NPU; `eager` raises.
 
 ### 5.5 Save / load artefacts
 
@@ -346,8 +412,11 @@ A MoE-LoRA run writes only the two standard PEFT artefacts — **no sidecar**:
 ```
 <output_dir>/global_step_N/
 ├── adapter_config.json     # PEFT-format; MoE mode/rank/alpha in its `veomni_lora` block
-└── adapter_model.bin       # PEFT-format — both linear LoRA and MoE-LoRA tensors
+└── adapter_model.safetensors  # PEFT-format — both linear LoRA and MoE-LoRA tensors
 ```
+
+A stock-PEFT adapter that only has `adapter_model.bin` still loads: `from_pretrained`
+uses the same fallback.
 
 At resume, `VeOmniLoraModel.from_pretrained` reads `adapter_config.json`: the
 `veomni_lora.moe_mode` field decides which wrapper class to install
@@ -355,7 +424,7 @@ At resume, `VeOmniLoraModel.from_pretrained` reads `adapter_config.json`: the
 stock-PEFT adapter (no `veomni_lora` block) is loaded, the MoE mode is inferred from the
 on-disk LoRA tensor shapes (3-D per-expert → independent, 2-D → shared).
 
-The MoE-LoRA tensors in `adapter_model.bin` use PEFT-aligned FQNs
+The MoE-LoRA tensors in `adapter_model.safetensors` use PEFT-aligned FQNs
 (`base_model.model.<...>.<spec>.lora_A.<adapter>.weight`), so third-party PEFT tooling
 (HuggingFace Hub, `peft.PeftModel.from_pretrained`) can also load the file — though without
 VeOmni's wrappers re-installed first, the MoE-LoRA half of the keys will be dropped as
@@ -366,6 +435,7 @@ ignored on its side, keeping the file loadable by both stacks.
 
 Text-only:
 - [`configs/text/qwen3_moe_lora.yaml`](../../configs/text/qwen3_moe_lora.yaml) — Qwen3-MoE
+- [`configs/text/qwen3_5_moe_lora.yaml`](../../configs/text/qwen3_5_moe_lora.yaml) — Qwen3.5-MoE-35B, Ascend NPU FSDP2 + EP
 - [`configs/text/deepseek_v3_lora.yaml`](../../configs/text/deepseek_v3_lora.yaml) — DeepSeek-V3 (v5), with EP=8
 
 Multimodal:
@@ -393,10 +463,8 @@ model:
       - to_out.0
       - ffn.net.0.proj
       - ffn.net.2
-
-train:
-  init_device: meta
   accelerator:
+    init_device: meta
     fsdp_config:
       fsdp_mode: fsdp2
 ```
@@ -415,7 +483,7 @@ bash train.sh tasks/train_dit.py configs/dit/wan2.1_I2V_1.3B_lora.yaml \
     --train.training_task        offline_training \
     --train.global_batch_size    8 \
     --train.micro_batch_size     1 \
-    --train.accelerator.ulysses_size ${SP_SIZE} \
+    --model.accelerator.ulysses_size ${SP_SIZE} \
     --train.checkpoint.output_dir ./exp/wan_lora \
     --train.checkpoint.save_hf_weights true \
     --train.checkpoint.save_epochs 5 \
@@ -450,10 +518,8 @@ model:
       - gate_proj
       - up_proj
       - down_proj
-
-train:
-  init_device: meta          # required for FSDP2
   accelerator:
+    init_device: meta          # required for FSDP2
     fsdp_config:
       fsdp_mode: fsdp2
 ```
@@ -502,10 +568,8 @@ model:
     # gate_proj/up_proj/down_proj auto-map to the fused expert parameters.
     lora_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
     share_expert_lora: true                            # one LoRA per layer (Mode 2)
-
-train:
-  init_device: meta
   accelerator:
+    init_device: meta
     ulysses_size: 1
     ep_size: 1                          # set >1 to enable EP; also set moe_implementation: fused_triton
     fsdp_config:
@@ -543,6 +607,9 @@ sets `ep_size: 8` and additionally LoRA-wraps DeepSeek's MLA projections
 (`q_a_proj` / `q_b_proj` / `kv_a_proj_with_mqa` / `kv_b_proj` / `o_proj`) via
 `lora_modules`.
 
+For a Qwen3.5-MoE LoRA configuration, see
+[`configs/text/qwen3_5_moe_lora.yaml`](../../configs/text/qwen3_5_moe_lora.yaml).
+
 ---
 
 ### 6.4 Qwen-Image LoRA (DiT, FSDP2)
@@ -567,10 +634,8 @@ model:
       - to_add_out
       - net.0.proj
       - net.2
-
-train:
-  init_device: meta
   accelerator:
+    init_device: meta
     fsdp_config:
       fsdp_mode: fsdp2
 ```
@@ -593,7 +658,7 @@ bash train.sh tasks/train_dit.py configs/dit/qwen_image_lora.yaml \
     --train.num_train_epochs 3
 ```
 
-`HFLoraCkptCallback` writes the trained adapter to `${output_dir}/global_step_${step}/{adapter_config.json, adapter_model.{bin,safetensors}}`, which is the standard PEFT format consumable by `PeftModel.from_pretrained` and `diffusers`' `pipeline.transformer.load_lora_adapter` (the adapter keys carry the `base_model.model.` prefix expected by `peft`).
+`CheckpointCallback` writes the trained adapter to `${output_dir}/global_step_${step}/{adapter_config.json, adapter_model.safetensors}`, which is the standard PEFT format consumable by `PeftModel.from_pretrained` and `diffusers`' `pipeline.transformer.load_lora_adapter` (the adapter keys carry the `base_model.model.` prefix expected by `peft`). Loading a PEFT-trained adapter still accepts `adapter_model.bin`.
 
 ---
 
@@ -632,6 +697,6 @@ torchrun --nproc_per_node=4 tests/lora/test_moe_lora_trainer.py \
 ```
 
 **What the round-trip test verifies:**
-1. Writer trains `max_steps=4`, writes DCP shards at step 2 / step 4 and the HF LoRA adapter (`adapter_config.json` with the `veomni_lora` block + `adapter_model.bin`, no sidecar) at the same cadence; snapshots the full LoRA tensors at `on_train_begin` and `on_train_end`.
+1. Writer trains `max_steps=4`, writes DCP shards at step 2 / step 4 and the HF LoRA adapter (`adapter_config.json` with the `veomni_lora` block + `adapter_model.safetensors`, no sidecar) at the same cadence; snapshots the full LoRA tensors at `on_train_begin` and `on_train_end`.
 2. DCP-resume subprocess loads the step-2 DCP shard, continues to step 4, and the resulting LoRA tensors must be **bit-exact** vs the writer's `on_train_end` snapshot (DCP ships model + optimizer + RNG + dataloader state).
 3. LoRA-adapter-resume subprocess loads the step-4 HF adapter via `model.lora_config.lora_adapter`, and the resulting `on_train_begin` snapshot (= post-load, pre-train) must be bit-exact vs the writer's `on_train_end` snapshot in bf16 (the on-disk adapter dtype).

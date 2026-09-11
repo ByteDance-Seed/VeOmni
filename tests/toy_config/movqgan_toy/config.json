@@ -1,0 +1,22 @@
+{
+    "attn_resolutions": [
+      32
+    ],
+    "ch": 32,
+    "ch_mult": [
+      1,
+      2
+    ],
+    "double_z": false,
+    "dropout": 0.0,
+    "embed_dim": 4,
+    "in_channels": 3,
+    "initializer_range": 0.02,
+    "model_type": "movqgan",
+    "n_embed": 256,
+    "num_res_blocks": 1,
+    "out_ch": 3,
+    "resolution": 64,
+    "transformers_version": "4.49.0",
+    "z_channels": 4
+  }

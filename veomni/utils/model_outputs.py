@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-from transformers.modeling_outputs import CausalLMOutputWithPast, MoeCausalLMOutputWithPast
+from transformers.modeling_outputs import CausalLMOutputWithPast, MoeCausalLMOutputWithPast, MoeModelOutputWithPast
 from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniThinkerCausalLMOutputWithPast
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLCausalLMOutputWithPast
 from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLCausalLMOutputWithPast
@@ -150,7 +150,68 @@ class CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, CausalLMOutputWithPa
 
 @dataclass
 class MoeCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, MoeCausalLMOutputWithPast):
-    __doc__ = "``MoeCausalLMOutputWithPast`` + ``fused_linear_aux`` payload." + _FUSED_LINEAR_AUX_ARGS_DOC
+    __doc__ = (
+        "``MoeCausalLMOutputWithPast`` + ``fused_linear_aux`` payload, and scalar "
+        "auxiliary metrics already folded into ``loss``."
+        + _FUSED_LINEAR_AUX_ARGS_DOC
+        + """
+        aux_metrics (`dict[str, torch.Tensor]`, *optional*):
+            Detached 0-d tensors a forward wants reported next to the loss --
+            DeepSeek-V4's ``indexer_kl`` is the first. Whatever the forward chose
+            to add to ``loss`` it has already added; the trainer reports these and
+            must not sum them into the backward scalar a second time.
+    """
+    )
+
+    aux_metrics: Optional[dict[str, torch.Tensor]] = None
+
+
+@dataclass
+class MoeModelOutputWithIndexerKL(MoeModelOutputWithPast):
+    """``MoeModelOutputWithPast`` + the auxiliary KL a model body accumulated.
+
+    Declared fields rather than attributes assigned onto the output object, which
+    is what the DeepSeek-V4 indexer loss originally called for.
+    ``ModelOutput.__setattr__`` writes into the underlying dict only for keys that
+    already exist, so ``outputs.indexer_kl_total = kl`` on the base class creates a
+    plain instance attribute: absent from ``keys()``, from ``to_tuple()`` and from
+    pytree flattening, and dropped by any round-trip. The immediate read in
+    ``ForCausalLM.forward`` would still work and the loss would look right, while
+    FSDP2's pre-backward unshard hook -- which walks that same flattened output to
+    find the tensors a backward will need -- would never see it.
+
+    Every field below is ``None`` with the loss disabled, and ``ModelOutput.keys()``
+    skips ``None``, so a flag-off output is indistinguishable from the base class's.
+
+    The entries below are in HuggingFace's ``name (type):`` form because
+    ``@auto_docstring`` parses this class -- it is the return annotation of a
+    decorated ``forward`` -- and raises ``No `Args` or `Parameters` section is
+    found`` on a docstring whose parameters it cannot match.
+
+    Args:
+        indexer_kl_total (`torch.Tensor`, *optional*):
+            0-d, summed over the CSA layers and over this rank's query rows. Not
+            yet divided by the token count: that division and the cross-rank
+            reduction belong together, in ``ForCausalLM.forward``.
+        indexer_uniform_total (`torch.Tensor`, *optional*):
+            0-d, ``log(n_candidates) - H(target)`` accumulated over exactly the rows
+            and layers ``indexer_kl_total`` covers: the KL a student would pay
+            knowing the candidate set and nothing else. Detached -- it is the scale
+            the KL is reported against and must never reach the objective. Summed
+            here rather than divided per row so the reported quantity can be a ratio
+            of means.
+        indexer_query_tokens (`int`, *optional*):
+            Number of local query rows the sums above cover.
+        indexer_kl_layers (`int`, *optional*):
+            Number of CSA layers that contributed to the sums. The loss keeps the
+            sum; the reported metric divides by this, so runs with different CSA
+            layer counts are comparable.
+    """
+
+    indexer_kl_total: Optional[torch.Tensor] = None
+    indexer_uniform_total: Optional[torch.Tensor] = None
+    indexer_query_tokens: Optional[int] = None
+    indexer_kl_layers: Optional[int] = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────

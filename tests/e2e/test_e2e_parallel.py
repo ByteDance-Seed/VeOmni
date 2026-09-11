@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import yaml
 
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
@@ -146,6 +147,7 @@ def main(
         compare_metrics(res, rtol=rtol, atol=atol)
 
     shutil.rmtree(test_path)
+    return res
 
 
 _DEFAULT_RTOL = 1e-1
@@ -235,7 +237,7 @@ deepseek_v4_tilelang_dyn_bsz_test_cases = [
     ),
     pytest.param(
         "dummy_deepseek_v4_dense_packed_text_dataset",
-        ["--train.gradient_checkpointing.enable=False"],
+        ["--model.accelerator.gradient_checkpointing.enable=False"],
         id="packed-4x512-no-gc",
     ),
 ]
@@ -550,6 +552,44 @@ def test_qwen3vl_parallel_align(
     )
 
 
+def test_qwen3vl_lora_smoke(dummy_qwen3vl_dataset, tmp_path):
+    lora_config_path = tmp_path / "qwen3vl_lora_smoke.yaml"
+    lora_config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "lora_config": {
+                        "rank": 4,
+                        "alpha": 8,
+                        "lora_modules": ["q_proj", "qkv"],
+                    }
+                }
+            }
+        )
+    )
+    results = main(
+        task_name="train_vlm_test",
+        model_name="qwen3vl",
+        config_path="./tests/toy_config/qwen3vl_toy",
+        is_moe=False,
+        rtol=_DEFAULT_RTOL,
+        atol=_DEFAULT_ATOL,
+        train_path=dummy_qwen3vl_dataset,
+        max_sp_size=1,
+        compare_alignment=False,
+        extra_args=[
+            str(lora_config_path),
+            "--train.freeze_vit=True",
+        ],
+    )
+    assert results and all(results.values())
+    assert all(
+        values and torch.isfinite(torch.tensor(values)).all()
+        for result in results.values()
+        for values in result.values()
+    )
+
+
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", qwen2omni_test_cases)
 def test_qwen2omni_parallel_align(
     model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_qwen2omni_dataset
@@ -596,9 +636,9 @@ def test_wan_dit_uses_bfloat16_and_flash_attention():
     for _, cmd_kwargs in command_list:
         cmd = build_torchrun_cmd(**cmd_kwargs)
         assert cmd_kwargs["extra_args"] == [
-            "--train.accelerator.fsdp_config.mixed_precision.enable=True",
-            "--train.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
-            "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+            "--model.accelerator.fsdp_config.mixed_precision.enable=True",
+            "--model.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+            "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
         ]
         assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
 

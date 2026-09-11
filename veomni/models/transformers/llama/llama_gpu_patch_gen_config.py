@@ -21,7 +21,8 @@ Patches:
 - OpSlot guards for RMSNorm, SwiGLU MLP, RoPE, and (sequence-classification +
   causal) cross-entropy loss. Each guard falls through to the original HF eager
   code when no fused kernel is bound, so the generated file is safe to import
-  even when ``_bind_veomni_ops()`` does not run (e.g. seed_omni wrappers).
+  even when ``_bind_veomni_ops()`` does not run (e.g. the module is imported
+  outside VeOmni's model build path).
 - ``LlamaForCausalLM.forward`` returns the unified
   ``CausalLMOutputWithLogProbs`` dataclass so callers can surface per-token
   log-probs / entropy alongside the loss.
@@ -152,6 +153,11 @@ def llama_forcausallm_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> CausalLMOutputWithPast:
+    r"""
+    cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+        Indices depicting the position of the input sequence tokens in the sequence. Retained in the
+        signature for callers that pass it positionally; transformers 5.16 moved it into `**kwargs`.
+    """
     outputs = self.model(
         input_ids=input_ids,
         attention_mask=attention_mask,
