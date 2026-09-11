@@ -504,6 +504,12 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
   `torch_npu.npu_fusion_attention` / `npu_fusion_attention_grad`. Both dense
   and packed paths select the backend from the active device. FA3 is not used
   by Ring Attention.
+- **FA2 backward determinism**: dense and packed CUDA Ring paths honor
+  `FLASH_ATTENTION_DETERMINISTIC=1`, which `train.enable_full_determinism=true`
+  sets during trainer setup. Unset or `0` keeps the faster non-deterministic
+  backward. Deterministic FA2 backward uses more memory and may be slower;
+  this does not guarantee bitwise equality between different USP topologies
+  and does not change the FA4 or NPU backend behavior.
 - **Divisibility**: `max_seq_len` must be divisible by `2 · ulysses_size · cp_size`
   (the collator pads up to this multiple automatically).
 - **Loss/data layout**: the `SequenceParallelCollator` lays sequences out

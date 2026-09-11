@@ -34,6 +34,7 @@ the ``cp`` group on the resulting shard (see
 """
 
 import inspect
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -181,7 +182,7 @@ def _fa_backward(dout, q, k, v, out, lse, softmax_scale, causal, dropout_p=0.0):
         window_size_right=-1,
         softcap=0.0,
         alibi_slopes=None,
-        deterministic=False,
+        deterministic=os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") == "1",
         rng_state=None,
     )
     return dq, dk, dv
@@ -413,7 +414,7 @@ def _zigzag_ring_backward(group, dout, q, k, v, out, lse, softmax_scale):
             window_size_right=-1,
             softcap=0.0,
             alibi_slopes=None,
-            deterministic=False,
+            deterministic=os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") == "1",
             rng_state=None,
         )
 
@@ -620,7 +621,7 @@ def _fa_varlen_backward(dout, q, k, v, out, lse, dq, dk, dv, cu_q, cu_k, max_q, 
         window_size_right=-1,
         softcap=0.0,
         alibi_slopes=None,
-        deterministic=False,
+        deterministic=os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") == "1",
         rng_state=None,
     )
 
