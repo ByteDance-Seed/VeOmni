@@ -18,6 +18,7 @@
 ``(op, variant, impl, device)``. Authors register with the public
 triple; ``requirement.device`` (or ``ANY_DEVICE``) fills the fourth key.
 ``resolve_op`` still takes the triple and adds the current device.
+Hardware ``requirement`` and software ``requires`` decide availability.
 ``VeomniOp`` is a local handle that calls ``entry.wrapper``.
 """
 
@@ -31,6 +32,7 @@ import torch
 from torch import Tensor
 
 from ..utils.device import get_device_type
+from ..utils.import_utils import is_package_available
 from .platform import ANY_DEVICE, KernelRequirement
 
 
@@ -119,7 +121,8 @@ class OpEntry:
 
     Either a raw ``forward`` / ``backward`` pair (the wrapper is generated)
     or an opaque ``wrapper``. ``description`` records stable implementation
-    semantics for discovery. Hardware ``requirement`` is optional.
+    semantics for discovery. Hardware ``requirement`` and software
+    ``requires`` are optional and independently participate in resolution.
     """
 
     op: str
@@ -130,11 +133,18 @@ class OpEntry:
     backward: Callable | None = None
     wrapper: Callable | None = None
     requirement: KernelRequirement | None = None
+    requires: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate the raw/wrapper pairing and generate the wrapper if needed."""
         if not isinstance(self.description, str) or not self.description.strip():
             raise ValueError("description must be a non-empty string")
+        if not isinstance(self.requires, tuple) or not all(
+            isinstance(package, str) and package.strip() for package in self.requires
+        ):
+            raise TypeError("requires must be a tuple of non-empty import package names")
+        if len(set(self.requires)) != len(self.requires):
+            raise ValueError("requires must not contain duplicate package names")
         if (self.forward is None) != (self.backward is None):
             raise ValueError("forward and backward must both be set or both be None")
         if self.forward is None and self.wrapper is None:
@@ -159,9 +169,10 @@ class OpRegistry:
         """Create an empty registry table."""
         self._entries: dict[tuple[str, str, str, str], OpEntry] = {}
 
-    def _requirement_matches(self, entry: OpEntry) -> bool:
-        """Return whether ``entry.requirement`` is missing or matches this machine."""
-        return entry.requirement is None or entry.requirement.matches()
+    def _entry_is_available(self, entry: OpEntry) -> bool:
+        """Return whether both hardware and software requirements are satisfied."""
+        hardware_matches = entry.requirement is None or entry.requirement.matches()
+        return hardware_matches and all(is_package_available(package) for package in entry.requires)
 
     def register(self, entry: OpEntry) -> None:
         """Insert ``entry``. Duplicate ``(op, variant, impl, device)`` keys raise."""
@@ -182,8 +193,9 @@ class OpRegistry:
 
         Looks up ``(op, variant, impl, current_device)``, then
         ``ANY_DEVICE``. Unknown triples raise ``KeyError``. A row that
-        exists only for other devices, or whose ``requirement`` does not
-        match, raises ``RuntimeError``.
+        exists only for other devices, whose hardware ``requirement`` does
+        not match, or whose software ``requires`` are missing raises
+        ``RuntimeError``.
         """
         device = get_device_type()
         entry = self._entries.get((op, variant, impl, device))
@@ -208,6 +220,12 @@ class OpRegistry:
                 raise RuntimeError(
                     f"Op {op!r} variant={variant!r} impl={impl!r} requirement is not satisfied: {exc}"
                 ) from exc
+        missing_packages = tuple(package for package in entry.requires if not is_package_available(package))
+        if missing_packages:
+            packages = ", ".join(repr(package) for package in missing_packages)
+            raise RuntimeError(
+                f"Op {op!r} variant={variant!r} impl={impl!r} requires unavailable package(s): {packages}"
+            )
         return entry
 
     def list_registered(self, op: str, variant: str) -> list[str]:
@@ -219,7 +237,7 @@ class OpRegistry:
         return seen
 
     def list_available(self, op: str, variant: str) -> list[str]:
-        """Return impl names for ``(op, variant)`` that match this machine."""
+        """Return impl names whose hardware and optional packages are available."""
         device = get_device_type()
         seen: list[str] = []
         for (entry_op, entry_variant, impl, entry_device), entry in self._entries.items():
@@ -227,7 +245,7 @@ class OpRegistry:
                 continue
             if entry_device not in (device, ANY_DEVICE):
                 continue
-            if not self._requirement_matches(entry):
+            if not self._entry_is_available(entry):
                 continue
             if impl not in seen:
                 seen.append(impl)
@@ -259,6 +277,7 @@ def register_op(
     description: str,
     wrapper: Callable | None = None,
     requirement: KernelRequirement | None = None,
+    requires: tuple[str, ...] = (),
 ) -> None:
     """Register one row on ``OP_REGISTRY``.
 
@@ -266,6 +285,7 @@ def register_op(
     required discovery metadata and should describe stable implementation
     semantics rather than duplicating hardware constraints.
     ``requirement.device`` (or ``ANY_DEVICE``) is the fourth key.
+    ``requires`` lists import package names checked without importing them.
     ``resolve_op`` still takes the public triple.
     """
     OP_REGISTRY.register(
@@ -278,6 +298,7 @@ def register_op(
             backward=backward,
             wrapper=wrapper,
             requirement=requirement,
+            requires=requires,
         )
     )
 

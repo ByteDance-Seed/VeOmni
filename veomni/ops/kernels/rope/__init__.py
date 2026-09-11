@@ -54,6 +54,7 @@ register_op(
     full_liger.backward,
     description="Liger Kernel rotary embedding over every channel with eager vision fallback",
     requirement=_GPU,
+    requires=("liger_kernel",),
 )
 
 register_op(
@@ -102,6 +103,7 @@ register_op(
     dsv4_triton.backward,
     description="Triton DeepSeek-V4 rotary embedding over a trailing interleaved slice",
     requirement=_GPU,
+    requires=("triton",),
 )
 
 register_op(
@@ -121,6 +123,7 @@ register_op(
     wan_triton.backward,
     description="Triton Wan rotary embedding using complex multiplication",
     requirement=_GPU,
+    requires=("triton",),
 )
 
 register_op(

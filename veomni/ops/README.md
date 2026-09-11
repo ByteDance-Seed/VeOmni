@@ -33,7 +33,8 @@ Registered rows use the identity:
 
 Callers select the public `(op, variant, implementation)` triple. The
 registry derives `device` from the row's requirement and resolves the current
-device first, followed by a device-agnostic row.
+device first, followed by a device-agnostic row. A row's `requires` metadata
+is then checked for importable optional packages without importing its kernel.
 
 ## Built-in families
 
@@ -64,10 +65,12 @@ OP_REGISTRY.list_entries("rms_norm", "standard")
 ```
 
 `list_registered` includes every known implementation. `list_available`
-filters those rows using the current device and hardware requirement.
+filters those rows using the current device, hardware requirement, and
+optional-package requirements.
 `list_entries` returns the complete device-specific rows, including their
-descriptions and requirements; an implementation registered for multiple
-devices therefore appears more than once.
+descriptions, hardware requirements, and package requirements; an
+implementation registered for multiple devices therefore appears more than
+once.
 
 ## Registering an op
 
@@ -100,12 +103,14 @@ register_op(
     backward=triton_backward,
     description="Triton implementation of the example operation",
     requirement=GpuKernelRequirement(platforms=(NvidiaGpuPlatform(min_cc=80),)),
+    requires=("triton",),
 )
 ```
 
 Descriptions identify the implementation source, algorithm, layout, or other
 stable semantic differences. Device and compute-capability support belong in
-the requirement instead of the description so the metadata cannot drift apart.
+the hardware requirement, while optional import packages belong in `requires`,
+so availability metadata cannot drift into the description.
 
 For a raw pair, `forward` returns `(output, SavedState)`, and `backward`
 returns one gradient entry for every positional tensor passed to the generated
@@ -125,8 +130,8 @@ def raw_backward(grad_output, saved):
 ```
 
 An explicit non-eager selection never silently falls back. Unknown rows raise
-`KeyError`; rows for the wrong device or unmet hardware requirements raise
-`RuntimeError`.
+`KeyError`; rows for the wrong device, unmet hardware requirements, or missing
+optional packages raise `RuntimeError` during resolution.
 
 ## Calling an op from modeling
 
@@ -187,6 +192,7 @@ selected through `VeomniOp`.
 - Model-facing integration and helpers: `tests/models_kernel/`
 - User-facing selection and lifecycle: `docs/design/kernel_selection.md`
 
-When adding a row, test both its numerical contract and its registration or
-hardware requirement. When adding model-specific argument policy, test it in
-`tests/models_kernel` rather than duplicating it in the raw-kernel suite.
+When adding a row, test its numerical contract, registration, hardware
+requirement, and optional-package requirements. When adding model-specific
+argument policy, test it in `tests/models_kernel` rather than duplicating it in
+the raw-kernel suite.

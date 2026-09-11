@@ -52,6 +52,7 @@ register_op(
     lb_triton.backward,
     description="Triton token-level MoE load-balancing loss",
     requirement=_GPU,
+    requires=("triton",),
 )
 
 register_op(
@@ -71,6 +72,7 @@ register_op(
     ce_liger.backward,
     description="Liger Kernel token-level cross-entropy loss",
     requirement=_GPU,
+    requires=("liger_kernel",),
 )
 
 register_op(

@@ -56,6 +56,7 @@ register_op(
     description="Triton grouped-GEMM routed SwiGLU MoE experts",
     wrapper=standard_triton.wrapper,
     requirement=_GPU_SM70_OR_ROCM,
+    requires=("triton",),
 )
 
 register_op(
@@ -65,6 +66,7 @@ register_op(
     description="Triton grouped-GEMM routed SwiGLU MoE experts",
     wrapper=standard_triton.wrapper,
     requirement=MluKernelRequirement(),
+    requires=("triton",),
 )
 
 register_op(
@@ -74,6 +76,7 @@ register_op(
     description="Quack CUTLASS/CuTe routed SwiGLU MoE experts",
     wrapper=standard_quack.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
+    requires=("quack",),
 )
 
 register_op(
@@ -92,6 +95,7 @@ register_op(
     description="Apex grouped-GEMM routed SwiGLU MoE experts",
     wrapper=standard_mlu.wrapper,
     requirement=MluKernelRequirement(),
+    requires=("apex",),
 )
 
 register_op(
@@ -109,4 +113,5 @@ register_op(
     description="Quack CUTLASS/CuTe GPT-OSS MoE experts with interleaved gate/up weights and bias",
     wrapper=gpt_oss_quack.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
+    requires=("quack",),
 )

@@ -30,9 +30,8 @@ _NPU_OPS_DEFAULTS: Dict[str, str] = {
     "rms_norm_implementation": "npu",
     "rotary_pos_emb_implementation": "npu",
     "swiglu_mlp_implementation": "eager",  # no NPU backend
-    # NPU ships ``triton-ascend`` (not mainline ``triton``); the validator
-    # gates ``triton`` on ``is_package_available("triton")`` so the fused
-    # load-balancing-loss kernel would raise on the NPU runner. Pin to eager.
+    # The Triton load-balancing-loss row is CUDA-only, so NPU resolution rejects
+    # it even when ``triton-ascend`` is installed. Pin to eager.
     "load_balancing_loss_implementation": "eager",
 }
 

@@ -47,6 +47,7 @@ register_op(
     description="TileKernels DeepSeek-V4 mHC pre transform with Sinkhorn normalization and collapse",
     wrapper=pre_tilelang.wrapper,
     requirement=_TILELANG,
+    requires=("tile_kernels",),
 )
 
 register_op(
@@ -65,6 +66,7 @@ register_op(
     post_tilelang.backward,
     description="TileKernels DeepSeek-V4 mHC residual post-mix",
     requirement=_TILELANG,
+    requires=("tile_kernels",),
 )
 
 register_op(
@@ -82,4 +84,5 @@ register_op(
     description="TileKernels DeepSeek-V4 final mHC collapse",
     wrapper=head_tilelang.wrapper,
     requirement=_TILELANG,
+    requires=("tile_kernels",),
 )

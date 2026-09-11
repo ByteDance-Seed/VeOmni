@@ -1300,7 +1300,6 @@ class OpsImplementationConfig:
         """
         from ..utils.import_utils import (
             is_apex_mlu_available,
-            is_package_available,
             is_torch_mlu_available,
             is_torch_npu_available,
         )
@@ -1336,14 +1335,6 @@ class OpsImplementationConfig:
                         f"Set to one of {allowed}; 'eager' is the universal fallback "
                         f"for ops with no MLU kernel for the current model."
                     )
-
-        # Surface a missing Triton package before a model tries to construct
-        # its instance-local load-balancing-loss ``VeomniOp`` handle.
-        if self.load_balancing_loss_implementation == "triton" and not is_package_available("triton"):
-            raise ValueError(
-                "load_balancing_loss_implementation='triton' requires the 'triton' package "
-                "on CUDA. Install it or set the field to 'eager'."
-            )
 
 
 @dataclass

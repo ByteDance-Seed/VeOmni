@@ -49,6 +49,7 @@ register_op(
     description="TileLang DeepSeek-V4 sparse attention",
     wrapper=dsv4_attn_tilelang.wrapper,
     requirement=_TILELANG,
+    requires=("tilelang",),
 )
 register_op(
     "dsa_attention",
@@ -65,6 +66,7 @@ register_op(
     description="FlashMLA cuDNN GLM sparse attention",
     wrapper=glm_attn_flashmla.wrapper,
     requirement=_GLM_FUSED,
+    requires=("cudnn", "flash_mla"),
 )
 
 register_op(
@@ -82,6 +84,7 @@ register_op(
     description="TileLang DeepSeek-V4 sparse-attention indexer",
     wrapper=dsv4_indexer_tilelang.wrapper,
     requirement=_TILELANG,
+    requires=("tilelang",),
 )
 register_op(
     "dsa_indexer",
@@ -98,4 +101,5 @@ register_op(
     description="cuDNN GLM sparse-attention indexer",
     wrapper=glm_indexer_cudnn.wrapper,
     requirement=_GLM_FUSED,
+    requires=("cudnn", "flash_mla"),
 )

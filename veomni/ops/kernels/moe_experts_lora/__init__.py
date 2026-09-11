@@ -130,6 +130,7 @@ register_op(
     description="Triton routed MoE experts with LoRA weights shared across experts",
     wrapper=_shared_triton_wrapper,
     requirement=_GPU_SM70_OR_ROCM,
+    requires=("triton",),
 )
 
 register_op(
@@ -156,6 +157,7 @@ register_op(
     description="Triton routed MoE experts with independent per-expert LoRA weights",
     wrapper=_independent_triton_wrapper,
     requirement=_GPU_SM70_OR_ROCM,
+    requires=("triton",),
 )
 
 register_op(

@@ -107,6 +107,29 @@ class TestOpEntryValidation:
         with pytest.raises(ValueError, match="description must be a non-empty string"):
             OpEntry(op="add", variant="standard", impl="eager", description=" ", wrapper=lambda: None)
 
+    @pytest.mark.parametrize("requires", (["optional_backend"], ("",), (None,)))
+    def test_requires_must_be_non_empty_package_tuple(self, requires):
+        with pytest.raises(TypeError, match="tuple of non-empty import package names"):
+            OpEntry(
+                op="add",
+                variant="standard",
+                impl="optional",
+                description=_TEST_DESCRIPTION,
+                wrapper=lambda: None,
+                requires=requires,
+            )
+
+    def test_requires_rejects_duplicates(self):
+        with pytest.raises(ValueError, match="must not contain duplicate"):
+            OpEntry(
+                op="add",
+                variant="standard",
+                impl="optional",
+                description=_TEST_DESCRIPTION,
+                wrapper=lambda: None,
+                requires=("optional_backend", "optional_backend"),
+            )
+
     def test_raw_plus_wrapper_raises(self):
         with pytest.raises(ValueError, match="do not pass wrapper"):
             OpEntry(
@@ -248,6 +271,56 @@ class TestRegisterAndResolve:
             resolve_op("add", "standard", "cuda_only")
         with pytest.raises(RuntimeError, match="requirement is not satisfied"):
             VeomniOp("add", "standard", "cuda_only")
+
+    def test_missing_package_is_registered_but_not_available_or_resolvable(self, monkeypatch):
+        wrapper_called = False
+
+        def optional_wrapper(x: Tensor) -> Tensor:
+            nonlocal wrapper_called
+            wrapper_called = True
+            return x
+
+        monkeypatch.setattr(
+            "veomni.ops.registry.is_package_available",
+            lambda package: package != "missing_optional_backend",
+        )
+        register_op(
+            "add",
+            "standard",
+            "optional",
+            description="Optional add",
+            wrapper=optional_wrapper,
+            requires=("missing_optional_backend",),
+        )
+
+        assert "optional" in OP_REGISTRY.list_registered("add", "standard")
+        assert "optional" not in OP_REGISTRY.list_available("add", "standard")
+        with pytest.raises(RuntimeError, match="requires unavailable package.*missing_optional_backend"):
+            resolve_op("add", "standard", "optional")
+        with pytest.raises(RuntimeError, match="requires unavailable package.*missing_optional_backend"):
+            VeomniOp("add", "standard", "optional")
+        assert not wrapper_called
+
+    def test_available_package_resolves_without_importing_backend(self, monkeypatch):
+        checked = []
+
+        def package_available(package: str) -> bool:
+            checked.append(package)
+            return True
+
+        monkeypatch.setattr("veomni.ops.registry.is_package_available", package_available)
+        register_op(
+            "add",
+            "standard",
+            "optional",
+            description="Optional add",
+            wrapper=lambda x: x,
+            requires=("optional_backend",),
+        )
+
+        assert "optional" in OP_REGISTRY.list_available("add", "standard")
+        assert resolve_op("add", "standard", "optional").requires == ("optional_backend",)
+        assert checked == ["optional_backend", "optional_backend"]
 
     def test_register_rejects_non_entry(self):
         with pytest.raises(TypeError, match="OpEntry"):

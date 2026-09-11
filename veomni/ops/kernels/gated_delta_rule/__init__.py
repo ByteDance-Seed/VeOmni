@@ -66,6 +66,7 @@ register_op(
     description="flash-linear-attention fused RMSNorm with a SiLU gate",
     wrapper=rms_fla.wrapper,
     requirement=_GPU,
+    requires=("fla",),
 )
 
 register_op(
@@ -75,6 +76,7 @@ register_op(
     description="flash-linear-attention fused RMSNorm with a SiLU gate",
     wrapper=rms_fla.wrapper,
     requirement=MluKernelRequirement(),
+    requires=("fla",),
 )
 
 register_op(
@@ -101,6 +103,7 @@ register_op(
     description="flash-linear-attention depthwise causal convolution with variable-length support",
     wrapper=conv_fla.wrapper,
     requirement=_GPU,
+    requires=("fla",),
 )
 
 register_op(
@@ -110,6 +113,7 @@ register_op(
     description="flash-linear-attention depthwise causal convolution with variable-length support",
     wrapper=conv_fla.wrapper,
     requirement=MluKernelRequirement(),
+    requires=("fla",),
 )
 
 register_op(
@@ -120,6 +124,7 @@ register_op(
     conv_npu.backward,
     description="Vendored Triton depthwise causal convolution with variable-length support",
     requirement=NpuKernelRequirement(),
+    requires=("triton",),
 )
 
 register_op(
@@ -137,6 +142,7 @@ register_op(
     description="flash-linear-attention chunked gated delta rule with variable-length support",
     wrapper=chunk_fla.wrapper,
     requirement=_GPU,
+    requires=("fla",),
 )
 
 register_op(
@@ -146,6 +152,7 @@ register_op(
     description="flash-linear-attention chunked gated delta rule with variable-length support",
     wrapper=chunk_fla.wrapper,
     requirement=MluKernelRequirement(),
+    requires=("fla",),
 )
 
 register_op(
@@ -155,6 +162,7 @@ register_op(
     description="FlashQLA chunked gated delta rule",
     wrapper=chunk_flash_qla.wrapper,
     requirement=_FLASH_QLA_GPU,
+    requires=("flash_qla",),
 )
 
 register_op(
@@ -165,6 +173,7 @@ register_op(
     chunk_npu.backward,
     description="Vendored Triton chunked gated delta rule with variable-length support",
     requirement=NpuKernelRequirement(),
+    requires=("triton",),
 )
 
 register_op(
@@ -175,4 +184,5 @@ register_op(
     chunk_ascendc.backward,
     description="AscendC chunked gated delta rule with variable-length support",
     requirement=NpuKernelRequirement(),
+    requires=("fla_npu", "triton"),
 )

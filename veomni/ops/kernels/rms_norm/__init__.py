@@ -52,6 +52,7 @@ register_op(
     standard_liger.backward,
     description="Liger Kernel standard RMSNorm with Llama-style casting",
     requirement=_GPU,
+    requires=("liger_kernel",),
 )
 
 register_op(
@@ -72,6 +73,7 @@ register_op(
     standard_triton.backward,
     description="Triton standard RMSNorm with Llama-style casting",
     requirement=_GPU,
+    requires=("triton",),
 )
 
 register_op(
@@ -91,6 +93,7 @@ register_op(
     qwen3_5_liger.backward,
     description="Liger Kernel Qwen3.5 RMSNorm with offset weights and Gemma-style scaling",
     requirement=_GPU,
+    requires=("liger_kernel",),
 )
 
 register_op(
@@ -120,4 +123,5 @@ register_op(
     unweighted_liger.backward,
     description="Liger Kernel RMSNorm without an affine weight",
     requirement=_GPU,
+    requires=("liger_kernel",),
 )

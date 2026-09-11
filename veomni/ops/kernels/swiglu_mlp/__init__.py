@@ -44,4 +44,5 @@ register_op(
     standard_liger.backward,
     description="Liger Kernel SwiGLU MLP with optional activation clamping",
     requirement=_GPU,
+    requires=("liger_kernel",),
 )

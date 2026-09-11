@@ -54,7 +54,7 @@ import veomni                                 # (1) import time
             └─ apply_veomni_attention_patch() # register Flash/Flex facade names with SP
 
 OpsImplementationConfig.__post_init__()       # (2) config parse time
-  ├─ validate requested backends are available
+  ├─ validate model-agnostic device/backend compatibility
   └─ rewrite attn_implementation for SP
 
 BaseTrainer._build_model()                    # (3) model build time
@@ -62,6 +62,7 @@ BaseTrainer._build_model()                    # (3) model build time
        ├─ set_ops_config(ops)
        └─ model init + weight loading
             ├─ patched modules construct their local VeomniOp handles
+            ├─ registry validates row hardware + optional packages
             ├─ self.veomni_ce = VeomniOp("cross_entropy_loss", ...)
             ├─ self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
             └─ MoE models bind experts and load-balancing helpers to local handles
@@ -259,7 +260,8 @@ model-specific arguments such as an optional RMSNorm weight:
 | `swiglu_mlp_implementation` | `{Model}MLP.forward` | Functional Liger SwiGLU |
 
 The `npu` and `triton` backends use the same handle flow; the selected registry
-row determines the callable and validates its hardware requirement.
+row determines the callable and validates its hardware and optional-package
+requirements before the first forward.
 
 ### Models with Liger support
 
