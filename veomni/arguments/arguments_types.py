@@ -1599,7 +1599,7 @@ class ModelArguments(BaseModelArguments):
     ep_sharded_stream_load: bool = field(
         default=False,
         metadata={
-            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
+            "help": "Opt-in fast/low-memory loader for large ExtraParallel-sharded checkpoint tensors (for example MoE experts or PLE embedding tables): each rank reads only its dim-0 slice straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
         },
     )
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
@@ -1615,6 +1615,19 @@ class ModelArguments(BaseModelArguments):
             "model.broadcast_model_weights_from_rank0=False "
             "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
         )
+
+        extra_parallel_sizes = dict(zip(self.accelerator.extra_parallel_names, self.accelerator.extra_parallel_sizes))
+        ple_size = extra_parallel_sizes.get("ple", 1)
+        if ple_size > 1:
+            if self.accelerator.dp_shard_size % ple_size != 0:
+                raise ValueError(
+                    f"PLE size ({ple_size}) must divide the FSDP shard size ({self.accelerator.dp_shard_size})."
+                )
+            if not self.ep_sharded_stream_load:
+                raise ValueError(
+                    "PLE two-dimensional parallelism requires model.ep_sharded_stream_load=true so each rank "
+                    "reads only its local row-by-column checkpoint rectangle."
+                )
 
 
 # ================================ Data Arguments ======================================
