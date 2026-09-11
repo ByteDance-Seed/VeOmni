@@ -66,7 +66,7 @@ def test_attention_op_defaults_to_eager():
     assert op.impl == "eager"
 
 
-def test_attention_op_reads_ops_config():
+def test_attention_op_reads_ops_config(available_nvidia_ops):
     set_ops_config(SimpleNamespace(attn_implementation="veomni_flash_attention_2"))
     op = attention_op()
     assert op.impl == "veomni_flash_attention_2"

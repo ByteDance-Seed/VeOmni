@@ -114,7 +114,7 @@ def test_wan_t2v_eager_matches_official():
     assert_outputs_and_grads_match(official, ours, call)
 
 
-def test_wan_t2v_flash2_kernel_passes_full_sequence_varlen_kwargs():
+def test_wan_t2v_flash2_kernel_passes_full_sequence_varlen_kwargs(available_nvidia_ops):
     ops = eager_ops_config()
     ops.attn_implementation = "veomni_flash_attention_2"
     model = _build_ours(_tiny_ours_config(), ops).to(dtype=torch.bfloat16)

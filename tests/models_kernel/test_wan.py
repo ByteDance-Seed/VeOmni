@@ -85,7 +85,7 @@ def _wan_inputs(in_dim: int, text_len: int, text_dim: int) -> dict[str, torch.Te
     }
 
 
-def test_wan_sage_constructs_veomni_sage_attention():
+def test_wan_sage_constructs_veomni_sage_attention(available_nvidia_ops):
     sage_cfg = eager_ops_config()
     sage_cfg.attn_implementation = "sageattention"
     model = _build_ours(_tiny_ours_config(), sage_cfg)
@@ -103,7 +103,7 @@ def test_should_use_fa3_fp8_policy():
     assert not should_use_fa3_fp8("veomni_sage_attention", is_self_attn=True, last_loss=0.1)
 
 
-def test_wan_fa3_constructs_generic_flash_attention_3():
+def test_wan_fa3_constructs_generic_flash_attention_3(available_nvidia_ops):
     fa3_cfg = eager_ops_config()
     fa3_cfg.attn_implementation = "flash_attention_3"
     model = _build_ours(_tiny_ours_config(), fa3_cfg)
@@ -112,7 +112,7 @@ def test_wan_fa3_constructs_generic_flash_attention_3():
     assert handle.impl == "flash_attention_3"
 
 
-def test_wan_fa3_finite_last_loss_quantizes(monkeypatch):
+def test_wan_fa3_finite_last_loss_quantizes(monkeypatch, available_nvidia_ops):
     fa3_cfg = eager_ops_config()
     fa3_cfg.attn_implementation = "flash_attention_3"
     model = _build_ours(_tiny_ours_config(), fa3_cfg)
@@ -146,7 +146,7 @@ def test_wan_fa3_finite_last_loss_quantizes(monkeypatch):
         ({"last_loss": 0.1, "isSelfAttn": False},),
     ),
 )
-def test_wan_fa3_skips_fp8_outside_policy(monkeypatch, kwargs):
+def test_wan_fa3_skips_fp8_outside_policy(monkeypatch, available_nvidia_ops, kwargs):
     fa3_cfg = eager_ops_config()
     fa3_cfg.attn_implementation = "flash_attention_3"
     model = _build_ours(_tiny_ours_config(), fa3_cfg)

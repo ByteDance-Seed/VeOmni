@@ -19,11 +19,17 @@ from __future__ import annotations
 import pytest
 
 from veomni.ops import OP_REGISTRY
+from veomni.utils.import_utils import is_package_available
 
 
 def _entries_for_impl(impl: str):
     """Return every built-in row registered with ``impl``."""
     return [entry for entry in OP_REGISTRY._entries.values() if entry.impl == impl]
+
+
+def test_dotted_missing_optional_module_is_unavailable() -> None:
+    """A missing dotted parent is an unavailable package, not a lookup error."""
+    assert not is_package_available("veomni_definitely_missing_optional.child")
 
 
 @pytest.mark.parametrize(

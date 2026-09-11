@@ -25,7 +25,8 @@ from transformers.integrations.flex_attention import flex_attention_forward as h
 from transformers.integrations.sdpa_attention import sdpa_attention_forward as hf_sdpa_attention_forward
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from veomni.ops import OP_REGISTRY, VeomniOp, resolve_op
+from veomni.ops import OP_REGISTRY, VeomniOp
+from veomni.ops import registry as op_registry
 from veomni.ops.install import apply_veomni_attention_patch
 from veomni.ops.kernels.attention import lookup
 from veomni.ops.kernels.attention import ulysses as ulysses_backend
@@ -35,7 +36,15 @@ from veomni.ops.kernels.attention.standard.magi import magi_attention_forward
 from veomni.ops.kernels.attention.standard.sage import sage_attention_forward
 from veomni.ops.kernels.attention.standard.sdpa import sdpa_attention_forward
 from veomni.ops.kernels.attention.ulysses import should_apply_ulysses
-from veomni.ops.platform import ANY_DEVICE
+from veomni.ops.platform import (
+    ANY_DEVICE,
+    NVIDIA_SM90_PLUS,
+    ROCM_GPU,
+    GpuKernelRequirement,
+    MluKernelRequirement,
+    NpuKernelRequirement,
+    NvidiaGpuPlatform,
+)
 
 
 _VEOMNI_FORWARDS = {
@@ -79,20 +88,41 @@ _PUBLIC_PARAMETERS = (
     "kwargs",
 )
 
+_ANY_DEVICE_IMPLS = (
+    "eager",
+    "sdpa",
+    "flex_attention",
+    "native-sparse",
+    "veomni_flex_attention",
+    "veomni_sdpa",
+)
+_FA2_IMPLS = ("flash_attention_2", "veomni_flash_attention_2")
+_FA3_IMPLS = ("flash_attention_3", "veomni_flash_attention_3")
+_FA4_IMPLS = ("flash_attention_4", "veomni_flash_attention_4")
+_MAGI_IMPLS = ("magi_attention", "veomni_magi_attention")
+
 
 def test_standard_rows_are_registered():
     assert OP_REGISTRY.list_registered("attention", "standard") == list(_STANDARD_IMPLS)
-    assert {key for key in OP_REGISTRY._entries if key[0] == "attention"} == {
-        ("attention", "standard", impl, ANY_DEVICE) for impl in _STANDARD_IMPLS
-    }
+    expected_keys = {("attention", "standard", impl, ANY_DEVICE) for impl in _ANY_DEVICE_IMPLS}
+    expected_keys.update(("attention", "standard", impl, "cuda") for impl in (*_FA2_IMPLS, *_FA3_IMPLS))
+    expected_keys.update(("attention", "standard", impl, "cuda") for impl in (*_FA4_IMPLS, *_MAGI_IMPLS))
+    expected_keys.add(("attention", "standard", "veomni_sage_attention", "cuda"))
+    expected_keys.update(("attention", "standard", impl, "npu") for impl in _FA2_IMPLS)
+    expected_keys.update(("attention", "standard", impl, "mlu") for impl in _FA2_IMPLS)
+    assert {key for key in OP_REGISTRY._entries if key[0] == "attention"} == expected_keys
+
     for impl in _STANDARD_IMPLS:
-        entry = resolve_op("attention", "standard", impl)
-        assert entry.wrapper is not None
+        entries = [entry for entry in OP_REGISTRY.list_entries("attention", "standard") if entry.impl == impl]
+        assert entries
+        assert all(entry.wrapper is entries[0].wrapper for entry in entries)
 
 
 def test_registered_attention_rows_share_public_signature_contract():
     for impl in _STANDARD_IMPLS:
-        wrapper = resolve_op("attention", "standard", impl).wrapper
+        wrapper = next(
+            entry.wrapper for entry in OP_REGISTRY.list_entries("attention", "standard") if entry.impl == impl
+        )
         assert wrapper is not None
         parameters = inspect.signature(wrapper).parameters
         assert tuple(parameters) == _PUBLIC_PARAMETERS
@@ -117,8 +147,71 @@ def test_veomni_names_register_on_hf_dict_without_overwriting_stock():
         assert ALL_ATTENTION_FUNCTIONS[name] is forward
     assert ALL_ATTENTION_FUNCTIONS["flex_attention"] is hf_flex_attention_forward
     assert ALL_ATTENTION_FUNCTIONS["sdpa"] is hf_sdpa_attention_forward
-    op = VeomniOp("attention", "standard", "veomni_flash_attention_2")
-    assert op.impl == "veomni_flash_attention_2"
+    assert "veomni_flash_attention_2" in OP_REGISTRY.list_registered("attention", "standard")
+
+
+def test_cpu_availability_excludes_accelerator_attention(monkeypatch):
+    monkeypatch.setattr(op_registry, "get_device_type", lambda: "cpu")
+
+    assert OP_REGISTRY.list_available("attention", "standard") == list(_ANY_DEVICE_IMPLS)
+    for impl in (*_FA2_IMPLS, *_FA3_IMPLS, *_FA4_IMPLS, *_MAGI_IMPLS, "veomni_sage_attention"):
+        with pytest.raises(RuntimeError, match="not registered for device 'cpu'"):
+            OP_REGISTRY.resolve("attention", "standard", impl)
+
+
+def test_attention_rows_declare_platform_and_package_requirements():
+    sm80_plus = NvidiaGpuPlatform(min_cc=80)
+    expected = (
+        (_FA2_IMPLS, (sm80_plus, ROCM_GPU), ("flash_attn",)),
+        (_FA3_IMPLS, (NVIDIA_SM90_PLUS,), ("flash_attn_interface",)),
+        (_FA4_IMPLS, (NVIDIA_SM90_PLUS,), ("flash_attn.cute",)),
+        (_MAGI_IMPLS, (NVIDIA_SM90_PLUS,), ("magi_attention",)),
+        (("veomni_sage_attention",), (sm80_plus,), ("sageattention",)),
+    )
+
+    for impls, platforms, requires in expected:
+        for impl in impls:
+            entry = OP_REGISTRY._entries[("attention", "standard", impl, "cuda")]
+            assert isinstance(entry.requirement, GpuKernelRequirement)
+            assert entry.requirement.platforms == platforms
+            assert entry.requires == requires
+
+    for impl in _FA2_IMPLS:
+        assert isinstance(
+            OP_REGISTRY._entries[("attention", "standard", impl, "npu")].requirement, NpuKernelRequirement
+        )
+        mlu_entry = OP_REGISTRY._entries[("attention", "standard", impl, "mlu")]
+        assert isinstance(mlu_entry.requirement, MluKernelRequirement)
+        assert mlu_entry.requires == ("flash_attn",)
+
+
+def test_attention_packages_participate_in_gpu_availability(monkeypatch):
+    monkeypatch.setattr(op_registry, "get_device_type", lambda: "cuda")
+    monkeypatch.setattr(NvidiaGpuPlatform, "matches", lambda self: True)
+    monkeypatch.setattr(op_registry, "is_package_available", lambda _package: False)
+
+    assert OP_REGISTRY.list_available("attention", "standard") == list(_ANY_DEVICE_IMPLS)
+
+
+def test_magi_short_name_uses_installed_veomni_interface(monkeypatch):
+    captured = {}
+
+    def replacement(module, query, key, value, attention_mask, **kwargs):
+        captured.update(module=module, query=query, kwargs=kwargs)
+        return query.transpose(1, 2), "magi-metadata"
+
+    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, "veomni_magi_attention", replacement)
+    wrapper = OP_REGISTRY._entries[("attention", "standard", "magi_attention", "cuda")].wrapper
+    module = SimpleNamespace(is_causal=True)
+    query = torch.randn(2, 4, 3, 8)
+
+    output, metadata = wrapper(module, query, query, query, None, scaling=0.5)
+
+    assert captured["module"] is module
+    assert captured["query"] is query
+    assert captured["kwargs"]["scaling"] == 0.5
+    torch.testing.assert_close(output, query.transpose(1, 2))
+    assert metadata == "magi-metadata"
 
 
 def test_apply_veomni_attention_patch_is_idempotent():

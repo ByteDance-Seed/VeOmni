@@ -29,7 +29,12 @@ if TYPE_CHECKING:
 
 
 def _is_package_available(name: str) -> bool:
-    return importlib.util.find_spec(name) is not None
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, AttributeError, ValueError):
+        # Dotted optional modules (for example ``flash_attn.cute``) raise
+        # instead of returning ``None`` when their parent is unavailable.
+        return False
 
 
 def _get_package_version(name: str) -> "Version":

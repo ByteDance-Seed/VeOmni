@@ -26,6 +26,15 @@ from typing import Optional
 import torch
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
+from ...platform import (
+    NVIDIA_SM90_PLUS,
+    ROCM_GPU,
+    GpuKernelRequirement,
+    KernelRequirement,
+    MluKernelRequirement,
+    NpuKernelRequirement,
+    NvidiaGpuPlatform,
+)
 from ...registry import register_op
 
 
@@ -85,24 +94,88 @@ def lookup(impl: str) -> Callable:
     return wrapper
 
 
-_STANDARD_IMPL_DESCRIPTIONS = {
-    "eager": "Transformers model-local eager attention",
-    "sdpa": "PyTorch scaled dot-product attention through Transformers",
-    "flash_attention_2": "FlashAttention 2 through Transformers",
-    "flash_attention_3": "FlashAttention 3 through Transformers",
-    "flash_attention_4": "FlashAttention 4 through Transformers",
-    "flex_attention": "PyTorch FlexAttention through Transformers",
-    "magi_attention": "MagiAttention through Transformers",
-    "native-sparse": "Transformers native sparse attention",
-    "veomni_flash_attention_2": "VeOmni FlashAttention 2 adapter through Transformers",
-    "veomni_flash_attention_3": "VeOmni FlashAttention 3 adapter through Transformers",
-    "veomni_flash_attention_4": "VeOmni FlashAttention 4 adapter through Transformers",
-    "veomni_flex_attention": "VeOmni FlexAttention adapter through Transformers",
-    "veomni_magi_attention": "VeOmni MagiAttention adapter through Transformers",
-    "veomni_sage_attention": "VeOmni SageAttention adapter through Transformers",
-    "veomni_sdpa": "VeOmni scaled dot-product attention adapter through Transformers",
-}
-_STANDARD_IMPLS = tuple(_STANDARD_IMPL_DESCRIPTIONS)
+_NVIDIA_SM80_PLUS = NvidiaGpuPlatform(min_cc=80)
+_FA2_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
+    (
+        GpuKernelRequirement(platforms=(_NVIDIA_SM80_PLUS, ROCM_GPU)),
+        ("flash_attn",),
+    ),
+    (NpuKernelRequirement(), ()),
+    (MluKernelRequirement(), ("flash_attn",)),
+)
+_FA3_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
+    (GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,)), ("flash_attn_interface",)),
+)
+_FA4_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
+    (GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,)), ("flash_attn.cute",)),
+)
+_MAGI_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
+    (GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,)), ("magi_attention",)),
+)
+_SAGE_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
+    (GpuKernelRequirement(platforms=(_NVIDIA_SM80_PLUS,)), ("sageattention",)),
+)
+_ANY_ROW: tuple[tuple[KernelRequirement | None, tuple[str, ...]], ...] = ((None, ()),)
 
-for _impl, _description in _STANDARD_IMPL_DESCRIPTIONS.items():
-    register_op("attention", "standard", _impl, description=_description, wrapper=lookup(_impl))
+
+def _register_attention(
+    impl: str,
+    description: str,
+    *,
+    rows: tuple[tuple[KernelRequirement | None, tuple[str, ...]], ...] = _ANY_ROW,
+    interface: str | None = None,
+) -> None:
+    """Register one public attention name with its static availability rows."""
+    wrapper = lookup(interface or impl)
+    for requirement, requires in rows:
+        register_op(
+            "attention",
+            "standard",
+            impl,
+            description=description,
+            wrapper=wrapper,
+            requirement=requirement,
+            requires=requires,
+        )
+
+
+_register_attention("eager", "Transformers model-local eager attention")
+_register_attention("sdpa", "PyTorch scaled dot-product attention through Transformers")
+_register_attention("flash_attention_2", "FlashAttention 2 through Transformers", rows=_FA2_ROWS)
+_register_attention("flash_attention_3", "FlashAttention 3 through Transformers", rows=_FA3_ROWS)
+_register_attention("flash_attention_4", "FlashAttention 4 through Transformers", rows=_FA4_ROWS)
+_register_attention("flex_attention", "PyTorch FlexAttention through Transformers")
+_register_attention(
+    "magi_attention",
+    "MagiAttention short-name alias to the VeOmni adapter",
+    rows=_MAGI_ROWS,
+    interface="veomni_magi_attention",
+)
+_register_attention("native-sparse", "Transformers native sparse attention")
+_register_attention(
+    "veomni_flash_attention_2",
+    "VeOmni FlashAttention 2 adapter through Transformers",
+    rows=_FA2_ROWS,
+)
+_register_attention(
+    "veomni_flash_attention_3",
+    "VeOmni FlashAttention 3 adapter through Transformers",
+    rows=_FA3_ROWS,
+)
+_register_attention(
+    "veomni_flash_attention_4",
+    "VeOmni FlashAttention 4 adapter through Transformers",
+    rows=_FA4_ROWS,
+)
+_register_attention("veomni_flex_attention", "VeOmni FlexAttention adapter through Transformers")
+_register_attention(
+    "veomni_magi_attention",
+    "VeOmni MagiAttention adapter through Transformers",
+    rows=_MAGI_ROWS,
+)
+_register_attention(
+    "veomni_sage_attention",
+    "VeOmni SageAttention adapter through Transformers",
+    rows=_SAGE_ROWS,
+)
+_register_attention("veomni_sdpa", "VeOmni scaled dot-product attention adapter through Transformers")
