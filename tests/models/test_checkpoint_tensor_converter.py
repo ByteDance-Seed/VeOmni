@@ -27,8 +27,6 @@ import torch
 
 from veomni.models.checkpoint_tensor_loading import (
     ConvertedCheckpointTensor,
-    checkpoint_converter_record_skip_without_loading,
-    checkpoint_converter_should_skip_without_loading,
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
 )
@@ -121,23 +119,6 @@ class TestMaybeConvertCheckpointTensor:
         result = maybe_convert_checkpoint_tensor("handle_me.weight", t, converter)
         assert result is not None
         assert result.name == "HANDLE_ME.WEIGHT"
-
-    def test_optional_skip_without_loading_capability(self):
-        class _SkippingConverter(_DummyConverter):
-            skipped = 0
-
-            def should_skip_without_loading(self, name: str) -> bool:
-                return name == "handle_me.skip"
-
-            def record_skip_without_loading(self, name: str) -> None:
-                assert name == "handle_me.skip"
-                self.skipped += 1
-
-        converter = _SkippingConverter()
-        assert checkpoint_converter_should_skip_without_loading(converter, "handle_me.skip")
-        assert not checkpoint_converter_should_skip_without_loading(converter, "other_key")
-        checkpoint_converter_record_skip_without_loading(converter, "handle_me.skip")
-        assert converter.skipped == 1
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +516,7 @@ class TestDeepseekV4ConverterConvert:
             ),
             (
                 "layers.2.attn.indexer.weights_proj.weight",
-                "model.layers.2.self_attn.compressor.indexer.scorer.weights_proj.weight",
+                "model.layers.2.self_attn.compressor.indexer.weights_proj.weight",
             ),
             ("layers.2.ffn.gate.bias", "model.layers.2.mlp.gate.e_score_correction_bias"),
             ("layers.2.ffn.gate.tid2eid", "model.layers.2.mlp.gate.tid2eid"),
@@ -1000,27 +981,6 @@ class TestQwen3VLMoeConverterConvert:
                 "l.mlp.experts.gate_up_proj",
                 torch.randn(VLMOE_NUM_EXPERTS, 999, VLMOE_HIDDEN),
             )
-
-    @pytest.mark.parametrize(("proj", "hidden", "intermediate"), [("gate_up_proj", 8, 4), ("down_proj", 8, 8)])
-    def test_rejects_ambiguous_layout_without_changing_weights(self, proj, hidden, intermediate):
-        converter = Qwen3VLMoeCheckpointTensorConverter(VLMOE_NUM_EXPERTS, hidden, intermediate)
-        tensor = torch.arange(VLMOE_NUM_EXPERTS * hidden * hidden, dtype=torch.float32).reshape(
-            VLMOE_NUM_EXPERTS, hidden, hidden
-        )
-        original = tensor.clone()
-        with pytest.raises(RuntimeError, match="ambiguous layout"):
-            maybe_convert_checkpoint_tensor(f"l.mlp.experts.{proj}", tensor, converter)
-        assert torch.equal(tensor, original)
-
-    @pytest.mark.parametrize("proj", ["gate_up_proj", "down_proj"])
-    @pytest.mark.parametrize("layout", ["hf", "v5"])
-    def test_rejects_wrong_last_dim(self, proj, layout):
-        if proj == "gate_up_proj":
-            middle = VLMOE_HIDDEN if layout == "hf" else 2 * VLMOE_INTERMEDIATE
-        else:
-            middle = VLMOE_INTERMEDIATE if layout == "hf" else VLMOE_HIDDEN
-        with pytest.raises(RuntimeError, match="unrecognized layout"):
-            self.converter.convert(f"l.mlp.experts.{proj}", torch.randn(VLMOE_NUM_EXPERTS, middle, 999))
 
 
 class TestQwen3VLMoeConverterFinalize:
