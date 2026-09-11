@@ -48,6 +48,9 @@ class BaseRLTrainer(BaseTrainer):
     # post init preforward and postforward hooks
     def _build_preforward_postforward(self):
         """Build preforward and postforward hooks."""
+        state = get_parallel_state()
+        if state.cp_enabled and state.cp_layout == "zigzag":
+            raise NotImplementedError("RL postprocessing does not support USP zigzag CP; set cp_size=1.")
         self.pre_forward = Preforward()
         self.post_forward = Postforward()
 

@@ -143,6 +143,7 @@ Core files:
     - `DynamicBatchingSizeDataset` (preferred) / `DynBszBuffer` (legacy): per-worker buffer, yields when token sum ≥ `micro_batch_seq_length`.
     - `_get_micro_batch` greedily adds samples that fit. Supports `state_dict` / `load_state_dict` for checkpoint resumption.
     - Position IDs in packed sequences must encode segment boundaries (see constraint 10).
+    - With USP context parallelism (`cp_size > 1`), `PackingCollator` pads each document to `2 * cp_size`; dynamic batching must therefore budget total/physical sample lengths rounded up to the same alignment. Padding labels use `IGNORE_INDEX`, while padding position IDs continue monotonically so they do not create false document boundaries.
 
 ### Multimodal Data
 
@@ -225,3 +226,12 @@ Core files:
     - `_Gather.backward` uses NCCL reduce-scatter for nonempty real gradients with positive shard sizes. Equal shards use rank-major stacked tensor input to avoid the list API's internal flatten; uneven shards use the list path. Borrowed inputs require a separate output. Owned packed inputs may reuse the local rank's slice only where the old contiguous all-reduce result would also retain full storage; otherwise keep compact local storage. This avoids adding a local output allocation on top of a required full packing buffer. Other backends and complex/empty inputs retain an owned contiguous all-reduce buffer. `_GatherConcatSP.backward` also owns its in-place reduction buffer.
     - Collective selection must agree across ranks: negative-view flags and strides may differ by rank, so materialize them locally without changing the chosen collective. Preserve scaling before summation (FP16 overflow makes the order observable). The no-sum path scales only the local slice. Regression tests in `tests/parallel/ulysses/test_all_gather.py` cover shared gradients, edge cases, and local output storage with real Gloo/NCCL collectives where available.
     - A regression's reference collective must also use a contiguous buffer for NCCL. Make only the reference clone contiguous; preserve the layout of the actual incoming gradient so transposed, narrowed and expanded inputs remain covered.
+
+### USP versus model-specific context parallelism
+
+- `model.accelerator.cp_layout` defaults to `contiguous` for DeepSeek V4.
+  USP requires explicit `zigzag`; only this layout pads documents to `2*cp_size`
+  and reorders them. Include layout in the parallel-state cache key.
+- USP model builds currently allow only Qwen3 with VeOmni FA2/FA4. DPO and
+  unsupported attention modifiers must fail before training rather than silently
+  using a different attention function.

@@ -1,0 +1,64 @@
+# Qwen3 dense long-context SFT with USP (Unified Sequence Parallelism).
+#
+# USP composes Ulysses (all-to-all head/seq exchange) with Ring-Attention
+# (context parallel). The effective sequence-parallel size is
+# ``ulysses_size * cp_size``. Rule of thumb: set ``ulysses_size`` up to the
+# number of KV heads (cheap all-to-all, keep it within a high-bandwidth node),
+# then scale further with ``cp_size`` (ring attention is not bounded by head
+# count). See docs/key_features/ulysses.md (USP section).
+#
+# Constraints for the ``cp`` (ring) path:
+#   * causal attention only (no explicit attention masks under cp)
+#   * a flash-attn backend is required (FA2 on Ampere/Hopper, FA4 CuTe on
+#     Blackwell/GB200 — auto-selected at import time)
+#   * max_seq_len must be divisible by 2 * ulysses_size * cp_size
+#   * packed (varlen) sequences ARE supported: every packed document length
+#     must additionally be divisible by 2 * cp_size (balanced ring attention
+#     splits each document into 2*cp_size zig-zag blocks)
+
+model:
+  model_path: Qwen3-8B-Base
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    ulysses_size: 8
+    cp_size: 4
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    cp_layout: zigzag
+    offload_config:
+      enable_activation: false
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+  optimizer:
+    type: adamw
+    lr: 0.0001
+    lr_decay_style: cosine
+    max_grad_norm: 1.0
+data:
+  train_path: tulu-3-sft-mixture
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 131072
+  train_size: 750000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+train:
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  num_train_epochs: 3
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: Qwen3-8B-Base-sft-usp
+    manager: dcp
+    save_steps: 100
+    save_epochs: 1
+    save_hf_weights: true
+  wandb:
+    project: VeOmni
+    name: Qwen3-8B-Base-sft-usp

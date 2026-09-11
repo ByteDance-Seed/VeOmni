@@ -138,6 +138,8 @@ class TextDPOTrainer:
     reference_model: PreTrainedModel
 
     def __init__(self, args: VeOmniDPOArguments):
+        if args.model.accelerator.cp_size > 1 and args.model.accelerator.cp_layout == "zigzag":
+            raise NotImplementedError("DPO does not support USP zigzag CP; set cp_size=1.")
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 

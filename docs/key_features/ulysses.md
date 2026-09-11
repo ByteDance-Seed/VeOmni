@@ -426,3 +426,100 @@ Async Ulysses is currently available for the following models:
 - Qwen3VL Dense
 
 Support for more models will be added in future releases.
+
+## 🔗 USP: Unified Sequence Parallelism (Ulysses × Ring)
+
+Ulysses alone is bounded by the number of attention (KV) heads: `ulysses_size`
+must divide `num_key_value_heads`, so a GQA/MQA model with few KV heads cannot
+scale SP beyond that. **USP** ([paper](https://arxiv.org/abs/2405.07719))
+removes this ceiling by composing Ulysses with **Ring-Attention** (context
+parallel, `cp`). The two are orthogonal and multiply:
+
+```
+sp_size = ulysses_size × cp_size
+```
+
+- **Ulysses (`ulysses_size`)** — all-to-all head/sequence exchange. Cheap
+  communication (`~4·M·(P-1)/P²`, shrinks as `P` grows), but capped at the KV
+  head count. Best placed on a high-bandwidth intra-node link (NVLink).
+- **Ring (`cp_size`)** — K/V blocks rotate around the `cp` group while an online
+  softmax accumulates partial outputs. Not bounded by head count, so it carries
+  the scaling beyond the Ulysses ceiling. Communication is `O(S)` P2P, well
+  suited to inter-node links where it overlaps with compute.
+
+VeOmni uses **zig-zag** block placement for the ring so causal attention stays
+load-balanced: the sequence is split into `2·cp_size` blocks and cp-rank `r`
+owns blocks `r` and `2·cp_size-1-r`.
+
+### Quick Start
+
+```shell
+bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
+    --model.model_path YOUR_MODEL_PATH \
+    --data.train_path YOUR_DATA_PATH \
+    --model.accelerator.ulysses_size 8 \
+    --model.accelerator.cp_size 4          # effective SP size = 32
+```
+
+### Choosing `ulysses_size` vs `cp_size`
+
+| Seq len | Typical layout (8 KV heads) | Notes |
+|---------|------------------------------|-------|
+| 32K     | `ulysses=4`, `cp=1`          | Ulysses alone is enough. |
+| 64K     | `ulysses=8`, `cp=1`          | At the Ulysses/head ceiling. |
+| 128K    | `ulysses=8`, `cp=2..4`       | Ring extends past the head ceiling. |
+| 256K+   | `ulysses=8` (intra-node), `cp=N` (inter-node) | Ring scales horizontally. |
+
+### Constraints
+
+- **Ring path is causal-only**: `cp_size > 1` does not support explicit
+  attention masks (only causal). Packed (varlen) sequences ARE supported —
+  each document is zig-zag split independently across the `cp` group.
+- **Packed divisibility**: under `cp_size > 1`, `PackingCollator` automatically
+  pads every packed document to a multiple of `2 · cp_size` before concatenation.
+  The inserted tokens use ignored labels (`-100`) and continuing position IDs,
+  so they satisfy the zig-zag layout without creating extra varlen boundaries.
+  Dynamic batching budgets these aligned physical lengths, and fixed/SP tail
+  padding is coalesced into one aligned segment. The lower-level USP reorder
+  helpers still validate the invariant and reject manually constructed
+  unaligned batches.
+- **Flash-attention backend**: ring attention builds on a `flash_attn`
+  forward/backward pair, auto-selected at import time (FA2 when installed, otherwise FA4) (see `FA_BACKEND` in
+  `ring_attention.py`): classic **FA2** (`flash_attn.flash_attn_interface`) on
+  Ampere/Hopper, or the **FA4** CuTe backend (`flash_attn.cute.interface`) on
+  Blackwell/GB200. FA3 is Hopper-only (no Blackwell kernel image) and is not
+  used by the ring path. Any one of these backends is sufficient.
+- **Divisibility**: `max_seq_len` must be divisible by `2 · ulysses_size · cp_size`
+  (the collator pads up to this multiple automatically).
+- **Loss/data layout**: the `SequenceParallelCollator` lays sequences out
+  cp-outer (zig-zag) / ulysses-inner (contiguous). SFT cross-entropy reduces
+  over the SP group by token count, so it is invariant to this reordering. The
+  RL/DPO trainers (which gather and re-linearise logits) do not yet support
+  `cp_size > 1`.
+
+### Implementation Map
+
+- Ring kernel: `veomni/distributed/sequence_parallel/ring_attention.py`
+  (`zigzag_ring_flash_attn_func` for dense, `zigzag_ring_flash_attn_varlen_func`
+  for packed, online-softmax `update_out_and_lse`, `RingComm`).
+- Data layout: `veomni/distributed/sequence_parallel/data.py`
+  (`zigzag_reorder` / `zigzag_undo` for dense, `zigzag_reorder_varlen` /
+  `local_cu_seqlens` for packed) and `SequenceParallelCollator._usp_slice`.
+- Attention integration: the ring branch in
+  `veomni/ops/kernels/attention/flash.py` runs after the Ulysses all-to-all.
+- Mesh: `init_parallel_state_from_config()` builds `[ulysses, cp]` and flattens `sp`.
+
+### USP integration with model-specific CP
+
+Set `model.accelerator.cp_layout: zigzag` for USP. The default `contiguous`
+layout preserves DeepSeek V4's model-specific CP and does not allow combining
+CP with Ulysses. This release enables USP for Qwen3 causal text training with
+VeOmni FlashAttention 2 or 4. RL/DPO, multimodal packing, sliding-window attention,
+softcap, attention sinks, and nonzero attention dropout are unsupported and
+rejected. Other models require a separate compatibility check before enabling USP.
+
+BF16 Ring changes attention reduction and rounding order. Training-equivalence
+tests use numerical tolerances; they do not guarantee identical gradients across
+CP sizes. Fixed-weight Qwen3-8B diagnostics have shown substantial gradient
+differences even when scalar losses are close. Deterministic execution within
+one topology does not imply invariance across topologies.

@@ -169,6 +169,9 @@ jobs:
           uv run --frozen pytest -s -x tests/distributed/test_async_offload_unit.py
           uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
           uv run --frozen pytest -s -x tests/distributed/test_torch_compile.py
+      - name: Run USP ring tests
+        run: |
+          uv run --frozen pytest -s -x tests/parallel/ring
       - name: Run data tests
         run: |
           uv run --frozen pytest -s -x tests/data

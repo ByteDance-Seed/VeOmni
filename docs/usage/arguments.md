@@ -550,8 +550,10 @@ configured and never round-trip through a saved config.
 | pp_size | `int` | `1` | Pipeline parallel size. |
 | ulysses_size | `int` | `1` | Ulysses sequence parallel size. |
 | enable_async | `bool` | `False` | Enable async Ulysses. |
-| cp_size | `int` | `1` | Ring-attention context parallel size. |
+| cp_size | `int` | `1` | Ring-attention context-parallel size (USP). Composes with `ulysses_size`; effective SP size is `ulysses_size * cp_size`. Ring path is causal-only and needs a flash-attn backend (FA2 on Ampere/Hopper or FA4 CuTe on Blackwell/GB200, auto-selected); packed (varlen) sequences are supported when every document length is divisible by `2 * cp_size`. |
+| cp_layout | `Literal["contiguous", "zigzag"]` | `"contiguous"` | Keep contiguous model-specific CP (DeepSeek V4), or select zigzag USP for Qwen3 FlashAttention. |
 | init_device | `Literal["cuda", "meta", "npu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2 and also works for multi-rank DDP; a run with no FSDP wrap (`fsdp_size == 1`) must name an accelerator. |
+
 | fsdp_config | `FSDPConfig` | — | FSDP sharding configuration. |
 | offload_config | `OffloadConfig` | — | Activation offload settings. |
 | gradient_checkpointing | `GradientCheckpointingConfig` | — | Activation recomputation settings. |
