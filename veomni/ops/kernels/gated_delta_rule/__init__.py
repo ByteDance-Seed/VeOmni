@@ -106,7 +106,7 @@ KERNEL_REGISTRY.register(
         op_name="rms_norm_gated",
         variant="standard",
         factory=_fla_fused_rms_norm_gated_factory,
-        hardware=HardwareRequirement(device_type=["gpu", "mlu"]),
+        hardware=HardwareRequirement(device_type=["gpu", "mlu", "npu"]),
         description="flash-linear-attention FusedRMSNormGated (RMSNorm + SiLU gate fused)",
     )
 )
@@ -129,11 +129,10 @@ KERNEL_REGISTRY.register(
         op_name="causal_conv1d",
         variant="standard",
         factory=_fla_causal_conv1d_factory,
-        hardware=HardwareRequirement(device_type=["gpu", "mlu"]),
+        hardware=HardwareRequirement(device_type=["gpu", "mlu", "npu"]),
         description="flash-linear-attention causal conv1d (Triton, varlen-aware)",
     )
 )
-
 
 # ── causal_conv1d (NPU vendored Triton) ──────────────────────────────────────
 
@@ -178,7 +177,7 @@ KERNEL_REGISTRY.register(
         op_name="chunk_gated_delta_rule",
         variant="standard",
         factory=_fla_chunk_gated_delta_rule_factory,
-        hardware=HardwareRequirement(device_type=["gpu", "mlu"]),
+        hardware=HardwareRequirement(device_type=["gpu", "mlu", "npu"]),
         description="flash-linear-attention chunk gated delta rule (Triton, varlen-aware)",
     )
 )

@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from veomni.data.chat_template import (
     CHAT_TEMPLATE_REGISTRY,
@@ -9,6 +10,7 @@ from veomni.data.chat_template import (
     Qwen2VLChatTemplate,
     Qwen3VLChatTemplate,
     TokenizerTemplate,
+    add_mtp_labels,
     build_chat_template,
 )
 from veomni.utils.constants import IGNORE_INDEX, TYPE2INDEX
@@ -43,6 +45,30 @@ def test_tokenizer_template_masks_non_assistant_turns_and_truncates():
         "attention_mask": [1, 1, 1, 1],
         "labels": [IGNORE_INDEX, 3, 20, 21],
     }
+
+
+def test_add_mtp_labels_builds_each_depth_before_packing():
+    feature = {"labels": torch.tensor([10, 11, 12, 13, 14])}
+
+    add_mtp_labels(feature, num_depths=3)
+
+    expected = torch.tensor(
+        [
+            [12, 13, 14, IGNORE_INDEX, IGNORE_INDEX],
+            [13, 14, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX],
+            [14, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX],
+        ]
+    )
+    assert torch.equal(feature["mtp_labels"], expected)
+
+
+def test_tokenizer_template_does_not_emit_mtp_labels():
+    template = TokenizerTemplate(_PrefixStableTokenizer())
+    encoded = template.encode_messages(
+        [{"role": "user", "content": [10, 11]}, {"role": "assistant", "content": [20, 21]}],
+        max_seq_len=4,
+    )
+    assert "mtp_labels" not in encoded
 
 
 def test_gpt_oss_tokenizer_template_supports_terminal_token_rewrite():
@@ -270,6 +296,12 @@ def _video_metadata(total_num_frames, fps=2.0, frames_indices=None):
         fps=fps,
         frames_indices=list(range(total_num_frames)) if frames_indices is None else frames_indices,
     )
+
+
+def test_qwen2vl_template_does_not_emit_mtp_labels():
+    template = build_chat_template("qwen2vl", _Processor(_SpecialTokenTokenizer()))
+    encoded = template.encode_messages([("user", ("text", "hi")), ("assistant", ("text", "ok"))], {})
+    assert "mtp_labels" not in encoded
 
 
 @pytest.mark.parametrize("sample_fps,max_frames", [(2.0, 4), (2.0, None), (1.0, None)])

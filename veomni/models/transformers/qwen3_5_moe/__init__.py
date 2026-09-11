@@ -36,6 +36,13 @@ def _convert_qwen3_5_moe_causal_lora_targets_to_parameters(_model, lora_modules,
     )
 
 
+def _create_qwen3_5_moe_checkpoint_tensor_converter(model):
+    from ..qwen3_moe.checkpoint_tensor_converter import Qwen3MoeCheckpointTensorConverter
+
+    text_config = getattr(model.config, "text_config", model.config)
+    return Qwen3MoeCheckpointTensorConverter(num_experts=text_config.num_experts)
+
+
 #
 # NPU branch is opt-in; everything else (CUDA, CPU-only) falls back to the GPU
 # generated file. The GPU generated module imports cleanly without an active
@@ -46,6 +53,8 @@ def _convert_qwen3_5_moe_causal_lora_targets_to_parameters(_model, lora_modules,
 @MODELING_REGISTRY.register("qwen3_5_moe")
 def register_qwen3_5_moe_modeling(architecture: str):
     """Register and return the device-specific Qwen3.5-MoE modeling class."""
+    from ..qwen3_moe.checkpoint_tensor_converter import convert_qwen3_moe_fqn_to_index_mapping
+
     if IS_NPU_AVAILABLE:
         from .generated.patched_modeling_qwen3_5_moe_npu import (
             Qwen3_5MoeForCausalLM,
@@ -63,6 +72,9 @@ def register_qwen3_5_moe_modeling(architecture: str):
     Qwen3_5MoeForCausalLM._convert_lora_targets_to_parameters = staticmethod(
         _convert_qwen3_5_moe_causal_lora_targets_to_parameters
     )
+    for model_cls in (Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration):
+        model_cls._create_checkpoint_tensor_converter = staticmethod(_create_qwen3_5_moe_checkpoint_tensor_converter)
+        model_cls._convert_fqn_to_index_mapping = staticmethod(convert_qwen3_moe_fqn_to_index_mapping)
     if "ForCausalLM" in architecture:
         return Qwen3_5MoeForCausalLM
     elif "ForConditionalGeneration" in architecture:
