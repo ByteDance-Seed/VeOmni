@@ -47,7 +47,6 @@ from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerB
 from transformers.modeling_outputs import ModelOutput
 
 from ..arguments import OffloadConfig, VeOmniArguments, save_args
-from ..checkpoint import CheckpointerBase
 from ..data import (
     DistributedDataloader,
     build_dataloader,
@@ -59,10 +58,11 @@ from ..data.data_transform import build_data_transform
 from ..distributed.async_offload import apply_async_activation_offload, reset_async_activation_offload
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.offloading import build_activation_offloading_context
-from ..distributed.parallel_state import clear_parallel_state, init_parallel_state, use_parallel_state
+from ..distributed.parallel_state import clear_parallel_state, init_parallel_state_from_config, use_parallel_state
 from ..distributed.torch_compile import CompileConfig, mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
+from ..models.checkpoint_manager import ModelCheckpointManager
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..optim import build_lr_scheduler, build_optimizer
 from ..utils import helper, logging
@@ -79,11 +79,10 @@ from ..utils.model_utils import pretty_print_trainable_parameters
 from .callbacks import (
     RESERVED_TRAINING_METRIC_NAMES,
     ChannelLossCallback,
-    CheckpointerCallback,
+    CheckpointCallback,
     EnvironMeterCallback,
     EvaluateCallback,
-    HFLoraCkptCallback,
-    HuggingfaceCkptCallback,
+    GlobalStateCallback,
     MoERouterMonitorCallback,
     ProfileTraceCallback,
     TqdmCallback,
@@ -211,7 +210,7 @@ class VeOmniIter:
 
 def _resolve_offload_config(args) -> OffloadConfig:
     """Return activation-offload config, or the disabled defaults if a stub omitted it."""
-    accelerator = getattr(getattr(args, "train", None), "accelerator", None)
+    accelerator = getattr(getattr(args, "model", None), "accelerator", None)
     config = getattr(accelerator, "offload_config", None)
     return config if config is not None else OffloadConfig()
 
@@ -288,7 +287,7 @@ class BaseTrainer(Stateful, ABC):
     step_train_metrics: Dict[str, Any]  # loss, grad_norm, lr, etc
 
     # Checkpointer
-    checkpointer: CheckpointerBase  # see in checkpoint_callback.CheckpointerCallback
+    checkpoint: ModelCheckpointManager
 
     # Callback system
     state: TrainerState
@@ -378,33 +377,19 @@ class BaseTrainer(Stateful, ABC):
             save_args(self.args, self.args.train.checkpoint.output_dir)
 
         # Gradient checkpointing debug
-        set_checkpoint_debug_enabled(self.args.train.gradient_checkpointing.debug)
+        set_checkpoint_debug_enabled(self.args.model.accelerator.gradient_checkpointing.debug)
 
     def register_parallel_state(self, name: str = "base"):
         """Register this trainer's ParallelState under ``name`` in the registry."""
-        init_parallel_state(
-            dp_size=self.args.train.accelerator.dp_size,
-            dp_replicate_size=self.args.train.accelerator.dp_replicate_size,
-            dp_shard_size=self.args.train.accelerator.dp_shard_size,
-            tp_size=self.args.train.accelerator.tp_size,
-            pp_size=self.args.train.accelerator.pp_size,
-            cp_size=self.args.train.accelerator.cp_size,
-            ulysses_size=self.args.train.accelerator.ulysses_size,
-            extra_parallel_sizes=self.args.train.accelerator.extra_parallel_sizes,
-            extra_parallel_placement_innermost=self.args.train.accelerator.extra_parallel_placement_innermost,
-            extra_parallel_names=self.args.train.accelerator.extra_parallel_names,
-            dp_mode=self.args.train.accelerator.fsdp_config.fsdp_mode,
-            async_enabled=self.args.train.accelerator.enable_async,
-            name=name,
-        )
+        init_parallel_state_from_config(self.args.model.accelerator, name=name)
 
     def _build_model(self):
         logger.info_rank0("Build model")
         self.model = build_foundation_model(
             config_path=self.args.model.config_path,
             weights_path=self.args.model.model_path,
-            torch_dtype="float32" if self.args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
-            init_device=self.args.train.init_device,
+            torch_dtype="float32" if self.args.model.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
+            init_device=self.args.model.accelerator.init_device,
             ops_implementation=self.args.model.ops_implementation,
             config_kwargs=self.args.model.model_config,
         )
@@ -492,7 +477,7 @@ class BaseTrainer(Stateful, ABC):
         )
         dataset_length = None if not hasattr(self.train_dataset, "__len__") else len(self.train_dataset)
         if args.data.datasets_type == "mapping":
-            dataset_length = dataset_length / args.train.accelerator.dp_size
+            dataset_length = dataset_length / args.model.accelerator.dp_size
         args.compute_train_steps(dataset_length)
         self.train_steps = args.train_steps
 
@@ -556,7 +541,7 @@ class BaseTrainer(Stateful, ABC):
             kwargs["adapter_path"] = lora_adapter_path
             kwargs["is_peft_model"] = True
 
-        muon_expert_zero_comm = args.train.optimizer.type == "muon" and args.train.optimizer.muon_expert_zero_comm
+        muon_expert_zero_comm = args.model.optimizer.type == "muon" and args.model.optimizer.muon_expert_zero_comm
 
         if args.model.fqn_to_index_mapping is not None:
             kwargs["fqn_to_index_mapping"] = args.model.fqn_to_index_mapping
@@ -577,26 +562,30 @@ class BaseTrainer(Stateful, ABC):
         # Parallelize model
         self.model = build_parallelize_model(
             self.model,
-            init_device=args.train.init_device,
+            init_device=args.model.accelerator.init_device,
             weights_path=args.model.model_path,
             should_skip_hf_weight_load=skip_hf_weight_load,
-            enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
-            mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
-            enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
+            enable_reshard_after_forward=args.model.accelerator.fsdp_config.reshard_after_forward,
+            mixed_precision=args.model.accelerator.fsdp_config.mixed_precision,
+            enable_gradient_checkpointing=args.model.accelerator.gradient_checkpointing.enable,
             basic_modules=list(
                 set(getattr(self.model, "_no_split_modules", None) or []) | set(args.model.basic_modules)
             ),
-            enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
-            early_stop=args.train.gradient_checkpointing.early_stop,
-            enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
-            enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
-            broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
-            ep_sharded_stream_load=args.train.ep_sharded_stream_load,
-            max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
+            enable_reentrant=args.model.accelerator.gradient_checkpointing.enable_reentrant,
+            early_stop=args.model.accelerator.gradient_checkpointing.early_stop,
+            enable_forward_prefetch=args.model.accelerator.fsdp_config.forward_prefetch,
+            enable_fsdp_offload=args.model.accelerator.fsdp_config.offload,
+            fsdp_offload_pin_memory=args.model.accelerator.fsdp_config.offload_pin_memory,
+            broadcast_model_weights_from_rank0=args.model.broadcast_model_weights_from_rank0,
+            ep_sharded_stream_load=args.model.ep_sharded_stream_load,
+            max_load_broadcast_size=args.model.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
-            reduce_scatter_transport_dtype=args.train.accelerator.fsdp_config.reduce_scatter_transport_dtype,
+            reduce_scatter_transport_dtype=args.model.accelerator.fsdp_config.reduce_scatter_transport_dtype,
             compile_config=CompileConfig(
-                **{field.name: getattr(args.train.torch_compile, field.name) for field in fields(CompileConfig)}
+                **{
+                    field.name: getattr(args.model.accelerator.torch_compile, field.name)
+                    for field in fields(CompileConfig)
+                }
             ),
             **kwargs,
         )
@@ -607,14 +596,14 @@ class BaseTrainer(Stateful, ABC):
         # Build optimizer
         self.optimizer = build_optimizer(
             self.model,
-            lr=args.train.optimizer.lr,
-            betas=args.train.optimizer.betas,
-            weight_decay=args.train.optimizer.weight_decay,
+            lr=args.model.optimizer.lr,
+            betas=args.model.optimizer.betas,
+            weight_decay=args.model.optimizer.weight_decay,
             fused=True,
-            optimizer_type=args.train.optimizer.type,
-            no_decay_modules=args.train.optimizer.no_decay_modules,
-            no_decay_params=args.train.optimizer.no_decay_params,
-            optimizer_config=args.train.optimizer,
+            optimizer_type=args.model.optimizer.type,
+            no_decay_modules=args.model.optimizer.no_decay_modules,
+            no_decay_params=args.model.optimizer.no_decay_params,
+            optimizer_config=args.model.optimizer,
         )
 
     def _build_lr_scheduler(self):
@@ -623,12 +612,12 @@ class BaseTrainer(Stateful, ABC):
         self.lr_scheduler = build_lr_scheduler(
             self.optimizer,
             train_steps=args.train_steps * args.train.num_train_epochs,
-            lr=args.train.optimizer.lr,
-            lr_min=args.train.optimizer.lr_min,
-            lr_decay_style=args.train.optimizer.lr_decay_style,
-            lr_decay_ratio=args.train.optimizer.lr_decay_ratio,
-            lr_warmup_ratio=args.train.optimizer.lr_warmup_ratio,
-            lr_start=args.train.optimizer.lr_start,
+            lr=args.model.optimizer.lr,
+            lr_min=args.model.optimizer.lr_min,
+            lr_decay_style=args.model.optimizer.lr_decay_style,
+            lr_decay_ratio=args.model.optimizer.lr_decay_ratio,
+            lr_warmup_ratio=args.model.optimizer.lr_warmup_ratio,
+            lr_start=args.model.optimizer.lr_start,
         )
 
     def _build_training_context(self):
@@ -644,45 +633,69 @@ class BaseTrainer(Stateful, ABC):
             return
         self.model_fwd_context, self.model_bwd_context = build_activation_offloading_context(
             offload_config.enable_activation,
-            self.args.train.gradient_checkpointing.enable,
+            self.args.model.accelerator.gradient_checkpointing.enable,
             offload_config.activation_gpu_limit,
         )
 
     def _init_callbacks(self):
         """Initialize callbacks."""
+        self.checkpoint = ModelCheckpointManager(self)
         self.environ_meter_callback = EnvironMeterCallback(self)
         self.tqdm_callback = TqdmCallback(self)
         self.wandb_callback = WandbTraceCallback(self)
         self.profile_callback = ProfileTraceCallback(self)
-        self.checkpointer_callback = CheckpointerCallback(self)
-        if self.args.model.lora_config:
-            self.hf_ckpt_callback = HFLoraCkptCallback(self)
-        else:
-            self.hf_ckpt_callback = HuggingfaceCkptCallback(self)
+        self.checkpoint_callback = CheckpointCallback(self)
+        self.global_state_callback = GlobalStateCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self.moe_monitor_callback = MoERouterMonitorCallback(self)
         self.channel_loss_callback = ChannelLossCallback(self)
         # Ordered dispatch list. Callbacks own their ParallelState explicitly:
         # each captured it at construction (``Callback.parallel_state``), and
         # ChannelLossComputer receives that same cached state. Shared objects
-        # (EnvironMeter, DCP checkpointer) are handed the state directly, so
-        # no ambient ``use_parallel_state`` scope is needed around hook dispatch.
+        # (EnvironMeter) are handed the state directly. The checkpoint manager
+        # caches ParallelState at construction the same way, so save/load do
+        # not depend on ambient.
         #
         # ``channel_loss_callback`` is ordered after the meter (which resets
         # ``step_*_metrics`` in ``on_step_end``) and before ``wandb`` (which
         # logs them), so its per-source metrics survive into the logged payload.
+        #
+        # Weights first, then the cursor: at resume the DCP load frees its
+        # materialization buffers before the dataloader prefetches, and at
+        # save a crash between the two leaves weights whose trainer state is
+        # merely absent, which resumes with a warning.
         self._callbacks = [
             self.environ_meter_callback,
             self.tqdm_callback,
             self.channel_loss_callback,
             self.wandb_callback,
             self.profile_callback,
-            self.checkpointer_callback,
-            self.hf_ckpt_callback,
+            self.checkpoint_callback,
+            self.global_state_callback,
             self.evaluate_callback,
             self.moe_monitor_callback,
         ]
         self.state = TrainerState()
+
+    def load(self) -> None:
+        """Resume this job's model weights and optimizer."""
+        self.checkpoint.load()
+
+    def save_dcp(self, state: TrainerState) -> None:
+        """Write this job's resumable checkpoint for ``state.global_step``."""
+        self.checkpoint.save_dcp(state)
+
+    def save_hf_or_lora(self, state: TrainerState, stage: str = "step_end") -> None:
+        """Export this job's weights in whichever format the model was trained in."""
+        self.checkpoint.save_hf_or_lora(state, stage=stage)
+
+    def save_model_assets(self) -> None:
+        from ..models.module_utils import save_model_assets as _save_model_assets
+
+        args: VeOmniArguments = self.args
+        if args.train.global_rank == 0:
+            _save_model_assets(args.train.checkpoint.model_assets_dir, self.model_assets)
+        dist.barrier()
 
     def on_train_begin(self):
         for callback in self._callbacks:
@@ -819,8 +832,8 @@ class BaseTrainer(Stateful, ABC):
         """Reshard model after backward pass."""
         args: VeOmniArguments = self.args
         if (
-            args.train.accelerator.fsdp_config.fsdp_mode == "fsdp2"
-            and not args.train.accelerator.fsdp_config.reshard_after_backward
+            args.model.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+            and not args.model.accelerator.fsdp_config.reshard_after_backward
             and num_micro_steps > 1
         ):
             if micro_step == 0:
@@ -831,8 +844,8 @@ class BaseTrainer(Stateful, ABC):
     def _configure_hsdp_allreduce(self, micro_step: int, num_micro_steps: int):
         args: VeOmniArguments = self.args
         if (
-            args.train.accelerator.fsdp_config.fsdp_mode == "fsdp2"
-            and args.train.accelerator.dp_replicate_size > 1
+            args.model.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+            and args.model.accelerator.dp_replicate_size > 1
             and num_micro_steps > 1
         ):
             if micro_step == 0:
@@ -891,7 +904,7 @@ class BaseTrainer(Stateful, ABC):
 
         # Gradient clipping (reads FSDP/EP groups from current ParallelState)
         with use_parallel_state("base"):
-            grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
+            grad_norm = veomni_clip_grad_norm(self.model, args.model.optimizer.max_grad_norm)
 
         # Optimizer and scheduler step
         self.optimizer.step()

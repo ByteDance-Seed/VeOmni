@@ -56,7 +56,7 @@ from safetensors.torch import save_file
 from torch.distributed.tensor import DTensor, Shard
 
 from veomni.distributed.parallel_plan import ParallelPlan
-from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
+from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models.checkpoint_tensor_loading import ConvertedCheckpointTensor
 from veomni.utils import helper
@@ -225,7 +225,7 @@ def run_worker() -> None:
 
     dist.init_process_group(backend=get_dist_comm_backend())
     # world == ep: experts sharded across all ranks, dense FSDP-sharded.
-    init_parallel_state(dp_size=world, extra_parallel_sizes=(world,), extra_parallel_names=("ep",), dp_mode="fsdp2")
+    _init_parallel_state(dp_size=world, extra_parallel_sizes=(world,), extra_parallel_names=("ep",), dp_mode="fsdp2")
 
     tmp = Path(os.environ["MOE_MATRIX_TMP"])
     ref = _reference_state()

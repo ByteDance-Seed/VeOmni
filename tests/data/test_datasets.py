@@ -4,6 +4,7 @@ import random
 import subprocess
 import sys
 from functools import partial
+from itertools import islice
 from typing import Any, Dict, List
 
 
@@ -13,7 +14,7 @@ import pytest
 import torch
 import yaml
 from tools import resolve_ops_overrides
-from torch.utils.data import DistributedSampler
+from torch.utils.data import DistributedSampler, IterableDataset
 from transformers import PretrainedConfig
 from utils import (
     DummyDataset,
@@ -26,15 +27,24 @@ from utils import (
 )
 
 from veomni.arguments import parse_args
+from veomni.data import dataset as dataset_module
 from veomni.data.data_collator import MainCollator
 from veomni.data.data_loader import DistributedDataloader
-from veomni.data.dataset import DynamicBatchingSizeDataset, _MapStyleSamplerWrapper
+from veomni.data.dataset import (
+    DynamicBatchingSizeDataset,
+    InterleavedMappingDataset,
+    MappingDataset,
+    ShardedIterableDataset,
+    _MapStyleSamplerWrapper,
+    build_dataset,
+    get_data_files,
+)
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.trainer.callbacks import (
     Callback,
-    CheckpointerCallback,
     EnvironMeterCallback,
+    GlobalStateCallback,
     TrainerState,
 )
 from veomni.utils import helper
@@ -57,7 +67,7 @@ class TrainerTest(BaseTrainer):
 
     def _init_callbacks(self):
         self.environ_meter_callback = EnvironMeterCallback(self)
-        self.checkpointer_callback = CheckpointerCallbackTest(self)
+        self.global_state_callback = GlobalStateCallbackTest(self)
         self.check_callback = CheckCallback(self)
         self.state = TrainerState()
 
@@ -78,33 +88,33 @@ class TrainerTest(BaseTrainer):
 
     def on_train_begin(self):
         self.environ_meter_callback.on_train_begin(self.state)
-        self.checkpointer_callback.on_train_begin(self.state)
+        self.global_state_callback.on_train_begin(self.state)
         self.check_callback.on_train_begin(self.state)
 
     def on_train_end(self):
         self.environ_meter_callback.on_train_end(self.state)
-        self.checkpointer_callback.on_train_end(self.state)
+        self.global_state_callback.on_train_end(self.state)
         self.check_callback.on_train_end(self.state)
 
     def on_epoch_begin(self):
         self.environ_meter_callback.on_epoch_begin(self.state)
-        self.checkpointer_callback.on_epoch_begin(self.state)
+        self.global_state_callback.on_epoch_begin(self.state)
         self.check_callback.on_epoch_begin(self.state)
         self.state.curr_step = 0
 
     def on_epoch_end(self):
         self.environ_meter_callback.on_epoch_end(self.state)
-        self.checkpointer_callback.on_epoch_end(self.state)
+        self.global_state_callback.on_epoch_end(self.state)
         self.check_callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.checkpointer_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.global_state_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.check_callback.on_step_begin(self.state, micro_batches=micro_batches)
 
     def on_step_end(self, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs) -> None:
         self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.checkpointer_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.global_state_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.check_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def train_step(
@@ -127,7 +137,7 @@ class TrainerTest(BaseTrainer):
             super().destroy_distributed()
 
 
-class CheckpointerCallbackTest(CheckpointerCallback):
+class GlobalStateCallbackTest(GlobalStateCallback):
     trainer: TrainerTest
 
     def on_step_end(self, state: TrainerState, **kwargs):
@@ -135,7 +145,7 @@ class CheckpointerCallbackTest(CheckpointerCallback):
 
     def on_epoch_end(self, state: TrainerState, **kwargs):
         if state.epoch == 1 and not self.trainer.is_resume:
-            self._save_checkpoint(state)
+            self.save_global_state(state)
             self.trainer.resume_dcp_path = os.path.join(
                 self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}"
             )
@@ -144,7 +154,7 @@ class CheckpointerCallbackTest(CheckpointerCallback):
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         if self.trainer.is_resume:
-            self._load_checkpoint()
+            self.load_global_state()
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         pass
@@ -248,11 +258,11 @@ def build_command(dataset_type: str, dyn_bsz: bool, data_path: str):
         "--data.max_seq_len=16",
         "--train.global_batch_size=16",
         "--train.micro_batch_size=2",
-        "--train.accelerator.fsdp_config.fsdp_mode=ddp",
+        "--model.accelerator.fsdp_config.fsdp_mode=ddp",
         f"--data.datasets_type={dataset_type}",
         f"--train.dyn_bsz={dyn_bsz}",
         "--train.wandb.enable=True",
-        "--train.accelerator.ulysses_size=2",
+        "--model.accelerator.ulysses_size=2",
         "--train.bsz_warmup_ratio=0",
         "--data.dataloader.num_workers=1",
         # Force pin_memory=False: on NPU the pin_memory background thread
@@ -444,7 +454,7 @@ def test_map_style_sampler_wrapper_resume():
             next_epoch_dataloader.load_state_dict(epoch_boundary_state)
             iter(
                 next_epoch_dataloader
-            )  # check _load_checkpoint() of checkpoint_callback.py for more details on why we need to call iter() when the checkpoint is saved at the epoch boundary
+            )  # check GlobalStateCallback.load_global_state for more details on why we need to call iter() when the checkpoint is saved at the epoch boundary
             next_epoch_dataloader.set_epoch(3)
             next_epoch_batches = list(next_epoch_dataloader)
 
@@ -498,3 +508,172 @@ def test_map_style_sampler_wrapper_rejects_incompatible_resume_state():
 
     with pytest.raises(RuntimeError, match="missing sampler fingerprint fields"):
         source.load_state_dict({"epoch": 0, "yielded": 0})
+
+
+def _read_cycle(dataset, cycle):
+    start = cycle * len(dataset)
+    return [dataset[index] for index in range(start, start + len(dataset))]
+
+
+def test_mapping_dataset_overlength_indices_are_deterministic():
+    first = MappingDataset(list(range(8)), seed=17)
+    second = MappingDataset(list(range(8)), seed=17)
+
+    expected = _read_cycle(first, 1)
+    assert expected != list(range(8))
+    assert sorted(expected) == list(range(8))
+    assert _read_cycle(second, 1) == expected
+    assert [second[index] for index in (12, 8, 15, 9)] == [expected[index] for index in (4, 0, 7, 1)]
+
+
+def test_mapping_dataset_preserves_python_negative_index_semantics():
+    dataset = MappingDataset(list(range(8)), seed=17)
+    assert dataset[-1] == 7
+    with pytest.raises(IndexError, match="out of range"):
+        dataset[-9]
+
+
+def test_mapping_dataset_cycle_is_reproducible_after_restart():
+    uninterrupted = MappingDataset(list(range(8)), seed=9)
+    expected = _read_cycle(uninterrupted, 2)
+
+    resumed = MappingDataset(list(range(8)), seed=9)
+    assert [resumed[index] for index in range(19, 24)] == expected[3:]
+
+
+def test_mapping_dataset_mapping_is_independent_of_cycle_access_order():
+    dataset = MappingDataset(list(range(8)), seed=9)
+    expected = {index: dataset[index] for index in range(8, 32)}
+
+    for index in (25, 9, 17, 31, 8, 24, 16):
+        assert dataset[index] == expected[index]
+
+
+def test_empty_mapping_dataset_raises_index_error():
+    dataset = MappingDataset([], seed=9)
+    with pytest.raises(IndexError, match="empty dataset"):
+        dataset[0]
+    with pytest.raises(IndexError, match="empty dataset"):
+        dataset[-1]
+
+
+def test_mapping_dataset_seed_controls_overlength_order_without_global_rng_side_effect():
+    first = MappingDataset(list(range(8)), seed=3)
+    second = MappingDataset(list(range(8)), seed=4)
+    assert _read_cycle(first, 1) != _read_cycle(second, 1)
+
+    random.seed(123)
+    expected = random.random()
+    random.seed(123)
+    first[len(first)]
+    assert random.random() == expected
+
+
+def test_build_mapping_dataset_forwards_seed(monkeypatch):
+    monkeypatch.setattr(dataset_module, "get_data_files", lambda _: (["unused.jsonl"], "json"))
+    monkeypatch.setattr(dataset_module, "load_dataset", lambda *args, **kwargs: list(range(8)))
+
+    first = build_dataset(dataset_name="mapping", train_path="unused.jsonl", seed=3)
+    second = build_dataset(dataset_name="mapping", train_path="unused.jsonl", seed=4)
+
+    assert _read_cycle(first, 1) != _read_cycle(second, 1)
+
+
+def test_overlength_read_does_not_change_first_cycle_order():
+    dataset = MappingDataset(list(range(8)), seed=3)
+    dataset[len(dataset)]
+    assert _read_cycle(dataset, 0) == list(range(8))
+
+
+def test_interleaved_mapping_dataset_uses_same_deterministic_mapping():
+    data = [{"value": index, "ds_idx": index % 2} for index in range(8)]
+
+    first = InterleavedMappingDataset(data, seed=7)
+    second = InterleavedMappingDataset(data, seed=7)
+
+    assert _read_cycle(first, 1) == _read_cycle(second, 1)
+
+
+class _ListStream(IterableDataset):
+    def __init__(self, values):
+        self.values = list(values)
+        self.epoch = 0
+        self.epochs = []
+
+    def __iter__(self):
+        yield from self.values
+
+    def set_epoch(self, epoch: int):
+        self.epochs.append(epoch)
+        self.epoch = epoch
+
+
+def test_get_data_files_skips_non_table_artifacts(tmp_path):
+    nested = tmp_path / "rank0"
+    nested.mkdir()
+    parquet_path = nested / "shard.parquet"
+    parquet_path.write_bytes(b"PAR1")
+    (tmp_path / "veomni_cli.yaml").write_text("train: {}\n")
+    (tmp_path / "first.png").write_bytes(b"\x89PNG")
+
+    files, loader = get_data_files(str(tmp_path))
+    assert loader == "parquet"
+    assert files == [str(parquet_path)]
+
+
+def test_get_data_files_rejects_mixed_table_types(tmp_path):
+    (tmp_path / "a.csv").write_text("x\n1\n")
+    (tmp_path / "b.json").write_text("{}\n")
+    with pytest.raises(ValueError, match="Mixed data file types"):
+        get_data_files(str(tmp_path))
+
+
+def test_get_data_files_empty_directory_errors(tmp_path):
+    (tmp_path / "readme.md").write_text("not data")
+    with pytest.raises(FileNotFoundError, match="No supported data files"):
+        get_data_files(str(tmp_path))
+
+
+def test_iterable_drop_last_equalizes_ranks():
+    source = list(range(15))
+    ranks = [
+        list(ShardedIterableDataset(_ListStream(source), dp_rank=rank, dp_size=8, repeat=False)) for rank in range(8)
+    ]
+    assert [len(items) for items in ranks] == [1] * 8
+    assert [items[0] for items in ranks] == list(range(8))
+
+
+def test_iterable_one_pass_does_not_replay():
+    stream = ShardedIterableDataset(_ListStream([0, 1]), repeat=False)
+    assert list(stream) == [0, 1]
+
+
+def test_iterable_repeat_replays_until_consumed():
+    stream = ShardedIterableDataset(_ListStream([0, 1]), repeat=True)
+    assert list(islice(stream, 5)) == [0, 1, 0, 1, 0]
+
+
+def test_iterable_repeat_drops_incomplete_round_before_replay():
+    source = [0, 1, 2]
+    ranks = [
+        list(islice(ShardedIterableDataset(_ListStream(source), dp_rank=rank, dp_size=2, repeat=True), 4))
+        for rank in range(2)
+    ]
+    assert ranks[0] == [0, 0, 0, 0]
+    assert ranks[1] == [1, 1, 1, 1]
+
+
+def test_iterable_repeat_exits_when_source_shorter_than_dp():
+    ranks = [
+        list(islice(ShardedIterableDataset(_ListStream([0]), dp_rank=rank, dp_size=2, repeat=True), 4))
+        for rank in range(2)
+    ]
+    assert ranks == [[], []]
+
+
+def test_iterable_repeat_advances_inner_epoch():
+    inner = _ListStream(["a"])
+    stream = ShardedIterableDataset(inner, repeat=True, seed=10)
+    stream.set_epoch(3)
+    assert list(islice(stream, 2)) == ["a", "a"]
+    assert inner.epochs == [13, 14]

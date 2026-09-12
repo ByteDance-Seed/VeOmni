@@ -83,9 +83,9 @@ class ParallelMode:
 _SP_SIZE = [1, 2]
 _EP_SIZE = [1, 2]
 _WAN_BFLOAT16_TRAINING_ARGS = [
-    "--train.accelerator.fsdp_config.mixed_precision.enable=True",
-    "--train.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
-    "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+    "--model.accelerator.fsdp_config.mixed_precision.enable=True",
+    "--model.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+    "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
 ]
 _GPT_OSS_FA4_QUACK_TRAINING_ARGS = [
     "--model.ops_implementation.attn_implementation=flash_attention_4",

@@ -20,8 +20,9 @@ Provides callback system for customizing trainer behavior at various stages of t
 
 from .base import Callback, TrainerState
 from .channel_loss_callback import ChannelLossCallback, ChannelLossComputer
-from .checkpoint_callback import CheckpointerCallback, HFLoraCkptCallback, HuggingfaceCkptCallback
+from .checkpoint_callback import CheckpointCallback
 from .evaluate_callback import EvaluateCallback
+from .global_state_callback import GlobalStateCallback
 from .trace_callback import (
     RESERVED_TRAINING_METRIC_NAMES,
     EnvironMeterCallback,
@@ -37,9 +38,8 @@ __all__ = [
     "TrainerState",
     "ChannelLossCallback",
     "ChannelLossComputer",
-    "CheckpointerCallback",
-    "HuggingfaceCkptCallback",
-    "HFLoraCkptCallback",
+    "CheckpointCallback",
+    "GlobalStateCallback",
     "EvaluateCallback",
     "WandbTraceCallback",
     "ProfileTraceCallback",

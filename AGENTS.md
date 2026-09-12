@@ -16,7 +16,11 @@ On session start, read the following:
 - `.agents/knowledge/constraints.md` — hard constraints to check before any code change
 - `.agents/knowledge/architecture.md` — module map, trainer hierarchy, data flow
 - `.agents/knowledge/uv.md` — dependency management architecture (uv, extras, lockfile)
-- `.agents/knowledge/cloud_env.md` — Cursor Cloud (CPU-only VM) setup; read when running on the Cursor Cloud VM
+- `.agents/knowledge/cpu_only_env.md` — what can be verified without a GPU/NPU; read when running on a CPU-only machine
+
+Read on demand:
+- `.agents/knowledge/testing.md` — how CI selects tests, and how to decide whether a change needs one; read before adding or wiring a test
+- `.agents/knowledge/multimodal_metadata.md` — multimodal metadata precompute contract; read before touching VLM/Omni collators, ViT forwards, or the model metadata hooks
 
 ---
 
@@ -26,7 +30,7 @@ On session start, read the following:
 - **Explain, Don't Assume**: Explain **why** (motivation, tradeoffs), not just what. Cite files and line numbers.
 - **Ask When Stuck**: 3+ approaches fail? Stop, summarize, ask user. No hacks.
 - **Search Before You Act**: On unexpected behavior, search codebase + check constraints + review `git log` before attempting fixes.
-- **Planning Discipline**: Complex tasks (multi-file, >30 min) -> TodoWrite. Plan must state which skills will be used (e.g. `/veomni-develop` + `/veomni-review`). Simple tasks -> just do them.
+- **Planning Discipline**: Complex tasks (multi-file, >30 min) -> write a plan with the agent's todo/plan tool. The plan must state which skills will be used (e.g. `/veomni-develop` + `/veomni-review`). Simple tasks -> just do them.
 - **Cross-modality Awareness**: Changes in shared code (`BaseTrainer`, `data_collator`, `distributed/`) affect all modalities.
 - **No Patchgen Edits**: Never edit files under `veomni/models/transformers/*/generated/`.
 
@@ -39,7 +43,7 @@ uv sync --extra gpu --dev
 source .venv/bin/activate
 ```
 
-This installs `transformers==5.9.0` via the `transformers-stable` dependency
+This installs `transformers==5.16.1` via the `transformers-stable` dependency
 group. `gpu` / `npu` / `npu_aarch64` are mutually exclusive hardware extras;
 each is a complete superset for that accelerator. MagiAttention is an
 optional `--extra magi` that combines with `gpu` (`uv sync --extra gpu --extra magi`).
@@ -68,6 +72,7 @@ Title: `[{modules}] {type}: {description}`
 
 - Allowed modules and types are defined in `.github/workflows/check_pr_title.yml` (the CI source of truth).
 - Breaking: prepend `[BREAKING]`
+- **Run `/veomni-review` before opening the PR** (subagent code review over the branch diff), and again before pushing a substantive update to an open one. **safe** / **needs-attention** -> proceed. **risky** -> report to the user and wait. This is the review gate; it is per PR, not per commit.
 - GitHub PRs are also reviewed by CodeRabbit (`.coderabbit.yaml`). On an existing PR, comment `@coderabbitai review` or `@coderabbitai full review`.
 
 ---
@@ -76,26 +81,29 @@ Title: `[{modules}] {type}: {description}`
 
 1. Complete and verify the change.
 2. Update related documentation: `docs/`, `README.md`, `.agents/knowledge/`, config examples — if the change introduces, modifies, or removes any API, config field, or workflow.
-3. Run `/veomni-review` skill (subagent code review).
-4. **safe** -> commit. **risky** -> report to user, wait for approval.
-5. Each fix -> immediate commit. Do not batch unrelated changes.
-6. Run `make quality` before every commit.
-7. **Commit messages must NOT mention Claude/AI/Co-Authored-By.**
-8. **Skill gap check**: If the task didn't match any existing skill, briefly assess after completion: Was this a one-off, or a repeatable pattern? If repeatable, suggest creating a new skill to the user.
+3. Run `make quality` before every commit.
+4. Each fix -> immediate commit. Do not batch unrelated changes.
+5. **Commit messages describe the change, not the tool that produced it** — do not name the assistant or agent that wrote it, and no `Co-Authored-By` trailers. (Naming a *model being added* is expected — that is the change.)
+6. **Skill gap check**: If the task didn't match any existing skill, briefly assess after completion: Was this a one-off, or a repeatable pattern? If repeatable, suggest creating a new skill to the user.
+
+The subagent review gate is **per PR, not per commit** — see **PR Guidelines**.
+Commits are gated by `make quality` and your own verification. Nothing stops you
+invoking `/veomni-review` mid-branch when a change worries you; it just is not
+owed on every commit.
 
 ---
 
 ## Skills
 
-Skills follow the [Agent Skills](https://agentskills.io) open standard. Each skill is a folder in `.agents/skills/<name>/` containing a `SKILL.md` with YAML frontmatter (`name`, `description`). Skills are auto-discovered by compatible agents (Cursor, Claude Code, Codex, etc.) and can also be invoked manually with `/skill-name` in chat.
+Skills follow the [Agent Skills](https://agentskills.io) open standard. Each skill is a folder in `.agents/skills/<name>/` containing a `SKILL.md` with YAML frontmatter (`name`, `description`). Agents that implement the standard auto-discover them from the `description`; they can also be invoked manually with `/skill-name` in chat.
 
 | Task | Skill |
 |------|-------|
 | Feature / refactoring | `/veomni-develop` |
 | Bug fix / debugging | `/veomni-debug` |
-| Code review (pre-commit) | `/veomni-review` |
+| Code review (before opening a PR) | `/veomni-review` |
 | Add new model | `/veomni-new-model` |
-| Migrate existing model to transformers v5 | `/veomni-migrate-transformers-v5` |
+| Write or refresh a model's patchgen modeling | `/veomni-patchgen-model` |
 | Add new op/kernel | `/veomni-new-op` |
 | Update dependencies (uv) | `/veomni-uv-update` |
 | Performance profiling | `/veomni-profile` |
@@ -104,7 +112,7 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 ### Quick Decision Guide
 
 - **"Add support for model X"** → `/veomni-new-model`
-- **"Migrate X to transformers v5" / "port X to patchgen" / "convert monkey patch to generated modeling"** → `/veomni-migrate-transformers-v5`
+- **"Write a patch_gen_config" / "regenerate the generated modeling" / "add NPU patchgen" / "port X to patchgen"** → `/veomni-patchgen-model` (also the modeling step inside `/veomni-new-model`)
 - **"Add a new kernel / fused op"** → `/veomni-new-op`
 - **"Fix this error" / "training hangs" / "wrong results"** → `/veomni-debug`
 - **"Add a new capability" / "refactor" / "clean up"** → `/veomni-develop`
