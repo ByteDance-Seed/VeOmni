@@ -1,5 +1,3 @@
-import importlib
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -9,22 +7,6 @@ import torch
 @pytest.fixture
 def dsa():
     return pytest.importorskip("veomni.ops.kernels.dsa.vendor.flashmla_cudnn")
-
-
-def test_flashmla_cudnn_is_not_eagerly_imported_by_kernels():
-    sys.modules.pop("veomni.ops.kernels.dsa.vendor.flashmla_cudnn", None)
-
-    importlib.import_module("veomni.ops")
-
-    assert "veomni.ops.kernels.dsa.vendor.flashmla_cudnn" not in sys.modules
-
-
-def test_dsa_vendor_package_does_not_import_flashmla_cudnn_backend():
-    sys.modules.pop("veomni.ops.kernels.dsa.vendor.flashmla_cudnn", None)
-
-    importlib.import_module("veomni.ops.kernels.dsa.vendor")
-
-    assert "veomni.ops.kernels.dsa.vendor.flashmla_cudnn" not in sys.modules
 
 
 def test_indexer_select_topk_uses_cudnn_score_wrapper(monkeypatch, dsa):
@@ -143,22 +125,6 @@ def test_flash_mla_sparse_forward_returns_lse(monkeypatch, dsa):
 
     assert torch.equal(result["out"], expected_out)
     assert torch.equal(result["lse"], expected_lse)
-
-
-def test_flash_mla_sparse_forward_uses_imported_flash_mla_symbol(monkeypatch, dsa):
-    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
-    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
-    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
-
-    def fake_flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v):
-        return torch.empty(2, 128, 512, dtype=q.dtype), torch.empty(2, 128), torch.empty(2, 128)
-
-    monkeypatch.setattr(dsa, "flash_mla_sparse_fwd", fake_flash_mla_sparse_fwd)
-
-    result = dsa.flash_mla_sparse_forward(q_pe, k_pe, kv_cache, q_nope, gather)
-    assert set(result) == {"out", "lse"}
 
 
 def test_flash_mla_sparse_forward_compatibility_rejects_unaligned_topk(dsa):

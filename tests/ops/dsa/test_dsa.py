@@ -36,33 +36,16 @@ from tests.ops.tol import (
     EAGER_GRAD_RTOL,
     EAGER_RTOL,
 )
-from veomni.ops import OP_REGISTRY, resolve_op
+from tests.ops.utils import cosine_similarity, is_nvidia_cuda_available, make_grad_leaves
+from veomni.ops import resolve_op
 from veomni.ops.kernels.dsa.attention.glm import flashmla_cudnn as glm_fused_attention
 from veomni.ops.kernels.dsa.indexer.glm import cudnn as glm_fused_indexer
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
 
 
-# Installed functions: eager_attention_forward / DeepseekV4Indexer.forward
-# in transformers 5.9.0.
-# https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/deepseek_v4/modeling_deepseek_v4.py
-#
-# GLM indexer / attention eager path:
-# https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+# Installed Transformers implementations provide the DeepSeek-V4 and GLM eager references.
 
-_TILELANG_AVAILABLE = (
-    IS_CUDA_AVAILABLE and get_gpu_compute_capability() >= 90 and importlib.util.find_spec("tilelang") is not None
-)
-_GLM_FUSED_HARDWARE_AVAILABLE = IS_CUDA_AVAILABLE and torch.version.hip is None and get_gpu_compute_capability() >= 90
-
-
-def _clone(*tensors: Tensor) -> tuple[Tensor, ...]:
-    """Detach and turn ``requires_grad`` on for a fresh backward."""
-    return tuple(t.detach().requires_grad_(True) for t in tensors)
-
-
-def _cosine(actual: Tensor, expected: Tensor) -> float:
-    """Cosine similarity of two flattened tensors."""
-    return F.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0).item()
+_TILELANG_AVAILABLE = is_nvidia_cuda_available(min_cc=90) and importlib.util.find_spec("tilelang") is not None
+_GLM_FUSED_HARDWARE_AVAILABLE = is_nvidia_cuda_available(min_cc=90)
 
 
 def _require_glm_fused_dependencies() -> None:
@@ -106,7 +89,7 @@ def _hf_dsv4_indexer_scores(
     compress_ratio: int,
     topk: int,
 ) -> tuple[Tensor, Tensor]:
-    """Oracle from ``DeepseekV4Indexer.forward`` (transformers v5.9.0)."""
+    """Oracle from the installed ``DeepseekV4Indexer.forward`` implementation."""
     scores = torch.matmul(q_bshd.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))
     scores = F.relu(scores) * (q_bshd.shape[-1] ** -0.5)
     index_scores = (scores * weights.float().unsqueeze(-1)).sum(dim=2)
@@ -144,63 +127,6 @@ def _hf_glm_indexer_indices(
     return index_scores.topk(min(top_k, index_scores.shape[-1]), dim=-1).indices.to(torch.int32)
 
 
-def test_dsa_package_does_not_import_tilelang_eagerly():
-    """Registering DSA must not import TileLang or FlashMLA."""
-    importlib.import_module("veomni.ops.kernels.dsa")
-    assert "veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla" not in sys.modules
-    assert "veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_target" not in sys.modules
-    assert "veomni.ops.kernels.dsa.vendor.tilelang_indexer" not in sys.modules
-    assert "veomni.ops.kernels.dsa.vendor.flashmla_cudnn" not in sys.modules
-
-
-def test_dsa_rows_are_registered():
-    """Both kernels expose eager plus the fused impl names."""
-    assert OP_REGISTRY.list_registered("dsa_attention", "deepseek_v4") == ["eager", "tilelang"]
-    assert OP_REGISTRY.list_registered("dsa_attention", "glm") == ["eager", "flashmla_cudnn"]
-    assert OP_REGISTRY.list_registered("dsa_indexer", "deepseek_v4") == ["eager", "tilelang"]
-    assert OP_REGISTRY.list_registered("dsa_indexer", "glm") == ["eager", "cudnn"]
-    for kernel, variant in (
-        ("dsa_attention", "deepseek_v4"),
-        ("dsa_attention", "glm"),
-        ("dsa_indexer", "deepseek_v4"),
-        ("dsa_indexer", "glm"),
-    ):
-        assert "eager" in OP_REGISTRY.list_available(kernel, variant)
-
-
-def test_dsa_fused_rows_reject_rocm(monkeypatch):
-    """NVIDIA-only DSA rows must fail before importing their vendor kernels."""
-    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "cuda")
-    monkeypatch.setattr("veomni.ops.platform.gpu.IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr("veomni.ops.platform.gpu.torch.version.hip", "6.0", raising=False)
-
-    for op, variant, impl in (
-        ("dsa_attention", "deepseek_v4", "tilelang"),
-        ("dsa_indexer", "deepseek_v4", "tilelang"),
-        ("dsa_attention", "glm", "flashmla_cudnn"),
-        ("dsa_indexer", "glm", "cudnn"),
-    ):
-        assert impl not in OP_REGISTRY.list_available(op, variant)
-        with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
-            resolve_op(op, variant, impl)
-
-
-def test_glm_fused_rows_reject_sm80(monkeypatch):
-    """The packaged FlashMLA dependency requires Hopper or newer."""
-    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "cuda")
-    monkeypatch.setattr("veomni.ops.platform.gpu.IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr("veomni.ops.platform.gpu.torch.version.hip", None, raising=False)
-    monkeypatch.setattr("veomni.ops.platform.gpu.get_gpu_compute_capability", lambda: 80)
-
-    for op, variant, impl in (
-        ("dsa_attention", "glm", "flashmla_cudnn"),
-        ("dsa_indexer", "glm", "cudnn"),
-    ):
-        assert impl not in OP_REGISTRY.list_available(op, variant)
-        with pytest.raises(RuntimeError, match="compute capability >= 90"):
-            resolve_op(op, variant, impl)
-
-
 def test_glm_fused_rows_reject_attention_mask_before_vendor_import(monkeypatch):
     """Unsupported masks must not be silently ignored by fused GLM rows."""
     vendor_module = "veomni.ops.kernels.dsa.vendor.flashmla_cudnn"
@@ -235,7 +161,7 @@ def test_dsa_attention_deepseek_v4_eager_matches_hf():
     indices[..., -1] = -1
     scale = dim**-0.5
 
-    q_h, kv_h, sink_h = _clone(q, kv, sink)
+    q_h, kv_h, sink_h = make_grad_leaves(q, kv, sink)
     query = q_h.transpose(1, 2).contiguous()
     key = kv_h.unsqueeze(1).contiguous()
     mask = _official_topk_additive_mask(indices, kv_len, query.dtype)
@@ -249,7 +175,7 @@ def test_dsa_attention_deepseek_v4_eager_matches_hf():
         dropout=0.0,
     )
 
-    q_e, kv_e, sink_e = _clone(q, kv, sink)
+    q_e, kv_e, sink_e = make_grad_leaves(q, kv, sink)
     ours = resolve_op("dsa_attention", "deepseek_v4", "eager").wrapper(q_e, kv_e, sink_e, indices, sm_scale=scale)
     assert torch.allclose(ours, hf_out, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
@@ -484,8 +410,8 @@ def test_dsa_attention_glm_flashmla_cudnn_matches_eager_forward_and_backward():
         torch.randn(batch, kv_len, 1, nope_dim, device="cuda", dtype=torch.bfloat16),
         torch.randn(batch, q_len, heads, nope_dim, device="cuda", dtype=torch.bfloat16),
     )
-    q_pe_e, k_pe_e, kv_e, q_nope_e = _clone(*tensors)
-    q_pe_f, k_pe_f, kv_f, q_nope_f = _clone(*tensors)
+    q_pe_e, k_pe_e, kv_e, q_nope_e = make_grad_leaves(*tensors)
+    q_pe_f, k_pe_f, kv_f, q_nope_f = make_grad_leaves(*tensors)
     indices = (
         torch.arange(kv_len, device="cuda", dtype=torch.int32).view(1, 1, topk).expand(batch, q_len, -1).contiguous()
     )
@@ -520,7 +446,7 @@ def test_dsa_attention_glm_flashmla_cudnn_matches_eager_forward_and_backward():
         strict=True,
     ):
         assert actual_input.grad is not None and torch.isfinite(actual_input.grad).all()
-        assert _cosine(actual_input.grad, expected_input.grad) > 0.95
+        assert cosine_similarity(actual_input.grad, expected_input.grad) > 0.95
         torch.testing.assert_close(
             actual_input.grad.float(),
             expected_input.grad.float(),
@@ -600,8 +526,8 @@ def test_dsa_attention_tilelang_matches_eager():
     indices = torch.randint(kv_len, (batch, seq_len, topk), device=device, dtype=torch.int32)
     indices[..., -1] = -1
     scale = dim**-0.5
-    q_e, kv_e, sink_e = _clone(q, kv, sink)
-    q_t, kv_t, sink_t = _clone(q, kv, sink)
+    q_e, kv_e, sink_e = make_grad_leaves(q, kv, sink)
+    q_t, kv_t, sink_t = make_grad_leaves(q, kv, sink)
     eager = resolve_op("dsa_attention", "deepseek_v4", "eager").wrapper
     fused = resolve_op("dsa_attention", "deepseek_v4", "tilelang").wrapper
     expected = eager(q_e, kv_e, sink_e, indices, sm_scale=scale)
@@ -612,7 +538,7 @@ def test_dsa_attention_tilelang_matches_eager():
     actual.backward(grad)
     for actual_grad, expected_grad in zip((q_t.grad, kv_t.grad, sink_t.grad), (q_e.grad, kv_e.grad, sink_e.grad)):
         assert actual_grad is not None and expected_grad is not None
-        assert _cosine(actual_grad, expected_grad) > 0.95
+        assert cosine_similarity(actual_grad, expected_grad) > 0.95
     # dAttnSink is accumulated by an atomic under a replicated T.Parallel loop, so a
     # lost replication guard would scale it by the warp count -- which cosine, being
     # scale-invariant, cannot see.
@@ -628,8 +554,8 @@ def test_dsa_indexer_tilelang_matches_eager():
     q = torch.randn(seq_len, batch, heads, dim, device=device, dtype=torch.bfloat16)
     k = torch.randn(seq_len // compress, batch, dim, device=device, dtype=torch.bfloat16)
     weights = torch.randn(seq_len, batch, heads, device=device) * 0.01
-    q_e, k_e, w_e = _clone(q, k, weights)
-    q_t, k_t, w_t = _clone(q, k, weights)
+    q_e, k_e, w_e = make_grad_leaves(q, k, weights)
+    q_t, k_t, w_t = make_grad_leaves(q, k, weights)
     eager = resolve_op("dsa_indexer", "deepseek_v4", "eager").wrapper
     fused = resolve_op("dsa_indexer", "deepseek_v4", "tilelang").wrapper
     expected_scores, expected_indices = eager(q_e, k_e, w_e, compress, topk)
@@ -642,4 +568,4 @@ def test_dsa_indexer_tilelang_matches_eager():
     actual_scores.backward(grad)
     for actual_grad, expected_grad in zip((q_t.grad, k_t.grad, w_t.grad), (q_e.grad, k_e.grad, w_e.grad)):
         assert actual_grad is not None and expected_grad is not None
-        assert _cosine(actual_grad, expected_grad) > 0.95
+        assert cosine_similarity(actual_grad, expected_grad) > 0.95

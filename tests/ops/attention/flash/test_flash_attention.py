@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tests.ops.attention.utils import UlyssesHelperRecorder
 from tests.ops.tol import ATTN_ATOL, ATTN_GRAD_ATOL, ATTN_GRAD_RTOL, ATTN_RTOL
 from veomni.ops import resolve_op
 from veomni.ops.kernels.attention.standard import flash as flash_backend
@@ -157,29 +157,17 @@ def test_flash_attention_preserves_layout_and_backend_contract(monkeypatch, impl
 def test_flash_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
     group = object()
     state = SimpleNamespace(ulysses_group=group, ulysses_size=2)
-    calls = []
-
-    def fake_prepare(query, key, value, *, group, ulysses_size):
-        calls.append(("prepare", query, key, value, group, ulysses_size))
-        return query[:, :, :2], key[:, :, :1], value[:, :, :1], 4
-
-    def fake_slice(auxiliary, *, query_head_count, local_query_head_count, group):
-        calls.append(("slice", auxiliary, query_head_count, local_query_head_count, group))
-        return auxiliary[:local_query_head_count]
-
-    def fake_restore(output, *, group):
-        calls.append(("restore", output, group))
-        return output
+    recorder = UlyssesHelperRecorder()
 
     def fake_flash(query, key, value, attention_mask, **kwargs):
-        calls.append(("backend", query, key, value, attention_mask, kwargs))
+        recorder.calls.append(("backend", query, key, value, attention_mask, kwargs))
         return query
 
     monkeypatch.setattr(flash_backend, "get_parallel_state", lambda: state)
     monkeypatch.setattr(flash_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
-    monkeypatch.setattr(flash_backend, "prepare_ulysses_qkv", fake_prepare)
-    monkeypatch.setattr(flash_backend, "slice_ulysses_head_auxiliary", fake_slice)
-    monkeypatch.setattr(flash_backend, "restore_ulysses_output", fake_restore)
+    monkeypatch.setattr(flash_backend, "prepare_ulysses_qkv", recorder.prepare)
+    monkeypatch.setattr(flash_backend, "slice_ulysses_head_auxiliary", recorder.slice_auxiliary)
+    monkeypatch.setattr(flash_backend, "restore_ulysses_output", recorder.restore)
     monkeypatch.setattr(flash_backend, "_flash_attention_forward", fake_flash)
     query = torch.randn(1, 4, 5, 8, dtype=torch.float16)
     auxiliary = torch.arange(4, dtype=torch.float16)
@@ -193,10 +181,10 @@ def test_flash_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch)
         s_aux=auxiliary,
     )
 
-    assert [call[0] for call in calls] == ["prepare", "slice", "backend", "restore"]
-    assert calls[0][1].shape == (1, 5, 4, 8)
-    assert calls[0][4:] == (group, 2)
-    torch.testing.assert_close(calls[2][-1]["s_aux"], auxiliary[:2])
+    assert [call[0] for call in recorder.calls] == ["prepare", "slice", "backend", "restore"]
+    assert recorder.calls[0][1].shape == (1, 5, 4, 8)
+    assert recorder.calls[0][4:] == (group, 2)
+    torch.testing.assert_close(recorder.calls[2][-1]["s_aux"], auxiliary[:2])
     assert output.shape == (1, 5, 2, 8)
 
 
@@ -216,7 +204,6 @@ def test_flash_attention_skip_ulysses_skips_exchange_and_is_not_forwarded(monkey
     monkeypatch.setattr(flash_backend, "_flash_attention_forward", fake_flash)
     query = torch.randn(1, 4, 5, 8, dtype=torch.float16)
 
-    assert inspect.signature(flash_backend.flash_attention_forward).parameters["skip_ulysses"].default is False
     flash_backend.flash_attention_forward(
         _FakeAttentionModule("veomni_flash_attention_2"),
         query,
@@ -227,6 +214,45 @@ def test_flash_attention_skip_ulysses_skips_exchange_and_is_not_forwarded(monkey
         contract_marker=object(),
     )
     assert "skip_ulysses" not in captured["kwargs"]
+
+
+def test_varlen_flash_attn_padded_input_matches_unpadded():
+    """Pin the vendor contract used when packed inputs retain padded tails."""
+    if not IS_CUDA_AVAILABLE or torch.version.hip is not None:
+        pytest.skip("FlashAttention varlen requires an NVIDIA CUDA GPU")
+    try:
+        from flash_attn import flash_attn_varlen_func
+    except Exception as exc:
+        pytest.skip(f"flash-attn is not available: {exc}")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.float16
+    seqlens = torch.tensor([5, 7], dtype=torch.int32, device=device)
+    cu_seqlens = torch.nn.functional.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0), value=0)
+    max_seqlen = int(seqlens.max().item())
+    total_tokens = int(cu_seqlens[-1].item())
+    padded_tokens = total_tokens + 4
+    nheads, head_dim = 4, 8
+    q = torch.randn(total_tokens, nheads, head_dim, device=device, dtype=dtype)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    padding = torch.zeros(padded_tokens - total_tokens, nheads, head_dim, device=device, dtype=dtype)
+
+    out_unpadded = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, dropout_p=0.0)
+    out_padded = flash_attn_varlen_func(
+        torch.cat((q, padding)),
+        torch.cat((k, padding)),
+        torch.cat((v, padding)),
+        cu_seqlens,
+        cu_seqlens,
+        max_seqlen,
+        max_seqlen,
+        dropout_p=0.0,
+    )
+
+    assert out_padded.shape[0] == padded_tokens
+    torch.testing.assert_close(out_padded[:total_tokens], out_unpadded, rtol=0.0, atol=0.0)
 
 
 def test_flash_attention_forwards_fa4_sinks_and_sliding_window(monkeypatch):

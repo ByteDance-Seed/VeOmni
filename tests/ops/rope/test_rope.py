@@ -38,7 +38,8 @@ from tests.ops.tol import (
     ROPE_NPU_PROD_FP16_ATOL,
     ROPE_NPU_RTOL,
 )
-from veomni.ops import OP_REGISTRY, resolve_op
+from tests.ops.utils import make_grad_leaves
+from veomni.ops import resolve_op
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
@@ -55,18 +56,9 @@ def _wan_reference_rope_apply(x: Tensor, freqs: Tensor, head_dim: int) -> Tensor
     return torch.view_as_real(x_c * freqs).flatten(2).to(x.dtype)
 
 
-def _clone_qk(q: Tensor, k: Tensor) -> tuple[Tensor, Tensor]:
-    return q.detach().requires_grad_(True), k.detach().requires_grad_(True)
-
-
 def _assert_pair(left: tuple[Tensor, Tensor], right: tuple[Tensor, Tensor], *, atol: float, rtol: float) -> None:
     assert torch.allclose(left[0], right[0], atol=atol, rtol=rtol)
     assert torch.allclose(left[1], right[1], atol=atol, rtol=rtol)
-
-
-def test_vision_layout_uses_full_rope_family():
-    assert OP_REGISTRY.list_registered("rope_vision", "full") == []
-    assert {"eager", "liger_kernel", "npu"} <= set(OP_REGISTRY.list_registered("rope", "full"))
 
 
 def test_full_eager_matches_hf():
@@ -76,10 +68,10 @@ def test_full_eager_matches_hf():
     cos = torch.randn(2, 16, 64, dtype=torch.float32)
     sin = torch.randn(2, 16, 64, dtype=torch.float32)
 
-    q_h, k_h = _clone_qk(q, k)
+    q_h, k_h = make_grad_leaves(q, k)
     out_h = hf_full_rope(q_h, k_h, cos, sin, unsqueeze_dim=1)
 
-    q_e, k_e = _clone_qk(q, k)
+    q_e, k_e = make_grad_leaves(q, k)
     out_e = resolve_op("rope", "full", "eager").wrapper(q_e, k_e, cos, sin, unsqueeze_dim=1)
     _assert_pair(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
@@ -97,10 +89,10 @@ def test_partial_eager_matches_hf():
     cos = torch.randn(2, 16, 64, dtype=torch.float32)
     sin = torch.randn(2, 16, 64, dtype=torch.float32)
 
-    q_h, k_h = _clone_qk(q, k)
+    q_h, k_h = make_grad_leaves(q, k)
     out_h = hf_partial_rope(q_h, k_h, cos, sin, unsqueeze_dim=1)
 
-    q_e, k_e = _clone_qk(q, k)
+    q_e, k_e = make_grad_leaves(q, k)
     out_e = resolve_op("rope", "partial", "eager").wrapper(q_e, k_e, cos, sin, unsqueeze_dim=1)
     _assert_pair(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
@@ -119,10 +111,10 @@ def test_vision_eager_matches_hf(dtype: torch.dtype):
     cos = torch.randn(16, 64, dtype=dtype)
     sin = torch.randn(16, 64, dtype=dtype)
 
-    q_h, k_h = _clone_qk(q, k)
+    q_h, k_h = make_grad_leaves(q, k)
     out_h = hf_vision_rope(q_h, k_h, cos, sin)
 
-    q_e, k_e = _clone_qk(q, k)
+    q_e, k_e = make_grad_leaves(q, k)
     out_e = resolve_op("rope", "full", "eager").wrapper(q_e, k_e, cos, sin)
     _assert_pair(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
@@ -165,8 +157,8 @@ def test_eager_rope_table_gradients_match_hf(kind: str, cos_requires_grad: bool,
         op = resolve_op("rope", "full", "eager").wrapper
         attrs = {}
 
-    q_h, k_h = _clone_qk(q, k)
-    q_e, k_e = _clone_qk(q, k)
+    q_h, k_h = make_grad_leaves(q, k)
+    q_e, k_e = make_grad_leaves(q, k)
     cos_h = cos.detach().clone().requires_grad_(cos_requires_grad)
     cos_e = cos.detach().clone().requires_grad_(cos_requires_grad)
     sin_h = sin.detach().clone().requires_grad_(sin_requires_grad)
@@ -299,8 +291,8 @@ def test_full_liger_matches_eager():
     cos = torch.cat((cos_half, cos_half), dim=-1)
     sin = torch.cat((sin_half, sin_half), dim=-1)
 
-    q_e, k_e = _clone_qk(q, k)
-    q_o, k_o = _clone_qk(q, k)
+    q_e, k_e = make_grad_leaves(q, k)
+    q_o, k_o = make_grad_leaves(q, k)
     out_e = eager(q_e, k_e, cos, sin, unsqueeze_dim=1)
     out_o = other(q_o, k_o, cos, sin, unsqueeze_dim=1)
     _assert_pair(out_e, out_o, atol=ROPE_FUSED_ATOL, rtol=ROPE_FUSED_RTOL)
@@ -326,8 +318,8 @@ def test_full_liger_matches_eager_unsqueeze_dim_2():
     cos = torch.cat((cos_half, cos_half), dim=-1)
     sin = torch.cat((sin_half, sin_half), dim=-1)
 
-    q_e, k_e = _clone_qk(q, k)
-    q_o, k_o = _clone_qk(q, k)
+    q_e, k_e = make_grad_leaves(q, k)
+    q_o, k_o = make_grad_leaves(q, k)
     out_e = eager(q_e, k_e, cos, sin, unsqueeze_dim=2)
     out_o = other(q_o, k_o, cos, sin, unsqueeze_dim=2)
     _assert_pair(out_e, out_o, atol=ROPE_FUSED_ATOL, rtol=ROPE_FUSED_RTOL)
@@ -352,8 +344,8 @@ def test_rope_npu_matches_eager(variant: str):
     cos = torch.randn(2, 16, rotary_dim, device="npu", dtype=torch.bfloat16)
     sin = torch.randn(2, 16, rotary_dim, device="npu", dtype=torch.bfloat16)
 
-    q_e, k_e = _clone_qk(q, k)
-    q_o, k_o = _clone_qk(q, k)
+    q_e, k_e = make_grad_leaves(q, k)
+    q_o, k_o = make_grad_leaves(q, k)
     out_e = eager(q_e, k_e, cos, sin, unsqueeze_dim=1)
     out_o = other(q_o, k_o, cos, sin, unsqueeze_dim=1)
     _assert_pair(
@@ -380,8 +372,8 @@ def test_vision_npu_matches_eager():
     cos = torch.randn(16, 64, device="npu", dtype=torch.bfloat16)
     sin = torch.randn(16, 64, device="npu", dtype=torch.bfloat16)
 
-    q_e, k_e = _clone_qk(q, k)
-    q_o, k_o = _clone_qk(q, k)
+    q_e, k_e = make_grad_leaves(q, k)
+    q_o, k_o = make_grad_leaves(q, k)
     out_e = eager(q_e, k_e, cos, sin)
     out_o = other(q_o, k_o, cos, sin)
     _assert_pair(

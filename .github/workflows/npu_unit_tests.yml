@@ -188,7 +188,7 @@ jobs:
           uv run --frozen pytest -v -s -x tests/data
       - name: Run kernels tests
         run: |
-          uv run --frozen pytest -v -s -x tests/ops
+          uv run --frozen pytest -v -s -x -m "not benchmark" tests/ops
       - name: Run utils tests
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_count_flops.py

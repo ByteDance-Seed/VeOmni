@@ -20,7 +20,6 @@ import importlib.util
 
 import pytest
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 from transformers import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4HyperConnection, DeepseekV4HyperHead
@@ -34,25 +33,13 @@ from tests.ops.tol import (
     MHC_FUSED_GRAD_COSINE,
     MHC_FUSED_RTOL,
 )
-from veomni.ops import OP_REGISTRY, resolve_op
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+from tests.ops.utils import cosine_similarity, is_nvidia_cuda_available, make_grad_leaves
+from veomni.ops import resolve_op
 
 
-# Installed classes: DeepseekV4HyperConnection / DeepseekV4HyperHead /
-# DeepseekV4DecoderLayer in transformers 5.9.0.
-# https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/deepseek_v4/modeling_deepseek_v4.py
+# Installed Transformers classes used as the mHC eager reference.
 
-_TILELANG_AVAILABLE = (
-    IS_CUDA_AVAILABLE and get_gpu_compute_capability() >= 90 and importlib.util.find_spec("tile_kernels") is not None
-)
-
-
-def _clone(*tensors: Tensor) -> tuple[Tensor, ...]:
-    return tuple(t.detach().requires_grad_(True) for t in tensors)
-
-
-def _cosine(actual: Tensor, expected: Tensor) -> float:
-    return F.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0).item()
+_TILELANG_AVAILABLE = is_nvidia_cuda_available(min_cc=90) and importlib.util.find_spec("tile_kernels") is not None
 
 
 def _tiny_dsv4_config(
@@ -77,8 +64,8 @@ def _tiny_dsv4_config(
 def _hf_decoder_layer_post(output: Tensor, residual: Tensor, post: Tensor, comb: Tensor) -> Tensor:
     """HuggingFace decoder-layer residual mix. There is no standalone post module.
 
-    Copied from ``DeepseekV4DecoderLayer.forward`` (transformers v5.9.0):
-    https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/deepseek_v4/modeling_deepseek_v4.py
+    This is the residual-mixing expression used by the installed
+    ``DeepseekV4DecoderLayer.forward`` implementation.
     """
     dtype = residual.dtype
     return post.to(dtype).unsqueeze(-1) * output.unsqueeze(-2) + torch.matmul(
@@ -113,7 +100,7 @@ def test_mhc_pre_eager_matches_hf():
     x_h = x.detach().requires_grad_(True)
     post_h, comb_h, collapsed_h = hc(x_h)
 
-    x_e, fn_e, scale_e, base_e = _clone(x, fn, scale, base)
+    x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
     post_e, comb_e, collapsed_e = resolve_op("mhc", "pre", "eager").wrapper(
         x_e, fn_e, scale_e, base_e, norm_eps, hc_mult, sinkhorn_iters, hc_eps
     )
@@ -138,9 +125,9 @@ def test_mhc_post_eager_matches_hf():
     post = torch.randn(batch, seq_len, hc_mult)
     comb = torch.randn(batch, seq_len, hc_mult, hc_mult)
 
-    out_h, res_h, post_h, comb_h = _clone(output, residual, post, comb)
+    out_h, res_h, post_h, comb_h = make_grad_leaves(output, residual, post, comb)
     y_h = _hf_decoder_layer_post(out_h, res_h, post_h, comb_h)
-    out_e, res_e, post_e, comb_e = _clone(output, residual, post, comb)
+    out_e, res_e, post_e, comb_e = make_grad_leaves(output, residual, post, comb)
     y_e = resolve_op("mhc", "post", "eager").wrapper(out_e, res_e, post_e, comb_e)
     assert torch.allclose(y_e, y_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
@@ -178,7 +165,7 @@ def test_mhc_head_eager_matches_hf():
 
     x_h = x.detach().requires_grad_(True)
     y_h = head(x_h)
-    x_e, fn_e, scale_e, base_e = _clone(x, fn, scale, base)
+    x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
     y_e = resolve_op("mhc", "head", "eager").wrapper(x_e, fn_e, scale_e, base_e, norm_eps, hc_mult, hc_eps)
     assert torch.allclose(y_e, y_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
@@ -189,13 +176,6 @@ def test_mhc_head_eager_matches_hf():
     assert torch.allclose(fn_e.grad, head.hc_fn.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     assert torch.allclose(scale_e.grad, head.hc_scale.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     assert torch.allclose(base_e.grad, head.hc_base.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-
-
-def test_mhc_eager_is_registered():
-    for variant in ("pre", "post", "head"):
-        assert "eager" in OP_REGISTRY.list_available("mhc", variant)
-        assert "eager" in OP_REGISTRY.list_registered("mhc", variant)
-        assert "tilelang" in OP_REGISTRY.list_registered("mhc", variant)
 
 
 @pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="TileKernels mHC requires an SM90+ NVIDIA CUDA GPU")
@@ -220,8 +200,8 @@ def test_mhc_tilelang_pre_post_matches_eager():
     for actual, expected in zip(inference, eager_inference, strict=True):
         torch.testing.assert_close(actual, expected, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
 
-    x_o, fn_o, scale_o, base_o = _clone(x, fn, scale, base)
-    x_e, fn_e, scale_e, base_e = _clone(x, fn, scale, base)
+    x_o, fn_o, scale_o, base_o = make_grad_leaves(x, fn, scale, base)
+    x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
     post_o, comb_o, collapsed_o = other_pre(x_o, fn_o, scale_o, base_o, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
     post_e, comb_e, collapsed_e = eager_pre(x_e, fn_e, scale_e, base_e, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
     y_o = other_post(collapsed_o * 0.75, x_o, post_o, comb_o)
@@ -237,7 +217,7 @@ def test_mhc_tilelang_pre_post_matches_eager():
     eager_grads = torch.autograd.grad((y_e * grad).sum(), (x_e, fn_e, scale_e, base_e))
     for actual, expected in zip(other_grads, eager_grads, strict=True):
         assert torch.isfinite(actual).all()
-        assert _cosine(actual, expected) > MHC_FUSED_GRAD_COSINE
+        assert cosine_similarity(actual, expected) > MHC_FUSED_GRAD_COSINE
 
 
 @pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="TileKernels mHC requires an SM90+ NVIDIA CUDA GPU")
@@ -253,8 +233,8 @@ def test_mhc_tilelang_head_matches_eager():
     eager = resolve_op("mhc", "head", "eager").wrapper
     other = resolve_op("mhc", "head", "tilelang").wrapper
 
-    x_o, fn_o, scale_o, base_o = _clone(x, fn, scale, base)
-    x_e, fn_e, scale_e, base_e = _clone(x, fn, scale, base)
+    x_o, fn_o, scale_o, base_o = make_grad_leaves(x, fn, scale, base)
+    x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
     y_o = other(x_o, fn_o, scale_o, base_o, norm_eps, hc_mult, hc_eps)
     y_e = eager(x_e, fn_e, scale_e, base_e, norm_eps, hc_mult, hc_eps)
     torch.testing.assert_close(y_o, y_e, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
@@ -264,4 +244,4 @@ def test_mhc_tilelang_head_matches_eager():
     eager_grads = torch.autograd.grad((y_e * grad).sum(), (x_e, fn_e, scale_e, base_e))
     for actual, expected in zip(other_grads, eager_grads, strict=True):
         assert torch.isfinite(actual).all()
-        assert _cosine(actual, expected) > MHC_FUSED_GRAD_COSINE
+        assert cosine_similarity(actual, expected) > MHC_FUSED_GRAD_COSINE

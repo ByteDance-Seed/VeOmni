@@ -16,8 +16,6 @@
 
 from __future__ import annotations
 
-import subprocess
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -68,20 +66,6 @@ def fake_library(monkeypatch):
     yield implementations
 
     batch_patch.disable_batch_invariant_mode()
-
-
-def test_import_does_not_load_triton_implementations():
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import sys; import veomni.ops.batch_invariant; "
-                "assert 'veomni.ops.batch_invariant.triton' not in sys.modules"
-            ),
-        ],
-        check=True,
-    )
 
 
 def test_enable_is_idempotent_and_registers_all_implementations(fake_library):

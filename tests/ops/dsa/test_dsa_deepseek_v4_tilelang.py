@@ -18,20 +18,12 @@ import inspect
 
 import pytest
 import torch
-import torch.nn.functional as F
 
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
+from tests.ops.utils import cosine_similarity, require_nvidia_cuda
+from veomni.utils.device import get_device_type
 
 
 DEVICE = get_device_type()
-
-
-def _require_tilelang_cuda():
-    pytest.importorskip("tilelang")
-    if torch.version.hip is not None or not IS_CUDA_AVAILABLE:
-        pytest.skip("DeepSeek V4 TileLang kernels require an NVIDIA CUDA GPU")
-    if get_gpu_compute_capability() < 90:
-        pytest.skip("DeepSeek V4 TileLang kernels require SM90 or later")
 
 
 def _indexer_reference(q, k, weights, topk_indices):
@@ -42,12 +34,8 @@ def _indexer_reference(q, k, weights, topk_indices):
     return torch.where(valid, scores, float("-inf"))
 
 
-def _cosine_similarity(actual, expected):
-    return F.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0)
-
-
 def test_tilelang_indexer_non_power_of_two_topk_forward_backward():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.vendor.tilelang_indexer import v4_lighting_indexer
 
     torch.manual_seed(0)
@@ -77,11 +65,11 @@ def test_tilelang_indexer_non_power_of_two_topk_forward_backward():
     actual.backward(grad)
     for actual_grad, expected_grad in zip((q.grad, k.grad, weights.grad), expected_grads, strict=True):
         assert actual_grad is not None and torch.isfinite(actual_grad).all()
-        assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+        assert cosine_similarity(actual_grad, expected_grad) > 0.95
 
 
 def test_tilelang_indexer_packed_forward_backward():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.vendor.tilelang_indexer import v4_lighting_indexer
 
     torch.manual_seed(4)
@@ -128,11 +116,11 @@ def test_tilelang_indexer_packed_forward_backward():
     actual.backward(grad)
     for actual_grad, expected_grad in zip((q.grad, k.grad, weights.grad), expected_grads, strict=True):
         assert actual_grad is not None and torch.isfinite(actual_grad).all()
-        assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+        assert cosine_similarity(actual_grad, expected_grad) > 0.95
 
 
 def test_tilelang_indexer_rejects_unsupported_head_count():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.vendor.tilelang_indexer import v4_lighting_indexer
 
     q = torch.empty(8, 1, 7, 128, device=DEVICE, dtype=torch.bfloat16)
@@ -169,7 +157,7 @@ def test_tilelang_sparse_attention_forward_pipelines_the_gather_without_changing
     Pipelining is off by default because it is a loss at the production shape, so this
     only pins that it remains available and exact when asked for.
     """
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_fwd import sparse_mqa_fwd, sparse_mqa_fwd_interface
 
     torch.manual_seed(4)
@@ -241,7 +229,7 @@ def test_tilelang_sparse_attention_forward_defaults_to_no_pipelining():
 
 
 def test_tilelang_sparse_attention_forward_backward_with_invalid_indices():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla import sparse_attn_tilelang
 
     torch.manual_seed(1)
@@ -265,7 +253,7 @@ def test_tilelang_sparse_attention_forward_backward_with_invalid_indices():
     actual.backward(grad)
     for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
         assert actual_grad is not None and torch.isfinite(actual_grad).all()
-        assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+        assert cosine_similarity(actual_grad, expected_grad) > 0.95
     # dAttnSink is accumulated by an atomic under a replicated T.Parallel loop, so a
     # lost replication guard would scale it by the warp count -- which cosine, being
     # scale-invariant, cannot see.
@@ -318,7 +306,7 @@ def test_tilelang_sparse_attention_backward_matches_reference_on_wide_head_tile(
     historical 128 threads. 32 heads is the smallest tile that actually widens to 256,
     so without this case the wide path is never run.
     """
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla import sparse_attn_tilelang
 
     torch.manual_seed(6)
@@ -337,7 +325,7 @@ def test_tilelang_sparse_attention_backward_matches_reference_on_wide_head_tile(
     actual.backward(grad)
     for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
         assert actual_grad is not None and torch.isfinite(actual_grad).all()
-        assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+        assert cosine_similarity(actual_grad, expected_grad) > 0.95
     # The CTA width sets the replicate extent of the T.Parallel loop that atomically
     # accumulates dAttnSink, so a lost replication guard would scale it by the warp
     # count while leaving every cosine above intact.
@@ -345,7 +333,7 @@ def test_tilelang_sparse_attention_backward_matches_reference_on_wide_head_tile(
 
 
 def test_tilelang_sparse_attention_backward_shares_kernel_across_kv_lengths(monkeypatch):
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.vendor import tilelang_sparse_mla_bwd as sparse_mla_bwd
     from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla import sparse_attn_tilelang
 
@@ -379,7 +367,7 @@ def test_tilelang_sparse_attention_backward_shares_kernel_across_kv_lengths(monk
         actual.backward(grad)
         assert kv.grad.shape == kv.shape
         for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
-            assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+            assert cosine_similarity(actual_grad, expected_grad) > 0.95
 
     # One specialization key for all three lengths, so TileLang compiles once.
     assert set(requested_kv_lengths) == {kv_block}

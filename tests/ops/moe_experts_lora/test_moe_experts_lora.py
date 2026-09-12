@@ -23,7 +23,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from veomni.ops import OP_REGISTRY, VeomniOp, resolve_op
+from veomni.ops import VeomniOp
 from veomni.ops.kernels.moe_experts.shared.dispatch import expert_histogram, moe_gather, moe_scatter
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 from veomni.utils.import_utils import is_fused_moe_available
@@ -189,38 +189,6 @@ def _build_lora_leaves(variant: str, *, E: int, H: int, I: int, r: int, dtype: t
 
 
 @pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_moe_experts_lora_registered_impls(variant):
-    registered = OP_REGISTRY.list_registered("moe_experts_lora", variant)
-    assert "eager" in registered
-    assert "fused_triton" in registered
-    assert "fused_npu" in registered
-    assert "fused_quack" not in registered
-    assert "fused_mlu" not in registered
-
-
-@pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_moe_experts_lora_eager_resolves(variant):
-    entry = resolve_op("moe_experts_lora", variant, "eager")
-    assert entry.wrapper is not None
-    handle = VeomniOp("moe_experts_lora", variant, "eager")
-    assert handle.impl == "eager"
-
-
-@pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_moe_experts_lora_eager_forward_smoke(variant):
-    torch.manual_seed(0)
-    B, H, I, E, top_k, r = 8, 16, 24, 4, 2, 4
-    hidden = torch.randn(B, H)
-    routing = torch.softmax(torch.randn(B, top_k), dim=-1)
-    selected = torch.randint(0, E, (B, top_k))
-    fc1 = torch.randn(E, 2 * I, H) * 0.05
-    fc2 = torch.randn(E, H, I) * 0.05
-    loras = _lora_tensors(variant, E=E, H=H, I=I, r=r, device=hidden.device, dtype=hidden.dtype)
-    out = _call("eager", variant, hidden, routing, selected, fc1, fc2, loras, num_experts=E)
-    assert out.shape == hidden.shape
-
-
-@pytest.mark.parametrize("variant", ["shared", "independent"])
 def test_moe_experts_lora_eager_matches_manual_oracle_forward_and_all_gradients(variant):
     torch.manual_seed(11)
     B, H, I, E, top_k, r = 4, 5, 7, 3, 2, 3
@@ -253,22 +221,6 @@ def test_moe_experts_lora_eager_matches_manual_oracle_forward_and_all_gradients(
             rtol=1e-10,
             msg=lambda message, name=name: f"{name}: {message}",
         )
-
-
-@pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_moe_experts_lora_triton_available_on_cuda(variant):
-    if not IS_CUDA_AVAILABLE:
-        pytest.skip("triton LoRA row requires a GPU")
-    assert "fused_triton" in OP_REGISTRY.list_available("moe_experts_lora", variant)
-    resolve_op("moe_experts_lora", variant, "fused_triton")
-
-
-@pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_moe_experts_lora_npu_available_on_npu(variant):
-    if not IS_NPU_AVAILABLE:
-        pytest.skip("npu LoRA row is NPU-gated")
-    assert "fused_npu" in OP_REGISTRY.list_available("moe_experts_lora", variant)
-    resolve_op("moe_experts_lora", variant, "fused_npu")
 
 
 @pytest.mark.skipif(

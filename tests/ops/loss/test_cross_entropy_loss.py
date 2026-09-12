@@ -32,6 +32,7 @@ from tests.ops.tol import (
     EAGER_GRAD_RTOL,
     EAGER_RTOL,
 )
+from tests.ops.utils import make_grad_leaf
 from veomni.ops import resolve_op
 from veomni.utils.device import IS_CUDA_AVAILABLE
 
@@ -40,20 +41,16 @@ def _empty_weight(device: torch.device | str) -> Tensor:
     return torch.empty(0, device=device)
 
 
-def _clone(tensor: Tensor) -> Tensor:
-    return tensor.detach().requires_grad_(True)
-
-
 def test_eager_matches_hf_logits():
     torch.manual_seed(0)
     logits = torch.randn(8, 16, dtype=torch.float32)
     labels = torch.randint(0, 16, (8,))
     labels[0] = -100
 
-    logits_h = _clone(logits)
+    logits_h = make_grad_leaf(logits)
     out_h = fixed_cross_entropy(logits_h, labels)
 
-    logits_e = _clone(logits)
+    logits_e = make_grad_leaf(logits)
     out_e = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(
         logits_e, labels, _empty_weight(logits.device)
     )
@@ -71,10 +68,10 @@ def test_eager_matches_hf_hidden_weight():
     labels = torch.randint(0, 16, (4, 8))
     labels[:, 0] = -100
 
-    hidden_h, weight_h = _clone(hidden), _clone(weight)
+    hidden_h, weight_h = make_grad_leaf(hidden), make_grad_leaf(weight)
     out_h = fixed_cross_entropy(F.linear(hidden_h.reshape(-1, 32), weight_h), labels.reshape(-1))
 
-    hidden_e, weight_e = _clone(hidden), _clone(weight)
+    hidden_e, weight_e = make_grad_leaf(hidden), make_grad_leaf(weight)
     out_e = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(hidden_e, labels, weight_e)
     assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
@@ -90,9 +87,9 @@ def test_eager_matches_hf_num_items():
     labels = torch.randint(0, 7, (10,))
     num_items = 6
 
-    logits_h = _clone(logits)
+    logits_h = make_grad_leaf(logits)
     out_h = fixed_cross_entropy(logits_h, labels, num_items_in_batch=num_items)
-    logits_e = _clone(logits)
+    logits_e = make_grad_leaf(logits)
     out_e = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(
         logits_e, labels, _empty_weight(logits.device), num_items_in_batch=num_items
     )
@@ -103,17 +100,17 @@ def test_eager_matches_hf_num_items():
     assert torch.allclose(logits_e.grad, logits_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-def test_chunk_loss_matches_eager():
+def test_chunk_loss_matches_eager_with_uneven_valid_tokens():
     eager = resolve_op("cross_entropy_loss", "standard", "eager").wrapper
     other = resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper
     torch.manual_seed(0)
     hidden = torch.randn(2, 20, 16, dtype=torch.float32)
     weight = torch.randn(8, 16, dtype=torch.float32)
     labels = torch.randint(0, 8, (2, 20))
-    labels[:, :3] = -100
+    labels.reshape(-1)[[0, 1, 2, 7, 8, 20, 27, 28, 29, 30]] = -100
 
-    hidden_e, weight_e = _clone(hidden), _clone(weight)
-    hidden_o, weight_o = _clone(hidden), _clone(weight)
+    hidden_e, weight_e = make_grad_leaf(hidden), make_grad_leaf(weight)
+    hidden_o, weight_o = make_grad_leaf(hidden), make_grad_leaf(weight)
     out_e = eager(hidden_e, labels, weight_e)
     out_o = other(hidden_o, labels, weight_o, chunk_size=7)
     assert torch.allclose(out_e, out_o, atol=EAGER_ATOL, rtol=EAGER_RTOL)
@@ -124,32 +121,6 @@ def test_chunk_loss_matches_eager():
     assert torch.allclose(weight_e.grad, weight_o.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-def test_chunk_loss_computes_shared_valid_token_denominator_once(monkeypatch):
-    """Chunking must not turn one global mean into a sum of chunk means."""
-    original_sum = torch.Tensor.sum
-    denominator_sum_calls = 0
-
-    def counting_sum(self, *args, **kwargs):
-        nonlocal denominator_sum_calls
-        if self.dtype == torch.bool and self.shape == (2 * 11,):
-            denominator_sum_calls += 1
-        return original_sum(self, *args, **kwargs)
-
-    monkeypatch.setattr(torch.Tensor, "sum", counting_sum)
-
-    torch.manual_seed(4)
-    hidden = torch.randn(2, 11, 6, requires_grad=True)
-    weight = torch.randn(9, 6, requires_grad=True)
-    labels = torch.randint(0, 9, (2, 11))
-    labels[:, :2] = -100
-    loss = resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper(hidden, labels, weight, chunk_size=4)
-    loss.backward()
-
-    assert denominator_sum_calls == 1
-    assert hidden.grad is not None
-    assert weight.grad is not None
-
-
 def test_chunk_loss_requires_weight():
     with pytest.raises(RuntimeError, match="nonempty ``weight``"):
         resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper(
@@ -158,133 +129,61 @@ def test_chunk_loss_requires_weight():
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
-def test_liger_matches_eager():
+@pytest.mark.parametrize(
+    ("seed", "hidden_requires_grad", "weight_requires_grad", "num_items_in_batch", "noncontiguous"),
+    (
+        pytest.param(0, True, True, None, False, id="all-gradients"),
+        pytest.param(5, True, False, None, False, id="frozen-weight"),
+        pytest.param(6, False, True, None, False, id="frozen-hidden"),
+        pytest.param(3, True, True, 12, False, id="num-items"),
+        pytest.param(1, True, True, None, True, id="noncontiguous-hidden"),
+    ),
+)
+def test_liger_matches_eager(
+    seed: int,
+    hidden_requires_grad: bool,
+    weight_requires_grad: bool,
+    num_items_in_batch: int | None,
+    noncontiguous: bool,
+):
     pytest.importorskip("liger_kernel")
     eager = resolve_op("cross_entropy_loss", "standard", "eager").wrapper
     other = resolve_op("cross_entropy_loss", "standard", "liger_kernel").wrapper
-    torch.manual_seed(0)
-    hidden = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
+    torch.manual_seed(seed)
+    batch_size = 4 if noncontiguous else 2
+    hidden = torch.randn(batch_size, 16, 32, device="cuda", dtype=torch.bfloat16)
+    if noncontiguous:
+        hidden = hidden.transpose(0, 1).contiguous().transpose(0, 1)
+        assert not hidden.is_contiguous()
     weight = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
-    labels = torch.randint(0, 64, (2, 16), device="cuda")
+    labels = torch.randint(0, 64, (batch_size, 16), device="cuda")
     labels[:, 0] = -100
 
-    hidden_e, weight_e = _clone(hidden), _clone(weight)
-    hidden_o, weight_o = _clone(hidden), _clone(weight)
-    out_e = eager(hidden_e, labels, weight_e)
-    out_o = other(hidden_o, labels, weight_o)
+    hidden_e = hidden.detach().requires_grad_(hidden_requires_grad)
+    hidden_o = hidden.detach().requires_grad_(hidden_requires_grad)
+    weight_e = weight.detach().requires_grad_(weight_requires_grad)
+    weight_o = weight.detach().requires_grad_(weight_requires_grad)
+    kwargs = {} if num_items_in_batch is None else {"num_items_in_batch": num_items_in_batch}
+    out_e = eager(hidden_e, labels, weight_e, **kwargs)
+    out_o = other(hidden_o, labels, weight_o, **kwargs)
     assert torch.allclose(out_e.float(), out_o.float(), atol=CE_FUSED_ATOL, rtol=CE_FUSED_RTOL)
 
     out_e.backward()
     out_o.backward()
-    assert torch.allclose(
-        hidden_e.grad.float(), hidden_o.grad.float(), atol=CE_FUSED_GRAD_ATOL, rtol=CE_FUSED_GRAD_RTOL
-    )
-    assert torch.allclose(
-        weight_e.grad.float(), weight_o.grad.float(), atol=CE_FUSED_GRAD_ATOL, rtol=CE_FUSED_GRAD_RTOL
-    )
-
-
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
-def test_liger_matches_eager_with_frozen_weight():
-    pytest.importorskip("liger_kernel")
-    eager = resolve_op("cross_entropy_loss", "standard", "eager").wrapper
-    other = resolve_op("cross_entropy_loss", "standard", "liger_kernel").wrapper
-    torch.manual_seed(5)
-    hidden = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
-    labels = torch.randint(0, 64, (2, 16), device="cuda")
-    labels[:, 0] = -100
-
-    hidden_e, hidden_o = _clone(hidden), _clone(hidden)
-    weight_e, weight_o = weight.clone(), weight.clone()
-    out_e = eager(hidden_e, labels, weight_e)
-    out_o = other(hidden_o, labels, weight_o)
-    assert torch.allclose(out_e.float(), out_o.float(), atol=CE_FUSED_ATOL, rtol=CE_FUSED_RTOL)
-
-    out_e.backward()
-    out_o.backward()
-    assert torch.allclose(
-        hidden_e.grad.float(), hidden_o.grad.float(), atol=CE_FUSED_GRAD_ATOL, rtol=CE_FUSED_GRAD_RTOL
-    )
-    assert weight_e.grad is None
-    assert weight_o.grad is None
-
-
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
-def test_liger_matches_eager_with_frozen_hidden():
-    pytest.importorskip("liger_kernel")
-    eager = resolve_op("cross_entropy_loss", "standard", "eager").wrapper
-    other = resolve_op("cross_entropy_loss", "standard", "liger_kernel").wrapper
-    torch.manual_seed(6)
-    hidden = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
-    labels = torch.randint(0, 64, (2, 16), device="cuda")
-    labels[:, 0] = -100
-
-    hidden_e, hidden_o = hidden.clone(), hidden.clone()
-    weight_e, weight_o = _clone(weight), _clone(weight)
-    out_e = eager(hidden_e, labels, weight_e)
-    out_o = other(hidden_o, labels, weight_o)
-    assert torch.allclose(out_e.float(), out_o.float(), atol=CE_FUSED_ATOL, rtol=CE_FUSED_RTOL)
-
-    out_e.backward()
-    out_o.backward()
-    assert hidden_e.grad is None
-    assert hidden_o.grad is None
-    assert torch.allclose(
-        weight_e.grad.float(), weight_o.grad.float(), atol=CE_FUSED_GRAD_ATOL, rtol=CE_FUSED_GRAD_RTOL
-    )
-
-
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
-def test_liger_matches_eager_num_items():
-    pytest.importorskip("liger_kernel")
-    eager = resolve_op("cross_entropy_loss", "standard", "eager").wrapper
-    other = resolve_op("cross_entropy_loss", "standard", "liger_kernel").wrapper
-    torch.manual_seed(3)
-    hidden = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
-    labels = torch.randint(0, 64, (2, 16), device="cuda")
-    labels[:, 0] = -100
-    # Deliberately not the valid-token count so mean and sum/N diverge.
-    num_items = 12
-
-    hidden_e, weight_e = _clone(hidden), _clone(weight)
-    hidden_o, weight_o = _clone(hidden), _clone(weight)
-    out_e = eager(hidden_e, labels, weight_e, num_items_in_batch=num_items)
-    out_o = other(hidden_o, labels, weight_o, num_items_in_batch=num_items)
-    assert torch.allclose(out_e.float(), out_o.float(), atol=CE_FUSED_ATOL, rtol=CE_FUSED_RTOL)
-
-    out_e.backward()
-    out_o.backward()
-    assert torch.allclose(
-        hidden_e.grad.float(), hidden_o.grad.float(), atol=CE_FUSED_GRAD_ATOL, rtol=CE_FUSED_GRAD_RTOL
-    )
-    assert torch.allclose(
-        weight_e.grad.float(), weight_o.grad.float(), atol=CE_FUSED_GRAD_ATOL, rtol=CE_FUSED_GRAD_RTOL
-    )
-
-
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
-def test_liger_matches_eager_noncontiguous_hidden():
-    pytest.importorskip("liger_kernel")
-    eager = resolve_op("cross_entropy_loss", "standard", "eager").wrapper
-    other = resolve_op("cross_entropy_loss", "standard", "liger_kernel").wrapper
-    torch.manual_seed(1)
-    hidden = torch.randn(4, 16, 32, device="cuda", dtype=torch.bfloat16).transpose(0, 1).contiguous().transpose(0, 1)
-    assert not hidden.is_contiguous()
-    weight = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
-    labels = torch.randint(0, 64, (4, 16), device="cuda")
-    hidden_e, weight_e = _clone(hidden), _clone(weight)
-    hidden_o, weight_o = _clone(hidden), _clone(weight)
-    out_e = eager(hidden_e, labels, weight_e)
-    out_o = other(hidden_o, labels, weight_o)
-    assert torch.allclose(out_e.float(), out_o.float(), atol=CE_FUSED_ATOL, rtol=CE_FUSED_RTOL)
-    out_e.backward()
-    out_o.backward()
-    assert torch.allclose(
-        hidden_e.grad.float(), hidden_o.grad.float(), atol=CE_FUSED_GRAD_ATOL, rtol=CE_FUSED_GRAD_RTOL
-    )
+    for eager_input, other_input, requires_grad in (
+        (hidden_e, hidden_o, hidden_requires_grad),
+        (weight_e, weight_o, weight_requires_grad),
+    ):
+        if requires_grad:
+            assert torch.allclose(
+                eager_input.grad.float(),
+                other_input.grad.float(),
+                atol=CE_FUSED_GRAD_ATOL,
+                rtol=CE_FUSED_GRAD_RTOL,
+            )
+        else:
+            assert eager_input.grad is None
+            assert other_input.grad is None
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")

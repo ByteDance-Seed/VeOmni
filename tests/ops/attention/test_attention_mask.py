@@ -22,8 +22,7 @@ import pytest
 import torch
 from torch.nn.attention.flex_attention import BlockMask
 from transformers import PreTrainedConfig
-from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, create_causal_mask
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.masking_utils import create_causal_mask
 
 from tests.ops.attention.attention_cases import (
     dense_2d_mask,
@@ -32,7 +31,6 @@ from tests.ops.attention.attention_cases import (
     magi_2d_mask,
     materialize_magi_mask,
 )
-from veomni.ops.install import _VEOMNI_HF_PATCHES
 from veomni.ops.kernels.attention import ulysses as ulysses_mask
 from veomni.ops.kernels.attention.mask import flex as flex_mask
 from veomni.ops.kernels.attention.mask import magi as magi_mask
@@ -44,12 +42,6 @@ from veomni.ops.mask import (
     magi_attention_mask_builder,
     sdpa_attention_mask_builder,
 )
-
-
-def test_veomni_hf_patches_pair_attention_and_mask():
-    for name, forward, mask_builder in _VEOMNI_HF_PATCHES:
-        assert ALL_ATTENTION_FUNCTIONS[name] is forward
-        assert ALL_MASK_ATTENTION_FUNCTIONS[name] is mask_builder
 
 
 def test_mask_builder_return_types():

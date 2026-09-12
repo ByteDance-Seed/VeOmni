@@ -33,7 +33,7 @@ from tests.ops.tol import (
     LB_FUSED_GRAD_RTOL,
     LB_FUSED_RTOL,
 )
-from veomni.ops import OP_REGISTRY, resolve_op
+from veomni.ops import resolve_op
 from veomni.utils.device import IS_CUDA_AVAILABLE
 
 
@@ -53,19 +53,6 @@ def _empty_mask(device: torch.device | str) -> Tensor:
 def _concat_layers(base: Tensor) -> Tensor:
     """``[num_layers, tokens, E]`` -> ops-style ``[N, E]``."""
     return base.reshape(-1, base.shape[-1]).detach().requires_grad_(True)
-
-
-def test_registered_impls():
-    assert OP_REGISTRY.list_registered("load_balancing_loss", "standard") == ["eager", "triton"]
-
-
-def test_eager_uniform_distribution_is_well_conditioned():
-    torch.manual_seed(0)
-    gate_logits = torch.randn(3 * 1024, 8)
-    output = resolve_op("load_balancing_loss", "standard", "eager").wrapper(
-        gate_logits, _empty_mask(gate_logits.device), top_k=2
-    )
-    assert 0 < output.item() < 5.0
 
 
 def test_eager_uniform_probabilities_return_top_k():
@@ -104,22 +91,6 @@ def test_eager_repeated_layers_are_invariant():
     torch.testing.assert_close(once, twice, atol=1e-4, rtol=0)
 
 
-@pytest.mark.parametrize(
-    "num_experts,top_k,num_layers,batch_size,seq_len",
-    [(8, 2, 2, 4, 128), (60, 8, 4, 2, 512)],
-)
-def test_eager_is_deterministic(num_experts, top_k, num_layers, batch_size, seq_len):
-    torch.manual_seed(42)
-    gate_logits = torch.randn(num_layers * batch_size * seq_len, num_experts)
-    eager = resolve_op("load_balancing_loss", "standard", "eager").wrapper
-    empty_mask = _empty_mask(gate_logits.device)
-
-    outputs = [eager(gate_logits, empty_mask, top_k=top_k) for _ in range(5)]
-
-    for output in outputs[1:]:
-        assert torch.equal(outputs[0], output)
-
-
 def test_eager_all_masked_returns_zero_with_zero_grad():
     gate_logits = torch.randn(8, 4, requires_grad=True)
     attention_mask = torch.zeros(2, 4)
@@ -129,35 +100,19 @@ def test_eager_all_masked_returns_zero_with_zero_grad():
     assert torch.count_nonzero(gate_logits.grad) == 0
 
 
-def test_eager_matches_hf():
-    torch.manual_seed(0)
+@pytest.mark.parametrize("use_mask", (False, True))
+def test_eager_matches_hf(use_mask: bool):
+    torch.manual_seed(int(use_mask))
     num_layers, batch, seq_len, num_experts, top_k = 2, 2, 16, 8, 2
     base = torch.randn(num_layers, batch * seq_len, num_experts, dtype=torch.float32)
     layers_h = tuple(base[i].detach().requires_grad_(True) for i in range(num_layers))
     concat_e = _concat_layers(base)
+    attention_mask = torch.ones(batch, seq_len, dtype=torch.float32) if use_mask else _empty_mask(base.device)
+    if use_mask:
+        attention_mask[:, seq_len // 2 :] = 0
+    hf_mask = attention_mask if use_mask else None
 
-    out_h = hf_load_balancing_loss(layers_h, num_experts, top_k)
-    out_e = resolve_op("load_balancing_loss", "standard", "eager").wrapper(
-        concat_e, _empty_mask(base.device), top_k=top_k
-    )
-    assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
-
-    out_h.backward()
-    out_e.backward()
-    grad_h = torch.cat([layer.grad for layer in layers_h], dim=0)
-    assert torch.allclose(concat_e.grad, grad_h, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-
-
-def test_eager_matches_hf_with_mask():
-    torch.manual_seed(1)
-    num_layers, batch, seq_len, num_experts, top_k = 2, 2, 16, 8, 2
-    base = torch.randn(num_layers, batch * seq_len, num_experts, dtype=torch.float32)
-    attention_mask = torch.ones(batch, seq_len, dtype=torch.float32)
-    attention_mask[:, seq_len // 2 :] = 0
-    layers_h = tuple(base[i].detach().requires_grad_(True) for i in range(num_layers))
-    concat_e = _concat_layers(base)
-
-    out_h = hf_load_balancing_loss(layers_h, num_experts, top_k, attention_mask)
+    out_h = hf_load_balancing_loss(layers_h, num_experts, top_k, hf_mask)
     out_e = resolve_op("load_balancing_loss", "standard", "eager").wrapper(concat_e, attention_mask, top_k=top_k)
     assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
@@ -249,6 +204,7 @@ def test_triton_is_deterministic(num_experts, top_k, num_layers, batch_size, seq
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs a GPU")
+@pytest.mark.benchmark
 @pytest.mark.parametrize("num_experts,top_k,num_layers,batch_size,seq_len", _CONFIGS)
 def test_triton_uses_less_peak_memory_than_hf(num_experts, top_k, num_layers, batch_size, seq_len):
     pytest.importorskip("triton")

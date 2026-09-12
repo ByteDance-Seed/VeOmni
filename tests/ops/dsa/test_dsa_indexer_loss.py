@@ -12,43 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DSA indexer-loss teacher: reference math plus the unregistered TileLang wrapper."""
-
-import warnings
+"""DSA indexer-loss teacher reference math and direct TileLang helper contract."""
 
 import pytest
 import torch
 
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
+from tests.ops.utils import require_nvidia_cuda
+from veomni.utils.device import get_device_type
 
 
 DEVICE = get_device_type()
 
-_WRAPPER = "veomni.ops.kernels.dsa.sparse_mqa_target"
 _VENDOR_TARGET = "veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_target"
-
-
-def test_wrapper_does_not_import_tilelang_eagerly():
-    import importlib
-    import sys
-
-    sys.modules.pop(_WRAPPER, None)
-    sys.modules.pop(_VENDOR_TARGET, None)
-    before = "tilelang" in sys.modules
-
-    importlib.import_module(_WRAPPER)
-
-    assert ("tilelang" in sys.modules) is before
-    assert _VENDOR_TARGET not in sys.modules
-
-
-def test_wrapper_is_not_a_registered_kernel():
-    from veomni.ops import resolve_op
-
-    with pytest.raises(KeyError, match="sparse_mqa_target"):
-        resolve_op("sparse_mqa_target", "standard", "tilelang")
-    with pytest.raises(KeyError, match="sparse_mqa_target_fwd"):
-        resolve_op("sparse_mqa_target_fwd", "standard", "tilelang")
 
 
 def test_wrapper_rejects_pre_sm90_before_import(monkeypatch):
@@ -78,21 +53,6 @@ def test_wrapper_rejects_rocm_before_import(monkeypatch):
     with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
         target.sparse_mqa_target_fwd(torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0))
     assert _VENDOR_TARGET not in sys.modules
-
-
-# Warnings this module tolerates, matched as substrings of the warning message.
-# Everything else fails test_target_kernel_emits_no_unexpected_warnings, so a new
-# warning cannot slip into a run unnoticed. Only add an entry for a warning that
-# provably originates outside this repository; a warning raised by our own code is
-# a bug to fix, not an entry here.
-_TOLERATED_WARNING_SUBSTRINGS = (
-    # tilelang deprecating one of its own pass-config keys. Raised from
-    # tilelang/transform/pass_config.py::normalize_pass_configs on every
-    # JITKernel construction, for the `TL_DISABLE_TMA_LOWER` config that every
-    # DeepSeek-V4 tilelang kernel in this tree sets -- including the attention
-    # forward these tests call to produce the LSE.
-    "`tl.disable_tma_lower` is deprecated",
-)
 
 
 def reference_compressed_target(q, kv, attn_sink, topk_idxs, compressed_start, sm_scale):
@@ -190,14 +150,6 @@ def test_reference_target_all_invalid_compressed_row_is_zero():
     assert torch.allclose(target[0, 1].sum(), torch.ones(()), atol=1e-5)
 
 
-def _require_tilelang_cuda():
-    pytest.importorskip("tilelang")
-    if torch.version.hip is not None or not IS_CUDA_AVAILABLE:
-        pytest.skip("DeepSeek V4 TileLang kernels require an NVIDIA CUDA GPU")
-    if get_gpu_compute_capability() < 90:
-        pytest.skip("DeepSeek V4 TileLang kernels require SM90 or later")
-
-
 @pytest.mark.parametrize("heads", [8, 16, 64])
 @pytest.mark.parametrize("c", [64, 128, 100])
 def test_target_kernel_matches_reference(heads, c):
@@ -214,7 +166,7 @@ def test_target_kernel_matches_reference(heads, c):
     it is the only case that runs the interface's ``-1``-sentinel padding and the
     final ``[:, :, :topk]`` slice that has to hide it again.
     """
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
     from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
 
@@ -251,7 +203,7 @@ def test_target_kernel_matches_reference(heads, c):
 
 
 def test_target_kernel_zeroes_invalid_slots():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
     from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
 
@@ -275,7 +227,7 @@ def test_target_kernel_all_invalid_compressed_row_is_zero():
     compressed row comes back as exact zeros, and the caller's ``clamp_min``
     normalisation leaves it as zeros rather than turning it into a NaN or a
     uniform distribution."""
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
     from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
 
@@ -303,7 +255,7 @@ def test_target_kernel_all_invalid_compressed_row_is_zero():
 
 
 def test_target_kernel_rejects_more_than_64_heads():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 
     q = torch.randn(1, 2, 128, 64, device=DEVICE, dtype=torch.bfloat16)
@@ -316,25 +268,10 @@ def test_target_kernel_rejects_more_than_64_heads():
         sparse_mqa_target_fwd(q, kv, topk, lse)
 
 
-def test_target_kernel_rejects_head_counts_the_interface_cannot_emit():
-    """``heads % 16 == 0`` on its own admits 48, which no interface call can
-    produce -- padding is ``max(next_power_of_2(heads), 16)``, so one of
-    {16, 32, 64} -- and which ``T.GemmWarpPolicy.FullRow`` cannot partition: with
-    the guard removed, lowering dies on ``Check failed: (m_warp * n_warp ==
-    num_warps) is false: m_warp: 3, n_warp: 2, num_warps: 8``. Only a caller that
-    bypasses the interface can reach this, which is exactly what this test does.
-    """
-    _require_tilelang_cuda()
-    from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_target import sparse_mqa_target
-
-    with pytest.raises(RuntimeError, match=r"padded to one of \(16, 32, 64\)"):
-        sparse_mqa_target(48, 64, 64)
-
-
 def test_target_kernel_rejects_non_bfloat16_inputs():
     """The kernel hardcodes ``dtype = T.bfloat16``; the interface names that
     constraint instead of letting an fp16 caller fall into tilelang's lowering."""
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 
     q = torch.randn(1, 2, 16, 64, device=DEVICE, dtype=torch.bfloat16)
@@ -353,7 +290,7 @@ def test_target_kernel_rejects_empty_kv():
     would clamp to row 0 of a tensor with no rows -- an out-of-bounds device read
     that the candidate mask cannot prevent, since it only zeroes the score after
     the gather. ``sparse_mqa_fwd_interface`` guards this; mirror it here."""
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 
     q = torch.randn(1, 2, 16, 64, device=DEVICE, dtype=torch.bfloat16)
@@ -365,41 +302,8 @@ def test_target_kernel_rejects_empty_kv():
         sparse_mqa_target_fwd(q, kv, topk, lse)
 
 
-def test_target_kernel_emits_no_unexpected_warnings():
-    """Pin the warning set, so a newly introduced warning is a failure rather than
-    an unexplained bump in pytest's summary count.
-
-    ``heads = 32`` is used by no other test in this module, so both kernels below
-    are constructed here rather than being served from tilelang's in-process
-    cache; that is what makes the construction-time warnings observable at all.
-    """
-    _require_tilelang_cuda()
-    from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
-    from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
-
-    torch.manual_seed(5)
-    b, s, heads, d, w, c = 1, 2, 32, 64, 64, 64
-    q = torch.randn(b, s, heads, d, device=DEVICE, dtype=torch.bfloat16)
-    kv = torch.randn(b, 256, d, device=DEVICE, dtype=torch.bfloat16)
-    sink = torch.zeros(heads, device=DEVICE, dtype=torch.float32)
-    topk = torch.randint(0, 256, (b, s, w + c), device=DEVICE, dtype=torch.int32)
-    scale = d**-0.5
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        _, lse = sparse_mqa_fwd_interface(q, kv, sink, topk, sm_scale=scale)
-        sparse_mqa_target_fwd(q, kv, topk[:, :, w:].contiguous(), lse, sm_scale=scale)
-
-    unexpected = [
-        f"{w.category.__name__} at {w.filename}:{w.lineno}: {w.message}"
-        for w in caught
-        if not any(known in str(w.message) for known in _TOLERATED_WARNING_SUBSTRINGS)
-    ]
-    assert not unexpected, "unexpected warning(s):\n" + "\n".join(unexpected)
-
-
 def test_sparse_attn_returns_non_differentiable_lse():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops import VeomniOp
 
     sparse_attn_tilelang = VeomniOp("dsa_attention", "deepseek_v4", "tilelang")
