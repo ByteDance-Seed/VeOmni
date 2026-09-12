@@ -22,12 +22,19 @@ from ..utils.env import get_env
 # Eagerly import kernel packages so that every op registers itself with the
 # registry.  Order does not matter; each ``register_op`` call is idempotent.
 from . import kernels, liger  # noqa: F401  triggers all register_op() calls
+from .config._plugin_loader import load_ops_backend_plugins
 from .config.registry import apply_global_ops
 from .config.singleton import set_ops_config
 from .dispatch import OpSlot
 from .kernels import attention, cross_entropy, load_balancing_loss, moe  # noqa: F401
 from .kernels.load_balancing_loss import load_balancing_loss_func
 from .kernels.moe import fused_moe_forward
+
+
+# Merge external ops-backend plugins (entry-point group ``veomni.ops_backends``)
+# once all built-in ops are registered. Opt-in additions only; no-op when no
+# plugin package is installed or VEOMNI_OPS_PLUGINS=0. See config/_plugin_loader.py.
+load_ops_backend_plugins()
 
 
 if TYPE_CHECKING:

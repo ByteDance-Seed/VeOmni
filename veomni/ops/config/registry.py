@@ -37,7 +37,7 @@ callback remains as an escape hatch for truly one-off behaviour.
 from __future__ import annotations
 
 import importlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import ModuleType
 from typing import TYPE_CHECKING, Callable
@@ -69,7 +69,10 @@ class BackendSpec:
     Attributes:
         entry: ``"module:attr"`` - lazily imported to resolve the replacement.
         requires: Package names that must be available, checked before
-            resolution. Supported values: ``"liger_kernel"``, ``"torch_npu"``.
+            resolution. Supported values: ``"liger_kernel"``, ``"torch_npu"``,
+            ``"triton"``, or any other importable package name (generic
+            importability check — used by external ops-backend plugins, see
+            ``_plugin_loader.py``).
         side_effect: GLOBAL ops only. ``"module:callable"`` invoked after
             ``entry`` is bound to ``global_slot`` (e.g. installing additional
             ``LOSS_MAPPING`` entries).
@@ -140,6 +143,22 @@ def get_op(name: str) -> OpSpec:
     return _OPS_REGISTRY[name]
 
 
+def extend_op_backends(op_name: str, backends: dict[str, BackendSpec]) -> None:
+    """Merge external backends into an already-registered op.
+
+    Used by the ops-backend plugin loader (``_plugin_loader.py``) to make
+    third-party implementations resolvable without re-registering the whole
+    ``OpSpec`` (``register_op`` treats a differing spec for a known op as an
+    error). Raises ``ValueError`` if any backend name already exists for the
+    op; never changes the op's ``default``.
+    """
+    op = get_op(op_name)
+    overlap = op.backends.keys() & backends.keys()
+    if overlap:
+        raise ValueError(f"Backend(s) {sorted(overlap)} already registered for op {op_name!r}.")
+    _OPS_REGISTRY[op_name] = replace(op, backends={**op.backends, **backends})
+
+
 def list_ops(scope: OpScope | None = None) -> list[OpSpec]:
     """Return all registered ops, optionally filtered by ``scope``."""
     ops = list(_OPS_REGISTRY.values())
@@ -187,7 +206,13 @@ def _check_requires(requires: tuple[str, ...]) -> None:
                     "(or 'triton-ascend' on NPU). Install it or set the field to 'eager'."
                 )
         else:
-            raise ValueError(f"Unsupported 'requires' token: {pkg!r}")
+            # Generic third-party package (e.g. an external ops-backend plugin
+            # package). Same importability check as the special cases above.
+            if not is_package_available(pkg):
+                raise RuntimeError(
+                    f"Backend requested but the {pkg!r} package is not installed. "
+                    f"Install it or set the field to another backend / 'eager'."
+                )
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ the dispatch machinery that picks the right implementation based on
 ```
 veomni/ops/
 ├── config/                 Dispatch infrastructure (no kernels here)
+│   ├── _plugin_loader.py   External ops-backend plugin loader (entry points)
 │   ├── registry.py         OpSpec / BackendSpec / OpScope + register_op,
 │   │                       apply_global_ops, apply_per_model_patches
 │   └── singleton.py        get_ops_config / set_ops_config — bridges the
@@ -75,6 +76,61 @@ own Triton RMSNorm/rotary. See the per-model table below.
 | `moe_implementation=fused_quack` | `quack` package, SM90+ | `is_quack_gemm_available()` |
 | `moe_implementation=fused_npu` | `torch_npu` + Ascend NPU | `is_torch_npu_available()` |
 | `mhc_implementation=tilelang` | `tile-kernels==1.0.0`, BF16, NVIDIA SM90+ | `KernelSpec(HardwareRequirement(..., min_compute_capability=90))` |
+
+### External ops-backend plugins
+
+Third-party kernel packages can add **opt-in** backends to any registered op
+without modifying VeOmni, via the standard entry-point group
+`veomni.ops_backends`. After a one-time merge of this mechanism, a new
+external kernel package requires **zero VeOmni changes**: install the package
+and its backend names become valid values for the matching
+`*_implementation` config fields (still opt-in; defaults never change).
+
+A plugin declares one entry point pointing at a **pure-data declaration
+module** (no heavy imports, no side effects):
+
+```toml
+# in the plugin package's pyproject.toml
+[project.entry-points."veomni.ops_backends"]
+my_kernels = "my_kernels.veomni_plugin"
+```
+
+```python
+# my_kernels/veomni_plugin.py
+VEOMNI_PLUGIN_API_VERSION = 1
+
+VEOMNI_OPS_BACKENDS = {
+    "ops": {  # merged into OpSpec.backends (config-field dispatch)
+        "rms_norm": {
+            "my_backend": {"entry": "my_kernels:MyRMSNorm",       # "module:attr", lazy
+                            "requires": ["my_kernels"]},           # generic package probe
+        },
+    },
+    "kernels": [  # merged into KERNEL_REGISTRY (OpSlot dispatch)
+        {"name": "my_backend", "op_name": "rms_norm", "variant": "standard",
+         "factory": "my_kernels:rms_norm", "device_type": "gpu",
+         "description": "fused RMSNorm (Triton fwd+bwd)"},
+    ],
+}
+```
+
+Semantics (enforced by `config/_plugin_loader.py`):
+
+- **Opt-in only.** The payload schema has no default/fallback keys — plugins
+  can make a backend resolvable, never change any default.
+- **Atomic per plugin.** The payload is fully validated before anything is
+  registered; any invalid entry rejects the whole plugin.
+- **Never fatal.** Import errors, bad payloads, and name conflicts (with
+  built-ins or other plugins) degrade to a warning and the plugin is skipped,
+  exactly as if it were not installed.
+- **One-shot, ordered.** Discovery runs once per process at `import
+  veomni.ops`, after built-in ops register; results are independent of load
+  order. `VEOMNI_OPS_PLUGINS=0` disables the mechanism entirely.
+
+`requires` entries are package names: `liger_kernel` / `torch_npu` / `triton`
+keep their dedicated availability helpers; any other name is checked by plain
+importability at resolve time (clear `RuntimeError` naming the missing
+package).
 
 #### Installing MagiAttention
 
