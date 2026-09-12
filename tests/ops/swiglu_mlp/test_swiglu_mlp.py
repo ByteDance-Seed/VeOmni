@@ -135,9 +135,6 @@ def test_eager_matches_swiglu_limit():
 
     Installed class: ``transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Experts``.
 
-    Source:
-    https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/deepseek_v4/modeling_deepseek_v4.py
-
     One expert, every token routed to it with weight 1, so the expert MLP
     is the same as ``swiglu_mlp`` with the DSV4 clamp.
     """

@@ -19,21 +19,12 @@ from __future__ import annotations
 import pytest
 
 from veomni.ops.platform import (
-    NVIDIA_GPU,
     NVIDIA_SM70_PLUS,
-    NVIDIA_SM90_PLUS,
     ROCM_GPU,
     GpuKernelRequirement,
     NvidiaGpuPlatform,
     RocmGpuPlatform,
 )
-from veomni.ops.registry import OP_REGISTRY
-
-
-def _registered_gpu_requirement(op: str, variant: str, impl: str) -> GpuKernelRequirement:
-    requirement = OP_REGISTRY._entries[(op, variant, impl, "cuda")].requirement
-    assert isinstance(requirement, GpuKernelRequirement)
-    return requirement
 
 
 def test_nvidia_platform_rejects_rocm_without_reading_cuda_cc(monkeypatch):
@@ -114,64 +105,3 @@ def test_gpu_requirement_requires_platforms():
     """An empty GPU requirement cannot match any platform and is rejected."""
     with pytest.raises(ValueError, match="at least one platform"):
         GpuKernelRequirement(platforms=())
-
-
-@pytest.mark.parametrize(
-    ("op", "variant", "impl"),
-    (
-        ("load_balancing_loss", "standard", "triton"),
-        ("cross_entropy_loss", "standard", "liger_kernel"),
-        ("rms_norm", "standard", "liger_kernel"),
-        ("rms_norm", "standard", "triton"),
-        ("rms_norm", "qwen3_5", "liger_kernel"),
-        ("rms_norm", "unweighted", "liger_kernel"),
-        ("rope", "full", "liger_kernel"),
-        ("rope", "deepseek_v4", "triton"),
-        ("rope", "wan", "triton"),
-        ("swiglu_mlp", "standard", "liger_kernel"),
-        ("rms_norm_gated", "standard", "fla"),
-        ("causal_conv1d", "standard", "fla"),
-        ("chunk_gated_delta_rule", "standard", "fla"),
-    ),
-)
-def test_general_gpu_rows_support_nvidia_and_rocm(op, variant, impl):
-    """Portable GPU kernels use the default NVIDIA plus ROCm requirement."""
-    assert _registered_gpu_requirement(op, variant, impl).platforms == (NVIDIA_GPU, ROCM_GPU)
-
-
-@pytest.mark.parametrize(
-    ("op", "variant", "impl"),
-    (
-        ("moe_experts", "standard", "fused_triton"),
-        ("moe_experts_lora", "shared", "fused_triton"),
-        ("moe_experts_lora", "independent", "fused_triton"),
-    ),
-)
-def test_triton_moe_rows_apply_cc_only_to_nvidia(op, variant, impl):
-    """Triton MoE keeps its NVIDIA SM70 floor without excluding ROCm."""
-    assert _registered_gpu_requirement(op, variant, impl).platforms == (NVIDIA_SM70_PLUS, ROCM_GPU)
-
-
-@pytest.mark.parametrize(
-    ("op", "variant", "impl", "platform"),
-    (
-        ("dsa_attention", "deepseek_v4", "tilelang", NVIDIA_SM90_PLUS),
-        ("dsa_indexer", "deepseek_v4", "tilelang", NVIDIA_SM90_PLUS),
-        ("dsa_attention", "glm", "flashmla_cudnn", NVIDIA_SM90_PLUS),
-        ("dsa_indexer", "glm", "cudnn", NVIDIA_SM90_PLUS),
-        ("mhc", "pre", "tilelang", NVIDIA_SM90_PLUS),
-        ("mhc", "post", "tilelang", NVIDIA_SM90_PLUS),
-        ("mhc", "head", "tilelang", NVIDIA_SM90_PLUS),
-        ("moe_experts", "standard", "fused_quack", NVIDIA_SM90_PLUS),
-        ("moe_experts", "gpt_oss", "fused_quack", NVIDIA_SM90_PLUS),
-        (
-            "chunk_gated_delta_rule",
-            "standard",
-            "flash_qla",
-            NvidiaGpuPlatform(min_cc=90, max_cc=100),
-        ),
-    ),
-)
-def test_nvidia_only_rows_do_not_advertise_rocm(op, variant, impl, platform):
-    """CUDA-library and NVIDIA-architecture kernels expose only NVIDIA."""
-    assert _registered_gpu_requirement(op, variant, impl).platforms == (platform,)

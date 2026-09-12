@@ -12,14 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Numerical parity tests for ``compute_expert_scatter_index``.
+"""Stable grouping and inverse-permutation tests for expert scatter indices.
 
-The helper replaces the ``argsort(stable=True).argsort()`` pair that the
-Triton and Quack MoE kernels used to build the scatter-index tensor. The
-second ``argsort`` was inverting a permutation of ``[0..N)`` -- an O(N)
-operation that used to be implemented as an O(N log N) sort. These tests
-verify bit-exact parity with the old expression and the inverse-permutation
-invariant.
+The Triton and Quack MoE paths require tokens to be grouped by expert while
+preserving source order within each expert. ``scatter_index`` is the inverse
+of that stable grouping permutation. An independent double-``argsort`` oracle
+checks the exact mapping in addition to the structural invariants.
 
 All checks run on CPU: the helper is device-agnostic (composes ``argsort`` +
 ``arange`` + scatter) and the semantic parity is what matters downstream.
@@ -32,7 +30,7 @@ from veomni.ops.kernels.moe_experts.shared.scatter import compute_expert_scatter
 
 
 def _reference_scatter_index(expert_index: torch.Tensor) -> torch.Tensor:
-    """Old expression, kept as the numeric ground truth."""
+    """Build an independent inverse-permutation oracle with stable sorts."""
     return expert_index.flatten().argsort(stable=True).argsort().to(torch.int32).view(expert_index.shape)
 
 

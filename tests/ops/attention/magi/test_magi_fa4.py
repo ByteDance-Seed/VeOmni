@@ -199,10 +199,10 @@ def test_default_magi_backend_lazily_calls_package_fa4_backend(monkeypatch):
 
 
 def test_default_magi_backend_attn_forward_meta_import_skips_query_device(monkeypatch):
-    """AttnForwardMeta is a Python container. Kernels import it outside cuda_device_context.
+    """Import the Python-only metadata container outside the CUDA device context.
 
-    Leftover ops wrapped this import in ``torch.cuda.device(query.device)``.
-    Device-sensitive Magi imports stay in ``_MagiFA4Function`` and ``_prepare_attn_arg``.
+    Device-sensitive Magi imports stay in ``_MagiFA4Function`` and
+    ``_prepare_attn_arg``.
     """
     active_devices = []
 

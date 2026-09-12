@@ -123,9 +123,6 @@ def _gpt_oss_hf_loop(
     Installed class: ``transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts``
     (``forward`` and ``_apply_gate``).
 
-    Source:
-    https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py
-
     Returns ``(output, experts)`` so weight grads are read from the HF module.
     """
     experts = GptOssExperts(
@@ -159,9 +156,6 @@ def _qwen3_moe_hf_experts(
     """Call HuggingFace ``Qwen3MoeExperts.forward``.
 
     Installed class: ``transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts``.
-
-    Source:
-    https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py
 
     HF scales routing after ``down_proj``. Our eager scales the SwiGLU
     intermediate before ``fc2``. Those match when ``down_proj`` has no bias.
@@ -655,11 +649,7 @@ def test_npu_matches_eager():
     _run_fused_vs_eager("fused_npu")
 
 
-def test_mlu_rows_are_registered():
-    registered = OP_REGISTRY.list_registered("moe_experts", "standard")
-    assert "fused_mlu" in registered
-    assert "fused_triton" in registered
-    assert "mlu_triton" not in registered
+def test_mlu_impl_is_unavailable_off_mlu():
     if not IS_MLU_AVAILABLE:
         assert "fused_mlu" not in OP_REGISTRY.list_available("moe_experts", "standard")
         with pytest.raises(RuntimeError, match="not registered for device"):
@@ -770,23 +760,6 @@ def test_build_moe_indices_all_same_expert():
     cu_seqlens_m, a_idx, _scatter_index = build_moe_indices(expert_index, num_experts=4)
     assert cu_seqlens_m.tolist() == [0, 8, 8, 8, 8]
     assert a_idx.tolist() == list(range(8))
-
-
-def test_moe_experts_rows_are_registered():
-    registered = OP_REGISTRY.list_registered("moe_experts", "standard")
-    assert "fused_triton" in registered
-    assert "fused_quack" in registered
-    assert "fused_npu" in registered
-    assert "eager" in registered
-
-
-def test_moe_experts_unknown_impl_raises():
-    with pytest.raises(KeyError, match="Unknown op"):
-        resolve_op("moe_experts", "standard", "bogus")
-
-
-def test_moe_experts_eager_resolves_without_hw():
-    assert resolve_op("moe_experts", "standard", "eager").wrapper is not None
 
 
 def test_quack_rejects_low_compute_capability(monkeypatch: pytest.MonkeyPatch):

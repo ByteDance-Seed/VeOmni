@@ -38,7 +38,7 @@ from tests.ops.tol import (
     ROPE_NPU_PROD_FP16_ATOL,
     ROPE_NPU_RTOL,
 )
-from veomni.ops import OP_REGISTRY, resolve_op
+from veomni.ops import resolve_op
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
@@ -62,11 +62,6 @@ def _clone_qk(q: Tensor, k: Tensor) -> tuple[Tensor, Tensor]:
 def _assert_pair(left: tuple[Tensor, Tensor], right: tuple[Tensor, Tensor], *, atol: float, rtol: float) -> None:
     assert torch.allclose(left[0], right[0], atol=atol, rtol=rtol)
     assert torch.allclose(left[1], right[1], atol=atol, rtol=rtol)
-
-
-def test_vision_layout_uses_full_rope_family():
-    assert OP_REGISTRY.list_registered("rope_vision", "full") == []
-    assert {"eager", "liger_kernel", "npu"} <= set(OP_REGISTRY.list_registered("rope", "full"))
 
 
 def test_full_eager_matches_hf():

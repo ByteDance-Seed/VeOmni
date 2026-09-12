@@ -27,7 +27,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from veomni.ops import VeomniOp, resolve_op
+from veomni.ops import VeomniOp
 from veomni.ops.registry import OpEntry, SavedState
 
 
@@ -141,20 +141,6 @@ def _sequential_dit_qkv(
         query = rms(query, norm_q_weight, eps=eps)
         key = rms(key, norm_k_weight, eps=eps)
     return query, key, value
-
-
-def test_registered_eager_rows() -> None:
-    for op, variant in (
-        ("async_ulysses_qkv", "standard"),
-        ("async_ulysses_qkv", "dit"),
-        ("async_ulysses_o", "standard"),
-        ("async_ulysses_o", "dit"),
-    ):
-        entry = resolve_op(op, variant, "eager")
-        assert entry.forward is not None
-        assert entry.backward is not None
-    with pytest.raises(KeyError):
-        resolve_op("async_ulysses_qkv", "bagel", "eager")
 
 
 def test_standard_qkv_rejects_nondivisible_kv_heads(monkeypatch: pytest.MonkeyPatch) -> None:

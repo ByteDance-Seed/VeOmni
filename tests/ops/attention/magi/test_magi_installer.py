@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Magi SM90 installer CLI contract. The script is not leftover ops attention."""
+"""Magi SM90 optional-dependency installer CLI contract."""
 
 import subprocess
 from pathlib import Path

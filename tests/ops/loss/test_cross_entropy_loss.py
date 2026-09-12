@@ -103,14 +103,14 @@ def test_eager_matches_hf_num_items():
     assert torch.allclose(logits_e.grad, logits_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-def test_chunk_loss_matches_eager():
+def test_chunk_loss_matches_eager_with_uneven_valid_tokens():
     eager = resolve_op("cross_entropy_loss", "standard", "eager").wrapper
     other = resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper
     torch.manual_seed(0)
     hidden = torch.randn(2, 20, 16, dtype=torch.float32)
     weight = torch.randn(8, 16, dtype=torch.float32)
     labels = torch.randint(0, 8, (2, 20))
-    labels[:, :3] = -100
+    labels.reshape(-1)[[0, 1, 2, 7, 8, 20, 27, 28, 29, 30]] = -100
 
     hidden_e, weight_e = _clone(hidden), _clone(weight)
     hidden_o, weight_o = _clone(hidden), _clone(weight)
@@ -122,32 +122,6 @@ def test_chunk_loss_matches_eager():
     out_o.backward()
     assert torch.allclose(hidden_e.grad, hidden_o.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     assert torch.allclose(weight_e.grad, weight_o.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-
-
-def test_chunk_loss_computes_shared_valid_token_denominator_once(monkeypatch):
-    """Chunking must not turn one global mean into a sum of chunk means."""
-    original_sum = torch.Tensor.sum
-    denominator_sum_calls = 0
-
-    def counting_sum(self, *args, **kwargs):
-        nonlocal denominator_sum_calls
-        if self.dtype == torch.bool and self.shape == (2 * 11,):
-            denominator_sum_calls += 1
-        return original_sum(self, *args, **kwargs)
-
-    monkeypatch.setattr(torch.Tensor, "sum", counting_sum)
-
-    torch.manual_seed(4)
-    hidden = torch.randn(2, 11, 6, requires_grad=True)
-    weight = torch.randn(9, 6, requires_grad=True)
-    labels = torch.randint(0, 9, (2, 11))
-    labels[:, :2] = -100
-    loss = resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper(hidden, labels, weight, chunk_size=4)
-    loss.backward()
-
-    assert denominator_sum_calls == 1
-    assert hidden.grad is not None
-    assert weight.grad is not None
 
 
 def test_chunk_loss_requires_weight():

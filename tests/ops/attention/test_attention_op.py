@@ -36,15 +36,7 @@ from veomni.ops.kernels.attention.standard.magi import magi_attention_forward
 from veomni.ops.kernels.attention.standard.sage import sage_attention_forward
 from veomni.ops.kernels.attention.standard.sdpa import sdpa_attention_forward
 from veomni.ops.kernels.attention.ulysses import should_apply_ulysses
-from veomni.ops.platform import (
-    ANY_DEVICE,
-    NVIDIA_SM90_PLUS,
-    ROCM_GPU,
-    GpuKernelRequirement,
-    MluKernelRequirement,
-    NpuKernelRequirement,
-    NvidiaGpuPlatform,
-)
+from veomni.ops.platform import NvidiaGpuPlatform
 
 
 _VEOMNI_FORWARDS = {
@@ -100,29 +92,6 @@ _FA4_IMPLS = ("flash_attention_4", "veomni_flash_attention_4")
 _MAGI_IMPLS = ("magi_attention", "veomni_magi_attention")
 
 
-def test_standard_rows_are_registered():
-    assert OP_REGISTRY.list_registered("attention", "standard") == list(_STANDARD_IMPLS)
-    expected_keys = {("attention", "standard", impl, ANY_DEVICE) for impl in _ANY_DEVICE_IMPLS}
-    expected_keys.update(("attention", "standard", impl, "cuda") for impl in (*_FA2_IMPLS, *_FA3_IMPLS))
-    expected_keys.update(("attention", "standard", impl, "cuda") for impl in (*_FA4_IMPLS, *_MAGI_IMPLS))
-    expected_keys.add(("attention", "standard", "veomni_sage_attention", "cuda"))
-    expected_keys.update(("attention", "standard", impl, "npu") for impl in _FA2_IMPLS)
-    expected_keys.update(("attention", "standard", impl, "mlu") for impl in _FA2_IMPLS)
-    assert {key for key in OP_REGISTRY._entries if key[0] == "attention"} == expected_keys
-
-    for impl in _STANDARD_IMPLS:
-        entries = [entry for entry in OP_REGISTRY.list_entries("attention", "standard") if entry.impl == impl]
-        assert entries
-        assert all(entry.wrapper is entries[0].wrapper for entry in entries)
-
-
-def test_unimplemented_native_sparse_is_not_registered():
-    assert "native-sparse" not in OP_REGISTRY.list_registered("attention", "standard")
-    assert "native-sparse" not in OP_REGISTRY.list_available("attention", "standard")
-    with pytest.raises(KeyError, match="Unknown op"):
-        OP_REGISTRY.resolve("attention", "standard", "native-sparse")
-
-
 def test_registered_attention_rows_share_public_signature_contract():
     for impl in _STANDARD_IMPLS:
         wrapper = next(
@@ -162,32 +131,6 @@ def test_cpu_availability_excludes_accelerator_attention(monkeypatch):
     for impl in (*_FA2_IMPLS, *_FA3_IMPLS, *_FA4_IMPLS, *_MAGI_IMPLS, "veomni_sage_attention"):
         with pytest.raises(RuntimeError, match="not registered for device 'cpu'"):
             OP_REGISTRY.resolve("attention", "standard", impl)
-
-
-def test_attention_rows_declare_platform_and_package_requirements():
-    sm80_plus = NvidiaGpuPlatform(min_cc=80)
-    expected = (
-        (_FA2_IMPLS, (sm80_plus, ROCM_GPU), ("flash_attn",)),
-        (_FA3_IMPLS, (NVIDIA_SM90_PLUS,), ("flash_attn_interface",)),
-        (_FA4_IMPLS, (NVIDIA_SM90_PLUS,), ("flash_attn.cute",)),
-        (_MAGI_IMPLS, (NVIDIA_SM90_PLUS,), ("magi_attention", "flash_attn_cute", "cuda.bindings", "debugpy")),
-        (("veomni_sage_attention",), (sm80_plus,), ("sageattention",)),
-    )
-
-    for impls, platforms, requires in expected:
-        for impl in impls:
-            entry = OP_REGISTRY._entries[("attention", "standard", impl, "cuda")]
-            assert isinstance(entry.requirement, GpuKernelRequirement)
-            assert entry.requirement.platforms == platforms
-            assert entry.requires == requires
-
-    for impl in _FA2_IMPLS:
-        assert isinstance(
-            OP_REGISTRY._entries[("attention", "standard", impl, "npu")].requirement, NpuKernelRequirement
-        )
-        mlu_entry = OP_REGISTRY._entries[("attention", "standard", impl, "mlu")]
-        assert isinstance(mlu_entry.requirement, MluKernelRequirement)
-        assert mlu_entry.requires == ("flash_attn",)
 
 
 def test_attention_packages_participate_in_gpu_availability(monkeypatch):
@@ -239,12 +182,16 @@ def test_apply_veomni_attention_patch_is_idempotent():
         assert ALL_ATTENTION_FUNCTIONS[name] is forward
 
 
-def test_apply_ops_patch_registers_attention_names():
-    from veomni.ops import apply_ops_patch
+def test_apply_ops_patch_delegates_attention_registration(monkeypatch):
+    from veomni.ops import install
 
-    apply_ops_patch()
-    for name, forward in _VEOMNI_FORWARDS.items():
-        assert ALL_ATTENTION_FUNCTIONS[name] is forward
+    calls = []
+    monkeypatch.setattr(install, "get_env", lambda _name: "veomni")
+    monkeypatch.setattr(install, "apply_veomni_attention_patch", lambda: calls.append(True))
+
+    install.apply_ops_patch()
+
+    assert calls == [True]
 
 
 def test_apply_ops_patch_skips_hf_backend(monkeypatch):

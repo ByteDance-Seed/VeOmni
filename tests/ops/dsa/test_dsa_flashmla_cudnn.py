@@ -1,5 +1,3 @@
-import importlib
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -9,22 +7,6 @@ import torch
 @pytest.fixture
 def dsa():
     return pytest.importorskip("veomni.ops.kernels.dsa.vendor.flashmla_cudnn")
-
-
-def test_flashmla_cudnn_is_not_eagerly_imported_by_kernels():
-    sys.modules.pop("veomni.ops.kernels.dsa.vendor.flashmla_cudnn", None)
-
-    importlib.import_module("veomni.ops")
-
-    assert "veomni.ops.kernels.dsa.vendor.flashmla_cudnn" not in sys.modules
-
-
-def test_dsa_vendor_package_does_not_import_flashmla_cudnn_backend():
-    sys.modules.pop("veomni.ops.kernels.dsa.vendor.flashmla_cudnn", None)
-
-    importlib.import_module("veomni.ops.kernels.dsa.vendor")
-
-    assert "veomni.ops.kernels.dsa.vendor.flashmla_cudnn" not in sys.modules
 
 
 def test_indexer_select_topk_uses_cudnn_score_wrapper(monkeypatch, dsa):

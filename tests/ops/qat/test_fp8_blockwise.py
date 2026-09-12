@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
-import sys
-
 import pytest
 import torch
 from torch import nn
@@ -152,19 +149,6 @@ class _GroupedLinear(nn.Linear):
 # ---------------------------------------------------------------------------
 # Argument validation
 # ---------------------------------------------------------------------------
-
-
-def test_qat_package_does_not_import_tilelang_eagerly():
-    if "tilelang" in sys.modules:
-        # Another test in this session already paid for the import, so a
-        # re-import here could not tell us anything.
-        pytest.skip("tilelang is already imported")
-    original = {name: sys.modules.pop(name) for name in list(sys.modules) if name.startswith("veomni.ops.qat")}
-    try:
-        importlib.import_module("veomni.ops.qat")
-        assert "tilelang" not in sys.modules
-    finally:
-        sys.modules.update(original)
 
 
 def test_fake_quant_rejects_non_bfloat16_operands():

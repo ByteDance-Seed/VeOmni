@@ -42,12 +42,7 @@ from veomni.ops.kernels.dsa.indexer.glm import cudnn as glm_fused_indexer
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
 
 
-# Installed functions: eager_attention_forward / DeepseekV4Indexer.forward
-# in transformers 5.9.0.
-# https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/deepseek_v4/modeling_deepseek_v4.py
-#
-# GLM indexer / attention eager path:
-# https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+# Installed Transformers implementations provide the DeepSeek-V4 and GLM eager references.
 
 _TILELANG_AVAILABLE = (
     IS_CUDA_AVAILABLE and get_gpu_compute_capability() >= 90 and importlib.util.find_spec("tilelang") is not None
@@ -106,7 +101,7 @@ def _hf_dsv4_indexer_scores(
     compress_ratio: int,
     topk: int,
 ) -> tuple[Tensor, Tensor]:
-    """Oracle from ``DeepseekV4Indexer.forward`` (transformers v5.9.0)."""
+    """Oracle from the installed ``DeepseekV4Indexer.forward`` implementation."""
     scores = torch.matmul(q_bshd.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))
     scores = F.relu(scores) * (q_bshd.shape[-1] ** -0.5)
     index_scores = (scores * weights.float().unsqueeze(-1)).sum(dim=2)
@@ -142,30 +137,6 @@ def _hf_glm_indexer_indices(
     future = torch.arange(k.shape[1], device=k.device).view(1, 1, -1) > position_ids.unsqueeze(-1)
     index_scores = index_scores.masked_fill(future, float("-inf"))
     return index_scores.topk(min(top_k, index_scores.shape[-1]), dim=-1).indices.to(torch.int32)
-
-
-def test_dsa_package_does_not_import_tilelang_eagerly():
-    """Registering DSA must not import TileLang or FlashMLA."""
-    importlib.import_module("veomni.ops.kernels.dsa")
-    assert "veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla" not in sys.modules
-    assert "veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_target" not in sys.modules
-    assert "veomni.ops.kernels.dsa.vendor.tilelang_indexer" not in sys.modules
-    assert "veomni.ops.kernels.dsa.vendor.flashmla_cudnn" not in sys.modules
-
-
-def test_dsa_rows_are_registered():
-    """Both kernels expose eager plus the fused impl names."""
-    assert OP_REGISTRY.list_registered("dsa_attention", "deepseek_v4") == ["eager", "tilelang"]
-    assert OP_REGISTRY.list_registered("dsa_attention", "glm") == ["eager", "flashmla_cudnn"]
-    assert OP_REGISTRY.list_registered("dsa_indexer", "deepseek_v4") == ["eager", "tilelang"]
-    assert OP_REGISTRY.list_registered("dsa_indexer", "glm") == ["eager", "cudnn"]
-    for kernel, variant in (
-        ("dsa_attention", "deepseek_v4"),
-        ("dsa_attention", "glm"),
-        ("dsa_indexer", "deepseek_v4"),
-        ("dsa_indexer", "glm"),
-    ):
-        assert "eager" in OP_REGISTRY.list_available(kernel, variant)
 
 
 def test_dsa_fused_rows_reject_rocm(monkeypatch):

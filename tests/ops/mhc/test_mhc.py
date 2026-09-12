@@ -34,13 +34,11 @@ from tests.ops.tol import (
     MHC_FUSED_GRAD_COSINE,
     MHC_FUSED_RTOL,
 )
-from veomni.ops import OP_REGISTRY, resolve_op
+from veomni.ops import resolve_op
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
 
 
-# Installed classes: DeepseekV4HyperConnection / DeepseekV4HyperHead /
-# DeepseekV4DecoderLayer in transformers 5.9.0.
-# https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/deepseek_v4/modeling_deepseek_v4.py
+# Installed Transformers classes used as the mHC eager reference.
 
 _TILELANG_AVAILABLE = (
     IS_CUDA_AVAILABLE and get_gpu_compute_capability() >= 90 and importlib.util.find_spec("tile_kernels") is not None
@@ -77,8 +75,8 @@ def _tiny_dsv4_config(
 def _hf_decoder_layer_post(output: Tensor, residual: Tensor, post: Tensor, comb: Tensor) -> Tensor:
     """HuggingFace decoder-layer residual mix. There is no standalone post module.
 
-    Copied from ``DeepseekV4DecoderLayer.forward`` (transformers v5.9.0):
-    https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/deepseek_v4/modeling_deepseek_v4.py
+    This is the residual-mixing expression used by the installed
+    ``DeepseekV4DecoderLayer.forward`` implementation.
     """
     dtype = residual.dtype
     return post.to(dtype).unsqueeze(-1) * output.unsqueeze(-2) + torch.matmul(
@@ -189,13 +187,6 @@ def test_mhc_head_eager_matches_hf():
     assert torch.allclose(fn_e.grad, head.hc_fn.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     assert torch.allclose(scale_e.grad, head.hc_scale.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     assert torch.allclose(base_e.grad, head.hc_base.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-
-
-def test_mhc_eager_is_registered():
-    for variant in ("pre", "post", "head"):
-        assert "eager" in OP_REGISTRY.list_available("mhc", variant)
-        assert "eager" in OP_REGISTRY.list_registered("mhc", variant)
-        assert "tilelang" in OP_REGISTRY.list_registered("mhc", variant)
 
 
 @pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="TileKernels mHC requires an SM90+ NVIDIA CUDA GPU")

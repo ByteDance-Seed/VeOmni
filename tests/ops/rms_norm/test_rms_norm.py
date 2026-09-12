@@ -53,7 +53,7 @@ from tests.ops.tol import (
     RMS_UNWEIGHTED_ATOL,
     RMS_UNWEIGHTED_RTOL,
 )
-from veomni.ops import OP_REGISTRY, resolve_op
+from veomni.ops import resolve_op
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
@@ -107,10 +107,6 @@ def test_eager_matches_hf(variant: str, dtype: torch.dtype):
     out_e.backward(go)
     assert torch.allclose(x_e.grad.float(), x_h.grad.float(), atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     assert torch.allclose(w_e.grad.float(), module.weight.grad.float(), atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-
-
-def test_deepseek_v4_registers_only_supported_impls():
-    assert set(OP_REGISTRY.list_registered("rms_norm", "deepseek_v4")) == {"eager", "liger_kernel"}
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

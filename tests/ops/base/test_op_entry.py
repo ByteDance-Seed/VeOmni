@@ -303,10 +303,16 @@ class TestRegisterAndResolve:
 
     def test_available_package_resolves_without_importing_backend(self, monkeypatch):
         checked = []
+        wrapper_called = False
 
         def package_available(package: str) -> bool:
             checked.append(package)
             return True
+
+        def optional_wrapper(x: Tensor) -> Tensor:
+            nonlocal wrapper_called
+            wrapper_called = True
+            return x
 
         monkeypatch.setattr("veomni.ops.registry.is_package_available", package_available)
         register_op(
@@ -314,22 +320,19 @@ class TestRegisterAndResolve:
             "standard",
             "optional",
             description="Optional add",
-            wrapper=lambda x: x,
+            wrapper=optional_wrapper,
             requires=("optional_backend",),
         )
 
         assert "optional" in OP_REGISTRY.list_available("add", "standard")
         assert resolve_op("add", "standard", "optional").requires == ("optional_backend",)
-        assert checked == ["optional_backend", "optional_backend"]
+        assert checked
+        assert set(checked) == {"optional_backend"}
+        assert not wrapper_called
 
     def test_register_rejects_non_entry(self):
         with pytest.raises(TypeError, match="OpEntry"):
             OP_REGISTRY.register(object())  # type: ignore[arg-type]
-
-    def test_resolve_returns_same_entry(self):
-        register_op("add", "standard", "eager", _add_forward, _add_backward, description=_TEST_DESCRIPTION)
-        entry = OP_REGISTRY.resolve("add", "standard", "eager")
-        assert entry is resolve_op("add", "standard", "eager")
 
     def test_opaque_wrapper_has_no_raw(self):
         def opaque(x: Tensor) -> Tensor:

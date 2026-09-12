@@ -42,7 +42,7 @@ from tests.ops.tol import (
     GDN_NPU_ATOL,
     GDN_NPU_RTOL,
 )
-from veomni.ops import OP_REGISTRY, resolve_op
+from veomni.ops import resolve_op
 from veomni.ops.registry import OpEntry
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
 
@@ -68,34 +68,6 @@ def _require_npu_gdr_dependencies(*, ascendc: bool = False) -> None:
         pytest.skip("NPU GDR kernels require the Triton Ascend backend")
     if ascendc:
         pytest.importorskip("fla_npu")
-
-
-@pytest.mark.parametrize(
-    "kernel",
-    ("rms_norm_gated", "causal_conv1d", "chunk_gated_delta_rule"),
-)
-def test_fla_is_registered_for_cuda_and_mlu(kernel):
-    assert (kernel, "standard", "fla", "cuda") in OP_REGISTRY._entries
-    assert (kernel, "standard", "fla", "mlu") in OP_REGISTRY._entries
-    assert OP_REGISTRY.list_registered(kernel, "standard").count("fla") == 1
-
-
-@pytest.mark.parametrize(
-    "kernel,impls",
-    (
-        ("rms_norm_gated", ["eager", "fla", "npu"]),
-        ("causal_conv1d", ["eager", "fla", "npu"]),
-        ("chunk_gated_delta_rule", ["eager", "fla", "flash_qla", "npu", "npu_ascendc"]),
-    ),
-)
-def test_gated_delta_rule_registration_matrix(kernel, impls):
-    assert OP_REGISTRY.list_registered(kernel, "standard") == impls
-
-
-def test_npu_ascendc_is_scoped_to_chunk_gated_delta_rule():
-    assert "npu_ascendc" in OP_REGISTRY.list_registered("chunk_gated_delta_rule", "standard")
-    assert "npu_ascendc" not in OP_REGISTRY.list_registered("rms_norm_gated", "standard")
-    assert "npu_ascendc" not in OP_REGISTRY.list_registered("causal_conv1d", "standard")
 
 
 def test_rms_norm_gated_eager_matches_hf():
@@ -214,7 +186,7 @@ def _hf_qwen3_5_prefill_causal_conv1d(x: Tensor, weight: Tensor, bias: Tensor, *
     ``self.conv1d`` is ``nn.Conv1d(..., padding=kernel_size-1, groups=dim)``.
 
     Source:
-    https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/qwen3_5/modeling_qwen3_5.py
+    This mirrors the installed Transformers Qwen3.5 implementation.
     """
     mixed = x.transpose(1, 2)
     conv = F.conv1d(

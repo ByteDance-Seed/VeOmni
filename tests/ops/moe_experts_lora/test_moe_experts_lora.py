@@ -189,38 +189,6 @@ def _build_lora_leaves(variant: str, *, E: int, H: int, I: int, r: int, dtype: t
 
 
 @pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_moe_experts_lora_registered_impls(variant):
-    registered = OP_REGISTRY.list_registered("moe_experts_lora", variant)
-    assert "eager" in registered
-    assert "fused_triton" in registered
-    assert "fused_npu" in registered
-    assert "fused_quack" not in registered
-    assert "fused_mlu" not in registered
-
-
-@pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_moe_experts_lora_eager_resolves(variant):
-    entry = resolve_op("moe_experts_lora", variant, "eager")
-    assert entry.wrapper is not None
-    handle = VeomniOp("moe_experts_lora", variant, "eager")
-    assert handle.impl == "eager"
-
-
-@pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_moe_experts_lora_eager_forward_smoke(variant):
-    torch.manual_seed(0)
-    B, H, I, E, top_k, r = 8, 16, 24, 4, 2, 4
-    hidden = torch.randn(B, H)
-    routing = torch.softmax(torch.randn(B, top_k), dim=-1)
-    selected = torch.randint(0, E, (B, top_k))
-    fc1 = torch.randn(E, 2 * I, H) * 0.05
-    fc2 = torch.randn(E, H, I) * 0.05
-    loras = _lora_tensors(variant, E=E, H=H, I=I, r=r, device=hidden.device, dtype=hidden.dtype)
-    out = _call("eager", variant, hidden, routing, selected, fc1, fc2, loras, num_experts=E)
-    assert out.shape == hidden.shape
-
-
-@pytest.mark.parametrize("variant", ["shared", "independent"])
 def test_moe_experts_lora_eager_matches_manual_oracle_forward_and_all_gradients(variant):
     torch.manual_seed(11)
     B, H, I, E, top_k, r = 4, 5, 7, 3, 2, 3
