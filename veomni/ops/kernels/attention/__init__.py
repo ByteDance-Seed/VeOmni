@@ -151,7 +151,6 @@ _register_attention(
     rows=_MAGI_ROWS,
     interface="veomni_magi_attention",
 )
-_register_attention("native-sparse", "Transformers native sparse attention")
 _register_attention(
     "veomni_flash_attention_2",
     "VeOmni FlashAttention 2 adapter through Transformers",

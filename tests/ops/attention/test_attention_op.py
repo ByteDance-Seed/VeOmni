@@ -65,7 +65,6 @@ _STANDARD_IMPLS = (
     "flash_attention_4",
     "flex_attention",
     "magi_attention",
-    "native-sparse",
     "veomni_flash_attention_2",
     "veomni_flash_attention_3",
     "veomni_flash_attention_4",
@@ -92,7 +91,6 @@ _ANY_DEVICE_IMPLS = (
     "eager",
     "sdpa",
     "flex_attention",
-    "native-sparse",
     "veomni_flex_attention",
     "veomni_sdpa",
 )
@@ -116,6 +114,13 @@ def test_standard_rows_are_registered():
         entries = [entry for entry in OP_REGISTRY.list_entries("attention", "standard") if entry.impl == impl]
         assert entries
         assert all(entry.wrapper is entries[0].wrapper for entry in entries)
+
+
+def test_unimplemented_native_sparse_is_not_registered():
+    assert "native-sparse" not in OP_REGISTRY.list_registered("attention", "standard")
+    assert "native-sparse" not in OP_REGISTRY.list_available("attention", "standard")
+    with pytest.raises(KeyError, match="Unknown op"):
+        OP_REGISTRY.resolve("attention", "standard", "native-sparse")
 
 
 def test_registered_attention_rows_share_public_signature_contract():
