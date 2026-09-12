@@ -30,16 +30,17 @@ from torch import Tensor
 
 
 def _topk_to_additive_mask(topk_idxs: Tensor, kv_len: int, dtype: torch.dtype) -> Tensor:
-    """HF additive mask: 0 at selected keys, ``finfo.min`` elsewhere."""
+    """Dense mask preserving the candidate-list multiplicity of each key."""
     batch, q_len, _ = topk_idxs.shape
     valid = (topk_idxs >= 0) & (topk_idxs < kv_len)
     safe = topk_idxs.clamp(0, max(kv_len - 1, 0)).long()
-    # scatter_add so -1 sentinels (clamped to 0) cannot overwrite a real keep.
-    keep = torch.zeros(batch, q_len, kv_len, dtype=torch.int32, device=topk_idxs.device)
-    keep.scatter_add_(-1, safe, valid.to(keep.dtype))
-    keep = keep > 0
+    counts = torch.zeros(batch, q_len, kv_len, dtype=torch.int32, device=topk_idxs.device)
+    counts.scatter_add_(-1, safe, valid.to(counts.dtype))
+    # Repeating a candidate n times in the gathered TileLang softmax is
+    # equivalent to adding log(n) to that key's dense logit.
+    multiplicity_bias = counts.to(dtype).log()
     min_value = torch.finfo(dtype).min
-    return torch.where(keep.unsqueeze(1), torch.zeros((), device=topk_idxs.device, dtype=dtype), min_value)
+    return torch.where(counts.unsqueeze(1) > 0, multiplicity_bias.unsqueeze(1), min_value)
 
 
 def wrapper(
@@ -53,7 +54,8 @@ def wrapper(
     """Sparse MQA with HF sink-softmax math.
 
     ``q`` is ``[B, S, H, D]``, ``kv`` is ``[B, S_kv, D]``, ``attn_sink`` is
-    ``[H]``, ``topk_idxs`` is ``[B, S, topk]``.
+    ``[H]``, ``topk_idxs`` is ``[B, S, topk]``. Repeated valid indices retain
+    their per-slot softmax multiplicity, matching the TileLang row.
     """
     scale = q.shape[-1] ** -0.5 if sm_scale is None else sm_scale
     query = q.transpose(1, 2).contiguous()

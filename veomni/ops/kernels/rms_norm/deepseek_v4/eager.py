@@ -32,11 +32,6 @@ class _Meta:
     eps: float
 
 
-def _batch_dims(tensor: Tensor) -> tuple[int, ...]:
-    """Reduce over every dim except the last (the normalized channel)."""
-    return tuple(range(tensor.ndim - 1))
-
-
 def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
     """Affine RMSNorm with offset 0 and an fp32 weight multiply.
 
@@ -65,6 +60,6 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor]:
     x_f = x.float()
     normalized = x_f * rstd
     scaled_grad = grad_output.float() * weight.float()
-    grad_weight = (grad_output.float() * normalized).sum(dim=_batch_dims(x))
+    grad_weight = (grad_output.float() * normalized).sum_to_size(weight.shape)
     grad_x = rstd * scaled_grad - (rstd.pow(3) / x.shape[-1]) * x_f * (scaled_grad * x_f).sum(dim=-1, keepdim=True)
     return grad_x.to(x.dtype), grad_weight.to(weight.dtype)

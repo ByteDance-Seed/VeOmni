@@ -53,6 +53,10 @@ is then checked for importable optional packages without importing its kernel.
 | `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `cudnn`, or `flashmla_cudnn` by variant |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang` |
 
+DeepSeek-V4 `dsa_attention` treats `topk_idxs` as candidate slots. Repeated
+valid indices participate once per occurrence, matching the TileLang kernel;
+invalid sentinel entries contribute no attention mass.
+
 The registry is the source of truth for the exact rows available in a given
 revision:
 

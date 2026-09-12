@@ -34,7 +34,7 @@ def wrapper(
     ``index_q`` is ``[S, B, H, D]``, ``index_k`` is ``[S_kv, B, D]``,
     ``weights`` is ``[S, B, H]``. Returns ``(index_score, topk_indices)``.
     """
-    from ....vendor.tilelang_indexer import v4_lighting_indexer
+    from ...vendor.tilelang_indexer import v4_lighting_indexer
 
     return v4_lighting_indexer(
         index_q,

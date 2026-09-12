@@ -61,6 +61,53 @@ def test_eager_matches_hf_logits():
     assert torch.allclose(logits_e.grad, logits_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+def test_eager_fp16_logits_do_not_overflow_outside_cross_entropy():
+    logits = torch.ones(128, 1024, dtype=torch.float16)
+    labels = torch.zeros(128, dtype=torch.long)
+
+    logits_h = make_grad_leaf(logits)
+    out_h = F.cross_entropy(logits_h.float(), labels)
+    logits_e = make_grad_leaf(logits)
+    out_e = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(
+        logits_e, labels, _empty_weight(logits.device)
+    )
+
+    torch.testing.assert_close(out_e, out_h)
+    out_h.backward()
+    out_e.backward()
+    torch.testing.assert_close(logits_e.grad, logits_h.grad)
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
+def test_eager_logits_allow_infinite_mask_values(dtype):
+    logits = torch.tensor([[0.0, -torch.inf, 1.0]], dtype=dtype)
+    labels = torch.tensor([2])
+
+    logits_h = make_grad_leaf(logits)
+    out_h = F.cross_entropy(logits_h.float(), labels)
+    logits_e = make_grad_leaf(logits)
+    out_e = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(
+        logits_e, labels, _empty_weight(logits.device)
+    )
+
+    torch.testing.assert_close(out_e, out_h)
+    out_h.backward()
+    out_e.backward()
+    torch.testing.assert_close(logits_e.grad, logits_h.grad)
+
+
+@pytest.mark.parametrize("num_tokens", (0, 3), ids=("empty", "all-ignored"))
+def test_eager_empty_or_all_ignored_returns_connected_zero(num_tokens):
+    logits = torch.randn(num_tokens, 4, requires_grad=True)
+    labels = torch.full((num_tokens,), -100, dtype=torch.long)
+
+    loss = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(logits, labels, _empty_weight(logits.device))
+
+    assert loss.item() == 0.0
+    loss.backward()
+    torch.testing.assert_close(logits.grad, torch.zeros_like(logits))
+
+
 def test_eager_matches_hf_hidden_weight():
     torch.manual_seed(1)
     hidden = torch.randn(4, 8, 32, dtype=torch.float32)

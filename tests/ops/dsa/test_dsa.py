@@ -156,9 +156,10 @@ def test_dsa_attention_deepseek_v4_eager_matches_hf():
     q = torch.randn(batch, seq_len, heads, dim)
     kv = torch.randn(batch, kv_len, dim)
     sink = torch.randn(heads)
-    indices = torch.randint(kv_len, (batch, seq_len, topk), dtype=torch.int32)
+    indices = torch.empty(batch, seq_len, topk, dtype=torch.int32)
     indices[..., 0] = 0
-    indices[..., -1] = -1
+    indices[..., 1] = torch.randint(1, kv_len, (batch, seq_len), dtype=torch.int32)
+    indices[..., 2] = -1
     scale = dim**-0.5
 
     q_h, kv_h, sink_h = make_grad_leaves(q, kv, sink)
@@ -185,6 +186,36 @@ def test_dsa_attention_deepseek_v4_eager_matches_hf():
     assert torch.allclose(q_e.grad, q_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     assert torch.allclose(kv_e.grad, kv_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     assert torch.allclose(sink_e.grad, sink_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+def test_dsa_attention_deepseek_v4_eager_preserves_repeated_candidate_slots():
+    """Repeated candidates carry repeated softmax mass, as in the fused kernel."""
+    q = torch.zeros(1, 1, 1, 1)
+    kv = torch.tensor([[[0.0], [2.0]]])
+    sink = torch.tensor([-1.0])
+    indices = torch.tensor([[[0, 0, 1]]], dtype=torch.int32)
+
+    q_ref, kv_ref, sink_ref = make_grad_leaves(q, kv, sink)
+    gathered = kv_ref[:, None, :, :].expand(-1, q.shape[1], -1, -1)
+    gathered = gathered.gather(2, indices.long().unsqueeze(-1).expand(-1, -1, -1, kv.shape[-1]))
+    logits = torch.einsum("bmhd,bmkd->bmhk", q_ref, gathered)
+    combined_logits = torch.cat((logits, sink_ref.reshape(1, 1, 1, 1)), dim=-1)
+    probs = combined_logits.softmax(dim=-1)
+    expected = torch.einsum("bmhk,bmkd->bmhd", probs[..., :-1], gathered)
+    expected_lse = torch.logsumexp(combined_logits, dim=-1)
+
+    q_eager, kv_eager, sink_eager = make_grad_leaves(q, kv, sink)
+    actual, actual_lse = resolve_op("dsa_attention", "deepseek_v4", "eager").wrapper(
+        q_eager, kv_eager, sink_eager, indices, sm_scale=1.0, return_lse=True
+    )
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_lse, expected_lse)
+
+    grad = torch.randn_like(actual)
+    expected.backward(grad)
+    actual.backward(grad)
+    for actual_input, expected_input in zip((q_eager, kv_eager, sink_eager), (q_ref, kv_ref, sink_ref), strict=True):
+        torch.testing.assert_close(actual_input.grad, expected_input.grad)
 
 
 def test_dsa_attention_deepseek_v4_eager_matches_official_hf_sliding_mask():
@@ -516,7 +547,7 @@ def test_dsa_attention_glm_eager_matches_official_hf_causal_plus_scatter():
 
 @pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="DeepSeek V4 TileLang requires SM90+ NVIDIA CUDA")
 def test_dsa_attention_tilelang_matches_eager():
-    """TileLang sparse MQA matches the HF-aligned eager row."""
+    """TileLang sparse MQA matches eager, including repeated candidate slots."""
     torch.manual_seed(4)
     device = torch.device("cuda")
     batch, seq_len, heads, dim, kv_len, topk = 1, 32, 8, 512, 48, 64
