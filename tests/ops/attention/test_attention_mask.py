@@ -142,8 +142,19 @@ def test_magi_hf_builder_rejects_implicit_2d_visibility(attention_2d):
         magi_attention_mask_builder(1, 4, 4, attention_mask=attention_2d, device="cpu")
 
 
-def test_magi_hf_builder_rejects_mismatched_causal_lengths():
-    with pytest.raises(ValueError, match="matching query and key segment lengths"):
+def test_magi_hf_builder_accepts_bottom_right_aligned_causal_lengths():
+    mask = magi_attention_mask_builder(1, 2, 4, q_offset=2, device="cpu")
+    expected = torch.tensor(
+        [
+            [True, True, True, False],
+            [True, True, True, True],
+        ]
+    )
+    torch.testing.assert_close(materialize_magi_mask(mask, 2, 4)[0, 0], expected)
+
+
+def test_magi_hf_builder_rejects_incompatible_causal_offsets():
+    with pytest.raises(ValueError, match="bottom-right aligned"):
         magi_attention_mask_builder(1, 2, 4, device="cpu")
 
 
@@ -174,8 +185,6 @@ def test_flex_ulysses_2d_mask_length_aligns(monkeypatch):
 @pytest.mark.parametrize(
     ("builder", "module", "attention_mask", "match"),
     [
-        (flex_attention_mask_builder, flex_mask, None, "full-sequence 2D attention mask"),
-        (sdpa_attention_mask_builder, sdpa_mask, None, "full-sequence 2D attention mask"),
         (
             flex_attention_mask_builder,
             flex_mask,
@@ -196,11 +205,56 @@ def test_flex_and_sdpa_ulysses_reject_incomplete_2d_mask(monkeypatch, builder, m
         builder(1, 4, 4, attention_mask=attention_mask, device="cpu")
 
 
+@pytest.mark.parametrize(
+    ("builder", "module"),
+    (
+        (flex_attention_mask_builder, flex_mask),
+        (sdpa_attention_mask_builder, sdpa_mask),
+    ),
+)
+def test_flex_and_sdpa_ulysses_allow_canonical_mask_without_metadata(monkeypatch, builder, module):
+    _patch_mask_ulysses(monkeypatch, module, apply=True)
+    mask = builder(1, 4, 4, device="cpu", allow_is_causal_skip=False)
+    assert tuple(mask.shape[-2:]) == (8, 8)
+
+
+@pytest.mark.parametrize(
+    ("builder", "module"),
+    (
+        (flex_attention_mask_builder, flex_mask),
+        (sdpa_attention_mask_builder, sdpa_mask),
+    ),
+)
+def test_flex_and_sdpa_ulysses_reject_custom_mask_without_metadata(monkeypatch, builder, module):
+    _patch_mask_ulysses(monkeypatch, module, apply=True)
+    with pytest.raises(ValueError, match="full-sequence metadata for a custom mask function"):
+        builder(1, 4, 4, mask_function=lambda *args: True, device="cpu")
+
+
+@pytest.mark.parametrize(
+    ("builder", "module"),
+    (
+        (flex_attention_mask_builder, flex_mask),
+        (sdpa_attention_mask_builder, sdpa_mask),
+    ),
+)
+def test_flex_and_sdpa_ulysses_allow_sliding_window_without_metadata(monkeypatch, builder, module):
+    _patch_mask_ulysses(monkeypatch, module, apply=True)
+    mask = builder(1, 4, 4, sliding_window=2, device="cpu", allow_is_causal_skip=False)
+    assert tuple(mask.shape[-2:]) == (8, 8)
+
+
 def test_magi_hf_builder_expands_ulysses_local_lengths(monkeypatch):
     _patch_mask_ulysses(monkeypatch, magi_mask, apply=True)
     mask = magi_attention_mask_builder(1, 4, 4, device="cpu")
     assert mask.q_ranges.tolist() == [[0, 8]]
     assert mask.k_ranges.tolist() == [[0, 8]]
+
+
+def test_magi_hf_builder_keeps_cached_offsets_unsupported_with_ulysses(monkeypatch):
+    _patch_mask_ulysses(monkeypatch, magi_mask, apply=True)
+    with pytest.raises(ValueError, match="with Ulysses does not support cached mask offsets"):
+        magi_attention_mask_builder(1, 2, 4, q_offset=2, device="cpu")
 
 
 @pytest.mark.parametrize(
@@ -237,7 +291,7 @@ def test_mask_builders_keep_local_lengths_when_async_or_skipped(monkeypatch, bui
     ("override", "match"),
     [
         ({"batch_size": 2}, "physical batch size 1"),
-        ({"q_offset": 1}, "does not support KV-cache offsets"),
+        ({"q_offset": 1}, "bottom-right aligned"),
         ({"mask_function": lambda *args: True}, "canonical causal or bidirectional"),
     ],
 )
@@ -267,6 +321,18 @@ def test_magi_from_ranges_casts_ffa_contract():
     assert mask.q_ranges.tolist() == [[0, 4]]
     assert mask.attn_type_map is not None
     assert mask.attn_type_map.tolist() == [1]
+
+
+@pytest.mark.parametrize("name", ("q_ranges", "k_ranges", "attn_type_map"))
+def test_magi_from_ranges_rejects_non_integer_metadata(name):
+    values = {
+        "q_ranges": torch.tensor([[0, 4]]),
+        "k_ranges": torch.tensor([[0, 4]]),
+        "attn_type_map": torch.tensor([1]),
+    }
+    values[name] = values[name].to(torch.float32)
+    with pytest.raises(TypeError, match="dtype int32 or int64"):
+        MagiAttentionMask.from_ranges(**values)
 
 
 def test_magi_from_ranges_preserves_mixed_visibility():

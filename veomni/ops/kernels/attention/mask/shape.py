@@ -23,7 +23,6 @@ from transformers.masking_utils import (
     and_masks,
     causal_mask_function,
     or_masks,
-    sliding_window_overlay,
 )
 
 from ..ulysses import effective_sequence_lengths
@@ -41,7 +40,7 @@ from .sdpa import sdpa_attention_mask_builder
 _FLASH = frozenset({"flash_attention_2", "flash_attention_3", "flash_attention_4"})
 _SAGE = frozenset({"sage_attention"})
 _FLASH_LIKE_CAUSAL = _FLASH | _SAGE
-_SDPA = frozenset({"sdpa", "native-sparse"})
+_SDPA = frozenset({"sdpa"})
 _EAGER = frozenset({"eager"})
 
 
@@ -70,6 +69,15 @@ def _to_eager_additive(mask: torch.Tensor | None, dtype: torch.dtype) -> torch.T
         mask = mask != 0
     min_dtype = torch.finfo(dtype).min
     return torch.where(mask, torch.zeros((), device=mask.device, dtype=dtype), min_dtype)
+
+
+def _require_canonical_causal(backend: str, mask_function: Any) -> None:
+    """Reject visibility predicates that a flash-like or range backend would drop."""
+    if mask_function is not causal_mask_function:
+        raise ValueError(
+            f"{backend} cannot represent a custom mask_function through this shape API; "
+            "use SDPA/FlexAttention or backend-specific mask metadata."
+        )
 
 
 def _sdpa_or_eager_mask(
@@ -116,10 +124,10 @@ def _flex_mask(
     """Build a FlexAttention block mask for causal, sliding, or packed input."""
     extra.pop("dtype", None)
     mask_function = extra.get("mask_function", causal_mask_function)
-    if sliding_window is not None:
-        mask_function = and_masks(mask_function, sliding_window_overlay(sliding_window))
     cu_seqlens_k = extra.pop("cu_seq_lens_k", extra.pop("cu_seqlens_k", None))
     extra["mask_function"] = mask_function
+    if sliding_window is not None:
+        extra["sliding_window"] = sliding_window
     return flex_attention_mask_builder(
         batch_size=batch_size,
         q_length=q_len,
@@ -152,6 +160,7 @@ def causal_mask(
     extra = _compose_or_and(kwargs)
     extra["skip_ulysses"] = skip_ulysses
     if backend in _FLASH_LIKE_CAUSAL:
+        _require_canonical_causal(backend, extra["mask_function"])
         return flash_attention_mask_builder(
             batch_size,
             q_len,
@@ -165,7 +174,7 @@ def causal_mask(
         return _flex_mask(batch_size, q_len, kv_len, extra, device=device)
     if backend == "magi_attention":
         extra.pop("dtype", None)
-        extra.pop("mask_function", None)
+        _require_canonical_causal(backend, extra["mask_function"])
         return magi_attention_mask_builder(
             batch_size=batch_size,
             q_length=q_len,
@@ -200,6 +209,7 @@ def sliding_window_mask(
     if backend in _SAGE:
         raise ValueError("veomni_sage_attention does not support sliding_window_mask")
     if backend in _FLASH:
+        _require_canonical_causal(backend, extra["mask_function"])
         return flash_attention_mask_builder(
             batch_size,
             q_len,
@@ -256,6 +266,7 @@ def packed_causal_mask(
     if backend in _SAGE:
         raise ValueError("veomni_sage_attention does not support packed_causal_mask")
     if backend in _FLASH:
+        _require_canonical_causal(backend, extra["mask_function"])
         return flash_attention_mask_builder(
             batch_size,
             q_len,
@@ -284,7 +295,7 @@ def packed_causal_mask(
         )
     if backend == "magi_attention":
         extra.pop("dtype", None)
-        extra.pop("mask_function", None)
+        _require_canonical_causal(backend, extra.pop("mask_function"))
         effective_q_len, effective_kv_len = effective_sequence_lengths(
             q_len,
             kv_len,

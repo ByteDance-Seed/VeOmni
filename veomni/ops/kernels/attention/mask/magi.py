@@ -26,7 +26,7 @@ from transformers.masking_utils import (
 )
 
 from ..helper import require_all
-from ..ulysses import effective_sequence_lengths
+from ..ulysses import effective_sequence_lengths, should_apply_ulysses
 
 
 @dataclass(frozen=True)
@@ -59,6 +59,10 @@ class MagiAttentionMask:
         device: torch.device | str | None = None,
     ) -> MagiAttentionMask:
         """Build a mask from explicit ranges, casting to the FFA tensor contract."""
+        _validate_integer_input("q_ranges", q_ranges)
+        _validate_integer_input("k_ranges", k_ranges)
+        if attn_type_map is not None:
+            _validate_integer_input("attn_type_map", attn_type_map)
         device = q_ranges.device if device is None else torch.device(device)
         q_ranges = q_ranges.to(device=device, dtype=torch.int32).contiguous()
         k_ranges = k_ranges.to(device=device, dtype=torch.int32).contiguous()
@@ -77,9 +81,16 @@ class MagiAttentionMask:
         q_length: int | None = None,
         kv_length: int | None = None,
     ) -> MagiAttentionMask:
-        """Build packed ranges, optionally requiring complete Q/K coverage."""
+        """Build bottom-right packed ranges with optional complete-coverage checks.
+
+        Query and key segments may have different lengths; Magi applies causal
+        visibility relative to the bottom-right corner of each paired range.
+        """
+        _validate_integer_input("cu_seqlens_q", cu_seqlens_q)
         if cu_seqlens_k is None:
             cu_seqlens_k = cu_seqlens_q
+        else:
+            _validate_integer_input("cu_seqlens_k", cu_seqlens_k)
         device = cu_seqlens_q.device if device is None else torch.device(device)
         q_ranges = _ranges_from_cu_seqlens(
             "cu_seqlens_q",
@@ -94,13 +105,7 @@ class MagiAttentionMask:
             sequence_length=kv_length,
         )
         attn_type_map = torch.ones(q_ranges.shape[0], device=device, dtype=torch.int32) if causal else None
-        result = cls.from_ranges(q_ranges, k_ranges, attn_type_map, device=device)
-        if causal:
-            require_all(
-                result.q_ranges.diff(dim=1) == result.k_ranges.diff(dim=1),
-                "Packed causal MagiAttention requires matching query and key segment lengths.",
-            )
-        return result
+        return cls.from_ranges(q_ranges, k_ranges, attn_type_map, device=device)
 
 
 def magi_attention_mask_builder(
@@ -117,15 +122,11 @@ def magi_attention_mask_builder(
     """HF-signature Magi mask for unpacked causal / bidirectional attention.
 
     Expand local lengths only when the adapter would gather Q/K/V itself:
-    sync Ulysses and not ``skip_ulysses``.
+    sync Ulysses and not ``skip_ulysses``. Unequal causal lengths are accepted
+    when HF offsets describe the same bottom-right alignment as Magi ranges.
     """
     if batch_size != 1:
         raise ValueError(f"MagiAttention mask creation requires physical batch size 1, got {batch_size}.")
-    if q_offset != 0 or kv_offset != 0:
-        raise ValueError(
-            "MagiAttention mask creation does not support KV-cache offsets; "
-            f"got q_offset={q_offset} and kv_offset={kv_offset}."
-        )
     if mask_function is causal_mask_function:
         causal = True
     elif mask_function is bidirectional_mask_function:
@@ -159,13 +160,25 @@ def magi_attention_mask_builder(
         raise ValueError("MagiAttention mask creation requires a device or tensor metadata.")
     device = torch.device(device)
 
+    apply_ulysses = should_apply_ulysses(skip_ulysses=skip_ulysses)
     full_q_length, full_kv_length = effective_sequence_lengths(
         q_length,
         kv_length,
         skip_ulysses=skip_ulysses,
     )
-    if causal and full_q_length != full_kv_length:
-        raise ValueError("Packed causal MagiAttention requires matching query and key segment lengths.")
+    if causal:
+        if apply_ulysses and (q_offset != 0 or kv_offset != 0):
+            raise ValueError(
+                "MagiAttention with Ulysses does not support cached mask offsets; "
+                f"got q_offset={q_offset} and kv_offset={kv_offset}."
+            )
+        expected_offset_delta = full_kv_length - full_q_length
+        if q_offset - kv_offset != expected_offset_delta:
+            raise ValueError(
+                "MagiAttention causal ranges are bottom-right aligned, so HF offsets must satisfy "
+                "q_offset - kv_offset == kv_length - q_length; "
+                f"got offsets {q_offset}/{kv_offset} and effective lengths {full_q_length}/{full_kv_length}."
+            )
     attn_type_map = torch.ones(1, device=device, dtype=torch.int32) if causal else None
     return MagiAttentionMask.from_ranges(
         torch.tensor([[0, full_q_length]], device=device, dtype=torch.int32),
@@ -183,6 +196,7 @@ def _ranges_from_cu_seqlens(
     sequence_length: int | None,
 ) -> torch.Tensor:
     """Convert cumulative sequence lengths to contiguous half-open ranges."""
+    _validate_integer_input(name, cu_seqlens)
     if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
         raise ValueError(f"{name} must have shape [num_sequences + 1], got {tuple(cu_seqlens.shape)}.")
     cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32)
@@ -192,7 +206,16 @@ def _ranges_from_cu_seqlens(
             cu_seqlens[-1:] == sequence_length,
             f"{name} must end at the full sequence length ({sequence_length}).",
         )
+    require_all(cu_seqlens[1:] > cu_seqlens[:-1], f"{name} must be strictly increasing.")
     return torch.stack((cu_seqlens[:-1], cu_seqlens[1:]), dim=1).contiguous()
+
+
+def _validate_integer_input(name: str, tensor: torch.Tensor) -> None:
+    """Require an integer tensor before converting it to the FFA int32 ABI."""
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}.")
+    if tensor.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"{name} must have dtype int32 or int64, got {tensor.dtype}.")
 
 
 def _validate_ranges(q_ranges: torch.Tensor, k_ranges: torch.Tensor) -> None:
