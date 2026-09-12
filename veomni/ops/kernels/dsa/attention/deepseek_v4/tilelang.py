@@ -30,7 +30,8 @@ def wrapper(
     """Sparse MQA. Same face as the eager row.
 
     ``q`` is ``[B, S, H, D]``, ``kv`` is ``[B, S_kv, D]``, ``attn_sink`` is
-    ``[H]``, ``topk_idxs`` is ``[B, S, topk]``.
+    ``[H]``, ``topk_idxs`` is ``[B, S, topk]``. Each valid candidate slot
+    participates independently, including repeated indices.
     """
     from ...vendor.tilelang_sparse_mla import sparse_attn_tilelang
 

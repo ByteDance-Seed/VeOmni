@@ -126,6 +126,43 @@ def test_deepseek_v4_eager_matches_fp32_affine_reference(dtype: torch.dtype):
     torch.testing.assert_close(w_e.grad.float(), w_ref.grad.float(), atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+@pytest.mark.parametrize("variant", ["standard", "qwen3_5", "deepseek_v4"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_weighted_eager_rank_one_matches_reference(variant: str, dtype: torch.dtype):
+    """A single normalized vector keeps a vector-shaped weight gradient."""
+    torch.manual_seed(9)
+    hidden = 64
+    eps = 1e-6
+    x = torch.randn(hidden, dtype=dtype)
+    weight = torch.randn(hidden, dtype=dtype)
+
+    if variant == "deepseek_v4":
+        x_ref, weight_ref = make_grad_leaves(x, weight)
+        out_ref = _deepseek_v4_reference(x_ref, weight_ref, eps)
+    else:
+        module = _hf_rms_norm(variant, hidden, eps).to(dtype=dtype)
+        with torch.no_grad():
+            module.weight.copy_(weight)
+        x_ref = x.detach().requires_grad_(True)
+        weight_ref = module.weight
+        out_ref = module(x_ref)
+
+    x_eager, weight_eager = make_grad_leaves(x, weight)
+    out_eager = resolve_op("rms_norm", variant, "eager").wrapper(x_eager, weight_eager, eps=eps)
+    torch.testing.assert_close(out_eager.float(), out_ref.float(), atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    grad_output = torch.randn_like(out_eager)
+    out_ref.backward(grad_output)
+    out_eager.backward(grad_output)
+
+    assert x_eager.grad.shape == x.shape
+    assert weight_eager.grad.shape == weight.shape
+    torch.testing.assert_close(x_eager.grad.float(), x_ref.grad.float(), atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    torch.testing.assert_close(
+        weight_eager.grad.float(), weight_ref.grad.float(), atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL
+    )
+
+
 def test_deepseek_v4_eager_preserves_fp32_weight_multiply_order():
     generator = torch.Generator().manual_seed(42)
     x = torch.randn(2, 3, 32, generator=generator, dtype=torch.bfloat16)
