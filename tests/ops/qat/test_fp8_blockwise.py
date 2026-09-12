@@ -17,6 +17,7 @@ import torch
 from torch import nn
 
 from tests.ops.qat.reference import reference_act_quant, reference_fp8_weight_quant
+from tests.ops.utils import require_nvidia_cuda
 from veomni.ops.qat import (
     fp8_blockwise,
     fp8_fake_quant_act,
@@ -24,18 +25,10 @@ from veomni.ops.qat import (
     fp8_fake_quant_weight,
     qat_linear,
 )
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
+from veomni.utils.device import get_device_type
 
 
 DEVICE = get_device_type()
-
-
-def _require_tilelang_cuda():
-    pytest.importorskip("tilelang")
-    if torch.version.hip is not None or not IS_CUDA_AVAILABLE:
-        pytest.skip("DeepSeek V4 TileLang kernels require an NVIDIA CUDA GPU")
-    if get_gpu_compute_capability() < 90:
-        pytest.skip("DeepSeek V4 TileLang kernels require SM90 or later")
 
 
 @pytest.fixture
@@ -406,7 +399,7 @@ def test_qat_linear_restores_the_parameter_after_the_call(reference_quantizers):
 
 def test_reference_quantizers_match_the_tilelang_kernels():
     """Pin the torch stand-ins the tests above rely on to the real kernels."""
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.qat.quant import act_quant, fp8_weight_quant
 
     torch.manual_seed(20)
@@ -435,7 +428,7 @@ def test_reference_quantizers_match_the_tilelang_kernels():
 
 
 def test_qat_linear_runs_on_the_tilelang_kernels():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     torch.manual_seed(21)
     linear = nn.Linear(256, 128, bias=False, device=DEVICE, dtype=torch.bfloat16)
     x = torch.randn(8, 256, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)

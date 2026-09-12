@@ -53,6 +53,7 @@ from tests.ops.tol import (
     RMS_UNWEIGHTED_ATOL,
     RMS_UNWEIGHTED_RTOL,
 )
+from tests.ops.utils import make_grad_leaves
 from veomni.ops import resolve_op
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
@@ -63,10 +64,6 @@ def _hf_rms_norm(variant: str, hidden: int, eps: float) -> nn.Module:
     if variant == "qwen3_5":
         return Qwen3_5RMSNorm(hidden, eps=eps)
     raise KeyError(variant)
-
-
-def _clone_inputs(x: Tensor, weight: Tensor) -> tuple[Tensor, Tensor]:
-    return x.detach().requires_grad_(True), weight.detach().requires_grad_(True)
 
 
 def _deepseek_v4_reference(x: Tensor, weight: Tensor, eps: float) -> Tensor:
@@ -98,7 +95,7 @@ def test_eager_matches_hf(variant: str, dtype: torch.dtype):
     x_h = x.detach().requires_grad_(True)
     out_h = module(x_h)
 
-    x_e, w_e = _clone_inputs(x, weight)
+    x_e, w_e = make_grad_leaves(x, weight)
     out_e = resolve_op("rms_norm", variant, "eager").wrapper(x_e, w_e, eps=eps)
     assert torch.allclose(out_e.float(), out_h.float(), atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
@@ -116,9 +113,9 @@ def test_deepseek_v4_eager_matches_fp32_affine_reference(dtype: torch.dtype):
     x = torch.randn(2, 16, 64, dtype=dtype)
     weight = torch.randn(64, dtype=dtype)
 
-    x_ref, w_ref = _clone_inputs(x, weight)
+    x_ref, w_ref = make_grad_leaves(x, weight)
     out_ref = _deepseek_v4_reference(x_ref, w_ref, eps)
-    x_e, w_e = _clone_inputs(x, weight)
+    x_e, w_e = make_grad_leaves(x, weight)
     out_e = resolve_op("rms_norm", "deepseek_v4", "eager").wrapper(x_e, w_e, eps=eps)
 
     torch.testing.assert_close(out_e, out_ref, rtol=0, atol=0)
@@ -189,8 +186,8 @@ def _fused_matches_eager(
     if grad_rtol is None:
         grad_rtol = rtol
 
-    x_e, w_e = _clone_inputs(base_x, base_w)
-    x_o, w_o = _clone_inputs(base_x, base_w)
+    x_e, w_e = make_grad_leaves(base_x, base_w)
+    x_o, w_o = make_grad_leaves(base_x, base_w)
     out_e = eager(x_e, w_e, eps=eps)
     out_o = other(x_o, w_o, eps=eps)
     left, right = (out_e.float(), out_o.float()) if cast_fp32 else (out_e, out_o)

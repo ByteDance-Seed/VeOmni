@@ -17,7 +17,8 @@
 import pytest
 import torch
 
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
+from tests.ops.utils import require_nvidia_cuda
+from veomni.utils.device import get_device_type
 
 
 DEVICE = get_device_type()
@@ -149,14 +150,6 @@ def test_reference_target_all_invalid_compressed_row_is_zero():
     assert torch.allclose(target[0, 1].sum(), torch.ones(()), atol=1e-5)
 
 
-def _require_tilelang_cuda():
-    pytest.importorskip("tilelang")
-    if torch.version.hip is not None or not IS_CUDA_AVAILABLE:
-        pytest.skip("DeepSeek V4 TileLang kernels require an NVIDIA CUDA GPU")
-    if get_gpu_compute_capability() < 90:
-        pytest.skip("DeepSeek V4 TileLang kernels require SM90 or later")
-
-
 @pytest.mark.parametrize("heads", [8, 16, 64])
 @pytest.mark.parametrize("c", [64, 128, 100])
 def test_target_kernel_matches_reference(heads, c):
@@ -173,7 +166,7 @@ def test_target_kernel_matches_reference(heads, c):
     it is the only case that runs the interface's ``-1``-sentinel padding and the
     final ``[:, :, :topk]`` slice that has to hide it again.
     """
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
     from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
 
@@ -210,7 +203,7 @@ def test_target_kernel_matches_reference(heads, c):
 
 
 def test_target_kernel_zeroes_invalid_slots():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
     from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
 
@@ -234,7 +227,7 @@ def test_target_kernel_all_invalid_compressed_row_is_zero():
     compressed row comes back as exact zeros, and the caller's ``clamp_min``
     normalisation leaves it as zeros rather than turning it into a NaN or a
     uniform distribution."""
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
     from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
 
@@ -262,7 +255,7 @@ def test_target_kernel_all_invalid_compressed_row_is_zero():
 
 
 def test_target_kernel_rejects_more_than_64_heads():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 
     q = torch.randn(1, 2, 128, 64, device=DEVICE, dtype=torch.bfloat16)
@@ -278,7 +271,7 @@ def test_target_kernel_rejects_more_than_64_heads():
 def test_target_kernel_rejects_non_bfloat16_inputs():
     """The kernel hardcodes ``dtype = T.bfloat16``; the interface names that
     constraint instead of letting an fp16 caller fall into tilelang's lowering."""
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 
     q = torch.randn(1, 2, 16, 64, device=DEVICE, dtype=torch.bfloat16)
@@ -297,7 +290,7 @@ def test_target_kernel_rejects_empty_kv():
     would clamp to row 0 of a tensor with no rows -- an out-of-bounds device read
     that the candidate mask cannot prevent, since it only zeroes the score after
     the gather. ``sparse_mqa_fwd_interface`` guards this; mirror it here."""
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 
     q = torch.randn(1, 2, 16, 64, device=DEVICE, dtype=torch.bfloat16)
@@ -310,7 +303,7 @@ def test_target_kernel_rejects_empty_kv():
 
 
 def test_sparse_attn_returns_non_differentiable_lse():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops import VeomniOp
 
     sparse_attn_tilelang = VeomniOp("dsa_attention", "deepseek_v4", "tilelang")

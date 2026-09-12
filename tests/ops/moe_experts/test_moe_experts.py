@@ -49,6 +49,7 @@ from tests.ops.tol import (
     MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
     MOE_SPLIT_MERGED_GRAD_HIDDEN_RTOL,
 )
+from tests.ops.utils import make_grad_leaf
 from veomni.ops import resolve_op
 from veomni.ops.kernels.moe_experts.shared.indices import build_moe_indices
 from veomni.ops.kernels.moe_experts.standard.npu import _fc1_weight
@@ -58,10 +59,6 @@ from veomni.utils.import_utils import is_fused_moe_available, is_quack_gemm_avai
 
 def _empty(device: torch.device | str, dtype: torch.dtype = torch.float32) -> Tensor:
     return torch.empty(0, device=device, dtype=dtype)
-
-
-def _clone(tensor: Tensor) -> Tensor:
-    return tensor.detach().requires_grad_(True)
 
 
 def _route(num_tokens: int, num_experts: int, top_k: int, device: torch.device | str, dtype: torch.dtype):
@@ -185,10 +182,10 @@ def test_standard_eager_matches_hf_qwen3_moe_experts():
     gate_up = torch.cat([fc1_1, fc1_2], dim=1).contiguous()
     fc2 = torch.randn(num_experts, hidden_dim, ffn_dim)
 
-    hidden_h, routing_h, gu_h, fc2_h = map(_clone, (hidden, routing, gate_up, fc2))
+    hidden_h, routing_h, gu_h, fc2_h = map(make_grad_leaf, (hidden, routing, gate_up, fc2))
     out_h, experts_h = _qwen3_moe_hf_experts(hidden_h, routing_h, selected, gu_h, fc2_h, num_experts=num_experts)
 
-    hidden_e, routing_e, gu_e, fc2_e = map(_clone, (hidden, routing, gate_up, fc2))
+    hidden_e, routing_e, gu_e, fc2_e = map(make_grad_leaf, (hidden, routing, gate_up, fc2))
     out_e = resolve_op("moe_experts", "standard", "eager").wrapper(
         hidden_e,
         routing_e,
@@ -221,10 +218,10 @@ def test_eager_matches_fused_reference():
     fc1_2 = torch.randn(num_experts, ffn_dim, hidden_dim)
     fc2 = torch.randn(num_experts, hidden_dim, ffn_dim)
 
-    hidden_h, routing_h, fc1_1_h, fc1_2_h, fc2_h = map(_clone, (hidden, routing, fc1_1, fc1_2, fc2))
+    hidden_h, routing_h, fc1_1_h, fc1_2_h, fc2_h = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
     out_h = _standard_fused_ref(hidden_h, routing_h, selected, fc1_1_h, fc1_2_h, fc2_h, num_experts=num_experts)
 
-    hidden_e, routing_e, fc1_1_e, fc1_2_e, fc2_e = map(_clone, (hidden, routing, fc1_1, fc1_2, fc2))
+    hidden_e, routing_e, fc1_1_e, fc1_2_e, fc2_e = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
     out_e = resolve_op("moe_experts", "standard", "eager").wrapper(
         hidden_e,
         routing_e,
@@ -258,12 +255,12 @@ def test_eager_merged_matches_split():
     fc2 = torch.randn(num_experts, hidden_dim, ffn_dim)
     wrapper = resolve_op("moe_experts", "standard", "eager").wrapper
 
-    hidden_s, routing_s, fc1_1_s, fc1_2_s, fc2_s = map(_clone, (hidden, routing, fc1_1, fc1_2, fc2))
+    hidden_s, routing_s, fc1_1_s, fc1_2_s, fc2_s = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
     out_s = wrapper(
         hidden_s, routing_s, selected, fc1_1_s, fc1_2_s, fc2_s, _empty(hidden.device), num_experts=num_experts
     )
 
-    hidden_m, routing_m, fc1_12_m, fc2_m = map(_clone, (hidden, routing, fc1_12, fc2))
+    hidden_m, routing_m, fc1_12_m, fc2_m = map(make_grad_leaf, (hidden, routing, fc1_12, fc2))
     out_m = wrapper(
         hidden_m,
         routing_m,
@@ -322,7 +319,9 @@ def test_gpt_oss_eager_matches_hf_loop():
     down_b = torch.randn(num_experts, hidden_dim)
     alpha, limit = 1.702, 7.0
 
-    hidden_h, routing_h, gu_h, gub_h, dn_h, dnb_h = map(_clone, (hidden, routing, gate_up, gate_up_b, down, down_b))
+    hidden_h, routing_h, gu_h, gub_h, dn_h, dnb_h = map(
+        make_grad_leaf, (hidden, routing, gate_up, gate_up_b, down, down_b)
+    )
     out_h, experts_h = _gpt_oss_hf_loop(
         hidden_h,
         routing_h,
@@ -336,7 +335,9 @@ def test_gpt_oss_eager_matches_hf_loop():
         limit=limit,
     )
 
-    hidden_e, routing_e, gu_e, gub_e, dn_e, dnb_e = map(_clone, (hidden, routing, gate_up, gate_up_b, down, down_b))
+    hidden_e, routing_e, gu_e, gub_e, dn_e, dnb_e = map(
+        make_grad_leaf, (hidden, routing, gate_up, gate_up_b, down, down_b)
+    )
     out_e = resolve_op("moe_experts", "gpt_oss", "eager").wrapper(
         hidden_e, routing_e, selected, gu_e, gub_e, dn_e, dnb_e, num_experts=num_experts, alpha=alpha, limit=limit
     )
@@ -387,13 +388,13 @@ def _run_fused_vs_eager(
     other = resolve_op("moe_experts", "standard", impl).wrapper
     kwargs = {"num_experts": num_experts, "swiglu_limit": swiglu_limit}
     if merged:
-        hidden_e, routing_e, fc1_12_e, fc2_e = map(_clone, (hidden, routing, fc1_12, fc2))
-        hidden_o, routing_o, fc1_12_o, fc2_o = map(_clone, (hidden, routing, fc1_12, fc2))
+        hidden_e, routing_e, fc1_12_e, fc2_e = map(make_grad_leaf, (hidden, routing, fc1_12, fc2))
+        hidden_o, routing_o, fc1_12_o, fc2_o = map(make_grad_leaf, (hidden, routing, fc1_12, fc2))
         out_e = eager(hidden_e, routing_e, selected, empty, empty, fc2_e, fc1_12_e, **kwargs)
         out_o = other(hidden_o, routing_o, selected, empty, empty, fc2_o, fc1_12_o, **kwargs)
     else:
-        hidden_e, routing_e, fc1_1_e, fc1_2_e, fc2_e = map(_clone, (hidden, routing, fc1_1, fc1_2, fc2))
-        hidden_o, routing_o, fc1_1_o, fc1_2_o, fc2_o = map(_clone, (hidden, routing, fc1_1, fc1_2, fc2))
+        hidden_e, routing_e, fc1_1_e, fc1_2_e, fc2_e = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
+        hidden_o, routing_o, fc1_1_o, fc1_2_o, fc2_o = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
         out_e = eager(hidden_e, routing_e, selected, fc1_1_e, fc1_2_e, fc2_e, empty, **kwargs)
         out_o = other(hidden_o, routing_o, selected, fc1_1_o, fc1_2_o, fc2_o, empty, **kwargs)
     if swiglu_limit is not None:
@@ -449,9 +450,9 @@ def _run_fused_three_way(
     eager = resolve_op("moe_experts", "standard", "eager").wrapper
     kwargs = {"num_experts": num_experts, "swiglu_limit": swiglu_limit}
 
-    hidden_s, routing_s, fc1_1_s, fc1_2_s, fc2_s = map(_clone, (hidden, routing, fc1_1, fc1_2, fc2))
-    hidden_m, routing_m, fc1_12_m, fc2_m = map(_clone, (hidden, routing, fc1_12, fc2))
-    hidden_e, routing_e, fc1_1_e, fc1_2_e, fc2_e = map(_clone, (hidden, routing, fc1_1, fc1_2, fc2))
+    hidden_s, routing_s, fc1_1_s, fc1_2_s, fc2_s = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
+    hidden_m, routing_m, fc1_12_m, fc2_m = map(make_grad_leaf, (hidden, routing, fc1_12, fc2))
+    hidden_e, routing_e, fc1_1_e, fc1_2_e, fc2_e = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
     out_s = fused(hidden_s, routing_s, selected, fc1_1_s, fc1_2_s, fc2_s, empty, **kwargs)
     out_m = fused(hidden_m, routing_m, selected, empty, empty, fc2_m, fc1_12_m, **kwargs)
     out_e = eager(hidden_e, routing_e, selected, fc1_1_e, fc1_2_e, fc2_e, empty, **kwargs)
@@ -568,8 +569,12 @@ def test_gpt_oss_quack_matches_eager():
     down_b = 0.1 * torch.randn(num_experts, hidden_dim, device=device, dtype=dtype)
     eager = resolve_op("moe_experts", "gpt_oss", "eager").wrapper
     other = resolve_op("moe_experts", "gpt_oss", "fused_quack").wrapper
-    hidden_e, routing_e, gu_e, gub_e, dn_e, dnb_e = map(_clone, (hidden, routing, gate_up, gate_up_b, down, down_b))
-    hidden_o, routing_o, gu_o, gub_o, dn_o, dnb_o = map(_clone, (hidden, routing, gate_up, gate_up_b, down, down_b))
+    hidden_e, routing_e, gu_e, gub_e, dn_e, dnb_e = map(
+        make_grad_leaf, (hidden, routing, gate_up, gate_up_b, down, down_b)
+    )
+    hidden_o, routing_o, gu_o, gub_o, dn_o, dnb_o = map(
+        make_grad_leaf, (hidden, routing, gate_up, gate_up_b, down, down_b)
+    )
     kwargs = {"num_experts": num_experts, "alpha": 1.702, "limit": 7.0}
     out_e = eager(hidden_e, routing_e, selected, gu_e, gub_e, dn_e, dnb_e, **kwargs)
     out_o = other(hidden_o, routing_o, selected, gu_o, gub_o, dn_o, dnb_o, **kwargs)

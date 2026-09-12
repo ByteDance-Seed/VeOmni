@@ -18,22 +18,15 @@ import pytest
 import torch
 
 from tests.ops.qat.reference import reference_act_quant, reference_fp8_weight_quant
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
+from tests.ops.utils import require_nvidia_cuda
+from veomni.utils.device import get_device_type
 
 
 DEVICE = get_device_type()
 
 
-def _require_tilelang_cuda():
-    pytest.importorskip("tilelang")
-    if torch.version.hip is not None or not IS_CUDA_AVAILABLE:
-        pytest.skip("DeepSeek V4 TileLang kernels require an NVIDIA CUDA GPU")
-    if get_gpu_compute_capability() < 90:
-        pytest.skip("DeepSeek V4 TileLang kernels require SM90 or later")
-
-
 def test_tilelang_act_quant_shapes_scales_and_dequant():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.qat.quant import act_quant
 
     torch.manual_seed(2)
@@ -72,7 +65,7 @@ def test_tilelang_act_quant_shapes_scales_and_dequant():
 
 
 def test_tilelang_act_quant_dequant_fuses_the_round_trip():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.qat.quant import act_quant
 
     torch.manual_seed(2)
@@ -124,7 +117,7 @@ def _tiles_above_amax_floor():
 
 
 def test_tilelang_fp8_weight_quant_matches_reference():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.qat.quant import fp8_weight_quant
 
     x = _weight_quant_test_input()
@@ -152,7 +145,7 @@ def test_tilelang_fp8_weight_quant_matches_reference():
 
 
 def test_tilelang_fp8_weight_quant_round_trip_and_non_contiguous_input():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.qat.quant import fp8_weight_quant
 
     x = _weight_quant_test_input()
@@ -174,7 +167,7 @@ def test_tilelang_fp8_weight_quant_round_trip_and_non_contiguous_input():
 
 
 def test_tilelang_fp8_weight_quant_ue8m0_matches_reference():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.qat.quant import fp8_weight_quant
 
     x = _weight_quant_test_input()
@@ -206,7 +199,7 @@ def test_tilelang_fp8_weight_quant_ue8m0_matches_reference():
 
 def test_tilelang_fp8_weight_quant_scale_fmt_and_scale_dtype_are_orthogonal():
     """scale_fmt decides how the scale is computed, scale_dtype only how it is stored."""
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.qat.quant import fp8_weight_quant
 
     x = _weight_quant_test_input()
@@ -226,7 +219,7 @@ def test_tilelang_fp8_weight_quant_scale_fmt_and_scale_dtype_are_orthogonal():
 
 def test_tilelang_fp8_weight_quant_ue8m0_keeps_exact_power_of_two_scale():
     """An amax that already divides to a power of two must not gain a binade."""
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.qat.quant import fp8_weight_quant
 
     x = torch.zeros(128, 128, device=DEVICE, dtype=torch.bfloat16)
@@ -239,7 +232,7 @@ def test_tilelang_fp8_weight_quant_ue8m0_keeps_exact_power_of_two_scale():
 
 
 def test_tilelang_fp8_weight_quant_ue8m0_round_trip():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.qat.quant import fp8_weight_quant
 
     x = _weight_quant_test_input()
@@ -255,7 +248,7 @@ def test_tilelang_fp8_weight_quant_ue8m0_round_trip():
 
 
 def test_tilelang_fp8_weight_quant_dequant_fuses_the_round_trip():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.qat.quant import fp8_weight_quant
 
     x = _weight_quant_test_input()
@@ -282,7 +275,7 @@ def test_tilelang_fp8_weight_quant_dequant_fuses_the_round_trip():
 
 
 def test_tilelang_fp8_weight_quant_rejects_unsupported_inputs():
-    _require_tilelang_cuda()
+    require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.qat.quant import fp8_weight_quant
 
     with pytest.raises(AssertionError, match="2D weight"):

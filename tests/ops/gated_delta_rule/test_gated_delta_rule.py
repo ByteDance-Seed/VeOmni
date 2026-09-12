@@ -42,13 +42,10 @@ from tests.ops.tol import (
     GDN_NPU_ATOL,
     GDN_NPU_RTOL,
 )
+from tests.ops.utils import is_nvidia_cuda_available, make_grad_leaves
 from veomni.ops import resolve_op
 from veomni.ops.registry import OpEntry
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
-
-
-def _clone(*tensors: Tensor) -> tuple[Tensor, ...]:
-    return tuple(t.detach().requires_grad_(True) for t in tensors)
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE
 
 
 _FLA_DEVICE_CASES = (
@@ -82,10 +79,10 @@ def test_rms_norm_gated_eager_matches_hf():
     with torch.no_grad():
         module.weight.copy_(weight)
 
-    x_h, g_h = _clone(x, gate)
+    x_h, g_h = make_grad_leaves(x, gate)
     out_h = module(x_h, g_h)
 
-    x_e, g_e, w_e = _clone(x, gate, weight)
+    x_e, g_e, w_e = make_grad_leaves(x, gate, weight)
     out_e = resolve_op("rms_norm_gated", "standard", "eager").wrapper(x_e, g_e, w_e, eps=eps)
     assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
@@ -108,8 +105,8 @@ def test_rms_norm_gated_fla_matches_eager(device):
     gate = torch.randn(2, 16, hidden, device=device, dtype=torch.bfloat16)
     weight = torch.randn(hidden, device=device, dtype=torch.bfloat16)
 
-    x_e, g_e, w_e = _clone(x, gate, weight)
-    x_o, g_o, w_o = _clone(x, gate, weight)
+    x_e, g_e, w_e = make_grad_leaves(x, gate, weight)
+    x_o, g_o, w_o = make_grad_leaves(x, gate, weight)
     out_e = eager(x_e, g_e, w_e, eps=1e-6)
     out_o = other(x_o, g_o, w_o, eps=1e-6)
     assert torch.allclose(out_e, out_o, atol=GDN_FUSED_ATOL, rtol=GDN_FUSED_RTOL)
@@ -132,8 +129,8 @@ def test_rms_norm_gated_npu_matches_eager(shape):
     gate = torch.randn_like(x)
     weight = torch.randn(shape[-1], device="npu", dtype=torch.bfloat16)
 
-    x_e, g_e, w_e = _clone(x, gate, weight)
-    x_o, g_o, w_o = _clone(x, gate, weight)
+    x_e, g_e, w_e = make_grad_leaves(x, gate, weight)
+    x_o, g_o, w_o = make_grad_leaves(x, gate, weight)
     out_e = eager(x_e, g_e, w_e, eps=1e-6)
     out_o = other(x_o, g_o, w_o, eps=1e-6)
     assert out_o.shape == x.shape
@@ -206,10 +203,10 @@ def test_causal_conv1d_eager_matches_hf():
     weight = torch.randn(dim, kernel, dtype=torch.float32)
     bias = torch.randn(dim, dtype=torch.float32)
 
-    x_e, w_e, b_e = _clone(x, weight, bias)
+    x_e, w_e, b_e = make_grad_leaves(x, weight, bias)
     out_e = resolve_op("causal_conv1d", "standard", "eager").wrapper(x_e, w_e, b_e, activation="silu")
 
-    x_r, w_r, b_r = _clone(x, weight, bias)
+    x_r, w_r, b_r = make_grad_leaves(x, weight, bias)
     out_r = _hf_qwen3_5_prefill_causal_conv1d(x_r, w_r, b_r, kernel_size=kernel)
     assert torch.allclose(out_e, out_r, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
@@ -232,8 +229,8 @@ def test_causal_conv1d_fla_matches_eager(device):
     weight = torch.randn(dim, kernel, device=device, dtype=torch.bfloat16)
     bias = torch.randn(dim, device=device, dtype=torch.bfloat16)
 
-    x_e, w_e, b_e = _clone(x, weight, bias)
-    x_o, w_o, b_o = _clone(x, weight, bias)
+    x_e, w_e, b_e = make_grad_leaves(x, weight, bias)
+    x_o, w_o, b_o = make_grad_leaves(x, weight, bias)
     out_e = eager(x_e, w_e, b_e, activation="silu")
     out_o = other(x_o, w_o, b_o, activation="silu")
     assert torch.allclose(out_e, out_o, atol=GDN_FUSED_ATOL, rtol=GDN_FUSED_RTOL)
@@ -262,8 +259,8 @@ def test_causal_conv1d_npu_matches_eager_forward_and_backward():
     weight = torch.randn(dim, kernel, device="npu", dtype=torch.bfloat16)
     bias = torch.randn(dim, device="npu", dtype=torch.bfloat16)
 
-    x_e, w_e, b_e = _clone(x, weight, bias)
-    x_o, w_o, b_o = _clone(x, weight, bias)
+    x_e, w_e, b_e = make_grad_leaves(x, weight, bias)
+    x_o, w_o, b_o = make_grad_leaves(x, weight, bias)
     out_e = eager(x_e, w_e, b_e, activation="silu")
     out_o = other(x_o, w_o, b_o, activation="silu")
     torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
@@ -289,7 +286,7 @@ def test_chunk_gated_delta_rule_eager_matches_hf():
     g = -torch.rand(batch, seq, heads, dtype=torch.float32) * 0.5
     beta = torch.rand(batch, seq, heads, dtype=torch.float32)
 
-    q_h, k_h, v_h, g_h, b_h = _clone(q, k, v, g, beta)
+    q_h, k_h, v_h, g_h, b_h = make_grad_leaves(q, k, v, g, beta)
     out_h, _ = torch_chunk_gated_delta_rule(
         q_h,
         k_h,
@@ -300,7 +297,7 @@ def test_chunk_gated_delta_rule_eager_matches_hf():
         use_qk_l2norm_in_kernel=True,
     )
 
-    q_e, k_e, v_e, g_e, b_e = _clone(q, k, v, g, beta)
+    q_e, k_e, v_e, g_e, b_e = make_grad_leaves(q, k, v, g, beta)
     out_e, _ = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper(
         q_e,
         k_e,
@@ -336,10 +333,10 @@ def test_chunk_gated_delta_rule_eager_uses_explicit_scale():
     default_scale = dim**-0.5
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
 
-    q_e, k_e, v_e, g_e, b_e = _clone(*tensors)
+    q_e, k_e, v_e, g_e, b_e = make_grad_leaves(*tensors)
     out_e, _ = eager(q_e, k_e, v_e, g_e, b_e, chunk_size=8, scale=explicit_scale)
 
-    q_r, k_r, v_r, g_r, b_r = _clone(*tensors)
+    q_r, k_r, v_r, g_r, b_r = make_grad_leaves(*tensors)
     out_r, _ = eager(q_r * (explicit_scale / default_scale), k_r, v_r, g_r, b_r, chunk_size=8)
     assert torch.allclose(out_e, out_r, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
@@ -475,8 +472,8 @@ def test_chunk_gated_delta_rule_fla_matches_eager(device):
     g = -torch.rand(batch, seq, heads, device=device, dtype=torch.float32) * 0.5
     beta = torch.rand(batch, seq, heads, device=device, dtype=torch.bfloat16)
 
-    q_e, k_e, v_e, g_e, b_e = _clone(q, k, v, g, beta)
-    q_o, k_o, v_o, g_o, b_o = _clone(q, k, v, g, beta)
+    q_e, k_e, v_e, g_e, b_e = make_grad_leaves(q, k, v, g, beta)
+    q_o, k_o, v_o, g_o, b_o = make_grad_leaves(q, k, v, g, beta)
     # FLA ignores ``chunk_size``. Compare at the vendor / eager default (64).
     out_e, _ = eager(
         q_e,
@@ -522,8 +519,8 @@ def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl):
     g = -torch.rand(batch, seq, heads, device="npu", dtype=torch.float32) * 0.5
     beta = torch.rand(batch, seq, heads, device="npu", dtype=torch.bfloat16)
 
-    q_e, k_e, v_e, g_e, b_e = _clone(q, k, v, g, beta)
-    q_o, k_o, v_o, g_o, b_o = _clone(q, k, v, g, beta)
+    q_e, k_e, v_e, g_e, b_e = make_grad_leaves(q, k, v, g, beta)
+    q_o, k_o, v_o, g_o, b_o = make_grad_leaves(q, k, v, g, beta)
     out_e, _ = eager(q_e, k_e, v_e, g_e, b_e, use_qk_l2norm_in_kernel=True)
     out_o, _ = other(q_o, k_o, v_o, g_o, b_o, use_qk_l2norm_in_kernel=True)
     torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
@@ -541,7 +538,7 @@ def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl):
 
 
 @pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or torch.version.hip is not None or not 90 <= get_gpu_compute_capability() <= 100,
+    not is_nvidia_cuda_available(min_cc=90, max_cc=100),
     reason="flash_qla requires an NVIDIA GPU from SM90 through SM100",
 )
 def test_chunk_gated_delta_rule_flash_qla_matches_fla():
@@ -562,7 +559,7 @@ def test_chunk_gated_delta_rule_flash_qla_matches_fla():
 
 
 @pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or torch.version.hip is not None or not 90 <= get_gpu_compute_capability() <= 100,
+    not is_nvidia_cuda_available(min_cc=90, max_cc=100),
     reason="flash_qla requires an NVIDIA GPU from SM90 through SM100",
 )
 def test_chunk_gated_delta_rule_flash_qla_matches_eager():
@@ -577,8 +574,8 @@ def test_chunk_gated_delta_rule_flash_qla_matches_eager():
     g = -torch.rand(batch, seq, heads, device="cuda", dtype=torch.float32) * 0.5
     beta = torch.rand(batch, seq, heads, device="cuda", dtype=torch.bfloat16)
 
-    q_e, k_e, v_e, g_e, b_e = _clone(q, k, v, g, beta)
-    q_o, k_o, v_o, g_o, b_o = _clone(q, k, v, g, beta)
+    q_e, k_e, v_e, g_e, b_e = make_grad_leaves(q, k, v, g, beta)
+    q_o, k_o, v_o, g_o, b_o = make_grad_leaves(q, k, v, g, beta)
     # FlashQLA ignores ``chunk_size``. Compare at the vendor / eager default (64).
     out_e, _ = eager(q_e, k_e, v_e, g_e, b_e, use_qk_l2norm_in_kernel=True)
     out_o, _ = other(q_o, k_o, v_o, g_o, b_o, use_qk_l2norm_in_kernel=True)

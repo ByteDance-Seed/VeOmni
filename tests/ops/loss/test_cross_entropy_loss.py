@@ -32,6 +32,7 @@ from tests.ops.tol import (
     EAGER_GRAD_RTOL,
     EAGER_RTOL,
 )
+from tests.ops.utils import make_grad_leaf
 from veomni.ops import resolve_op
 from veomni.utils.device import IS_CUDA_AVAILABLE
 
@@ -40,20 +41,16 @@ def _empty_weight(device: torch.device | str) -> Tensor:
     return torch.empty(0, device=device)
 
 
-def _clone(tensor: Tensor) -> Tensor:
-    return tensor.detach().requires_grad_(True)
-
-
 def test_eager_matches_hf_logits():
     torch.manual_seed(0)
     logits = torch.randn(8, 16, dtype=torch.float32)
     labels = torch.randint(0, 16, (8,))
     labels[0] = -100
 
-    logits_h = _clone(logits)
+    logits_h = make_grad_leaf(logits)
     out_h = fixed_cross_entropy(logits_h, labels)
 
-    logits_e = _clone(logits)
+    logits_e = make_grad_leaf(logits)
     out_e = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(
         logits_e, labels, _empty_weight(logits.device)
     )
@@ -71,10 +68,10 @@ def test_eager_matches_hf_hidden_weight():
     labels = torch.randint(0, 16, (4, 8))
     labels[:, 0] = -100
 
-    hidden_h, weight_h = _clone(hidden), _clone(weight)
+    hidden_h, weight_h = make_grad_leaf(hidden), make_grad_leaf(weight)
     out_h = fixed_cross_entropy(F.linear(hidden_h.reshape(-1, 32), weight_h), labels.reshape(-1))
 
-    hidden_e, weight_e = _clone(hidden), _clone(weight)
+    hidden_e, weight_e = make_grad_leaf(hidden), make_grad_leaf(weight)
     out_e = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(hidden_e, labels, weight_e)
     assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
@@ -90,9 +87,9 @@ def test_eager_matches_hf_num_items():
     labels = torch.randint(0, 7, (10,))
     num_items = 6
 
-    logits_h = _clone(logits)
+    logits_h = make_grad_leaf(logits)
     out_h = fixed_cross_entropy(logits_h, labels, num_items_in_batch=num_items)
-    logits_e = _clone(logits)
+    logits_e = make_grad_leaf(logits)
     out_e = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(
         logits_e, labels, _empty_weight(logits.device), num_items_in_batch=num_items
     )
@@ -112,8 +109,8 @@ def test_chunk_loss_matches_eager_with_uneven_valid_tokens():
     labels = torch.randint(0, 8, (2, 20))
     labels.reshape(-1)[[0, 1, 2, 7, 8, 20, 27, 28, 29, 30]] = -100
 
-    hidden_e, weight_e = _clone(hidden), _clone(weight)
-    hidden_o, weight_o = _clone(hidden), _clone(weight)
+    hidden_e, weight_e = make_grad_leaf(hidden), make_grad_leaf(weight)
+    hidden_o, weight_o = make_grad_leaf(hidden), make_grad_leaf(weight)
     out_e = eager(hidden_e, labels, weight_e)
     out_o = other(hidden_o, labels, weight_o, chunk_size=7)
     assert torch.allclose(out_e, out_o, atol=EAGER_ATOL, rtol=EAGER_RTOL)

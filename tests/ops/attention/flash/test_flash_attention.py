@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tests.ops.attention.utils import UlyssesHelperRecorder
 from tests.ops.tol import ATTN_ATOL, ATTN_GRAD_ATOL, ATTN_GRAD_RTOL, ATTN_RTOL
 from veomni.ops import resolve_op
 from veomni.ops.kernels.attention.standard import flash as flash_backend
@@ -156,29 +157,17 @@ def test_flash_attention_preserves_layout_and_backend_contract(monkeypatch, impl
 def test_flash_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
     group = object()
     state = SimpleNamespace(ulysses_group=group, ulysses_size=2)
-    calls = []
-
-    def fake_prepare(query, key, value, *, group, ulysses_size):
-        calls.append(("prepare", query, key, value, group, ulysses_size))
-        return query[:, :, :2], key[:, :, :1], value[:, :, :1], 4
-
-    def fake_slice(auxiliary, *, query_head_count, local_query_head_count, group):
-        calls.append(("slice", auxiliary, query_head_count, local_query_head_count, group))
-        return auxiliary[:local_query_head_count]
-
-    def fake_restore(output, *, group):
-        calls.append(("restore", output, group))
-        return output
+    recorder = UlyssesHelperRecorder()
 
     def fake_flash(query, key, value, attention_mask, **kwargs):
-        calls.append(("backend", query, key, value, attention_mask, kwargs))
+        recorder.calls.append(("backend", query, key, value, attention_mask, kwargs))
         return query
 
     monkeypatch.setattr(flash_backend, "get_parallel_state", lambda: state)
     monkeypatch.setattr(flash_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
-    monkeypatch.setattr(flash_backend, "prepare_ulysses_qkv", fake_prepare)
-    monkeypatch.setattr(flash_backend, "slice_ulysses_head_auxiliary", fake_slice)
-    monkeypatch.setattr(flash_backend, "restore_ulysses_output", fake_restore)
+    monkeypatch.setattr(flash_backend, "prepare_ulysses_qkv", recorder.prepare)
+    monkeypatch.setattr(flash_backend, "slice_ulysses_head_auxiliary", recorder.slice_auxiliary)
+    monkeypatch.setattr(flash_backend, "restore_ulysses_output", recorder.restore)
     monkeypatch.setattr(flash_backend, "_flash_attention_forward", fake_flash)
     query = torch.randn(1, 4, 5, 8, dtype=torch.float16)
     auxiliary = torch.arange(4, dtype=torch.float16)
@@ -192,10 +181,10 @@ def test_flash_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch)
         s_aux=auxiliary,
     )
 
-    assert [call[0] for call in calls] == ["prepare", "slice", "backend", "restore"]
-    assert calls[0][1].shape == (1, 5, 4, 8)
-    assert calls[0][4:] == (group, 2)
-    torch.testing.assert_close(calls[2][-1]["s_aux"], auxiliary[:2])
+    assert [call[0] for call in recorder.calls] == ["prepare", "slice", "backend", "restore"]
+    assert recorder.calls[0][1].shape == (1, 5, 4, 8)
+    assert recorder.calls[0][4:] == (group, 2)
+    torch.testing.assert_close(recorder.calls[2][-1]["s_aux"], auxiliary[:2])
     assert output.shape == (1, 5, 2, 8)
 
 

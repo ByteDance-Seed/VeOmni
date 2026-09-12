@@ -25,6 +25,7 @@ from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask
 
 from tests.ops.attention.attention_cases import clone_qkv, dense_mask, flex_mask, math_sdpa_reference
+from tests.ops.attention.utils import UlyssesHelperRecorder
 from tests.ops.tol import ATTN_ATOL, ATTN_BF16_GRAD_ATOL, ATTN_GRAD_ATOL, ATTN_GRAD_RTOL, ATTN_RTOL
 from veomni.ops.kernels.attention.standard import flex as flex_backend
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
@@ -198,30 +199,18 @@ def test_flex_attention_accepts_sliding_window_metadata_with_block_mask(monkeypa
 def test_flex_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
     group = object()
     state = SimpleNamespace(ulysses_group=group, ulysses_size=2)
-    calls = []
-
-    def fake_prepare(query, key, value, *, group, ulysses_size):
-        calls.append(("prepare", query, key, value, group, ulysses_size))
-        return query[:, :, :2], key[:, :, :1], value[:, :, :1], 4
-
-    def fake_slice(auxiliary, *, query_head_count, local_query_head_count, group):
-        calls.append(("slice", auxiliary, query_head_count, local_query_head_count, group))
-        return auxiliary[:local_query_head_count]
+    recorder = UlyssesHelperRecorder()
 
     def fake_backend(module, query, key, value, attention_mask, **kwargs):
-        calls.append(("backend", query, key, value, attention_mask, kwargs))
+        recorder.calls.append(("backend", query, key, value, attention_mask, kwargs))
         return query.transpose(1, 2), torch.ones(query.shape[:3])
-
-    def fake_restore(output, *, group):
-        calls.append(("restore", output, group))
-        return output
 
     monkeypatch.setattr(flex_backend, "get_parallel_state", lambda: state)
     monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
-    monkeypatch.setattr(flex_backend, "prepare_ulysses_qkv", fake_prepare)
-    monkeypatch.setattr(flex_backend, "slice_ulysses_head_auxiliary", fake_slice)
+    monkeypatch.setattr(flex_backend, "prepare_ulysses_qkv", recorder.prepare)
+    monkeypatch.setattr(flex_backend, "slice_ulysses_head_auxiliary", recorder.slice_auxiliary)
     monkeypatch.setattr(flex_backend, "hf_flex_attention_forward", fake_backend)
-    monkeypatch.setattr(flex_backend, "restore_ulysses_output", fake_restore)
+    monkeypatch.setattr(flex_backend, "restore_ulysses_output", recorder.restore)
     query = torch.randn(1, 4, 8, 8)
     key = torch.randn(1, 2, 8, 8)
     value = torch.randn(1, 2, 8, 8)
@@ -236,10 +225,10 @@ def test_flex_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
         s_aux=auxiliary,
     )
 
-    assert [call[0] for call in calls] == ["prepare", "slice", "backend", "restore", "restore"]
-    assert calls[0][1].shape == (1, 8, 4, 8)
-    assert calls[0][4:] == (group, 2)
-    torch.testing.assert_close(calls[2][-1]["s_aux"], auxiliary[:2])
+    assert [call[0] for call in recorder.calls] == ["prepare", "slice", "backend", "restore", "restore"]
+    assert recorder.calls[0][1].shape == (1, 8, 4, 8)
+    assert recorder.calls[0][4:] == (group, 2)
+    torch.testing.assert_close(recorder.calls[2][-1]["s_aux"], auxiliary[:2])
     assert output.shape == (1, 8, 2, 8)
     assert lse.shape == (1, 2, 8)
 
