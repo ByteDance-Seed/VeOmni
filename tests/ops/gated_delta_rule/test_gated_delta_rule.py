@@ -541,7 +541,7 @@ def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl):
 
 
 @pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not 90 <= get_gpu_compute_capability() <= 100,
+    not IS_CUDA_AVAILABLE or torch.version.hip is not None or not 90 <= get_gpu_compute_capability() <= 100,
     reason="flash_qla requires an NVIDIA GPU from SM90 through SM100",
 )
 def test_chunk_gated_delta_rule_flash_qla_matches_fla():
@@ -562,7 +562,7 @@ def test_chunk_gated_delta_rule_flash_qla_matches_fla():
 
 
 @pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not 90 <= get_gpu_compute_capability() <= 100,
+    not IS_CUDA_AVAILABLE or torch.version.hip is not None or not 90 <= get_gpu_compute_capability() <= 100,
     reason="flash_qla requires an NVIDIA GPU from SM90 through SM100",
 )
 def test_chunk_gated_delta_rule_flash_qla_matches_eager():

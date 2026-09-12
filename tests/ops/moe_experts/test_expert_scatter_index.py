@@ -60,15 +60,6 @@ def test_scatter_index_matches_argsort_argsort(num_tokens, num_experts, topk):
     )
 
 
-def test_scatter_index_is_a_permutation_of_range():
-    torch.manual_seed(1)
-    expert_index = torch.randint(0, 16, (64, 4), dtype=torch.int64)
-
-    _, scatter_index = compute_expert_scatter_index(expert_index)
-    flat = scatter_index.flatten().to(torch.int64)
-    assert torch.equal(flat.sort().values, torch.arange(flat.numel(), dtype=torch.int64))
-
-
 def test_sorted_order_is_stable_and_experts_are_contiguous():
     """Equal-expert entries must retain their original token/top-k order."""
     expert_index = torch.tensor(

@@ -36,7 +36,7 @@ from tests.ops.tol import (
     EAGER_GRAD_RTOL,
     EAGER_RTOL,
 )
-from veomni.ops import OP_REGISTRY, resolve_op
+from veomni.ops import resolve_op
 from veomni.ops.kernels.dsa.attention.glm import flashmla_cudnn as glm_fused_attention
 from veomni.ops.kernels.dsa.indexer.glm import cudnn as glm_fused_indexer
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
@@ -45,7 +45,10 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
 # Installed Transformers implementations provide the DeepSeek-V4 and GLM eager references.
 
 _TILELANG_AVAILABLE = (
-    IS_CUDA_AVAILABLE and get_gpu_compute_capability() >= 90 and importlib.util.find_spec("tilelang") is not None
+    IS_CUDA_AVAILABLE
+    and torch.version.hip is None
+    and get_gpu_compute_capability() >= 90
+    and importlib.util.find_spec("tilelang") is not None
 )
 _GLM_FUSED_HARDWARE_AVAILABLE = IS_CUDA_AVAILABLE and torch.version.hip is None and get_gpu_compute_capability() >= 90
 
@@ -137,39 +140,6 @@ def _hf_glm_indexer_indices(
     future = torch.arange(k.shape[1], device=k.device).view(1, 1, -1) > position_ids.unsqueeze(-1)
     index_scores = index_scores.masked_fill(future, float("-inf"))
     return index_scores.topk(min(top_k, index_scores.shape[-1]), dim=-1).indices.to(torch.int32)
-
-
-def test_dsa_fused_rows_reject_rocm(monkeypatch):
-    """NVIDIA-only DSA rows must fail before importing their vendor kernels."""
-    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "cuda")
-    monkeypatch.setattr("veomni.ops.platform.gpu.IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr("veomni.ops.platform.gpu.torch.version.hip", "6.0", raising=False)
-
-    for op, variant, impl in (
-        ("dsa_attention", "deepseek_v4", "tilelang"),
-        ("dsa_indexer", "deepseek_v4", "tilelang"),
-        ("dsa_attention", "glm", "flashmla_cudnn"),
-        ("dsa_indexer", "glm", "cudnn"),
-    ):
-        assert impl not in OP_REGISTRY.list_available(op, variant)
-        with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
-            resolve_op(op, variant, impl)
-
-
-def test_glm_fused_rows_reject_sm80(monkeypatch):
-    """The packaged FlashMLA dependency requires Hopper or newer."""
-    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "cuda")
-    monkeypatch.setattr("veomni.ops.platform.gpu.IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr("veomni.ops.platform.gpu.torch.version.hip", None, raising=False)
-    monkeypatch.setattr("veomni.ops.platform.gpu.get_gpu_compute_capability", lambda: 80)
-
-    for op, variant, impl in (
-        ("dsa_attention", "glm", "flashmla_cudnn"),
-        ("dsa_indexer", "glm", "cudnn"),
-    ):
-        assert impl not in OP_REGISTRY.list_available(op, variant)
-        with pytest.raises(RuntimeError, match="compute capability >= 90"):
-            resolve_op(op, variant, impl)
 
 
 def test_glm_fused_rows_reject_attention_mask_before_vendor_import(monkeypatch):

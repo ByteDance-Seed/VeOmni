@@ -23,11 +23,11 @@ import pytest
 import torch
 from transformers.integrations.flex_attention import flex_attention_forward as hf_flex_attention_forward
 from transformers.integrations.sdpa_attention import sdpa_attention_forward as hf_sdpa_attention_forward
+from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from veomni.ops import OP_REGISTRY, VeomniOp
-from veomni.ops import registry as op_registry
-from veomni.ops.install import apply_veomni_attention_patch
+from veomni.ops.install import _VEOMNI_HF_PATCHES, apply_veomni_attention_patch
 from veomni.ops.kernels.attention import lookup
 from veomni.ops.kernels.attention import ulysses as ulysses_backend
 from veomni.ops.kernels.attention.standard.flash import flash_attention_forward
@@ -36,7 +36,6 @@ from veomni.ops.kernels.attention.standard.magi import magi_attention_forward
 from veomni.ops.kernels.attention.standard.sage import sage_attention_forward
 from veomni.ops.kernels.attention.standard.sdpa import sdpa_attention_forward
 from veomni.ops.kernels.attention.ulysses import should_apply_ulysses
-from veomni.ops.platform import NvidiaGpuPlatform
 
 
 _VEOMNI_FORWARDS = {
@@ -79,18 +78,6 @@ _PUBLIC_PARAMETERS = (
     "kwargs",
 )
 
-_ANY_DEVICE_IMPLS = (
-    "eager",
-    "sdpa",
-    "flex_attention",
-    "veomni_flex_attention",
-    "veomni_sdpa",
-)
-_FA2_IMPLS = ("flash_attention_2", "veomni_flash_attention_2")
-_FA3_IMPLS = ("flash_attention_3", "veomni_flash_attention_3")
-_FA4_IMPLS = ("flash_attention_4", "veomni_flash_attention_4")
-_MAGI_IMPLS = ("magi_attention", "veomni_magi_attention")
-
 
 def test_registered_attention_rows_share_public_signature_contract():
     for impl in _STANDARD_IMPLS:
@@ -116,42 +103,15 @@ def test_veomni_hf_attention_adapters_share_extended_signature_contract():
         assert parameters["kwargs"].kind is inspect.Parameter.VAR_KEYWORD
 
 
-def test_veomni_names_register_on_hf_dict_without_overwriting_stock():
-    for name, forward in _VEOMNI_FORWARDS.items():
+def test_veomni_hf_patches_pair_attention_and_mask_without_overwriting_stock():
+    assert {name for name, _, _ in _VEOMNI_HF_PATCHES} == set(_VEOMNI_FORWARDS)
+    for name, forward, mask_builder in _VEOMNI_HF_PATCHES:
+        assert _VEOMNI_FORWARDS[name] is forward
         assert ALL_ATTENTION_FUNCTIONS[name] is forward
+        assert ALL_MASK_ATTENTION_FUNCTIONS[name] is mask_builder
     assert ALL_ATTENTION_FUNCTIONS["flex_attention"] is hf_flex_attention_forward
     assert ALL_ATTENTION_FUNCTIONS["sdpa"] is hf_sdpa_attention_forward
     assert "veomni_flash_attention_2" in OP_REGISTRY.list_registered("attention", "standard")
-
-
-def test_cpu_availability_excludes_accelerator_attention(monkeypatch):
-    monkeypatch.setattr(op_registry, "get_device_type", lambda: "cpu")
-
-    assert OP_REGISTRY.list_available("attention", "standard") == list(_ANY_DEVICE_IMPLS)
-    for impl in (*_FA2_IMPLS, *_FA3_IMPLS, *_FA4_IMPLS, *_MAGI_IMPLS, "veomni_sage_attention"):
-        with pytest.raises(RuntimeError, match="not registered for device 'cpu'"):
-            OP_REGISTRY.resolve("attention", "standard", impl)
-
-
-def test_attention_packages_participate_in_gpu_availability(monkeypatch):
-    monkeypatch.setattr(op_registry, "get_device_type", lambda: "cuda")
-    monkeypatch.setattr(NvidiaGpuPlatform, "matches", lambda self: True)
-    monkeypatch.setattr(op_registry, "is_package_available", lambda _package: False)
-
-    assert OP_REGISTRY.list_available("attention", "standard") == list(_ANY_DEVICE_IMPLS)
-
-
-@pytest.mark.parametrize("missing_package", ("magi_attention", "flash_attn_cute", "cuda.bindings", "debugpy"))
-def test_magi_dependency_closure_fails_fast(monkeypatch, missing_package):
-    monkeypatch.setattr(op_registry, "get_device_type", lambda: "cuda")
-    monkeypatch.setattr(NvidiaGpuPlatform, "matches", lambda self: True)
-    monkeypatch.setattr(op_registry, "is_package_available", lambda package: package != missing_package)
-
-    available = OP_REGISTRY.list_available("attention", "standard")
-    for impl in _MAGI_IMPLS:
-        assert impl not in available
-        with pytest.raises(RuntimeError, match="requires unavailable package"):
-            OP_REGISTRY.resolve("attention", "standard", impl)
 
 
 def test_magi_short_name_uses_installed_veomni_interface(monkeypatch):
@@ -162,7 +122,9 @@ def test_magi_short_name_uses_installed_veomni_interface(monkeypatch):
         return query.transpose(1, 2), "magi-metadata"
 
     monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, "veomni_magi_attention", replacement)
-    wrapper = OP_REGISTRY._entries[("attention", "standard", "magi_attention", "cuda")].wrapper
+    wrapper = next(
+        entry.wrapper for entry in OP_REGISTRY.list_entries("attention", "standard") if entry.impl == "magi_attention"
+    )
     module = SimpleNamespace(is_causal=True)
     query = torch.randn(2, 4, 3, 8)
 

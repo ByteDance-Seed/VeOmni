@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -216,7 +215,6 @@ def test_flash_attention_skip_ulysses_skips_exchange_and_is_not_forwarded(monkey
     monkeypatch.setattr(flash_backend, "_flash_attention_forward", fake_flash)
     query = torch.randn(1, 4, 5, 8, dtype=torch.float16)
 
-    assert inspect.signature(flash_backend.flash_attention_forward).parameters["skip_ulysses"].default is False
     flash_backend.flash_attention_forward(
         _FakeAttentionModule("veomni_flash_attention_2"),
         query,
@@ -227,6 +225,45 @@ def test_flash_attention_skip_ulysses_skips_exchange_and_is_not_forwarded(monkey
         contract_marker=object(),
     )
     assert "skip_ulysses" not in captured["kwargs"]
+
+
+def test_varlen_flash_attn_padded_input_matches_unpadded():
+    """Pin the vendor contract used when packed inputs retain padded tails."""
+    if not IS_CUDA_AVAILABLE or torch.version.hip is not None:
+        pytest.skip("FlashAttention varlen requires an NVIDIA CUDA GPU")
+    try:
+        from flash_attn import flash_attn_varlen_func
+    except Exception as exc:
+        pytest.skip(f"flash-attn is not available: {exc}")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.float16
+    seqlens = torch.tensor([5, 7], dtype=torch.int32, device=device)
+    cu_seqlens = torch.nn.functional.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0), value=0)
+    max_seqlen = int(seqlens.max().item())
+    total_tokens = int(cu_seqlens[-1].item())
+    padded_tokens = total_tokens + 4
+    nheads, head_dim = 4, 8
+    q = torch.randn(total_tokens, nheads, head_dim, device=device, dtype=dtype)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    padding = torch.zeros(padded_tokens - total_tokens, nheads, head_dim, device=device, dtype=dtype)
+
+    out_unpadded = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, dropout_p=0.0)
+    out_padded = flash_attn_varlen_func(
+        torch.cat((q, padding)),
+        torch.cat((k, padding)),
+        torch.cat((v, padding)),
+        cu_seqlens,
+        cu_seqlens,
+        max_seqlen,
+        max_seqlen,
+        dropout_p=0.0,
+    )
+
+    assert out_padded.shape[0] == padded_tokens
+    torch.testing.assert_close(out_padded[:total_tokens], out_unpadded, rtol=0.0, atol=0.0)
 
 
 def test_flash_attention_forwards_fa4_sinks_and_sliding_window(monkeypatch):

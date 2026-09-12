@@ -174,7 +174,7 @@ jobs:
           uv run --frozen pytest -s -x tests/data
       - name: Run kernels tests
         run: |
-          uv run --frozen pytest -s -x tests/ops
+          uv run --frozen pytest -s -x -m "not benchmark" tests/ops
       - name: Run utils tests
         # TODO: run all tests under tests/utils/ once all util tests are verified
         run: |

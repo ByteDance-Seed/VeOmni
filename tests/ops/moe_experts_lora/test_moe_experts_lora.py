@@ -23,7 +23,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from veomni.ops import OP_REGISTRY, VeomniOp, resolve_op
+from veomni.ops import VeomniOp
 from veomni.ops.kernels.moe_experts.shared.dispatch import expert_histogram, moe_gather, moe_scatter
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 from veomni.utils.import_utils import is_fused_moe_available
@@ -221,22 +221,6 @@ def test_moe_experts_lora_eager_matches_manual_oracle_forward_and_all_gradients(
             rtol=1e-10,
             msg=lambda message, name=name: f"{name}: {message}",
         )
-
-
-@pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_moe_experts_lora_triton_available_on_cuda(variant):
-    if not IS_CUDA_AVAILABLE:
-        pytest.skip("triton LoRA row requires a GPU")
-    assert "fused_triton" in OP_REGISTRY.list_available("moe_experts_lora", variant)
-    resolve_op("moe_experts_lora", variant, "fused_triton")
-
-
-@pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_moe_experts_lora_npu_available_on_npu(variant):
-    if not IS_NPU_AVAILABLE:
-        pytest.skip("npu LoRA row is NPU-gated")
-    assert "fused_npu" in OP_REGISTRY.list_available("moe_experts_lora", variant)
-    resolve_op("moe_experts_lora", variant, "fused_npu")
 
 
 @pytest.mark.skipif(

@@ -16,6 +16,7 @@ import pytest
 import torch
 from torch import nn
 
+from tests.ops.qat.reference import reference_act_quant, reference_fp8_weight_quant
 from veomni.ops.qat import (
     fp8_blockwise,
     fp8_fake_quant_act,
@@ -27,7 +28,6 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_comp
 
 
 DEVICE = get_device_type()
-FP8_MAX = 448.0
 
 
 def _require_tilelang_cuda():
@@ -36,69 +36,6 @@ def _require_tilelang_cuda():
         pytest.skip("DeepSeek V4 TileLang kernels require an NVIDIA CUDA GPU")
     if get_gpu_compute_capability() < 90:
         pytest.skip("DeepSeek V4 TileLang kernels require SM90 or later")
-
-
-FP8_MAX_INV = torch.tensor(1.0 / FP8_MAX, dtype=torch.float32)
-
-
-def _reference_scale(amax, scale_fmt):
-    """The kernels' scale arithmetic, reproduced operation for operation.
-
-    `amax * fl(1/448)` is not `amax / 448`: the reciprocal is rounded first, and
-    the two disagree by one ulp for a bit over half of all inputs. The pow2 path
-    is insensitive to that, but the unrounded path is not, so the stand-in has
-    to multiply rather than divide.
-
-    `fast_round_scale` (quant.py:75) reads the exponent straight off the
-    FP32 bit pattern instead of calling `log2`/`ceil`, so do the same here
-    rather than rely on the library's rounding agreeing.
-    """
-    scaled = amax * FP8_MAX_INV.to(amax.device)
-    if not scale_fmt:
-        return scaled
-    bits = scaled.view(torch.int32)
-    exponent = ((bits >> 23) & 0xFF) - 127
-    log2_ceil = exponent + ((bits & ((1 << 23) - 1)) != 0).to(torch.int32)
-    return ((log2_ceil + 127) << 23).view(torch.float32)
-
-
-def _reference_act_quant(x, block_size=128, scale_fmt=None, scale_dtype=torch.float32, dequant=False):
-    """Torch stand-in for `veomni.ops.qat.quant.act_quant`.
-
-    Reproduces the contract, not just the numbers: `dequant=True` fuses the
-    dequantizing FP32 product and returns a fresh tensor, reading its operand
-    without writing to it.
-    """
-    features = x.shape[-1]
-    assert features % block_size == 0
-    blocks = x.float().reshape(-1, features // block_size, block_size)
-    amax = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-4)
-    scales = _reference_scale(amax, scale_fmt)
-    quantized = (blocks / scales).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-    if dequant:
-        return (quantized.float() * scales).reshape(x.shape).to(x.dtype)
-    return (
-        quantized.reshape(x.shape),
-        scales.reshape(*x.shape[:-1], features // block_size).to(scale_dtype),
-    )
-
-
-def _reference_fp8_weight_quant(x, block_size=128, scale_fmt=None, scale_dtype=torch.float32, dequant=False):
-    """Torch stand-in for `veomni.ops.qat.quant.fp8_weight_quant`.
-
-    Reproduces the contract, not just the numbers: ``dequant=True`` fuses the
-    dequantizing FP32 product and returns a fresh BF16 tensor, reading its
-    operand without writing to it.
-    """
-    assert x.dim() == 2 and x.dtype == torch.bfloat16
-    rows, cols = x.shape
-    tiles = x.float().contiguous().view(rows // block_size, block_size, cols // block_size, block_size)
-    amax = tiles.abs().amax(dim=(1, 3)).clamp_min(1e-4)
-    scales = _reference_scale(amax, scale_fmt)
-    quantized = (tiles / scales[:, None, :, None]).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-    if dequant:
-        return (quantized.float() * scales[:, None, :, None]).view(rows, cols).to(x.dtype)
-    return quantized.view(rows, cols), scales.to(scale_dtype)
 
 
 @pytest.fixture
@@ -112,16 +49,16 @@ def reference_quantizers(monkeypatch):
     cover. `test_reference_quantizers_match_the_tilelang_kernels` pins the
     stand-ins to the real kernels wherever those can run.
     """
-    monkeypatch.setattr(fp8_blockwise, "act_quant", _reference_act_quant)
-    monkeypatch.setattr(fp8_blockwise, "fp8_weight_quant", _reference_fp8_weight_quant)
+    monkeypatch.setattr(fp8_blockwise, "act_quant", reference_act_quant)
+    monkeypatch.setattr(fp8_blockwise, "fp8_weight_quant", reference_fp8_weight_quant)
 
 
 def _act_qdq(x, block_size=128, round_scale=True):
-    return _reference_act_quant(x, block_size, "ue8m0" if round_scale else None, dequant=True)
+    return reference_act_quant(x, block_size, "ue8m0" if round_scale else None, dequant=True)
 
 
 def _weight_qdq(weight, block_size=128, round_scale=True):
-    quantized, scales = _reference_fp8_weight_quant(weight, block_size, "ue8m0" if round_scale else None)
+    quantized, scales = reference_fp8_weight_quant(weight, block_size, "ue8m0" if round_scale else None)
     rows, cols = weight.shape
     tiles = quantized.float().view(rows // block_size, block_size, cols // block_size, block_size)
     return (tiles * scales[:, None, :, None]).view(rows, cols).to(weight.dtype)
@@ -144,11 +81,6 @@ class _GroupedLinear(nn.Linear):
         w = self.weight.view(self.n_groups, -1, hidden_dim).transpose(1, 2)
         grouped = x.reshape(-1, self.n_groups, hidden_dim).transpose(0, 1)
         return torch.bmm(grouped, w).transpose(0, 1).reshape(*x.shape[:-2], self.n_groups, -1)
-
-
-# ---------------------------------------------------------------------------
-# Argument validation
-# ---------------------------------------------------------------------------
 
 
 def test_fake_quant_rejects_non_bfloat16_operands():
@@ -199,11 +131,6 @@ def test_fake_quant_act_prefix_rejects_out_of_range_split():
         fp8_fake_quant_act_prefix(x, 0)
     with pytest.raises(ValueError, match=r"\(0, 512\]"):
         fp8_fake_quant_act_prefix(x, 576)
-
-
-# ---------------------------------------------------------------------------
-# Wrapper behaviour, on the torch stand-ins
-# ---------------------------------------------------------------------------
 
 
 def test_fake_quant_act_dequantizes_in_place_of_its_input(reference_quantizers):
@@ -367,11 +294,6 @@ def test_fake_quant_weight_scales_each_tile_independently(reference_quantizers):
     assert (dequantized[:128, :128] == 0).all()
 
 
-# ---------------------------------------------------------------------------
-# qat_linear
-# ---------------------------------------------------------------------------
-
-
 def test_qat_linear_disabled_is_a_transparent_wrapper():
     # The whole point of the `enabled` flag: a converted call site stays valid,
     # and free, when QAT is off -- including on hosts without the kernels.
@@ -482,11 +404,6 @@ def test_qat_linear_restores_the_parameter_after_the_call(reference_quantizers):
     assert torch.equal(linear.weight.detach(), original)
 
 
-# ---------------------------------------------------------------------------
-# Kernel parity: the only part that needs the hardware
-# ---------------------------------------------------------------------------
-
-
 def test_reference_quantizers_match_the_tilelang_kernels():
     """Pin the torch stand-ins the tests above rely on to the real kernels."""
     _require_tilelang_cuda()
@@ -502,17 +419,17 @@ def test_reference_quantizers_match_the_tilelang_kernels():
     for block_size in (64, 128):
         for scale_fmt in (None, "ue8m0"):
             actual = act_quant(x, block_size, scale_fmt, dequant=True)
-            expected = _reference_act_quant(x, block_size, scale_fmt, dequant=True)
+            expected = reference_act_quant(x, block_size, scale_fmt, dequant=True)
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
             quantized, scales = act_quant(x, block_size, scale_fmt)
-            reference_quantized, reference_scales = _reference_act_quant(x, block_size, scale_fmt)
+            reference_quantized, reference_scales = reference_act_quant(x, block_size, scale_fmt)
             assert torch.equal(quantized.view(torch.uint8), reference_quantized.view(torch.uint8))
             assert torch.equal(scales, reference_scales)
 
     for scale_fmt in (None, "ue8m0"):
         quantized, scales = fp8_weight_quant(weight, 128, scale_fmt)
-        reference_quantized, reference_scales = _reference_fp8_weight_quant(weight, 128, scale_fmt)
+        reference_quantized, reference_scales = reference_fp8_weight_quant(weight, 128, scale_fmt)
         assert torch.equal(quantized.view(torch.uint8), reference_quantized.view(torch.uint8))
         assert torch.equal(scales, reference_scales)
 

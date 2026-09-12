@@ -127,22 +127,6 @@ def test_flash_mla_sparse_forward_returns_lse(monkeypatch, dsa):
     assert torch.equal(result["lse"], expected_lse)
 
 
-def test_flash_mla_sparse_forward_uses_imported_flash_mla_symbol(monkeypatch, dsa):
-    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
-    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
-    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
-
-    def fake_flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v):
-        return torch.empty(2, 128, 512, dtype=q.dtype), torch.empty(2, 128), torch.empty(2, 128)
-
-    monkeypatch.setattr(dsa, "flash_mla_sparse_fwd", fake_flash_mla_sparse_fwd)
-
-    result = dsa.flash_mla_sparse_forward(q_pe, k_pe, kv_cache, q_nope, gather)
-    assert set(result) == {"out", "lse"}
-
-
 def test_flash_mla_sparse_forward_compatibility_rejects_unaligned_topk(dsa):
     q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
     k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)

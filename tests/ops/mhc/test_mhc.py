@@ -41,7 +41,10 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
 # Installed Transformers classes used as the mHC eager reference.
 
 _TILELANG_AVAILABLE = (
-    IS_CUDA_AVAILABLE and get_gpu_compute_capability() >= 90 and importlib.util.find_spec("tile_kernels") is not None
+    IS_CUDA_AVAILABLE
+    and torch.version.hip is None
+    and get_gpu_compute_capability() >= 90
+    and importlib.util.find_spec("tile_kernels") is not None
 )
 
 

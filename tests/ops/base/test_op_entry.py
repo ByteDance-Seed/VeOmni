@@ -31,6 +31,7 @@ from veomni.ops.platform import (
     NvidiaGpuPlatform,
 )
 from veomni.ops.registry import OpEntry, SavedState
+from veomni.utils.import_utils import is_package_available
 
 
 _GPU = GpuKernelRequirement()
@@ -79,6 +80,10 @@ def _optional_forward(x: Tensor, y: Tensor | None = None) -> tuple[Tensor, Saved
 
 def _optional_backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...]:
     return grad_output, grad_output if saved.metadata else None
+
+
+def test_dotted_missing_optional_module_is_unavailable():
+    assert not is_package_available("veomni_definitely_missing_optional.child")
 
 
 @pytest.mark.usefixtures("isolated_entries")

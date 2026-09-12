@@ -100,35 +100,19 @@ def test_eager_all_masked_returns_zero_with_zero_grad():
     assert torch.count_nonzero(gate_logits.grad) == 0
 
 
-def test_eager_matches_hf():
-    torch.manual_seed(0)
+@pytest.mark.parametrize("use_mask", (False, True))
+def test_eager_matches_hf(use_mask: bool):
+    torch.manual_seed(int(use_mask))
     num_layers, batch, seq_len, num_experts, top_k = 2, 2, 16, 8, 2
     base = torch.randn(num_layers, batch * seq_len, num_experts, dtype=torch.float32)
     layers_h = tuple(base[i].detach().requires_grad_(True) for i in range(num_layers))
     concat_e = _concat_layers(base)
+    attention_mask = torch.ones(batch, seq_len, dtype=torch.float32) if use_mask else _empty_mask(base.device)
+    if use_mask:
+        attention_mask[:, seq_len // 2 :] = 0
+    hf_mask = attention_mask if use_mask else None
 
-    out_h = hf_load_balancing_loss(layers_h, num_experts, top_k)
-    out_e = resolve_op("load_balancing_loss", "standard", "eager").wrapper(
-        concat_e, _empty_mask(base.device), top_k=top_k
-    )
-    assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
-
-    out_h.backward()
-    out_e.backward()
-    grad_h = torch.cat([layer.grad for layer in layers_h], dim=0)
-    assert torch.allclose(concat_e.grad, grad_h, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-
-
-def test_eager_matches_hf_with_mask():
-    torch.manual_seed(1)
-    num_layers, batch, seq_len, num_experts, top_k = 2, 2, 16, 8, 2
-    base = torch.randn(num_layers, batch * seq_len, num_experts, dtype=torch.float32)
-    attention_mask = torch.ones(batch, seq_len, dtype=torch.float32)
-    attention_mask[:, seq_len // 2 :] = 0
-    layers_h = tuple(base[i].detach().requires_grad_(True) for i in range(num_layers))
-    concat_e = _concat_layers(base)
-
-    out_h = hf_load_balancing_loss(layers_h, num_experts, top_k, attention_mask)
+    out_h = hf_load_balancing_loss(layers_h, num_experts, top_k, hf_mask)
     out_e = resolve_op("load_balancing_loss", "standard", "eager").wrapper(concat_e, attention_mask, top_k=top_k)
     assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 

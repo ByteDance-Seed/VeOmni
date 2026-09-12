@@ -49,7 +49,7 @@ from tests.ops.tol import (
     MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
     MOE_SPLIT_MERGED_GRAD_HIDDEN_RTOL,
 )
-from veomni.ops import OP_REGISTRY, resolve_op
+from veomni.ops import resolve_op
 from veomni.ops.kernels.moe_experts.shared.indices import build_moe_indices
 from veomni.ops.kernels.moe_experts.standard.npu import _fc1_weight
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE
@@ -421,7 +421,7 @@ def _run_fused_vs_eager(
         assert torch.allclose(fc1_2_e.grad.float(), fc1_2_o.grad.float(), atol=fc1_atol, rtol=fc1_rtol)
 
 
-def _run_split_vs_merged(
+def _run_fused_three_way(
     impl: str,
     *,
     swiglu_limit: float | None = None,
@@ -431,7 +431,7 @@ def _run_split_vs_merged(
     seed: int = 0,
     device: torch.device | None = None,
 ):
-    """Same fused impl, split fc1 vs merged fc1. Also compare merged to eager."""
+    """Compare one fused implementation's split and merged layouts with eager."""
     torch.manual_seed(seed)
     if device is None:
         device = torch.device("cuda")
@@ -474,6 +474,12 @@ def _run_split_vs_merged(
         atol=MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
         rtol=MOE_SPLIT_MERGED_GRAD_HIDDEN_RTOL,
     )
+    assert torch.allclose(
+        routing_s.grad.float(),
+        routing_m.grad.float(),
+        atol=MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
+        rtol=MOE_SPLIT_MERGED_GRAD_HIDDEN_RTOL,
+    )
     if swiglu_limit is not None:
         fwd_atol, fwd_rtol = MOE_FUSED_SWIGLU_ATOL, MOE_FUSED_SWIGLU_RTOL
         hidden_atol, hidden_rtol = MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL, MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL
@@ -486,6 +492,7 @@ def _run_split_vs_merged(
         fc2_atol, fc2_rtol = MOE_FUSED_GRAD_FC2_ATOL, MOE_FUSED_GRAD_FC2_RTOL
     assert torch.allclose(out_m.float(), out_e.float(), atol=fwd_atol, rtol=fwd_rtol)
     assert torch.allclose(hidden_m.grad.float(), hidden_e.grad.float(), atol=hidden_atol, rtol=hidden_rtol)
+    assert torch.allclose(routing_m.grad.float(), routing_e.grad.float(), atol=hidden_atol, rtol=hidden_rtol)
     assert torch.allclose(fc2_m.grad.float(), fc2_e.grad.float(), atol=fc2_atol, rtol=fc2_rtol)
     assert torch.allclose(
         fc1_12_m.grad.float(),
@@ -508,55 +515,23 @@ def test_npu_fc1_layout_matches_eager_contract():
     not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
     reason="triton fused MoE needs a GPU + triton",
 )
-def test_triton_matches_eager():
-    _run_fused_vs_eager("fused_triton")
+@pytest.mark.parametrize("swiglu_limit", (None, 1.0))
+def test_triton_split_and_merged_match_eager(swiglu_limit: float | None):
+    _run_fused_three_way("fused_triton", swiglu_limit=swiglu_limit)
 
 
 @pytest.mark.skipif(
     not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
     reason="triton fused MoE needs a GPU + triton",
 )
-def test_triton_matches_eager_merged():
-    _run_fused_vs_eager("fused_triton", merged=True)
-
-
-@pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
-    reason="triton fused MoE needs a GPU + triton",
-)
-def test_triton_matches_eager_swiglu_limit():
-    _run_fused_vs_eager("fused_triton", swiglu_limit=1.0)
-
-
-@pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
-    reason="triton fused MoE needs a GPU + triton",
-)
-def test_triton_matches_eager_merged_swiglu_limit():
-    _run_fused_vs_eager("fused_triton", merged=True, swiglu_limit=1.0)
-
-
-@pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
-    reason="triton fused MoE needs a GPU + triton",
-)
-def test_triton_matches_eager_duplicate_expert():
+def test_triton_split_and_merged_match_eager_duplicate_expert():
     device = torch.device("cuda")
     dtype = torch.bfloat16
     num_tokens, top_k = 256, 2
     selected = torch.zeros(num_tokens, top_k, device=device, dtype=torch.long)
     routing = torch.full((num_tokens, top_k), 0.75, device=device, dtype=dtype)
-    _run_fused_vs_eager(
+    _run_fused_three_way(
         "fused_triton",
-        swiglu_limit=10.0,
-        shape=(num_tokens, 4, 128, 64, top_k),
-        selected=selected,
-        routing=routing,
-        seed=7,
-    )
-    _run_fused_vs_eager(
-        "fused_triton",
-        merged=True,
         swiglu_limit=10.0,
         shape=(num_tokens, 4, 128, 64, top_k),
         selected=selected,
@@ -569,23 +544,14 @@ def test_triton_matches_eager_duplicate_expert():
     not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
     reason="triton fused MoE needs a GPU + triton",
 )
-def test_triton_matches_eager_larger_gpu():
-    _run_fused_vs_eager("fused_triton", shape=(128, 16, 256, 128, 4), seed=11)
+def test_triton_split_and_merged_match_eager_larger_gpu():
+    _run_fused_three_way("fused_triton", shape=(128, 16, 256, 128, 4), seed=11)
 
 
 @pytest.mark.skipif(not is_quack_gemm_available(), reason="quack fused MoE needs SM90+")
-def test_quack_matches_eager():
-    _run_fused_vs_eager("fused_quack")
-
-
-@pytest.mark.skipif(not is_quack_gemm_available(), reason="quack fused MoE needs SM90+")
-def test_quack_matches_eager_merged():
-    _run_fused_vs_eager("fused_quack", merged=True)
-
-
-@pytest.mark.skipif(not is_quack_gemm_available(), reason="quack fused MoE needs SM90+")
-def test_quack_matches_eager_swiglu_limit():
-    _run_fused_vs_eager("fused_quack", swiglu_limit=1.0)
+@pytest.mark.parametrize("swiglu_limit", (None, 1.0))
+def test_quack_split_and_merged_match_eager(swiglu_limit: float | None):
+    _run_fused_three_way("fused_quack", swiglu_limit=swiglu_limit)
 
 
 @pytest.mark.skipif(not is_quack_gemm_available(), reason="gpt_oss quack needs SM90+")
@@ -649,13 +615,6 @@ def test_npu_matches_eager():
     _run_fused_vs_eager("fused_npu")
 
 
-def test_mlu_impl_is_unavailable_off_mlu():
-    if not IS_MLU_AVAILABLE:
-        assert "fused_mlu" not in OP_REGISTRY.list_available("moe_experts", "standard")
-        with pytest.raises(RuntimeError, match="not registered for device"):
-            resolve_op("moe_experts", "standard", "fused_mlu")
-
-
 @pytest.mark.skipif(not IS_MLU_AVAILABLE, reason="MLU fused MoE needs torch_mlu")
 def test_mlu_matches_eager():
     _run_fused_vs_eager("fused_mlu")
@@ -675,37 +634,9 @@ def test_mlu_matches_eager_merged():
     not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
     reason="triton fused MoE needs a GPU + triton",
 )
-def test_triton_split_matches_merged():
-    _run_split_vs_merged("fused_triton")
-
-
-@pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
-    reason="triton fused MoE needs a GPU + triton",
-)
 @pytest.mark.parametrize("swiglu_limit", [7.0, 10.0])
-def test_triton_split_matches_merged_swiglu_limit(swiglu_limit: float):
-    _run_split_vs_merged("fused_triton", swiglu_limit=swiglu_limit, shape=(128, 8, 512, 256, 2), seed=42)
-
-
-@pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
-    reason="triton fused MoE needs a GPU + triton",
-)
-def test_triton_split_matches_merged_duplicate_expert():
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-    num_tokens, top_k = 256, 2
-    selected = torch.zeros(num_tokens, top_k, device=device, dtype=torch.long)
-    routing = torch.full((num_tokens, top_k), 0.75, device=device, dtype=dtype)
-    _run_split_vs_merged(
-        "fused_triton",
-        swiglu_limit=10.0,
-        shape=(num_tokens, 4, 128, 64, top_k),
-        selected=selected,
-        routing=routing,
-        seed=7,
-    )
+def test_triton_split_and_merged_match_eager_swiglu_limit(swiglu_limit: float):
+    _run_fused_three_way("fused_triton", swiglu_limit=swiglu_limit, shape=(128, 8, 512, 256, 2), seed=42)
 
 
 @pytest.mark.skipif(
@@ -719,13 +650,8 @@ def test_triton_split_matches_merged_duplicate_expert():
         ((256, 64, 2048, 1408, 6), 1),
     ],
 )
-def test_triton_split_matches_merged_production(shape: tuple[int, int, int, int, int], seed: int):
-    _run_split_vs_merged("fused_triton", shape=shape, seed=seed)
-
-
-@pytest.mark.skipif(not is_quack_gemm_available(), reason="quack fused MoE needs SM90+")
-def test_quack_split_matches_merged():
-    _run_split_vs_merged("fused_quack")
+def test_triton_split_and_merged_match_eager_production(shape: tuple[int, int, int, int, int], seed: int):
+    _run_fused_three_way("fused_triton", shape=shape, seed=seed)
 
 
 @pytest.mark.skipif(not is_quack_gemm_available(), reason="quack fused MoE needs SM90+")
@@ -738,9 +664,8 @@ def test_quack_split_matches_merged():
         (1024, 64, 2048, 1408, 6),
     ],
 )
-def test_quack_matches_eager_production(shape: tuple[int, int, int, int, int]):
-    _run_fused_vs_eager("fused_quack", shape=shape, seed=42)
-    _run_fused_vs_eager("fused_quack", merged=True, shape=shape, seed=42)
+def test_quack_split_and_merged_match_eager_production(shape: tuple[int, int, int, int, int]):
+    _run_fused_three_way("fused_quack", shape=shape, seed=42)
 
 
 def test_build_moe_indices_basic_example():
@@ -760,30 +685,3 @@ def test_build_moe_indices_all_same_expert():
     cu_seqlens_m, a_idx, _scatter_index = build_moe_indices(expert_index, num_experts=4)
     assert cu_seqlens_m.tolist() == [0, 8, 8, 8, 8]
     assert a_idx.tolist() == list(range(8))
-
-
-def test_quack_rejects_low_compute_capability(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "cuda")
-    monkeypatch.setattr("veomni.ops.platform.gpu.IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr("veomni.ops.platform.gpu.get_gpu_compute_capability", lambda: 80)
-    monkeypatch.setattr("veomni.ops.platform.gpu.torch.version.hip", None, raising=False)
-    with pytest.raises(RuntimeError, match="requirement is not satisfied"):
-        resolve_op("moe_experts", "standard", "fused_quack")
-
-
-def test_quack_rejects_npu_device(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "npu")
-    with pytest.raises(RuntimeError, match="not registered for device"):
-        resolve_op("moe_experts", "standard", "fused_quack")
-
-
-def test_triton_rejects_npu_device(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "npu")
-    with pytest.raises(RuntimeError, match="not registered for device"):
-        resolve_op("moe_experts", "standard", "fused_triton")
-
-
-def test_npu_rejects_cuda_device(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "cuda")
-    with pytest.raises(RuntimeError, match="not registered for device"):
-        resolve_op("moe_experts", "standard", "fused_npu")

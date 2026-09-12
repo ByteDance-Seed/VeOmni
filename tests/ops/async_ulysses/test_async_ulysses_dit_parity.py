@@ -51,19 +51,18 @@ def _scale_ratio(sp_t: torch.Tensor, dp_t: torch.Tensor, eps: float = 1e-12) -> 
     return num / denom
 
 
-def _safe_assert_close(title: str, a: torch.Tensor, b: torch.Tensor, *, atol: float, rtol: float) -> bool:
-    """Print max-abs and scale, then ``assert_close``. Returns whether they matched."""
+def _assert_close_with_diagnostics(title: str, a: torch.Tensor, b: torch.Tensor, *, atol: float, rtol: float) -> None:
+    """Print comparison diagnostics and propagate any parity failure."""
     max_diff = (a.detach().float() - b.detach().float()).abs().max().item()
     ratio = _scale_ratio(a, b)
     try:
         torch.testing.assert_close(a, b, atol=atol, rtol=rtol)
         if dist.get_rank() == 0:
             print(f"[PASS] {title}: equal=True, ratio={ratio:.6f}, max_abs_diff={max_diff:.6e}")
-        return True
     except AssertionError:
         if dist.get_rank() == 0:
             print(f"[FAIL] {title}: equal=False, ratio={ratio:.6f}, max_abs_diff={max_diff:.6e}")
-        return False
+        raise
 
 
 class RMSNorm(nn.Module):
@@ -273,14 +272,18 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
         attn_dp_q_norm_grad = attn_dp.q_norm.weight.grad.detach().clone()
         full_input_grad = full_input.grad.detach().clone()
 
-        _safe_assert_close("forward_output", dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
-        _safe_assert_close("proj_o.weight.grad", attn_dp_o_grad, attn_sp_o_grad, atol=1e-3, rtol=1e-4)
-        _safe_assert_close("q_proj.weight.grad", attn_dp_q_grad, attn_sp_q_grad, atol=1e-4, rtol=1e-4)
-        _safe_assert_close("k_proj.weight.grad", attn_dp_k_grad, attn_sp_k_grad, atol=1e-4, rtol=1e-4)
-        _safe_assert_close("v_proj.weight.grad", attn_dp_v_grad, attn_sp_v_grad, atol=3e-3, rtol=1e-4)
-        _safe_assert_close("k_norm.weight.grad", attn_dp_k_norm_grad, attn_sp_k_norm_grad, atol=2e-3, rtol=1e-4)
-        _safe_assert_close("q_norm.weight.grad", attn_dp_q_norm_grad, attn_sp_q_norm_grad, atol=2e-3, rtol=1e-4)
-        _safe_assert_close("input.grad", full_input_grad, part_input_grad, atol=1e-4, rtol=1e-4)
+        _assert_close_with_diagnostics("forward_output", dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
+        _assert_close_with_diagnostics("proj_o.weight.grad", attn_dp_o_grad, attn_sp_o_grad, atol=1e-3, rtol=1e-4)
+        _assert_close_with_diagnostics("q_proj.weight.grad", attn_dp_q_grad, attn_sp_q_grad, atol=1e-4, rtol=1e-4)
+        _assert_close_with_diagnostics("k_proj.weight.grad", attn_dp_k_grad, attn_sp_k_grad, atol=1e-4, rtol=1e-4)
+        _assert_close_with_diagnostics("v_proj.weight.grad", attn_dp_v_grad, attn_sp_v_grad, atol=3e-3, rtol=1e-4)
+        _assert_close_with_diagnostics(
+            "k_norm.weight.grad", attn_dp_k_norm_grad, attn_sp_k_norm_grad, atol=2e-3, rtol=1e-4
+        )
+        _assert_close_with_diagnostics(
+            "q_norm.weight.grad", attn_dp_q_norm_grad, attn_sp_q_norm_grad, atol=2e-3, rtol=1e-4
+        )
+        _assert_close_with_diagnostics("input.grad", full_input_grad, part_input_grad, atol=1e-4, rtol=1e-4)
 
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses dit")
@@ -350,18 +353,26 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
         attn_dp_q_norm_grad = attn_dp.q_norm.weight.grad.detach().clone()
         full_input_grad = full_input.grad.detach().clone()
 
-        _safe_assert_close("[padding] forward_output", dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
-        _safe_assert_close("[padding] proj_o.weight.grad", attn_dp_o_grad, attn_sp_o_grad, atol=1e-3, rtol=1e-4)
-        _safe_assert_close("[padding] q_proj.weight.grad", attn_dp_q_grad, attn_sp_q_grad, atol=1e-4, rtol=1e-4)
-        _safe_assert_close("[padding] k_proj.weight.grad", attn_dp_k_grad, attn_sp_k_grad, atol=1e-4, rtol=1e-4)
-        _safe_assert_close("[padding] v_proj.weight.grad", attn_dp_v_grad, attn_sp_v_grad, atol=3e-3, rtol=1e-4)
-        _safe_assert_close(
+        _assert_close_with_diagnostics("[padding] forward_output", dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
+        _assert_close_with_diagnostics(
+            "[padding] proj_o.weight.grad", attn_dp_o_grad, attn_sp_o_grad, atol=1e-3, rtol=1e-4
+        )
+        _assert_close_with_diagnostics(
+            "[padding] q_proj.weight.grad", attn_dp_q_grad, attn_sp_q_grad, atol=1e-4, rtol=1e-4
+        )
+        _assert_close_with_diagnostics(
+            "[padding] k_proj.weight.grad", attn_dp_k_grad, attn_sp_k_grad, atol=1e-4, rtol=1e-4
+        )
+        _assert_close_with_diagnostics(
+            "[padding] v_proj.weight.grad", attn_dp_v_grad, attn_sp_v_grad, atol=3e-3, rtol=1e-4
+        )
+        _assert_close_with_diagnostics(
             "[padding] k_norm.weight.grad", attn_dp_k_norm_grad, attn_sp_k_norm_grad, atol=2e-3, rtol=1e-4
         )
-        _safe_assert_close(
+        _assert_close_with_diagnostics(
             "[padding] q_norm.weight.grad", attn_dp_q_norm_grad, attn_sp_q_norm_grad, atol=2e-3, rtol=1e-4
         )
-        _safe_assert_close("[padding] input.grad", full_input_grad, part_input_grad, atol=1e-4, rtol=1e-4)
+        _assert_close_with_diagnostics("[padding] input.grad", full_input_grad, part_input_grad, atol=1e-4, rtol=1e-4)
 
 
 if __name__ == "__main__":
