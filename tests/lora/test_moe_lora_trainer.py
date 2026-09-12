@@ -375,8 +375,9 @@ def _build_and_save_toy_base(dest_dir: str) -> None:
     16 experts, 4 layers). Module-scoped means once per pytest invocation.
     """
     from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.models import build_foundation_model
     from veomni.utils import helper as _helper
+
+    from .utils import build_lora_test_model
 
     _helper.set_seed(42)
     ops = OpsImplementationConfig(
@@ -387,7 +388,7 @@ def _build_and_save_toy_base(dest_dir: str) -> None:
         swiglu_mlp_implementation="eager",
         rotary_pos_emb_implementation="eager",
     )
-    model = build_foundation_model(
+    model = build_lora_test_model(
         config_path=_TOY_CONFIG_PATH,
         weights_path=None,
         torch_dtype="bfloat16",

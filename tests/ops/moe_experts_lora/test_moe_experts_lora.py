@@ -155,11 +155,12 @@ def _manual_moe_lora_oracle(
             gate = base_gate + F.linear(F.linear(token, a_gate), b_gate) * _SCALES["lora_scale_gate"]
             up = base_up + F.linear(F.linear(token, a_up), b_up) * _SCALES["lora_scale_up"]
             intermediate = F.silu(gate) * up
+            intermediate = intermediate * routing[token_index, slot_index]
             expert_output = F.linear(intermediate, fc2[expert_index])
             expert_output = expert_output + (
                 F.linear(F.linear(intermediate, a_down), b_down) * _SCALES["lora_scale_down"]
             )
-            token_output = token_output + routing[token_index, slot_index] * expert_output
+            token_output = token_output + expert_output
         outputs.append(token_output)
     return torch.stack(outputs)
 

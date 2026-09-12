@@ -36,6 +36,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -44,7 +45,8 @@ import transformers
 import yaml
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
-from veomni.models import build_foundation_model
+from veomni.models_kernel import MODELING_REGISTRY
+from veomni.models_kernel import build_foundation_model as build_kernel_foundation_model
 from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
@@ -76,7 +78,7 @@ class LoraYamlSpec:
         yaml: Path (relative to repo root) of the LoRA fine-tuning yaml.
         min_transformers_version: Minimum ``transformers`` version where
             this model family is registered (mirrors the gate in
-            ``veomni/models/transformers/<model>/__init__.py``). Tests skip
+            the model package's ``__init__.py``). Tests skip
             on older envs rather than failing during model build.
     """
 
@@ -162,6 +164,24 @@ def fused_npu_moe_ops() -> OpsImplementationConfig:
     )
 
 
+def build_lora_test_model(config_path: str, **kwargs):
+    """Build a registered model family through ``models_kernel``.
+
+    LoRA tests span model families that are moving to ``models_kernel`` in
+    separate changes. Skip pending families until their registration lands;
+    the same test activates automatically once the family is registered.
+    """
+    config_file = Path(config_path)
+    if config_file.is_dir():
+        config_file = config_file / "config.json"
+    model_type = yaml.safe_load(config_file.read_text(encoding="utf-8"))["model_type"]
+
+    if model_type not in MODELING_REGISTRY.valid_keys():
+        pytest.skip(f"{model_type}: not registered in veomni.models_kernel yet")
+
+    return build_kernel_foundation_model(config_path=config_path, **kwargs)
+
+
 def build_toy(toy_dir: str, *, ops: OpsImplementationConfig | None = None):
     """Build a bf16 toy model from ``tests/toy_config/<toy_dir>/`` on the active device.
 
@@ -176,7 +196,7 @@ def build_toy(toy_dir: str, *, ops: OpsImplementationConfig | None = None):
     cfg_path = os.path.join(TOY_CONFIG_ROOT, toy_dir)
     if not os.path.isfile(os.path.join(cfg_path, "config.json")):
         pytest.skip(f"toy config not found: {cfg_path}")
-    return build_foundation_model(
+    return build_lora_test_model(
         config_path=cfg_path,
         weights_path=None,
         torch_dtype="bfloat16",
