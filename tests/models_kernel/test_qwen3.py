@@ -24,6 +24,8 @@ from types import SimpleNamespace
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM as HFQwen3ForCausalLM
+from transformers.models.qwen3.modeling_qwen3 import Qwen3ForTokenClassification as HFQwen3ForTokenClassification
+from transformers.models.qwen3.modeling_qwen3 import Qwen3Model as HFQwen3Model
 
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 from veomni.ops import VeomniOp
@@ -71,20 +73,24 @@ def _qwen3_classes():
         from veomni.models_kernel.transformers.qwen3.generated.patched_modeling_qwen3_npu import (
             Qwen3ForCausalLM,
             Qwen3ForSequenceClassification,
+            Qwen3ForTokenClassification,
+            Qwen3Model,
         )
     else:
         from veomni.models_kernel.transformers.qwen3.generated.patched_modeling_qwen3_gpu import (
             Qwen3ForCausalLM,
             Qwen3ForSequenceClassification,
+            Qwen3ForTokenClassification,
+            Qwen3Model,
         )
-    return Qwen3ForCausalLM, Qwen3ForSequenceClassification
+    return Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3ForTokenClassification, Qwen3Model
 
 
 def _build_qwen3(config: Qwen3Config, ops: SimpleNamespace | None = None):
     previous = get_ops_config()
     set_ops_config(ops if ops is not None else _eager_kernels_config())
     try:
-        causal_cls, _ = _qwen3_classes()
+        causal_cls, _, _, _ = _qwen3_classes()
         return causal_cls(config)
     finally:
         set_ops_config(previous)
@@ -103,6 +109,25 @@ def test_qwen3_constructs_local_kernels():
     assert layer.mlp.veomni_swiglu_mlp.impl == "eager"
     assert layer.self_attn.veomni_rope.impl == "eager"
     assert layer.self_attn.veomni_attn.impl == "eager"
+
+
+def test_qwen3_selects_liger_kernels(available_nvidia_ops):
+    ops = _eager_kernels_config()
+    ops.rms_norm_implementation = "liger_kernel"
+    ops.rotary_pos_emb_implementation = "liger_kernel"
+    ops.swiglu_mlp_implementation = "liger_kernel"
+    ops.cross_entropy_loss_implementation = "liger_kernel"
+    model = _build_qwen3(_tiny_config(), ops)
+
+    assert model.veomni_ce.variant == "standard"
+    assert model.veomni_ce.impl == "liger_kernel"
+    layer = model.model.layers[0]
+    assert layer.input_layernorm.veomni_rms_norm.variant == "standard"
+    assert layer.input_layernorm.veomni_rms_norm.impl == "liger_kernel"
+    assert layer.mlp.veomni_swiglu_mlp.variant == "standard"
+    assert layer.mlp.veomni_swiglu_mlp.impl == "liger_kernel"
+    assert layer.self_attn.veomni_rope.variant == "full"
+    assert layer.self_attn.veomni_rope.impl == "liger_kernel"
 
 
 def test_qwen3_instances_keep_distinct_impls():
@@ -149,8 +174,27 @@ def test_qwen3_eager_matches_hf_logits_and_loss():
         )
 
 
+def test_qwen3_base_model_eager_matches_hf():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    hf = HFQwen3Model(config)
+    previous = get_ops_config()
+    set_ops_config(_eager_kernels_config())
+    try:
+        *_, model_cls = _qwen3_classes()
+        ours = model_cls(config)
+    finally:
+        set_ops_config(previous)
+    ours.load_state_dict(hf.state_dict())
+
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    hf_out = hf(input_ids=input_ids, use_cache=False)
+    ours_out = ours(input_ids=input_ids, use_cache=False)
+    torch.testing.assert_close(ours_out.last_hidden_state, hf_out.last_hidden_state, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+
 def test_qwen3_seq_cls_forward():
-    _, seq_cls = _qwen3_classes()
+    _, seq_cls, _, _ = _qwen3_classes()
     previous = get_ops_config()
     set_ops_config(_eager_kernels_config())
     try:
@@ -166,3 +210,26 @@ def test_qwen3_seq_cls_forward():
     assert out.loss.ndim == 0
     assert torch.isfinite(out.loss)
     assert out.logits is not None
+
+
+def test_qwen3_token_cls_eager_matches_hf():
+    torch.manual_seed(0)
+    config = _tiny_config(num_labels=4)
+    hf = HFQwen3ForTokenClassification(config)
+    previous = get_ops_config()
+    set_ops_config(_eager_kernels_config())
+    try:
+        _, _, token_cls, _ = _qwen3_classes()
+        ours = token_cls(config)
+    finally:
+        set_ops_config(previous)
+    ours.load_state_dict(hf.state_dict())
+    hf.eval()
+    ours.eval()
+
+    input_ids = torch.randint(3, config.vocab_size, (2, 6))
+    labels = torch.randint(0, config.num_labels, input_ids.shape)
+    hf_out = hf(input_ids=input_ids, labels=labels, use_cache=False)
+    ours_out = ours(input_ids=input_ids, labels=labels, use_cache=False)
+    torch.testing.assert_close(ours_out.logits, hf_out.logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    torch.testing.assert_close(ours_out.loss, hf_out.loss, atol=EAGER_ATOL, rtol=EAGER_RTOL)

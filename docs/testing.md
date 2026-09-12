@@ -163,22 +163,16 @@ Additional per-directory helpers:
 
 **GPU**: 1 GPU, runs serially per model mode.
 
-DeepSeek-V4's router precision, norm/RoPE ordering, and fused-MoE-specific
-merged `gate_up_proj` plus `swiglu_limit` forwarding are covered by
-`tests/models_kernel/test_deepseek_v4.py` (CPU).
-Its kernel package import behavior, hardware guards, BF16/FP32 utility, and
-TileLang DSA indexer/attention numerical checks are covered by
-`tests/ops/dsa/`. The guard and utility cases run on CPU; optimized
-numerical tests require TileLang on an SM90+ NVIDIA GPU.
-Registry binding plus mHC pre/post/head forward and backward parity are covered
-by `tests/ops/mhc/test_mhc.py`, which requires TileKernels on an SM90+
-NVIDIA GPU for kernel execution.
-
-Llama registry/build coverage, all four registered architectures, eager
-forward/backward parity, and eager/Liger op selection are covered by
-`tests/models_kernel/test_auto_registry.py` and
-`tests/models_kernel/test_llama.py`. Optimized op numerics are covered by the
+The models migrated to `models_kernel` are currently DeepSeek-V4, Llama, and
+Qwen3. Their registry/build dispatch, supported architectures, eager
+forward/backward parity, and optimized-op selection are covered by
+`tests/models_kernel/test_auto_registry.py` and the corresponding model tests
+under `tests/models_kernel/`. Optimized op numerics are covered by the
 corresponding tests under `tests/ops/`.
+
+DeepSeek-V4-specific DSA checks live under `tests/ops/dsa/`; optimized numerical
+tests require TileLang on an SM90+ NVIDIA GPU. Its mHC kernel parity is covered
+by `tests/ops/mhc/test_mhc.py` and requires TileKernels on an SM90+ NVIDIA GPU.
 
 ---
 

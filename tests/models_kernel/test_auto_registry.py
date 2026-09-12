@@ -16,7 +16,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
+
 import pytest
+from transformers import PretrainedConfig
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
@@ -33,7 +37,48 @@ from veomni.models_kernel import (
 from veomni.ops.config import get_ops_config, set_ops_config
 
 
-def _tiny_qwen3_config() -> Qwen3Config:
+class _UnregisteredConfig(PretrainedConfig):
+    model_type = "unregistered_test_model"
+
+    def __init__(self):
+        super().__init__()
+        self.architectures = ["UnregisteredForCausalLM"]
+
+
+@dataclass(frozen=True)
+class _ModelCase:
+    model_type: str
+    config_factory: Callable[[str], PretrainedConfig]
+    architectures: tuple[str, ...]
+    has_registered_config: bool = False
+
+
+def _tiny_deepseek_v4_config(architecture: str = "DeepseekV4ForCausalLM") -> PretrainedConfig:
+    from veomni.models_kernel.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+    return DeepseekV4Config(
+        vocab_size=128,
+        hidden_size=64,
+        moe_intermediate_size=32,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=32,
+        q_lora_rank=16,
+        num_experts_per_tok=2,
+        n_routed_experts=4,
+        max_position_embeddings=64,
+        o_groups=8,
+        o_lora_rank=16,
+        index_n_heads=4,
+        index_head_dim=16,
+        architectures=[architecture],
+        attn_implementation="eager",
+        experts_implementation="eager",
+    )
+
+
+def _tiny_qwen3_config(architecture: str = "Qwen3ForCausalLM") -> Qwen3Config:
     return Qwen3Config(
         vocab_size=32,
         hidden_size=32,
@@ -43,7 +88,7 @@ def _tiny_qwen3_config() -> Qwen3Config:
         num_key_value_heads=2,
         head_dim=8,
         max_position_embeddings=32,
-        architectures=["Qwen3ForCausalLM"],
+        architectures=[architecture],
         attn_implementation="eager",
     )
 
@@ -62,9 +107,45 @@ def _tiny_llama_config(architecture: str = "LlamaForCausalLM") -> LlamaConfig:
     )
 
 
+_MODEL_CASES = (
+    _ModelCase(
+        model_type="deepseek_v4",
+        config_factory=_tiny_deepseek_v4_config,
+        architectures=("DeepseekV4ForCausalLM", "DeepseekV4Model"),
+        has_registered_config=True,
+    ),
+    _ModelCase(
+        model_type="llama",
+        config_factory=_tiny_llama_config,
+        architectures=(
+            "LlamaForCausalLM",
+            "LlamaForTokenClassification",
+            "LlamaForSequenceClassification",
+            "LlamaModel",
+        ),
+    ),
+    _ModelCase(
+        model_type="qwen3",
+        config_factory=_tiny_qwen3_config,
+        architectures=(
+            "Qwen3ForCausalLM",
+            "Qwen3ForTokenClassification",
+            "Qwen3ForSequenceClassification",
+            "Qwen3Model",
+        ),
+    ),
+)
+
+_ARCHITECTURE_CASES = tuple(
+    pytest.param(model_case, architecture, id=f"{model_case.model_type}-{architecture}")
+    for model_case in _MODEL_CASES
+    for architecture in model_case.architectures
+)
+
+
 def test_get_model_class_unknown_type_raises():
-    with pytest.raises(RuntimeError, match="qwen3.*not registered in veomni.models_kernel.*deepseek_v4"):
-        get_model_class(_tiny_qwen3_config())
+    with pytest.raises(RuntimeError, match="unregistered_test_model.*not registered in veomni.models_kernel"):
+        get_model_class(_UnregisteredConfig())
 
 
 def test_get_model_class_hf_backend(monkeypatch):
@@ -74,7 +155,7 @@ def test_get_model_class_hf_backend(monkeypatch):
     assert get_model_class(_tiny_qwen3_config()) is AutoModelForCausalLM
 
 
-def test_build_foundation_model_requires_kernels_config():
+def test_build_foundation_model_requires_ops_config():
     previous = get_ops_config()
     try:
         set_ops_config(None)
@@ -84,73 +165,36 @@ def test_build_foundation_model_requires_kernels_config():
         set_ops_config(previous)
 
 
-def test_build_foundation_model_installs_kernels_config():
+@pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
+def test_build_foundation_model_constructs_registered_model(model_case: _ModelCase):
     previous = get_ops_config()
     cfg = eager_ops_config()
     try:
         set_ops_config(None)
-        with pytest.raises(RuntimeError, match="not registered in veomni.models_kernel"):
-            build_foundation_model(_tiny_qwen3_config(), ops_implementation=cfg)
+        model = build_foundation_model(
+            model_case.config_factory(model_case.architectures[0]),
+            torch_dtype="float32",
+            init_device="cpu",
+            ops_implementation=cfg,
+        )
         assert get_ops_config() is cfg
     finally:
         set_ops_config(previous)
-
-
-def test_modeling_registry_starts_without_qwen3():
-    assert "qwen3" not in MODELING_REGISTRY.valid_keys()
-
-
-def test_deepseek_v4_uses_registered_config_and_modeling():
-    assert "deepseek_v4" in MODEL_CONFIG_REGISTRY.valid_keys()
-    assert "deepseek_v4" in MODELING_REGISTRY.valid_keys()
-
-
-def test_llama_uses_hf_config_and_registered_modeling():
-    assert "llama" not in MODEL_CONFIG_REGISTRY.valid_keys()
-    assert "llama" in MODELING_REGISTRY.valid_keys()
-
-
-@pytest.mark.parametrize(
-    ("architecture", "expected_class"),
-    [
-        ("LlamaForCausalLM", "LlamaForCausalLM"),
-        ("LlamaForTokenClassification", "LlamaForTokenClassification"),
-        ("LlamaForSequenceClassification", "LlamaForSequenceClassification"),
-        ("LlamaModel", "LlamaModel"),
-    ],
-)
-def test_get_model_class_returns_registered_llama_architectures(architecture: str, expected_class: str):
-    model_cls = get_model_class(_tiny_llama_config(architecture))
-    assert model_cls.__name__ == expected_class
-    assert "models_kernel" in model_cls.__module__
-
-
-def test_build_foundation_model_constructs_registered_llama():
-    previous = get_ops_config()
-    try:
-        model = build_foundation_model(
-            _tiny_llama_config(),
-            torch_dtype="float32",
-            init_device="cpu",
-            ops_implementation=eager_ops_config(),
-        )
-    finally:
-        set_ops_config(previous)
-    assert model.__class__.__name__ == "LlamaForCausalLM"
+    assert model.__class__.__name__ == model_case.architectures[0]
     assert "models_kernel" in model.__class__.__module__
     assert model.veomni_ce.impl == "eager"
 
 
-def test_get_model_class_returns_the_generated_dsv4_causal_lm():
-    from veomni.models_kernel.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+@pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
+def test_model_registry_entries(model_case: _ModelCase):
+    assert (model_case.model_type in MODEL_CONFIG_REGISTRY.valid_keys()) is model_case.has_registered_config
+    assert model_case.model_type in MODELING_REGISTRY.valid_keys()
 
-    config = DeepseekV4Config(
-        num_hidden_layers=2,
-        layer_types=["compressed_sparse_attention"] * 2,
-        architectures=["DeepseekV4ForCausalLM"],
-    )
-    model_cls = get_model_class(config)
-    assert model_cls.__name__ == "DeepseekV4ForCausalLM"
+
+@pytest.mark.parametrize(("model_case", "architecture"), _ARCHITECTURE_CASES)
+def test_get_model_class_returns_registered_architecture(model_case: _ModelCase, architecture: str):
+    model_cls = get_model_class(model_case.config_factory(architecture))
+    assert model_cls.__name__ == architecture
     assert "models_kernel" in model_cls.__module__
 
 
