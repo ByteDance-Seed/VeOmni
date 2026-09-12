@@ -323,13 +323,6 @@ _DEFAULT_ATOL = 1e-2
 # ``/veomni-patchgen-model`` to bring them back into this list.
 TEST_CASES = [
     pytest.param(
-        "./tests/toy_config/llama31_toy/config.json",
-        False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="llama3_1",
-    ),
-    pytest.param(
         "./tests/toy_config/qwen3_5_toy/config.json",
         False,
         # qwen3_5* uses chunk_loss in liger mode (see forward_backward_step

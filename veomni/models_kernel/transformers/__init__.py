@@ -18,9 +18,10 @@ Importing this package registers the models listed below on the
 ``models_kernel`` registries. Add the next model here when it is ready.
 """
 
-from . import deepseek_v4
+from . import deepseek_v4, llama
 
 
 __all__ = [
     "deepseek_v4",
+    "llama",
 ]

@@ -12,4 +12,27 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Llama modeling that calls local VeomniOp handles. Not on ``MODELING_REGISTRY``."""
+"""Llama modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.models_kernel.registry import MODELING_REGISTRY
+
+
+@MODELING_REGISTRY.register("llama")
+def register_llama_modeling(architecture: str):
+    from .generated.patched_modeling_llama_gpu import (
+        LlamaForCausalLM,
+        LlamaForSequenceClassification,
+        LlamaForTokenClassification,
+        LlamaModel,
+    )
+
+    if "ForCausalLM" in architecture:
+        return LlamaForCausalLM
+    elif "ForTokenClassification" in architecture:
+        return LlamaForTokenClassification
+    elif "ForSequenceClassification" in architecture:
+        return LlamaForSequenceClassification
+    elif "Model" in architecture:
+        return LlamaModel
+    else:
+        return LlamaForCausalLM

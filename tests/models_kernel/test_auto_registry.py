@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import pytest
+from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from tests.models_kernel.compare import eager_ops_config
@@ -43,6 +44,20 @@ def _tiny_qwen3_config() -> Qwen3Config:
         head_dim=8,
         max_position_embeddings=32,
         architectures=["Qwen3ForCausalLM"],
+        attn_implementation="eager",
+    )
+
+
+def _tiny_llama_config(architecture: str = "LlamaForCausalLM") -> LlamaConfig:
+    return LlamaConfig(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+        architectures=[architecture],
         attn_implementation="eager",
     )
 
@@ -85,9 +100,45 @@ def test_modeling_registry_starts_without_qwen3():
     assert "qwen3" not in MODELING_REGISTRY.valid_keys()
 
 
-def test_deepseek_v4_is_the_first_registered_model():
+def test_deepseek_v4_uses_registered_config_and_modeling():
     assert "deepseek_v4" in MODEL_CONFIG_REGISTRY.valid_keys()
     assert "deepseek_v4" in MODELING_REGISTRY.valid_keys()
+
+
+def test_llama_uses_hf_config_and_registered_modeling():
+    assert "llama" not in MODEL_CONFIG_REGISTRY.valid_keys()
+    assert "llama" in MODELING_REGISTRY.valid_keys()
+
+
+@pytest.mark.parametrize(
+    ("architecture", "expected_class"),
+    [
+        ("LlamaForCausalLM", "LlamaForCausalLM"),
+        ("LlamaForTokenClassification", "LlamaForTokenClassification"),
+        ("LlamaForSequenceClassification", "LlamaForSequenceClassification"),
+        ("LlamaModel", "LlamaModel"),
+    ],
+)
+def test_get_model_class_returns_registered_llama_architectures(architecture: str, expected_class: str):
+    model_cls = get_model_class(_tiny_llama_config(architecture))
+    assert model_cls.__name__ == expected_class
+    assert "models_kernel" in model_cls.__module__
+
+
+def test_build_foundation_model_constructs_registered_llama():
+    previous = get_ops_config()
+    try:
+        model = build_foundation_model(
+            _tiny_llama_config(),
+            torch_dtype="float32",
+            init_device="cpu",
+            ops_implementation=eager_ops_config(),
+        )
+    finally:
+        set_ops_config(previous)
+    assert model.__class__.__name__ == "LlamaForCausalLM"
+    assert "models_kernel" in model.__class__.__module__
+    assert model.veomni_ce.impl == "eager"
 
 
 def test_get_model_class_returns_the_generated_dsv4_causal_lm():

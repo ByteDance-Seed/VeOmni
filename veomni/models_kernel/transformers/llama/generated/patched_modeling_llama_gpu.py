@@ -485,6 +485,11 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
+        r"""
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Indices depicting the position of input tokens in the sequence. This is
+            retained explicitly for callers that pass it positionally.
+        """
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,

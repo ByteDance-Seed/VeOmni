@@ -157,7 +157,7 @@ Additional per-directory helpers:
 | Liger kernel | `True`, `False` (VeOmni only) |
 
 **Models covered**:
-- Text / MoE: llama3_1, qwen2, qwen3_5, qwen3_5_moe, seed_oss, deepseek_v3
+- Text / MoE: qwen2, qwen3_5, qwen3_5_moe, seed_oss, deepseek_v3
 - VLM: qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe
 - Omni: qwen2_5_omni, qwen3_omni_moe
 
@@ -173,6 +173,12 @@ numerical tests require TileLang on an SM90+ NVIDIA GPU.
 Registry binding plus mHC pre/post/head forward and backward parity are covered
 by `tests/ops/mhc/test_mhc.py`, which requires TileKernels on an SM90+
 NVIDIA GPU for kernel execution.
+
+Llama registry/build coverage, all four registered architectures, eager
+forward/backward parity, and eager/Liger op selection are covered by
+`tests/models_kernel/test_auto_registry.py` and
+`tests/models_kernel/test_llama.py`. Optimized op numerics are covered by the
+corresponding tests under `tests/ops/`.
 
 ---
 
