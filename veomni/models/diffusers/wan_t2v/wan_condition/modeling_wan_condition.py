@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -65,11 +67,33 @@ class WanTransformer3DConditionModel(PreTrainedModel):
                 subfolder=self.config.vae_subfolder,
                 torch_dtype=torch.float32,
             )
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            base,
-            subfolder=self.config.scheduler_subfolder,
-        )
-        self.video_processor = VideoProcessor(vae_scale_factor=self.vae.config.scale_factor_spatial)
+        try:
+            self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+                base,
+                subfolder=self.config.scheduler_subfolder,
+            )
+        except Exception:
+            logger.info_rank0(
+                "FlowMatchEulerDiscreteScheduler.from_pretrained failed (checkpoint may use a different "
+                "scheduler class such as UniPCMultistepScheduler). Falling back to default config."
+            )
+            self.scheduler = FlowMatchEulerDiscreteScheduler()
+        vae_sf = self.vae.config.scale_factor_spatial
+        patch_size = self.config.patch_size
+        if patch_size is None:
+            transformer_cfg_path = Path(base) / "transformer" / "config.json"
+            if transformer_cfg_path.exists():
+                with open(transformer_cfg_path) as f:
+                    _cfg = json.load(f)
+                patch_size = _cfg.get("patch_size")
+        if patch_size is not None:
+            _, patch_h, patch_w = patch_size
+            vae_sf = vae_sf * max(patch_h, patch_w)
+            logger.info_rank0(
+                f"Aligning video H/W to multiples of {vae_sf} "
+                f"(vae_scale_factor_spatial={self.vae.config.scale_factor_spatial} * max(patch_h, patch_w)={max(patch_h, patch_w)})"
+            )
+        self.video_processor = VideoProcessor(vae_scale_factor=vae_sf)
         self._prepare_negative_prompt_embeds()
         if self.meta_init:
             del self.text_encoder
@@ -91,6 +115,21 @@ class WanTransformer3DConditionModel(PreTrainedModel):
         size = min(self.config.video_max_size, min(width, height))
         video = functional.resize(video, size, interpolation=InterpolationMode.BICUBIC).float().clamp(0, 255)
         video = self.video_processor.preprocess_video(video)
+
+        # Align temporal dim: Wan VAE uses causal conv3d with temporal compression
+        # ratio = scale_factor_temporal, so (num_frames - 1) must be divisible by it.
+        scale_factor_temporal = self.vae.config.scale_factor_temporal
+        num_frames = video.shape[2]
+        remainder = (num_frames - 1) % scale_factor_temporal
+        if remainder != 0:
+            target_frames = num_frames - remainder
+            if target_frames < 1:
+                target_frames = num_frames + (scale_factor_temporal - remainder)
+            video = video[:, :, :target_frames]
+            logger.info_once(
+                f"Aligned temporal dim from {num_frames} to {target_frames} "
+                f"to satisfy (T-1) % {scale_factor_temporal} == 0"
+            )
         video = video.to(device=self.vae.device, dtype=self.vae.dtype)
 
         # save mean & logvar

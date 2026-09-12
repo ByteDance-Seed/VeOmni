@@ -37,6 +37,9 @@ data:
   mm_configs:
     fps: 24
     max_frames: 81
+    frame_factor: 4
+    frame_factor_remainder: 1
+    scale_factor: 16
 
 train:
   global_batch_size: 8

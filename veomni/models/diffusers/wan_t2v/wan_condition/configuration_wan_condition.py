@@ -26,6 +26,7 @@ class WanTransformer3DConditionModelConfig(PretrainedConfig):
         ),
         cfg_negative_prob: float = 0.1,
         video_max_size: int = 480,
+        patch_size: tuple[int, int, int] | None = None,
         seed: Optional[int] = 42,
         **kwargs,
     ):
@@ -41,6 +42,7 @@ class WanTransformer3DConditionModelConfig(PretrainedConfig):
         self.cfg_negative_prompt = cfg_negative_prompt
         self.cfg_negative_prob = cfg_negative_prob
         self.video_max_size = video_max_size
+        self.patch_size = patch_size
         self.seed = seed
         super().__init__(**kwargs)
 
