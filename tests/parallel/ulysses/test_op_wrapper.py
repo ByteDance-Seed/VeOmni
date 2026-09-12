@@ -51,6 +51,16 @@ def _set_ops(*, rms_norm: str = "eager", rotary_pos_emb: str = "eager") -> None:
     )
 
 
+def _mock_unvalidated_ops(monkeypatch, *, rms_norm: str = "eager", rotary_pos_emb: str = "eager") -> None:
+    """Inject wrapper selections without invoking accelerator config validation."""
+    _clear_wrapper_cache()
+    config = types.SimpleNamespace(
+        rms_norm_implementation=rms_norm,
+        rotary_pos_emb_implementation=rotary_pos_emb,
+    )
+    monkeypatch.setattr(op_wrappers_mod, "get_ops_config", lambda: config)
+
+
 def _eager_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float, *, offset: float = 0.0) -> torch.Tensor:
     x_f = x.float()
     rstd = torch.rsqrt(x_f.square().mean(dim=-1, keepdim=True) + eps)
@@ -309,14 +319,14 @@ def test_get_op_wrapper_rejects_unknown_op() -> None:
         get_op_wrapper("swiglu_mlp")
 
 
-def test_unknown_implementation_raises() -> None:
-    _set_ops(rms_norm="not_a_backend")
+def test_unknown_implementation_raises(monkeypatch) -> None:
+    _mock_unvalidated_ops(monkeypatch, rms_norm="not_a_backend")
     with pytest.raises(KeyError, match="Supported: \\['eager', 'liger_kernel', 'npu'\\]"):
         get_op_wrapper("rms_norm")
 
 
-def test_triton_implementation_raises() -> None:
-    _set_ops(rms_norm="triton", rotary_pos_emb="triton")
+def test_triton_implementation_raises(monkeypatch) -> None:
+    _mock_unvalidated_ops(monkeypatch, rms_norm="triton", rotary_pos_emb="triton")
     with pytest.raises(KeyError, match="implementation 'triton'"):
         get_op_wrapper("rms_norm")
     with pytest.raises(KeyError, match="implementation 'triton'"):

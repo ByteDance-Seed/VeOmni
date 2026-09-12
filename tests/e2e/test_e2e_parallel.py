@@ -13,7 +13,7 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_com
 from veomni.utils.import_utils import is_diffusers_available, is_quack_gemm_available
 
 from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
-from ..tools.training_utils import make_eager_ops_config
+from ..tools.training_utils import is_npu_image_gdn_enabled, make_eager_ops_config
 from .utils import prepare_exec_cmd
 
 
@@ -21,10 +21,12 @@ from .utils import prepare_exec_cmd
 # lists with a TODO; uncomment once the corresponding model gains a v5
 # patchgen path.
 _dit_only = pytest.mark.skipif(not is_diffusers_available(), reason="Requires diffusers")
-# Qwen3.5 GatedDeltaNet has no NPU kernel today; eager-only path also requires
-# non-varlen training (dyn_bsz=False), but the e2e command uses dyn_bsz=True.
+# Qwen3.5 varlen training needs the optional NPU GDN kernels. The dedicated
+# image workflow opts in only after validating its fla_npu installation; the
+# regular NPU workflow keeps skipping these cases.
 _qwen3_5_npu_skip = pytest.mark.skipif(
-    IS_NPU_AVAILABLE, reason="Qwen3.5 GatedDeltaNet has no NPU backend (varlen path)"
+    IS_NPU_AVAILABLE and not is_npu_image_gdn_enabled(),
+    reason="Qwen3.5 NPU varlen training requires the GDN-enabled image workflow",
 )
 _qwen_image_npu_skip = pytest.mark.skipif(IS_NPU_AVAILABLE, reason="Qwen-Image training is GPU-only for now")
 

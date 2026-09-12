@@ -22,10 +22,12 @@ kernels at the top level; those are mocked so the tests run on any host (CPU/GPU
 from __future__ import annotations
 
 import sys
-from unittest.mock import MagicMock
+from importlib.machinery import ModuleSpec
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.utils._triton as torch_triton_utils
 
 
 # ---------------------------------------------------------------------------
@@ -33,32 +35,43 @@ import torch
 # ---------------------------------------------------------------------------
 
 
-def _install_npu_mocks() -> None:
-    """Pre-populate ``sys.modules`` with stubs for every NPU / Triton dep."""
-    _TL = MagicMock(__path__=[], __spec__=MagicMock())
-    _TRITON = MagicMock(language=_TL, __version__="3.2.0", __path__=[], __spec__=MagicMock())
+def _package_mock(name: str) -> MagicMock:
+    """Return a package-like mock that is safe for ``importlib.find_spec``."""
+    return MagicMock(__path__=[], __spec__=ModuleSpec(name, loader=None, is_package=True))
 
-    _TRITON_SUBS = [
+
+def _npu_mocks() -> dict[str, object]:
+    """Build stubs for every NPU / Triton dependency imported by the target."""
+    triton_language = _package_mock("triton.language")
+    triton_runtime = _package_mock("triton.runtime")
+    triton_driver = _package_mock("triton.runtime.driver")
+    triton_driver.active.get_current_target.return_value.backend = "cpu"
+    triton_runtime.driver = triton_driver
+
+    triton = _package_mock("triton")
+    triton.language = triton_language
+    triton.runtime = triton_runtime
+    triton.__version__ = "3.2.0"
+
+    triton_submodules = [
         "triton.language.extra",
         "triton.language.extra.libdevice",
         "triton.language.extra.cann",
         "triton.language.extra.cann.extension",
-        "triton.runtime",
-        "triton.runtime.driver",
     ]
 
-    _MOCKS: dict[str, object] = {
-        "torch_npu": MagicMock(),
-        "fla_npu": MagicMock(),
-        "triton": _TRITON,
-        "triton.language": _TL,
+    mocks: dict[str, object] = {
+        "torch_npu": _package_mock("torch_npu"),
+        "fla_npu": _package_mock("fla_npu"),
+        "triton": triton,
+        "triton.language": triton_language,
+        "triton.runtime": triton_runtime,
+        "triton.runtime.driver": triton_driver,
     }
-    for sub in _TRITON_SUBS:
-        _MOCKS[sub] = MagicMock(__path__=[], __spec__=MagicMock())
+    for name in triton_submodules:
+        mocks[name] = _package_mock(name)
 
-    for name, mock in _MOCKS.items():
-        if name not in sys.modules:
-            sys.modules[name] = mock
+    return mocks
 
 
 # ---------------------------------------------------------------------------
@@ -82,10 +95,21 @@ class TestPrecomputeVarlenMetadataContract:
 
     @pytest.fixture(scope="class")
     def module(self):
-        _install_npu_mocks()
-        from veomni.ops.kernels.gated_delta_rule._ascend import flash_gated_delta_rule as m
+        # This contract does not exercise TorchInductor. Hide the synthetic
+        # Triton package from its availability probe while importing VeOmni.
+        mocks = _npu_mocks()
+        # ``import torch`` may preload the real torch_npu integration and its
+        # import hooks. Keep already-loaded hardware modules intact.
+        for name in ("torch_npu", "fla_npu"):
+            if name in sys.modules:
+                mocks.pop(name)
+        with (
+            patch.dict(sys.modules, mocks),
+            patch.object(torch_triton_utils, "has_triton_package", return_value=False),
+        ):
+            from veomni.ops.kernels.gated_delta_rule._ascend import flash_gated_delta_rule as m
 
-        return m
+            yield m
 
     @pytest.mark.parametrize(
         "lengths,chunk_size,num_heads",

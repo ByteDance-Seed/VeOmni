@@ -1,0 +1,183 @@
+name: NPU image unit tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Ascend VeOmni image to validate
+        required: true
+        default: quay.io/ascend/veomni:veomni-9.0.0-910b-ubuntu22.04-py3.11-torch2.10.0-latest
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  npu_image_unit_tests:
+    name: VeOmni Ascend image UT
+    runs-on: [self-hosted, 910b-8]
+    timeout-minutes: 90
+    # Local CI already runs inside the prepared VeOmni environment, so keep the
+    # job container disabled to avoid pulling the image and creating a sibling container.
+    # container:
+    #   image: ${{ inputs.image }}
+    #   volumes:
+    #     - /usr/local/dcmi:/usr/local/dcmi
+    #     - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi
+    #     - /usr/local/Ascend/driver:/usr/local/Ascend/driver
+    #     - /etc/ascend_install.info:/etc/ascend_install.info:ro
+    #     - /data00/tiger/actions-runner_veomni/proxy/latest_proxy:/tmp/latest_proxy:ro
+    #     - /mnt/veomni_ci:/mnt/veomni_ci:ro
+    #   options: >-
+    #     --cap-add=ALL
+    #     --device /dev/davinci_manager
+    #     --device /dev/devmm_svm
+    #     --device /dev/hisi_hdc
+    #     --device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3
+    #     --device /dev/davinci4 --device /dev/davinci5 --device /dev/davinci6 --device /dev/davinci7
+    #     --device /dev/davinci8 --device /dev/davinci9 --device /dev/davinci10 --device /dev/davinci11
+    #     --device /dev/davinci12 --device /dev/davinci13 --device /dev/davinci14 --device /dev/davinci15
+    #     --shm-size 16g
+    env:
+      IMAGE_PYTHON: /app/.venv/bin/python
+      PYTHONPATH: ${{ github.workspace }}
+      NO_PROXY: localhost,127.0.0.1,hf-mirror.com
+      HF_ENDPOINT: https://hf-mirror.com
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
+      CI_HF_MODELS_DIR: /mnt/veomni_ci/models
+      CI_SAMPLES_DIR: /mnt/veomni_ci/datasets/custom_data/samples
+      CI_DATASET_DIR: /mnt/veomni_ci/datasets
+      HCCL_HOST_SOCKET_PORT_RANGE: auto
+      HCCL_NPU_SOCKET_PORT_RANGE: auto
+
+    steps:
+      - name: Set ASCEND_VISIBLE_DEVICES from runner slice
+        shell: bash
+        run: |
+          set -u
+          name="${RUNNER_NAME:-${HOSTNAME:-}}"
+          cards="0,1,2,3,4,5,6,7"
+          if [[ "$name" =~ ^910b-([0-9]+)$ ]] && (( BASH_REMATCH[1] % 2 != 0 )); then
+            cards="8,9,10,11,12,13,14,15"
+          fi
+          echo "Runner '$name' uses cards $cards"
+          echo "ASCEND_VISIBLE_DEVICES=$cards" | tee -a "$GITHUB_ENV"
+          echo "ASCEND_RT_VISIBLE_DEVICES=$cards" | tee -a "$GITHUB_ENV"
+          echo "PATH=$(dirname "$IMAGE_PYTHON"):$PATH" >> "$GITHUB_ENV"
+
+      - name: Check image environment
+        run: |
+          cat /usr/local/Ascend/ascend-toolkit/latest/"$(uname -i)"-linux/ascend_toolkit_install.info
+          npu-smi info
+          test -x "$IMAGE_PYTHON"
+          command -v torchrun
+          "$IMAGE_PYTHON" -c "import sys, pytest, torch, torch_npu; print(sys.executable); print(pytest.__version__, torch.__version__, getattr(torch_npu, '__version__', 'unknown'))"
+
+      - name: Checkout VeOmni source under test
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          clean: true
+
+      - name: Run additional image tests
+        run: |
+          echo "Running additional NPU image tests."
+
+          # Parallel tests
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses_npu.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/parallel/ulysses/test_op_wrapper.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/parallel/context_parallel
+
+          # Model tests
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/models/test_deepseek_v4_liger_ops.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/models/test_generated_call_site_signatures.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/models/test_models_logits_equal_v5_npu.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/models/test_return_log_probs_e2e_npu.py
+
+          # FSDP and model loading tests
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/utils/test_rank0_load_and_broadcast_weights.py
+
+          # Ops tests
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_chunk_loss.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_chunk_topk_distill.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_chunked_fused_linear_grad_gating.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_eager_kernels_cpu.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_expert_scatter_index.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_fused_load_balancing_loss.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_gdn_ascend_gate.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_gdn_varlen_metadata.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_kernel_registry_sanity.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_npu_kernels_extended.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_seqcls_loss_npu.py
+
+          # Distributed and optimizer tests
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/distributed/test_muon_zero_comm_shard.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/optim/test_muon_unit.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/optim/test_muon_fsdp2_parity.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/optim/test_muon_fsdp2_smoke_npu.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/optim/test_optimizer_vlm_param_groups.py
+
+          # LoRA tests
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_target_mapping.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_veomni_lora_moe_native.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_moe_lora_eager.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_moe_lora_trainer.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_moe_lora_ep2_npu.py
+
+      - name: Run parallel tests
+        run: |
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/parallel/ulysses/test_ulysses.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/parallel/ulysses/test_all_gather.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/parallel/ulysses/test_slice_input_tensor.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/parallel/test_ddp_sp_grad_sync.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/parallel/test_parallel_state_registry.py
+
+      - name: Run models tests
+        run: |
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/models/test_model_registry.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/models/test_models_patch.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/models/test_padded_packed_loss.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/models/test_vlm_trainer.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/trainer/test_aux_metrics.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_vlm_lora.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/models/test_checkpoint_tensor_converter.py
+
+      - name: Run FSDP and model loading tests
+        run: |
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/utils/test_moe_ep_sharded_load_matrix.py
+
+      - name: Run checkpoint tests
+        run: |
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/checkpoints/test_checkpoint_callback.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/checkpoints/test_dcp_checkpointer.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/checkpoints/test_trainer_saveload.py
+
+      - name: Run distributed and data tests
+        run: |
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/distributed/test_async_offload_unit.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/distributed/test_dummy_forward.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/data
+
+      - name: Run ops tests
+        run: |
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_comp.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_fla_npu_installation_contract.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_moe_hw_gate.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_npu_kernels.py
+
+      - name: Run utils and optimizer tests
+        run: |
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/utils/test_count_flops.py
+
+      - name: Run LoRA tests
+        run: |
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_lora_trainer_saveload.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_moe_lora_fused_npu.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_moe_lora_ep_sharded_stream_load.py
