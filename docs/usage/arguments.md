@@ -569,8 +569,30 @@ configured and never round-trip through a saved config.
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |
 | offload | `bool` | `False` | Enable CPU offload. |
 | offload_pin_memory | `bool` | `True` | Pin the CPU offload buffers, matching torch's `CPUOffloadPolicy` default. Set `False` to keep offloaded shards pageable, so a large-MoE job is not charged non-reclaimable Shmem. |
+| reduce_scatter_transport_dtype | `Optional[str]` | `None` | Optional `bfloat16` or `float16` wire dtype for FSDP2 ReduceScatter while keeping `mixed_precision.reduce_dtype: float32`. `None` or a value equal to `reduce_dtype` uses native PyTorch communication. |
 | max_load_broadcast_size | `float` | `20.0` | Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting. |
 | mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |
+
+When `reduce_scatter_transport_dtype` differs from `mixed_precision.reduce_dtype`, VeOmni converts the FP32
+ReduceScatter input to the configured wire dtype, performs an all-to-all over the shard group, and accumulates
+directly into the FP32 output. This allocates low-precision send and receive buffers. Under HSDP, only the shard-
+group ReduceScatter uses the low-precision transport; the replicate-group AllReduce remains native FP32. When
+the transport and reduction dtypes match, VeOmni does not register the custom collective or alter native gradient
+scaling and reduction behavior.
+
+`bfloat16` is the recommended transport dtype because it retains FP32's exponent range. `float16` can be
+faster on some systems, but casting the FP32 reduction buffer follows normal IEEE FP16 semantics: finite
+values with magnitude above `65504` become infinity. Use FP16 only when gradient ranges are known to be safe.
+
+The supported combinations are intentionally narrow:
+
+| `mixed_precision.reduce_dtype` | `reduce_scatter_transport_dtype` | Behavior |
+| --- | --- | --- |
+| Any supported dtype | `None` | Native PyTorch path |
+| Any supported dtype | Same as `reduce_dtype` | Native PyTorch path |
+| `float32` | `bfloat16` or `float16` | With `mixed_precision.enable: true`, custom low-precision transport with FP32 accumulation and output; FP16 has the range limitation described above |
+| `bfloat16` | `float16` | Unsupported: both use two bytes per value, while BF16-to-FP16 may overflow |
+| `float16` | `bfloat16` | Unsupported: both use two bytes per value and provide no traffic reduction |
 
 ### MixedPrecisionConfig
 

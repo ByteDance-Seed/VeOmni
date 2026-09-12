@@ -31,6 +31,7 @@ from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_lo
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
+from .fsdp2.reduce_scatter import register_fp32_reduce_scatter_with_low_precision_transport
 from .parallel_plan import ParallelPlan, get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
 from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_runtime
@@ -310,6 +311,33 @@ def _can_shard_extra_parallel_dim0(
     return True
 
 
+def _configure_fsdp_gradient_reduction(
+    module: FSDPModule,
+    *,
+    gradient_divide_factor: float,
+    reduce_scatter_group_size: int,
+    transport_reduction_scales: dict[nn.Module, float],
+) -> None:
+    if reduce_scatter_group_size > 1:
+        transport_reduction_scales[module] = 1.0 / gradient_divide_factor
+    else:
+        # FSDP does not call the custom hook for a single-rank shard group, so
+        # that path must retain its native divide factor.
+        module.set_gradient_divide_factor(gradient_divide_factor)
+
+
+def _reduce_scatter_group_size(mesh) -> int:
+    """Return the shard-dimension size for 1D FSDP or 2D HSDP meshes."""
+    return mesh[mesh.mesh_dim_names[-1]].size()
+
+
+def _uses_low_precision_reduce_scatter_transport(
+    transport_dtype: Optional[str],
+    reduce_dtype: Optional[str],
+) -> bool:
+    return transport_dtype is not None and transport_dtype != reduce_dtype
+
+
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str] = None,
@@ -317,6 +345,7 @@ def parallelize_model_fsdp2(
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
+    reduce_scatter_transport_dtype: Optional[str] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
@@ -345,6 +374,25 @@ def parallelize_model_fsdp2(
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
     parallel_state = get_parallel_state()
+
+    use_low_precision_transport = reduce_scatter_transport_dtype is not None and (
+        _uses_low_precision_reduce_scatter_transport(
+            reduce_scatter_transport_dtype,
+            getattr(mixed_precision, "reduce_dtype", None),
+        )
+    )
+    if use_low_precision_transport:
+        if not mixed_precision.enable or mixed_precision.reduce_dtype != "float32":
+            raise ValueError(
+                "The custom ReduceScatter transport path supports only mixed precision with "
+                "reduce_dtype='float32' and transport dtype 'bfloat16' or 'float16'."
+            )
+        if reduce_scatter_transport_dtype not in ("bfloat16", "float16"):
+            raise ValueError("Low-precision ReduceScatter transport must use transport dtype 'bfloat16' or 'float16'.")
+        if get_device_type() != "cuda":
+            raise RuntimeError("Low-precision ReduceScatter transport is only supported on CUDA/NCCL.")
+    elif reduce_scatter_transport_dtype is not None:
+        logger.info_rank0("ReduceScatter transport dtype matches reduce dtype; using the native PyTorch collective.")
 
     model_no_split_modules = getattr(model, "_no_split_modules", None) or []
     target_classes = set(model_no_split_modules) | set(basic_modules or [])
@@ -586,6 +634,12 @@ def parallelize_model_fsdp2(
     #   e.g. sorted_fqn_list = ['decoder.embed_tokens', 'embed_tokens', 'decoder']
     sorted_fqn_list = sort_fqn_by_submodule_first(list(layer_pairs.keys()))
     layer_pairs_list = [(fqn, layer_pairs[fqn]) for fqn in sorted_fqn_list]
+    if use_low_precision_transport:
+        transport_reduction_scales = {}
+        fsdp_reduce_scatter_group_size = _reduce_scatter_group_size(parallel_state.fsdp_mesh)
+        fsdp_reduction_scale = 1.0 / parallel_state.fsdp_mesh.size()
+    else:
+        transport_reduction_scales = None
 
     for layer_fqn, (layer_mod, extra_parallel_mod) in layer_pairs_list:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
@@ -611,9 +665,15 @@ def parallelize_model_fsdp2(
                 if IS_NPU_AVAILABLE:
                     # NPU is using torch 2.7
                     _para_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
-                else:
-                    # from torch 2.8
+                elif transport_reduction_scales is None:
                     _para_mod.set_gradient_divide_factor(gradient_divide_factor)
+                else:
+                    _configure_fsdp_gradient_reduction(
+                        _para_mod,
+                        gradient_divide_factor=gradient_divide_factor,
+                        reduce_scatter_group_size=_reduce_scatter_group_size(extra_parallel_fsdp_kwargs[para]["mesh"]),
+                        transport_reduction_scales=transport_reduction_scales,
+                    )
                 layer_mod._fsdp_modules.append(_para_mod)
 
         # shard module that needs to ignore mixed precision control
@@ -631,6 +691,8 @@ def parallelize_model_fsdp2(
         #      no need to shard layer_mod again.
         if not isinstance(layer_mod, FSDPModule):
             fully_shard(layer_mod, **fsdp_kwargs)
+            if transport_reduction_scales is not None and fsdp_reduce_scatter_group_size > 1:
+                transport_reduction_scales[layer_mod] = fsdp_reduction_scale
             layer_mod._fsdp_modules.append(layer_mod)
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
 
@@ -645,6 +707,20 @@ def parallelize_model_fsdp2(
     # above pass `reshard_after_forward` explicitly).
     root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
     fully_shard(model, **root_fsdp_kwargs)
+
+    if use_low_precision_transport:
+        assert transport_reduction_scales is not None
+        if fsdp_reduce_scatter_group_size > 1:
+            transport_reduction_scales[model] = fsdp_reduction_scale
+        registered = register_fp32_reduce_scatter_with_low_precision_transport(
+            model,
+            transport_dtype=getattr(torch, reduce_scatter_transport_dtype),
+            reduction_scales=transport_reduction_scales,
+        )
+        logger.info_rank0(
+            f"Enabled {reduce_scatter_transport_dtype} ReduceScatter transport with FP32 output on "
+            f"{registered} FSDP module{'s' if registered != 1 else ''}."
+        )
 
     # configure manual prefetching when needed
     need_manual_prefetch = (
@@ -782,6 +858,7 @@ def build_parallelize_model(
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
+    reduce_scatter_transport_dtype: Optional[str] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
@@ -837,6 +914,7 @@ def build_parallelize_model(
                 mixed_precision=mixed_precision,
                 basic_modules=basic_modules,
                 muon_expert_zero_comm=muon_expert_zero_comm,
+                reduce_scatter_transport_dtype=reduce_scatter_transport_dtype,
                 compile_config=compile_config,
                 should_skip_hf_weight_load=should_skip_hf_weight_load,
                 **kwargs,
