@@ -273,20 +273,44 @@ def build_torchrun_cmd(
 # ---------------------------------------------------------------------------
 
 
+def build_hf_reference_model(config_path: str, *, torch_dtype: str, init_device: str):
+    """Build an upstream HF model through the models_kernel entry point.
+
+    Reference-weight materialization must work before a model family is added to
+    ``MODELING_REGISTRY``. Select the explicit HF backend for only this build and
+    restore the caller's environment afterwards; the VeOmni runtime keeps its
+    strict no-fallback registry behavior.
+    """
+    from veomni.models_kernel import build_foundation_model
+
+    previous_backend = os.environ.get("MODELING_BACKEND")
+    os.environ["MODELING_BACKEND"] = "hf"
+    try:
+        return build_foundation_model(
+            config_path=config_path,
+            weights_path=None,
+            torch_dtype=torch_dtype,
+            init_device=init_device,
+            ops_implementation=make_eager_ops_config(),
+        )
+    finally:
+        if previous_backend is None:
+            os.environ.pop("MODELING_BACKEND", None)
+        else:
+            os.environ["MODELING_BACKEND"] = previous_backend
+
+
 def materialize_weights(config_path: str, output_path: str, save_original_format: bool = True) -> None:
     """Build a model from toy config and save random weights to disk.
 
     This avoids downloading real model weights for CI tests.
     """
-    from veomni.models.auto import build_foundation_model
     from veomni.utils.device import empty_cache, get_device_type
 
-    model = build_foundation_model(
-        config_path=config_path,
-        weights_path=None,
+    model = build_hf_reference_model(
+        config_path,
         torch_dtype="float32",
         init_device=get_device_type(),
-        ops_implementation=make_eager_ops_config(),
     )
     model.save_pretrained(output_path, save_original_format=save_original_format)
     # The fp32 model can pin tens of GiB on the device (e.g. qwen3_5's full

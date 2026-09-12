@@ -71,7 +71,7 @@ checkpoint round-trip tests; do not hide mismatches with `strict=False`.
    embeddings; a model without ExtraParallel does not need one.
 
 3. **Exception — non-transformers architectures.** Diffusion models under
-   `veomni/models/diffusers/<model_name>/`, and the `flux` / `movqgan` / `wan`
+   `veomni/models_kernel/diffusers/<model_name>/`, and the `flux` / `movqgan` / `wan`
    directories, have no `generated/` output and no patchgen config: they patch
    through `device_patch.py` or direct modeling. Copy the closest existing one
    and skip to Phase 3.

@@ -255,7 +255,7 @@ config = PatchConfig(
 **Cross-config reuse pattern** (qwen3_5_moe reusing qwen3_5):
 
 ```python
-from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
+from veomni.models_kernel.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_forward_patched,
     qwen3_5_vision_model_forward,
     # ...
@@ -351,12 +351,12 @@ Guidelines:
 
 ```bash
 patchgen \
-    veomni.models.transformers.<m>.<m>_gpu_patch_gen_config \
+    veomni.models_kernel.transformers.<m>.<m>_gpu_patch_gen_config \
     -o veomni/models_kernel/transformers/<m>/generated --diff
 ```
 
 **Validation**: file is syntactically valid (import it: `python -c "import
-veomni.models.transformers.<m>.<m>_gpu_patch_gen_config"`) and every behaviour
+veomni.models_kernel.transformers.<m>.<m>_gpu_patch_gen_config"`) and every behaviour
 identified in Phase 1 has a corresponding decorator here.
 
 ---
@@ -448,7 +448,7 @@ def register_<m>_modeling(architecture: str):
    sibling behind. Target a single module only when you want a fast loop:
    ```bash
    patchgen \
-       veomni.models.transformers.<m>.<m>_gpu_patch_gen_config \
+       veomni.models_kernel.transformers.<m>.<m>_gpu_patch_gen_config \
        -o veomni/models_kernel/transformers/<m>/generated --diff -v
    ```
 2. Inspect `generated/patched_modeling_<m>_gpu.py`:

@@ -8,12 +8,11 @@ import pytest
 import torch
 import yaml
 
-from veomni.models.auto import build_foundation_model
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
 from veomni.utils.import_utils import is_diffusers_available, is_quack_gemm_available
 
 from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
-from ..tools.training_utils import make_eager_ops_config
+from ..tools.training_utils import build_hf_reference_model
 from .utils import prepare_exec_cmd
 
 
@@ -65,12 +64,10 @@ def _materialize_weights_dir(config_path: str, output_path: str, save_original_f
     # comparisons flaky at the toy-config scale (CI hit a seed where the EP=2 vs
     # EP=1 step-2 grad_norm diff was 0.69, blowing past the 0.1 atol+rtol envelope).
     torch.manual_seed(0)
-    model = build_foundation_model(
-        config_path=config_path,
-        weights_path=None,
+    model = build_hf_reference_model(
+        config_path,
         torch_dtype="float32",
         init_device="cpu",
-        ops_implementation=make_eager_ops_config(),
     )
 
     model.save_pretrained(output_path, save_original_format=save_original_format)

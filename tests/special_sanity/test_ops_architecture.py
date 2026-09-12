@@ -30,7 +30,6 @@ RETAINED_MODEL_CONSUMER_TESTS = {
     Path("tests/data/multimodal/test_vlm_data_process.py"),
     Path("tests/distributed/test_dummy_forward.py"),
     Path("tests/distributed/test_torch_compile.py"),
-    Path("tests/e2e/test_e2e_parallel.py"),
     Path("tests/lora/test_moe_lora_ep_sharded_stream_load.py"),
     Path("tests/lora/test_moe_lora_trainer.py"),
     Path("tests/lora/test_qwen3_5_moe_lora.py"),
@@ -38,7 +37,7 @@ RETAINED_MODEL_CONSUMER_TESTS = {
     Path("tests/lora/utils.py"),
     Path("tests/optim/test_muon_fsdp2_parity.py"),
     Path("tests/optim/test_muon_fsdp2_smoke.py"),
-    Path("tests/tools/training_utils.py"),
+    Path("tests/parallel/ulysses/test_wan_self_attn_ulysses.py"),
     Path("tests/utils/test_model_loader.py"),
 }
 
