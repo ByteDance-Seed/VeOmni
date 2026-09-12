@@ -107,4 +107,4 @@ Validated on 8×MI308X / ROCm 7.14. End-to-end training (FSDP2 sharding, Ulysses
 
 - **CUDA-only kernels** (FA3/FA4/Quack/FlashMLA/DSA, e.g. `gpt_oss`) fall back to triton/eager on ROCm, or are skipped.
 - **GatedDeltaNet (qwen3_5 / qwen3_5_moe)**: the tilelang ROCm backend has a HIP wrapper/codegen defect; set `FLA_TILELANG=0` to use the Triton fallback (validated to train and align correctly).
-- **DCP → HF weight consolidation**: the version guard in `veomni/checkpoint/dcp_consolidation.py` only allows torch `2.9`/`2.11` and rejects the image's torch `2.12`. Relax the guard or use a 2.9/2.11 ROCm torch build; otherwise disable `save_hf_weights`.
+- **DCP → HF weight consolidation**: torch `2.12` is supported by the allow-listed patch in `veomni/checkpoint/dcp_consolidation.py`. Newer torch releases still need their `_process_output_file` hash added before `save_hf_weights` consolidation will succeed.
