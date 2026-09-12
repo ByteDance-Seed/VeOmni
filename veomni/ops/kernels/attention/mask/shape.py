@@ -170,6 +170,7 @@ def causal_mask(
             batch_size=batch_size,
             q_length=q_len,
             kv_length=kv_len,
+            q_offset=kv_len - q_len,
             device=device,
             **extra,
         )

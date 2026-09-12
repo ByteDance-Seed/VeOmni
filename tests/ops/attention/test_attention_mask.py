@@ -142,6 +142,11 @@ def test_magi_hf_builder_rejects_implicit_2d_visibility(attention_2d):
         magi_attention_mask_builder(1, 4, 4, attention_mask=attention_2d, device="cpu")
 
 
+def test_magi_hf_builder_rejects_mismatched_causal_lengths():
+    with pytest.raises(ValueError, match="matching query and key segment lengths"):
+        magi_attention_mask_builder(1, 2, 4, device="cpu")
+
+
 def _sync_ulysses_state(*, size: int = 2) -> SimpleNamespace:
     return SimpleNamespace(ulysses_size=size, async_enabled=False)
 

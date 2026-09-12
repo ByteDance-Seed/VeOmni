@@ -258,6 +258,12 @@ def test_magi_causal_aligns_with_hf_builder(impl):
     torch.testing.assert_close(shaped.attn_type_map, built.attn_type_map)
 
 
+@pytest.mark.parametrize("impl", ("magi_attention", "veomni_magi_attention"))
+def test_magi_causal_rejects_kv_cache_lengths(impl):
+    with pytest.raises(ValueError, match="does not support KV-cache offsets"):
+        causal_mask(2, 4, impl=impl, device="cpu")
+
+
 def test_magi_packed_aligns_with_from_cu_seqlens():
     cu_seqlens = torch.tensor([0, 2, 4])
     built = MagiAttentionMask.from_cu_seqlens(cu_seqlens)

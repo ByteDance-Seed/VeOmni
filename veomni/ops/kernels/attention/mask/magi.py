@@ -164,6 +164,8 @@ def magi_attention_mask_builder(
         kv_length,
         skip_ulysses=skip_ulysses,
     )
+    if causal and full_q_length != full_kv_length:
+        raise ValueError("Packed causal MagiAttention requires matching query and key segment lengths.")
     attn_type_map = torch.ones(1, device=device, dtype=torch.int32) if causal else None
     return MagiAttentionMask.from_ranges(
         torch.tensor([[0, full_q_length]], device=device, dtype=torch.int32),
