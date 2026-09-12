@@ -8,6 +8,7 @@ import pytest
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from tests.tools import training_utils
+from veomni.utils.device import MOE_TRITON_DEVICE_TYPES
 
 
 @pytest.mark.parametrize("previous_backend", [None, "veomni"])
@@ -91,3 +92,19 @@ def test_build_hf_reference_model_supports_an_unregistered_family(monkeypatch, t
     assert model.config.model_type == "qwen3"
     assert model.__class__.__module__.startswith("transformers.models.qwen3")
     assert os.environ["MODELING_BACKEND"] == "veomni"
+
+
+@pytest.mark.parametrize(
+    ("device_type", "expected_moe"),
+    [
+        (MOE_TRITON_DEVICE_TYPES[0], "fused_triton"),
+        ("npu", "fused_npu"),
+    ],
+)
+def test_deepseek_v4_ops_overrides_follow_active_device(monkeypatch, device_type, expected_moe):
+    monkeypatch.setattr(training_utils, "get_device_type", lambda: device_type)
+
+    overrides = training_utils.resolve_ops_overrides("deepseek_v4")
+
+    assert "--model.ops_implementation.attn_implementation=eager" in overrides
+    assert f"--model.ops_implementation.moe_implementation={expected_moe}" in overrides

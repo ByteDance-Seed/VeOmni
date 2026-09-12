@@ -413,19 +413,6 @@ TEST_CASES = [
         _DEFAULT_ATOL,
         id="deepseek_v3",
     ),
-    pytest.param(
-        "./tests/toy_config/deepseek_v4_toy/config.json",
-        True,
-        # DeepSeek-V4 ships eager-only attention (head_dim=512 > FA cap,
-        # no SDPA sink-aware kernel, FlexAttention can't resize BlockMask
-        # mid-block). Until a v4-specific eager-SP / fused-attention path
-        # lands, the per-block parity gap inherits the eager baseline; the
-        # default rtol/atol remain a strict gate on the fused-MoE +
-        # cross-entropy patch.
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="deepseek_v4",
-    ),
 ]
 
 
@@ -447,20 +434,6 @@ def test_models_patch_fwd_bwd(
         if IS_NPU_AVAILABLE:
             # npu not support torch.kaiser_window init in Token2WavBigVGANModel
             return
-
-    # DeepSeek-V4 attention is eager-only: ``_supports_flash_attn = False``
-    # / ``_supports_sdpa = False`` / ``_supports_flex_attn = False`` —
-    # ``head_dim=512`` exceeds FA's 256 cap, SDPA lacks the per-head learnable
-    # sink, and FlexAttention can't resize BlockMask after the in-block
-    # compressor concatenation. The default FA-based mode grid would fail at
-    # ``TrainerTest(hf_model_modes[0])`` with
-    # ``ValueError: DeepseekV4ForCausalLM does not support Flash Attention 2``.
-    # Keep attention eager, but exercise the clamp-aware fused MoE path on each
-    # backend: DeepSeek-V4 forwards ``swiglu_limit`` into triton/npu.
-    if case_id == "deepseek_v4":
-        hf_model_modes = [ModelMode("hf", "eager")]
-        moe_impl = "npu" if get_device_type() == "npu" else "triton"
-        veomni_model_modes = [ModelMode("veomni", "eager", moe_implementation=moe_impl)]
 
     # Qwen3.5 compatibility:
     # - HF backend doesn't support the test's position_ids test cases.
@@ -515,13 +488,7 @@ def test_models_patch_fwd_bwd(
     del trainer.model, trainer.optimizer, trainer.lr_scheduler
 
     model_config = trainer.model_config
-    # Upstream DeepSeek-V4 eager attention does not consume packed cu-seqlens.
-    # Comparing it with VeOmni's boundary-aware packed path on two concatenated
-    # samples would therefore compare different attention semantics. Keep this
-    # HF↔VeOmni patch-alignment case to one sequence; multi-sample packed V4 is
-    # covered by ``test_deepseek_v4_tilelang_dyn_bsz_smoke``.
-    num_samples = 1 if case_id == "deepseek_v4" else 2
-    dummy_data_loader = prepare_data(case_id, max_seq_len=1024, model_config=model_config, num_samples=num_samples)
+    dummy_data_loader = prepare_data(case_id, max_seq_len=1024, model_config=model_config, num_samples=2)
 
     res = {}
     log_keys = []

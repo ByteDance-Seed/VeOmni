@@ -128,10 +128,10 @@ def compress_packed_windows(
     sequence and lets every operation stay on device.
 
     ``apply_rope`` is injected so callers in the generated modeling pass their
-    module-global ``apply_rotary_pos_emb``, which ``device_patch.py`` may have
-    swapped for the fused Triton backend. It is required rather than defaulted
-    to the eager reference: a defaulted call site would silently keep eager
-    while every other one is fused, which no test would catch.
+    module-global ``apply_rotary_pos_emb``, whose local ``VeomniOp`` selection may
+    use the fused Triton backend. It is required rather than defaulted to the eager
+    reference: a defaulted call site would silently keep eager while every other
+    one is fused, which no test would catch.
 
     ``kv`` and ``gate`` may be pre-extended with halos, as context parallelism
     does, provided ``window_indices`` has been rebased onto the extended buffer

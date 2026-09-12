@@ -18,7 +18,6 @@ tests/
 │   ├── test_vlm_trainer.py         # VLM freeze_vit smoke test
 │   ├── test_model_registry.py      # Model loader registry (HF vs VeOmni)
 │   ├── test_checkpoint_tensor_converter.py  # Checkpoint tensor conversion (e.g. Qwen3MoE fuse)
-│   ├── test_deepseek_v4_fused_moe.py  # DeepSeek-V4 fused MoE swiglu_limit plumbing
 │   ├── test_padded_packed_loss.py   # Padded vs packed (cu_seqlens) loss equivalence
 │   ├── test_models_logits_equal_v5.py  # HF↔VeOmni logits through the real loader
 │   └── utils.py                    # ModelMode, prepare_model_modes, prepare_data
@@ -32,6 +31,7 @@ tests/
 │   ├── moe_experts/                         # Eager/Triton/Quack/NPU/MLU expert kernels
 │   └── gated_delta_rule/                    # GatedDeltaNet kernel family
 ├── models_kernel/
+│   ├── test_deepseek_v4.py                  # DeepSeek-V4 model and op-callsite parity
 │   ├── test_loss_utils.py                   # causal/seq-cls policy, SP reduction, side-path routing
 │   ├── test_return_log_probs_e2e.py          # generated Qwen3/VL log-probs and distill wiring
 │   └── test_model_load_balancing_loss.py    # HF-shaped model helper and gradient fan-out
@@ -157,14 +157,15 @@ Additional per-directory helpers:
 | Liger kernel | `True`, `False` (VeOmni only) |
 
 **Models covered**:
-- Text / MoE: llama3_1, qwen2, qwen3_5, qwen3_5_moe, seed_oss, deepseek_v3, deepseek_v4
+- Text / MoE: llama3_1, qwen2, qwen3_5, qwen3_5_moe, seed_oss, deepseek_v3
 - VLM: qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe
 - Omni: qwen2_5_omni, qwen3_omni_moe
 
 **GPU**: 1 GPU, runs serially per model mode.
 
-DeepSeek-V4's fused-MoE-specific merged `gate_up_proj` and `swiglu_limit`
-forwarding are covered by `tests/models/test_deepseek_v4_fused_moe.py` (CPU).
+DeepSeek-V4's router precision, norm/RoPE ordering, and fused-MoE-specific
+merged `gate_up_proj` plus `swiglu_limit` forwarding are covered by
+`tests/models_kernel/test_deepseek_v4.py` (CPU).
 Its kernel package import behavior, hardware guards, BF16/FP32 utility, and
 TileLang DSA indexer/attention numerical checks are covered by
 `tests/ops/dsa/`. The guard and utility cases run on CPU; optimized

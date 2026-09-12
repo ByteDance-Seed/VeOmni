@@ -45,7 +45,7 @@ logger = logging.get_logger(__name__)
 # false — so the shards are never gathered, each rank attends only within its own
 # 1/cp_size of the sequence, and the run trains to a plausible loss curve while
 # being silently wrong.
-CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
+CONTEXT_PARALLEL_MODEL_TYPES = frozenset()
 
 
 def check_model_build_prerequisites(config: PretrainedConfig) -> None:
@@ -62,10 +62,8 @@ def check_model_build_prerequisites(config: PretrainedConfig) -> None:
     plain ``getattr`` for the same reason: a config that has nothing to refuse should
     not have to say so.
 
-    ``DeepseekV4Config.validate_build_prerequisites`` is the only implementation
-    today. It refuses a Lightning Indexer KL objective configured without the TileLang
-    indexer and attention it is defined in terms of -- a disagreement between a model
-    field and two kernel selections, which no single dataclass can see.
+    The hook remains available to legacy config subclasses until their model family
+    moves to ``models_kernel``; generic code does not special-case model names here.
     """
     validate = getattr(config, "validate_build_prerequisites", None)
     if callable(validate):

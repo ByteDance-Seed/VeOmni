@@ -22,6 +22,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
+import torch.nn.functional as F
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM as HFDeepseekV4ForCausalLM
 
@@ -63,18 +64,18 @@ def _tiny_config() -> DeepseekV4Config:
     )
 
 
-def _dsv4_cls():
+def _dsv4_module():
     from veomni.utils.device import IS_NPU_AVAILABLE
 
     if IS_NPU_AVAILABLE:
-        from veomni.models_kernel.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_npu import (
-            DeepseekV4ForCausalLM,
-        )
+        from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as gen
     else:
-        from veomni.models_kernel.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
-            DeepseekV4ForCausalLM,
-        )
-    return DeepseekV4ForCausalLM
+        from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as gen
+    return gen
+
+
+def _dsv4_cls():
+    return _dsv4_module().DeepseekV4ForCausalLM
 
 
 def _build_ours(config: DeepseekV4Config, ops: SimpleNamespace | None = None):
@@ -141,6 +142,135 @@ def test_deepseek_v4_instances_keep_distinct_impls():
     set_ops_config(chunk_cfg)
     assert eager.veomni_ce.impl == "eager"
     assert eager.model.layers[0].self_attn.veomni_dsa_attention.impl == "eager"
+
+
+def test_deepseek_v4_rms_norms_use_selected_liger_impl(available_nvidia_ops):
+    ops = eager_ops_config()
+    ops.rms_norm_implementation = "liger_kernel"
+    model = _build_ours(_tiny_config(), ops)
+    layer = model.model.layers[0]
+
+    assert layer.input_layernorm.veomni_rms_norm.variant == "deepseek_v4"
+    assert layer.input_layernorm.veomni_rms_norm.impl == "liger_kernel"
+    assert layer.self_attn.q_b_norm.veomni_unweighted_rms_norm.variant == "unweighted"
+    assert layer.self_attn.q_b_norm.veomni_unweighted_rms_norm.impl == "liger_kernel"
+
+
+def test_deepseek_v4_routers_use_fp32_projection_under_autocast():
+    modeling = _dsv4_module()
+    config = SimpleNamespace(
+        num_experts_per_tok=2,
+        num_local_experts=4,
+        hidden_size=8,
+        scoring_func="sigmoid",
+        routed_scaling_factor=1.0,
+        vocab_size=16,
+    )
+    topk_router = modeling.DeepseekV4TopKRouter(config).to(torch.bfloat16)
+    hash_router = modeling.DeepseekV4HashRouter(config).to(torch.bfloat16)
+    with torch.no_grad():
+        topk_router.weight.copy_(torch.linspace(-0.5, 0.5, topk_router.weight.numel()).reshape_as(topk_router.weight))
+        hash_router.weight.copy_(torch.linspace(0.5, -0.5, hash_router.weight.numel()).reshape_as(hash_router.weight))
+    hidden_states = torch.linspace(-1.0, 1.0, 24, dtype=torch.bfloat16).reshape(1, 3, 8)
+    input_ids = torch.tensor([[0, 1, 2]])
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        logits, weights, indices = topk_router(hidden_states)
+        hash_logits, _, _ = hash_router(hidden_states, input_ids)
+    expected_logits = F.linear(hidden_states.reshape(-1, 8).float(), topk_router.weight.float())
+    expected_hash_logits = F.linear(hidden_states.reshape(-1, 8).float(), hash_router.weight.float())
+    expected_scores = expected_logits.sigmoid()
+    expected_indices = torch.topk(expected_scores, 2, dim=-1, sorted=False).indices
+    expected_weights = expected_scores.gather(1, expected_indices)
+    expected_weights /= expected_weights.sum(dim=-1, keepdim=True) + 1e-20
+
+    assert logits.dtype == torch.float32
+    assert hash_logits.dtype == torch.float32
+    torch.testing.assert_close(logits, expected_logits, rtol=0, atol=0)
+    torch.testing.assert_close(hash_logits, expected_hash_logits, rtol=0, atol=0)
+    torch.testing.assert_close(indices, expected_indices, rtol=0, atol=0)
+    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+
+
+def test_deepseek_v4_attention_preserves_q_norm_and_rope_dtype_modes(monkeypatch):
+    modeling = _dsv4_module()
+    config = _tiny_config()
+    model = _build_ours(config)
+    attention = model.model.layers[0].self_attn.to(torch.bfloat16).eval()
+    hidden_states = torch.randn(1, 7, config.hidden_size, dtype=torch.bfloat16)
+    position_ids = torch.arange(hidden_states.shape[1]).unsqueeze(0)
+    rotary = model.model.rotary_emb.train()
+    train_cos, train_sin = rotary(hidden_states, position_ids, layer_type="main")
+
+    assert train_cos.dtype == hidden_states.dtype
+    assert train_sin.dtype == hidden_states.dtype
+
+    rotary.eval()
+    cos, sin = rotary(hidden_states, position_ids, layer_type="main")
+    assert cos.dtype == torch.float32
+    assert sin.dtype == torch.float32
+
+    captured = {}
+
+    def fake_attention(_module, query, _key, _value, _mask, **_kwargs):
+        captured["query"] = query
+        return torch.zeros_like(query.transpose(1, 2)), None
+
+    monkeypatch.setattr(
+        modeling, "ALL_ATTENTION_FUNCTIONS", SimpleNamespace(get_interface=lambda *_args: fake_attention)
+    )
+    attention(
+        hidden_states,
+        position_embeddings={"main": (cos, sin), "compress": (cos, sin)},
+        position_ids=position_ids,
+        attention_mask=None,
+    )
+
+    q_residual = attention.q_a_norm(attention.q_a_proj(hidden_states))
+    q_raw = attention.q_b_proj(q_residual).view(
+        hidden_states.shape[0], hidden_states.shape[1], config.num_attention_heads, config.head_dim
+    )
+    rstd = torch.rsqrt(q_raw.float().square().mean(-1, keepdim=True) + config.rms_norm_eps)
+    expected = q_raw * rstd.to(q_raw.dtype)
+    expected = modeling.apply_rotary_pos_emb(expected.transpose(1, 2), cos, sin)
+    wrong_fp32_multiply = (q_raw.float() * rstd).to(q_raw.dtype)
+    wrong_fp32_multiply = modeling.apply_rotary_pos_emb(wrong_fp32_multiply.transpose(1, 2), cos, sin)
+
+    torch.testing.assert_close(captured["query"], expected, rtol=0, atol=0)
+    assert not torch.equal(captured["query"], wrong_fp32_multiply)
+
+
+def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit():
+    config = _tiny_config()
+    model = _build_ours(config)
+    experts = model.model.layers[3].mlp.experts
+    hidden_states = torch.linspace(-0.7, 0.8, steps=4 * config.hidden_size).reshape(4, config.hidden_size)
+    selected_experts = torch.tensor([[0, 1], [2, 0], [1, 2], [0, 2]], dtype=torch.long)
+    top_k_weights = torch.tensor(
+        [[0.7, 0.3], [0.6, 0.4], [0.55, 0.45], [0.8, 0.2]],
+        dtype=torch.float64,
+    )
+    captured = {}
+
+    def record(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return torch.zeros_like(hidden_states)
+
+    experts.veomni_moe = record
+    actual = experts(hidden_states, selected_experts, top_k_weights)
+    args = captured["args"]
+    kwargs = captured["kwargs"]
+
+    assert args[0] is hidden_states
+    torch.testing.assert_close(args[1], top_k_weights.to(hidden_states.dtype), rtol=0, atol=0)
+    assert args[2] is selected_experts
+    assert args[3].numel() == 0
+    assert args[4].numel() == 0
+    assert args[5] is experts.down_proj
+    assert args[6] is experts.gate_up_proj
+    assert kwargs == {"num_experts": experts.num_experts, "swiglu_limit": config.swiglu_limit}
+    torch.testing.assert_close(actual, torch.zeros_like(hidden_states), rtol=0, atol=0)
 
 
 def test_deepseek_v4_eager_matches_hf():
