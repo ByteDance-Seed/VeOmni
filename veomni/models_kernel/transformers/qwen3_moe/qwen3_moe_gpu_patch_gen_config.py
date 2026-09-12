@@ -29,7 +29,7 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_outputs import MoeModelOutputWithPast
+from transformers.modeling_outputs import MoeModelOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
@@ -68,6 +68,7 @@ config.add_import(
 config.drop_import_names("MoeCausalLMOutputWithPast")
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 config.add_import("functools", names=["partial"])
+config.add_import("transformers.modeling_outputs", names=["SequenceClassifierOutputWithPast"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models_kernel.utils.op_utils",
@@ -75,7 +76,7 @@ config.add_import(
 )
 config.add_import(
     "veomni.models_kernel.loss_utils",
-    names=["ForCausalLMLoss", "load_balancing_loss"],
+    names=["ForCausalLMLoss", "ForSequenceClassificationLoss", "load_balancing_loss"],
 )
 
 
@@ -305,6 +306,103 @@ def qwen3_moe_forcausallm_init_patched(self, config):
         resolve_op_impl("load_balancing_loss_implementation"),
     )
     self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
+    self.post_init()
+
+
+@config.override_method(
+    "Qwen3MoeForSequenceClassification.__init__",
+    description="Construct the local base model and bind sequence-classification loss",
+)
+def qwen3_moe_for_sequence_classification_init_patched(self, config):
+    Qwen3MoePreTrainedModel.__init__(self, config)
+    self.num_labels = config.num_labels
+    self.model = Qwen3MoeModel(config)
+    self.score = nn.Linear(config.get_text_config().hidden_size, self.num_labels, bias=False)
+    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForSequenceClassificationLoss, op=self.veomni_ce)
+    self.post_init()
+
+
+@config.override_method(
+    "Qwen3MoeForSequenceClassification.forward",
+    description="Always call the local sequence-classification loss",
+)
+def qwen3_moe_for_sequence_classification_forward_patched(
+    self,
+    input_ids=None,
+    attention_mask=None,
+    position_ids=None,
+    past_key_values=None,
+    inputs_embeds=None,
+    labels=None,
+    use_cache=None,
+    cache_position=None,
+    **kwargs,
+):
+    outputs = self.model(
+        input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        cache_position=cache_position,
+        **kwargs,
+    )
+    hidden_states = outputs.last_hidden_state
+    logits = self.score(hidden_states)
+
+    loss = None
+    if labels is not None:
+        loss, _, _ = self.loss_function(
+            logits=None,
+            labels=labels,
+            num_labels=self.num_labels,
+            hidden_states=hidden_states,
+            weights=self.score.weight,
+            **kwargs,
+        )
+
+    return SequenceClassifierOutputWithPast(
+        loss=loss,
+        logits=logits,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+    )
+
+
+@config.override_method(
+    "Qwen3MoeForTokenClassification.__init__",
+    description="Construct the local base model for token classification",
+)
+def qwen3_moe_for_token_classification_init_patched(self, config):
+    Qwen3MoePreTrainedModel.__init__(self, config)
+    self.num_labels = config.num_labels
+    self.model = Qwen3MoeModel(config)
+    classifier_dropout = getattr(config, "classifier_dropout", None)
+    if classifier_dropout is None:
+        classifier_dropout = getattr(config, "hidden_dropout", None)
+    if classifier_dropout is None:
+        classifier_dropout = 0.1
+    self.dropout = nn.Dropout(classifier_dropout)
+    self.score = nn.Linear(
+        config.get_text_config().hidden_size,
+        config.num_labels,
+        bias=getattr(config, "token_classification_bias", True),
+    )
+    self.post_init()
+
+
+@config.override_method(
+    "Qwen3MoeForQuestionAnswering.__init__",
+    description="Construct the local base model for question answering",
+)
+def qwen3_moe_for_question_answering_init_patched(self, config):
+    Qwen3MoePreTrainedModel.__init__(self, config)
+    self.transformer = Qwen3MoeModel(config)
+    self.qa_outputs = nn.Linear(config.hidden_size, 2)
     self.post_init()
 
 

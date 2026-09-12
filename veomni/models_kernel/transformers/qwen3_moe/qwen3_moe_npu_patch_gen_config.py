@@ -22,6 +22,10 @@ from veomni.models_kernel.transformers.qwen3_moe.qwen3_moe_gpu_patch_gen_config 
     PatchedQwen3MoeExperts,
     apply_rotary_pos_emb_patched,
     qwen3_moe_attention_forward_patched,
+    qwen3_moe_for_question_answering_init_patched,
+    qwen3_moe_for_sequence_classification_forward_patched,
+    qwen3_moe_for_sequence_classification_init_patched,
+    qwen3_moe_for_token_classification_init_patched,
     qwen3_moe_forcausallm_forward_patched,
     qwen3_moe_forcausallm_init_patched,
     qwen3_moe_get_parallel_plan_patched,
@@ -122,6 +126,27 @@ config.override_method(
     "Qwen3MoeForCausalLM.forward",
     replacement=qwen3_moe_forcausallm_forward_patched,
     description="Always call ForCausalLMLoss and load_balancing_loss VeomniOps",
+)
+
+config.override_method(
+    "Qwen3MoeForSequenceClassification.__init__",
+    replacement=qwen3_moe_for_sequence_classification_init_patched,
+    description="Construct the local base model and bind sequence-classification loss",
+)
+config.override_method(
+    "Qwen3MoeForSequenceClassification.forward",
+    replacement=qwen3_moe_for_sequence_classification_forward_patched,
+    description="Always call the local sequence-classification loss",
+)
+config.override_method(
+    "Qwen3MoeForTokenClassification.__init__",
+    replacement=qwen3_moe_for_token_classification_init_patched,
+    description="Construct the local base model for token classification",
+)
+config.override_method(
+    "Qwen3MoeForQuestionAnswering.__init__",
+    replacement=qwen3_moe_for_question_answering_init_patched,
+    description="Construct the local base model for question answering",
 )
 
 

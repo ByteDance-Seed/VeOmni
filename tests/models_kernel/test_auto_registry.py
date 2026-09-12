@@ -23,6 +23,7 @@ import pytest
 from transformers import PretrainedConfig
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from tests.models_kernel.compare import eager_ops_config
 from veomni.models_kernel import (
@@ -107,6 +108,27 @@ def _tiny_llama_config(architecture: str = "LlamaForCausalLM") -> LlamaConfig:
     )
 
 
+def _tiny_qwen3_moe_config(architecture: str = "Qwen3MoeForCausalLM") -> Qwen3MoeConfig:
+    return Qwen3MoeConfig(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=32,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=16,
+        decoder_sparse_step=1,
+        mlp_only_layers=[],
+        architectures=[architecture],
+        attn_implementation="eager",
+        experts_implementation="eager",
+    )
+
+
 _MODEL_CASES = (
     _ModelCase(
         model_type="deepseek_v4",
@@ -132,6 +154,17 @@ _MODEL_CASES = (
             "Qwen3ForTokenClassification",
             "Qwen3ForSequenceClassification",
             "Qwen3Model",
+        ),
+    ),
+    _ModelCase(
+        model_type="qwen3_moe",
+        config_factory=_tiny_qwen3_moe_config,
+        architectures=(
+            "Qwen3MoeForCausalLM",
+            "Qwen3MoeForTokenClassification",
+            "Qwen3MoeForSequenceClassification",
+            "Qwen3MoeForQuestionAnswering",
+            "Qwen3MoeModel",
         ),
     ),
 )

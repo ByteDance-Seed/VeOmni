@@ -29,6 +29,14 @@
 #      Bind ForCausalLMLoss and load_balancing_loss VeomniOps
 #    - method_override: Qwen3MoeForCausalLM.forward
 #      Always call ForCausalLMLoss and load_balancing_loss VeomniOps
+#    - method_override: Qwen3MoeForSequenceClassification.__init__
+#      Construct the local base model and bind sequence-classification loss
+#    - method_override: Qwen3MoeForSequenceClassification.forward
+#      Always call the local sequence-classification loss
+#    - method_override: Qwen3MoeForTokenClassification.__init__
+#      Construct the local base model for token classification
+#    - method_override: Qwen3MoeForQuestionAnswering.__init__
+#      Construct the local base model for question answering
 #    - method_override: Qwen3MoeForCausalLM.get_parallel_plan
 #      Register Qwen3Moe expert parallel plan for v5 generated modeling
 #    - method_override: Qwen3MoeAttention.forward
@@ -57,7 +65,7 @@ from transformers.modeling_layers import (
     GenericForTokenClassification,
     GradientCheckpointingLayer,
 )
-from transformers.modeling_outputs import MoeModelOutputWithPast
+from transformers.modeling_outputs import MoeModelOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
@@ -67,7 +75,7 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
-from veomni.models_kernel.loss_utils import ForCausalLMLoss, load_balancing_loss
+from veomni.models_kernel.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss, load_balancing_loss
 from veomni.models_kernel.utils.op_utils import (
     attention_op,
     empty_bias,
@@ -772,16 +780,107 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         return _get_parallel_plan()
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeForSequenceClassification
+# Methods patched: __init__, forward
+# ======================================================================
+
+
 class Qwen3MoeForSequenceClassification(GenericForSequenceClassification, Qwen3MoePreTrainedModel):
-    pass
+    def __init__(self, config):
+        Qwen3MoePreTrainedModel.__init__(self, config)
+        self.num_labels = config.num_labels
+        self.model = Qwen3MoeModel(config)
+        self.score = nn.Linear(config.get_text_config().hidden_size, self.num_labels, bias=False)
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForSequenceClassificationLoss, op=self.veomni_ce)
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        outputs = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        hidden_states = outputs.last_hidden_state
+        logits = self.score(hidden_states)
+
+        loss = None
+        if labels is not None:
+            loss, _, _ = self.loss_function(
+                logits=None,
+                labels=labels,
+                num_labels=self.num_labels,
+                hidden_states=hidden_states,
+                weights=self.score.weight,
+                **kwargs,
+            )
+
+        return SequenceClassifierOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeForTokenClassification
+# Methods patched: __init__
+# ======================================================================
 
 
 class Qwen3MoeForTokenClassification(GenericForTokenClassification, Qwen3MoePreTrainedModel):
-    pass
+    def __init__(self, config):
+        Qwen3MoePreTrainedModel.__init__(self, config)
+        self.num_labels = config.num_labels
+        self.model = Qwen3MoeModel(config)
+        classifier_dropout = getattr(config, "classifier_dropout", None)
+        if classifier_dropout is None:
+            classifier_dropout = getattr(config, "hidden_dropout", None)
+        if classifier_dropout is None:
+            classifier_dropout = 0.1
+        self.dropout = nn.Dropout(classifier_dropout)
+        self.score = nn.Linear(
+            config.get_text_config().hidden_size,
+            config.num_labels,
+            bias=getattr(config, "token_classification_bias", True),
+        )
+        self.post_init()
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeForQuestionAnswering
+# Methods patched: __init__
+# ======================================================================
 
 
 class Qwen3MoeForQuestionAnswering(GenericForQuestionAnswering, Qwen3MoePreTrainedModel):
     base_model_prefix = "transformer"  # For BC, where `transformer` was used instead of `model`
+
+    def __init__(self, config):
+        Qwen3MoePreTrainedModel.__init__(self, config)
+        self.transformer = Qwen3MoeModel(config)
+        self.qa_outputs = nn.Linear(config.hidden_size, 2)
+        self.post_init()
 
 
 __all__ = [
