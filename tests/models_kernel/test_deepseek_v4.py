@@ -100,6 +100,7 @@ def test_deepseek_v4_constructs_local_kernels():
     assert model.config.mlp_layer_types == ["hash_moe", "hash_moe", "hash_moe", "moe"]
     layer = model.model.layers[0]
     assert layer.input_layernorm.veomni_rms_norm.impl == "eager"
+    assert layer.input_layernorm.veomni_rms_norm.variant == "deepseek_v4"
     assert layer.attn_hc.veomni_mhc_pre.op == "mhc"
     assert layer.veomni_mhc_post.variant == "post"
     assert layer.self_attn.veomni_dsa_attention.op == "dsa_attention"

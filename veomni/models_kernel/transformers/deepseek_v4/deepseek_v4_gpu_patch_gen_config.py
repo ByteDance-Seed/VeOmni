@@ -201,7 +201,7 @@ def deepseek_v4_rms_norm_init_patched(self, hidden_size, eps: float = 1e-6) -> N
     nn.Module.__init__(self)
     self.weight = nn.Parameter(torch.ones(hidden_size))
     self.variance_epsilon = eps
-    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+    self.veomni_rms_norm = VeomniOp("rms_norm", "deepseek_v4", resolve_op_impl("rms_norm_implementation"))
 
 
 @config.override_method(

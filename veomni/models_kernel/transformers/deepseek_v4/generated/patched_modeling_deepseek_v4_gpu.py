@@ -195,7 +195,7 @@ class DeepseekV4RMSNorm(nn.Module):
         nn.Module.__init__(self)
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+        self.veomni_rms_norm = VeomniOp("rms_norm", "deepseek_v4", resolve_op_impl("rms_norm_implementation"))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)

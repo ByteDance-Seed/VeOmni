@@ -53,7 +53,7 @@ from tests.ops.tol import (
     RMS_UNWEIGHTED_ATOL,
     RMS_UNWEIGHTED_RTOL,
 )
-from veomni.ops import resolve_op
+from veomni.ops import OP_REGISTRY, resolve_op
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
@@ -67,6 +67,12 @@ def _hf_rms_norm(variant: str, hidden: int, eps: float) -> nn.Module:
 
 def _clone_inputs(x: Tensor, weight: Tensor) -> tuple[Tensor, Tensor]:
     return x.detach().requires_grad_(True), weight.detach().requires_grad_(True)
+
+
+def _deepseek_v4_reference(x: Tensor, weight: Tensor, eps: float) -> Tensor:
+    x_f = x.float()
+    rstd = torch.rsqrt(x_f.square().mean(dim=-1, keepdim=True) + eps)
+    return (weight.float() * (x_f * rstd)).to(x.dtype)
 
 
 def _fused_weight(variant: str, hidden: int, device: str, dtype: torch.dtype) -> Tensor:
@@ -101,6 +107,46 @@ def test_eager_matches_hf(variant: str, dtype: torch.dtype):
     out_e.backward(go)
     assert torch.allclose(x_e.grad.float(), x_h.grad.float(), atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     assert torch.allclose(w_e.grad.float(), module.weight.grad.float(), atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+def test_deepseek_v4_registers_only_supported_impls():
+    assert set(OP_REGISTRY.list_registered("rms_norm", "deepseek_v4")) == {"eager", "liger_kernel"}
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_deepseek_v4_eager_matches_fp32_affine_reference(dtype: torch.dtype):
+    torch.manual_seed(0)
+    eps = 1e-6
+    x = torch.randn(2, 16, 64, dtype=dtype)
+    weight = torch.randn(64, dtype=dtype)
+
+    x_ref, w_ref = _clone_inputs(x, weight)
+    out_ref = _deepseek_v4_reference(x_ref, w_ref, eps)
+    x_e, w_e = _clone_inputs(x, weight)
+    out_e = resolve_op("rms_norm", "deepseek_v4", "eager").wrapper(x_e, w_e, eps=eps)
+
+    torch.testing.assert_close(out_e, out_ref, rtol=0, atol=0)
+    grad_output = torch.randn_like(out_e)
+    out_ref.backward(grad_output)
+    out_e.backward(grad_output)
+    torch.testing.assert_close(x_e.grad.float(), x_ref.grad.float(), atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    torch.testing.assert_close(w_e.grad.float(), w_ref.grad.float(), atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+def test_deepseek_v4_eager_preserves_fp32_weight_multiply_order():
+    generator = torch.Generator().manual_seed(42)
+    x = torch.randn(2, 3, 32, generator=generator, dtype=torch.bfloat16)
+    weight = torch.randn(32, generator=generator, dtype=torch.bfloat16)
+    eps = 1e-6
+
+    normalized = x.float()
+    normalized *= torch.rsqrt(normalized.square().mean(-1, keepdim=True) + eps)
+    expected = (weight.float() * normalized).to(x.dtype)
+    llama_cast_order = weight * normalized.to(x.dtype)
+    actual = resolve_op("rms_norm", "deepseek_v4", "eager").wrapper(x, weight, eps=eps)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert not torch.equal(actual, llama_cast_order)
 
 
 def test_unweighted_eager_matches_hf():
@@ -162,19 +208,20 @@ def _fused_matches_eager(
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RMSNorm needs a GPU")
-@pytest.mark.parametrize("variant", ["standard", "qwen3_5"])
+@pytest.mark.parametrize("variant", ["standard", "deepseek_v4", "qwen3_5"])
 def test_liger_matches_eager(variant: str):
     pytest.importorskip("liger_kernel")
+    fp32_affine = variant in {"deepseek_v4", "qwen3_5"}
     _fused_matches_eager(
         variant,
         "liger_kernel",
         "cuda",
         torch.bfloat16,
-        atol=RMS_FUSED_QWEN35_ATOL if variant == "qwen3_5" else RMS_FUSED_ATOL,
-        rtol=RMS_FUSED_QWEN35_RTOL if variant == "qwen3_5" else RMS_FUSED_RTOL,
+        atol=RMS_FUSED_QWEN35_ATOL if fp32_affine else RMS_FUSED_ATOL,
+        rtol=RMS_FUSED_QWEN35_RTOL if fp32_affine else RMS_FUSED_RTOL,
         grad_atol=RMS_FUSED_GRAD_ATOL,
         grad_rtol=RMS_FUSED_GRAD_RTOL,
-        cast_fp32=variant == "qwen3_5",
+        cast_fp32=fp32_affine,
     )
 
 
