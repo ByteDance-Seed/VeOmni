@@ -46,7 +46,7 @@ def wrapper(
     if use_cache:
         raise ValueError("cuDNN GLM sparse-attention indexer does not support KV cache.")
 
-    from ....vendor.flashmla_cudnn import indexer_select_topk
+    from ...vendor.flashmla_cudnn import indexer_select_topk
 
     return indexer_select_topk(
         q,

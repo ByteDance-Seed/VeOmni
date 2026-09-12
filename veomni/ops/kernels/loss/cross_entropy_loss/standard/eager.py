@@ -55,13 +55,12 @@ def cross_entropy_from_logits(
     device; do not ``.item()`` it.
     """
     if labels.numel() == 0:
-        return logits.sum() * 0
+        return logits.float().sum()
     loss = F.cross_entropy(logits.float(), labels, ignore_index=ignore_index, reduction="sum")
-    connected = loss + logits.sum() * 0
     if num_items_in_batch is not None:
-        return connected / num_items_in_batch
-    n_valid = (labels != ignore_index).sum().to(dtype=connected.dtype)
-    return connected / n_valid.clamp(min=1)
+        return loss / num_items_in_batch
+    n_valid = (labels != ignore_index).sum().to(dtype=loss.dtype)
+    return loss / n_valid.clamp(min=1)
 
 
 def _loss_hidden_weight(

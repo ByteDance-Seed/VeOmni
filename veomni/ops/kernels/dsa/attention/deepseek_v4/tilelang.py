@@ -32,6 +32,6 @@ def wrapper(
     ``q`` is ``[B, S, H, D]``, ``kv`` is ``[B, S_kv, D]``, ``attn_sink`` is
     ``[H]``, ``topk_idxs`` is ``[B, S, topk]``.
     """
-    from ....vendor.tilelang_sparse_mla import sparse_attn_tilelang
+    from ...vendor.tilelang_sparse_mla import sparse_attn_tilelang
 
     return sparse_attn_tilelang(q, kv, attn_sink, topk_idxs, sm_scale, return_lse)

@@ -46,7 +46,7 @@ def wrapper(
     if training and attention_dropout != 0:
         raise ValueError("flashmla_cudnn GLM sparse attention requires attention_dropout=0.")
 
-    from ....vendor.flashmla_cudnn import flash_mla_sparse_attention_with_cudnn_backward
+    from ...vendor.flashmla_cudnn import flash_mla_sparse_attention_with_cudnn_backward
 
     return flash_mla_sparse_attention_with_cudnn_backward(
         q_pe,
