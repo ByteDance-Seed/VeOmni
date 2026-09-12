@@ -21,9 +21,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
+from tests.ops.tol import ATTN_ATOL, ATTN_GRAD_ATOL, ATTN_GRAD_RTOL, ATTN_RTOL
+from veomni.ops import resolve_op
 from veomni.ops.kernels.attention.standard import flash as flash_backend
+from veomni.utils.device import IS_CUDA_AVAILABLE
 
 
 class _FakeAttentionModule(nn.Module):
@@ -33,6 +37,62 @@ class _FakeAttentionModule(nn.Module):
         self.is_causal = True
         self.layer_idx = 7
         self.proj = nn.Linear(4, 4)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FlashAttention 2 needs a CUDA GPU")
+def test_registered_fa2_adapter_matches_sdpa_with_mla_value_dim_and_gradients():
+    """Exercise the complete facade/adapter/FA2 path, including MLA padding."""
+    try:
+        __import__("flash_attn")
+    except Exception as exc:
+        pytest.skip(f"flash-attn is not available: {exc}")
+
+    torch.manual_seed(17)
+    batch, heads, seq_len, head_dim, value_head_dim = 2, 4, 32, 64, 32
+    tensors = (
+        torch.randn(batch, heads, seq_len, head_dim, device="cuda", dtype=torch.float16),
+        torch.randn(batch, heads, seq_len, head_dim, device="cuda", dtype=torch.float16),
+        torch.randn(batch, heads, seq_len, value_head_dim, device="cuda", dtype=torch.float16),
+    )
+    q_fa, k_fa, v_fa = (tensor.detach().requires_grad_(True) for tensor in tensors)
+    q_ref, k_ref, v_ref = (tensor.detach().requires_grad_(True) for tensor in tensors)
+    scale = 0.17
+
+    adapter = resolve_op("attention", "standard", "veomni_flash_attention_2").wrapper
+    actual, attention_weights = adapter(
+        _FakeAttentionModule("veomni_flash_attention_2"),
+        q_fa,
+        k_fa,
+        v_fa,
+        None,
+        dropout=0.0,
+        scaling=scale,
+        is_causal=True,
+        skip_ulysses=True,
+    )
+    expected = F.scaled_dot_product_attention(
+        q_ref,
+        k_ref,
+        v_ref,
+        dropout_p=0.0,
+        is_causal=True,
+        scale=scale,
+    ).transpose(1, 2)
+
+    assert attention_weights is None
+    assert actual.shape == (batch, seq_len, heads, value_head_dim)
+    torch.testing.assert_close(actual.float(), expected.float(), atol=ATTN_ATOL, rtol=ATTN_RTOL)
+
+    grad_output = torch.randn_like(actual)
+    actual.backward(grad_output)
+    expected.backward(grad_output)
+    for actual_input, expected_input in zip((q_fa, k_fa, v_fa), (q_ref, k_ref, v_ref), strict=True):
+        torch.testing.assert_close(
+            actual_input.grad.float(),
+            expected_input.grad.float(),
+            atol=ATTN_GRAD_ATOL,
+            rtol=ATTN_GRAD_RTOL,
+        )
 
 
 @pytest.mark.parametrize(

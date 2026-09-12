@@ -110,7 +110,10 @@ _FA4_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
     (GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,)), ("flash_attn.cute",)),
 )
 _MAGI_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
-    (GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,)), ("magi_attention",)),
+    (
+        GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,)),
+        ("magi_attention", "flash_attn_cute", "cuda.bindings", "debugpy"),
+    ),
 )
 _SAGE_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
     (GpuKernelRequirement(platforms=(_NVIDIA_SM80_PLUS,)), ("sageattention",)),

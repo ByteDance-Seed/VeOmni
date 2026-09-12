@@ -170,7 +170,7 @@ def test_attention_rows_declare_platform_and_package_requirements():
         (_FA2_IMPLS, (sm80_plus, ROCM_GPU), ("flash_attn",)),
         (_FA3_IMPLS, (NVIDIA_SM90_PLUS,), ("flash_attn_interface",)),
         (_FA4_IMPLS, (NVIDIA_SM90_PLUS,), ("flash_attn.cute",)),
-        (_MAGI_IMPLS, (NVIDIA_SM90_PLUS,), ("magi_attention",)),
+        (_MAGI_IMPLS, (NVIDIA_SM90_PLUS,), ("magi_attention", "flash_attn_cute", "cuda.bindings", "debugpy")),
         (("veomni_sage_attention",), (sm80_plus,), ("sageattention",)),
     )
 
@@ -196,6 +196,19 @@ def test_attention_packages_participate_in_gpu_availability(monkeypatch):
     monkeypatch.setattr(op_registry, "is_package_available", lambda _package: False)
 
     assert OP_REGISTRY.list_available("attention", "standard") == list(_ANY_DEVICE_IMPLS)
+
+
+@pytest.mark.parametrize("missing_package", ("magi_attention", "flash_attn_cute", "cuda.bindings", "debugpy"))
+def test_magi_dependency_closure_fails_fast(monkeypatch, missing_package):
+    monkeypatch.setattr(op_registry, "get_device_type", lambda: "cuda")
+    monkeypatch.setattr(NvidiaGpuPlatform, "matches", lambda self: True)
+    monkeypatch.setattr(op_registry, "is_package_available", lambda package: package != missing_package)
+
+    available = OP_REGISTRY.list_available("attention", "standard")
+    for impl in _MAGI_IMPLS:
+        assert impl not in available
+        with pytest.raises(RuntimeError, match="requires unavailable package"):
+            OP_REGISTRY.resolve("attention", "standard", impl)
 
 
 def test_magi_short_name_uses_installed_veomni_interface(monkeypatch):

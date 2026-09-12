@@ -160,11 +160,24 @@ def test_rms_norm_gated_npu_matches_eager(shape):
     gate = torch.randn_like(x)
     weight = torch.randn(shape[-1], device="npu", dtype=torch.bfloat16)
 
-    out_e = eager(x, gate, weight, eps=1e-6)
-    out_o = other(x, gate, weight, eps=1e-6)
+    x_e, g_e, w_e = _clone(x, gate, weight)
+    x_o, g_o, w_o = _clone(x, gate, weight)
+    out_e = eager(x_e, g_e, w_e, eps=1e-6)
+    out_o = other(x_o, g_o, w_o, eps=1e-6)
     assert out_o.shape == x.shape
     assert out_o.dtype == x.dtype
     assert torch.allclose(out_o.float(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
+
+    grad_output = torch.randn_like(out_e)
+    out_e.backward(grad_output)
+    out_o.backward(grad_output)
+    for actual, expected in zip((x_o, g_o, w_o), (x_e, g_e, w_e), strict=True):
+        torch.testing.assert_close(
+            actual.grad.float(),
+            expected.grad.float(),
+            atol=GDN_FUSED_GRAD_ATOL,
+            rtol=GDN_FUSED_GRAD_RTOL,
+        )
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="rms_norm_gated npu needs torch_npu")
@@ -514,9 +527,13 @@ def test_chunk_gated_delta_rule_fla_matches_eager(device):
     go = torch.randn_like(out_e)
     out_e.backward(go)
     out_o.backward(go)
-    assert torch.allclose(q_e.grad, q_o.grad, atol=GDN_CHUNK_GRAD_ATOL, rtol=GDN_CHUNK_GRAD_RTOL)
-    assert torch.allclose(k_e.grad, k_o.grad, atol=GDN_CHUNK_GRAD_ATOL, rtol=GDN_CHUNK_GRAD_RTOL)
-    assert torch.allclose(v_e.grad, v_o.grad, atol=GDN_CHUNK_GRAD_ATOL, rtol=GDN_CHUNK_GRAD_RTOL)
+    for actual, expected in zip((q_o, k_o, v_o, g_o, b_o), (q_e, k_e, v_e, g_e, b_e), strict=True):
+        torch.testing.assert_close(
+            actual.grad,
+            expected.grad,
+            atol=GDN_CHUNK_GRAD_ATOL,
+            rtol=GDN_CHUNK_GRAD_RTOL,
+        )
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="chunk_gated_delta_rule npu needs torch_npu")
@@ -598,9 +615,13 @@ def test_chunk_gated_delta_rule_flash_qla_matches_eager():
     go = torch.randn_like(out_e)
     out_e.backward(go)
     out_o.backward(go)
-    assert torch.allclose(q_e.grad, q_o.grad, atol=GDN_CHUNK_GRAD_ATOL, rtol=GDN_CHUNK_GRAD_RTOL)
-    assert torch.allclose(k_e.grad, k_o.grad, atol=GDN_CHUNK_GRAD_ATOL, rtol=GDN_CHUNK_GRAD_RTOL)
-    assert torch.allclose(v_e.grad, v_o.grad, atol=GDN_CHUNK_GRAD_ATOL, rtol=GDN_CHUNK_GRAD_RTOL)
+    for actual, expected in zip((q_o, k_o, v_o, g_o, b_o), (q_e, k_e, v_e, g_e, b_e), strict=True):
+        torch.testing.assert_close(
+            actual.grad,
+            expected.grad,
+            atol=GDN_CHUNK_GRAD_ATOL,
+            rtol=GDN_CHUNK_GRAD_RTOL,
+        )
 
 
 @pytest.mark.parametrize(
