@@ -42,6 +42,10 @@ def packed_mask_function(
     queries are the suffix of each key segment, matching cached-attention
     ``q_offset=kv_length-q_length`` semantics.
     """
+    if not isinstance(cu_seqlens, Tensor):
+        raise TypeError(f"cu_seqlens must be a torch.Tensor, got {type(cu_seqlens).__name__}")
+    if cu_seqlens_k is not None and not isinstance(cu_seqlens_k, Tensor):
+        raise TypeError(f"cu_seqlens_k must be a torch.Tensor, got {type(cu_seqlens_k).__name__}")
     if cu_seqlens_k is None and q_length != kv_length:
         raise ValueError("packed SDPA/FlexAttention with q_length != kv_length requires cu_seqlens_k")
     cu_seqlens_k = cu_seqlens if cu_seqlens_k is None else cu_seqlens_k
@@ -82,14 +86,19 @@ def packed_mask_function(
 
 
 def _validated_cu_seqlens(cu_seqlens: Tensor, length: int, device: torch.device) -> Tensor:
-    """Move cumulative lengths to ``device`` and require full coverage."""
+    """Require integer, strictly increasing, full-coverage cumulative lengths."""
+    if not isinstance(cu_seqlens, Tensor):
+        raise TypeError(f"cu_seqlens must be a torch.Tensor, got {type(cu_seqlens).__name__}")
     if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
         raise ValueError(f"cu_seqlens must have shape [n_seg + 1], got {tuple(cu_seqlens.shape)}")
+    if cu_seqlens.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"cu_seqlens must have dtype int32 or int64, got {cu_seqlens.dtype}")
     cu_seqlens = cu_seqlens.to(device=device)
     require_all(
         (cu_seqlens[:1] == 0) & (cu_seqlens[-1:] == length),
         f"cu_seqlens must run from 0 to {length}",
     )
+    require_all(cu_seqlens[1:] > cu_seqlens[:-1], "cu_seqlens must be strictly increasing")
     return cu_seqlens
 
 

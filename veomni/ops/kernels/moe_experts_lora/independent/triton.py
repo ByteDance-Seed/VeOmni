@@ -314,10 +314,10 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
 
         hidden_dim = grad_output.shape[-1]
         grad_output = grad_output.view(-1, hidden_dim)
-        max_t = grad_output.shape[0]
 
         # MoE step 10: undo gather → grad on per-(token,slot) fc2 output.
         grad_fc2_output = moe_scatter(grad_output, scatter_index)  # [T, H]
+        max_t = grad_fc2_output.shape[0]
 
         # ---- LoRA fc2 backward (per-expert closed form). ----------------
         grad_lora_a_down, grad_lora_b_down, grad_fc1_weighted_output_lora = _per_expert_lora_half_backward(

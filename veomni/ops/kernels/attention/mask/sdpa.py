@@ -23,6 +23,7 @@ from torch import Tensor
 from transformers.masking_utils import (
     ALL_MASK_ATTENTION_FUNCTIONS,
     and_masks,
+    bidirectional_mask_function,
     causal_mask_function,
     sliding_window_overlay,
 )
@@ -48,7 +49,8 @@ def sdpa_attention_mask_builder(
     itself: sync Ulysses and not ``skip_ulysses``. Then call Transformers'
     ``sdpa`` builder. Cached decode (``q_length != kv_length``) cannot use
     SDPA ``is_causal`` skip. Optional ``sliding_window`` / ``cu_seqlens``
-    compose onto ``mask_function``.
+    compose onto ``mask_function``. Canonical causal/bidirectional masks need
+    no explicit metadata under Ulysses; custom predicates do.
     """
     sliding_window = kwargs.pop("sliding_window", None)
     cu_seqlens = kwargs.pop("cu_seqlens", None)
@@ -62,8 +64,15 @@ def sdpa_attention_mask_builder(
     if should_apply_ulysses(skip_ulysses=skip_ulysses):
         if q_offset != 0 or kv_offset != 0:
             raise ValueError("SDPA with Ulysses does not support cached mask offsets.")
-        if attention_mask is None and cu_seqlens is None:
-            raise ValueError("SDPA with Ulysses requires a full-sequence 2D attention mask or cu_seqlens.")
+        if (
+            attention_mask is None
+            and cu_seqlens is None
+            and mask_function not in (causal_mask_function, bidirectional_mask_function)
+        ):
+            raise ValueError(
+                "SDPA with Ulysses requires full-sequence metadata for a custom mask function; "
+                "pass a 2D attention mask or cu_seqlens."
+            )
         if attention_mask is not None and attention_mask.ndim != 2:
             raise ValueError("SDPA with Ulysses requires a full-sequence 2D attention mask.")
         full_q_length, full_kv_length = effective_sequence_lengths(

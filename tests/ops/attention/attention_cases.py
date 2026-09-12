@@ -155,8 +155,14 @@ def flex_visible(block_mask: BlockMask, q_len: int, kv_len: int) -> torch.Tensor
     return block_mask.mask_mod(0, 0, query_idx[:, None], key_idx[None, :])
 
 
-def materialize_magi_mask(attention_mask: MagiAttentionMask, sequence_length: int) -> torch.Tensor:
-    visible = torch.zeros((sequence_length, sequence_length), dtype=torch.bool)
+def materialize_magi_mask(
+    attention_mask: MagiAttentionMask,
+    q_length: int,
+    kv_length: int | None = None,
+) -> torch.Tensor:
+    """Materialize Magi ranges, including its bottom-right causal alignment."""
+    kv_length = q_length if kv_length is None else kv_length
+    visible = torch.zeros((q_length, kv_length), dtype=torch.bool)
     attn_types = (
         torch.zeros(attention_mask.q_ranges.shape[0], dtype=torch.int32)
         if attention_mask.attn_type_map is None
@@ -172,7 +178,7 @@ def materialize_magi_mask(attention_mask: MagiAttentionMask, sequence_length: in
         k_start, k_end = k_range.tolist()
         slice_mask = torch.ones((q_end - q_start, k_end - k_start), dtype=torch.bool)
         if int(attn_type) == 1:
-            slice_mask.tril_()
+            slice_mask.tril_(diagonal=(k_end - k_start) - (q_end - q_start))
         visible[q_start:q_end, k_start:k_end] |= slice_mask
     return visible.unsqueeze(0).unsqueeze(0)
 

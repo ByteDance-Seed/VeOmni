@@ -20,7 +20,10 @@ import torch
 from torch.nn.attention.flex_attention import BlockMask
 from transformers.masking_utils import (
     ALL_MASK_ATTENTION_FUNCTIONS,
+    and_masks,
+    bidirectional_mask_function,
     causal_mask_function,
+    sliding_window_overlay,
 )
 
 from ..ulysses import effective_sequence_lengths, should_apply_ulysses
@@ -46,16 +49,25 @@ def flex_attention_mask_builder(
     adapter would gather Q/K/V itself: sync Ulysses and not
     ``skip_ulysses``. Async Ulysses keeps local tokens, so the mask stays
     local too. Explicit cumulative lengths are sufficient packed-sequence
-    metadata and do not require an additional 2D mask.
+    metadata and do not require an additional 2D mask. Canonical masks can be
+    rebuilt from global lengths; custom predicates require global metadata.
     """
+    sliding_window = kwargs.pop("sliding_window", None)
     if cu_seqlens_k is None:
         cu_seqlens_k = kwargs.pop("cu_seq_lens_k", None)
     device = kwargs.get("device", attention_mask.device if attention_mask is not None else "cpu")
     if should_apply_ulysses(skip_ulysses=skip_ulysses):
         if q_offset != 0 or kv_offset != 0:
             raise ValueError("FlexAttention with Ulysses does not support cached mask offsets.")
-        if attention_mask is None and cu_seqlens is None:
-            raise ValueError("FlexAttention with Ulysses requires a full-sequence 2D attention mask or cu_seqlens.")
+        if (
+            attention_mask is None
+            and cu_seqlens is None
+            and mask_function not in (causal_mask_function, bidirectional_mask_function)
+        ):
+            raise ValueError(
+                "FlexAttention with Ulysses requires full-sequence metadata for a custom mask function; "
+                "pass a 2D attention mask or cu_seqlens."
+            )
         if attention_mask is not None and attention_mask.ndim != 2:
             raise ValueError("FlexAttention with Ulysses requires a full-sequence 2D attention mask.")
 
@@ -73,6 +85,8 @@ def flex_attention_mask_builder(
         q_length, kv_length = full_q_length, full_kv_length
         q_offset = kv_offset = 0
 
+    if sliding_window is not None:
+        mask_function = and_masks(mask_function, sliding_window_overlay(sliding_window))
     if cu_seqlens is not None:
         mask_function = packed_mask_function(
             mask_function=mask_function,

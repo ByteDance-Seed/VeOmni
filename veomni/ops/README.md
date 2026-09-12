@@ -40,7 +40,7 @@ is then checked for importable optional packages without importing its kernel.
 
 | Op | Variants | Implementations |
 |---|---|---|
-| `attention` | `standard` | `eager`, `sdpa`, FlashAttention/FlexAttention/MagiAttention/SageAttention names, `native-sparse` |
+| `attention` | `standard` | `eager`, `sdpa`, and FlashAttention/FlexAttention/MagiAttention/SageAttention names |
 | `async_ulysses_qkv`, `async_ulysses_o` | `standard`, `dit` | `eager` orchestration |
 | `rms_norm` | `standard`, `deepseek_v4`, `unweighted`, `qwen3_5` | `eager`, `liger_kernel`, `npu`, and `triton` where supported |
 | `rope` | `full`, `partial`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |

@@ -27,7 +27,7 @@ from transformers.masking_utils import (
     sliding_window_overlay,
 )
 
-from tests.ops.attention.attention_cases import flex_visible
+from tests.ops.attention.attention_cases import flex_visible, materialize_magi_mask
 from veomni.ops.kernels.attention import ulysses as ulysses_mask
 from veomni.ops.kernels.attention.mask import flex as flex_mask
 from veomni.ops.kernels.attention.mask import magi as magi_mask
@@ -193,7 +193,7 @@ def test_sdpa_packed_cached_aligns_with_hf_builder():
     torch.testing.assert_close(shaped, built)
 
 
-@pytest.mark.parametrize("impl", ("sdpa", "flex_attention"))
+@pytest.mark.parametrize("impl", ("sdpa", "flex_attention", "magi_attention"))
 def test_packed_cached_uses_independent_query_and_key_segments(impl):
     """Cross-length packed masks align each query with its paired key segment."""
     shaped = packed_causal_mask(
@@ -204,7 +204,12 @@ def test_packed_cached_uses_independent_query_and_key_segments(impl):
         cu_seqlens=torch.tensor([0, 2, 3]),
         cu_seqlens_k=torch.tensor([0, 4, 6]),
     )
-    visible = shaped[0, 0] if impl == "sdpa" else flex_visible(shaped, 3, 6)
+    if impl == "sdpa":
+        visible = shaped[0, 0]
+    elif impl == "flex_attention":
+        visible = flex_visible(shaped, 3, 6)
+    else:
+        visible = materialize_magi_mask(shaped, 3, 6)[0, 0]
     expected = torch.tensor(
         [
             [True, True, True, False, False, False],
@@ -256,6 +261,18 @@ def test_magi_causal_aligns_with_hf_builder(impl):
     torch.testing.assert_close(shaped.q_ranges, built.q_ranges)
     torch.testing.assert_close(shaped.k_ranges, built.k_ranges)
     torch.testing.assert_close(shaped.attn_type_map, built.attn_type_map)
+
+
+@pytest.mark.parametrize("impl", ("magi_attention", "veomni_magi_attention"))
+def test_magi_cached_causal_uses_bottom_right_alignment(impl):
+    shaped = causal_mask(2, 4, impl=impl, device="cpu")
+    expected = torch.tensor(
+        [
+            [True, True, True, False],
+            [True, True, True, True],
+        ]
+    )
+    torch.testing.assert_close(materialize_magi_mask(shaped, 2, 4)[0, 0], expected)
 
 
 def test_magi_packed_aligns_with_from_cu_seqlens():
@@ -314,6 +331,63 @@ def test_magi_packed_rejects_incomplete_key_coverage():
             device="cpu",
             cu_seqlens=torch.tensor([0, 8]),
             cu_seqlens_k=torch.tensor([0, 4]),
+        )
+
+
+@pytest.mark.parametrize("impl", ("sdpa", "flex_attention", "magi_attention"))
+@pytest.mark.parametrize(
+    ("cu_seqlens", "error", "match"),
+    (
+        (torch.tensor([0.0, 2.0, 4.0]), TypeError, "dtype int32 or int64"),
+        (torch.tensor([0, 3, 2, 4]), ValueError, "strictly increasing"),
+    ),
+)
+def test_packed_mask_rejects_invalid_cumulative_lengths(impl, cu_seqlens, error, match):
+    with pytest.raises(error, match=match):
+        packed_causal_mask(4, 4, impl=impl, device="cpu", cu_seqlens=cu_seqlens)
+
+
+@pytest.mark.parametrize(
+    ("mask_builder", "impl"),
+    (
+        (causal_mask, "flash_attention_2"),
+        (causal_mask, "veomni_sage_attention"),
+        (causal_mask, "magi_attention"),
+    ),
+)
+def test_shape_mask_rejects_unrepresentable_custom_visibility(mask_builder, impl):
+    with pytest.raises(ValueError, match="custom mask_function"):
+        mask_builder(
+            4,
+            4,
+            impl=impl,
+            device="cpu",
+            or_mask_function=lambda *args: torch.tensor(True),
+        )
+
+
+@pytest.mark.parametrize("impl", ("flash_attention_2", "magi_attention"))
+def test_packed_shape_mask_rejects_unrepresentable_custom_visibility(impl):
+    with pytest.raises(ValueError, match="custom mask_function"):
+        packed_causal_mask(
+            4,
+            4,
+            impl=impl,
+            device="cpu",
+            cu_seqlens=torch.tensor([0, 4]),
+            and_mask_function=lambda *args: torch.tensor(True),
+        )
+
+
+def test_flash_sliding_shape_mask_rejects_unrepresentable_custom_visibility():
+    with pytest.raises(ValueError, match="custom mask_function"):
+        sliding_window_mask(
+            4,
+            4,
+            impl="flash_attention_2",
+            device="cpu",
+            sliding_window=2,
+            or_mask_function=lambda *args: torch.tensor(True),
         )
 
 

@@ -65,14 +65,18 @@ def _call(impl: str, variant: str, hidden, routing, selected, fc1, fc2, loras, *
     )
 
 
-def _run_fused_vs_eager(impl: str, variant: str):
+def _run_fused_vs_eager(impl: str, variant: str, *, concentrated_routing: bool = False):
     torch.manual_seed(0)
     device = torch.device("npu" if impl == "fused_npu" else "cuda")
     dtype = torch.bfloat16
-    B, H, I, E, top_k, r = 32, 64, 96, 4, 2, 8
+    B, H, I, E, top_k, r = (256 if concentrated_routing else 32), 64, 96, 4, 2, 8
     hidden = 0.1 * torch.randn(B, H, device=device, dtype=dtype)
     routing = torch.softmax(torch.randn(B, top_k, device=device, dtype=torch.float32), dim=-1).to(dtype)
-    selected = torch.randint(0, E, (B, top_k), device=device)
+    selected = (
+        torch.zeros(B, top_k, device=device, dtype=torch.long)
+        if concentrated_routing
+        else torch.randint(0, E, (B, top_k), device=device)
+    )
     fc1 = (0.05 * torch.randn(E, 2 * I, H, device=device, dtype=dtype)).detach()
     fc2 = (0.05 * torch.randn(E, H, I, device=device, dtype=dtype)).detach()
     loras = _lora_tensors(variant, E=E, H=H, I=I, r=r, device=device, dtype=dtype)
@@ -274,6 +278,15 @@ def test_moe_experts_lora_npu_available_on_npu(variant):
 @pytest.mark.parametrize("variant", ["shared", "independent"])
 def test_triton_matches_eager(variant):
     _run_fused_vs_eager("fused_triton", variant)
+
+
+@pytest.mark.skipif(
+    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+    reason="triton moe_experts_lora needs a GPU + triton",
+)
+@pytest.mark.parametrize("variant", ["shared", "independent"])
+def test_triton_matches_eager_with_concentrated_routes(variant):
+    _run_fused_vs_eager("fused_triton", variant, concentrated_routing=True)
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="npu moe_experts_lora needs torch_npu")

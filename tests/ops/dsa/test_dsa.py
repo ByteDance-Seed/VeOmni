@@ -26,7 +26,16 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import eager_attention_forward
 
-from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
+from tests.ops.tol import (
+    ATTN_ATOL,
+    ATTN_BF16_GRAD_ATOL,
+    ATTN_GRAD_RTOL,
+    ATTN_RTOL,
+    EAGER_ATOL,
+    EAGER_GRAD_ATOL,
+    EAGER_GRAD_RTOL,
+    EAGER_RTOL,
+)
 from veomni.ops import OP_REGISTRY, resolve_op
 from veomni.ops.kernels.dsa.attention.glm import flashmla_cudnn as glm_fused_attention
 from veomni.ops.kernels.dsa.indexer.glm import cudnn as glm_fused_indexer
@@ -43,6 +52,7 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
 _TILELANG_AVAILABLE = (
     IS_CUDA_AVAILABLE and get_gpu_compute_capability() >= 90 and importlib.util.find_spec("tilelang") is not None
 )
+_GLM_FUSED_HARDWARE_AVAILABLE = IS_CUDA_AVAILABLE and torch.version.hip is None and get_gpu_compute_capability() >= 90
 
 
 def _clone(*tensors: Tensor) -> tuple[Tensor, ...]:
@@ -53,6 +63,15 @@ def _clone(*tensors: Tensor) -> tuple[Tensor, ...]:
 def _cosine(actual: Tensor, expected: Tensor) -> float:
     """Cosine similarity of two flattened tensors."""
     return F.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0).item()
+
+
+def _require_glm_fused_dependencies() -> None:
+    """Skip real GLM fused tests unless both vendor runtimes can be loaded."""
+    for package in ("cudnn", "flash_mla"):
+        try:
+            importlib.import_module(package)
+        except Exception as exc:
+            pytest.skip(f"GLM fused DSA requires {package}: {exc}")
 
 
 class _HFAttentionModule(nn.Module):
@@ -408,6 +427,106 @@ def test_dsa_attention_glm_eager_matches_hf_mask_path():
         q_pe, k_pe, kv_cache, q_nope, indices, softmax_scale=scale
     )
     assert torch.allclose(ours, hf_out, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+
+@pytest.mark.skipif(
+    not _GLM_FUSED_HARDWARE_AVAILABLE,
+    reason="GLM fused DSA requires an SM90+ NVIDIA GPU",
+)
+def test_dsa_indexer_glm_cudnn_matches_eager():
+    """Run the public cuDNN indexer adapter and compare its causal top-k."""
+    _require_glm_fused_dependencies()
+    torch.manual_seed(23)
+    batch, seq_len, heads, dim, topk = 1, 128, 32, 128, 8
+    q = torch.randn(batch, seq_len, heads, dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, seq_len, dim, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand(batch, seq_len, heads, device="cuda", dtype=torch.bfloat16)
+    position_ids = torch.arange(seq_len, device="cuda").expand(batch, -1)
+    scale = dim**-0.5
+
+    expected = resolve_op("dsa_indexer", "glm", "eager").wrapper(
+        q,
+        k,
+        weights,
+        topk,
+        ratio=1,
+        qhead_per_kv_head=heads,
+        sm_scale=scale,
+        position_ids=position_ids,
+    )
+    actual = resolve_op("dsa_indexer", "glm", "cudnn").wrapper(
+        q,
+        k,
+        weights,
+        topk,
+        ratio=1,
+        qhead_per_kv_head=heads,
+        sm_scale=scale,
+        position_ids=position_ids,
+    )
+
+    assert actual.dtype == torch.int32
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(
+    not _GLM_FUSED_HARDWARE_AVAILABLE,
+    reason="GLM fused DSA requires an SM90+ NVIDIA GPU",
+)
+def test_dsa_attention_glm_flashmla_cudnn_matches_eager_forward_and_backward():
+    """Run FlashMLA forward/cuDNN backward through the public GLM adapter."""
+    _require_glm_fused_dependencies()
+    torch.manual_seed(29)
+    batch, q_len, heads, pe_dim, nope_dim, kv_len, topk = 1, 64, 128, 64, 512, 128, 128
+    tensors = (
+        torch.randn(batch, q_len, heads, pe_dim, device="cuda", dtype=torch.bfloat16),
+        torch.randn(batch, kv_len, 1, pe_dim, device="cuda", dtype=torch.bfloat16),
+        torch.randn(batch, kv_len, 1, nope_dim, device="cuda", dtype=torch.bfloat16),
+        torch.randn(batch, q_len, heads, nope_dim, device="cuda", dtype=torch.bfloat16),
+    )
+    q_pe_e, k_pe_e, kv_e, q_nope_e = _clone(*tensors)
+    q_pe_f, k_pe_f, kv_f, q_nope_f = _clone(*tensors)
+    indices = (
+        torch.arange(kv_len, device="cuda", dtype=torch.int32).view(1, 1, topk).expand(batch, q_len, -1).contiguous()
+    )
+    scale = (pe_dim + nope_dim) ** -0.5
+
+    expected = resolve_op("dsa_attention", "glm", "eager").wrapper(
+        q_pe_e,
+        k_pe_e,
+        kv_e,
+        q_nope_e,
+        indices,
+        softmax_scale=scale,
+        training=True,
+    )
+    actual = resolve_op("dsa_attention", "glm", "flashmla_cudnn").wrapper(
+        q_pe_f,
+        k_pe_f,
+        kv_f,
+        q_nope_f,
+        indices,
+        softmax_scale=scale,
+        training=True,
+    )
+    torch.testing.assert_close(actual.float(), expected.float(), atol=ATTN_ATOL, rtol=ATTN_RTOL)
+
+    grad_output = torch.randn_like(actual)
+    expected.backward(grad_output)
+    actual.backward(grad_output)
+    for actual_input, expected_input in zip(
+        (q_pe_f, k_pe_f, kv_f, q_nope_f),
+        (q_pe_e, k_pe_e, kv_e, q_nope_e),
+        strict=True,
+    ):
+        assert actual_input.grad is not None and torch.isfinite(actual_input.grad).all()
+        assert _cosine(actual_input.grad, expected_input.grad) > 0.95
+        torch.testing.assert_close(
+            actual_input.grad.float(),
+            expected_input.grad.float(),
+            atol=ATTN_BF16_GRAD_ATOL,
+            rtol=ATTN_GRAD_RTOL,
+        )
 
 
 def test_dsa_attention_glm_eager_matches_official_hf_causal_plus_scatter():
