@@ -17,7 +17,7 @@ import os
 import pickle as pk
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, Literal, Optional, Sequence
+from typing import Any, ClassVar, Dict, Literal, Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -137,6 +137,7 @@ class DiTModelArguments(ModelArguments):
 @dataclass
 class DiTDataArguments(DataArguments):
     supports_torch_compile = False
+    data_modality: ClassVar[Literal["text", "multimodal", "diffusion"]] = "diffusion"
     mm_configs: Optional[Dict] = field(
         default_factory=dict,
         metadata={"help": "Config for multimodal input."},
@@ -407,6 +408,8 @@ class DiTTrainer:
                 dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
                 dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
                 dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
+                dyn_bsz_buffer_policy=args.data.dyn_bsz_buffer_policy,
+                data_modality=args.data.data_modality,
                 num_workers=args.data.dataloader.num_workers,
                 drop_last=args.data.dataloader.drop_last,
                 pin_memory=args.data.dataloader.pin_memory,
