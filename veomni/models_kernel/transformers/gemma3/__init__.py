@@ -12,4 +12,18 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Gemma 3 text modeling that calls local VeomniOp handles. Not on ``MODELING_REGISTRY``."""
+"""Gemma 3 text modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.models_kernel.registry import MODELING_REGISTRY
+
+
+@MODELING_REGISTRY.register("gemma3_text")
+def register_gemma3_text_modeling(architecture: str | None):
+    from .generated.patched_modeling_gemma3_gpu import Gemma3ForCausalLM, Gemma3TextModel
+
+    architecture = architecture or "Gemma3ForCausalLM"
+    if "ForCausalLM" in architecture:
+        return Gemma3ForCausalLM
+    if "Model" in architecture:
+        return Gemma3TextModel
+    return Gemma3ForCausalLM

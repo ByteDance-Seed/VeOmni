@@ -50,6 +50,45 @@ def tiny_deepseek_v4_config(architecture: str = "DeepseekV4ForCausalLM") -> Pret
     )
 
 
+def tiny_gemma3_text_config(
+    architecture: str = "Gemma3ForCausalLM",
+    *,
+    layer_types: list[str] | None = None,
+    final_logit_softcapping: float | None = None,
+    attn_logit_softcapping: float | None = None,
+) -> PretrainedConfig:
+    from transformers.models.gemma3.configuration_gemma3 import Gemma3TextConfig
+
+    if layer_types is None:
+        layer_types = ["sliding_attention", "sliding_attention", "full_attention"]
+    return Gemma3TextConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=len(layer_types),
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=64,
+        rms_norm_eps=1e-6,
+        hidden_activation="gelu_pytorch_tanh",
+        attention_bias=False,
+        attention_dropout=0.0,
+        query_pre_attn_scalar=16,
+        sliding_window=8,
+        layer_types=layer_types,
+        final_logit_softcapping=final_logit_softcapping,
+        attn_logit_softcapping=attn_logit_softcapping,
+        use_bidirectional_attention=False,
+        pad_token_id=0,
+        bos_token_id=2,
+        eos_token_id=1,
+        tie_word_embeddings=False,
+        architectures=[architecture],
+        attn_implementation="eager",
+    )
+
+
 def tiny_gpt_oss_config(architecture: str = "GptOssForCausalLM") -> PretrainedConfig:
     from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 

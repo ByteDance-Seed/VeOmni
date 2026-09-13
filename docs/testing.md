@@ -163,7 +163,7 @@ Additional per-directory helpers:
 
 **GPU**: 1 GPU, runs serially per model mode.
 
-The models migrated to `models_kernel` are currently DeepSeek-V4, GPT-OSS, Llama, Seed-OSS,
+The models migrated to `models_kernel` are currently DeepSeek-V4, Gemma3 Text, GPT-OSS, Llama, Seed-OSS,
 Qwen2, Qwen2-VL, Qwen2.5-VL, Qwen2.5-Omni, Qwen3, Qwen3-MoE, Qwen3-VL, Qwen3-VL-MoE, Qwen3.5,
 Qwen3.5-MoE, and Qwen3-Omni-MoE. Their registry/build
 dispatch, supported architectures, eager forward/backward parity, and
