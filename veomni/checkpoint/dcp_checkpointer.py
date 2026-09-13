@@ -555,43 +555,7 @@ def _prepare_stage_dir(stage_dir: str, path: str) -> str:
     return stage_path
 
 
-_INPROGRESS_SUFFIX = ".inprogress"
-
-
-def _inprogress_dir(checkpoint_dir: str) -> str:
-    """Sibling of the step directory used when ``stage_dir`` is unset."""
-    return checkpoint_dir.rstrip(os.sep) + _INPROGRESS_SUFFIX
-
-
-def _prepare_inprogress_dir(checkpoint_dir: str) -> str:
-    """Empty the destination-sibling staging directory for this step.
-
-    Same filesystem as the published checkpoint, so promotion is a copy rather
-    than a cross-device move. Only the coordinator touches the directory:
-    every rank of a shared-FS job would otherwise race the sweep.
-    """
-    stage_path = _inprogress_dir(checkpoint_dir)
-    error: Optional[BaseException] = None
-    is_coordinator = (not dist.is_initialized()) or dist.get_rank() == 0
-    if is_coordinator:
-        try:
-            shutil.rmtree(stage_path, ignore_errors=True)
-            os.makedirs(stage_path, exist_ok=True)
-        except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
-            error = e
-    if _any_rank_failed(error is not None):
-        raise error or RuntimeError(f"another rank could not prepare {stage_path}")
-    return stage_path
-
-
-def _discard_stage(stage_path: str, *, node_local: bool) -> None:
-    """Drop a staging directory that will not be published."""
-    leader = (_local_rank() == 0) if node_local else ((not dist.is_initialized()) or dist.get_rank() == 0)
-    if leader:
-        shutil.rmtree(stage_path, ignore_errors=True)
-
-
-def _promote_staged_checkpoint(stage_path: str, final_path: str, *, node_local: bool = True) -> None:
+def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
     """Copy a staged checkpoint to its destination, then drop the staged copy.
 
     The staging directory is node-local, so one rank per node copies all of it
@@ -608,19 +572,11 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str, *, node_local: 
     over data that is only partly there.
 
     Nested files are copied in the data phase, before ``.metadata`` is
-    published. The lr_scheduler sidecar is a single replicated file
-    (``lr_scheduler.pt``); it must not be written into a still-valid
-    destination while the previous marker is up.
-
-    ``node_local`` is True for ``stage_dir`` (each node leader copies that
-    node's scratch). It is False for the implicit ``*.inprogress`` sibling on
-    the destination filesystem: every rank already wrote into the same
-    directory, so only the coordinator copies.
+    published. ``lr_scheduler.pt`` is one of those files.
     """
     metadata_name = ".metadata"
     is_node_leader = _local_rank() == 0
     is_coordinator = (not dist.is_initialized()) or dist.get_rank() == 0
-    file_copier = is_node_leader if node_local else is_coordinator
     final_metadata = os.path.join(final_path, metadata_name)
     state = _Promotion()
 
@@ -685,9 +641,9 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str, *, node_local: 
         shutil.rmtree(stage_path, ignore_errors=True)
 
     _promotion_phase(state, drop_stale_marker, participates=is_coordinator)
-    _promotion_phase(state, copy_this_nodes_files, participates=file_copier)
+    _promotion_phase(state, copy_this_nodes_files, participates=is_node_leader)
     _promotion_phase(state, publish_marker, participates=is_coordinator)
-    _promotion_phase(state, drop_staged_copy, participates=file_copier, always=True)
+    _promotion_phase(state, drop_staged_copy, participates=is_node_leader, always=True)
 
     if state.error is not None:
         raise state.error
@@ -703,9 +659,6 @@ class DistributedCheckpointer(CheckpointerBase):
     save_future: Optional[Any] = None
     # Dedicated process group for async saves (created on first use)
     _async_process_group: Optional[Any] = None
-    # (stage_path, final_path, node_local) published by wait_for_pending_save
-    # after an async DCP write finishes. None when nothing is in flight.
-    _pending_promote: Optional[tuple[str, str, bool]] = None
 
     @classmethod
     def save(
@@ -750,12 +703,10 @@ class DistributedCheckpointer(CheckpointerBase):
             stage_dir: write the checkpoint here and copy it to ``path`` afterwards,
                 instead of writing straight to ``path``. Intended for a destination far
                 slower than local disk. The lr_scheduler sidecar is a single
-                ``lr_scheduler.pt``. With staging it is written under the staging
-                directory and copied with the shards, before ``.metadata`` is
-                published. When unset, the same order uses a ``*.inprogress`` sibling
-                of the step directory; ``save_async`` promotes that sibling from
-                ``wait_for_pending_save``, not from ``save()``. The caller owns
-                the choice: this does not probe
+                ``lr_scheduler.pt``, written before DCP so ``.metadata`` (DCP's
+                completion marker) is last. With staging, both land under the staging
+                directory and are copied with ``.metadata`` published last. The caller
+                owns the choice: this does not probe
                 for a usable directory or check free space, and an unusable ``stage_dir``
                 fails the save rather than silently writing elsewhere. See
                 ``CheckpointConfig.stage_dir``.
@@ -766,14 +717,14 @@ class DistributedCheckpointer(CheckpointerBase):
             raise ValueError("Model must be provided to save a distributed checkpoint.")
 
         # Rejected up front, before anything reaches disk. An async write is still
-        # running when save() returns and drops a caller ``stage_dir``; a caller-
-        # supplied writer already points somewhere, so DCP would miss the staged
-        # directory (and the sidecar would not land next to the shards).
+        # running when save() returns and drops the staged copy; a caller-supplied
+        # writer already points somewhere, and ignoring stage_dir would write straight
+        # to the slow destination it was meant to avoid.
         if stage_dir and save_async:
             raise ValueError("stage_dir cannot be combined with save_async")
 
-        if storage_writer is not None:
-            raise ValueError("an explicit storage_writer cannot be combined with staging")
+        if stage_dir and storage_writer is not None:
+            raise ValueError("stage_dir cannot be combined with an explicit storage_writer")
 
         # ``is not None`` rather than truthiness: step 0 is a step like any other, and
         # folding it onto ``path`` would write it over the run's own directory.
@@ -791,23 +742,19 @@ class DistributedCheckpointer(CheckpointerBase):
                 load=False,
             )
 
-        # Drain a previous async save before sweeping this step's inprogress
-        # directory: the previous write may still be filling that path.
-        cls.wait_for_pending_save()
+        # Sidecar first, then DCP. ``.metadata`` is DCP's completion marker, so a
+        # reader that sees it also sees ``lr_scheduler.pt``. Each step writes a
+        # new ``global_step_{N}/``; a failed save has no marker and is skipped
+        # on resume. ``stage_dir`` uses the same order on scratch, then copies
+        # with ``.metadata`` last.
+        stage_path = _prepare_stage_dir(stage_dir, path) if stage_dir else None
+        write_dir = stage_path or checkpoint_dir
+        cls._save_lr_scheduler(checkpoint_dir=write_dir, state=state)
 
-        if stage_dir:
-            stage_path = _prepare_stage_dir(stage_dir, path)
-            node_local = True
-        else:
-            # Same atomic boundary as stage_dir (sidecar + shards, then
-            # .metadata), on a sibling of the published step directory.
-            stage_path = _prepare_inprogress_dir(checkpoint_dir)
-            node_local = False
-
-        storage_writer = cls._create_storage_writer(stage_path)
+        if storage_writer is None:
+            storage_writer = cls._create_storage_writer(write_dir)
 
         try:
-            cls._save_lr_scheduler(checkpoint_dir=stage_path, state=state)
             cls.execute_save(
                 save_state=save_state,
                 storage_writer=storage_writer,
@@ -815,16 +762,12 @@ class DistributedCheckpointer(CheckpointerBase):
                 save_to_lowest_rank=save_to_lowest_rank,
             )
         except BaseException:
-            _discard_stage(stage_path, node_local=node_local)
+            if stage_path is not None and _local_rank() == 0:
+                shutil.rmtree(stage_path, ignore_errors=True)
             raise
 
-        if save_async:
-            # save() returns while DCP is still in flight. Promotion waits for
-            # that future in wait_for_pending_save so training can overlap the
-            # write without publishing a new scheduler under the old marker.
-            cls._pending_promote = (stage_path, checkpoint_dir, node_local)
-        else:
-            _promote_staged_checkpoint(stage_path, checkpoint_dir, node_local=node_local)
+        if stage_path is not None:
+            _promote_staged_checkpoint(stage_path, checkpoint_dir)
 
         logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 
@@ -900,45 +843,20 @@ class DistributedCheckpointer(CheckpointerBase):
 
         This is the single entrypoint for all async-save coordination —
         prefer calling this over poking ``save_future`` directly.
-
-        When ``save_async`` used the implicit ``*.inprogress`` sibling, this
-        is also when that sibling is promoted: after the future succeeds,
-        ``_promote_staged_checkpoint`` copies shards and ``lr_scheduler.pt``
-        before publishing ``.metadata``. A failed future discards the sibling
-        and leaves the published checkpoint unchanged.
         """
-        pending = cls._pending_promote
-        if cls.save_future is None and pending is None:
+        if cls.save_future is None:
             return
-
-        error: Optional[BaseException] = None
+        rank = dist.get_rank() if dist.is_initialized() else 0
         try:
-            if cls.save_future is not None:
-                rank = dist.get_rank() if dist.is_initialized() else 0
-                try:
-                    logger.info(f"[RANK {rank}] waiting for previous DCP saving session to end...")
-                    cls.save_future.result()
-                except Exception as e:
-                    logger.error(f"[RANK {rank}] previous async DCP save raised; propagating", exc_info=True)
-                    error = e
-                finally:
-                    cls.save_future = None
-
-            if error is not None:
-                if pending is not None:
-                    _discard_stage(pending[0], node_local=pending[2])
-                    cls._pending_promote = None
-            elif pending is not None:
-                try:
-                    _promote_staged_checkpoint(pending[0], pending[1], node_local=pending[2])
-                finally:
-                    cls._pending_promote = None
+            logger.info(f"[RANK {rank}] waiting for previous DCP saving session to end...")
+            cls.save_future.result()
+        except Exception:
+            logger.error(f"[RANK {rank}] previous async DCP save raised; propagating", exc_info=True)
+            raise
         finally:
-            if dist.is_initialized():
-                dist.barrier()
-
-        if error is not None:
-            raise error
+            cls.save_future = None
+        if dist.is_initialized():
+            dist.barrier()
 
     @classmethod
     def execute_save(

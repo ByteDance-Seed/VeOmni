@@ -56,12 +56,11 @@ module.
 
 `train.checkpoint.stage_dir`, when set, is node-local scratch: the shards and
 `lr_scheduler.pt` are written there first and copied to `global_step_{N}/`
-only after DCP finishes. When it is unset, the same publish order uses a
-`global_step_{N}.inprogress` sibling of the step directory (same filesystem as
-the destination). `save_async` still returns from `save()` before that copy;
-`wait_for_pending_save()` promotes the sibling after the write finishes, or
-discards it on failure so the published checkpoint is unchanged. Neither
-scratch path is part of the published checkpoint.
+only after DCP finishes, with `.metadata` published last. When it is unset,
+VeOmni writes `lr_scheduler.pt` into `global_step_{N}/` and then runs DCP;
+`.metadata` is DCP's completion marker and is written last. Resume only
+considers a step directory that has `.metadata`. The staging directory is not
+part of the published checkpoint.
 
 ### Who writes what
 
