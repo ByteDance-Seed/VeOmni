@@ -13,14 +13,12 @@
 # limitations under the License.
 
 from . import (
-    flux,
     movqgan,
     wan,
 )
 
 
 __all__ = [
-    "flux",
     "movqgan",
     "wan",
 ]

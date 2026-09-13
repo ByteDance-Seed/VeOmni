@@ -30,6 +30,9 @@ from tests.models_kernel.tiny_configs import (
     tiny_deepseek_v4_config as _tiny_deepseek_v4_config,
 )
 from tests.models_kernel.tiny_configs import (
+    tiny_flux_config as _tiny_flux_config,
+)
+from tests.models_kernel.tiny_configs import (
     tiny_gemma3_text_config as _tiny_gemma3_text_config,
 )
 from tests.models_kernel.tiny_configs import (
@@ -143,6 +146,13 @@ _MODEL_CASES = (
         config_factory=_tiny_deepseek_v4_config,
         architectures=("DeepseekV4ForCausalLM", "DeepseekV4Model"),
         has_registered_config=True,
+    ),
+    _ModelCase(
+        model_type="flux",
+        config_factory=_tiny_flux_config,
+        architectures=("FluxModel",),
+        has_registered_config=True,
+        eager_op_path="blocks.0.attn.norm_q_a.veomni_rms_norm",
     ),
     _ModelCase(
         model_type="gemma3_text",

@@ -454,18 +454,38 @@ class FluxModel(PreTrainedModel):
     def __init__(self, config: FluxConfig, **kwargs):
         super().__init__(config, **kwargs)
 
-        self.pos_embedder = RoPEEmbedding(3072, 10000, [16, 56, 56])
-        self.time_embedder = TimestepEmbeddings(256, 3072)
-        self.guidance_embedder = None if config.disable_guidance_embedder else TimestepEmbeddings(256, 3072)
-        self.pooled_text_embedder = torch.nn.Sequential(
-            torch.nn.Linear(768, 3072), torch.nn.SiLU(), torch.nn.Linear(3072, 3072)
+        hidden_size = config.num_attention_heads * config.attention_head_dim
+        if sum(config.axes_dims_rope) != config.attention_head_dim:
+            raise ValueError(
+                f"sum(axes_dims_rope) must equal attention_head_dim, got "
+                f"{sum(config.axes_dims_rope)} and {config.attention_head_dim}"
+            )
+
+        self.pos_embedder = RoPEEmbedding(hidden_size, config.rope_theta, config.axes_dims_rope)
+        self.time_embedder = TimestepEmbeddings(config.timestep_embedding_dim, hidden_size)
+        self.guidance_embedder = (
+            None
+            if config.disable_guidance_embedder
+            else TimestepEmbeddings(config.timestep_embedding_dim, hidden_size)
         )
-        self.context_embedder = torch.nn.Linear(4096, 3072)
-        self.x_embedder = torch.nn.Linear(config.input_dim, 3072)
-        self.blocks = torch.nn.ModuleList([FluxJointTransformerBlock(3072, 24) for _ in range(config.num_blocks)])
-        self.single_blocks = torch.nn.ModuleList([FluxSingleTransformerBlock(3072, 24) for _ in range(38)])
-        self.final_norm_out = AdaLayerNormContinuous(3072)
-        self.final_proj_out = torch.nn.Linear(3072, 64)
+        self.pooled_text_embedder = torch.nn.Sequential(
+            torch.nn.Linear(config.pooled_projection_dim, hidden_size),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden_size, hidden_size),
+        )
+        self.context_embedder = torch.nn.Linear(config.joint_attention_dim, hidden_size)
+        self.x_embedder = torch.nn.Linear(config.input_dim, hidden_size)
+        self.blocks = torch.nn.ModuleList(
+            [FluxJointTransformerBlock(hidden_size, config.num_attention_heads) for _ in range(config.num_blocks)]
+        )
+        self.single_blocks = torch.nn.ModuleList(
+            [
+                FluxSingleTransformerBlock(hidden_size, config.num_attention_heads)
+                for _ in range(config.num_single_layers)
+            ]
+        )
+        self.final_norm_out = AdaLayerNormContinuous(hidden_size)
+        self.final_proj_out = torch.nn.Linear(hidden_size, config.output_dim)
         self.input_dim = config.input_dim
 
         self.gradient_checkpointing = False

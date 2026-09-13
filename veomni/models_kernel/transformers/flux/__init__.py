@@ -12,4 +12,20 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Flux modeling that calls local VeomniOp handles. Not on ``MODELING_REGISTRY``."""
+"""Flux modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+
+
+@MODEL_CONFIG_REGISTRY.register("flux")
+def register_flux_config():
+    from .config_flux import FluxConfig
+
+    return FluxConfig
+
+
+@MODELING_REGISTRY.register("flux")
+def register_flux_modeling(_architecture: str):
+    from .modeling_flux import FluxModel
+
+    return FluxModel

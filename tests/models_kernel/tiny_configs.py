@@ -77,6 +77,26 @@ def tiny_deepseek_v4_config(architecture: str = "DeepseekV4ForCausalLM") -> Pret
     )
 
 
+def tiny_flux_config(architecture: str = "FluxModel") -> PretrainedConfig:
+    from veomni.models_kernel.transformers.flux.config_flux import FluxConfig
+
+    return FluxConfig(
+        disable_guidance_embedder=False,
+        input_dim=16,
+        output_dim=16,
+        num_blocks=1,
+        num_single_layers=1,
+        num_attention_heads=4,
+        attention_head_dim=16,
+        joint_attention_dim=48,
+        pooled_projection_dim=32,
+        timestep_embedding_dim=32,
+        axes_dims_rope=(4, 6, 6),
+        architectures=[architecture],
+        tie_word_embeddings=False,
+    )
+
+
 def tiny_glm_moe_dsa_config(architecture: str = "GlmMoeDsaForCausalLM") -> PretrainedConfig:
     """Build a four-layer toy that retains GLM's dense-to-MoE schedule."""
     from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
