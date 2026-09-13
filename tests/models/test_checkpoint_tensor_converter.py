@@ -34,11 +34,11 @@ from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import (
     Qwen3MoeCheckpointTensorConverter,
     create_qwen3_moe_checkpoint_tensor_converter,
 )
-from veomni.models.transformers.qwen3_omni_moe.checkpoint_tensor_converter import (
+from veomni.models_kernel.transformers.qwen3_omni_moe.checkpoint_tensor_converter import (
     Qwen3OmniMoeCheckpointTensorConverter,
     create_qwen3_omni_moe_checkpoint_tensor_converter,
 )
-from veomni.models.transformers.qwen3_vl_moe.checkpoint_tensor_converter import (
+from veomni.models_kernel.transformers.qwen3_vl_moe.checkpoint_tensor_converter import (
     Qwen3VLMoeCheckpointTensorConverter,
     create_qwen3_vl_moe_checkpoint_tensor_converter,
 )
