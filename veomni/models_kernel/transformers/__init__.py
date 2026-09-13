@@ -19,6 +19,7 @@ Importing this package registers the models listed below on the
 """
 
 from . import (
+    deepseek_v3,
     deepseek_v4,
     gemma3,
     gpt_oss,
@@ -39,6 +40,7 @@ from . import (
 
 
 __all__ = [
+    "deepseek_v3",
     "deepseek_v4",
     "gemma3",
     "gpt_oss",

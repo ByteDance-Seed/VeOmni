@@ -16,7 +16,7 @@ under `generated/` — always go back to the patchgen config.
   - `parallel_plan.py` — single `get_parallel_plan()` sharding the fused `gate_up_proj`.
 - **MoE + NPU patchgen** — `veomni/models_kernel/transformers/deepseek_v3/`
   - Sibling `deepseek_v3_{gpu,npu}_patch_gen_config.py`; both generated files committed.
-  - Runtime kernel choice (deterministic Triton RoPE + batch-invariant RMSNorm) is wired in `__init__.py` via `apply_veomni_deepseek_v3_device_patch(gen_module)` for actor/rollout numerical parity. No Liger kernels in the generated file itself.
+  - The generated modeling owns runtime kernel selection: RMSNorm calls the local `rms_norm/standard` op, while the rotary embedding selects the package-local deterministic `triton_bmm` when requested. No legacy runtime device patch is needed.
 - **VLM (non-MoE) + GPU+NPU patchgen** — `veomni/models_kernel/transformers/qwen3_vl/`
   - `__init__.py` — registers the patchgen-generated classes, branching on `IS_NPU_AVAILABLE` between `patched_modeling_qwen3_vl_{gpu,npu}`.
   - `qwen3_vl_gpu_patch_gen_config.py` — full VLM forward with Ulysses SP, async Ulysses text attention, deepstack, precomputed mrope via `get_position_id_func`, and a SP-aware `dummy_forward`.

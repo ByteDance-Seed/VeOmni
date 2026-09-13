@@ -29,39 +29,9 @@ from tests.models_kernel.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
 )
+from tests.models_kernel.tiny_configs import tiny_deepseek_v3_config as _tiny_config
 from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config, set_ops_config
-
-
-def _tiny_config() -> DeepseekV3Config:
-    """Official DeepseekV3Config fields, sized down for a toy.
-
-    Algorithm defaults stay official: ``rope_interleave=True``,
-    ``first_k_dense_replace=3``, ``n_group=8``, ``topk_group=4``,
-    ``routed_scaling_factor=2.5``. Sixteen routed experts keep the official
-    grouped router (``experts_per_group >= 2``). Four layers keep one routed
-    MoE layer after the official dense prefix.
-    """
-    return DeepseekV3Config(
-        vocab_size=128,
-        hidden_size=64,
-        intermediate_size=128,
-        moe_intermediate_size=32,
-        num_hidden_layers=4,
-        num_attention_heads=4,
-        num_key_value_heads=4,
-        n_shared_experts=1,
-        n_routed_experts=16,
-        kv_lora_rank=16,
-        q_lora_rank=32,
-        qk_rope_head_dim=8,
-        v_head_dim=16,
-        qk_nope_head_dim=8,
-        num_experts_per_tok=2,
-        max_position_embeddings=64,
-        attn_implementation="eager",
-        experts_implementation="eager",
-    )
 
 
 def _dsv3_cls():
@@ -123,3 +93,17 @@ def test_deepseek_v3_eager_matches_hf():
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
     assert_eager_matches_hf(hf, ours, input_ids=input_ids)
+
+
+def test_deepseek_v3_registry_installs_checkpoint_hooks():
+    from veomni.models_kernel import get_model_class
+
+    for architecture in (
+        "DeepseekV3ForCausalLM",
+        "DeepseekV3ForSequenceClassification",
+        "DeepseekV3ForTokenClassification",
+        "DeepseekV3Model",
+    ):
+        model_cls = get_model_class(_tiny_config(architecture))
+        assert callable(model_cls._create_checkpoint_tensor_converter)
+        assert callable(model_cls._convert_fqn_to_index_mapping)

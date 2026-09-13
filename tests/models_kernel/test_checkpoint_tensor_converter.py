@@ -25,6 +25,11 @@ from veomni.models_kernel.checkpoint.convert import (
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
 )
+from veomni.models_kernel.transformers.deepseek_v3.checkpoint_tensor_converter import (
+    DeepseekV3CheckpointTensorConverter,
+    convert_deepseek_v3_fqn_to_index_mapping,
+    create_deepseek_v3_checkpoint_tensor_converter,
+)
 from veomni.models_kernel.transformers.deepseek_v4.checkpoint_tensor_converter import (
     DeepseekV4CheckpointTensorConverter,
     _dequantize_scaled_weight,
@@ -372,6 +377,84 @@ class TestQwen3MoeConverterIntegration:
             HIDDEN_DIM,
             INTERMEDIATE_DIM,
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for DeepseekV3CheckpointTensorConverter
+# ---------------------------------------------------------------------------
+
+
+class TestDeepseekV3CheckpointTensorConverter:
+    def test_matches_only_per_expert_projection_keys(self):
+        converter = DeepseekV3CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            assert converter.can_handle(_make_expert_key(0, 1, projection))
+        assert not converter.can_handle("model.layers.0.self_attn.q_proj.weight")
+        assert not converter.can_handle("model.layers.0.mlp.experts.gate_up_proj")
+
+    def test_full_layer_conversion_preserves_expert_order_and_layout(self):
+        converter = DeepseekV3CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+        dispatched = {}
+
+        passthrough = maybe_convert_checkpoint_tensor(
+            "model.layers.0.self_attn.q_proj.weight",
+            torch.randn(HIDDEN_DIM, HIDDEN_DIM),
+            converter,
+        )
+        assert passthrough is not None
+        dispatched[passthrough.name] = passthrough.tensor
+
+        for projection in ("up_proj", "gate_proj", "down_proj"):
+            for expert_id in (3, 1, 0, 2):
+                result = maybe_convert_checkpoint_tensor(
+                    _make_expert_key(0, expert_id, projection),
+                    _make_expert_tensor(projection, expert_id),
+                    converter,
+                )
+                if result is not None:
+                    dispatched[result.name] = result.tensor
+
+        assert converter.finalize() == []
+        gate_up = dispatched["model.layers.0.mlp.experts.gate_up_proj"]
+        down = dispatched["model.layers.0.mlp.experts.down_proj"]
+        assert gate_up.shape == (NUM_EXPERTS, 2 * INTERMEDIATE_DIM, HIDDEN_DIM)
+        assert down.shape == (NUM_EXPERTS, HIDDEN_DIM, INTERMEDIATE_DIM)
+        for expert_id in range(NUM_EXPERTS):
+            assert torch.equal(gate_up[expert_id, :INTERMEDIATE_DIM], _make_expert_tensor("gate_proj", expert_id))
+            assert torch.equal(gate_up[expert_id, INTERMEDIATE_DIM:], _make_expert_tensor("up_proj", expert_id))
+            assert torch.equal(down[expert_id], _make_expert_tensor("down_proj", expert_id))
+
+    @pytest.mark.parametrize("projection", ("down_proj", "gate_proj"))
+    def test_finalize_rejects_incomplete_checkpoint(self, projection: str):
+        converter = DeepseekV3CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+        expert_ids = range(NUM_EXPERTS - 1) if projection == "down_proj" else range(NUM_EXPERTS)
+        for expert_id in expert_ids:
+            converter.convert(
+                _make_expert_key(0, expert_id, projection),
+                _make_expert_tensor(projection, expert_id),
+            )
+
+        with pytest.raises(RuntimeError, match="incomplete checkpoint detected"):
+            converter.finalize()
+
+    def test_factory_and_fqn_mapping(self):
+        model = SimpleNamespace(config=SimpleNamespace(n_routed_experts=8))
+        converter = create_deepseek_v3_checkpoint_tensor_converter(model)
+        assert isinstance(converter, DeepseekV3CheckpointTensorConverter)
+        assert converter.num_experts == 8
+
+        mapping = {
+            "model.layers.0.mlp.experts.0.gate_proj.weight": 3,
+            "model.layers.0.mlp.experts.0.up_proj.weight": 4,
+            "model.layers.0.mlp.experts.0.down_proj.weight": 5,
+            "model.layers.0.self_attn.q_proj.weight": 7,
+        }
+        assert convert_deepseek_v3_fqn_to_index_mapping(mapping) == {
+            "model.layers.0.mlp.experts.gate_up_proj": 3,
+            "model.layers.0.mlp.experts.down_proj": 5,
+            "model.layers.0.self_attn.q_proj.weight": 7,
+        }
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,9 @@ from transformers import PretrainedConfig
 
 from tests.models_kernel.compare import eager_ops_config
 from tests.models_kernel.tiny_configs import (
+    tiny_deepseek_v3_config as _tiny_deepseek_v3_config,
+)
+from tests.models_kernel.tiny_configs import (
     tiny_deepseek_v4_config as _tiny_deepseek_v4_config,
 )
 from tests.models_kernel.tiny_configs import (
@@ -122,6 +125,16 @@ class _ModelCase:
 
 
 _MODEL_CASES = (
+    _ModelCase(
+        model_type="deepseek_v3",
+        config_factory=_tiny_deepseek_v3_config,
+        architectures=(
+            "DeepseekV3ForCausalLM",
+            "DeepseekV3ForSequenceClassification",
+            "DeepseekV3ForTokenClassification",
+            "DeepseekV3Model",
+        ),
+    ),
     _ModelCase(
         model_type="deepseek_v4",
         config_factory=_tiny_deepseek_v4_config,
