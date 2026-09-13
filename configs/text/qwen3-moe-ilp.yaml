@@ -1,0 +1,57 @@
+model:
+  model_path: Qwen3-30B-A3B-merge
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused_npu
+
+data:
+  train_path: tulu-3-sft-mixture
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 16384
+  train_size: 750000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  accelerator:
+    ep_size: 16
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+  gradient_checkpointing:
+    enable: true
+    enable_reentrant: false
+  inter_layer_replay:
+    enable: true
+    current_layer: -1
+    window_size: 0
+    strict: true
+  global_batch_size: 16
+  micro_batch_size: 1
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: cosine
+    max_grad_norm: 1.0
+  num_train_epochs: 3
+  init_device: meta
+  checkpoint:
+    output_dir: Qwen3-30B-A3B-ilp
+    manager: dcp
+    save_steps: 0
+    save_epochs: 0
+    save_hf_weights: false
+  profile:
+    enable: false
+    start_step: 2
+    end_step: 8
+    trace_dir: ./trace/qwen3_moe_ilp
+    profile_memory: false
+    with_stack: false
+    rank0_only: true

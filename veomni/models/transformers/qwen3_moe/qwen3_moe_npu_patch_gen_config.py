@@ -23,6 +23,8 @@ This keeps only the needed v5 patches:
 3. Register get_parallel_plan on Qwen3MoeForCausalLM.
 """
 
+from transformers.modeling_layers import GradientCheckpointingLayer
+
 from veomni.models.transformers.qwen3_moe.qwen3_moe_gpu_patch_gen_config import (
     PatchedQwen3MoeExperts,
     apply_rotary_pos_emb_patched,
@@ -55,6 +57,78 @@ config.helpers.extend(gpu_config.helpers)
 # now superseded by ``Qwen3MoeCausalLMOutputWithLogProbs`` for the FSDP2-safe
 # pre-backward unshard hook on ``lm_head``).
 config.drop_imported_names.update(gpu_config.drop_imported_names)
+
+
+# ── Decoder layer split for inter-layer replay ─────────────────────────────
+
+
+@config.replace_class(
+    "Qwen3MoeDecoderLayer",
+    description="Expose attention and MLP phases for NPU inter-layer replay scheduling",
+)
+class PatchedQwen3MoeDecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.self_attn = Qwen3MoeAttention(config, layer_idx)
+        if (layer_idx not in config.mlp_only_layers) and (
+            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+        ):
+            self.mlp = Qwen3MoeSparseMoeBlock(config)
+        else:
+            self.mlp = Qwen3MoeMLP(config, intermediate_size=config.intermediate_size)
+        self.input_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hidden_size = config.hidden_size
+
+    def forward_attention(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        use_cache=False,
+        position_embeddings=None,
+        **kwargs,
+    ):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        return residual + hidden_states
+
+    def forward_mlp(self, hidden_states):
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        return residual + hidden_states
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        use_cache=False,
+        position_embeddings=None,
+        **kwargs,
+    ):
+        hidden_states = self.forward_attention(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        return self.forward_mlp(hidden_states)
 
 
 # ── RMSNorm (OpSlot guard, functional NPU kernel) ──────────────────────────

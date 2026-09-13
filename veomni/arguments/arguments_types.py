@@ -237,6 +237,49 @@ class GradientCheckpointingConfig:
 
 
 @dataclass
+class InterLayerReplayConfig:
+    """train.inter_layer_replay.* — Rolling FSDP/MoE replay options."""
+
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable inter-layer replay for Qwen3-MoE training on Ascend NPU."},
+    )
+    current_layer: int = field(
+        default=-1,
+        metadata={"help": "Highest scheduled backward layer; -1 selects the final decoder layer."},
+    )
+    window_size: int = field(
+        default=0,
+        metadata={"help": "Number of rolling replay boundaries; 0 covers all layers below current_layer."},
+    )
+    memory_budget_gb: float = field(
+        default=0.0,
+        metadata={"help": "Maximum predicted allocated NPU memory for replay; 0 disables this limit."},
+    )
+    memory_reserve_gb: float = field(
+        default=0.0,
+        metadata={"help": "Minimum predicted free NPU memory retained before replay; 0 disables this limit."},
+    )
+    memory_safety_factor: float = field(
+        default=1.1,
+        metadata={"help": "Safety multiplier applied to the observed replay-memory estimate."},
+    )
+    memory_retry_steps: int = field(
+        default=4,
+        metadata={"help": "Training-step interval between memory probes while replay is paused."},
+    )
+    strict: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Fail when the adjacent replay frame is unavailable as current-layer backward starts. "
+                "Disable to fall back to standard checkpoint replay before ILP scheduling begins."
+            )
+        },
+    )
+
+
+@dataclass
 class MixedPrecisionConfig:
     """train.accelerator.fsdp_config.mixed_precision.* — Mixed precision settings."""
 
@@ -606,6 +649,7 @@ class TrainingArguments:
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
+    inter_layer_replay: InterLayerReplayConfig = field(default_factory=InterLayerReplayConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
@@ -615,6 +659,24 @@ class TrainingArguments:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
             )
+        if self.inter_layer_replay.enable:
+            replay = self.inter_layer_replay
+            if not self.gradient_checkpointing.enable:
+                raise ValueError("train.inter_layer_replay.enable requires gradient checkpointing.")
+            if replay.current_layer < -1:
+                raise ValueError("train.inter_layer_replay.current_layer must be -1 or non-negative.")
+            if replay.window_size < 0:
+                raise ValueError("train.inter_layer_replay.window_size must be non-negative.")
+            if replay.current_layer >= 0 and replay.window_size > replay.current_layer:
+                raise ValueError("train.inter_layer_replay.window_size reaches below decoder layer 0.")
+            if replay.memory_budget_gb < 0:
+                raise ValueError("train.inter_layer_replay.memory_budget_gb must be non-negative.")
+            if replay.memory_reserve_gb < 0:
+                raise ValueError("train.inter_layer_replay.memory_reserve_gb must be non-negative.")
+            if replay.memory_safety_factor < 1:
+                raise ValueError("train.inter_layer_replay.memory_safety_factor must be at least 1.")
+            if replay.memory_retry_steps < 1:
+                raise ValueError("train.inter_layer_replay.memory_retry_steps must be at least 1.")
 
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))

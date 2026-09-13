@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - class_replacement: Qwen3MoeDecoderLayer
+#      Expose attention and MLP phases for NPU inter-layer replay scheduling
 #    - method_override: Qwen3MoeRMSNorm.forward
 #      OpSlot guard for NPU fused RMSNorm (standard formulation)
 #    - method_override: Qwen3MoeMLP.forward
@@ -373,8 +375,15 @@ class Qwen3MoeRMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
+# ======================================================================
+# [PATCHED CLASS] Qwen3MoeDecoderLayer
+# Original class replaced with: PatchedQwen3MoeDecoderLayer
+# Reason: Expose attention and MLP phases for NPU inter-layer replay scheduling
+# Source: veomni.models.transformers.qwen3_moe.qwen3_moe_npu_patch_gen_config
+# ======================================================================
+# ── Decoder layer split for inter-layer replay ─────────────────────────────
 class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3MoeConfig, layer_idx: int):
+    def __init__(self, config, layer_idx):
         super().__init__()
         self.self_attn = Qwen3MoeAttention(config, layer_idx)
         if (layer_idx not in config.mlp_only_layers) and (
@@ -387,19 +396,18 @@ class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
         self.post_attention_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hidden_size = config.hidden_size
 
-    def forward(
+    def forward_attention(
         self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        use_cache: bool | None = False,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        use_cache=False,
+        position_embeddings=None,
+        **kwargs,
+    ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -409,14 +417,34 @@ class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )
-        hidden_states = residual + hidden_states
+        return residual + hidden_states
 
-        # Fully Connected
+    def forward_mlp(self, hidden_states):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+        return residual + hidden_states
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        use_cache=False,
+        position_embeddings=None,
+        **kwargs,
+    ):
+        hidden_states = self.forward_attention(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        return self.forward_mlp(hidden_states)
 
 
 @auto_docstring

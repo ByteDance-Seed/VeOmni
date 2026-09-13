@@ -31,6 +31,7 @@ from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_lo
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
+from .inter_layer_replay import apply_inter_layer_replay
 from .parallel_plan import get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
 from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_config_for_fsdp2
@@ -518,6 +519,30 @@ def build_parallelize_model(
 
     parallel_state = get_parallel_state()
     compile_config = compile_config or CompileConfig()
+    inter_layer_replay_config = kwargs.pop("inter_layer_replay_config", None)
+    inter_layer_replay_moe_implementation = kwargs.pop("inter_layer_replay_moe_implementation", None)
+
+    if inter_layer_replay_config is not None and inter_layer_replay_config.enable:
+        if compile_config.enable:
+            raise ValueError("Inter-layer replay is not supported with torch.compile yet.")
+        if not enable_gradient_checkpointing:
+            raise ValueError("Inter-layer replay requires gradient checkpointing.")
+        if kwargs.get("enable_reentrant", False):
+            raise ValueError("Inter-layer replay requires non-reentrant gradient checkpointing.")
+        if not parallel_state.fsdp_enabled or parallel_state.dp_mode != "fsdp2":
+            raise ValueError("Inter-layer replay requires FSDP2.")
+        unsupported_sizes = {
+            "tp_size": parallel_state.tp_size,
+            "pp_size": parallel_state.pp_size,
+            "ulysses_size": parallel_state.ulysses_size,
+            "cp_size": parallel_state.cp_size,
+        }
+        unsupported_sizes = {name: size for name, size in unsupported_sizes.items() if size != 1}
+        if unsupported_sizes:
+            details = ", ".join(f"{name}={size}" for name, size in unsupported_sizes.items())
+            raise ValueError(f"Inter-layer replay does not support additional model parallelism: {details}.")
+        if inter_layer_replay_moe_implementation != "fused_npu":
+            raise ValueError("Inter-layer replay requires model.ops_implementation.moe_implementation='fused_npu'.")
 
     if not parallel_state.fsdp_enabled:
         if kwargs.get("init_device") not in ["cuda", "npu"]:
@@ -565,5 +590,8 @@ def build_parallelize_model(
             model = DDP(model, device_ids=[parallel_state.local_rank], process_group=parallel_state.dp_group)
     elif compile_config.enable:
         raise RuntimeError("train.torch_compile.enable requires FSDP2; compile without FSDP is not supported.")
+
+    if inter_layer_replay_config is not None and inter_layer_replay_config.enable:
+        model = apply_inter_layer_replay(model, inter_layer_replay_config)
 
     return model

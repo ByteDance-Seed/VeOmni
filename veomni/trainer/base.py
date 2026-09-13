@@ -502,6 +502,9 @@ class BaseTrainer(Stateful, ABC):
 
         if args.model.fqn_to_index_mapping is not None:
             kwargs["fqn_to_index_mapping"] = args.model.fqn_to_index_mapping
+        if args.train.inter_layer_replay.enable:
+            kwargs["inter_layer_replay_config"] = args.train.inter_layer_replay
+            kwargs["inter_layer_replay_moe_implementation"] = args.model.ops_implementation.moe_implementation
 
         # Parallelize model
         self.model = build_parallelize_model(

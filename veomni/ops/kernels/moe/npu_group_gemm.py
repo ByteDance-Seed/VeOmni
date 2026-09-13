@@ -13,17 +13,70 @@
 # limitations under the License.
 
 
-from typing import List, Optional
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Callable, Iterator, List, Optional
 
 import torch
 import torch.distributed as dist
 import torch_npu
 
-from ....distributed.moe.comm import all_to_all
+from ....distributed.moe.comm import (
+    AsyncCollectiveHandle,
+    all_to_all,
+    all_to_all_async,
+    register_expert_backward_boundary,
+)
 from ....distributed.moe.moe_utils import sort_chunks_by_idxs
 from ....distributed.parallel_state import get_parallel_state
 from ....utils.device import stream_synchronize
 from ._kernels.kernel.npu_group_gemm import npu_group_gemm
+
+
+@dataclass
+class NpuEpDispatchPlan:
+    num_global_experts: int
+    input_splits: List
+    output_splits: List
+    num_global_tokens_per_local_expert: torch.Tensor
+    num_global_sum_tokens_per_local_expert: torch.Tensor
+    routing_shape: torch.Size
+    ep_group: Optional[dist.ProcessGroup]
+
+
+NpuEpDispatchPlanCallback = Callable[[NpuEpDispatchPlan], None]
+_npu_ep_dispatch_plan_callback: ContextVar[Optional[NpuEpDispatchPlanCallback]] = ContextVar(
+    "npu_ep_dispatch_plan_callback",
+    default=None,
+)
+NpuEpDispatchLaunchCallback = Callable[[], None]
+_npu_ep_dispatch_launch_callback: ContextVar[Optional[NpuEpDispatchLaunchCallback]] = ContextVar(
+    "npu_ep_dispatch_launch_callback",
+    default=None,
+)
+
+
+@contextmanager
+def npu_ep_dispatch_plan_callback(
+    callback: Optional[NpuEpDispatchPlanCallback],
+) -> Iterator[None]:
+    token = _npu_ep_dispatch_plan_callback.set(callback)
+    try:
+        yield
+    finally:
+        _npu_ep_dispatch_plan_callback.reset(token)
+
+
+@contextmanager
+def npu_ep_dispatch_launch_callback(
+    callback: Optional[NpuEpDispatchLaunchCallback],
+) -> Iterator[None]:
+    token = _npu_ep_dispatch_launch_callback.set(callback)
+    try:
+        yield
+    finally:
+        _npu_ep_dispatch_launch_callback.reset(token)
 
 
 def _npu_fused_moe_forward(
@@ -76,38 +129,49 @@ def npu_ep_fused_moe_forward(
     Handles alltoall dispatch/combine for expert parallelism.
     """
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-    input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
-        dispatch_preprocess(selected_experts, num_experts, ep_group)
-    )
+    dispatch_plan = npu_ep_dispatch_prepare(selected_experts, num_experts, ep_group)
+    callback = _npu_ep_dispatch_plan_callback.get()
+    if callback is not None:
+        callback(dispatch_plan)
+    launch_callback = _npu_ep_dispatch_launch_callback.get()
+    if launch_callback is not None:
+        launch_callback()
     hidden_states, unpermute_indices = alltoall_dispatch(
         hidden_states,
         selected_experts,
-        input_splits,
-        output_splits,
+        dispatch_plan.input_splits,
+        dispatch_plan.output_splits,
         num_experts,
-        num_global_tokens_per_local_expert,
+        dispatch_plan.num_global_tokens_per_local_expert,
         ep_group,
     )
+    hidden_states = register_expert_backward_boundary(hidden_states)
 
     if fc1_1_2_weight is not None:
         fc1_weight = fc1_1_2_weight
     else:
         fc1_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1)
     fc1_weight = fc1_weight.transpose(1, 2)
-    intermediate_hidden_states = npu_group_gemm(hidden_states, fc1_weight, num_global_sum_tokens_per_local_expert)
+    intermediate_hidden_states = npu_group_gemm(
+        hidden_states,
+        fc1_weight,
+        dispatch_plan.num_global_sum_tokens_per_local_expert,
+    )
     intermediate_activations = torch_npu.npu_swiglu(intermediate_hidden_states, dim=-1)
     hidden_states = npu_group_gemm(
-        intermediate_activations, fc2_weight.transpose(1, 2), num_global_sum_tokens_per_local_expert
+        intermediate_activations,
+        fc2_weight.transpose(1, 2),
+        dispatch_plan.num_global_sum_tokens_per_local_expert,
     )
 
     hidden_states = alltoall_combine(
         hidden_states,
         routing_weights,
         unpermute_indices,
-        input_splits,
-        output_splits,
+        dispatch_plan.input_splits,
+        dispatch_plan.output_splits,
         num_experts,
-        num_global_tokens_per_local_expert,
+        dispatch_plan.num_global_tokens_per_local_expert,
         ep_group,
     )
     return hidden_states
@@ -163,7 +227,7 @@ def alltoall_dispatch(
     ep_group: Optional[dist.ProcessGroup] = None,
 ):
     hidden_states, unpermute_indices = torch_npu.npu_moe_token_permute(hidden_states, selected_experts.to(torch.int32))
-    hidden_states = all_to_all(ep_group, hidden_states, output_splits, input_splits)
+    hidden_states = all_to_all(ep_group, hidden_states, output_splits, input_splits, phase="dispatch")
 
     stream_synchronize()
     ep_size = 1 if ep_group is None else dist.get_world_size(ep_group)
@@ -202,9 +266,202 @@ def alltoall_combine(
         unpermute_order,
     )
 
-    hidden_states = all_to_all(ep_group, hidden_states, input_splits, output_splits)
+    hidden_states = all_to_all(ep_group, hidden_states, input_splits, output_splits, phase="combine")
     hidden_states = torch_npu.npu_moe_token_unpermute(hidden_states, unpermute_indices, probs=routing_weights)
     return hidden_states
+
+
+@dataclass
+class NpuEpDispatchState(NpuEpDispatchPlan):
+    unpermute_indices: torch.Tensor
+    output: torch.Tensor
+    handle: AsyncCollectiveHandle
+
+
+@dataclass
+class NpuEpDispatchInput:
+    plan: NpuEpDispatchPlan
+    permuted: torch.Tensor
+    unpermute_indices: torch.Tensor
+
+
+@dataclass
+class NpuEpCombineState:
+    routing_weights: torch.Tensor
+    unpermute_indices: torch.Tensor
+    output: torch.Tensor
+    handle: AsyncCollectiveHandle
+
+
+def npu_ep_dispatch_prepare(
+    selected_experts: torch.Tensor,
+    num_global_experts: int,
+    ep_group: Optional[dist.ProcessGroup],
+) -> NpuEpDispatchPlan:
+    """Prepare token counts and split metadata before the overlap boundary."""
+    input_splits, output_splits, tokens_per_local_expert, summed_tokens_per_local_expert = dispatch_preprocess(
+        selected_experts, num_global_experts, ep_group
+    )
+    return NpuEpDispatchPlan(
+        num_global_experts=num_global_experts,
+        input_splits=input_splits,
+        output_splits=output_splits,
+        num_global_tokens_per_local_expert=tokens_per_local_expert,
+        num_global_sum_tokens_per_local_expert=summed_tokens_per_local_expert,
+        routing_shape=selected_experts.shape,
+        ep_group=ep_group,
+    )
+
+
+def npu_ep_dispatch_input_prepare(
+    hidden_states: torch.Tensor,
+    selected_experts: torch.Tensor,
+    plan: NpuEpDispatchPlan,
+) -> NpuEpDispatchInput:
+    """Run replay token permutation before its communication ticket is granted."""
+    permuted, unpermute_indices = torch_npu.npu_moe_token_permute(
+        hidden_states,
+        selected_experts.to(torch.int32),
+    )
+    return NpuEpDispatchInput(
+        plan=plan,
+        permuted=permuted,
+        unpermute_indices=unpermute_indices,
+    )
+
+
+def npu_ep_dispatch_async(
+    hidden_states: torch.Tensor,
+    selected_experts: torch.Tensor,
+    num_global_experts: int,
+    ep_group: Optional[dist.ProcessGroup],
+    plan: Optional[NpuEpDispatchPlan] = None,
+    prepared_input: Optional[NpuEpDispatchInput] = None,
+) -> NpuEpDispatchState:
+    """Launch replay dispatch and defer its host/device synchronization."""
+    if plan is None:
+        plan = npu_ep_dispatch_prepare(selected_experts, num_global_experts, ep_group)
+    elif plan.num_global_experts != num_global_experts or plan.ep_group is not ep_group:
+        raise ValueError("NPU EP dispatch plan does not match the requested expert topology.")
+    if prepared_input is None:
+        prepared_input = npu_ep_dispatch_input_prepare(hidden_states, selected_experts, plan)
+    elif prepared_input.plan is not plan:
+        raise ValueError("NPU EP prepared dispatch input does not match the requested dispatch plan.")
+    permuted = prepared_input.permuted
+    unpermute_indices = prepared_input.unpermute_indices
+    output, handle = all_to_all_async(ep_group, permuted, plan.output_splits, plan.input_splits)
+    return NpuEpDispatchState(
+        num_global_experts=plan.num_global_experts,
+        input_splits=plan.input_splits,
+        output_splits=plan.output_splits,
+        num_global_tokens_per_local_expert=plan.num_global_tokens_per_local_expert,
+        num_global_sum_tokens_per_local_expert=plan.num_global_sum_tokens_per_local_expert,
+        unpermute_indices=unpermute_indices,
+        routing_shape=plan.routing_shape,
+        output=output,
+        handle=handle,
+        ep_group=plan.ep_group,
+    )
+
+
+def npu_ep_dispatch_wait(state: NpuEpDispatchState, synchronize: bool = True) -> torch.Tensor:
+    state.handle.wait()
+    if synchronize:
+        stream_synchronize()
+    ep_size = 1 if state.ep_group is None else dist.get_world_size(state.ep_group)
+    num_local_experts = state.num_global_experts // ep_size
+    permute_order = torch.arange(state.num_global_experts).reshape(-1, num_local_experts).T.ravel().tolist()
+    return sort_chunks_by_idxs(
+        state.output,
+        state.num_global_tokens_per_local_expert.ravel(),
+        permute_order,
+    )
+
+
+def npu_ep_dispatch_input_backward(
+    grad_dispatched: torch.Tensor,
+    state: NpuEpDispatchState,
+) -> torch.Tensor:
+    """Map local expert-input gradients back to the pre-dispatch token order."""
+    ep_size = 1 if state.ep_group is None else dist.get_world_size(state.ep_group)
+    num_local_experts = state.num_global_experts // ep_size
+    unpermute_order = torch.arange(state.num_global_experts).reshape(num_local_experts, -1).T.ravel().tolist()
+    grad_dispatched = sort_chunks_by_idxs(
+        grad_dispatched,
+        state.num_global_tokens_per_local_expert.T.ravel(),
+        unpermute_order,
+    )
+    grad_permuted, handle = all_to_all_async(
+        state.ep_group,
+        grad_dispatched,
+        state.input_splits,
+        state.output_splits,
+    )
+    handle.wait()
+    return torch_npu.npu_moe_token_unpermute(
+        grad_permuted,
+        state.unpermute_indices,
+        probs=torch.ones(state.routing_shape, dtype=grad_permuted.dtype, device=grad_permuted.device),
+    )
+
+
+def npu_ep_expert_forward(
+    hidden_states: torch.Tensor,
+    dispatch_state: NpuEpDispatchState,
+    fc2_weight: torch.Tensor,
+    fc1_1_2_weight: torch.Tensor,
+) -> torch.Tensor:
+    fc1_weight = fc1_1_2_weight.transpose(1, 2)
+    intermediate = npu_group_gemm(
+        hidden_states,
+        fc1_weight,
+        dispatch_state.num_global_sum_tokens_per_local_expert,
+    )
+    activations = torch_npu.npu_swiglu(intermediate, dim=-1)
+    return npu_group_gemm(
+        activations,
+        fc2_weight.transpose(1, 2),
+        dispatch_state.num_global_sum_tokens_per_local_expert,
+    )
+
+
+def npu_ep_combine_async(
+    hidden_states: torch.Tensor,
+    routing_weights: torch.Tensor,
+    dispatch_state: NpuEpDispatchState,
+    backward_phase_callback=None,
+) -> NpuEpCombineState:
+    ep_size = 1 if dispatch_state.ep_group is None else dist.get_world_size(dispatch_state.ep_group)
+    num_local_experts = dispatch_state.num_global_experts // ep_size
+    unpermute_order = torch.arange(dispatch_state.num_global_experts).reshape(num_local_experts, -1).T.ravel().tolist()
+    hidden_states = sort_chunks_by_idxs(
+        hidden_states,
+        dispatch_state.num_global_tokens_per_local_expert.T.ravel(),
+        unpermute_order,
+    )
+    output, handle = all_to_all_async(
+        dispatch_state.ep_group,
+        hidden_states,
+        dispatch_state.input_splits,
+        dispatch_state.output_splits,
+        phase="combine",
+        callback=backward_phase_callback,
+    )
+    return NpuEpCombineState(
+        routing_weights=routing_weights,
+        unpermute_indices=dispatch_state.unpermute_indices,
+        output=output,
+        handle=handle,
+    )
+
+
+def npu_ep_combine_wait(state: NpuEpCombineState) -> torch.Tensor:
+    state.handle.wait()
+    return torch_npu.npu_moe_token_unpermute(
+        state.output,
+        state.unpermute_indices,
+        probs=state.routing_weights,
+    )
 
 
 def npu_fused_moe_forward(

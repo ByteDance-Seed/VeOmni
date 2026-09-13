@@ -27,6 +27,7 @@ from ....distributed.sequence_parallel import (
 )
 from ....utils import logging
 from ....utils.import_utils import is_transformers_version_greater_or_equal_to
+from .backward_boundary import register_attention_backward_boundary
 
 
 logger = logging.get_logger(__name__)
@@ -324,6 +325,7 @@ def flash_attention_forward(
         layer_idx=module.layer_idx if hasattr(module, "layer_idx") else None,
         **kwargs,
     )
+    attn_output = register_attention_backward_boundary(attn_output)
 
     # Ulysses patch
     if ulysses_enabled and not skip_ulysses:
