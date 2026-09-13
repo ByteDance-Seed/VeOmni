@@ -235,8 +235,8 @@ def forward(x: Tensor, freqs: Tensor, *, head_dim: int) -> tuple[Tensor, SavedSt
         output, saved = _eager.forward(x, freqs, head_dim=head_dim)
         return output, SavedState(saved.tensors, _Meta(False, head_dim))
 
-    cos = freqs.real.squeeze().contiguous()
-    sin = freqs.imag.squeeze().contiguous()
+    cos = freqs.real.squeeze(1).contiguous()
+    sin = freqs.imag.squeeze(1).contiguous()
     shaped = x.reshape(*x.shape[:2], -1, head_dim)
     output = apply_rotary_interleaved(shaped, cos, sin).flatten(2)
     return output, SavedState((cos, sin), _Meta(True, head_dim))
