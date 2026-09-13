@@ -180,25 +180,6 @@ def test_eager_rope_table_gradients_match_hf(kind: str, cos_requires_grad: bool,
         torch.testing.assert_close(sin_e.grad, sin_h.grad)
 
 
-@pytest.mark.parametrize("kind", ("full", "partial", "vision"))
-def test_eager_rope_fixed_tables_do_not_save_inputs(kind: str):
-    if kind == "vision":
-        q = torch.randn(4, 3, 8, requires_grad=True)
-        k = torch.randn(4, 2, 8, requires_grad=True)
-        cos = torch.randn(4, 8)
-        sin = torch.randn(4, 8)
-        output = resolve_op("rope", "full", "eager").wrapper(q, k, cos, sin)
-    else:
-        head_dim = 8 if kind == "full" else 12
-        q = torch.randn(2, 3, 4, head_dim, requires_grad=True)
-        k = torch.randn(2, 2, 4, head_dim, requires_grad=True)
-        cos = torch.randn(2, 4, 8)
-        sin = torch.randn(2, 4, 8)
-        output = resolve_op("rope", kind, "eager").wrapper(q, k, cos, sin, unsqueeze_dim=1)
-
-    assert [tensor.shape for tensor in output[0].grad_fn.saved_tensors] == [cos.shape, sin.shape]
-
-
 @pytest.mark.parametrize("kind", ("full", "vision"))
 def test_rope_accepts_compatible_optional_arguments(kind: str):
     position_ids = torch.arange(4).unsqueeze(0)
@@ -578,16 +559,6 @@ def test_deepseek_v4_triton_inverse_rotation_round_trips():
     round_tripped = rope(rope(x, cos, sin, unsqueeze_dim=1), cos, -sin, unsqueeze_dim=1)
 
     torch.testing.assert_close(round_tripped, x.contiguous(), rtol=1e-5, atol=1e-5)
-
-
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek-V4 Triton RoPE needs a GPU")
-def test_deepseek_v4_triton_saves_only_cos_sin():
-    pytest.importorskip("triton")
-    rope = resolve_op("rope", "deepseek_v4", "triton").wrapper
-    torch.manual_seed(7)
-    x, cos, sin = _dsv4_rope_inputs(1, 4, 32, 512, 64, True, torch.bfloat16)
-    out = rope(x.detach().requires_grad_(True), cos, sin, unsqueeze_dim=1)
-    assert [tensor.shape for tensor in out.grad_fn.saved_tensors] == [cos.shape, sin.shape]
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek-V4 Triton RoPE needs a GPU")

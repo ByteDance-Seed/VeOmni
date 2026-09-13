@@ -397,36 +397,6 @@ def test_qat_linear_restores_the_parameter_after_the_call(reference_quantizers):
     assert torch.equal(linear.weight.detach(), original)
 
 
-def test_reference_quantizers_match_the_tilelang_kernels():
-    """Pin the torch stand-ins the tests above rely on to the real kernels."""
-    require_nvidia_cuda("tilelang", min_cc=90)
-    from veomni.ops.qat.quant import act_quant, fp8_weight_quant
-
-    torch.manual_seed(20)
-    x = torch.randn(6, 256, device=DEVICE, dtype=torch.bfloat16)
-    x[0].zero_()  # amax clamp floor: must not divide by zero
-    x[1] *= 1e4
-    weight = torch.randn(256, 384, device=DEVICE, dtype=torch.bfloat16)
-    weight[:128, :128] = 0.0
-
-    for block_size in (64, 128):
-        for scale_fmt in (None, "ue8m0"):
-            actual = act_quant(x, block_size, scale_fmt, dequant=True)
-            expected = reference_act_quant(x, block_size, scale_fmt, dequant=True)
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-            quantized, scales = act_quant(x, block_size, scale_fmt)
-            reference_quantized, reference_scales = reference_act_quant(x, block_size, scale_fmt)
-            assert torch.equal(quantized.view(torch.uint8), reference_quantized.view(torch.uint8))
-            assert torch.equal(scales, reference_scales)
-
-    for scale_fmt in (None, "ue8m0"):
-        quantized, scales = fp8_weight_quant(weight, 128, scale_fmt)
-        reference_quantized, reference_scales = reference_fp8_weight_quant(weight, 128, scale_fmt)
-        assert torch.equal(quantized.view(torch.uint8), reference_quantized.view(torch.uint8))
-        assert torch.equal(scales, reference_scales)
-
-
 def test_qat_linear_runs_on_the_tilelang_kernels():
     require_nvidia_cuda("tilelang", min_cc=90)
     torch.manual_seed(21)

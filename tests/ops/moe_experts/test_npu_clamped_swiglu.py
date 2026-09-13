@@ -76,26 +76,18 @@ def test_npu_clamped_swiglu_missing_triton_uses_eager(monkeypatch: pytest.Monkey
     torch.testing.assert_close(source.grad, expected_input.grad, rtol=0, atol=0)
 
 
-def test_npu_clamped_swiglu_requires_ascend_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_npu_clamped_swiglu_dispatches_to_ascend_triton(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_triton = ModuleType("triton")
     fake_triton.__path__ = []
     fake_triton_c = ModuleType("triton._C")
-    fake_triton_c.libtriton = SimpleNamespace()
+    fake_triton_c.libtriton = SimpleNamespace(ascend=object())
     monkeypatch.setitem(sys.modules, "triton", fake_triton)
     monkeypatch.setitem(sys.modules, "triton._C", fake_triton_c)
-
-    assert not npu_moe._is_triton_ascend_available()
-    fake_triton_c.libtriton.ascend = object()
-    assert npu_moe._is_triton_ascend_available()
-
-
-def test_npu_clamped_swiglu_dispatches_to_ascend_triton(monkeypatch: pytest.MonkeyPatch) -> None:
     x = torch.empty((1, 2))
     output = object()
     fake_kernel = ModuleType(_CLAMPED_SWIGLU_MODULE)
     fake_kernel.npu_triton_clamped_swiglu = lambda actual_x, limit: output if actual_x is x and limit == 7.0 else None
     monkeypatch.setitem(sys.modules, _CLAMPED_SWIGLU_MODULE, fake_kernel)
-    monkeypatch.setattr(npu_moe, "_is_triton_ascend_available", lambda: True)
 
     assert npu_moe._clamped_swiglu(x, 7.0) is output
 

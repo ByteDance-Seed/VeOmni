@@ -63,7 +63,11 @@ def forward(
     num_heads = hidden_states.shape[head_dimension]
     head_dim = hidden_states.shape[-1]
     # Output linear sees [B, S, H*D]. Backward reshapes the input grad back to heads.
-    hidden_states = hidden_states.view(hidden_states.shape[0], hidden_states.shape[1], -1)
+    hidden_states = hidden_states.reshape(
+        hidden_states.shape[0],
+        hidden_states.shape[1],
+        num_heads * head_dim,
+    )
     output = F.linear(hidden_states, proj_weight, proj_bias)
     return output, SavedState(
         (hidden_states, proj_weight, proj_bias),
@@ -78,7 +82,12 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
     hidden_states, proj_weight, proj_bias = saved.tensors
     grad_hidden = linear_input_backward(grad_output, hidden_states, proj_weight)
     # Reverse all-to-all needs the collected head layout, not the flattened [B, S, H*D].
-    grad_hidden = grad_hidden.reshape(grad_hidden.shape[0], -1, meta.num_heads, meta.head_dim)
+    grad_hidden = grad_hidden.reshape(
+        grad_hidden.shape[0],
+        grad_hidden.shape[1],
+        meta.num_heads,
+        meta.head_dim,
+    )
     grad_out_res = all_to_all_tensor(
         grad_hidden,
         scatter_dim=meta.head_dimension,

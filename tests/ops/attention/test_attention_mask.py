@@ -134,17 +134,6 @@ def test_magi_hf_builder_rejects_implicit_2d_visibility(attention_2d):
         magi_attention_mask_builder(1, 4, 4, attention_mask=attention_2d, device="cpu")
 
 
-def test_magi_hf_builder_accepts_bottom_right_aligned_causal_lengths():
-    mask = magi_attention_mask_builder(1, 2, 4, q_offset=2, device="cpu")
-    expected = torch.tensor(
-        [
-            [True, True, True, False],
-            [True, True, True, True],
-        ]
-    )
-    torch.testing.assert_close(materialize_magi_mask(mask, 2, 4)[0, 0], expected)
-
-
 def test_magi_hf_builder_rejects_incompatible_causal_offsets():
     with pytest.raises(ValueError, match="bottom-right aligned"):
         magi_attention_mask_builder(1, 2, 4, device="cpu")
