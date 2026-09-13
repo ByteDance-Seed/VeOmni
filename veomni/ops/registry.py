@@ -81,14 +81,14 @@ def _make_autograd_fn(raw_forward: Callable, raw_backward: Callable) -> Callable
             ):
                 raise TypeError("raw forward output must be a Tensor or a non-empty tuple of Tensors")
 
-            ctx.n_out = 1 if isinstance(output, Tensor) else len(output)
+            ctx.output_is_tuple = isinstance(output, tuple)
             return output
 
         @staticmethod
         def backward(ctx: Any, *grad_outputs: Tensor) -> tuple[Tensor | None, ...]:
             """Rebuild ``SavedState`` and return grads for the positional tensors."""
             saved = SavedState(ctx.saved_tensors, ctx.saved_metadata)
-            grad_output: Output = grad_outputs[0] if ctx.n_out == 1 else grad_outputs
+            grad_output: Output = grad_outputs if ctx.output_is_tuple else grad_outputs[0]
             grads = raw_backward(grad_output, saved)
 
             if not isinstance(grads, tuple):

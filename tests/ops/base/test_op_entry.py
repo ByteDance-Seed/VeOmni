@@ -384,6 +384,32 @@ class TestGeneratedWrapper:
         assert x.grad is not None
         assert y.grad is not None
 
+    def test_singleton_tuple_output_preserves_backward_structure(self):
+        def singleton_forward(x: Tensor) -> tuple[tuple[Tensor], SavedState]:
+            return (x.square(),), SavedState((x,))
+
+        def singleton_backward(grad_output: tuple[Tensor], saved: SavedState) -> tuple[Tensor | None, ...]:
+            (grad_output,) = grad_output
+            (x,) = saved.tensors
+            return (2 * x * grad_output,)
+
+        register_op(
+            "singleton",
+            "standard",
+            "eager",
+            singleton_forward,
+            singleton_backward,
+            description=_TEST_DESCRIPTION,
+        )
+        x = torch.randn(3, requires_grad=True)
+
+        output = resolve_op("singleton", "standard", "eager").wrapper(x)
+        assert isinstance(output, tuple)
+        assert len(output) == 1
+        output[0].sum().backward()
+
+        torch.testing.assert_close(x.grad, 2 * x)
+
     @pytest.mark.parametrize("pass_as_keyword", (False, True))
     def test_optional_positional_tensor_uses_full_autograd_signature(self, pass_as_keyword):
         register_op(

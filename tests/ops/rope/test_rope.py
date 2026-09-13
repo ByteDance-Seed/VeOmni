@@ -683,15 +683,56 @@ def test_wan_eager_matches_reference():
     assert torch.allclose(x_e.grad, x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+@pytest.mark.parametrize(
+    ("seqlen", "head_dim"),
+    (
+        pytest.param(1, 8, id="singleton-sequence"),
+        pytest.param(16, 2, id="singleton-half-head"),
+    ),
+)
+def test_wan_triton_preserves_singleton_frequency_axes(monkeypatch, seqlen: int, head_dim: int):
+    from veomni.ops.kernels.rope.wan import triton as wan_triton
+
+    expected_freq_shape = (seqlen, head_dim // 2)
+    conjugate_calls = []
+
+    def record_launch(shaped: Tensor, cos: Tensor, sin: Tensor, *, conjugate: bool = False) -> Tensor:
+        assert cos.shape == expected_freq_shape
+        assert sin.shape == expected_freq_shape
+        conjugate_calls.append(conjugate)
+        return shaped
+
+    monkeypatch.setattr(wan_triton, "apply_rotary_interleaved", record_launch)
+    x = torch.randn(2, seqlen, 4 * head_dim)
+    angle = torch.randn(seqlen, 1, head_dim // 2, dtype=torch.float64)
+    freqs = torch.polar(torch.ones_like(angle), angle)
+
+    output, saved = wan_triton.forward(x, freqs, head_dim=head_dim)
+    grad_output = torch.randn_like(output)
+    grad_x, grad_freqs = wan_triton.backward(grad_output, saved)
+
+    torch.testing.assert_close(output, x)
+    torch.testing.assert_close(grad_x, grad_output)
+    assert grad_freqs is None
+    assert conjugate_calls == [False, True]
+
+
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Wan Triton RoPE needs a GPU")
-def test_wan_triton_matches_eager():
+@pytest.mark.parametrize(
+    ("seqlen", "head_dim"),
+    (
+        pytest.param(16, 64, id="standard"),
+        pytest.param(1, 8, id="singleton-sequence"),
+        pytest.param(16, 2, id="singleton-half-head"),
+    ),
+)
+def test_wan_triton_matches_eager(seqlen: int, head_dim: int):
     pytest.importorskip("triton")
     eager = resolve_op("rope", "wan", "eager").wrapper
     other = resolve_op("rope", "wan", "triton").wrapper
     torch.manual_seed(0)
-    head_dim = 64
-    x = torch.randn(2, 16, 4 * head_dim, device="cuda", dtype=torch.bfloat16)
-    angle = torch.randn(16, 1, head_dim // 2, device="cuda", dtype=torch.float64)
+    x = torch.randn(2, seqlen, 4 * head_dim, device="cuda", dtype=torch.bfloat16)
+    angle = torch.randn(seqlen, 1, head_dim // 2, device="cuda", dtype=torch.float64)
     freqs = torch.polar(torch.ones_like(angle), angle)
 
     x_e = x.detach().requires_grad_(True)
