@@ -16,23 +16,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from torch import Tensor
 
 from ....registry import SavedState
 from . import eager as _eager
-
-
-@dataclass(frozen=True)
-class _Meta:
-    """Empty / eager-fallback flag, clamp, and which biases were real."""
-
-    empty: bool
-    swiglu_limit: float | None
-    has_gate_bias: bool
-    has_up_bias: bool
-    has_down_bias: bool
 
 
 def forward(
@@ -47,16 +34,16 @@ def forward(
     swiglu_limit: float | None = None,
 ) -> tuple[Tensor, SavedState]:
     """Same MLP as eager; ``silu(gate) * up`` uses Liger when the tensors are nonempty."""
-    meta = _Meta(
-        x.numel() == 0,
-        swiglu_limit,
-        gate_b.numel() > 0,
-        up_b.numel() > 0,
-        down_b.numel() > 0,
+    if x.numel() == 0:
+        return _eager.forward(x, gate_w, gate_b, up_w, up_b, down_w, down_b, swiglu_limit=swiglu_limit)
+
+    meta = _eager._Meta(
+        empty=False,
+        swiglu_limit=swiglu_limit,
+        has_gate_bias=gate_b.numel() > 0,
+        has_up_bias=up_b.numel() > 0,
+        has_down_bias=down_b.numel() > 0,
     )
-    if meta.empty:
-        output, saved = _eager.forward(x, gate_w, gate_b, up_w, up_b, down_w, down_b, swiglu_limit=swiglu_limit)
-        return output, SavedState(saved.tensors, meta)
 
     gate = _eager.linear(x, gate_w, gate_b)
     up = _eager.linear(x, up_w, up_b)
@@ -80,9 +67,9 @@ def forward(
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...]:
     """Down linear, Liger silu-mul, then the two input linears."""
     meta = saved.metadata
-    assert isinstance(meta, _Meta)
+    assert isinstance(meta, _eager._Meta)
     if meta.empty:
-        return _eager.backward(grad_output, SavedState(saved.tensors, _eager._Meta(*meta)))
+        return _eager.backward(grad_output, saved)
 
     x, gate_w, gate_b, up_w, up_b, down_w, down_b, gate, up, hidden, saved_gate, saved_up = saved.tensors
     grad_hidden, grad_down_w, grad_down_b = _eager.linear_backward(
