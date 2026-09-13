@@ -23,6 +23,11 @@ import pytest
 from transformers import PretrainedConfig
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+from transformers.models.qwen3_5.configuration_qwen3_5 import (
+    Qwen3_5Config,
+    Qwen3_5TextConfig,
+    Qwen3_5VisionConfig,
+)
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from transformers.models.qwen3_vl.configuration_qwen3_vl import (
     Qwen3VLConfig,
@@ -101,6 +106,47 @@ def _tiny_qwen3_config(architecture: str = "Qwen3ForCausalLM") -> Qwen3Config:
         max_position_embeddings=32,
         architectures=[architecture],
         attn_implementation="eager",
+    )
+
+
+def _tiny_qwen3_5_text_config(architecture: str = "Qwen3_5ForCausalLM") -> Qwen3_5TextConfig:
+    return Qwen3_5TextConfig(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=32,
+        layer_types=["linear_attention"],
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        architectures=[architecture],
+        attn_implementation="eager",
+    )
+
+
+def _tiny_qwen3_5_config(architecture: str = "Qwen3_5ForConditionalGeneration") -> Qwen3_5Config:
+    text_config = _tiny_qwen3_5_text_config()
+    vision_config = Qwen3_5VisionConfig(
+        depth=1,
+        hidden_size=32,
+        intermediate_size=64,
+        num_heads=4,
+        patch_size=8,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        out_hidden_size=32,
+        num_position_embeddings=16,
+    )
+    return Qwen3_5Config(
+        text_config=text_config.to_dict(),
+        vision_config=vision_config.to_dict(),
+        architectures=[architecture],
     )
 
 
@@ -234,6 +280,25 @@ _MODEL_CASES = (
             "Qwen3ForTokenClassification",
             "Qwen3ForSequenceClassification",
             "Qwen3Model",
+        ),
+    ),
+    _ModelCase(
+        model_type="qwen3_5",
+        config_factory=_tiny_qwen3_5_config,
+        architectures=(
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5ForTokenClassification",
+            "Qwen3_5ForSequenceClassification",
+            "Qwen3_5Model",
+        ),
+    ),
+    _ModelCase(
+        model_type="qwen3_5_text",
+        config_factory=_tiny_qwen3_5_text_config,
+        architectures=(
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5TextForSequenceClassification",
+            "Qwen3_5TextModel",
         ),
     ),
     _ModelCase(
