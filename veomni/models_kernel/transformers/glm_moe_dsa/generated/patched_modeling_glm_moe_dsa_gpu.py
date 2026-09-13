@@ -21,6 +21,8 @@
 #      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: GlmMoeDsaForCausalLM.forward
 #      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
+#    - method_override: GlmMoeDsaForCausalLM.get_parallel_plan
+#      Register GLM-MoE-DSA expert parallel plan for v5 generated modeling
 #
 # ==============================================================================
 
@@ -786,7 +788,7 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] GlmMoeDsaForCausalLM
-# Methods patched: __init__, forward
+# Methods patched: __init__, forward, get_parallel_plan
 # ======================================================================
 
 
@@ -822,6 +824,11 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
+        r"""
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Indices depicting the position of input tokens in the sequence. This is
+            retained explicitly for callers that pass it positionally.
+        """
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -859,6 +866,11 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def get_parallel_plan(self):
+        from ..parallel_plan import get_parallel_plan as _get_parallel_plan
+
+        return _get_parallel_plan()
 
 
 __all__ = ["GlmMoeDsaPreTrainedModel", "GlmMoeDsaModel", "GlmMoeDsaForCausalLM"]

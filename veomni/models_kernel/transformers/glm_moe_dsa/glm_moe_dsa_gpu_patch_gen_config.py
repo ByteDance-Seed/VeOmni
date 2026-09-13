@@ -344,6 +344,11 @@ def glm_moe_dsa_forcausallm_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> CausalLMOutputWithPast:
+    r"""
+    cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+        Indices depicting the position of input tokens in the sequence. This is
+        retained explicitly for callers that pass it positionally.
+    """
     outputs = self.model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -381,3 +386,13 @@ def glm_moe_dsa_forcausallm_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
     )
+
+
+@config.override_method(
+    "GlmMoeDsaForCausalLM.get_parallel_plan",
+    description="Register GLM-MoE-DSA expert parallel plan for v5 generated modeling",
+)
+def glm_moe_dsa_get_parallel_plan_patched(self):
+    from ..parallel_plan import get_parallel_plan as _get_parallel_plan
+
+    return _get_parallel_plan()

@@ -38,6 +38,11 @@ from veomni.models_kernel.transformers.deepseek_v4.checkpoint_tensor_converter i
     convert_deepseek_v4_fqn_to_index_mapping,
     create_deepseek_v4_checkpoint_tensor_converter,
 )
+from veomni.models_kernel.transformers.glm_moe_dsa.checkpoint_tensor_converter import (
+    GlmMoeDsaCheckpointTensorConverter,
+    convert_glm_moe_dsa_fqn_to_index_mapping,
+    create_glm_moe_dsa_checkpoint_tensor_converter,
+)
 from veomni.models_kernel.transformers.qwen3_moe.checkpoint_tensor_converter import (
     Qwen3MoeCheckpointTensorConverter,
     create_qwen3_moe_checkpoint_tensor_converter,
@@ -380,21 +385,29 @@ class TestQwen3MoeConverterIntegration:
 
 
 # ---------------------------------------------------------------------------
-# Tests for DeepseekV3CheckpointTensorConverter
+# Tests for routed-expert checkpoint tensor converters
 # ---------------------------------------------------------------------------
 
 
-class TestDeepseekV3CheckpointTensorConverter:
-    def test_matches_only_per_expert_projection_keys(self):
-        converter = DeepseekV3CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+_ROUTED_EXPERT_CONVERTER_CASES = (
+    pytest.param(DeepseekV3CheckpointTensorConverter, id="deepseek_v3"),
+    pytest.param(GlmMoeDsaCheckpointTensorConverter, id="glm_moe_dsa"),
+)
+
+
+class TestRoutedExpertCheckpointTensorConverter:
+    @pytest.mark.parametrize("converter_cls", _ROUTED_EXPERT_CONVERTER_CASES)
+    def test_matches_only_per_expert_projection_keys(self, converter_cls):
+        converter = converter_cls(num_experts=NUM_EXPERTS)
 
         for projection in ("gate_proj", "up_proj", "down_proj"):
             assert converter.can_handle(_make_expert_key(0, 1, projection))
         assert not converter.can_handle("model.layers.0.self_attn.q_proj.weight")
         assert not converter.can_handle("model.layers.0.mlp.experts.gate_up_proj")
 
-    def test_full_layer_conversion_preserves_expert_order_and_layout(self):
-        converter = DeepseekV3CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+    @pytest.mark.parametrize("converter_cls", _ROUTED_EXPERT_CONVERTER_CASES)
+    def test_full_layer_conversion_preserves_expert_order_and_layout(self, converter_cls):
+        converter = converter_cls(num_experts=NUM_EXPERTS)
         dispatched = {}
 
         passthrough = maybe_convert_checkpoint_tensor(
@@ -426,8 +439,9 @@ class TestDeepseekV3CheckpointTensorConverter:
             assert torch.equal(down[expert_id], _make_expert_tensor("down_proj", expert_id))
 
     @pytest.mark.parametrize("projection", ("down_proj", "gate_proj"))
-    def test_finalize_rejects_incomplete_checkpoint(self, projection: str):
-        converter = DeepseekV3CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+    @pytest.mark.parametrize("converter_cls", _ROUTED_EXPERT_CONVERTER_CASES)
+    def test_finalize_rejects_incomplete_checkpoint(self, converter_cls, projection: str):
+        converter = converter_cls(num_experts=NUM_EXPERTS)
         expert_ids = range(NUM_EXPERTS - 1) if projection == "down_proj" else range(NUM_EXPERTS)
         for expert_id in expert_ids:
             converter.convert(
@@ -438,10 +452,27 @@ class TestDeepseekV3CheckpointTensorConverter:
         with pytest.raises(RuntimeError, match="incomplete checkpoint detected"):
             converter.finalize()
 
-    def test_factory_and_fqn_mapping(self):
+    @pytest.mark.parametrize(
+        ("factory", "converter_cls", "convert_mapping"),
+        (
+            pytest.param(
+                create_deepseek_v3_checkpoint_tensor_converter,
+                DeepseekV3CheckpointTensorConverter,
+                convert_deepseek_v3_fqn_to_index_mapping,
+                id="deepseek_v3",
+            ),
+            pytest.param(
+                create_glm_moe_dsa_checkpoint_tensor_converter,
+                GlmMoeDsaCheckpointTensorConverter,
+                convert_glm_moe_dsa_fqn_to_index_mapping,
+                id="glm_moe_dsa",
+            ),
+        ),
+    )
+    def test_factory_and_fqn_mapping(self, factory, converter_cls, convert_mapping):
         model = SimpleNamespace(config=SimpleNamespace(n_routed_experts=8))
-        converter = create_deepseek_v3_checkpoint_tensor_converter(model)
-        assert isinstance(converter, DeepseekV3CheckpointTensorConverter)
+        converter = factory(model)
+        assert isinstance(converter, converter_cls)
         assert converter.num_experts == 8
 
         mapping = {
@@ -450,7 +481,7 @@ class TestDeepseekV3CheckpointTensorConverter:
             "model.layers.0.mlp.experts.0.down_proj.weight": 5,
             "model.layers.0.self_attn.q_proj.weight": 7,
         }
-        assert convert_deepseek_v3_fqn_to_index_mapping(mapping) == {
+        assert convert_mapping(mapping) == {
             "model.layers.0.mlp.experts.gate_up_proj": 3,
             "model.layers.0.mlp.experts.down_proj": 5,
             "model.layers.0.self_attn.q_proj.weight": 7,

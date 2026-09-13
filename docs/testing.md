@@ -163,7 +163,8 @@ Additional per-directory helpers:
 
 **GPU**: 1 GPU, runs serially per model mode.
 
-The models migrated to `models_kernel` are currently DeepSeek-V3, DeepSeek-V4, Gemma3 Text, GPT-OSS, Llama, Seed-OSS,
+The models migrated to `models_kernel` are currently DeepSeek-V3, DeepSeek-V4, Gemma3 Text, GLM-MoE-DSA,
+GPT-OSS, Llama, Seed-OSS,
 Qwen2, Qwen2-VL, Qwen2.5-VL, Qwen2.5-Omni, Qwen3, Qwen3-MoE, Qwen3-VL, Qwen3-VL-MoE, Qwen3.5,
 Qwen3.5-MoE, and Qwen3-Omni-MoE. Their registry/build
 dispatch, supported architectures, eager forward/backward parity, and
@@ -172,7 +173,7 @@ and the corresponding model tests under `tests/models_kernel/`. Backend
 availability and optimized op numerics are covered by the corresponding tests
 under `tests/ops/`.
 
-DeepSeek-V4-specific DSA checks live under `tests/ops/dsa/`; optimized numerical
+DeepSeek-V4- and GLM-MoE-DSA-specific DSA checks live under `tests/ops/dsa/`; optimized numerical
 tests require TileLang on an SM90+ NVIDIA GPU. Its mHC kernel parity is covered
 by `tests/ops/mhc/test_mhc.py` and requires TileKernels on an SM90+ NVIDIA GPU.
 

@@ -12,10 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""GLM-MoE-DSA models_kernel consume tests.
-
-Direct-import the generated class. Compare a toy CausalLM against HuggingFace.
-"""
+"""GLM-MoE-DSA models_kernel consume tests."""
 
 from __future__ import annotations
 
@@ -24,58 +21,37 @@ from types import SimpleNamespace
 import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaForCausalLM as HFGlmMoeDsaForCausalLM
+from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaModel as HFGlmMoeDsaModel
 
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
+    assert_outputs_and_grads_match,
     eager_ops_config,
 )
+from tests.models_kernel.tiny_configs import tiny_glm_moe_dsa_config as _tiny_config
 from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config, set_ops_config
 
 
-def _tiny_config() -> GlmMoeDsaConfig:
-    """Official GlmMoeDsaConfig fields, sized down for a toy.
+def _glm_cls(architecture: str):
+    from veomni.utils.device import IS_NPU_AVAILABLE
 
-    Omit ``mlp_layer_types`` / ``indexer_types`` so official ``__post_init__``
-    fills them: first 3 dense then sparse, first layer full indexer then
-    every ``index_topk_freq`` (default 1) layer full. Four layers therefore
-    keep one sparse MoE layer. ``index_topk`` is shrunk below the toy
-    sequence so the official top-k additive mask is actually sparse.
-    """
-    return GlmMoeDsaConfig(
-        vocab_size=128,
-        hidden_size=64,
-        intermediate_size=64,
-        moe_intermediate_size=32,
-        num_hidden_layers=4,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        n_shared_experts=1,
-        n_routed_experts=4,
-        kv_lora_rank=16,
-        q_lora_rank=32,
-        qk_rope_head_dim=8,
-        v_head_dim=8,
-        qk_nope_head_dim=8,
-        num_experts_per_tok=2,
-        max_position_embeddings=64,
-        index_topk=4,
-        index_head_dim=16,
-        index_n_heads=2,
-        attn_implementation="eager",
-        experts_implementation="eager",
-    )
+    if IS_NPU_AVAILABLE:
+        from veomni.models_kernel.transformers.glm_moe_dsa.generated import patched_modeling_glm_moe_dsa_npu as gen
+    else:
+        from veomni.models_kernel.transformers.glm_moe_dsa.generated import patched_modeling_glm_moe_dsa_gpu as gen
+    return getattr(gen, architecture)
 
 
-def _build_ours(config: GlmMoeDsaConfig, ops: SimpleNamespace | None = None):
-    from veomni.models_kernel.transformers.glm_moe_dsa.generated.patched_modeling_glm_moe_dsa_gpu import (
-        GlmMoeDsaForCausalLM,
-    )
-
+def _build_ours(
+    config: GlmMoeDsaConfig,
+    ops: SimpleNamespace | None = None,
+    architecture: str = "GlmMoeDsaForCausalLM",
+):
     previous = get_ops_config()
     set_ops_config(ops if ops is not None else eager_ops_config())
     try:
-        return GlmMoeDsaForCausalLM(config)
+        return _glm_cls(architecture)(config)
     finally:
         set_ops_config(previous)
 
@@ -116,3 +92,36 @@ def test_glm_moe_dsa_eager_matches_hf():
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
     assert_eager_matches_hf(hf, ours, input_ids=input_ids)
+
+
+def test_glm_moe_dsa_base_model_eager_matches_hf():
+    torch.manual_seed(0)
+    config = _tiny_config("GlmMoeDsaModel")
+    hf = HFGlmMoeDsaModel(config)
+    ours = _build_ours(config, architecture="GlmMoeDsaModel")
+    ours.load_state_dict(hf.state_dict())
+
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    gradient_weights = torch.randn(2, 8, config.hidden_size)
+    assert_outputs_and_grads_match(
+        hf,
+        ours,
+        lambda model: model(input_ids=input_ids, use_cache=False).last_hidden_state * gradient_weights,
+    )
+
+
+def test_glm_moe_dsa_registry_installs_checkpoint_hooks_and_ep_plan():
+    from veomni.models_kernel import get_model_class
+
+    for architecture in ("GlmMoeDsaForCausalLM", "GlmMoeDsaModel"):
+        model_cls = get_model_class(_tiny_config(architecture))
+        assert callable(model_cls._create_checkpoint_tensor_converter)
+        assert callable(model_cls._convert_fqn_to_index_mapping)
+
+    causal_cls = get_model_class(_tiny_config())
+    ep_plan = causal_cls.get_parallel_plan(None).extra_parallel_plan["ep"]
+    assert set(ep_plan) == {
+        "model.layers.*.mlp.experts.gate_up_proj",
+        "model.layers.*.mlp.experts.down_proj",
+    }
+    assert all(placement.dim == 0 for placement in ep_plan.values())

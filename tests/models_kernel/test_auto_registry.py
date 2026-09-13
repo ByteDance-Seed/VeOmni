@@ -33,6 +33,9 @@ from tests.models_kernel.tiny_configs import (
     tiny_gemma3_text_config as _tiny_gemma3_text_config,
 )
 from tests.models_kernel.tiny_configs import (
+    tiny_glm_moe_dsa_config as _tiny_glm_moe_dsa_config,
+)
+from tests.models_kernel.tiny_configs import (
     tiny_gpt_oss_config as _tiny_gpt_oss_config,
 )
 from tests.models_kernel.tiny_configs import (
@@ -155,6 +158,11 @@ _MODEL_CASES = (
             "GptOssForTokenClassification",
             "GptOssModel",
         ),
+    ),
+    _ModelCase(
+        model_type="glm_moe_dsa",
+        config_factory=_tiny_glm_moe_dsa_config,
+        architectures=("GlmMoeDsaForCausalLM", "GlmMoeDsaModel"),
     ),
     _ModelCase(
         model_type="llama",

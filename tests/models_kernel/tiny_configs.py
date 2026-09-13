@@ -77,6 +77,36 @@ def tiny_deepseek_v4_config(architecture: str = "DeepseekV4ForCausalLM") -> Pret
     )
 
 
+def tiny_glm_moe_dsa_config(architecture: str = "GlmMoeDsaForCausalLM") -> PretrainedConfig:
+    """Build a four-layer toy that retains GLM's dense-to-MoE schedule."""
+    from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
+
+    return GlmMoeDsaConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=64,
+        moe_intermediate_size=32,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        n_shared_experts=1,
+        n_routed_experts=4,
+        kv_lora_rank=16,
+        q_lora_rank=32,
+        qk_rope_head_dim=8,
+        v_head_dim=8,
+        qk_nope_head_dim=8,
+        num_experts_per_tok=2,
+        max_position_embeddings=64,
+        index_topk=4,
+        index_head_dim=16,
+        index_n_heads=2,
+        architectures=[architecture],
+        attn_implementation="eager",
+        experts_implementation="eager",
+    )
+
+
 def tiny_gemma3_text_config(
     architecture: str = "Gemma3ForCausalLM",
     *,

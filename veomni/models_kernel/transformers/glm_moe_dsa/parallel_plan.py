@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import (
-    flux,
-    movqgan,
-    wan,
-)
+from torch.distributed._tensor import Shard
+
+from ....distributed.parallel_plan import ParallelPlan
 
 
-__all__ = [
-    "flux",
-    "movqgan",
-    "wan",
-]
+def get_parallel_plan():
+    return ParallelPlan(
+        extra_parallel_plan={
+            "ep": {
+                "model.layers.*.mlp.experts.gate_up_proj": Shard(0),
+                "model.layers.*.mlp.experts.down_proj": Shard(0),
+            }
+        }
+    )
