@@ -19,6 +19,8 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import sys
+from types import ModuleType
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -38,7 +40,9 @@ from tests.ops.tol import (
 )
 from tests.ops.utils import cosine_similarity, is_nvidia_cuda_available, make_grad_leaves
 from veomni.ops import resolve_op
+from veomni.ops.kernels.dsa.attention.deepseek_v4 import tilelang as deepseek_v4_fused_attention
 from veomni.ops.kernels.dsa.attention.glm import flashmla_cudnn as glm_fused_attention
+from veomni.ops.kernels.dsa.indexer.deepseek_v4 import tilelang as deepseek_v4_fused_indexer
 from veomni.ops.kernels.dsa.indexer.glm import cudnn as glm_fused_indexer
 
 
@@ -147,6 +151,94 @@ def test_glm_fused_rows_reject_attention_mask_before_vendor_import(monkeypatch):
         glm_fused_indexer.wrapper(tensor, tensor, tensor, 1, attention_mask=attention_mask)
 
     assert vendor_module not in sys.modules
+
+
+def _fake_vendor(monkeypatch, module_name: str, symbol: str, return_value: object) -> Mock:
+    module = ModuleType(module_name)
+    function = Mock(return_value=return_value)
+    setattr(module, symbol, function)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    return function
+
+
+def test_deepseek_v4_tilelang_attention_adapter_delegates_to_dsa_vendor(monkeypatch):
+    tensor = torch.empty(0)
+    sentinel = object()
+    vendor = _fake_vendor(
+        monkeypatch,
+        "veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla",
+        "sparse_attn_tilelang",
+        sentinel,
+    )
+
+    actual = deepseek_v4_fused_attention.wrapper(tensor, tensor, tensor, tensor, 0.25, True)
+
+    assert actual is sentinel
+    vendor.assert_called_once_with(tensor, tensor, tensor, tensor, 0.25, True)
+
+
+def test_glm_flashmla_cudnn_attention_adapter_delegates_to_dsa_vendor(monkeypatch):
+    tensor = torch.empty(0)
+    sentinel = object()
+    vendor = _fake_vendor(
+        monkeypatch,
+        "veomni.ops.kernels.dsa.vendor.flashmla_cudnn",
+        "flash_mla_sparse_attention_with_cudnn_backward",
+        sentinel,
+    )
+
+    actual = glm_fused_attention.wrapper(tensor, tensor, tensor, tensor, tensor, softmax_scale=0.25)
+
+    assert actual is sentinel
+    vendor.assert_called_once_with(tensor, tensor, tensor, tensor, tensor, softmax_scale=0.25)
+
+
+def test_deepseek_v4_tilelang_indexer_adapter_delegates_to_dsa_vendor(monkeypatch):
+    tensor = torch.empty(0)
+    sentinel = object()
+    vendor = _fake_vendor(
+        monkeypatch,
+        "veomni.ops.kernels.dsa.vendor.tilelang_indexer",
+        "v4_lighting_indexer",
+        sentinel,
+    )
+
+    actual = deepseek_v4_fused_indexer.wrapper(tensor, tensor, tensor, 2, 3, tensor, tensor, tensor)
+
+    assert actual is sentinel
+    vendor.assert_called_once_with(tensor, tensor, tensor, 2, 3, tensor, tensor, tensor)
+
+
+def test_glm_cudnn_indexer_adapter_delegates_to_dsa_vendor(monkeypatch):
+    tensor = torch.empty(0)
+    vendor_output = torch.tensor([3], dtype=torch.int64)
+    vendor = _fake_vendor(
+        monkeypatch,
+        "veomni.ops.kernels.dsa.vendor.flashmla_cudnn",
+        "indexer_select_topk",
+        vendor_output,
+    )
+
+    actual = glm_fused_indexer.wrapper(
+        tensor,
+        tensor,
+        tensor,
+        4,
+        ratio=2,
+        qhead_per_kv_head=8,
+        sm_scale=0.25,
+    )
+
+    torch.testing.assert_close(actual, vendor_output.to(torch.int32))
+    vendor.assert_called_once_with(
+        tensor,
+        tensor,
+        tensor,
+        4,
+        ratio=2,
+        qhead_per_kv_head=8,
+        sm_scale=0.25,
+    )
 
 
 def test_dsa_attention_deepseek_v4_eager_matches_hf():

@@ -50,15 +50,21 @@ def cross_entropy_from_logits(
 ) -> Tensor:
     """Same reduction as HuggingFace ``fixed_cross_entropy``.
 
-    ``mean`` over non-ignored tokens, or ``sum / num_items_in_batch``. All-ignored
-    or empty labels return a graph-connected zero. Valid-token count stays on
-    device; do not ``.item()`` it.
+    ``mean`` over non-ignored tokens, or ``sum / num_items_in_batch``. A zero
+    explicit count uses one so all-ignored and empty labels return a
+    graph-connected zero. Valid-token count stays on device; do not ``.item()``
+    it.
     """
     if labels.numel() == 0:
         return logits.float().sum()
     loss = F.cross_entropy(logits.float(), labels, ignore_index=ignore_index, reduction="sum")
     if num_items_in_batch is not None:
-        return loss / num_items_in_batch
+        if isinstance(num_items_in_batch, Tensor):
+            denominator = num_items_in_batch.to(dtype=loss.dtype, device=loss.device)
+            denominator = torch.where(denominator == 0, torch.ones_like(denominator), denominator)
+        else:
+            denominator = 1 if num_items_in_batch == 0 else num_items_in_batch
+        return loss / denominator
     n_valid = (labels != ignore_index).sum().to(dtype=loss.dtype)
     return loss / n_valid.clamp(min=1)
 
@@ -97,7 +103,7 @@ def forward(
     weight: Tensor,
     *,
     ignore_index: int = -100,
-    num_items_in_batch: int | None = None,
+    num_items_in_batch: int | Tensor | None = None,
 ) -> tuple[Tensor, SavedState]:
     """Token-level CE. Empty ``weight`` means ``hidden`` is already logits.
 
