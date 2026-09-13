@@ -77,6 +77,34 @@ def tiny_llama_config(architecture: str = "LlamaForCausalLM", **overrides) -> Pr
     return LlamaConfig(**kwargs)
 
 
+def tiny_seed_oss_config(architecture: str = "SeedOssForCausalLM") -> PretrainedConfig:
+    from transformers.models.seed_oss.configuration_seed_oss import SeedOssConfig
+
+    return SeedOssConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=64,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        attention_bias=True,
+        attention_out_bias=False,
+        attention_dropout=0.0,
+        residual_dropout=0.0,
+        mlp_bias=False,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        tie_word_embeddings=False,
+        architectures=[architecture],
+        attn_implementation="eager",
+    )
+
+
 def tiny_qwen2_config(architecture: str = "Qwen2ForCausalLM", **overrides) -> PretrainedConfig:
     from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 

@@ -80,6 +80,9 @@ from tests.models_kernel.tiny_configs import (
 from tests.models_kernel.tiny_configs import (
     tiny_qwen3_vl_moe_config as _tiny_qwen3_vl_moe_config,
 )
+from tests.models_kernel.tiny_configs import (
+    tiny_seed_oss_config as _tiny_seed_oss_config,
+)
 from veomni.models_kernel import (
     MODEL_CONFIG_REGISTRY,
     MODEL_PROCESSOR_REGISTRY,
@@ -127,6 +130,17 @@ _MODEL_CASES = (
             "LlamaForTokenClassification",
             "LlamaForSequenceClassification",
             "LlamaModel",
+        ),
+    ),
+    _ModelCase(
+        model_type="seed_oss",
+        config_factory=_tiny_seed_oss_config,
+        architectures=(
+            "SeedOssForCausalLM",
+            "SeedOssForQuestionAnswering",
+            "SeedOssForSequenceClassification",
+            "SeedOssForTokenClassification",
+            "SeedOssModel",
         ),
     ),
     _ModelCase(

@@ -29,33 +29,9 @@ from tests.models_kernel.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
 )
+from tests.models_kernel.tiny_configs import tiny_seed_oss_config as _tiny_config
 from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config, set_ops_config
-
-
-def _tiny_config() -> SeedOssConfig:
-    return SeedOssConfig(
-        vocab_size=128,
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=16,
-        max_position_embeddings=64,
-        rms_norm_eps=1e-6,
-        hidden_act="silu",
-        attention_bias=True,
-        attention_out_bias=False,
-        attention_dropout=0.0,
-        residual_dropout=0.0,
-        mlp_bias=False,
-        pad_token_id=0,
-        bos_token_id=1,
-        eos_token_id=2,
-        tie_word_embeddings=False,
-        attn_implementation="eager",
-    )
 
 
 def _seed_oss_cls():

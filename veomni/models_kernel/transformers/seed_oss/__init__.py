@@ -12,4 +12,40 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""SeedOss modeling that calls local VeomniOp handles. Not on ``MODELING_REGISTRY``."""
+"""SeedOss modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.models_kernel.registry import MODELING_REGISTRY
+from veomni.utils.device import IS_NPU_AVAILABLE
+
+
+@MODELING_REGISTRY.register("seed_oss")
+def register_seed_oss_modeling(architecture: str):
+    if IS_NPU_AVAILABLE:
+        from .generated.patched_modeling_seed_oss_npu import (
+            SeedOssForCausalLM,
+            SeedOssForQuestionAnswering,
+            SeedOssForSequenceClassification,
+            SeedOssForTokenClassification,
+            SeedOssModel,
+        )
+    else:
+        from .generated.patched_modeling_seed_oss_gpu import (
+            SeedOssForCausalLM,
+            SeedOssForQuestionAnswering,
+            SeedOssForSequenceClassification,
+            SeedOssForTokenClassification,
+            SeedOssModel,
+        )
+
+    if "ForCausalLM" in architecture:
+        return SeedOssForCausalLM
+    elif "ForQuestionAnswering" in architecture:
+        return SeedOssForQuestionAnswering
+    elif "ForSequenceClassification" in architecture:
+        return SeedOssForSequenceClassification
+    elif "ForTokenClassification" in architecture:
+        return SeedOssForTokenClassification
+    elif "Model" in architecture:
+        return SeedOssModel
+    else:
+        return SeedOssForCausalLM

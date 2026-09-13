@@ -19,7 +19,6 @@ from . import (
     glm_moe_dsa,
     gpt_oss,
     movqgan,
-    seed_oss,
     wan,
 )
 
@@ -30,7 +29,6 @@ __all__ = [
     "gemma3",
     "gpt_oss",
     "movqgan",
-    "seed_oss",
     "wan",
     "glm_moe_dsa",
 ]
