@@ -182,10 +182,11 @@ def test_tilelang_fp8_weight_quant_ue8m0_matches_reference():
     assert quantized.dtype == torch.float8_e4m3fn
     assert scales.shape == (2, 3)
     assert scales.dtype == torch.float8_e8m0fnu
+    assert reference_scales.dtype == torch.float8_e8m0fnu
     # E8M0 stores the exponent alone, so a power-of-two scale survives the cast
     # bit for bit and matches the FP32 value the kernel divided by.
     assert torch.equal(scales.float().log2(), scales.float().log2().round())
-    assert torch.equal(scales.float(), reference_scales)
+    assert torch.equal(scales.view(torch.uint8), reference_scales.view(torch.uint8))
     assert torch.equal(quantized.view(torch.uint8), reference_quantized.view(torch.uint8))
     assert not quantized.float().isnan().any()
 

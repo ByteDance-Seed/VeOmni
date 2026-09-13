@@ -567,7 +567,7 @@ def test_chunk_gated_delta_rule_flash_qla_matches_eager():
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
     other = resolve_op("chunk_gated_delta_rule", "standard", "flash_qla").wrapper
     torch.manual_seed(2)
-    batch, seq, heads, dim = 1, 32, 2, 16
+    batch, seq, heads, dim = 1, 32, 2, 128
     q = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
