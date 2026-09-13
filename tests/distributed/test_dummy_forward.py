@@ -134,15 +134,12 @@ def _omni_batch(*, rank, device, dtype, patch_size, is_qwen3_omni=False):
 
 def _asymmetric_forward_worker(model_type, config_path, batch_fn):
     """Rank 0 gets multimodal data, other ranks get text-only. Verifies no NCCL hang."""
-    from veomni import _apply_patches
     from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.distributed.torch_parallelize import build_parallelize_model
     from veomni.models_kernel import MODELING_REGISTRY
     from veomni.utils.device import get_device_type
 
     from ..tools.training_utils import make_eager_ops_config
-
-    _apply_patches()
 
     if model_type in MODELING_REGISTRY.valid_keys():
         from veomni.models_kernel import build_foundation_model
