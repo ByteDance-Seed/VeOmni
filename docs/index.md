@@ -72,6 +72,7 @@ examples/qwen3_dpo.md
 key_features/model_loader.md
 key_features/preprocessor_registry.md
 key_features/ep_fsdp2.md
+key_features/inter_layer_replay.md
 key_features/ulysses.md
 key_features/lora.md
 
