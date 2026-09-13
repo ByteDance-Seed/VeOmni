@@ -22,6 +22,7 @@ from dataclasses import dataclass
 import pytest
 from transformers import PretrainedConfig
 from transformers.models.llama.configuration_llama import LlamaConfig
+from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3_5.configuration_qwen3_5 import (
     Qwen3_5Config,
@@ -118,6 +119,21 @@ def _tiny_qwen3_config(architecture: str = "Qwen3ForCausalLM") -> Qwen3Config:
         max_position_embeddings=32,
         architectures=[architecture],
         attn_implementation="eager",
+    )
+
+
+def _tiny_qwen2_config(architecture: str = "Qwen2ForCausalLM") -> Qwen2Config:
+    return Qwen2Config(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+        architectures=[architecture],
+        attn_implementation="eager",
+        use_sliding_window=False,
     )
 
 
@@ -409,6 +425,17 @@ _MODEL_CASES = (
             "LlamaForTokenClassification",
             "LlamaForSequenceClassification",
             "LlamaModel",
+        ),
+    ),
+    _ModelCase(
+        model_type="qwen2",
+        config_factory=_tiny_qwen2_config,
+        architectures=(
+            "Qwen2ForCausalLM",
+            "Qwen2ForTokenClassification",
+            "Qwen2ForSequenceClassification",
+            "Qwen2ForQuestionAnswering",
+            "Qwen2Model",
         ),
     ),
     _ModelCase(

@@ -29,11 +29,15 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+    SequenceClassifierOutputWithPast,
+)
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
-from veomni.models_kernel.loss_utils import ForCausalLMLoss
+from veomni.models_kernel.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
 from veomni.models_kernel.utils.op_utils import attention_op, linear_bias, resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
@@ -53,6 +57,7 @@ config = PatchConfig(
 config.add_import("typing", names=["Optional"])
 
 config.add_import("functools", names=["partial"])
+config.add_import("transformers.modeling_outputs", names=["SequenceClassifierOutputWithPast"])
 config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
@@ -64,7 +69,7 @@ config.add_import(
 )
 config.add_import(
     "veomni.models_kernel.loss_utils",
-    names=["ForCausalLMLoss"],
+    names=["ForCausalLMLoss", "ForSequenceClassificationLoss"],
 )
 
 
@@ -272,6 +277,103 @@ def qwen2forcausallm_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
     )
+
+
+@config.override_method(
+    "Qwen2ForSequenceClassification.__init__",
+    description="Construct the local base model and bind sequence-classification loss",
+)
+def qwen2_for_sequence_classification_init_patched(self, config):
+    Qwen2PreTrainedModel.__init__(self, config)
+    self.num_labels = config.num_labels
+    self.model = Qwen2Model(config)
+    self.score = nn.Linear(config.get_text_config().hidden_size, self.num_labels, bias=False)
+    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForSequenceClassificationLoss, op=self.veomni_ce)
+    self.post_init()
+
+
+@config.override_method(
+    "Qwen2ForSequenceClassification.forward",
+    description="Always call the local sequence-classification loss",
+)
+def qwen2_for_sequence_classification_forward_patched(
+    self,
+    input_ids=None,
+    attention_mask=None,
+    position_ids=None,
+    past_key_values=None,
+    inputs_embeds=None,
+    labels=None,
+    use_cache=None,
+    cache_position=None,
+    **kwargs,
+):
+    outputs = self.model(
+        input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        cache_position=cache_position,
+        **kwargs,
+    )
+    hidden_states = outputs.last_hidden_state
+    logits = self.score(hidden_states)
+
+    loss = None
+    if labels is not None:
+        loss, _, _ = self.loss_function(
+            logits=None,
+            labels=labels,
+            num_labels=self.num_labels,
+            hidden_states=hidden_states,
+            weights=self.score.weight,
+            **kwargs,
+        )
+
+    return SequenceClassifierOutputWithPast(
+        loss=loss,
+        logits=logits,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+    )
+
+
+@config.override_method(
+    "Qwen2ForTokenClassification.__init__",
+    description="Construct the local base model for token classification",
+)
+def qwen2_for_token_classification_init_patched(self, config):
+    Qwen2PreTrainedModel.__init__(self, config)
+    self.num_labels = config.num_labels
+    self.model = Qwen2Model(config)
+    classifier_dropout = getattr(config, "classifier_dropout", None)
+    if classifier_dropout is None:
+        classifier_dropout = getattr(config, "hidden_dropout", None)
+    if classifier_dropout is None:
+        classifier_dropout = 0.1
+    self.dropout = nn.Dropout(classifier_dropout)
+    self.score = nn.Linear(
+        config.get_text_config().hidden_size,
+        config.num_labels,
+        bias=getattr(config, "token_classification_bias", True),
+    )
+    self.post_init()
+
+
+@config.override_method(
+    "Qwen2ForQuestionAnswering.__init__",
+    description="Construct the local base model for question answering",
+)
+def qwen2_for_question_answering_init_patched(self, config):
+    Qwen2PreTrainedModel.__init__(self, config)
+    self.transformer = Qwen2Model(config)
+    self.qa_outputs = nn.Linear(config.hidden_size, 2)
+    self.post_init()
 
 
 @config.override_method(

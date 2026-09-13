@@ -12,4 +12,30 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Qwen2 modeling that calls local VeomniOp handles. Not on ``MODELING_REGISTRY``."""
+"""Qwen2 modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.models_kernel.registry import MODELING_REGISTRY
+
+
+@MODELING_REGISTRY.register("qwen2")
+def register_qwen2_modeling(architecture: str | None):
+    from .generated.patched_modeling_qwen2_gpu import (
+        Qwen2ForCausalLM,
+        Qwen2ForQuestionAnswering,
+        Qwen2ForSequenceClassification,
+        Qwen2ForTokenClassification,
+        Qwen2Model,
+    )
+
+    architecture = architecture or ""
+    if "ForCausalLM" in architecture:
+        return Qwen2ForCausalLM
+    if "ForTokenClassification" in architecture:
+        return Qwen2ForTokenClassification
+    if "ForSequenceClassification" in architecture:
+        return Qwen2ForSequenceClassification
+    if "ForQuestionAnswering" in architecture:
+        return Qwen2ForQuestionAnswering
+    if "Model" in architecture:
+        return Qwen2Model
+    return Qwen2ForCausalLM
