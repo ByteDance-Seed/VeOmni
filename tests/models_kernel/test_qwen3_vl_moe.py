@@ -45,7 +45,7 @@ IMAGE_TOKEN_ID = 120
 VIDEO_TOKEN_ID = 121
 
 
-def _tiny_config() -> Qwen3VLMoeConfig:
+def _tiny_config(architecture: str = "Qwen3VLMoeForConditionalGeneration") -> Qwen3VLMoeConfig:
     text = Qwen3VLMoeTextConfig(
         vocab_size=128,
         hidden_size=64,
@@ -89,6 +89,7 @@ def _tiny_config() -> Qwen3VLMoeConfig:
         vision_config=vision.to_dict(),
         image_token_id=IMAGE_TOKEN_ID,
         video_token_id=VIDEO_TOKEN_ID,
+        architectures=[architecture],
     )
 
 
@@ -160,6 +161,30 @@ def test_qwen3_vl_moe_instances_keep_distinct_impls():
 
     set_ops_config(fused_cfg)
     assert eager.model.language_model.layers[0].mlp.experts.veomni_moe.impl == "eager"
+
+
+@torch.no_grad()
+def test_qwen3_vl_moe_registry_installs_checkpoint_and_lora_hooks():
+    from veomni.models_kernel import get_model_class
+
+    cases = (
+        ("Qwen3VLMoeForConditionalGeneration", "model.language_model."),
+        ("Qwen3VLMoeModel", "language_model."),
+        ("Qwen3VLMoeTextModel", ""),
+    )
+    for architecture, prefix in cases:
+        model_cls = get_model_class(_tiny_config(architecture))
+        assert callable(model_cls._create_checkpoint_tensor_converter)
+        modules, parameters = model_cls._convert_lora_targets_to_parameters(
+            None,
+            ["q_proj", "gate_proj", "up_proj", "down_proj"],
+            [],
+        )
+        assert modules == ["q_proj"]
+        assert parameters == [
+            f"{prefix}layers.*.mlp.experts.gate_up_proj",
+            f"{prefix}layers.*.mlp.experts.down_proj",
+        ]
 
 
 def test_qwen3_vl_moe_eager_matches_hf_text_only():

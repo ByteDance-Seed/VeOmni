@@ -1027,6 +1027,22 @@ class TestQwen3VLMoeConverterConvert:
                 torch.randn(VLMOE_NUM_EXPERTS, 999, VLMOE_HIDDEN),
             )
 
+    @pytest.mark.parametrize(
+        ("projection", "hidden_size", "intermediate_size", "shape"),
+        [
+            pytest.param("gate_up_proj", 12, 6, (VLMOE_NUM_EXPERTS, 12, 12), id="gate-up"),
+            pytest.param("down_proj", 8, 8, (VLMOE_NUM_EXPERTS, 8, 8), id="down"),
+        ],
+    )
+    def test_raises_on_ambiguous_layout(self, projection, hidden_size, intermediate_size, shape):
+        converter = Qwen3VLMoeCheckpointTensorConverter(
+            num_experts=VLMOE_NUM_EXPERTS,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+        with pytest.raises(RuntimeError, match="ambiguous layout"):
+            converter.convert(f"l.mlp.experts.{projection}", torch.randn(shape))
+
 
 class TestQwen3VLMoeConverterFinalize:
     def test_finalize_is_noop(self):

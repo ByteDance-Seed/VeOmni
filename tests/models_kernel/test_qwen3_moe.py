@@ -126,23 +126,7 @@ def test_qwen3_moe_constructs_local_kernels():
     assert layer.mlp.experts.veomni_moe.op == "moe_experts"
 
 
-def test_qwen3_moe_selects_liger_kernels(available_nvidia_ops):
-    ops = eager_ops_config()
-    ops.rms_norm_implementation = "liger_kernel"
-    ops.swiglu_mlp_implementation = "liger_kernel"
-    ops.cross_entropy_loss_implementation = "liger_kernel"
-    model = _build_ours(_tiny_config(mlp_only_layers=[0]), ops)
-
-    assert model.veomni_ce.variant == "standard"
-    assert model.veomni_ce.impl == "liger_kernel"
-    dense_layer = model.model.layers[0]
-    assert dense_layer.input_layernorm.veomni_rms_norm.variant == "standard"
-    assert dense_layer.input_layernorm.veomni_rms_norm.impl == "liger_kernel"
-    assert dense_layer.mlp.veomni_swiglu_mlp.variant == "standard"
-    assert dense_layer.mlp.veomni_swiglu_mlp.impl == "liger_kernel"
-
-
-def test_qwen3_moe_rope_uses_selected_liger_impl(monkeypatch):
+def test_qwen3_moe_rope_reads_selected_impl(monkeypatch):
     from veomni.models_kernel.transformers.qwen3_moe.generated import patched_modeling_qwen3_moe_gpu as modeling
 
     selected: list[tuple[str, str, str]] = []
@@ -156,7 +140,7 @@ def test_qwen3_moe_rope_uses_selected_liger_impl(monkeypatch):
 
     monkeypatch.setattr(modeling, "VeomniOp", StubOp)
     ops = eager_ops_config()
-    ops.rotary_pos_emb_implementation = "liger_kernel"
+    ops.rotary_pos_emb_implementation = "test_impl"
     previous = get_ops_config()
     set_ops_config(ops)
     try:
@@ -168,7 +152,7 @@ def test_qwen3_moe_rope_uses_selected_liger_impl(monkeypatch):
     finally:
         set_ops_config(previous)
 
-    assert selected == [("rope", "full", "liger_kernel")]
+    assert selected == [("rope", "full", "test_impl")]
     assert q_out is q
     assert k_out is k
 

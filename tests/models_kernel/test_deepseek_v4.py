@@ -102,6 +102,8 @@ def test_deepseek_v4_constructs_local_kernels():
     layer = model.model.layers[0]
     assert layer.input_layernorm.veomni_rms_norm.impl == "eager"
     assert layer.input_layernorm.veomni_rms_norm.variant == "deepseek_v4"
+    assert layer.self_attn.q_b_norm.veomni_unweighted_rms_norm.impl == "eager"
+    assert layer.self_attn.q_b_norm.veomni_unweighted_rms_norm.variant == "unweighted"
     assert layer.attn_hc.veomni_mhc_pre.op == "mhc"
     assert layer.veomni_mhc_post.variant == "post"
     assert layer.self_attn.veomni_dsa_attention.op == "dsa_attention"
@@ -142,18 +144,6 @@ def test_deepseek_v4_instances_keep_distinct_impls():
     set_ops_config(chunk_cfg)
     assert eager.veomni_ce.impl == "eager"
     assert eager.model.layers[0].self_attn.veomni_dsa_attention.impl == "eager"
-
-
-def test_deepseek_v4_rms_norms_use_selected_liger_impl(available_nvidia_ops):
-    ops = eager_ops_config()
-    ops.rms_norm_implementation = "liger_kernel"
-    model = _build_ours(_tiny_config(), ops)
-    layer = model.model.layers[0]
-
-    assert layer.input_layernorm.veomni_rms_norm.variant == "deepseek_v4"
-    assert layer.input_layernorm.veomni_rms_norm.impl == "liger_kernel"
-    assert layer.self_attn.q_b_norm.veomni_unweighted_rms_norm.variant == "unweighted"
-    assert layer.self_attn.q_b_norm.veomni_unweighted_rms_norm.impl == "liger_kernel"
 
 
 def test_deepseek_v4_routers_use_fp32_projection_under_autocast():

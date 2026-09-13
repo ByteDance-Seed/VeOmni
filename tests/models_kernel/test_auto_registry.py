@@ -29,6 +29,11 @@ from transformers.models.qwen3_vl.configuration_qwen3_vl import (
     Qwen3VLTextConfig,
     Qwen3VLVisionConfig,
 )
+from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
+    Qwen3VLMoeConfig,
+    Qwen3VLMoeTextConfig,
+    Qwen3VLMoeVisionConfig,
+)
 
 from tests.models_kernel.compare import eager_ops_config
 from veomni.models_kernel import (
@@ -166,6 +171,44 @@ def _tiny_qwen3_vl_config(architecture: str = "Qwen3VLForConditionalGeneration")
     )
 
 
+def _tiny_qwen3_vl_moe_config(architecture: str = "Qwen3VLMoeForConditionalGeneration") -> Qwen3VLMoeConfig:
+    text_config = Qwen3VLMoeTextConfig(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=32,
+        rope_scaling={"mrope_interleaved": True, "mrope_section": [4, 2, 2], "rope_type": "default"},
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=12,
+        decoder_sparse_step=1,
+        mlp_only_layers=[],
+        attn_implementation="eager",
+        experts_implementation="eager",
+    )
+    vision_config = Qwen3VLMoeVisionConfig(
+        depth=1,
+        hidden_size=32,
+        intermediate_size=64,
+        num_heads=4,
+        patch_size=8,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        out_hidden_size=32,
+        num_position_embeddings=16,
+        deepstack_visual_indexes=[0],
+    )
+    return Qwen3VLMoeConfig(
+        text_config=text_config.to_dict(),
+        vision_config=vision_config.to_dict(),
+        architectures=[architecture],
+    )
+
+
 _MODEL_CASES = (
     _ModelCase(
         model_type="deepseek_v4",
@@ -208,6 +251,15 @@ _MODEL_CASES = (
         model_type="qwen3_vl",
         config_factory=_tiny_qwen3_vl_config,
         architectures=("Qwen3VLForConditionalGeneration", "Qwen3VLModel"),
+    ),
+    _ModelCase(
+        model_type="qwen3_vl_moe",
+        config_factory=_tiny_qwen3_vl_moe_config,
+        architectures=(
+            "Qwen3VLMoeForConditionalGeneration",
+            "Qwen3VLMoeModel",
+            "Qwen3VLMoeTextModel",
+        ),
     ),
 )
 
