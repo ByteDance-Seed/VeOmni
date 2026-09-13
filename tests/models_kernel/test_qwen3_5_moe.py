@@ -223,6 +223,22 @@ def test_qwen3_5_moe_instances_keep_distinct_impls():
     assert eager.model.layers[0].mlp.experts.veomni_moe.impl == "eager"
 
 
+def test_qwen3_5_moe_parallel_plans_cover_multimodal_and_text_wrappers():
+    causal_cls, conditional_cls = _qwen3_5_moe_classes()
+
+    conditional_ep_plan = conditional_cls.get_parallel_plan(None).extra_parallel_plan["ep"]
+    causal_ep_plan = causal_cls.get_parallel_plan(None).extra_parallel_plan["ep"]
+
+    assert set(conditional_ep_plan) == {
+        "model.language_model.layers.*.mlp.experts.gate_up_proj",
+        "model.language_model.layers.*.mlp.experts.down_proj",
+    }
+    assert set(causal_ep_plan) == {
+        "model.layers.*.mlp.experts.gate_up_proj",
+        "model.layers.*.mlp.experts.down_proj",
+    }
+
+
 def test_qwen3_5_moe_eager_matches_hf_full_attention():
     torch.manual_seed(0)
     config = _tiny_text_config(layer_types=["full_attention", "full_attention"])

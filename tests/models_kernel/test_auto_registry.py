@@ -28,6 +28,11 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import (
     Qwen3_5TextConfig,
     Qwen3_5VisionConfig,
 )
+from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+    Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
+    Qwen3_5MoeVisionConfig,
+)
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from transformers.models.qwen3_vl.configuration_qwen3_vl import (
     Qwen3VLConfig,
@@ -148,6 +153,60 @@ def _tiny_qwen3_5_config(architecture: str = "Qwen3_5ForConditionalGeneration") 
         vision_config=vision_config.to_dict(),
         architectures=[architecture],
     )
+
+
+def _tiny_qwen3_5_moe_text_config(
+    architecture: str = "Qwen3_5MoeForCausalLM",
+) -> Qwen3_5MoeTextConfig:
+    return Qwen3_5MoeTextConfig(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=32,
+        layer_types=["linear_attention"],
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=16,
+        output_router_logits=False,
+        router_aux_loss_coef=0.001,
+        architectures=[architecture],
+        attn_implementation="eager",
+        experts_implementation="eager",
+    )
+
+
+def _tiny_qwen3_5_moe_config(
+    architecture: str = "Qwen3_5MoeForConditionalGeneration",
+) -> Qwen3_5MoeConfig:
+    text_config = _tiny_qwen3_5_moe_text_config()
+    vision_config = Qwen3_5MoeVisionConfig(
+        depth=1,
+        hidden_size=32,
+        intermediate_size=64,
+        num_heads=4,
+        patch_size=8,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        out_hidden_size=32,
+        num_position_embeddings=16,
+    )
+    config = Qwen3_5MoeConfig(
+        text_config=text_config.to_dict(),
+        vision_config=vision_config.to_dict(),
+        architectures=[architecture],
+    )
+    config._experts_implementation = "eager"
+    config.text_config._experts_implementation = "eager"
+    return config
 
 
 def _tiny_llama_config(architecture: str = "LlamaForCausalLM") -> LlamaConfig:
@@ -300,6 +359,16 @@ _MODEL_CASES = (
             "Qwen3_5TextForSequenceClassification",
             "Qwen3_5TextModel",
         ),
+    ),
+    _ModelCase(
+        model_type="qwen3_5_moe",
+        config_factory=_tiny_qwen3_5_moe_config,
+        architectures=("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeModel"),
+    ),
+    _ModelCase(
+        model_type="qwen3_5_moe_text",
+        config_factory=_tiny_qwen3_5_moe_text_config,
+        architectures=("Qwen3_5MoeForCausalLM", "Qwen3_5MoeTextModel"),
     ),
     _ModelCase(
         model_type="qwen3_moe",

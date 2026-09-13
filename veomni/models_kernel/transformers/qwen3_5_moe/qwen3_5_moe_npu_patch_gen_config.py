@@ -48,6 +48,7 @@ from veomni.models_kernel.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_con
     get_position_id,
     mm_token_type_ids_from_input_ids,
     qwen3_5_moe_attention_forward_patched,
+    qwen3_5_moe_causal_lm_get_parallel_plan_patched,
     qwen3_5_moe_forcausallm_forward_patched,
     qwen3_5_moe_forcausallm_init_patched,
     qwen3_5_moe_forconditional_generation_forward_patched,
@@ -387,6 +388,12 @@ config.override_method(
     "Qwen3_5MoeForConditionalGeneration.get_parallel_plan",
     replacement=qwen3_5_moe_get_parallel_plan_patched,
     description="Register Qwen3_5Moe expert parallel plan for v5 generated modeling",
+)
+
+config.override_method(
+    "Qwen3_5MoeForCausalLM.get_parallel_plan",
+    replacement=qwen3_5_moe_causal_lm_get_parallel_plan_patched,
+    description="Register Qwen3_5MoeForCausalLM expert parallel plan for v5 generated modeling",
 )
 
 config.override_method(

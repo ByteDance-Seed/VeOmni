@@ -164,7 +164,7 @@ Additional per-directory helpers:
 **GPU**: 1 GPU, runs serially per model mode.
 
 The models migrated to `models_kernel` are currently DeepSeek-V4, Llama,
-Qwen3, Qwen3-MoE, Qwen3-VL, Qwen3-VL-MoE, and Qwen3.5. Their registry/build
+Qwen3, Qwen3-MoE, Qwen3-VL, Qwen3-VL-MoE, Qwen3.5, and Qwen3.5-MoE. Their registry/build
 dispatch, supported architectures, eager forward/backward parity, and
 instance-local op binding are covered by `tests/models_kernel/test_auto_registry.py`
 and the corresponding model tests under `tests/models_kernel/`. Backend
