@@ -32,8 +32,6 @@ the runnable explicitly-patched modeling file
 "generated/patched_modeling_seed_oss_npu.py".
 """
 
-from typing import Optional
-
 import torch
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -83,7 +81,7 @@ def apply_rotary_pos_emb_npu(
     k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    position_ids: Optional[torch.Tensor] = None,
+    position_ids: torch.Tensor | None = None,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from veomni.ops.kernels.rotary.npu import apply_rotary_pos_emb_npu as _apply_rotary_pos_emb_npu
@@ -131,6 +129,11 @@ def seed_oss_forcausallm_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> CausalLMOutputWithPast:
+    r"""
+    cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+        Indices depicting the position of the input sequence tokens in the sequence. Retained in the
+        signature for callers that pass it positionally; transformers 5.16 moved it into `**kwargs`.
+    """
     outputs = self.model(
         input_ids=input_ids,
         attention_mask=attention_mask,

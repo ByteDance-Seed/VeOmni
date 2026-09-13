@@ -1,4 +1,3 @@
-import copy
 import functools
 import gc
 import importlib
@@ -242,8 +241,8 @@ class TrainerTest(BaseTrainer):
             self.args.model.ops_implementation.rotary_pos_emb_implementation = "liger_kernel"
             # qwen3_5 / qwen3_5_moe have a large vocab and the fused Liger
             # cross-entropy materializes the full [B, S, V] logits buffer
-            # (~5 GiB on the toy config), which OOMs on shared L20 runners
-            # where another job is still holding part of the card. Use
+            # (~5 GiB on the toy config), which leaves little room for
+            # activations and gradients on the L20 CI runners. Use
             # chunk_loss for those two models — it processes the vocab in
             # chunks so peak allocation stays modest; the other liger ops
             # (rms_norm / rotary / swiglu) are still exercised.
@@ -263,14 +262,6 @@ class TrainerTest(BaseTrainer):
         self._build_lr_scheduler()
         print_device_mem_info(f"[Memory Info] after building model {model_name}:")
 
-        # Sync weights — every model that test_models_patch covers ships a
-        # patchgen layout that matches HF's in-memory state dict, so a
-        # straight ``load_state_dict`` is sufficient. When loading from a real
-        # on-disk HF safetensors checkpoint, the per-expert → fused merge
-        # still happens, but at the runtime-converter layer (e.g.
-        # ``DeepseekV3CheckpointTensorConverter``); that path is exercised by
-        # ``test_logits_bitwise_equal_v5_via_loader`` in
-        # ``test_models_logits_equal.py``.
         self.model.load_state_dict(state_dict)
 
         if self.model.model_config.model_type in ["qwen2_5_omni", "qwen3_omni_moe"]:
@@ -513,7 +504,9 @@ def test_models_patch_fwd_bwd(
 
     trainer = TrainerTest(hf_model_modes[0], trainer_config)
 
-    state_dict = copy.deepcopy(trainer.model.state_dict())
+    # Keep the immutable reference off the accelerator while each mode holds
+    # its own model, gradients and activations (Qwen3.5 has a full-size vocab).
+    state_dict = {key: value.detach().to("cpu", copy=True) for key, value in trainer.model.state_dict().items()}
     model_config = trainer.model.model_config
 
     # Release the first build before the loop rebuilds through the same handle.

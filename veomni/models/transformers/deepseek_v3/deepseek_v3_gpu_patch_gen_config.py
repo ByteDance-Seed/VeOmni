@@ -18,7 +18,7 @@ Regen command:
 patchgen veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config -o veomni/models/transformers/deepseek_v3/generated --diff
 
 Patches:
-1. ``DeepseekV3NaiveMoe`` — drops upstream ``@use_experts_implementation``
+1. ``DeepseekV3Experts`` — drops upstream ``@use_experts_implementation``
    (which otherwise routes around our fused MoE kernel) and adopts the
    stacked ``gate_up_proj [E, 2*I, H]`` / ``down_proj [E, H, I]`` layout.
    Dispatch is OpSlot-guarded (``veomni_moe_experts_forward``): non-eager →
@@ -98,7 +98,7 @@ config.add_post_import_block(
 
 
 # ================================================================
-# Patch: DeepseekV3NaiveMoe
+# Patch: DeepseekV3Experts (named ``DeepseekV3NaiveMoe`` before transformers 5.16)
 # 1. Drop upstream ``@use_experts_implementation`` decorator — it dispatches
 #    to ``grouped_mm`` / HF fused paths and bypasses VeOmni's fused MoE.
 # 2. OpSlot guard for fused-MoE: when ``veomni_moe_experts_forward`` is bound
@@ -114,10 +114,10 @@ config.add_post_import_block(
 #   gate_up_proj [E, 2*I, H],  down_proj [E, H, I]
 # ================================================================
 @config.replace_class(
-    "DeepseekV3NaiveMoe",
+    "DeepseekV3Experts",
     description="Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path",
 )
-class PatchedDeepseekV3NaiveMoe(nn.Module):
+class PatchedDeepseekV3Experts(nn.Module):
     """Collection of expert weights stored as 3D tensors."""
 
     def __init__(self, config):
@@ -181,7 +181,7 @@ class PatchedDeepseekV3NaiveMoe(nn.Module):
     description="Disable autocast around fp32 router linear for VeRL actor/rollout parity",
 )
 def deepseek_v3_topk_router_forward_patched(self, hidden_states):
-    hidden_states = hidden_states.view(-1, self.config.hidden_size)
+    hidden_states = hidden_states.view(-1, self.hidden_dim)
     # --- Patch.1 ---
     # Disable autocast to ensure fp32 computation — autocast overrides
     # explicit .type(torch.float32) in F.linear, causing precision mismatch
@@ -189,16 +189,38 @@ def deepseek_v3_topk_router_forward_patched(self, hidden_states):
     with torch.autocast(device_type=hidden_states.device.type, enabled=False):
         router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
     # --- Patch.1 ---
-    return router_logits
+    scores = router_logits.sigmoid()
+    scores_for_choice = scores + self.e_score_correction_bias
+    group_scores = (
+        scores_for_choice.view(-1, self.num_group, self.num_experts // self.num_group).topk(2, dim=-1)[0].sum(dim=-1)
+    )
+    group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1)
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(-1, self.num_group, self.num_experts // self.num_group)
+        .reshape(-1, self.num_experts)
+    )
+    scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
+    topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
+    topk_weights = scores.gather(1, topk_indices)
+    if self.norm_topk_prob:
+        denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
+        topk_weights /= denominator
+    topk_weights = topk_weights * self.routed_scaling_factor
+    return router_logits, topk_weights, topk_indices
 
 
 # ================================================================
 # Patch: DeepseekV3MoE.forward
-# 1. After the family-specific top-k math in ``route_tokens_to_experts``
-#    (sigmoid + bias correction + group routing) produces ``topk_indices``,
-#    feed those indices into the MoE load-balance monitor. Symmetric to the
-#    ``maybe_replay_indices`` call other families make in their SparseMoeBlock
-#    patches. No-op when no monitor is active.
+# 1. Feed the top-k indices chosen by the router into the MoE load-balance
+#    monitor. Symmetric to the ``maybe_replay_indices`` call other families make
+#    in their SparseMoeBlock patches. No-op when no monitor is active.
+#    transformers 5.16 folded the family-specific top-k math (sigmoid + bias
+#    correction + group routing) from ``DeepseekV3MoE.route_tokens_to_experts``
+#    into ``DeepseekV3TopkRouter.forward``, which now returns
+#    ``(router_logits, topk_weights, topk_indices)``.
 # ================================================================
 @config.override_method(
     "DeepseekV3MoE.forward",
@@ -207,13 +229,11 @@ def deepseek_v3_topk_router_forward_patched(self, hidden_states):
 def deepseek_v3_moe_forward_patched(self, hidden_states):
     residuals = hidden_states
     orig_shape = hidden_states.shape
-    router_logits = self.gate(hidden_states)
-    topk_indices, topk_weights = self.route_tokens_to_experts(router_logits)
+    _, topk_weights, topk_indices = self.gate(hidden_states)
     # --- Patch.1 ---
     # Hand the actual top-k indices used by this layer to the load-balance
-    # monitor. The router itself only produces logits; the chosen experts
-    # come out of ``route_tokens_to_experts``. Keyed on ``self.gate`` so the
-    # monitor's layer order matches the router module identity.
+    # monitor. Keyed on ``self.gate`` so the monitor's layer order matches the
+    # router module identity.
     record_router_indices(self.gate, topk_indices)
     # --- Patch.1 ---
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -246,6 +266,11 @@ def deepseek_v3_forcausallm_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> CausalLMOutputWithPast:
+    r"""
+    cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+        Indices depicting the position of the input sequence tokens in the sequence. Retained in the
+        signature for callers that pass it positionally; transformers 5.16 moved it into `**kwargs`.
+    """
     outputs: BaseModelOutputWithPast = self.model(
         input_ids=input_ids,
         attention_mask=attention_mask,

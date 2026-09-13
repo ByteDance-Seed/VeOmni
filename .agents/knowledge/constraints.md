@@ -18,17 +18,17 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
    - Manual edits are silently overwritten on the next patchgen run.
    - To change generated behavior, edit the patch spec (`patch_spec.py`) or the modeling patch file (`modeling_*_patch.py`).
 
-4. **Transformers version: pinned to v5.9.0**
-   - VeOmni installs `transformers==5.9.0` via the `transformers-stable`
+4. **Transformers version: pinned to v5.16.1**
+   - VeOmni installs `transformers==5.16.1` via the `transformers-stable`
      default dependency group in `pyproject.toml`.
    - The legacy v4 path was removed; all modeling under
      `veomni/models/transformers/<m>/` is patchgen-generated.
    - `is_transformers_version_greater_or_equal_to()` from
      `veomni/utils/import_utils.py` is retained only for forward-looking
      gates (for HF APIs newer than the current pin) — do **not** add new
-     version gates for versions `<= 5.9.0` (the legacy `>= 5.0.0` …
-     `>= 5.8.x` interval is dead code).
-   - Patchgen regeneration must be done with `transformers==5.9.0` installed.
+     version gates for versions `<= 5.16.1` (the legacy `>= 5.0.0` …
+     `>= 5.15.x` interval is dead code).
+   - Patchgen regeneration must be done with `transformers==5.16.1` installed.
 
 ## Distributed Training
 
@@ -198,11 +198,14 @@ Core files:
     - DCP operations are collective — all ranks must call save/load simultaneously.
     - Calling checkpoint operations from only rank 0 causes deadlocks.
     - ``lr_scheduler.pt`` is replicated: rank 0 writes the file, but every rank
-      still joins the save reduction and the promotion collectives. When
-      ``stage_dir`` is set, the sidecar is written under the staging directory
-      and copied with the DCP shards, before ``.metadata`` is published.
-      Writing it into the destination first would pair a new scheduler with a
-      still-valid previous ``.metadata``.
+      still joins the save reduction and the promotion collectives. The sidecar
+      is written before ``dcp.save`` / ``dcp.async_save``, so DCP's ``.metadata``
+      (the resume completeness marker) lands last. Each step writes a new
+      ``global_step_{N}/``; a failed save has no ``.metadata`` and is skipped.
+      A resume that expects a scheduler and finds no ``lr_scheduler.pt`` falls
+      back to ``extra_state/`` via ``veomni/checkpoint/legacy_v0_1_12.py``
+      (VeOmni 0.1.12). Delete that module and its two imports to drop the
+      fallback; the load then raises.
     - ``trainer_state_rank_{R}.pt`` stays per-rank: the dataloader cursor and RNG
       are rank-local. Changing world size still requires a matching cursor file
       per rank. On-disk layout: ``docs/usage/checkpoint.md``.

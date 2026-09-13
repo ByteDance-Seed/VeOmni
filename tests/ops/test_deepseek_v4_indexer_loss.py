@@ -1239,7 +1239,7 @@ class TestIndexerScoresAndDecoupling:
         placed one line too late — after the projections rather than before them —
         would still leave ``hidden_states.grad`` unset while cutting the indexer off
         from its own gradient, so the loss would train nothing. All three of
-        ``q_b_proj`` / ``kv_proj`` / ``weights_proj`` are checked because they are
+        ``q_b_proj`` / ``kv_proj`` / ``scorer.weights_proj`` are checked because they are
         exactly the three tensors ``v4_lighting_indexer`` differentiates: the query,
         the compressed key and the per-head weight. ``grad.abs().sum() > 0`` rather
         than a ``grad_fn`` check, because a graph that exists and carries zeros trains
@@ -1268,8 +1268,8 @@ class TestIndexerScoresAndDecoupling:
 
         assert hidden.grad is None, "indexer input must be detached"
         assert q_residual.grad is None, "indexer q_residual must be detached"
-        for name in ("q_b_proj", "kv_proj", "weights_proj"):
-            grad = getattr(indexer, name).weight.grad
+        for name in ("q_b_proj", "kv_proj", "scorer.weights_proj"):
+            grad = indexer.get_submodule(name).weight.grad
             assert grad is not None, f"{name} received no gradient from the indexer score"
             assert grad.abs().sum() > 0, f"{name} received an all-zero gradient"
 
@@ -2081,8 +2081,8 @@ class TestAttentionForwardIndexerKL:
         assert torch.isfinite(kl_sum), f"the dense-mask path made the KL {kl_sum}"
         assert kl_sum > 0, "the KL collapsed to zero on the dense-mask path"
         kl_sum.backward()
-        for name in ("q_b_proj", "kv_proj", "weights_proj"):
-            grad = getattr(attn.compressor.indexer, name).weight.grad
+        for name in ("q_b_proj", "kv_proj", "scorer.weights_proj"):
+            grad = attn.compressor.indexer.get_submodule(name).weight.grad
             assert grad is not None, f"indexer.{name} received no gradient from the KL"
             assert torch.isfinite(grad).all(), f"indexer.{name} received a non-finite gradient from the KL"
             assert grad.abs().sum() > 0, f"indexer.{name} received an all-zero gradient from the KL"
@@ -2272,8 +2272,8 @@ class TestAttentionForwardIndexerKL:
         kl_sum.backward()
 
         assert inputs["hidden_states"].grad is None, "the indexer KL reached the language-model input"
-        for name in ("q_b_proj", "kv_proj", "weights_proj"):
-            grad = getattr(attn.compressor.indexer, name).weight.grad
+        for name in ("q_b_proj", "kv_proj", "scorer.weights_proj"):
+            grad = attn.compressor.indexer.get_submodule(name).weight.grad
             assert grad is not None, f"indexer.{name} received no gradient from the KL"
             assert torch.isfinite(grad).all(), f"indexer.{name} received a non-finite gradient from the KL"
             assert grad.abs().sum() > 0, f"indexer.{name} received an all-zero gradient from the KL"
@@ -2614,8 +2614,8 @@ class TestFourLayerModelIndexerKL:
         csa = _csa_layers(model)
         assert csa, "test model must contain at least one CSA layer"
         for layer in csa:
-            for name in ("q_b_proj", "kv_proj", "gate_proj", "weights_proj"):
-                param = getattr(layer.self_attn.compressor.indexer, name).weight
+            for name in ("q_b_proj", "kv_proj", "gate_proj", "scorer.weights_proj"):
+                param = layer.self_attn.compressor.indexer.get_submodule(name).weight
                 assert param.grad is not None, f"{name} received no gradient"
                 assert param.grad.abs().sum() > 0, f"{name} received an all-zero gradient"
 
@@ -2875,8 +2875,8 @@ class TestFourLayerModelIndexerKL:
 
         out.loss.backward()
         for layer in _csa_layers(model):
-            for name in ("q_b_proj", "kv_proj", "gate_proj", "weights_proj"):
-                param = getattr(layer.self_attn.compressor.indexer, name).weight
+            for name in ("q_b_proj", "kv_proj", "gate_proj", "scorer.weights_proj"):
+                param = layer.self_attn.compressor.indexer.get_submodule(name).weight
                 assert param.grad is None, (
                     f"indexer.{name} ends the step with p.grad set at coefficient 0; Muon steps it and "
                     "weight decay applies"
@@ -3175,8 +3175,8 @@ class TestFourLayerModelIndexerKL:
             f"the indexer objective moved parameters outside the indexer: "
             f"{[name for name in moved if '.indexer.' not in name]}"
         )
-        for name in ("q_b_proj", "kv_proj", "gate_proj", "weights_proj"):
-            grad = getattr(_csa_layers(model)[0].self_attn.compressor.indexer, name).weight.grad
+        for name in ("q_b_proj", "kv_proj", "gate_proj", "scorer.weights_proj"):
+            grad = _csa_layers(model)[0].self_attn.compressor.indexer.get_submodule(name).weight.grad
             assert grad is not None and grad.abs().sum() > 0, f"indexer.{name} received no usable gradient"
 
     def test_the_flag_off_model_forward_is_untouched(self):
@@ -3201,14 +3201,14 @@ class TestFourLayerModelIndexerKL:
         assert out.aux_metrics is None
         assert torch.isfinite(out.loss)
         for layer in _csa_layers(model):
-            for name in ("q_b_proj", "kv_proj", "gate_proj", "weights_proj"):
-                param = getattr(layer.self_attn.compressor.indexer, name).weight
+            for name in ("q_b_proj", "kv_proj", "gate_proj", "scorer.weights_proj"):
+                param = layer.self_attn.compressor.indexer.get_submodule(name).weight
                 assert param.grad is None
 
         out.loss.backward()
         for layer in _csa_layers(model):
-            for name in ("q_b_proj", "kv_proj", "gate_proj", "weights_proj"):
-                param = getattr(layer.self_attn.compressor.indexer, name).weight
+            for name in ("q_b_proj", "kv_proj", "gate_proj", "scorer.weights_proj"):
+                param = layer.self_attn.compressor.indexer.get_submodule(name).weight
                 assert param.grad is None, f"indexer.{name} received a gradient with the loss disabled"
 
     def test_the_kl_is_reported_but_not_added_when_there_are_no_labels(self):

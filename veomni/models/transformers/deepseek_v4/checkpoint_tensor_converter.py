@@ -81,6 +81,10 @@ _DEEPSEEK_V4_WEIGHT_RENAMINGS = [
 # NOTE: Transformers's DeepSeek-V4 weight reverse renaming is buggy, manually fix it here.
 _INDEXER_REVERSE_RENAMINGS = [
     WeightRenaming(
+        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.scorer\.weights_proj\.",
+        target_patterns=r"layers.\1.attn.indexer.weights_proj.",
+    ),
+    WeightRenaming(
         source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.q_b_proj\.",
         target_patterns=r"layers.\1.attn.indexer.wq_b.",
     ),
@@ -164,6 +168,11 @@ def convert_deepseek_v4_checkpoint_key(name: str, *, target_model_prefix: str = 
         return name
     has_model_prefix = name.startswith("model.")
     source_name = name.removeprefix("model.") if has_model_prefix else name
+    # Upgrade old VeOmni keys before HF's broad inference-name rewrite can
+    # add a second compressor prefix. The model always uses the current HF key.
+    if re.match(r"^layers\.\d+\.self_attn\.compressor\.indexer\.weights_proj\.", source_name):
+        source_name = source_name.replace(".indexer.weights_proj.", ".indexer.scorer.weights_proj.")
+        return f"{target_model_prefix}{source_name}"
     converted_name, _ = rename_source_key(source_name, _DEEPSEEK_V4_WEIGHT_RENAMINGS, [])
     if converted_name.startswith(_BASE_MODEL_KEY_PREFIXES):
         return f"{target_model_prefix}{converted_name}"

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3-Omni-MoE transformers>=5.9.0 code generation.
+Patch configuration for Qwen3-Omni-MoE transformers>=5.16.1 code generation.
 
 Covers the thinker training path (text + vision + audio + MoE):
   - Vision SP slicing with pad_scale=4 + varlen-aware attention
@@ -35,7 +35,7 @@ patchgen veomni.models.transformers.qwen3_omni_moe.qwen3_omni_moe_gpu_patch_gen_
 import copy
 from functools import partial
 from types import SimpleNamespace
-from typing import Callable, Optional
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -294,14 +294,24 @@ def collate_multimodal_metadata(batch, sp_pad):
     "Qwen3OmniMoePreTrainedModel._init_weights",
     description="Drop Qwen3OmniMoeCode2Wav branch since the class is excluded from the generated file",
 )
-@torch.no_grad()
 def qwen3_omni_moe_pretrained_init_weights_patched(self, module):
     super()._init_weights(module)
     std = self.config.initializer_range
-    if isinstance(module, Qwen3OmniMoeThinkerTextSparseMoeBlock):  # noqa: F821
-        init.normal_(module.experts.gate_up_proj, mean=0.0, std=std)  # noqa: F821
-        init.normal_(module.experts.down_proj, mean=0.0, std=std)  # noqa: F821
-        init.normal_(module.gate.weight, mean=0.0, std=std)  # noqa: F821
+    # Key the MoE branch on the modules that *own* the parameters rather than on
+    # the ``Qwen3OmniMoeThinkerTextSparseMoeBlock`` container. transformers 5.16's
+    # ``PreTrainedModel._initialize_weights`` skips ``_init_weights`` entirely for
+    # modules with no direct parameters when ``is_custom_code`` is true — which it
+    # is for VeOmni's out-of-tree generated modeling — so a container-keyed branch
+    # never fires and the expert weights stay at their uninitialised
+    # ``torch.empty`` values. Upstream's own text-level initialiser
+    # (``Qwen3OmniMoeThinkerTextPreTrainedModel._init_weights``) keys on these two
+    # classes for the same reason; mirror it here since that class is not in
+    # ``Qwen3OmniMoeThinkerTextModel``'s MRO.
+    if isinstance(module, Qwen3OmniMoeThinkerTextExperts):  # noqa: F821
+        init.normal_(module.gate_up_proj, mean=0.0, std=std)  # noqa: F821
+        init.normal_(module.down_proj, mean=0.0, std=std)  # noqa: F821
+    elif isinstance(module, Qwen3OmniMoeThinkerTextTopKRouter):  # noqa: F821
+        init.normal_(module.weight, mean=0.0, std=std)  # noqa: F821
     elif isinstance(module, SinusoidsPositionEmbedding):  # noqa: F821
         log_timescale_increment = np.log(module.max_timescale) / (module.channels // 2 - 1)  # noqa: F821
         inv_timescales = torch.exp(-log_timescale_increment * torch.arange(module.channels // 2).float())
@@ -327,15 +337,13 @@ def qwen3_omni_moe_pretrained_init_weights_patched(self, module):
 )
 def qwen3_omni_moe_get_rope_index_patched(
     self,
-    input_ids: Optional[torch.LongTensor] = None,
-    image_grid_thw: Optional[torch.LongTensor] = None,
-    video_grid_thw: Optional[torch.LongTensor] = None,
-    attention_mask: Optional[torch.Tensor] = None,
-    # --- Patch.1 ---
-    # use_audio_in_video removed; decided per-video below.
-    # --- Patch.1 ---
-    audio_seqlens: Optional[torch.LongTensor] = None,
-    second_per_grids: Optional[torch.Tensor] = None,
+    input_ids: torch.LongTensor | None = None,
+    image_grid_thw: torch.LongTensor | None = None,
+    video_grid_thw: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    use_audio_in_video: bool | None = None,
+    audio_seqlens: torch.LongTensor | None = None,
+    second_per_grids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     spatial_merge_size = self.spatial_merge_size
     image_token_id = self.config.image_token_id
@@ -444,14 +452,16 @@ def qwen3_omni_moe_get_rope_index_patched(
                 # Video only — audio track determined per-video via audio_seqlens
                 elif min_ed == ed_vision_start:
                     # --- Patch.1 ---
-                    if audio_seqlens[audio_idx] == 0:
-                        use_audio_in_video = False
-                        audio_idx += 1  # consume zero-length placeholder
-                    else:
-                        use_audio_in_video = True
+                    # None selects VeOmni's per-video placeholder convention;
+                    # explicit booleans retain HF generation's global contract.
+                    video_has_audio = use_audio_in_video
+                    if video_has_audio is None:
+                        video_has_audio = audio_seqlens[audio_idx] != 0
+                        if not video_has_audio:
+                            audio_idx += 1  # consume zero-length placeholder
                     # --- Patch.1 ---
 
-                    if not use_audio_in_video:
+                    if not video_has_audio:
                         assert input_ids_i[ed_vision_start + 1] == video_token_id
 
                         grid_t = video_grid_thw[video_idx][0]
@@ -549,8 +559,8 @@ def qwen3_omni_moe_vision_attention_forward_patched(
     self,
     hidden_states: torch.Tensor,
     cu_seqlens: torch.Tensor,
-    rotary_pos_emb: Optional[torch.Tensor] = None,
-    position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    max_seqlen: int | None = None,
     **kwargs,
 ) -> torch.Tensor:
     seq_length = hidden_states.shape[0]
@@ -570,7 +580,13 @@ def qwen3_omni_moe_vision_attention_forward_patched(
 
     # --- Patch.1 ---
     if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+        # Upstream calls `get_max_seqlen(...)` here, which returns None for
+        # VeOmni's custom `veomni_flash_attention_*` names because it gates on
+        # HF's built-in `is_flash_attention_requested`. Honour a caller-supplied
+        # value (upstream threads one down from the encoder) and otherwise
+        # reduce locally.
+        if max_seqlen is None:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
         attn_output, _ = attention_interface(
             self,
             query_states,
@@ -947,18 +963,21 @@ def qwen3_omni_moe_audio_dummy_forward_patched(self):
 )
 def qwen3_omni_moe_thinker_text_model_forward_patched(
     self,
-    input_ids: Optional[torch.LongTensor] = None,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
+    input_ids: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
     past_key_values=None,
-    inputs_embeds: Optional[torch.FloatTensor] = None,
-    use_cache: Optional[bool] = None,
-    cache_position: Optional[torch.LongTensor] = None,
-    visual_pos_masks: Optional[torch.Tensor] = None,
-    deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    use_cache: bool | None = None,
+    cache_position: torch.LongTensor | None = None,
+    visual_pos_masks: torch.Tensor | None = None,
+    deepstack_visual_embeds: list[torch.Tensor] | None = None,
     **kwargs: Unpack[FlashAttentionKwargs],
 ) -> tuple | MoeModelOutputWithPast:
     r"""
+    cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+        Indices depicting the position of the input sequence tokens in the sequence. Retained in the
+        signature for callers that pass it positionally; transformers 5.16 moved it into `**kwargs`.
     visual_pos_masks (`torch.Tensor` of shape `(batch_size, seqlen)`, *optional*):
         The mask of the visual positions.
     deepstack_visual_embeds (`list[torch.Tensor]`, *optional*):
@@ -1131,6 +1150,67 @@ class PatchedQwen3OmniMoeThinkerTextExperts(nn.Module):
 
 
 # ================================================================
+# Patch: Qwen3OmniMoeThinkerForConditionalGeneration.get_image_features
+# 1. skip the upstream `torch.split(pooler_output, split_sizes)` that
+#    transformers 5.16 added — VeOmni needs the flat tensor for the SP
+#    all-to-all, and the downstream masked_scatter is indexed by a single
+#    n_image_tokens slice rather than a per-image list. Mirrors the same patch
+#    on qwen3_vl / qwen3_5 / qwen2_5_omni.
+# ================================================================
+@config.override_method(
+    "Qwen3OmniMoeThinkerForConditionalGeneration.get_image_features",
+    description="Return flat image_embeds tensor (skip per-image torch.split)",
+)
+def qwen3_omni_moe_thinker_get_image_features_patched(
+    self,
+    pixel_values: torch.FloatTensor,
+    image_grid_thw: torch.LongTensor | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> tuple | BaseModelOutputWithDeepstackFeatures:
+    r"""
+    pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+        The tensors corresponding to the input images.
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    """
+    pixel_values = pixel_values.type(self.visual.dtype)
+    # --- Patch.1 ---
+    # vision_outputs = self.visual(pixel_values, grid_thw=image_grid_thw, **kwargs)
+    # split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+    # vision_outputs.pooler_output = list(torch.split(vision_outputs.pooler_output, split_sizes))
+    # return vision_outputs
+    # --- Patch.1 ---
+    return self.visual(pixel_values, grid_thw=image_grid_thw, **kwargs)
+
+
+# ================================================================
+# Patch: Qwen3OmniMoeThinkerForConditionalGeneration.get_video_features
+# 1. same as get_image_features above — keep pooler_output flat.
+# ================================================================
+@config.override_method(
+    "Qwen3OmniMoeThinkerForConditionalGeneration.get_video_features",
+    description="Return flat video_embeds tensor (skip per-video torch.split)",
+)
+def qwen3_omni_moe_thinker_get_video_features_patched(
+    self,
+    pixel_values_videos: torch.FloatTensor,
+    video_grid_thw: torch.LongTensor | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> tuple | BaseModelOutputWithDeepstackFeatures:
+    r"""
+    pixel_values_videos (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+        The tensors corresponding to the input videos.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    """
+    pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
+    # --- Patch.1 ---
+    # See get_image_features: upstream 5.16 splits pooler_output per video.
+    # --- Patch.1 ---
+    return self.visual(pixel_values_videos, grid_thw=video_grid_thw, **kwargs)
+
+
+# ================================================================
 # Patch: Qwen3OmniMoeThinkerForConditionalGeneration.get_audio_features
 # Simplified to the VeOmni training path: input_features is already the
 # flat (len, num_mel_bins) tensor (after the collator strips feature
@@ -1226,13 +1306,16 @@ def qwen3_omni_moe_thinker_forward_patched(
     rope_deltas=None,
     labels=None,
     use_cache=None,
-    output_router_logits: Optional[bool] = None,
+    output_router_logits: bool | None = None,
     use_audio_in_video=None,
     cache_position=None,
     video_second_per_grid=None,
     **kwargs,
 ) -> tuple | Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs:
     r"""
+    cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+        Indices depicting the position of the input sequence tokens in the sequence. Retained in the
+        signature for callers that pass it positionally; transformers 5.16 moved it into `**kwargs`.
     image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
         The temporal, height and width of feature shape of each image in LLM.
     video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
@@ -1459,13 +1542,15 @@ def qwen3_omni_moe_thinker_forward_patched(
             or self.rope_deltas is None
         ):
             delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
+            # Keep the per-video audio lengths separate from HF's global flag.
             position_ids, rope_deltas = self.get_rope_index(
-                input_ids,
-                image_grid_thw,
-                video_grid_thw,
-                attention_mask,
-                audio_feature_lengths,
-                video_second_per_grid,
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                attention_mask=attention_mask,
+                use_audio_in_video=use_audio_in_video,
+                audio_seqlens=audio_feature_lengths,
+                second_per_grids=video_second_per_grid,
             )
             rope_deltas = rope_deltas - delta0
             self.rope_deltas = rope_deltas

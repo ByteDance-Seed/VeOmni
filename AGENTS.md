@@ -43,7 +43,7 @@ uv sync --extra gpu --dev
 source .venv/bin/activate
 ```
 
-This installs `transformers==5.9.0` via the `transformers-stable` dependency
+This installs `transformers==5.16.1` via the `transformers-stable` dependency
 group. `gpu` / `npu` / `npu_aarch64` are mutually exclusive hardware extras;
 each is a complete superset for that accelerator. MagiAttention is an
 optional `--extra magi` that combines with `gpu` (`uv sync --extra gpu --extra magi`).

@@ -56,7 +56,7 @@ ENV PIP_CONSTRAINT=/opt/rocm-constraints.txt
 # classes); liger-kernel (default cross_entropy); the rest are runtime/test deps
 # missing from the base image.
 RUN pip install \
-      "transformers==5.12.1" \
+      "transformers==5.16.1" \
       "diffusers==0.37.0" \
       "liger-kernel==0.8.0" \
       timm expecttest megatron-energon librosa soundfile ftfy hf_transfer rich

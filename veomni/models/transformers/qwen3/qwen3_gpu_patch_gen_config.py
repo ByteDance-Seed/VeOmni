@@ -142,13 +142,9 @@ def qwen3_forcausallm_forward_patched(
     **kwargs: Unpack[TransformersKwargs],
 ) -> CausalLMOutputWithPast:
     r"""
-    labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-        Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-        config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-        (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
     cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-        Indices depicting the position of the input sequence tokens in the sequence. It is used to update the
-        cache in the correct position and to infer the complete sequence length.
+        Indices depicting the position of the input sequence tokens in the sequence. Retained in the
+        signature for callers that pass it positionally; transformers 5.16 moved it into `**kwargs`.
     """
     outputs = self.model(
         input_ids=input_ids,
