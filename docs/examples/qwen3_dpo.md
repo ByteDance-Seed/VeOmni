@@ -50,6 +50,7 @@ Key config values (full DPO argument reference: [arguments.md — DPOConfig](../
 | `train.num_train_epochs` | `1` |
 | `dpo_config.beta` | `0.1` |
 | `dpo_config.loss_type` | `sigmoid` |
+| `reference_model` | omitted — reuse `model`; set a full `reference_model` block for a different checkpoint |
 | `train.checkpoint.output_dir` | `Qwen3-0.6B-dpo-ultrafeedback` |
 | `train.wandb.project` | `VeOmni` |
 | `train.wandb.name` | `Qwen3-0.6B-dpo-ultrafeedback` |
@@ -72,6 +73,11 @@ With `save_hf_weights: true`, a HuggingFace-compatible checkpoint is also writte
 Qwen3-0.6B-dpo-ultrafeedback/
 └── checkpoints/
     └── global_step_200/
-        ├── ...          ← DCP distributed checkpoint
-        └── hf_ckpt/     ← HuggingFace safetensors
+        ├── .metadata
+        ├── __0_0.distcp …          ← model + optimizer
+        ├── lr_scheduler.pt
+        ├── trainer_state_rank_{R}.pt
+        └── hf_ckpt/                ← HuggingFace safetensors (when save_hf_weights)
 ```
+
+File-by-file contract: [Checkpoint layout](../usage/checkpoint.md).

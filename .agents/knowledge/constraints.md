@@ -63,9 +63,9 @@ Core entry points:
    - Data slicing: `veomni/distributed/sequence_parallel/data.py` — `sp_pad_and_slice()`, `slice_input_tensor()`, `gather_outputs()`.
    - Loss reduction: `reduce_sequence_parallel_loss()` in `loss.py` aggregates across SP ranks (optional `group=` arg; defaults to the current state's unified SP group).
    - Process groups: `comm.py` has NO group globals. Its getters (`get_ulysses_sequence_parallel_group`, `get_unified_sequence_parallel_group`, `get_context_parallel_group`, `get_data_parallel_group`) resolve from the *current* `ParallelState`'s device mesh (`get_parallel_state().{ulysses,sp,cp,dp}_group`) — exactly how `fsdp_group` already worked. `set_ulysses_sequence_parallel_group(group)` survives ONLY as a unit-test injection seam (`_ULYSSES_SP_GROUP_OVERRIDE`, `None` in production); no production code calls it. Meshless SP is unsupported — `ParallelState.__post_init__` raises if `sp_enabled and device_mesh is None`; always build via `init_parallel_state_from_config`.
-   - Local parallel state: `BaseTrainer._setup()` calls `init_parallel_state_from_config(args.model.accelerator, name="base")` **before** seed/determinism env vars (`NCCL_DETERMINISTIC`, etc.). Initialization caches by topology and registers under `name`; duplicate name → warn and return existing. Trainers do not store the ParallelState object or name — use `use_parallel_state("base")` / `get_parallel_state_by_name("base")`. `clear_parallel_state()` after `destroy_process_group()`. Tests that need a topology no job config can express call `_init_parallel_state` directly.
-   - **Build scope**: `_setup()` (registers `"base"`) → one `with use_parallel_state("base"):` around the whole build sequence. Do NOT re-wrap individual build helpers.
-   - **Run scope (per-op, not whole `train_step`)**: each ambient-dependent op gets its own wrap with `"base"` — `model` forward, `postforward`/`mean_global_loss`, `loss.backward()`, `veomni_clip_grad_norm`. When an API takes explicit `group=`, pass `get_parallel_state_by_name("base").sp_group` and skip ambient.
+   - Local parallel state: `BaseTrainer._setup(args)` registers `"base"` **before** seed/determinism env vars (`NCCL_DETERMINISTIC`, etc.). Initialization caches by topology and registers under `name`; duplicate name → warn and return existing. Never store the ParallelState **object**: `VeOmniModelRuntime.parallel_state` is a by-name registry lookup on every access, and every scope is opened as `use_parallel_state(self.model_name)`, so the registry stays authoritative. Only the *name* is held. `clear_parallel_state()` after `destroy_process_group()`. Tests that need a topology no job config can express call `_init_parallel_state` directly.
+   - **Build scope**: `_setup(args)` registers `"base"`. `VeOmniModelRuntime.setup()` only registers this model's mesh; `__init__` then wraps meta-init, freeze, FSDP2/EP wrap + weight load, and optimizer in `use_parallel_state(self.model_name)`. A trainer must NOT open a build scope of its own or resequence those steps from outside: a model whose build differs subclasses the runtime.
+   - **Run scope (per-op, not whole `train_step`)**: each ambient-dependent op gets its own wrap with this model's ParallelState name (`"base"` for a single-model trainer; `"policy"` / `"reference"` on `TextDPOTrainer`) — `model` forward, `postforward`/`mean_global_loss`, `loss.backward()`, and grad clipping (`VeOmniModelRuntime.clip_grad_norm()` enters its own scope). When an API takes explicit `group=`, pass `get_parallel_state_by_name(<that name>).sp_group` and skip ambient.
    - **Callbacks**: cache `Callback.parallel_state` at construction (ChannelLossComputer too). Hook dispatch must not depend on ambient ParallelState.
    - See `docs/design/local_parallel_state.md`.
 
@@ -86,7 +86,7 @@ Core entry points:
    - Dropping `"cpu"` from the field's `Literal` is *not* what enforces this, and no `Literal` in the arguments layer enforces anything. The parser turns it into argparse `choices`, which covers the CLI only; a YAML value goes straight to the dataclass constructor via `_instantiate_recursive()` (`veomni/arguments/parser.py`), and annotations are never checked at runtime. Any config value that must actually be rejected needs an explicit assert in `__post_init__`.
    - Two other users of `"cpu"` are unaffected and must not be swept up in that: `build_foundation_model(init_device="cpu")` is a live public API (several tests build on CPU that way), and `materialize_device="cpu"` is how fsdp2 CPU offload reaches `load_model_weights()`. The `init_device` parameters in `veomni/models/module_utils.py` are fed by the latter, not by `model.accelerator.init_device`.
    - `should_skip_hf_weight_load` must be honoured here too: a distributed-checkpoint resume is about to overwrite every parameter, so reading the HF snapshot doubles peak memory, and the snapshot may not exist at all.
-   - `broadcast_model_weights_from_rank0` is honoured here, and the `AcceleratorConfig._validate_init_device()` warning that used to call it fsdp2-only is gone. That warning was correct only while DDP loaded nothing at all; now that this path loads, the flag applies verbatim — `rank0_load_and_broadcast_weights()` broadcasts over the default (world) group from global rank0 (`dist.broadcast(..., src=0)`, no `group=`), and a DDP replica wants exactly that whole tensor. It defaults to `True`, so ignoring it would have pinned every DDP run to the every-rank-reads path while printing that it was being ignored.
+   - `broadcast_model_weights_from_rank0` is honoured here under both FSDP2 and DDP. `rank0_load_and_broadcast_weights()` broadcasts over the default (world) group from global rank0 (`dist.broadcast(..., src=0)`, no `group=`), which is what a DDP replica wants. It defaults to `True`.
    - After the load pass, `parallelize_model_ddp()` re-checks `param.is_meta` and raises with the offending parameter names. A loader that leaves one behind would otherwise surface inside DDP's constructor as `Tensor.item() cannot be called on meta tensors`, which names neither the parameter nor the cause.
    - ExtraParallel is refused on the DDP path, keyed on **the model's plan** (`_has_extra_parallel_plan()`), not on `ParallelState.any_extra_parallel_enabled`. Only `parallelize_model_fsdp2()` applies the plan that shards expert weights, so DDP experts are whole and loading a sharded-expert config into them — previously prevented only by the meta crash — would silently produce full tensors. But the mesh alone does not identify such a model: a SeedOmni V2 sub-module's accelerator is `_deep_update(global, override)`, so a DDP vision tower inherits the backbone's ep dim while owning no experts, and refusing on the mesh would block it. The same predicate gates `ep_sharded_stream_load` in `_materialize_and_load_weights()`: a plan-less model skips the fast path with a log line (there was never one to take), while a model that *does* have a plan still lets the loader's `NotImplementedError` propagate, because that one means the checkpoint layout is unsupported — the distinction `tests/utils/test_moe_ep_sharded_load_matrix.py` pins for `nonmerged x ep_sharded`.
 
@@ -160,11 +160,22 @@ Core files:
 16. **DCP checkpoint keys must match model state dict**
     - `veomni/checkpoint/dcp_checkpointer.py` uses PyTorch's DCP (`torch.distributed.checkpoint`).
     - Renaming model parameters or changing the model structure between save and load breaks checkpoint loading.
-    - Extra state is saved per-rank via `_EXTRA_STATE_FORMAT` — changing rank count requires checkpoint resharding.
 
 17. **Checkpoint save/load requires all ranks to participate**
     - DCP operations are collective — all ranks must call save/load simultaneously.
     - Calling checkpoint operations from only rank 0 causes deadlocks.
+    - ``lr_scheduler.pt`` is replicated: rank 0 writes the file, but every rank
+      still joins the save reduction and the promotion collectives. The sidecar
+      is written before ``dcp.save`` / ``dcp.async_save``, so DCP's ``.metadata``
+      (the resume completeness marker) lands last. Each step writes a new
+      ``global_step_{N}/``; a failed save has no ``.metadata`` and is skipped.
+      A resume that expects a scheduler and finds no ``lr_scheduler.pt`` falls
+      back to ``extra_state/`` via ``veomni/checkpoint/legacy_v0_1_12.py``
+      (VeOmni 0.1.12). Delete that module and its two imports to drop the
+      fallback; the load then raises.
+    - ``trainer_state_rank_{R}.pt`` stays per-rank: the dataloader cursor and RNG
+      are rank-local. Changing world size still requires a matching cursor file
+      per rank. On-disk layout: ``docs/usage/checkpoint.md``.
 
 18. **Distributed HF safetensors consolidation must support non-floating tensors**
     - PyTorch 2.9–2.11 computes consolidated tensor byte sizes with `torch.finfo`, which crashes for valid integer and boolean buffers such as DeepSeek V4 `tid2eid`.

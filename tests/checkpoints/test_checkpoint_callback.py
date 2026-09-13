@@ -1,8 +1,8 @@
 """Unit tests for checkpoint cadence, manager save contract, and job-level state.
 
 Validates that ``_last_saved_step`` is only updated AFTER the save succeeds, that
-DCP save keys staging on the run-root path plus ``global_steps``, that extra_state
-is model-bound only, and that job-level state lives on ``GlobalStateCallback``.
+the manager forwards ``lr_scheduler`` like the optimizer, and that global_state
+lives on ``GlobalStateCallback``.
 """
 
 from types import SimpleNamespace
@@ -48,18 +48,22 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
     trainer = MagicMock()
     trainer.args = args
     trainer.model = MagicMock()
-    trainer.optimizer = MagicMock()
-    trainer.lr_scheduler = MagicMock()
-    trainer.lr_scheduler.state_dict.return_value = {"lr": 1e-4}
+    trainer.model.args = SimpleNamespace(
+        accelerator=accelerator,
+        lora_config=None,
+        fqn_to_index_mapping={},
+    )
+    trainer.model.lr_scheduler = MagicMock()
+    trainer.model.lr_scheduler.state_dict.return_value = {"lr": 1e-4}
+    trainer.model.optimizer = MagicMock()
+    trainer.model.model_assets = []
     trainer.train_dataloader = MagicMock()
     trainer.environ_meter = MagicMock()
     trainer.channel_loss_callback = MagicMock()
     trainer.channel_loss_callback.state_dict.return_value = {}
-    trainer.model_assets = []
     trainer.state = TrainerState()
     trainer.start_epoch = 0
     trainer.start_step = 0
-    trainer.checkpoint = MagicMock()
 
     return trainer
 
@@ -208,7 +212,7 @@ class TestCheckpointCallbackTrainBegin:
     def test_on_train_begin_exports_assets_then_loads(self, mock_helper):
         trainer = _make_mock_trainer()
         order = []
-        trainer.save_model_assets.side_effect = lambda: order.append("assets")
+        trainer.model.save_model_assets.side_effect = lambda: order.append("assets")
         trainer.load.side_effect = lambda: order.append("load")
         cb = CheckpointCallback(trainer)
 
@@ -229,12 +233,12 @@ class TestCheckpointCallbackTrainEndWait:
 
         cb.on_train_end(TrainerState(global_step=60))
 
-        trainer.checkpoint.wait_for_pending_save.assert_called_once_with()
+        trainer.model.checkpoint.wait_for_pending_save.assert_called_once_with()
 
     def test_train_end_propagates_async_save_failure(self, mock_helper):
         trainer = _make_mock_trainer(save_async=True)
         trainer.args.train.checkpoint.save_hf_weights = False
-        trainer.checkpoint.wait_for_pending_save.side_effect = RuntimeError("HDFS write failed")
+        trainer.model.checkpoint.wait_for_pending_save.side_effect = RuntimeError("HDFS write failed")
         cb = CheckpointCallback(trainer)
 
         with pytest.raises(RuntimeError, match="HDFS write failed"):
@@ -248,10 +252,9 @@ class TestCheckpointCallbackTrainEndWait:
 
         cb.on_train_end(TrainerState(global_step=60))
 
-        trainer.checkpoint.wait_for_pending_save.assert_called_once_with()
+        trainer.model.checkpoint.wait_for_pending_save.assert_called_once_with()
 
 
-@patch("veomni.models.checkpoint_manager.get_parallel_state")
 @patch("veomni.models.checkpoint_manager.build_checkpointer")
 @patch("veomni.models.checkpoint_manager.dist")
 @patch("veomni.models.checkpoint_manager.helper")
@@ -262,20 +265,20 @@ class TestModelCheckpointManagerSaveContract:
     gets a fresh staging directory per step, and a save killed part-way then
     strands a model-plus-optimizer-sized copy that no later save clears.
 
-    extra_state is model-bound only: the dataloader cursor, rng, and meters
-    belong to ``GlobalStateCallback``.
+    The manager forwards this model's lr_scheduler like the optimizer; the
+    dataloader cursor, rng, and meters belong to ``GlobalStateCallback``.
     """
 
     def test_the_step_reaches_save_instead_of_being_folded_into_the_path(
-        self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps, tmp_path
+        self, mock_helper, mock_dist, mock_build_ckpt, tmp_path
     ):
         from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
 
         trainer = _make_mock_trainer(save_path=str(tmp_path / "run"))
         trainer.args.train.checkpoint.stage_dir = str(tmp_path / "stage")
         mock_build_ckpt.return_value = MagicMock()
-        manager = ModelCheckpointManager(trainer)
-        trainer.checkpoint = manager
+        manager = ModelCheckpointManager(trainer.model, trainer.args.train.checkpoint)
+        trainer.model.checkpoint = manager
 
         staged = []
         with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
@@ -288,65 +291,78 @@ class TestModelCheckpointManagerSaveContract:
 
         assert staged[0] == staged[1], "each step staged somewhere different"
 
-    def test_the_logged_destination_is_the_one_save_writes(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
+    def test_the_logged_destination_is_the_one_save_writes(self, mock_helper, mock_dist, mock_build_ckpt):
         """The manager names the step directory for its log and its HF export, while
         ``save`` builds the same directory from ``path`` and ``global_steps``."""
         from veomni.checkpoint.dcp_checkpointer import _GLOBAL_STEP_PREFIX
 
         trainer = _make_mock_trainer(save_path="/remote/run")
         mock_build_ckpt.return_value = MagicMock()
-        manager = ModelCheckpointManager(trainer)
+        manager = ModelCheckpointManager(trainer.model, trainer.args.train.checkpoint)
 
         manager.save_dcp(TrainerState(global_step=10))
 
         call = manager.checkpointer.save.call_args
         assert f"{call.args[0]}/{_GLOBAL_STEP_PREFIX}{call.kwargs['global_steps']}" == "/remote/run/global_step_10"
 
-    def test_extra_state_is_only_the_scheduler(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
+    def test_save_forwards_lr_scheduler_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
         trainer = _make_mock_trainer()
         mock_build_ckpt.return_value = MagicMock()
-        manager = ModelCheckpointManager(trainer)
+        manager = ModelCheckpointManager(trainer.model, trainer.args.train.checkpoint)
 
         manager.save_dcp(TrainerState(global_step=10))
 
-        extra_state = manager.checkpointer.save.call_args.args[1]["extra_state"]
-        assert set(extra_state) == {"lr_scheduler"}
-        assert extra_state["lr_scheduler"] == {"lr": 1e-4}
+        saved = manager.checkpointer.save.call_args.args[1]
+        assert saved["lr_scheduler"] is trainer.model.lr_scheduler
+        assert saved["optimizer"] is trainer.model.optimizer
+        assert "extra_state" not in saved
 
-    def test_legacy_extra_state_restores_the_job_cursor(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
-        """Checkpoints written by CheckpointerCallback still resume the cursor."""
+    def test_load_forwards_lr_scheduler_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
         trainer = _make_mock_trainer()
-        trainer.args.train.checkpoint.load_path = "/tmp/old_ckpt"
-        trainer.train_dataloader = MagicMock()
+        trainer.args.train.checkpoint.load_path = "/tmp/ckpt"
         mock_checkpointer = MagicMock()
         mock_build_ckpt.return_value = mock_checkpointer
 
-        def load_checkpoint(path, state, **kwargs):
-            state["extra_state"] = {
-                "global_step": 7,
-                "lr_scheduler": {"lr": 1e-5},
-                "train_dataloader": {"cursor": 3},
-                "environ_meter": {"tokens": 1},
-                "channel_loss_callback": {"source_registry": [(1, "train/a")]},
-                "torch_rng_state": torch.get_rng_state(),
-            }
-
-        mock_checkpointer.load.side_effect = load_checkpoint
-        manager = ModelCheckpointManager(trainer)
+        manager = ModelCheckpointManager(trainer.model, trainer.args.train.checkpoint)
         manager.load()
 
-        assert trainer.state.global_step == 7
-        assert trainer.start_epoch == 0
-        assert trainer.start_step == 7
-        trainer.lr_scheduler.load_state_dict.assert_called_once_with({"lr": 1e-5})
-        trainer.train_dataloader.load_state_dict.assert_called_once_with({"cursor": 3})
-        trainer.channel_loss_callback.load_state_dict.assert_called_once_with({"source_registry": [(1, "train/a")]})
-        assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is mock_get_ps.return_value
+        loaded = mock_checkpointer.load.call_args.args[1]
+        assert loaded["lr_scheduler"] is trainer.model.lr_scheduler
+        assert loaded["optimizer"] is trainer.model.optimizer
+        assert trainer.state.global_step == 0
+        assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is trainer.model.parallel_state
+
+    def test_save_lora_writes_the_adapter_beside_the_dcp_shards(
+        self, mock_helper, mock_dist, mock_build_ckpt, tmp_path
+    ):
+        """LoRA export lives under checkpoints/global_step_N, same parent as DCP and hf_ckpt."""
+        trainer = _make_mock_trainer(save_path=str(tmp_path / "checkpoints"))
+        mock_build_ckpt.return_value = MagicMock()
+        manager = ModelCheckpointManager(trainer.model, trainer.args.train.checkpoint)
+        state = TrainerState(global_step=10)
+        (tmp_path / "checkpoints" / "global_step_10").mkdir(parents=True)
+
+        with patch("veomni.utils.save_safetensor_utils.save_lora_adapter_with_dcp") as save_adapter:
+            manager.save_lora(state)
+
+        assert save_adapter.call_args.kwargs["save_path"] == str(tmp_path / "checkpoints" / "global_step_10")
+        assert save_adapter.call_args.kwargs["save_path"] == manager.save_dir(state)
+
+    def test_save_uses_the_runtime_mesh_not_the_ambient_one(self, mock_helper, mock_dist, mock_build_ckpt):
+        """build_checkpoint runs outside use_parallel_state, so ambient is still ``base``."""
+        trainer = _make_mock_trainer()
+        mock_build_ckpt.return_value = MagicMock()
+        manager = ModelCheckpointManager(trainer.model, trainer.args.train.checkpoint)
+
+        manager.save_dcp(TrainerState(global_step=10))
+
+        assert manager.parallel_state is trainer.model.parallel_state
+        assert manager.checkpointer.save.call_args.kwargs["parallel_state"] is trainer.model.parallel_state
 
 
 @patch("veomni.trainer.callbacks.global_state_callback.dist")
 class TestGlobalStateCallbackJobState:
-    """Job-level state — dataloader, rng, meters, channel-loss — is not in DCP extra_state."""
+    """global_state — dataloader, rng, meters, channel-loss — is not in the DCP sidecar."""
 
     def test_state_dict_includes_channel_loss_callback_state(self, mock_dist):
         trainer = _make_mock_trainer()
@@ -373,7 +389,7 @@ class TestGlobalStateCallbackJobState:
 
         cb.save_global_state(TrainerState(global_step=10))
 
-        trainer.checkpoint.wait_for_pending_save.assert_called_once_with()
+        trainer.model.checkpoint.wait_for_pending_save.assert_called_once_with()
         assert (tmp_path / "global_step_10" / "trainer_state_rank_0.pt").is_file()
 
     def test_load_restores_channel_loss_callback_state(self, mock_dist, tmp_path):
@@ -428,3 +444,74 @@ class TestGlobalStateCallbackJobState:
         assert trainer.state.global_step == 0
         mock_dist.all_reduce.assert_called_once()
         assert mock_dist.all_reduce.call_args.kwargs["op"] is torch.distributed.ReduceOp.MIN
+
+    def test_load_restores_0_1_12_extra_state_job_cursor(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = str(tmp_path)
+        trainer.args.train.global_rank = 0
+        trainer.args.train_steps = 100
+        rng = torch.get_rng_state()
+        extra = tmp_path / "extra_state"
+        extra.mkdir()
+        torch.save(
+            {
+                "global_step": 7,
+                "lr_scheduler": {"last_epoch": 7},
+                "train_dataloader": {"cursor": 3},
+                "environ_meter": {"tokens": 1},
+                "channel_loss_callback": {"source_registry": [(1, "train/a")]},
+                "torch_rng_state": rng,
+            },
+            extra / "extra_state_rank_0.pt",
+        )
+
+        cb = GlobalStateCallback(trainer)
+        cb.load_global_state()
+
+        assert trainer.state.global_step == 7
+        assert trainer.start_epoch == 0
+        assert trainer.start_step == 7
+        trainer.train_dataloader.load_state_dict.assert_called_once_with({"cursor": 3})
+        trainer.environ_meter.load_state_dict.assert_called_once_with({"tokens": 1})
+        trainer.channel_loss_callback.load_state_dict.assert_called_once_with({"source_registry": [(1, "train/a")]})
+
+    def test_trainer_state_wins_over_extra_state_job_cursor(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = str(tmp_path)
+        trainer.args.train.global_rank = 0
+        trainer.train_dataloader = None
+        torch.save(
+            {
+                "global_step": 7,
+                "train_dataloader": None,
+                "environ_meter": {},
+                "channel_loss_callback": {},
+                "torch_rng_state": torch.get_rng_state(),
+            },
+            tmp_path / "trainer_state_rank_0.pt",
+        )
+        extra = tmp_path / "extra_state"
+        extra.mkdir()
+        torch.save(
+            {"global_step": 99, "lr_scheduler": {}, "torch_rng_state": torch.get_rng_state()},
+            extra / "extra_state_rank_0.pt",
+        )
+
+        cb = GlobalStateCallback(trainer)
+        cb.load_global_state()
+        assert trainer.state.global_step == 7
+
+    def test_scheduler_only_extra_state_does_not_restore_job_cursor(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = str(tmp_path)
+        trainer.args.train.global_rank = 0
+        extra = tmp_path / "extra_state"
+        extra.mkdir()
+        torch.save({"lr_scheduler": {"last_epoch": 3}}, extra / "extra_state_rank_0.pt")
+
+        cb = GlobalStateCallback(trainer)
+        assert cb.load_global_state() is None
+        assert trainer.state.global_step == 0

@@ -33,17 +33,14 @@ import threading
 from abc import ABC
 from collections import defaultdict
 from contextlib import nullcontext
-from dataclasses import asdict, fields
+from dataclasses import asdict
 from typing import Any, Callable, Dict, List
 
 import torch
 import torch.distributed as dist
 from torch.distributed.checkpoint.stateful import Stateful
-from torch.optim.lr_scheduler import LRScheduler
-from torch.optim.optimizer import Optimizer
 from torch.utils.checkpoint import set_checkpoint_debug_enabled
 from torch.utils.data import Dataset
-from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.modeling_outputs import ModelOutput
 
 from ..arguments import OffloadConfig, VeOmniArguments, save_args
@@ -52,21 +49,19 @@ from ..data import (
     build_dataloader,
     build_dataset,
 )
-from ..data.chat_template import ChatTemplate
 from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
-from ..distributed.async_offload import apply_async_activation_offload, reset_async_activation_offload
-from ..distributed.clip_grad_norm import veomni_clip_grad_norm
+from ..distributed.async_offload import reset_async_activation_offload
 from ..distributed.offloading import build_activation_offloading_context
-from ..distributed.parallel_state import clear_parallel_state, init_parallel_state_from_config, use_parallel_state
-from ..distributed.torch_compile import CompileConfig, mark_compile_step_begin
-from ..distributed.torch_parallelize import build_parallelize_model
-from ..models import build_foundation_model, build_tokenizer
-from ..models.checkpoint_manager import ModelCheckpointManager
+from ..distributed.parallel_state import (
+    clear_parallel_state,
+    init_parallel_state_from_config,
+    use_parallel_state,
+)
+from ..distributed.torch_compile import mark_compile_step_begin
+from ..models.model_runtime import VeOmniModelRuntime
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
-from ..optim import build_lr_scheduler, build_optimizer
 from ..utils import helper, logging
-from ..utils.checkpoint_utils import should_skip_hf_weight_load
 from ..utils.device import (
     get_device_type,
     get_dist_comm_backend,
@@ -75,7 +70,6 @@ from ..utils.device import (
     synchronize,
 )
 from ..utils.loss_utils import count_loss_token, mean_global_loss, reduce_global_loss_token
-from ..utils.model_utils import pretty_print_trainable_parameters
 from .callbacks import (
     RESERVED_TRAINING_METRIC_NAMES,
     ChannelLossCallback,
@@ -92,15 +86,6 @@ from .callbacks import (
 
 
 logger = logging.get_logger(__name__)
-
-
-def _has_trainable_lora_parameters(module: torch.nn.Module | None) -> bool:
-    if module is None:
-        return False
-    return any(
-        param.requires_grad and ({"lora_A", "lora_B"} & set(name.split(".")))
-        for name, param in module.named_parameters()
-    )
 
 
 class BackgroundPrefetcher:
@@ -235,6 +220,14 @@ class BaseTrainer(Stateful, ABC):
     """
     Base trainer class for distributed model training.
 
+    Holds the model-bound half of a training job as :attr:`model`, a
+    :class:`~veomni.models.model_runtime.VeOmniModelRuntime` (build, freeze /
+    LoRA, parallelize, optimizer, lr-scheduler, gradient clipping, device mesh,
+    checkpoint I/O), and owns the job-bound half itself: distributed init, the
+    data pipeline, the train loop, callbacks and checkpoint scheduling. The
+    handle forwards the wrapped model's own API, so ``trainer.model.config``
+    and ``trainer.model(**batch)`` read as before.
+
     This class provides the core training infrastructure including:
     - Distributed initialization and parallelism setup
     - Model, optimizer, and scheduler initialization
@@ -266,16 +259,7 @@ class BaseTrainer(Stateful, ABC):
     train_dataloader: DistributedDataloader
 
     # Model
-    model: PreTrainedModel = None
-    model_config: PretrainedConfig = PretrainedConfig()
-    tokenizer: PreTrainedTokenizerBase = None
-    processor: ProcessorMixin = None
-    chat_template: ChatTemplate = None
-    model_assets: List[Any] = []
-
-    # Training components
-    optimizer: Optimizer = None
-    lr_scheduler: LRScheduler = None
+    model: VeOmniModelRuntime = None
 
     # Training context
     model_fwd_context: Any
@@ -286,8 +270,7 @@ class BaseTrainer(Stateful, ABC):
     step_env_metrics: Dict[str, Any]  # mfu, flops, tokens, etc
     step_train_metrics: Dict[str, Any]  # loss, grad_norm, lr, etc
 
-    # Checkpointer
-    checkpoint: ModelCheckpointManager
+    # Checkpointer — built on the runtime, which owns every model/torch boundary.
 
     # Callback system
     state: TrainerState
@@ -310,158 +293,114 @@ class BaseTrainer(Stateful, ABC):
         """
 
         self.args: VeOmniArguments = args
-        # ``_setup`` registers ParallelState ("base") before seed/determinism so
-        # device-mesh process groups are created with default NCCL settings —
-        # matching pre-registry init order (avoids L20 SIGSEGV when
-        # NCCL_DETERMINISTIC=1 is set before mesh construction).
-        self._setup()
-        # Every build step below reads the current ParallelState via
-        # ``get_parallel_state()`` (meta-init, FSDP2/TP/EP wrap + weight load,
-        # EP-/muon-aware optimizer, SP-aware data pipeline). Scope the whole
-        # build under the registered name (a no-op for the single-model case:
-        # the global already equals the registered ``"base"`` state).
-        with use_parallel_state("base"):
-            # build model
-            self._build_model()
-            # freeze module and print trainable parameters
-            self._freeze_model_module()
-            # build model assets (config, tokenizer, processor, chat_template)
-            self._build_model_assets()
-            # build dataset and dataloader
-            self._build_data_transform()
-            self._build_dataset()
-            self._build_collate_fn()
-            self._build_dataloader()
+        self.device = self._setup(args)
+        # Builds the model: meta-init, freeze, parallelize and optimizer all run
+        # under the mesh the runtime registered, so nothing below needs a scope.
+        self.model = self._build_model_runtime()
+        # build dataset and dataloader
+        self._build_data_transform()
+        self._build_dataset()
+        self._build_collate_fn()
+        self._build_dataloader()
+        # The dataset fixes train_steps, which the schedule needs.
+        self._build_lr_scheduler()
+        self._build_training_context()
+        self._init_callbacks()
 
-            # Parallelize model
-            self._build_parallelized_model()
-            # Build optimizer and lr scheduler
-            self._build_optimizer()
-            self._build_lr_scheduler()
-            # Build training context
-            self._build_training_context()
-            # Initialize callbacks
-            self._init_callbacks()
+    @staticmethod
+    def _setup(args: VeOmniArguments) -> torch.device:
+        """Init process group, device, seed, and register the job's ParallelState.
 
-    def _setup(self):
+        Everything here is job-level and runs before any model exists, so it
+        takes the config rather than a built trainer.
+        """
         # log args
-        logger.info_rank0(json.dumps(asdict(self.args), indent=2))
+        logger.info_rank0(json.dumps(asdict(args), indent=2))
 
         # init distributed environment
-        device_str = f"{get_device_type()}:{self.args.train.local_rank}"
+        device_str = f"{get_device_type()}:{args.train.local_rank}"
         get_torch_device().set_device(device_str)
-        self.device = torch.device(device_str)
+        device = torch.device(device_str)
 
         # Initialize distributed process group
         if not dist.is_initialized():
             dist.init_process_group(backend=get_dist_comm_backend())
 
-        logger.info(f"Process rank: {self.args.train.global_rank}, world size: {self.args.train.world_size}")
+        logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
 
         # Register ParallelState before seed/determinism env vars. Mesh creation
         # must not run under NCCL_DETERMINISTIC=1 on some GPU platforms (L20).
-        self.register_parallel_state("base")
+        init_parallel_state_from_config(args.model.accelerator, name="base")
 
         # Set random seed
-        helper.set_seed(self.args.train.seed, self.args.train.enable_full_determinism)
+        helper.set_seed(args.train.seed, args.train.enable_full_determinism)
 
         # Enable high precision for bf16
         helper.enable_high_precision_for_bf16()
 
         # Enable third party logging
-        if self.args.train.local_rank == 0:
+        if args.train.local_rank == 0:
             helper.enable_third_party_logging()
 
         # Save arguments
-        if self.args.train.global_rank == 0:
-            save_args(self.args, self.args.train.checkpoint.output_dir)
+        if args.train.global_rank == 0:
+            save_args(args, args.train.checkpoint.output_dir)
 
         # Gradient checkpointing debug
-        set_checkpoint_debug_enabled(self.args.model.accelerator.gradient_checkpointing.debug)
+        set_checkpoint_debug_enabled(args.model.accelerator.gradient_checkpointing.debug)
+        return device
 
-    def register_parallel_state(self, name: str = "base"):
-        """Register this trainer's ParallelState under ``name`` in the registry."""
-        init_parallel_state_from_config(self.args.model.accelerator, name=name)
-
-    def _build_model(self):
-        logger.info_rank0("Build model")
-        self.model = build_foundation_model(
-            config_path=self.args.model.config_path,
-            weights_path=self.args.model.model_path,
-            torch_dtype="float32" if self.args.model.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
-            init_device=self.args.model.accelerator.init_device,
-            ops_implementation=self.args.model.ops_implementation,
-            config_kwargs=self.args.model.model_config,
-        )
-        self.model_config = self.model.config
-
-    def _setup_lora(self):
-        """Wrap ``self.model`` with the PEFT-free :class:`veomni.lora.VeOmniLoraModel`.
-
-        A single native path handles both dense ``nn.Linear`` LoRA
-        (``lora_modules`` / ``target_modules``) and MoE expert LoRA
-        (``target_parameters``, wrapper flavour selected by
-        ``share_expert_lora``). On resume (``lora_config['lora_adapter']`` set)
-        the wrappers are rebuilt from the on-disk ``adapter_config.json`` (MoE
-        mode lives in its ``veomni_lora`` block); otherwise a fresh adapter is
-        initialised from the yaml config. Either way the actual adapter
-        *weights* are streamed in later during parallelization
-        (``build_parallelize_model`` with ``adapter_path``).
-
-        Recognised ``lora_config`` keys (in addition to ``rank`` / ``alpha`` /
-        ``lora_adapter`` / ``is_trainable``): ``lora_modules`` (aka
-        ``target_modules``), ``target_parameters``, ``share_expert_lora``,
-        ``use_rslora``, ``lora_dropout``, ``bias``, ``exclude_modules``,
-        ``rank_pattern``, ``alpha_pattern``, ``modules_to_save`` — see
-        :class:`veomni.lora.VeOmniLoraConfig`.
-
-        Fused-MoE models (Qwen3-MoE family) may list the semantic expert module
-        names ``gate_proj`` / ``up_proj`` / ``down_proj`` in ``lora_modules``;
-        these are auto-mapped to the model's fused expert ``target_parameters``
-        (see :func:`veomni.lora.resolve_fused_moe_lora_targets`). Dense models
-        keep those names as ordinary ``nn.Linear`` LoRA targets.
-        """
-        lora_config = self.args.model.lora_config
-        if not bool(lora_config):
+    def destroy_distributed(self):
+        if not dist.is_available() or not dist.is_initialized():
             return
 
-        from ..lora import VeOmniLoraConfig, VeOmniLoraModel, resolve_fused_moe_lora_targets
+        backend = dist.get_backend()
+        helper.empty_cache()
+        dist.barrier()
 
-        lora_adapter_path = lora_config.get("lora_adapter", None)
-        if lora_adapter_path is not None:
-            logger.info_rank0(f"Wrapping model with VeOmniLoraModel from {lora_adapter_path}.")
-            self.model = VeOmniLoraModel.from_pretrained(
-                self.model,
-                lora_adapter_path,
-                is_trainable=lora_config.get("is_trainable", True),
+        if is_nccl_backend(backend) and os.getenv("VEOMNI_DESTROY_NCCL_ON_EXIT", "0") != "1":
+            logger.info_rank0(
+                "Skipping explicit NCCL process-group destroy on normal trainer exit. "
+                "Set VEOMNI_DESTROY_NCCL_ON_EXIT=1 to restore the previous teardown behavior."
             )
-        else:
-            # Rewrite semantic MoE module names onto fused expert parameters
-            # before building the config (no-op for dense models / plain configs).
-            resolved_config = resolve_fused_moe_lora_targets(self.model, lora_config)
-            cfg = VeOmniLoraConfig.from_yaml(resolved_config)
-            logger.info_rank0(f"Initialising VeOmni LoRA adapter from scratch: {cfg}.")
-            self.model = VeOmniLoraModel(self.model, cfg)
+            return
 
-        if not _has_trainable_lora_parameters(self.model):
-            raise ValueError(
-                "LoRA configuration produced no trainable adapters. Select at least one Linear or MoE target."
-            )
+        synchronize()
+        dist.destroy_process_group()
+        clear_parallel_state()
 
-    def _freeze_model_module(self):
-        self._setup_lora()
-        pretty_print_trainable_parameters(self.model)
-        helper.print_device_mem_info("VRAM usage after building model")
+    def _build_model_runtime(self, model_name: str = "base") -> VeOmniModelRuntime:
+        """Build this job's model under ``model_name``'s ParallelState.
 
-    def _build_model_assets(self):
-        # model assets
-        self.tokenizer = build_tokenizer(self.args.model.tokenizer_path)
-        self.model_assets = [self.model_config, self.tokenizer]
+        Defaults to ``"base"`` — the single-model name. A trainer that holds
+        more than one model (DPO's policy) passes a distinct name so each
+        runtime registers its own mesh.
+
+        Returns it already built — meta-init, freeze, parallelize and optimizer
+        included. A model whose build differs (see :class:`VLMModelRuntime`)
+        overrides that step on a runtime subclass returned from here, rather
+        than resequencing the build from the trainer.
+        """
+        return VeOmniModelRuntime(
+            self.args.model,
+            model_name=model_name,
+            train=self.args.train,
+            chat_template_name=self.args.data.chat_template,
+        )
+
+    def _build_lr_scheduler(self):
+        """Size the run, then let the model schedule over it.
+
+        The step count is job-bound — it needs the dataset length and the epoch
+        count — so the model takes the number rather than deriving it.
+        """
+        self.model._build_lr_scheduler(self.args.train_steps * self.args.train.num_train_epochs)
 
     def _build_data_transform(self):
         self.data_transform = build_data_transform(
             self.args.data.data_type,
-            tokenizer=self.tokenizer,
+            tokenizer=self.model.tokenizer,
+            chat_template=self.model.chat_template,
             max_seq_len=self.args.data.max_seq_len,
             text_keys=self.args.data.text_keys,
         )
@@ -515,110 +454,6 @@ class BaseTrainer(Stateful, ABC):
             **dataloader_kwargs,
         )
 
-    def _build_parallelized_model(self):
-        args: VeOmniArguments = self.args
-        # Apply async activation offload BEFORE FSDP2 sharding.
-        # Uses per-instance __call__ patching so that async_save_on_cpu is
-        # OUTER to the checkpoint boundary pushed by GradientCheckpointingLayer,
-        # matching MindSpeed-MM's GC+async offload behavior: hidden_states
-        # inputs are offloaded to CPU (via _NoopSaveInputs), while intermediate
-        # activations are handled by GC recomputation (via _checkpoint_hook).
-        offload_config = _resolve_offload_config(args)
-        if offload_config.enable_async_activation:
-            apply_async_activation_offload(
-                self.model,
-                offload_config.activation_offload_modules,
-                host_cache_limit_bytes=int(offload_config.activation_offload_host_cache_limit_gb * 1024**3),
-            )
-
-        kwargs = {}
-        cpu_load_param_name = None
-        if hasattr(self.model, "get_parallel_plan"):
-            cpu_load_param_name = getattr(self.model.get_parallel_plan(), "cpu_load_param_name", None)
-        kwargs["cpu_load_param_name"] = cpu_load_param_name
-        if bool(args.model.lora_config):
-            lora_adapter_path = args.model.lora_config.get("lora_adapter", None)
-            kwargs["adapter_path"] = lora_adapter_path
-            kwargs["is_peft_model"] = True
-
-        muon_expert_zero_comm = args.model.optimizer.type == "muon" and args.model.optimizer.muon_expert_zero_comm
-
-        if args.model.fqn_to_index_mapping is not None:
-            kwargs["fqn_to_index_mapping"] = args.model.fqn_to_index_mapping
-
-        # A full non-LoRA resume already contains model weights. Skip the HF
-        # materialization pass to avoid a second peak (HF load then checkpoint
-        # overwrite) that can OOM large MoE jobs. LoRA resumes still need the HF base.
-        skip_hf_weight_load = should_skip_hf_weight_load(
-            args.train.checkpoint.load_path,
-            args.model.lora_config,
-        )
-        if skip_hf_weight_load:
-            logger.info_rank0(
-                f"Checkpoint resume enabled (load_path={args.train.checkpoint.load_path}); "
-                "skipping HF weight materialization before checkpoint restore."
-            )
-
-        # Parallelize model
-        self.model = build_parallelize_model(
-            self.model,
-            init_device=args.model.accelerator.init_device,
-            weights_path=args.model.model_path,
-            should_skip_hf_weight_load=skip_hf_weight_load,
-            enable_reshard_after_forward=args.model.accelerator.fsdp_config.reshard_after_forward,
-            mixed_precision=args.model.accelerator.fsdp_config.mixed_precision,
-            enable_gradient_checkpointing=args.model.accelerator.gradient_checkpointing.enable,
-            basic_modules=list(
-                set(getattr(self.model, "_no_split_modules", None) or []) | set(args.model.basic_modules)
-            ),
-            enable_reentrant=args.model.accelerator.gradient_checkpointing.enable_reentrant,
-            early_stop=args.model.accelerator.gradient_checkpointing.early_stop,
-            enable_forward_prefetch=args.model.accelerator.fsdp_config.forward_prefetch,
-            enable_fsdp_offload=args.model.accelerator.fsdp_config.offload,
-            fsdp_offload_pin_memory=args.model.accelerator.fsdp_config.offload_pin_memory,
-            broadcast_model_weights_from_rank0=args.model.broadcast_model_weights_from_rank0,
-            ep_sharded_stream_load=args.model.ep_sharded_stream_load,
-            max_load_broadcast_size=args.model.accelerator.fsdp_config.max_load_broadcast_size,
-            muon_expert_zero_comm=muon_expert_zero_comm,
-            compile_config=CompileConfig(
-                **{
-                    field.name: getattr(args.model.accelerator.torch_compile, field.name)
-                    for field in fields(CompileConfig)
-                }
-            ),
-            **kwargs,
-        )
-        self.model.train()
-
-    def _build_optimizer(self):
-        args: VeOmniArguments = self.args
-        # Build optimizer
-        self.optimizer = build_optimizer(
-            self.model,
-            lr=args.model.optimizer.lr,
-            betas=args.model.optimizer.betas,
-            weight_decay=args.model.optimizer.weight_decay,
-            fused=True,
-            optimizer_type=args.model.optimizer.type,
-            no_decay_modules=args.model.optimizer.no_decay_modules,
-            no_decay_params=args.model.optimizer.no_decay_params,
-            optimizer_config=args.model.optimizer,
-        )
-
-    def _build_lr_scheduler(self):
-        args: VeOmniArguments = self.args
-        # Build lr scheduler
-        self.lr_scheduler = build_lr_scheduler(
-            self.optimizer,
-            train_steps=args.train_steps * args.train.num_train_epochs,
-            lr=args.model.optimizer.lr,
-            lr_min=args.model.optimizer.lr_min,
-            lr_decay_style=args.model.optimizer.lr_decay_style,
-            lr_decay_ratio=args.model.optimizer.lr_decay_ratio,
-            lr_warmup_ratio=args.model.optimizer.lr_warmup_ratio,
-            lr_start=args.model.optimizer.lr_start,
-        )
-
     def _build_training_context(self):
         """Build training context for distributed training."""
         offload_config = _resolve_offload_config(self.args)
@@ -636,39 +471,38 @@ class BaseTrainer(Stateful, ABC):
             offload_config.activation_gpu_limit,
         )
 
-    def _init_callbacks(self):
-        """Initialize callbacks."""
-        self.checkpoint = ModelCheckpointManager(self)
-        self.environ_meter_callback = EnvironMeterCallback(self)
-        self.tqdm_callback = TqdmCallback(self)
-        self.wandb_callback = WandbTraceCallback(self)
-        self.profile_callback = ProfileTraceCallback(self)
-        self.checkpoint_callback = CheckpointCallback(self)
-        self.global_state_callback = GlobalStateCallback(self)
-        self.evaluate_callback = EvaluateCallback(self)
-        self.moe_monitor_callback = MoERouterMonitorCallback(self)
-        self.channel_loss_callback = ChannelLossCallback(self)
+    def _init_callbacks(self, trainer=None):
+        """Initialize callbacks. ``trainer`` is who they bind to; defaults to ``self``."""
+        trainer = self if trainer is None else trainer
+        self.environ_meter_callback = EnvironMeterCallback(trainer)
+        self.tqdm_callback = TqdmCallback(trainer)
+        self.wandb_callback = WandbTraceCallback(trainer)
+        self.profile_callback = ProfileTraceCallback(trainer)
+        self.checkpoint_callback = CheckpointCallback(trainer)
+        self.global_state_callback = GlobalStateCallback(trainer)
+        self.evaluate_callback = EvaluateCallback(trainer)
+        self.moe_monitor_callback = MoERouterMonitorCallback(trainer)
+        self.channel_loss_callback = ChannelLossCallback(trainer)
         # Ordered dispatch list. Callbacks own their ParallelState explicitly:
         # each captured it at construction (``Callback.parallel_state``), and
         # ChannelLossComputer receives that same cached state. Shared objects
-        # (EnvironMeter) are handed the state directly. The checkpoint manager
-        # caches ParallelState at construction the same way, so save/load do
-        # not depend on ambient.
+        # (EnvironMeter, DCP checkpointer) are handed the state directly, so
+        # no ambient ``use_parallel_state`` scope is needed around hook dispatch.
         #
         # ``channel_loss_callback`` is ordered after the meter (which resets
         # ``step_*_metrics`` in ``on_step_end``) and before ``wandb`` (which
         # logs them), so its per-source metrics survive into the logged payload.
-        #
-        # Weights first, then the cursor: at resume the DCP load frees its
-        # materialization buffers before the dataloader prefetches, and at
-        # save a crash between the two leaves weights whose trainer state is
-        # merely absent, which resumes with a warning.
         self._callbacks = [
             self.environ_meter_callback,
             self.tqdm_callback,
             self.channel_loss_callback,
             self.wandb_callback,
             self.profile_callback,
+            # Weights first, then the cursor: at resume the DCP load frees its
+            # materialization buffers before the dataloader prefetches, and at
+            # save a crash between the two leaves weights whose trainer state is
+            # merely absent, which resumes with a warning. Assets + DCP + HF
+            # share CheckpointCallback so the sidecar export runs before load.
             self.checkpoint_callback,
             self.global_state_callback,
             self.evaluate_callback,
@@ -677,24 +511,23 @@ class BaseTrainer(Stateful, ABC):
         self.state = TrainerState()
 
     def load(self) -> None:
-        """Resume this job's model weights and optimizer."""
-        self.checkpoint.load()
+        """Resume this job's model.
+
+        The fan-out is the point: a trainer holding a second model (a DPO
+        reference, a distillation teacher) extends this to load both, and the
+        callback that triggers it keeps knowing only *when*. Extra state is
+        restored inside the checkpoint manager; job cursor lives on
+        ``GlobalStateCallback``.
+        """
+        self.model.load()
 
     def save_dcp(self, state: TrainerState) -> None:
         """Write this job's resumable checkpoint for ``state.global_step``."""
-        self.checkpoint.save_dcp(state)
+        self.model.save_dcp(state)
 
     def save_hf_or_lora(self, state: TrainerState, stage: str = "step_end") -> None:
         """Export this job's weights in whichever format the model was trained in."""
-        self.checkpoint.save_hf_or_lora(state, stage=stage)
-
-    def save_model_assets(self) -> None:
-        from ..models.module_utils import save_model_assets as _save_model_assets
-
-        args: VeOmniArguments = self.args
-        if args.train.global_rank == 0:
-            _save_model_assets(args.train.checkpoint.model_assets_dir, self.model_assets)
-        dist.barrier()
+        self.model.save_hf_or_lora(state, stage=stage)
 
     def on_train_begin(self):
         for callback in self._callbacks:
@@ -827,30 +660,32 @@ class BaseTrainer(Stateful, ABC):
             del micro_batch
             return loss, loss_dict, aux_metrics
 
-    def model_reshard(self, micro_step: int, num_micro_steps: int):
+    def model_reshard(self, micro_step: int, num_micro_steps: int, model=None):
         """Reshard model after backward pass."""
         args: VeOmniArguments = self.args
+        model = self.model if model is None else model
         if (
             args.model.accelerator.fsdp_config.fsdp_mode == "fsdp2"
             and not args.model.accelerator.fsdp_config.reshard_after_backward
             and num_micro_steps > 1
         ):
             if micro_step == 0:
-                self.model.set_reshard_after_backward(False)
+                model.set_reshard_after_backward(False)
             elif micro_step == num_micro_steps - 1:
-                self.model.set_reshard_after_backward(True)
+                model.set_reshard_after_backward(True)
 
-    def _configure_hsdp_allreduce(self, micro_step: int, num_micro_steps: int):
+    def _configure_hsdp_allreduce(self, micro_step: int, num_micro_steps: int, model=None):
         args: VeOmniArguments = self.args
+        model = self.model if model is None else model
         if (
             args.model.accelerator.fsdp_config.fsdp_mode == "fsdp2"
             and args.model.accelerator.dp_replicate_size > 1
             and num_micro_steps > 1
         ):
             if micro_step == 0:
-                self.model.set_requires_all_reduce(False)
+                model.set_requires_all_reduce(False)
             elif micro_step == num_micro_steps - 1:
-                self.model.set_requires_all_reduce(True)
+                model.set_requires_all_reduce(True)
 
     def _reset_async_activation_offload_if_enabled(self):
         if _resolve_offload_config(self.args).enable_async_activation:
@@ -864,7 +699,6 @@ class BaseTrainer(Stateful, ABC):
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
-        args = self.args
         self.state.global_step += 1
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
@@ -901,14 +735,13 @@ class BaseTrainer(Stateful, ABC):
             for k, v in aux_metrics.items():
                 total_aux_metrics[k] += v.item()
 
-        # Gradient clipping (reads FSDP/EP groups from current ParallelState)
-        with use_parallel_state("base"):
-            grad_norm = veomni_clip_grad_norm(self.model, args.model.optimizer.max_grad_norm)
+        # Gradient clipping (reads FSDP/EP groups from this model's ParallelState)
+        grad_norm = self.model.clip_grad_norm()
 
         # Optimizer and scheduler step
-        self.optimizer.step()
-        self.lr_scheduler.step()
-        self.optimizer.zero_grad()
+        self.model.optimizer.step()
+        self.model.lr_scheduler.step()
+        self.model.optimizer.zero_grad()
 
         self.on_step_end(
             loss=total_loss,
@@ -916,25 +749,6 @@ class BaseTrainer(Stateful, ABC):
             grad_norm=grad_norm,
             aux_metrics=mean_aux_metrics(total_aux_metrics, num_micro_steps),
         )
-
-    def destroy_distributed(self):
-        if not dist.is_available() or not dist.is_initialized():
-            return
-
-        backend = dist.get_backend()
-        helper.empty_cache()
-        dist.barrier()
-
-        if is_nccl_backend(backend) and os.getenv("VEOMNI_DESTROY_NCCL_ON_EXIT", "0") != "1":
-            logger.info_rank0(
-                "Skipping explicit NCCL process-group destroy on normal trainer exit. "
-                "Set VEOMNI_DESTROY_NCCL_ON_EXIT=1 to restore the previous teardown behavior."
-            )
-            return
-
-        synchronize()
-        dist.destroy_process_group()
-        clear_parallel_state()
 
     def train(self):
         args: VeOmniArguments = self.args

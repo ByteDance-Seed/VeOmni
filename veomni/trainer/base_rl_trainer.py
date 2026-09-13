@@ -45,7 +45,6 @@ class BaseRLTrainer(BaseTrainer):
         with use_parallel_state("base"):
             self._build_preforward_postforward()
 
-    # post init preforward and postforward hooks
     def _build_preforward_postforward(self):
         """Build preforward and postforward hooks."""
         self.pre_forward = Preforward()

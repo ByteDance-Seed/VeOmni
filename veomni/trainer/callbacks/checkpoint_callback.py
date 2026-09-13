@@ -16,15 +16,16 @@
 
 This owns the every-N-steps / epochs cadence and the one-shot sidecar export.
 *What* is written is :meth:`BaseTrainer.save_dcp` /
-:meth:`~BaseTrainer.save_hf_or_lora` / :meth:`~BaseTrainer.load` /
-:meth:`~BaseTrainer.save_model_assets`. *How* belongs to
+:meth:`~BaseTrainer.save_hf_or_lora` / :meth:`~BaseTrainer.load`, which fan
+out to the model handles, plus :meth:`VeOmniModelRuntime.save_model_assets`.
+*How* belongs to each model's
 :class:`~veomni.models.checkpoint_manager.ModelCheckpointManager`.
 
 DCP and HF/LoRA share this callback because they share a manager; each format
 still has its own cadence knobs and its own last-saved step so a DCP write
 does not suppress an HF export or the reverse.
 
-Job-level state — where the dataloader is, the rng, the meters — is not written
+Job-level global_state — where the dataloader is, the rng, the meters — is not written
 here. It has its own schedule and its own files, in
 :mod:`~veomni.trainer.callbacks.global_state_callback`.
 """
@@ -58,12 +59,12 @@ class CheckpointCallback(Callback):
         self._last_hf_step: int = -1
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
-        self.trainer.save_model_assets()
+        self.trainer.model.save_model_assets()
         self.trainer.load()
         helper.empty_cache()
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
-        self.trainer.checkpoint.wait_for_pending_save()
+        self.trainer.model.checkpoint.wait_for_pending_save()
         if self.save_hf_weights:
             if state.global_step != self._last_hf_step:
                 self._save_hf(state, stage="train_end")

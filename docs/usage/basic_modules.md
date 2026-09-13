@@ -65,10 +65,10 @@ class Arguments(VeOmniArguments):
 
 ## Parallel State
 VeOmni uses PyTorch DeviceMesh to manage multidimensional parallel topologies.
-`init_parallel_state_from_config` registers a state under a logical name from
-an `AcceleratorConfig`, while `use_parallel_state` scopes operations that need
-to resolve the current process groups. See
-[Local Parallel State Registry and Scoping](../design/local_parallel_state.md)
+`init_parallel_state_from_config` registers a state under a logical name,
+while `use_parallel_state` scopes operations that need to resolve the current
+process groups. The topology comes straight off `model.accelerator`, so no call
+site restates it. See [Local Parallel State Registry and Scoping](../design/local_parallel_state.md)
 for the registry, topology-cache, and teardown rules.
 
 More details about torch device mesh, you can refer to the [Getting Started with DeviceMesh](https://pytorch.org/tutorials/recipes/distributed_device_mesh.html).
@@ -83,6 +83,8 @@ from veomni.distributed.parallel_state import (
     use_parallel_state,
 )
 
+# Reads dp / tp / pp / cp / ulysses / extra-parallel sizes, the FSDP mode and
+# async ulysses off the config; see `model.accelerator.*` for each knob.
 init_parallel_state_from_config(args.model.accelerator, name="base")
 
 parallel_state = get_parallel_state()
@@ -211,7 +213,7 @@ transform = build_data_transform(
 )
 ```
 
-**SFT Example**:  
+**SFT Example**: (building the template by hand — inside a trainer you read `self.model.chat_template`, which the model runtime already built; see [Chat Template](#chat-template))
 ```python
 from veomni.data import build_data_transform
 from veomni.data.chat_template import build_chat_template
@@ -259,6 +261,9 @@ Multimodal dataset transform follows the similar pipeline:
 
 ### Chat Template
 VeOmni default supports several chat templates, text-only and multimodal alike, all registered in [veomni/data/chat_template.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/chat_template.py) and built by name through the single `build_chat_template` entrypoint.
+
+In a training job you do not call it yourself: the model runtime builds the template named by `data.chat_template` right after it loads the preprocessor, and exposes it as `model.chat_template` for the data transform to read. Leave `chat_template` unset when the job needs none — plaintext and diffusion data carry no conversation to lay out, and a Qwen-Omni model formats prompts through its processor's own template.
+
 You can add your custom chat template by implementing the `ChatTemplate` class — or `MultimodalChatTemplate` if it needs the per-modality token counts. A `ChatTemplate` is built from a tokenizer; a `MultimodalChatTemplate` is built from the processor instead, since laying out placeholders also needs the grid parameters the processor used.
 **Custom Template Implementation**:  
 ```python
@@ -268,10 +273,9 @@ class CustomTemplate(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         # Implement encoding logic
         pass
-
-    def get_jinja_template(self) -> str:
-        return ""  # Jinja template string
 ```
+
+`encode_messages` is the only method you have to write: training lays out tokens through it, including the assistant-only label mask that jinja cannot express. `get_jinja_template` is optional and read by nothing in the training or export path — an exported checkpoint keeps whatever chat template it shipped with, so selecting a template here never rewrites it.
 
 
 ## DataLoader
@@ -543,7 +547,7 @@ lr_scheduler = build_lr_scheduler(
 
 
 ## Train Loop
-After the parallel_state, model, optimizer, and dataloader are initialized, you can start the training loop.
+After the parallel_state, model, optimizer, and dataloader are initialized, you can start the training loop. The supported path is [`BaseTrainer`](./trainer.md), which owns this loop and reads optimizer / clip / preprocessor off `trainer.model` (`VeOmniModelRuntime`). The snippet below is the same shape, written out by hand:
 
 ```python
 for epoch in range(args.train.num_train_epochs):

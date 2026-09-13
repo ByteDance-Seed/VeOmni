@@ -494,14 +494,14 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
                     baseline_output,
                     rtol=3e-2,
                     atol=3e-2,
-                    msg=lambda message, dtype=dtype, mask_case=mask_case: (f"{dtype=} {mask_case=} output: {message}"),
+                    msg=lambda message, dtype=dtype, mask_case=mask_case: f"{dtype=} {mask_case=} output: {message}",
                 )
                 torch.testing.assert_close(
                     sync_tensor(local_lse, dim=2),
                     baseline_lse,
                     rtol=3e-2,
                     atol=3e-2,
-                    msg=lambda message, dtype=dtype, mask_case=mask_case: (f"{dtype=} {mask_case=} LSE: {message}"),
+                    msg=lambda message, dtype=dtype, mask_case=mask_case: f"{dtype=} {mask_case=} LSE: {message}",
                 )
 
                 baseline_output.backward(output_gradient)

@@ -20,9 +20,9 @@ emit, then validates both resume paths bit-exact (modulo bf16 storage):
 
     1. Writer subprocess
        - DCP shards under ``<output_dir>/checkpoints/global_step_<S>/``
-         (model + optimizer + extra_state -- the format ``BaseTrainer``
+         (model + optimizer + lr_scheduler -- the format ``BaseTrainer``
          resumes via ``train.checkpoint.load_path``).
-       - HF-format LoRA adapter under ``<output_dir>/global_step_<S>/``
+       - HF-format LoRA adapter in the same directory
          (``adapter_model.safetensors`` + ``adapter_config.json``; the MoE mode +
          rank/alpha VeOmni's wrappers need to re-install themselves on resume
          live in the ``veomni_lora`` block of ``adapter_config.json``) -- the
@@ -82,7 +82,6 @@ import yaml
 
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dummy_dataset
-from veomni.models.checkpoint_manager import ModelCheckpointManager
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
@@ -286,7 +285,6 @@ class MoeLoraTrainer(BaseTrainer):
         self.train_steps = args.train_steps
 
     def _init_callbacks(self) -> None:
-        self.checkpoint = ModelCheckpointManager(self)
         self.environ_meter_callback = _EnvironMeterCallbackTest(self)
         # CheckpointCallback drives DCP save+load and the HF LoRA export; the
         # ``train.checkpoint.load_path`` resume case in the resume test
@@ -587,7 +585,7 @@ def _writer_adapter_path(writer_dir: str, save_step: int = 4) -> str:
     Uses the *final* step's adapter so the resumer's pre-snapshot can be
     compared directly against the writer's post-snapshot.
     """
-    return os.path.join(writer_dir, f"global_step_{save_step}")
+    return os.path.join(writer_dir, "checkpoints", f"global_step_{save_step}")
 
 
 def _assert_writer_artifacts_exist(writer_dir: str, mode: str, *, final_step: int = 4) -> None:
