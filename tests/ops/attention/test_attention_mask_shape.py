@@ -265,6 +265,7 @@ def test_magi_causal_aligns_with_hf_builder(impl):
 
 @pytest.mark.parametrize("impl", ("magi_attention", "veomni_magi_attention"))
 def test_magi_cached_causal_uses_bottom_right_alignment(impl):
+    built = magi_attention_mask_builder(1, 2, 4, q_offset=2, device="cpu")
     shaped = causal_mask(2, 4, impl=impl, device="cpu")
     expected = torch.tensor(
         [
@@ -272,6 +273,7 @@ def test_magi_cached_causal_uses_bottom_right_alignment(impl):
             [True, True, True, True],
         ]
     )
+    torch.testing.assert_close(materialize_magi_mask(shaped, 2, 4), materialize_magi_mask(built, 2, 4))
     torch.testing.assert_close(materialize_magi_mask(shaped, 2, 4)[0, 0], expected)
 
 

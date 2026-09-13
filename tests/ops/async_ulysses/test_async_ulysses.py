@@ -29,6 +29,7 @@ from torch import Tensor
 
 from veomni.ops import VeomniOp
 from veomni.ops.registry import OpEntry, SavedState
+from veomni.utils.device import IS_CUDA_AVAILABLE
 
 
 _EAGER_ROWS = (
@@ -160,7 +161,7 @@ def test_standard_qkv_rejects_nondivisible_kv_heads(monkeypatch: pytest.MonkeyPa
         ValueError,
         match=r"num_key_value_heads \(6\) must be divisible by ulysses_size \(4\)",
     ):
-        module.forward(
+        VeomniOp("async_ulysses_qkv", "standard")(
             hidden_states,
             *weights,
             None,
@@ -225,6 +226,48 @@ def test_standard_qkv_matches_sequential(monkeypatch: pytest.MonkeyPatch, norm_t
         torch.testing.assert_close(actual.grad, expected.grad)
 
 
+def test_standard_qkv_repeated_kv_heads_matches_sequential(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise repeated-KV reduction through the public compound op."""
+    _mock_identity_comm(monkeypatch)
+    module = _eager_module("async_ulysses_qkv", "standard")
+    monkeypatch.setattr(module, "get_ulysses_sequence_parallel_world_size", lambda: 4)
+    torch.manual_seed(6105)
+    batch, seq, hidden, head_dim = 2, 3, 20, 5
+    inputs = (
+        torch.randn(batch, seq, hidden, dtype=torch.float64, requires_grad=True),
+        *_qkv_weights(hidden, 4 * head_dim, 2 * head_dim),
+    )
+    actual_inputs = _leaf(*inputs)
+    expected_inputs = _leaf(*inputs)
+
+    actual = VeomniOp("async_ulysses_qkv", "standard")(
+        *actual_inputs,
+        None,
+        None,
+        None,
+        None,
+        seq_dimension=1,
+        head_dimension=2,
+        unpadded_dim_size=seq,
+        head_dim=head_dim,
+        group=object(),
+    )
+    hidden_e, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias = expected_inputs
+    expected = (
+        F.linear(hidden_e, q_weight, q_bias).view(batch, seq, 4, head_dim),
+        F.linear(hidden_e, k_weight, k_bias).view(batch, seq, 2, head_dim).repeat_interleave(2, dim=2),
+        F.linear(hidden_e, v_weight, v_bias).view(batch, seq, 2, head_dim).repeat_interleave(2, dim=2),
+    )
+    for actual_output, expected_output in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_output, expected_output)
+
+    grad_outputs = tuple(torch.randn_like(output) for output in actual)
+    torch.autograd.backward(actual, grad_outputs)
+    torch.autograd.backward(expected, grad_outputs)
+    for actual_input, expected_input in zip(actual_inputs, expected_inputs, strict=True):
+        torch.testing.assert_close(actual_input.grad, expected_input.grad)
+
+
 @pytest.mark.parametrize("norm_type", [None, "rmsnorm"])
 def test_dit_qkv_matches_sequential(monkeypatch: pytest.MonkeyPatch, norm_type: str | None) -> None:
     _mock_identity_comm(monkeypatch)
@@ -270,6 +313,107 @@ def test_dit_qkv_matches_sequential(monkeypatch: pytest.MonkeyPatch, norm_type: 
     (seq_q.sum() + seq_k.sum() + seq_v.sum()).backward()
     for actual, expected in zip(kernel_in + kernel_norms, seq_in + seq_norms, strict=True):
         torch.testing.assert_close(actual.grad, expected.grad)
+
+
+@pytest.mark.parametrize("variant", ("standard", "dit"))
+def test_qkv_empty_sequence_matches_sequential(monkeypatch: pytest.MonkeyPatch, variant: str) -> None:
+    _mock_identity_comm(monkeypatch)
+    batch, seq, hidden, head_dim = 2, 0, 20, 5
+    key_value_size = 10 if variant == "standard" else hidden
+    inputs = (
+        torch.empty(batch, seq, hidden, dtype=torch.float64, requires_grad=True),
+        *_qkv_weights(hidden, hidden, key_value_size),
+    )
+    actual_inputs = _leaf(*inputs)
+    expected_inputs = _leaf(*inputs)
+
+    actual = VeomniOp("async_ulysses_qkv", variant)(
+        *actual_inputs,
+        None,
+        None,
+        None,
+        None,
+        seq_dimension=1,
+        head_dimension=2,
+        unpadded_dim_size=seq,
+        head_dim=head_dim,
+        group=object(),
+    )
+    hidden_e, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias = expected_inputs
+    expected = (
+        F.linear(hidden_e, q_weight, q_bias),
+        F.linear(hidden_e, k_weight, k_bias),
+        F.linear(hidden_e, v_weight, v_bias),
+    )
+    if variant == "standard":
+        expected = (
+            expected[0].reshape(batch, seq, hidden // head_dim, head_dim),
+            expected[1].reshape(batch, seq, key_value_size // head_dim, head_dim),
+            expected[2].reshape(batch, seq, key_value_size // head_dim, head_dim),
+        )
+    for actual_output, expected_output in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_output, expected_output)
+
+    sum(output.sum() for output in actual).backward()
+    sum(output.sum() for output in expected).backward()
+    for actual_input, expected_input in zip(actual_inputs, expected_inputs, strict=True):
+        torch.testing.assert_close(actual_input.grad, expected_input.grad)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="async Ulysses LayerNorm backward requires CUDA")
+@pytest.mark.parametrize("variant", ("standard", "dit"))
+def test_qkv_layer_norm_matches_sequential(monkeypatch: pytest.MonkeyPatch, variant: str) -> None:
+    pytest.importorskip("fused_layer_norm_cuda")
+    _mock_identity_comm(monkeypatch)
+    torch.manual_seed(6106)
+    batch, seq, hidden, head_dim = 2, 3, 16, 4
+    norm_size = head_dim if variant == "standard" else hidden
+    weights = tuple(tensor.to("cuda") for tensor in _qkv_weights(hidden, hidden, hidden, dtype=torch.float32))
+    inputs = (
+        torch.randn(batch, seq, hidden, device="cuda", dtype=torch.float32),
+        *weights,
+        torch.randn(norm_size, device="cuda"),
+        torch.randn(norm_size, device="cuda"),
+        torch.randn(norm_size, device="cuda"),
+        torch.randn(norm_size, device="cuda"),
+    )
+    actual_inputs = [tensor.detach().clone().requires_grad_(True) for tensor in inputs]
+    expected_inputs = [tensor.detach().clone().requires_grad_(True) for tensor in inputs]
+
+    actual = VeomniOp("async_ulysses_qkv", variant)(
+        *actual_inputs[:7],
+        *actual_inputs[7:],
+        seq_dimension=1,
+        head_dimension=2,
+        unpadded_dim_size=seq,
+        head_dim=head_dim,
+        group=object(),
+        norm_type="layernorm",
+        normalized_shape=norm_size,
+        eps=1e-5,
+    )
+    hidden_e, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias = expected_inputs[:7]
+    norm_q_weight, norm_q_bias, norm_k_weight, norm_k_bias = expected_inputs[7:]
+    query = F.linear(hidden_e, q_weight, q_bias)
+    key = F.linear(hidden_e, k_weight, k_bias)
+    value = F.linear(hidden_e, v_weight, v_bias)
+    if variant == "standard":
+        query = query.reshape(batch, seq, hidden // head_dim, head_dim)
+        key = key.reshape(batch, seq, hidden // head_dim, head_dim)
+        value = value.reshape(batch, seq, hidden // head_dim, head_dim)
+    expected = (
+        F.layer_norm(query, (norm_size,), norm_q_weight, norm_q_bias, 1e-5),
+        F.layer_norm(key, (norm_size,), norm_k_weight, norm_k_bias, 1e-5),
+        value,
+    )
+    for actual_output, expected_output in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_output, expected_output, atol=2e-6, rtol=2e-5)
+
+    grad_outputs = tuple(torch.randn_like(output) for output in actual)
+    torch.autograd.backward(actual, grad_outputs)
+    torch.autograd.backward(expected, grad_outputs)
+    for actual_input, expected_input in zip(actual_inputs, expected_inputs, strict=True):
+        torch.testing.assert_close(actual_input.grad, expected_input.grad, atol=2e-6, rtol=2e-5)
 
 
 def test_standard_o_matches_sequential(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -326,6 +470,40 @@ def test_dit_o_matches_sequential(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.testing.assert_close(k_hidden.grad, s_hidden.grad)
     torch.testing.assert_close(k_weight.grad, s_weight.grad)
     torch.testing.assert_close(k_bias.grad, s_bias.grad)
+
+
+@pytest.mark.parametrize("variant", ("standard", "dit"))
+def test_output_projection_empty_sequence_matches_sequential(
+    monkeypatch: pytest.MonkeyPatch,
+    variant: str,
+) -> None:
+    _mock_identity_comm(monkeypatch)
+    batch, seq, hidden, out_dim = 2, 0, 20, 7
+    hidden_states = (
+        torch.empty(batch, seq, 4, 5, dtype=torch.float64)
+        if variant == "standard"
+        else torch.empty(batch, seq, hidden, dtype=torch.float64)
+    )
+    weight = torch.randn(out_dim, hidden, dtype=torch.float64)
+    bias = torch.randn(out_dim, dtype=torch.float64)
+    actual_inputs = [tensor.detach().clone().requires_grad_(True) for tensor in (hidden_states, weight, bias)]
+    expected_inputs = [tensor.detach().clone().requires_grad_(True) for tensor in (hidden_states, weight, bias)]
+
+    actual = VeomniOp("async_ulysses_o", variant)(
+        *actual_inputs,
+        seq_dimension=1,
+        head_dimension=2,
+        unpadded_dim_size=seq,
+        group=object(),
+    )
+    hidden_e = expected_inputs[0].flatten(start_dim=2) if variant == "standard" else expected_inputs[0]
+    expected = F.linear(hidden_e, expected_inputs[1], expected_inputs[2])
+    torch.testing.assert_close(actual, expected)
+
+    actual.sum().backward()
+    expected.sum().backward()
+    for actual_input, expected_input in zip(actual_inputs, expected_inputs, strict=True):
+        torch.testing.assert_close(actual_input.grad, expected_input.grad)
 
 
 def test_output_projection_weight_bias_grad_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -404,14 +582,11 @@ def test_qkv_projection_bias_grad_when_weights_frozen(monkeypatch: pytest.Monkey
 
 def test_nested_rms_handle_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
     _mock_identity_comm(monkeypatch)
-    seen: list[str] = []
 
     def dummy_forward(hidden: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
-        seen.append("fwd")
         return hidden * 2, SavedState((hidden, weight), eps)
 
     def dummy_backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...]:
-        seen.append("bwd")
         return grad_output * 2, None
 
     dummy = OpEntry(
@@ -422,18 +597,14 @@ def test_nested_rms_handle_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
         forward=dummy_forward,
         backward=dummy_backward,
     )
-    hidden = torch.randn(2, 3, 16, requires_grad=True)
-    q_weight, q_bias, k_weight, k_bias, v_weight, v_bias = _qkv_weights(16, 16, 16, dtype=torch.float32)
+    hidden = torch.randn(2, 3, 16)
+    weights = _qkv_weights(16, 16, 16, dtype=torch.float32)
+    actual_inputs = [tensor.detach().clone().requires_grad_(True) for tensor in (hidden, *weights)]
+    expected_inputs = [tensor.detach().clone().requires_grad_(True) for tensor in (hidden, *weights)]
     norm_q = torch.ones(16)
     norm_k = torch.ones(16)
-    query, key, value = VeomniOp("async_ulysses_qkv", "dit")(
-        hidden,
-        q_weight,
-        q_bias,
-        k_weight,
-        k_bias,
-        v_weight,
-        v_bias,
+    actual = VeomniOp("async_ulysses_qkv", "dit")(
+        *actual_inputs,
         norm_q,
         None,
         norm_k,
@@ -447,5 +618,17 @@ def test_nested_rms_handle_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
         eps=1e-6,
         rms_norm=dummy,
     )
-    (query + key + value).sum().backward()
-    assert seen == ["fwd", "fwd", "bwd", "bwd"]
+    hidden_e, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias = expected_inputs
+    expected = (
+        F.linear(hidden_e, q_weight, q_bias) * 2,
+        F.linear(hidden_e, k_weight, k_bias) * 2,
+        F.linear(hidden_e, v_weight, v_bias),
+    )
+    for actual_output, expected_output in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_output, expected_output)
+
+    grad_outputs = tuple(torch.randn_like(output) for output in actual)
+    torch.autograd.backward(actual, grad_outputs)
+    torch.autograd.backward(expected, grad_outputs)
+    for actual_input, expected_input in zip(actual_inputs, expected_inputs, strict=True):
+        torch.testing.assert_close(actual_input.grad, expected_input.grad)

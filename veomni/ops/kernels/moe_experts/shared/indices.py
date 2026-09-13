@@ -37,7 +37,15 @@ def build_moe_indices(expert_index: torch.Tensor, num_experts: int):
     sorted_order, scatter_index = compute_expert_scatter_index(expert_index)
     A_idx = (sorted_order // topk).int()
 
-    splits = torch.bincount(expert_index.reshape(-1), minlength=num_experts)
+    if expert_index.is_cuda:
+        if expert_index.numel() == 0:
+            splits = torch.zeros(num_experts, dtype=torch.int32, device=expert_index.device)
+        else:
+            from .dispatch import expert_histogram
+
+            splits = expert_histogram(expert_index, num_experts)
+    else:
+        splits = torch.bincount(expert_index.reshape(-1), minlength=num_experts)
     cu_seqlens_m = torch.zeros(num_experts + 1, dtype=torch.int32, device=expert_index.device)
     cu_seqlens_m[1:] = torch.cumsum(splits, dim=0).int()
 

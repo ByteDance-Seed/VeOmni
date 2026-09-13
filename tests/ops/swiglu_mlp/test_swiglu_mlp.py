@@ -260,18 +260,54 @@ def test_liger_matches_eager(hidden: int, intermediate: int, swiglu_limit: float
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger SwiGLU needs a GPU")
-def test_liger_swiglu_limit_keeps_fused_activation_in_fp32():
-    """Keep the clamped tensors in FP32 until fused SiLU-mul completes."""
+def test_liger_swiglu_limit_matches_fp32_activation_contract():
+    """Catch BF16 rounding between the clamp and fused SiLU multiplication."""
     pytest.importorskip("liger_kernel")
-    torch.manual_seed(3)
-    mlp = _tiny_qwen3_mlp().to(device="cuda", dtype=torch.bfloat16)
-    x = torch.randn(2, 16, mlp.hidden_size, device="cuda", dtype=torch.bfloat16)
-    entry = resolve_op("swiglu_mlp", "standard", "liger_kernel")
-    assert entry.forward is not None
+    hidden, intermediate = 64, 128
+    x = torch.zeros(2, 16, hidden, device="cuda", dtype=torch.bfloat16)
+    x[..., 0] = 1
+    gate_w = torch.zeros(intermediate, hidden, device="cuda", dtype=torch.bfloat16)
+    up_w = torch.zeros_like(gate_w)
+    gate_w[:, 0] = -0.5
+    up_w[:, 0] = 0.9921875
+    down_w = torch.zeros(hidden, intermediate, device="cuda", dtype=torch.bfloat16)
+    down_w[:, :hidden] = torch.eye(hidden, device="cuda", dtype=torch.bfloat16)
+    tensors = (x, gate_w, up_w, down_w)
 
-    output, saved = entry.forward(*_mlp_args(mlp, x), swiglu_limit=1.0)
-    saved_gate, saved_up = saved.tensors[-2:]
+    eager_args = [tensor.detach().clone().requires_grad_(True) for tensor in tensors]
+    liger_args = [tensor.detach().clone().requires_grad_(True) for tensor in tensors]
+    empty = x.new_empty(0)
+    eager = resolve_op("swiglu_mlp", "standard", "eager").wrapper
+    liger = resolve_op("swiglu_mlp", "standard", "liger_kernel").wrapper
+    output_eager = eager(
+        eager_args[0],
+        eager_args[1],
+        empty,
+        eager_args[2],
+        empty,
+        eager_args[3],
+        empty,
+        swiglu_limit=1.0,
+    )
+    output_liger = liger(
+        liger_args[0],
+        liger_args[1],
+        empty,
+        liger_args[2],
+        empty,
+        liger_args[3],
+        empty,
+        swiglu_limit=1.0,
+    )
 
-    assert output.dtype == torch.bfloat16
-    assert saved_gate.dtype == torch.float32
-    assert saved_up.dtype == torch.float32
+    torch.testing.assert_close(output_liger, output_eager, rtol=0, atol=5e-4)
+    grad_output = torch.randn_like(output_eager)
+    output_eager.backward(grad_output)
+    output_liger.backward(grad_output)
+    for actual, expected in zip(liger_args, eager_args, strict=True):
+        torch.testing.assert_close(
+            actual.grad,
+            expected.grad,
+            atol=SWIGLU_FUSED_GRAD_ATOL,
+            rtol=SWIGLU_FUSED_GRAD_RTOL,
+        )
