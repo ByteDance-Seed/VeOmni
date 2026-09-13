@@ -166,6 +166,9 @@ jobs:
           uv run --frozen pytest -v -s -x tests/trainer/test_aux_metrics.py
           uv run --frozen pytest -v -s -x tests/lora/test_vlm_lora.py
           uv run --frozen pytest -v -s -x tests/models/test_checkpoint_tensor_converter.py
+      - name: Run SeedOmni V2 unit tests
+        run: |
+          uv run --frozen pytest -v -s -x tests/seed_omni/
       - name: Run fsdp2/extra_parallel+fsdp2 (e.g. ep+fsdp2, mb+fsdp2, ep+emb+fsdp2) clip grad norm test
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
