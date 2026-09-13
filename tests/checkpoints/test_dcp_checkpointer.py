@@ -1,7 +1,7 @@
 """Unit tests for distributed checkpoint and resume behavior.
 
 Covers: OptimizerState (no placeholder synthesis), key normalization,
-extra-state persistence, allow_partial_load planner, skip-HF resume, and
+lr_scheduler sidecar persistence, allow_partial_load planner, skip-HF resume, and
 trainer step-counting correctness. Tests marked ``xfail`` document known
 in-tree bugs — they become regression guards once the fix lands.
 """
@@ -1064,11 +1064,6 @@ class TestNormalizeKey:
         )
 
 
-# ---------------------------------------------------------------------------
-# lr_scheduler sidecar save/load roundtrip
-# ---------------------------------------------------------------------------
-
-
 @patch("veomni.checkpoint.dcp_checkpointer.dist")
 class TestLrSchedulerSaveLoad:
     def test_roundtrip(self, mock_dist, tmp_path):
@@ -1127,6 +1122,60 @@ class TestLrSchedulerSaveLoad:
 
         DistributedCheckpointer._save_lr_scheduler(str(tmp_path), {"lr_scheduler": None})
         DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": None})
+
+    def test_missing_sidecar_raises_when_scheduler_is_expected(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        loaded = MagicMock()
+        with pytest.raises(FileNotFoundError, match="lr_scheduler sidecar"):
+            DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": loaded})
+        loaded.load_state_dict.assert_not_called()
+
+    def test_load_falls_back_to_extra_state_scheduler(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
+        mock_dist.get_rank.return_value = 0
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+        from veomni.checkpoint.legacy_v0_1_12 import extra_state_path
+
+        extra = tmp_path / "extra_state"
+        extra.mkdir()
+        torch.save({"lr_scheduler": {"last_epoch": 4}}, extra_state_path(str(tmp_path), 0))
+
+        loaded = MagicMock()
+        DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": loaded})
+        loaded.load_state_dict.assert_called_once_with({"last_epoch": 4})
+
+    def test_sidecar_wins_over_extra_state(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
+        from veomni.checkpoint.dcp_checkpointer import (
+            _LR_SCHEDULER_FILENAME,
+            DistributedCheckpointer,
+        )
+        from veomni.checkpoint.legacy_v0_1_12 import extra_state_path
+
+        torch.save({"last_epoch": 1}, tmp_path / _LR_SCHEDULER_FILENAME)
+        extra = tmp_path / "extra_state"
+        extra.mkdir()
+        torch.save({"lr_scheduler": {"last_epoch": 99}}, extra_state_path(str(tmp_path), 0))
+
+        loaded = MagicMock()
+        DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": loaded})
+        loaded.load_state_dict.assert_called_once_with({"last_epoch": 1})
+
+    def test_rank_nonzero_reads_rank0_extra_state_for_scheduler(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = True
+        mock_dist.get_rank.return_value = 3
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+        from veomni.checkpoint.legacy_v0_1_12 import extra_state_path
+
+        extra = tmp_path / "extra_state"
+        extra.mkdir()
+        torch.save({"lr_scheduler": {"last_epoch": 8}}, extra_state_path(str(tmp_path), 0))
+
+        loaded = MagicMock()
+        DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": loaded})
+        loaded.load_state_dict.assert_called_once_with({"last_epoch": 8})
 
 
 class TestPromoteStagedCheckpoint:
@@ -1619,19 +1668,19 @@ class TestStageDirValidation:
         assert (step_dir / ".metadata").read_text() == "previous"
 
     def test_unset_stage_dir_writes_straight_to_the_destination(self, tmp_path):
-        """Staging is opt-in: unset, nothing about the write changes.
+        """Staging is opt-in: unset, DCP and the sidecar write the step directory.
 
-        DCP is pointed at the destination itself, and neither the staging directory
-        nor the promotion is reached -- so no scratch disk is touched and no extra
-        collective is issued.
+        ``lr_scheduler.pt`` is written first; DCP then publishes ``.metadata``.
+        Resume treats a directory without ``.metadata`` as incomplete.
         """
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
         final = tmp_path / "ckpt"
+        dest = str(final / "global_step_10")
         with (
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,
             patch.object(DistributedCheckpointer, "_create_storage_writer") as create_writer,
-            patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
+            patch.object(DistributedCheckpointer, "_save_lr_scheduler") as save_sched,
             patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
             patch("veomni.checkpoint.dcp_checkpointer._prepare_stage_dir") as prepare,
             patch("veomni.checkpoint.dcp_checkpointer._promote_staged_checkpoint") as promote,
@@ -1643,8 +1692,10 @@ class TestStageDirValidation:
                 global_steps=10,
             )
 
-        assert create_writer.call_args.args[0] == str(final / "global_step_10")
+        assert save_sched.call_args.kwargs["checkpoint_dir"] == dest
+        assert create_writer.call_args.args[0] == dest
         assert execute_save.call_args.kwargs["storage_writer"] is create_writer.return_value
+        assert save_sched.call_count == 1
         prepare.assert_not_called()
         promote.assert_not_called()
 

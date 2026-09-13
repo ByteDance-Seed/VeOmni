@@ -572,9 +572,7 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
     over data that is only partly there.
 
     Nested files are copied in the data phase, before ``.metadata`` is
-    published. The lr_scheduler sidecar is a single replicated file
-    (``lr_scheduler.pt``); it must not be written into a still-valid
-    destination while the previous marker is up.
+    published. ``lr_scheduler.pt`` is one of those files.
     """
     metadata_name = ".metadata"
     is_node_leader = _local_rank() == 0
@@ -705,9 +703,10 @@ class DistributedCheckpointer(CheckpointerBase):
             stage_dir: write the checkpoint here and copy it to ``path`` afterwards,
                 instead of writing straight to ``path``. Intended for a destination far
                 slower than local disk. The lr_scheduler sidecar is a single
-                ``lr_scheduler.pt`` written under the staging directory and copied
-                with the shards, before ``.metadata`` is published. The caller owns
-                the choice: this does not probe
+                ``lr_scheduler.pt``, written before DCP so ``.metadata`` (DCP's
+                completion marker) is last. With staging, both land under the staging
+                directory and are copied with ``.metadata`` published last. The caller
+                owns the choice: this does not probe
                 for a usable directory or check free space, and an unusable ``stage_dir``
                 fails the save rather than silently writing elsewhere. See
                 ``CheckpointConfig.stage_dir``.
@@ -743,19 +742,19 @@ class DistributedCheckpointer(CheckpointerBase):
                 load=False,
             )
 
-        # Prepare staging before the sidecar. Writing ``lr_scheduler.pt`` into a
-        # still-valid destination would pair a new scheduler with the previous
-        # model and optimizer: ``.metadata`` stays up until promotion, and a
-        # failed staged save would leave the same mix.
+        # Sidecar first, then DCP. ``.metadata`` is DCP's completion marker, so a
+        # reader that sees it also sees ``lr_scheduler.pt``. Each step writes a
+        # new ``global_step_{N}/``; a failed save has no marker and is skipped
+        # on resume. ``stage_dir`` uses the same order on scratch, then copies
+        # with ``.metadata`` last.
         stage_path = _prepare_stage_dir(stage_dir, path) if stage_dir else None
-
-        # Sidecar first so a model/optimizer write is never missing its scheduler.
+        write_dir = stage_path or checkpoint_dir
         # Rank 0 writes the single replicated file; every rank still enters the
         # reduction so a write failure cannot leave peers inside ``dcp.save``.
-        cls._save_lr_scheduler(checkpoint_dir=stage_path or checkpoint_dir, state=state)
+        cls._save_lr_scheduler(checkpoint_dir=write_dir, state=state)
 
         if storage_writer is None:
-            storage_writer = cls._create_storage_writer(stage_path or checkpoint_dir)
+            storage_writer = cls._create_storage_writer(write_dir)
 
         try:
             cls.execute_save(
@@ -955,10 +954,21 @@ class DistributedCheckpointer(CheckpointerBase):
             return
 
         lr_scheduler_path = os.path.join(checkpoint_dir, _LR_SCHEDULER_FILENAME)
-        if not os.path.exists(lr_scheduler_path):
-            logger.warning_rank0(f"lr_scheduler sidecar not found at {lr_scheduler_path}, skipping")
+        if os.path.exists(lr_scheduler_path):
+            lr_scheduler.load_state_dict(torch.load(lr_scheduler_path, weights_only=False))
             return
-        lr_scheduler.load_state_dict(torch.load(lr_scheduler_path, weights_only=False))
+
+        # Delete this import (and veomni/checkpoint/legacy_v0_1_12.py) to drop 0.1.12 extra_state resume.
+        from .legacy_v0_1_12 import apply_legacy_lr_scheduler
+
+        if apply_legacy_lr_scheduler(checkpoint_dir, lr_scheduler):
+            return
+
+        raise FileNotFoundError(
+            f"lr_scheduler sidecar not found at {lr_scheduler_path}. "
+            "This layout writes lr_scheduler.pt next to the DCP shards "
+            "(see docs/usage/checkpoint.md)."
+        )
 
 
 def get_dtype_size(dtype: torch.dtype) -> int:

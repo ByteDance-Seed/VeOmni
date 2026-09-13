@@ -231,10 +231,11 @@ infix (PEFT convention — e.g. `lora_A.weight`), whereas the live model stores 
 `CheckpointCallback` decides *when* to save and calls `trainer.save_dcp`, which fans out to
 `trainer.model.save_dcp` and lands in `ModelCheckpointManager`
 (`veomni/models/checkpoint_manager.py`). That writes the
-full distributed state (model + optimizer + lr_scheduler) via PyTorch DCP. For LoRA training
-the DCP stores the trainable adapter parameters, optimizer state, and lr_scheduler;
-the base model is loaded separately from `model.model_path`. global_state
-(dataloader cursor, rng, meters) is written separately by `GlobalStateCallback`.
+distributed model and optimizer via PyTorch DCP, plus a replicated `lr_scheduler.pt`
+beside the shards. For LoRA training the DCP stores the trainable adapter parameters
+and optimizer state; the frozen base is reloaded from `model.model_path`.
+global_state (dataloader cursor, rng, meters) is written separately by
+`GlobalStateCallback` as `trainer_state_rank_{R}.pt`.
 
 ### HF LoRA adapter (inference artifact)
 
@@ -268,6 +269,10 @@ Output structure for each checkpoint:
 ```
 
 Full file-by-file contract: [Checkpoint layout](../usage/checkpoint.md).
+
+Load still accepts a PEFT `adapter_model.bin` (`load_adapter_state_dict` prefers
+safetensors, then falls back to `.bin`). VeOmni's own export is safetensors so the
+EP-sharded MoE-LoRA reader can stream per-expert rows.
 
 ---
 
@@ -417,6 +422,9 @@ A MoE-LoRA run writes only the two standard PEFT artefacts — **no sidecar**:
 ```
 
 (Same `global_step_N` directory as the DCP shards. See [Checkpoint layout](../usage/checkpoint.md).)
+
+A stock-PEFT adapter that only has `adapter_model.bin` still loads: `from_pretrained`
+uses the same fallback.
 
 At resume, `VeOmniLoraModel.from_pretrained` reads `adapter_config.json`: the
 `veomni_lora.moe_mode` field decides which wrapper class to install
