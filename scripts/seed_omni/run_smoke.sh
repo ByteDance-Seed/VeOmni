@@ -178,14 +178,14 @@ run_infer() {
         --model.model_path "$QWEN3_IT_CKPT" \
         --model.model_config.modules.qwen3vl_vision.model_path "$QWEN3_IT_CKPT/qwen3vl_vision" \
         --infer.prompt "Describe this image briefly." \
-        --infer.image "$it_image" \
+        --infer.images "$it_image" \
         $common
       ;;
     qwen3vl)
       # shellcheck disable=SC2046
       run_logged "$log" python "$INFER_PY" "${CONFIG[$name]}" \
         --infer.prompt "Describe this image briefly." \
-        --infer.image "$TEST_IMAGE" \
+        --infer.images "$TEST_IMAGE" \
         $common
       ;;
     qwen3moe)
