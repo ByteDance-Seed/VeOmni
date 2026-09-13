@@ -33,7 +33,7 @@ from safetensors.torch import safe_open
 from tqdm import tqdm
 from transformers import AutoConfig
 
-from veomni.models import build_tokenizer, save_model_weights
+from veomni.models_kernel import build_tokenizer, save_model_weights
 
 
 @dataclass

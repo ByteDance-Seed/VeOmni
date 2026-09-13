@@ -23,8 +23,8 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 
 from veomni.checkpoint import ckpt_to_state_dict
-from veomni.models import save_model_assets, save_model_weights
-from veomni.models.module_utils import _save_state_dict
+from veomni.models_kernel import save_model_assets, save_model_weights
+from veomni.models_kernel.checkpoint.weights import _save_state_dict
 from veomni.utils import helper
 from veomni.utils.device import IS_NPU_AVAILABLE, synchronize
 from veomni.utils.import_utils import is_torch_version_greater_than
@@ -225,14 +225,14 @@ def save_hf_safetensor(
         DistributedCheckpointer.wait_for_pending_save()
 
     if use_distributed:
-        from veomni.models.checkpoint_tensor_loading import resolve_fqn_to_index_mapping_for_save
+        from veomni.models_kernel.checkpoint import resolve_fqn_to_index_mapping_for_save
 
         fqn_to_index_mapping = resolve_fqn_to_index_mapping_for_save(model, fqn_to_index_mapping)
         _save_hf_safetensor_distributed(
             model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets, parallel_state=parallel_state
         )
     else:
-        # Legacy path is rank-0 only; non-rank-0 waits at the barrier below
+        # The single-writer path is rank-0 only; non-rank-0 waits at the barrier below
         if is_rank_0:
             _save_hf_safetensor_legacy(
                 save_checkpoint_path,

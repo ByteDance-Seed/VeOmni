@@ -3,7 +3,7 @@ from PIL import Image
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.data.multimodal.video_utils import write_video_audio
-from veomni.models.diffusers.minimax_h3.inference import MiniMaxH3Pipeline
+from veomni.models_kernel.diffusers.minimax_h3.inference import MiniMaxH3Pipeline
 from veomni.utils.device import get_device_type
 
 

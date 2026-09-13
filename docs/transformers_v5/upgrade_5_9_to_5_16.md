@@ -118,7 +118,7 @@ exercise their sequence-parallel forward and backward paths.
   conditional imports. `FusedRMSNormGated`, `is_fast_path_available`, and
   `torch_causal_conv1d_update` are gone. The `drop_import_names` call and the
   `<name> = None` post-import placeholders were removed — they had nothing left
-  to neutralise and collided with the new definitions. VeOmni's OpSlot dispatch
+  to neutralise and collided with the new definitions. VeOmni's local `VeomniOp` dispatch
   in `Qwen3_5GatedDeltaNet.__init__` is unchanged in intent.
 - `Qwen3_5DecoderLayer.layer_type` was renamed to `block_type`
   (`Qwen3_5GatedDeltaNet.layer_type` kept its name).

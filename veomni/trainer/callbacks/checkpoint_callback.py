@@ -18,7 +18,7 @@ This owns the every-N-steps / epochs cadence and the one-shot sidecar export.
 *What* is written is :meth:`BaseTrainer.save_dcp` /
 :meth:`~BaseTrainer.save_hf_or_lora` / :meth:`~BaseTrainer.load` /
 :meth:`~BaseTrainer.save_model_assets`. *How* belongs to
-:class:`~veomni.models.checkpoint_manager.ModelCheckpointManager`.
+:class:`~veomni.models_kernel.checkpoint.ModelCheckpointManager`.
 
 DCP and HF/LoRA share this callback because they share a manager; each format
 still has its own cadence knobs and its own last-saved step so a DCP write

@@ -160,7 +160,7 @@ data:
 ```
 
 Token interleaving is decided **per video position** by the processor at
-`veomni/models/transformers/qwen3_omni_moe/processing_qwen3_omni_moe.py:159`
+`veomni/models_kernel/transformers/qwen3_omni_moe/processing_qwen3_omni_moe.py:159`
 (`use_audio_in_video = audio_length != 0`). For the offline-A/V recipe each
 video dict carries its own audio, so `audio_length > 0` and the per-position
 decision is "interleave" — matching the raw-video path.

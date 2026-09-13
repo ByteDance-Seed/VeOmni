@@ -27,7 +27,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
 from ..arguments import MixedPrecisionConfig
-from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
+from ..models_kernel import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
@@ -371,7 +371,7 @@ def parallelize_model_fsdp2(
         parallel_plan = get_runtime_parallel_plan(model)
         assert parallel_plan is not None, (
             "ExtraParallel needs parallel plan defined in the model! \
-            Please see veomni/models/transformers/qwen3_moe/parallel_plan.py for example of expert parallelism. \
+            Please see veomni/models_kernel/transformers/qwen3_moe/parallel_plan.py for example of expert parallelism. \
             Please see tests/utils/test_extra_parallel_clip_grad_norm.py::test_clip_grad_norm_fsdp2_ep2_emb4 \
             for example of expert parallelism + embed parallelism."
         )
@@ -578,7 +578,7 @@ def parallelize_model_fsdp2(
     # TODO(https://github.com/ByteDance-Seed/VeOmni/issues/241):
     # NPU is missing PreSumMul ReduceOp. Need to remove this condition after the issue is resolved.
     if IS_NPU_AVAILABLE and parallel_state.any_extra_parallel_enabled:
-        from veomni.ops.platform.npu import apply_hccl_premul_sum_patch
+        from .hccl_premul_sum import apply_hccl_premul_sum_patch
 
         apply_hccl_premul_sum_patch()
 

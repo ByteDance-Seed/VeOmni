@@ -35,8 +35,8 @@ from types import SimpleNamespace
 import pytest
 
 from veomni.distributed import parallel_state as parallel_state_module
-from veomni.models import auto as auto_module
-from veomni.models.auto import build_config, check_context_parallel_supported
+from veomni.models_kernel import auto as auto_module
+from veomni.models_kernel.auto import build_config, check_context_parallel_supported
 
 
 def test_gate_is_inert_when_no_parallel_state_was_installed(monkeypatch):

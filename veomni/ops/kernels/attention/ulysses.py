@@ -18,10 +18,47 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from ....distributed.sequence_parallel import (
+from ....distributed.parallel_state import get_parallel_state
+from ....distributed.sequence_parallel.ulysses import (
     gather_heads_scatter_seq,
     gather_seq_scatter_heads,
 )
+
+
+def should_apply_ulysses(*, skip_ulysses: bool = False) -> bool:
+    """Return whether this call should gather/scatter Ulysses itself.
+
+    Sync Ulysses belongs inside attention only when the Ulysses axis is
+    greater than 1 and async Ulysses is off. Async SP gathers outside
+    attention. ``ulysses_size == 1`` is a no-op. ``skip_ulysses`` opts a
+    call out when its tokens are not on the SP mesh.
+    """
+    if skip_ulysses:
+        return False
+
+    parallel_state = get_parallel_state()
+    if parallel_state.ulysses_size <= 1:
+        return False
+    return not bool(parallel_state.async_enabled)
+
+
+def effective_sequence_lengths(
+    q_length: int,
+    kv_length: int,
+    *,
+    skip_ulysses: bool = False,
+) -> tuple[int, int]:
+    """Return the Q/K lengths seen by the attention kernel.
+
+    Synchronous Ulysses gathers the sequence inside attention, so mask
+    metadata must describe the global sequence. Async Ulysses gathers before
+    attention, and skipped calls stay local, so their input lengths are already
+    the effective lengths.
+    """
+    if not should_apply_ulysses(skip_ulysses=skip_ulysses):
+        return q_length, kv_length
+    scale = get_parallel_state().ulysses_size
+    return q_length * scale, kv_length * scale
 
 
 def prepare_ulysses_qkv(

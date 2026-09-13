@@ -242,7 +242,7 @@ def test_qwen3_omni_offline_av_end_to_end():
     *before* position_id_func runs.
     """
     from veomni.data.data_transform import process_sample_qwen_omni
-    from veomni.models import build_processor
+    from veomni.models_kernel import build_processor
 
     processor = build_processor(QWEN3_OMNI_MODEL_PATH)
 

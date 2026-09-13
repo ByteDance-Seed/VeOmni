@@ -157,9 +157,10 @@ jobs:
           uv run --frozen pytest -v -s -x tests/parallel/test_parallel_state_registry.py
       - name: Run models tests
         run: |
+          uv run --frozen pytest -v -s -x tests/models_kernel
           uv run --frozen pytest -v -s -x tests/models/test_model_registry.py
-          uv run --frozen pytest -v -s -x tests/models/test_generated_modeling_imports.py
-          uv run --frozen pytest -v -s -x tests/models/test_transformers_upgrade_compat.py
+          uv run --frozen pytest -v -s -x tests/models_kernel/test_generated_modeling_imports.py
+          uv run --frozen pytest -v -s -x tests/models_kernel/test_transformers_upgrade_compat.py
           uv run --frozen pytest -v -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -v -s -x tests/models/test_padded_packed_loss.py
           uv run --frozen pytest -v -s -x tests/models/test_vlm_trainer.py
@@ -185,11 +186,9 @@ jobs:
       - name: Run data tests
         run: |
           uv run --frozen pytest -v -s -x tests/data
-      - name: Run ops tests
+      - name: Run kernels tests
         run: |
-          uv run --frozen pytest -v -s -x tests/ops/test_comp.py
-          uv run --frozen pytest -v -s -x tests/ops/test_moe_hw_gate.py
-          uv run --frozen pytest -v -s -x tests/ops/test_npu_kernels.py
+          uv run --frozen pytest -v -s -x -m "not benchmark" tests/ops
       - name: Run utils tests
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_count_flops.py
@@ -199,12 +198,11 @@ jobs:
         # sync needed here.
         run: |
           uv run --frozen pytest -v -s -x tests/lora/test_lora_trainer_saveload.py
-      - name: Run MoE-LoRA NPU fused vs eager parity
-        # Numerical gate for the new NPU fused MoE-LoRA autograd composition
-        # (shared + independent; forward + A/B grads; EP=1 vs non-EP).
-        # Cheap single-process; run before the multi-process stream-load test.
+      - name: Run moe_experts_lora NPU fused vs eager parity
+        # Numerical gate for NPU fused MoE-LoRA (shared + independent; forward +
+        # hidden/A/B grads; EP=1 vs non-EP). Lives with the kernel family.
         run: |
-          uv run --frozen pytest -v -s -x tests/lora/test_moe_lora_fused_npu.py
+          uv run --frozen pytest -v -s -x tests/ops/moe_experts_lora/test_moe_experts_lora.py
       - name: Run MoE-LoRA ep_sharded_stream_load (PEFT, EP=2)
         # Exercises the PEFT ep_sharded adapter streaming *and* the NPU
         # fused MoE-LoRA EP kernel (fused_npu): the test auto-selects

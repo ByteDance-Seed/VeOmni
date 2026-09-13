@@ -122,14 +122,14 @@ def _logits_case(case_id: str) -> Case:
 
 
 # Per-case ``moe_implementation`` for VeOmni's ``apply_ops_config``. Defaults
-# to ``"eager"``. Set to ``"fused_triton"`` for production-path coverage
+# to ``"eager"``. Set to ``"triton"`` for production-path coverage
 # (A100/SM80+); the fused dispatch in ``patched_modeling_*_moe_gpu.py``
 # short-circuits the eager expert loop and replaces it with a single
 # Triton kernel call — no Python-level sync sites.
 _MOE_IMPL_BY_CASE: dict[str, str] = {
-    "qwen3_5_moe-text-fa2-fused": "fused_triton",
-    "qwen3_vl_moe-fa2-fused": "fused_triton",
-    "qwen3_omni_moe-fa2-fused": "fused_triton",
+    "qwen3_5_moe-text-fa2-fused": "triton",
+    "qwen3_vl_moe-fa2-fused": "triton",
+    "qwen3_omni_moe-fa2-fused": "triton",
 }
 
 
@@ -601,11 +601,11 @@ def test_no_implicit_sync_in_generated_forward(case):
         pytest.skip(f"Path not found: {case.toy_config_dir}")
     if case.attn_implementation == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
         pytest.skip("flash_attn package not installed.")
-    if _MOE_IMPL_BY_CASE.get(case.case_id) == "fused_triton":
+    if _MOE_IMPL_BY_CASE.get(case.case_id) == "triton":
         from veomni.utils.import_utils import is_fused_moe_available
 
         if not is_fused_moe_available():
-            pytest.skip("fused_triton MoE requires triton + CUDA SM70+.")
+            pytest.skip("triton MoE requires triton + CUDA SM70+.")
     if case.case_id in _PENDING_FIX_CASES:
         pytest.skip(f"Pending fix: {_PENDING_FIX_CASES[case.case_id]}")
 
@@ -749,11 +749,11 @@ def test_multimodal_metadata_path_matches_fallback(case):
         pytest.skip(f"Path not found: {case.toy_config_dir}")
     if case.attn_implementation == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
         pytest.skip("flash_attn package not installed.")
-    if _MOE_IMPL_BY_CASE.get(case.case_id) == "fused_triton":
+    if _MOE_IMPL_BY_CASE.get(case.case_id) == "triton":
         from veomni.utils.import_utils import is_fused_moe_available
 
         if not is_fused_moe_available():
-            pytest.skip("fused_triton MoE requires triton + CUDA SM70+.")
+            pytest.skip("triton MoE requires triton + CUDA SM70+.")
 
     _apply_determinism()
 

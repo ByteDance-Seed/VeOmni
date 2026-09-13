@@ -27,7 +27,7 @@ _USE_LIGER_KERNEL = [True, False] if is_liger_kernel_available() else [False]
 _LOAD_BALANCING_LOSS_IMPL = "triton" if is_package_available("triton") else "eager"
 # Pick the fused-MoE backend that matches the test hardware. On NPU the NPU
 # kernel is the only option; on GPU default to Triton (SM70+).
-_FUSED_MOE_IMPL = "fused_npu" if is_torch_npu_available() else "fused_triton"
+_FUSED_MOE_IMPL = "npu" if is_torch_npu_available() else "triton"
 
 
 @dataclass(frozen=True)
@@ -252,9 +252,8 @@ def apply_veomni_loss_unpatch():
 
 
 def apply_veomni_moe_unpatch():
-    from veomni.ops.kernels import moe
-
-    moe._fused_moe_forward = None
+    """Leftover ``ops/kernels/moe`` pointer is gone. Keep the hook for old suites."""
+    return
 
 
 def _build_ops_config_for_mode(model_mode: ModelMode) -> OpsImplementationConfig:

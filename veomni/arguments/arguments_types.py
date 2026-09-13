@@ -1076,9 +1076,9 @@ class TrainingArguments:
 # always allowed implicitly. A value not in ``_NPU_ALLOWED[field]`` raises on
 # NPU; a value in ``_NPU_REQUIRED[field]`` raises off NPU.
 #
-# Hardcoded (not inferred from ``BackendSpec.requires``) because backend names
-# alone do not capture per-model and per-hardware compatibility. The NPU
-# default-normalization step runs before this allow-list validation.
+# Hardcoded rather than inferred from registry requirements because backend
+# names alone do not capture per-model compatibility. The NPU default
+# normalization step runs before this allow-list validation.
 _NPU_ALLOWED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"npu"}),
     "rotary_pos_emb_implementation": frozenset({"npu"}),
@@ -1103,22 +1103,22 @@ _NPU_DEFAULT_FALLBACK: Dict[str, str] = {
     "rotary_pos_emb_vision_implementation": "npu",
     "swiglu_mlp_implementation": "eager",
     "load_balancing_loss_implementation": "eager",
-    "cross_entropy_loss_implementation": "npu",
+    "cross_entropy_loss_implementation": "chunk_loss",
     "moe_implementation": "fused_npu",
 }
 
 # MLU compatibility tables for ``_validate_implementations``.
+# ``fused_triton`` is the same group-gemm as on GPU; ``fused_mlu`` is Apex grouped-GEMM.
 _MLU_ALLOWED: Dict[str, frozenset] = {
-    "moe_implementation": frozenset({"fused_mlu", "fused_mlu_triton"}),
+    "moe_implementation": frozenset({"fused_mlu", "fused_triton"}),
 }
 
-_MLU_DEFAULT_FALLBACK: Dict[str, str | frozenset] = {
+_MLU_DEFAULT_FALLBACK: Dict[str, str] = {
     "rms_norm_implementation": "eager",
     "rotary_pos_emb_implementation": "eager",
     "swiglu_mlp_implementation": "eager",
     "load_balancing_loss_implementation": "eager",
     "cross_entropy_loss_implementation": "eager",
-    "moe_implementation": frozenset({"fused_mlu", "fused_mlu_triton"}),
 }
 
 
@@ -1126,7 +1126,7 @@ _MLU_DEFAULT_FALLBACK: Dict[str, str | frozenset] = {
 class OpsImplementationConfig:
     """model.ops_implementation.* — kernel backend selection per op.
 
-    Defaults are GPU-optimal (Liger / Triton / fused_triton). On NPU, values
+    Defaults are GPU-optimal (Liger / Triton / fused Triton MoE). On NPU, values
     still equal to the dataclass defaults listed in ``_NPU_DEFAULT_FALLBACK``
     are automatically mapped to NPU-compatible or eager implementations;
     explicit non-default overrides are validated and unsupported values raise.
@@ -1135,16 +1135,15 @@ class OpsImplementationConfig:
 
     NPU validation runs at two times:
 
-    - **Config-parse time** (``__post_init__``) for ops registered in the
-      legacy per-model registry: ``rms_norm``, ``rotary_pos_emb``,
+    - **Config-parse time** (``__post_init__``) for the model-agnostic fields:
+      ``rms_norm``, ``rotary_pos_emb``,
       ``rotary_pos_emb_vision``, ``swiglu_mlp``, ``load_balancing_loss``, plus
       ``cross_entropy_loss`` and ``moe``. Errors fire immediately with a
       model-agnostic allow-list.
-    - **Model-build time** (``OpSlot.bind`` via ``KERNEL_REGISTRY.resolve``)
-      for Qwen3.5-only ops: ``rms_norm_gated``, ``causal_conv1d``,
-      ``chunk_gated_delta_rule``. These OpSlots only exist in Qwen3.5's
-      patched modeling module, so config-parse-time validation would force
-      every NPU user to override them even when training non-Qwen3.5 models.
+    - **Model-build time** (instance-local ``VeomniOp`` resolution) for
+      model-specific ops such as ``rms_norm_gated``, ``causal_conv1d``, and
+      ``chunk_gated_delta_rule``. Keeping this compatibility check at the
+      consuming model avoids forcing unrelated models to configure them.
       All three ship both a GPU (``fla``) and an NPU (``npu``) backend; the
       kernel's ``HardwareRequirement`` raises only when the requested value has
       no backend for the current hardware. The varlen (``dyn_bsz=True``) caveat
@@ -1166,20 +1165,32 @@ class OpsImplementationConfig:
             "flash_attention_4",
             "flex_attention",
             "magi_attention",
+            "sage_attention",
             "native-sparse",
+            "veomni_flash_attention_2",
+            "veomni_flash_attention_3",
+            "veomni_flash_attention_4",
+            "veomni_flex_attention",
+            "veomni_magi_attention",
+            "veomni_sage_attention",
+            "veomni_sdpa",
         ]
     ] = field(
         default="flash_attention_2",
-        metadata={"help": "Attention implementation."},
+        metadata={
+            "help": "Attention implementation. Short names (flash_attention_2, flex_attention, "
+            "magi_attention, sage_attention, sdpa) rewrite to the matching veomni_* adapter when "
+            "MODELING_BACKEND=veomni. Pass a veomni_* name to select that adapter directly."
+        },
     )
     moe_implementation: str = field(
         default="fused_triton",
         metadata={
-            "help": "MoE experts forward. 'fused_triton' (default, GPU SM70+) | "
-            "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | 'fused_mlu' (MLU) | 'fused_mlu_triton' (MLU) | 'eager'. "
+            "help": "MoE experts forward. 'fused_triton' (default, GPU SM70+ or MLU) | "
+            "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | "
+            "'fused_mlu' (MLU Apex grouped-GEMM) | 'eager'. "
             "On NPU, a default-valued 'fused_triton' selection maps to 'fused_npu'; "
-            "incompatible non-default overrides raise. Legacy 'fused' "
-            "auto-resolves to fused_quack/fused_npu with a deprecation warning."
+            "incompatible non-default overrides raise."
         },
     )
     cross_entropy_loss_implementation: str = field(
@@ -1215,7 +1226,10 @@ class OpsImplementationConfig:
     )
     rotary_pos_emb_vision_implementation: str = field(
         default="eager",
-        metadata={"help": "Rotary positional embedding in vision part. 'npu' | 'eager' (default)."},
+        metadata={
+            "help": "Rank-3 vision layout for full rotary positional embedding. "
+            "Uses the same 'rope' op with an independent implementation choice: 'npu' | 'eager' (default)."
+        },
     )
     load_balancing_loss_implementation: str = field(
         default="triton",
@@ -1242,7 +1256,7 @@ class OpsImplementationConfig:
             "because no torch fallback handles cu_seqlens. "
             "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
             "Only affects varlen (dyn_bsz) training; a non-eager value on hardware without a "
-            "matching backend raises at OpSlot bind time."
+            "matching backend raises when the model resolves its kernel."
         },
     )
     chunk_gated_delta_rule_implementation: str = field(
@@ -1250,14 +1264,14 @@ class OpsImplementationConfig:
         metadata={
             "help": "Chunk gated delta-rule kernel for Qwen3.5 linear attention. "
             "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU or MLU). "
-            "'flash_qla' uses QwenLM FlashQLA (ships under the gpu extra, Hopper SM90 only — "
-            "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
+            "'flash_qla' uses QwenLM FlashQLA (ships under the gpu extra and supports "
+            "NVIDIA SM90 through SM100). "
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
             "cu_seqlens; varlen training therefore raises at runtime. "
             "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
             "'npu_ascendc' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
             "delegates heavy GDN compute to torch.ops.npu.*). "
-            "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
+            "A non-eager value on hardware without a matching backend raises when the model resolves its kernel."
         },
     )
     dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = field(
@@ -1293,39 +1307,18 @@ class OpsImplementationConfig:
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {
-                "flash_attention_2": "veomni_flash_attention_2_with_sp",
-                "flash_attention_3": "veomni_flash_attention_3_with_sp",
-                "flash_attention_4": "veomni_flash_attention_4_with_sp",
-                "flex_attention": "veomni_flex_attention_with_sp",
-                "magi_attention": "veomni_magi_attention_with_sp",
+                "flash_attention_2": "veomni_flash_attention_2",
+                "flash_attention_3": "veomni_flash_attention_3",
+                "flash_attention_4": "veomni_flash_attention_4",
+                "flex_attention": "veomni_flex_attention",
+                "magi_attention": "veomni_magi_attention",
+                "sage_attention": "veomni_sage_attention",
+                "sdpa": "veomni_sdpa",
             }
             if self.attn_implementation in replacements:
                 new_impl = replacements[self.attn_implementation]
                 logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
                 self.attn_implementation = new_impl
-
-        # Legacy alias: ``moe_implementation='fused'`` resolves to a
-        # hardware-appropriate fused kernel — Quack on GPU, NPU group-gemm on
-        # Ascend, MLU group-gemm or triton on Cambricon MLU. Kept for back-compat with pre-#678 YAMLs; warn so users
-        # migrate to the explicit name.
-        if self.moe_implementation == "fused":
-            from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available, is_torch_npu_available
-
-            if is_torch_npu_available():
-                resolved = "fused_npu"
-            elif is_torch_mlu_available():
-                if is_apex_mlu_available():
-                    resolved = "fused_mlu"
-                else:
-                    resolved = "fused_mlu_triton"
-            else:
-                resolved = "fused_quack"
-
-            logger.warning_rank0(
-                f"moe_implementation='fused' is a deprecated alias; resolving to '{resolved}' on this host. "
-                f"Set moe_implementation='{resolved}' explicitly to silence this warning."
-            )
-            self.moe_implementation = resolved
 
         self._apply_npu_default_fallback()
         self._apply_mlu_default_fallback()
@@ -1363,7 +1356,7 @@ class OpsImplementationConfig:
         user overrides (non-default values) are left untouched and will be
         caught by ``_validate_implementations`` if unsupported.
         """
-        from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available
+        from ..utils.import_utils import is_torch_mlu_available
 
         if not is_torch_mlu_available():
             return
@@ -1375,8 +1368,6 @@ class OpsImplementationConfig:
 
             current = getattr(self, field_name)
             if current == gpu_defaults[field_name]:
-                if field_name == "moe_implementation":
-                    mlu_value = "fused_mlu" if is_apex_mlu_available() else "fused_mlu_triton"
                 setattr(self, field_name, mlu_value)
                 logger.info_rank0(
                     f"{field_name}: auto-resolved GPU default {current!r} -> {mlu_value!r} on Cambricon MLU."
@@ -1385,28 +1376,15 @@ class OpsImplementationConfig:
     def _validate_implementations(self):
         """Fail fast on hardware/op mismatch at config-parse time.
 
-        Only checks things cheaper to catch here than at bind time. Package
-        availability (liger / torch_npu) and per-model backend compatibility
-        are validated by the resolution sites (``apply_per_model_patches`` /
-        ``apply_global_ops`` / ``install_loss_mapping`` /
-        ``KERNEL_REGISTRY.resolve``) — not duplicated here.
+        Only checks things cheaper to catch here than at model-build time.
+        Package availability (liger / torch_npu) and model-specific backend
+        compatibility are validated by instance-local ``VeomniOp``
+        resolution — not duplicated here.
         """
-        from ..ops import config as _ops_config_pkg  # noqa: F401  triggers op registrations
-        from ..ops.config.registry import list_ops
         from ..utils.import_utils import (
             is_apex_mlu_available,
-            is_package_available,
             is_torch_mlu_available,
             is_torch_npu_available,
-        )
-
-        # Coverage check: every registered op must appear in ``_NPU_ALLOWED``,
-        # otherwise a future op addition silently bypasses NPU validation.
-        registered_fields = {op.config_field for op in list_ops()}
-        missing = registered_fields - _NPU_ALLOWED.keys()
-        assert not missing, (
-            f"NPU allow-list missing entries for registered ops: {sorted(missing)}. "
-            f"Add them to _NPU_ALLOWED in arguments_types.py."
         )
 
         on_npu = is_torch_npu_available()
@@ -1441,17 +1419,8 @@ class OpsImplementationConfig:
                         f"for ops with no MLU kernel for the current model."
                     )
 
-        # The Triton load-balancing-loss kernel imports ``triton`` at module
-        # top — surface a missing package here with an actionable message
-        # instead of a noisy ImportError at apply_global_ops time.
-        if self.load_balancing_loss_implementation == "triton" and not is_package_available("triton"):
-            raise ValueError(
-                "load_balancing_loss_implementation='triton' requires the 'triton' package "
-                "on CUDA. Install it or set the field to 'eager'."
-            )
-
-        # ``qat_implementation`` selects a quantization recipe instead of a
-        # kernel backend, so no OpSlot resolution validates it. Its fake
+        # ``qat_implementation`` selects a quantization recipe rather than an
+        # op implementation, so registry resolution does not validate it. Its fake
         # quantizers are the SM90-only TileLang kernels: without this check a
         # CPU, NPU, ROCm or pre-SM90 host trains for a while and then raises
         # inside the first fake-quant call.
@@ -1563,7 +1532,7 @@ class BaseModelArguments:
         cache = BaseModelArguments._fqn_to_index_mapping_cache
         if idx_path not in cache:
             if os.path.exists(idx_path):
-                from ..models.checkpoint_tensor_loading import parse_fqn_to_index_mapping_from_json
+                from ..models_kernel.checkpoint import parse_fqn_to_index_mapping_from_json
 
                 cache[idx_path] = parse_fqn_to_index_mapping_from_json(idx_path)
             else:

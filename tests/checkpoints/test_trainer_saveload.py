@@ -22,7 +22,7 @@ except Exception as _:
     from checkpoint_verification_utils import verify_dcp_to_hf_conversion
 from veomni.arguments import parse_args
 from veomni.data import build_dummy_dataset
-from veomni.models.checkpoint_manager import ModelCheckpointManager
+from veomni.models_kernel.checkpoint import ModelCheckpointManager
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback

@@ -29,7 +29,7 @@ Use the built-in preprocessing pipeline to split videos, generate captions, and 
 Split raw videos into scene clips using PySceneDetect:
 
 ```shell
-python veomni/models/diffusers/ltx2_3/ltx_condition/preprocess_dataset.py split-scenes \
+python veomni/models_kernel/diffusers/ltx2_3/ltx_condition/preprocess_dataset.py split-scenes \
     --video_dir /path/to/raw/videos \
     --output_dir /path/to/output/clips
 ```
@@ -39,7 +39,7 @@ python veomni/models/diffusers/ltx2_3/ltx_condition/preprocess_dataset.py split-
 Auto-caption video clips using a multimodal model (Qwen2.5-Omni by default):
 
 ```shell
-python veomni/models/diffusers/ltx2_3/ltx_condition/preprocess_dataset.py caption \
+python veomni/models_kernel/diffusers/ltx2_3/ltx_condition/preprocess_dataset.py caption \
     --input_dir /path/to/output/clips \
     --output /path/to/output/clips/dataset.json
 ```
@@ -54,7 +54,7 @@ Generate Canny edge reference videos before preprocessing so their paths are
 written to the dataset file:
 
 ```shell
-python veomni/models/diffusers/ltx2_3/ltx_condition/preprocess_dataset.py compute-reference \
+python veomni/models_kernel/diffusers/ltx2_3/ltx_condition/preprocess_dataset.py compute-reference \
     --input_dir /path/to/output/clips \
     --dataset_file /path/to/output/clips/dataset.json
 ```
@@ -64,7 +64,7 @@ python veomni/models/diffusers/ltx2_3/ltx_condition/preprocess_dataset.py comput
 Compute text embeddings + VAE latents from the dataset file:
 
 ```shell
-python veomni/models/diffusers/ltx2_3/ltx_condition/preprocess_dataset.py preprocess \
+python veomni/models_kernel/diffusers/ltx2_3/ltx_condition/preprocess_dataset.py preprocess \
     --dataset_file /path/to/output/clips/dataset.json \
     --gemma_model_path /path/to/models/gemma-3-12b-it-qat-q4_0-unquantized \
     --checkpoint_path /path/to/models/LTX-2.3 \
@@ -83,7 +83,7 @@ reference videos generated in Step 3.
 Pack precomputed `.pt` files into parquet shards for offline training:
 
 ```shell
-python veomni/models/diffusers/ltx2_3/ltx_condition/preprocess_dataset.py save-parquet \
+python veomni/models_kernel/diffusers/ltx2_3/ltx_condition/preprocess_dataset.py save-parquet \
     --precomputed_dir /path/to/output/clips/.precomputed \
     --output_dir /path/to/output/parquet_output \
     --pad_to_multiple_of 8 \

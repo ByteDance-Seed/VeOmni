@@ -64,12 +64,12 @@ Two authoritative sources:
 **Pick the template by the verified HF layout, not by model family:**
 
 - **HF ships per-expert split keys** (`*.mlp.experts.{j}.{gate|up|down}_proj.weight`)
-  → template = `veomni/models/transformers/qwen3_moe/checkpoint_tensor_converter.py`.
+  → template = `veomni/models_kernel/transformers/qwen3_moe/checkpoint_tensor_converter.py`.
   The regex only matches *HF-side* keys, so a v5-saved fused-key checkpoint
   passes through the converter untouched — no round-trip hazard.
 - **HF ships fused expert keys with same names as v5** (`*.mlp.experts.{gate_up_proj|down_proj}`
   at the module level, not per-expert) → template =
-  `veomni/models/transformers/qwen3_vl_moe/checkpoint_tensor_converter.py`.
+  `veomni/models_kernel/transformers/qwen3_vl_moe/checkpoint_tensor_converter.py`.
   Key names collide with v5 output, so you **must** use shape-based dispatch
   (see "Round-trip safety" below); blindly transposing corrupts v5-saved ckpts.
 
@@ -191,11 +191,11 @@ tensors through and confirm they come out identical (no transpose applied).
   leave `gate_up_proj` un-sharded and EP training hits
   `AssertionError: len(cumsum_M) == b.shape[0]` inside `group_gemm_same_nk`
   (cumsum length = `E_local`, but the weight has all `E` experts). See
-  `veomni/models/transformers/deepseek_v3/parallel_plan.py`.
+  `veomni/models_kernel/transformers/deepseek_v3/parallel_plan.py`.
 - **Checkpoint converters must detect the fused layout** — HF checkpoints may
   already ship `experts.gate_up_proj` / `experts.down_proj`. A
   `CheckpointTensorConverter` that unconditionally stacks per-expert
   `gate_proj`/`up_proj`/`down_proj` will raise
   `KeyError: '...experts.0.gate_proj.weight'`. Guard with a key-existence check,
   skip stacking when fused keys are already present, and cover both layouts in
-  `tests/models/test_checkpoint_tensor_converter.py`.
+  `tests/models_kernel/test_checkpoint_tensor_converter.py`.

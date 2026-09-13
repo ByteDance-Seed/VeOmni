@@ -26,12 +26,12 @@ Phase 5: Test and document             -> pending
 1. **Identify the model** on HuggingFace. Read its `config.json`, `modeling_*.py`, and any processor configs.
 
 2. **Determine model category**:
-   - Text-only LLM -> `veomni/models/transformers/<model_name>/`
-   - Vision-Language -> `veomni/models/transformers/<model_name>/` + `veomni/data/multimodal/`
+   - Text-only LLM -> `veomni/models_kernel/transformers/<model_name>/`
+   - Vision-Language -> `veomni/models_kernel/transformers/<model_name>/` + `veomni/data/multimodal/`
    - MoE model -> additional `veomni/distributed/moe/` integration
-   - Diffusion model -> `veomni/models/diffusers/<model_name>/`
+   - Diffusion model -> `veomni/models_kernel/diffusers/<model_name>/`
 
-3. **Check existing similar models**: Find the closest existing model in `veomni/models/transformers/` and use it as a reference. E.g., if adding a new Qwen variant, reference `qwen3/` or `qwen3_vl/`.
+3. **Check existing similar models**: Find the closest existing model in `veomni/models_kernel/transformers/` and use it as a reference. E.g., if adding a new Qwen variant, reference `qwen3/` or `qwen3_vl/`.
 
 4. **Identify required patches**: VeOmni uses a patchgen system (`veomni/patchgen/`) to generate model patches from the HuggingFace modeling. Check whether a sibling model already has a config you can extend via `name_map` — that is usually the difference between a 60-line config and a 1000-line one.
 
@@ -54,7 +54,7 @@ checkpoint round-trip tests; do not hide mismatches with `strict=False`.
 
 ## Phase 2: Modeling — hand off to `/veomni-patchgen-model`
 
-1. **Create the model directory**: `veomni/models/transformers/<model_name>/`.
+1. **Create the model directory**: `veomni/models_kernel/transformers/<model_name>/`.
 
 2. **Switch to `/veomni-patchgen-model`.** It owns the whole modeling surface —
    the `<model_name>_{gpu,npu}_patch_gen_config.py` files, ExtraParallel
@@ -71,12 +71,18 @@ checkpoint round-trip tests; do not hide mismatches with `strict=False`.
    embeddings; a model without ExtraParallel does not need one.
 
 3. **Exception — non-transformers architectures.** Diffusion models under
-   `veomni/models/diffusers/<model_name>/`, and the `flux` / `movqgan` / `wan`
+   `veomni/models_kernel/diffusers/<model_name>/`, and the `flux` / `movqgan` / `wan`
    directories, have no `generated/` output and no patchgen config: they patch
    through `device_patch.py` or direct modeling. Copy the closest existing one
    and skip to Phase 3.
 
-Come back here once the model loads and its registry / patch tests pass.
+4. Reference existing parallel plans for guidance (e.g., `veomni/models_kernel/transformers/qwen3_moe/parallel_plan.py`). Come back here once the model loads and its registry and patch tests pass.
+
+5. **Patch patterns** — follow existing models:
+   - Sequence parallel: construct an instance-local attention `VeomniOp` and override `forward` via patchgen.
+   - MoE: stack per-expert weights (`gate_up_proj [E, 2*I, H]` / `down_proj [E, H, I]`) and store a `moe_experts` `VeomniOp` on the expert module.
+   - Cross-entropy: bind a `cross_entropy_loss` `VeomniOp` on the model instance and return `CausalLMOutputWithLogProbs`.
+   - Register the model class in the model package `__init__.py`; transformers models register through their per-model `MODELING_REGISTRY` decorators.
 
 ## Phase 3: Write Training Config
 
@@ -118,19 +124,17 @@ Come back here once the model loads and its registry / patch tests pass.
 
 1. **Create toy config**: Add `tests/toy_config/<model_name>_toy/config.json` with minimal parameters for fast testing.
 
-2. **Unit tests**: add cases to the existing enumerated tables rather than new
-   files — `tests/models/test_model_registry.py` and
-   `tests/models/test_models_patch.py` (`TEST_CASES`) already cover loading via
-   `veomni.models.auto`, forward output shape, and patch application. See
-   `.agents/knowledge/testing.md` for the full landing-spot table and for why a
-   new file outside `tests/ops/` / `tests/data/` will not run in CI unless it is
-   wired into the unit-test workflows.
+2. **Unit tests**: Add tests in `tests/models_kernel/` to verify:
+   - Model loads correctly via `veomni.models_kernel.auto`
+   - Forward pass produces correct output shape
+   - Model patch applies without errors
+   Check `.agents/knowledge/testing.md` and the owning workflow so a new test is actually collected in CI.
 
 3. **E2e tests** (if feasible): add a `pytest.param` to
    `tests/e2e/test_e2e_parallel.py` using the toy config, rather than a new
    e2e file.
 
-4. Run `make quality` and `pytest tests/models/`.
+4. Run `make quality` and `pytest tests/models_kernel/`.
 
 5. **Update documentation**:
    - Add usage example to `docs/` (training command, config reference).

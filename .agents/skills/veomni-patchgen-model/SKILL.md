@@ -6,7 +6,7 @@ description: "Author or refresh a VeOmni model's patchgen-generated modeling und
 # VeOmni Patchgen Modeling Protocol
 
 Purpose: add or refresh a model's patchgen-generated modeling under
-`veomni/models/transformers/<model>/generated/`. VeOmni pins
+`veomni/models_kernel/transformers/<model>/generated/`. VeOmni pins
 `transformers==5.16.1` and ships patchgen-generated modeling for every
 supported transformers-family model. The non-transformers architectures
 (`flux`, `movqgan`, `wan`) have no `generated/` directory and are out of scope.
@@ -170,12 +170,12 @@ Drop phases that don't apply (e.g. Phase 3 for non-MoE models).
 
 **Operations:**
 
-1. Locate `veomni/models/transformers/<M>/`. If the directory does not exist yet
+1. Locate `veomni/models_kernel/transformers/<M>/`. If the directory does not exist yet
    you are being called as the modeling step of `/veomni-new-model`: create it,
    and read that skill's Phase 1 first so the category (text / VLM / Omni,
    dense / MoE, GPU-only or GPU+NPU) is already decided when you get here.
 2. If a patchgen-generated file already exists under
-   `veomni/models/transformers/<M>/generated/` you are **refreshing** an
+   `veomni/models_kernel/transformers/<M>/generated/` you are **refreshing** an
    existing config (e.g. picking up upstream changes, adding NPU sibling,
    fixing a bug). Otherwise you are writing the first config for this model.
    Either way, the rest of this protocol applies identically.
@@ -201,7 +201,7 @@ Drop phases that don't apply (e.g. Phase 3 for non-MoE models).
    diverge between sibling models — see
    `docs/transformers_v5/transformers_v5_moe_weight_loading.md`.
 6. Note related configs/loaders to preserve: `MODELING_REGISTRY`,
-   `MODEL_CONFIG_REGISTRY` in `veomni/models/loader.py`; any auto-config
+   `MODEL_CONFIG_REGISTRY` in `veomni/models_kernel/loader.py`; any auto-config
    registrations.
 7. Look for a **sibling model** you can borrow patches from: e.g. qwen3_5_moe
    reuses GatedDeltaNet/ViT patches from `qwen3_5` via direct import +
@@ -222,7 +222,7 @@ model directory to mirror, and the backend/category decision pinned down.
 
 ## Phase 2: Draft `<M>_gpu_patch_gen_config.py`
 
-Create `veomni/models/transformers/<M>/<M>_gpu_patch_gen_config.py` at the model root.
+Create `veomni/models_kernel/transformers/<M>/<M>_gpu_patch_gen_config.py` at the model root.
 
 **Skeleton (mirror `qwen3_gpu_patch_gen_config.py`):**
 
@@ -255,7 +255,7 @@ config = PatchConfig(
 **Cross-config reuse pattern** (qwen3_5_moe reusing qwen3_5):
 
 ```python
-from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
+from veomni.models_kernel.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_forward_patched,
     qwen3_5_vision_model_forward,
     # ...
@@ -351,12 +351,12 @@ Guidelines:
 
 ```bash
 patchgen \
-    veomni.models.transformers.<m>.<m>_gpu_patch_gen_config \
-    -o veomni/models/transformers/<m>/generated --diff
+    veomni.models_kernel.transformers.<m>.<m>_gpu_patch_gen_config \
+    -o veomni/models_kernel/transformers/<m>/generated --diff
 ```
 
 **Validation**: file is syntactically valid (import it: `python -c "import
-veomni.models.transformers.<m>.<m>_gpu_patch_gen_config"`) and every behaviour
+veomni.models_kernel.transformers.<m>.<m>_gpu_patch_gen_config"`) and every behaviour
 identified in Phase 1 has a corresponding decorator here.
 
 ---
@@ -448,8 +448,8 @@ def register_<m>_modeling(architecture: str):
    sibling behind. Target a single module only when you want a fast loop:
    ```bash
    patchgen \
-       veomni.models.transformers.<m>.<m>_gpu_patch_gen_config \
-       -o veomni/models/transformers/<m>/generated --diff -v
+       veomni.models_kernel.transformers.<m>.<m>_gpu_patch_gen_config \
+       -o veomni/models_kernel/transformers/<m>/generated --diff -v
    ```
 2. Inspect `generated/patched_modeling_<m>_gpu.py`:
    - Header lists every patch you defined under "Patches applied".
@@ -518,7 +518,7 @@ Minimum coverage:
    covers single-GPU vs FSDP2 `grad_norm` for *text* models only. If the model
    is text-only, append to the text test cases list. VLM/Omni models are out
    of scope for this suite (no VLM scaffolding exists).
-7. **MoE with a converter** — `tests/models/test_checkpoint_tensor_converter.py`: add a
+7. **MoE with a converter** — `tests/models_kernel/test_checkpoint_tensor_converter.py`: add a
    test group mirroring the existing `qwen3_moe` / `qwen3_vl_moe` blocks.
    Minimum coverage:
    - `can_handle` — matches the expected key regex, rejects non-expert keys.
@@ -557,7 +557,7 @@ pytest tests/models/test_models_logits_equal_v5.py -k <m> -v
 pytest tests/models/test_models_patch.py -k <m> -v
 pytest tests/e2e/test_e2e_parallel.py::<test_fn> -k <model_name> -v   # see note below; needs multi-GPU worker
 # MoE with a converter:
-pytest tests/models/test_checkpoint_tensor_converter.py -v
+pytest tests/models_kernel/test_checkpoint_tensor_converter.py -v
 # VLM / Omni (requires multiple GPUs):
 pytest tests/distributed/test_dummy_forward.py -k <m> -v
 # VLM only:
@@ -704,13 +704,13 @@ category too, since most of the expensive, silent failures live there.
   via `override_method` on a synthetic class (e.g.
   `LlamaForSequenceClassification`), verify the generated file imports cleanly
   before declaring victory.
-- **Text/MoE models silently fail on NPU CI with `KeyError: "Unknown kernel
-  'npu' for op='rotary_pos_emb'/'rms_norm'"`** — the `KERNEL_REGISTRY` (used
-  by the OpSlot path in patchgen-generated modeling) currently registers only
-  the `liger_kernel` GPU backend for `rotary_pos_emb/full` and
-  `rms_norm/standard`. Until matching NPU `KernelSpec`s are added, every
-  patchgen-generated text/MoE model that runs on NPU CI must be pinned to
-  eager via `_NPU_PER_MODEL_OVERRIDES` in `tests/tools/training_utils.py`:
+- **A model selects an op implementation that its variant does not expose on NPU** —
+  each generated module constructs a local `VeomniOp(op, variant, impl)`, and
+  resolution validates both the device-specific registry row and its optional
+  package requirements. Generic `rms_norm/standard` and `rope/full` have NPU
+  rows; specialized variants such as DeepSeek-V4 RoPE and unweighted RMSNorm
+  intentionally remain eager. Pin only those unsupported variants via
+  `_NPU_PER_MODEL_OVERRIDES` in `tests/tools/training_utils.py`:
   ```python
   "<model_name>": {
       "rms_norm_implementation": "eager",
@@ -719,10 +719,8 @@ category too, since most of the expensive, silent failures live there.
   ```
   Match the `model_name` exactly to the key used in `test_e2e_parallel.py`'s
   parametrize (e.g. `"qwen2"`, `"qwen3_moe"`, `"llama3.1"`, `"qwen2_5_omni"`).
-  Skipping this step is the canonical "GPU CI is green but NPU CI explodes at
-  model build" symptom. Multimodal/Omni models often need the override on
-  **both** `rms_norm_implementation` and `rotary_pos_emb_implementation`
-  because the audio/vision encoders pull the same OpSlots as the text tower.
+  Match overrides to the variants actually constructed by the model; do not
+  blanket-disable NPU implementations that are registered and tested.
 - **`pytest -k` mismatch on e2e** — `test_e2e_parallel.py` uses the first
   positional arg (`model_name`) as id, not the registry `<m>` id. For VL
   models that's the HF short name (`qwen25vl`, `qwen3vl`, `qwen3vlmoe`, …),
@@ -743,13 +741,13 @@ category too, since most of the expensive, silent failures live there.
 ## Scope Guard
 
 This skill owns everything that produces `generated/patched_modeling_<m>_*.py`
-for a model under `veomni/models/transformers/` — for a brand-new model
+for a model under `veomni/models_kernel/transformers/` — for a brand-new model
 directory as much as for an existing one. For:
 
 - The rest of onboarding a new model — deciding the model category, the
   training config, trainer and data-pipeline integration, docs: use
   `/veomni-new-model`, which hands the modeling step back here.
-- A diffusion or other non-transformers architecture (`veomni/models/diffusers/`,
+- A diffusion or other non-transformers architecture (`veomni/models_kernel/diffusers/`,
   or `flux` / `movqgan` / `wan`): patchgen does not apply — use
   `/veomni-new-model`.
 - New op / kernel: use `/veomni-new-op`.

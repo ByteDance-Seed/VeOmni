@@ -31,8 +31,6 @@ inherit those restrictions.
 import torch
 from torch.distributed.tensor import DTensor
 
-from ..kernels.deepseek_v4 import fp4_act_quant
-
 
 __all__ = [
     "FP4_BLOCK_SIZE",
@@ -44,12 +42,18 @@ FP4_BLOCK_SIZE = 32
 
 
 class _Fp4FakeQuantWeight(torch.autograd.Function):
+    """Straight-through FP4 weight fake quantization."""
+
     @staticmethod
     def forward(ctx, weight: torch.Tensor, block_size: int) -> torch.Tensor:
+        """Return the quantize-dequantize round trip for ``weight``."""
+        from .quant import fp4_act_quant
+
         return fp4_act_quant(weight.detach(), block_size, dequant=True)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Pass the output gradient straight through to the master weight."""
         return grad_output, None
 
 

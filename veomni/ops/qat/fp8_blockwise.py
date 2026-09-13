@@ -37,8 +37,6 @@ import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-from ..kernels.deepseek_v4 import act_quant, fp8_weight_quant
-
 
 # DeepSeek-V4 rounds every scale up to a power of two so that it survives
 # storage as a bare E8M0 exponent. Every published V4 checkpoint ships pow2
@@ -56,7 +54,22 @@ __all__ = [
 ]
 
 
+def act_quant(*args, **kwargs):
+    """Lazily call the TileLang activation quantizer."""
+    from .quant import act_quant as quantize
+
+    return quantize(*args, **kwargs)
+
+
+def fp8_weight_quant(*args, **kwargs):
+    """Lazily call the TileLang FP8 weight quantizer."""
+    from .quant import fp8_weight_quant as quantize
+
+    return quantize(*args, **kwargs)
+
+
 def _check_operand(tensor: torch.Tensor, scale_fmt: str | None, what: str) -> None:
+    """Validate dtype, scale format, and local-tensor ownership."""
     # The TileLang quantizers hard-code a BF16 operand dtype, so a FP32 tensor
     # would be reinterpreted rather than converted. Refuse instead of casting:
     # a silent downcast here would change training numerics invisibly.
@@ -74,22 +87,30 @@ def _check_operand(tensor: torch.Tensor, scale_fmt: str | None, what: str) -> No
 
 
 class _Fp8FakeQuantAct(torch.autograd.Function):
+    """Straight-through FP8 activation fake quantization."""
+
     @staticmethod
     def forward(ctx, x: torch.Tensor, block_size: int, scale_fmt: str | None) -> torch.Tensor:
+        """Return the activation quantize-dequantize round trip."""
         return act_quant(x.detach(), block_size, scale_fmt, dequant=True)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        """Pass the output gradient straight through to the activation."""
         return grad_output, None, None
 
 
 class _Fp8FakeQuantWeight(torch.autograd.Function):
+    """Straight-through FP8 weight fake quantization."""
+
     @staticmethod
     def forward(ctx, weight: torch.Tensor, block_size: int, scale_fmt: str | None) -> torch.Tensor:
+        """Return the weight quantize-dequantize round trip."""
         return fp8_weight_quant(weight.detach(), block_size, scale_fmt, dequant=True)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        """Pass the output gradient straight through to the master weight."""
         return grad_output, None, None
 
 

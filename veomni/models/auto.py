@@ -14,7 +14,6 @@
 
 
 import functools
-import sys
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
 
 import torch
@@ -26,7 +25,6 @@ from transformers import (
 
 from ..arguments.arguments_types import OpsImplementationConfig
 from ..distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
-from ..ops.dispatch import OpsConfigSlot, OpSlot
 from ..utils import logging
 from ..utils.device import is_torch_npu_available
 from .loader import BaseModelLoader, get_loader, get_model_config, get_model_processor
@@ -47,7 +45,7 @@ logger = logging.get_logger(__name__)
 # false — so the shards are never gathered, each rank attends only within its own
 # 1/cp_size of the sequence, and the run trains to a plausible loss curve while
 # being silently wrong.
-CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
+CONTEXT_PARALLEL_MODEL_TYPES = frozenset()
 
 
 def check_model_build_prerequisites(config: PretrainedConfig) -> None:
@@ -64,10 +62,8 @@ def check_model_build_prerequisites(config: PretrainedConfig) -> None:
     plain ``getattr`` for the same reason: a config that has nothing to refuse should
     not have to say so.
 
-    ``DeepseekV4Config.validate_build_prerequisites`` is the only implementation
-    today. It refuses a Lightning Indexer KL objective configured without the TileLang
-    indexer and attention it is defined in terms of -- a disagreement between a model
-    field and two kernel selections, which no single dataclass can see.
+    The hook remains available to legacy config subclasses until their model family
+    moves to ``models_kernel``; generic code does not special-case model names here.
     """
     validate = getattr(config, "validate_build_prerequisites", None)
     if callable(validate):
@@ -126,53 +122,6 @@ def build_config(config_path: str, **config_kwargs) -> "PretrainedConfig":
     """
     trust_remote_code = config_kwargs.pop("trust_remote_code", True)
     return get_model_config(config_path, trust_remote_code=trust_remote_code, **config_kwargs)
-
-
-def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bool:
-    """Bind every OpSlot in *modeling_module* from *ops_config*.
-
-    Returns ``True`` if at least one OpSlot was found (and bound).
-    """
-    bound: list[str] = []
-    moe_experts_kernel: Optional[str] = None
-    for name in dir(modeling_module):
-        obj = getattr(modeling_module, name, None)
-        if isinstance(obj, OpsConfigSlot):
-            obj.bind(ops_config)
-            bound.append(f"{obj.field_name} ({obj.value})")
-            continue
-        if not isinstance(obj, OpSlot):
-            continue
-        # ``moe_experts`` reads ``moe_implementation`` (not the
-        # ``{op}_implementation`` convention) and its values carry a
-        # ``fused_`` prefix the registry entries don't. Translate so the
-        # registry lookup finds the kernel and the HardwareRequirement
-        # check fires.
-        if obj.op_name == "moe_experts":
-            impl_name = (
-                "eager"
-                if ops_config.moe_implementation == "eager"
-                else ops_config.moe_implementation.removeprefix("fused_")
-            )
-            if impl_name != "eager" and obj.variant == "standard":
-                moe_experts_kernel = impl_name
-        else:
-            impl_name = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
-        obj.bind(impl_name)
-        bound.append(f"{obj.op_name} ({impl_name})")
-
-    # OpSlot is just an eager-vs-fused guard; inside the fused branch the
-    # generated modeling code dispatches through the module-level pointer
-    # ``veomni.ops.kernels.moe._fused_moe_forward``. Keep the pointer in
-    # sync with the slot's bound kernel; eager leaves it untouched.
-    if moe_experts_kernel is not None:
-        from ..ops.kernels.moe import apply_veomni_fused_moe_patch
-
-        apply_veomni_fused_moe_patch(fused_moe_kernel=moe_experts_kernel)
-
-    if bound:
-        logger.info_rank0(f"OpSlot dispatch bound: {', '.join(bound)}.")
-    return bool(bound)
 
 
 def _validate_attention_parallelism(attn_implementation: Optional[str]) -> None:
@@ -290,23 +239,6 @@ def build_foundation_model(
         config.encoder_data_balance = False
 
     loader: Optional[BaseModelLoader] = get_loader(config)
-
-    # ── Pre-init: OpSlot binding ──────────────────────────────────────────
-    # ``get_loader`` -> ``get_model_class`` -> ``MODELING_REGISTRY[...]()``
-    # has already imported the patched modeling module, so ``loader.model_cls``
-    # is in ``sys.modules`` and we can resolve OpSlot bindings *before*
-    # the model is constructed. This matters for slots consumed inside
-    # ``__init__`` (e.g. Qwen3.5's GatedDeltaNet picks between
-    # ``Qwen3_5RMSNormGated`` and ``FusedRMSNormGated`` at init time based
-    # on ``veomni_rms_norm_gated.use_non_eager_impl``); slots consumed only
-    # in ``forward`` would also work post-init, but binding once, here, keeps
-    # the timing uniform. Assumes ``loader.model_cls`` is final at this point —
-    # i.e. no loader rewrites it between here and ``loader.load_model()`` below.
-    model_cls = getattr(loader, "model_cls", None) if loader is not None else None
-    modeling_module = sys.modules.get(model_cls.__module__) if model_cls is not None else None
-    if modeling_module is not None:
-        if _bind_veomni_ops(modeling_module, get_ops_config()):
-            logger.info_rank0("OpSlot-based kernel dispatch active.")
 
     init_kwargs = {
         "config": config,

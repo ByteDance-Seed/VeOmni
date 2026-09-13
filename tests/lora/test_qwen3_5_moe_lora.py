@@ -3,13 +3,9 @@ from pathlib import Path
 import yaml
 
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel, resolve_fused_moe_lora_targets
-from veomni.models import build_foundation_model
-from veomni.models.transformers.qwen3_5_moe import (
-    register_qwen3_5_moe_modeling,
-    register_qwen3_5_moe_text_modeling,
-)
 
 from ..tools.training_utils import make_eager_ops_config
+from .utils import build_lora_test_model
 
 
 _CONFIG_PATH = Path("configs/text/qwen3_5_moe_lora.yaml")
@@ -34,6 +30,14 @@ _CAUSAL_EXPERT_PATTERNS = [
     "model.layers.*.mlp.experts.gate_up_proj",
     "model.layers.*.mlp.experts.down_proj",
 ]
+_MODEL_EXPERT_PATTERNS = [
+    "language_model.layers.*.mlp.experts.gate_up_proj",
+    "language_model.layers.*.mlp.experts.down_proj",
+]
+_TEXT_EXPERT_PATTERNS = [
+    "layers.*.mlp.experts.gate_up_proj",
+    "layers.*.mlp.experts.down_proj",
+]
 
 
 def _production_lora_config():
@@ -41,26 +45,31 @@ def _production_lora_config():
     return yaml.safe_load(_CONFIG_PATH.read_text(encoding="utf-8"))["model"]["lora_config"]
 
 
-def test_qwen3_5_moe_registers_semantic_expert_target_mapping_for_both_wrappers():
-    """Verify semantic expert targets resolve for both Qwen3.5-MoE wrappers."""
+def test_qwen3_5_moe_registers_semantic_expert_target_mapping_for_all_architectures():
+    """Verify semantic expert targets resolve for every registered architecture."""
+    from veomni.models_kernel.transformers.qwen3_5_moe import (
+        register_qwen3_5_moe_modeling,
+        register_qwen3_5_moe_text_modeling,
+    )
+
     lora_modules = [*_DENSE_TARGETS, *_SEMANTIC_EXPERT_TARGETS]
 
-    conditional_cls = register_qwen3_5_moe_modeling("Qwen3_5MoeForConditionalGeneration")
-    conditional_modules, conditional_parameters = conditional_cls._convert_lora_targets_to_parameters(
-        None, lora_modules, []
+    architecture_cases = (
+        (register_qwen3_5_moe_modeling("Qwen3_5MoeForConditionalGeneration"), _CONDITIONAL_EXPERT_PATTERNS),
+        (register_qwen3_5_moe_modeling("Qwen3_5MoeModel"), _MODEL_EXPERT_PATTERNS),
+        (register_qwen3_5_moe_text_modeling("Qwen3_5MoeForCausalLM"), _CAUSAL_EXPERT_PATTERNS),
+        (register_qwen3_5_moe_text_modeling("Qwen3_5MoeTextModel"), _TEXT_EXPERT_PATTERNS),
     )
-    causal_cls = register_qwen3_5_moe_text_modeling("Qwen3_5MoeForCausalLM")
-    causal_modules, causal_parameters = causal_cls._convert_lora_targets_to_parameters(None, lora_modules, [])
 
-    assert set(conditional_modules) == _DENSE_TARGETS
-    assert conditional_parameters == _CONDITIONAL_EXPERT_PATTERNS
-    assert set(causal_modules) == _DENSE_TARGETS
-    assert causal_parameters == _CAUSAL_EXPERT_PATTERNS
+    for model_cls, expected_patterns in architecture_cases:
+        modules, parameters = model_cls._convert_lora_targets_to_parameters(None, lora_modules, [])
+        assert set(modules) == _DENSE_TARGETS
+        assert parameters == expected_patterns
 
 
 def test_qwen3_5_moe_production_config_injects_all_targets_and_freezes_base_model():
     """Verify the production config injects every target and freezes base weights."""
-    model = build_foundation_model(
+    model = build_lora_test_model(
         config_path=_TOY_CONFIG_PATH,
         weights_path=None,
         torch_dtype="float32",

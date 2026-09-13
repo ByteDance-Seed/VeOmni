@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from veomni.models.checkpoint_manager import ModelCheckpointManager
+from veomni.models_kernel.checkpoint import ModelCheckpointManager
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import (
     CheckpointCallback,
@@ -251,10 +251,10 @@ class TestCheckpointCallbackTrainEndWait:
         trainer.checkpoint.wait_for_pending_save.assert_called_once_with()
 
 
-@patch("veomni.models.checkpoint_manager.get_parallel_state")
-@patch("veomni.models.checkpoint_manager.build_checkpointer")
-@patch("veomni.models.checkpoint_manager.dist")
-@patch("veomni.models.checkpoint_manager.helper")
+@patch("veomni.models_kernel.checkpoint.manager.get_parallel_state")
+@patch("veomni.models_kernel.checkpoint.manager.build_checkpointer")
+@patch("veomni.models_kernel.checkpoint.manager.dist")
+@patch("veomni.models_kernel.checkpoint.manager.helper")
 class TestModelCheckpointManagerSaveContract:
     """``stage_dir`` keys its staging directory on the ``path`` given to ``save``.
 

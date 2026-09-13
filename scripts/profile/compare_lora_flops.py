@@ -21,7 +21,7 @@ from veomni.lora.config import (
     VIT_LORA_MODULES_BY_MODEL_TYPE,
     VeOmniLoraConfig,
 )
-from veomni.models.auto import build_config
+from veomni.models_kernel.auto import build_config
 from veomni.utils.count_flops import VeomniFlopsCounter
 
 

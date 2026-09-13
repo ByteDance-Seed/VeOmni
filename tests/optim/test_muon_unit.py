@@ -110,7 +110,7 @@ def _dsv4_csa_attention_model() -> nn.Module:
     """
     from transformers import AutoConfig
 
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+    from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
     config = AutoConfig.from_pretrained(str(_TOY_CONFIG_ROOT / "deepseek_v4_toy"))
     config.index_n_heads = 64
@@ -125,7 +125,7 @@ def _glm_dsa_attention_model() -> nn.Module:
     """A real ``GlmMoeDsaAttention``, whose indexer names ``wq_b`` and never collides."""
     from transformers import AutoConfig
 
-    from veomni.models.transformers.glm_moe_dsa.generated import patched_modeling_glm_moe_dsa_gpu as modeling
+    from veomni.models_kernel.transformers.glm_moe_dsa.generated import patched_modeling_glm_moe_dsa_gpu as modeling
 
     config = AutoConfig.from_pretrained(str(_TOY_CONFIG_ROOT / "glm_moe_dsa_toy"))
     torch.manual_seed(0)

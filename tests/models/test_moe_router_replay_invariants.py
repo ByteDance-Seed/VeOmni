@@ -217,7 +217,7 @@ def _init_block_deterministic(block: nn.Module, seed: int = 0) -> None:
 
 
 def _build_patched_qwen3_moe_block(config, device=_DEVICE, dtype=torch.bfloat16):
-    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import (
+    from veomni.models_kernel.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import (
         Qwen3MoeSparseMoeBlock as PatchedQwen3MoeSparseMoeBlock,
     )
 
@@ -243,7 +243,7 @@ def _build_vanilla_qwen3_moe_block(config, device=_DEVICE, dtype=torch.bfloat16)
 
 
 def _build_patched_qwen3_5_moe_block(config, device=_DEVICE, dtype=torch.bfloat16):
-    from veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_gpu import (
+    from veomni.models_kernel.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_gpu import (
         Qwen3_5MoeSparseMoeBlock as PatchedQwen3_5MoeSparseMoeBlock,
     )
 

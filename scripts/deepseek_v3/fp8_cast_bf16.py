@@ -9,7 +9,7 @@ from kernel import weight_dequant
 from safetensors.torch import load_file
 from tqdm import tqdm
 
-from veomni.models import save_model_weights
+from veomni.models_kernel import save_model_weights
 from veomni.utils.device import empty_cache, get_device_type
 
 

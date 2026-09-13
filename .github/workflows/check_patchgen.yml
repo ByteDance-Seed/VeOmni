@@ -6,7 +6,7 @@ on:
       - ".github/workflows/check_patchgen.yml"
       - "patchgen-pkg/**"
       - "veomni/patchgen/**"
-      - "veomni/models/transformers/**"
+      - "veomni/models_kernel/transformers/**"
       - "pyproject.toml"
       - "uv.lock"
   push:
@@ -16,7 +16,7 @@ on:
       - ".github/workflows/check_patchgen.yml"
       - "patchgen-pkg/**"
       - "veomni/patchgen/**"
-      - "veomni/models/transformers/**"
+      - "veomni/models_kernel/transformers/**"
       - "pyproject.toml"
       - "uv.lock"
 
@@ -28,6 +28,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v3
         with:

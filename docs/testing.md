@@ -18,20 +18,23 @@ tests/
 │   ├── test_vlm_trainer.py         # VLM freeze_vit smoke test
 │   ├── test_model_registry.py      # Model loader registry (HF vs VeOmni)
 │   ├── test_checkpoint_tensor_converter.py  # Checkpoint tensor conversion (e.g. Qwen3MoE fuse)
-│   ├── test_deepseek_v4_fused_moe.py  # DeepSeek-V4 fused MoE swiglu_limit plumbing
 │   ├── test_padded_packed_loss.py   # Padded vs packed (cu_seqlens) loss equivalence
 │   ├── test_models_logits_equal_v5.py  # HF↔VeOmni logits through the real loader
 │   └── utils.py                    # ModelMode, prepare_model_modes, prepare_data
 │
-├── ops/                            # Fused kernel correctness & performance
-│   ├── test_fused_moe_split_vs_merged.py   # Split vs merged MoE fc1
-│   ├── test_quack_fused_moe.py             # Quack GEMM MoE (SM90+)
-│   ├── test_fused_load_balancing_loss.py    # Triton load-balancing loss kernel
-│   ├── test_deepseek_v4_kernels.py           # DeepSeek-V4 TileLang guards and numerical parity
-│   ├── test_mhc_tile_kernels.py              # DeepSeek-V4 TileKernels mHC dispatch and parity
-│   ├── test_flash_attn_varlen_padding.py   # Flash-attn variable-length padding
-│   ├── test_seqcls_loss.py                 # Sequence classification loss
-│   └── test_comp.py                        # Position embedding computation
+├── kernels/                        # Registry and tensor-kernel correctness
+│   ├── base/test_kernel_entry.py            # Registration, resolution, and generated autograd
+│   ├── attention/                           # Eager/SDPA/Flash/Flex/Magi/Sage contracts
+│   ├── dsa/                                 # DeepSeek/GLM sparse-attention kernels
+│   ├── loss/                                # Cross-entropy and load-balancing kernels
+│   ├── mhc/                                 # mHC eager/TileKernels parity
+│   ├── moe_experts/                         # Eager/Triton/Quack/NPU/MLU expert kernels
+│   └── gated_delta_rule/                    # GatedDeltaNet kernel family
+├── models_kernel/
+│   ├── test_deepseek_v4.py                  # DeepSeek-V4 model and op-callsite parity
+│   ├── test_loss_utils.py                   # causal/seq-cls policy, SP reduction, side-path routing
+│   ├── test_return_log_probs_e2e.py          # generated Qwen3/VL log-probs and distill wiring
+│   └── test_model_load_balancing_loss.py    # HF-shaped model helper and gradient fan-out
 │
 ├── data/                           # Data loading & preprocessing
 │   ├── test_datasets.py            # Dataset loading, filtering, schema validation
@@ -104,7 +107,7 @@ tests/
 | Category | Directory | GPU Req | Execution | Purpose |
 |---|---|---|---|---|
 | **Model patch** | `tests/models/` | 1 GPU | pytest | Fwd/bwd correctness across attn/MoE backends |
-| **Ops / kernels** | `tests/ops/` | 0-1 GPU (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Fused kernel guards, dispatch, correctness, and performance |
+| **Kernels** | `tests/ops/` | 0-1 GPU (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Registry contracts, hardware guards, numerical correctness, and performance |
 | **Data pipeline** | `tests/data/` | 0-1 GPU | pytest | Data loading, collation, preprocessing |
 | **Parallelism** | `tests/parallel/` | 4-8 GPUs | torchrun / pytest | SP, EP, data-balance primitives |
 | **FSDP correctness** | `tests/distributed/` | 2+ GPUs | torchrun (subprocess + mp.spawn) | Single-GPU vs FSDP2 equivalence, dummy forward |
@@ -149,26 +152,29 @@ Additional per-directory helpers:
 | Dimension | Values |
 |---|---|
 | Modeling backend | HuggingFace, VeOmni |
-| Attention implementation | `eager`, `flash_attention_2`, `flash_attention_3`, `veomni_flash_attention_2_with_sp`, `veomni_flash_attention_3_with_sp` |
+| Attention implementation | `eager`, `flash_attention_2`, `flash_attention_3`, `veomni_flash_attention_2`, `veomni_flash_attention_3` |
 | MoE implementation | `eager`, hardware fused backend (`fused_triton` on GPU, `fused_npu` on NPU where supported) |
 | Liger kernel | `True`, `False` (VeOmni only) |
 
 **Models covered**:
-- Text / MoE: llama3_1, qwen2, qwen3_5, qwen3_5_moe, seed_oss, deepseek_v3, deepseek_v4
+- Text / MoE: qwen2, qwen3_5, qwen3_5_moe, seed_oss, deepseek_v3
 - VLM: qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe
 - Omni: qwen2_5_omni, qwen3_omni_moe
 
 **GPU**: 1 GPU, runs serially per model mode.
 
-DeepSeek-V4's fused-MoE-specific merged `gate_up_proj` and `swiglu_limit`
-forwarding are covered by `tests/models/test_deepseek_v4_fused_moe.py` (CPU).
-Its kernel package import behavior, hardware guards, BF16/FP32 utility, and
-TileLang DSA indexer/attention numerical checks are covered by
-`tests/ops/test_deepseek_v4_kernels.py`. The guard and utility cases run on
-CPU; optimized numerical tests require TileLang on an SM90+ NVIDIA GPU.
-Registry binding plus mHC pre/post/head forward and backward parity are covered
-by `tests/ops/test_mhc_tile_kernels.py`, which requires TileKernels on an SM90+
-NVIDIA GPU for kernel execution.
+The models migrated to `models_kernel` are currently DeepSeek-V4, Llama,
+Qwen3, Qwen3-MoE, Qwen3-VL, Qwen3-VL-MoE, Qwen3.5, Qwen3.5-MoE, and
+Qwen3-Omni-MoE. Their registry/build
+dispatch, supported architectures, eager forward/backward parity, and
+instance-local op binding are covered by `tests/models_kernel/test_auto_registry.py`
+and the corresponding model tests under `tests/models_kernel/`. Backend
+availability and optimized op numerics are covered by the corresponding tests
+under `tests/ops/`.
+
+DeepSeek-V4-specific DSA checks live under `tests/ops/dsa/`; optimized numerical
+tests require TileLang on an SM90+ NVIDIA GPU. Its mHC kernel parity is covered
+by `tests/ops/mhc/test_mhc.py` and requires TileKernels on an SM90+ NVIDIA GPU.
 
 ---
 
@@ -267,19 +273,29 @@ NVIDIA GPU for kernel execution.
 
 ---
 
-### 11. Ops / Kernel Tests (`tests/ops/`)
+### 11. Kernel Tests (`tests/ops/`)
 
 | Test | Purpose | GPU |
 |---|---|---|
-| `test_fused_moe_split_vs_merged.py` | Split vs merged fc1 in fused MoE | 1 GPU |
-| `test_quack_fused_moe.py` | Quack GEMM MoE backend | SM90+ |
-| `test_kernel_registry_numerical.py` | Numerical alignment per (op, variant, impl) | CUDA; the FlashQLA `chunk_gated_delta_rule` case skips unless running on SM90 (Hopper) — SM10x WIP upstream. |
-| `test_fused_load_balancing_loss.py` | Triton load-balancing loss | CUDA |
-| `test_deepseek_v4_kernels.py` | CPU import/hardware guards plus TileLang DSA numerical parity | CPU for guards; TileLang + NVIDIA SM90+ for optimized kernels |
-| `test_mhc_tile_kernels.py` | TileKernels mHC registry dispatch and forward/backward parity | TileKernels + NVIDIA SM90+ |
-| `test_flash_attn_varlen_padding.py` | Flash-attn variable-length padding | CUDA |
-| `test_seqcls_loss.py` | Sequence classification loss | CUDA (optional) |
-| `test_comp.py` | Position embedding computation | CUDA |
+| `base/test_kernel_entry.py` | Registration, requirements, resolution, and generated autograd | CPU |
+| `moe_experts/test_moe_experts.py` | Eager/Triton/Quack MoE parity, split/merged weights, and hardware guards | CPU for guards; CUDA for optimized kernels |
+| `dsa/test_dsa*.py` | DSA registry, CPU guards, and TileLang/cuDNN numerical parity | CPU for guards; matching CUDA hardware for optimized kernels |
+| `attention/flash/test_flash_attn_varlen_padding.py` | FlashAttention variable-length padding | CUDA |
+| `attention/magi/` | Magi mask, installer, FA4 metadata, and numerical contracts | CPU for guards; SM90/SM100 for optimized kernels |
+| `batch_invariant/test_batch_invariant.py` | Batch-invariant ATen patch lifecycle and math | CPU for lifecycle; CUDA for Triton kernels |
+
+Cross-entropy is covered at two layers: `tests/ops/loss/test_cross_entropy_loss.py`
+checks token-level eager parity with HF plus chunked/Liger forward and backward;
+`tests/models_kernel/test_loss_utils.py` checks causal target selection,
+sequence-classification policy, SP reduction, logits ownership, and log-probs
+side-path dispatch. Chunked log-probs and top-k distillation have focused tests
+in `tests/models_kernel/`.
+
+Load-balancing loss is covered at two layers: `tests/ops/loss/test_load_balancing_loss.py`
+checks the raw `[N, E]` eager and Triton kernels against HF/eager across the
+configuration matrix, forward/backward, masks, determinism, and peak memory;
+`tests/models_kernel/test_model_load_balancing_loss.py` checks tuple
+concatenation, optional-input policy, and gradient fan-out in the model helper.
 
 ---
 
@@ -291,7 +307,6 @@ NVIDIA GPU for kernel execution.
 | `test_async_ulysses.py` | Dense async Ulysses forward/backward parity | 4+ |
 | `test_async_ulysses_dit.py` | DiT async Ulysses forward/backward parity | 4+ |
 | `test_async_ulysses_grad.py` | Dense async projection grad shapes and frozen-weight bias grads | CPU |
-| `test_op_wrapper.py` | No-autograd RMSNorm/RoPE wrappers selected by `ops_implementation` | CUDA for Liger cases; eager cases use the active device |
 | `test_backward.py` | Shared linear, LayerNorm, and repeated-KV backward units | CUDA for fused LayerNorm; remaining cases use the active device |
 | `test_qwen3_5_gated_deltanet_ulysses.py` | Gated DeltaNet + SP | 4+ |
 | `test_slice_input_tensor.py` | SP input slicing utilities | CPU |
@@ -325,7 +340,7 @@ See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_
 | **MoE model** | `tests/e2e/test_e2e_parallel.py` | Set `is_moe=True` to include `ep_size` iteration. |
 | **MoE with fused experts** | `tests/models/test_checkpoint_tensor_converter.py` | Add converter tests if a custom `CheckpointTensorConverter` is needed. |
 | **Custom checkpoint layout** | `tests/models/test_checkpoint_tensor_converter.py` | Add converter tests for any on-disk HF↔VeOmni key or tensor-layout conversion. |
-| **Custom fused kernels** | `tests/ops/` | Add kernel-specific correctness tests. |
+| **Custom fused kernels** | `tests/ops/<family>/` | Add kernel-specific correctness and registration tests. |
 | **New data modality** | `tests/data/` | Add data processing and collation tests. |
 
 ### Verification Commands
@@ -356,8 +371,8 @@ pytest tests/e2e/test_e2e_parallel.py -k <model_name>
 pytest → test_models_patch_fwd_bwd(config, is_moe, ...)
   → prepare_model_modes(is_moe) → [(HF, eager), (HF, fa2), (VeOmni, fa2_sp), ...]
   → for each mode:
-      apply_ops_config(mode-specific OpsImplementationConfig)
-      BaseTrainer._build_model() → build_foundation_model(config, ops_implementation=...)
+      set_ops_config(mode-specific OpsImplementationConfig)
+      BaseTrainer._build_model() → models_kernel.build_foundation_model(config, ops_implementation=...)
       TrainerTest.forward_backward_step(dummy_batch)
       → record loss, grad_norm
   → compare_multi_items(all_results, rtol, atol)

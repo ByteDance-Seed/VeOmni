@@ -55,7 +55,7 @@ description: "Create a pull request for the current branch. Handles uncommitted 
 
    | Path prefix | Module |
    |------------|--------|
-   | `veomni/models/` | `model` |
+   | `veomni/models_kernel/` | `model` |
    | `veomni/trainer/` | `trainer` |
    | `veomni/data/` | `data` |
    | `veomni/distributed/` | `dist` (use `parallel` when the change is about a parallelism strategy rather than the plumbing) |

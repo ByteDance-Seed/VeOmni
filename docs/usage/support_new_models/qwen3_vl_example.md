@@ -5,8 +5,8 @@
 This document walks through the specific patches applied to integrate **Qwen3-VL MoE** into VeOmni. It is a concrete example of the patterns described in [guide_and_checklist.md](./guide_and_checklist.md), covering FSDP, Sequence Parallelism, Expert Parallelism, and model registration.
 
 > **Scope note:** VeOmni now ships patchgen-generated modeling files under
-> `veomni/models/transformers/<model>/generated/`, so the actual code lives in
-> [veomni/models/transformers/qwen3_vl_moe/qwen3_vl_moe_gpu_patch_gen_config.py](../../../veomni/models/transformers/qwen3_vl_moe/qwen3_vl_moe_gpu_patch_gen_config.py)
+> `veomni/models_kernel/transformers/<model>/generated/`, so the actual code lives in
+> [veomni/models_kernel/transformers/qwen3_vl_moe/qwen3_vl_moe_gpu_patch_gen_config.py](../../../veomni/models_kernel/transformers/qwen3_vl_moe/qwen3_vl_moe_gpu_patch_gen_config.py)
 > rather than the runtime `apply_veomni_*_patch()` helpers shown below. The
 > patterns (FSDP dummy forward, SP slicing, fused MoE, EP plan) are unchanged;
 > what has changed is *where* the patches are declared (in the patchgen config
@@ -321,14 +321,14 @@ outputs = self.language_model(..., **kwargs)
 
 ## 5. Model Registration
 
-In [veomni/models/transformers/__init__.py](../../../veomni/models/transformers/__init__.py):
+In [veomni/models_kernel/transformers/__init__.py](../../../veomni/models_kernel/transformers/__init__.py):
 ```python
 from . import qwen3_vl_moe
 ```
 
 In your model's `__init__.py`:
 ```python
-from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
+from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
 
 @MODEL_CONFIG_REGISTRY.register("qwen3_vl_moe")
 def register_qwen3_vl_moe_config():

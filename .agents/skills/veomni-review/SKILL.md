@@ -104,7 +104,7 @@ For each changed file, check:
 ### VeOmni-Specific Checks
 - PR title format: `[{modules}] {type}: {description}`?
 - All comments and docstrings in English?
-- No auto-generated files (`veomni/models/transformers/*/generated/`) edited directly?
+- No auto-generated files (`veomni/models_kernel/transformers/*/generated/`) edited directly?
 - Tests: does the diff extend an existing CI-enumerated test, or add a new file that the workflow owning that path actually lists? Check the owning workflow rather than assuming — `tests/data/` runs wholesale in both unit workflows, `tests/ops/` only in the GPU one (NPU enumerates ops files by name, so an Ascend-relevant ops file still needs a line), the e2e paths belong to `{gpu,npu}_e2e_test.yml`, and everything else must be listed file by file or it never runs. See `.agents/knowledge/testing.md`.
 - Ruff-compliant (`make quality` passes)?
 

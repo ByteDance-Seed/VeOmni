@@ -12,22 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-op kernel implementations.
+"""Registered kernel families.
 
-Each sub-package groups the backends for one operation and registers it with
-the dispatch registry.  Importing this package triggers registration for all
-ops so that ``apply_global_ops`` / ``apply_per_model_patches`` can discover
-them.
+Importing this package registers every family on ``OP_REGISTRY``.
+Callers resolve rows through ``veomni.ops``, not this package.
 """
 
-from . import (  # noqa: F401
-    attention,
-    cross_entropy,
-    gated_delta_rule,
-    load_balancing_loss,
-    mhc,
-    moe,
-    rms_norm,
-    rotary,
-    swiglu,
-)
+from . import async_ulysses as _async_ulysses  # noqa: F401
+from . import attention as _attention  # noqa: F401
+from . import dsa as _dsa  # noqa: F401
+from . import gated_delta_rule as _gated_delta_rule  # noqa: F401
+from . import loss as _loss  # noqa: F401
+from . import mhc as _mhc  # noqa: F401
+from . import moe_experts as _moe_experts  # noqa: F401
+from . import moe_experts_lora as _moe_experts_lora  # noqa: F401
+from . import rms_norm as _rms_norm  # noqa: F401
+from . import rope as _rope  # noqa: F401
+from . import swiglu_mlp as _swiglu_mlp  # noqa: F401

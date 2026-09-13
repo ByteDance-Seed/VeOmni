@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Platform-specific (non-kernel) integration shims grouped by accelerator.
+"""Hardware-platform constraints for registered operations."""
 
-Currently hosts the Ascend NPU PreMulSum collective patch.  Add a new
-sub-package per accelerator if more device-specific patches are introduced.
-"""
+from .gpu import (
+    NVIDIA_GPU,
+    NVIDIA_SM70_PLUS,
+    NVIDIA_SM90_PLUS,
+    ROCM_GPU,
+    GpuPlatform,
+    NvidiaGpuPlatform,
+    RocmGpuPlatform,
+)
+from .requirement import (
+    ANY_DEVICE,
+    GpuKernelRequirement,
+    KernelRequirement,
+    MluKernelRequirement,
+    NpuKernelRequirement,
+)
+
+
+__all__ = [
+    "ANY_DEVICE",
+    "GpuKernelRequirement",
+    "GpuPlatform",
+    "KernelRequirement",
+    "MluKernelRequirement",
+    "NVIDIA_GPU",
+    "NVIDIA_SM70_PLUS",
+    "NVIDIA_SM90_PLUS",
+    "NpuKernelRequirement",
+    "NvidiaGpuPlatform",
+    "ROCM_GPU",
+    "RocmGpuPlatform",
+]

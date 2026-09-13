@@ -5,8 +5,8 @@
 This document provides in-depth implementation details for each patch applied in the **Qwen3-Omni-MoE** integration — VeOmni's most complex model type, covering image, video, and audio modalities with MoE and Expert Parallelism. Use this alongside [guide_and_checklist.md](./guide_and_checklist.md).
 
 > **Scope note:** VeOmni now ships patchgen-generated modeling files under
-> `veomni/models/transformers/<model>/generated/`. The actual patches live in
-> [veomni/models/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py)
+> `veomni/models_kernel/transformers/<model>/generated/`. The actual patches live in
+> [veomni/models_kernel/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models_kernel/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py)
 > rather than the runtime `apply_veomni_*_patch()` helpers shown below. The
 > patterns (config fix, FSDP dummy, SP, fused MoE, EP plan, processor patch)
 > are unchanged; what has changed is *where* the patches are declared
@@ -304,13 +304,21 @@ if position_ids is not None and position_ids.ndim == 3 and position_ids.shape[1]
 
 ## P11. VeOmni Loss Utility
 
-Replace the model's built-in CE loss with `ForCausalLMLoss` to get Liger/fused kernel selection and correct SP loss reduction:
+Replace the model's built-in CE loss with the models-kernel helper and an
+instance-local registry handle to get fused selection and correct SP loss reduction:
 
 ```python
-from ....ops.kernels.cross_entropy import ForCausalLMLoss
+from functools import partial
+
+from veomni.ops import VeomniOp
+from veomni.models_kernel.loss_utils import ForCausalLMLoss
+
+# In the model constructor:
+self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", implementation)
+self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
 
 if labels is not None:
-    loss, logits = ForCausalLMLoss(
+    loss, logits, aux = self.loss_function(
         labels=labels,
         vocab_size=self.config.vocab_size,
         hidden_states=hidden_states,

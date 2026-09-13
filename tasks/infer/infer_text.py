@@ -7,7 +7,7 @@ from transformers import AutoTokenizer, TextStreamer
 
 from veomni.arguments import InferArguments, parse_args
 from veomni.arguments.arguments_types import OpsImplementationConfig
-from veomni.models import build_foundation_model
+from veomni.models_kernel import build_foundation_model
 from veomni.utils import helper
 from veomni.utils.import_utils import is_flash_attn_2_available
 

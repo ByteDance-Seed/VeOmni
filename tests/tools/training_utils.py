@@ -18,7 +18,7 @@ from .launch_utils import find_free_port
 
 
 # NPU ops_implementation overrides per model. The public
-# ``OpsImplementationConfig`` defaults are GPU-optimal (Liger / Triton) and
+# ``OpsImplementationConfig`` defaults are GPU-optimal (Liger / Triton / fused Triton MoE) and
 # raise on NPU at config validation time, so every NPU test must override
 # every per-op field. ``_NPU_OPS_DEFAULTS`` is the baseline; entries in
 # ``_NPU_PER_MODEL_OVERRIDES`` (DeepSeek-V3/V4, Qwen-VL family) pin
@@ -30,9 +30,8 @@ _NPU_OPS_DEFAULTS: Dict[str, str] = {
     "rms_norm_implementation": "npu",
     "rotary_pos_emb_implementation": "npu",
     "swiglu_mlp_implementation": "eager",  # no NPU backend
-    # NPU ships ``triton-ascend`` (not mainline ``triton``); the validator
-    # gates ``triton`` on ``is_package_available("triton")`` so the fused
-    # load-balancing-loss kernel would raise on the NPU runner. Pin to eager.
+    # The Triton load-balancing-loss row is CUDA-only, so NPU resolution rejects
+    # it even when ``triton-ascend`` is installed. Pin to eager.
     "load_balancing_loss_implementation": "eager",
 }
 
@@ -45,7 +44,7 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "deepseek_v4": {
         # DeepSeek-V4 attention, RMSNorm, and partial RoPE remain eager-only on NPU.
         # The generic NPU rotary backend is incompatible with V4's partial layout.
-        # Routed experts keep fused_npu; its clamp-aware activation uses Ascend
+        # Routed experts keep npu; its clamp-aware activation uses Ascend
         # Triton when available and preserves the eager training fallback otherwise.
         "attn_implementation": "eager",
         "rms_norm_implementation": "eager",
@@ -54,29 +53,6 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # Multimodal RoPE has no NPU backend in the Qwen-VL family.
     "qwen2vl": {"rotary_pos_emb_implementation": "eager"},
     "qwen25vl": {"rotary_pos_emb_implementation": "eager"},
-    # qwen2 / qwen3_moe / llama3.1 / qwen2_5_omni patchgen-generated modeling
-    # declares OpSlots for rotary_pos_emb and rms_norm but KERNEL_REGISTRY
-    # has no ``npu`` KernelSpec for either — only ``liger_kernel`` (GPU). Pin
-    # both to eager until NPU KernelSpecs are registered.
-    "qwen2": {
-        "rms_norm_implementation": "eager",
-        "rotary_pos_emb_implementation": "eager",
-    },
-    "qwen3_moe": {
-        "rms_norm_implementation": "eager",
-        "rotary_pos_emb_implementation": "eager",
-    },
-    "llama3.1": {
-        "rms_norm_implementation": "eager",
-        "rotary_pos_emb_implementation": "eager",
-    },
-    # qwen2_5_omni inherits the same KERNEL_REGISTRY gap; mm RoPE has no
-    # NPU backend either, so pinning both keeps the thinker text path on
-    # eager kernels on NPU.
-    "qwen2_5_omni": {
-        "rms_norm_implementation": "eager",
-        "rotary_pos_emb_implementation": "eager",
-    },
 }
 
 # GPU per-model overrides for models whose patched ops disable a default
@@ -116,8 +92,8 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # configs/text/deepseek_v4.yaml so the fused partial-interleaved Triton
     # kernel is exercised under FSDP2, Ulysses SP and the TileLang paths rather
     # than only by the standalone kernel tests. MoE uses the GPU-default
-    # fused_triton backend, while weighted/unweighted RMSNorm and the
-    # shared-expert MLP use their default Liger OpSlots.
+    # triton backend, while weighted/unweighted RMSNorm and the
+    # shared-expert MLP use their default Liger kernels.
     "deepseek_v4": {
         "attn_implementation": "eager",
         "moe_implementation": "fused_triton",
@@ -297,20 +273,44 @@ def build_torchrun_cmd(
 # ---------------------------------------------------------------------------
 
 
+def build_hf_reference_model(config_path: str, *, torch_dtype: str, init_device: str):
+    """Build an upstream HF model through the models_kernel entry point.
+
+    Reference-weight materialization must work before a model family is added to
+    ``MODELING_REGISTRY``. Select the explicit HF backend for only this build and
+    restore the caller's environment afterwards; the VeOmni runtime keeps its
+    strict no-fallback registry behavior.
+    """
+    from veomni.models_kernel import build_foundation_model
+
+    previous_backend = os.environ.get("MODELING_BACKEND")
+    os.environ["MODELING_BACKEND"] = "hf"
+    try:
+        return build_foundation_model(
+            config_path=config_path,
+            weights_path=None,
+            torch_dtype=torch_dtype,
+            init_device=init_device,
+            ops_implementation=make_eager_ops_config(),
+        )
+    finally:
+        if previous_backend is None:
+            os.environ.pop("MODELING_BACKEND", None)
+        else:
+            os.environ["MODELING_BACKEND"] = previous_backend
+
+
 def materialize_weights(config_path: str, output_path: str, save_original_format: bool = True) -> None:
     """Build a model from toy config and save random weights to disk.
 
     This avoids downloading real model weights for CI tests.
     """
-    from veomni.models.auto import build_foundation_model
     from veomni.utils.device import empty_cache, get_device_type
 
-    model = build_foundation_model(
-        config_path=config_path,
-        weights_path=None,
+    model = build_hf_reference_model(
+        config_path,
         torch_dtype="float32",
         init_device=get_device_type(),
-        ops_implementation=make_eager_ops_config(),
     )
     model.save_pretrained(output_path, save_original_format=save_original_format)
     # The fp32 model can pin tens of GiB on the device (e.g. qwen3_5's full

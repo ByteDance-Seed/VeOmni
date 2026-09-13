@@ -22,7 +22,7 @@ weights to the reference broadcast loader.
 What ``ep_sharded_stream_load`` does for a PEFT model
 -----------------------------------------------------
 ``load_model_weights_ep_sharded`` under ``is_peft_model=True`` (wired in
-``veomni/models/module_utils.py``):
+``veomni/models_kernel/checkpoint/weights.py``):
 
   * **Base experts** — the fused ``...experts.gate_up_proj`` /
     ``down_proj`` tensors are streamed from the base checkpoint straight
@@ -79,9 +79,8 @@ __all__ = [
 
 
 # EP requires a fused MoE-LoRA kernel: the wrappers only implement the EP
-# dispatch on the fused path. The backend is device-specific — ``fused_triton``
-# on GPU, ``fused_npu`` on NPU (selecting the wrong one raises a hard error in
-# ``apply_veomni_fused_moe_patch``), so pick it from the active accelerator.
+# dispatch on the fused path. The backend is device-specific — ``triton``
+# on GPU, ``npu`` on NPU — so pick it from the active accelerator.
 def _fused_ops_override() -> str:
     from veomni.utils.import_utils import is_torch_npu_available
 
@@ -129,8 +128,9 @@ def _build_and_save_fused_toy_base(dest_dir: str) -> None:
     from safetensors.torch import save_file
 
     from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.models import build_foundation_model
     from veomni.utils import helper as _helper
+
+    from .utils import build_lora_test_model
 
     _helper.set_seed(42)
     ops = OpsImplementationConfig(
@@ -141,7 +141,7 @@ def _build_and_save_fused_toy_base(dest_dir: str) -> None:
         swiglu_mlp_implementation="eager",
         rotary_pos_emb_implementation="eager",
     )
-    model = build_foundation_model(
+    model = build_lora_test_model(
         config_path=_TOY_CONFIG_PATH,
         weights_path=None,
         torch_dtype="bfloat16",

@@ -12,92 +12,139 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""RMSNorm kernel registry entry.
+"""RMSNorm kernel family.
 
-Default per-model backends:
-    - ``liger_kernel``: ``liger_kernel.transformers.rms_norm.LigerRMSNorm``
-    - ``npu``: ``torch_npu.npu_rms_norm`` via ``veomni.ops.kernels.rms_norm.npu``
-Models can register a ``triton`` backend via ``extra_backends`` in their
-``device_patch.py`` (e.g. DeepSeek V3 batch-invariant kernel).
+Variants: ``standard`` (offset 0, llama-style cast), ``deepseek_v4`` (offset 0,
+fp32 affine scale), ``qwen3_5`` (offset 1, gemma-style fp32 scale), and
+``unweighted`` (no affine weight). Each variant registers an eager row plus
+optional CUDA / NPU adapters.
 """
 
-from ...config.registry import BackendSpec, OpScope, OpSpec, register_op
-from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
+from ...platform import GpuKernelRequirement, NpuKernelRequirement
+from ...registry import register_op
+from .deepseek_v4 import eager as deepseek_v4_eager
+from .deepseek_v4 import liger_kernel as deepseek_v4_liger
+from .qwen3_5 import eager as qwen3_5_eager
+from .qwen3_5 import liger_kernel as qwen3_5_liger
+from .qwen3_5 import npu as qwen3_5_npu
+from .standard import eager as standard_eager
+from .standard import liger_kernel as standard_liger
+from .standard import npu as standard_npu
+from .standard import triton as standard_triton
+from .unweighted import eager as unweighted_eager
+from .unweighted import liger_kernel as unweighted_liger
+
+
+_GPU = GpuKernelRequirement()
 
 
 register_op(
-    OpSpec(
-        name="rms_norm",
-        config_field="rms_norm_implementation",
-        label="RMSNorm",
-        scope=OpScope.PER_MODEL,
-        default="liger_kernel",
-        backends={
-            "liger_kernel": BackendSpec(
-                entry="liger_kernel.transformers.rms_norm:LigerRMSNorm",
-                requires=("liger_kernel",),
-            ),
-            "npu": BackendSpec(
-                entry="veomni.ops.kernels.rms_norm.npu:rms_norm_forward_npu",
-                requires=("torch_npu",),
-                replace_forward=True,
-            ),
-        },
-    )
+    "rms_norm",
+    "standard",
+    "eager",
+    standard_eager.forward,
+    standard_eager.backward,
+    description="PyTorch standard RMSNorm with Llama-style casting",
 )
 
-# ── rms_norm (Torch_npu) ───────────────────────────────────
-
-
-def _npu_standard_rms_norm_factory():
-    from .npu import standard_rms_norm_forward_npu
-
-    return standard_rms_norm_forward_npu
-
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="npu",
-        op_name="rms_norm",
-        variant="standard",
-        factory=_npu_standard_rms_norm_factory,
-        hardware=HardwareRequirement(device_type="npu"),
-        description="standard fused RMSNorm on NPU",
-    )
+register_op(
+    "rms_norm",
+    "standard",
+    "liger_kernel",
+    standard_liger.forward,
+    standard_liger.backward,
+    description="Liger Kernel standard RMSNorm with Llama-style casting",
+    requirement=_GPU,
+    requires=("liger_kernel",),
 )
 
-
-def _npu_unweighted_rms_norm_factory():
-    from .npu import unweighted_rms_norm_forward_npu
-
-    return unweighted_rms_norm_forward_npu
-
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="npu",
-        op_name="rms_norm",
-        variant="unweighted",
-        factory=_npu_unweighted_rms_norm_factory,
-        hardware=HardwareRequirement(device_type="npu"),
-        description="unweighted RMSNorm eager fallback on NPU",
-    )
+register_op(
+    "rms_norm",
+    "standard",
+    "npu",
+    standard_npu.forward,
+    standard_npu.backward,
+    description="torch_npu standard RMSNorm with Llama-style casting",
+    requirement=NpuKernelRequirement(),
 )
 
+register_op(
+    "rms_norm",
+    "standard",
+    "triton",
+    standard_triton.forward,
+    standard_triton.backward,
+    description="Triton standard RMSNorm with Llama-style casting",
+    requirement=_GPU,
+    requires=("triton",),
+)
 
-def _npu_qwen3_5_rms_norm_factory():
-    from .npu import qwen3_5_rms_norm_forward_npu
+register_op(
+    "rms_norm",
+    "deepseek_v4",
+    "eager",
+    deepseek_v4_eager.forward,
+    deepseek_v4_eager.backward,
+    description="PyTorch DeepSeek-V4 RMSNorm with an fp32 affine scale",
+)
 
-    return qwen3_5_rms_norm_forward_npu
+register_op(
+    "rms_norm",
+    "deepseek_v4",
+    "liger_kernel",
+    deepseek_v4_liger.forward,
+    deepseek_v4_liger.backward,
+    description="Liger Kernel DeepSeek-V4 RMSNorm with offset 0 and Gemma-style scaling",
+    requirement=_GPU,
+    requires=("liger_kernel",),
+)
 
+register_op(
+    "rms_norm",
+    "qwen3_5",
+    "eager",
+    qwen3_5_eager.forward,
+    qwen3_5_eager.backward,
+    description="PyTorch Qwen3.5 RMSNorm with offset weights and Gemma-style scaling",
+)
 
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="npu",
-        op_name="rms_norm",
-        variant="qwen3_5",
-        factory=_npu_qwen3_5_rms_norm_factory,
-        hardware=HardwareRequirement(device_type="npu"),
-        description="Qwen3.5 fused RMSNorm on NPU",
-    )
+register_op(
+    "rms_norm",
+    "qwen3_5",
+    "liger_kernel",
+    qwen3_5_liger.forward,
+    qwen3_5_liger.backward,
+    description="Liger Kernel Qwen3.5 RMSNorm with offset weights and Gemma-style scaling",
+    requirement=_GPU,
+    requires=("liger_kernel",),
+)
+
+register_op(
+    "rms_norm",
+    "qwen3_5",
+    "npu",
+    qwen3_5_npu.forward,
+    qwen3_5_npu.backward,
+    description="torch_npu Qwen3.5 RMSNorm with offset weights and Gemma-style scaling",
+    requirement=NpuKernelRequirement(),
+)
+
+register_op(
+    "rms_norm",
+    "unweighted",
+    "eager",
+    unweighted_eager.forward,
+    unweighted_eager.backward,
+    description="PyTorch RMSNorm without an affine weight",
+)
+
+register_op(
+    "rms_norm",
+    "unweighted",
+    "liger_kernel",
+    unweighted_liger.forward,
+    unweighted_liger.backward,
+    description="Liger Kernel RMSNorm without an affine weight",
+    requirement=_GPU,
+    requires=("liger_kernel",),
 )

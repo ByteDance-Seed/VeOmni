@@ -28,7 +28,7 @@ from ..distributed.torch_compile import (
     validate_compile_model,
     validate_compile_runtime,
 )
-from ..models import build_foundation_model, build_processor
+from ..models_kernel import build_foundation_model, build_processor
 from ..optim import build_optimizer
 from ..utils import helper
 from ..utils.device import get_device_type, synchronize

@@ -1,4 +1,4 @@
-# Copyright 2026 Bytedance Ltd. and/or its affiliates
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,44 +12,77 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Registry entries for manifold-constrained Hyper-Connection kernels."""
+"""Manifold-constrained Hyper-Connection kernels used by DeepSeek-V4.
 
-from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
+Three independent variants share this package. They are not a compound
+kernel. Eager is the modeling math (regular autograd). ``tilelang`` is
+TileKernels on SM90+. ``post`` / ``tilelang`` is a raw pair; ``pre`` and
+``head`` keep an opaque wrapper because TileKernels owns that autograd.
+"""
 
-
-def _mhc_pre_tile_kernels_factory():
-    from .tile_kernels import mhc_pre_tile_kernels
-
-    return mhc_pre_tile_kernels
-
-
-def _mhc_post_tile_kernels_factory():
-    from .tile_kernels import mhc_post_tile_kernels
-
-    return mhc_post_tile_kernels
-
-
-def _mhc_head_tile_kernels_factory():
-    from .tile_kernels import mhc_head_tile_kernels
-
-    return mhc_head_tile_kernels
+from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement
+from ...registry import register_op
+from .head import eager as head_eager
+from .head import tilelang as head_tilelang
+from .post import eager as post_eager
+from .post import tilelang as post_tilelang
+from .pre import eager as pre_eager
+from .pre import tilelang as pre_tilelang
 
 
-for variant, factory, description in (
-    ("pre", _mhc_pre_tile_kernels_factory, "TileKernels DeepSeek V4 mHC pre/Sinkhorn/collapse"),
-    ("post", _mhc_post_tile_kernels_factory, "TileKernels DeepSeek V4 mHC residual post-mix"),
-    ("head", _mhc_head_tile_kernels_factory, "TileKernels DeepSeek V4 final mHC collapse"),
-):
-    KERNEL_REGISTRY.register(
-        KernelSpec(
-            name="tilelang",
-            op_name="mhc",
-            variant=variant,
-            factory=factory,
-            hardware=HardwareRequirement(device_type="gpu", min_compute_capability=90),
-            description=description,
-        )
-    )
+_TILELANG = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 
+register_op(
+    "mhc",
+    "pre",
+    "eager",
+    description="PyTorch DeepSeek-V4 mHC pre transform with Sinkhorn normalization and collapse",
+    wrapper=pre_eager.wrapper,
+)
 
-__all__ = []
+register_op(
+    "mhc",
+    "pre",
+    "tilelang",
+    description="TileKernels DeepSeek-V4 mHC pre transform with Sinkhorn normalization and collapse",
+    wrapper=pre_tilelang.wrapper,
+    requirement=_TILELANG,
+    requires=("tile_kernels",),
+)
+
+register_op(
+    "mhc",
+    "post",
+    "eager",
+    description="PyTorch DeepSeek-V4 mHC residual post-mix",
+    wrapper=post_eager.wrapper,
+)
+
+register_op(
+    "mhc",
+    "post",
+    "tilelang",
+    post_tilelang.forward,
+    post_tilelang.backward,
+    description="TileKernels DeepSeek-V4 mHC residual post-mix",
+    requirement=_TILELANG,
+    requires=("tile_kernels",),
+)
+
+register_op(
+    "mhc",
+    "head",
+    "eager",
+    description="PyTorch DeepSeek-V4 final mHC collapse",
+    wrapper=head_eager.wrapper,
+)
+
+register_op(
+    "mhc",
+    "head",
+    "tilelang",
+    description="TileKernels DeepSeek-V4 final mHC collapse",
+    wrapper=head_tilelang.wrapper,
+    requirement=_TILELANG,
+    requires=("tile_kernels",),
+)
