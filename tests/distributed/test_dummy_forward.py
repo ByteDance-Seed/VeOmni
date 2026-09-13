@@ -137,12 +137,17 @@ def _asymmetric_forward_worker(model_type, config_path, batch_fn):
     from veomni import _apply_patches
     from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.distributed.torch_parallelize import build_parallelize_model
-    from veomni.models.auto import build_foundation_model
+    from veomni.models_kernel import MODELING_REGISTRY
     from veomni.utils.device import get_device_type
 
     from ..tools.training_utils import make_eager_ops_config
 
     _apply_patches()
+
+    if model_type in MODELING_REGISTRY.valid_keys():
+        from veomni.models_kernel import build_foundation_model
+    else:
+        from veomni.models.auto import build_foundation_model
 
     # Tight NCCL timeout so a missing dummy_forward fails fast instead of hanging
     os.environ["NCCL_TIMEOUT"] = "120"

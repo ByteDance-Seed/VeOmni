@@ -34,6 +34,12 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeVisionConfig,
 )
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeAudioEncoderConfig,
+    Qwen3OmniMoeTextConfig,
+    Qwen3OmniMoeThinkerConfig,
+    Qwen3OmniMoeVisionEncoderConfig,
+)
 from transformers.models.qwen3_vl.configuration_qwen3_vl import (
     Qwen3VLConfig,
     Qwen3VLTextConfig,
@@ -72,6 +78,7 @@ class _ModelCase:
     config_factory: Callable[[str], PretrainedConfig]
     architectures: tuple[str, ...]
     has_registered_config: bool = False
+    eager_op_path: str | None = "veomni_ce"
 
 
 def _tiny_deepseek_v4_config(architecture: str = "DeepseekV4ForCausalLM") -> PretrainedConfig:
@@ -244,6 +251,79 @@ def _tiny_qwen3_moe_config(architecture: str = "Qwen3MoeForCausalLM") -> Qwen3Mo
     )
 
 
+def _tiny_qwen3_omni_moe_text_config(
+    architecture: str = "Qwen3OmniMoeThinkerTextModel",
+) -> Qwen3OmniMoeTextConfig:
+    return Qwen3OmniMoeTextConfig(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=16,
+        decoder_sparse_step=1,
+        mlp_only_layers=[],
+        output_router_logits=False,
+        router_aux_loss_coef=0.001,
+        architectures=[architecture],
+        attn_implementation="eager",
+    )
+
+
+def _tiny_qwen3_omni_moe_thinker_config(
+    architecture: str = "Qwen3OmniMoeThinkerForConditionalGeneration",
+) -> Qwen3OmniMoeThinkerConfig:
+    text_config = _tiny_qwen3_omni_moe_text_config()
+    vision_config = Qwen3OmniMoeVisionEncoderConfig(
+        depth=1,
+        hidden_size=32,
+        intermediate_size=64,
+        num_heads=4,
+        patch_size=8,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        out_hidden_size=32,
+        num_position_embeddings=16,
+        deepstack_visual_indexes=[0],
+    )
+    audio_config = Qwen3OmniMoeAudioEncoderConfig(
+        num_mel_bins=16,
+        encoder_layers=1,
+        encoder_attention_heads=2,
+        encoder_ffn_dim=32,
+        d_model=16,
+        output_dim=32,
+        downsample_hidden_size=16,
+        n_window=4,
+        max_source_positions=16,
+    )
+    return Qwen3OmniMoeThinkerConfig(
+        text_config=text_config.to_dict(),
+        vision_config=vision_config.to_dict(),
+        audio_config=audio_config.to_dict(),
+        architectures=[architecture],
+    )
+
+
+def _tiny_qwen3_omni_moe_config(
+    architecture: str = "Qwen3OmniMoeForConditionalGeneration",
+) -> PretrainedConfig:
+    from veomni.models_kernel.transformers.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+        Qwen3OmniMoeConfig,
+    )
+
+    thinker_config = _tiny_qwen3_omni_moe_thinker_config()
+    return Qwen3OmniMoeConfig(
+        thinker_config=thinker_config.to_dict(),
+        enable_audio_output=False,
+        architectures=[architecture],
+    )
+
+
 def _tiny_qwen3_vl_config(architecture: str = "Qwen3VLForConditionalGeneration") -> Qwen3VLConfig:
     text_config = Qwen3VLTextConfig(
         vocab_size=32,
@@ -382,6 +462,24 @@ _MODEL_CASES = (
         ),
     ),
     _ModelCase(
+        model_type="qwen3_omni_moe",
+        config_factory=_tiny_qwen3_omni_moe_config,
+        architectures=("Qwen3OmniMoeForConditionalGeneration",),
+        has_registered_config=True,
+        eager_op_path="thinker.veomni_ce",
+    ),
+    _ModelCase(
+        model_type="qwen3_omni_moe_thinker",
+        config_factory=_tiny_qwen3_omni_moe_thinker_config,
+        architectures=("Qwen3OmniMoeThinkerForConditionalGeneration",),
+    ),
+    _ModelCase(
+        model_type="qwen3_omni_moe_text",
+        config_factory=_tiny_qwen3_omni_moe_text_config,
+        architectures=("Qwen3OmniMoeThinkerTextModel",),
+        eager_op_path=None,
+    ),
+    _ModelCase(
         model_type="qwen3_vl",
         config_factory=_tiny_qwen3_vl_config,
         architectures=("Qwen3VLForConditionalGeneration", "Qwen3VLModel"),
@@ -443,7 +541,11 @@ def test_build_foundation_model_constructs_registered_model(model_case: _ModelCa
         set_ops_config(previous)
     assert model.__class__.__name__ == model_case.architectures[0]
     assert "models_kernel" in model.__class__.__module__
-    assert model.veomni_ce.impl == "eager"
+    if model_case.eager_op_path is not None:
+        op = model
+        for attribute in model_case.eager_op_path.split("."):
+            op = getattr(op, attribute)
+        assert op.impl == "eager"
 
 
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)

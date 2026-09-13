@@ -1765,6 +1765,26 @@ def qwen3_omni_moe_get_parallel_plan_patched(self):
 
 
 @config.override_method(
+    "Qwen3OmniMoeThinkerForConditionalGeneration.get_parallel_plan",
+    description="Register the standalone Qwen3-Omni-MoE thinker expert parallel plan",
+)
+def qwen3_omni_moe_thinker_get_parallel_plan_patched(self):
+    from ..parallel_plan import get_thinker_parallel_plan as _get_thinker_parallel_plan
+
+    return _get_thinker_parallel_plan()
+
+
+@config.override_method(
+    "Qwen3OmniMoeThinkerTextModel.get_parallel_plan",
+    description="Register the standalone Qwen3-Omni-MoE text expert parallel plan",
+)
+def qwen3_omni_moe_text_get_parallel_plan_patched(self):
+    from ..parallel_plan import get_text_parallel_plan as _get_text_parallel_plan
+
+    return _get_text_parallel_plan()
+
+
+@config.override_method(
     "Qwen3OmniMoeAudioAttention.forward",
     description="Dispatch audio attention through the interned VeomniOp",
 )

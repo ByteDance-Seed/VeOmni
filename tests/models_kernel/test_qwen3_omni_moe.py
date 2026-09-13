@@ -113,18 +113,30 @@ def _tiny_thinker_config() -> Qwen3OmniMoeThinkerConfig:
     )
 
 
-def _qwen3_omni_moe_thinker_cls():
+def _qwen3_omni_moe_classes():
     from veomni.utils.device import IS_NPU_AVAILABLE
 
     if IS_NPU_AVAILABLE:
         from veomni.models_kernel.transformers.qwen3_omni_moe.generated.patched_modeling_qwen3_omni_moe_npu import (
+            Qwen3OmniMoeForConditionalGeneration,
             Qwen3OmniMoeThinkerForConditionalGeneration,
+            Qwen3OmniMoeThinkerTextModel,
         )
     else:
         from veomni.models_kernel.transformers.qwen3_omni_moe.generated.patched_modeling_qwen3_omni_moe_gpu import (
+            Qwen3OmniMoeForConditionalGeneration,
             Qwen3OmniMoeThinkerForConditionalGeneration,
+            Qwen3OmniMoeThinkerTextModel,
         )
-    return Qwen3OmniMoeThinkerForConditionalGeneration
+    return (
+        Qwen3OmniMoeForConditionalGeneration,
+        Qwen3OmniMoeThinkerForConditionalGeneration,
+        Qwen3OmniMoeThinkerTextModel,
+    )
+
+
+def _qwen3_omni_moe_thinker_cls():
+    return _qwen3_omni_moe_classes()[1]
 
 
 def _build_ours(config: Qwen3OmniMoeThinkerConfig, ops: SimpleNamespace | None = None):
@@ -192,6 +204,92 @@ def test_qwen3_omni_moe_instances_keep_distinct_impls():
 
     set_ops_config(fused_cfg)
     assert eager.model.layers[0].mlp.experts.veomni_moe.impl == "eager"
+
+
+def test_qwen3_omni_moe_parallel_plans_cover_all_kernel_load_entries():
+    top_cls, thinker_cls, text_cls = _qwen3_omni_moe_classes()
+
+    top_ep_plan = top_cls.get_parallel_plan(None).extra_parallel_plan["ep"]
+    thinker_ep_plan = thinker_cls.get_parallel_plan(None).extra_parallel_plan["ep"]
+    text_ep_plan = text_cls.get_parallel_plan(None).extra_parallel_plan["ep"]
+
+    assert set(top_ep_plan) == {
+        "thinker.model.layers.*.mlp.experts.gate_up_proj",
+        "thinker.model.layers.*.mlp.experts.down_proj",
+    }
+    assert set(thinker_ep_plan) == {
+        "model.layers.*.mlp.experts.gate_up_proj",
+        "model.layers.*.mlp.experts.down_proj",
+    }
+    assert set(text_ep_plan) == {
+        "layers.*.mlp.experts.gate_up_proj",
+        "layers.*.mlp.experts.down_proj",
+    }
+
+
+def test_qwen3_omni_moe_registry_wires_kernel_and_upstream_talker_entries():
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+        Qwen3OmniMoeTalkerForConditionalGeneration,
+        Qwen3OmniMoeTalkerModel,
+    )
+
+    from veomni.models_kernel import MODEL_PROCESSOR_REGISTRY
+    from veomni.models_kernel.transformers.qwen3_omni_moe import (
+        register_qwen3_omni_moe_modeling,
+        register_qwen3_omni_moe_text_modeling,
+        register_qwen3_omni_moe_thinker_modeling,
+    )
+
+    top_cls = register_qwen3_omni_moe_modeling("Qwen3OmniMoeForConditionalGeneration")
+    thinker_cls = register_qwen3_omni_moe_thinker_modeling(None)
+    text_cls = register_qwen3_omni_moe_text_modeling(None)
+
+    assert top_cls.__name__ == "Qwen3OmniMoeForConditionalGeneration"
+    assert thinker_cls.__name__ == "Qwen3OmniMoeThinkerForConditionalGeneration"
+    assert text_cls.__name__ == "Qwen3OmniMoeThinkerTextModel"
+    assert (
+        register_qwen3_omni_moe_modeling("Qwen3OmniMoeTalkerForConditionalGeneration")
+        is Qwen3OmniMoeTalkerForConditionalGeneration
+    )
+    assert register_qwen3_omni_moe_modeling("Qwen3OmniMoeTalkerModel") is Qwen3OmniMoeTalkerModel
+    assert "Qwen3OmniMoeProcessor" in MODEL_PROCESSOR_REGISTRY.valid_keys()
+
+    for model_cls in (top_cls, thinker_cls, text_cls):
+        assert callable(model_cls._create_checkpoint_tensor_converter)
+        assert callable(model_cls._convert_fqn_to_index_mapping)
+        assert callable(model_cls._convert_lora_targets_to_parameters)
+
+
+def test_qwen3_omni_moe_lora_mapping_covers_all_kernel_load_entries():
+    from veomni.models_kernel.transformers.qwen3_omni_moe import (
+        register_qwen3_omni_moe_modeling,
+        register_qwen3_omni_moe_text_modeling,
+        register_qwen3_omni_moe_thinker_modeling,
+    )
+
+    lora_modules = ["q_proj", "gate_proj", "up_proj", "down_proj"]
+    cases = (
+        (
+            register_qwen3_omni_moe_modeling("Qwen3OmniMoeForConditionalGeneration"),
+            [
+                "thinker.model.layers.*.mlp.experts.gate_up_proj",
+                "thinker.model.layers.*.mlp.experts.down_proj",
+            ],
+        ),
+        (
+            register_qwen3_omni_moe_thinker_modeling(None),
+            ["model.layers.*.mlp.experts.gate_up_proj", "model.layers.*.mlp.experts.down_proj"],
+        ),
+        (
+            register_qwen3_omni_moe_text_modeling(None),
+            ["layers.*.mlp.experts.gate_up_proj", "layers.*.mlp.experts.down_proj"],
+        ),
+    )
+
+    for model_cls, expected_patterns in cases:
+        modules, patterns = model_cls._convert_lora_targets_to_parameters(None, lora_modules, [])
+        assert modules == ["q_proj"]
+        assert patterns == expected_patterns
 
 
 def test_qwen3_omni_moe_eager_matches_hf_text_only():

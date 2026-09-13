@@ -55,6 +55,10 @@
 #      Declare omni-specific (audio) collate rules for the VeOmni collator
 #    - method_override: Qwen3OmniMoeForConditionalGeneration.get_parallel_plan
 #      Register Qwen3-Omni-MoE thinker expert parallel plan for v5 generated modeling
+#    - method_override: Qwen3OmniMoeThinkerForConditionalGeneration.get_parallel_plan
+#      Register the standalone Qwen3-Omni-MoE thinker expert parallel plan
+#    - method_override: Qwen3OmniMoeThinkerTextModel.get_parallel_plan
+#      Register the standalone Qwen3-Omni-MoE text expert parallel plan
 #    - method_override: Qwen3OmniMoeAudioAttention.forward
 #      Dispatch audio attention through the interned VeomniOp
 #    - method_override: Qwen3OmniMoeThinkerTextAttention.forward
@@ -1954,7 +1958,7 @@ class Qwen3OmniMoeTextRMSNorm(nn.Module):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3OmniMoeThinkerTextModel
-# Methods patched: forward, _deepstack_process
+# Methods patched: forward, _deepstack_process, get_parallel_plan
 # ======================================================================
 
 
@@ -2120,6 +2124,11 @@ class Qwen3OmniMoeThinkerTextModel(Qwen3OmniMoePreTrainedModel):
         hidden_states[visual_pos_masks, :] = local_this
         return hidden_states
 
+    def get_parallel_plan(self):
+        from ..parallel_plan import get_text_parallel_plan as _get_text_parallel_plan
+
+        return _get_text_parallel_plan()
+
 
 @auto_docstring
 @dataclass
@@ -2204,7 +2213,7 @@ def load_balancing_loss_func(
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3OmniMoeThinkerForConditionalGeneration
-# Methods patched: __init__, get_image_features, get_video_features, get_audio_features, get_position_id_func, forward
+# Methods patched: __init__, get_image_features, get_video_features, get_audio_features, get_position_id_func, forward, get_parallel_plan
 # ======================================================================
 
 
@@ -2871,6 +2880,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             type(self).get_rope_index,
             fake_model,
         )
+
+    def get_parallel_plan(self):
+        from ..parallel_plan import get_thinker_parallel_plan as _get_thinker_parallel_plan
+
+        return _get_thinker_parallel_plan()
 
 
 class Qwen3OmniMoeSnakeBeta(nn.Module):
