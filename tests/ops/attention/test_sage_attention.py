@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import builtins
 import importlib.util
 from types import SimpleNamespace
 
@@ -107,10 +108,21 @@ def test_sage_attention_rejects_dense_mask(monkeypatch):
 
 
 def test_sage_attention_requires_package(monkeypatch):
+    real_import = builtins.__import__
+    missing = ModuleNotFoundError("No module named 'sageattention'", name="sageattention")
+    attempts = []
+
+    def blocked_import(name, *args, **kwargs):
+        if name == "sageattention":
+            attempts.append(name)
+            raise missing
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
     monkeypatch.setattr(sage_backend, "sageattn", None)
     monkeypatch.setattr(sage_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
     query = torch.randn(1, 2, 4, 8)
-    with pytest.raises(ImportError, match="sageattention"):
+    with pytest.raises(ImportError, match="sageattention") as exc_info:
         sage_backend.sage_attention_forward(
             _FakeAttentionModule(),
             query,
@@ -118,6 +130,32 @@ def test_sage_attention_requires_package(monkeypatch):
             query,
             attention_mask=None,
         )
+    assert attempts == ["sageattention"]
+    assert exc_info.value.__cause__ is missing
+
+
+def test_sage_attention_preserves_transitive_import_error(monkeypatch):
+    real_import = builtins.__import__
+    missing_dependency = ModuleNotFoundError("No module named 'sageattention_cuda'", name="sageattention_cuda")
+
+    def broken_import(name, *args, **kwargs):
+        if name == "sageattention":
+            raise missing_dependency
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", broken_import)
+    monkeypatch.setattr(sage_backend, "sageattn", None)
+    monkeypatch.setattr(sage_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
+    query = torch.randn(1, 2, 4, 8)
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        sage_backend.sage_attention_forward(
+            _FakeAttentionModule(),
+            query,
+            query,
+            query,
+            attention_mask=None,
+        )
+    assert exc_info.value is missing_dependency
 
 
 def test_sage_attention_rejects_training_graph(monkeypatch):

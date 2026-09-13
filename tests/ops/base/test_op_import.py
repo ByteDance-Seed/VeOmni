@@ -31,6 +31,7 @@ import builtins
 import sys
 
 real_import = builtins.__import__
+attempted_optional_imports = []
 optional_roots = {
     "apex",
     "cuda",
@@ -55,6 +56,7 @@ optional_roots = {
 
 def blocked_import(name, *args, **kwargs):
     if name.partition(".")[0] in optional_roots:
+        attempted_optional_imports.append(name)
         raise ModuleNotFoundError(f"No module named {name!r} (blocked by test)", name=name)
     return real_import(name, *args, **kwargs)
 
@@ -68,6 +70,7 @@ import veomni.ops.kernels.dsa.vendor
 import veomni.ops.qat
 from veomni.ops import OP_REGISTRY
 
+assert "sageattention" not in {name.partition(".")[0] for name in attempted_optional_imports}
 assert not optional_roots.intersection(sys.modules)
 for module in (
     "veomni.ops.batch_invariant.triton",

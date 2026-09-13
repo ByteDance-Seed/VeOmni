@@ -14,6 +14,8 @@
 
 """DeepSeek-V4 TileLang vendor-kernel boundary and gradient coverage."""
 
+import inspect
+
 import pytest
 import torch
 
@@ -142,6 +144,63 @@ def _sparse_attention_reference(q, kv, sinks, indices, scale):
     return numerator / denominator.unsqueeze(-1)
 
 
+def test_tilelang_sparse_attention_forward_pipelines_the_gather_without_changing_output():
+    """Pipelining the forward's sparse gather must stay legal, real, and exact."""
+    require_nvidia_cuda("tilelang", min_cc=90)
+    from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_fwd import sparse_mqa_fwd, sparse_mqa_fwd_interface
+
+    torch.manual_seed(4)
+    batch, seqlen, heads, dim, kv_len, topk = 1, 64, 8, 512, 128, 640
+    q = torch.randn(batch, seqlen, heads, dim, device=DEVICE, dtype=torch.bfloat16)
+    kv = torch.randn(batch, kv_len, dim, device=DEVICE, dtype=torch.bfloat16)
+    sinks = torch.randn(heads, device=DEVICE)
+    indices = torch.randint(kv_len, (batch, seqlen, topk), device=DEVICE, dtype=torch.int32)
+    indices[..., ::64] = -1
+    indices[..., 63::64] = kv_len
+    scale = dim**-0.5
+
+    pipelined = sparse_mqa_fwd(heads, dim, topk, scale, num_stages=1)
+    serial = sparse_mqa_fwd(heads, dim, topk, scale, num_stages=0)
+    assert "cp_async_gs" in pipelined.get_kernel_source()
+    assert "cp_async_gs" not in serial.get_kernel_source()
+
+    expected_out, expected_lse = serial(q, kv, sinks, indices)
+    for out, lse in (
+        pipelined(q, kv, sinks, indices),
+        sparse_mqa_fwd_interface(q, kv, sinks, indices, scale, num_stages=1),
+    ):
+        assert torch.equal(out, expected_out)
+        assert torch.equal(lse, expected_lse)
+
+    wide_heads = 64
+    wide_q = torch.randn(batch, seqlen, wide_heads, dim, device=DEVICE, dtype=torch.bfloat16)
+    wide_sinks = torch.randn(wide_heads, device=DEVICE)
+    deepest = None
+    for depth in range(1, 9):
+        try:
+            candidate = sparse_mqa_fwd(wide_heads, dim, topk, scale, num_stages=depth)
+        except AssertionError as exc:
+            assert "shared memory per block" in str(exc)
+            break
+        deepest = candidate
+    else:
+        pytest.fail("the shared-memory guard never rejected a gather depth")
+
+    assert deepest is not None, "the guard rejected even a single-stage gather"
+    deep_out, _ = deepest(wide_q, kv, wide_sinks, indices)
+    assert torch.isfinite(deep_out).all().item()
+
+
+def test_tilelang_sparse_attention_forward_defaults_to_no_pipelining():
+    """Keep the measured production default at the serial gather depth."""
+    pytest.importorskip("tilelang")
+    from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_fwd import sparse_mqa_fwd, sparse_mqa_fwd_interface
+
+    for entry in (sparse_mqa_fwd, sparse_mqa_fwd_interface):
+        params = inspect.signature(getattr(entry, "func", entry)).parameters
+        assert params["num_stages"].default == 0
+
+
 def test_tilelang_sparse_attention_forward_backward_with_invalid_indices():
     require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla import sparse_attn_tilelang
@@ -172,6 +231,31 @@ def test_tilelang_sparse_attention_forward_backward_with_invalid_indices():
     # lost replication guard would scale it by the warp count -- which cosine, being
     # scale-invariant, cannot see.
     torch.testing.assert_close(sinks.grad, expected_grads[2], rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "block_H, block_size, expected",
+    [
+        (16, 32, 128),
+        (32, 32, 256),
+        (64, 32, 256),
+        (32, 16, 128),
+        (64, 16, 256),
+        (16, 16, 64),
+    ],
+)
+def test_tilelang_bwd_cta_threads_respects_warp_tile_bound(block_H, block_size, expected):
+    """Keep the CTA width within TileLang's compile-time GEMM warp bound."""
+    pytest.importorskip("tilelang")
+    from veomni.ops.kernels.dsa.vendor import tilelang_sparse_mla_bwd
+
+    threads = tilelang_sparse_mla_bwd.cta_threads(block_H, block_size)
+
+    assert threads == expected
+    assert threads % 32 == 0 and threads & (threads - 1) == 0
+    num_warps = threads // 32
+    column_warps = min(num_warps, block_size // 8)
+    assert block_H // (num_warps // column_warps) >= 16
 
 
 def test_tilelang_sparse_attention_backward_matches_reference_on_wide_head_tile():
@@ -206,6 +290,43 @@ def test_tilelang_sparse_attention_backward_matches_reference_on_wide_head_tile(
     # accumulates dAttnSink, so a lost replication guard would scale it by the warp
     # count while leaving every cosine above intact.
     torch.testing.assert_close(sinks.grad, expected_grads[2], rtol=2e-2, atol=2e-2)
+
+
+def test_tilelang_sparse_attention_backward_shares_kernel_across_kv_lengths(monkeypatch):
+    require_nvidia_cuda("tilelang", min_cc=90)
+    from veomni.ops.kernels.dsa.vendor import tilelang_sparse_mla_bwd as sparse_mla_bwd
+    from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla import sparse_attn_tilelang
+
+    kv_block = sparse_mla_bwd.KV_BLOCK
+    requested_kv_lengths = []
+    original_bwd = sparse_mla_bwd.bwd
+
+    def tracking_bwd(B, S, S_kv, *args, **kwargs):
+        requested_kv_lengths.append(S_kv)
+        return original_bwd(B, S, S_kv, *args, **kwargs)
+
+    monkeypatch.setattr(sparse_mla_bwd, "bwd", tracking_bwd)
+
+    batch, seqlen, heads, dim, topk = 1, 32, 8, 512, 64
+    scale = dim**-0.5
+    for kv_len in (48, 129, kv_block):
+        torch.manual_seed(4)
+        q = torch.randn(batch, seqlen, heads, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        kv = torch.randn(batch, kv_len, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        sinks = torch.randn(heads, device=DEVICE, requires_grad=True)
+        indices = torch.randint(kv_len, (batch, seqlen, topk), device=DEVICE, dtype=torch.int32)
+        indices[..., -2:] = kv_len
+
+        actual = sparse_attn_tilelang(q, kv, sinks, indices, scale)
+        expected = _sparse_attention_reference(q, kv, sinks, indices, scale)
+        grad = torch.randn_like(actual)
+        expected_grads = torch.autograd.grad((expected * grad.float()).sum(), (q, kv, sinks))
+        actual.backward(grad)
+        assert kv.grad.shape == kv.shape
+        for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
+            assert cosine_similarity(actual_grad, expected_grad) > 0.95
+
+    assert set(requested_kv_lengths) == {kv_block}
 
 
 @pytest.mark.parametrize("kv_len", (48, 129, 1024))

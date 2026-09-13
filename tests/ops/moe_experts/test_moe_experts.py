@@ -49,7 +49,7 @@ from tests.ops.tol import (
     MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
     MOE_SPLIT_MERGED_GRAD_HIDDEN_RTOL,
 )
-from tests.ops.utils import make_grad_leaf
+from tests.ops.utils import make_grad_leaf, require_nvidia_cuda
 from veomni.ops import resolve_op
 from veomni.ops.kernels.moe_experts.shared.indices import build_moe_indices
 from veomni.ops.kernels.moe_experts.standard.npu import _fc1_weight
@@ -690,3 +690,29 @@ def test_build_moe_indices_all_same_expert():
     cu_seqlens_m, a_idx, _scatter_index = build_moe_indices(expert_index, num_experts=4)
     assert cu_seqlens_m.tolist() == [0, 8, 8, 8, 8]
     assert a_idx.tolist() == list(range(8))
+
+
+@pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype feature")
+@pytest.mark.filterwarnings("ignore:Logical operators 'and' and 'or' are deprecated")
+def test_build_moe_indices_cuda_does_not_synchronize(monkeypatch):
+    """CUDA routing uses the fixed-size Triton histogram without a host sync."""
+    require_nvidia_cuda("triton")
+    expert_index = torch.tensor([[0, 2], [1, 0], [2, 1], [0, 1]], device="cuda", dtype=torch.int32)
+
+    def reject_bincount(*_args, **_kwargs):
+        raise AssertionError("CUDA routing must not use torch.bincount")
+
+    monkeypatch.setattr(torch, "bincount", reject_bincount)
+    build_moe_indices(expert_index, num_experts=3)  # compile before enabling the sync detector
+    torch.cuda.synchronize()
+
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        cu_seqlens_m, a_idx, scatter_index = build_moe_indices(expert_index, num_experts=3)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+
+    assert cu_seqlens_m.cpu().tolist() == [0, 3, 6, 8]
+    assert a_idx.cpu().tolist() == [0, 1, 3, 1, 2, 3, 0, 2]
+    assert scatter_index.shape == expert_index.shape
