@@ -27,7 +27,6 @@ from . import (
     qwen3_5_moe,
     qwen3_moe,
     qwen3_omni_moe,
-    qwen3_vl,
     qwen3_vl_moe,
     seed_oss,
     wan,
@@ -50,7 +49,6 @@ __all__ = [
     "qwen3_omni_moe",
     "seed_oss",
     "wan",
-    "qwen3_vl",
     "qwen3_vl_moe",
     "glm_moe_dsa",
 ]

@@ -139,6 +139,19 @@ def test_qwen3_vl_constructs_local_kernels():
     assert layer.input_layernorm.veomni_rms_norm.impl == "eager"
 
 
+def test_qwen3_vl_selects_liger_kernels(available_nvidia_ops):
+    ops = eager_ops_config()
+    ops.cross_entropy_loss_implementation = "liger_kernel"
+    ops.rms_norm_implementation = "liger_kernel"
+    model = _build_ours(_tiny_config(), ops)
+
+    assert model.veomni_ce.variant == "standard"
+    assert model.veomni_ce.impl == "liger_kernel"
+    rms_norm = model.model.language_model.layers[0].input_layernorm.veomni_rms_norm
+    assert rms_norm.variant == "standard"
+    assert rms_norm.impl == "liger_kernel"
+
+
 def test_qwen3_vl_instances_keep_distinct_impls():
     eager = _build_ours(_tiny_config(), eager_ops_config())
     chunk_cfg = eager_ops_config()

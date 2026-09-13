@@ -12,4 +12,28 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Qwen3-VL modeling that calls local VeomniOp handles. Not on ``MODELING_REGISTRY``."""
+"""Qwen3-VL modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.models_kernel.registry import MODELING_REGISTRY
+from veomni.utils.device import IS_NPU_AVAILABLE
+
+
+@MODELING_REGISTRY.register("qwen3_vl")
+def register_qwen3_vl_modeling(architecture: str):
+    if IS_NPU_AVAILABLE:
+        from .generated.patched_modeling_qwen3_vl_npu import (
+            Qwen3VLForConditionalGeneration,
+            Qwen3VLModel,
+        )
+    else:
+        from .generated.patched_modeling_qwen3_vl_gpu import (
+            Qwen3VLForConditionalGeneration,
+            Qwen3VLModel,
+        )
+
+    if "ForConditionalGeneration" in architecture:
+        return Qwen3VLForConditionalGeneration
+    elif "Model" in architecture:
+        return Qwen3VLModel
+    else:
+        return Qwen3VLForConditionalGeneration
