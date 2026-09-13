@@ -149,6 +149,54 @@ def tiny_qwen2_vl_config(architecture: str = "Qwen2VLForConditionalGeneration") 
     )
 
 
+def tiny_qwen2_5_vl_config(architecture: str = "Qwen2_5_VLForConditionalGeneration") -> PretrainedConfig:
+    from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
+        Qwen2_5_VLConfig,
+        Qwen2_5_VLTextConfig,
+        Qwen2_5_VLVisionConfig,
+    )
+
+    text = Qwen2_5_VLTextConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        rope_scaling={"mrope_section": [4, 2, 2], "rope_type": "default"},
+        tie_word_embeddings=False,
+        attn_implementation="eager",
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        use_sliding_window=False,
+    )
+    vision = Qwen2_5_VLVisionConfig(
+        depth=2,
+        hidden_size=64,
+        intermediate_size=128,
+        num_heads=4,
+        in_channels=3,
+        patch_size=8,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        window_size=16,
+        out_hidden_size=64,
+        fullatt_block_indexes=[0],
+        hidden_act="silu",
+    )
+    return Qwen2_5_VLConfig(
+        text_config=text.to_dict(),
+        vision_config=vision.to_dict(),
+        image_token_id=IMAGE_TOKEN_ID,
+        video_token_id=VIDEO_TOKEN_ID,
+        architectures=[architecture],
+    )
+
+
 def tiny_qwen3_config(architecture: str = "Qwen3ForCausalLM", **overrides) -> PretrainedConfig:
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 

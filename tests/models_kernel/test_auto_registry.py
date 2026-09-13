@@ -30,6 +30,9 @@ from tests.models_kernel.tiny_configs import (
     tiny_llama_config as _tiny_llama_config,
 )
 from tests.models_kernel.tiny_configs import (
+    tiny_qwen2_5_vl_config as _tiny_qwen2_5_vl_config,
+)
+from tests.models_kernel.tiny_configs import (
     tiny_qwen2_config as _tiny_qwen2_config,
 )
 from tests.models_kernel.tiny_configs import (
@@ -94,6 +97,7 @@ class _ModelCase:
     config_factory: Callable[[str], PretrainedConfig]
     architectures: tuple[str, ...]
     has_registered_config: bool = False
+    registered_config_aliases: tuple[str, ...] = ()
     eager_op_path: str | None = "veomni_ce"
 
 
@@ -130,6 +134,13 @@ _MODEL_CASES = (
         config_factory=_tiny_qwen2_vl_config,
         architectures=("Qwen2VLForConditionalGeneration", "Qwen2VLModel"),
         has_registered_config=True,
+    ),
+    _ModelCase(
+        model_type="qwen2_5_vl",
+        config_factory=_tiny_qwen2_5_vl_config,
+        architectures=("Qwen2_5_VLForConditionalGeneration", "Qwen2_5_VLModel"),
+        has_registered_config=True,
+        registered_config_aliases=("qwen2_5_vl_text",),
     ),
     _ModelCase(
         model_type="qwen3",
@@ -270,6 +281,7 @@ def test_build_foundation_model_constructs_registered_model(model_case: _ModelCa
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
 def test_model_registry_entries(model_case: _ModelCase):
     assert (model_case.model_type in MODEL_CONFIG_REGISTRY.valid_keys()) is model_case.has_registered_config
+    assert set(model_case.registered_config_aliases) <= set(MODEL_CONFIG_REGISTRY.valid_keys())
     assert model_case.model_type in MODELING_REGISTRY.valid_keys()
 
 

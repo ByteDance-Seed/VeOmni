@@ -25,8 +25,6 @@ from types import SimpleNamespace
 import torch
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
-    Qwen2_5_VLTextConfig,
-    Qwen2_5_VLVisionConfig,
 )
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLForConditionalGeneration as HFQwen2_5_VLForConditionalGeneration,
@@ -36,53 +34,9 @@ from tests.models_kernel.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
 )
+from tests.models_kernel.tiny_configs import tiny_qwen2_5_vl_config as _tiny_config
 from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config, set_ops_config
-
-
-IMAGE_TOKEN_ID = 120
-VIDEO_TOKEN_ID = 121
-
-
-def _tiny_config() -> Qwen2_5_VLConfig:
-    text = Qwen2_5_VLTextConfig(
-        vocab_size=128,
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        max_position_embeddings=64,
-        rms_norm_eps=1e-6,
-        hidden_act="silu",
-        rope_scaling={"mrope_section": [4, 2, 2], "rope_type": "default"},
-        tie_word_embeddings=False,
-        attn_implementation="eager",
-        pad_token_id=0,
-        bos_token_id=1,
-        eos_token_id=2,
-        use_sliding_window=False,
-    )
-    vision = Qwen2_5_VLVisionConfig(
-        depth=2,
-        hidden_size=64,
-        intermediate_size=128,
-        num_heads=4,
-        in_channels=3,
-        patch_size=8,
-        temporal_patch_size=2,
-        spatial_merge_size=2,
-        window_size=16,
-        out_hidden_size=64,
-        fullatt_block_indexes=[0],
-        hidden_act="silu",
-    )
-    return Qwen2_5_VLConfig(
-        text_config=text.to_dict(),
-        vision_config=vision.to_dict(),
-        image_token_id=IMAGE_TOKEN_ID,
-        video_token_id=VIDEO_TOKEN_ID,
-    )
 
 
 def _build_ours(config: Qwen2_5_VLConfig, ops: SimpleNamespace | None = None):
