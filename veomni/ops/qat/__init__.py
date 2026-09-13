@@ -25,6 +25,7 @@ stays bit-aligned with inference by construction. They are SM90-only and loaded
 lazily, so importing this package on CPU or NPU stays free.
 """
 
+from ._hardware import require_tilelang_sm90
 from .fp4_blockwise import (
     FP4_BLOCK_SIZE,
     fp4_fake_quant_weight,
@@ -41,6 +42,7 @@ from .fp8_blockwise import (
 
 def act_quant(*args, **kwargs):
     """Run the optional TileLang FP8 activation quantizer lazily."""
+    require_tilelang_sm90()
     from .quant import act_quant as impl
 
     return impl(*args, **kwargs)
@@ -48,6 +50,7 @@ def act_quant(*args, **kwargs):
 
 def fp4_act_quant(*args, **kwargs):
     """Run the optional TileLang FP4 quantizer lazily."""
+    require_tilelang_sm90()
     from .quant import fp4_act_quant as impl
 
     return impl(*args, **kwargs)
@@ -55,6 +58,7 @@ def fp4_act_quant(*args, **kwargs):
 
 def fp8_weight_quant(*args, **kwargs):
     """Run the optional TileLang FP8 weight quantizer lazily."""
+    require_tilelang_sm90()
     from .quant import fp8_weight_quant as impl
 
     return impl(*args, **kwargs)

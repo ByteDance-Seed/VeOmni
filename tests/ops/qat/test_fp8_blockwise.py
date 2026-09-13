@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+from types import ModuleType
+
 import pytest
 import torch
 from torch import nn
 
+import veomni.ops.qat as qat
 from tests.ops.qat.reference import reference_act_quant, reference_fp8_weight_quant
 from tests.ops.utils import require_nvidia_cuda
+from veomni.ops.qat import _hardware as qat_hardware
 from veomni.ops.qat import (
     fp8_blockwise,
     fp8_fake_quant_act,
@@ -29,6 +34,80 @@ from veomni.utils.device import get_device_type
 
 
 DEVICE = get_device_type()
+
+
+@pytest.fixture(autouse=True)
+def clear_qat_hardware_gate_cache():
+    """Keep process-level hardware caching isolated between QAT tests."""
+    qat_hardware.require_tilelang_sm90.cache_clear()
+    yield
+    qat_hardware.require_tilelang_sm90.cache_clear()
+
+
+def _qat_entry_calls():
+    activation = torch.zeros(1, 256, dtype=torch.bfloat16)
+    fp4_weight = torch.zeros(2, 32, dtype=torch.bfloat16)
+    fp8_weight = torch.zeros(128, 128, dtype=torch.bfloat16)
+    stacked_weight = torch.zeros(1, 128, 128, dtype=torch.bfloat16)
+    linear = nn.Linear(128, 128, bias=False, dtype=torch.bfloat16)
+    return (
+        ("act_quant", lambda: qat.act_quant(activation)),
+        ("fp4_act_quant", lambda: qat.fp4_act_quant(fp4_weight)),
+        ("fp8_weight_quant", lambda: qat.fp8_weight_quant(fp8_weight)),
+        ("fp4_fake_quant_weight", lambda: qat.fp4_fake_quant_weight(fp4_weight)),
+        ("fp8_fake_quant_act", lambda: qat.fp8_fake_quant_act(activation)),
+        ("fp8_fake_quant_act_prefix", lambda: qat.fp8_fake_quant_act_prefix(activation, 128)),
+        ("fp8_fake_quant_weight", lambda: qat.fp8_fake_quant_weight(fp8_weight)),
+        ("fp8_fake_quant_stacked_weight", lambda: qat.fp8_fake_quant_stacked_weight(stacked_weight)),
+        ("qat_linear", lambda: qat.qat_linear(linear, activation[..., :128])),
+    )
+
+
+def _install_fake_quant_backend(monkeypatch, calls: list[str]) -> None:
+    backend = ModuleType("veomni.ops.qat.quant")
+
+    def record(name):
+        def fake_quant(tensor, *args, **kwargs):
+            calls.append(name)
+            return tensor.clone()
+
+        return fake_quant
+
+    backend.act_quant = record("act_quant")
+    backend.fp4_act_quant = record("fp4_act_quant")
+    backend.fp8_weight_quant = record("fp8_weight_quant")
+    monkeypatch.setitem(sys.modules, "veomni.ops.qat.quant", backend)
+
+
+def test_qat_entry_points_reject_pre_sm90_before_vendor_import(monkeypatch):
+    """Every QAT path checks hardware before entering the shared TileLang backend."""
+    vendor_calls = []
+    _install_fake_quant_backend(monkeypatch, vendor_calls)
+    monkeypatch.setattr(type(qat_hardware.NVIDIA_SM90_PLUS), "matches", lambda self: False)
+
+    for name, call in _qat_entry_calls():
+        with pytest.raises(RuntimeError, match="SM90 or later NVIDIA CUDA GPU"):
+            call()
+        assert vendor_calls == [], f"{name} entered the vendor backend before the hardware check"
+
+
+def test_qat_entry_points_reach_vendor_backend_after_sm90_check(monkeypatch):
+    """The hardware gate does not intercept supported QAT calls."""
+    vendor_calls = []
+    hardware_checks = []
+    _install_fake_quant_backend(monkeypatch, vendor_calls)
+
+    def supports_sm90(self):
+        hardware_checks.append(True)
+        return True
+
+    monkeypatch.setattr(type(qat_hardware.NVIDIA_SM90_PLUS), "matches", supports_sm90)
+
+    for name, call in _qat_entry_calls():
+        vendor_calls.clear()
+        call()
+        assert vendor_calls, f"{name} did not reach the vendor backend after the hardware check"
+    assert hardware_checks == [True]
 
 
 @pytest.fixture
