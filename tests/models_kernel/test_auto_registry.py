@@ -30,6 +30,15 @@ from tests.models_kernel.tiny_configs import (
     tiny_llama_config as _tiny_llama_config,
 )
 from tests.models_kernel.tiny_configs import (
+    tiny_qwen2_5_omni_config as _tiny_qwen2_5_omni_config,
+)
+from tests.models_kernel.tiny_configs import (
+    tiny_qwen2_5_omni_text_config as _tiny_qwen2_5_omni_text_config,
+)
+from tests.models_kernel.tiny_configs import (
+    tiny_qwen2_5_omni_thinker_config as _tiny_qwen2_5_omni_thinker_config,
+)
+from tests.models_kernel.tiny_configs import (
     tiny_qwen2_5_vl_config as _tiny_qwen2_5_vl_config,
 )
 from tests.models_kernel.tiny_configs import (
@@ -73,6 +82,7 @@ from tests.models_kernel.tiny_configs import (
 )
 from veomni.models_kernel import (
     MODEL_CONFIG_REGISTRY,
+    MODEL_PROCESSOR_REGISTRY,
     MODELING_REGISTRY,
     build_config,
     build_foundation_model,
@@ -98,6 +108,7 @@ class _ModelCase:
     architectures: tuple[str, ...]
     has_registered_config: bool = False
     registered_config_aliases: tuple[str, ...] = ()
+    processor_class_name: str | None = None
     eager_op_path: str | None = "veomni_ce"
 
 
@@ -141,6 +152,25 @@ _MODEL_CASES = (
         architectures=("Qwen2_5_VLForConditionalGeneration", "Qwen2_5_VLModel"),
         has_registered_config=True,
         registered_config_aliases=("qwen2_5_vl_text",),
+    ),
+    _ModelCase(
+        model_type="qwen2_5_omni",
+        config_factory=_tiny_qwen2_5_omni_config,
+        architectures=("Qwen2_5OmniForConditionalGeneration",),
+        has_registered_config=True,
+        processor_class_name="Qwen2_5OmniProcessor",
+        eager_op_path="thinker.veomni_ce",
+    ),
+    _ModelCase(
+        model_type="qwen2_5_omni_thinker",
+        config_factory=_tiny_qwen2_5_omni_thinker_config,
+        architectures=("Qwen2_5OmniThinkerForConditionalGeneration",),
+    ),
+    _ModelCase(
+        model_type="qwen2_5_omni_text",
+        config_factory=_tiny_qwen2_5_omni_text_config,
+        architectures=("Qwen2_5OmniThinkerTextModel",),
+        eager_op_path=None,
     ),
     _ModelCase(
         model_type="qwen3",
@@ -197,6 +227,7 @@ _MODEL_CASES = (
         config_factory=_tiny_qwen3_omni_moe_config,
         architectures=("Qwen3OmniMoeForConditionalGeneration",),
         has_registered_config=True,
+        processor_class_name="Qwen3OmniMoeProcessor",
         eager_op_path="thinker.veomni_ce",
     ),
     _ModelCase(
@@ -283,6 +314,8 @@ def test_model_registry_entries(model_case: _ModelCase):
     assert (model_case.model_type in MODEL_CONFIG_REGISTRY.valid_keys()) is model_case.has_registered_config
     assert set(model_case.registered_config_aliases) <= set(MODEL_CONFIG_REGISTRY.valid_keys())
     assert model_case.model_type in MODELING_REGISTRY.valid_keys()
+    if model_case.processor_class_name is not None:
+        assert model_case.processor_class_name in MODEL_PROCESSOR_REGISTRY.valid_keys()
 
 
 @pytest.mark.parametrize(("model_case", "architecture"), _ARCHITECTURE_CASES)

@@ -24,13 +24,10 @@ from types import SimpleNamespace
 
 import torch
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
-    Qwen2_5OmniAudioEncoderConfig,
-    Qwen2_5OmniTextConfig,
-    Qwen2_5OmniThinkerConfig,
-    Qwen2_5OmniVisionEncoderConfig,
+    Qwen2_5OmniConfig as HFQwen2_5OmniConfig,
 )
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
-    Qwen2_5OmniConfig as HFQwen2_5OmniConfig,
+    Qwen2_5OmniThinkerConfig,
 )
 from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
     Qwen2_5OmniThinkerForConditionalGeneration as HFQwen2_5OmniThinker,
@@ -43,66 +40,9 @@ from tests.models_kernel.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
 )
+from tests.models_kernel.tiny_configs import tiny_qwen2_5_omni_thinker_config as _tiny_thinker_config
 from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config, set_ops_config
-
-
-IMAGE_TOKEN_ID = 120
-VIDEO_TOKEN_ID = 121
-AUDIO_TOKEN_ID = 122
-
-
-def _tiny_thinker_config() -> Qwen2_5OmniThinkerConfig:
-    text = Qwen2_5OmniTextConfig(
-        vocab_size=128,
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        max_position_embeddings=64,
-        rms_norm_eps=1e-6,
-        hidden_act="silu",
-        rope_scaling={"mrope_section": [4, 2, 2], "rope_type": "default"},
-        tie_word_embeddings=False,
-        attn_implementation="eager",
-        pad_token_id=0,
-        bos_token_id=1,
-        eos_token_id=2,
-        use_sliding_window=False,
-    )
-    vision = Qwen2_5OmniVisionEncoderConfig(
-        depth=2,
-        hidden_size=64,
-        intermediate_size=128,
-        num_heads=4,
-        in_channels=3,
-        patch_size=8,
-        temporal_patch_size=2,
-        spatial_merge_size=2,
-        window_size=16,
-        out_hidden_size=64,
-        fullatt_block_indexes=[0],
-        hidden_act="silu",
-    )
-    audio = Qwen2_5OmniAudioEncoderConfig(
-        num_mel_bins=16,
-        encoder_layers=1,
-        encoder_attention_heads=2,
-        encoder_ffn_dim=32,
-        d_model=16,
-        output_dim=64,
-        n_window=4,
-        max_source_positions=16,
-    )
-    return Qwen2_5OmniThinkerConfig(
-        text_config=text.to_dict(),
-        vision_config=vision.to_dict(),
-        audio_config=audio.to_dict(),
-        image_token_id=IMAGE_TOKEN_ID,
-        video_token_id=VIDEO_TOKEN_ID,
-        audio_token_id=AUDIO_TOKEN_ID,
-    )
 
 
 def _build_ours(config: Qwen2_5OmniThinkerConfig, ops: SimpleNamespace | None = None):
@@ -169,6 +109,28 @@ def test_qwen2_5_omni_instances_keep_distinct_impls():
 
     set_ops_config(chunk_cfg)
     assert eager.veomni_ce.impl == "eager"
+
+
+def test_qwen2_5_omni_registry_wires_kernel_and_upstream_talker_entries():
+    from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
+        Qwen2_5OmniTalkerForConditionalGeneration,
+        Qwen2_5OmniTalkerModel,
+    )
+
+    from veomni.models_kernel.transformers.qwen2_5_omni import (
+        register_qwen2_5_omni_modeling,
+        register_qwen2_5_omni_text_modeling,
+        register_qwen2_5_omni_thinker_modeling,
+    )
+
+    assert register_qwen2_5_omni_modeling(None).__name__ == "Qwen2_5OmniForConditionalGeneration"
+    assert register_qwen2_5_omni_thinker_modeling(None).__name__ == "Qwen2_5OmniThinkerForConditionalGeneration"
+    assert register_qwen2_5_omni_text_modeling(None).__name__ == "Qwen2_5OmniThinkerTextModel"
+    assert (
+        register_qwen2_5_omni_modeling("Qwen2_5OmniTalkerForConditionalGeneration")
+        is Qwen2_5OmniTalkerForConditionalGeneration
+    )
+    assert register_qwen2_5_omni_modeling("Qwen2_5OmniTalkerModel") is Qwen2_5OmniTalkerModel
 
 
 def test_qwen2_5_omni_eager_matches_hf_text_only():

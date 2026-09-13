@@ -197,6 +197,90 @@ def tiny_qwen2_5_vl_config(architecture: str = "Qwen2_5_VLForConditionalGenerati
     )
 
 
+def tiny_qwen2_5_omni_text_config(
+    architecture: str = "Qwen2_5OmniThinkerTextModel",
+) -> PretrainedConfig:
+    from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniTextConfig
+
+    return Qwen2_5OmniTextConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        rope_scaling={"mrope_section": [4, 2, 2], "rope_type": "default"},
+        tie_word_embeddings=False,
+        architectures=[architecture],
+        attn_implementation="eager",
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        use_sliding_window=False,
+    )
+
+
+def tiny_qwen2_5_omni_thinker_config(
+    architecture: str = "Qwen2_5OmniThinkerForConditionalGeneration",
+) -> PretrainedConfig:
+    from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
+        Qwen2_5OmniAudioEncoderConfig,
+        Qwen2_5OmniThinkerConfig,
+        Qwen2_5OmniVisionEncoderConfig,
+    )
+
+    text = tiny_qwen2_5_omni_text_config()
+    vision = Qwen2_5OmniVisionEncoderConfig(
+        depth=2,
+        hidden_size=64,
+        intermediate_size=128,
+        num_heads=4,
+        in_channels=3,
+        patch_size=8,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        window_size=16,
+        out_hidden_size=64,
+        fullatt_block_indexes=[0],
+        hidden_act="silu",
+    )
+    audio = Qwen2_5OmniAudioEncoderConfig(
+        num_mel_bins=16,
+        encoder_layers=1,
+        encoder_attention_heads=2,
+        encoder_ffn_dim=32,
+        d_model=16,
+        output_dim=64,
+        n_window=4,
+        max_source_positions=16,
+    )
+    return Qwen2_5OmniThinkerConfig(
+        text_config=text.to_dict(),
+        vision_config=vision.to_dict(),
+        audio_config=audio.to_dict(),
+        image_token_id=IMAGE_TOKEN_ID,
+        video_token_id=VIDEO_TOKEN_ID,
+        audio_token_id=AUDIO_TOKEN_ID,
+        architectures=[architecture],
+    )
+
+
+def tiny_qwen2_5_omni_config(
+    architecture: str = "Qwen2_5OmniForConditionalGeneration",
+) -> PretrainedConfig:
+    from veomni.models_kernel.transformers.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniConfig
+
+    thinker = tiny_qwen2_5_omni_thinker_config()
+    return Qwen2_5OmniConfig(
+        thinker_config=thinker.to_dict(),
+        enable_audio_output=False,
+        architectures=[architecture],
+    )
+
+
 def tiny_qwen3_config(architecture: str = "Qwen3ForCausalLM", **overrides) -> PretrainedConfig:
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
