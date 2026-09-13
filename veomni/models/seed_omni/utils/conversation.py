@@ -100,7 +100,7 @@ class ConversationItem:
         return f"{{{','.join(meta_items)}}}"
 
     def __repr__(self) -> str:
-        return f"ConversationItem(type={self.type}, value={self.__value_repr__()}, role={self.role}, source={self.source}, meta={self.__meta_repr__()}"
+        return f"ConversationItem(type={self.type}, value={self.__value_repr__()}, role={self.role}, source={self.source}, meta={self.__meta_repr__()})"
 
 
 def is_dummy(item: ConversationItem) -> bool:

@@ -132,7 +132,7 @@ class InferenceMixin:
             logits = self._top_p_filter(logits, top_p)
         probs = F.softmax(logits, dim=-1)
         token = torch.multinomial(probs, num_samples=1)
-        return token
+        return int(token.item())
 
     def _token_id_tensor(self, token_id: int) -> torch.Tensor:
         device = self.device
@@ -200,8 +200,6 @@ class TextEncoder(InferenceMixin, OmniPreTrainedModel):
         self._bos_injected: bool = False
         self.post_init()
 
-    # ── Embedding accessors ────────────────────────────────────────────────────
-
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
 
@@ -220,8 +218,6 @@ class TextEncoder(InferenceMixin, OmniPreTrainedModel):
     def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
         if not self.config.tie_word_embeddings:
             self.lm_head = new_embeddings
-
-    # ── Forward ────────────────────────────────────────────────────────────────
 
     def forward(self, **kwargs) -> Dict[str, Any]:  # type: ignore[override]
         return self.encode(**kwargs)

@@ -51,7 +51,9 @@ class OfflineEncodingMixin(ABC):
             return "encode_only"
         if train_type == "train_with_cache":
             return "process_only"
-        return cls.DEFAULT_CACHE_MODE
+        if train_type == "train":
+            return cls.DEFAULT_CACHE_MODE
+        raise ValueError(f"Unsupported train_type: {train_type!r}")
 
     @classmethod
     def patch_config(cls, config: Any, **overrides: Any) -> None:

@@ -43,6 +43,16 @@ class SeedOmniOfflineCacheWriter:
         self.buffer: list[dict[str, bytes]] = []
         self.rows_written = 0
         os.makedirs(save_path, exist_ok=True)
+        existing_shards = [
+            name for name in os.listdir(save_path) if name.startswith("shard_") and name.endswith(".parquet")
+        ]
+        if existing_shards:
+            raise FileExistsError(
+                f"SeedOmni offline cache directory {save_path} already contains "
+                f"{len(existing_shards)} shard file(s) from a previous run. Remove them "
+                f"before starting a new offline-cache write to avoid mixing stale shards "
+                f"into the compacted output."
+            )
         logger.info_rank0(f"SeedOmni offline cache writer saving parquet shards under {save_path}.")
 
     @staticmethod

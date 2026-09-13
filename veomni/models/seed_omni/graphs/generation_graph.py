@@ -416,9 +416,17 @@ class GenerationGraph:
             # A terminating ``module_signal`` (e.g. ``text_done`` on ``</s>``),
             # written by the node the caller just ran, means no further nodes in
             # this body should run — the transition is evaluated in
-            # :meth:`maybe_transition` after this generator is exhausted.
-            if FSM_SIGNAL_KEY in ctx:
-                return
+            # :meth:`maybe_transition` after this generator is exhausted. An
+            # unknown or stale signal (no matching transition in this state)
+            # must not truncate the body — it is rejected and cleared instead.
+            signal = ctx.get(FSM_SIGNAL_KEY)
+            if signal is not None:
+                if any(
+                    trans.condition.type == "module_signal" and trans.condition.key == signal
+                    for trans in state.transitions
+                ):
+                    return
+                ctx.pop(FSM_SIGNAL_KEY, None)
 
             # 2. Decrement the destination's feed-forward pending count so it
             #    becomes runnable once its later `from_` appearance is reached.
@@ -426,6 +434,17 @@ class GenerationGraph:
                 fi = first_from_idx.get(edge.to, len(state.body))
                 if i < fi:
                     pending[edge.to] -= 1
+                    if edge.to not in first_from_idx and pending[edge.to] == 0 and edge.to not in executed:
+                        executed.add(edge.to)
+                        yield self._node_pool[edge.to]
+                        signal = ctx.get(FSM_SIGNAL_KEY)
+                        if signal is not None:
+                            if any(
+                                trans.condition.type == "module_signal" and trans.condition.key == signal
+                                for trans in state.transitions
+                            ):
+                                return
+                            ctx.pop(FSM_SIGNAL_KEY, None)
 
     def maybe_transition(self, context: Dict[str, Any]) -> Optional["FiredTransition"]:
         """Check transitions for the current state.

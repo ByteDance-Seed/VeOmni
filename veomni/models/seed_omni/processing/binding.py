@@ -25,8 +25,6 @@ from .base import ModulePreprocessorBase
 # directly on the model (``self._image_processor``, ``self.tokenizer``, …).
 MODULE_ASSET_ATTRS = ("_processor", "_image_processor", "_video_processor", "_tokenizer", "_chat_template")
 
-_BOUND_CHECK_ATTRS = ("_image_processor", "_video_processor", "_tokenizer")
-
 
 def bind_module_assets(
     model: Any,
@@ -46,9 +44,6 @@ def bind_module_assets(
     No-op when the module declares no ``preprocessor_class``, assets are already
     bound, or ``from_pretrained`` returns ``None`` (modules with no CPU worker).
     """
-    if any(getattr(model, attr, None) is not None for attr in _BOUND_CHECK_ATTRS):
-        return
-
     if preprocessor is None:
         preprocessor_cls = getattr(type(model), "preprocessor_class", None)
         if preprocessor_cls is None or checkpoint_path is None:
@@ -59,7 +54,7 @@ def bind_module_assets(
         return
 
     for attr in MODULE_ASSET_ATTRS:
-        if hasattr(preprocessor, attr):
+        if hasattr(preprocessor, attr) and getattr(model, attr, None) is None:
             setattr(model, attr, getattr(preprocessor, attr))
 
 

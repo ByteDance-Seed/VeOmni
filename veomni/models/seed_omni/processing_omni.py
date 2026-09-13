@@ -168,7 +168,8 @@ class OmniProcessor:
         Returns a dict suitable for :meth:`OmniModel.generate` — currently
         ``{"conversation_list": [...]}``.
         """
-        del videos  # video inputs follow the same path once callers pass PIL/VideoInputs
+        if videos is not None:
+            raise NotImplementedError("Video preprocessing is not implemented.")
 
         image_items = _normalize_images(images) if images is not None else []
         conversation = build_conversation(prompt=text, images=image_items)

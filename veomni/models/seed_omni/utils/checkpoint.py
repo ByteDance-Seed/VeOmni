@@ -72,8 +72,6 @@ class OmniModuleCheckpointManager:
     def parallel_state(self):
         return self.runtime.parallel_state
 
-    # ── Path helpers ──────────────────────────────────────────────────────────
-
     def _global_step_root(self, state: TrainerState) -> str:
         return os.path.join(self.runtime.train.checkpoint.save_path, f"global_step_{state.global_step}")
 
@@ -108,8 +106,6 @@ class OmniModuleCheckpointManager:
         if not isinstance(model, OfflineEncodingMixin) or model.cache_mode == "full":
             return None
         return model
-
-    # ── Load ──────────────────────────────────────────────────────────────────
 
     def load(self) -> None:
         model = self._offline_cache_model()
@@ -148,8 +144,6 @@ class OmniModuleCheckpointManager:
         if dist.is_initialized():
             dist.barrier()
         logger.info_rank0(f"Load partial offline-cache checkpoint from {load_dir} successfully!")
-
-    # ── Save (DCP / HF / LoRA) ────────────────────────────────────────────────
 
     def save_dcp(self, state: TrainerState) -> None:
         model = self._offline_cache_model()

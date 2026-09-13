@@ -166,7 +166,7 @@ class OmniModel(PreTrainedModel):
             for key, value in config_overrides.items():
                 setattr(config, key, value)
 
-        checkpoint_root = getattr(config, "_name_or_path", None) or str(pretrained_model_name_or_path)
+        checkpoint_root = str(pretrained_model_name_or_path)
         modules = cls._load_modules(
             config,
             checkpoint_root=checkpoint_root,
@@ -340,8 +340,6 @@ class OmniModel(PreTrainedModel):
             "Training requires OmniModelRuntime (see OmniTrainer)."
         )
 
-    # ── Inference ─────────────────────────────────────────────────────────────
-
     def reset(self) -> None:
         """Clear per-conversation inference runtime state."""
         self.generation_graph.reset()
@@ -448,12 +446,9 @@ class OmniModel(PreTrainedModel):
 
         self._emit_progress(total_steps)
 
-        if not self.generation_graph.is_done():
-            self._invoke_module_finalize(ctx)
+        self._invoke_module_finalize(ctx)
 
         return list(self._generated)
-
-    # ── Utilities ─────────────────────────────────────────────────────────────
 
     def named_omni_modules(self) -> Iterator[tuple[str, nn.Module]]:
         """Yield ``(name, module)`` for every graph participant."""
@@ -480,9 +475,6 @@ class OmniModel(PreTrainedModel):
             if get_assets is not None:
                 assets.extend(get_assets())
         return assets
-
-
-# ── helpers ───────────────────────────────────────────────────────────────────
 
 
 def merge_generation_kwargs(
