@@ -12,4 +12,28 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Qwen2-VL modeling that calls local VeomniOp handles. Not on ``MODELING_REGISTRY``."""
+"""Qwen2-VL modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+
+
+@MODEL_CONFIG_REGISTRY.register("qwen2_vl")
+def register_qwen2_vl_model_config():
+    from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLConfig
+
+    return Qwen2VLConfig
+
+
+@MODELING_REGISTRY.register("qwen2_vl")
+def register_qwen2_vl_modeling(architecture: str | None):
+    from .generated.patched_modeling_qwen2_vl_gpu import (
+        Qwen2VLForConditionalGeneration,
+        Qwen2VLModel,
+    )
+
+    architecture = architecture or ""
+    if "ForConditionalGeneration" in architecture:
+        return Qwen2VLForConditionalGeneration
+    if "Model" in architecture:
+        return Qwen2VLModel
+    return Qwen2VLForConditionalGeneration

@@ -26,7 +26,6 @@ import torch
 from transformers.models.qwen3_5.configuration_qwen3_5 import (
     Qwen3_5Config,
     Qwen3_5TextConfig,
-    Qwen3_5VisionConfig,
 )
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM as HFQwen3_5ForCausalLM
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
@@ -38,62 +37,18 @@ from tests.models_kernel.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
 )
+from tests.models_kernel.tiny_configs import (
+    tiny_qwen3_5_config as _tiny_vl_config,
+)
+from tests.models_kernel.tiny_configs import (
+    tiny_qwen3_5_text_config as _tiny_text_config,
+)
 from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config, set_ops_config
 
 
 IMAGE_TOKEN_ID = 120
 VIDEO_TOKEN_ID = 121
-
-
-def _tiny_text_config(*, layer_types: list[str]) -> Qwen3_5TextConfig:
-    return Qwen3_5TextConfig(
-        vocab_size=128,
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=len(layer_types),
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=16,
-        max_position_embeddings=64,
-        rms_norm_eps=1e-6,
-        hidden_act="silu",
-        attention_bias=False,
-        pad_token_id=0,
-        bos_token_id=1,
-        eos_token_id=2,
-        tie_word_embeddings=False,
-        attn_implementation="eager",
-        linear_conv_kernel_dim=4,
-        linear_key_head_dim=16,
-        linear_value_head_dim=16,
-        linear_num_key_heads=2,
-        linear_num_value_heads=4,
-        layer_types=layer_types,
-    )
-
-
-def _tiny_vl_config(*, layer_types: list[str]) -> Qwen3_5Config:
-    text = _tiny_text_config(layer_types=layer_types)
-    vision = Qwen3_5VisionConfig(
-        depth=2,
-        hidden_size=64,
-        intermediate_size=128,
-        num_heads=4,
-        in_channels=3,
-        patch_size=8,
-        temporal_patch_size=2,
-        spatial_merge_size=2,
-        out_hidden_size=64,
-        num_position_embeddings=16,
-        hidden_act="gelu_pytorch_tanh",
-    )
-    return Qwen3_5Config(
-        text_config=text.to_dict(),
-        vision_config=vision.to_dict(),
-        image_token_id=IMAGE_TOKEN_ID,
-        video_token_id=VIDEO_TOKEN_ID,
-    )
 
 
 def _qwen3_5_classes():

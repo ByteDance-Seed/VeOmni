@@ -24,13 +24,10 @@ from types import SimpleNamespace
 
 import torch
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
-    Qwen3OmniMoeAudioEncoderConfig,
-    Qwen3OmniMoeTextConfig,
-    Qwen3OmniMoeThinkerConfig,
-    Qwen3OmniMoeVisionEncoderConfig,
+    Qwen3OmniMoeConfig as HFQwen3OmniMoeConfig,
 )
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
-    Qwen3OmniMoeConfig as HFQwen3OmniMoeConfig,
+    Qwen3OmniMoeThinkerConfig,
 )
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerForConditionalGeneration as HFQwen3OmniMoeThinker,
@@ -44,6 +41,7 @@ from tests.models_kernel.compare import (
     eager_ops_config,
     pin_eager_attn_implementation,
 )
+from tests.models_kernel.tiny_configs import tiny_qwen3_omni_moe_thinker_config as _tiny_thinker_config
 from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config, set_ops_config
 
@@ -51,66 +49,6 @@ from veomni.ops.config import get_ops_config, set_ops_config
 IMAGE_TOKEN_ID = 120
 VIDEO_TOKEN_ID = 121
 AUDIO_TOKEN_ID = 122
-
-
-def _tiny_thinker_config() -> Qwen3OmniMoeThinkerConfig:
-    text = Qwen3OmniMoeTextConfig(
-        vocab_size=128,
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        max_position_embeddings=64,
-        rms_norm_eps=1e-6,
-        hidden_act="silu",
-        attention_bias=False,
-        pad_token_id=0,
-        bos_token_id=1,
-        eos_token_id=2,
-        attn_implementation="eager",
-        num_experts=4,
-        num_experts_per_tok=2,
-        moe_intermediate_size=32,
-        decoder_sparse_step=1,
-        mlp_only_layers=[],
-        output_router_logits=False,
-        router_aux_loss_coef=0.001,
-    )
-    text._experts_implementation = "eager"
-    vision = Qwen3OmniMoeVisionEncoderConfig(
-        depth=2,
-        hidden_size=64,
-        intermediate_size=128,
-        num_heads=4,
-        in_channels=3,
-        patch_size=8,
-        temporal_patch_size=2,
-        spatial_merge_size=2,
-        out_hidden_size=64,
-        num_position_embeddings=16,
-        deepstack_visual_indexes=[0],
-        hidden_act="gelu_pytorch_tanh",
-    )
-    audio = Qwen3OmniMoeAudioEncoderConfig(
-        num_mel_bins=16,
-        encoder_layers=1,
-        encoder_attention_heads=2,
-        encoder_ffn_dim=32,
-        d_model=16,
-        output_dim=64,
-        downsample_hidden_size=16,
-        n_window=4,
-        max_source_positions=16,
-    )
-    return Qwen3OmniMoeThinkerConfig(
-        text_config=text.to_dict(),
-        vision_config=vision.to_dict(),
-        audio_config=audio.to_dict(),
-        image_token_id=IMAGE_TOKEN_ID,
-        video_token_id=VIDEO_TOKEN_ID,
-        audio_token_id=AUDIO_TOKEN_ID,
-    )
 
 
 def _qwen3_omni_moe_classes():

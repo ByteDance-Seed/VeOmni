@@ -30,38 +30,9 @@ from tests.models_kernel.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
 )
+from tests.models_kernel.tiny_configs import tiny_deepseek_v4_config as _tiny_config
 from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config, set_ops_config
-
-
-def _tiny_config() -> DeepseekV4Config:
-    """Official DeepseekV4Config fields, sized down for a toy.
-
-    Omit schedule / router / mHC / RoPE / window fields so ``__post_init__``
-    keeps the official defaults: 2× HCA bootstrap then CSA/HCA interleave,
-    3× ``hash_moe`` then ``moe``, ``scoring_func="sqrtsoftplus"``,
-    ``hc_mult=4``, ``sliding_window=128``, CSA=4 / HCA=128.
-    Four layers therefore include a CSA indexer layer and one routed MoE layer.
-    """
-    return DeepseekV4Config(
-        vocab_size=128,
-        hidden_size=64,
-        moe_intermediate_size=32,
-        num_hidden_layers=4,
-        num_attention_heads=4,
-        num_key_value_heads=1,
-        head_dim=32,
-        q_lora_rank=16,
-        num_experts_per_tok=2,
-        n_routed_experts=4,
-        max_position_embeddings=64,
-        o_groups=8,
-        o_lora_rank=16,
-        index_n_heads=4,
-        index_head_dim=16,
-        attn_implementation="eager",
-        experts_implementation="eager",
-    )
 
 
 def _dsv4_module():

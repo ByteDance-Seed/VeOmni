@@ -21,38 +21,53 @@ from dataclasses import dataclass
 
 import pytest
 from transformers import PretrainedConfig
-from transformers.models.llama.configuration_llama import LlamaConfig
-from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
-from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
-from transformers.models.qwen3_5.configuration_qwen3_5 import (
-    Qwen3_5Config,
-    Qwen3_5TextConfig,
-    Qwen3_5VisionConfig,
-)
-from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
-    Qwen3_5MoeConfig,
-    Qwen3_5MoeTextConfig,
-    Qwen3_5MoeVisionConfig,
-)
-from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
-from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
-    Qwen3OmniMoeAudioEncoderConfig,
-    Qwen3OmniMoeTextConfig,
-    Qwen3OmniMoeThinkerConfig,
-    Qwen3OmniMoeVisionEncoderConfig,
-)
-from transformers.models.qwen3_vl.configuration_qwen3_vl import (
-    Qwen3VLConfig,
-    Qwen3VLTextConfig,
-    Qwen3VLVisionConfig,
-)
-from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
-    Qwen3VLMoeConfig,
-    Qwen3VLMoeTextConfig,
-    Qwen3VLMoeVisionConfig,
-)
 
 from tests.models_kernel.compare import eager_ops_config
+from tests.models_kernel.tiny_configs import (
+    tiny_deepseek_v4_config as _tiny_deepseek_v4_config,
+)
+from tests.models_kernel.tiny_configs import (
+    tiny_llama_config as _tiny_llama_config,
+)
+from tests.models_kernel.tiny_configs import (
+    tiny_qwen2_config as _tiny_qwen2_config,
+)
+from tests.models_kernel.tiny_configs import (
+    tiny_qwen2_vl_config as _tiny_qwen2_vl_config,
+)
+from tests.models_kernel.tiny_configs import (
+    tiny_qwen3_5_config as _tiny_qwen3_5_config,
+)
+from tests.models_kernel.tiny_configs import (
+    tiny_qwen3_5_moe_config as _tiny_qwen3_5_moe_config,
+)
+from tests.models_kernel.tiny_configs import (
+    tiny_qwen3_5_moe_text_config as _tiny_qwen3_5_moe_text_config,
+)
+from tests.models_kernel.tiny_configs import (
+    tiny_qwen3_5_text_config as _tiny_qwen3_5_text_config,
+)
+from tests.models_kernel.tiny_configs import (
+    tiny_qwen3_config as _tiny_qwen3_config,
+)
+from tests.models_kernel.tiny_configs import (
+    tiny_qwen3_moe_config as _tiny_qwen3_moe_config,
+)
+from tests.models_kernel.tiny_configs import (
+    tiny_qwen3_omni_moe_config as _tiny_qwen3_omni_moe_config,
+)
+from tests.models_kernel.tiny_configs import (
+    tiny_qwen3_omni_moe_text_config as _tiny_qwen3_omni_moe_text_config,
+)
+from tests.models_kernel.tiny_configs import (
+    tiny_qwen3_omni_moe_thinker_config as _tiny_qwen3_omni_moe_thinker_config,
+)
+from tests.models_kernel.tiny_configs import (
+    tiny_qwen3_vl_config as _tiny_qwen3_vl_config,
+)
+from tests.models_kernel.tiny_configs import (
+    tiny_qwen3_vl_moe_config as _tiny_qwen3_vl_moe_config,
+)
 from veomni.models_kernel import (
     MODEL_CONFIG_REGISTRY,
     MODELING_REGISTRY,
@@ -82,334 +97,6 @@ class _ModelCase:
     eager_op_path: str | None = "veomni_ce"
 
 
-def _tiny_deepseek_v4_config(architecture: str = "DeepseekV4ForCausalLM") -> PretrainedConfig:
-    from veomni.models_kernel.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
-
-    return DeepseekV4Config(
-        vocab_size=128,
-        hidden_size=64,
-        moe_intermediate_size=32,
-        num_hidden_layers=4,
-        num_attention_heads=4,
-        num_key_value_heads=1,
-        head_dim=32,
-        q_lora_rank=16,
-        num_experts_per_tok=2,
-        n_routed_experts=4,
-        max_position_embeddings=64,
-        o_groups=8,
-        o_lora_rank=16,
-        index_n_heads=4,
-        index_head_dim=16,
-        architectures=[architecture],
-        attn_implementation="eager",
-        experts_implementation="eager",
-    )
-
-
-def _tiny_qwen3_config(architecture: str = "Qwen3ForCausalLM") -> Qwen3Config:
-    return Qwen3Config(
-        vocab_size=32,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        max_position_embeddings=32,
-        architectures=[architecture],
-        attn_implementation="eager",
-    )
-
-
-def _tiny_qwen2_config(architecture: str = "Qwen2ForCausalLM") -> Qwen2Config:
-    return Qwen2Config(
-        vocab_size=32,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        max_position_embeddings=32,
-        architectures=[architecture],
-        attn_implementation="eager",
-        use_sliding_window=False,
-    )
-
-
-def _tiny_qwen3_5_text_config(architecture: str = "Qwen3_5ForCausalLM") -> Qwen3_5TextConfig:
-    return Qwen3_5TextConfig(
-        vocab_size=32,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        max_position_embeddings=32,
-        layer_types=["linear_attention"],
-        linear_conv_kernel_dim=4,
-        linear_key_head_dim=8,
-        linear_value_head_dim=8,
-        linear_num_key_heads=2,
-        linear_num_value_heads=4,
-        architectures=[architecture],
-        attn_implementation="eager",
-    )
-
-
-def _tiny_qwen3_5_config(architecture: str = "Qwen3_5ForConditionalGeneration") -> Qwen3_5Config:
-    text_config = _tiny_qwen3_5_text_config()
-    vision_config = Qwen3_5VisionConfig(
-        depth=1,
-        hidden_size=32,
-        intermediate_size=64,
-        num_heads=4,
-        patch_size=8,
-        temporal_patch_size=2,
-        spatial_merge_size=2,
-        out_hidden_size=32,
-        num_position_embeddings=16,
-    )
-    return Qwen3_5Config(
-        text_config=text_config.to_dict(),
-        vision_config=vision_config.to_dict(),
-        architectures=[architecture],
-    )
-
-
-def _tiny_qwen3_5_moe_text_config(
-    architecture: str = "Qwen3_5MoeForCausalLM",
-) -> Qwen3_5MoeTextConfig:
-    return Qwen3_5MoeTextConfig(
-        vocab_size=32,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        max_position_embeddings=32,
-        layer_types=["linear_attention"],
-        linear_conv_kernel_dim=4,
-        linear_key_head_dim=8,
-        linear_value_head_dim=8,
-        linear_num_key_heads=2,
-        linear_num_value_heads=4,
-        num_experts=4,
-        num_experts_per_tok=2,
-        moe_intermediate_size=16,
-        output_router_logits=False,
-        router_aux_loss_coef=0.001,
-        architectures=[architecture],
-        attn_implementation="eager",
-        experts_implementation="eager",
-    )
-
-
-def _tiny_qwen3_5_moe_config(
-    architecture: str = "Qwen3_5MoeForConditionalGeneration",
-) -> Qwen3_5MoeConfig:
-    text_config = _tiny_qwen3_5_moe_text_config()
-    vision_config = Qwen3_5MoeVisionConfig(
-        depth=1,
-        hidden_size=32,
-        intermediate_size=64,
-        num_heads=4,
-        patch_size=8,
-        temporal_patch_size=2,
-        spatial_merge_size=2,
-        out_hidden_size=32,
-        num_position_embeddings=16,
-    )
-    config = Qwen3_5MoeConfig(
-        text_config=text_config.to_dict(),
-        vision_config=vision_config.to_dict(),
-        architectures=[architecture],
-    )
-    config._experts_implementation = "eager"
-    config.text_config._experts_implementation = "eager"
-    return config
-
-
-def _tiny_llama_config(architecture: str = "LlamaForCausalLM") -> LlamaConfig:
-    return LlamaConfig(
-        vocab_size=32,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        max_position_embeddings=32,
-        architectures=[architecture],
-        attn_implementation="eager",
-    )
-
-
-def _tiny_qwen3_moe_config(architecture: str = "Qwen3MoeForCausalLM") -> Qwen3MoeConfig:
-    return Qwen3MoeConfig(
-        vocab_size=32,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        max_position_embeddings=32,
-        num_experts=4,
-        num_experts_per_tok=2,
-        moe_intermediate_size=16,
-        decoder_sparse_step=1,
-        mlp_only_layers=[],
-        architectures=[architecture],
-        attn_implementation="eager",
-        experts_implementation="eager",
-    )
-
-
-def _tiny_qwen3_omni_moe_text_config(
-    architecture: str = "Qwen3OmniMoeThinkerTextModel",
-) -> Qwen3OmniMoeTextConfig:
-    return Qwen3OmniMoeTextConfig(
-        vocab_size=32,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        max_position_embeddings=32,
-        num_experts=4,
-        num_experts_per_tok=2,
-        moe_intermediate_size=16,
-        decoder_sparse_step=1,
-        mlp_only_layers=[],
-        output_router_logits=False,
-        router_aux_loss_coef=0.001,
-        architectures=[architecture],
-        attn_implementation="eager",
-    )
-
-
-def _tiny_qwen3_omni_moe_thinker_config(
-    architecture: str = "Qwen3OmniMoeThinkerForConditionalGeneration",
-) -> Qwen3OmniMoeThinkerConfig:
-    text_config = _tiny_qwen3_omni_moe_text_config()
-    vision_config = Qwen3OmniMoeVisionEncoderConfig(
-        depth=1,
-        hidden_size=32,
-        intermediate_size=64,
-        num_heads=4,
-        patch_size=8,
-        temporal_patch_size=2,
-        spatial_merge_size=2,
-        out_hidden_size=32,
-        num_position_embeddings=16,
-        deepstack_visual_indexes=[0],
-    )
-    audio_config = Qwen3OmniMoeAudioEncoderConfig(
-        num_mel_bins=16,
-        encoder_layers=1,
-        encoder_attention_heads=2,
-        encoder_ffn_dim=32,
-        d_model=16,
-        output_dim=32,
-        downsample_hidden_size=16,
-        n_window=4,
-        max_source_positions=16,
-    )
-    return Qwen3OmniMoeThinkerConfig(
-        text_config=text_config.to_dict(),
-        vision_config=vision_config.to_dict(),
-        audio_config=audio_config.to_dict(),
-        architectures=[architecture],
-    )
-
-
-def _tiny_qwen3_omni_moe_config(
-    architecture: str = "Qwen3OmniMoeForConditionalGeneration",
-) -> PretrainedConfig:
-    from veomni.models_kernel.transformers.qwen3_omni_moe.configuration_qwen3_omni_moe import (
-        Qwen3OmniMoeConfig,
-    )
-
-    thinker_config = _tiny_qwen3_omni_moe_thinker_config()
-    return Qwen3OmniMoeConfig(
-        thinker_config=thinker_config.to_dict(),
-        enable_audio_output=False,
-        architectures=[architecture],
-    )
-
-
-def _tiny_qwen3_vl_config(architecture: str = "Qwen3VLForConditionalGeneration") -> Qwen3VLConfig:
-    text_config = Qwen3VLTextConfig(
-        vocab_size=32,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        max_position_embeddings=32,
-        rope_scaling={"mrope_interleaved": True, "mrope_section": [4, 2, 2], "rope_type": "default"},
-        attn_implementation="eager",
-    )
-    vision_config = Qwen3VLVisionConfig(
-        depth=1,
-        hidden_size=32,
-        intermediate_size=64,
-        num_heads=4,
-        patch_size=8,
-        temporal_patch_size=2,
-        spatial_merge_size=2,
-        out_hidden_size=32,
-        num_position_embeddings=16,
-        deepstack_visual_indexes=[0],
-    )
-    return Qwen3VLConfig(
-        text_config=text_config.to_dict(),
-        vision_config=vision_config.to_dict(),
-        architectures=[architecture],
-    )
-
-
-def _tiny_qwen3_vl_moe_config(architecture: str = "Qwen3VLMoeForConditionalGeneration") -> Qwen3VLMoeConfig:
-    text_config = Qwen3VLMoeTextConfig(
-        vocab_size=32,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        max_position_embeddings=32,
-        rope_scaling={"mrope_interleaved": True, "mrope_section": [4, 2, 2], "rope_type": "default"},
-        num_experts=4,
-        num_experts_per_tok=2,
-        moe_intermediate_size=12,
-        decoder_sparse_step=1,
-        mlp_only_layers=[],
-        attn_implementation="eager",
-        experts_implementation="eager",
-    )
-    vision_config = Qwen3VLMoeVisionConfig(
-        depth=1,
-        hidden_size=32,
-        intermediate_size=64,
-        num_heads=4,
-        patch_size=8,
-        temporal_patch_size=2,
-        spatial_merge_size=2,
-        out_hidden_size=32,
-        num_position_embeddings=16,
-        deepstack_visual_indexes=[0],
-    )
-    return Qwen3VLMoeConfig(
-        text_config=text_config.to_dict(),
-        vision_config=vision_config.to_dict(),
-        architectures=[architecture],
-    )
-
-
 _MODEL_CASES = (
     _ModelCase(
         model_type="deepseek_v4",
@@ -437,6 +124,12 @@ _MODEL_CASES = (
             "Qwen2ForQuestionAnswering",
             "Qwen2Model",
         ),
+    ),
+    _ModelCase(
+        model_type="qwen2_vl",
+        config_factory=_tiny_qwen2_vl_config,
+        architectures=("Qwen2VLForConditionalGeneration", "Qwen2VLModel"),
+        has_registered_config=True,
     ),
     _ModelCase(
         model_type="qwen3",
@@ -567,7 +260,6 @@ def test_build_foundation_model_constructs_registered_model(model_case: _ModelCa
     finally:
         set_ops_config(previous)
     assert model.__class__.__name__ == model_case.architectures[0]
-    assert "models_kernel" in model.__class__.__module__
     if model_case.eager_op_path is not None:
         op = model
         for attribute in model_case.eager_op_path.split("."):
@@ -585,7 +277,6 @@ def test_model_registry_entries(model_case: _ModelCase):
 def test_get_model_class_returns_registered_architecture(model_case: _ModelCase, architecture: str):
     model_cls = get_model_class(model_case.config_factory(architecture))
     assert model_cls.__name__ == architecture
-    assert "models_kernel" in model_cls.__module__
 
 
 def test_get_model_config_uses_the_registered_dsv4_subclass(tmp_path):

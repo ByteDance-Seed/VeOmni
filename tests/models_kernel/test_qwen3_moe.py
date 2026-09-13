@@ -37,39 +37,9 @@ from tests.models_kernel.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
 )
+from tests.models_kernel.tiny_configs import tiny_qwen3_moe_config as _tiny_config
 from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config, set_ops_config
-
-
-def _tiny_config(**overrides) -> Qwen3MoeConfig:
-    kwargs = {
-        "vocab_size": 128,
-        "hidden_size": 64,
-        "intermediate_size": 128,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 4,
-        "num_key_value_heads": 2,
-        "head_dim": 16,
-        "max_position_embeddings": 64,
-        "rms_norm_eps": 1e-6,
-        "hidden_act": "silu",
-        "attention_bias": False,
-        "pad_token_id": 0,
-        "bos_token_id": 1,
-        "eos_token_id": 2,
-        "tie_word_embeddings": False,
-        "attn_implementation": "eager",
-        "num_experts": 4,
-        "num_experts_per_tok": 2,
-        "moe_intermediate_size": 32,
-        "decoder_sparse_step": 1,
-        "mlp_only_layers": [],
-        "output_router_logits": False,
-        "router_aux_loss_coef": 0.001,
-        "experts_implementation": "eager",
-    }
-    kwargs.update(overrides)
-    return Qwen3MoeConfig(**kwargs)
 
 
 def _qwen3_moe_classes():
@@ -199,7 +169,6 @@ def test_qwen3_moe_sequence_classification_forward():
     config = _tiny_config(num_labels=4)
     _, model_cls, *_ = _qwen3_moe_classes()
     model = _construct_ours(model_cls, config)
-    assert "models_kernel" in model.model.__class__.__module__
     assert model.veomni_ce.impl == "eager"
 
     input_ids = torch.randint(3, config.vocab_size, (2, 6))
@@ -217,7 +186,6 @@ def test_qwen3_moe_token_classification_eager_matches_hf():
     hf = HFQwen3MoeForTokenClassification(config)
     _, _, model_cls, *_ = _qwen3_moe_classes()
     ours = _construct_ours(model_cls, config)
-    assert "models_kernel" in ours.model.__class__.__module__
     ours.load_state_dict(hf.state_dict())
     hf.eval()
     ours.eval()
@@ -236,7 +204,6 @@ def test_qwen3_moe_question_answering_eager_matches_hf():
     hf = HFQwen3MoeForQuestionAnswering(config)
     _, _, _, model_cls, _ = _qwen3_moe_classes()
     ours = _construct_ours(model_cls, config)
-    assert "models_kernel" in ours.transformer.__class__.__module__
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, 6))

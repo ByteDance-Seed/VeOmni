@@ -25,8 +25,6 @@ from types import SimpleNamespace
 import torch
 from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
     Qwen3VLMoeConfig,
-    Qwen3VLMoeTextConfig,
-    Qwen3VLMoeVisionConfig,
 )
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration as HFQwen3VLMoeForConditionalGeneration,
@@ -37,60 +35,13 @@ from tests.models_kernel.compare import (
     eager_ops_config,
     pin_eager_attn_implementation,
 )
+from tests.models_kernel.tiny_configs import tiny_qwen3_vl_moe_config as _tiny_config
 from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config, set_ops_config
 
 
 IMAGE_TOKEN_ID = 120
 VIDEO_TOKEN_ID = 121
-
-
-def _tiny_config(architecture: str = "Qwen3VLMoeForConditionalGeneration") -> Qwen3VLMoeConfig:
-    text = Qwen3VLMoeTextConfig(
-        vocab_size=128,
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=16,
-        max_position_embeddings=64,
-        rms_norm_eps=1e-6,
-        hidden_act="silu",
-        rope_scaling={"mrope_interleaved": True, "mrope_section": [8, 4, 4], "rope_type": "default"},
-        tie_word_embeddings=False,
-        attn_implementation="eager",
-        pad_token_id=0,
-        bos_token_id=1,
-        eos_token_id=2,
-        num_experts=4,
-        num_experts_per_tok=2,
-        moe_intermediate_size=32,
-        decoder_sparse_step=1,
-        mlp_only_layers=[],
-        _experts_implementation="eager",
-    )
-    vision = Qwen3VLMoeVisionConfig(
-        depth=2,
-        hidden_size=64,
-        intermediate_size=128,
-        num_heads=4,
-        in_channels=3,
-        patch_size=8,
-        temporal_patch_size=2,
-        spatial_merge_size=2,
-        out_hidden_size=64,
-        num_position_embeddings=16,
-        deepstack_visual_indexes=[0],
-        hidden_act="gelu_pytorch_tanh",
-    )
-    return Qwen3VLMoeConfig(
-        text_config=text.to_dict(),
-        vision_config=vision.to_dict(),
-        image_token_id=IMAGE_TOKEN_ID,
-        video_token_id=VIDEO_TOKEN_ID,
-        architectures=[architecture],
-    )
 
 
 def _qwen3_vl_moe_cls():
