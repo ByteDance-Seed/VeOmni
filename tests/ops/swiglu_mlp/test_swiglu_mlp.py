@@ -35,6 +35,8 @@ from tests.ops.tol import (
     SWIGLU_FUSED_RTOL,
 )
 from veomni.ops import resolve_op
+from veomni.ops.kernels.swiglu_mlp.standard import liger_kernel as standard_liger
+from veomni.ops.registry import OpEntry
 from veomni.utils.device import IS_CUDA_AVAILABLE
 
 
@@ -188,6 +190,44 @@ def test_eager_matches_swiglu_limit():
     assert torch.allclose(gate_e.grad, gate_h_grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     assert torch.allclose(up_e.grad, up_h_grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     assert torch.allclose(down_e.grad, experts.down_proj.grad[0], atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+@pytest.mark.parametrize("with_bias", (False, True), ids=("no-bias", "bias"))
+def test_liger_empty_input_falls_back_to_eager_backward(with_bias: bool):
+    hidden, intermediate = 4, 8
+    x = torch.empty(2, 0, hidden, requires_grad=True)
+    gate_w = torch.randn(intermediate, hidden, requires_grad=True)
+    up_w = torch.randn(intermediate, hidden, requires_grad=True)
+    down_w = torch.randn(hidden, intermediate, requires_grad=True)
+    if with_bias:
+        gate_b = torch.randn(intermediate, requires_grad=True)
+        up_b = torch.randn(intermediate, requires_grad=True)
+        down_b = torch.randn(hidden, requires_grad=True)
+    else:
+        gate_b = torch.empty(0, requires_grad=True)
+        up_b = torch.empty(0, requires_grad=True)
+        down_b = torch.empty(0, requires_grad=True)
+
+    entry = OpEntry(
+        "swiglu_mlp",
+        "standard",
+        "liger-empty-test",
+        description="Test-only Liger SwiGLU entry",
+        forward=standard_liger.forward,
+        backward=standard_liger.backward,
+    )
+    assert entry.wrapper is not None
+    output = entry.wrapper(x, gate_w, gate_b, up_w, up_b, down_w, down_b, swiglu_limit=1.0)
+
+    assert output.shape == x.shape
+    output.sum().backward()
+    for tensor in (x, gate_w, up_w, down_w):
+        torch.testing.assert_close(tensor.grad, torch.zeros_like(tensor))
+    for bias in (gate_b, up_b, down_b):
+        if with_bias:
+            torch.testing.assert_close(bias.grad, torch.zeros_like(bias))
+        else:
+            assert bias.grad is None
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger SwiGLU needs a GPU")

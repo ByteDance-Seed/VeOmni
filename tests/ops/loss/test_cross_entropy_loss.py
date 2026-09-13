@@ -96,12 +96,25 @@ def test_eager_logits_allow_infinite_mask_values(dtype):
     torch.testing.assert_close(logits_e.grad, logits_h.grad)
 
 
-@pytest.mark.parametrize("num_tokens", (0, 3), ids=("empty", "all-ignored"))
-def test_eager_empty_or_all_ignored_returns_connected_zero(num_tokens):
+@pytest.mark.parametrize(
+    ("num_tokens", "num_items_in_batch"),
+    (
+        pytest.param(0, None, id="empty"),
+        pytest.param(3, None, id="all-ignored"),
+        pytest.param(3, 0, id="all-ignored-zero-items"),
+        pytest.param(3, torch.tensor(0), id="all-ignored-zero-items-tensor"),
+    ),
+)
+def test_eager_empty_or_all_ignored_returns_connected_zero(num_tokens: int, num_items_in_batch: int | Tensor | None):
     logits = torch.randn(num_tokens, 4, requires_grad=True)
     labels = torch.full((num_tokens,), -100, dtype=torch.long)
 
-    loss = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(logits, labels, _empty_weight(logits.device))
+    loss = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(
+        logits,
+        labels,
+        _empty_weight(logits.device),
+        num_items_in_batch=num_items_in_batch,
+    )
 
     assert loss.item() == 0.0
     loss.backward()
