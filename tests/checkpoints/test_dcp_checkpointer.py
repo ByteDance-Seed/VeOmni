@@ -1132,6 +1132,51 @@ class TestLrSchedulerSaveLoad:
             DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": loaded})
         loaded.load_state_dict.assert_not_called()
 
+    def test_load_falls_back_to_extra_state_scheduler(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
+        mock_dist.get_rank.return_value = 0
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+        from veomni.checkpoint.legacy_v0_1_12 import extra_state_path
+
+        extra = tmp_path / "extra_state"
+        extra.mkdir()
+        torch.save({"lr_scheduler": {"last_epoch": 4}}, extra_state_path(str(tmp_path), 0))
+
+        loaded = MagicMock()
+        DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": loaded})
+        loaded.load_state_dict.assert_called_once_with({"last_epoch": 4})
+
+    def test_sidecar_wins_over_extra_state(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
+        from veomni.checkpoint.dcp_checkpointer import (
+            _LR_SCHEDULER_FILENAME,
+            DistributedCheckpointer,
+        )
+        from veomni.checkpoint.legacy_v0_1_12 import extra_state_path
+
+        torch.save({"last_epoch": 1}, tmp_path / _LR_SCHEDULER_FILENAME)
+        extra = tmp_path / "extra_state"
+        extra.mkdir()
+        torch.save({"lr_scheduler": {"last_epoch": 99}}, extra_state_path(str(tmp_path), 0))
+
+        loaded = MagicMock()
+        DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": loaded})
+        loaded.load_state_dict.assert_called_once_with({"last_epoch": 1})
+
+    def test_rank_nonzero_reads_rank0_extra_state_for_scheduler(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = True
+        mock_dist.get_rank.return_value = 3
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+        from veomni.checkpoint.legacy_v0_1_12 import extra_state_path
+
+        extra = tmp_path / "extra_state"
+        extra.mkdir()
+        torch.save({"lr_scheduler": {"last_epoch": 8}}, extra_state_path(str(tmp_path), 0))
+
+        loaded = MagicMock()
+        DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": loaded})
+        loaded.load_state_dict.assert_called_once_with({"last_epoch": 8})
+
 
 class TestPromoteStagedCheckpoint:
     """`stage_dir` promotion: a staged checkpoint becomes visible only once complete.

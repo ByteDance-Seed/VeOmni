@@ -952,13 +952,21 @@ class DistributedCheckpointer(CheckpointerBase):
             return
 
         lr_scheduler_path = os.path.join(checkpoint_dir, _LR_SCHEDULER_FILENAME)
-        if not os.path.exists(lr_scheduler_path):
-            raise FileNotFoundError(
-                f"lr_scheduler sidecar not found at {lr_scheduler_path}. "
-                "This layout writes lr_scheduler.pt next to the DCP shards "
-                "(see docs/usage/checkpoint.md). Older extra_state/ pickles are not loaded."
-            )
-        lr_scheduler.load_state_dict(torch.load(lr_scheduler_path, weights_only=False))
+        if os.path.exists(lr_scheduler_path):
+            lr_scheduler.load_state_dict(torch.load(lr_scheduler_path, weights_only=False))
+            return
+
+        # Delete this import (and veomni/checkpoint/legacy_v0_1_12.py) to drop 0.1.12 extra_state resume.
+        from .legacy_v0_1_12 import apply_legacy_lr_scheduler
+
+        if apply_legacy_lr_scheduler(checkpoint_dir, lr_scheduler):
+            return
+
+        raise FileNotFoundError(
+            f"lr_scheduler sidecar not found at {lr_scheduler_path}. "
+            "This layout writes lr_scheduler.pt next to the DCP shards "
+            "(see docs/usage/checkpoint.md)."
+        )
 
 
 def get_dtype_size(dtype: torch.dtype) -> int:

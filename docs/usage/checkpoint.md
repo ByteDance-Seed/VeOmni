@@ -2,8 +2,9 @@
 
 This page is the on-disk contract for a VeOmni training run: which directories
 are written, what each file holds, and how that differs from the previous
-layout. Resume reads **this** layout only. Older `extra_state/` pickles are
-not loaded.
+layout. New writes use **this** layout. Resume also reads VeOmni 0.1.12
+`extra_state/` pickles through a throwaway loader (see
+[Legacy resume (VeOmni 0.1.12)](#legacy-resume-veomni-0112)).
 
 `train.checkpoint.output_dir` is the run root. Every per-step artifact — DCP
 shards, scheduler, job cursor, HuggingFace export, and LoRA adapter — lives
@@ -75,7 +76,8 @@ part of the published checkpoint.
 ## Previous layout
 
 Checkpoints written before this layout used a per-rank `extra_state` pickle
-instead of `lr_scheduler.pt`. That path is **not** read on resume.
+instead of `lr_scheduler.pt`. Resume still reads those pickles; see
+[Legacy resume (VeOmni 0.1.12)](#legacy-resume-veomni-0112).
 
 ```
 <output_dir>/
@@ -100,10 +102,31 @@ it contained changed once:
 | `CheckpointerCallback` (before the manager / global_state split) | Mixed bag: `lr_scheduler.state_dict()`, and the job cursor (`global_step`, dataloader, RNG, meters). Rank-local cursor is why the file was per-rank. Changing world size required a matching `extra_state_rank_{R}.pt`. |
 | After the split, before this layout | **Only** `lr_scheduler.state_dict()`. The job cursor moved to `trainer_state_rank_{R}.pt` beside the shards. The per-rank `extra_state` files were leftover: the scheduler is replicated, so every rank wrote the same pickle. |
 
-There is no loader for `extra_state/`. A directory that only has
-`extra_state_rank_*.pt` fails resume if a scheduler is expected: the load
-raises rather than silently restarting the LR at step 0. Re-run from the
-HuggingFace / adapter export, or convert the pickle yourself.
+## Legacy resume (VeOmni 0.1.12)
+
+Temporary. New saves never write `extra_state/`. This loader exists so a
+0.1.12 (and later extra_state-era) checkpoint can still resume; it will be
+removed.
+
+**Where:** `veomni/checkpoint/legacy_v0_1_12.py`. The only call sites are:
+
+- `DistributedCheckpointer._load_lr_scheduler` — if `lr_scheduler.pt` is
+  missing, load `extra_state/extra_state_rank_{R}.pt` (`lr_scheduler` key).
+- `GlobalStateCallback.load_global_state` — if `trainer_state_rank_{R}.pt` is
+  missing, load the same pickle's job cursor (`global_step`, dataloader, RNG,
+  meters) when `global_step` is present.
+
+**How to drop it:** delete `veomni/checkpoint/legacy_v0_1_12.py` and the two
+imports that load it (search for `legacy_v0_1_12`). After that, a directory
+with only `extra_state_rank_*.pt` fails resume if a scheduler is expected.
+
+Current files always win: `lr_scheduler.pt` is not mixed with extra_state, and
+`trainer_state_rank_{R}.pt` is not mixed with a 0.1.12 job cursor.
+
+0.1.12 LoRA export lived at `<output_dir>/global_step_{N}/` (sibling of
+`checkpoints/`). That path is an inference artifact; DCP resume does not read
+it. Point `PeftModel.from_pretrained` at the old directory if you need the
+adapter.
 
 ## Related pages
 

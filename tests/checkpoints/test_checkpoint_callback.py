@@ -431,3 +431,74 @@ class TestGlobalStateCallbackJobState:
         assert trainer.state.global_step == 0
         mock_dist.all_reduce.assert_called_once()
         assert mock_dist.all_reduce.call_args.kwargs["op"] is torch.distributed.ReduceOp.MIN
+
+    def test_load_restores_0_1_12_extra_state_job_cursor(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = str(tmp_path)
+        trainer.args.train.global_rank = 0
+        trainer.args.train_steps = 100
+        rng = torch.get_rng_state()
+        extra = tmp_path / "extra_state"
+        extra.mkdir()
+        torch.save(
+            {
+                "global_step": 7,
+                "lr_scheduler": {"last_epoch": 7},
+                "train_dataloader": {"cursor": 3},
+                "environ_meter": {"tokens": 1},
+                "channel_loss_callback": {"source_registry": [(1, "train/a")]},
+                "torch_rng_state": rng,
+            },
+            extra / "extra_state_rank_0.pt",
+        )
+
+        cb = GlobalStateCallback(trainer)
+        cb.load_global_state()
+
+        assert trainer.state.global_step == 7
+        assert trainer.start_epoch == 0
+        assert trainer.start_step == 7
+        trainer.train_dataloader.load_state_dict.assert_called_once_with({"cursor": 3})
+        trainer.environ_meter.load_state_dict.assert_called_once_with({"tokens": 1})
+        trainer.channel_loss_callback.load_state_dict.assert_called_once_with({"source_registry": [(1, "train/a")]})
+
+    def test_trainer_state_wins_over_extra_state_job_cursor(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = str(tmp_path)
+        trainer.args.train.global_rank = 0
+        trainer.train_dataloader = None
+        torch.save(
+            {
+                "global_step": 7,
+                "train_dataloader": None,
+                "environ_meter": {},
+                "channel_loss_callback": {},
+                "torch_rng_state": torch.get_rng_state(),
+            },
+            tmp_path / "trainer_state_rank_0.pt",
+        )
+        extra = tmp_path / "extra_state"
+        extra.mkdir()
+        torch.save(
+            {"global_step": 99, "lr_scheduler": {}, "torch_rng_state": torch.get_rng_state()},
+            extra / "extra_state_rank_0.pt",
+        )
+
+        cb = GlobalStateCallback(trainer)
+        cb.load_global_state()
+        assert trainer.state.global_step == 7
+
+    def test_scheduler_only_extra_state_does_not_restore_job_cursor(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = str(tmp_path)
+        trainer.args.train.global_rank = 0
+        extra = tmp_path / "extra_state"
+        extra.mkdir()
+        torch.save({"lr_scheduler": {"last_epoch": 3}}, extra / "extra_state_rank_0.pt")
+
+        cb = GlobalStateCallback(trainer)
+        assert cb.load_global_state() is None
+        assert trainer.state.global_step == 0

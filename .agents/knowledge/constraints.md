@@ -169,8 +169,10 @@ Core files:
       is written before ``dcp.save`` / ``dcp.async_save``, so DCP's ``.metadata``
       (the resume completeness marker) lands last. Each step writes a new
       ``global_step_{N}/``; a failed save has no ``.metadata`` and is skipped.
-      A resume that expects a scheduler and finds no ``lr_scheduler.pt`` raises
-      — older ``extra_state/`` pickles are not loaded.
+      A resume that expects a scheduler and finds no ``lr_scheduler.pt`` falls
+      back to ``extra_state/`` via ``veomni/checkpoint/legacy_v0_1_12.py``
+      (VeOmni 0.1.12). Delete that module and its two imports to drop the
+      fallback; the load then raises.
     - ``trainer_state_rank_{R}.pt`` stays per-rank: the dataloader cursor and RNG
       are rank-local. Changing world size still requires a matching cursor file
       per rank. On-disk layout: ``docs/usage/checkpoint.md``.
