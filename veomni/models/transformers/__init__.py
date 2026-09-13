@@ -17,7 +17,6 @@ from . import (
     flux,
     gemma3,
     glm_moe_dsa,
-    gpt_oss,
     movqgan,
     wan,
 )
@@ -27,7 +26,6 @@ __all__ = [
     "deepseek_v3",
     "flux",
     "gemma3",
-    "gpt_oss",
     "movqgan",
     "wan",
     "glm_moe_dsa",

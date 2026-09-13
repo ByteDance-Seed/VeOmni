@@ -27,6 +27,9 @@ from tests.models_kernel.tiny_configs import (
     tiny_deepseek_v4_config as _tiny_deepseek_v4_config,
 )
 from tests.models_kernel.tiny_configs import (
+    tiny_gpt_oss_config as _tiny_gpt_oss_config,
+)
+from tests.models_kernel.tiny_configs import (
     tiny_llama_config as _tiny_llama_config,
 )
 from tests.models_kernel.tiny_configs import (
@@ -121,6 +124,16 @@ _MODEL_CASES = (
         config_factory=_tiny_deepseek_v4_config,
         architectures=("DeepseekV4ForCausalLM", "DeepseekV4Model"),
         has_registered_config=True,
+    ),
+    _ModelCase(
+        model_type="gpt_oss",
+        config_factory=_tiny_gpt_oss_config,
+        architectures=(
+            "GptOssForCausalLM",
+            "GptOssForSequenceClassification",
+            "GptOssForTokenClassification",
+            "GptOssModel",
+        ),
     ),
     _ModelCase(
         model_type="llama",

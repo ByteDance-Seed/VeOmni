@@ -20,6 +20,7 @@ Importing this package registers the models listed below on the
 
 from . import (
     deepseek_v4,
+    gpt_oss,
     llama,
     qwen2,
     qwen2_5_omni,
@@ -38,6 +39,7 @@ from . import (
 
 __all__ = [
     "deepseek_v4",
+    "gpt_oss",
     "llama",
     "qwen2",
     "qwen2_5_omni",

@@ -50,6 +50,38 @@ def tiny_deepseek_v4_config(architecture: str = "DeepseekV4ForCausalLM") -> Pret
     )
 
 
+def tiny_gpt_oss_config(architecture: str = "GptOssForCausalLM") -> PretrainedConfig:
+    from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
+
+    return GptOssConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=32,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=64,
+        rms_norm_eps=1e-5,
+        hidden_act="silu",
+        attention_bias=True,
+        attention_dropout=0.0,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        router_aux_loss_coef=0.001,
+        output_router_logits=False,
+        sliding_window=8,
+        layer_types=["sliding_attention", "sliding_attention", "full_attention"],
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        tie_word_embeddings=False,
+        architectures=[architecture],
+        attn_implementation="eager",
+        _experts_implementation="eager",
+    )
+
+
 def tiny_llama_config(architecture: str = "LlamaForCausalLM", **overrides) -> PretrainedConfig:
     from transformers.models.llama.configuration_llama import LlamaConfig
 
