@@ -133,6 +133,15 @@ def _init_every_position_bias(model: torch.nn.Module) -> None:
                 torch.nn.init.normal_(module.position_bias, std=0.02)
 
 
+def _init_attention_parameters(layer) -> None:
+    # A bare Attention skips PreTrainedModel.post_init(): sinks is allocated
+    # with torch.empty. Match the model's zero initialization before broadcast;
+    # otherwise allocator contents can make both baseline and CP outputs NaN.
+    torch.nn.init.zeros_(layer.sinks)
+    if layer.compressor is not None:
+        _init_position_bias(layer.compressor)
+
+
 def _make_forward(layer, rotary):
     """The attention call every test shares: both rope variants, then the layer."""
 
@@ -207,8 +216,7 @@ def _init_cp_attention(
     layer = dsv4.DeepseekV4Attention(config, layer_idx=layer_idx).to(device=device_type, dtype=dtype)
     if not with_compressor:
         layer.compressor = None
-    else:
-        _init_position_bias(layer.compressor)
+    _init_attention_parameters(layer)
     _broadcast_module(layer)
     layer.train()
 
@@ -745,12 +753,38 @@ def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int, 
     layer = dsv4.DeepseekV4Attention(config, layer_idx=layer_idx)
     if not with_compressor:
         layer.compressor = None
+    _init_attention_parameters(layer)
 
     hidden = torch.randn(1, local_len, config.hidden_size)
     position_ids = torch.arange(local_len).view(1, -1)
     full_mask = _build_causal_mask(local_len * cp_size, config.sliding_window, "cpu", torch.float32)
     rotary = dsv4.DeepseekV4RotaryEmbedding(config)
     return config, _make_forward(layer, rotary), hidden, position_ids, full_mask
+
+
+@pytest.mark.parametrize("with_compressor,layer_idx", [(False, 0), (True, 0), (True, 3)])
+def test_attention_fixture_initializes_empty_parameters(monkeypatch, with_compressor, layer_idx):
+    """Recycled allocator contents must not decide whether CP fixtures produce NaNs."""
+    original_empty = torch.empty
+
+    def poisoned_empty(*args, **kwargs):
+        tensor = original_empty(*args, **kwargs)
+        if tensor.is_floating_point():
+            tensor.fill_(float("nan"))
+        return tensor
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(torch, "empty", poisoned_empty)
+        _, forward, hidden, positions, mask = _build_local_attention(
+            with_compressor, local_len=128, cp_size=1, layer_idx=layer_idx
+        )
+    hidden.requires_grad_(True)
+    no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
+    with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+        output = forward(hidden, positions, mask)
+        assert torch.isfinite(output).all()
+        output.sum().backward()
+    assert torch.isfinite(hidden.grad).all()
 
 
 # The three modules that compress windows, and the role each names in its

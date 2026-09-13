@@ -32,7 +32,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
@@ -41,6 +40,8 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Model,
     Qwen3_5ModelOutputWithPast,
     Qwen3_5RMSNormGated,
+    Qwen3_5TextModel,
+    Qwen3_5VisionModel,
     apply_mask_to_padding_states,
     torch_chunk_gated_delta_rule,
 )
@@ -66,6 +67,19 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_5_gpu.py",
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
 )
+
+
+@config.override_method(
+    "Qwen3_5Model.__init__",
+    description="Construct generated vision and text towers instead of upstream AutoModel classes",
+)
+def qwen3_5_model_init_patched(self, config):
+    super().__init__(config)
+    self.visual = Qwen3_5VisionModel._from_config(config.vision_config)
+    self.language_model = Qwen3_5TextModel._from_config(config.text_config)
+    self.rope_deltas = None
+    self.post_init()
+
 
 config.add_import("copy", names=["copy"])
 config.add_import("functools", names=["partial"])
@@ -95,33 +109,17 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
-config.drop_import_names(
-    "FusedRMSNormGated",
-    "causal_conv1d_fn",
-    "causal_conv1d_update",
-    "chunk_gated_delta_rule",
-    "fused_recurrent_gated_delta_rule",
-)
-config.add_post_import_block(
-    """
-    # Selection of FusedRMSNormGated / causal_conv1d / chunk_gated_delta_rule
-    # used to come from `try: from fla.modules import ... except ImportError`
-    # at module import time. That selection now lives in OpSlot guards (see
-    # below) — picked from OpsImplementationConfig instead of "is the library
-    # importable". These None placeholders only exist so:
-    #   (1) the upstream HF module-level
-    #       `is_fast_path_available = all((causal_conv1d_fn, ...))`
-    #       resolves to False (legacy warning behaviour preserved); and
-    #   (2) the decode-only `*_update` / `fused_recurrent_*` paths, which raise
-    #       NotImplementedError in our patched forward, still satisfy the
-    #       `<fla_name> or <torch_fallback>` assignments in __init__.
-    FusedRMSNormGated = None
-    causal_conv1d_fn = None
-    causal_conv1d_update = None
-    chunk_gated_delta_rule = None
-    fused_recurrent_gated_delta_rule = None
-    """
-)
+# transformers 5.16 no longer imports the FLA / causal-conv1d symbols at module
+# import time: `causal_conv1d_fn` / `causal_conv1d_update` /
+# `torch_chunk_gated_delta_rule` / `torch_recurrent_gated_delta_rule` are now
+# module-level torch implementations decorated with
+# `@use_kernel_func_from_hub_with_fallback(...)`, `FusedRMSNormGated` and
+# `is_fast_path_available` are gone entirely. The previous `drop_import_names`
+# call plus the `<name> = None` post-import placeholders therefore have nothing
+# left to neutralise, and the placeholders would shadow-then-collide with the
+# upstream definitions (ruff F811). VeOmni's kernel selection still happens
+# through the OpSlot guards declared below and consumed in
+# `Qwen3_5GatedDeltaNet.__init__`.
 
 config.add_post_import_block(
     """
@@ -153,12 +151,9 @@ config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = True")
 # Dummy definitions for names that exist in the generated file's scope but not here.
 # The patchgen only extracts the function body; these are resolved at codegen time.
 Qwen3_5GatedDeltaNet = None
-causal_conv1d_update = None  # decode-only; placeholder set in post-import block above
-torch_causal_conv1d_update = None
+causal_conv1d_update = None  # decode-only; upstream module-level torch impl
 torch_chunk_gated_delta_rule = None  # noqa: F811 — also imported above for the forward patch
-fused_recurrent_gated_delta_rule = None  # decode-only; placeholder set in post-import block above
-torch_recurrent_gated_delta_rule = None
-is_fast_path_available = None
+torch_recurrent_gated_delta_rule = None  # decode-only; upstream module-level torch impl
 gather_seq_scatter_heads = None
 gather_heads_scatter_seq = None
 gather_outputs = None
@@ -219,7 +214,6 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
     self.conv_kernel_size = config.linear_conv_kernel_dim
     self.layer_idx = layer_idx
     self.activation = config.hidden_act
-    self.act = ACT2FN[config.hidden_act]
     self.layer_norm_epsilon = config.rms_norm_eps
 
     # QKV
@@ -237,7 +231,8 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
     # instantiate once and copy inv_dt in init_weights of PretrainedModel
     self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
 
-    A = torch.empty(self.num_v_heads).uniform_(0, 16)
+    # Lower bound kept away from 0 so log(A) never becomes -inf
+    A = torch.empty(self.num_v_heads).uniform_(0.01, 16)
     self.A_log = nn.Parameter(torch.log(A))
 
     # Modification: OpSlot dispatch for fused gated RMSNorm. The slot stores
@@ -257,6 +252,8 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
 
     self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
+    self.layer_type = config.layer_types[layer_idx]
+
     # Modification: OpSlot dispatch for causal conv1d / chunk gated delta-rule.
     # We freeze the resolved kernel (or None for eager) on the instance via
     # `.bound_kernel()`; storing the OpSlot itself would couple the instance to
@@ -266,17 +263,14 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
     # falls back to the torch chunk_gated_delta_rule, which `forward` rejects
     # for varlen training; the decode-only `*_update` aliases are kept None
     # because the precomputed-state path raises NotImplementedError anyway.
+    # transformers 5.16 dropped the `<fla_name> or <torch_fallback>` pairs:
+    # `causal_conv1d_update` / `torch_recurrent_gated_delta_rule` are now the
+    # upstream module-level torch implementations, so the `or` fallbacks (and
+    # the removed `is_fast_path_available` warning) no longer apply.
     self.causal_conv1d_fn = veomni_causal_conv1d.bound_kernel()
-    self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
+    self.causal_conv1d_update = causal_conv1d_update
     self.chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel() or torch_chunk_gated_delta_rule
-    self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
-
-    if not is_fast_path_available:
-        logger.warning_once(
-            "The fast path is not available because one of the required library is not installed. Falling back to "
-            "torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and"
-            " https://github.com/Dao-AILab/causal-conv1d"
-        )
+    self.recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
 
     self.in_proj_qkv = nn.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
     self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
@@ -514,40 +508,17 @@ def qwen3_5_gated_deltanet_forward_patched(
     return output
 
 
-@config.override_method(
-    "Qwen3_5TextModel._update_linear_attn_mask",
-    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
-)
-def qwen3_5_text_model_update_linear_attn_mask(self, attention_mask, cache_position):
-    """
-    Build the attention mask passed to the linear-attention (gated DeltaNet) layers.
-
-    Upstream returns ``None`` — disabling the per-token zeroing in ``apply_mask_to_padding_states``
-    — when ``cache_position[0] > 0`` (a cached forward) or ``torch.all(attention_mask == 1)`` (the
-    batch has no padding). Both predicates read a 0-D GPU tensor and force an implicit ``.item()``
-    / host-device sync on *every* forward, which serialises the host against the device in
-    VeOmni's otherwise sync-free training step.
-
-    We keep the cached-forward branch — it is a correctness guard, not just an optimization:
-    ``apply_mask_to_padding_states`` does ``hidden_states * attention_mask[:, :, None]``, and in a
-    cached forward the 2-D ``attention_mask`` spans ``past + current`` tokens while ``hidden_states``
-    only covers the current chunk, so the shapes wouldn't broadcast (or would broadcast wrongly for
-    a 1-token decode step). But we detect it host-side from tensor shapes — ``attention_mask`` has
-    ``shape[-1] == past + current`` whereas ``cache_position`` has ``shape[-1] == current`` — rather
-    than reading ``cache_position[0]``, so no sync.
-
-    The all-ones short-circuit is the one we drop: returning the all-ones mask makes
-    ``apply_mask_to_padding_states`` a no-op multiply, so it is equivalent to upstream's ``None``
-    while avoiding the ``torch.all`` reduction + sync. A genuinely padded mask is still returned and
-    correctly zeroed.
-    """
-    if attention_mask is None:
-        return None
-    # Cached forward (decode / continuation): see docstring — shapes wouldn't line up in
-    # apply_mask_to_padding_states, and upstream returns None here. Detected from shapes only.
-    if cache_position is not None and attention_mask.shape[-1] != cache_position.shape[-1]:
-        return None
-    return attention_mask
+# NOTE: `Qwen3_5TextModel._update_linear_attn_mask` was removed in transformers
+# 5.16. `Qwen3_5TextModel.forward` now builds a per-attention-type mask mapping
+# with `create_causal_mask` / `create_recurrent_attention_mask`, so the previous
+# override (which avoided the `cache_position[0] > 0` host sync) had nothing left
+# to hook. Upstream's `create_recurrent_attention_mask` already decides the
+# cached-forward case from shapes (`inputs_embeds.shape[1] == 1`) and — unlike
+# the old override — trims the 2-D mask to the local sequence instead of
+# dropping it, which is the more correct behaviour for chunked prefill. It still
+# reads `torch.all(attention_mask == 1)` (guarded by `is_tracing`), so the
+# all-ones host sync is upstream behaviour now; re-optimising that belongs in a
+# separate change.
 
 
 @config.override_method(
@@ -577,7 +548,7 @@ def qwen3_5_decoder_layer_forward_patched(
     linear_attn_cu_seq_lens_q = kwargs.pop("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
 
     # Token Mixer
-    if self.layer_type == "linear_attention":
+    if self.block_type == "linear_attention":
         # Modification: pass linear-attention cu_seqlens through to Qwen3_5GatedDeltaNet.forward.
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
@@ -586,7 +557,7 @@ def qwen3_5_decoder_layer_forward_patched(
             attention_mask=attention_mask,
             cu_seq_lens_q=linear_attn_cu_seq_lens_q,
         )
-    elif self.layer_type == "full_attention":
+    elif self.block_type == "full_attention":
         # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
@@ -1600,6 +1571,11 @@ def qwen3_5_forconditional_generation_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen3_5CausalLMOutputWithLogProbs:
+    r"""
+    cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+        Indices depicting the position of the input sequence tokens in the sequence. Retained in the
+        signature for callers that pass it positionally; transformers 5.16 moved it into `**kwargs`.
+    """
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,
