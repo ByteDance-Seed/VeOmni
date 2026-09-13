@@ -15,8 +15,11 @@
 """Job-level checkpoint callback, as distinct from per-model checkpoint I/O.
 
 Nothing here belongs to a model: where the dataloader is, the rng, the metric
-meters. Model weights, optimizer, HF/LoRA export, and the tokenizer/config
-sidecars are scheduled by :mod:`~veomni.trainer.callbacks.checkpoint_callback`.
+meters. Written per rank as ``trainer_state_rank_{N}.pt``. The model's
+``lr_scheduler`` is a separate ``lr_scheduler.pt`` next to the DCP shards
+(see ``docs/usage/checkpoint.md``). Model weights, optimizer, HF/LoRA export,
+and the tokenizer/config sidecars are scheduled by
+:mod:`~veomni.trainer.callbacks.checkpoint_callback`.
 """
 
 import os
@@ -119,7 +122,14 @@ class GlobalStateCallback(Callback):
             return None
 
         state_path = global_state_path(load_path, self.rank)
-        found = os.path.exists(state_path)
+        found_current = os.path.exists(state_path)
+        legacy_state = None
+        if not found_current:
+            # Delete this import (and veomni/checkpoint/legacy_v0_1_12.py) to drop 0.1.12 extra_state resume.
+            from ...checkpoint.legacy_v0_1_12 import apply_legacy_global_state
+
+            legacy_state = apply_legacy_global_state(load_path, self.rank)
+        found = found_current or legacy_state is not None
         if dist.is_initialized():
             flag = torch.tensor([int(found)], dtype=torch.int32, device=get_device_type())
             dist.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
@@ -131,7 +141,10 @@ class GlobalStateCallback(Callback):
             logger.warning(f"No trainer state at {state_path}; resuming weights only.")
             return None
 
-        global_state = torch.load(state_path, map_location="cpu", weights_only=False)
+        if found_current:
+            global_state = torch.load(state_path, map_location="cpu", weights_only=False)
+        else:
+            global_state = legacy_state
         self.trainer.state.global_step = global_state["global_step"]
         self._restore_position(global_state)
 
@@ -144,7 +157,9 @@ class GlobalStateCallback(Callback):
             self.trainer.train_dataloader.load_state_dict(global_state["train_dataloader"])
 
         self.trainer.environ_meter.load_state_dict(global_state["environ_meter"])
-        torch.set_rng_state(global_state["torch_rng_state"])
+        rng_state = global_state.get("torch_rng_state")
+        if rng_state is not None:
+            torch.set_rng_state(rng_state)
         if self.trainer.start_step == 0 and self.trainer.train_dataloader is not None:
             iter(self.trainer.train_dataloader)
 
