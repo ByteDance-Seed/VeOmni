@@ -225,6 +225,27 @@ def tiny_llama_config(architecture: str = "LlamaForCausalLM", **overrides) -> Pr
     return LlamaConfig(**kwargs)
 
 
+def tiny_movqgan_config(architecture: str = "MoVQGAN") -> PretrainedConfig:
+    from veomni.models_kernel.transformers.movqgan.configuration_movqgan import MoVQGANConfig
+
+    return MoVQGANConfig(
+        embed_dim=4,
+        n_embed=16,
+        double_z=False,
+        z_channels=4,
+        resolution=8,
+        in_channels=3,
+        out_ch=3,
+        ch=32,
+        ch_mult=(1, 2),
+        num_res_blocks=1,
+        attn_resolutions=(4,),
+        dropout=0.0,
+        architectures=[architecture],
+        tie_word_embeddings=False,
+    )
+
+
 def tiny_seed_oss_config(architecture: str = "SeedOssForCausalLM") -> PretrainedConfig:
     from transformers.models.seed_oss.configuration_seed_oss import SeedOssConfig
 

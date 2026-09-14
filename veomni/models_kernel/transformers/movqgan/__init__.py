@@ -12,4 +12,27 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""MoVQGAN modeling staged under models_kernel. Not on ``MODELING_REGISTRY``."""
+"""Register the local MoVQGAN config, model, and processor."""
+
+from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
+
+
+@MODEL_CONFIG_REGISTRY.register("movqgan")
+def register_movqgan_config():
+    from .configuration_movqgan import MoVQGANConfig
+
+    return MoVQGANConfig
+
+
+@MODELING_REGISTRY.register("movqgan")
+def register_movqgan_modeling(_architecture: str):
+    from .modeling_movqgan import MoVQGAN
+
+    return MoVQGAN
+
+
+@MODEL_PROCESSOR_REGISTRY.register("MoVQGANProcessor")
+def register_movqgan_processor():
+    from .processing_movqgan import MoVQGANProcessor
+
+    return MoVQGANProcessor

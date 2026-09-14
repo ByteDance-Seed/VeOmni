@@ -13,12 +13,10 @@
 # limitations under the License.
 
 from . import (
-    movqgan,
     wan,
 )
 
 
 __all__ = [
-    "movqgan",
     "wan",
 ]

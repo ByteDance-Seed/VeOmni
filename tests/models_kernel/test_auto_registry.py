@@ -45,6 +45,9 @@ from tests.models_kernel.tiny_configs import (
     tiny_llama_config as _tiny_llama_config,
 )
 from tests.models_kernel.tiny_configs import (
+    tiny_movqgan_config as _tiny_movqgan_config,
+)
+from tests.models_kernel.tiny_configs import (
     tiny_qwen2_5_omni_config as _tiny_qwen2_5_omni_config,
 )
 from tests.models_kernel.tiny_configs import (
@@ -183,6 +186,14 @@ _MODEL_CASES = (
             "LlamaForSequenceClassification",
             "LlamaModel",
         ),
+    ),
+    _ModelCase(
+        model_type="movqgan",
+        config_factory=_tiny_movqgan_config,
+        architectures=("MoVQGAN",),
+        has_registered_config=True,
+        processor_class_name="MoVQGANProcessor",
+        eager_op_path=None,
     ),
     _ModelCase(
         model_type="seed_oss",
