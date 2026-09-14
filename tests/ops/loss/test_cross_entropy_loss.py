@@ -212,6 +212,68 @@ def test_chunk_loss_accumulates_weight_gradient_without_full_size_temporary():
     assert counter.out_of_place_adds == 0
 
 
+def test_chunk_loss_does_not_copy_full_noncontiguous_hidden():
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from veomni.ops.kernels.loss.cross_entropy_loss.standard import chunk_loss
+
+    hidden_shape = (2, 7, 4)
+
+    class FullHiddenCloneCounter(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.full_hidden_clones = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            del types
+            output = func(*args, **(kwargs or {}))
+            if func == torch.ops.aten.clone.default and isinstance(output, Tensor) and output.shape == hidden_shape:
+                self.full_hidden_clones += 1
+            return output
+
+    torch.manual_seed(9)
+    hidden = torch.randn(7, 2, hidden_shape[-1]).transpose(0, 1)
+    assert hidden.shape == hidden_shape
+    assert not hidden.is_contiguous()
+    labels = torch.randint(0, 16, hidden_shape[:-1])
+    weight = torch.randn(16, hidden_shape[-1])
+    counter = FullHiddenCloneCounter()
+
+    with counter:
+        chunk_loss.forward(hidden, labels, weight, chunk_size=2)
+
+    assert counter.full_hidden_clones == 0
+
+
+@pytest.mark.parametrize(
+    ("hidden_shape", "labels_shape"),
+    (
+        ((2, 3, 4), (2, 0)),
+        ((2, 0, 4), (2, 3)),
+    ),
+)
+def test_chunk_loss_rejects_mismatched_empty_token_counts(hidden_shape, labels_shape):
+    hidden = torch.randn(hidden_shape)
+    labels = torch.zeros(labels_shape, dtype=torch.long)
+    weight = torch.randn(8, hidden_shape[-1])
+
+    with pytest.raises(ValueError, match="token count"):
+        resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper(hidden, labels, weight)
+
+
+def test_chunk_loss_empty_returns_connected_zero():
+    hidden = torch.empty(2, 0, 4, requires_grad=True)
+    labels = torch.empty(2, 0, dtype=torch.long)
+    weight = torch.randn(8, 4, requires_grad=True)
+
+    loss = resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper(hidden, labels, weight)
+
+    assert loss.item() == 0.0
+    loss.backward()
+    torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden))
+    torch.testing.assert_close(weight.grad, torch.zeros_like(weight))
+
+
 def test_chunk_loss_requires_weight():
     with pytest.raises(RuntimeError, match="nonempty ``weight``"):
         resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper(
