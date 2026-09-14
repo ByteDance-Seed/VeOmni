@@ -34,7 +34,9 @@ Registered rows use the identity:
 Callers select the public `(op, variant, implementation)` triple. The
 registry derives `device` from the row's requirement and resolves the current
 device first, followed by a device-agnostic row. A row's `requires` metadata
-is then checked for importable optional packages without importing its kernel.
+is then checked for discoverable optional module paths without importing vendor
+code. This is a static discovery check; actual vendor initialization happens
+when the selected implementation runs.
 
 ## Built-in families
 
@@ -70,7 +72,7 @@ OP_REGISTRY.list_entries("rms_norm", "standard")
 
 `list_registered` includes every known implementation. `list_available`
 filters those rows using the current device, hardware requirement, and
-optional-package requirements.
+discoverable optional-module requirements.
 `list_entries` returns the complete device-specific rows, including their
 descriptions, hardware requirements, and package requirements; an
 implementation registered for multiple devices therefore appears more than

@@ -306,6 +306,53 @@ class TestRegisterAndResolve:
             VeomniOp("add", "standard", "optional")
         assert not wrapper_called
 
+    def test_list_available_respects_device_override_before_any_fallback(self, monkeypatch):
+        class CpuRequirement:
+            device = "cpu"
+
+            def matches(self) -> bool:
+                return True
+
+            def check(self) -> None:
+                return None
+
+        any_entry = OpEntry(
+            op="add",
+            variant="standard",
+            impl="shadowed",
+            description="Device-agnostic add",
+            wrapper=lambda x: x,
+        )
+        override_entry = OpEntry(
+            op="add",
+            variant="standard",
+            impl="shadowed",
+            description="CPU add requiring an optional backend",
+            wrapper=lambda x: x,
+            requirement=CpuRequirement(),
+            requires=("missing_optional_backend",),
+        )
+        fallback_entry = OpEntry(
+            op="add",
+            variant="standard",
+            impl="fallback",
+            description="Device-agnostic fallback add",
+            wrapper=lambda x: x,
+        )
+        OP_REGISTRY.register(any_entry)
+        OP_REGISTRY.register(override_entry)
+        OP_REGISTRY.register(fallback_entry)
+        monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "cpu")
+        monkeypatch.setattr(
+            "veomni.ops.registry.is_package_available",
+            lambda package: package != "missing_optional_backend",
+        )
+
+        assert OP_REGISTRY.list_available("add", "standard") == ["fallback"]
+        with pytest.raises(RuntimeError, match="requires unavailable package.*missing_optional_backend"):
+            resolve_op("add", "standard", "shadowed")
+        assert resolve_op("add", "standard", "fallback") is fallback_entry
+
     def test_available_package_resolves_without_importing_backend(self, monkeypatch):
         checked = []
         wrapper_called = False

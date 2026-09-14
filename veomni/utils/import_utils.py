@@ -16,8 +16,8 @@
 """Import utils"""
 
 import importlib.metadata
-import importlib.util
 import subprocess
+import sys
 from functools import lru_cache
 from typing import TYPE_CHECKING, Dict
 
@@ -28,12 +28,45 @@ if TYPE_CHECKING:
     from packaging.version import Version
 
 
+def _find_spec_without_import(fullname: str, path) -> object | None:
+    """Ask active meta-path finders for a spec without executing a parent loader."""
+    for finder in tuple(sys.meta_path):
+        find_spec = getattr(finder, "find_spec", None)
+        if find_spec is None:
+            continue
+        spec = find_spec(fullname, path, None)
+        if spec is not None:
+            return spec
+    return None
+
+
 def _is_package_available(name: str) -> bool:
+    """Return whether a module path is discoverable without importing its parents."""
     try:
-        return importlib.util.find_spec(name) is not None
+        search_path = None
+        parts = name.split(".")
+        for index, _part in enumerate(parts):
+            fullname = ".".join(parts[: index + 1])
+            if fullname in sys.modules:
+                loaded = sys.modules[fullname]
+                if loaded is None:
+                    return False
+                if index == len(parts) - 1:
+                    return True
+                search_path = getattr(loaded, "__path__", None)
+                if search_path is None:
+                    return False
+                continue
+
+            spec = _find_spec_without_import(fullname, search_path)
+            if spec is None:
+                return False
+            if index != len(parts) - 1:
+                search_path = spec.submodule_search_locations
+                if search_path is None:
+                    return False
+        return True
     except (ImportError, AttributeError, ValueError):
-        # Dotted optional modules (for example ``flash_attn.cute``) raise
-        # instead of returning ``None`` when their parent is unavailable.
         return False
 
 

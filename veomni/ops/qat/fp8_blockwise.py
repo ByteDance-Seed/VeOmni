@@ -37,6 +37,8 @@ import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
 
+from ._hardware import require_tilelang_sm90
+
 
 # DeepSeek-V4 rounds every scale up to a power of two so that it survives
 # storage as a bare E8M0 exponent. Every published V4 checkpoint ships pow2
@@ -56,6 +58,7 @@ __all__ = [
 
 def act_quant(*args, **kwargs):
     """Lazily call the TileLang activation quantizer."""
+    require_tilelang_sm90()
     from .quant import act_quant as quantize
 
     return quantize(*args, **kwargs)
@@ -63,6 +66,7 @@ def act_quant(*args, **kwargs):
 
 def fp8_weight_quant(*args, **kwargs):
     """Lazily call the TileLang FP8 weight quantizer."""
+    require_tilelang_sm90()
     from .quant import fp8_weight_quant as quantize
 
     return quantize(*args, **kwargs)

@@ -32,10 +32,20 @@ from ..ulysses import (
 )
 
 
-try:
-    from sageattention import sageattn
-except ModuleNotFoundError:
-    sageattn = None
+sageattn = None
+
+
+def _load_sageattn():
+    """Load the optional SageAttention callable only when this adapter runs."""
+    if sageattn is not None:
+        return sageattn
+    try:
+        from sageattention import sageattn as imported_sageattn
+    except ModuleNotFoundError as exc:
+        if exc.name != "sageattention":
+            raise
+        raise ImportError("veomni_sage_attention requires the sageattention package.") from exc
+    return imported_sageattn
 
 
 def _requires_attention_grad(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> bool:
@@ -71,8 +81,6 @@ def sage_attention_forward(
     ``skip_ulysses`` opts a call out of sync Ulysses when its tokens are not
     on the SP mesh. Async Ulysses stays outside attention.
     """
-    if sageattn is None:
-        raise ImportError("veomni_sage_attention requires the sageattention package.")
     if _requires_attention_grad(query, key, value):
         raise RuntimeError(
             "veomni_sage_attention is inference-only; official sageattn has no backward. "
@@ -91,6 +99,8 @@ def sage_attention_forward(
         raise ValueError(f"veomni_sage_attention does not support attention dropout, got dropout={dropout}.")
     if any(dim == 0 for tensor in (query, key, value) for dim in tensor.shape):
         raise ValueError("SageAttention does not support query/key/value tensors with zero dimensions.")
+
+    sageattn_fn = _load_sageattn()
 
     is_causal = kwargs.pop("is_causal", None)
     if is_causal is None:
@@ -117,7 +127,7 @@ def sage_attention_forward(
                 group=parallel_state.ulysses_group,
             )
 
-    output = sageattn(
+    output = sageattn_fn(
         query,
         key,
         value,
