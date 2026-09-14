@@ -42,6 +42,7 @@ _TELEMETRY_KEYS = {
     "replicas": "moe/ep_active_replicas/sum",
     "moved_tokens": "moe/ep_moved_tokens/sum",
     "moved_fraction": "moe/ep_moved_token_fraction/avg",
+    "total_tokens": "moe/ep_total_routed_tokens/sum",
 }
 
 _WRAPPER_SOURCE = r"""
@@ -64,6 +65,10 @@ from veomni.utils.moe_router_replay import get_active_replay, set_active_replay
 
 
 class HotspotReplay:
+    def __init__(self, ep_size):
+        # EP2 has one hot owner; EP4 has two tied hot owners.
+        self.experts = [0, 1] if ep_size == 2 else [0, 4]
+
     def on_router_forward(self, module, routing_scores, top_indices):
         if module.__class__.__name__ != "Qwen3_5MoeTopKRouter":
             raise RuntimeError(f"unexpected replay router: {module.__class__.__name__}")
@@ -71,7 +76,7 @@ class HotspotReplay:
             raise RuntimeError(f"Qwen3.5 toy replay requires top-k=2, got shape={tuple(top_indices.shape)}")
         if routing_scores.device != top_indices.device:
             raise RuntimeError("routing scores and native top-k indices must share a device")
-        hotspot = torch.tensor([0, 1], dtype=top_indices.dtype, device=top_indices.device)
+        hotspot = torch.tensor(self.experts, dtype=top_indices.dtype, device=top_indices.device)
         return hotspot.expand_as(top_indices).clone()
 
 
@@ -147,7 +152,7 @@ def main():
     )
     previous_replay = get_active_replay()
     try:
-        set_active_replay(HotspotReplay())
+        set_active_replay(HotspotReplay(args.train.accelerator.ep_size))
         trainer.train()
     finally:
         set_active_replay(previous_replay)
@@ -546,7 +551,8 @@ def test_npu_generated_model_only_precomputes_gdn_metadata_when_needed():
     assert source.count('"linear_attention" in self.config.layer_types') == 1
 
 
-def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(tmp_path):
+@pytest.mark.parametrize("ep_size", [2, 4])
+def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(tmp_path, ep_size):
     _require_accelerators()
 
     from tests.tools import DummyDataset, ParallelConfig, build_torchrun_cmd
@@ -572,6 +578,7 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(tmp_path):
     candidate_output = tmp_path / "candidate"
     common_args = [
         "--train.seed=0",
+        "--data.max_seq_len=2048",
         "--train.profile.enable=False",
         "--train.wandb.enable=False",
         "--train.gradient_checkpointing.enable=False",
@@ -584,7 +591,7 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(tmp_path):
         *_backend_args(),
         "--train.moe_ep_load_balance.enabled=False",
     ]
-    parallel = ParallelConfig(sp_size=1, ep_size=2, fsdp_mode="fsdp2")
+    parallel = ParallelConfig(sp_size=1, ep_size=ep_size, fsdp_mode="fsdp2")
     baseline_command = build_torchrun_cmd(
         script=str(wrapper),
         config_path=str(config_path),
@@ -637,9 +644,18 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(tmp_path):
     replicas = _finite_curve(candidate, _TELEMETRY_KEYS["replicas"])
     moved_tokens = _finite_curve(candidate, _TELEMETRY_KEYS["moved_tokens"])
     moved_fraction = _finite_curve(candidate, _TELEMETRY_KEYS["moved_fraction"])
+    total_tokens = _finite_curve(candidate, _TELEMETRY_KEYS["total_tokens"])
     assert len(before) == len(after) == len(replicas) == len(moved_tokens) == len(moved_fraction) == 2
     assert all(value > 0 for value in replicas)
     assert all(value > 0 for value in moved_tokens)
     assert all(value > 0 for value in moved_fraction)
     assert all(after_value <= before_value for before_value, after_value in zip(before, after, strict=True))
     assert any(after_value < before_value for before_value, after_value in zip(before, after, strict=True))
+    # Four MoE layers, GBS8, 2048 tokens, top-k2; count physical plans once,
+    # not once per EP sibling. Both fixtures move exactly half the assignments.
+    expected_total = toy_config["text_config"]["num_hidden_layers"] * 8 * 2048 * 2
+    assert total_tokens == [expected_total] * 2
+    assert moved_tokens == [expected_total // 2] * 2
+    # Two accumulated microbatches, four layers: EP2 has two groups with
+    # one replica each; EP4 has one group with two replicas.
+    assert replicas == [16] * 2
