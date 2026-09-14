@@ -116,9 +116,11 @@ __all__ = [
 ]
 
 
-# Registry of HuggingFace `model_type` strings whose VeOmni MoE
-# SparseMoeBlock.forward (or route_tokens_to_experts) has been wired to call
-# `maybe_replay_indices`. Extend when wiring replay into a new model family.
+# Registry of HuggingFace `model_type` strings whose VeOmni MoE top-k
+# selection has been wired to call `maybe_replay_indices` — the
+# SparseMoeBlock/MoE forward for most families, or the router forward itself
+# where upstream folded routing into it. Extend when wiring replay into a new
+# model family.
 SUPPORTED_MOE_MODEL_TYPES: frozenset[str] = frozenset(
     {
         "qwen3_moe",
@@ -184,8 +186,8 @@ def validate_model_for_replay(model: nn.Module) -> None:
 
     This function fails fast at controller install time with a message
     pointing the user at the concrete fix: extend
-    :data:`SUPPORTED_MOE_MODEL_TYPES` and patch the corresponding
-    ``SparseMoeBlock.forward`` / ``route_tokens_to_experts`` method.
+    :data:`SUPPORTED_MOE_MODEL_TYPES` and patch whichever method produces the
+    top-k expert indices for that family.
 
     Args:
         model: The top-level model (usually the HF ``*ForCausalLM``) whose
@@ -214,8 +216,10 @@ def validate_model_for_replay(model: nn.Module) -> None:
         raise RuntimeError(
             f"router replay is not wired for model_type={model_type!r}. "
             f"Supported model types: {supported}. "
-            "To add support, patch the corresponding SparseMoeBlock.forward "
-            "(or route_tokens_to_experts) to call "
+            "To add support, patch whichever method produces the top-k expert "
+            "indices for that family — the SparseMoeBlock/MoE forward, or the "
+            "router forward itself (transformers 5.16 folded DeepSeek-V3's "
+            "`route_tokens_to_experts` into `DeepseekV3TopkRouter.forward`) — to call "
             "`veomni.utils.moe_router_replay.maybe_replay_indices`, then extend "
             "`SUPPORTED_MOE_MODEL_TYPES` in this file."
         )

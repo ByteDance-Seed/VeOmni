@@ -433,7 +433,7 @@ overridden by setting the corresponding shell environment variable.
 
 ## 7. Comparison with Transformers v5 Kernel Selection
 
-VeOmni targets Transformers 5.9.0, whose kernel selection APIs replace the
+VeOmni targets Transformers 5.16.1, whose kernel selection APIs replace the
 ad-hoc patching used in earlier versions. This section compares VeOmni's
 approach (Sections 1-6 above) with the four
 mechanisms available in Transformers v5, using `Qwen3MoE` and `Qwen3.5MoE` as
@@ -444,7 +444,7 @@ reference models.
 | # | Mechanism | Decorator / API | What it replaces | Scope |
 |---|-----------|----------------|------------------|-------|
 | 1 | Hub kernel layers | `@use_kernel_forward_from_hub("RMSNorm")` | `nn.Module.forward` | Per-class, via `kernels` library from HF Hub |
-| 2 | Hub kernel functions | `@use_kernel_func_from_hub("rotary_pos_emb")` | Standalone functions (e.g. `apply_rotary_pos_emb`) | Per-function, via `kernels` library from HF Hub |
+| 2 | Hub kernel functions | `@use_kernel_forward_from_hub("rotary_pos_emb")`, or `@use_kernel_func_from_hub_with_fallback("causal_conv1d_fn", "causal_conv1d")` when a torch fallback ships alongside | Standalone functions (e.g. `apply_rotary_pos_emb`, `causal_conv1d_fn`) | Per-function, via `kernels` library from HF Hub |
 | 3 | Attention interface | `ALL_ATTENTION_FUNCTIONS.get_interface(...)` | Attention forward pass | Per-model via `config._attn_implementation` |
 | 4 | Experts interface | `@use_experts_implementation` | MoE expert forward pass | Per-class via `config._experts_implementation` |
 
@@ -469,10 +469,10 @@ All four are defined in `transformers.integrations`:
 
 | | VeOmni | Transformers v5 |
 |---|--------|----------------|
-| **Mechanism** | The per-model registry or variant-aware `OpSlot` selects `liger_kernel`, `npu`, or a model-specific `triton` backend | `@use_kernel_func_from_hub("rotary_pos_emb")` on the `apply_rotary_pos_emb` function; `kernels` library downloads `apply_rotary_transformers` from `kernels-community/rotary`. The function is also attached to the Attention module via `@use_kernelized_func(apply_rotary_pos_emb)` so `kernelize()` can find it. |
+| **Mechanism** | The per-model registry or variant-aware `OpSlot` selects `liger_kernel`, `npu`, or a model-specific `triton` backend | `@use_kernel_forward_from_hub("rotary_pos_emb")` on the `apply_rotary_pos_emb` function (renamed from `use_kernel_func_from_hub` for standalone functions as of 5.16); `kernels` library downloads `apply_rotary_transformers` from `kernels-community/rotary`. The function is also attached to the Attention module via `@use_kernelized_func(apply_rotary_pos_emb)` so `kernelize()` can find it. |
 | **Config** | `OpsImplementationConfig.rotary_pos_emb_implementation` field (default `"liger_kernel"` on GPU) | `USE_HUB_KERNELS` env var |
 | **When** | Model registration (import time) | Import time (decorator) + `kernelize()` |
-| **Qwen3.5 MoE gap** | Covered on NPU by the `rotary_pos_emb/partial` OpSlot variant | **Partially annotated.** `apply_rotary_pos_emb` in `Qwen3_5MoeAttention` is annotated with `@use_kernelized_func` but **not** with `@use_kernel_func_from_hub("rotary_pos_emb")`. This is because Qwen3.5 MoE uses *partial RoPE* (`partial_rotary_factor < 1.0`): it splits Q/K into rotary and pass-through parts, applies RoPE only to the rotary part, then concatenates. The standard hub kernel `apply_rotary_transformers` does not handle this split-and-concat pattern. A dedicated partial-RoPE kernel could still be used. |
+| **Qwen3.5 MoE gap** | Covered on NPU by the `rotary_pos_emb/partial` OpSlot variant | **Partially annotated.** `apply_rotary_pos_emb` in `Qwen3_5MoeAttention` is annotated with `@use_kernelized_func` but **not** with `@use_kernel_forward_from_hub("rotary_pos_emb")`. This is because Qwen3.5 MoE uses *partial RoPE* (`partial_rotary_factor < 1.0`): it splits Q/K into rotary and pass-through parts, applies RoPE only to the rotary part, then concatenates. The standard hub kernel `apply_rotary_transformers` does not handle this split-and-concat pattern. A dedicated partial-RoPE kernel could still be used. |
 
 #### Attention
 
@@ -605,7 +605,7 @@ currently exist in the `kernels-community` hub.
 | Component | VeOmni mechanism | Transformers v5 mechanism | Compatible? | Gap |
 |-----------|-----------------|--------------------------|:-----------:|-----|
 | RMSNorm | Per-model registry + variant-aware OpSlot | `@use_kernel_forward_from_hub` | Parallel — both can apply | VeOmni covers Qwen3.5's `+1` variant explicitly |
-| RoPE | Per-model registry + variant-aware OpSlot | `@use_kernel_func_from_hub` + `@use_kernelized_func` | Parallel | VeOmni adds an NPU partial-RoPE variant |
+| RoPE | Per-model registry + variant-aware OpSlot | `@use_kernel_forward_from_hub` + `@use_kernelized_func` | Parallel | VeOmni adds an NPU partial-RoPE variant |
 | SwiGLU MLP | Per-model registry | Not annotated in MoE models (MLP is per-expert, not standalone) | VeOmni only | — |
 | Attention | `ALL_ATTENTION_FUNCTIONS` (shared registry) | `ALL_ATTENTION_FUNCTIONS` (same registry) | Yes | VeOmni adds SP wrapping |
 | MoE experts | `apply_veomni_fused_moe_patch` (Triton/Quack) | `@use_experts_implementation` (batched_mm/grouped_mm) | No — different dispatch paths | VeOmni uses custom Triton kernels; HF uses PyTorch native `grouped_mm` |

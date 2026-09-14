@@ -65,6 +65,21 @@ For a substantial external repository, read
 local analyzer inventories classes, imports, configuration, and source revision;
 it does not classify the model or generate implementation requirements.
 
+### Checkpoint key conflicts require a user decision
+
+Compare checkpoint keys against the supported upstream version and any existing
+VeOmni model. When upstream model, VeOmni model, or checkpoint parameter keys
+disagree, show the concrete old/new keys and explain the impact on weight
+loading, export, and optimizer/DCP resume. Ask the user how to resolve the
+conflict before implementing a rename, alias, or compatibility mapping. Do not
+silently retain an obsolete model hierarchy just to preserve checkpoint keys.
+
+If the user has already chosen a resolution in the current task, apply it
+without asking again. When that choice is to follow current upstream keys,
+keep those keys in the model and handle approved legacy-key conversion in the
+checkpoint layer. Verify the chosen direction with strict loading and
+checkpoint round-trip tests; do not hide mismatches with `strict=False`.
+
 ## Phase 2: Implement modeling
 
 Place DiT model integrations under `veomni/models/diffusers/<model_name>/`,

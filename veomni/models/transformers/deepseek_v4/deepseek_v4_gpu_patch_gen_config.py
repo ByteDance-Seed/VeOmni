@@ -124,8 +124,6 @@ Intentionally NOT patched:
   rather than via FA's ``veomni_flash_attention_*_with_sp`` path.
 """
 
-from typing import Optional
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -1330,7 +1328,9 @@ def deepseek_v4_indexer_forward_patched(
     # `weights_proj` stays unquantized: it produces one score per head, so its
     # [index_n_heads, hidden_size] weight has too few rows to tile at 128 in the
     # first place, and inference keeps it BF16.
-    weights = self.weights_proj(hidden_states).float() * (self.weights_scaling * self.softmax_scale)
+    weights = self.scorer.weights_proj(hidden_states).float() * (
+        self.scorer.weights_scaling * self.scorer.softmax_scale
+    )
     compressed_len = compressed_kv.shape[1]
     top_k = min(self.index_topk, compressed_len)
 
@@ -1444,8 +1444,8 @@ def deepseek_v4_indexer_forward_patched(
     # that no test can exercise is worse than none: it reads as the protection while
     # the one doing the work sits elsewhere.
     scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))
-    scores = F.relu(scores) * self.softmax_scale
-    eager_weights = self.weights_proj(hidden_states).float() * self.weights_scaling
+    scores = F.relu(scores) * self.scorer.softmax_scale
+    eager_weights = self.scorer.weights_proj(hidden_states).float() * self.scorer.weights_scaling
     index_scores = (scores * eager_weights.unsqueeze(-1)).sum(dim=2)
     if compressed_len > 0:
         entry_indices = torch.arange(compressed_len, device=index_scores.device)
@@ -2406,14 +2406,14 @@ def deepseek_v4_hash_router_forward_patched(
 )
 def deepseek_v4_forcausallm_forward_patched(
     self,
-    input_ids: Optional[torch.LongTensor] = None,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_values: Optional[Cache] = None,
-    inputs_embeds: Optional[torch.FloatTensor] = None,
-    labels: Optional[torch.LongTensor] = None,
-    use_cache: Optional[bool] = None,
-    output_router_logits: Optional[bool] = None,
+    input_ids: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    labels: torch.LongTensor | None = None,
+    use_cache: bool | None = None,
+    output_router_logits: bool | None = None,
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> MoeCausalLMOutputWithLogProbs:
