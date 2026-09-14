@@ -382,6 +382,54 @@ def tiny_ltx2_3_condition_config(architecture: str = "LTXVideoConditionModel", *
     return LTXVideoConditionModelConfig(**kwargs)
 
 
+def tiny_minimax_h3_config(architecture: str = "MiniMaxH3DiTModel", **overrides) -> PretrainedConfig:
+    from veomni.models_kernel.diffusers.minimax_h3.minimax_h3_transformer.configuration_minimax_h3_transformer import (
+        MiniMaxH3DiTModelConfig,
+    )
+
+    kwargs = {
+        "hidden_size": 24,
+        "num_layers": 1,
+        "token_refiner_num_layers": 1,
+        "num_attention_heads": 2,
+        "attention_head_dim": 12,
+        "ffn_hidden_size": 32,
+        "latents_dim": 2,
+        "audio_latents_dim": 4,
+        "patch_size": (1, 1, 1),
+        "text_dim": 16,
+        "timestep_input_dim": 8,
+        "time_embed_hidden_size": 16,
+        "time_embed_dim": 12,
+        "adaln_out_features": 432,
+        "final_adaln_out_features": 48,
+        "rope_inv_freq_len": 2,
+        "norm_eps": 1e-5,
+        "qk_norm_eps": 1e-5,
+        "final_norm_eps": 1e-5,
+        "architectures": [architecture],
+        "tie_word_embeddings": False,
+    }
+    kwargs.update(overrides)
+    return MiniMaxH3DiTModelConfig(**kwargs)
+
+
+def tiny_minimax_h3_condition_config(architecture: str = "MiniMaxH3ConditionModel", **overrides) -> PretrainedConfig:
+    from veomni.models_kernel.diffusers.minimax_h3.minimax_h3_condition.configuration_minimax_h3_condition import (
+        MiniMaxH3ConditionModelConfig,
+    )
+
+    kwargs = {
+        "base_model_path": "",
+        "skip_encoder_load": True,
+        "num_train_timesteps": 8,
+        "architectures": [architecture],
+        "tie_word_embeddings": False,
+    }
+    kwargs.update(overrides)
+    return MiniMaxH3ConditionModelConfig(**kwargs)
+
+
 def tiny_qwen_image_config(architecture: str = "QwenImageTransformer2DModel", **overrides) -> PretrainedConfig:
     from veomni.models_kernel.diffusers.qwen_image.qwen_image_transformer.configuration_qwen_image_transformer import (
         QwenImageTransformer2DModelConfig,

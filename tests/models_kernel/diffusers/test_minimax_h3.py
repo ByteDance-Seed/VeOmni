@@ -12,57 +12,127 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""MiniMax H3 models_kernel consume tests.
-
-Direct-import staged classes. Compare ``VeomniRMSNorm`` against official
-``torch.nn.RMSNorm``.
-"""
+"""MiniMax H3 models_kernel registry and eager parity tests."""
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import torch
+import torch.nn.functional as F
 from torch import nn
 
-from tests.models_kernel.compare import (
-    assert_outputs_and_grads_match,
-    eager_ops_config,
+from tests.models_kernel.compare import assert_outputs_and_grads_match, eager_ops_config
+from tests.models_kernel.tiny_configs import tiny_minimax_h3_condition_config as _tiny_condition_config
+from tests.models_kernel.tiny_configs import tiny_minimax_h3_config as _tiny_config
+from veomni.models_kernel.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import VeomniRMSNorm
+from veomni.models_kernel.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
+    MiniMaxH3DiTModel,
 )
-from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config, set_ops_config
 
 
-def _build_ours(size: int = 16, ops: SimpleNamespace | None = None):
-    from veomni.models_kernel.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import VeomniRMSNorm
+_VEOMNI_RMS_NORM_FORWARD = VeomniRMSNorm.forward
 
+
+def _torch_rms_norm_forward(self, x: torch.Tensor) -> torch.Tensor:
+    return F.rms_norm(x, (x.shape[-1],), self.weight, self.eps)
+
+
+def _build_norm(size: int = 16):
     previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
+    set_ops_config(eager_ops_config())
     try:
         return VeomniRMSNorm(size, eps=1e-6)
     finally:
         set_ops_config(previous)
 
 
-def test_minimax_h3_constructs_local_kernels():
-    norm = _build_ours()
-    assert isinstance(norm.veomni_rms_norm, VeomniOp)
-    assert norm.veomni_rms_norm.op == "rms_norm"
-    assert norm.veomni_rms_norm.variant == "standard"
-    assert norm.veomni_rms_norm.impl == "eager"
+def _build_model():
+    previous = get_ops_config()
+    set_ops_config(eager_ops_config())
+    try:
+        return MiniMaxH3DiTModel(_tiny_config())
+    finally:
+        set_ops_config(previous)
 
 
-def test_minimax_h3_instances_keep_distinct_impls():
-    eager = _build_ours(ops=eager_ops_config())
-    other_cfg = eager_ops_config()
-    other_cfg.rms_norm_implementation = "liger_kernel"
-    other = _build_ours(ops=other_cfg)
+def _minimax_h3_inputs() -> dict:
+    return {
+        "x": torch.randn(1, 4, 2),
+        "audio_x": torch.randn(1, 4, 4),
+        "img_position_ids": torch.tensor([[[0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1]]]),
+        "unique_timesteps": torch.tensor([0.5]),
+        "inverse_indices": torch.zeros(4, dtype=torch.long),
+        "update_mask": torch.ones(2),
+        "token_tags": torch.tensor([0, 0, 1, 2]),
+        "prompt_embeds": torch.randn(1, 16),
+        "img_pos_info": {"position_ids": torch.tensor([0, 1])},
+        "audio_pos_info": {"position_ids": torch.tensor([3])},
+        "text_pos_info": {"position_ids": torch.tensor([2])},
+        "img_pos_for_infer_output_info": {"position_ids": torch.tensor([0, 1])},
+        "packed_seq_params": {"cu_seqlens_q": torch.tensor([0, 4]), "max_seqlen_q": 4},
+        "refiner_packed_seq_params": {"cu_seqlens_q": torch.tensor([0, 1]), "max_seqlen_q": 1},
+    }
 
-    assert eager.veomni_rms_norm.impl == "eager"
-    assert other.veomni_rms_norm.impl == "liger_kernel"
 
-    set_ops_config(other_cfg)
-    assert eager.veomni_rms_norm.impl == "eager"
+def test_minimax_h3_configs_roundtrip_through_registry(tmp_path):
+    from veomni.models_kernel import build_config, get_model_class
+    from veomni.models_kernel.diffusers.minimax_h3.minimax_h3_condition.configuration_minimax_h3_condition import (
+        MiniMaxH3ConditionModelConfig,
+    )
+    from veomni.models_kernel.diffusers.minimax_h3.minimax_h3_transformer.configuration_minimax_h3_transformer import (
+        MiniMaxH3DiTModelConfig,
+    )
+
+    transformer_path = tmp_path / "transformer"
+    condition_path = tmp_path / "condition"
+    _tiny_config().save_pretrained(transformer_path)
+    _tiny_condition_config().save_pretrained(condition_path)
+
+    transformer = build_config(str(transformer_path))
+    condition = build_config(str(condition_path))
+
+    assert type(transformer) is MiniMaxH3DiTModelConfig
+    assert type(condition) is MiniMaxH3ConditionModelConfig
+    assert get_model_class(transformer).__name__ == "MiniMaxH3DiTModel"
+    assert get_model_class(condition).__name__ == "MiniMaxH3ConditionModel"
+
+
+def test_minimax_h3_condition_builds_from_registered_class_without_assets():
+    from veomni.models_kernel import MODELING_REGISTRY
+    from veomni.models_kernel.diffusers.minimax_h3.minimax_h3_condition import modeling_minimax_h3_condition
+
+    model_class = MODELING_REGISTRY["MiniMaxH3ConditionModel"]()
+    model = model_class._from_config(_tiny_condition_config())
+
+    assert type(model) is modeling_minimax_h3_condition.MiniMaxH3ConditionModel
+    assert model.config.model_type == "MiniMaxH3ConditionModel"
+
+
+def test_minimax_h3_eager_forward_and_backward_match_torch_reference():
+    from veomni.models_kernel.diffusers.minimax_h3.minimax_h3_core import core
+
+    torch.manual_seed(1)
+    reference = _build_model()
+    ours = _build_model()
+    ours.load_state_dict(reference.state_dict())
+    inputs = _minimax_h3_inputs()
+
+    previous = get_ops_config()
+    previous_attention_impl = core.ATTENTION_IMPLEMENTATION
+    previous_norm_forward = VeomniRMSNorm.forward
+    set_ops_config(eager_ops_config())
+    core.ATTENTION_IMPLEMENTATION = "torch"
+    try:
+
+        def call(model):
+            VeomniRMSNorm.forward = _torch_rms_norm_forward if model is reference else _VEOMNI_RMS_NORM_FORWARD
+            return model.dit(**inputs)
+
+        assert_outputs_and_grads_match(reference, ours, call)
+    finally:
+        VeomniRMSNorm.forward = previous_norm_forward
+        core.ATTENTION_IMPLEMENTATION = previous_attention_impl
+        set_ops_config(previous)
 
 
 def test_minimax_h3_pipeline_constructs_without_weights():
@@ -77,7 +147,7 @@ def test_minimax_h3_pipeline_constructs_without_weights():
 def test_minimax_h3_rms_norm_matches_official():
     torch.manual_seed(0)
     official = nn.RMSNorm(16, eps=1e-6)
-    ours = _build_ours()
+    ours = _build_norm()
     ours.load_state_dict(official.state_dict())
     hidden = torch.randn(2, 8, 16)
 

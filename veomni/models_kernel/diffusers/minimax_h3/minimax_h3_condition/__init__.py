@@ -12,4 +12,20 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""MiniMax H3 condition model."""
+"""Register the local MiniMax H3 condition config and model."""
+
+from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+
+
+@MODEL_CONFIG_REGISTRY.register("MiniMaxH3ConditionModel")
+def register_minimax_h3_condition_config():
+    from .configuration_minimax_h3_condition import MiniMaxH3ConditionModelConfig
+
+    return MiniMaxH3ConditionModelConfig
+
+
+@MODELING_REGISTRY.register("MiniMaxH3ConditionModel")
+def register_minimax_h3_condition_modeling(_architecture: str | None = None):
+    from .modeling_minimax_h3_condition import MiniMaxH3ConditionModel
+
+    return MiniMaxH3ConditionModel

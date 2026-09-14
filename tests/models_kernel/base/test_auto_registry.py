@@ -48,6 +48,9 @@ from tests.models_kernel.tiny_configs import (
     tiny_ltx2_3_config as _tiny_ltx2_3_config,
 )
 from tests.models_kernel.tiny_configs import (
+    tiny_minimax_h3_config as _tiny_minimax_h3_config,
+)
+from tests.models_kernel.tiny_configs import (
     tiny_movqgan_config as _tiny_movqgan_config,
 )
 from tests.models_kernel.tiny_configs import (
@@ -352,6 +355,15 @@ _MODEL_CASES = (
         has_registered_config=True,
         registered_config_aliases=("LTXVideoConditionModel",),
         registered_model_aliases=("LTXVideoConditionModel",),
+        eager_op_path=None,
+    ),
+    _ModelCase(
+        model_type="MiniMaxH3DiTModel",
+        config_factory=_tiny_minimax_h3_config,
+        architectures=("MiniMaxH3DiTModel",),
+        has_registered_config=True,
+        registered_config_aliases=("MiniMaxH3ConditionModel",),
+        registered_model_aliases=("MiniMaxH3ConditionModel",),
         eager_op_path=None,
     ),
     _ModelCase(

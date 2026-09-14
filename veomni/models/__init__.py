@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ..utils.import_utils import is_diffusers_available
 from .auto import build_foundation_model, build_processor, build_tokenizer
 from .module_utils import (
     init_empty_weights,
@@ -34,10 +33,4 @@ __all__ = [
     "rank0_load_and_broadcast_weights",
     "save_model_assets",
     "save_model_weights",
-    "diffusers",
 ]
-
-if is_diffusers_available():
-    from . import diffusers
-
-    __all__ += ["diffusers"]
