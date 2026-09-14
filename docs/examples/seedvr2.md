@@ -124,8 +124,12 @@ torchrun --standalone --nproc-per-node=2 tasks/train_dit.py configs/dit/seedvr2.
 
 The example uses FSDP2 and a global batch of 16. Choose a batch divisible by
 the data-parallel size and size the hardware for the full model and optimizer.
-`init_device=meta` requires FSDP; for a single-device debug run, set the actual
-accelerator (`npu` or `cuda`) as the initialization device.
+For a single-device debug run, keep the supplied `fsdp_mode: fsdp2` and
+`init_device: meta`, launch with `--nproc-per-node=1`, and set
+`--train.global_batch_size=1`. FSDP2 requires meta initialization even on one
+device; changing only `init_device` to `npu` or `cuda` makes this config invalid.
+DDP also supports meta initialization, but switching parallelism modes is not
+required for this debug recipe.
 
 Conditioning builds `[noise, LQ latent, ones mask]`, fixes t=1000, and uses
 `noise - HQ latent` as the velocity target. The model returns a mean MSE loss
@@ -169,6 +173,11 @@ make quality
 ```
 
 The scripts are manual numerical reproducers, not newly added CI jobs.
+`tests/checkpoints/test_seedvr2_state_dict.py` checks missing/unexpected VAE
+convolution keys, complete state round trips, and 2D-to-3D inflation. Both GPU
+and NPU unit workflows already run the whole `tests/checkpoints/` directory.
+Convolution inflation preserves strict loading checks; an incomplete VAE
+checkpoint must fail rather than leave randomly initialized parameters.
 The source comparison uses the pinned upstream model with explicitly disclosed
 native attention/normalization substitutes and a bounded, equivalent RoPE grid.
 It does not execute the original CUDA kernels.

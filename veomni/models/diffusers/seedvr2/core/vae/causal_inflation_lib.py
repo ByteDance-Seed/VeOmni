@@ -288,7 +288,7 @@ class InflatedCausalConv3d(Conv3d):
             state_dict,
             prefix,
             local_metadata,
-            (strict and self.inflation_mode == "none"),
+            strict,
             missing_keys,
             unexpected_keys,
             error_msgs,
