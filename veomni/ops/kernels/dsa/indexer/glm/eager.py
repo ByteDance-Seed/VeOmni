@@ -43,11 +43,11 @@ def wrapper(
     position_ids: Tensor | None = None,
     use_cache: bool = False,
 ) -> Tensor:
-    """Official GLM indexer scores. Same face as cuDNN ``indexer_select_topk``.
+    """Compute GLM DSA scores and causal top-k compressed-KV indices.
 
     ``q`` is ``[B, S, H, D]``. ``k`` is ``[B, T, D]`` or ``[B, T, 1, D]``.
-    ``w`` is ``[B, S, H]``. Returns top-k indices ``[B, S, top_k]`` as long.
-    ``ratio`` is accepted for call-face parity with cuDNN. Official eager
+    ``w`` is ``[B, S, H]``. Returns ``[B, S, top_k]`` ``torch.int32`` indices.
+    ``ratio`` is accepted for API parity with cuDNN. The eager implementation
     applies causality through ``attention_mask``, not ``ratio``.
     ``qhead_per_kv_head`` is unused.
     """

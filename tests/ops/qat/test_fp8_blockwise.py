@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""FP8 fake-quantization and QAT linear contract tests."""
+
 import sys
 from types import ModuleType
 
@@ -400,35 +402,23 @@ def test_qat_linear_refuses_a_module_that_does_not_own_its_weight():
         qat_linear(_Wrapper(), torch.zeros(2, 128, dtype=torch.bfloat16))
 
 
-def test_qat_linear_composes_the_two_quantizers(reference_quantizers):
+@pytest.mark.parametrize(
+    ("with_bias", "quantize_activation"),
+    (
+        (False, True),
+        (True, True),
+        (False, False),
+    ),
+    ids=("act-and-weight", "with-bias", "weight-only"),
+)
+def test_qat_linear_composes_requested_quantizers(reference_quantizers, with_bias, quantize_activation):
     torch.manual_seed(14)
-    linear = nn.Linear(256, 128, bias=False, dtype=torch.bfloat16)
+    linear = nn.Linear(256, 128, bias=with_bias, dtype=torch.bfloat16)
     x = torch.randn(8, 256, dtype=torch.bfloat16)
 
-    actual = qat_linear(linear, x)
-    expected = nn.functional.linear(fp8_fake_quant_act(x), fp8_fake_quant_weight(linear.weight))
-
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-def test_qat_linear_keeps_the_bias_out_of_the_quantizer(reference_quantizers):
-    torch.manual_seed(15)
-    linear = nn.Linear(256, 128, bias=True, dtype=torch.bfloat16)
-    x = torch.randn(8, 256, dtype=torch.bfloat16)
-
-    actual = qat_linear(linear, x)
-    expected = nn.functional.linear(fp8_fake_quant_act(x), fp8_fake_quant_weight(linear.weight), linear.bias)
-
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-def test_qat_linear_weight_only_leaves_the_activation_alone(reference_quantizers):
-    torch.manual_seed(16)
-    linear = nn.Linear(256, 128, bias=False, dtype=torch.bfloat16)
-    x = torch.randn(8, 256, dtype=torch.bfloat16)
-
-    actual = qat_linear(linear, x, quantize_activation=False)
-    expected = nn.functional.linear(x, fp8_fake_quant_weight(linear.weight))
+    actual = qat_linear(linear, x, quantize_activation=quantize_activation)
+    quantized_x = fp8_fake_quant_act(x) if quantize_activation else x
+    expected = nn.functional.linear(quantized_x, fp8_fake_quant_weight(linear.weight), linear.bias)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 

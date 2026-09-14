@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MoE dispatch bookkeeping helpers shared by the Triton / Quack backends.
+"""MoE dispatch bookkeeping helpers shared by the Triton and Quack backends.
 
-The scatter-index maps each ``(token, top-k slot)`` pair to its position in
-the expert-sorted flattened buffer. The reference implementation in prior
-versions of these kernels was:
+The scatter index maps each ``(token, top-k slot)`` pair to its position in
+the expert-sorted flattened buffer. A simple reference implementation is:
 
     perm = flat.argsort(stable=True)   # 1
     scatter_index = perm.argsort()     # 2
@@ -55,8 +54,8 @@ def compute_expert_scatter_index(
             the same expert are contiguous in original order.
         scatter_index: int32 tensor with the same shape as ``expert_index``.
             ``scatter_index[t, k]`` is the row in the expert-sorted buffer
-            that ``(t, k)`` maps to. The int32 dtype matches the prior
-            behavior (the Triton MoE kernels take int32 indices).
+            that ``(t, k)`` maps to. The int32 dtype matches the Triton and
+            Quack consumer ABI.
 
     Design note (why not ``argsort().argsort()``):
         ``sorted_order.argsort()`` inverts a permutation and is unnecessarily

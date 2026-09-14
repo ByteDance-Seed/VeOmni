@@ -41,18 +41,30 @@ def _empty_weight(device: torch.device | str) -> Tensor:
     return torch.empty(0, device=device)
 
 
-def test_eager_matches_hf_logits():
-    torch.manual_seed(0)
-    logits = torch.randn(8, 16, dtype=torch.float32)
-    labels = torch.randint(0, 16, (8,))
-    labels[0] = -100
+@pytest.mark.parametrize(
+    ("seed", "num_tokens", "num_classes", "ignore_first", "num_items_in_batch"),
+    (
+        (0, 8, 16, True, None),
+        (2, 10, 7, False, 6),
+    ),
+    ids=("mean-reduction", "explicit-item-count"),
+)
+def test_eager_logits_match_hf(seed, num_tokens, num_classes, ignore_first, num_items_in_batch):
+    torch.manual_seed(seed)
+    logits = torch.randn(num_tokens, num_classes, dtype=torch.float32)
+    labels = torch.randint(0, num_classes, (num_tokens,))
+    if ignore_first:
+        labels[0] = -100
 
     logits_h = make_grad_leaf(logits)
-    out_h = fixed_cross_entropy(logits_h, labels)
+    out_h = fixed_cross_entropy(logits_h, labels, num_items_in_batch=num_items_in_batch)
 
     logits_e = make_grad_leaf(logits)
     out_e = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(
-        logits_e, labels, _empty_weight(logits.device)
+        logits_e,
+        labels,
+        _empty_weight(logits.device),
+        num_items_in_batch=num_items_in_batch,
     )
     assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
@@ -176,25 +188,6 @@ def test_eager_matches_hf_hidden_weight():
     assert torch.allclose(weight_e.grad, weight_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-def test_eager_matches_hf_num_items():
-    torch.manual_seed(2)
-    logits = torch.randn(10, 7, dtype=torch.float32)
-    labels = torch.randint(0, 7, (10,))
-    num_items = 6
-
-    logits_h = make_grad_leaf(logits)
-    out_h = fixed_cross_entropy(logits_h, labels, num_items_in_batch=num_items)
-    logits_e = make_grad_leaf(logits)
-    out_e = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(
-        logits_e, labels, _empty_weight(logits.device), num_items_in_batch=num_items
-    )
-    assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
-
-    out_h.backward()
-    out_e.backward()
-    assert torch.allclose(logits_e.grad, logits_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-
-
 def test_chunk_loss_matches_eager_with_uneven_valid_tokens():
     eager = resolve_op("cross_entropy_loss", "standard", "eager").wrapper
     other = resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper
@@ -309,13 +302,6 @@ def test_chunk_loss_empty_returns_connected_zero():
     torch.testing.assert_close(weight.grad, torch.zeros_like(weight))
 
 
-def test_chunk_loss_requires_weight():
-    with pytest.raises(RuntimeError, match="nonempty ``weight``"):
-        resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper(
-            torch.randn(4, 8), torch.zeros(4, dtype=torch.long), _empty_weight("cpu")
-        )
-
-
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
 @pytest.mark.parametrize(
     ("seed", "hidden_requires_grad", "weight_requires_grad", "num_items_in_batch", "noncontiguous"),
@@ -374,12 +360,24 @@ def test_liger_matches_eager(
             assert other_input.grad is None
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
-def test_liger_requires_weight():
-    pytest.importorskip("liger_kernel")
+@pytest.mark.parametrize(
+    ("impl", "device"),
+    (
+        pytest.param("chunk_loss", "cpu", id="chunk-loss"),
+        pytest.param(
+            "liger_kernel",
+            "cuda",
+            marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU"),
+            id="liger",
+        ),
+    ),
+)
+def test_hidden_state_implementations_require_weight(impl: str, device: str):
+    if impl == "liger_kernel":
+        pytest.importorskip("liger_kernel")
     with pytest.raises(RuntimeError, match="nonempty ``weight``"):
-        resolve_op("cross_entropy_loss", "standard", "liger_kernel").wrapper(
-            torch.randn(4, 8, device="cuda"),
-            torch.zeros(4, dtype=torch.long, device="cuda"),
-            _empty_weight("cuda"),
+        resolve_op("cross_entropy_loss", "standard", impl).wrapper(
+            torch.randn(4, 8, device=device),
+            torch.zeros(4, dtype=torch.long, device=device),
+            _empty_weight(device),
         )

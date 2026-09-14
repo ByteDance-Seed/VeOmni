@@ -27,31 +27,27 @@ DEVICE = get_device_type()
 _VENDOR_TARGET = "veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_target"
 
 
-def test_wrapper_rejects_pre_sm90_before_import(monkeypatch):
+@pytest.mark.parametrize(
+    ("hip_version", "compute_capability", "match"),
+    (
+        (None, 89, "SM90 or later"),
+        ("6.0", 90, "NVIDIA CUDA"),
+    ),
+    ids=("pre-sm90", "rocm"),
+)
+def test_wrapper_rejects_unsupported_nvidia_platform_before_import(
+    monkeypatch, hip_version, compute_capability, match
+):
     import sys
 
     sys.modules.pop(_VENDOR_TARGET, None)
     import veomni.ops.kernels.dsa.sparse_mqa_target as target
 
+    monkeypatch.setattr(target.torch.version, "hip", hip_version, raising=False)
     monkeypatch.setattr(target, "IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr(target, "get_gpu_compute_capability", lambda: 89)
+    monkeypatch.setattr(target, "get_gpu_compute_capability", lambda: compute_capability)
 
-    with pytest.raises(RuntimeError, match="SM90 or later"):
-        target.sparse_mqa_target_fwd(torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0))
-    assert _VENDOR_TARGET not in sys.modules
-
-
-def test_wrapper_rejects_rocm_before_import(monkeypatch):
-    import sys
-
-    sys.modules.pop(_VENDOR_TARGET, None)
-    import veomni.ops.kernels.dsa.sparse_mqa_target as target
-
-    monkeypatch.setattr(target.torch.version, "hip", "6.0", raising=False)
-    monkeypatch.setattr(target, "IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr(target, "get_gpu_compute_capability", lambda: 90)
-
-    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+    with pytest.raises(RuntimeError, match=match):
         target.sparse_mqa_target_fwd(torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0))
     assert _VENDOR_TARGET not in sys.modules
 

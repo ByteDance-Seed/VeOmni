@@ -29,7 +29,7 @@ def wrapper(
     cu_seqlen_ks: Tensor | None = None,
     cu_seqlen_ke: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """Lighting indexer. Same face as the eager row.
+    """Run the TileLang lighting indexer for compressed-KV selection.
 
     ``index_q`` is ``[S, B, H, D]``, ``index_k`` is ``[S_kv, B, D]``,
     ``weights`` is ``[S, B, H]``. Returns ``(index_score, topk_indices)``.

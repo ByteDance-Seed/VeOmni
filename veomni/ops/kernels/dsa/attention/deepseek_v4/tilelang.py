@@ -27,7 +27,7 @@ def wrapper(
     sm_scale: float | None = None,
     return_lse: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor]:
-    """Sparse MQA. Same face as the eager row.
+    """Run TileLang sparse MQA over selected KV candidate slots.
 
     ``q`` is ``[B, S, H, D]``, ``kv`` is ``[B, S_kv, D]``, ``attn_sink`` is
     ``[H]``, ``topk_idxs`` is ``[B, S, topk]``. Each valid candidate slot

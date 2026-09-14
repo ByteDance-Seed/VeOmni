@@ -61,39 +61,25 @@ def _assert_pair(left: tuple[Tensor, Tensor], right: tuple[Tensor, Tensor], *, a
     assert torch.allclose(left[1], right[1], atol=atol, rtol=rtol)
 
 
-def test_full_eager_matches_hf():
+@pytest.mark.parametrize(
+    ("variant", "head_dim", "rotary_dim", "reference"),
+    (
+        ("full", 64, 64, hf_full_rope),
+        ("partial", 128, 64, hf_partial_rope),
+    ),
+)
+def test_text_eager_matches_hf(variant: str, head_dim: int, rotary_dim: int, reference):
     torch.manual_seed(0)
-    q = torch.randn(2, 8, 16, 64, dtype=torch.float32, requires_grad=True)
-    k = torch.randn(2, 4, 16, 64, dtype=torch.float32, requires_grad=True)
-    cos = torch.randn(2, 16, 64, dtype=torch.float32)
-    sin = torch.randn(2, 16, 64, dtype=torch.float32)
+    q = torch.randn(2, 8, 16, head_dim, dtype=torch.float32, requires_grad=True)
+    k = torch.randn(2, 4, 16, head_dim, dtype=torch.float32, requires_grad=True)
+    cos = torch.randn(2, 16, rotary_dim, dtype=torch.float32)
+    sin = torch.randn(2, 16, rotary_dim, dtype=torch.float32)
 
     q_h, k_h = make_grad_leaves(q, k)
-    out_h = hf_full_rope(q_h, k_h, cos, sin, unsqueeze_dim=1)
+    out_h = reference(q_h, k_h, cos, sin, unsqueeze_dim=1)
 
     q_e, k_e = make_grad_leaves(q, k)
-    out_e = resolve_op("rope", "full", "eager").wrapper(q_e, k_e, cos, sin, unsqueeze_dim=1)
-    _assert_pair(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
-
-    go = (torch.randn_like(out_e[0]), torch.randn_like(out_e[1]))
-    torch.autograd.backward(out_h, go)
-    torch.autograd.backward(out_e, go)
-    assert torch.allclose(q_e.grad, q_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-    assert torch.allclose(k_e.grad, k_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-
-
-def test_partial_eager_matches_hf():
-    torch.manual_seed(0)
-    q = torch.randn(2, 8, 16, 128, dtype=torch.float32, requires_grad=True)
-    k = torch.randn(2, 4, 16, 128, dtype=torch.float32, requires_grad=True)
-    cos = torch.randn(2, 16, 64, dtype=torch.float32)
-    sin = torch.randn(2, 16, 64, dtype=torch.float32)
-
-    q_h, k_h = make_grad_leaves(q, k)
-    out_h = hf_partial_rope(q_h, k_h, cos, sin, unsqueeze_dim=1)
-
-    q_e, k_e = make_grad_leaves(q, k)
-    out_e = resolve_op("rope", "partial", "eager").wrapper(q_e, k_e, cos, sin, unsqueeze_dim=1)
+    out_e = resolve_op("rope", variant, "eager").wrapper(q_e, k_e, cos, sin, unsqueeze_dim=1)
     _assert_pair(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     go = (torch.randn_like(out_e[0]), torch.randn_like(out_e[1]))
@@ -281,13 +267,22 @@ def test_full_liger_falls_back_for_vision_layout_before_vendor_import():
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RoPE needs a GPU")
-def test_full_liger_matches_eager():
+@pytest.mark.parametrize(
+    ("seed", "unsqueeze_dim", "query_shape", "key_shape"),
+    (
+        pytest.param(0, 1, (2, 8, 16, 64), (2, 4, 16, 64), id="bhsd"),
+        pytest.param(4, 2, (2, 16, 8, 64), (2, 16, 4, 64), id="bshd"),
+    ),
+)
+def test_full_liger_matches_eager(
+    seed: int, unsqueeze_dim: int, query_shape: tuple[int, ...], key_shape: tuple[int, ...]
+):
     pytest.importorskip("liger_kernel")
     eager = resolve_op("rope", "full", "eager").wrapper
     other = resolve_op("rope", "full", "liger_kernel").wrapper
-    torch.manual_seed(0)
-    q = torch.randn(2, 8, 16, 64, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(2, 4, 16, 64, device="cuda", dtype=torch.bfloat16)
+    torch.manual_seed(seed)
+    q = torch.randn(query_shape, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(key_shape, device="cuda", dtype=torch.bfloat16)
     # Llama-style tables duplicate the first half. Liger only reads that half.
     cos_half = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
     sin_half = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
@@ -296,35 +291,8 @@ def test_full_liger_matches_eager():
 
     q_e, k_e = make_grad_leaves(q, k)
     q_o, k_o = make_grad_leaves(q, k)
-    out_e = eager(q_e, k_e, cos, sin, unsqueeze_dim=1)
-    out_o = other(q_o, k_o, cos, sin, unsqueeze_dim=1)
-    _assert_pair(out_e, out_o, atol=ROPE_FUSED_ATOL, rtol=ROPE_FUSED_RTOL)
-
-    go = (torch.randn_like(out_e[0]), torch.randn_like(out_e[1]))
-    torch.autograd.backward(out_e, go)
-    torch.autograd.backward(out_o, go)
-    assert torch.allclose(q_e.grad, q_o.grad, atol=ROPE_FUSED_GRAD_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
-    assert torch.allclose(k_e.grad, k_o.grad, atol=ROPE_FUSED_GRAD_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
-
-
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RoPE needs a GPU")
-def test_full_liger_matches_eager_unsqueeze_dim_2():
-    pytest.importorskip("liger_kernel")
-    eager = resolve_op("rope", "full", "eager").wrapper
-    other = resolve_op("rope", "full", "liger_kernel").wrapper
-    torch.manual_seed(4)
-    # HF unsqueeze_dim=2: q/k are [B, S, H, D], tables are [B, S, D].
-    q = torch.randn(2, 16, 8, 64, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(2, 16, 4, 64, device="cuda", dtype=torch.bfloat16)
-    cos_half = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
-    sin_half = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
-    cos = torch.cat((cos_half, cos_half), dim=-1)
-    sin = torch.cat((sin_half, sin_half), dim=-1)
-
-    q_e, k_e = make_grad_leaves(q, k)
-    q_o, k_o = make_grad_leaves(q, k)
-    out_e = eager(q_e, k_e, cos, sin, unsqueeze_dim=2)
-    out_o = other(q_o, k_o, cos, sin, unsqueeze_dim=2)
+    out_e = eager(q_e, k_e, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    out_o = other(q_o, k_o, cos, sin, unsqueeze_dim=unsqueeze_dim)
     _assert_pair(out_e, out_o, atol=ROPE_FUSED_ATOL, rtol=ROPE_FUSED_RTOL)
 
     go = (torch.randn_like(out_e[0]), torch.randn_like(out_e[1]))

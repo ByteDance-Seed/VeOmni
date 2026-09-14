@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""DSA registry, eager vs HuggingFace, then TileLang vs that eager."""
+"""DSA adapter contracts, eager/reference parity, and fused-backend parity."""
 
 from __future__ import annotations
 

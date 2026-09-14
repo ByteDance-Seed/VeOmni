@@ -42,7 +42,7 @@ def wrapper(
     training: bool = False,
     attention_dropout: float = 0.0,
 ) -> Tensor:
-    """Official GLM eager attention on the FlashMLA packed face.
+    """Compute GLM sparse attention from split NoPE/RoPE query and KV tensors.
 
     ``q_pe`` / ``q_nope_absorbed`` are ``[B, S, H, D]``. ``k_pe`` and
     ``kv_cache`` are MQA ``[B, S_kv, 1, D]``.

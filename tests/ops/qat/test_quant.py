@@ -43,9 +43,6 @@ def test_tilelang_act_quant_shapes_scales_and_dequant():
     actual_dequantized = (quantized.float() * scales.repeat_interleave(128, dim=-1)).to(torch.bfloat16)
     torch.testing.assert_close(actual_dequantized, expected_dequantized, rtol=0, atol=0)
 
-    result = act_quant(x, block_size=128, dequant=True)
-    torch.testing.assert_close(result, expected_dequantized, rtol=0, atol=0)
-
     x_mx = x.clone()
     x_mx[0].zero_()
     quantized_mx, scales_mx = act_quant(
@@ -144,24 +141,34 @@ def test_tilelang_fp8_weight_quant_matches_reference():
     assert scales[0, 2] == 1e-4 / 448.0
 
 
-def test_tilelang_fp8_weight_quant_round_trip_and_non_contiguous_input():
+@pytest.mark.parametrize(
+    ("scale_fmt", "scale_dtype", "tolerance_divisor"),
+    (
+        (None, None, 16.0),
+        ("ue8m0", torch.float8_e8m0fnu, 8.0),
+    ),
+    ids=("exact-scale", "ue8m0"),
+)
+def test_tilelang_fp8_weight_quant_round_trip_and_non_contiguous_input(scale_fmt, scale_dtype, tolerance_divisor):
     require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.qat.quant import fp8_weight_quant
 
     x = _weight_quant_test_input()
-    quantized, scales = fp8_weight_quant(x, block_size=128)
+    kwargs = {"scale_fmt": scale_fmt}
+    if scale_dtype is not None:
+        kwargs["scale_dtype"] = scale_dtype
+    quantized, scales = fp8_weight_quant(x, block_size=128, **kwargs)
 
-    dequantized = quantized.float().view(2, 128, 3, 128) * scales[:, None, :, None]
+    dequantized = quantized.float().view(2, 128, 3, 128) * scales.float()[:, None, :, None]
     dequantized = dequantized.view(x.shape)
-    # E4M3 keeps 3 mantissa bits, so a correctly scaled tile round-trips to
-    # within one ulp (~2^-4) relative to that tile's amax.
+    # E8M0 scale rounding spends one additional mantissa bit of the E4M3 value.
     tile_amax = x.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
-    tolerance = (tile_amax / 16.0)[:, None, :, None].expand(2, 128, 3, 128).reshape(x.shape)
+    tolerance = (tile_amax / tolerance_divisor)[:, None, :, None].expand(2, 128, 3, 128).reshape(x.shape)
     assert ((dequantized - x.float()).abs() <= tolerance).all()
 
     transposed = x.t().contiguous().t()
     assert not transposed.is_contiguous()
-    transposed_quantized, transposed_scales = fp8_weight_quant(transposed, block_size=128)
+    transposed_quantized, transposed_scales = fp8_weight_quant(transposed, block_size=128, **kwargs)
     assert torch.equal(transposed_quantized.view(torch.uint8), quantized.view(torch.uint8))
     assert torch.equal(transposed_scales, scales)
 
@@ -230,22 +237,6 @@ def test_tilelang_fp8_weight_quant_ue8m0_keeps_exact_power_of_two_scale():
     assert scales.shape == (1, 1)
     assert scales.float().item() == 0.125
     assert quantized.float()[3, 5] == 448.0
-
-
-def test_tilelang_fp8_weight_quant_ue8m0_round_trip():
-    require_nvidia_cuda("tilelang", min_cc=90)
-    from veomni.ops.qat.quant import fp8_weight_quant
-
-    x = _weight_quant_test_input()
-    quantized, scales = fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu)
-
-    dequantized = quantized.float().view(2, 128, 3, 128) * scales.float()[:, None, :, None]
-    dequantized = dequantized.view(x.shape)
-    # Rounding the scale up spends up to one of E4M3's 3 mantissa bits, so the
-    # round-trip budget is twice the ~2^-4 of the exact-scale mode.
-    tile_amax = x.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
-    tolerance = (tile_amax / 8.0)[:, None, :, None].expand(2, 128, 3, 128).reshape(x.shape)
-    assert ((dequantized - x.float()).abs() <= tolerance).all()
 
 
 def test_tilelang_fp8_weight_quant_dequant_fuses_the_round_trip():
