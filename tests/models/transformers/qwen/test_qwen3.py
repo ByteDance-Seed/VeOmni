@@ -28,6 +28,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM as HFQwen3
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForTokenClassification as HFQwen3ForTokenClassification
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Model as HFQwen3Model
 
+from tests.models.compare import assert_sequence_classification_matches_hf
 from tests.models.tiny_configs import tiny_qwen3_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 from tests.tools.training_utils import make_eager_ops_config
@@ -156,7 +157,9 @@ def test_qwen3_base_model_eager_matches_hf():
     torch.testing.assert_close(ours_out.last_hidden_state, hf_out.last_hidden_state, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
 
-def test_qwen3_seq_cls_forward():
+@pytest.mark.parametrize("supervision", ["last-valid", "selected-tokens"])
+def test_qwen3_seq_cls_matches_hf(supervision):
+    torch.manual_seed(0)
     _, seq_cls, _, _ = _qwen3_classes()
     previous = get_ops_config()
     set_ops_config(_eager_kernels_config())
@@ -164,15 +167,7 @@ def test_qwen3_seq_cls_forward():
         model = seq_cls(_tiny_config(num_labels=4))
     finally:
         set_ops_config(previous)
-    assert model.veomni_ce.impl == "eager"
-
-    input_ids = torch.randint(3, 128, (2, 6))
-    labels = torch.full((2, 6), -100, dtype=torch.long)
-    labels[:, -1] = torch.tensor([1, 2])
-    out = model(input_ids=input_ids, labels=labels, use_cache=False)
-    assert out.loss.ndim == 0
-    assert torch.isfinite(out.loss)
-    assert out.logits is not None
+    assert_sequence_classification_matches_hf(model, supervision=supervision)
 
 
 def test_qwen3_token_cls_eager_matches_hf():

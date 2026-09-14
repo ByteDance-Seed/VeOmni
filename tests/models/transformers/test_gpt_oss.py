@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssForCausalLM as HFGptOssForCausalLM
@@ -72,15 +73,27 @@ def test_gpt_oss_instances_keep_distinct_impls():
     assert eager.veomni_ce.impl == "eager"
 
 
-def test_gpt_oss_eager_matches_hf():
+@pytest.mark.parametrize(
+    "seq_len,partial_labels", [(7, False), (17, True)], ids=["within-window", "padded-beyond-window"]
+)
+def test_gpt_oss_eager_matches_hf(seq_len, partial_labels):
     torch.manual_seed(0)
     config = _tiny_config()
     hf = HFGptOssForCausalLM(config)
     ours = _build_ours(config)
     ours.load_state_dict(hf.state_dict())
 
-    input_ids = torch.randint(3, config.vocab_size, (2, 8))
-    assert_eager_matches_hf(hf, ours, input_ids=input_ids)
+    input_ids = torch.randint(3, config.vocab_size, (2, seq_len))
+    attention_mask = torch.ones_like(input_ids)
+    labels = input_ids.clone()
+    if partial_labels:
+        attention_mask[1, :3] = 0
+        input_ids[1, :3] = config.pad_token_id
+        labels[:, :4] = -100  # Prompt tokens are visible but not supervised.
+        labels[0, 8:10] = -100
+    assert_eager_matches_hf(
+        hf, ours, input_ids=input_ids, labels=labels, fwd_kwargs={"attention_mask": attention_mask}
+    )
 
 
 def test_gpt_oss_eager_matches_hf_aux_loss():
@@ -90,7 +103,7 @@ def test_gpt_oss_eager_matches_hf_aux_loss():
     ours = _build_ours(config)
     ours.load_state_dict(hf.state_dict())
 
-    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    input_ids = torch.randint(3, config.vocab_size, (2, 17))
     labels = input_ids.clone()
     hf_out = hf(input_ids=input_ids, labels=labels, use_cache=False, output_router_logits=True)
     ours_out = ours(input_ids=input_ids, labels=labels, use_cache=False, output_router_logits=True)

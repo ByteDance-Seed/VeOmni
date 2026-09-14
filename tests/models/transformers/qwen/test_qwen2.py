@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM as HFQwen2ForCausalLM
@@ -34,6 +35,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Model as HFQwen2Model
 
 from tests.models.compare import (
     assert_eager_matches_hf,
+    assert_sequence_classification_matches_hf,
     eager_ops_config,
 )
 from tests.models.tiny_configs import tiny_qwen2_config as _tiny_config
@@ -151,19 +153,13 @@ def test_qwen2_base_model_eager_matches_hf():
     torch.testing.assert_close(ours_out.last_hidden_state, hf_out.last_hidden_state)
 
 
-def test_qwen2_sequence_classification_forward():
+@pytest.mark.parametrize("supervision", ["last-valid", "selected-tokens"])
+def test_qwen2_sequence_classification_matches_hf(supervision):
+    torch.manual_seed(0)
     config = _tiny_config(num_labels=4)
     _, model_cls, *_ = _qwen2_classes()
     model = _construct_ours(model_cls, config)
-    assert model.veomni_ce.impl == "eager"
-
-    input_ids = torch.randint(3, config.vocab_size, (2, 6))
-    labels = torch.full(input_ids.shape, -100, dtype=torch.long)
-    labels[:, -1] = torch.tensor([1, 2])
-    out = model(input_ids=input_ids, labels=labels, use_cache=False)
-    assert out.loss.ndim == 0
-    assert torch.isfinite(out.loss)
-    assert out.logits is not None
+    assert_sequence_classification_matches_hf(model, supervision=supervision)
 
 
 def test_qwen2_token_classification_eager_matches_hf():

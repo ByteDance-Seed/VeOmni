@@ -22,6 +22,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
+import torch.nn.functional as F
 from diffusers import WanTransformer3DModel as OfficialWanTransformer3DModel
 
 from tests.models.compare import (
@@ -51,14 +52,6 @@ def _build_ours(config: WanTransformer3DModelConfig, ops: SimpleNamespace | None
         return WanTransformer3DModel(config)
     finally:
         set_ops_config(previous)
-
-
-def _wan_inputs() -> dict[str, torch.Tensor]:
-    return {
-        "hidden_states": torch.randn(1, 4, 2, 8, 8),
-        "timestep": torch.tensor([500], dtype=torch.long),
-        "encoder_hidden_states": torch.randn(1, 8, 32),
-    }
 
 
 def test_wan_t2v_configs_roundtrip_through_registry(tmp_path):
@@ -117,19 +110,63 @@ def test_wan_t2v_instances_keep_distinct_impls():
     assert eager.blocks[0].attn1.processor.veomni_attn.impl == "eager"
 
 
-def test_wan_t2v_eager_matches_official():
+def test_wan_t2v_public_training_forward_matches_official(monkeypatch):
+    """Compare ragged-sample predictions and mean sample loss through the public entry."""
+    from veomni.models import get_model_class
+
     torch.manual_seed(0)
     config = _tiny_config()
     official = OfficialWanTransformer3DModel(**config.to_diffuser_dict())
-    ours = _build_ours(config)
+    # Registry resolution installs the production backbone forward. Restore that
+    # class-level patch after this test, including when an assertion fails.
+    monkeypatch.setattr(OfficialWanTransformer3DModel, "forward", OfficialWanTransformer3DModel.forward)
+    previous = get_ops_config()
+    set_ops_config(eager_ops_config())
+    try:
+        ours = get_model_class(config)(config)
+    finally:
+        set_ops_config(previous)
     ours.load_state_dict(official.state_dict())
-    inputs = _wan_inputs()
+    samples = [
+        {
+            "hidden_states": torch.randn(1, 4, frames, height, width, requires_grad=True),
+            "timestep": torch.tensor([timestep]),
+            "encoder_hidden_states": torch.randn(1, text_len, 32, requires_grad=True),
+        }
+        for frames, height, width, text_len, timestep in [(2, 4, 4, 3, 250), (1, 4, 6, 5, 750)]
+    ]
+    ours_samples = [
+        {key: value.detach().clone().requires_grad_(value.requires_grad) for key, value in sample.items()}
+        for sample in samples
+    ]
+    targets = [torch.randn_like(sample["hidden_states"]) + 2 * i for i, sample in enumerate(samples)]
+    expected_predictions = []
 
     def call(model):
-        output = _OFFICIAL_FORWARD(model, **inputs, return_dict=False)
-        return output[0] if isinstance(output, tuple) else output
+        if model is official:
+            expected_predictions.extend(_OFFICIAL_FORWARD(model, **sample, return_dict=False)[0] for sample in samples)
+            return torch.stack(
+                [
+                    F.mse_loss(prediction, target)
+                    for prediction, target in zip(expected_predictions, targets, strict=True)
+                ]
+            ).mean()
+        output = model(
+            latents=None,
+            **{key: [sample[key] for sample in ours_samples] for key in samples[0]},
+            training_target=targets,
+        )
+        assert set(output.loss) == {"mse_loss"}
+        assert len(output.predictions) == len(samples)
+        for actual, expected in zip(output.predictions, expected_predictions, strict=True):
+            torch.testing.assert_close(actual, expected)
+        return output.loss["mse_loss"]
 
     assert_outputs_and_grads_match(official, ours, call)
+    for actual, expected in zip(ours_samples, samples, strict=True):
+        for key in ("hidden_states", "encoder_hidden_states"):
+            assert expected[key].grad is not None
+            torch.testing.assert_close(actual[key].grad, expected[key].grad)
 
 
 def test_wan_t2v_flash2_kernel_passes_full_sequence_varlen_kwargs(available_nvidia_ops):

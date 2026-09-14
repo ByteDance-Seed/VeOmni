@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaForCausalLM as HFLlamaForCausalLM
@@ -29,6 +30,7 @@ from transformers.models.llama.modeling_llama import LlamaModel as HFLlamaModel
 
 from tests.models.compare import (
     assert_eager_matches_hf,
+    assert_sequence_classification_matches_hf,
     eager_ops_config,
 )
 from tests.models.tiny_configs import tiny_llama_config as _tiny_config
@@ -140,7 +142,9 @@ def test_llama_base_model_eager_matches_hf():
     torch.testing.assert_close(ours_out.last_hidden_state, hf_out.last_hidden_state)
 
 
-def test_llama_seq_cls_forward():
+@pytest.mark.parametrize("supervision", ["last-valid", "selected-tokens"])
+def test_llama_seq_cls_matches_hf(supervision):
+    torch.manual_seed(0)
     _, seq_cls, _, _ = _llama_classes()
     previous = get_ops_config()
     set_ops_config(eager_ops_config())
@@ -148,15 +152,7 @@ def test_llama_seq_cls_forward():
         model = seq_cls(_tiny_config(num_labels=4))
     finally:
         set_ops_config(previous)
-    assert model.veomni_ce.impl == "eager"
-
-    input_ids = torch.randint(3, 128, (2, 6))
-    labels = torch.full((2, 6), -100, dtype=torch.long)
-    labels[:, -1] = torch.tensor([1, 2])
-    out = model(input_ids=input_ids, labels=labels, use_cache=False)
-    assert out.loss.ndim == 0
-    assert torch.isfinite(out.loss)
-    assert out.logits is not None
+    assert_sequence_classification_matches_hf(model, supervision=supervision)
 
 
 def test_llama_token_cls_eager_matches_hf():

@@ -20,6 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import torch.nn.functional as F
 
 from tests.models.compare import (
     assert_outputs_and_grads_match,
@@ -177,15 +178,17 @@ def test_flux_joint_attention_matches_official():
         ours_flux.FLASH_ATTN_2_AVAILABLE, ours_flux.FLASH_ATTN_3_AVAILABLE = ours_flags
 
 
-def test_flux_tiny_model_forward_backward():
+def test_flux_tiny_model_forward_backward_smoke():
+    """Check end-to-end connectivity, not numerical parity of the whole backbone."""
     from veomni.models.transformers.flux import modeling_flux
 
     flags = (modeling_flux.FLASH_ATTN_2_AVAILABLE, modeling_flux.FLASH_ATTN_3_AVAILABLE)
     modeling_flux.FLASH_ATTN_2_AVAILABLE = False
     modeling_flux.FLASH_ATTN_3_AVAILABLE = False
     try:
+        torch.manual_seed(0)
         model = _build_ours_model()
-        hidden_states = torch.randn(2, 4, 4, 4)
+        hidden_states = torch.randn(2, 4, 4, 6)
         timestep = torch.rand(2)
         prompt_emb = torch.randn(2, 3, 48)
         pooled_prompt_emb = torch.randn(2, 32)
@@ -201,6 +204,7 @@ def test_flux_tiny_model_forward_backward():
             text_ids,
         )
         assert output.shape == hidden_states.shape
+        assert torch.isfinite(output).all()
 
         output.square().mean().backward()
         assert model.x_embedder.weight.grad is not None
@@ -208,6 +212,57 @@ def test_flux_tiny_model_forward_backward():
         assert model.single_blocks[0].to_qkv_mlp.weight.grad is not None
     finally:
         modeling_flux.FLASH_ATTN_2_AVAILABLE, modeling_flux.FLASH_ATTN_3_AVAILABLE = flags
+
+
+def test_flux_patch_layout_and_image_coordinates():
+    model = _build_ours_model()
+    image = torch.arange(2 * 4 * 4 * 6, dtype=torch.float32).reshape(2, 4, 4, 6).requires_grad_()
+    # Enumerate 2x2 tiles in row-major order, flattening channel before local pixel.
+    expected = torch.stack(
+        [image[:, :, row : row + 2, col : col + 2].flatten(1) for row in (0, 2) for col in (0, 2, 4)], dim=1
+    )
+    patches = model.patchify(image)
+    torch.testing.assert_close(patches, expected, rtol=0, atol=0)
+    weights = torch.linspace(-1, 2, patches.numel()).reshape_as(patches)
+    actual_grad = torch.autograd.grad((patches * weights).sum(), image)[0]
+    expected_grad = torch.autograd.grad((expected * weights).sum(), image)[0]
+    torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+
+    # A separate token tensor prevents mutually wrong pack/unpack functions from cancelling.
+    tokens = torch.linspace(-2, 3, patches.numel()).reshape_as(patches).requires_grad_()
+    reconstructed = model.unpatchify(tokens, height=4, width=6)
+    expected_image = F.fold(tokens.transpose(1, 2), output_size=(4, 6), kernel_size=2, stride=2)
+    torch.testing.assert_close(reconstructed, expected_image, rtol=0, atol=0)
+    image_weights = torch.arange(image.numel()).reshape_as(image)
+    actual_grad = torch.autograd.grad((reconstructed * image_weights).sum(), tokens)[0]
+    expected_grad = torch.autograd.grad((expected_image * image_weights).sum(), tokens)[0]
+    torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+
+    expected_ids = image.new_tensor([[0, 0, 0], [0, 0, 1], [0, 0, 2], [0, 1, 0], [0, 1, 1], [0, 1, 2]])
+    torch.testing.assert_close(model.prepare_image_ids(image), expected_ids.expand(2, -1, -1), rtol=0, atol=0)
+
+
+def test_flux_final_conditioning_matches_explicit_formula():
+    from veomni.models.transformers.flux.modeling_flux import AdaLayerNormContinuous
+
+    torch.manual_seed(0)
+    module = AdaLayerNormContinuous(8)
+    hidden = torch.randn(2, 5, 8, requires_grad=True)
+    condition = torch.randn(2, 8, requires_grad=True)
+    actual = module(hidden, condition)
+    modulation = F.linear(condition * condition.sigmoid(), module.linear.weight, module.linear.bias)
+    scale, shift = modulation[:, :8], modulation[:, 8:]
+    normalized = (hidden - hidden.mean(-1, keepdim=True)) * torch.rsqrt(
+        hidden.var(-1, unbiased=False, keepdim=True) + 1e-6
+    )
+    expected = normalized * (1 + scale[:, None]) + shift[:, None]
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    probe = torch.randn_like(actual)
+    inputs = (hidden, condition, module.linear.weight, module.linear.bias)
+    actual_grads = torch.autograd.grad((actual * probe).sum(), inputs)
+    expected_grads = torch.autograd.grad((expected * probe).sum(), inputs)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad, atol=1e-5, rtol=1e-5)
 
 
 def test_flux_joint_attention_is_non_causal():

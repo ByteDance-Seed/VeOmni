@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
@@ -234,15 +235,23 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit():
     torch.testing.assert_close(actual, torch.zeros_like(hidden_states), rtol=0, atol=0)
 
 
-def test_deepseek_v4_eager_matches_hf():
+@pytest.mark.parametrize("seq_len", [7, 19], ids=["before-hca-window", "compressed-topk"])
+def test_deepseek_v4_eager_matches_hf(seq_len):
     torch.manual_seed(0)
     config = _tiny_config()
     hf = HFDeepseekV4ForCausalLM(config)
     ours = _build_ours(config)
     ours.load_state_dict(hf.state_dict())
 
-    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    input_ids = torch.randint(3, config.vocab_size, (2, seq_len))
     assert_eager_matches_hf(hf, ours, input_ids=input_ids)
+
+    if seq_len >= config.compress_rates["heavily_compressed_attention"]:
+        # Every attention layer must train its compressor, not just match an unused branch.
+        for layer in ours.model.layers:
+            grad = layer.self_attn.compressor.kv_proj.weight.grad
+            assert grad is not None
+            assert torch.isfinite(grad).all() and grad.count_nonzero() > 0
 
 
 def test_deepseek_v4_eager_matches_hf_aux_loss():
@@ -252,7 +261,7 @@ def test_deepseek_v4_eager_matches_hf_aux_loss():
     ours = _build_ours(config)
     ours.load_state_dict(hf.state_dict())
 
-    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    input_ids = torch.randint(3, config.vocab_size, (2, 19))
     labels = input_ids.clone()
     hf_out = hf(input_ids=input_ids, labels=labels, use_cache=False, output_router_logits=True)
     ours_out = ours(input_ids=input_ids, labels=labels, use_cache=False, output_router_logits=True)

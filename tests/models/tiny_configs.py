@@ -22,6 +22,9 @@ from transformers import PretrainedConfig
 IMAGE_TOKEN_ID = 120
 VIDEO_TOKEN_ID = 121
 AUDIO_TOKEN_ID = 122
+VISION_START_TOKEN_ID = 123
+VISION_END_TOKEN_ID = 124
+AUDIO_START_TOKEN_ID = 125
 
 
 def tiny_deepseek_v3_config(architecture: str = "DeepseekV3ForCausalLM") -> PretrainedConfig:
@@ -52,7 +55,7 @@ def tiny_deepseek_v3_config(architecture: str = "DeepseekV3ForCausalLM") -> Pret
 
 
 def tiny_deepseek_v4_config(architecture: str = "DeepseekV4ForCausalLM") -> PretrainedConfig:
-    """Build a four-layer toy that retains the official DSV4 layer schedules."""
+    """Keep DSV4's layer schedules with compression and top-k thresholds scaled for CPU tests."""
     from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
     return DeepseekV4Config(
@@ -71,6 +74,9 @@ def tiny_deepseek_v4_config(architecture: str = "DeepseekV4ForCausalLM") -> Pret
         o_lora_rank=16,
         index_n_heads=4,
         index_head_dim=16,
+        compress_rates={"compressed_sparse_attention": 4, "heavily_compressed_attention": 8},
+        sliding_window=8,
+        index_topk=2,
         architectures=[architecture],
         attn_implementation="eager",
         experts_implementation="eager",
@@ -579,7 +585,7 @@ def tiny_qwen2_5_vl_config(architecture: str = "Qwen2_5_VLForConditionalGenerati
         patch_size=8,
         temporal_patch_size=2,
         spatial_merge_size=2,
-        window_size=16,
+        window_size=32,
         out_hidden_size=64,
         fullatt_block_indexes=[0],
         hidden_act="silu",
@@ -638,7 +644,7 @@ def tiny_qwen2_5_omni_thinker_config(
         patch_size=8,
         temporal_patch_size=2,
         spatial_merge_size=2,
-        window_size=16,
+        window_size=32,
         out_hidden_size=64,
         fullatt_block_indexes=[0],
         hidden_act="silu",
@@ -660,6 +666,9 @@ def tiny_qwen2_5_omni_thinker_config(
         image_token_id=IMAGE_TOKEN_ID,
         video_token_id=VIDEO_TOKEN_ID,
         audio_token_id=AUDIO_TOKEN_ID,
+        vision_start_token_id=VISION_START_TOKEN_ID,
+        vision_end_token_id=VISION_END_TOKEN_ID,
+        audio_start_token_id=AUDIO_START_TOKEN_ID,
         architectures=[architecture],
     )
 
@@ -952,6 +961,9 @@ def tiny_qwen3_omni_moe_thinker_config(
         image_token_id=IMAGE_TOKEN_ID,
         video_token_id=VIDEO_TOKEN_ID,
         audio_token_id=AUDIO_TOKEN_ID,
+        vision_start_token_id=VISION_START_TOKEN_ID,
+        vision_end_token_id=VISION_END_TOKEN_ID,
+        audio_start_token_id=AUDIO_START_TOKEN_ID,
         architectures=[architecture],
     )
 

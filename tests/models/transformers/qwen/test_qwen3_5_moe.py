@@ -42,6 +42,7 @@ from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
     pin_eager_attn_implementation,
+    qwen_image_inputs,
 )
 from tests.models.tiny_configs import (
     tiny_qwen3_5_moe_config as _tiny_vl_config,
@@ -114,29 +115,6 @@ def _pin_hf_gdn_to_torch(model: torch.nn.Module) -> None:
             replacement = Qwen3_5MoeRMSNormGated(gdn.head_v_dim, eps=gdn.layer_norm_epsilon).to(device)
             replacement.weight.data.copy_(gdn.norm.weight.detach().to(device))
             gdn.norm = replacement
-
-
-def _image_inputs(config: Qwen3_5MoeConfig, input_ids: torch.Tensor) -> dict:
-    vision = config.vision_config
-    merge = vision.spatial_merge_size
-    grid_t, grid_h, grid_w = 1, merge, merge
-    num_patches = grid_t * grid_h * grid_w
-    n_tokens = num_patches // (merge**2)
-    feat_dim = vision.in_channels * vision.temporal_patch_size * vision.patch_size * vision.patch_size
-    pixel_values = torch.randn(num_patches, feat_dim)
-    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long)
-    ids = input_ids.clone()
-    ids[0, :n_tokens] = config.image_token_id
-    image_mask = ids == config.image_token_id
-    video_mask = torch.zeros_like(ids, dtype=torch.bool)
-    return {
-        "input_ids": ids,
-        "pixel_values": pixel_values,
-        "image_grid_thw": image_grid_thw,
-        "image_mask": image_mask,
-        "video_mask": video_mask,
-        "mm_token_type_ids": image_mask.int(),
-    }
 
 
 def test_qwen3_5_moe_constructs_local_kernels():
@@ -239,14 +217,16 @@ def test_qwen3_5_moe_eager_matches_hf_image_and_text():
     ours = _build_vlm(config)
     ours.load_state_dict(hf.state_dict())
 
-    input_ids = torch.randint(3, 100, (2, 8))
-    image = _image_inputs(config, input_ids)
+    input_ids = torch.randint(3, 100, (2, 20))
+    image = qwen_image_inputs(config, input_ids)
     ids = image.pop("input_ids")
+    labels = image.pop("labels")
     _pin_hf_gdn_to_torch(hf)
     assert_eager_matches_hf(
         hf,
         ours,
         input_ids=ids,
+        labels=labels,
         fwd_kwargs=image,
         ours_fwd_kwargs={"cu_seq_lens_q": _empty_cu_seq_lens()},
     )
