@@ -12,4 +12,9 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Wan T2V modeling that calls local VeomniOp handles. Not on ``MODELING_REGISTRY``."""
+"""Register Wan T2V transformer and condition modeling."""
+
+from . import wan_condition, wan_transformer
+
+
+__all__ = ["wan_condition", "wan_transformer"]

@@ -20,7 +20,7 @@ import pytest
 
 from veomni.ops import VeomniOp
 from veomni.ops import registry as op_registry
-from veomni.ops.platform import NvidiaGpuPlatform
+from veomni.ops.platform import GpuKernelRequirement, NvidiaGpuPlatform
 
 
 @pytest.fixture
@@ -28,7 +28,7 @@ def available_nvidia_ops(monkeypatch):
     """Make static NVIDIA/package gates pass without executing a GPU kernel."""
     previous_handles = dict(VeomniOp._intern)
     VeomniOp._intern.clear()
-    monkeypatch.setattr(op_registry, "get_device_type", lambda: "cuda")
+    monkeypatch.setattr(op_registry, "get_device_type", lambda: GpuKernelRequirement.device)
     monkeypatch.setattr(NvidiaGpuPlatform, "matches", lambda self: True)
     monkeypatch.setattr(op_registry, "is_package_available", lambda _package: True)
     yield

@@ -298,6 +298,49 @@ def tiny_wan_config(architecture: str = "WanModel", **overrides) -> PretrainedCo
     return WanConfig(**kwargs)
 
 
+def tiny_wan_t2v_config(architecture: str = "WanTransformer3DModel", **overrides) -> PretrainedConfig:
+    from veomni.models_kernel.diffusers.wan_t2v.wan_transformer.configuration_wan_transformer import (
+        WanTransformer3DModelConfig,
+    )
+
+    kwargs = {
+        "patch_size": (1, 2, 2),
+        "num_attention_heads": 4,
+        "attention_head_dim": 16,
+        "in_channels": 4,
+        "out_channels": 4,
+        "text_dim": 32,
+        "freq_dim": 16,
+        "ffn_dim": 64,
+        "num_layers": 1,
+        "cross_attn_norm": True,
+        "qk_norm": "rms_norm_across_heads",
+        "eps": 1e-6,
+        "rope_max_seq_len": 64,
+        "architectures": [architecture],
+        "tie_word_embeddings": False,
+        "attn_implementation": "eager",
+    }
+    kwargs.update(overrides)
+    return WanTransformer3DModelConfig(**kwargs)
+
+
+def tiny_wan_t2v_condition_config(
+    architecture: str = "WanTransformer3DConditionModel", **overrides
+) -> PretrainedConfig:
+    from veomni.models_kernel.diffusers.wan_t2v.wan_condition.configuration_wan_condition import (
+        WanTransformer3DConditionModelConfig,
+    )
+
+    kwargs = {
+        "base_model_path": "",
+        "architectures": [architecture],
+        "tie_word_embeddings": False,
+    }
+    kwargs.update(overrides)
+    return WanTransformer3DConditionModelConfig(**kwargs)
+
+
 def tiny_qwen2_config(architecture: str = "Qwen2ForCausalLM", **overrides) -> PretrainedConfig:
     from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 

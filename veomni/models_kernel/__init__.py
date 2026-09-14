@@ -12,13 +12,14 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Transformer modeling that calls local ``VeomniOp`` handles.
+"""Modeling that calls local ``VeomniOp`` handles.
 
 Import classes from ``transformers.<model>.generated``. Construct helpers
 live on this package: ``build_foundation_model``, ``get_model_class``, and
 the checkpoint weight I/O functions.
 """
 
+from ..utils.import_utils import is_diffusers_available
 from . import transformers
 from .auto import (
     build_config,
@@ -65,3 +66,8 @@ __all__ = [
     "save_model_weights",
     "transformers",
 ]
+
+if is_diffusers_available():
+    from . import diffusers
+
+    __all__.append("diffusers")

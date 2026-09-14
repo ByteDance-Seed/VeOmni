@@ -104,6 +104,9 @@ from tests.models_kernel.tiny_configs import (
 from tests.models_kernel.tiny_configs import (
     tiny_wan_config as _tiny_wan_config,
 )
+from tests.models_kernel.tiny_configs import (
+    tiny_wan_t2v_config as _tiny_wan_t2v_config,
+)
 from veomni.models_kernel import (
     MODEL_CONFIG_REGISTRY,
     MODEL_PROCESSOR_REGISTRY,
@@ -132,6 +135,7 @@ class _ModelCase:
     architectures: tuple[str, ...]
     has_registered_config: bool = False
     registered_config_aliases: tuple[str, ...] = ()
+    registered_model_aliases: tuple[str, ...] = ()
     processor_class_name: str | None = None
     eager_op_path: str | None = "veomni_ce"
 
@@ -342,6 +346,15 @@ _MODEL_CASES = (
         has_registered_config=True,
         eager_op_path="blocks.0.self_attn.norm_q.veomni_rms_norm",
     ),
+    _ModelCase(
+        model_type="WanTransformer3DModel",
+        config_factory=_tiny_wan_t2v_config,
+        architectures=("WanTransformer3DModel",),
+        has_registered_config=True,
+        registered_config_aliases=("WanTransformer3DConditionModel",),
+        registered_model_aliases=("WanTransformer3DConditionModel",),
+        eager_op_path="blocks.0.attn1.processor.veomni_attn",
+    ),
 )
 
 _ARCHITECTURE_CASES = tuple(
@@ -401,6 +414,7 @@ def test_model_registry_entries(model_case: _ModelCase):
     assert (model_case.model_type in MODEL_CONFIG_REGISTRY.valid_keys()) is model_case.has_registered_config
     assert set(model_case.registered_config_aliases) <= set(MODEL_CONFIG_REGISTRY.valid_keys())
     assert model_case.model_type in MODELING_REGISTRY.valid_keys()
+    assert set(model_case.registered_model_aliases) <= set(MODELING_REGISTRY.valid_keys())
     if model_case.processor_class_name is not None:
         assert model_case.processor_class_name in MODEL_PROCESSOR_REGISTRY.valid_keys()
 

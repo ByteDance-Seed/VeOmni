@@ -12,10 +12,9 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Wan T2V models_kernel consume tests.
+"""Wan T2V models_kernel registry, op-selection, and parity tests.
 
-Direct-import the staged wrapper. Compare a tiny transformer against official
-``diffusers.WanTransformer3DModel``.
+Compare a tiny transformer against official ``diffusers.WanTransformer3DModel``.
 """
 
 from __future__ import annotations
@@ -29,6 +28,8 @@ from tests.models_kernel.compare import (
     assert_outputs_and_grads_match,
     eager_ops_config,
 )
+from tests.models_kernel.tiny_configs import tiny_wan_t2v_condition_config as _tiny_condition_config
+from tests.models_kernel.tiny_configs import tiny_wan_t2v_config as _tiny_config
 from veomni.models_kernel.diffusers.wan_t2v.wan_transformer.configuration_wan_transformer import (
     WanTransformer3DModelConfig,
 )
@@ -36,26 +37,7 @@ from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config, set_ops_config
 
 
-def _tiny_kwargs() -> dict:
-    return {
-        "patch_size": (1, 2, 2),
-        "num_attention_heads": 4,
-        "attention_head_dim": 16,
-        "in_channels": 4,
-        "out_channels": 4,
-        "text_dim": 32,
-        "freq_dim": 16,
-        "ffn_dim": 64,
-        "num_layers": 1,
-        "cross_attn_norm": True,
-        "qk_norm": "rms_norm_across_heads",
-        "eps": 1e-6,
-        "rope_max_seq_len": 64,
-    }
-
-
-def _tiny_ours_config() -> WanTransformer3DModelConfig:
-    return WanTransformer3DModelConfig(**_tiny_kwargs(), attn_implementation="eager")
+_OFFICIAL_FORWARD = OfficialWanTransformer3DModel.forward
 
 
 def _build_ours(config: WanTransformer3DModelConfig, ops: SimpleNamespace | None = None):
@@ -79,8 +61,43 @@ def _wan_inputs() -> dict[str, torch.Tensor]:
     }
 
 
+def test_wan_t2v_configs_roundtrip_through_registry(tmp_path):
+    from veomni.models_kernel import build_config, get_model_class
+    from veomni.models_kernel.diffusers.wan_t2v.wan_condition.configuration_wan_condition import (
+        WanTransformer3DConditionModelConfig,
+    )
+
+    transformer_path = tmp_path / "transformer"
+    condition_path = tmp_path / "condition"
+    _tiny_config().save_pretrained(transformer_path)
+    _tiny_condition_config().save_pretrained(condition_path)
+
+    transformer = build_config(str(transformer_path))
+    condition = build_config(str(condition_path))
+
+    assert type(transformer) is WanTransformer3DModelConfig
+    assert type(condition) is WanTransformer3DConditionModelConfig
+    assert get_model_class(transformer).__name__ == "WanTransformer3DModel"
+    assert get_model_class(condition).__name__ == "WanTransformer3DConditionModel"
+
+
+def test_wan_t2v_condition_builds_from_registered_class_without_assets(monkeypatch):
+    from veomni.models_kernel import MODELING_REGISTRY
+    from veomni.models_kernel.diffusers.wan_t2v.wan_condition import modeling_wan_condition
+
+    monkeypatch.setattr(modeling_wan_condition, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(modeling_wan_condition, "get_parallel_state", lambda: SimpleNamespace(dp_rank=0))
+    monkeypatch.setattr(modeling_wan_condition.WanTransformer3DConditionModel, "_load_components", lambda self: None)
+
+    model_class = MODELING_REGISTRY["WanTransformer3DConditionModel"]()
+    model = model_class._from_config(_tiny_condition_config())
+
+    assert type(model) is modeling_wan_condition.WanTransformer3DConditionModel
+    assert model.config.model_type == "WanTransformer3DConditionModel"
+
+
 def test_wan_t2v_constructs_local_kernels():
-    model = _build_ours(_tiny_ours_config())
+    model = _build_ours(_tiny_config())
     processor = model.blocks[0].attn1.processor
     assert isinstance(processor.veomni_attn, VeomniOp)
     assert processor.veomni_attn.op == "attention"
@@ -88,10 +105,10 @@ def test_wan_t2v_constructs_local_kernels():
 
 
 def test_wan_t2v_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_ours_config(), eager_ops_config())
+    eager = _build_ours(_tiny_config(), eager_ops_config())
     other_cfg = eager_ops_config()
     other_cfg.attn_implementation = "sdpa"
-    other = _build_ours(_tiny_ours_config(), other_cfg)
+    other = _build_ours(_tiny_config(), other_cfg)
 
     assert eager.blocks[0].attn1.processor.veomni_attn.impl == "eager"
     assert other.blocks[0].attn1.processor.veomni_attn.impl == "sdpa"
@@ -102,13 +119,14 @@ def test_wan_t2v_instances_keep_distinct_impls():
 
 def test_wan_t2v_eager_matches_official():
     torch.manual_seed(0)
-    official = OfficialWanTransformer3DModel(**_tiny_kwargs())
-    ours = _build_ours(_tiny_ours_config())
+    config = _tiny_config()
+    official = OfficialWanTransformer3DModel(**config.to_diffuser_dict())
+    ours = _build_ours(config)
     ours.load_state_dict(official.state_dict())
     inputs = _wan_inputs()
 
     def call(model):
-        output = OfficialWanTransformer3DModel.forward(model, **inputs, return_dict=False)
+        output = _OFFICIAL_FORWARD(model, **inputs, return_dict=False)
         return output[0] if isinstance(output, tuple) else output
 
     assert_outputs_and_grads_match(official, ours, call)
@@ -117,7 +135,7 @@ def test_wan_t2v_eager_matches_official():
 def test_wan_t2v_flash2_kernel_passes_full_sequence_varlen_kwargs(available_nvidia_ops):
     ops = eager_ops_config()
     ops.attn_implementation = "veomni_flash_attention_2"
-    model = _build_ours(_tiny_ours_config(), ops).to(dtype=torch.bfloat16)
+    model = _build_ours(_tiny_config(), ops).to(dtype=torch.bfloat16)
     attn = model.blocks[0].attn1
     processor = attn.processor
     assert processor.veomni_attn.impl == "veomni_flash_attention_2"
@@ -140,7 +158,7 @@ def test_wan_t2v_flash2_kernel_passes_full_sequence_varlen_kwargs(available_nvid
 
 
 def test_wan_t2v_eager_skips_full_sequence_varlen_kwargs():
-    model = _build_ours(_tiny_ours_config()).to(dtype=torch.bfloat16)
+    model = _build_ours(_tiny_config()).to(dtype=torch.bfloat16)
     attn = model.blocks[0].attn1
     captured: dict = {}
 

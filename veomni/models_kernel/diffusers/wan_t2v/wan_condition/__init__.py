@@ -12,4 +12,20 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Wan T2V condition staged under models_kernel. Not on ``MODELING_REGISTRY``."""
+"""Register the local Wan T2V condition config and model."""
+
+from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+
+
+@MODEL_CONFIG_REGISTRY.register("WanTransformer3DConditionModel")
+def register_wan_condition_config():
+    from .configuration_wan_condition import WanTransformer3DConditionModelConfig
+
+    return WanTransformer3DConditionModelConfig
+
+
+@MODELING_REGISTRY.register("WanTransformer3DConditionModel")
+def register_wan_condition_modeling(_architecture: str | None = None):
+    from .modeling_wan_condition import WanTransformer3DConditionModel
+
+    return WanTransformer3DConditionModel

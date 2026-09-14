@@ -12,4 +12,9 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Diffusers modeling that calls local ``VeomniOp`` handles. Not on ``MODELING_REGISTRY``."""
+"""Registered Diffusers modeling that calls local ``VeomniOp`` handles."""
+
+from . import wan_t2v
+
+
+__all__ = ["wan_t2v"]
