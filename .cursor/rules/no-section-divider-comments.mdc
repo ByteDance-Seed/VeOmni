@@ -26,7 +26,7 @@ These add visual noise without value. If code needs grouping, use module-level o
 
 ## Exception: patchgen patch headers
 
-`veomni/models_kernel/transformers/*/**_patch_gen_config.py` and the
+`veomni/models/transformers/*/**_patch_gen_config.py` and the
 `generated/patched_modeling_*.py` files they emit are exempt. There, the
 
 ```python

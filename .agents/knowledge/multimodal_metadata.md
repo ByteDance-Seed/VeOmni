@@ -17,7 +17,7 @@ eliminates the syncs entirely and lets the model forward consume CPU-int /
 CPU-tensor values that are batched up onto the device by the normal trainer
 `.to(device)` step.
 
-`tests/models/test_model_forward_no_implicit_sync.py` is the regression gate: it
+`tests/models/transformers/test_model_forward_no_implicit_sync.py` is the regression gate: it
 asserts the wired models' forwards stay sync-free.
 
 ## The derivation is model-owned, not framework-generic
@@ -202,7 +202,8 @@ guarantees:
 1. Third-party collators / data pipelines that don't precompute keep working.
 2. Inference scripts that construct inputs manually keep working.
 3. Models without the `get_metadata_collate_func` hook keep working (they pay the
-   runtime sync cost — caught by `tests/models/test_model_forward_no_implicit_sync.py`).
+   runtime sync cost — caught by
+   `tests/models/transformers/test_model_forward_no_implicit_sync.py`).
 
 ## Model coverage
 
@@ -237,7 +238,8 @@ guarantees:
    with a runtime fallback when absent.
 6. `dummy_forward` (FSDP path): build the `vit_metadata` sub-dict host-side from
    the Python-int dummy grid.
-7. Add the model to `tests/models/test_model_forward_no_implicit_sync.py`'s
+7. Add the model to
+   `tests/models/transformers/test_model_forward_no_implicit_sync.py`'s
    `CASES` + `_MM_METADATA_WIRED_CASES` so the sync gate feeds synthetic
    metadata and the bitwise-equivalence test
    (`test_multimodal_metadata_path_matches_fallback`) gates the collate hook
@@ -250,9 +252,9 @@ guarantees:
 - `veomni/data/data_transform.py` — transforms emit the `*_grid_thw` tensors +
   `position_ids`.
 - `veomni/trainer/vlm_trainer.py` — `_build_collate_fn` resolves the two model hooks.
-- `veomni/models_kernel/transformers/<model>/<model>_{gpu,npu}_patch_gen_config.py` —
+- `veomni/models/transformers/<model>/<model>_{gpu,npu}_patch_gen_config.py` —
   `collate_multimodal_metadata` helper + `get_metadata_collate_func` /
   `get_extra_collate_infos` overrides; regenerated `generated/` files.
 - `tests/data/test_mm_metadata.py` — collator-hook handoff + hook picklability.
-- `tests/models/test_model_forward_no_implicit_sync.py` — sync gate; feeds synthetic
+- `tests/models/transformers/test_model_forward_no_implicit_sync.py` — sync gate; feeds synthetic
   `multimodal_metadata` for the wired cases.

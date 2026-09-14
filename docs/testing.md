@@ -13,28 +13,24 @@ tests/
 ├── toy_config/                     # Minimal model configs for fast CI testing
 ├── testdata/                       # Sample images, audio, etc.
 │
-├── models/                         # Single-GPU model correctness
-│   ├── test_models_patch.py        # Fwd/bwd across attention & MoE backends
-│   ├── test_vlm_trainer.py         # VLM freeze_vit smoke test
-│   ├── test_model_registry.py      # Model loader registry (HF vs VeOmni)
-│   ├── test_checkpoint_tensor_converter.py  # Checkpoint tensor conversion (e.g. Qwen3MoE fuse)
-│   ├── test_padded_packed_loss.py   # Padded vs packed (cu_seqlens) loss equivalence
-│   ├── test_models_logits_equal_v5.py  # HF↔VeOmni logits through the real loader
-│   └── utils.py                    # ModelMode, prepare_model_modes, prepare_data
+├── models/                         # Registry-backed model correctness
+│   ├── tiny_configs.py             # Canonical tiny configs shared by model suites
+│   ├── compare.py                  # Upstream-vs-VeOmni parity helpers
+│   ├── base/                       # Registry/build, loading, loss-policy tests
+│   ├── transformers/               # Transformer-family parity and contracts
+│   │   ├── deepseek_v4/            # DeepSeek-V4-specific model coverage
+│   │   └── qwen/                   # Qwen-family model coverage
+│   ├── diffusers/                  # Diffuser-family parity and contracts
+│   └── refs/                       # Vendored comparison helpers
 │
-├── kernels/                        # Registry and tensor-kernel correctness
-│   ├── base/test_kernel_entry.py            # Registration, resolution, and generated autograd
+├── ops/                            # Registry and tensor-kernel correctness
+│   ├── base/test_op_entry.py                # Registration, resolution, and generated autograd
 │   ├── attention/                           # Eager/SDPA/Flash/Flex/Magi/Sage contracts
 │   ├── dsa/                                 # DeepSeek/GLM sparse-attention kernels
 │   ├── loss/                                # Cross-entropy and load-balancing kernels
 │   ├── mhc/                                 # mHC eager/TileKernels parity
 │   ├── moe_experts/                         # Eager/Triton/Quack/NPU/MLU expert kernels
 │   └── gated_delta_rule/                    # GatedDeltaNet kernel family
-├── models_kernel/
-│   ├── test_deepseek_v4.py                  # DeepSeek-V4 model and op-callsite parity
-│   ├── test_loss_utils.py                   # causal/seq-cls policy, SP reduction, side-path routing
-│   ├── test_return_log_probs_e2e.py          # generated Qwen3/VL log-probs and distill wiring
-│   └── test_model_load_balancing_loss.py    # HF-shaped model helper and gradient fan-out
 │
 ├── data/                           # Data loading & preprocessing
 │   ├── test_datasets.py            # Dataset loading, filtering, schema validation
@@ -106,7 +102,7 @@ tests/
 
 | Category | Directory | GPU Req | Execution | Purpose |
 |---|---|---|---|---|
-| **Model kernels** | `tests/models_kernel/` | 0-1 GPU | pytest | Registry/build contracts, model parity, and implementation selection |
+| **Models** | `tests/models/` | 0-1 GPU | pytest | Registry/build contracts, model parity, and implementation selection |
 | **Kernels** | `tests/ops/` | 0-1 GPU (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Registry contracts, hardware guards, numerical correctness, and performance |
 | **Data pipeline** | `tests/data/` | 0-1 GPU | pytest | Data loading, collation, preprocessing |
 | **Parallelism** | `tests/parallel/` | 4-8 GPUs | torchrun / pytest | SP, EP, data-balance primitives |
@@ -133,9 +129,9 @@ Additional per-directory helpers:
 
 | File | Scope | Key Exports |
 |---|---|---|
-| `tests/models_kernel/compare.py` | Model parity tests | Eager ops config and comparison helpers |
-| `tests/models_kernel/tiny_configs.py` | Registry and model tests | Canonical tiny-config factories shared across suites |
-| `tests/models_kernel/base/test_checkpoint_tensor_converter.py` | Model loading | Runtime checkpoint layout conversion and fused-expert weight mapping |
+| `tests/models/compare.py` | Model parity tests | Eager ops config and comparison helpers |
+| `tests/models/tiny_configs.py` | Registry and model tests | Canonical tiny-config factories shared across suites |
+| `tests/models/base/test_checkpoint_tensor_converter.py` | Model loading | Runtime checkpoint layout conversion and fused-expert weight mapping |
 | `tests/e2e/utils.py` | E2E tests | `prepare_exec_cmd`, `parse_training_log`, `ParallelMode` |
 | `tests/checkpoints/utils.py` | Checkpoint tests | Command/config builders for trainer save/load |
 | `tests/parallel/ulysses/utils.py` | SP tests | `SequenceParallelTest` base class, `sync_tensor` |
@@ -144,7 +140,7 @@ Additional per-directory helpers:
 
 ## Detailed Test Descriptions
 
-### 1. Model Kernel Tests (`tests/models_kernel/`)
+### 1. Model Tests (`tests/models/`)
 
 **Purpose**: Verify registry/build behavior, eager forward/backward parity with
 the upstream reference, instance-local operator binding, and model-specific
@@ -168,10 +164,10 @@ Most eager and registry coverage runs on CPU. Tests for optimized operators or
 accelerator-only paths declare their own hardware prerequisites.
 
 Registry/build coverage is centralized in
-`tests/models_kernel/base/test_auto_registry.py`; canonical tiny configs live
-in `tests/models_kernel/tiny_configs.py`; family-specific parity and contracts
-live under `tests/models_kernel/transformers/` and
-`tests/models_kernel/diffusers/`. Optimized operator numerics live under
+`tests/models/base/test_auto_registry.py`; canonical tiny configs live
+in `tests/models/tiny_configs.py`; family-specific parity and contracts
+live under `tests/models/transformers/` and
+`tests/models/diffusers/`. Optimized operator numerics live under
 `tests/ops/`.
 
 DeepSeek-V4- and GLM-MoE-DSA-specific DSA checks live under `tests/ops/dsa/`; optimized numerical
@@ -190,7 +186,7 @@ by `tests/ops/mhc/test_mhc.py` and requires TileKernels on an SM90+ NVIDIA GPU.
 
 ---
 
-### 3. Model Registry Test (`tests/models_kernel/base/test_auto_registry.py`)
+### 3. Model Registry Test (`tests/models/base/test_auto_registry.py`)
 
 **Purpose**: Verify that `get_model_config/class/processor` returns the correct HF or VeOmni module.
 
@@ -198,7 +194,7 @@ by `tests/ops/mhc/test_mhc.py` and requires TileKernels on an SM90+ NVIDIA GPU.
 
 ---
 
-### 4. Checkpoint Tensor Converter (`tests/models_kernel/base/test_checkpoint_tensor_converter.py`)
+### 4. Checkpoint Tensor Converter (`tests/models/base/test_checkpoint_tensor_converter.py`)
 
 **Purpose**: Test checkpoint tensor conversion protocol (e.g., Qwen3MoE expert weight fusion: per-expert → stacked `gate_up_proj`).
 
@@ -206,7 +202,7 @@ by `tests/ops/mhc/test_mhc.py` and requires TileKernels on an SM90+ NVIDIA GPU.
 
 ---
 
-### 5. Padded vs Packed Loss (`tests/models_kernel/transformers/qwen/test_qwen3.py`)
+### 5. Padded vs Packed Loss (`tests/models/transformers/qwen/test_qwen3.py`)
 
 **Purpose**: Verify that padded input and packed input (with `cu_seqlens`) produce identical loss.
 
@@ -288,15 +284,15 @@ by `tests/ops/mhc/test_mhc.py` and requires TileKernels on an SM90+ NVIDIA GPU.
 
 Cross-entropy is covered at two layers: `tests/ops/loss/test_cross_entropy_loss.py`
 checks token-level eager parity with HF plus chunked/Liger forward and backward;
-`tests/models_kernel/base/test_loss_utils.py` checks causal target selection,
+`tests/models/base/test_loss_utils.py` checks causal target selection,
 sequence-classification policy, SP reduction, logits ownership, and log-probs
 side-path dispatch. Chunked log-probs and top-k distillation have focused tests
-in `tests/models_kernel/`.
+in `tests/models/`.
 
 Load-balancing loss is covered at two layers: `tests/ops/loss/test_load_balancing_loss.py`
 checks the raw `[N, E]` eager and Triton kernels against HF/eager across the
 configuration matrix, forward/backward, masks, determinism, and peak memory;
-`tests/models_kernel/base/test_model_load_balancing_loss.py` checks tuple
+`tests/models/base/test_model_load_balancing_loss.py` checks tuple
 concatenation, optional-input policy, and gradient fan-out in the model helper.
 
 ---
@@ -328,7 +324,7 @@ See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_
 | Step | Test File | What to Do |
 |---|---|---|
 | 1. **Create toy config** | `tests/toy_config/<model>_toy/` | Minimal config (few layers, small dims). Add `README.md` noting the source config and changes. |
-| 2. **Registry + model parity** | `tests/models_kernel/` | Add the registry case and a family test for eager fwd/bwd parity and model-specific contracts. |
+| 2. **Registry + model parity** | `tests/models/` | Add the registry case and a family test for eager fwd/bwd parity and model-specific contracts. |
 | 3. **E2E parallel alignment** | `tests/e2e/test_e2e_parallel.py` | Add entry to `text_test_cases` (text) or the appropriate VLM/omni list. Set `max_sp_size=1` if SP not yet supported. |
 | 4. **FSDP equivalence** | `tests/distributed/test_fsdp_equivalence.py` | Add entry to verify single-GPU vs FSDP2 grad_norm matches. |
 
@@ -338,10 +334,10 @@ See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_
 |---|---|---|
 | **VLM model** | `tests/trainer/test_vlm_trainer.py` | Add toy config to `_FREEZE_VIT_VLM_CASES_*`. |
 | **VLM model** | `tests/distributed/test_dummy_forward.py` | Add test case for asymmetric multimodal batches. |
-| **MoE model** | `tests/models_kernel/transformers/` | Cover eager parity and selectable fused expert implementations in the family test. |
+| **MoE model** | `tests/models/transformers/` | Cover eager parity and selectable fused expert implementations in the family test. |
 | **MoE model** | `tests/e2e/test_e2e_parallel.py` | Set `is_moe=True` to include `ep_size` iteration. |
-| **MoE with fused experts** | `tests/models_kernel/base/test_checkpoint_tensor_converter.py` | Add converter tests if a custom `CheckpointTensorConverter` is needed. |
-| **Custom checkpoint layout** | `tests/models_kernel/base/test_checkpoint_tensor_converter.py` | Add converter tests for any on-disk HF↔VeOmni key or tensor-layout conversion. |
+| **MoE with fused experts** | `tests/models/base/test_checkpoint_tensor_converter.py` | Add converter tests if a custom `CheckpointTensorConverter` is needed. |
+| **Custom checkpoint layout** | `tests/models/base/test_checkpoint_tensor_converter.py` | Add converter tests for any on-disk HF↔VeOmni key or tensor-layout conversion. |
 | **Custom fused kernels** | `tests/ops/<family>/` | Add kernel-specific correctness and registration tests. |
 | **New data modality** | `tests/data/` | Add data processing and collation tests. |
 
@@ -352,7 +348,7 @@ See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_
 pytest --collect-only -k <model_name>
 
 # Run registry and model parity tests
-pytest tests/models_kernel -k <model_name>
+pytest tests/models -k <model_name>
 
 # Run VLM freeze test (VLM only)
 pytest tests/trainer/test_vlm_trainer.py -k <model_name>
@@ -368,16 +364,17 @@ pytest tests/e2e/test_e2e_parallel.py -k <model_name>
 
 ## Test Execution Flow
 
-### Model Kernel Test Flow
+### Model Test Flow
 ```
-pytest → test_models_patch_fwd_bwd(config, is_moe, ...)
-  → prepare_model_modes(is_moe) → [(HF, eager), (HF, fa2), (VeOmni, fa2_sp), ...]
-  → for each mode:
-      set_ops_config(mode-specific OpsImplementationConfig)
-      BaseTrainer._build_model() → models_kernel.build_foundation_model(config, ops_implementation=...)
-      TrainerTest.forward_backward_step(dummy_batch)
-      → record loss, grad_norm
-  → compare_multi_items(all_results, rtol, atol)
+pytest → test_build_foundation_model_constructs_registered_model(model_case)
+  → build the canonical tiny config from tests/models/tiny_configs.py
+  → build_foundation_model(config, ops_implementation=eager_ops)
+  → verify the registry/build contract for every registered architecture
+
+pytest → family-specific eager parity test
+  → build the upstream reference and VeOmni model from the same tiny config
+  → copy/load matching weights
+  → compare forward outputs and backward gradients
 ```
 
 ### E2E Parallel Test Flow

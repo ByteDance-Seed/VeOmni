@@ -1532,7 +1532,7 @@ class BaseModelArguments:
         cache = BaseModelArguments._fqn_to_index_mapping_cache
         if idx_path not in cache:
             if os.path.exists(idx_path):
-                from ..models_kernel.checkpoint import parse_fqn_to_index_mapping_from_json
+                from ..models.checkpoint import parse_fqn_to_index_mapping_from_json
 
                 cache[idx_path] = parse_fqn_to_index_mapping_from_json(idx_path)
             else:

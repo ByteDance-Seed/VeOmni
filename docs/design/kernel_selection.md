@@ -64,7 +64,7 @@ OpsImplementationConfig.__post_init__()       # (2) config parse time
   └─ rewrite attn_implementation for SP
 
 BaseTrainer._build_model()                    # (3) model build time
-  └─ models_kernel.build_foundation_model(..., ops_implementation=ops)
+  └─ models.build_foundation_model(..., ops_implementation=ops)
        ├─ set_ops_config(ops)
        └─ model init + weight loading
             ├─ patched modules construct their local VeomniOp handles
@@ -81,12 +81,12 @@ model.forward()                               # (4) runtime
   └─ MoE: fused_moe_forward(...) or eager loop
 ```
 
-**No global loss mutation.** The current `models_kernel` stack does not replace
+**No global loss mutation.** The current `models` stack does not replace
 Transformers' `LOSS_MAPPING`. Each model resolves its configured CE row once,
 stores an instance-local `VeomniOp`, and binds that handle to the model
 helper with `functools.partial`; there is no per-forward implementation lookup.
 
-**Ownership.** `models_kernel.build_foundation_model` installs the supplied
+**Ownership.** `models.build_foundation_model` installs the supplied
 `ops_implementation` through `set_ops_config` before constructing the
 model. Callers that provide neither an explicit config nor a previously
 installed ops config receive `ValueError`; there is no silent all-eager
@@ -134,7 +134,7 @@ not rebased for head-specific masks. See
 
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
 - Installation: `veomni/ops/install.py` — `apply_ops_patch()` / `apply_veomni_attention_patch()`
-- Plumbing: `veomni/models_kernel/auto.py` — `build_foundation_model(ops_implementation=...)`
+- Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
 
 ### DeepSeek V4 DSA and mHC
 
@@ -185,7 +185,7 @@ All registered rows implement the same token-level `standard` contract:
 An empty weight marks a logits input and is supported by eager; the fused rows
 require a projection weight. Causal shifting, sequence-classification label
 policy, and SP reduction are outside the op in
-`models_kernel/loss_utils/cross_entropy_loss.py`, so chunked CE is no longer
+`models/loss_utils/cross_entropy_loss.py`, so chunked CE is no longer
 causal-only.
 
 Selecting `liger_kernel` requires that the model's forward pass pass
@@ -203,8 +203,8 @@ model cannot be patched.
 
 - Registration: `veomni/ops/kernels/loss/__init__.py`
 - Implementations: `veomni/ops/kernels/loss/cross_entropy_loss/standard/`
-- Model policy: `veomni/models_kernel/loss_utils/cross_entropy_loss.py`
-- Log-probs/distillation side paths: `veomni/models_kernel/loss_utils/`
+- Model policy: `veomni/models/loss_utils/cross_entropy_loss.py`
+- Log-probs/distillation side paths: `veomni/models/loss_utils/`
 
 ---
 
@@ -283,7 +283,7 @@ interleaved RoPE has no Liger equivalent, so `liger_kernel` is rejected for
 - Config singleton: `veomni/ops/config.py` — `get_ops_config()`, `set_ops_config()`
 - Unified registry: `veomni/ops/registry.py` — `register_op()`, `resolve_op()`, `VeomniOp`
 - Backend registration: `veomni/ops/kernels/{rms_norm,rope,swiglu_mlp}/__init__.py`
-- Model integration: `veomni/models_kernel/transformers/{model}/*_patch_gen_config.py`
+- Model integration: `veomni/models/transformers/{model}/*_patch_gen_config.py`
 
 ---
 
@@ -349,7 +349,7 @@ the tuple of per-layer router logits into the raw op's `[N, E]` input.
 
 ### Key files
 
-- Model helper: `veomni/models_kernel/loss_utils/load_balancing_loss.py`
+- Model helper: `veomni/models/loss_utils/load_balancing_loss.py`
 - Triton impl: `veomni/ops/kernels/loss/load_balancing_loss/standard/triton.py`
 - Eager impl: `veomni/ops/kernels/loss/load_balancing_loss/standard/eager.py`
 - Registration: `veomni/ops/kernels/loss/__init__.py`
@@ -408,8 +408,8 @@ CANN and `torch_npu` stack to enable the fused activation.
 
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
 - Registration: `veomni/ops/kernels/moe_experts/__init__.py`
-- Model integration: `veomni/models_kernel/transformers/*/*_patch_gen_config.py`
-- Plumbing: `veomni/models_kernel/auto.py` — `build_foundation_model(ops_implementation=...)`
+- Model integration: `veomni/models/transformers/*/*_patch_gen_config.py`
+- Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
 
 ---
 
@@ -503,9 +503,9 @@ up `LOSS_MAPPING[self.loss_type]` — this returns a standard PyTorch
 `F.cross_entropy`-based loss. There is no decorator, no hub kernel, and no
 env-var-based kernel swap for the loss function.
 
-VeOmni's `models_kernel` stack leaves that global mapping untouched. Generated
+VeOmni's `models` stack leaves that global mapping untouched. Generated
 model classes construct a local `VeomniOp` and bind it to
-`models_kernel.loss_utils.ForCausalLMLoss` (or the sequence-classification
+`models.loss_utils.ForCausalLMLoss` (or the sequence-classification
 helper). The fused Liger and chunked implementations compute loss without
 materializing the full logits tensor, while wrapper-only input policy remains
 outside the raw registry.
@@ -518,7 +518,7 @@ loss. This function is called directly in `Qwen3MoeForCausalLM.forward()` —
 there is no kernel selection, no registry, and no hub kernel for it.
 
 VeOmni adds a configurable Triton implementation through an instance-local
-`VeomniOp`. `models_kernel/loss_utils/load_balancing_loss.py` preserves the
+`VeomniOp`. `models/loss_utils/load_balancing_loss.py` preserves the
 HF input policy while the registered eager/Triton kernels operate only on a
 concatenated `[N, E]` tensor. Transformers itself still has no corresponding
 selection surface for this function.

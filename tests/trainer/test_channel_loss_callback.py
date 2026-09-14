@@ -28,10 +28,10 @@ try:
     import veomni.trainer.callbacks.base as callback_base_module
     import veomni.trainer.callbacks.channel_loss_callback as channel_loss_module
     from veomni.arguments.arguments_types import ChannelLossConfig
-    from veomni.models_kernel.transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import (
+    from veomni.models.transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import (
         Qwen2_5OmniForConditionalGeneration,
     )
-    from veomni.models_kernel.transformers.qwen3_omni_moe.generated.patched_modeling_qwen3_omni_moe_gpu import (
+    from veomni.models.transformers.qwen3_omni_moe.generated.patched_modeling_qwen3_omni_moe_gpu import (
         Qwen3OmniMoeForConditionalGeneration,
     )
     from veomni.trainer.base import BaseTrainer
@@ -206,8 +206,8 @@ def test_channel_loss_wrapper_forwards_original_call_unchanged():
         computer.uninstall()
 
 
-def test_channel_loss_extracts_fused_inputs_from_models_kernel_loss_partial():
-    from veomni.models_kernel.loss_utils import ForCausalLMLoss
+def test_channel_loss_extracts_fused_inputs_from_models_loss_partial():
+    from veomni.models.loss_utils import ForCausalLMLoss
 
     def fake_ce(hidden_states, labels, weights, **kwargs):
         del labels, kwargs

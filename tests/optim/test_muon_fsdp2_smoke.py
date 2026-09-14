@@ -61,7 +61,7 @@ def _distributed_smoke(use_zero_comm: bool) -> None:
     )
 
     from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.models_kernel import build_foundation_model
+    from veomni.models import build_foundation_model
 
     # The eager Qwen3-MoE expert path is not EP-aware; use fused MoE here.
     ops_cfg = OpsImplementationConfig(

@@ -27,7 +27,7 @@ CPU tensors (no Python-list sidecar); the collator packs them via
 ``DataCollateInfo`` and the model hook does the ``.tolist()`` once at batch
 time. The batch-level cu_seqlens / window cu_seqlens derivation is per-model
 and lives in the patchgen-generated helpers — its sync behaviour is gated by
-``tests/models_kernel/transformers/test_model_forward_no_implicit_sync.py``.
+``tests/models/transformers/test_model_forward_no_implicit_sync.py``.
 """
 
 import os
@@ -37,7 +37,7 @@ import torch
 
 # Bootstrap a single-rank "process group" env so collator import doesn't crash
 # on `get_parallel_state()`. Mirrors the pattern used by
-# tests/models_kernel/transformers/test_model_forward_no_implicit_sync.py.
+# tests/models/transformers/test_model_forward_no_implicit_sync.py.
 os.environ.setdefault("RANK", "0")
 os.environ.setdefault("LOCAL_RANK", "0")
 os.environ.setdefault("WORLD_SIZE", "1")
@@ -145,7 +145,7 @@ def test_qwen3_vl_metadata_hook_is_picklable_and_correct():
     cu_seqlens + SP-pad tail from the packed ``image_grid_thw`` tensor."""
     import pickle
 
-    from veomni.models_kernel.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
         collate_multimodal_metadata,
     )
 

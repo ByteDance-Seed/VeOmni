@@ -6,7 +6,7 @@ on:
       - ".github/workflows/check_patchgen.yml"
       - "patchgen-pkg/**"
       - "veomni/patchgen/**"
-      - "veomni/models_kernel/transformers/**"
+      - "veomni/models/transformers/**"
       - "pyproject.toml"
       - "uv.lock"
   push:
@@ -16,7 +16,7 @@ on:
       - ".github/workflows/check_patchgen.yml"
       - "patchgen-pkg/**"
       - "veomni/patchgen/**"
-      - "veomni/models_kernel/transformers/**"
+      - "veomni/models/transformers/**"
       - "pyproject.toml"
       - "uv.lock"
 

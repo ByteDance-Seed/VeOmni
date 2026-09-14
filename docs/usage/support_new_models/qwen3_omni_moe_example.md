@@ -5,8 +5,8 @@
 This document provides in-depth implementation details for each patch applied in the **Qwen3-Omni-MoE** integration — VeOmni's most complex model type, covering image, video, and audio modalities with MoE and Expert Parallelism. Use this alongside [guide_and_checklist.md](./guide_and_checklist.md).
 
 > **Scope note:** VeOmni now ships patchgen-generated modeling files under
-> `veomni/models_kernel/transformers/<model>/generated/`. The actual patches live in
-> [veomni/models_kernel/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models_kernel/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py)
+> `veomni/models/transformers/<model>/generated/`. The actual patches live in
+> [veomni/models/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py)
 > rather than the runtime `apply_veomni_*_patch()` helpers shown below. The
 > patterns (config fix, FSDP dummy, SP, fused MoE, EP plan, processor patch)
 > are unchanged; what has changed is *where* the patches are declared
@@ -304,14 +304,14 @@ if position_ids is not None and position_ids.ndim == 3 and position_ids.shape[1]
 
 ## P11. VeOmni Loss Utility
 
-Replace the model's built-in CE loss with the models-kernel helper and an
+Replace the model's built-in CE loss with the VeOmni model helper and an
 instance-local registry handle to get fused selection and correct SP loss reduction:
 
 ```python
 from functools import partial
 
 from veomni.ops import VeomniOp
-from veomni.models_kernel.loss_utils import ForCausalLMLoss
+from veomni.models.loss_utils import ForCausalLMLoss
 
 # In the model constructor:
 self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", implementation)
@@ -371,7 +371,7 @@ class YourModel(hf_your_model.YourModel):
 ### Three-Level Strategy
 
 ```
-Level 1 — Registry/model parity                → tests/models_kernel/
+Level 1 — Registry/model parity                → tests/models/
 Level 2 — Parallel alignment (multi-GPU)        → tests/e2e/test_e2e_parallel.py
 Level 3 — End-to-end training (real data/ckpt)  → tests/e2e/test_e2e_training.py
 ```
@@ -382,7 +382,7 @@ Pass Level 1 before running Level 2, and Level 2 before Level 3.
 
 #### Toy Config
 
-Add one canonical tiny-config factory to `tests/models_kernel/tiny_configs.py`
+Add one canonical tiny-config factory to `tests/models/tiny_configs.py`
 and reuse it from the registry and family tests. Keep dimensions small while
 retaining architecture-specific schedules and shape constraints:
 
@@ -396,7 +396,7 @@ retaining architecture-specific schedules and shape constraints:
 For omni-modal models, copy `preprocessor_config.json` from the real model as-is — feature extractor parameters (mel bins, sample rate, patch size) are not reducible.
 
 Reference: `tiny_qwen3_omni_moe_config` in
-`tests/models_kernel/tiny_configs.py`.
+`tests/models/tiny_configs.py`.
 
 #### Dummy Dataset
 
@@ -418,9 +418,9 @@ elif task_type == "your_model":
 #### Registry and Forward/Backward Tests
 
 Add the model type, supported architectures, aliases, and prerequisites to
-`tests/models_kernel/base/test_auto_registry.py`. Add eager parity and
+`tests/models/base/test_auto_registry.py`. Add eager parity and
 model-specific contracts to the corresponding family test under
-`tests/models_kernel/transformers/qwen/`:
+`tests/models/transformers/qwen/`:
 
 ```python
 _ModelCase(
@@ -433,7 +433,7 @@ _ModelCase(
 Run:
 ```bash
 source .venv/bin/activate
-pytest -s tests/models_kernel -k your_model_type
+pytest -s tests/models -k your_model_type
 ```
 
 ### Level 2 — Parallel Alignment Test
@@ -496,11 +496,11 @@ pytest -s tests/e2e/test_e2e_training.py -k your_model
 
 | What to add | Location | Required for |
 |---|---|---|
-| Canonical tiny-config factory | `tests/models_kernel/tiny_configs.py` | Level 1 |
+| Canonical tiny-config factory | `tests/models/tiny_configs.py` | Level 1 |
 | `DummyYourModelDataset` | `veomni/data/dummy_dataset.py` | Multimodal |
 | `build_dummy_dataset` entry | `veomni/data/dummy_dataset.py` | Multimodal |
-| Registry case | `tests/models_kernel/base/test_auto_registry.py` | Level 1 |
-| Family parity/contract tests | `tests/models_kernel/transformers/` | Level 1 |
+| Registry case | `tests/models/base/test_auto_registry.py` | Level 1 |
+| Family parity/contract tests | `tests/models/transformers/` | Level 1 |
 | `pytest.param` in `*_test_cases` | `tests/e2e/test_e2e_parallel.py` | Level 2 |
 | Dataset fixture | `tests/e2e/test_e2e_parallel.py` | Level 2 |
 | Test function | `tests/e2e/test_e2e_parallel.py` | Level 2 |

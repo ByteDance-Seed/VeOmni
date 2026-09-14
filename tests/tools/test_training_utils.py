@@ -12,8 +12,8 @@ from veomni.utils.device import MOE_TRITON_DEVICE_TYPES
 
 
 @pytest.mark.parametrize("previous_backend", [None, "veomni"])
-def test_build_hf_reference_model_uses_models_kernel_and_restores_backend(monkeypatch, previous_backend):
-    import veomni.models_kernel as models_kernel
+def test_build_hf_reference_model_uses_models_and_restores_backend(monkeypatch, previous_backend):
+    import veomni.models as models
 
     if previous_backend is None:
         monkeypatch.delenv("MODELING_BACKEND", raising=False)
@@ -28,7 +28,7 @@ def test_build_hf_reference_model_uses_models_kernel_and_restores_backend(monkey
         captured["kwargs"] = kwargs
         return expected
 
-    monkeypatch.setattr(models_kernel, "build_foundation_model", fake_build_foundation_model)
+    monkeypatch.setattr(models, "build_foundation_model", fake_build_foundation_model)
 
     actual = training_utils.build_hf_reference_model(
         "toy-config",
@@ -47,7 +47,7 @@ def test_build_hf_reference_model_uses_models_kernel_and_restores_backend(monkey
 
 
 def test_build_hf_reference_model_restores_backend_after_failure(monkeypatch):
-    import veomni.models_kernel as models_kernel
+    import veomni.models as models
 
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
 
@@ -55,7 +55,7 @@ def test_build_hf_reference_model_restores_backend_after_failure(monkeypatch):
         assert os.environ["MODELING_BACKEND"] == "hf"
         raise RuntimeError("build failed")
 
-    monkeypatch.setattr(models_kernel, "build_foundation_model", fail_build_foundation_model)
+    monkeypatch.setattr(models, "build_foundation_model", fail_build_foundation_model)
 
     with pytest.raises(RuntimeError, match="build failed"):
         training_utils.build_hf_reference_model(

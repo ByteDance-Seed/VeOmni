@@ -32,7 +32,7 @@ if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backen
 
 
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, get_parallel_state
-from veomni.models_kernel.transformers.wan.modeling_wan import SelfAttention, precompute_freqs_cis
+from veomni.models.transformers.wan.modeling_wan import SelfAttention, precompute_freqs_cis
 
 from .utils import SequenceParallelTest
 
@@ -105,7 +105,7 @@ class WanSelfAttentionUlyssesTest(SequenceParallelTest):
 
 
 def rope_apply_ref(x, freqs, head_dim):
-    from veomni.models_kernel.transformers.wan.modeling_wan import rope_apply
+    from veomni.models.transformers.wan.modeling_wan import rope_apply
 
     return rope_apply(x, freqs=freqs, cos=None, sin=None, head_dim=head_dim)
 

@@ -82,7 +82,7 @@ import yaml
 
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dummy_dataset
-from veomni.models_kernel.checkpoint import ModelCheckpointManager
+from veomni.models.checkpoint import ModelCheckpointManager
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback

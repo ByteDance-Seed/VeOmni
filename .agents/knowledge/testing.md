@@ -46,11 +46,11 @@ by a `pytest.param` table, so a new case is a few lines:
 
 | Change | Extend |
 |--------|--------|
-| New/changed model registration | `tests/models/test_model_registry.py`, `tests/models/test_models_patch.py` (`TEST_CASES`) |
-| Patched-vs-upstream numerics | `tests/models/test_models_logits_equal_v5.py` (`CASES` / `_LOADER_CASES`) |
-| Host-device sync regressions | `tests/models/test_model_forward_no_implicit_sync.py` |
-| VLM trainer / freeze-ViT | `tests/models/test_vlm_trainer.py` |
-| MoE checkpoint conversion | `tests/models/test_checkpoint_tensor_converter.py` |
+| New/changed model registration/build | `tests/models/base/test_auto_registry.py` (`_MODEL_CASES`) |
+| Patched-vs-upstream numerics | the matching family test under `tests/models/transformers/` or `tests/models/diffusers/` |
+| Host-device sync regressions | `tests/models/transformers/test_model_forward_no_implicit_sync.py` |
+| VLM trainer / freeze-ViT | `tests/trainer/test_vlm_trainer.py` |
+| MoE checkpoint conversion | `tests/models/base/test_checkpoint_tensor_converter.py` |
 | VLM / Omni dummy forward | `tests/distributed/test_dummy_forward.py` (`_vlm_cases` / `_omni_cases`) |
 | `torch.compile` support | `tests/distributed/test_torch_compile.py` |
 | Ulysses SP behaviour | `tests/parallel/ulysses/test_ulysses.py` and siblings |

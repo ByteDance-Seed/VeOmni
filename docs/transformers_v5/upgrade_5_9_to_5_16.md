@@ -47,12 +47,12 @@ Three signals together cover most of the risk:
    `indexer.scorer.weights_proj`), and `@auto_docstring` validates patched
    signatures and return-dataclass docstrings while the class body executes, so
    some breakage only appears at import.
-   `tests/models_kernel/transformers/test_generated_modeling_imports.py`
+   `tests/models/transformers/test_generated_modeling_imports.py`
    was added for this: the bitwise logits suite only builds the GPU families that
    have toy configs, so an NPU-only generated file can be broken with no test
    noticing — which is exactly what happened to `patched_modeling_qwen3_5_npu.py`.
 
-The `tests/models_kernel/` family parity tests are the gate that confirms a
+The `tests/models/` family parity tests are the gate that confirms a
 migration landed: they build canonical tiny configs (no checkpoints needed)
 and compare VeOmni's generated modeling against pristine HF behavior.
 
@@ -252,11 +252,11 @@ These results describe the original migration before the final patch bump.
 
 - `patchgen --check` — clean, no drift across all 29 configs.
 - The then-current bitwise logits suite — 34/34 pass (19/34 before the
-  migration); this coverage now lives in the `tests/models_kernel/` family tests.
-- `pytest tests/models_kernel/transformers/test_generated_modeling_imports.py`
+  migration); this coverage now lives in the `tests/models/` family tests.
+- `pytest tests/models/transformers/test_generated_modeling_imports.py`
   — 29 pass, 1 skipped
   (needs `torch_npu`).
-- `pytest tests/models_kernel/transformers/test_model_forward_no_implicit_sync.py`
+- `pytest tests/models/transformers/test_model_forward_no_implicit_sync.py`
   initially
   passed after dropping three allowlist entries. Those sites were hidden by
   the `AutoModel` constructor regression, rather than removed upstream.

@@ -1,37 +1,37 @@
 # Testing a New Model
 
-When adding a model under `veomni/models_kernel/transformers/<model>/`, keep
+When adding a model under `veomni/models/transformers/<model>/`, keep
 the model-specific coverage beside the maintained implementation. The old
 shared model-patch suite has been retired; new families should not add tests
 under a separate legacy model tree.
 
 ## 1. Registry and model parity
 
-Add one canonical tiny-config factory to `tests/models_kernel/tiny_configs.py`.
+Add one canonical tiny-config factory to `tests/models/tiny_configs.py`.
 Reuse that factory from both places below instead of copying the config:
 
-- `tests/models_kernel/base/test_auto_registry.py` lists the registered model
+- `tests/models/base/test_auto_registry.py` lists the registered model
   type, supported architectures, aliases, and build prerequisites.
-- The corresponding test under `tests/models_kernel/transformers/` covers the
+- The corresponding test under `tests/models/transformers/` covers the
   model's eager forward/backward parity and any family-specific behavior.
 
 For a Qwen family, place the test under
-`tests/models_kernel/transformers/qwen/`; otherwise use a family file or
-subdirectory under `tests/models_kernel/transformers/`.
+`tests/models/transformers/qwen/`; otherwise use a family file or
+subdirectory under `tests/models/transformers/`.
 
 Keep implementation assertions capability-based. A test may prove that eager
 and an optimized implementation can be selected, but it should not require a
 particular YAML file to choose one fixed implementation.
 
 If an on-disk HuggingFace checkpoint needs key or tensor-layout conversion,
-implement the converter in `veomni/models_kernel/` and cover it in
-`tests/models_kernel/base/test_checkpoint_tensor_converter.py`.
+implement the converter in `veomni/models/` and cover it in
+`tests/models/base/test_checkpoint_tensor_converter.py`.
 
 Run the focused model tests first:
 
 ```bash
-pytest tests/models_kernel/base/test_auto_registry.py -k <model>
-pytest tests/models_kernel/transformers -k <model>
+pytest tests/models/base/test_auto_registry.py -k <model>
+pytest tests/models/transformers -k <model>
 ```
 
 ## 2. Optimized operator coverage
@@ -74,8 +74,8 @@ pytest tests/distributed/test_dummy_forward.py -k <model>
 
 ## Checklist
 
-- [ ] One canonical tiny config added to `tests/models_kernel/tiny_configs.py`
-- [ ] Registry case added to `tests/models_kernel/base/test_auto_registry.py`
+- [ ] One canonical tiny config added to `tests/models/tiny_configs.py`
+- [ ] Registry case added to `tests/models/base/test_auto_registry.py`
 - [ ] Family test covers eager forward/backward parity and model-specific contracts
 - [ ] Optimized operators have focused coverage under `tests/ops/`
 - [ ] E2E SP/EP case added to `tests/e2e/test_e2e_parallel.py`

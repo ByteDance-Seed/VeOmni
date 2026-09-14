@@ -36,10 +36,10 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/utils/device.py",
     "veomni/utils/helper.py",
     "veomni/distributed/torch_parallelize.py",
-    "veomni/models_kernel/auto.py",
-    "veomni/models_kernel/loader.py",
-    "veomni/models_kernel/checkpoint/weights.py",
-    "veomni/models_kernel/transformers/flux/encode_flux.py",
+    "veomni/models/auto.py",
+    "veomni/models/loader.py",
+    "veomni/models/checkpoint/weights.py",
+    "veomni/models/transformers/flux/encode_flux.py",
     "veomni/arguments/arguments_types.py",
     # Declarative GPU platform detection; this is not kernel device management.
     "veomni/ops/platform/gpu.py",
@@ -56,7 +56,7 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # directly because the API is intrinsically CUDA-only and has no
     # ``veomni.utils.device`` equivalent; the test is gated on
     # ``IS_CUDA_AVAILABLE`` so it skips on non-CUDA hosts.
-    "tests/models_kernel/transformers/test_model_forward_no_implicit_sync.py",
+    "tests/models/transformers/test_model_forward_no_implicit_sync.py",
     # Vendored Ascend Triton kernels for Qwen3.5 gated delta-rule (FLA + Huawei
     # port) are kept byte-identical to upstream; the FLA-origin code references
     # ``.cuda`` in fallback/util paths. Excluded wholesale, matching the ruff

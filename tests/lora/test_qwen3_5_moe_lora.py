@@ -47,7 +47,7 @@ def _production_lora_config():
 
 def test_qwen3_5_moe_registers_semantic_expert_target_mapping_for_all_architectures():
     """Verify semantic expert targets resolve for every registered architecture."""
-    from veomni.models_kernel.transformers.qwen3_5_moe import (
+    from veomni.models.transformers.qwen3_5_moe import (
         register_qwen3_5_moe_modeling,
         register_qwen3_5_moe_text_modeling,
     )

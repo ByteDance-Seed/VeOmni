@@ -2,7 +2,7 @@
 
 `veomni.ops` owns VeOmni's tensor-level operation registry and concrete kernel
 implementations. Model-specific input normalization, Hugging Face-compatible
-signatures, and loss policy belong in `veomni.models_kernel`.
+signatures, and loss policy belong in `veomni.models`.
 
 Importing `veomni.ops` registers every built-in op family and applies
 the process-wide attention integration from `install.py`.
@@ -151,7 +151,7 @@ Models construct a local handle once and call it directly:
 
 ```python
 from veomni.ops import VeomniOp
-from veomni.models_kernel.utils.op_utils import resolve_op_impl
+from veomni.models.utils.op_utils import resolve_op_impl
 
 
 self.veomni_rms_norm = VeomniOp(
@@ -164,7 +164,7 @@ hidden_states = self.veomni_rms_norm(hidden_states, self.weight, eps=self.varian
 ```
 
 `VeomniOp` resolves its row at construction, is interned by the public
-triple, and always calls the row's wrapper. `models_kernel.build_foundation_model`
+triple, and always calls the row's wrapper. `models.build_foundation_model`
 installs the `OpsImplementationConfig` object in `ops/config.py` before
 constructing the model.
 
@@ -173,9 +173,9 @@ it is not a collection of model-specific adapters. Transformations that vary
 by consumer stay with that consumer. For example:
 
 - causal shifting and sequence-parallel loss reduction live in
-  `models_kernel/loss_utils/cross_entropy_loss.py`;
+  `models/loss_utils/cross_entropy_loss.py`;
 - concatenating per-layer router logits and applying attention masks live in
-  `models_kernel/loss_utils/load_balancing_loss.py`;
+  `models/loss_utils/load_balancing_loss.py`;
 - generated model patches construct the appropriate variant and translate
   model-owned parameters into its tensor contract.
 
@@ -201,10 +201,10 @@ selected through `VeomniOp`.
 
 - Registry and generated-autograd contract: `tests/ops/base/test_op_entry.py`
 - Per-family math and hardware behavior: `tests/ops/<family>/`
-- Model-facing integration and helpers: `tests/models_kernel/`
+- Model-facing integration and helpers: `tests/models/`
 - User-facing selection and lifecycle: `docs/design/kernel_selection.md`
 
 When adding a row, test its numerical contract, registration, hardware
 requirement, and optional-package requirements. When adding model-specific
-argument policy, test it in `tests/models_kernel` rather than duplicating it in
+argument policy, test it in `tests/models` rather than duplicating it in
 the raw-kernel suite.

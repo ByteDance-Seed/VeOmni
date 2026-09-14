@@ -6,7 +6,7 @@ description: "Author or refresh a VeOmni model's patchgen-generated modeling und
 # VeOmni Patchgen Modeling Protocol
 
 Purpose: add or refresh a model's patchgen-generated modeling under
-`veomni/models_kernel/transformers/<model>/generated/`. VeOmni pins
+`veomni/models/transformers/<model>/generated/`. VeOmni pins
 `transformers==5.16.1` and ships patchgen-generated modeling for every
 supported transformers-family model. The non-transformers architectures
 (`flux`, `movqgan`, `wan`) have no `generated/` directory and are out of scope.
@@ -170,12 +170,12 @@ Drop phases that don't apply (e.g. Phase 3 for non-MoE models).
 
 **Operations:**
 
-1. Locate `veomni/models_kernel/transformers/<M>/`. If the directory does not exist yet
+1. Locate `veomni/models/transformers/<M>/`. If the directory does not exist yet
    you are being called as the modeling step of `/veomni-new-model`: create it,
    and read that skill's Phase 1 first so the category (text / VLM / Omni,
    dense / MoE, GPU-only or GPU+NPU) is already decided when you get here.
 2. If a patchgen-generated file already exists under
-   `veomni/models_kernel/transformers/<M>/generated/` you are **refreshing** an
+   `veomni/models/transformers/<M>/generated/` you are **refreshing** an
    existing config (e.g. picking up upstream changes, adding NPU sibling,
    fixing a bug). Otherwise you are writing the first config for this model.
    Either way, the rest of this protocol applies identically.
@@ -201,7 +201,7 @@ Drop phases that don't apply (e.g. Phase 3 for non-MoE models).
    diverge between sibling models — see
    `docs/transformers_v5/transformers_v5_moe_weight_loading.md`.
 6. Note related configs/loaders to preserve: `MODELING_REGISTRY`,
-   `MODEL_CONFIG_REGISTRY` in `veomni/models_kernel/loader.py`; any auto-config
+   `MODEL_CONFIG_REGISTRY` in `veomni/models/loader.py`; any auto-config
    registrations.
 7. Look for a **sibling model** you can borrow patches from: e.g. qwen3_5_moe
    reuses GatedDeltaNet/ViT patches from `qwen3_5` via direct import +
@@ -222,7 +222,7 @@ model directory to mirror, and the backend/category decision pinned down.
 
 ## Phase 2: Draft `<M>_gpu_patch_gen_config.py`
 
-Create `veomni/models_kernel/transformers/<M>/<M>_gpu_patch_gen_config.py` at the model root.
+Create `veomni/models/transformers/<M>/<M>_gpu_patch_gen_config.py` at the model root.
 
 **Skeleton (mirror `qwen3_gpu_patch_gen_config.py`):**
 
@@ -255,7 +255,7 @@ config = PatchConfig(
 **Cross-config reuse pattern** (qwen3_5_moe reusing qwen3_5):
 
 ```python
-from veomni.models_kernel.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
+from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_forward_patched,
     qwen3_5_vision_model_forward,
     # ...
@@ -351,12 +351,12 @@ Guidelines:
 
 ```bash
 patchgen \
-    veomni.models_kernel.transformers.<m>.<m>_gpu_patch_gen_config \
-    -o veomni/models_kernel/transformers/<m>/generated --diff
+    veomni.models.transformers.<m>.<m>_gpu_patch_gen_config \
+    -o veomni/models/transformers/<m>/generated --diff
 ```
 
 **Validation**: file is syntactically valid (import it: `python -c "import
-veomni.models_kernel.transformers.<m>.<m>_gpu_patch_gen_config"`) and every behaviour
+veomni.models.transformers.<m>.<m>_gpu_patch_gen_config"`) and every behaviour
 identified in Phase 1 has a corresponding decorator here.
 
 ---
@@ -448,8 +448,8 @@ def register_<m>_modeling(architecture: str):
    sibling behind. Target a single module only when you want a fast loop:
    ```bash
    patchgen \
-       veomni.models_kernel.transformers.<m>.<m>_gpu_patch_gen_config \
-       -o veomni/models_kernel/transformers/<m>/generated --diff -v
+       veomni.models.transformers.<m>.<m>_gpu_patch_gen_config \
+       -o veomni/models/transformers/<m>/generated --diff -v
    ```
 2. Inspect `generated/patched_modeling_<m>_gpu.py`:
    - Header lists every patch you defined under "Patches applied".
@@ -490,23 +490,22 @@ Follow `docs/transformers_v5/testing_new_model.md`. Every file below is already
 enumerated in a CI workflow — the unit-test ones, or `gpu_e2e_test.yml` /
 `npu_e2e_test.yml` for the e2e tables — so appending a case needs no workflow
 change. That is exactly why this phase extends tables instead of adding files.
-`tests/models/test_model_registry.py` and
-`tests/models/test_models_logits_equal_v5.py` are part of the minimum too:
-the first proves the registry returns the generated class, the second that it
-is numerically equal to upstream.
+`tests/models/base/test_auto_registry.py` and the matching family test under
+`tests/models/transformers/` or `tests/models/diffusers/` are part of the
+minimum too: the first proves the registry constructs the registered class; the
+second owns model-specific eager forward/backward parity and integration gates.
 If you think you need a new test file, read `.agents/knowledge/testing.md` first.
 Minimum coverage:
 
 1. **Toy config**: create `tests/toy_config/<m>_toy/config.json` (few layers,
    small hidden/intermediate, tiny vocab). Add a `README.md` next to it noting
    source config + changes.
-2. **`tests/models/test_models_patch.py`**: append an entry to the test cases
-   list with `id="<m>"` and `is_moe=<bool>`. If the model lacks certain
-   attention/MoE backends, add a `case_id == "<m>"` filter block in
-   `test_models_patch_fwd_bwd`.
+2. **Registry/build coverage**: append one `_ModelCase` to
+   `tests/models/base/test_auto_registry.py`, using the canonical tiny-config
+   factory from `tests/models/tiny_configs.py`.
 3. **`tests/e2e/test_e2e_parallel.py`**: append a `pytest.param(...)`. Use
    `max_sp_size=1` if SP not yet supported, else `None`.
-4. **VLM only** — `tests/models/test_vlm_trainer.py`: add to the freeze-ViT
+4. **VLM only** — `tests/trainer/test_vlm_trainer.py`: add to the freeze-ViT
    VLM cases list.
 5. **VLM / Omni only** — `tests/distributed/test_dummy_forward.py`: add a
    `pytest.param(...)` in `_vlm_cases` (or `_omni_cases`). Required because
@@ -518,7 +517,7 @@ Minimum coverage:
    covers single-GPU vs FSDP2 `grad_norm` for *text* models only. If the model
    is text-only, append to the text test cases list. VLM/Omni models are out
    of scope for this suite (no VLM scaffolding exists).
-7. **MoE with a converter** — `tests/models_kernel/base/test_checkpoint_tensor_converter.py`: add a
+7. **MoE with a converter** — `tests/models/base/test_checkpoint_tensor_converter.py`: add a
    test group mirroring the existing `qwen3_moe` / `qwen3_vl_moe` blocks.
    Minimum coverage:
    - `can_handle` — matches the expected key regex, rejects non-expert keys.
@@ -552,16 +551,15 @@ source .venv/bin/activate
 Run:
 
 ```bash
-pytest tests/models/test_model_registry.py -v
-pytest tests/models/test_models_logits_equal_v5.py -k <m> -v
-pytest tests/models/test_models_patch.py -k <m> -v
+pytest tests/models/base/test_auto_registry.py -k <m> -v
+pytest tests/models/<family-test>.py -k <m> -v
 pytest tests/e2e/test_e2e_parallel.py::<test_fn> -k <model_name> -v   # see note below; needs multi-GPU worker
 # MoE with a converter:
-pytest tests/models_kernel/base/test_checkpoint_tensor_converter.py -v
+pytest tests/models/base/test_checkpoint_tensor_converter.py -v
 # VLM / Omni (requires multiple GPUs):
 pytest tests/distributed/test_dummy_forward.py -k <m> -v
 # VLM only:
-pytest tests/models/test_vlm_trainer.py -k <m> -v
+pytest tests/trainer/test_vlm_trainer.py -k <m> -v
 ```
 
 Run every applicable minimum-coverage suite from Phase 6 on a worker with the
@@ -573,9 +571,9 @@ getting this wrong silently produces `0 selected / N deselected`:**
 
 | Suite | id source | keyword to pass to `-k` |
 |---|---|---|
-| `test_models_patch.py` | explicit `pytest.param(..., id="<m>")` | model id as registered (e.g. `qwen2_5_vl`, `qwen3_5_moe`) |
+| `test_auto_registry.py` | `model_type` from `_MODEL_CASES` | model id as registered (e.g. `qwen2_5_vl`, `qwen3_5_moe`) |
+| family model test | file-local parametrization/cases | matching model keyword from `--collect-only` |
 | `test_vlm_trainer.py` | explicit `id="<m>"` | same as above |
-| `test_models_logits_equal_v5.py` | `case_id` from `CASES` / `_LOADER_CASES` | matching model keyword from `--collect-only` |
 | `test_dummy_forward.py` | explicit ids in `_vlm_cases` / `_omni_cases` | model id as registered |
 | `test_e2e_parallel.py` | **first positional arg (`model_name`)**, *no explicit id* | the HF-style short name (e.g. `qwen25vl`, `qwen2vl`, `qwen3vl`, `qwen3vlmoe`) — **no underscores for VL series** |
 
@@ -741,13 +739,13 @@ category too, since most of the expensive, silent failures live there.
 ## Scope Guard
 
 This skill owns everything that produces `generated/patched_modeling_<m>_*.py`
-for a model under `veomni/models_kernel/transformers/` — for a brand-new model
+for a model under `veomni/models/transformers/` — for a brand-new model
 directory as much as for an existing one. For:
 
 - The rest of onboarding a new model — deciding the model category, the
   training config, trainer and data-pipeline integration, docs: use
   `/veomni-new-model`, which hands the modeling step back here.
-- A diffusion or other non-transformers architecture (`veomni/models_kernel/diffusers/`,
+- A diffusion or other non-transformers architecture (`veomni/models/diffusers/`,
   or `flux` / `movqgan` / `wan`): patchgen does not apply — use
   `/veomni-new-model`.
 - New op / kernel: use `/veomni-new-op`.

@@ -6,7 +6,7 @@
 
 > **Scope note:** VeOmni now pins `transformers==5.16.1` and ships
 > patchgen-generated modeling files under
-> `veomni/models_kernel/transformers/<model>/generated/`. The runtime monkey-patch
+> `veomni/models/transformers/<model>/generated/`. The runtime monkey-patch
 > flow this document was originally written for has been retired. The high-level
 > checklists (registration, parallel plan, multimodal data transform, trainer
 > wiring, tests) still apply, but the modeling-patch steps below should be
@@ -44,21 +44,21 @@ Before writing any VeOmni code, answer:
 ### Step 1: Create the Model Directory
 
 ```bash
-mkdir veomni/models_kernel/transformers/your_model_name/
-touch veomni/models_kernel/transformers/your_model_name/__init__.py
+mkdir veomni/models/transformers/your_model_name/
+touch veomni/models/transformers/your_model_name/__init__.py
 # For complex models, also add:
-touch veomni/models_kernel/transformers/your_model_name/your_model_name_gpu_patch_gen_config.py
-touch veomni/models_kernel/transformers/your_model_name/your_model_name_npu_patch_gen_config.py  # if NPU supported
-touch veomni/models_kernel/transformers/your_model_name/configuration_your_model_name.py  # if config fix needed
-touch veomni/models_kernel/transformers/your_model_name/processing_your_model_name.py    # if multimodal
-touch veomni/models_kernel/transformers/your_model_name/parallel_plan.py                 # if MoE
+touch veomni/models/transformers/your_model_name/your_model_name_gpu_patch_gen_config.py
+touch veomni/models/transformers/your_model_name/your_model_name_npu_patch_gen_config.py  # if NPU supported
+touch veomni/models/transformers/your_model_name/configuration_your_model_name.py  # if config fix needed
+touch veomni/models/transformers/your_model_name/processing_your_model_name.py    # if multimodal
+touch veomni/models/transformers/your_model_name/parallel_plan.py                 # if MoE
 ```
 
 ### Step 2: Register Your Model (`__init__.py`)
 
 **Minimal (text-only):**
 ```python
-from veomni.models_kernel.registry import MODELING_REGISTRY
+from veomni.models.registry import MODELING_REGISTRY
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 @MODELING_REGISTRY.register("your_model_type")
@@ -72,7 +72,7 @@ def register_modeling(architecture: str):
 
 **Full (multimodal MoE):**
 ```python
-from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 @MODEL_CONFIG_REGISTRY.register("your_model_type")
@@ -100,7 +100,7 @@ def register_processor():
 
 ### Step 3: Add to Package `__init__.py`
 
-Add your module to [veomni/models_kernel/transformers/__init__.py](../../../veomni/models_kernel/transformers/__init__.py):
+Add your module to [veomni/models/transformers/__init__.py](../../../veomni/models/transformers/__init__.py):
 
 ```python
 from . import (
@@ -186,8 +186,8 @@ For implementation details of each patch, refer to the example docs.
 
 ### Any New Model
 
-- [ ] `veomni/models_kernel/transformers/your_model/__init__.py` with `@MODELING_REGISTRY.register`
-- [ ] `veomni/models_kernel/transformers/__init__.py` updated
+- [ ] `veomni/models/transformers/your_model/__init__.py` with `@MODELING_REGISTRY.register`
+- [ ] `veomni/models/transformers/__init__.py` updated
 
 ### VLMs (image/video)
 
@@ -215,10 +215,10 @@ For implementation details of each patch, refer to the example docs.
 
 ### Testing (all models)
 
-- [ ] Canonical tiny-config factory in `tests/models_kernel/tiny_configs.py`
+- [ ] Canonical tiny-config factory in `tests/models/tiny_configs.py`
 - [ ] `DummyYourModelDataset` in `veomni/data/dummy_dataset.py` (multimodal)
-- [ ] Registry case in `tests/models_kernel/base/test_auto_registry.py`
-- [ ] Family parity and contract tests under `tests/models_kernel/transformers/`
+- [ ] Registry case in `tests/models/base/test_auto_registry.py`
+- [ ] Family parity and contract tests under `tests/models/transformers/`
 - [ ] Test case + fixture + test function in `tests/e2e/test_e2e_parallel.py` (Level 2)
 - [ ] For VLM models, add the toy config to the `freeze_vit` smoke test list in `tests/trainer/test_vlm_trainer.py`
 
@@ -255,7 +255,7 @@ from veomni.distributed.sequence_parallel import (
 from veomni.distributed.sequence_parallel.ulysses import _Gather  # all-gather with autograd
 
 from veomni.ops import VeomniOp
-from veomni.models_kernel.loss_utils import ForCausalLMLoss
+from veomni.models.loss_utils import ForCausalLMLoss
 
 from veomni.utils.constants import (
     AUDIO_INPUT_INDEX,   # placeholder token ID for audio in input_ids

@@ -1,6 +1,6 @@
 ---
 name: veomni-new-op
-description: "Add or optimize a tensor-level kernel in veomni/ops, register its variants, integrate it with models_kernel, and add numerical and registry tests. Trigger: 'add op', 'new kernel', 'add attention variant', 'new fused op', 'add triton kernel', 'optimize operator'."
+description: "Add or optimize a tensor-level kernel in veomni/ops, register its variants, integrate it with models, and add numerical and registry tests. Trigger: 'add op', 'new kernel', 'add attention variant', 'new fused op', 'add triton kernel', 'optimize operator'."
 ---
 
 ## Before You Start
@@ -30,7 +30,7 @@ non-tensor attributes by keyword.
 
 Model classes construct an instance-local `VeomniOp` handle and call it
 directly. Input normalization, HuggingFace-compatible signatures, and loss
-policy belong in `veomni/models_kernel/`; do not add consumer-specific adapters
+policy belong in `veomni/models/`; do not add consumer-specific adapters
 to the registry. The public CLI/YAML field remains
 `model.ops_implementation`, while model builders receive it through the
 `ops_implementation` keyword.
@@ -47,7 +47,7 @@ Use these separate mechanisms only when their semantics require them:
 ## Phase 1: Design
 
 1. Define the stable tensor contract and decide whether consumer-specific
-   preprocessing belongs in `models_kernel`.
+   preprocessing belongs in `models`.
 2. Choose the op name, semantic variant, implementation name, and device
    requirement. A variant changes the tensor contract; an implementation keeps
    that contract and changes how it is computed.
@@ -101,7 +101,7 @@ Use these separate mechanisms only when their semantics require them:
    - registration and device requirements;
    - explicit failure for unknown or unavailable implementations.
 2. Put consumer-specific normalization and model wiring tests under
-   `tests/models_kernel/` instead of duplicating them in the raw-kernel suite.
+   `tests/models/` instead of duplicating them in the raw-kernel suite.
 3. Run the family tests plus the registry and documentation guards:
 
    The GPU job runs `tests/ops/` wholesale. The NPU job enumerates ops files,

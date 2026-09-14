@@ -157,7 +157,7 @@ jobs:
           uv run --frozen pytest -v -s -x tests/parallel/test_parallel_state_registry.py
       - name: Run models tests
         run: |
-          uv run --frozen pytest -v -s -x tests/models_kernel
+          uv run --frozen pytest -v -s -x tests/models
           uv run --frozen pytest -v -s -x tests/trainer/test_vlm_trainer.py
           uv run --frozen pytest -v -s -x tests/trainer/test_aux_metrics.py
           uv run --frozen pytest -v -s -x tests/lora/test_vlm_lora.py

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.tools.training_utils import make_eager_ops_config
-from veomni.models_kernel import build_foundation_model
+from veomni.models import build_foundation_model
 from veomni.trainer.vlm_trainer import (
     VeOmniVLMArguments,
     VLMMDataArguments,

@@ -20,7 +20,7 @@ veomni/
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
 │   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
-├── models_kernel/      Model loading, patchgen configs, and kernel-aware modeling
+├── models/      Model loading, patchgen configs, and kernel-aware modeling
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
 │   ├── registry.py     Import-time model/config/processor registries
 │   ├── checkpoint/     Weight I/O, tensor conversion, and ModelCheckpointManager
@@ -91,7 +91,7 @@ BaseTrainer (ABC)
 - `train_step()` -> single training step (forward + backward + update)
 - `training_loop()` -> main loop with callbacks
 
-**Checkpointing**: `CheckpointCallback` owns cadence for DCP, HF/LoRA, and the one-shot tokenizer/config sidecars; `GlobalStateCallback` owns the job cursor; `BaseTrainer.load` / `save_dcp` / `save_hf_or_lora` / `save_model_assets` fan out; `ModelCheckpointManager` (`veomni/models_kernel/checkpoint/manager.py`) owns DCP / HF / LoRA I/O, drain-async, `empty_cache`, barrier, and directory layout. Job cursor (dataloader, rng, meters) is not in DCP extra_state.
+**Checkpointing**: `CheckpointCallback` owns cadence for DCP, HF/LoRA, and the one-shot tokenizer/config sidecars; `GlobalStateCallback` owns the job cursor; `BaseTrainer.load` / `save_dcp` / `save_hf_or_lora` / `save_model_assets` fan out; `ModelCheckpointManager` (`veomni/models/checkpoint/manager.py`) owns DCP / HF / LoRA I/O, drain-async, `empty_cache`, barrier, and directory layout. Job cursor (dataloader, rng, meters) is not in DCP extra_state.
 
 Subclasses override specific methods (e.g., `compute_loss()`, custom data transforms) rather than the entire training loop.
 
@@ -122,7 +122,7 @@ YAML Config -> VeOmniArguments -> Trainer
 
 ## Model Loading Flow
 
-1. `models_kernel.build_foundation_model()` installs the supplied ops selection.
+1. `models.build_foundation_model()` installs the supplied ops selection.
 2. Read `config.json` -> `AutoConfig.from_pretrained()` -> check `MODEL_CONFIG_REGISTRY`.
 3. Determine the model class via `MODELING_REGISTRY` (keyed by `model_type`); an unregistered model fails explicitly unless `MODELING_BACKEND=hf` selects the upstream class.
 4. Instantiate model on meta device (`init_empty_weights()`)
@@ -169,7 +169,7 @@ configs/
 
 ```
 tests/
-├── models_kernel/  Kernel-aware model loading, integration, and helper tests
+├── models/  Kernel-aware model loading, integration, and helper tests
 ├── kernels/        Registry contracts and per-family kernel tests
 ├── data/           Data pipeline, collator, transform tests
 ├── parallel/       Distributed parallelism tests (ulysses, data balance)
@@ -191,7 +191,7 @@ tests/
 
 | Change in | Test command |
 |-----------|-------------|
-| `veomni/models_kernel/` | `pytest tests/models_kernel/` |
+| `veomni/models/` | `pytest tests/models/` |
 | `veomni/ops/` | `pytest tests/ops/` |
 | `veomni/data/` | `pytest tests/data/` |
 | `veomni/distributed/` | `pytest tests/parallel/ tests/distributed/` |

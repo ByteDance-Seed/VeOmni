@@ -360,7 +360,7 @@ def _eager_ops_config():
 
 def _build_qwen3_moe(device: torch.device) -> nn.Module:
     """Build the real Qwen3-MoE toy via ``build_foundation_model``."""
-    from veomni.models_kernel import build_foundation_model
+    from veomni.models import build_foundation_model
 
     return build_foundation_model(
         config_path=QWEN3_MOE_TOY_CFG,

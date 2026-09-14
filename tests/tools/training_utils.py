@@ -274,14 +274,14 @@ def build_torchrun_cmd(
 
 
 def build_hf_reference_model(config_path: str, *, torch_dtype: str, init_device: str):
-    """Build an upstream HF model through the models_kernel entry point.
+    """Build an upstream HF model through the models entry point.
 
     Reference-weight materialization must work before a model family is added to
     ``MODELING_REGISTRY``. Select the explicit HF backend for only this build and
     restore the caller's environment afterwards; the VeOmni runtime keeps its
     strict no-fallback registry behavior.
     """
-    from veomni.models_kernel import build_foundation_model
+    from veomni.models import build_foundation_model
 
     previous_backend = os.environ.get("MODELING_BACKEND")
     os.environ["MODELING_BACKEND"] = "hf"
