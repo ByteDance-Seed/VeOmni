@@ -216,16 +216,13 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None]:
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     gate_logits, attention_mask, expert_count, total_weight = saved.tensors
-    if total_weight == 0:
-        return torch.zeros_like(gate_logits), None
-
     if gate_logits.ndim != 2:
         raise ValueError(f"gate_logits must be [N, E], got {tuple(gate_logits.shape)}")
     concatenated = gate_logits.contiguous()
     token_count, num_experts = concatenated.shape
     grad_logits = torch.empty_like(concatenated, dtype=torch.float32)
     block_e = triton.next_power_of_2(num_experts)
-    grad_scale = grad_output * num_experts / (total_weight * total_weight)
+    grad_scale = _eager._safe_grad_scale(grad_output, num_experts, total_weight)
     mask_weights = _eager.token_mask(concatenated, attention_mask) if meta.has_mask else None
     mask_ptr = mask_weights.contiguous() if mask_weights is not None else concatenated
 

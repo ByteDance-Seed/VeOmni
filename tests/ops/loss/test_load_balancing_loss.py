@@ -180,6 +180,34 @@ def test_triton_all_masked_returns_zero_with_zero_grad():
     assert torch.count_nonzero(gate_logits.grad) == 0
 
 
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="load-balancing backward sync check needs CUDA")
+@pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype feature")
+@pytest.mark.parametrize("impl", ("eager", "triton"))
+def test_load_balancing_backward_cuda_does_not_synchronize(impl: str):
+    if impl == "triton":
+        pytest.importorskip("triton")
+    op = resolve_op("load_balancing_loss", "standard", impl).wrapper
+    attention_mask = _empty_mask("cuda")
+
+    warm_logits = torch.randn(8, 4, device="cuda", requires_grad=True)
+    op(warm_logits, attention_mask, top_k=2).backward()
+    torch.cuda.synchronize()
+
+    gate_logits = torch.randn(8, 4, device="cuda", requires_grad=True)
+    output = op(gate_logits, attention_mask, top_k=2)
+    grad_output = torch.ones_like(output)
+    torch.cuda.synchronize()
+
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        output.backward(grad_output)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+
+    assert gate_logits.grad is not None
+
+
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs a GPU")
 @pytest.mark.parametrize(
     "num_experts,top_k,num_layers,batch_size,seq_len",

@@ -56,6 +56,13 @@ def token_mask(gate_logits: Tensor, attention_mask: Tensor) -> Tensor | None:
     return attention_mask.reshape(-1).to(device=gate_logits.device, dtype=torch.float32).repeat(num_layers)
 
 
+def _safe_grad_scale(grad_output: Tensor, num_experts: int, total_weight: Tensor) -> Tensor:
+    """Scale the backward on-device while mapping zero total weight to zero."""
+    has_weight = total_weight != 0
+    safe_total_weight = torch.where(has_weight, total_weight, torch.ones_like(total_weight))
+    return grad_output * num_experts / safe_total_weight.square() * has_weight
+
+
 def forward(gate_logits: Tensor, attention_mask: Tensor, *, top_k: int) -> tuple[Tensor, SavedState]:
     """Switch Transformer load-balancing loss on concatenated layer logits.
 
@@ -95,11 +102,8 @@ def forward(gate_logits: Tensor, attention_mask: Tensor, *, top_k: int) -> tuple
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None]:
     """Return ``(grad_gate_logits, None)``. Mask is not differentiated."""
     gate_logits, attention_mask, expert_count, total_weight = saved.tensors
-    if total_weight == 0:
-        return torch.zeros_like(gate_logits), None
-
     num_experts = gate_logits.shape[-1]
-    scale = grad_output * num_experts / (total_weight * total_weight)
+    scale = _safe_grad_scale(grad_output, num_experts, total_weight)
     probs = torch.softmax(gate_logits.float(), dim=-1)
     dot_cs = (probs * expert_count).sum(dim=-1, keepdim=True)
     mask = token_mask(gate_logits, attention_mask)
