@@ -133,12 +133,6 @@ checkpoint from an older layout has no manifest to find; discovery falls back to
 a `.metadata` at the step root for those, which is the marker they were
 published by. See [Legacy resume](#legacy-resume).
 
-`train.checkpoint.output_dir` must be a POSIX path. An HDFS FUSE mount
-(`/mnt/hdfs/...`) qualifies, and is the usual way to checkpoint to remote
-storage; an `hdfs://` URL does not, and unlike a model path it is not copied to
-local scratch first. Every writer in the step directory — DCP, `torch.save`,
-staged promotion, the manifest — goes through ordinary filesystem calls.
-
 ### Staged and asynchronous saves
 
 `train.checkpoint.stage_dir` and `train.checkpoint.save_async` are two answers to
