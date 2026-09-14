@@ -42,6 +42,7 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
     train_cfg = SimpleNamespace(
         checkpoint=checkpoint_cfg,
         global_rank=0,
+        world_size=1,
     )
     model_cfg = SimpleNamespace(fqn_to_index_mapping={}, accelerator=accelerator, lora_config=None)
     args = SimpleNamespace(train=train_cfg, model=model_cfg, train_steps=100)
@@ -61,6 +62,9 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
     trainer.start_epoch = 0
     trainer.start_step = 0
     trainer.checkpoint = MagicMock()
+    # Single-model job: the real manager's class default, which keeps the
+    # manifest's module list empty.
+    trainer.checkpoint.module_name = ""
 
     return trainer
 
@@ -290,18 +294,21 @@ class TestModelCheckpointManagerSaveContract:
         assert staged[0] == staged[1], "each step staged somewhere different"
 
     def test_the_logged_destination_is_the_one_save_writes(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
-        """The manager names the step directory for its log and its HF export, while
-        ``save`` builds the same directory from ``path`` and ``global_steps``."""
-        from veomni.checkpoint.dcp_checkpointer import _GLOBAL_STEP_PREFIX
+        """The manager names the model directory for its log, and ``save`` rebuilds
+        the same one from ``path``, ``global_steps`` and ``module``."""
+        from veomni.checkpoint.layout import model_dir, step_dir
 
         trainer = _make_mock_trainer(save_path="/remote/run")
         mock_build_ckpt.return_value = MagicMock()
         manager = ModelCheckpointManager(trainer)
+        state = TrainerState(global_step=10)
 
-        manager.save_dcp(TrainerState(global_step=10))
+        manager.save_dcp(state)
 
         call = manager.checkpointer.save.call_args
-        assert f"{call.args[0]}/{_GLOBAL_STEP_PREFIX}{call.kwargs['global_steps']}" == "/remote/run/global_step_10"
+        rebuilt = model_dir(step_dir(call.args[0], call.kwargs["global_steps"]), call.kwargs["module"])
+        assert rebuilt == "/remote/run/global_step_10/model"
+        assert rebuilt == manager.save_dir(state)
 
     def test_save_forwards_lr_scheduler_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
         trainer = _make_mock_trainer()
@@ -330,21 +337,28 @@ class TestModelCheckpointManagerSaveContract:
         assert trainer.state.global_step == 0
         assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is mock_get_ps.return_value
 
-    def test_save_lora_writes_the_adapter_beside_the_dcp_shards(
+    def test_save_lora_writes_the_adapter_to_its_own_export_dir(
         self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps, tmp_path
     ):
-        """LoRA export lives under checkpoints/global_step_N, same parent as DCP and hf_ckpt."""
+        """The adapter is an export: it goes to lora_ckpt/, not in with the shards.
+
+        Separate from hf_ckpt/ as well, so a future LoRA merge can write both for
+        one step without either landing on the other.
+        """
         trainer = _make_mock_trainer(save_path=str(tmp_path / "checkpoints"))
         mock_build_ckpt.return_value = MagicMock()
         manager = ModelCheckpointManager(trainer)
         state = TrainerState(global_step=10)
-        (tmp_path / "checkpoints" / "global_step_10").mkdir(parents=True)
+        (tmp_path / "checkpoints" / "global_step_10" / "model").mkdir(parents=True)
 
         with patch("veomni.utils.save_safetensor_utils.save_lora_adapter_with_dcp") as save_adapter:
             manager.save_lora(state)
 
-        assert save_adapter.call_args.kwargs["save_path"] == str(tmp_path / "checkpoints" / "global_step_10")
-        assert save_adapter.call_args.kwargs["save_path"] == manager.save_dir(state)
+        save_path = save_adapter.call_args.kwargs["save_path"]
+        assert save_path == str(tmp_path / "checkpoints" / "global_step_10" / "lora_ckpt")
+        assert save_path == manager.lora_export_dir(state)
+        assert save_path != manager.hf_export_dir(state)
+        assert save_path != manager.save_dir(state)
 
 
 @patch("veomni.trainer.callbacks.global_state_callback.dist")
@@ -377,7 +391,12 @@ class TestGlobalStateCallbackJobState:
         cb.save_global_state(TrainerState(global_step=10))
 
         trainer.checkpoint.wait_for_pending_save.assert_called_once_with()
-        assert (tmp_path / "global_step_10" / "trainer_state_rank_0.pt").is_file()
+        step = tmp_path / "global_step_10"
+        assert (step / "extra_state" / "rank_0.pt").is_file()
+        assert (step / "loader" / "rank_0.pt").is_file()
+        # The manifest is the step's completion marker and must come last, after
+        # the DCP drain above and both per-rank files.
+        assert (step / "checkpoint_manifest.json").is_file()
 
     def test_load_restores_channel_loss_callback_state(self, mock_dist, tmp_path):
         mock_dist.is_initialized.return_value = False

@@ -12,6 +12,7 @@ from transformers import AutoConfig, AutoProcessor
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 
 from veomni.checkpoint.dcp_checkpointer import _get_sharding_plan, _process_shard
+from veomni.checkpoint.layout import weights_dir
 from veomni.utils import helper
 
 
@@ -204,7 +205,16 @@ def main():
         description="Merge DCP checkpoint to HuggingFace format (streaming optimized)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--load-dir", type=str, required=True, help="Directory containing DCP checkpoint")
+    parser.add_argument(
+        "--load-dir",
+        type=str,
+        required=True,
+        help=(
+            "A checkpoint step directory (checkpoints/global_step_N) or a DCP directory. "
+            "Given a step directory, the weights are read from its model/ckpt subdirectory; "
+            "the optimizer state sitting beside them is never read."
+        ),
+    )
     parser.add_argument(
         "--save-dir",
         type=str,
@@ -245,8 +255,14 @@ def main():
     )
     args = parser.parse_args()
 
-    load_dir = args.load_dir
-    save_dir = os.path.join(load_dir, "hf_ckpt") if args.save_dir is None else args.save_dir
+    # A step directory is not itself a DCP directory: it holds model/ckpt and
+    # model/optimizer. Resolve to the weights, but keep the export next to the
+    # rest of the step rather than burying it under model/.
+    save_root = args.load_dir
+    load_dir = weights_dir(args.load_dir)
+    if not os.path.exists(os.path.join(load_dir, ".metadata")):
+        load_dir = args.load_dir
+    save_dir = os.path.join(save_root, "hf_ckpt") if args.save_dir is None else args.save_dir
     model_assets_dir = args.model_assets_dir
     shard_size = args.shard_size
 

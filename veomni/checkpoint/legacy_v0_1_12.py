@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Resume checkpoints written by VeOmni 0.1.12 through the extra_state layout.
+"""Resume checkpoints written before the current on-disk layout.
 
 **Delete this file** (and the two imports that load it) to drop that
 compatibility. Call sites:
@@ -22,12 +22,19 @@ compatibility. Call sites:
 
 On-disk contract and removal notes: ``docs/usage/checkpoint.md``.
 
-0.1.12 stored a per-rank pickle at
-``{step_dir}/extra_state/extra_state_rank_{R}.pt`` whose dict always had
-``lr_scheduler`` and the job cursor (``global_step``, dataloader, RNG, meters).
-After GlobalStateCallback split, the same path held only
-``{"lr_scheduler": ...}`` and the cursor moved to ``trainer_state_rank_{R}.pt``.
-This module reads those pickles; it does not write them.
+Two shapes are read here, both per-rank pickles and neither written any more:
+
+* **0.1.12** — ``{step_dir}/extra_state/extra_state_rank_{R}.pt``, a dict holding
+  ``lr_scheduler`` *and* the job cursor (``global_step``, dataloader, RNG,
+  meters) together.
+* **0.2.x flat** — the same ``extra_state`` file reduced to
+  ``{"lr_scheduler": ...}``, with the cursor moved out to
+  ``{step_dir}/trainer_state_rank_{R}.pt``.
+
+The current layout splits that cursor again, into ``loader/rank_{R}.pt`` and
+``extra_state/rank_{R}.pt``. Note the directory name ``extra_state/`` is reused
+with different contents; what tells the layouts apart is the file name inside it
+(``rank_{R}.pt`` vs ``extra_state_rank_{R}.pt``), not the directory.
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ logger = logging.get_logger(__name__)
 
 _EXTRA_STATE_DIR = "extra_state"
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
+_TRAINER_STATE_FORMAT = "trainer_state_rank_{}.pt"
 
 
 def extra_state_path(checkpoint_dir: str, rank: int) -> str:
@@ -93,12 +101,25 @@ def apply_legacy_lr_scheduler(checkpoint_dir: str, lr_scheduler: Any) -> bool:
     return True
 
 
-def apply_legacy_global_state(load_path: str, rank: int) -> dict[str, Any] | None:
-    """Job cursor from a 0.1.12 mixed extra_state pickle, or None.
+def trainer_state_path(load_path: str, rank: int) -> str:
+    return os.path.join(load_path, _TRAINER_STATE_FORMAT.format(rank))
 
-    Post-split extra_state has no ``global_step``; those runs already write
-    ``trainer_state_rank_{R}.pt`` and this function stays out of the way.
+
+def apply_legacy_global_state(load_path: str, rank: int) -> dict[str, Any] | None:
+    """Job cursor from a pre-split checkpoint, or None if there is none.
+
+    Tries the 0.2.x flat cursor first: it is the more recent of the two, and a
+    checkpoint that has one also has an ``extra_state`` pickle beside it holding
+    nothing but the scheduler, which would otherwise be mistaken for a cursor.
     """
+    flat_path = trainer_state_path(load_path, rank)
+    if os.path.exists(flat_path):
+        logger.warning_rank0(
+            f"Loaded job cursor from {_TRAINER_STATE_FORMAT.format(rank)} (VeOmni 0.2.x flat layout). "
+            "See docs/usage/checkpoint.md; delete veomni/checkpoint/legacy_v0_1_12.py to drop this path."
+        )
+        return torch.load(flat_path, map_location="cpu", weights_only=False)
+
     blob = read_extra_state(load_path, rank)
     if blob is None or "global_step" not in blob:
         return None
@@ -121,4 +142,5 @@ __all__ = [
     "apply_legacy_lr_scheduler",
     "extra_state_path",
     "read_extra_state",
+    "trainer_state_path",
 ]

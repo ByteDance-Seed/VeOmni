@@ -38,7 +38,18 @@ def should_skip_hf_weight_load(load_path: Optional[str], lora_config: Any) -> bo
 
 
 def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
-    """Return the checkpoint step if the entry is a valid DCP checkpoint, otherwise None."""
+    """Return the checkpoint step if the entry is a complete checkpoint, else None.
+
+    The current layout publishes ``checkpoint_manifest.json`` once every module's
+    shards and every rank's cursor files are down; that file is what makes a step
+    resumable. DCP's own ``.metadata`` cannot serve: there is one per DCP
+    directory — weights and optimizer, times the number of modules — and none of
+    them knows whether its siblings finished.
+
+    A pre-split checkpoint has no manifest and is recognised by the ``.metadata``
+    that used to sit at the step root. Drop that branch together with
+    ``veomni/checkpoint/legacy_v0_1_12.py``.
+    """
     if not entry.startswith(_GLOBAL_STEP_PREFIX):
         return None
     # get the letters after "global_step_" in the given path, which should be numbers
@@ -52,11 +63,17 @@ def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
     if not isdir(checkpoint_path):
         return None
 
-    metadata_path = os.path.join(checkpoint_path, ".metadata")
-    if not exists(metadata_path):
-        return None
+    # Imported here rather than at module scope: ``veomni.checkpoint.layout``
+    # imports this module for the step-directory prefix.
+    from ..checkpoint.layout import MANIFEST_FILENAME
 
-    return step
+    if exists(os.path.join(checkpoint_path, MANIFEST_FILENAME)):
+        return step
+
+    if exists(os.path.join(checkpoint_path, ".metadata")):
+        return step
+
+    return None
 
 
 def get_last_iteration(output_dir, is_rank0: bool):
@@ -92,7 +109,7 @@ def dcp_get_last_iteration(output_dir):
             valid_steps.append(step)
 
     if not valid_steps:
-        logger.warning_rank0("Provided checkpoint path exists but there are no valid DCP .metadata")
+        logger.warning_rank0("Provided checkpoint path exists but holds no completed checkpoint")
         return None
 
     logger.info_rank0(f"found valid previously saved checkpointed steps: {checkpoints_dir}/global_step_{valid_steps}")

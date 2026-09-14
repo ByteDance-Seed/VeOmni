@@ -72,11 +72,14 @@ With `save_hf_weights: true`, a HuggingFace-compatible checkpoint is also writte
 Qwen3-0.6B-dpo-ultrafeedback/
 └── checkpoints/
     └── global_step_200/
-        ├── .metadata
-        ├── __0_0.distcp …          ← model + optimizer
-        ├── lr_scheduler.pt
-        ├── trainer_state_rank_{R}.pt
-        └── hf_ckpt/                ← HuggingFace safetensors (when save_hf_weights)
+        ├── checkpoint_manifest.json ← written last; marks the step resumable
+        ├── model/
+        │   ├── ckpt/                ← DCP shards: weights
+        │   ├── optimizer/           ← DCP shards: optimizer state
+        │   └── lr_scheduler.pt
+        ├── loader/rank_{R}.pt       ← dataloader cursor
+        ├── extra_state/rank_{R}.pt  ← step, rng, meters
+        └── hf_ckpt/                 ← HuggingFace safetensors (when save_hf_weights)
 ```
 
 File-by-file contract: [Checkpoint layout](../usage/checkpoint.md).

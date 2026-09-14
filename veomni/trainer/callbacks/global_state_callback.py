@@ -15,19 +15,28 @@
 """Job-level checkpoint callback, as distinct from per-model checkpoint I/O.
 
 Nothing here belongs to a model: where the dataloader is, the rng, the metric
-meters. Written per rank as ``trainer_state_rank_{N}.pt``. The model's
-``lr_scheduler`` is a separate ``lr_scheduler.pt`` next to the DCP shards
-(see ``docs/usage/checkpoint.md``). Model weights, optimizer, HF/LoRA export,
-and the tokenizer/config sidecars are scheduled by
-:mod:`~veomni.trainer.callbacks.checkpoint_callback`.
+meters. Written per rank into two directories — ``loader/`` for the dataloader
+cursor, ``extra_state/`` for the rest. They are separate because the cursor is
+the part a job may want to replace or drop on its own: an Energon or
+multisource-sampler state is large, and resuming weights onto a different
+dataset means keeping ``extra_state/`` while discarding ``loader/``.
+
+This callback also publishes ``checkpoint_manifest.json``. It runs after
+:mod:`~veomni.trainer.callbacks.checkpoint_callback` in the dispatch list, so by
+the time it finishes it is the last writer of the step's resume tree — which is
+exactly what the marker has to attest to. Model weights, optimizer, HF/LoRA
+export and the tokenizer/config sidecars are scheduled by that other callback.
+
+On-disk contract: ``docs/usage/checkpoint.md``.
 """
 
 import os
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
 
+from ...checkpoint import layout
 from ...utils import helper
 from ...utils.device import get_device_type
 from .base import Callback, TrainerState
@@ -39,11 +48,8 @@ if TYPE_CHECKING:
 
 logger = helper.create_logger(__name__)
 
-_GLOBAL_STATE_FORMAT = "trainer_state_rank_{}.pt"
-
-
-def global_state_path(root: str, rank: int) -> str:
-    return os.path.join(root, _GLOBAL_STATE_FORMAT.format(rank))
+# Keys of ``state_dict`` that belong to ``loader/`` rather than ``extra_state/``.
+_LOADER_KEYS = ("train_dataloader",)
 
 
 class GlobalStateCallback(Callback):
@@ -99,21 +105,75 @@ class GlobalStateCallback(Callback):
             "torch_rng_state": torch.get_rng_state(),
         }
 
+    def module_names(self) -> List[str]:
+        """Names of the models this job checkpoints, for the manifest.
+
+        Empty for a single-model job. A multi-module trainer overrides this to
+        list every module it saved.
+        """
+        checkpoint = getattr(self.trainer, "checkpoint", None)
+        name = getattr(checkpoint, "module_name", "")
+        return [name] if name else []
+
     def save_global_state(self, state: TrainerState) -> None:
         # Drain a pending async DCP save first. CheckpointCallback returns while
         # that write is still in flight; a cursor file that lands before the
-        # shards would resume a step whose weights never made it to disk.
+        # shards would resume a step whose weights never made it to disk. The
+        # manifest published below depends on this too: it claims the whole step
+        # is on disk, which is false while a shard write is still running.
         checkpoint = getattr(self.trainer, "checkpoint", None)
         if checkpoint is not None:
             checkpoint.wait_for_pending_save()
 
         args: "VeOmniArguments" = self.trainer.args
-        step_dir = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
-        os.makedirs(step_dir, exist_ok=True)
-        torch.save(self.state_dict(state), global_state_path(step_dir, self.rank))
+        step_root = layout.step_dir(args.train.checkpoint.save_path, state.global_step)
+        payload = self.state_dict(state)
+        loader_payload = {key: payload[key] for key in _LOADER_KEYS if key in payload}
+        extra_payload = {key: value for key, value in payload.items() if key not in _LOADER_KEYS}
+
+        for path, blob in (
+            (layout.loader_path(step_root, self.rank), loader_payload),
+            (layout.extra_state_path(step_root, self.rank), extra_payload),
+        ):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            torch.save(blob, path)
+
+        # Every rank's files must be down before the step is advertised.
         if dist.is_initialized():
             dist.barrier()
+
+        if self.rank == 0:
+            layout.write_manifest(
+                step_root,
+                global_step=state.global_step,
+                world_size=args.train.world_size,
+                modules=self.module_names(),
+            )
+        if dist.is_initialized():
+            dist.barrier()
+
         self._last_saved_step = state.global_step
+
+    def _read_current(self, load_path: str) -> Optional[Dict[str, Any]]:
+        """Merge this rank's ``extra_state/`` and ``loader/`` back into one dict.
+
+        ``extra_state/`` is the one that decides whether a current-layout state
+        exists: it holds ``global_step``, without which there is nothing to
+        resume. A missing ``loader/`` file is not an error — dropping it is how a
+        run resumes onto different data — so the cursor is simply absent and the
+        dataloader starts from the beginning.
+        """
+        extra_path = layout.extra_state_path(load_path, self.rank)
+        if not os.path.exists(extra_path):
+            return None
+        merged = torch.load(extra_path, map_location="cpu", weights_only=False)
+
+        loader_file = layout.loader_path(load_path, self.rank)
+        if os.path.exists(loader_file):
+            merged.update(torch.load(loader_file, map_location="cpu", weights_only=False))
+        else:
+            logger.warning_rank0(f"No dataloader cursor at {loader_file}; the dataloader restarts from its beginning.")
+        return merged
 
     def load_global_state(self) -> Optional[Dict[str, Any]]:
         args: "VeOmniArguments" = self.trainer.args
@@ -121,15 +181,16 @@ class GlobalStateCallback(Callback):
         if load_path is None:
             return None
 
-        state_path = global_state_path(load_path, self.rank)
-        found_current = os.path.exists(state_path)
+        state_path = layout.extra_state_path(load_path, self.rank)
+        current_state = self._read_current(load_path)
         legacy_state = None
-        if not found_current:
-            # Delete this import (and veomni/checkpoint/legacy_v0_1_12.py) to drop 0.1.12 extra_state resume.
+        if current_state is None:
+            # Delete this import (and veomni/checkpoint/legacy_v0_1_12.py) to drop
+            # resume from the pre-split layouts.
             from ...checkpoint.legacy_v0_1_12 import apply_legacy_global_state
 
             legacy_state = apply_legacy_global_state(load_path, self.rank)
-        found = found_current or legacy_state is not None
+        found = current_state is not None or legacy_state is not None
         if dist.is_initialized():
             flag = torch.tensor([int(found)], dtype=torch.int32, device=get_device_type())
             dist.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
@@ -141,10 +202,7 @@ class GlobalStateCallback(Callback):
             logger.warning(f"No trainer state at {state_path}; resuming weights only.")
             return None
 
-        if found_current:
-            global_state = torch.load(state_path, map_location="cpu", weights_only=False)
-        else:
-            global_state = legacy_state
+        global_state = current_state if current_state is not None else legacy_state
         self.trainer.state.global_step = global_state["global_step"]
         self._restore_position(global_state)
 
@@ -176,4 +234,4 @@ class GlobalStateCallback(Callback):
         self.trainer.start_step = global_step % args.train_steps
 
 
-__all__ = ["GlobalStateCallback", "global_state_path"]
+__all__ = ["GlobalStateCallback"]

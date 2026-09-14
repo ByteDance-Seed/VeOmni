@@ -249,6 +249,146 @@ class TestMultiOptimizerState:
         )
 
 
+@patch("veomni.checkpoint.dcp_checkpointer.get_parallel_state")
+class TestCheckpointLayoutRoundTrip:
+    """A step's model state lands where ``docs/usage/checkpoint.md`` says, and
+    comes back from there."""
+
+    @staticmethod
+    def _build(seed: int):
+        torch.manual_seed(seed)
+        model = nn.Linear(4, 4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
+        return model, optimizer, scheduler
+
+    @staticmethod
+    def _train_one_step(model, optimizer, scheduler):
+        model(torch.randn(2, 4)).sum().backward()
+        optimizer.step()
+        scheduler.step()
+
+    def test_weights_and_optimizer_are_separable_on_disk(self, mock_gps, tmp_path):
+        """The weights directory holds weights only.
+
+        This is the whole point of the split: a step can be shipped or converted
+        by copying ``model/ckpt`` alone. A single fused directory interleaves
+        both into the same ``.distcp`` files, where they cannot be told apart.
+        """
+        from torch.distributed.checkpoint import FileSystemReader
+
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
+        model, optimizer, scheduler = self._build(seed=0)
+        self._train_one_step(model, optimizer, scheduler)
+
+        DistributedCheckpointer.save(
+            path=str(tmp_path),
+            state={"model": model, "optimizer": optimizer, "lr_scheduler": scheduler},
+            global_steps=7,
+        )
+
+        model_root = tmp_path / "global_step_7" / "model"
+        assert (model_root / "ckpt" / ".metadata").is_file()
+        assert (model_root / "optimizer" / ".metadata").is_file()
+        assert (model_root / "lr_scheduler.pt").is_file()
+        # The pre-split marker at the step root is gone; only the manifest, which
+        # GlobalStateCallback writes, marks a step complete now.
+        assert not (tmp_path / "global_step_7" / ".metadata").exists()
+
+        weight_keys = FileSystemReader(model_root / "ckpt").read_metadata().state_dict_metadata.keys()
+        assert weight_keys, "weights directory is empty"
+        assert all(key.startswith("model") for key in weight_keys), (
+            f"optimizer state leaked into the weights directory: {sorted(weight_keys)}"
+        )
+
+    def test_resume_restores_weights_optimizer_and_scheduler(self, mock_gps, tmp_path):
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
+        model, optimizer, scheduler = self._build(seed=0)
+        self._train_one_step(model, optimizer, scheduler)
+
+        DistributedCheckpointer.save(
+            path=str(tmp_path),
+            state={"model": model, "optimizer": optimizer, "lr_scheduler": scheduler},
+            global_steps=7,
+        )
+
+        # A different starting point, so a load that silently did nothing fails.
+        resumed, resumed_optimizer, resumed_scheduler = self._build(seed=1)
+        assert not torch.equal(resumed.weight, model.weight)
+
+        DistributedCheckpointer.load(
+            path=str(tmp_path / "global_step_7"),
+            state={"model": resumed, "optimizer": resumed_optimizer, "lr_scheduler": resumed_scheduler},
+        )
+
+        torch.testing.assert_close(resumed.weight, model.weight, atol=0.0, rtol=0.0)
+        expected_exp_avg = optimizer.state_dict()["state"][0]["exp_avg"]
+        torch.testing.assert_close(
+            resumed_optimizer.state_dict()["state"][0]["exp_avg"], expected_exp_avg, atol=0.0, rtol=0.0
+        )
+        assert resumed_scheduler.state_dict()["last_epoch"] == scheduler.state_dict()["last_epoch"]
+
+    def test_modules_of_one_job_do_not_share_a_directory(self, mock_gps, tmp_path):
+        """A multi-module job nests under ``model/<module>/`` and nothing else moves."""
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
+        for index, module in enumerate(("vision", "llm")):
+            model, optimizer, scheduler = self._build(seed=index)
+            DistributedCheckpointer.save(
+                path=str(tmp_path),
+                state={"model": model, "optimizer": optimizer, "lr_scheduler": scheduler},
+                global_steps=7,
+                module=module,
+            )
+
+        model_root = tmp_path / "global_step_7" / "model"
+        assert sorted(p.name for p in model_root.iterdir()) == ["llm", "vision"]
+        for module in ("vision", "llm"):
+            assert (model_root / module / "ckpt" / ".metadata").is_file()
+            assert (model_root / module / "optimizer" / ".metadata").is_file()
+
+    def test_resume_reads_a_pre_split_checkpoint(self, mock_gps, tmp_path):
+        """A checkpoint written before the split keeps both in one directory.
+
+        Delete this along with ``veomni/checkpoint/legacy_v0_1_12.py``.
+        """
+        from veomni.checkpoint.dcp_checkpointer import (
+            _LR_SCHEDULER_FILENAME,
+            DistributedCheckpointer,
+            ModelState,
+            OptimizerState,
+        )
+
+        mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
+        parallel_state = SimpleNamespace(dp_mode="fsdp2")
+        model, optimizer, scheduler = self._build(seed=0)
+        self._train_one_step(model, optimizer, scheduler)
+
+        step = tmp_path / "global_step_7"
+        dcp.save(
+            {
+                "model": ModelState(model, parallel_state=parallel_state),
+                "optimizer": OptimizerState(model, optimizer, parallel_state=parallel_state),
+            },
+            checkpoint_id=step,
+        )
+        torch.save(scheduler.state_dict(), step / _LR_SCHEDULER_FILENAME)
+
+        resumed, resumed_optimizer, resumed_scheduler = self._build(seed=1)
+        DistributedCheckpointer.load(
+            path=str(step),
+            state={"model": resumed, "optimizer": resumed_optimizer, "lr_scheduler": resumed_scheduler},
+        )
+
+        torch.testing.assert_close(resumed.weight, model.weight, atol=0.0, rtol=0.0)
+        assert resumed_scheduler.state_dict()["last_epoch"] == scheduler.state_dict()["last_epoch"]
+
+
 class TestAllowPartialLoad:
     """DCP load may be partial for optimizer state, but not full model state."""
 
@@ -277,8 +417,14 @@ class TestAllowPartialLoad:
                 mock_reader.return_value = MagicMock()
                 DistributedCheckpointer.load(path="/fake", state=state)
 
-        mock_dcp.load.assert_called_once()
-        planner = mock_dcp.load.call_args.kwargs.get("planner")
+        # Weights and optimizer live in separate DCP directories, so a resume is
+        # two loads.
+        assert mock_dcp.load.call_count == 2
+        weights_call, optimizer_call = mock_dcp.load.call_args_list
+        assert list(weights_call.kwargs["state_dict"]) == ["model"]
+        assert list(optimizer_call.kwargs["state_dict"]) == ["optimizer"]
+
+        planner = weights_call.kwargs.get("planner")
         assert planner is not None, "load must pass a planner"
         assert planner.allow_partial_load is True, "load must use DefaultLoadPlanner(allow_partial_load=True)"
         assert planner.strict_model is True, "full-model load must reject missing model keys"
@@ -738,15 +884,15 @@ class TestWaitForPendingSave:
         """Reset class state between tests."""
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
-        DistributedCheckpointer.save_future = None
+        DistributedCheckpointer._save_futures = {}
 
     def test_noop_when_no_pending_save(self):
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
-        DistributedCheckpointer.save_future = None
+        DistributedCheckpointer._save_futures = {}
         # Should be a clean no-op — no exceptions, no barrier
         DistributedCheckpointer.wait_for_pending_save()
-        assert DistributedCheckpointer.save_future is None
+        assert DistributedCheckpointer._save_futures == {}
 
     @patch("veomni.checkpoint.dcp_checkpointer.dist")
     def test_waits_and_clears_future(self, mock_dist):
@@ -757,32 +903,35 @@ class TestWaitForPendingSave:
 
         future = MagicMock()
         future.result.return_value = None
-        DistributedCheckpointer.save_future = future
+        DistributedCheckpointer._save_futures = {"ckpt": future}
 
         DistributedCheckpointer.wait_for_pending_save()
 
         future.result.assert_called_once()
-        assert DistributedCheckpointer.save_future is None
+        assert DistributedCheckpointer._save_futures == {}
         mock_dist.barrier.assert_called_once()
 
     @patch("veomni.checkpoint.dcp_checkpointer.dist")
-    def test_propagates_exception_and_clears_future(self, mock_dist):
-        """If the pending save raised, the exception propagates AND the
-        future is cleared so retry on the next call is possible."""
+    def test_drains_every_slot_before_raising(self, mock_dist):
+        """A step writes the weights and the optimizer concurrently. If the
+        weights write raised, the optimizer write must still be drained — left
+        running, its background collectives would collide with the next step's."""
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
         mock_dist.is_initialized.return_value = True
         mock_dist.get_rank.return_value = 0
 
-        future = MagicMock()
-        future.result.side_effect = RuntimeError("save failed")
-        DistributedCheckpointer.save_future = future
+        failed = MagicMock()
+        failed.result.side_effect = RuntimeError("save failed")
+        healthy = MagicMock()
+        DistributedCheckpointer._save_futures = {"ckpt": failed, "optimizer": healthy}
 
         with pytest.raises(RuntimeError, match="save failed"):
             DistributedCheckpointer.wait_for_pending_save()
 
-        # Future must be cleared even on failure — otherwise stuck forever
-        assert DistributedCheckpointer.save_future is None
+        healthy.result.assert_called_once()
+        # Cleared even on failure — otherwise stuck forever
+        assert DistributedCheckpointer._save_futures == {}
 
     @patch("veomni.checkpoint.dcp_checkpointer.dist")
     def test_no_barrier_when_dist_not_initialized(self, mock_dist):
@@ -791,12 +940,48 @@ class TestWaitForPendingSave:
         mock_dist.is_initialized.return_value = False
 
         future = MagicMock()
-        DistributedCheckpointer.save_future = future
+        DistributedCheckpointer._save_futures = {"ckpt": future}
 
         DistributedCheckpointer.wait_for_pending_save()
 
         future.result.assert_called_once()
         mock_dist.barrier.assert_not_called()
+
+    @patch("veomni.checkpoint.dcp_checkpointer.dcp")
+    @patch("veomni.checkpoint.dcp_checkpointer.dist")
+    def test_concurrent_slots_get_their_own_group_and_are_not_drained(self, mock_dist, mock_dcp):
+        """The two saves of one step must overlap.
+
+        ``dcp.async_save`` runs the whole save, collectives included, on a
+        background thread using the group it is handed — so each slot needs its
+        own group, and issuing the second must not wait out the first.
+        """
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_dist.is_initialized.return_value = True
+        mock_dist.get_rank.return_value = 0
+        mock_dist.new_group.side_effect = ["group-ckpt", "group-optimizer"]
+        mock_dcp.async_save.side_effect = ["future-ckpt", "future-optimizer"]
+        DistributedCheckpointer._save_futures = {}
+        DistributedCheckpointer._async_process_groups = {}
+
+        for slot in ("ckpt", "optimizer"):
+            DistributedCheckpointer.execute_save(
+                save_state={},
+                storage_writer=MagicMock(),
+                save_async=True,
+                slot=slot,
+            )
+
+        assert DistributedCheckpointer._save_futures == {
+            "ckpt": "future-ckpt",
+            "optimizer": "future-optimizer",
+        }
+        groups = [call.kwargs["process_group"] for call in mock_dcp.async_save.call_args_list]
+        assert groups == ["group-ckpt", "group-optimizer"]
+
+        DistributedCheckpointer._save_futures = {}
+        DistributedCheckpointer._async_process_groups = {}
 
 
 class TestDcpToHfDtypeConversion:
@@ -1635,11 +1820,12 @@ class TestStageDirValidation:
         from veomni.checkpoint.dcp_checkpointer import _LR_SCHEDULER_FILENAME, DistributedCheckpointer
 
         final = tmp_path / "ckpt"
-        step_dir = final / "global_step_10"
-        step_dir.mkdir(parents=True)
-        (step_dir / ".metadata").write_text("previous")
-        (step_dir / "__0_0.distcp").write_text("old-weights")
-        sidecar = step_dir / _LR_SCHEDULER_FILENAME
+        model_root = final / "global_step_10" / "model"
+        weights = model_root / "ckpt"
+        weights.mkdir(parents=True)
+        (weights / ".metadata").write_text("previous")
+        (weights / "__0_0.distcp").write_text("old-weights")
+        sidecar = model_root / _LR_SCHEDULER_FILENAME
         previous = {"last_epoch": 10, "base_lrs": [1e-4]}
         torch.save(previous, sidecar)
 
@@ -1665,54 +1851,64 @@ class TestStageDirValidation:
                 )
 
         assert torch.load(sidecar, weights_only=False) == previous
-        assert (step_dir / ".metadata").read_text() == "previous"
+        assert (weights / ".metadata").read_text() == "previous"
 
     def test_unset_stage_dir_writes_straight_to_the_destination(self, tmp_path):
-        """Staging is opt-in: unset, DCP and the sidecar write the step directory.
-
-        ``lr_scheduler.pt`` is written first; DCP then publishes ``.metadata``.
-        Resume treats a directory without ``.metadata`` as incomplete.
-        """
+        """Staging is opt-in: unset, both DCP directories and the sidecar write
+        straight into ``global_step_N/model/``."""
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
         final = tmp_path / "ckpt"
-        dest = str(final / "global_step_10")
+        model_root = str(final / "global_step_10" / "model")
         with (
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,
             patch.object(DistributedCheckpointer, "_create_storage_writer") as create_writer,
             patch.object(DistributedCheckpointer, "_save_lr_scheduler") as save_sched,
             patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+            patch("veomni.checkpoint.dcp_checkpointer.OptimizerState"),
             patch("veomni.checkpoint.dcp_checkpointer._prepare_stage_dir") as prepare,
             patch("veomni.checkpoint.dcp_checkpointer._promote_staged_checkpoint") as promote,
         ):
             DistributedCheckpointer.save(
                 path=str(final),
-                state={"model": MagicMock()},
+                state={"model": MagicMock(), "optimizer": MagicMock()},
                 save_async=False,
                 global_steps=10,
             )
 
-        assert save_sched.call_args.kwargs["checkpoint_dir"] == dest
-        assert create_writer.call_args.args[0] == dest
-        assert execute_save.call_args.kwargs["storage_writer"] is create_writer.return_value
+        assert save_sched.call_args.kwargs["checkpoint_dir"] == model_root
         assert save_sched.call_count == 1
+        # Weights and optimizer are two directories and two saves, each with its
+        # own writer and its own async slot.
+        assert [call.args[0] for call in create_writer.call_args_list] == [
+            os.path.join(model_root, "ckpt"),
+            os.path.join(model_root, "optimizer"),
+        ]
+        assert [call.kwargs["slot"] for call in execute_save.call_args_list] == ["ckpt", "optimizer"]
+        assert list(execute_save.call_args_list[0].kwargs["save_state"]) == ["model"]
+        assert list(execute_save.call_args_list[1].kwargs["save_state"]) == ["optimizer"]
         prepare.assert_not_called()
         promote.assert_not_called()
 
-    def test_stage_dir_with_explicit_storage_writer_is_rejected(self, tmp_path):
-        """Silently ignoring stage_dir would write to the slow destination it was avoiding."""
+    def test_save_without_optimizer_writes_only_the_weights(self, tmp_path):
+        """A weights-only save leaves no empty optimizer directory behind."""
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
         final = tmp_path / "ckpt"
-        with pytest.raises(ValueError, match="explicit storage_writer"):
+        with (
+            patch.object(DistributedCheckpointer, "execute_save") as execute_save,
+            patch.object(DistributedCheckpointer, "_create_storage_writer"),
+            patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
+            patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+        ):
             DistributedCheckpointer.save(
                 path=str(final),
-                state={"model": MagicMock()},
+                state={"model": MagicMock(), "optimizer": None},
                 save_async=False,
-                storage_writer=MagicMock(),
-                stage_dir=str(tmp_path / "stage"),
+                global_steps=10,
             )
-        assert not final.exists()
+
+        assert [call.kwargs["slot"] for call in execute_save.call_args_list] == ["ckpt"]
 
     def test_stage_key_does_not_collide_across_similar_paths(self):
         """Separator substitution maps /tmp/a_b/c and /tmp/a/b_c onto one directory."""
