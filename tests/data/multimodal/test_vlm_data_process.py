@@ -24,7 +24,7 @@ from veomni.data import build_chat_template
 from veomni.data.data_transform import (
     process_sample_qwen_vl,
 )
-from veomni.models import build_foundation_model, build_processor
+from veomni.models_kernel import build_foundation_model, build_processor
 from veomni.utils.device import get_device_type
 
 

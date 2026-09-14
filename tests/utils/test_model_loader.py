@@ -8,7 +8,7 @@ import torch.distributed as dist
 
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments, parse_args
 from veomni.distributed.parallel_state import _init_parallel_state
-from veomni.models import build_foundation_model
+from veomni.models_kernel import build_foundation_model
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 

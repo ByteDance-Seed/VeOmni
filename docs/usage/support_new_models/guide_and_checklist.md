@@ -215,12 +215,12 @@ For implementation details of each patch, refer to the example docs.
 
 ### Testing (all models)
 
-- [ ] Toy config in `tests/toy_config/your_model_toy/`
+- [ ] Canonical tiny-config factory in `tests/models_kernel/tiny_configs.py`
 - [ ] `DummyYourModelDataset` in `veomni/data/dummy_dataset.py` (multimodal)
-- [ ] `MODEL_TO_DATASET` entry in `tests/models/utils.py`
-- [ ] `pytest.param` in `TEST_CASES` in `tests/models/test_models_patch.py` (Level 1)
+- [ ] Registry case in `tests/models_kernel/base/test_auto_registry.py`
+- [ ] Family parity and contract tests under `tests/models_kernel/transformers/`
 - [ ] Test case + fixture + test function in `tests/e2e/test_e2e_parallel.py` (Level 2)
-- [ ] For VLM models, add the toy config to the `freeze_vit` smoke test list in `tests/models/test_vlm_trainer.py`
+- [ ] For VLM models, add the toy config to the `freeze_vit` smoke test list in `tests/trainer/test_vlm_trainer.py`
 
 ---
 

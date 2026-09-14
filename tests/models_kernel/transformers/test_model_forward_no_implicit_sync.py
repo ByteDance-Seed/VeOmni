@@ -2,7 +2,7 @@
 
 Runs each model's forward under ``torch.cuda.set_sync_debug_mode("warn")``
 and fails if any new implicit host<->device sync site shows up in
-``veomni/models/transformers/<model>/generated/``.
+``veomni/models_kernel/transformers/<model>/generated/``.
 
 The principle — two axes
 ------------------------
@@ -13,7 +13,7 @@ For each surfaced sync site, decide along two independent axes:
      lives inside generated/).
   2. **Path** — production (code runs every real training/inference step,
      no override above it) vs eager-only fallback (code only runs under a
-     specific dev/fallback setting; production bypasses it via an OpSlot
+     specific dev/fallback setting; production bypasses it via a ``VeomniOp``
      or other VeOmni override above).
 
 The rule:
@@ -24,7 +24,7 @@ The rule:
     and fix there (now becomes ours). **Don't leave a production sync in
     just because the line originated upstream** — that's an unreasonable
     cost in our hot path.
-  - Eager-only fallback + HF-verbatim (production bypasses via OpSlot/
+  - Eager-only fallback + HF-verbatim (production bypasses via ``VeomniOp``/
     override)                          →  leave alone, allowlist if needed.
   - Algorithm-essential (EP dispatch sizes, variable per-rank counts) →
     accept.
@@ -58,10 +58,8 @@ to gate PRs. Real-model SP/EP coverage stays with the skill.
 
 Extending to more models
 ------------------------
-Append a ``Case`` to ``CASES`` — either reuse one from
-``test_models_logits_equal_v5.CASES`` via ``_logits_case("...")``, or
-declare a new one inline (for cases that don't have an HF-parity
-counterpart, e.g. fused-MoE on the production path). Add a
+Append a ``ForwardCase`` to ``SYNC_FORWARD_CASES`` in ``_forward_cases.py``.
+Add a
 ``_MOE_IMPL_BY_CASE`` entry to override the default ``"eager"``
 backend for MoE cases.
 
@@ -75,7 +73,7 @@ two-axis rule above:
   reference the follow-up.
 - HF-verbatim line on an eager-only fallback path that production
   bypasses (e.g. inside the eager experts loop, when production
-  dispatches to the fused MoE OpSlot) → allowlist with
+  dispatches to the fused MoE op) → allowlist with
   ``"HF-eager-only: ..."``.
 
 The allowlist is keyed by ``(generated-file, function qualname)``: each
@@ -86,7 +84,6 @@ the test, so a landed fix can't silently leave a stale entry behind.
 """
 
 import ast
-import importlib
 import importlib.util
 import os
 import re
@@ -96,122 +93,49 @@ from functools import lru_cache
 import pytest
 import torch
 
+from tests.models_kernel.transformers._forward_cases import (
+    DTYPE_MAP as _DTYPE_MAP,
+)
+from tests.models_kernel.transformers._forward_cases import (
+    SYNC_FORWARD_CASES as CASES,
+)
+from tests.models_kernel.transformers._forward_cases import ForwardCase
+from tests.models_kernel.transformers._forward_cases import (
+    apply_determinism as _apply_determinism,
+)
+from tests.models_kernel.transformers._forward_cases import (
+    forward_target as _forward_target,
+)
+from tests.models_kernel.transformers._forward_cases import (
+    make_config as _make_config,
+)
+from tests.models_kernel.transformers._forward_cases import (
+    make_inputs as _make_inputs,
+)
+from tests.models_kernel.transformers._forward_cases import (
+    release_device_memory as _release,
+)
+from tests.tools.training_utils import make_eager_ops_config
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device, synchronize
 
-from .test_models_logits_equal_v5 import (
-    _DTYPE_MAP,
-    Case,
-    _apply_determinism,
-    _forward_target,
-    _make_config,
-    _make_inputs,
-    _release,
-    _toy,
-)
-from .test_models_logits_equal_v5 import (
-    CASES as _ALL_CASES,
-)
 
-
-def _logits_case(case_id: str) -> Case:
-    """Pull a ``Case`` out of the logits-equal CASES list by ``case_id``."""
-    for c in _ALL_CASES:
-        if c.case_id == case_id:
-            return c
-    raise KeyError(f"{case_id!r} not in test_models_logits_equal_v5.CASES")
-
-
-# Per-case ``moe_implementation`` for VeOmni's ``apply_ops_config``. Defaults
-# to ``"eager"``. Set to ``"triton"`` for production-path coverage
+# Per-case ``moe_implementation``. Defaults to ``"eager"``. Set to
+# ``"fused_triton"`` for production-path coverage
 # (A100/SM80+); the fused dispatch in ``patched_modeling_*_moe_gpu.py``
 # short-circuits the eager expert loop and replaces it with a single
 # Triton kernel call — no Python-level sync sites.
 _MOE_IMPL_BY_CASE: dict[str, str] = {
-    "qwen3_5_moe-text-fa2-fused": "triton",
-    "qwen3_vl_moe-fa2-fused": "triton",
-    "qwen3_omni_moe-fa2-fused": "triton",
+    "qwen3_5_moe-text-fa2-fused": "fused_triton",
+    "qwen3_vl_moe-fa2-fused": "fused_triton",
+    "qwen3_omni_moe-fa2-fused": "fused_triton",
 }
 
 
-# Cases this gate covers. Built explicitly (rather than imported wholesale
-# from logits_equal) because we want a different MoE backend than the
-# logits test forces for HF parity, and we want to drop SDPA in favour of
-# FA2. To extend, add a ``Case`` here (and optionally a ``_MOE_IMPL_BY_CASE``
-# entry for fused-MoE coverage).
-#
-# Eager-MoE cases are intentionally absent: the eager experts loop body is
-# HF-verbatim and not the production path (production uses
-# ``veomni_moe_experts_forward`` via OpSlot, exercised by the fa2-fused
-# cases below). Gating MoE on the fused path alone keeps the allowlist
-# focused on VeOmni-patched code.
-CASES = [
-    # qwen3_5 (non-MoE, text-only sub-config) — both attention paths through
-    # our patched Qwen3_5Model.forward.
-    _logits_case("qwen3_5-text-eager"),
-    _logits_case("qwen3_5-text-fa2"),
-    # qwen3_5_moe-text — production FA2 + fused-Triton MoE. The fused
-    # short-circuit (line ~1044 in patched_modeling_qwen3_5_moe_gpu.py)
-    # is VeOmni's; the HF eager loop body that it bypasses is verbatim
-    # and not exercised in this case.
-    Case(
-        "qwen3_5_moe-text-fa2-fused",
-        _toy("qwen3_5_moe_toy"),
-        "Qwen3_5MoeForCausalLM",
-        "qwen3_5_text",
-        attn_implementation="flash_attention_2",
-        dtype="bfloat16",
-    ),
-    # qwen3_5_vl (non-MoE VLM) — exercises the qwen3_5-family ViT
-    # (``Qwen3_5VisionModel.forward`` + ``fast_pos_embed_interpolate`` +
-    # ``rot_pos_emb``) and the VLM path of ``Qwen3_5Model.forward``. The
-    # qwen3_5-text-* cases above are text-only sub-configs and never reach
-    # the vision tower, so this case is what gates the qwen3_5 ViT precompute
-    # consumer. qwen3_5_moe's ViT forward is the *same* imported function, so
-    # one non-MoE case covers the shared ViT.
-    #
-    # SDPA (not FA2) here: FA2+bf16 produces NaN on the qwen3_5 toy config
-    # (an upstream FA-on-tiny-shape issue — see test_models_logits_equal_v5).
-    # The ViT metadata syncs this case gates (cu_seqlens build, .tolist(),
-    # rot_pos_emb) are attention-implementation-independent, so SDPA covers
-    # them exactly as well.
-    _logits_case("qwen3_5_vl-sdpa"),
-    # qwen3_vl (non-MoE VLM) — full multimodal forward with a dummy 2x2
-    # image patch; exercises patched ``Qwen3VLModel.forward`` +
-    # ``get_image_features`` + the vision tower.
-    _logits_case("qwen3_vl-fa2"),
-    # qwen3_vl_moe — production FA2 + fused-Triton MoE on the VLM path.
-    Case(
-        "qwen3_vl_moe-fa2-fused",
-        _toy("qwen3vlmoe_toy"),
-        "Qwen3VLMoeForConditionalGeneration",
-        "vlm_full",
-        attn_implementation="flash_attention_2",
-        dtype="bfloat16",
-    ),
-    # qwen3_omni_moe — forward on ``model.thinker`` (talker stays out of
-    # scope); production FA2 + fused-Triton MoE.
-    Case(
-        "qwen3_omni_moe-fa2-fused",
-        _toy("qwen3omni_toy"),
-        "Qwen3OmniMoeForConditionalGeneration",
-        "omni_thinker",
-        attn_implementation="flash_attention_2",
-        dtype="bfloat16",
-        forward_attr="thinker",
-    ),
-    # qwen2_vl — full multimodal forward; exercises patched
-    # ``Qwen2VLModel.forward`` + the (non-window) ViT precompute consumer.
-    _logits_case("qwen2_vl-fa2"),
-    # qwen2_5_vl — full multimodal forward; exercises the window-attention
-    # ViT precompute consumer (cu_seqlens + cu_window_seqlens + the
-    # get_window_index permutation, all collator-derived).
-    _logits_case("qwen2_5_vl-fa2"),
-    # qwen2_5_omni — forward on ``model.thinker``; shares the window-attention
-    # ViT layout with qwen2_5_vl.
-    _logits_case("qwen2_5_omni-fa2"),
-]
+# The case metadata and multimodal input construction live in
+# ``_forward_cases.py``. Eager-MoE cases stay absent because production uses
+# the fused expert op; the three fused cases above cover that path.
 
-# Acknowledged sync sites in generated/. Keyed by ``Case.case_id``;
+# Acknowledged sync sites in generated/. Keyed by ``ForwardCase.case_id``;
 # value maps ``(basename, lineno)`` -> one-line reason.
 #
 # Reasons MUST start with one of the category tags below — see the
@@ -220,7 +144,7 @@ CASES = [
 # encode follow-up state:
 #
 #   "HF-eager-only: ..."           accepted long-term; production
-#                                  bypasses this code via an OpSlot or
+#                                  bypasses this code via a ``VeomniOp`` or
 #                                  override above.
 #   "HF-prod-pending-fix: ..."     production-path HF-verbatim site
 #                                  currently tracked for a fix; the
@@ -398,7 +322,7 @@ _MM_METADATA_WIRED_CASES: set[str] = {
 }
 
 
-def _attach_multimodal_metadata(model, case: Case, fwd_kwargs: dict) -> None:
+def _attach_multimodal_metadata(model, case: ForwardCase, fwd_kwargs: dict) -> None:
     """Inject ``multimodal_metadata`` by running the model's real collate hook.
 
     Calls ``model.get_metadata_collate_func()`` — the exact picklable hook the
@@ -434,12 +358,12 @@ _SYNC_RE = re.compile(r"called a synchronizing")
 
 
 def _is_generated_path(filename: str) -> bool:
-    """True if ``filename`` lives under ``veomni/models/transformers/*/generated/``."""
+    """True for generated ``models_kernel`` transformer modeling files."""
     norm = filename.replace(os.sep, "/")
     # No leading slash on the first substring: ``WarningMessage.filename`` is
     # almost always absolute, but relative-path edge cases (zip imports,
     # custom loaders) shouldn't silently bypass the gate.
-    return "veomni/models/transformers/" in norm and "/generated/" in norm
+    return "veomni/models_kernel/transformers/" in norm and "/generated/" in norm
 
 
 @lru_cache(maxsize=None)
@@ -523,11 +447,8 @@ def test_enclosing_qualname_resolution(tmp_path):
     assert _enclosing_qualname(f, 15) == "gated"
 
 
-# NCCL bootstrap env so this module is runnable on its own (``pytest
-# tests/models/test_model_forward_no_implicit_sync.py``). In a same-process
-# pytest run the sibling logits_equal test is usually imported first and
-# its ``setdefault`` block already populated these; the fixture below
-# also no-ops if the PG is already initialised.
+# NCCL bootstrap env so this module is runnable on its own. The fixture below
+# no-ops if a process group is already initialised.
 os.environ.setdefault("RANK", "0")
 os.environ.setdefault("LOCAL_RANK", "0")
 os.environ.setdefault("WORLD_SIZE", "1")
@@ -540,8 +461,7 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 def _single_rank_process_group():
     """1-rank NCCL group for VeOmni's SP-aware attention wrappers.
 
-    Duplicated rather than imported from the sibling logits test because
-    pytest doesn't apply autouse fixtures across modules.
+    Only initialize and tear down the group when this module owns it.
     """
     from veomni.utils.device import get_dist_comm_backend
     from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
@@ -566,15 +486,11 @@ def _single_rank_process_group():
 
 def _build_veomni_model(case, config):
     """Random-init VeOmni model — we only need forward to run, not match HF."""
-    from veomni.models.auto import build_foundation_model
-    from veomni.ops import apply_ops_config
+    from veomni.models_kernel import build_foundation_model
 
-    training_utils = importlib.import_module("tests.tools.training_utils")
-    apply_ops_config(
-        training_utils.make_eager_ops_config(
-            attn_implementation=case.attn_implementation,
-            moe_implementation=_MOE_IMPL_BY_CASE.get(case.case_id, "eager"),
-        )
+    ops_implementation = make_eager_ops_config(
+        attn_implementation=case.attn_implementation,
+        moe_implementation=_MOE_IMPL_BY_CASE.get(case.case_id, "eager"),
     )
 
     torch.manual_seed(0)
@@ -583,8 +499,8 @@ def _build_veomni_model(case, config):
         config_path=config,
         weights_path=None,
         torch_dtype=case.dtype,
-        attn_implementation=case.attn_implementation,
         init_device=get_device_type(),
+        ops_implementation=ops_implementation,
     ).eval()
 
 
@@ -601,11 +517,11 @@ def test_no_implicit_sync_in_generated_forward(case):
         pytest.skip(f"Path not found: {case.toy_config_dir}")
     if case.attn_implementation == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
         pytest.skip("flash_attn package not installed.")
-    if _MOE_IMPL_BY_CASE.get(case.case_id) == "triton":
+    if _MOE_IMPL_BY_CASE.get(case.case_id) == "fused_triton":
         from veomni.utils.import_utils import is_fused_moe_available
 
         if not is_fused_moe_available():
-            pytest.skip("triton MoE requires triton + CUDA SM70+.")
+            pytest.skip("fused_triton MoE requires Triton + CUDA SM70+.")
     if case.case_id in _PENDING_FIX_CASES:
         pytest.skip(f"Pending fix: {_PENDING_FIX_CASES[case.case_id]}")
 
@@ -693,7 +609,7 @@ def test_no_implicit_sync_in_generated_forward(case):
                 f"     Code is *in the .diff* (added/modified by VeOmni) -> ours.\n"
                 f"     Code is *unchanged from HF* -> HF-verbatim.\n"
                 f"  2. Check whether the code is on the production path or only on an\n"
-                f"     eager/fallback path that production bypasses (e.g. via an OpSlot).\n"
+                f"     eager/fallback path that production bypasses (e.g. via a VeomniOp).\n"
                 f"Then act:\n"
                 f"  - Production + VeOmni-patched -> fix the patch (derive host-side,\n"
                 f"    precompute in the collator).\n"
@@ -749,11 +665,11 @@ def test_multimodal_metadata_path_matches_fallback(case):
         pytest.skip(f"Path not found: {case.toy_config_dir}")
     if case.attn_implementation == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
         pytest.skip("flash_attn package not installed.")
-    if _MOE_IMPL_BY_CASE.get(case.case_id) == "triton":
+    if _MOE_IMPL_BY_CASE.get(case.case_id) == "fused_triton":
         from veomni.utils.import_utils import is_fused_moe_available
 
         if not is_fused_moe_available():
-            pytest.skip("triton MoE requires triton + CUDA SM70+.")
+            pytest.skip("fused_triton MoE requires Triton + CUDA SM70+.")
 
     _apply_determinism()
 

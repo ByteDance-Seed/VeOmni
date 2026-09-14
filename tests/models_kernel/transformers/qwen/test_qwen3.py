@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM as HFQwen3ForCausalLM
@@ -29,8 +30,12 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3Model as HFQwen3Model
 
 from tests.models_kernel.tiny_configs import tiny_qwen3_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
+from tests.tools.training_utils import make_eager_ops_config
+from veomni.data.data_collator import MainCollator
+from veomni.models_kernel import build_foundation_model
 from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config, set_ops_config
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 def _eager_kernels_config() -> SimpleNamespace:
@@ -191,3 +196,62 @@ def test_qwen3_token_cls_eager_matches_hf():
     ours_out = ours(input_ids=input_ids, labels=labels, use_cache=False)
     torch.testing.assert_close(ours_out.logits, hf_out.logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
     torch.testing.assert_close(ours_out.loss, hf_out.loss, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+
+def test_qwen3_loss_matches_with_padded_packed_input(monkeypatch):
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("CUDA is required for flash-attn")
+    pytest.importorskip("flash_attn")
+
+    monkeypatch.setattr(
+        "veomni.data.data_collator.get_parallel_state",
+        lambda: type("PS", (), {"sp_enabled": False, "sp_size": 1, "sp_rank": 0})(),
+    )
+
+    device = torch.device(get_device_type())
+    torch.manual_seed(0)
+    model = build_foundation_model(
+        config_path="tests/toy_config/qwen3_toy",
+        weights_path=None,
+        torch_dtype="float16",
+        init_device=get_device_type(),
+        ops_implementation=make_eager_ops_config(attn_implementation="flash_attention_2"),
+    ).eval()
+
+    features = [
+        {
+            "input_ids": torch.tensor([11, 12, 13], dtype=torch.long),
+            "attention_mask": torch.tensor([1, 1, 1], dtype=torch.long),
+            "labels": torch.tensor([11, 12, 13], dtype=torch.long),
+        },
+        {
+            "input_ids": torch.tensor([21, 22], dtype=torch.long),
+            "attention_mask": torch.tensor([1, 1], dtype=torch.long),
+            "labels": torch.tensor([21, 22], dtype=torch.long),
+        },
+    ]
+
+    unpadded = MainCollator()(features)
+    padded = MainCollator(pad_to_length=16)(features)
+
+    def to_device(batch):
+        return {key: (value.to(device) if torch.is_tensor(value) else value) for key, value in batch.items()}
+
+    def forward(batch):
+        batch = to_device(batch)
+        return model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch.get("attention_mask"),
+            position_ids=batch.get("position_ids"),
+            cu_seq_lens_q=batch.get("cu_seq_lens_q"),
+            cu_seq_lens_k=batch.get("cu_seq_lens_k"),
+            max_length_q=batch.get("max_length_q"),
+            max_length_k=batch.get("max_length_k"),
+            labels=batch.get("labels"),
+        )
+
+    with torch.no_grad():
+        unpadded_loss = forward(unpadded).loss
+        padded_loss = forward(padded).loss
+
+    torch.testing.assert_close(padded_loss, unpadded_loss, rtol=1e-3, atol=1e-3)

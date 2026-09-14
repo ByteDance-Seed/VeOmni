@@ -1154,8 +1154,24 @@ class TestQwen3VLMoeConverterConvert:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
         )
+        tensor = torch.arange(shape[0] * shape[1] * shape[2], dtype=torch.float32).reshape(shape)
+        original = tensor.clone()
         with pytest.raises(RuntimeError, match="ambiguous layout"):
-            converter.convert(f"l.mlp.experts.{projection}", torch.randn(shape))
+            maybe_convert_checkpoint_tensor(f"l.mlp.experts.{projection}", tensor, converter)
+        assert torch.equal(tensor, original)
+
+    @pytest.mark.parametrize("projection", ("gate_up_proj", "down_proj"))
+    @pytest.mark.parametrize("layout", ("hf", "veomni"))
+    def test_raises_on_wrong_last_dim(self, projection, layout):
+        if projection == "gate_up_proj":
+            middle = VLMOE_HIDDEN if layout == "hf" else 2 * VLMOE_INTERMEDIATE
+        else:
+            middle = VLMOE_INTERMEDIATE if layout == "hf" else VLMOE_HIDDEN
+        with pytest.raises(RuntimeError, match="unrecognized layout"):
+            self.converter.convert(
+                f"l.mlp.experts.{projection}",
+                torch.randn(VLMOE_NUM_EXPERTS, middle, 999),
+            )
 
 
 class TestQwen3VLMoeConverterFinalize:

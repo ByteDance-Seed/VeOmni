@@ -273,5 +273,5 @@ full global compressed array; a CSA layer pays two extra collectives, since the
 compressor and its indexer compress the same windows at different head
 dimensions and cannot share a result; and `exchange_compressor_halos`
 all-gathers from every rank when only two neighbours are ever read.
-`tests/models/test_model_forward_no_implicit_sync.py` does not exercise CP, so
+`tests/models_kernel/transformers/test_model_forward_no_implicit_sync.py` does not exercise CP, so
 the CP paths have no automated guard against device-to-host syncs.
