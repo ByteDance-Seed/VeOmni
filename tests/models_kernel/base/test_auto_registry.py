@@ -45,6 +45,9 @@ from tests.models_kernel.tiny_configs import (
     tiny_llama_config as _tiny_llama_config,
 )
 from tests.models_kernel.tiny_configs import (
+    tiny_ltx2_3_config as _tiny_ltx2_3_config,
+)
+from tests.models_kernel.tiny_configs import (
     tiny_movqgan_config as _tiny_movqgan_config,
 )
 from tests.models_kernel.tiny_configs import (
@@ -341,6 +344,15 @@ _MODEL_CASES = (
             "Qwen3VLMoeModel",
             "Qwen3VLMoeTextModel",
         ),
+    ),
+    _ModelCase(
+        model_type="LTXVideoTransformerModel",
+        config_factory=_tiny_ltx2_3_config,
+        architectures=("LTXVideoTransformerModel",),
+        has_registered_config=True,
+        registered_config_aliases=("LTXVideoConditionModel",),
+        registered_model_aliases=("LTXVideoConditionModel",),
+        eager_op_path=None,
     ),
     _ModelCase(
         model_type="QwenImageTransformer2DModel",

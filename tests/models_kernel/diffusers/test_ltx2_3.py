@@ -20,12 +20,28 @@ import importlib
 import sys
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.models_kernel.compare import eager_ops_config
+
+# isort: off
+# Import the package binder before the vendored top-level ``ltx_core`` modules.
+from veomni.models_kernel.diffusers.ltx2_3.ltx_transformer import modeling_ltx2_3_transformer as ltx_modeling
+from ltx_core.guidance.perturbations import BatchedPerturbationConfig
+from ltx_core.model.transformer.attention import Attention
+from ltx_core.model.transformer.model import LTXModel
+# isort: on
+
+from tests.models_kernel.compare import assert_outputs_and_grads_match, eager_ops_config
+from tests.models_kernel.tiny_configs import tiny_ltx2_3_condition_config as _tiny_condition_config
+from tests.models_kernel.tiny_configs import tiny_ltx2_3_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 from veomni.ops.config import get_ops_config, set_ops_config
+
+
+_OFFICIAL_ATTENTION_FORWARD = Attention.forward
+_OFFICIAL_LTX_MODEL_FORWARD = LTXModel.forward
 
 
 def _call_rms(x: torch.Tensor, weight: torch.Tensor | None, ops: SimpleNamespace | None = None):
@@ -37,6 +53,95 @@ def _call_rms(x: torch.Tensor, weight: torch.Tensor | None, ops: SimpleNamespace
         return rms_norm(x, weight=weight, eps=1e-6)
     finally:
         set_ops_config(previous)
+
+
+def _ltx_inputs() -> dict:
+    return {
+        "hidden_states": [torch.randn(1, 4, 1, 2, 2)],
+        "timestep": [torch.tensor(0.5)],
+        "encoder_hidden_states": [torch.randn(1, 3, 16)],
+    }
+
+
+def test_ltx2_3_configs_roundtrip_through_registry(tmp_path):
+    from veomni.models_kernel import build_config, get_model_class
+    from veomni.models_kernel.diffusers.ltx2_3.ltx_condition.configuration_ltx2_3_condition import (
+        LTXVideoConditionModelConfig,
+    )
+    from veomni.models_kernel.diffusers.ltx2_3.ltx_transformer.configuration_ltx2_3_transformer import (
+        LTXVideoTransformerModelConfig,
+    )
+
+    transformer_path = tmp_path / "transformer"
+    condition_path = tmp_path / "condition"
+    _tiny_config().save_pretrained(transformer_path)
+    _tiny_condition_config().save_pretrained(condition_path)
+
+    transformer = build_config(str(transformer_path))
+    condition = build_config(str(condition_path))
+
+    assert type(transformer) is LTXVideoTransformerModelConfig
+    assert type(condition) is LTXVideoConditionModelConfig
+    assert get_model_class(transformer).__name__ == "LTXVideoTransformerModel"
+    assert get_model_class(condition).__name__ == "LTXVideoConditionModel"
+
+
+def test_ltx2_3_condition_builds_from_registered_class_without_assets(monkeypatch):
+    from veomni.models_kernel import MODELING_REGISTRY
+    from veomni.models_kernel.diffusers.ltx2_3.ltx_condition import modeling_ltx2_3_condition
+
+    monkeypatch.setattr(modeling_ltx2_3_condition.LTXVideoConditionModel, "_load_components", lambda self: None)
+
+    model_class = MODELING_REGISTRY["LTXVideoConditionModel"]()
+    model = model_class._from_config(_tiny_condition_config())
+
+    assert type(model) is modeling_ltx2_3_condition.LTXVideoConditionModel
+    assert model.config.model_type == "LTXVideoConditionModel"
+
+
+def test_ltx2_3_eager_forward_and_backward_match_vendored_reference():
+    torch.manual_seed(2)
+    config = _tiny_config()
+    official = ltx_modeling.LTXVideoTransformerModel(config)
+    official.apply(official._init_weights)
+    ours = ltx_modeling.LTXVideoTransformerModel(config)
+    ours.load_state_dict(official.state_dict())
+    official_inputs = _ltx_inputs()
+    ours_inputs = {key: [value.detach().clone() for value in values] for key, values in official_inputs.items()}
+
+    previous_ops = get_ops_config()
+    previous_attention_forward = Attention.forward
+    previous_ltx_model_forward = LTXModel.forward
+    set_ops_config(eager_ops_config())
+    try:
+
+        def call(model):
+            if model is official:
+                Attention.forward = _OFFICIAL_ATTENTION_FORWARD
+                LTXModel.forward = _OFFICIAL_LTX_MODEL_FORWARD
+                inputs = official_inputs
+            else:
+                Attention.forward = ltx_modeling.LTXSPAttention_forward
+                LTXModel.forward = ltx_modeling.LTXVideoModel_forward
+                inputs = ours_inputs
+            return model(**inputs).predictions[0]
+
+        assert_outputs_and_grads_match(official, ours, call)
+    finally:
+        Attention.forward = previous_attention_forward
+        LTXModel.forward = previous_ltx_model_forward
+        set_ops_config(previous_ops)
+
+
+def test_ltx2_3_video_only_model_rejects_audio_input():
+    model = ltx_modeling.LTXVideoTransformerModel(_tiny_config())
+    with pytest.raises(ValueError, match="Audio is not enabled"):
+        ltx_modeling.LTXVideoModel_forward(
+            model,
+            video=None,
+            audio=object(),
+            perturbations=BatchedPerturbationConfig.empty(1),
+        )
 
 
 def test_ltx2_3_rms_norm_matches_official():

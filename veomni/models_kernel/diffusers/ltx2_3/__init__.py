@@ -12,4 +12,9 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""LTX 2.3 modeling that calls local VeomniOp handles. Not on ``MODELING_REGISTRY``."""
+"""Register LTX 2.3 transformer and condition modeling."""
+
+from . import ltx_condition, ltx_transformer
+
+
+__all__ = ["ltx_condition", "ltx_transformer"]

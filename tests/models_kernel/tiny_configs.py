@@ -341,6 +341,47 @@ def tiny_wan_t2v_condition_config(
     return WanTransformer3DConditionModelConfig(**kwargs)
 
 
+def tiny_ltx2_3_config(architecture: str = "LTXVideoTransformerModel", **overrides) -> PretrainedConfig:
+    from veomni.models_kernel.diffusers.ltx2_3.ltx_transformer.configuration_ltx2_3_transformer import (
+        LTXVideoTransformerModelConfig,
+    )
+
+    kwargs = {
+        "in_channels": 4,
+        "out_channels": 4,
+        "num_attention_heads": 2,
+        "attention_head_dim": 8,
+        "num_layers": 1,
+        "cross_attention_dim": 16,
+        "caption_channels": 16,
+        "positional_embedding_max_pos": [4, 8, 8],
+        "frequencies_precision": "float32",
+        "caption_proj_before_connector": False,
+        "with_audio": False,
+        "architectures": [architecture],
+        "tie_word_embeddings": False,
+        "attn_implementation": "eager",
+    }
+    kwargs.update(overrides)
+    return LTXVideoTransformerModelConfig(**kwargs)
+
+
+def tiny_ltx2_3_condition_config(architecture: str = "LTXVideoConditionModel", **overrides) -> PretrainedConfig:
+    from veomni.models_kernel.diffusers.ltx2_3.ltx_condition.configuration_ltx2_3_condition import (
+        LTXVideoConditionModelConfig,
+    )
+
+    kwargs = {
+        "base_model_path": "",
+        "max_sequence_length": 16,
+        "video_max_size": 32,
+        "architectures": [architecture],
+        "tie_word_embeddings": False,
+    }
+    kwargs.update(overrides)
+    return LTXVideoConditionModelConfig(**kwargs)
+
+
 def tiny_qwen_image_config(architecture: str = "QwenImageTransformer2DModel", **overrides) -> PretrainedConfig:
     from veomni.models_kernel.diffusers.qwen_image.qwen_image_transformer.configuration_qwen_image_transformer import (
         QwenImageTransformer2DModelConfig,

@@ -117,6 +117,11 @@ def LTXVideoModel_forward(
     audio: Modality | None,
     perturbations: BatchedPerturbationConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if not self.model_type.is_video_enabled() and video is not None:
+        raise ValueError("Video is not enabled for this model")
+    if not self.model_type.is_audio_enabled() and audio is not None:
+        raise ValueError("Audio is not enabled for this model")
+
     video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
     audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
 

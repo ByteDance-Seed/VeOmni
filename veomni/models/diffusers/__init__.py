@@ -1,4 +1,4 @@
-from . import ltx2_3, minimax_h3
+from . import minimax_h3
 
 
-__all__ = ["ltx2_3", "minimax_h3"]
+__all__ = ["minimax_h3"]
