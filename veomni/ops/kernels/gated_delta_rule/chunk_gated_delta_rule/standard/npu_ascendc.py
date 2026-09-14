@@ -582,6 +582,7 @@ def forward(
     )
     if final_state is None:
         final_state = output.new_empty(0)
+    saved_cu_seqlens = cu_opt if cu_opt is not None else cu_seqlens
     return (output.to(query_h.dtype), final_state), SavedState(
         (
             query_h,
@@ -591,7 +592,7 @@ def forward(
             beta,
             a,
             initial_state,
-            cu_seqlens,
+            saved_cu_seqlens,
             query_inv_norm,
             key_inv_norm,
         ),
