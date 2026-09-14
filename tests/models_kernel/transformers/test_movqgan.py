@@ -25,7 +25,7 @@ def test_movqgan_repository_config_and_processor_load_through_registry():
     from veomni.models_kernel.transformers.movqgan.configuration_movqgan import MoVQGANConfig
     from veomni.models_kernel.transformers.movqgan.processing_movqgan import MoVQGANProcessor
 
-    config_path = Path(__file__).parents[1] / "toy_config/movqgan_toy"
+    config_path = Path(__file__).parents[2] / "toy_config/movqgan_toy"
     config = build_config(str(config_path))
     processor = build_processor(str(config_path))
 

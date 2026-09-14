@@ -136,8 +136,6 @@ jobs:
         run: |
           uv run --frozen pytest -s -x tests/models_kernel
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
-          uv run --frozen pytest -s -x tests/models_kernel/test_generated_modeling_imports.py
-          uv run --frozen pytest -s -x tests/models_kernel/test_transformers_upgrade_compat.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -s -x tests/models/test_vlm_trainer.py
           uv run --frozen pytest -s -x tests/trainer/test_aux_metrics.py

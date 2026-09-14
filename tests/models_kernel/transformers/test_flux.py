@@ -93,7 +93,7 @@ def test_flux_repository_config_loads_through_registry():
     from veomni.models_kernel import build_config, get_model_class
     from veomni.models_kernel.transformers.flux.config_flux import FluxConfig
 
-    config_path = Path(__file__).parents[2] / "configs/model_configs/flux/flux.json"
+    config_path = Path(__file__).parents[3] / "configs/model_configs/flux/flux.json"
     config = build_config(str(config_path))
 
     assert type(config) is FluxConfig

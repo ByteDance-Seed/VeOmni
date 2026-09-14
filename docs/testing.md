@@ -168,7 +168,7 @@ GPT-OSS, Llama, MoVQGAN, Seed-OSS,
 Qwen2, Qwen2-VL, Qwen2.5-VL, Qwen2.5-Omni, Qwen3, Qwen3-MoE, Qwen3-VL, Qwen3-VL-MoE, Qwen3.5,
 Qwen3.5-MoE, Qwen3-Omni-MoE, and Wan. Their registry/build
 dispatch, supported architectures, eager forward/backward parity, and
-instance-local op binding are covered by `tests/models_kernel/test_auto_registry.py`
+instance-local op binding are covered by `tests/models_kernel/base/test_auto_registry.py`
 and the corresponding model tests under `tests/models_kernel/`. Backend
 availability and optimized op numerics are covered by the corresponding tests
 under `tests/ops/`.
@@ -287,7 +287,7 @@ by `tests/ops/mhc/test_mhc.py` and requires TileKernels on an SM90+ NVIDIA GPU.
 
 Cross-entropy is covered at two layers: `tests/ops/loss/test_cross_entropy_loss.py`
 checks token-level eager parity with HF plus chunked/Liger forward and backward;
-`tests/models_kernel/test_loss_utils.py` checks causal target selection,
+`tests/models_kernel/base/test_loss_utils.py` checks causal target selection,
 sequence-classification policy, SP reduction, logits ownership, and log-probs
 side-path dispatch. Chunked log-probs and top-k distillation have focused tests
 in `tests/models_kernel/`.
@@ -295,7 +295,7 @@ in `tests/models_kernel/`.
 Load-balancing loss is covered at two layers: `tests/ops/loss/test_load_balancing_loss.py`
 checks the raw `[N, E]` eager and Triton kernels against HF/eager across the
 configuration matrix, forward/backward, masks, determinism, and peak memory;
-`tests/models_kernel/test_model_load_balancing_loss.py` checks tuple
+`tests/models_kernel/base/test_model_load_balancing_loss.py` checks tuple
 concatenation, optional-input policy, and gradient fan-out in the model helper.
 
 ---

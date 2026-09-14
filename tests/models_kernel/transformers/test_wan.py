@@ -89,7 +89,7 @@ def _wan_inputs(in_dim: int, text_len: int, text_dim: int) -> dict[str, torch.Te
 def test_wan_repository_configs_load_through_registry(filename, has_image_input):
     from veomni.models_kernel import build_config, get_model_class
 
-    config_path = Path(__file__).parents[2] / "configs/model_configs/wan" / filename
+    config_path = Path(__file__).parents[3] / "configs/model_configs/wan" / filename
     config = build_config(str(config_path))
 
     assert type(config) is WanConfig

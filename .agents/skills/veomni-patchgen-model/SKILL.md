@@ -518,7 +518,7 @@ Minimum coverage:
    covers single-GPU vs FSDP2 `grad_norm` for *text* models only. If the model
    is text-only, append to the text test cases list. VLM/Omni models are out
    of scope for this suite (no VLM scaffolding exists).
-7. **MoE with a converter** — `tests/models_kernel/test_checkpoint_tensor_converter.py`: add a
+7. **MoE with a converter** — `tests/models_kernel/base/test_checkpoint_tensor_converter.py`: add a
    test group mirroring the existing `qwen3_moe` / `qwen3_vl_moe` blocks.
    Minimum coverage:
    - `can_handle` — matches the expected key regex, rejects non-expert keys.
@@ -557,7 +557,7 @@ pytest tests/models/test_models_logits_equal_v5.py -k <m> -v
 pytest tests/models/test_models_patch.py -k <m> -v
 pytest tests/e2e/test_e2e_parallel.py::<test_fn> -k <model_name> -v   # see note below; needs multi-GPU worker
 # MoE with a converter:
-pytest tests/models_kernel/test_checkpoint_tensor_converter.py -v
+pytest tests/models_kernel/base/test_checkpoint_tensor_converter.py -v
 # VLM / Omni (requires multiple GPUs):
 pytest tests/distributed/test_dummy_forward.py -k <m> -v
 # VLM only:

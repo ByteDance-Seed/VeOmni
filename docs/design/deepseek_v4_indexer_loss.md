@@ -249,7 +249,7 @@ silently produces nothing.) Threading the decision is both smaller and stronger:
 one evaluation per layer per forward cannot disagree with itself mid-call, and the
 HCA compressor takes the same parameter and ignores it only because its shared
 call site demands one signature —
-`tests/models_kernel/test_generated_call_site_signatures.py` is what enforces that, and
+`tests/models_kernel/transformers/test_generated_call_site_signatures.py` is what enforces that, and
 it is what caught the NPU compressors missing it.
 
 The layer gate keys on `layer_type` rather than on `module.compressor.indexer`

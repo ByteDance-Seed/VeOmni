@@ -34,7 +34,7 @@ from pathlib import Path
 import pytest
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 TRANSFORMERS_ROOT = REPO_ROOT / "veomni" / "models_kernel" / "transformers"
 GENERATED_MODULES = sorted(TRANSFORMERS_ROOT.glob("*/generated/patched_modeling_*.py"))
 

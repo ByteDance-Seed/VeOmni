@@ -23,7 +23,7 @@ teacher_mass)``. We exercise:
   ``flash_attn``) so it runs in the default CI matrix.
 - Bitwise parity vs verl's ``compute_forward_kl_topk`` on CUDA under
   deterministic + batch-invariant mode, mirroring the pattern in
-  ``tests/models_kernel/test_chunk_logprobs.py``.
+  ``tests/models_kernel/base/test_chunk_logprobs.py``.
 - Closed-form backward correctness via a direct comparison against
   PyTorch's autograd through the dense reference.
 - IGNORE_INDEX masking → exact zero on all five outputs and zero

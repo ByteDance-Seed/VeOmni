@@ -198,4 +198,4 @@ tensors through and confirm they come out identical (no transpose applied).
   `gate_proj`/`up_proj`/`down_proj` will raise
   `KeyError: '...experts.0.gate_proj.weight'`. Guard with a key-existence check,
   skip stacking when fused keys are already present, and cover both layouts in
-  `tests/models_kernel/test_checkpoint_tensor_converter.py`.
+  `tests/models_kernel/base/test_checkpoint_tensor_converter.py`.

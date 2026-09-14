@@ -53,7 +53,7 @@ os.environ.setdefault("MASTER_PORT", "12356")
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 TOY_QWEN3 = os.path.join(REPO_ROOT, "tests", "toy_config", "qwen3_toy")
 TOY_QWEN3_VL = os.path.join(REPO_ROOT, "tests", "toy_config", "qwen3vl_toy")
 IGNORE_INDEX = -100
