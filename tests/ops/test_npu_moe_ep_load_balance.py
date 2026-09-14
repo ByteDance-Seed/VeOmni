@@ -480,7 +480,7 @@ def _exercise_cpu_two_rank_npu_plumbing(rank, group):
         expected_counts = [5, 0] if rank == 0 else [0, 5]
         assert observed_group_lists[0].tolist() == expected_counts
         assert observed_group_lists[1].tolist() == expected_counts
-        assert monitor.records == [(7, (10, 0), (5, 5), 1, 5)]
+        assert monitor.records == ([(7, (10, 0), (5, 5), 1, 5)] if rank == 0 else [])
 
         output.sum().backward()
         expected_gate_grad, expected_down_grad = _reference_owner_gradients(hidden_states, routing_weights, group)

@@ -237,11 +237,12 @@ class MoERouterMonitor:
             num_experts: Total experts per MoE layer (global, not per-EP-rank).
             dp_group: The process group to all-reduce expert counts across.
                 Should span every rank that holds a *distinct* token slice
-                (data-parallel × sequence-parallel). Do **not** include EP
-                siblings: the router gate is replicated across EP, so they
-                produce identical indices and summing them inflates counts
-                by ``ep_size``. In VeOmni this is ``parallel_state.fsdp_group``
-                (which is the ``dp_sp`` mesh dim).
+                (data-parallel × sequence-parallel). In the supported
+                ep_outside=False topology, EP siblings have replicated gates
+                but distinct token slices and must be included. In VeOmni
+                this is ``parallel_state.fsdp_group``. Physical balance plans
+                are already EP-global, so their caller records them on only
+                one EP representative before this group's reduction.
         """
         self.num_experts = num_experts
         self.dp_group = dp_group
@@ -442,10 +443,8 @@ class MoERouterMonitor:
         zero_row = torch.zeros(self.num_experts, dtype=torch.long, device=device)
         matrix = torch.stack([self._counts.get(mid, zero_row) for mid in self._layer_order])
 
-        # All-reduce across the DP+SP group so the heatmap aggregates every
-        # distinct token slice. EP siblings hold the replicated gate and
-        # produce identical counts, so we deliberately do not reduce across
-        # EP — that would inflate by ``ep_size``.
+        # Router counts are local, unlike the already EP-global physical
+        # plans. Sum every distinct token slice in the configured group.
         if self.dp_group is not None and dist.is_initialized():
             dist.all_reduce(matrix, op=dist.ReduceOp.SUM, group=self.dp_group)
         return matrix
@@ -659,7 +658,7 @@ class MoERouterMonitor:
         DP+SP/FSDP group. Every member must call this method even if only one
         global rank logs the result. Pass ``format_only_on=False`` on
         non-logging ranks to skip the scalar + heatmap build (the rank still
-        participates in collectives and resets). EP siblings are excluded.
+        participates in collectives and resets).
 
         Returns a dict with:
 

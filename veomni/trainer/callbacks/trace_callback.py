@@ -78,9 +78,9 @@ class MoERouterMonitorCallback(Callback):
             return
         from ...utils.moe_monitor import attach_moe_router_monitor
 
-        # fsdp_group is the dp_sp mesh dim — exactly the set of ranks that
-        # hold distinct token slices. EP is intentionally not in this group;
-        # see MoERouterMonitor.__init__ docstring.
+        # Sum all distinct token slices, including EP siblings in the
+        # supported ep_outside=False topology. Already EP-global physical
+        # plans contribute once per EP group at the dispatch boundary.
         self.monitor.dp_group = self.parallel_state.fsdp_group
 
         attached = attach_moe_router_monitor(self.trainer.model, self.monitor)

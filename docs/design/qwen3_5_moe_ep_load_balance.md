@@ -72,7 +72,7 @@ Invalid settings raise during argument validation or attachment. The implementat
 
 ## Telemetry
 
-Set `train.moe_load_balance_monitor_interval=N` to emit an interval every `N` optimizer steps. Logical expert counts and physical plan data are reduced across the cached DP+SP/FSDP group that contains distinct token slices. Replicated EP siblings are deliberately excluded; reducing them would duplicate identical router counts.
+Set `train.moe_load_balance_monitor_interval=N` to emit an interval every `N` optimizer steps. Logical expert counts are rank-local and reduced across the cached DP+SP/FSDP group containing all distinct token slices. In the supported `ep_outside=false` topology this group includes EP siblings: replicated router weights do not imply replicated input tokens. Physical plan data, in contrast, has already been gathered across EP and is identical on its siblings. Only EP-local rank 0 records that plan before the DP+SP/FSDP reduction. Every rank still enters the monitor collectives, including ranks with no physical contribution. This avoids multiplying moved-token totals, replica-event counts, and physical heatmap loads by `ep_size`; normalized imbalance and moved fractions alone would not reveal that error.
 
 For a physical rank-load row `x` with `R` ranks, normalized imbalance is
 

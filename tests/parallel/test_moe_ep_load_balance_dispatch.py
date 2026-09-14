@@ -400,6 +400,43 @@ class _BalanceMonitor:
         self.records.append(record)
 
 
+def _plan_telemetry_worker(rank: int, world_size: int, rendezvous: str, ep_size: int) -> None:
+    from veomni.utils import moe_monitor
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world_size)
+    try:
+        if ep_size == world_size:
+            ep_group = dist.group.WORLD
+        else:
+            even = dist.new_group((0, 2), backend="gloo")
+            odd = dist.new_group((1, 3), backend="gloo")
+            ep_group = even if rank % 2 == 0 else odd
+        ep_rank = dist.get_rank(ep_group)
+        selected = torch.zeros((2 + ep_rank, 1), dtype=torch.long)
+        plan = ep_load_balance.build_ep_balance_plan(selected, 4, ep_group, max_replicas_per_rank=1)
+        monitor = moe_monitor.MoERouterMonitor(num_experts=4, dp_group=dist.group.WORLD)
+        monitor.record(nn.Identity(), selected)
+        moe_monitor.set_active_monitor(monitor)
+        moe_layer._record_ep_balance(SimpleNamespace(ep_group=ep_group, layer_index=0), plan)
+        metrics = monitor.compute_metrics(current_step=1, format_only_on=rank == 0)
+        if rank == 0:
+            groups = world_size // ep_size
+            assert metrics["moe/ep_active_replicas/sum"] == len(plan.replicas) * groups
+            assert metrics["moe/ep_moved_tokens/sum"] == sum(r.moved_tokens for r in plan.replicas) * groups
+            assert metrics["moe/ep_total_routed_tokens/sum"] == sum(2 + r for r in range(ep_size)) * groups
+        else:
+            assert metrics == {}
+    finally:
+        moe_monitor.set_active_monitor(None)
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("ep_size", [2, 4])
+def test_global_ep_plan_telemetry_is_not_counted_once_per_ep_sibling(tmp_path, ep_size):
+    rendezvous = f"file://{tmp_path / f'plan-telemetry-ep{ep_size}'}"
+    mp.spawn(_plan_telemetry_worker, args=(4, rendezvous, ep_size), nprocs=4, join=True)
+
+
 def _cpu_merged_expert(tokens, cumsum, gate_up_proj, down_proj, swiglu_limit):
     assert swiglu_limit is None
     outputs = []
@@ -505,7 +542,7 @@ def _exercise_two_rank_dispatch(rank: int, group: dist.ProcessGroup) -> None:
             "cat_down",
         ]
         assert observed_cumsums[0].tolist() == ([5, 5] if rank == 0 else [0, 5])
-        assert monitor.records == [(7, (10, 0), (5, 5), 1, 5)]
+        assert monitor.records == ([(7, (10, 0), (5, 5), 1, 5)] if rank == 0 else [])
 
         output.sum().backward()
         weighted_input_sum = hidden_states.mul(routing_weights).sum()

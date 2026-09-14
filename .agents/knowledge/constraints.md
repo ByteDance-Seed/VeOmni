@@ -192,3 +192,13 @@ Core files:
 
 27. **Exact uv synchronization removes separately installed overlays**
     - The MagiAttention SM90 CUTLASS overlay is installed by `scripts/kernel/install_magi_sm90.sh` after the locked GPU environment. Reinstall it after a later exact `uv sync` before running MagiAttention on SM90.
+
+## EP Replica Boundaries
+
+28. **Replica-gradient P2P buffers must be contiguous on both ends**
+    - A transposed expert GEMM can return non-contiguous gradients; `clone()` and `empty_like()` preserve that layout by default.
+    - Pack outgoing rows and explicitly allocate contiguous receive buffers, then add them to owner gradients by logical index. Include non-square, multi-element gradient tests.
+
+29. **EP-global plan telemetry must contribute only once per EP group**
+    - The load-balancing planner has already gathered all EP senders. Recording its totals on every sibling and then summing over the FSDP/DP+SP group inflates absolute counts by `ep_size`.
+    - Record physical plans only on EP-local rank 0; all ranks still join monitoring collectives. Rank-local router histograms continue to sum every distinct token slice.

@@ -243,7 +243,10 @@ def _record_ep_balance(load_balancer: Any, plan: EPBalancePlan) -> None:
 
     monitor = get_active_monitor()
     record_ep_balance = getattr(monitor, "record_ep_balance", None)
-    if callable(record_ep_balance):
+    # Plans already contain all EP senders. The monitor later sums across the
+    # FSDP/DP+SP group, which includes EP siblings in the supported topology.
+    # Contribute each replicated plan once, not once per EP rank.
+    if callable(record_ep_balance) and dist.get_rank(load_balancer.ep_group) == 0:
         record_ep_balance(
             load_balancer.layer_index,
             plan.rank_loads_before,
