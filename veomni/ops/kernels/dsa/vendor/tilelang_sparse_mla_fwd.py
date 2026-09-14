@@ -239,7 +239,7 @@ def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I
 
     Returns:
         out: [B, S, H, D] bf16
-        lse: [B, S, H] fp32
+        lse: [B, S, H] fp32 in base-2 units
     """
     assert q.is_contiguous() and kv.is_contiguous() and topk_idxs.is_contiguous()
     batch, seq_len, heads, dim = q.shape

@@ -40,9 +40,9 @@ def sparse_mqa_target_fwd(
 ) -> torch.Tensor:
     """Head-summed attention mass over the compressed index slice.
 
-    ``lse`` is the full CSA log-sum-exp from sparse MQA forward, including
-    the sliding window and the folded attention sink. The returned tensor
-    is unnormalised; L1-normalise in the caller.
+    ``lse`` is the full base-2 CSA log-sum-exp from sparse MQA forward,
+    including the sliding window and the folded attention sink. The returned
+    tensor is unnormalised; L1-normalise in the caller.
     """
     _require_tilelang_sm90()
     from .vendor.tilelang_sparse_mla_target import sparse_mqa_target_fwd_interface

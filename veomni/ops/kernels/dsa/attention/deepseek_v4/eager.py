@@ -24,6 +24,8 @@ https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -55,7 +57,8 @@ def wrapper(
 
     ``q`` is ``[B, S, H, D]``, ``kv`` is ``[B, S_kv, D]``, ``attn_sink`` is
     ``[H]``, ``topk_idxs`` is ``[B, S, topk]``. Repeated valid indices retain
-    their per-slot softmax multiplicity, matching the TileLang row.
+    their per-slot softmax multiplicity, matching the TileLang row. When
+    requested, LSE is detached and returned in base-2 units.
     """
     scale = q.shape[-1] ** -0.5 if sm_scale is None else sm_scale
     query = q.transpose(1, 2).contiguous()
@@ -75,5 +78,7 @@ def wrapper(
     out = attn_output.transpose(1, 2).contiguous()
     if not return_lse:
         return out
-    lse = torch.logsumexp(torch.cat([attn_weights.float(), sinks.float()], dim=-1), dim=-1).transpose(1, 2)
+    lse = (
+        torch.logsumexp(torch.cat([attn_weights.float(), sinks.float()], dim=-1), dim=-1) * math.log2(math.e)
+    ).transpose(1, 2)
     return out, lse.detach()

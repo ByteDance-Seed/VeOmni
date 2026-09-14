@@ -39,14 +39,15 @@ def forward(
     weight: Tensor,
     *,
     ignore_index: int = -100,
-    num_items_in_batch: int | None = None,
+    num_items_in_batch: int | Tensor | None = None,
 ) -> tuple[Tensor, SavedState]:
     """Liger fused linear + CE. ``weight`` must be present.
 
     Calls ``fused_linear_cross_entropy_forward`` / ``_backward`` the same way
     ``LigerFusedLinearCrossEntropyFunction`` does. Reduction matches eager /
     HF ``fixed_cross_entropy``: mean over non-ignored tokens, or
-    ``sum / num_items_in_batch``. Empty ``hidden`` falls back to the eager pair.
+    ``sum / num_items_in_batch``. A zero explicit count uses one, matching the
+    eager row's connected-zero behavior. Empty ``hidden`` falls back to eager.
     """
     if weight.numel() == 0:
         raise RuntimeError("liger_kernel requires a nonempty ``weight`` (fused-linear path)")
@@ -86,7 +87,12 @@ def forward(
     if weight_needs_grad and grad_weight is None:
         raise RuntimeError("liger fused CE did not allocate the requested weight grad buffer")
     if num_items_in_batch is not None:
-        scale = 1.0 / num_items_in_batch
+        if isinstance(num_items_in_batch, Tensor):
+            denominator = num_items_in_batch.to(dtype=loss.dtype, device=loss.device)
+            denominator = denominator.masked_fill(denominator == 0, 1)
+            scale = denominator.reciprocal()
+        else:
+            scale = 1.0 / (1 if num_items_in_batch == 0 else num_items_in_batch)
         loss = loss * scale
         if grad_hidden is not None:
             grad_hidden = grad_hidden * scale

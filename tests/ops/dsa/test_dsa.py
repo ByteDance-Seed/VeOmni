@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import math
 import sys
 from types import ModuleType
 from unittest.mock import Mock
@@ -294,7 +295,7 @@ def test_dsa_attention_deepseek_v4_eager_preserves_repeated_candidate_slots():
     combined_logits = torch.cat((logits, sink_ref.reshape(1, 1, 1, 1)), dim=-1)
     probs = combined_logits.softmax(dim=-1)
     expected = torch.einsum("bmhk,bmkd->bmhd", probs[..., :-1], gathered)
-    expected_lse = torch.logsumexp(combined_logits, dim=-1)
+    expected_lse = torch.logsumexp(combined_logits, dim=-1) / math.log(2)
 
     q_eager, kv_eager, sink_eager = make_grad_leaves(q, kv, sink)
     actual, actual_lse = resolve_op("dsa_attention", "deepseek_v4", "eager").wrapper(
