@@ -63,7 +63,6 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
     qwen3_5_text_model_forward_patched,
-    qwen3_5_text_model_update_linear_attn_mask,
     qwen3_5_vision_attention_forward_patched,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
@@ -116,24 +115,6 @@ config.drop_import_names(
     "causal_conv1d_update",
     "chunk_gated_delta_rule",
     "fused_recurrent_gated_delta_rule",
-)
-config.add_post_import_block(
-    """
-    # Selection of FusedRMSNormGated / causal_conv1d / chunk_gated_delta_rule
-    # has moved into OpSlot guards below (driven by OpsImplementationConfig).
-    # These None placeholders preserve two pieces of the original module:
-    #   (1) the upstream HF top-level
-    #       `is_fast_path_available = all((causal_conv1d_fn, ...))` resolves
-    #       to False, keeping the legacy warning behaviour; and
-    #   (2) the decode-only `*_update` / `fused_recurrent_*` aliases satisfy
-    #       the `<fla_name> or <torch_fallback>` assignments in __init__
-    #       (the precomputed-state path raises NotImplementedError anyway).
-    FusedRMSNormGated = None
-    causal_conv1d_fn = None
-    causal_conv1d_update = None
-    chunk_gated_delta_rule = None
-    fused_recurrent_gated_delta_rule = None
-    """
 )
 config.add_post_import_block(
     """
@@ -926,11 +907,10 @@ config.override_method(
     description="Support varlen flash linear attention and Ulysses SP in Qwen3_5MoeGatedDeltaNet.forward",
 )
 
-config.override_method(
-    "Qwen3_5MoeTextModel._update_linear_attn_mask",
-    replacement=qwen3_5_text_model_update_linear_attn_mask,
-    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
-)
+# NOTE: `Qwen3_5MoeTextModel._update_linear_attn_mask` was removed in
+# transformers 5.16 — `Qwen3_5MoeTextModel.forward` now builds a per-attention-
+# type mask mapping via `create_causal_mask` / `create_recurrent_attention_mask`.
+# See the matching note in qwen3_5_gpu_patch_gen_config.py.
 
 
 # ── DecoderLayer forward ────────────────────────────────────────────────────────
@@ -964,7 +944,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
     linear_attn_cu_seq_lens_q = kwargs.pop("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
 
     # Token Mixer
-    if self.layer_type == "linear_attention":
+    if self.block_type == "linear_attention":
         # Modification: pass linear-attention cu_seqlens through to Qwen3_5MoeGatedDeltaNet.forward.
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
@@ -973,7 +953,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
             attention_mask=attention_mask,
             cu_seq_lens_q=linear_attn_cu_seq_lens_q,
         )
-    elif self.layer_type == "full_attention":
+    elif self.block_type == "full_attention":
         # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
@@ -1338,3 +1318,8 @@ def qwen3_5_moe_causal_lm_get_parallel_plan_patched(self):
     from ..parallel_plan import get_causal_lm_parallel_plan as _get_causal_lm_parallel_plan
 
     return _get_causal_lm_parallel_plan()
+config.add_import("transformers.utils", names=["logging"])
+config.add_post_import_block("""
+from transformers.utils import logging
+logger = logging.get_logger(__name__)
+""")

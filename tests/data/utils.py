@@ -8,8 +8,8 @@ import torch.nn as nn
 from datasets import Dataset as HuggingFaceDataset
 from torch.utils.data import Dataset, IterableDataset
 
-from veomni.distributed.parallel_state import init_parallel_state
-from veomni.trainer.callbacks import CheckpointerCallback, TrainerState
+from veomni.distributed.parallel_state import _init_parallel_state
+from veomni.trainer.callbacks import GlobalStateCallback, TrainerState
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 from veomni.utils.helper import get_cache_dir
@@ -46,111 +46,63 @@ def setup_test_distributed(args):
             rank=int(os.environ["RANK"]),
         )
 
-    parallel_state = init_parallel_state(
-        dp_size=args.train.accelerator.dp_size,
-        dp_replicate_size=args.train.accelerator.dp_replicate_size,
-        dp_shard_size=args.train.accelerator.dp_shard_size,
-        tp_size=args.train.accelerator.tp_size,
-        pp_size=args.train.accelerator.pp_size,
-        cp_size=args.train.accelerator.cp_size,
-        ulysses_size=args.train.accelerator.ulysses_size,
-        extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes,
-        extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
-        extra_parallel_names=args.train.accelerator.extra_parallel_names,
-        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
+    parallel_state = _init_parallel_state(
+        dp_size=args.model.accelerator.dp_size,
+        dp_replicate_size=args.model.accelerator.dp_replicate_size,
+        dp_shard_size=args.model.accelerator.dp_shard_size,
+        tp_size=args.model.accelerator.tp_size,
+        pp_size=args.model.accelerator.pp_size,
+        cp_size=args.model.accelerator.cp_size,
+        ulysses_size=args.model.accelerator.ulysses_size,
+        extra_parallel_sizes=args.model.accelerator.extra_parallel_sizes,
+        extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
+        extra_parallel_names=args.model.accelerator.extra_parallel_names,
+        dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
     )
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     return device, parallel_state
 
 
-class StepAwareTestCheckpointerCallback(CheckpointerCallback):
-    """Test-only checkpoint callback that preserves per-epoch step position."""
+class StepAwareTestGlobalStateCallback(GlobalStateCallback):
+    """Test-only global-state callback that preserves per-epoch step position."""
 
     resume_state_key = TEST_RESUME_STATE_KEY
 
-    def _load_checkpoint(self):
-        args = self.trainer.args
-        if args.train.checkpoint.load_path is None:
-            return
-
-        state = {
-            "model": self.trainer.model,
-            "optimizer": self.trainer.optimizer,
-            "extra_state": {},
-        }
-
-        self.trainer.checkpointer.wait_for_pending_save()
-
-        self.trainer.checkpointer.load(args.train.checkpoint.load_path, state)
-
-        extra_state = state["extra_state"]
-        self.trainer.state.global_step = extra_state["global_step"]
-
-        resume_state = extra_state.get(self.resume_state_key)
-        if resume_state is not None:
-            self.trainer.start_epoch = resume_state["epoch"]
-            self.trainer.start_step = resume_state["curr_step"] + 1
-        else:
-            self.trainer.start_epoch = self.trainer.state.global_step // args.train_steps
-            self.trainer.start_step = self.trainer.state.global_step % args.train_steps
-
-        self.trainer.lr_scheduler.load_state_dict(extra_state["lr_scheduler"])
-
-        if self.trainer.train_dataloader is not None and extra_state.get("train_dataloader") is not None:
-            self.trainer.train_dataloader.load_state_dict(extra_state["train_dataloader"])
-
-        self.trainer.environ_meter.load_state_dict(extra_state["environ_meter"])
-        torch.set_rng_state(extra_state["torch_rng_state"])
-        if self.trainer.start_step == 0 and self.trainer.train_dataloader is not None:
-            iter(self.trainer.train_dataloader)
-
-        dist.barrier()
-        logger.info_rank0(f"Load distributed checkpoint from {args.train.checkpoint.load_path} successfully!")
-
-    def _save_checkpoint(self, state: TrainerState):
-        args = self.trainer.args
+    def state_dict(self, state: TrainerState):
         curr_step = getattr(state, "curr_step", None)
         if curr_step is None:
-            raise AttributeError("StepAwareTestCheckpointerCallback requires TrainerState.curr_step in tests")
+            raise AttributeError("StepAwareTestGlobalStateCallback requires TrainerState.curr_step in tests")
 
-        save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
-        ckpt_state = {
-            "model": self.trainer.model,
-            "optimizer": self.trainer.optimizer,
-            "extra_state": {
-                "global_step": state.global_step,
-                self.resume_state_key: {
-                    "epoch": state.epoch,
-                    "curr_step": curr_step,
-                },
-                "lr_scheduler": self.trainer.lr_scheduler.state_dict(),
-                "train_dataloader": (
-                    self.trainer.train_dataloader.state_dict() if self.trainer.train_dataloader is not None else None
-                ),
-                "environ_meter": self.trainer.environ_meter.state_dict(),
-                "torch_rng_state": torch.get_rng_state(),
-            },
-        }
-        self.trainer.checkpointer.save(save_checkpoint_path, ckpt_state, save_async=args.train.checkpoint.save_async)
+        global_state = super().state_dict(state)
+        global_state[self.resume_state_key] = {"epoch": state.epoch, "curr_step": curr_step}
+        return global_state
 
-        helper.empty_cache()
-        dist.barrier()
+    def _restore_position(self, global_state):
+        """Resume from the exact cursor rather than rederiving it from ``global_step``.
 
-        logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
+        The base callback splits ``global_step`` by ``args.train_steps``, which
+        is only the true per-epoch step count when batches are fixed-size. Under
+        ``dyn_bsz`` it is a token-budget estimate, so the derived epoch/step pair
+        drifts and the resumed run consumes a different slice of the data.
+        """
+        resume_state = global_state.get(self.resume_state_key)
+        if resume_state is None:
+            super()._restore_position(global_state)
+            return
+        self.trainer.start_epoch = resume_state["epoch"]
+        self.trainer.start_step = resume_state["curr_step"] + 1
 
 
-class StepAwareResumeCheckpointerCallback(StepAwareTestCheckpointerCallback):
-    """Shared checkpoint callback for step-aware resume tests."""
+class StepAwareResumeGlobalStateCallback(StepAwareTestGlobalStateCallback):
+    """Shared global-state callback for step-aware resume tests."""
 
     def on_step_end(self, state: TrainerState, **kwargs):
-        # logger.error(f"[END][rank{self.trainer.args.train.global_rank}][epoch{state.epoch}][step{state.curr_step}][global_step{state.global_step}] metrics {getattr(getattr(self.trainer, 'step_env_metrics', None), 'consume_tokens(M)', None)}")
         if (
             not getattr(self.trainer, "is_resume_train", False)
             and state.epoch == self.trainer.save_epoch
             and state.curr_step == self.trainer.save_step
         ):
-            # logger.error(f"save checkpoint {state.global_step} {state.epoch} {state.curr_step} {self.trainer.environ_meter.state_dict()}")
-            self._save_checkpoint(state)
+            self.save_global_state(state)
             self.trainer.resume_dcp_path = os.path.join(
                 self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}"
             )

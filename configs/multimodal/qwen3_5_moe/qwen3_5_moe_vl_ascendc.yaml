@@ -11,6 +11,16 @@ model:
     causal_conv1d_implementation: npu
     chunk_gated_delta_rule_implementation: npu_ascendc
     load_balancing_loss_implementation: eager
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
+  accelerator:
+    gradient_checkpointing:
+      enable_reentrant: false
+    init_device: meta
+    ulysses_size: 4
+    fsdp_config:
+      fsdp_mode: fsdp2
 
 data:
   train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
@@ -27,25 +37,15 @@ data:
     use_audio_in_video: false
 
 train:
-  accelerator:
-    ulysses_size: 4
-    fsdp_config:
-      fsdp_mode: fsdp2
-  gradient_checkpointing:
-    enable_reentrant: false
   wandb:
     enable: false
     project: VeOmni
     name: Qwen3.5-35B-A3B-vl-sft
   freeze_vit: false
-  optimizer:
-    lr: 1.0e-5
-    lr_decay_style: cosine
   num_train_epochs: 2
   micro_batch_size: 1
   global_batch_size: 16
   max_steps: 500
-  init_device: meta
   profile:
     enable: true
     start_step: 20

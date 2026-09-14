@@ -35,6 +35,30 @@ model:
     # backends are CUDA SM90+ only) — no override needed for NPU, left unset
     # here on purpose so a future CUDA run of this same file doesn't need
     # editing.
+  optimizer:
+    type: adamw
+    lr: 3.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    # DeepSeek-V4's Ulysses SP path (Q head all-to-all + sequence all-gather
+    # around compressors / sparse attention) is backend-agnostic but has not
+    # been validated on NPU with this model yet — keep ulysses_size at 1
+    # until it has been.
+    ulysses_size: 1
+    ep_size: 8
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
 
 data:
   train_path: fineweb_100BT
@@ -49,33 +73,9 @@ data:
   dyn_bsz_buffer_size: 200
 
 train:
-  accelerator:
-    # DeepSeek-V4's Ulysses SP path (Q head all-to-all + sequence all-gather
-    # around compressors / sparse attention) is backend-agnostic but has not
-    # been validated on NPU with this model yet — keep ulysses_size at 1
-    # until it has been.
-    ulysses_size: 1
-    ep_size: 8
-    fsdp_config:
-      fsdp_mode: fsdp2
-      mixed_precision:
-        enable: true
-    offload:
-      enable_activation: false
-  gradient_checkpointing:
-    enable: true
   global_batch_size: 32
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007
-  optimizer:
-    type: adamw
-    lr: 3.0e-4
-    lr_warmup_ratio: 0.007
-    lr_decay_style: constant
-    lr_decay_ratio: 1.0
-    weight_decay: 0.01
-    max_grad_norm: 1.0
-  init_device: meta
   enable_full_determinism: false
   empty_cache_steps: 500
   checkpoint:

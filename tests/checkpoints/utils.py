@@ -88,17 +88,17 @@ def get_checkpoint_test_command(
         "--data.train_path dummy",
         "--data.max_seq_len 128",
         f"--train.checkpoint.output_dir {output_dir}",
-        "--train.accelerator.fsdp_config.fsdp_mode fsdp2",
-        "--train.init_device meta",
-        f"--train.accelerator.ep_size {ep_size}",
+        "--model.accelerator.fsdp_config.fsdp_mode fsdp2",
+        "--model.accelerator.init_device meta",
+        f"--model.accelerator.ep_size {ep_size}",
         f"--train.global_batch_size {global_batch_size}",
         "--train.micro_batch_size 1",
-        "--train.optimizer.lr 1e-7",
-        "--train.optimizer.lr_warmup_ratio 0.007",
-        "--train.optimizer.lr_decay_style constant",
-        "--train.optimizer.lr_decay_ratio 1.0",
-        "--train.optimizer.weight_decay 0.01",
-        "--train.optimizer.max_grad_norm 1.0",
+        "--model.optimizer.lr 1e-7",
+        "--model.optimizer.lr_warmup_ratio 0.007",
+        "--model.optimizer.lr_decay_style constant",
+        "--model.optimizer.lr_decay_ratio 1.0",
+        "--model.optimizer.weight_decay 0.01",
+        "--model.optimizer.max_grad_norm 1.0",
         "--train.max_steps 5",
         "--train.checkpoint.manager dcp",
         "--train.checkpoint.save_async True",
@@ -109,7 +109,7 @@ def get_checkpoint_test_command(
     # expert mesh becomes 3D (ep_replicate, ep_fsdp, ep), exercising the
     # 3-placement save/load path in the DCP checkpointer.
     if dp_replicate_size is not None:
-        params.append(f"--train.accelerator.dp_replicate_size {dp_replicate_size}")
+        params.append(f"--model.accelerator.dp_replicate_size {dp_replicate_size}")
 
     exec_script = " \\\n".join(params)
 

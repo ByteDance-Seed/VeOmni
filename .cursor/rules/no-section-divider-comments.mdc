@@ -38,4 +38,4 @@ These add visual noise without value. If code needs grouping, use module-level o
 
 headers plus inline `# --- Patch.N ---` markers are a required convention: they
 survive into the generated file and are what makes it reviewable against the
-upstream HuggingFace source. See `.agents/skills/veomni-migrate-transformers-v5/SKILL.md`.
+upstream HuggingFace source. See `.agents/skills/veomni-patchgen-model/SKILL.md`.
