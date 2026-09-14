@@ -1,0 +1,63 @@
+# Correctness-first template. Keep only fields supported by the selected current
+# VeOmni argument classes and compare the result with a nearby maintained config.
+model:
+  model_path: TBD_MODEL_OR_CONVERTED_CHECKPOINT
+  config_path: TBD_CONFIG_PATH
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    moe_implementation: eager
+    load_balancing_loss_implementation: eager
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_decay_style: constant
+    lr_min: 1.0e-5
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+  accelerator:
+    init_device: meta
+    gradient_checkpointing:
+      enable: false
+    ulysses_size: 1
+    ep_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        cast_forward_inputs: false
+
+data:
+  train_path: TBD_DATASET_PATH
+  data_type: TBD
+  datasets_type: mapping
+  source_name: TBD_SOURCE_NAME
+  text_keys: TBD_PRIMARY_FIELD
+  max_seq_len: 2048
+  dataloader:
+    type: native
+    num_workers: 0
+    drop_last: true
+
+train:
+  seed: 42
+  max_steps: 10
+  global_batch_size: 1
+  micro_batch_size: 1
+  dyn_bsz: false
+  checkpoint:
+    manager: dcp
+    output_dir: outputs/{{MODEL_SLUG}}
+    save_steps: 5
+    save_epochs: 0
+    save_hf_weights: false
+    # load_path: outputs/{{MODEL_SLUG}}/global_step_5
+  wandb:
+    enable: false
+    project: "{{MODEL_SLUG}}-migration"
