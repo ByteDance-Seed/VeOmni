@@ -16,14 +16,15 @@
 """Head-summed attention probability over the compressed slice, for the DSA
 indexer loss (DeepSeek-V3.2 eq. 4).
 
-This consumes the LSE that ``sparse_mqa_fwd_interface`` returns. That LSE is the
-*full* CSA denominator: ``sparse_mqa_fwd_interface`` folds the attention sink
-into ``sumexp`` before writing it (see ``tilelang_sparse_mla_fwd.py``, "attn_sink:
-add exp(attn_sink[h] - max_scaled) to softmax denominator"), and the ``Indices``
-it consumed spanned the sliding window as well as the compressed entries. That
-is what makes the teacher produced here paper-correct rather than the
-compressed-only approximation. If the sink ever moves out of ``sumexp``,
-attention stays correct and this silently does not.
+This consumes the base-2 LSE that ``sparse_mqa_fwd_interface`` returns. That LSE
+is the *full* CSA denominator: ``sparse_mqa_fwd_interface`` folds the attention
+sink into ``sumexp`` before writing it (see ``tilelang_sparse_mla_fwd.py``,
+"attn_sink: add exp(attn_sink[h] - max_scaled) to softmax denominator"), and the
+``Indices`` it consumed spanned the sliding window as well as the compressed
+entries. The base is load-bearing because this kernel reconstructs probabilities
+with ``exp2``. This is what makes the teacher produced here paper-correct rather
+than the compressed-only approximation. If the sink ever moves out of
+``sumexp``, attention stays correct and this silently does not.
 """
 
 import tilelang

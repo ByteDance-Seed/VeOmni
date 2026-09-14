@@ -31,7 +31,8 @@ def wrapper(
 
     ``q`` is ``[B, S, H, D]``, ``kv`` is ``[B, S_kv, D]``, ``attn_sink`` is
     ``[H]``, ``topk_idxs`` is ``[B, S, topk]``. Each valid candidate slot
-    participates independently, including repeated indices.
+    participates independently, including repeated indices. When requested,
+    LSE is detached and returned in base-2 units.
     """
     from ...vendor.tilelang_sparse_mla import sparse_attn_tilelang
 

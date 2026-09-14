@@ -9,9 +9,11 @@ everything beneath them moved.
 `dsa_indexer_loss` trains it with DeepSeek-V3.2 eq. (4): the KL from the real CSA
 attention distribution, restricted to the candidates the indexer itself selected,
 to `softmax(index_score)`. The teacher is recomputed in the forward by
-`sparse_mqa_target_fwd` from the TileLang attention's own log-sum-exp, summed over
-CSA layers, normalised per query token, scaled by `dsa_indexer_loss_coef` and added
-to the total loss.
+`sparse_mqa_target_fwd` from the TileLang attention's own base-2 log-sum-exp,
+summed over CSA layers, normalised per query token, scaled by
+`dsa_indexer_loss_coef` and added to the total loss. The base is part of the
+operator contract because the target and backward kernels reconstruct
+probabilities with `exp2`.
 
 The objective requires sequence parallelism switched off. Ulysses and context
 parallelism are the only two modes that enable it and the gate refuses both, for

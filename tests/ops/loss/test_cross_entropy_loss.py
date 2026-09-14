@@ -121,6 +121,41 @@ def test_eager_empty_or_all_ignored_returns_connected_zero(num_tokens: int, num_
     torch.testing.assert_close(logits.grad, torch.zeros_like(logits))
 
 
+@pytest.mark.parametrize(
+    ("impl", "device"),
+    (
+        pytest.param("chunk_loss", "cpu", id="chunk-loss"),
+        pytest.param(
+            "liger_kernel",
+            "cuda",
+            marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU"),
+            id="liger-kernel",
+        ),
+    ),
+)
+@pytest.mark.parametrize("tensor_count", (False, True), ids=("integer-count", "tensor-count"))
+def test_fused_all_ignored_zero_items_returns_connected_zero(impl: str, device: str, tensor_count: bool):
+    """Fused CE rows preserve the eager contract for an explicit zero count."""
+    if impl == "liger_kernel":
+        pytest.importorskip("liger_kernel")
+    hidden = torch.randn(3, 4, device=device, dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(8, 4, device=device, dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.full((3,), -100, device=device, dtype=torch.long)
+    num_items_in_batch = torch.tensor(0, device=device) if tensor_count else 0
+
+    loss = resolve_op("cross_entropy_loss", "standard", impl).wrapper(
+        hidden,
+        labels,
+        weight,
+        num_items_in_batch=num_items_in_batch,
+    )
+
+    assert loss.item() == 0.0
+    loss.backward()
+    torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden))
+    torch.testing.assert_close(weight.grad, torch.zeros_like(weight))
+
+
 def test_eager_matches_hf_hidden_weight():
     torch.manual_seed(1)
     hidden = torch.randn(4, 8, 32, dtype=torch.float32)

@@ -17,6 +17,7 @@
 import pytest
 import torch
 
+from tests.ops.tol import ATTN_ATOL, ATTN_RTOL
 from tests.ops.utils import require_nvidia_cuda
 from veomni.utils.device import get_device_type
 
@@ -317,8 +318,12 @@ def test_sparse_attn_returns_non_differentiable_lse():
 
     out_only = sparse_attn_tilelang(q, kv, sink, topk, d**-0.5)
     out, lse = sparse_attn_tilelang(q, kv, sink, topk, d**-0.5, return_lse=True)
+    _, eager_lse = VeomniOp("dsa_attention", "deepseek_v4", "eager")(
+        q.detach(), kv.detach(), sink.detach(), topk, d**-0.5, return_lse=True
+    )
 
     torch.testing.assert_close(out_only, out)
+    torch.testing.assert_close(lse, eager_lse, atol=ATTN_ATOL, rtol=ATTN_RTOL)
     assert lse.shape == (b, s, heads)
     assert lse.dtype == torch.float32
     assert not lse.requires_grad, "the LSE feeds a detached teacher and must not open a path back into attention"

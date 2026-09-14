@@ -57,7 +57,8 @@ when the selected implementation runs.
 
 DeepSeek-V4 `dsa_attention` treats `topk_idxs` as candidate slots. Repeated
 valid indices participate once per occurrence, matching the TileLang kernel;
-invalid sentinel entries contribute no attention mass.
+invalid sentinel entries contribute no attention mass. With `return_lse=True`,
+both implementations return a detached base-2 log-sum-exp tensor.
 
 The registry is the source of truth for the exact rows available in a given
 revision:
