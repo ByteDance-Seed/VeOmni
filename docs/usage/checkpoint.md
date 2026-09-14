@@ -126,20 +126,41 @@ different sharding topology. That is why the step-level marker is its own file.
 
 `checkpoint_manifest.json` is that marker. Rank 0 writes it only after every
 module's DCP save has returned and every rank's `loader/` and `extra_state/`
-files are on disk. Resume discovery accepts a `global_step_{N}/` directory only
-when the manifest is present, so a crash mid-save leaves a directory that is
-skipped rather than half-loaded.
+files are on disk. For a checkpoint in this layout, resume discovery accepts a
+`global_step_{N}/` directory only when the manifest is present, so a crash
+mid-save leaves a directory that is skipped rather than half-loaded. A
+checkpoint from an older layout has no manifest to find; discovery falls back to
+a `.metadata` at the step root for those, which is the marker they were
+published by. See [Legacy resume](#legacy-resume).
 
-`train.checkpoint.stage_dir`, when set, is node-local scratch: `model/` is
-written there first and copied into the step directory after DCP finishes, with
-every `.metadata` copied last. The staging directory is not part of the
-published checkpoint.
+`train.checkpoint.output_dir` must be a POSIX path. An HDFS FUSE mount
+(`/mnt/hdfs/...`) qualifies, and is the usual way to checkpoint to remote
+storage; an `hdfs://` URL does not, and unlike a model path it is not copied to
+local scratch first. Every writer in the step directory — DCP, `torch.save`,
+staged promotion, the manifest — goes through ordinary filesystem calls.
 
-`train.checkpoint.save_async` returns while the DCP write is still in flight.
-Weights and optimizer are two independent saves, each holding its own future and
-its own Gloo process group so they overlap rather than serialise. The manifest
-write drains both first, which is what keeps the marker from appearing before
-the shards it claims are complete.
+### Staged and asynchronous saves
+
+`train.checkpoint.stage_dir` and `train.checkpoint.save_async` are two answers to
+the same problem, a destination slow enough that writing to it blocks the train
+loop. **They cannot be combined** — `DistributedCheckpointer.save` raises on the
+pair, because an async write is still running when `save()` returns and drops the
+staged copy, so it would write straight to the destination staging was meant to
+avoid.
+
+With `stage_dir` (synchronous), the whole `model/` subtree — both DCP
+directories and `lr_scheduler.pt` — is written to node-local scratch and copied
+into the step directory afterwards, with every `.metadata` copied last. The
+staging directory is not part of the published checkpoint.
+
+With `save_async` (unstaged), `model/` is written in place and the call returns
+while the DCP write is still in flight. `lr_scheduler.pt` is written first, by
+rank 0, before either DCP save starts. Weights and optimizer are two independent
+saves, each holding its own future and its own Gloo process group so they
+overlap rather than serialise. The manifest write drains both first, which is
+what keeps the marker from appearing before the shards it claims are complete;
+a drain that finds a failed save raises on every rank, not just the one that
+saw it.
 
 ## Previous layouts
 
@@ -202,6 +223,7 @@ files always win — a fallback is consulted only when the current path is absen
 
 | Missing in the current layout | Falls back to |
 |-------------------------------|---------------|
+| `checkpoint_manifest.json` (discovery, `load_path: auto`) | `.metadata` at the step root, which is how an older step was published |
 | `model/ckpt/.metadata` | `.metadata` at the step root; weights and optimizer are both read from that fused directory |
 | `model/lr_scheduler.pt` | `lr_scheduler.pt` at the step root, then the 0.1.12 pickle's `lr_scheduler` key |
 | `loader/rank_{R}.pt`, `extra_state/rank_{R}.pt` | `trainer_state_rank_{R}.pt`, then the 0.1.12 pickle's job cursor when `global_step` is present |

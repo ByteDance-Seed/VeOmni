@@ -283,7 +283,7 @@ class TestModelCheckpointManagerSaveContract:
         trainer.checkpoint = manager
 
         staged = []
-        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
+        with patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", return_value=False):
             for step in (10, 20):
                 manager.save_dcp(TrainerState(global_step=step))
                 call = manager.checkpointer.save.call_args
@@ -397,6 +397,27 @@ class TestGlobalStateCallbackJobState:
         # The manifest is the step's completion marker and must come last, after
         # the DCP drain above and both per-rank files.
         assert (step / "checkpoint_manifest.json").is_file()
+
+    def test_a_peers_write_failure_stops_the_manifest(self, mock_dist, tmp_path):
+        """Each rank writes its own state files, so a full disk is visible to one
+        rank. A rank whose own write succeeded must not publish the step, and must
+        raise rather than walk into the next collective alone."""
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer(save_path=str(tmp_path))
+        trainer.train_dataloader = None
+        trainer.data_iterator = None
+        trainer.environ_meter.state_dict.return_value = {}
+        cb = GlobalStateCallback(trainer)
+
+        with patch(
+            "veomni.trainer.callbacks.global_state_callback.raise_if_any_rank_failed",
+            side_effect=RuntimeError("writing the trainer state failed on another rank"),
+        ):
+            with pytest.raises(RuntimeError, match="failed on another rank"):
+                cb.save_global_state(TrainerState(global_step=10))
+
+        assert not (tmp_path / "global_step_10" / "checkpoint_manifest.json").exists()
+        assert cb._last_saved_step == -1
 
     def test_load_restores_channel_loss_callback_state(self, mock_dist, tmp_path):
         mock_dist.is_initialized.return_value = False

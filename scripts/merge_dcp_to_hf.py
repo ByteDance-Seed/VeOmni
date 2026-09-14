@@ -85,7 +85,8 @@ def save_lora_adapter_weights(
     else:
         logger.warning(
             "No --adapter-config-path provided. ``adapter_model.safetensors`` was written, but you must drop "
-            "``adapter_config.json`` (from the matching training run's ``output_dir/checkpoints/global_step_*/``) next to it "
+            "``adapter_config.json`` (from the matching training run's "
+            "``output_dir/checkpoints/global_step_*/lora_ckpt/``) next to it "
             "before the adapter can be loaded by peft / diffusers."
         )
 
@@ -249,7 +250,8 @@ def main():
         default=None,
         help=(
             "Path to the matching adapter_config.json produced during LoRA training "
-            "(usually under <output_dir>/checkpoints/global_step_*/adapter_config.json). Only used in 'lora' mode; "
+            "(usually under <output_dir>/checkpoints/global_step_*/lora_ckpt/adapter_config.json). "
+            "Only used in 'lora' mode; "
             "copied next to adapter_model.safetensors so the adapter is loadable as-is."
         ),
     )

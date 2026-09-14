@@ -44,7 +44,8 @@ from torch.distributed.checkpoint.stateful import Stateful
 from ..distributed.parallel_state import get_parallel_state
 from ..optim.optimizer import restore_optimizer_param_group_defaults
 from ..utils import logging
-from ..utils.device import empty_cache, get_device_type, synchronize
+from ..utils.device import empty_cache, synchronize
+from ..utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
 from .checkpointer import CheckpointerBase
 from .layout import (
     LR_SCHEDULER_FILENAME as _LR_SCHEDULER_FILENAME,
@@ -497,19 +498,6 @@ class _Promotion:
         self.failed = False
 
 
-def _any_rank_failed(failed: bool) -> bool:
-    """Whether *any* rank hit an error, so every rank can agree on what to do next.
-
-    MAX rather than SUM: one failure is enough, and SUM would overflow int32 on a
-    large enough group.
-    """
-    if not dist.is_initialized():
-        return failed
-    flag = torch.tensor([1 if failed else 0], dtype=torch.int32, device=get_device_type())
-    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
-    return bool(flag.item())
-
-
 def _promotion_phase(state: _Promotion, work, *, participates: bool, always: bool = False) -> None:
     """Run one phase on the ranks that take part, then let every rank agree on the result.
 
@@ -527,7 +515,7 @@ def _promotion_phase(state: _Promotion, work, *, participates: bool, always: boo
         except BaseException as e:  # noqa: BLE001 - raised once every phase is done
             if state.error is None:
                 state.error = e
-    state.failed = _any_rank_failed(state.error is not None) or state.failed
+    state.failed = any_rank_failed(state.error is not None) or state.failed
 
 
 _STAGE_ROOT = "veomni_ckpt_stage"
@@ -559,7 +547,7 @@ def _prepare_stage_dir(stage_dir: str, path: str) -> str:
             os.makedirs(stage_path, exist_ok=True)
         except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
             error = e
-    if _any_rank_failed(error is not None):
+    if any_rank_failed(error is not None):
         raise error or RuntimeError(f"another rank could not prepare a staging directory under {stage_dir}")
     return stage_path
 
@@ -936,10 +924,10 @@ class DistributedCheckpointer(CheckpointerBase):
     def wait_for_pending_save(cls) -> None:
         """Block until every pending async DCP save completes.
 
-        Safe to call when no save is pending (no-op).  Re-raises any
-        exception from the pending saves after logging which rank saw it.
-        After completion, all ranks synchronize via a barrier so callers
-        can safely begin a new collective operation.
+        Safe to call when no save is pending (no-op).  Every rank ends up
+        raising if any rank's save failed, and the reduction that decides
+        that is also the synchronization callers rely on before starting a
+        new collective.
 
         This is the single entrypoint for all async-save coordination —
         prefer calling this over poking ``_save_futures`` directly.
@@ -958,30 +946,33 @@ class DistributedCheckpointer(CheckpointerBase):
             try:
                 logger.info(f"[RANK {rank}] waiting for pending DCP save ({slot}) to end...")
                 future.result()
-            except Exception as e:  # noqa: BLE001 - re-raised once every slot is drained
+            except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
                 logger.error(f"[RANK {rank}] pending async DCP save ({slot}) raised; propagating", exc_info=True)
                 if error is None:
                     error = e
-        if dist.is_initialized():
-            dist.barrier()
-        if error is not None:
-            raise error
+        raise_if_any_rank_failed(error, "a pending async DCP save")
 
     @classmethod
     def _drain_slot(cls, slot: str) -> None:
-        """Finish this slot's previous save before its process group is reused."""
+        """Finish this slot's previous save before its process group is reused.
+
+        DCP surfaces an async failure through the future of the rank that hit
+        it, and the save's own process group does not reduce that across the
+        group. Raising here on the failing rank alone would leave its peers in
+        the reduction below with nobody to meet.
+        """
         future = cls._save_futures.pop(slot, None)
         if future is None:
             return
         rank = dist.get_rank() if dist.is_initialized() else 0
+        error: Optional[BaseException] = None
         try:
             logger.info(f"[RANK {rank}] waiting for previous DCP save ({slot}) to end...")
             future.result()
-        except Exception:
+        except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
             logger.error(f"[RANK {rank}] previous async DCP save ({slot}) raised; propagating", exc_info=True)
-            raise
-        if dist.is_initialized():
-            dist.barrier()
+            error = e
+        raise_if_any_rank_failed(error, f"the previous async DCP save ({slot})")
 
     @classmethod
     def execute_save(
@@ -1071,7 +1062,7 @@ class DistributedCheckpointer(CheckpointerBase):
                         torch.save(lr_scheduler.state_dict(), os.path.join(checkpoint_dir, _LR_SCHEDULER_FILENAME))
             except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
                 error = e
-        if _any_rank_failed(error is not None):
+        if any_rank_failed(error is not None):
             raise error or RuntimeError("another rank could not save lr_scheduler")
 
     @classmethod

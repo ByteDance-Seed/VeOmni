@@ -39,6 +39,7 @@ import torch.distributed as dist
 from ...checkpoint import layout
 from ...utils import helper
 from ...utils.device import get_device_type
+from ...utils.dist_utils import raise_if_any_rank_failed
 from .base import Callback, TrainerState
 
 
@@ -131,26 +132,37 @@ class GlobalStateCallback(Callback):
         loader_payload = {key: payload[key] for key in _LOADER_KEYS if key in payload}
         extra_payload = {key: value for key, value in payload.items() if key not in _LOADER_KEYS}
 
-        for path, blob in (
-            (layout.loader_path(step_root, self.rank), loader_payload),
-            (layout.extra_state_path(step_root, self.rank), extra_payload),
-        ):
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            torch.save(blob, path)
+        # Each rank writes its own files, so a full disk or a bad pickle starts out
+        # visible to that rank alone. Reduce before the manifest: a rank that
+        # raised here would otherwise leave its peers publishing a step whose
+        # state is incomplete, or waiting in a collective it never reaches.
+        write_error: Optional[BaseException] = None
+        try:
+            for path, blob in (
+                (layout.loader_path(step_root, self.rank), loader_payload),
+                (layout.extra_state_path(step_root, self.rank), extra_payload),
+            ):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                torch.save(blob, path)
+        except BaseException as e:  # noqa: BLE001 - re-raised once every rank has agreed
+            logger.error(f"[RANK {self.rank}] failed to write trainer state under {step_root}", exc_info=True)
+            write_error = e
+        raise_if_any_rank_failed(write_error, "writing the trainer state")
 
-        # Every rank's files must be down before the step is advertised.
-        if dist.is_initialized():
-            dist.barrier()
-
+        # Every rank's files are down by now, so the step can be advertised.
+        manifest_error: Optional[BaseException] = None
         if self.rank == 0:
-            layout.write_manifest(
-                step_root,
-                global_step=state.global_step,
-                world_size=args.train.world_size,
-                modules=self.module_names(),
-            )
-        if dist.is_initialized():
-            dist.barrier()
+            try:
+                layout.write_manifest(
+                    step_root,
+                    global_step=state.global_step,
+                    world_size=args.train.world_size,
+                    modules=self.module_names(),
+                )
+            except BaseException as e:  # noqa: BLE001 - re-raised once every rank has agreed
+                logger.error(f"[RANK {self.rank}] failed to publish the manifest under {step_root}", exc_info=True)
+                manifest_error = e
+        raise_if_any_rank_failed(manifest_error, "publishing the checkpoint manifest")
 
         self._last_saved_step = state.global_step
 
@@ -182,14 +194,25 @@ class GlobalStateCallback(Callback):
             return None
 
         state_path = layout.extra_state_path(load_path, self.rank)
-        current_state = self._read_current(load_path)
-        legacy_state = None
-        if current_state is None:
-            # Delete this import (and veomni/checkpoint/legacy_v0_1_12.py) to drop
-            # resume from the pre-split layouts.
-            from ...checkpoint.legacy_v0_1_12 import apply_legacy_global_state
+        # A file that is present but unreadable is not the same as an absent one:
+        # the reduction below treats absence as "resume weights only", which would
+        # silently drop a corrupt cursor. Reduce the read failure separately, and
+        # before that reduction, so a rank that raised cannot strand its peers.
+        read_error: Optional[BaseException] = None
+        current_state = legacy_state = None
+        try:
+            current_state = self._read_current(load_path)
+            if current_state is None:
+                # Delete this import (and veomni/checkpoint/legacy_v0_1_12.py) to drop
+                # resume from the pre-split layouts.
+                from ...checkpoint.legacy_v0_1_12 import apply_legacy_global_state
 
-            legacy_state = apply_legacy_global_state(load_path, self.rank)
+                legacy_state = apply_legacy_global_state(load_path, self.rank)
+        except BaseException as e:  # noqa: BLE001 - re-raised once every rank has agreed
+            logger.error(f"[RANK {self.rank}] failed to read trainer state under {load_path}", exc_info=True)
+            read_error = e
+        raise_if_any_rank_failed(read_error, "reading the trainer state")
+
         found = current_state is not None or legacy_state is not None
         if dist.is_initialized():
             flag = torch.tensor([int(found)], dtype=torch.int32, device=get_device_type())

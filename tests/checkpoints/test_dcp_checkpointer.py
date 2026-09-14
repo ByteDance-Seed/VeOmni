@@ -905,11 +905,57 @@ class TestWaitForPendingSave:
         future.result.return_value = None
         DistributedCheckpointer._save_futures = {"ckpt": future}
 
-        DistributedCheckpointer.wait_for_pending_save()
+        # Patched in ``dist_utils`` rather than in the checkpointer: that is where
+        # ``raise_if_any_rank_failed`` looks the reduction up.
+        with patch("veomni.utils.dist_utils.any_rank_failed", return_value=False) as agreed:
+            DistributedCheckpointer.wait_for_pending_save()
 
         future.result.assert_called_once()
         assert DistributedCheckpointer._save_futures == {}
-        mock_dist.barrier.assert_called_once()
+        # The reduction is the synchronization callers rely on before their next
+        # collective; it replaces the barrier this used to end with.
+        agreed.assert_called_once_with(False)
+
+    @patch("veomni.checkpoint.dcp_checkpointer.dist")
+    def test_a_peers_failure_raises_here_too(self, mock_dist):
+        """DCP reports an async failure only through the future of the rank that
+        hit it, and the save's process group does not reduce that across the
+        group. A rank whose own write succeeded must still raise, or it enters
+        the next collective without the failing rank and hangs until timeout."""
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_dist.is_initialized.return_value = True
+        mock_dist.get_rank.return_value = 0
+
+        healthy = MagicMock()
+        DistributedCheckpointer._save_futures = {"ckpt": healthy}
+
+        with patch("veomni.utils.dist_utils.any_rank_failed", return_value=True):
+            with pytest.raises(RuntimeError, match="failed on another rank"):
+                DistributedCheckpointer.wait_for_pending_save()
+
+        healthy.result.assert_called_once()
+        assert DistributedCheckpointer._save_futures == {}
+
+    @patch("veomni.checkpoint.dcp_checkpointer.dist")
+    def test_drain_slot_raises_on_every_rank(self, mock_dist):
+        """``_drain_slot`` runs inside ``execute_save``, just before the slot's
+        group is reused. A failing rank raising alone there would leave its peers
+        in the reduction with nobody to meet."""
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_dist.is_initialized.return_value = True
+        mock_dist.get_rank.return_value = 0
+
+        healthy = MagicMock()
+        DistributedCheckpointer._save_futures = {"ckpt": healthy}
+
+        with patch("veomni.utils.dist_utils.any_rank_failed", return_value=True):
+            with pytest.raises(RuntimeError, match="failed on another rank"):
+                DistributedCheckpointer._drain_slot("ckpt")
+
+        healthy.result.assert_called_once()
+        assert DistributedCheckpointer._save_futures == {}
 
     @patch("veomni.checkpoint.dcp_checkpointer.dist")
     def test_drains_every_slot_before_raising(self, mock_dist):
@@ -933,19 +979,18 @@ class TestWaitForPendingSave:
         # Cleared even on failure — otherwise stuck forever
         assert DistributedCheckpointer._save_futures == {}
 
-    @patch("veomni.checkpoint.dcp_checkpointer.dist")
-    def test_no_barrier_when_dist_not_initialized(self, mock_dist):
+    def test_no_collective_when_dist_not_initialized(self):
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
-
-        mock_dist.is_initialized.return_value = False
 
         future = MagicMock()
         DistributedCheckpointer._save_futures = {"ckpt": future}
 
-        DistributedCheckpointer.wait_for_pending_save()
+        with patch("veomni.utils.dist_utils.dist") as mock_dist:
+            mock_dist.is_initialized.return_value = False
+            DistributedCheckpointer.wait_for_pending_save()
 
         future.result.assert_called_once()
-        mock_dist.barrier.assert_not_called()
+        mock_dist.all_reduce.assert_not_called()
 
     @patch("veomni.checkpoint.dcp_checkpointer.dcp")
     @patch("veomni.checkpoint.dcp_checkpointer.dist")
@@ -1281,7 +1326,7 @@ class TestLrSchedulerSaveLoad:
 
         saved_scheduler = MagicMock()
         saved_scheduler.state_dict.return_value = {"last_epoch": 10}
-        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=lambda failed: failed):
+        with patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed: failed):
             DistributedCheckpointer._save_lr_scheduler(str(tmp_path), {"lr_scheduler": saved_scheduler})
 
         saved_scheduler.state_dict.assert_not_called()
@@ -1374,16 +1419,16 @@ class TestPromoteStagedCheckpoint:
 
     @pytest.fixture(autouse=True)
     def _no_real_collectives(self):
-        """Keep `_any_rank_failed` off a real process group.
+        """Keep `any_rank_failed` off a real process group.
 
         These tests fake `dist.is_initialized()`, so its all_reduce would other-
         wise hit an uninitialised group. Leaving the tensor untouched makes the
         reduction reflect this rank's own flag, which is what a single-rank test
-        means; cases about *another* rank failing patch `_any_rank_failed`
+        means; cases about *another* rank failing patch `any_rank_failed`
         directly.
         """
-        with patch("veomni.checkpoint.dcp_checkpointer.get_device_type", return_value="cpu"):
-            with patch("veomni.checkpoint.dcp_checkpointer.dist.all_reduce", side_effect=lambda t, op=None: None):
+        with patch("veomni.utils.dist_utils.get_device_type", return_value="cpu"):
+            with patch("veomni.utils.dist_utils.dist.all_reduce", side_effect=lambda t, op=None: None):
                 yield
 
     @pytest.fixture
@@ -1568,7 +1613,7 @@ class TestPromoteStagedCheckpoint:
 
             raised = False
             with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True):
-                with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=reduction):
+                with patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=reduction):
                     with patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=global_rank):
                         with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=local_rank):
                             with patch("veomni.checkpoint.dcp_checkpointer.shutil.copyfile", side_effect=copyfile):
@@ -1669,7 +1714,7 @@ class TestPromoteStagedCheckpoint:
             with patch("veomni.checkpoint.dcp_checkpointer.dist.barrier"):
                 with patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0):
                     with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0):
-                        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=True):
+                        with patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", return_value=True):
                             with pytest.raises(RuntimeError, match="failed on another rank"):
                                 _promote_staged_checkpoint(stage_path, final_path)
 
@@ -1679,20 +1724,20 @@ class TestPromoteStagedCheckpoint:
         """One failing rank must make every rank see a failure."""
         import torch as _torch
 
-        from veomni.checkpoint.dcp_checkpointer import _any_rank_failed
+        from veomni.utils.dist_utils import any_rank_failed
 
-        with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False):
-            assert _any_rank_failed(True) is True
-            assert _any_rank_failed(False) is False
+        with patch("veomni.utils.dist_utils.dist.is_initialized", return_value=False):
+            assert any_rank_failed(True) is True
+            assert any_rank_failed(False) is False
 
         def fake_all_reduce(tensor, op=None):
             assert op is _torch.distributed.ReduceOp.MAX, "must be MAX; SUM would overflow on many ranks"
             tensor.fill_(1)
 
-        with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True):
-            with patch("veomni.checkpoint.dcp_checkpointer.get_device_type", return_value="cpu"):
-                with patch("veomni.checkpoint.dcp_checkpointer.dist.all_reduce", side_effect=fake_all_reduce):
-                    assert _any_rank_failed(False) is True
+        with patch("veomni.utils.dist_utils.dist.is_initialized", return_value=True):
+            with patch("veomni.utils.dist_utils.get_device_type", return_value="cpu"):
+                with patch("veomni.utils.dist_utils.dist.all_reduce", side_effect=fake_all_reduce):
+                    assert any_rank_failed(False) is True
 
     def test_non_leader_non_coordinator_ranks_touch_nothing(self, staged):
         """Ranks other than the node leaders and the coordinator only participate in barriers."""
@@ -1720,7 +1765,7 @@ class TestStageDirValidation:
 
         from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
 
-        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
+        with patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", return_value=False):
             abandoned = _prepare_stage_dir(str(tmp_path), "/remote/ckpt")
             with open(_os.path.join(abandoned, "big.distcp"), "w") as f:
                 f.write("a save that never finished")
@@ -1739,7 +1784,7 @@ class TestStageDirValidation:
         someone_elses.mkdir()
         (someone_elses / "important.bin").write_text("not ours")
 
-        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
+        with patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", return_value=False):
             _prepare_stage_dir(str(tmp_path), "/remote/ckpt")
 
         assert (someone_elses / "important.bin").exists(), "swept outside our own root"
@@ -1755,7 +1800,7 @@ class TestStageDirValidation:
 
         from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
 
-        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
+        with patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", return_value=False):
             with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=3):
                 path = _prepare_stage_dir(str(tmp_path), "/remote/ckpt")
             assert not _os.path.exists(path), "a peer created the directory itself"
@@ -1777,7 +1822,7 @@ class TestStageDirValidation:
 
         from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
 
-        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
+        with patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", return_value=False):
             other = _prepare_stage_dir(str(tmp_path), "/remote/other_run")
             with open(_os.path.join(other, "in_flight.distcp"), "w") as f:
                 f.write("another job is using this")
@@ -1795,7 +1840,7 @@ class TestStageDirValidation:
         from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
 
         # This rank prepares its directory fine; another node's did not.
-        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=True):
+        with patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", return_value=True):
             with pytest.raises(RuntimeError, match="another rank could not prepare"):
                 _prepare_stage_dir(str(tmp_path), "/remote/ckpt")
 
@@ -1803,7 +1848,7 @@ class TestStageDirValidation:
         """The rank that actually failed reports what happened, not the peer message."""
         from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
 
-        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=lambda f: f):
+        with patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda f: f):
             with patch("veomni.checkpoint.dcp_checkpointer.os.makedirs", side_effect=OSError("No space left")):
                 with pytest.raises(OSError, match="No space left"):
                     _prepare_stage_dir(str(tmp_path), "/remote/ckpt")
@@ -1836,7 +1881,7 @@ class TestStageDirValidation:
             patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
             patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0),
             patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
-            patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=lambda failed: failed),
+            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed: failed),
             patch.object(DistributedCheckpointer, "execute_save", side_effect=OSError("dcp write failed")),
             patch.object(DistributedCheckpointer, "_create_storage_writer"),
             patch("veomni.checkpoint.dcp_checkpointer.ModelState"),

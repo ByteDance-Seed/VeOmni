@@ -790,7 +790,13 @@ class CheckpointConfig:
     )
     save_async: bool = field(
         default=False,
-        metadata={"help": "Whether to save checkpoint asynchronously."},
+        metadata={
+            "help": (
+                "Return from the checkpoint save while the write is still in flight. "
+                "Cannot be combined with `stage_dir`: the staged copy is dropped when the "
+                "save returns, which an in-flight write would then be reading from."
+            )
+        },
     )
     stage_dir: Optional[str] = field(
         default=None,
