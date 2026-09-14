@@ -47,6 +47,8 @@ Qwen3.5's merged expert has two parameter tensors that must move together: the m
 
 The concatenation is a custom `torch.autograd.Function`. During backward, a target rank sends the gradient of each temporary row back to its source rank. The source adds that contribution to the corresponding original local expert gradient. The temporary tensor is not an `nn.Parameter`; the custom function returns no gradient for it.
 
+Replica-gradient P2P payloads are contiguous on both ends, even when the merged GEMM returns a transposed weight gradient. The owner's accumulated gradient may retain its original dense strided layout; received rows are added by logical index. Copying that layout into the receive buffer would violate Gloo's contiguous-tensor requirement and does not match the sender's packed payload. A non-square, multi-element weight-gradient check is required when validating new backends; scalar expert fixtures cannot expose transpose/layout mistakes.
+
 Consequently, model parameters, optimizer parameter groups/state, state-dict keys, and checkpoint format do not change. Checkpoint saving remains structurally unchanged. DCP resume with `train.moe_ep_load_balance.enabled=true` is intentionally rejected at configuration time via `train.checkpoint.load_path`. This statement describes the design and CPU/gloo structural tests only; it is not an accelerator checkpoint-resume support claim.
 
 ## Configuration and failure behavior

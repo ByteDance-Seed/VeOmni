@@ -221,7 +221,11 @@ class _CatLocalAndReplicaWeights(torch.autograd.Function):
                 communication_tensors.append(send_tensor)
                 work_handles.append(work)
             elif ep_rank == replica.source_rank:
-                recv_tensor = torch.empty_like(local_grad[replica.source_local_expert])
+                # Transposed expert GEMMs can return non-contiguous gradients.
+                # P2P payloads must use the same dense layout as the sender.
+                recv_tensor = torch.empty_like(
+                    local_grad[replica.source_local_expert], memory_format=torch.contiguous_format
+                )
                 target_global_rank = dist.get_global_rank(ep_group, replica.target_rank)
                 work = dist.irecv(recv_tensor, src=target_global_rank, group=ep_group)
                 communication_tensors.append(recv_tensor)

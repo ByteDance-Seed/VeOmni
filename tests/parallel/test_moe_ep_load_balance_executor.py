@@ -139,6 +139,33 @@ def test_two_rank_copy_alias_computation_and_replica_gradient_return(tmp_path: P
     mp.spawn(_two_rank_worker, args=(2, rendezvous), nprocs=2, join=True)
 
 
+def _transposed_gradient_worker(rank: int, world_size: int, rendezvous: str) -> None:
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world_size)
+    try:
+        plan = _plan(ep_size=2, replicas=(_replica(source_rank=0, target_rank=1),))
+        for rows, columns in ((2, 2), (4, 2), (2, 3)):
+            local_weight = nn.Parameter(torch.zeros(1, rows, columns))
+            replica_weight = ep_load_balance.ExpertReplicaTransfer.start(local_weight, plan, dist.group.WORLD).wait()
+            combined = ep_load_balance.cat_local_and_replica_weights(
+                local_weight, replica_weight, plan, dist.group.WORLD
+            )
+
+            # NPU merged GEMM transposes expert weights before computing them.
+            base = torch.arange(2 * rows * columns, dtype=torch.float32).reshape(2, columns, rows).transpose(1, 2)
+            gradient = base + 100 * rank
+            assert not gradient.is_contiguous()
+            combined.backward(gradient)
+            expected = (base[0] + base[1] + 100) if rank == 0 else base[0] + 100
+            torch.testing.assert_close(local_weight.grad, expected.unsqueeze(0), rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_transposed_replica_gradients_use_contiguous_receive_buffers(tmp_path: Path):
+    rendezvous = f"file://{tmp_path / 'executor-transposed-gradient'}"
+    mp.spawn(_transposed_gradient_worker, args=(2, rendezvous), nprocs=2, join=True)
+
+
 def test_torchrun_two_rank_copy_alias_computation_and_replica_gradient_return():
     if int(os.environ.get("WORLD_SIZE", "1")) != 2:
         pytest.skip("Run this test with torchrun --standalone --nproc-per-node=2.")
