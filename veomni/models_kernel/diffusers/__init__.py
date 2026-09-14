@@ -14,7 +14,7 @@
 
 """Registered Diffusers modeling that calls local ``VeomniOp`` handles."""
 
-from . import wan_t2v
+from . import qwen_image, wan_t2v
 
 
-__all__ = ["wan_t2v"]
+__all__ = ["qwen_image", "wan_t2v"]

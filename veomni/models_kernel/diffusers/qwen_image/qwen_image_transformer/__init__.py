@@ -12,4 +12,24 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Qwen Image transformer staged under models_kernel. Not on ``MODELING_REGISTRY``."""
+"""Register the local Qwen-Image transformer config and model."""
+
+from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+
+
+@MODEL_CONFIG_REGISTRY.register("QwenImageTransformer2DModel")
+def register_qwen_image_transformer_config():
+    from .configuration_qwen_image_transformer import QwenImageTransformer2DModelConfig
+
+    return QwenImageTransformer2DModelConfig
+
+
+@MODELING_REGISTRY.register("QwenImageTransformer2DModel")
+def register_qwen_image_transformer_modeling(_architecture: str | None = None):
+    from .modeling_qwen_image_transformer import (
+        QwenImageTransformer2DModel,
+        apply_veomni_qwen_image_transformer_patch,
+    )
+
+    apply_veomni_qwen_image_transformer_patch()
+    return QwenImageTransformer2DModel

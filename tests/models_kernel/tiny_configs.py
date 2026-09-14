@@ -341,6 +341,49 @@ def tiny_wan_t2v_condition_config(
     return WanTransformer3DConditionModelConfig(**kwargs)
 
 
+def tiny_qwen_image_config(architecture: str = "QwenImageTransformer2DModel", **overrides) -> PretrainedConfig:
+    from veomni.models_kernel.diffusers.qwen_image.qwen_image_transformer.configuration_qwen_image_transformer import (
+        QwenImageTransformer2DModelConfig,
+    )
+
+    kwargs = {
+        "patch_size": 2,
+        "in_channels": 16,
+        "out_channels": 4,
+        "num_layers": 1,
+        "attention_head_dim": 16,
+        "num_attention_heads": 2,
+        "joint_attention_dim": 32,
+        "guidance_embeds": False,
+        "axes_dims_rope": (4, 6, 6),
+        "zero_cond_t": False,
+        "use_additional_t_cond": False,
+        "use_layer3d_rope": False,
+        "architectures": [architecture],
+        "tie_word_embeddings": False,
+        "attn_implementation": "eager",
+    }
+    kwargs.update(overrides)
+    return QwenImageTransformer2DModelConfig(**kwargs)
+
+
+def tiny_qwen_image_condition_config(architecture: str = "QwenImageConditionModel", **overrides) -> PretrainedConfig:
+    from veomni.models_kernel.diffusers.qwen_image.qwen_image_condition.configuration_qwen_image_condition import (
+        QwenImageConditionModelConfig,
+    )
+
+    kwargs = {
+        "base_model_path": "",
+        "max_sequence_length": 16,
+        "height": 32,
+        "width": 32,
+        "architectures": [architecture],
+        "tie_word_embeddings": False,
+    }
+    kwargs.update(overrides)
+    return QwenImageConditionModelConfig(**kwargs)
+
+
 def tiny_qwen2_config(architecture: str = "Qwen2ForCausalLM", **overrides) -> PretrainedConfig:
     from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 

@@ -12,4 +12,20 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Qwen Image condition staged under models_kernel. Not on ``MODELING_REGISTRY``."""
+"""Register the local Qwen-Image condition config and model."""
+
+from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+
+
+@MODEL_CONFIG_REGISTRY.register("QwenImageConditionModel")
+def register_qwen_image_condition_config():
+    from .configuration_qwen_image_condition import QwenImageConditionModelConfig
+
+    return QwenImageConditionModelConfig
+
+
+@MODELING_REGISTRY.register("QwenImageConditionModel")
+def register_qwen_image_condition_modeling(_architecture: str | None = None):
+    from .modeling_qwen_image_condition import QwenImageConditionModel
+
+    return QwenImageConditionModel

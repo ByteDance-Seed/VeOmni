@@ -99,6 +99,9 @@ from tests.models_kernel.tiny_configs import (
     tiny_qwen3_vl_moe_config as _tiny_qwen3_vl_moe_config,
 )
 from tests.models_kernel.tiny_configs import (
+    tiny_qwen_image_config as _tiny_qwen_image_config,
+)
+from tests.models_kernel.tiny_configs import (
     tiny_seed_oss_config as _tiny_seed_oss_config,
 )
 from tests.models_kernel.tiny_configs import (
@@ -338,6 +341,15 @@ _MODEL_CASES = (
             "Qwen3VLMoeModel",
             "Qwen3VLMoeTextModel",
         ),
+    ),
+    _ModelCase(
+        model_type="QwenImageTransformer2DModel",
+        config_factory=_tiny_qwen_image_config,
+        architectures=("QwenImageTransformer2DModel",),
+        has_registered_config=True,
+        registered_config_aliases=("QwenImageConditionModel",),
+        registered_model_aliases=("QwenImageConditionModel",),
+        eager_op_path=None,
     ),
     _ModelCase(
         model_type="wan",

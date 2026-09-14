@@ -12,4 +12,9 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Qwen Image modeling staged under models_kernel. Not on ``MODELING_REGISTRY``."""
+"""Register Qwen-Image transformer and condition modeling."""
+
+from . import qwen_image_condition, qwen_image_transformer
+
+
+__all__ = ["qwen_image_condition", "qwen_image_transformer"]
