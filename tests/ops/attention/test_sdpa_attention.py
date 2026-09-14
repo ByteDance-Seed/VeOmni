@@ -21,10 +21,21 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from tests.ops.attention.attention_cases import clone_qkv, dense_mask, math_sdpa_reference
 from tests.ops.attention.utils import UlyssesHelperRecorder
-from tests.ops.tol import ATTN_ATOL, ATTN_GRAD_ATOL, ATTN_GRAD_RTOL, ATTN_RTOL, EAGER_ATOL, EAGER_RTOL
+from tests.ops.tol import (
+    ATTN_ATOL,
+    ATTN_GRAD_ATOL,
+    ATTN_GRAD_RTOL,
+    ATTN_RTOL,
+    EAGER_ATOL,
+    EAGER_GRAD_ATOL,
+    EAGER_GRAD_RTOL,
+    EAGER_RTOL,
+)
+from veomni.ops.kernels.attention import ulysses as ulysses_backend
 from veomni.ops.kernels.attention.standard import sdpa as sdpa_backend
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
@@ -123,6 +134,93 @@ def test_sdpa_attention_skip_ulysses_skips_exchange(monkeypatch):
         skip_ulysses=True,
     )
     assert "skip_ulysses" not in captured["kwargs"]
+
+
+@pytest.mark.parametrize(
+    ("query_heads", "key_value_heads", "ulysses_size", "mask_heads"),
+    (
+        pytest.param(8, 2, 4, 1, id="local-gqa-ratio"),
+        pytest.param(4, 4, 2, 4, id="head-specific-mask"),
+    ),
+)
+def test_sdpa_attention_uses_post_ulysses_head_layout(
+    monkeypatch,
+    query_heads,
+    key_value_heads,
+    ulysses_size,
+    mask_heads,
+):
+    rank = 1
+    group = object()
+    state = SimpleNamespace(ulysses_group=group, ulysses_size=ulysses_size)
+
+    def fake_gather_seq_scatter_heads(tensor, *, seq_dim, head_dim, group):
+        del group
+        full_sequence = torch.cat([tensor] * ulysses_size, dim=seq_dim)
+        local_head_count = tensor.shape[head_dim] // ulysses_size
+        return full_sequence.narrow(head_dim, rank * local_head_count, local_head_count).contiguous()
+
+    monkeypatch.setattr(sdpa_backend, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(sdpa_backend, "should_apply_ulysses", lambda **kwargs: True)
+    monkeypatch.setattr(ulysses_backend, "gather_seq_scatter_heads", fake_gather_seq_scatter_heads)
+    monkeypatch.setattr(ulysses_backend, "gather_heads_scatter_seq", lambda tensor, **kwargs: tensor)
+    monkeypatch.setattr(ulysses_backend.dist, "get_rank", lambda group: rank)
+
+    local_sequence_length = 3
+    full_sequence_length = local_sequence_length * ulysses_size
+    batch_size = 2
+    head_dim = 8
+    generator = torch.Generator().manual_seed(13)
+    query = torch.randn(batch_size, query_heads, local_sequence_length, head_dim, generator=generator)
+    key = torch.randn(batch_size, key_value_heads, local_sequence_length, head_dim, generator=generator)
+    value = torch.randn(batch_size, key_value_heads, local_sequence_length, head_dim, generator=generator)
+    causal_mask = torch.tril(torch.ones(full_sequence_length, full_sequence_length, dtype=torch.bool))
+    attention_mask = causal_mask[None, None].expand(batch_size, mask_heads, -1, -1).clone()
+    if mask_heads > 1:
+        for head in range(mask_heads):
+            attention_mask[:, head, :, head::mask_heads] = False
+            attention_mask[:, head].diagonal().fill_(True)
+
+    reference_qkv = clone_qkv(query, key, value)
+    local_query, local_key, local_value, global_query_heads = ulysses_backend.prepare_ulysses_qkv(
+        *(tensor.transpose(1, 2) for tensor in reference_qkv),
+        group=group,
+        ulysses_size=ulysses_size,
+    )
+    local_query, local_key, local_value = (tensor.transpose(1, 2) for tensor in (local_query, local_key, local_value))
+    local_key_value_groups = local_query.shape[1] // local_key.shape[1]
+    local_key = torch.repeat_interleave(local_key, local_key_value_groups, dim=1)
+    local_value = torch.repeat_interleave(local_value, local_key_value_groups, dim=1)
+    if attention_mask.shape[1] == global_query_heads:
+        local_attention_mask = attention_mask.narrow(1, rank * local_query.shape[1], local_query.shape[1])
+    else:
+        local_attention_mask = attention_mask
+
+    reference_output = F.scaled_dot_product_attention(
+        local_query,
+        local_key,
+        local_value,
+        attn_mask=local_attention_mask,
+    ).transpose(1, 2)
+    output_gradient = torch.randn(reference_output.shape, generator=generator)
+    reference_gradients = torch.autograd.grad(reference_output, reference_qkv, output_gradient)
+
+    module = _FakeAttentionModule()
+    module.num_key_value_groups = query_heads // key_value_heads
+    original_key_value_groups = module.num_key_value_groups
+    sdpa_qkv = clone_qkv(query, key, value)
+    sdpa_output, _ = sdpa_backend.sdpa_attention_forward(
+        module,
+        *sdpa_qkv,
+        attention_mask=attention_mask,
+        dropout=0.0,
+    )
+    sdpa_gradients = torch.autograd.grad(sdpa_output, sdpa_qkv, output_gradient)
+
+    assert module.num_key_value_groups == original_key_value_groups
+    torch.testing.assert_close(sdpa_output, reference_output, rtol=EAGER_RTOL, atol=EAGER_ATOL)
+    for gradient, reference_gradient in zip(sdpa_gradients, reference_gradients, strict=True):
+        torch.testing.assert_close(gradient, reference_gradient, rtol=EAGER_GRAD_RTOL, atol=EAGER_GRAD_ATOL)
 
 
 @pytest.mark.parametrize("mask_case", ("causal", "full", "2d_mask"))

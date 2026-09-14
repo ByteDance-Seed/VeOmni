@@ -132,6 +132,67 @@ def test_eager_matches_biased_linears():
     assert torch.allclose(down_e.bias.grad, down_h.bias.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+@pytest.mark.parametrize(
+    ("impl", "device"),
+    (
+        ("eager", "cpu"),
+        pytest.param("eager", "cuda", marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="needs CUDA")),
+        pytest.param(
+            "liger_kernel",
+            "cuda",
+            marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Liger SwiGLU needs CUDA"),
+        ),
+    ),
+)
+@pytest.mark.parametrize("swiglu_limit", (None, 1.0), ids=("plain", "clamped"))
+def test_autocast_forward_backward_matches_pytorch(impl: str, device: str, swiglu_limit: float | None):
+    if impl == "liger_kernel":
+        pytest.importorskip("liger_kernel")
+
+    torch.manual_seed(12)
+    hidden, intermediate = 64, 128
+    tensors = (
+        torch.randn(2, 8, hidden, device=device) * 0.1,
+        torch.randn(intermediate, hidden, device=device) * 0.1,
+        torch.randn(intermediate, device=device) * 0.1,
+        torch.randn(intermediate, hidden, device=device) * 0.1,
+        torch.randn(intermediate, device=device) * 0.1,
+        torch.randn(hidden, intermediate, device=device) * 0.1,
+        torch.randn(hidden, device=device) * 0.1,
+    )
+    reference_args = tuple(tensor.detach().clone().requires_grad_(True) for tensor in tensors)
+    actual_args = tuple(tensor.detach().clone().requires_grad_(True) for tensor in tensors)
+
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        x, gate_w, gate_b, up_w, up_b, down_w, down_b = reference_args
+        gate = F.linear(x, gate_w, gate_b)
+        up = F.linear(x, up_w, up_b)
+        if swiglu_limit is not None:
+            gate = gate.float().clamp(max=swiglu_limit)
+            up = up.float().clamp(min=-swiglu_limit, max=swiglu_limit)
+        hidden_state = F.silu(gate) * up
+        if hidden_state.dtype != x.dtype:
+            hidden_state = hidden_state.to(dtype=x.dtype)
+        expected = F.linear(hidden_state, down_w, down_b)
+        actual = resolve_op("swiglu_mlp", "standard", impl).wrapper(
+            *actual_args,
+            swiglu_limit=swiglu_limit,
+        )
+
+    grad_output = torch.randn_like(expected)
+    expected.backward(grad_output)
+    actual.backward(grad_output)
+
+    torch.testing.assert_close(actual, expected, atol=SWIGLU_FUSED_ATOL, rtol=SWIGLU_FUSED_RTOL)
+    for actual_arg, reference_arg in zip(actual_args, reference_args, strict=True):
+        torch.testing.assert_close(
+            actual_arg.grad,
+            reference_arg.grad,
+            atol=SWIGLU_FUSED_GRAD_ATOL,
+            rtol=SWIGLU_FUSED_GRAD_RTOL,
+        )
+
+
 def test_eager_matches_swiglu_limit():
     """``swiglu_limit`` matches HF ``DeepseekV4Experts._apply_gate``.
 

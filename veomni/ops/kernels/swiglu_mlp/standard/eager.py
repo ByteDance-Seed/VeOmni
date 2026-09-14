@@ -31,6 +31,7 @@ class _Meta:
 
     empty: bool
     swiglu_limit: float | None
+    projection_dtype: torch.dtype
     has_gate_bias: bool
     has_up_bias: bool
     has_down_bias: bool
@@ -87,13 +88,15 @@ def linear_backward(
     weight: Tensor,
     *,
     has_bias: bool,
+    compute_dtype: torch.dtype,
 ) -> tuple[Tensor, Tensor, Tensor | None]:
-    """Return ``(grad_input, grad_weight, grad_bias)`` for ``F.linear``."""
-    grad_2d = grad_output.reshape(-1, weight.shape[0])
-    inp_2d = inp.reshape(-1, weight.shape[1])
-    grad_input = (grad_2d @ weight).reshape_as(inp)
-    grad_weight = grad_2d.transpose(0, 1) @ inp_2d
-    grad_bias = grad_2d.sum(dim=0) if has_bias else None
+    """Return Linear grads using the dtype selected during its forward."""
+    grad_2d = grad_output.reshape(-1, weight.shape[0]).to(dtype=compute_dtype)
+    inp_2d = inp.reshape(-1, weight.shape[1]).to(dtype=compute_dtype)
+    weight_compute = weight.to(dtype=compute_dtype)
+    grad_input = (grad_2d @ weight_compute).reshape_as(inp).to(dtype=inp.dtype)
+    grad_weight = (grad_2d.transpose(0, 1) @ inp_2d).to(dtype=weight.dtype)
+    grad_bias = grad_2d.sum(dim=0).to(dtype=weight.dtype) if has_bias else None
     return grad_input, grad_weight, grad_bias
 
 
@@ -105,7 +108,7 @@ def mlp_hidden(
     up_b: Tensor,
     *,
     swiglu_limit: float | None,
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, torch.dtype]:
     """Project, optional clamp, then ``silu * up``.
 
     When *swiglu_limit* is set, clamp and the silu-mul run in fp32, then the
@@ -114,6 +117,7 @@ def mlp_hidden(
     """
     gate = linear(x, gate_w, gate_b)
     up = linear(x, up_w, up_b)
+    projection_dtype = gate.dtype
     if swiglu_limit is not None:
         gate = gate.float()
         up = up.float()
@@ -121,7 +125,7 @@ def mlp_hidden(
     hidden = silu_mul(gate_c, up_c)
     if hidden.dtype != x.dtype:
         hidden = hidden.to(dtype=x.dtype)
-    return hidden, gate, up
+    return hidden, gate, up, projection_dtype
 
 
 def empty_output(x: Tensor, down_w: Tensor) -> Tensor:
@@ -145,17 +149,26 @@ def forward(
     Empty biases are unused. ``swiglu_limit`` is the DeepSeek-V4 clamp; ``None``
     skips it.
     """
+    if x.numel() == 0:
+        meta = _Meta(
+            True,
+            swiglu_limit,
+            x.dtype,
+            gate_b.numel() > 0,
+            up_b.numel() > 0,
+            down_b.numel() > 0,
+        )
+        return empty_output(x, down_w), SavedState((x, gate_w, gate_b, up_w, up_b, down_w, down_b), meta)
+
+    hidden, gate, up, projection_dtype = mlp_hidden(x, gate_w, gate_b, up_w, up_b, swiglu_limit=swiglu_limit)
     meta = _Meta(
-        x.numel() == 0,
+        False,
         swiglu_limit,
+        projection_dtype,
         gate_b.numel() > 0,
         up_b.numel() > 0,
         down_b.numel() > 0,
     )
-    if meta.empty:
-        return empty_output(x, down_w), SavedState((x, gate_w, gate_b, up_w, up_b, down_w, down_b), meta)
-
-    hidden, gate, up = mlp_hidden(x, gate_w, gate_b, up_w, up_b, swiglu_limit=swiglu_limit)
     output = linear(hidden, down_w, down_b)
     return output, SavedState((x, gate_w, gate_b, up_w, up_b, down_w, down_b, gate, up, hidden), meta)
 
@@ -178,19 +191,36 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
 
     x, gate_w, gate_b, up_w, up_b, down_w, down_b, gate, up, hidden_out = saved.tensors
     grad_hidden, grad_down_w, grad_down_b = linear_backward(
-        grad_output, hidden_out, down_w, has_bias=meta.has_down_bias
+        grad_output,
+        hidden_out,
+        down_w,
+        has_bias=meta.has_down_bias,
+        compute_dtype=grad_output.dtype,
     )
     if meta.swiglu_limit is not None:
         gate_c, up_c = clamp_gate_up(gate, up, meta.swiglu_limit)
         grad_hidden = grad_hidden.to(dtype=gate_c.dtype)
         grad_gate_c, grad_up_c = silu_mul_backward(grad_hidden, gate_c, up_c)
-        grad_gate = unclamp_gate(grad_gate_c, gate, meta.swiglu_limit).to(dtype=x.dtype)
-        grad_up = unclamp_up(grad_up_c, up, meta.swiglu_limit).to(dtype=x.dtype)
+        grad_gate = unclamp_gate(grad_gate_c, gate, meta.swiglu_limit).to(dtype=meta.projection_dtype)
+        grad_up = unclamp_up(grad_up_c, up, meta.swiglu_limit).to(dtype=meta.projection_dtype)
     else:
+        grad_hidden = grad_hidden.to(dtype=meta.projection_dtype)
         grad_gate, grad_up = silu_mul_backward(grad_hidden, gate, up)
 
-    grad_x_gate, grad_gate_w, grad_gate_b = linear_backward(grad_gate, x, gate_w, has_bias=meta.has_gate_bias)
-    grad_x_up, grad_up_w, grad_up_b = linear_backward(grad_up, x, up_w, has_bias=meta.has_up_bias)
+    grad_x_gate, grad_gate_w, grad_gate_b = linear_backward(
+        grad_gate,
+        x,
+        gate_w,
+        has_bias=meta.has_gate_bias,
+        compute_dtype=meta.projection_dtype,
+    )
+    grad_x_up, grad_up_w, grad_up_b = linear_backward(
+        grad_up,
+        x,
+        up_w,
+        has_bias=meta.has_up_bias,
+        compute_dtype=meta.projection_dtype,
+    )
     return (
         grad_x_gate + grad_x_up,
         grad_gate_w,
