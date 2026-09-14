@@ -471,7 +471,7 @@ def test_vlm_runtime_rejects_unsupported_compile_model_while_building(monkeypatc
     calls = []
 
     def build_unsupported_model(runtime):
-        calls.append("build_model")
+        calls.append("_build_model")
         runtime.model = ToyModel()
         runtime.model.config = SimpleNamespace(model_type="qwen2_5_vl", vision_config=SimpleNamespace())
         runtime.model.input_modalities = ("image", "text")
@@ -483,8 +483,8 @@ def test_vlm_runtime_rejects_unsupported_compile_model_while_building(monkeypatc
     # build's own scope looking for a state that was never registered.
     monkeypatch.setattr(VLMModelRuntime, "setup", lambda _: None)
     monkeypatch.setattr("veomni.models.model_runtime.use_parallel_state", lambda _name: nullcontext())
-    monkeypatch.setattr(VLMModelRuntime, "build_model", build_unsupported_model)
-    monkeypatch.setattr(VLMModelRuntime, "freeze_model", lambda _: calls.append("freeze_model"))
+    monkeypatch.setattr(VLMModelRuntime, "_build_model", build_unsupported_model)
+    monkeypatch.setattr(VLMModelRuntime, "_freeze_model_module", lambda _: calls.append("_freeze_model_module"))
 
     args = SimpleNamespace(
         accelerator=SimpleNamespace(
@@ -497,7 +497,7 @@ def test_vlm_runtime_rejects_unsupported_compile_model_while_building(monkeypatc
     with pytest.raises(RuntimeError, match="only for dense Qwen3-VL"):
         VLMModelRuntime(args, train=SimpleNamespace())
 
-    assert calls == ["build_model"]
+    assert calls == ["_build_model"]
 
 
 def test_compile_config_detects_cuda_graphs():
