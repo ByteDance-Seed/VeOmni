@@ -28,11 +28,22 @@ from ..ulysses import (
     prepare_ulysses_qkv,
     restore_ulysses_output,
     should_apply_ulysses,
-    slice_ulysses_head_auxiliary,
 )
 
 
 sageattn = None
+
+_UNSUPPORTED_ATTENTION_METADATA = (
+    "cu_seq_lens_q",
+    "cu_seq_lens_k",
+    "cu_seqlens",
+    "cu_seqlens_q",
+    "cu_seqlens_k",
+    "max_length_q",
+    "max_length_k",
+    "indices",
+    "s_aux",
+)
 
 
 def _load_sageattn():
@@ -58,6 +69,16 @@ def _requires_attention_grad(query: torch.Tensor, key: torch.Tensor, value: torc
     return torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (query, key, value))
 
 
+def _reject_unsupported_attention_metadata(kwargs: dict) -> None:
+    """Reject metadata whose semantics SageAttention cannot represent."""
+    unsupported = tuple(name for name in _UNSUPPORTED_ATTENTION_METADATA if kwargs.get(name) is not None)
+    if unsupported:
+        names = ", ".join(f"`{name}`" for name in unsupported)
+        raise ValueError(
+            "veomni_sage_attention does not support packed, sparse, or auxiliary attention metadata: " + names
+        )
+
+
 def sage_attention_forward(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -78,6 +99,8 @@ def sage_attention_forward(
     SM; it does not register backward. This adapter therefore refuses a
     training graph instead of returning a detached tensor. Use
     ``flash_attention_2`` / ``3`` / ``4`` when gradients are needed.
+    Packed, sparse, and auxiliary attention metadata is rejected because the
+    SageAttention call below cannot represent those visibility semantics.
     ``skip_ulysses`` opts a call out of sync Ulysses when its tokens are not
     on the SP mesh. Async Ulysses stays outside attention.
     """
@@ -100,6 +123,8 @@ def sage_attention_forward(
     if any(dim == 0 for tensor in (query, key, value) for dim in tensor.shape):
         raise ValueError("SageAttention does not support query/key/value tensors with zero dimensions.")
 
+    _reject_unsupported_attention_metadata(kwargs)
+
     sageattn_fn = _load_sageattn()
 
     is_causal = kwargs.pop("is_causal", None)
@@ -109,7 +134,7 @@ def sage_attention_forward(
     parallel_state = get_parallel_state()
     ulysses_enabled = should_apply_ulysses(skip_ulysses=skip_ulysses)
     if ulysses_enabled:
-        query, key, value, query_head_count = prepare_ulysses_qkv(
+        query, key, value, _ = prepare_ulysses_qkv(
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
@@ -119,13 +144,6 @@ def sage_attention_forward(
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
-        if "s_aux" in kwargs:
-            kwargs["s_aux"] = slice_ulysses_head_auxiliary(
-                kwargs["s_aux"],
-                query_head_count=query_head_count,
-                local_query_head_count=query.shape[1],
-                group=parallel_state.ulysses_group,
-            )
 
     output = sageattn_fn(
         query,

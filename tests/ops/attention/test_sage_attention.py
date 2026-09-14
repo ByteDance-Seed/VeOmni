@@ -62,6 +62,9 @@ def test_sage_attention_hnd_layout_and_is_causal(monkeypatch):
         scaling=0.125,
         skip_ulysses=True,
         last_loss=0.1,
+        cu_seq_lens_q=None,
+        indices=None,
+        s_aux=None,
     )
 
     torch.testing.assert_close(captured["query"], query)
@@ -104,6 +107,44 @@ def test_sage_attention_rejects_dense_mask(monkeypatch):
             query,
             query,
             attention_mask=torch.ones(1, 1, 4, 4, dtype=torch.bool),
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("cu_seq_lens_q", torch.tensor([0, 2, 4], dtype=torch.int32)),
+        ("cu_seq_lens_k", torch.tensor([0, 2, 4], dtype=torch.int32)),
+        ("cu_seqlens", torch.tensor([0, 2, 4], dtype=torch.int32)),
+        ("cu_seqlens_q", torch.tensor([0, 2, 4], dtype=torch.int32)),
+        ("cu_seqlens_k", torch.tensor([0, 2, 4], dtype=torch.int32)),
+        ("max_length_q", 2),
+        ("max_length_k", 2),
+        ("indices", torch.tensor([[0, 1]], dtype=torch.int32)),
+        ("s_aux", torch.ones(2)),
+    ),
+)
+def test_sage_attention_rejects_unsupported_semantic_metadata(monkeypatch, name, value):
+    monkeypatch.setattr(
+        sage_backend,
+        "sageattn",
+        lambda query, key, value, **kwargs: pytest.fail("unsupported metadata must fail before the vendor call"),
+    )
+    monkeypatch.setattr(
+        sage_backend,
+        "should_apply_ulysses",
+        lambda *, skip_ulysses=False: pytest.fail("unsupported metadata must fail before Ulysses exchange"),
+    )
+    query = torch.randn(1, 2, 4, 8)
+
+    with pytest.raises(ValueError, match=rf"does not support .*`{name}`"):
+        sage_backend.sage_attention_forward(
+            _FakeAttentionModule(),
+            query,
+            query,
+            query,
+            attention_mask=None,
+            **{name: value},
         )
 
 

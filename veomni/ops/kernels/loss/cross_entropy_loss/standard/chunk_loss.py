@@ -86,7 +86,7 @@ def forward(
         )
         accumulated_loss = accumulated_loss + chunk_loss
         grad_chunk.copy_(chunk_grad_hidden)
-        grad_weight = grad_weight + chunk_grad_weight
+        grad_weight.add_(chunk_grad_weight)
 
     return accumulated_loss, SavedState((grad_hidden, grad_weight))
 

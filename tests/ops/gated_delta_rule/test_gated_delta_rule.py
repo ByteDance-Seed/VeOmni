@@ -459,6 +459,65 @@ def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
     assert seen_scales == [("forward", explicit_scale), ("backward", explicit_scale)]
 
 
+def test_npu_ascendc_packed_backward_reuses_normalized_cu_seqlens(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Backward receives the accelerator/int64 boundaries used by forward."""
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import npu_ascendc as module
+
+    triton_utils = import_module("veomni.ops.kernels.gated_delta_rule.vendor.triton.utils")
+    monkeypatch.setattr(triton_utils, "input_guard", lambda fn: fn)
+    observed: dict[str, Tensor] = {}
+
+    def fake_chunk_fwd(query, key, value, g, beta, scale, initial_state, output_final_state, cu_seqlens, *args):
+        del key, value, beta, scale, initial_state, output_final_state, args
+        observed["forward"] = cu_seqlens
+        return g, query.transpose(1, 2).contiguous(), query.new_empty(0), None
+
+    def fake_chunk_bwd(query, key, value, g, beta, a, scale, initial_state, grad_output, cu_seqlens, *args):
+        del a, scale, initial_state, args
+        observed["backward"] = cu_seqlens
+        grad_output = grad_output.transpose(1, 2).contiguous()
+        return (
+            grad_output,
+            torch.zeros_like(key),
+            torch.zeros_like(value),
+            torch.zeros_like(beta),
+            torch.zeros_like(g),
+        )
+
+    monkeypatch.setattr(module, "_chunk_fwd", fake_chunk_fwd)
+    monkeypatch.setattr(module, "_chunk_bwd", fake_chunk_bwd)
+
+    device = torch.device("cuda" if IS_CUDA_AVAILABLE else "cpu")
+    shape = (1, 4, 2, 8)
+    query = torch.randn(shape, device=device, dtype=torch.bfloat16, requires_grad=True)
+    key = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    value = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    g = torch.randn(shape[:3], device=device, dtype=torch.float32)
+    beta = torch.randn(shape[:3], device=device, dtype=torch.bfloat16)
+    original_cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
+    entry = OpEntry(
+        "test_chunk_gdr",
+        "standard",
+        "npu_ascendc",
+        module.forward,
+        module.backward,
+        description="Test AscendC packed metadata lifetime",
+    )
+
+    output, _final_state = entry.wrapper(query, key, value, g, beta, cu_seqlens=original_cu_seqlens)
+    output.sum().backward()
+
+    forward_cu_seqlens = observed["forward"]
+    backward_cu_seqlens = observed["backward"]
+    assert forward_cu_seqlens.device == query.device
+    assert forward_cu_seqlens.dtype == torch.int64
+    assert backward_cu_seqlens.device == query.device
+    assert backward_cu_seqlens.dtype == torch.int64
+    assert backward_cu_seqlens.data_ptr() == forward_cu_seqlens.data_ptr()
+    assert original_cu_seqlens.device.type == "cpu"
+    assert original_cu_seqlens.dtype == torch.int32
+
+
 @pytest.mark.parametrize("device", _FLA_DEVICE_CASES)
 def test_chunk_gated_delta_rule_fla_matches_eager(device):
     pytest.importorskip("fla")
