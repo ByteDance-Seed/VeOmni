@@ -274,6 +274,30 @@ def tiny_seed_oss_config(architecture: str = "SeedOssForCausalLM") -> Pretrained
     )
 
 
+def tiny_wan_config(architecture: str = "WanModel", **overrides) -> PretrainedConfig:
+    from veomni.models_kernel.transformers.wan.config_wan import WanConfig
+
+    kwargs = {
+        "patch_size": [1, 2, 2],
+        "dim": 32,
+        "eps": 1e-6,
+        "ffn_dim": 64,
+        "freq_dim": 16,
+        "in_dim": 4,
+        "num_heads": 4,
+        "num_layers": 2,
+        "out_dim": 4,
+        "text_dim": 16,
+        "text_len": 8,
+        "has_image_input": "false",
+        "architectures": [architecture],
+        "tie_word_embeddings": False,
+        "attn_implementation": "eager",
+    }
+    kwargs.update(overrides)
+    return WanConfig(**kwargs)
+
+
 def tiny_qwen2_config(architecture: str = "Qwen2ForCausalLM", **overrides) -> PretrainedConfig:
     from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 

@@ -101,6 +101,9 @@ from tests.models_kernel.tiny_configs import (
 from tests.models_kernel.tiny_configs import (
     tiny_seed_oss_config as _tiny_seed_oss_config,
 )
+from tests.models_kernel.tiny_configs import (
+    tiny_wan_config as _tiny_wan_config,
+)
 from veomni.models_kernel import (
     MODEL_CONFIG_REGISTRY,
     MODEL_PROCESSOR_REGISTRY,
@@ -331,6 +334,13 @@ _MODEL_CASES = (
             "Qwen3VLMoeModel",
             "Qwen3VLMoeTextModel",
         ),
+    ),
+    _ModelCase(
+        model_type="wan",
+        config_factory=_tiny_wan_config,
+        architectures=("WanModel",),
+        has_registered_config=True,
+        eager_op_path="blocks.0.self_attn.norm_q.veomni_rms_norm",
     ),
 )
 

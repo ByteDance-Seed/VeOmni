@@ -12,4 +12,20 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Wan modeling that calls local VeomniOp handles. Not on ``MODELING_REGISTRY``."""
+"""Register the local Wan config and model."""
+
+from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+
+
+@MODEL_CONFIG_REGISTRY.register("wan")
+def register_wan_config():
+    from .config_wan import WanConfig
+
+    return WanConfig
+
+
+@MODELING_REGISTRY.register("wan")
+def register_wan_modeling(_architecture: str):
+    from .modeling_wan import WanModel
+
+    return WanModel

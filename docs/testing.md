@@ -166,7 +166,7 @@ Additional per-directory helpers:
 The models migrated to `models_kernel` are currently DeepSeek-V3, DeepSeek-V4, Flux, Gemma3 Text, GLM-MoE-DSA,
 GPT-OSS, Llama, MoVQGAN, Seed-OSS,
 Qwen2, Qwen2-VL, Qwen2.5-VL, Qwen2.5-Omni, Qwen3, Qwen3-MoE, Qwen3-VL, Qwen3-VL-MoE, Qwen3.5,
-Qwen3.5-MoE, and Qwen3-Omni-MoE. Their registry/build
+Qwen3.5-MoE, Qwen3-Omni-MoE, and Wan. Their registry/build
 dispatch, supported architectures, eager forward/backward parity, and
 instance-local op binding are covered by `tests/models_kernel/test_auto_registry.py`
 and the corresponding model tests under `tests/models_kernel/`. Backend
