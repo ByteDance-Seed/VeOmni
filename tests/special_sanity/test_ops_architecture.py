@@ -70,12 +70,8 @@ def _active_text_files() -> list[Path]:
     return sorted(set(files))
 
 
-def _is_retained_model_config_reference(path: Path, line: str) -> bool:
-    """Allow tooling rules that still protect the retained model comparison tree."""
-    if path == REPO_ROOT / "pyproject.toml":
-        return line.startswith('"veomni/' + "models/transformers/")
-    if path == REPO_ROOT / ".coderabbit.yaml":
-        return line.strip().startswith('- "!veomni/' + "models/transformers/")
+def _is_retained_legacy_model_reference(path: Path, line: str) -> bool:
+    """Allow tooling rules that still inspect the retained model comparison tree."""
     if path == REPO_ROOT / "tests/special_sanity/check_device_api_usage.py":
         return line.strip().startswith('"veomni/' + "models/")
     return False
@@ -90,7 +86,7 @@ def test_active_tree_uses_ops_architecture_paths():
         relative = path.relative_to(REPO_ROOT)
         text = path.read_text(encoding="utf-8")
         for line_number, line in enumerate(text.splitlines(), start=1):
-            if _is_retained_model_config_reference(path, line):
+            if _is_retained_legacy_model_reference(path, line):
                 continue
             retained_model_consumer = relative in RETAINED_MODEL_CONSUMER_TESTS and model_package.search(line)
             if removed_ops_package.search(line) or (model_package.search(line) and not retained_model_consumer):

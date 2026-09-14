@@ -20,7 +20,6 @@ reviews:
   path_filters:
     - "!**/*.diff"
     - "!docs/assets/**"
-    - "!veomni/models/transformers/**/generated/**"
     - "!veomni/models_kernel/transformers/**/generated/**"
     - "!uv.lock"
   path_instructions:
