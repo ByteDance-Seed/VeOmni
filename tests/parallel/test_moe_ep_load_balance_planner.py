@@ -65,6 +65,9 @@ def _assert_global_invariants(counts: list[list[int]], plans: list[ep_load_balan
     assert all(plan.rank_loads_after == reference.rank_loads_after for plan in plans)
     assert sum(reference.rank_loads_before) == total_tokens
     assert sum(reference.rank_loads_after) == total_tokens
+    assert tuple(sorted(reference.rank_loads_after, reverse=True)) <= tuple(
+        sorted(reference.rank_loads_before, reverse=True)
+    )
 
     for rank, plan in enumerate(plans):
         assert sum(plan.input_splits) == sum(counts[rank])
@@ -210,6 +213,21 @@ def test_replica_slots_are_never_overcommitted():
     _assert_global_invariants(counts, plans)
 
 
+@pytest.mark.parametrize("hot_ranks", [2, 3])
+def test_tied_hotspots_can_improve_before_the_global_spread_changes(hot_ranks):
+    ep_size = 2 * hot_ranks
+    counts = [[100 if expert < hot_ranks else 0 for expert in range(ep_size)]]
+    counts += [[0] * ep_size for _ in range(ep_size - 1)]
+    plans = _plans_from_counts(counts, max_replicas_per_rank=1)
+
+    # The first move leaves both an untouched maximum and an untouched zero.
+    # Rejecting it by max(load)-min(load) prevents all independent pairs moving.
+    assert plans[0].rank_loads_after == (50,) * ep_size
+    assert len(plans[0].replicas) == hot_ranks
+    assert all(replica.moved_tokens == 50 for replica in plans[0].replicas)
+    _assert_global_invariants(counts, plans)
+
+
 def test_ties_choose_low_owner_expert_and_target_ids_deterministically():
     counts = [[6, 6, 0, 0, 0, 0], [0, 0, 6, 6, 0, 0], [0, 0, 0, 0, 0, 0]]
     first = _plans_from_counts(counts, max_replicas_per_rank=2)
@@ -224,7 +242,7 @@ def test_ties_choose_low_owner_expert_and_target_ids_deterministically():
     _assert_global_invariants(counts, first)
 
 
-def test_no_move_is_accepted_without_strict_spread_improvement():
+def test_no_move_is_accepted_without_strict_load_profile_improvement():
     counts = [[1, 0], [0, 0]]
     plans = _plans_from_counts(counts, max_replicas_per_rank=1)
 

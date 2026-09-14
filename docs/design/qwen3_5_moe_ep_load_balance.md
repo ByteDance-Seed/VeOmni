@@ -22,11 +22,13 @@ For every fused MoE forward:
 
 1. The native Qwen3.5 router produces weights and logical top-k expert IDs.
 2. The planner computes a histogram from those actual selected IDs, then gathers the histogram across the existing EP group. It does not predict load from a prior step or add a second routing policy.
-3. A deterministic greedy/water-filling plan selects only replicas that strictly reduce the physical rank-load spread. It conserves selected occurrences and assigns concrete occurrences of a hot logical expert to each replica.
+3. A deterministic greedy/water-filling plan selects only replicas that strictly improve the descending-sorted physical rank-load vector, compared lexicographically. This prioritizes the busiest ranks without requiring the global max-minus-min spread to drop on every individual move. It conserves selected occurrences and assigns concrete occurrences of a hot logical expert to each replica.
 4. Dispatch rewrites only those selected IDs into a private physical-alias namespace, transfers temporary weights, and runs the existing fused EP dispatcher.
 5. The custom autograd boundary returns every replica gradient to the original expert owner before the optimizer sees the original parameter gradient.
 
 The generic trainer owns lifecycle and validation; the planner owns the immutable per-forward plan; CUDA and NPU dispatchers own backend-specific fused execution. The monitor observes routing and physical-plan telemetry. No expert forward hook replaces routing. The synthetic E2E uses the existing router-replay seam, after native top-k, and leaves Qwen3.5's own gather and renormalization of routing weights in place.
+
+For example, `[100, 100, 0, 0]` first becomes `[50, 100, 50, 0]`, then `[50, 50, 50, 50]`. The first move leaves the spread unchanged because another hot rank and another empty rank remain. Rejecting that move would incorrectly leave both hotspots unbalanced. The sorted-load objective accepts it without increasing the busiest rank's load; moving a lone token between ranks with the same sorted load profile is still rejected. This is a token-load planning objective, not a communication-cost or end-to-end performance guarantee.
 
 ## Physical alias namespace
 

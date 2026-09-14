@@ -258,8 +258,9 @@ class _ReplicaState:
     moved_tokens: int
 
 
-def _spread(loads: list[int]) -> int:
-    return max(loads) - min(loads)
+def _rank_load_profile(loads: list[int]) -> tuple[int, ...]:
+    """Prioritize the busiest ranks without getting stuck on tied extrema."""
+    return tuple(sorted(loads, reverse=True))
 
 
 def _waterfill_allocations(total_tokens: int, base_loads: dict[int, int]) -> dict[int, int]:
@@ -391,7 +392,7 @@ def _plan_replicas(
         )
 
         accepted = None
-        current_spread = _spread(rank_loads)
+        current_profile = _rank_load_profile(rank_loads)
         for expert in candidate_experts:
             owner = expert // num_local_experts
             existing_indices = replica_indices_by_expert[expert]
@@ -415,7 +416,10 @@ def _plan_replicas(
                 proposed_loads = rank_loads.copy()
                 for rank in locations:
                     proposed_loads[rank] = base_loads[rank] + allocations[rank]
-                if _spread(proposed_loads) >= current_spread:
+                # A tied maximum or minimum can keep the global spread fixed
+                # while one hot rank improves. Compare all ranks, busiest
+                # first, so independent hot/cold pairs can move in sequence.
+                if _rank_load_profile(proposed_loads) >= current_profile:
                     continue
 
                 accepted = (expert, owner, target, existing_indices, allocations, proposed_loads)
