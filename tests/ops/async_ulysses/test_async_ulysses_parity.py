@@ -6,7 +6,6 @@ import pytest
 import torch
 import torch.distributed as c10d
 import torch.distributed as dist
-from torch.testing._internal.common_utils import run_tests
 
 from tests.parallel.ulysses.attention import Attention
 from tests.parallel.ulysses.utils import SequenceParallelTest, sync_tensor
@@ -171,4 +170,6 @@ if __name__ == "__main__":
 
     set_seed(seed=0, full_determinism=True)
     enable_high_precision_for_bf16()
+    from torch.testing._internal.common_utils import run_tests
+
     run_tests()

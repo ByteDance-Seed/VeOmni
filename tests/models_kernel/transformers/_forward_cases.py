@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import gc
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -111,11 +113,22 @@ SYNC_FORWARD_CASES = (
 )
 
 
-def apply_determinism() -> None:
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.use_deterministic_algorithms(True, warn_only=True)
+@contextmanager
+def deterministic_backend_flags() -> Iterator[None]:
+    """Scope deterministic CUDA flags without leaking state across tests."""
+    previous_deterministic = torch.are_deterministic_algorithms_enabled()
+    with torch.backends.cudnn.flags(
+        enabled=torch.backends.cudnn.enabled,
+        benchmark=False,
+        benchmark_limit=torch.backends.cudnn.benchmark_limit,
+        deterministic=True,
+        allow_tf32=False,
+    ):
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        try:
+            yield
+        finally:
+            torch.use_deterministic_algorithms(previous_deterministic, warn_only=True)
 
 
 def release_device_memory() -> None:

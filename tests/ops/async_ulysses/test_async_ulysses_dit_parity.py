@@ -12,7 +12,6 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from torch.testing._internal.common_utils import run_tests
 
 from tests.parallel.ulysses.utils import SequenceParallelTest, sync_tensor
 from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
@@ -382,4 +381,6 @@ if __name__ == "__main__":
 
     set_seed(seed=0, full_determinism=True)
     enable_high_precision_for_bf16()
+    from torch.testing._internal.common_utils import run_tests
+
     run_tests()

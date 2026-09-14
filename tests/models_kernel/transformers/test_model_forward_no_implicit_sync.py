@@ -101,7 +101,7 @@ from tests.models_kernel.transformers._forward_cases import (
 )
 from tests.models_kernel.transformers._forward_cases import ForwardCase
 from tests.models_kernel.transformers._forward_cases import (
-    apply_determinism as _apply_determinism,
+    deterministic_backend_flags as _deterministic_backend_flags,
 )
 from tests.models_kernel.transformers._forward_cases import (
     forward_target as _forward_target,
@@ -129,6 +129,15 @@ _MOE_IMPL_BY_CASE: dict[str, str] = {
     "qwen3_vl_moe-fa2-fused": "fused_triton",
     "qwen3_omni_moe-fa2-fused": "fused_triton",
 }
+
+
+@pytest.fixture(autouse=True)
+def _scope_deterministic_backend_flags():
+    if not IS_CUDA_AVAILABLE:
+        yield
+        return
+    with _deterministic_backend_flags():
+        yield
 
 
 # The case metadata and multimodal input construction live in
@@ -525,8 +534,6 @@ def test_no_implicit_sync_in_generated_forward(case):
     if case.case_id in _PENDING_FIX_CASES:
         pytest.skip(f"Pending fix: {_PENDING_FIX_CASES[case.case_id]}")
 
-    _apply_determinism()
-
     device = get_device_type()
     dtype = _DTYPE_MAP[case.dtype]
     config = _make_config(case)
@@ -670,8 +677,6 @@ def test_multimodal_metadata_path_matches_fallback(case):
 
         if not is_fused_moe_available():
             pytest.skip("fused_triton MoE requires Triton + CUDA SM70+.")
-
-    _apply_determinism()
 
     device = get_device_type()
     dtype = _DTYPE_MAP[case.dtype]

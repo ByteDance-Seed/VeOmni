@@ -30,7 +30,6 @@ from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torc
 if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backend()):
     pytest.skip("c10d NCCL not available, skipping tests", allow_module_level=True)
 
-from torch.testing._internal.common_utils import run_tests
 
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, get_parallel_state
 from veomni.models_kernel.transformers.wan.modeling_wan import SelfAttention, precompute_freqs_cis
@@ -112,4 +111,6 @@ def rope_apply_ref(x, freqs, head_dim):
 
 
 if __name__ == "__main__":
+    from torch.testing._internal.common_utils import run_tests
+
     run_tests()
