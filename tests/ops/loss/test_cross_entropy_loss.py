@@ -181,6 +181,37 @@ def test_chunk_loss_matches_eager_with_uneven_valid_tokens():
     assert torch.allclose(weight_e.grad, weight_o.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+def test_chunk_loss_accumulates_weight_gradient_without_full_size_temporary():
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from veomni.ops.kernels.loss.cross_entropy_loss.standard import chunk_loss
+
+    weight_shape = (16, 8)
+
+    class FullWeightAddCounter(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.out_of_place_adds = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            del types
+            output = func(*args, **(kwargs or {}))
+            if func == torch.ops.aten.add.Tensor and isinstance(output, Tensor) and output.shape == weight_shape:
+                self.out_of_place_adds += 1
+            return output
+
+    torch.manual_seed(8)
+    hidden = torch.randn(1, 4, weight_shape[1])
+    labels = torch.randint(0, weight_shape[0], (1, 4))
+    weight = torch.randn(weight_shape)
+    counter = FullWeightAddCounter()
+
+    with counter:
+        chunk_loss.forward(hidden, labels, weight, chunk_size=2)
+
+    assert counter.out_of_place_adds == 0
+
+
 def test_chunk_loss_requires_weight():
     with pytest.raises(RuntimeError, match="nonempty ``weight``"):
         resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper(

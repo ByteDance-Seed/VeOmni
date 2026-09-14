@@ -157,6 +157,34 @@ def test_dotted_requirement_discovery_supports_namespace_and_deep_paths(tmp_path
     assert "review_namespace.middle" not in sys.modules
 
 
+def test_dotted_requirement_discovery_supports_consecutive_namespace_packages(tmp_path: Path, monkeypatch) -> None:
+    """Nested namespace packages are discoverable without synthetic imports."""
+    from veomni.ops.registry import OpEntry, OpRegistry
+
+    package = tmp_path / "review_nested_namespace" / "middle"
+    package.mkdir(parents=True)
+    (package / "child.py").write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    registry = OpRegistry()
+    entry = OpEntry(
+        op="probe",
+        variant="standard",
+        impl="namespace",
+        description="Nested namespace requirement probe",
+        wrapper=lambda value: value,
+        requires=("review_nested_namespace.middle.child",),
+    )
+    registry.register(entry)
+
+    assert is_package_available("review_nested_namespace.middle.child")
+    assert registry.list_available("probe", "standard") == ["namespace"]
+    assert registry.resolve("probe", "standard", "namespace") is entry
+    assert "review_nested_namespace" not in sys.modules
+    assert "review_nested_namespace.middle" not in sys.modules
+    assert "review_nested_namespace.middle.child" not in sys.modules
+
+
 def test_dotted_requirement_discovery_uses_loaded_parent_path(tmp_path: Path, monkeypatch) -> None:
     """An already-loaded package contributes its runtime search path without reimport."""
     package = tmp_path / "review_loaded"
