@@ -52,6 +52,15 @@ _FLA_DEVICE_CASES = (
     pytest.param("cuda", marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FLA needs a CUDA GPU")),
     pytest.param("mlu", marks=pytest.mark.skipif(not IS_MLU_AVAILABLE, reason="FLA needs an MLU")),
 )
+_TRITON_UTILS_MODULE = "veomni.ops.kernels.gated_delta_rule.vendor.triton.utils"
+
+
+@pytest.fixture
+def _stub_npu_input_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide the only vendored Triton utility used by mocked NPU wrappers."""
+    triton_utils = ModuleType(_TRITON_UTILS_MODULE)
+    triton_utils.input_guard = lambda fn: fn
+    monkeypatch.setitem(sys.modules, _TRITON_UTILS_MODULE, triton_utils)
 
 
 def _require_npu_gdr_dependencies(*, ascendc: bool = False) -> None:
@@ -386,11 +395,10 @@ def test_chunk_gated_delta_rule_adapter_forwards_scale(
 def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
     impl: str,
     monkeypatch: pytest.MonkeyPatch,
+    _stub_npu_input_guard: None,
 ) -> None:
     """Exercise the NPU raw-pair autograd glue without requiring NPU hardware."""
     module = import_module(f"veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.{impl}")
-    triton_utils = import_module("veomni.ops.kernels.gated_delta_rule.vendor.triton.utils")
-    monkeypatch.setattr(triton_utils, "input_guard", lambda fn: fn)
 
     head_first = impl == "npu_ascendc"
     explicit_scale = 0.375
@@ -459,12 +467,13 @@ def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
     assert seen_scales == [("forward", explicit_scale), ("backward", explicit_scale)]
 
 
-def test_npu_ascendc_packed_backward_reuses_normalized_cu_seqlens(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_npu_ascendc_packed_backward_reuses_normalized_cu_seqlens(
+    monkeypatch: pytest.MonkeyPatch,
+    _stub_npu_input_guard: None,
+) -> None:
     """Backward receives the accelerator/int64 boundaries used by forward."""
     from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import npu_ascendc as module
 
-    triton_utils = import_module("veomni.ops.kernels.gated_delta_rule.vendor.triton.utils")
-    monkeypatch.setattr(triton_utils, "input_guard", lambda fn: fn)
     observed: dict[str, Tensor] = {}
 
     def fake_chunk_fwd(query, key, value, g, beta, scale, initial_state, output_final_state, cu_seqlens, *args):

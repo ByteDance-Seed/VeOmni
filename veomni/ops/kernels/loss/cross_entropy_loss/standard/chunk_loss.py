@@ -59,14 +59,17 @@ def forward(
     if weight.numel() == 0:
         raise RuntimeError("chunk_loss requires a nonempty ``weight`` (fused-linear path)")
 
-    _hidden_flat, labels_flat = _eager.flatten_tokens(hidden, labels)
-    if hidden.numel() == 0 or labels_flat.numel() == 0:
+    hidden_token_count = hidden.shape[:-1].numel()
+    label_token_count = labels.numel()
+    if hidden_token_count != label_token_count:
+        raise ValueError(f"token count {hidden_token_count} != labels {label_token_count}")
+    if hidden.numel() == 0 or label_token_count == 0:
         loss = hidden.sum() * 0 if hidden.numel() else torch.zeros((), device=hidden.device, dtype=torch.float32)
         return loss, SavedState((torch.zeros_like(hidden), torch.zeros_like(weight)))
 
     denom: int | Tensor
     if num_items_in_batch is None:
-        denom = (labels_flat != ignore_index).sum().clamp(min=1)
+        denom = (labels != ignore_index).sum().clamp(min=1)
     else:
         denom = num_items_in_batch
     split_dim = 1 if hidden.ndim >= 3 else 0
