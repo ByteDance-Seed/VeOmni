@@ -59,7 +59,7 @@ def forward(
     if weight.numel() == 0:
         raise RuntimeError("chunk_loss requires a nonempty ``weight`` (fused-linear path)")
 
-    labels_flat = labels.reshape(-1)
+    _hidden_flat, labels_flat = _eager.flatten_tokens(hidden, labels)
     if hidden.numel() == 0 or labels_flat.numel() == 0:
         loss = hidden.sum() * 0 if hidden.numel() else torch.zeros((), device=hidden.device, dtype=torch.float32)
         return loss, SavedState((torch.zeros_like(hidden), torch.zeros_like(weight)))
