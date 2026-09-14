@@ -188,6 +188,13 @@ class OpRegistry:
             )
         self._entries[key] = entry
 
+    def _select_entry(self, op: str, variant: str, impl: str, device: str) -> OpEntry | None:
+        """Select the device override, falling back to the device-agnostic row."""
+        entry = self._entries.get((op, variant, impl, device))
+        if entry is not None:
+            return entry
+        return self._entries.get((op, variant, impl, ANY_DEVICE))
+
     def resolve(self, op: str, variant: str, impl: str) -> OpEntry:
         """Return the row for ``(op, variant, impl)`` on this device.
 
@@ -198,9 +205,7 @@ class OpRegistry:
         ``RuntimeError``.
         """
         device = get_device_type()
-        entry = self._entries.get((op, variant, impl, device))
-        if entry is None:
-            entry = self._entries.get((op, variant, impl, ANY_DEVICE))
+        entry = self._select_entry(op, variant, impl, device)
         if entry is None:
             devices = [
                 entry_device
@@ -244,6 +249,8 @@ class OpRegistry:
             if entry_op != op or entry_variant != variant:
                 continue
             if entry_device not in (device, ANY_DEVICE):
+                continue
+            if entry is not self._select_entry(op, variant, impl, device):
                 continue
             if not self._entry_is_available(entry):
                 continue
