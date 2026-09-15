@@ -1568,38 +1568,42 @@ class TestPromoteStagedCheckpoint:
         assert (final_path / _LR_SCHEDULER_FILENAME).read_text() == "scheduler-v2"
         assert (final_path / nested_rel).read_text() == "nested"
 
-    def test_stale_metadata_is_removed_before_any_data_is_copied(self, staged):
-        """Overwriting in place must not leave the old marker over half-new data."""
+    def test_stale_metadata_is_gone_before_any_data_is_copied(self, staged):
+        """Overwriting in place must not leave the old marker over half-new data.
+
+        The old marker's absence is what matters, not the call that removes it --
+        the destination is emptied wholesale, so no single file is deleted by
+        name."""
         import shutil as _shutil
 
         from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
 
         stage_path, final_path = staged
         os.makedirs(final_path)
-        with open(os.path.join(final_path, ".metadata"), "w") as f:
+        marker = os.path.join(final_path, ".metadata")
+        with open(marker, "w") as f:
             f.write("previous checkpoint")
 
-        events = []
+        def stale_marker_present():
+            """Whether the previous checkpoint's marker is still standing."""
+            return os.path.exists(marker) and Path(marker).read_text() == "previous checkpoint"
+
+        order = []
         real_copy = _shutil.copyfile
-        real_remove = os.remove
 
         def copy_spy(src, dst):
-            """Record a copy event, then perform the real copy."""
-            events.append(("copy", os.path.basename(dst)))
+            """Record what the destination held at each copy, then really copy."""
+            order.append((os.path.basename(dst), stale_marker_present()))
             return real_copy(src, dst)
-
-        def remove_spy(path):
-            """Record a removal event, then perform the real removal."""
-            events.append(("remove", os.path.basename(path)))
-            return real_remove(path)
 
         with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False):
             with patch("veomni.checkpoint.dcp_checkpointer.shutil.copyfile", side_effect=copy_spy):
-                with patch("veomni.checkpoint.dcp_checkpointer.os.remove", side_effect=remove_spy):
-                    _promote_staged_checkpoint(stage_path, final_path)
+                _promote_staged_checkpoint(stage_path, final_path)
 
-        assert events[0] == ("remove", ".metadata")
-        assert events[-1] == ("copy", ".metadata")
+        assert order, "promotion copied nothing"
+        assert not any(stale for _name, stale in order), f"the old marker outlived a copy: {order}"
+        assert order[-1][0] == ".metadata"
+        assert not stale_marker_present()
 
     def test_staged_copy_is_removed_even_when_promotion_fails(self, staged):
         """A leftover staged copy is the size of the model plus its optimizer state."""
