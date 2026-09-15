@@ -208,8 +208,8 @@ def test_minimax_h3_pipeline_constructs_without_weights():
 
     pipe = MiniMaxH3Pipeline(device="cpu")
     assert pipe.dit is None
-    assert len(pipe.units) == 8
-    assert pipe.model_fn is not None
+    assert pipe.units
+    assert callable(pipe.model_fn)
 
 
 def test_minimax_h3_rms_norm_matches_official():

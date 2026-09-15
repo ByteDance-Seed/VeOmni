@@ -173,22 +173,12 @@ def test_qat_covers_exactly_the_projections_served_as_fp8_gemms(modeling):
 
 @pytest.mark.parametrize("modeling", [modeling_gpu, modeling_npu], ids=["gpu", "npu"])
 def test_qat_covers_exactly_the_activations_inference_stores_quantized(modeling):
+    """Check the full recipe, including the unquantized main-attention q/q_residual."""
     for qualname, expected in _EXPECTED_ACT_QUANT.items():
         assert _act_quant_calls(modeling, qualname) == sorted(expected), (
             f"{qualname}: activation fake-quant sites drifted from the recipe. Check both the "
             f"packed and the windowed branch before updating _EXPECTED_ACT_QUANT."
         )
-
-
-@pytest.mark.parametrize("modeling", [modeling_gpu, modeling_npu], ids=["gpu", "npu"])
-def test_main_attention_query_is_never_fake_quantized(modeling):
-    """The one activation the recipe calls out as staying BF16.
-
-    Quantizing it would be an easy mistake to make by symmetry with the indexer,
-    where both sides of the product *are* rounded.
-    """
-    quantized_args = {arg for _, arg in _act_quant_calls(modeling, "DeepseekV4Attention.forward")}
-    assert "q" not in quantized_args and "q_residual" not in quantized_args
 
 
 @pytest.mark.parametrize("modeling", [modeling_gpu, modeling_npu], ids=["gpu", "npu"])

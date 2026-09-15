@@ -198,7 +198,6 @@ def test_ltx_core_rebinds_away_from_another_copy(tmp_path):
         bound_utils = importlib.import_module("ltx_core.utils")
         package_utils = importlib.import_module("veomni.models.diffusers.ltx2_3.ltx_core.utils")
         assert bound_utils.__file__ == package_utils.__file__
-        assert "VeomniOp" in bound_utils.rms_norm.__doc__
         assert not hasattr(bound_utils, "MARKER")
     finally:
         sys.path[:] = saved_path

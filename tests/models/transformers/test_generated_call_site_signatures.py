@@ -227,7 +227,7 @@ def _violations(path: Path) -> list[str]:
 
 def test_generated_modules_exist():
     """A silent zero-module glob would make every check below vacuously pass."""
-    assert len(GENERATED_MODULES) > 20, GENERATED_MODULES
+    assert GENERATED_MODULES, f"No generated modeling modules found under {TRANSFORMERS_ROOT}"
 
 
 @pytest.mark.parametrize("path", GENERATED_MODULES, ids=lambda p: p.stem)

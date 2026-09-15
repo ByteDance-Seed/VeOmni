@@ -35,10 +35,10 @@ def load_balancing_loss(
 ) -> Tensor | int:
     """Adapt HF per-layer router logits to the unified ``[N, E]`` op.
 
-    The helper owns modeling policy only: the legacy ``None``/non-tuple
-    behavior, concatenating per-layer logits, optional expert-count
-    validation, and the empty-mask sentinel. Backend selection stays on the
-    instance-local ``op`` handle.
+    Return integer ``0`` when ``gate_logits`` is ``None`` or is not a tuple.
+    Otherwise concatenate the per-layer logits, validate ``num_experts`` when
+    provided, and pass the attention mask (an empty tensor when absent) to
+    ``op``. Backend selection stays on the instance-local ``op`` handle.
     """
     if gate_logits is None or not isinstance(gate_logits, tuple):
         return 0

@@ -12,11 +12,16 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Modeling that calls local ``VeomniOp`` handles.
+"""Public model construction, registration, and checkpoint interfaces.
 
-Import classes from ``transformers.<model>.generated``. Construct helpers
-live on this package: ``build_foundation_model``, ``get_model_class``, and
-the checkpoint weight I/O functions.
+Use ``build_config`` to load a configuration and ``build_foundation_model``
+to construct a model with explicit ops selection and initialization/weight
+loading settings. ``get_model_class`` exposes architecture resolution for
+callers that need the class itself. Importing this package registers the
+supported Transformers families and, when available, Diffusers families.
+
+Model implementations consume instance-local ``VeomniOp`` handles. This
+package also exports tokenizer/processor builders and checkpoint weight I/O.
 """
 
 from ..utils.import_utils import is_diffusers_available

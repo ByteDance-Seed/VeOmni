@@ -1,24 +1,22 @@
-"""MiniMax H3 audio/video inference pipeline.
+"""Joint video/audio generation with MiniMax H3.
 
-Ported from the minimax_h3_audio_video pipeline (MiniMaxH3Pipeline) and the
-base pipeline machinery (BasePipeline / PipelineUnit / PipelineUnitRunner).
-Framework-specific dependencies are replaced by VeOmni equivalents:
+``MiniMaxH3Pipeline`` accepts text prompts, optional first/last-frame keyframes,
+and optional image or silent-video references. It returns a list of PIL video
+frames and a CPU FP32 audio tensor shaped ``[C, T]`` at the audio VAE's sample
+rate. Text-to-video/audio (t2va) and keyframe-conditioned generation (fl2va)
+use the same denoising loop. Audio-bearing references (ref2va audio or
+video_audio inputs) are rejected by the DiT call with ``NotImplementedError``.
 
-- model loading: MiniMaxH3ConditionModel for the condition stack
-  (text encoder + VAEs + schedulers) and MiniMaxH3DiTModel for the DiT.
-- get_device_type: veomni.utils.device.get_device_type
-- audio utils (convert_to_stereo / resample_waveform): ported below.
-- attention / gradient checkpointing: veomni minimax_h3_core (not used here).
-- load_models_to_device: VeOmni models have no VRAM-management hooks, so the
-  pipeline stages models by name explicitly (listed models move to
-  self.device, all other children move to CPU).
+``MiniMaxH3ConditionModel`` supplies the text encoder, VAEs, and schedulers;
+``MiniMaxH3DiTModel`` supplies latent-grid predictions. Pipeline stages move
+named model children onto the inference device and other children onto CPU,
+except for models that manage their own offload. Video frame lists supplied
+as references must already be sampled at 24 fps; no frame-rate conversion is
+performed. Spatial dimensions and frame counts are aligned before denoising.
 
-Known deviations:
-- self.dit is the HF wrapper MiniMaxH3DiTModel; model_fn calls its
-  forward and takes predictions (same raw DiT forward + cond-row slicing +
-  unpatchify + negation). ref2va audio references are NOT supported by the
-  wrapper (raises NotImplementedError); t2va and fl2va paths are numerically
-  equivalent.
+Pipeline, audio utilities, and unit-runner machinery are adapted from
+minimax_h3_audio_video (MiniMaxH3Pipeline, BasePipeline, PipelineUnit, and
+PipelineUnitRunner).
 """
 
 from __future__ import annotations
@@ -480,11 +478,14 @@ class MiniMaxH3Pipeline(BasePipeline):
 
             {"type": "image",       "image": PIL.Image}
             {"type": "video",       "video": list[PIL.Image]}   # silent
-            {"type": "audio",       "audio": Tensor[C, L], "sample_rate": int}
-            {"type": "video_audio", "video": list[PIL.Image],
-                                    "audio": Tensor[C, L], "sample_rate": int}
 
-        Input contract: `video` frame lists must ALREADY. be 24fps the pipeline never resamples frame rate.
+        Reference preprocessing also parses `audio` and `video_audio` dicts
+        with waveform and sample-rate fields, but the DiT call does not support
+        reference-audio rows and raises `NotImplementedError` for these inputs.
+
+        Reference video frame lists must already be sampled at 24 fps; the
+        pipeline does not resample frame rates. Return a list of PIL frames and
+        a CPU FP32 waveform `[C, T]` at `self.audio_vae.sample_rate`.
         """
         self.scheduler.set_timesteps(num_inference_steps)
         self.scheduler_audio.set_timesteps(num_inference_steps)
@@ -1263,12 +1264,9 @@ def model_fn_minimax_h3(
 
     refiner_cu = torch.tensor([0, text_len, text_len], dtype=torch.int32, device=device)
 
-    # VeOmni DiT is the HF wrapper MiniMaxH3DiTModel: it runs the
-    # same raw DiT forward (skip_mask_out_condition=True, update_mask=None),
-    # slices cond rows, unpatchifies and negates, returning the same
-    # (video_pred, audio_pred) pair. The wrapper
-    # does NOT slice ref-audio rows, so ref2va audio references are
-    # unsupported (t2va / fl2va are unaffected).
+    # The DiT wrapper returns latent-grid predictions after slicing visual
+    # condition rows. It does not slice reference-audio rows, so reject those
+    # inputs before calling it.
     if ref_audio_anchor is not None:
         raise NotImplementedError(
             "ref2va audio references are not supported by the VeOmni wrapper (MiniMaxH3DiTModel)."
