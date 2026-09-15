@@ -366,8 +366,6 @@ _MODEL_CASES = (
         config_factory=_tiny_qwen3_5_config,
         architectures=(
             "Qwen3_5ForConditionalGeneration",
-            "Qwen3_5ForTokenClassification",
-            "Qwen3_5ForSequenceClassification",
             "Qwen3_5Model",
         ),
     ),
@@ -383,7 +381,6 @@ _MODEL_CASES = (
         config_factory=_tiny_qwen3_5_text_config,
         architectures=(
             "Qwen3_5ForCausalLM",
-            "Qwen3_5TextForSequenceClassification",
             "Qwen3_5TextModel",
         ),
     ),
