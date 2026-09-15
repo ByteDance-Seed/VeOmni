@@ -54,7 +54,6 @@ from .layout import (
     dcp_markers,
     model_dir,
     optimizer_dir,
-    remove_manifest,
     step_dir,
     weights_dir,
 )
@@ -770,9 +769,10 @@ class DistributedCheckpointer(CheckpointerBase):
         checkpoint_dir = step_dir(path, global_steps) if global_steps is not None else path
         model_root = model_dir(checkpoint_dir, module)
 
-        # Delete the old markers before anything in the step is overwritten, so
-        # that a rewrite which fails part-way leaves nothing claiming to be done.
-        cls._remove_completion_markers(checkpoint_dir, module)
+        # Delete this module's old markers before anything in it is overwritten,
+        # so that a rewrite which fails part-way leaves nothing claiming to be
+        # done. The manifest is not ours; ``GlobalStateCallback`` clears its own.
+        cls._remove_dcp_markers(checkpoint_dir, module)
 
         # Keyed on the module's own run-level path, not just ``path``: a
         # multi-module job calls this once per module, and a single key would have
@@ -826,24 +826,27 @@ class DistributedCheckpointer(CheckpointerBase):
         logger.info_rank0(f"Saved checkpoint to {model_root}")
 
     @classmethod
-    def _remove_completion_markers(cls, checkpoint_dir: str, module: str) -> None:
-        """Delete every marker that vouches for what this save will overwrite.
+    def _remove_dcp_markers(cls, checkpoint_dir: str, module: str) -> None:
+        """Delete the ``.metadata`` files vouching for what this save overwrites.
 
-        Three of them: the step's manifest, this module's ``.metadata`` files,
-        and the one an older VeOmni would have left at the step root. DCP writes
-        its own again at the end of a successful save, so deleting them costs
-        nothing then -- but a save that dies part-way would otherwise leave a
-        marker describing shards that are half this step and half the last one.
+        DCP writes them again at the end of a successful save, so deleting them
+        costs nothing then -- but a save that dies part-way would otherwise leave
+        a marker describing shards that are half this step and half the last one.
+
+        Two places to look. This module's ``ckpt/`` and ``optimizer/``, and the
+        step root, where an older VeOmni's fused save left the same file. Both
+        are DCP's own marker, which is why both are dropped here rather than by
+        the callback: this class is the one that puts them back.
 
         Only this module's. A sibling module is not being rewritten and its
-        markers still hold.
+        markers still hold. The step's ``checkpoint_manifest.json`` is not ours
+        either -- ``GlobalStateCallback`` writes it and clears it.
 
         One rank owns these files, so only that rank deletes them, and the
-        reduction turns a failure there into one every rank sees. Writing them
-        back belongs to DCP and to ``GlobalStateCallback``, each for its part.
+        reduction turns a failure there into one every rank sees.
         """
-        # The step being overwritten may predate this layout, in which case it
-        # carries a marker of its own. Delete this import (and
+        # The step being overwritten may predate this layout, in which case DCP
+        # left its marker at the step root. Delete this import (and
         # veomni/checkpoint/legacy_v0_1_12.py) to drop that layout.
         from .legacy_v0_1_12 import drop_marker
 
@@ -851,14 +854,13 @@ class DistributedCheckpointer(CheckpointerBase):
         error: Optional[Exception] = None
         if is_coordinator:
             try:
-                remove_manifest(checkpoint_dir)
                 drop_marker(checkpoint_dir)
                 for marker in dcp_markers(checkpoint_dir, [module]):
                     if os.path.exists(marker):
                         os.remove(marker)
             except Exception as e:  # noqa: BLE001 - raised once every rank has agreed
                 error = e
-        raise_if_any_rank_failed(error, f"removing the old checkpoint markers under {checkpoint_dir}")
+        raise_if_any_rank_failed(error, f"removing the old DCP markers under {checkpoint_dir}")
 
     @classmethod
     def load(

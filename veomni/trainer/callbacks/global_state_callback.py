@@ -146,19 +146,39 @@ class GlobalStateCallback(Callback):
         return [name] if name else []
 
     def save_global_state(self, state: TrainerState) -> None:
-        """Write this rank's cursor files, then record that they are down.
+        """Clear the step's manifest, write this rank's cursor files, write it back.
 
         Nothing here waits on the DCP. The cursor does not depend on those
-        shards, and the manifest written at the end claims only what this method
-        wrote -- the model state answers for itself, through the ``.metadata``
-        DCP puts in each directory it owns. Blocking for an async save here is
-        what used to leave ``save_async`` overlapping nothing.
+        shards, and the manifest claims only what this method wrote -- the model
+        state answers for itself, through the ``.metadata`` DCP puts in each
+        directory it owns. Blocking for an async save here is what used to leave
+        ``save_async`` overlapping nothing.
+
+        Both ends of the step's trainer half are this method's, which is the
+        point: the manifest is the only marker it writes, so it is the only one
+        it clears.
         """
         args: "VeOmniArguments" = self.trainer.args
         step_root = layout.step_dir(args.train.checkpoint.save_path, state.global_step)
         payload = self.state_dict(state)
         loader_payload = {key: payload[key] for key in _LOADER_KEYS if key in payload}
         extra_payload = {key: value for key, value in payload.items() if key not in _LOADER_KEYS}
+
+        # A restarted run reaching this step again overwrites the cursor files, so
+        # the manifest an earlier attempt left has to go before the first of them
+        # lands -- otherwise a rewrite that dies half-way leaves a step that still
+        # reads as complete. Only this file: DCP's markers belong to
+        # ``DistributedCheckpointer``, which drops them when it rewrites a module.
+        # Rank 0 owns it, so rank 0 clears it, and every rank waits for that
+        # before writing anything of its own.
+        remove_error: Optional[Exception] = None
+        if self.rank == 0:
+            try:
+                layout.remove_manifest(step_root)
+            except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
+                logger.error(f"[RANK {self.rank}] failed to remove the manifest under {step_root}", exc_info=True)
+                remove_error = e
+        raise_if_any_rank_failed(remove_error, "removing the stale checkpoint manifest")
 
         # Each rank writes its own files, so a full disk or a bad pickle starts out
         # visible to that rank alone. Reduce before the manifest: the manifest

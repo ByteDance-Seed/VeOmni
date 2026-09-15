@@ -6,12 +6,15 @@ manager forwards ``lr_scheduler`` like the optimizer, and that job-level state
 lives on ``GlobalStateCallback``.
 """
 
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+from veomni.checkpoint import layout
 from veomni.models.checkpoint_manager import ModelCheckpointManager
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import (
@@ -518,7 +521,7 @@ class TestGlobalStateCallbackJobState:
 
     def test_a_peers_write_failure_stops_the_manifest(self, mock_dist, tmp_path):
         """Each rank writes its own state files, so a full disk is visible to one
-        rank. A rank whose own write succeeded must not publish the step, and must
+        rank. A rank whose own write succeeded must not record the step, and must
         raise rather than walk into the next collective alone."""
         mock_dist.is_initialized.return_value = False
         trainer = _make_mock_trainer(save_path=str(tmp_path))
@@ -527,15 +530,61 @@ class TestGlobalStateCallbackJobState:
         trainer.environ_meter.state_dict.return_value = {}
         cb = GlobalStateCallback(trainer)
 
+        def fail_the_write(_error, context):
+            if "trainer state" in context:
+                raise RuntimeError("writing the trainer state failed on another rank")
+
         with patch(
             "veomni.trainer.callbacks.global_state_callback.raise_if_any_rank_failed",
-            side_effect=RuntimeError("writing the trainer state failed on another rank"),
+            side_effect=fail_the_write,
         ):
             with pytest.raises(RuntimeError, match="failed on another rank"):
                 cb.save_global_state(TrainerState(global_step=10))
 
         assert not (tmp_path / "global_step_10" / "checkpoint_manifest.json").exists()
         assert cb._last_saved_step == -1
+
+    def test_rewriting_a_step_removes_its_manifest_first(self, mock_dist, tmp_path):
+        """A restarted run reaching this step again overwrites the cursor files.
+        Until that finishes, what is on disk is neither the old state nor the new
+        one, so the manifest the earlier attempt left has to go before the first
+        of them lands — otherwise a rewrite that dies half-way leaves a step that
+        still reads as complete.
+
+        This file and no other. ``DistributedCheckpointer`` drops the ``.metadata``
+        files when it rewrites a module, because it is the one that writes them
+        back."""
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer(save_path=str(tmp_path))
+        trainer.train_dataloader = None
+        trainer.data_iterator = None
+        trainer.environ_meter.state_dict.return_value = {}
+        cb = GlobalStateCallback(trainer)
+
+        step_root = str(tmp_path / "global_step_10")
+        layout.write_manifest(step_root, global_step=10, world_size=1)
+        weights = Path(layout.weights_dir(step_root))
+        weights.mkdir(parents=True)
+        marker = weights / layout.DCP_MARKER_FILENAME
+        marker.write_text("written by the module's own save")
+
+        seen = []
+        real_save = torch.save
+        with patch.object(
+            torch,
+            "save",
+            side_effect=lambda *a, **kw: (
+                seen.append(os.path.exists(layout.manifest_path(step_root))),
+                real_save(*a, **kw),
+            )[-1],
+        ):
+            cb.save_global_state(TrainerState(global_step=10))
+
+        # Gone before the first cursor file, back once every rank's is down.
+        assert seen == [False, False]
+        assert os.path.exists(layout.manifest_path(step_root))
+        # Untouched: rewriting the cursor says nothing about the module's shards.
+        assert marker.read_text() == "written by the module's own save"
 
     def test_load_restores_channel_loss_callback_state(self, mock_dist, tmp_path):
         mock_dist.is_initialized.return_value = False

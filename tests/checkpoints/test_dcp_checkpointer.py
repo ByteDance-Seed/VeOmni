@@ -1983,28 +1983,25 @@ class TestStageDirValidation:
         prepare.assert_not_called()
         promote.assert_not_called()
 
-    def test_rewriting_a_step_removes_its_manifest_first(self, tmp_path):
-        """A restarted run reaches the same step again and writes over it. Until
-        that finishes, what is on disk is neither the old checkpoint nor the new
-        one, so the manifest the first attempt left has to go before the first
-        byte lands — otherwise a rewrite that fails leaves ``load_path: auto``
-        pointing at half a checkpoint. Deleting the nested ``.metadata`` during
-        promotion does not cover this: the manifest is what discovery reads."""
+    def test_rewriting_a_step_leaves_the_manifest_to_its_owner(self, tmp_path):
+        """A rewrite has to invalidate the step, but each half invalidates its own.
+
+        ``GlobalStateCallback`` writes ``checkpoint_manifest.json`` and clears it
+        when it rewrites the cursor files; this class never writes it, so it must
+        not delete it either. The step is still correctly rejected in between —
+        completeness is the conjunction, and the ``.metadata`` files are gone."""
         from veomni.checkpoint import layout
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
         final = tmp_path / "ckpt"
         step_root = str(final / "global_step_10")
         layout.write_manifest(step_root, global_step=10, world_size=1)
-        assert os.path.exists(layout.manifest_path(step_root))
+        weights = Path(layout.weights_dir(step_root))
+        weights.mkdir(parents=True)
+        (weights / layout.DCP_MARKER_FILENAME).write_text("from the previous run")
 
-        seen: list[bool] = []
         with (
-            patch.object(
-                DistributedCheckpointer,
-                "execute_save",
-                side_effect=lambda **_: seen.append(os.path.exists(layout.manifest_path(step_root))),
-            ),
+            patch.object(DistributedCheckpointer, "execute_save"),
             patch.object(DistributedCheckpointer, "_create_storage_writer"),
             patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
             patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
@@ -2016,10 +2013,8 @@ class TestStageDirValidation:
                 global_steps=10,
             )
 
-        # Gone before the shards are touched, and still gone afterwards: writing
-        # it back belongs to GlobalStateCallback, once every rank is done.
-        assert seen == [False]
-        assert not os.path.exists(layout.manifest_path(step_root))
+        assert os.path.exists(layout.manifest_path(step_root))
+        assert not layout.checkpoint_is_complete(step_root)
 
     def test_rewriting_a_legacy_step_drops_its_marker_too(self, tmp_path):
         """A pre-split step is vouched for by a ``.metadata`` at its root. Writing
@@ -2128,7 +2123,7 @@ class TestStageDirValidation:
             patch("veomni.utils.dist_utils.any_rank_failed", return_value=True),
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,
         ):
-            with pytest.raises(RuntimeError, match="removing the old checkpoint markers"):
+            with pytest.raises(RuntimeError, match="removing the old DCP markers"):
                 DistributedCheckpointer.save(
                     path=str(final),
                     state={"model": MagicMock()},

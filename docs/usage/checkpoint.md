@@ -121,11 +121,15 @@ Resume discovery accepts a `global_step_{N}/` directory only when both halves
 are there, so a crash mid-save leaves a directory that is skipped rather than
 half-loaded.
 
-Rewriting a step — a restarted run reaching the same step again — deletes its
+Rewriting a step — a restarted run reaching the same step again — deletes the
 markers first, so an interrupted rewrite cannot leave a stale one standing over
-new, partial data. All three go: the manifest, the module's `.metadata` files,
-and the `.metadata` at the step root that an older VeOmni would have left, which
-would otherwise keep the step discoverable through the legacy fallback below.
+new, partial data. Each half clears its own, right before it writes it back:
+`DistributedCheckpointer` drops the module's `.metadata` files (including the
+one at the step root that an older VeOmni's fused save left, which would
+otherwise keep the step discoverable through the legacy fallback below), and
+`GlobalStateCallback` drops the manifest. Since completeness is the conjunction,
+the step is correctly rejected throughout, including in the window where one
+half has been invalidated and the other has not.
 
 The cursor files follow the same cadences as the model state, including HF and
 LoRA exports: with `save_steps=100` and an export at train end, step 150 gets

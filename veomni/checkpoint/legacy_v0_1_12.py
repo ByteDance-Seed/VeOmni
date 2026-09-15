@@ -19,8 +19,8 @@ Call sites:
 
 * ``DistributedCheckpointer._load_lr_scheduler`` — the scheduler pickle
 * ``GlobalStateCallback.load_global_state`` — the job cursor
-* ``DistributedCheckpointer._remove_completion_markers`` — deletes the old
-  marker when a legacy step is overwritten
+* ``DistributedCheckpointer._remove_dcp_markers`` — deletes the old marker when
+  a legacy step is overwritten
 * ``_validate_dcp_checkpoint_entry`` — accepts a legacy step for resume
 
 On-disk contract and removal notes: ``docs/usage/checkpoint.md``.

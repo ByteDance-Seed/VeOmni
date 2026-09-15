@@ -167,8 +167,9 @@ def remove_manifest(step_root: str) -> None:
     -- ``load_path: auto`` would then pick a step whose cursor files are half
     overwritten.
 
-    Only the manifest. The ``.metadata`` files and the marker an older VeOmni
-    would have left are deleted by the same caller, from their own modules.
+    Only the manifest, and only ``GlobalStateCallback`` calls it -- the same code
+    that writes it. The ``.metadata`` files are DCP's, and
+    ``DistributedCheckpointer`` drops those when it rewrites a module.
     """
     path = manifest_path(step_root)
     if os.path.exists(path):
