@@ -2,7 +2,7 @@
 
 This guide explains how to convert VeOmni's Distributed Checkpoint (DCP) format to HuggingFace format using the `scripts/merge_dcp_to_hf.py` script.
 
-`--load-dir` is a `global_step_{N}` directory (the DCP shards and `.metadata`). The scheduler sidecar and job cursor next to those shards are not part of the HuggingFace export. For the full training-run tree, see [Checkpoint layout](checkpoint.md).
+`--load-dir` is a `global_step_{N}` directory. The script reads the weights from its `model/ckpt/` subdirectory; the optimizer state beside them, the scheduler sidecar and the job cursor are not part of a HuggingFace export and are never opened. You can also point `--load-dir` straight at a DCP directory, which is what a checkpoint written before weights and optimizer were split requires. For the full training-run tree, see [Checkpoint layout](checkpoint.md).
 
 ## Overview
 
@@ -32,7 +32,7 @@ python scripts/merge_dcp_to_hf.py \
 
 | Argument | Type | Required | Default | Description |
 |----------|------|----------|---------|-------------|
-| `--load-dir` | str | Yes | - | A `global_step_{N}` directory (DCP shards and `.metadata`) |
+| `--load-dir` | str | Yes | - | A `global_step_{N}` directory, or a DCP directory directly |
 | `--save-dir` | str | No | `<load-dir>/hf_ckpt` | Output directory for HuggingFace format checkpoint |
 | `--model-assets-dir` | str | No | None | Directory containing model config and processor (e.g., tokenizer) |
 | `--shard-size` | int | No | 2000000000 | Maximum shard size in bytes (default: 2GB) |

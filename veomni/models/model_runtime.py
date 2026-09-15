@@ -521,7 +521,7 @@ class VeOmniModelRuntime:
         """
         from .checkpoint_manager import ModelCheckpointManager
 
-        self.checkpoint = ModelCheckpointManager(self, self.train.checkpoint)
+        self.checkpoint = ModelCheckpointManager(self)
 
     def load(self) -> None:
         """Restore this model and its optimizer from the configured load path.

@@ -1,8 +1,13 @@
 """Unit tests for :class:`veomni.models.checkpoint_manager.ModelCheckpointManager`.
 
 The manager is the piece a multi-module model (SeedOmni V2) subclasses, so the
-tests pin the two things a subclass depends on: the directory policy and the
-hook that nests every artifact under a module name.
+tests pin the two things a subclass depends on: the directory policy (from
+:mod:`veomni.checkpoint.layout`) and the ``module_name`` hook that nests every
+artifact under a module name.
+
+Construction takes a :class:`~veomni.models.model_runtime.VeOmniModelRuntime`,
+not a trainer: the manager caches ``runtime.parallel_state`` rather than the
+ambient mesh.
 """
 
 from types import SimpleNamespace
@@ -14,22 +19,8 @@ from veomni.models.checkpoint_manager import ModelCheckpointManager
 from veomni.trainer.callbacks.base import TrainerState
 
 
-def _make_runtime(lora_config=None):
-    return SimpleNamespace(
-        model=MagicMock(),
-        optimizer=MagicMock(),
-        lr_scheduler=MagicMock(),
-        parallel_state=SimpleNamespace(global_rank=0),
-        args=SimpleNamespace(
-            lora_config=lora_config or {},
-            fqn_to_index_mapping={},
-            accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="fsdp2")),
-        ),
-    )
-
-
-def _make_config(load_path=None):
-    return SimpleNamespace(
+def _make_runtime(lora_config=None, load_path=None):
+    checkpoint = SimpleNamespace(
         save_path="/ckpt/checkpoints",
         output_dir="/ckpt",
         manager="dcp",
@@ -37,6 +28,19 @@ def _make_config(load_path=None):
         dcp_save_to_lowest_rank=False,
         load_path=load_path,
         stage_dir=None,
+    )
+    return SimpleNamespace(
+        model=MagicMock(),
+        optimizer=MagicMock(),
+        lr_scheduler=MagicMock(),
+        model_assets=[],
+        parallel_state=SimpleNamespace(global_rank=0),
+        args=SimpleNamespace(
+            lora_config=lora_config or {},
+            fqn_to_index_mapping={},
+            accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="fsdp2")),
+        ),
+        train=SimpleNamespace(checkpoint=checkpoint, global_rank=0),
     )
 
 
@@ -46,7 +50,7 @@ def make_manager():
         build.return_value = MagicMock()
 
         def _make(cls=ModelCheckpointManager, *, lora_config=None, load_path=None):
-            return cls(_make_runtime(lora_config), _make_config(load_path))
+            return cls(_make_runtime(lora_config, load_path))
 
         yield _make
 
@@ -54,34 +58,36 @@ def make_manager():
 class PerModuleManager(ModelCheckpointManager):
     """Stands in for SeedOmni V2's per-module manager."""
 
-    checkpoint_subfolder = "vision_encoder"
+    module_name = "vision_encoder"
 
 
 class TestWhereArtifactsLand:
-    def test_a_single_model_job_writes_straight_under_the_step_directory(self, make_manager):
+    def test_a_single_model_job_writes_straight_under_the_model_directory(self, make_manager):
         manager = make_manager()
         state = TrainerState(global_step=42)
 
-        assert manager.save_dir(state) == "/ckpt/checkpoints/global_step_42"
+        assert manager.save_dir(state) == "/ckpt/checkpoints/global_step_42/model"
         assert manager.hf_export_dir(state) == "/ckpt/checkpoints/global_step_42/hf_ckpt"
-        # LoRA adapter export shares save_dir with the DCP shards, not a sibling of checkpoints/.
+        assert manager.lora_export_dir(state) == "/ckpt/checkpoints/global_step_42/lora_ckpt"
 
-    def test_a_module_subfolder_nests_every_artifact_one_level_deeper(self, make_manager):
+    def test_a_module_name_nests_every_artifact_one_level_deeper(self, make_manager):
         """The hook a multi-module model overrides; each module owns its own directory."""
         manager = make_manager(PerModuleManager)
         state = TrainerState(global_step=42)
 
-        assert manager.save_dir(state) == "/ckpt/checkpoints/global_step_42/vision_encoder"
-        assert manager.hf_export_dir(state) == "/ckpt/checkpoints/global_step_42/vision_encoder/hf_ckpt"
+        assert manager.save_dir(state) == "/ckpt/checkpoints/global_step_42/model/vision_encoder"
+        assert manager.hf_export_dir(state) == "/ckpt/checkpoints/global_step_42/hf_ckpt/vision_encoder"
+        assert manager.lora_export_dir(state) == "/ckpt/checkpoints/global_step_42/lora_ckpt/vision_encoder"
 
     def test_resume_reads_the_load_path_as_given(self, make_manager):
         assert (
             make_manager(load_path="/ckpt/checkpoints/global_step_7").load_dir() == "/ckpt/checkpoints/global_step_7"
         )
 
-    def test_resume_reads_a_modules_own_subdirectory(self, make_manager):
+    def test_resume_does_not_fold_the_module_into_the_load_path(self, make_manager):
+        """The checkpointer takes ``module`` separately and resolves ``model/<module>/`` itself."""
         manager = make_manager(PerModuleManager, load_path="/ckpt/checkpoints/global_step_7")
-        assert manager.load_dir() == "/ckpt/checkpoints/global_step_7/vision_encoder"
+        assert manager.load_dir() == "/ckpt/checkpoints/global_step_7"
 
 
 class TestResume:
@@ -97,7 +103,11 @@ class TestResume:
         with patch("veomni.models.checkpoint_manager.dist"):
             manager.load()
 
-        assert manager.checkpointer.load.call_args.args[1]["lr_scheduler"] is manager.runtime.lr_scheduler
+        loaded = manager.checkpointer.load.call_args.args[1]
+        assert loaded["lr_scheduler"] is manager.runtime.lr_scheduler
+        assert loaded["model"] is manager.runtime.model
+        assert manager.checkpointer.load.call_args.kwargs["parallel_state"] is manager.runtime.parallel_state
+        assert manager.checkpointer.load.call_args.kwargs["module"] == ""
 
 
 class TestWhatRidesAlongWithTheWeights:
@@ -121,6 +131,7 @@ class TestWhatRidesAlongWithTheWeights:
         saved = manager.checkpointer.save.call_args.args[1]
         assert set(saved) == {"model", "optimizer", "lr_scheduler"}
         assert saved["lr_scheduler"] is manager.runtime.lr_scheduler
+        assert "extra_state" not in saved
 
     def test_save_forwards_stage_dir(self, make_manager):
         manager = make_manager()
@@ -142,37 +153,30 @@ class TestWhatRidesAlongWithTheWeights:
 
 
 class TestExport:
-    def test_export_saves_the_step_first_when_it_is_missing(self, make_manager):
+    def test_export_saves_the_step_first_when_this_run_has_not(self, make_manager):
         manager = make_manager()
         manager.save_dcp = MagicMock()
 
-        with (
-            patch("veomni.models.checkpoint_manager.dist"),
-            patch("veomni.models.checkpoint_manager.os.path.exists", return_value=False),
-        ):
+        with patch("veomni.models.checkpoint_manager.dist"):
             manager._prepare_export(TrainerState(global_step=10), stage="step_end")
 
         manager.save_dcp.assert_called_once()
 
-    def test_export_reuses_a_step_that_is_already_on_disk(self, make_manager):
+    def test_export_does_not_repeat_the_save_this_run_just_made(self, make_manager):
         manager = make_manager()
+        manager._last_saved_step = 10
         manager.save_dcp = MagicMock()
 
-        with (
-            patch("veomni.models.checkpoint_manager.dist"),
-            patch("veomni.models.checkpoint_manager.os.path.exists", return_value=True),
-        ):
+        with patch("veomni.models.checkpoint_manager.dist"):
             manager._prepare_export(TrainerState(global_step=10), stage="step_end")
 
         manager.save_dcp.assert_not_called()
 
     def test_the_final_export_drops_the_optimizer_to_free_memory(self, make_manager):
         manager = make_manager()
+        manager._last_saved_step = 10
 
-        with (
-            patch("veomni.models.checkpoint_manager.dist"),
-            patch("veomni.models.checkpoint_manager.os.path.exists", return_value=True),
-        ):
+        with patch("veomni.models.checkpoint_manager.dist"):
             manager._prepare_export(TrainerState(global_step=10), stage="train_end")
 
         assert manager.runtime.optimizer is None
@@ -180,11 +184,9 @@ class TestExport:
 
     def test_a_mid_training_export_keeps_the_optimizer(self, make_manager):
         manager = make_manager()
+        manager._last_saved_step = 10
 
-        with (
-            patch("veomni.models.checkpoint_manager.dist"),
-            patch("veomni.models.checkpoint_manager.os.path.exists", return_value=True),
-        ):
+        with patch("veomni.models.checkpoint_manager.dist"):
             manager._prepare_export(TrainerState(global_step=10), stage="step_end")
 
         assert manager.runtime.optimizer is not None
@@ -217,7 +219,7 @@ class TestFormatSelection:
     def test_a_full_run_checkpoints_everything(self, make_manager):
         assert make_manager().trainable_only is False
 
-    def test_lora_adapter_export_lands_in_the_dcp_step_directory(self, make_manager):
+    def test_lora_adapter_export_lands_in_its_own_export_dir(self, make_manager):
         manager = make_manager(lora_config={"rank": 8})
         state = TrainerState(global_step=10)
 
@@ -228,5 +230,5 @@ class TestFormatSelection:
         ):
             manager.save_lora(state)
 
-        assert save_adapter.call_args.kwargs["save_path"] == manager.save_dir(state)
-        assert save_adapter.call_args.kwargs["save_path"] == "/ckpt/checkpoints/global_step_10"
+        assert save_adapter.call_args.kwargs["save_path"] == manager.lora_export_dir(state)
+        assert save_adapter.call_args.kwargs["save_path"] == "/ckpt/checkpoints/global_step_10/lora_ckpt"

@@ -10,6 +10,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from tools import hf_local_or_remote, resolve_ops_overrides
 from tools.launch_utils import find_free_port
 
+from veomni.checkpoint.layout import weights_dir
+
 
 def get_checkpoint_test_nproc() -> int:
     """World size for trainer saveload torchrun jobs.
@@ -47,7 +49,13 @@ def get_output_dir(model_name, ep_size, dp_replicate_size=None):
 
 
 def get_checkpoint_dir(model_name, ep_size, dp_replicate_size=None):
+    """Step directory. Resume takes this; it is not itself a DCP directory."""
     return os.path.join(get_output_dir(model_name, ep_size, dp_replicate_size), "checkpoints", "global_step_5")
+
+
+def get_dcp_weights_dir(model_name, ep_size, dp_replicate_size=None):
+    """DCP directory holding the weights, which is what a reader of shards wants."""
+    return weights_dir(get_checkpoint_dir(model_name, ep_size, dp_replicate_size))
 
 
 def get_hf_output_dir(model_name, ep_size, dp_replicate_size=None):
