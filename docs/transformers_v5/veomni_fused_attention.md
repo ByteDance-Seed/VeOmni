@@ -3,8 +3,8 @@
 VeOmni registers sequence-parallel FlashAttention, FlexAttention, and
 MagiAttention FFA adapters in Transformers' `ALL_ATTENTION_FUNCTIONS`
 registry. Models continue to select an attention implementation through
-`config._attn_implementation`; VeOmni's registered names all enter one
-model-facing facade and then dispatch to a backend-specific adapter.
+`config._attn_implementation`; modeling code stores that choice in a local
+`VeomniOp("attention", "standard", implementation)` handle.
 
 ## Configuration
 
@@ -44,25 +44,24 @@ Only the VeOmni-specific name routes through VeOmni's SP-aware facade.
 The model-facing call path is:
 
 ```text
-ALL_ATTENTION_FUNCTIONS[config._attn_implementation]
-  -> fused_attention_forward(...)
-       -> one of:
-            flash_attention_forward(...)
-            flex_attention_forward(...)
-            magi_attention_forward(...)
+model-local VeomniOp("attention", "standard", implementation)
+  -> registered attention row created by attention.lookup(implementation)
+       -> ALL_ATTENTION_FUNCTIONS.get_interface(implementation, eager_default)
+            -> flash_attention_forward(...)
+             | flex_attention_forward(...)
+             | magi_attention_forward(...)
+             | sage_attention_forward(...)
+             | sdpa_attention_forward(...)
 ```
 
-The facade resolves only VeOmni's private dispatch table; it does not look the
-name up in `ALL_ATTENTION_FUNCTIONS` again. This avoids recursive dispatch and
-keeps the Flash, Flex, and Magi adapters independently testable.
-
-The backend compute functions are replaceable module-level slots:
-
-- `attention.flash._flash_attention_forward`, defaulting to Transformers'
-  `_flash_attention_forward`;
-- `attention.flex._flex_attention_forward`, defaulting to Transformers'
-  `flex_attention_forward`;
-- `attention.magi._magi_attention_forward`, defaulting to VeOmni's architecture-aware FA4 adapter.
+`apply_veomni_attention_patch()` registers the concrete `veomni_*` forward
+functions and matching mask builders in the Transformers registries. Each ops
+row then uses the same Transformers interface lookup as the model-facing path.
+The `eager` row falls back to the modeling module's local
+`eager_attention_forward`, because Transformers does not register eager
+attention globally. The short `magi_attention` row deliberately resolves the
+`veomni_magi_attention` interface so its dependency and hardware requirements
+remain visible to the ops registry.
 
 The Magi default prepares an explicit `FA4AttnArg` and reuses it while the range tensors and attention shape remain unchanged, avoiding the upstream facade's repeated GPU-to-CPU range conversion in every transformer layer. VeOmni's FA4 autograd function passes that prepared argument directly to MagiAttention's lower-level `fa4_fwd` and `fa4_bwd` functions. SM90 uses the precompiled CUTLASS `ffa_fa3` backend, while SM100 and newer GPUs use the CUTE DSL/JIT backend. VeOmni prepares and validates the selected backend once per device.
 

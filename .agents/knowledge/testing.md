@@ -11,7 +11,7 @@ A test that passes locally is not necessarily a test CI runs.
 |------|--------------------|
 | `tests/data/` | whole directory, in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
 | `tests/checkpoints/` | whole directory, in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
-| `tests/ops/` | whole directory in `gpu_unit_tests.yml`; NPU runs only a few named files |
+| `tests/ops/` | whole directory in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
 | `tests/parallel/context_parallel/` | whole directory, `gpu_unit_tests.yml` only |
 | everything else | **one `pytest` line per file**, listed in `gpu_unit_tests.yml`, and separately in `npu_unit_tests.yml` when it should run on Ascend |
 | `tests/e2e/test_e2e_parallel.py`, `tests/distributed/test_fsdp_equivalence.py` | `gpu_e2e_test.yml` / `npu_e2e_test.yml` |
@@ -63,10 +63,9 @@ by a `pytest.param` table, so a new case is a few lines:
 | End-to-end parallel parity | `tests/e2e/test_e2e_parallel.py` (`text_test_cases` and friends) |
 
 **2. It is a self-contained kernel or data-pipeline unit test → new file under
-`tests/ops/` or `tests/data/`.** Covered automatically on GPU; do not touch
-`gpu_unit_tests.yml`. One exception: the NPU job runs `tests/data` wholesale but
-enumerates ops files by name, so a new `tests/ops/` file that should run on
-Ascend still needs a line in `npu_unit_tests.yml`.
+`tests/ops/` or `tests/data/`.** Both directories are collected wholesale by the
+GPU and NPU unit workflows, so do not add a per-file workflow entry. Hardware
+markers and dependency guards inside the test decide which cases each job runs.
 
 **3. It genuinely needs a new file elsewhere.** Prefer folding it into an
 enumerated file in the same directory first. If a separate file is warranted
