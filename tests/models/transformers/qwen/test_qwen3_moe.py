@@ -12,9 +12,9 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Qwen3-MoE models consume tests.
+"""Qwen3-MoE registry hooks, operator selection, and task-head parity tests.
 
-Direct-import the generated classes. Compare a toy model against HuggingFace.
+Direct-import the generated classes. Compare a toy model against Hugging Face.
 """
 
 from __future__ import annotations

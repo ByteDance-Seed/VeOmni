@@ -12,9 +12,9 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Qwen3-Omni-MoE models consume tests.
+"""Qwen3-Omni-MoE registry, processor, parallel-plan, and parity tests.
 
-Direct-import the generated Thinker class. Compare a toy Thinker against HuggingFace.
+Direct-import the generated Thinker class. Compare a toy Thinker against Hugging Face.
 """
 
 from __future__ import annotations

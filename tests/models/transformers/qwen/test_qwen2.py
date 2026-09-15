@@ -12,9 +12,9 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Qwen2 models consume tests.
+"""Qwen2 operator selection and Hugging Face task-head parity tests.
 
-Direct-import the generated class. Compare a toy model against HuggingFace.
+Direct-import the generated class. Compare a toy model against Hugging Face.
 """
 
 from __future__ import annotations

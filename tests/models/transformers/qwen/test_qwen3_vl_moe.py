@@ -12,9 +12,9 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Qwen3-VL-MoE models consume tests.
+"""Qwen3-VL-MoE registry hooks, auxiliary-loss, and multimodal parity tests.
 
-Direct-import the generated classes. Compare a toy model against HuggingFace on
+Direct-import the generated classes. Compare a toy model against Hugging Face on
 both the text-only and image+text paths.
 """
 

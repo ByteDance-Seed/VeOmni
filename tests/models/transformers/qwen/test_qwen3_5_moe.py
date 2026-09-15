@@ -12,9 +12,9 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Qwen3.5-MoE models consume tests.
+"""Qwen3.5-MoE parallel-plan, auxiliary-loss, and multimodal parity tests.
 
-Direct-import the generated classes. Compare a toy model against HuggingFace on
+Direct-import the generated classes. Compare a toy model against Hugging Face on
 full-attention text, linear-attention (GDN) text, and image+text.
 """
 

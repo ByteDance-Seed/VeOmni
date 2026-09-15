@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""GLM-MoE-DSA models consume tests."""
+"""GLM-MoE-DSA registry, parallel-plan, and Hugging Face parity tests."""
 
 from __future__ import annotations
 

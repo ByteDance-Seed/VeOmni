@@ -12,10 +12,10 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Qwen2.5-VL models consume tests.
+"""Qwen2.5-VL text, image, and video Hugging Face parity tests.
 
-Direct-import the generated class. Compare a toy model against HuggingFace on
-both the text-only and image+text paths.
+Direct-import the generated class. Compare a toy model against Hugging Face on
+the text-only, image+text, and video+text paths.
 """
 
 from __future__ import annotations

@@ -12,9 +12,9 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Qwen2.5-Omni models consume tests.
+"""Qwen2.5-Omni registry, processor, and Hugging Face parity tests.
 
-Direct-import the generated Thinker class. Compare a toy Thinker against HuggingFace.
+Direct-import the generated Thinker class. Compare a toy Thinker against Hugging Face.
 """
 
 from __future__ import annotations

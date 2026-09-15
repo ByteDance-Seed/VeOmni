@@ -12,9 +12,9 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""DeepSeek-V3 models consume tests.
+"""DeepSeek-V3 registry-hook and Hugging Face parity tests.
 
-Direct-import the generated class. Compare a toy CausalLM against HuggingFace.
+Direct-import the generated class. Compare a toy CausalLM against Hugging Face.
 """
 
 from __future__ import annotations

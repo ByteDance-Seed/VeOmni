@@ -12,9 +12,9 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Qwen2-VL models consume tests.
+"""Qwen2-VL text and multimodal Hugging Face parity tests.
 
-Direct-import the generated class. Compare a toy model against HuggingFace on
+Direct-import the generated class. Compare a toy model against Hugging Face on
 both the text-only and image+text paths.
 """
 

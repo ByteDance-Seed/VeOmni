@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Flux models consume tests."""
+"""Flux configuration, operator integration, and numerical behavior tests."""
 
 from __future__ import annotations
 

@@ -12,9 +12,9 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""GPT-OSS models consume tests.
+"""GPT-OSS sliding-attention, auxiliary-loss, and Hugging Face parity tests.
 
-Direct-import the generated class. Compare a toy CausalLM against HuggingFace.
+Direct-import the generated class. Compare a toy CausalLM against Hugging Face.
 """
 
 from __future__ import annotations

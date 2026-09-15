@@ -12,9 +12,9 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Gemma 3 text models consume tests.
+"""Gemma 3 eager, soft-cap, packed, and FlexAttention numerical tests.
 
-Direct-import the generated CausalLM. Compare a toy model against HuggingFace.
+Direct-import the generated CausalLM. Compare a toy model against Hugging Face.
 """
 
 from __future__ import annotations

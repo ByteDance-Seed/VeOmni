@@ -12,9 +12,9 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Llama models consume tests.
+"""Llama operator selection and Hugging Face task-head parity tests.
 
-Direct-import the generated classes. Compare a toy CausalLM against HuggingFace.
+Direct-import the generated classes. Compare a toy CausalLM against Hugging Face.
 """
 
 from __future__ import annotations

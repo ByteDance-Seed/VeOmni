@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared fixtures for hardware-independent ``models`` consume tests."""
+"""Shared fixtures for model construction, integration, and parity tests."""
 
 from __future__ import annotations
 

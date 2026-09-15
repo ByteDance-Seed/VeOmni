@@ -64,8 +64,8 @@ def pin_eager_attn_implementation(model: torch.nn.Module) -> None:
     """Force every config on ``model`` onto HF eager attention.
 
     Composite VL/omni configs drop ``attn_implementation`` when nested
-    configs go through ``to_dict()``, so HuggingFace defaults to ``sdpa``.
-    models consume reads the ops config's ``attn_implementation`` (eager in
+    configs go through ``to_dict()``, so Hugging Face defaults to ``sdpa``.
+    VeOmni model implementations read the ops config's ``attn_implementation`` (eager in
     these tests). Pin HF to the same impl before comparing.
     """
     configs: list[object] = []

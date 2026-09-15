@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""LTX 2.3 models consume tests."""
+"""LTX 2.3 registry, integration, and numerical parity tests."""
 
 from __future__ import annotations
 
