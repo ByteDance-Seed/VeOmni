@@ -148,6 +148,23 @@ def write_manifest(
     return path
 
 
+def invalidate_manifest(step_root: str) -> None:
+    """Unpublish the step, so that rewriting it cannot be read as complete.
+
+    A step is written twice when a run is restarted and trains up to the same
+    step again. Between the first byte of the rewrite and its last, what is on
+    disk is neither the old checkpoint nor the new one, and the manifest the
+    first attempt left behind would still advertise it as complete --
+    ``load_path: auto`` would then pick a step whose shards are half
+    overwritten. DCP's ``.metadata`` is dropped for the same reason, but it
+    cannot stand in for this one: it lives inside ``model/`` and says nothing
+    about the loader or job state.
+    """
+    path = manifest_path(step_root)
+    if os.path.exists(path):
+        os.remove(path)
+
+
 def read_manifest(step_root: str) -> dict[str, Any] | None:
     """Manifest contents, or ``None`` when the step is not published."""
     path = manifest_path(step_root)
@@ -174,6 +191,7 @@ __all__ = [
     "WEIGHTS_DIRNAME",
     "extra_state_path",
     "hf_export_dir",
+    "invalidate_manifest",
     "loader_path",
     "lora_export_dir",
     "lr_scheduler_path",

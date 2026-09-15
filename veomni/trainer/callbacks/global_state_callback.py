@@ -79,13 +79,43 @@ class GlobalStateCallback(Callback):
         self.load_global_state()
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
-        if self.every_n_steps and state.global_step % self.every_n_steps == 0:
+        due = bool(self.every_n_steps) and state.global_step % self.every_n_steps == 0
+        if due or self._model_saved_but_unpublished(state):
             self.save_global_state(state)
 
     def on_epoch_end(self, state: TrainerState, **kwargs) -> None:
-        if self.every_n_epochs and (state.epoch + 1) % self.every_n_epochs == 0:
-            if state.global_step != self._last_saved_step:
-                self.save_global_state(state)
+        due = bool(self.every_n_epochs) and (state.epoch + 1) % self.every_n_epochs == 0
+        if (due or self._model_saved_but_unpublished(state)) and state.global_step != self._last_saved_step:
+            self.save_global_state(state)
+
+    def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        if self._model_saved_but_unpublished(state):
+            self.save_global_state(state)
+
+    def _model_saved_but_unpublished(self, state: TrainerState) -> bool:
+        """Whether this step has model state on disk that nothing has published.
+
+        An HF or LoRA export writes the step's DCP when the step does not
+        already have one (``ModelCheckpointManager._prepare_export``), so an
+        export cadence of its own — or an export at train end — puts a complete
+        ``model/`` at a step this callback never ran for. Without the cursor
+        files and the manifest that step is invisible to ``load_path: auto``,
+        and a resume goes back to the last cadence step to retrain weights that
+        are already on disk. Publishing it costs two small per-rank files beside
+        an export that already holds the whole model.
+
+        What decides is the manager's record of its last save rather than a
+        probe of the filesystem: every rank runs the same save calls and so
+        agrees on it, whereas a directory one rank wrote need not be visible to
+        the others — and ranks disagreeing here would split on a collective.
+
+        Read defensively, like ``module_names`` above: a trainer whose manager
+        does not report a last save keeps the cadence-only behaviour rather than
+        failing.
+        """
+        checkpoint = getattr(self.trainer, "checkpoint", None)
+        saved = getattr(checkpoint, "last_saved_step", None)
+        return saved == state.global_step and saved != self._last_saved_step
 
     def state_dict(self, state: TrainerState) -> Dict[str, Any]:
         if hasattr(self.trainer, "data_iterator") and hasattr(self.trainer.data_iterator, "state_dict"):

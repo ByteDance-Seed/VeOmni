@@ -979,6 +979,54 @@ class TestWaitForPendingSave:
         # Cleared even on failure — otherwise stuck forever
         assert DistributedCheckpointer._save_futures == {}
 
+    @patch("veomni.checkpoint.dcp_checkpointer.dist")
+    def test_a_dcp_failure_drains_every_slot_too(self, mock_dist):
+        """The way DCP actually reports a failed save is ``CheckpointException``,
+        which derives from ``BaseException`` rather than ``Exception``. Catching
+        the narrower one would let the very failures this drains for escape the
+        loop: the remaining slots keep running and their futures are already
+        unreachable, since the dict is cleared before the wait."""
+        from torch.distributed.checkpoint.api import CheckpointException
+
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_dist.is_initialized.return_value = True
+        mock_dist.get_rank.return_value = 0
+
+        failed = MagicMock()
+        failed.result.side_effect = CheckpointException("save failed", {0: (RuntimeError("disk full"), None)})
+        healthy = MagicMock()
+        DistributedCheckpointer._save_futures = {"ckpt": failed, "optimizer": healthy}
+
+        with pytest.raises(CheckpointException):
+            DistributedCheckpointer.wait_for_pending_save()
+
+        healthy.result.assert_called_once()
+        assert DistributedCheckpointer._save_futures == {}
+
+    @patch("veomni.checkpoint.dcp_checkpointer.dist")
+    def test_drain_slot_reduces_a_dcp_failure(self, mock_dist):
+        """Same exception, and here it is the reduction that must still run: a
+        ``CheckpointException`` raised past it leaves every peer waiting in a
+        collective the failing rank never reaches."""
+        from torch.distributed.checkpoint.api import CheckpointException
+
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_dist.is_initialized.return_value = True
+        mock_dist.get_rank.return_value = 0
+
+        failed = MagicMock()
+        failed.result.side_effect = CheckpointException("save failed", {0: (RuntimeError("disk full"), None)})
+        DistributedCheckpointer._save_futures = {"ckpt": failed}
+
+        with patch("veomni.utils.dist_utils.any_rank_failed", return_value=True) as agreed:
+            with pytest.raises(CheckpointException):
+                DistributedCheckpointer._drain_slot("ckpt")
+
+        agreed.assert_called_once_with(True)
+        assert DistributedCheckpointer._save_futures == {}
+
     def test_no_collective_when_dist_not_initialized(self):
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
@@ -1934,6 +1982,69 @@ class TestStageDirValidation:
         assert list(execute_save.call_args_list[1].kwargs["save_state"]) == ["optimizer"]
         prepare.assert_not_called()
         promote.assert_not_called()
+
+    def test_rewriting_a_step_unpublishes_it_first(self, tmp_path):
+        """A restarted run reaches the same step again and writes over it. Until
+        that finishes, what is on disk is neither the old checkpoint nor the new
+        one, so the marker the first attempt left has to go before the first byte
+        lands — otherwise a rewrite that fails leaves ``load_path: auto``
+        pointing at half a checkpoint. Dropping the nested ``.metadata`` during
+        promotion does not cover this: the manifest is what discovery reads."""
+        from veomni.checkpoint import layout
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        final = tmp_path / "ckpt"
+        step_root = str(final / "global_step_10")
+        layout.write_manifest(step_root, global_step=10, world_size=1)
+        assert os.path.exists(layout.manifest_path(step_root))
+
+        seen: list[bool] = []
+        with (
+            patch.object(
+                DistributedCheckpointer,
+                "execute_save",
+                side_effect=lambda **_: seen.append(os.path.exists(layout.manifest_path(step_root))),
+            ),
+            patch.object(DistributedCheckpointer, "_create_storage_writer"),
+            patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
+            patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+        ):
+            DistributedCheckpointer.save(
+                path=str(final),
+                state={"model": MagicMock()},
+                save_async=False,
+                global_steps=10,
+            )
+
+        # Gone before the shards are touched, and still gone afterwards:
+        # republishing belongs to GlobalStateCallback, once every rank is done.
+        assert seen == [False]
+        assert not os.path.exists(layout.manifest_path(step_root))
+
+    def test_a_rank_that_cannot_unpublish_fails_the_group(self, tmp_path):
+        """One rank owns the marker, so a failure to remove it starts out visible
+        to that rank alone. Left there, its peers walk into ``dcp.save`` on a
+        collective it never joins."""
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        final = tmp_path / "ckpt"
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True),
+            patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=1),
+            patch("veomni.utils.dist_utils.any_rank_failed", return_value=True),
+            patch.object(DistributedCheckpointer, "execute_save") as execute_save,
+        ):
+            with pytest.raises(RuntimeError, match="unpublishing the checkpoint manifest"):
+                DistributedCheckpointer.save(
+                    path=str(final),
+                    state={"model": MagicMock()},
+                    save_async=False,
+                    global_steps=10,
+                )
+
+        # A non-zero rank never touches the file, and still raises — and nothing
+        # was written into a step that is no longer safely published.
+        execute_save.assert_not_called()
 
     def test_save_without_optimizer_writes_only_the_weights(self, tmp_path):
         """A weights-only save leaves no empty optimizer directory behind."""

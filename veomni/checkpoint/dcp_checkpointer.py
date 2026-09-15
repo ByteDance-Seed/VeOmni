@@ -53,6 +53,7 @@ from .layout import (
 from .layout import (
     OPTIMIZER_DIRNAME,
     WEIGHTS_DIRNAME,
+    invalidate_manifest,
     model_dir,
     optimizer_dir,
     step_dir,
@@ -763,6 +764,12 @@ class DistributedCheckpointer(CheckpointerBase):
         checkpoint_dir = step_dir(path, global_steps) if global_steps is not None else path
         model_root = model_dir(checkpoint_dir, module)
 
+        # Unpublish the step before anything in it is overwritten. Dropping the
+        # nested ``.metadata`` during promotion is not enough on its own: the
+        # step-level manifest is what resume discovery reads, so a rewrite that
+        # fails part-way would otherwise leave it pointing at half a checkpoint.
+        cls._unpublish_step(checkpoint_dir)
+
         # Keyed on the module's own run-level path, not just ``path``: a
         # multi-module job calls this once per module, and a single key would have
         # each module clear the previous one's staged files.
@@ -813,6 +820,27 @@ class DistributedCheckpointer(CheckpointerBase):
             _promote_staged_checkpoint(stage_path, model_root)
 
         logger.info_rank0(f"Saved checkpoint to {model_root}")
+
+    @classmethod
+    def _unpublish_step(cls, checkpoint_dir: str) -> None:
+        """Drop the step's completion marker before writing into the step.
+
+        One rank owns the file, so only that rank removes it, and the reduction
+        turns a failure there into one every rank sees: a manifest that outlives
+        the checkpoint it describes is the one thing resume discovery cannot
+        detect on its own.
+
+        Republishing belongs to ``GlobalStateCallback``, once every module and
+        every rank has written its part.
+        """
+        is_coordinator = (not dist.is_initialized()) or dist.get_rank() == 0
+        error: Optional[BaseException] = None
+        if is_coordinator:
+            try:
+                invalidate_manifest(checkpoint_dir)
+            except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
+                error = e
+        raise_if_any_rank_failed(error, f"unpublishing the checkpoint manifest under {checkpoint_dir}")
 
     @classmethod
     def load(
@@ -934,7 +962,11 @@ class DistributedCheckpointer(CheckpointerBase):
 
         Every slot is drained even when one raises, so a failed weights write
         cannot leave the optimizer write running into the next step's
-        collectives.
+        collectives. That is also why the catch below is ``BaseException``:
+        DCP reports a failed save as ``CheckpointException``, which derives
+        from ``BaseException`` rather than ``Exception``, so catching the
+        latter would let the very failures this drains for escape the loop --
+        leaving the remaining slots running and their futures unreachable.
         """
         if not cls._save_futures:
             return
@@ -946,7 +978,7 @@ class DistributedCheckpointer(CheckpointerBase):
             try:
                 logger.info(f"[RANK {rank}] waiting for pending DCP save ({slot}) to end...")
                 future.result()
-            except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
+            except BaseException as e:  # noqa: BLE001 - re-raised once every rank has agreed
                 logger.error(f"[RANK {rank}] pending async DCP save ({slot}) raised; propagating", exc_info=True)
                 if error is None:
                     error = e
@@ -959,7 +991,10 @@ class DistributedCheckpointer(CheckpointerBase):
         DCP surfaces an async failure through the future of the rank that hit
         it, and the save's own process group does not reduce that across the
         group. Raising here on the failing rank alone would leave its peers in
-        the reduction below with nobody to meet.
+        the reduction below with nobody to meet -- which is also why the catch
+        is ``BaseException``: DCP's ``CheckpointException`` does not derive
+        from ``Exception``, and letting it past the reduction is exactly the
+        hang this method exists to prevent.
         """
         future = cls._save_futures.pop(slot, None)
         if future is None:
@@ -969,7 +1004,7 @@ class DistributedCheckpointer(CheckpointerBase):
         try:
             logger.info(f"[RANK {rank}] waiting for previous DCP save ({slot}) to end...")
             future.result()
-        except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
+        except BaseException as e:  # noqa: BLE001 - re-raised once every rank has agreed
             logger.error(f"[RANK {rank}] previous async DCP save ({slot}) raised; propagating", exc_info=True)
             error = e
         raise_if_any_rank_failed(error, f"the previous async DCP save ({slot})")

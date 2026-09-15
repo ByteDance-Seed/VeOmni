@@ -185,6 +185,10 @@ class ModelCheckpointManager:
         Returns the weights directory rather than ``save_dir`` because that is
         what the legacy (non-distributed) export path converts from, and it now
         holds the weights alone.
+
+        The DCP written here can land on a step the save cadence never reaches.
+        ``GlobalStateCallback.on_train_end`` finishes such a step off with the
+        cursor files and the manifest, so it resumes like any other.
         """
         if not os.path.exists(self.save_dir(state)):
             dist.barrier()

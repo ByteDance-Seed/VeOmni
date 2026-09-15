@@ -398,6 +398,73 @@ class TestGlobalStateCallbackJobState:
         # the DCP drain above and both per-rank files.
         assert (step / "checkpoint_manifest.json").is_file()
 
+    def test_train_end_publishes_a_step_the_export_wrote(self, mock_dist, tmp_path):
+        """An HF export writes the step's DCP when the step has none, which puts
+        a complete ``model/`` at a step the cadence never reached — 150 for
+        ``save_steps=100``. Without the cursor files and the manifest that step is
+        invisible to ``load_path: auto``, and a resume goes back to 100 to
+        retrain weights that are already on disk."""
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer(save_path=str(tmp_path))
+        trainer.train_dataloader = None
+        trainer.data_iterator = None
+        trainer.environ_meter.state_dict.return_value = {}
+        # What the manager records after the export's DCP save, on every rank.
+        trainer.checkpoint.last_saved_step = 150
+        cb = GlobalStateCallback(trainer)
+        cb._last_saved_step = 100
+
+        cb.on_train_end(TrainerState(global_step=150))
+
+        step = tmp_path / "global_step_150"
+        assert (step / "extra_state" / "rank_0.pt").is_file()
+        assert (step / "checkpoint_manifest.json").is_file()
+
+    def test_an_export_off_the_cadence_publishes_its_step(self, mock_dist, tmp_path):
+        """Same hole mid-run: an export cadence of its own (``hf_save_steps``
+        shorter than ``save_steps``) writes a full ``model/`` at a step this
+        callback would otherwise skip."""
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer(save_path=str(tmp_path))
+        trainer.train_dataloader = None
+        trainer.data_iterator = None
+        trainer.environ_meter.state_dict.return_value = {}
+        trainer.checkpoint.last_saved_step = 3
+        cb = GlobalStateCallback(trainer)
+
+        # Not a multiple of save_steps=5, so nothing but the export put a
+        # checkpoint here.
+        cb.on_step_end(TrainerState(global_step=3))
+
+        assert (tmp_path / "global_step_3" / "checkpoint_manifest.json").is_file()
+
+    def test_train_end_leaves_an_already_published_step_alone(self, mock_dist, tmp_path):
+        """Training that ends on a cadence step is already published; rewriting
+        it would cost a second dataloader-state dump for nothing."""
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer(save_path=str(tmp_path))
+        trainer.checkpoint.last_saved_step = 200
+        cb = GlobalStateCallback(trainer)
+        cb._last_saved_step = 200
+
+        cb.on_train_end(TrainerState(global_step=200))
+
+        trainer.checkpoint.wait_for_pending_save.assert_not_called()
+        assert not (tmp_path / "global_step_200").exists()
+
+    def test_train_end_skips_a_step_with_no_model_checkpoint(self, mock_dist, tmp_path):
+        """No export and no cadence save at the final step: publishing it would
+        advertise a step whose ``model/`` was never written."""
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer(save_path=str(tmp_path))
+        trainer.checkpoint.last_saved_step = 100
+        cb = GlobalStateCallback(trainer)
+        cb._last_saved_step = 100
+
+        cb.on_train_end(TrainerState(global_step=150))
+
+        assert not (tmp_path / "global_step_150").exists()
+
     def test_a_peers_write_failure_stops_the_manifest(self, mock_dist, tmp_path):
         """Each rank writes its own state files, so a full disk is visible to one
         rank. A rank whose own write succeeded must not publish the step, and must
