@@ -37,6 +37,7 @@ import torch
 from torch.distributed.checkpoint import FileSystemReader
 
 from veomni.arguments import VeOmniArguments, parse_args
+from veomni.checkpoint.layout import weights_dir
 from veomni.data import build_dummy_dataset
 from veomni.models.checkpoint_manager import ModelCheckpointManager
 from veomni.trainer.base import BaseTrainer
@@ -130,7 +131,7 @@ class _LoraCheckpointCallback(CheckpointCallback):
             # silently get restored on load and defeat the size optimisation.
             model_keys = [
                 k
-                for k in FileSystemReader(self.trainer.dcp_ckpt_path).read_metadata().state_dict_metadata
+                for k in FileSystemReader(weights_dir(self.trainer.dcp_ckpt_path)).read_metadata().state_dict_metadata
                 if k.startswith("model.")
             ]
             base_keys_in_dcp = [k for k in model_keys if "lora_" not in k]

@@ -790,7 +790,13 @@ class CheckpointConfig:
     )
     save_async: bool = field(
         default=False,
-        metadata={"help": "Whether to save checkpoint asynchronously."},
+        metadata={
+            "help": (
+                "Return from the checkpoint save while the write is still in flight. "
+                "Cannot be combined with `stage_dir`: the staged copy is dropped when the "
+                "save returns, which an in-flight write would then be reading from."
+            )
+        },
     )
     stage_dir: Optional[str] = field(
         default=None,
@@ -1043,11 +1049,12 @@ class TrainingArguments:
                 logger.warning("load_checkpoint_path should be under output_dir.")
 
         # output_dir/
-        # ├── checkpoints/          # DCP training checkpoints (model + optimizer + extra_state)
+        # ├── checkpoints/          # DCP: model + optimizer + lr_scheduler.pt + trainer_state
         # │   ├── global_step_100/
         # │   └── global_step_200/
         # │       └── hf_ckpt/      # HF safetensors saved under the last checkpoint folder
         # └── model_assets/
+        # See docs/usage/checkpoint.md.
         ckpt.save_path = os.path.join(ckpt.output_dir, "checkpoints")
         ckpt.model_assets_dir = os.path.join(ckpt.output_dir, "model_assets")
 

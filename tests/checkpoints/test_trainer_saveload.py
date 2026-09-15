@@ -12,8 +12,8 @@ import yaml
 try:
     from .checkpoint_verification_utils import verify_dcp_to_hf_conversion
     from .utils import (
-        get_checkpoint_dir,
         get_checkpoint_test_command,
+        get_dcp_weights_dir,
         get_hf_output_dir,
         get_merge_dcp_to_hf_command,
         get_output_dir,
@@ -21,6 +21,7 @@ try:
 except Exception as _:
     from checkpoint_verification_utils import verify_dcp_to_hf_conversion
 from veomni.arguments import parse_args
+from veomni.checkpoint.layout import weights_dir
 from veomni.data import build_dummy_dataset
 from veomni.models.checkpoint_manager import ModelCheckpointManager
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
@@ -179,9 +180,12 @@ class CheckpointCallbackTest(CheckpointCallback):
             self.trainer.golden_model_sd = copy.deepcopy(self.trainer.model.state_dict())
             self.trainer.golden_optim_sd = copy.deepcopy(self.trainer.optimizer.state_dict())
             self._save_dcp(state)
-            self.trainer.dcp_weights_path = os.path.join(
+            # Two different paths: resume takes the step directory, while a
+            # reader of raw shards wants the DCP directory inside it.
+            self.trainer.step_ckpt_path = os.path.join(
                 self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}"
             )
+            self.trainer.dcp_weights_path = weights_dir(self.trainer.step_ckpt_path)
             self.trainer.dcp_global_step = state.global_step
             dtypes_before_hf_save = capture_param_dtypes(self.trainer.model)
             self._save_hf(state)
@@ -210,7 +214,7 @@ class CheckCallback(Callback):
                 safe_serialization=True,
             ), "HF checkpoint verification failed"
 
-        self.trainer.args.train.checkpoint.load_path = self.trainer.dcp_weights_path
+        self.trainer.args.train.checkpoint.load_path = self.trainer.step_ckpt_path
         self.trainer.load()
 
         tied_weights_keys = None
@@ -242,7 +246,7 @@ def _run_trainer_saveload_and_verify(model_name: str, ep_size: int, dp_replicate
     assert merge_result.returncode == 0
 
     assert verify_dcp_to_hf_conversion(
-        dcp_checkpoint_dir=get_checkpoint_dir(model_name, ep_size, dp_replicate_size),
+        dcp_checkpoint_dir=get_dcp_weights_dir(model_name, ep_size, dp_replicate_size),
         hf_checkpoint_dir=get_hf_output_dir(model_name, ep_size, dp_replicate_size),
         safe_serialization=True,
     ), (
