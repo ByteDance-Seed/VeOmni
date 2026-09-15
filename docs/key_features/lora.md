@@ -8,10 +8,9 @@ significantly reduced GPU memory.
 LoRA is implemented by VeOmni's **own** stack, `veomni.lora` — a PEFT-free
 [`peft.PeftModel`](https://huggingface.co/docs/peft) replacement (`VeOmniLoraModel` /
 `VeOmniLoraConfig`). It supports PEFT's main features, adds MoE-LoRA and EP-LoRA, and is
-FSDP2-native. Crucially it stays **format-compatible** with PEFT: VeOmni writes
-`adapter_config.json` + `adapter_model.safetensors`, and loads either that or a
-legacy PEFT `adapter_model.bin`, so adapters train-here / load-there interchangeably
-with stock `peft`.
+FSDP2-native. Crucially it stays **format-compatible** with PEFT: it reads and writes
+standard `adapter_config.json` + `adapter_model.{safetensors,bin}` files, so adapters
+train-here / load-there interchangeably with stock `peft`.
 
 ---
 
@@ -92,16 +91,17 @@ model:
 
 ---
 
-## 2. LoRA Initialization in BaseTrainer
+## 2. LoRA Initialization in the Model Runtime
 
-LoRA wrapping happens in `BaseTrainer._setup_lora()`, called from `_freeze_model_module()`.
+LoRA wrapping happens in `VeOmniModelRuntime._setup_lora()`, called from `_freeze_model_module()`.
+Every trainer inherits both, so `BaseTrainer` reaches the same code through the runtime.
 A single native path wraps the model with `VeOmniLoraModel`, handling dense `nn.Linear`
 LoRA, MoE expert LoRA, and the two combined:
 
 ```python
-# veomni/trainer/base.py
+# veomni/models/model_runtime.py
 def _setup_lora(self):
-    lora_config = self.args.model.lora_config
+    lora_config = self.args.lora_config
     if not bool(lora_config):
         return
 
@@ -129,8 +129,8 @@ original model, so every LoRA parameter FQN and every saved adapter key carries 
 parameters (dense `LoraLinear` and MoE-LoRA, if any) have `requires_grad=True`.
 
 `BaseTrainer._init_callbacks()` registers one `CheckpointCallback` either way. The export format
-is the trainer's decision from `lora_config`, not a separate callback class: a run that trains
-only adapters exports the adapter, so there is nothing for a LoRA-specific callback to do.
+is the model's decision, not the callback's: a model that trains only adapters exports the
+adapter, so there is nothing for a LoRA-specific callback to do.
 
 ### 2.1 LoRA MFU and FLOPs accounting
 
@@ -201,8 +201,8 @@ VeOmni LoRA training uses FSDP2 with `init_device: meta`. Weight loading goes th
 1. **Base-model weights**: loaded via `rank0_load_and_broadcast_weights` or
    `load_model_weights` — the standard FSDP2 path, unchanged for LoRA.
 
-2. **Adapter weights** (resume only): `_build_parallelized_model` passes `adapter_path`
-   to `build_parallelize_model`, which — for a `VeOmniLoraModel` — calls the native
+2. **Adapter weights** (resume only): `build_parallelize_model` passes `adapter_path`
+   to the FSDP2/DDP wrap, which — for a `VeOmniLoraModel` — calls the native
    `veomni.lora.weight_loading.load_lora_weights` (all-ranks read) or
    `rank0_load_and_broadcast_lora_weights` (rank-0 reads then broadcasts). Both read the
    PEFT-format adapter file natively (safetensors / torch, **no `peft` import**) and remap
@@ -228,8 +228,9 @@ infix (PEFT convention — e.g. `lora_A.weight`), whereas the live model stores 
 
 ### DCP checkpoint (training state)
 
-`CheckpointCallback` decides *when* to save and calls `trainer.save_dcp`, which lands in
-`ModelCheckpointManager` (`veomni/models/checkpoint_manager.py`). That writes the
+`CheckpointCallback` decides *when* to save and calls `trainer.save_dcp`, which fans out to
+`trainer.model.save_dcp` and lands in `ModelCheckpointManager`
+(`veomni/models/checkpoint_manager.py`). That writes the
 weights to `model/ckpt/` and the optimizer to `model/optimizer/` — two separate DCP
 directories — plus a replicated `model/lr_scheduler.pt`. For LoRA training the DCP
 stores only the trainable adapter parameters and optimizer state; the frozen base is
@@ -239,9 +240,9 @@ reloaded from `model.model_path`. Job-level state is written separately by
 
 ### HF LoRA adapter (inference artifact)
 
-`CheckpointCallback` also drives `trainer.save_hf_or_lora`. When `lora_config` is set the manager
-exports the adapter via `save_lora_adapter_with_dcp`
-(`veomni/utils/save_safetensor_utils.py`), which:
+`CheckpointCallback` also drives `trainer.save_hf_or_lora`. The format is the model's decision,
+not the callback's: a model that trains only adapters exports the adapter, via
+`save_lora_adapter_with_dcp` (`veomni/utils/save_safetensor_utils.py`), which:
 
 1. Extracts adapter-only tensors via `veomni.lora.state_dict.get_lora_state_dict`
    (PEFT on-disk key format).
@@ -269,7 +270,7 @@ Output structure for each checkpoint:
 │       └── lora_ckpt/                   ← the inference artifact
 │           ├── adapter_config.json      ← PEFT-format; MoE mode in its `veomni_lora` block
 │           └── adapter_model.safetensors
-└── model_assets/
+└── model_assets/                   # or model_assets/<module>/ in a multi-module job
 ```
 
 The adapter export sits in its own `lora_ckpt/`, not in with the resume state and
@@ -324,7 +325,7 @@ model:
 The mapping is driven by a per-model `_convert_lora_targets_to_parameters` hook
 (registered in the model's `__init__.py`) plus
 `veomni.lora.resolve_fused_moe_lora_targets`, invoked by
-`BaseTrainer._setup_lora` before the adapter is built. It is a **no-op on dense
+`VeOmniModelRuntime._setup_lora` before the adapter is built. It is a **no-op on dense
 models and on models without the hook**, so `gate_proj` / `up_proj` /
 `down_proj` there stay ordinary `nn.Linear` LoRA targets.
 
@@ -441,7 +442,7 @@ At resume, `VeOmniLoraModel.from_pretrained` reads `adapter_config.json`: the
 stock-PEFT adapter (no `veomni_lora` block) is loaded, the MoE mode is inferred from the
 on-disk LoRA tensor shapes (3-D per-expert → independent, 2-D → shared).
 
-The MoE-LoRA tensors in `adapter_model.safetensors` use PEFT-aligned FQNs
+The MoE-LoRA tensors in `adapter_model.bin` use PEFT-aligned FQNs
 (`base_model.model.<...>.<spec>.lora_A.<adapter>.weight`), so third-party PEFT tooling
 (HuggingFace Hub, `peft.PeftModel.from_pretrained`) can also load the file — though without
 VeOmni's wrappers re-installed first, the MoE-LoRA half of the keys will be dropped as
@@ -714,6 +715,6 @@ torchrun --nproc_per_node=4 tests/lora/test_moe_lora_trainer.py \
 ```
 
 **What the round-trip test verifies:**
-1. Writer trains `max_steps=4`, writes DCP shards at step 2 / step 4 and the HF LoRA adapter (`adapter_config.json` with the `veomni_lora` block + `adapter_model.safetensors`, no sidecar) at the same cadence; snapshots the full LoRA tensors at `on_train_begin` and `on_train_end`.
+1. Writer trains `max_steps=4`, writes DCP shards at step 2 / step 4 and the HF LoRA adapter (`adapter_config.json` with the `veomni_lora` block + `adapter_model.bin`, no sidecar) at the same cadence; snapshots the full LoRA tensors at `on_train_begin` and `on_train_end`.
 2. DCP-resume subprocess loads the step-2 DCP shard, continues to step 4, and the resulting LoRA tensors must be **bit-exact** vs the writer's `on_train_end` snapshot (DCP ships model + optimizer + RNG + dataloader state).
 3. LoRA-adapter-resume subprocess loads the step-4 HF adapter via `model.lora_config.lora_adapter`, and the resulting `on_train_begin` snapshot (= post-load, pre-train) must be bit-exact vs the writer's `on_train_end` snapshot in bf16 (the on-disk adapter dtype).

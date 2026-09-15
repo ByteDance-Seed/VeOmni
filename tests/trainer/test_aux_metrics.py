@@ -183,9 +183,11 @@ def _accumulating_trainer(outputs, recorded):
     """
     trainer = _bare_trainer()
     trainer.state = TrainerState(global_step=0)
-    trainer.model = SimpleNamespace()
-    trainer.optimizer = SimpleNamespace(step=lambda: None, zero_grad=lambda: None)
-    trainer.lr_scheduler = SimpleNamespace(step=lambda: None)
+    trainer.model = SimpleNamespace(
+        clip_grad_norm=lambda: 0.0,
+        optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda: None),
+        lr_scheduler=SimpleNamespace(step=lambda: None),
+    )
     trainer.args = SimpleNamespace(
         train=SimpleNamespace(sync_each_train_step=False),
         model=SimpleNamespace(
@@ -226,8 +228,7 @@ def run_train_step(request, monkeypatch):
     """Runs one training step through whichever trainer owns the loop."""
     module, wrapper_cls = _TRAIN_STEP_OWNERS[request.param]
     monkeypatch.setattr(module, "synchronize", lambda: None)
-    monkeypatch.setattr(module, "use_parallel_state", lambda name: nullcontext())
-    monkeypatch.setattr(module, "veomni_clip_grad_norm", lambda *args, **kwargs: 0.0)
+    monkeypatch.setattr(module, "use_parallel_state", lambda name: nullcontext(), raising=False)
     # Single process: the all-reduce over the step's token denominators is the identity.
     monkeypatch.setattr(
         module, "reduce_global_loss_token", lambda token_len: {key: value.item() for key, value in token_len.items()}
@@ -324,7 +325,7 @@ def _environ_meter_callback(env_metrics=None, lr=None):
     callback.freeze_vit = None
     callback.trainer = SimpleNamespace(
         environ_meter=SimpleNamespace(step=lambda delta_time, global_step, **kwargs: dict(env_metrics or {})),
-        lr_scheduler=None if lr is None else SimpleNamespace(get_last_lr=lambda: [lr]),
+        model=SimpleNamespace(lr_scheduler=None if lr is None else SimpleNamespace(get_last_lr=lambda: [lr])),
     )
     return callback
 

@@ -24,9 +24,6 @@ Registration maintains two independent mappings:
   matches. Different names can therefore refer to the same state without
   creating duplicate process groups.
 
-Tests that need a topology no job config can express (a CPU mesh, or a rank
-layout unrelated to `WORLD_SIZE`) call `_init_parallel_state` directly.
-
 ## Basic usage
 
 Every parallelism knob already lives on `AcceleratorConfig`, so the topology is
@@ -80,12 +77,15 @@ error.
 ## Trainer lifecycle
 
 Current built-in trainers register the main topology as `"base"` during
-`BaseTrainer._setup()`, which calls `init_parallel_state_from_config` before
-any model is built. Model, dataloader, optimizer, and scheduler construction
-run inside one `use_parallel_state("base")` build scope. At run time, only
-operations that depend on ambient groups are scoped: model forward,
-post-forward loss handling, backward, and gradient clipping. Callbacks retain
-their state explicitly rather than depending on an ambient scope.
+`BaseTrainer._setup()`, which runs before any model is built. That
+registration also makes `"base"` the global state, so the dataloader, scheduler
+and callbacks read it ambiently with no scope of their own. `VeOmniModelRuntime.setup()`
+only registers that model's mesh. The build scope is `VeOmniModelRuntime.__init__()`,
+which wraps meta-init, freeze, parallelize, and optimizer in
+`use_parallel_state(<its own name>)` — a no-op for a single-model job, and the
+mechanism by which sibling modules each build over their own mesh. At run time,
+only operations that depend on ambient groups are scoped: model forward,
+post-forward loss handling, backward, and gradient clipping.
 
 When an API accepts an explicit process group, prefer passing the group from
 `get_parallel_state_by_name("base")` instead of opening a broader context.

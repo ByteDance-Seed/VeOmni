@@ -691,7 +691,8 @@ def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Opti
     """Build the mesh an :class:`AcceleratorConfig` describes and register it as ``name``.
 
     Every parallelism knob already lives on the config, so a caller that has one
-    should not be restating the mapping.
+    should not be restating the mapping. Both a job's own mesh and a single
+    model's come through here.
     """
     return _init_parallel_state(
         dp_size=accelerator.dp_size,

@@ -15,10 +15,9 @@ import torch
 import yaml
 from tools import resolve_ops_overrides
 from torch.utils.data import DistributedSampler, IterableDataset
-from transformers import PretrainedConfig
 from utils import (
     DummyDataset,
-    FakeModel,
+    FakeModelRuntime,
     ShardedMappingDataset,
     compare_global_batch,
     compare_items,
@@ -48,7 +47,6 @@ from veomni.trainer.callbacks import (
     TrainerState,
 )
 from veomni.utils import helper
-from veomni.utils.device import get_device_type
 from veomni.utils.helper import get_cache_dir
 
 
@@ -71,13 +69,8 @@ class TrainerTest(BaseTrainer):
         self.check_callback = CheckCallback(self)
         self.state = TrainerState()
 
-    def _build_model(self):
-        # only build fake model
-        self.model = FakeModel().to(get_device_type())
-        self.model_config = PretrainedConfig()
-
-    def _build_model_assets(self):
-        self.model_assets = [self.model_config]
+    def _build_model_runtime(self):
+        return FakeModelRuntime(self.args.model, train=self.args.train)
 
     def _build_data_transform(self):
         args: VeOmniArguments = self.args
