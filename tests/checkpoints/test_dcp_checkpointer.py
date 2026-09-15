@@ -1946,6 +1946,121 @@ class TestStageDirValidation:
         assert torch.load(sidecar, weights_only=False) == previous
         assert (weights / ".metadata").read_text() == "previous"
 
+    def test_a_failed_staged_save_over_a_legacy_step_leaves_it_resumable(self, tmp_path):
+        """Same guarantee, one layout back. A staged save must not invalidate the
+        destination before it has a complete copy to put there, and for a
+        pre-split step the marker that makes it resumable sits at the step root.
+        Dropping it when the save starts would cost the user a checkpoint the
+        save never got far enough to replace.
+        """
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+        from veomni.checkpoint.legacy_v0_1_12 import marker_path
+
+        final = tmp_path / "ckpt"
+        step_root = final / "global_step_10"
+        step_root.mkdir(parents=True)
+        legacy_marker = Path(marker_path(str(step_root)))
+        legacy_marker.write_text("written by an older VeOmni")
+
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
+            patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed: failed),
+            patch.object(DistributedCheckpointer, "execute_save", side_effect=OSError("dcp write failed")),
+            patch.object(DistributedCheckpointer, "_create_storage_writer"),
+            patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
+            patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+        ):
+            with pytest.raises(OSError, match="dcp write failed"):
+                DistributedCheckpointer.save(
+                    path=str(final),
+                    state={"model": MagicMock()},
+                    save_async=False,
+                    global_steps=10,
+                    stage_dir=str(tmp_path / "stage"),
+                )
+
+        assert legacy_marker.read_text() == "written by an older VeOmni"
+
+    def test_a_staged_save_drops_the_legacy_marker_when_it_promotes(self, tmp_path):
+        """And once the copy is real, the old marker has to go: the step is no
+        longer the pre-split checkpoint that marker describes."""
+        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
+        from veomni.checkpoint.legacy_v0_1_12 import marker_path
+
+        stage_path = tmp_path / "stage"
+        (stage_path / "ckpt").mkdir(parents=True)
+        (stage_path / "ckpt" / ".metadata").write_text("new")
+        (stage_path / "ckpt" / "__0_0.distcp").write_text("new-weights")
+
+        step_root = tmp_path / "ckpt" / "global_step_10"
+        step_root.mkdir(parents=True)
+        legacy_marker = Path(marker_path(str(step_root)))
+        legacy_marker.write_text("written by an older VeOmni")
+
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
+            patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed: failed),
+        ):
+            _promote_staged_checkpoint(str(stage_path), str(step_root / "model"), step_root=str(step_root))
+
+        assert not legacy_marker.exists()
+        assert (step_root / "model" / "ckpt" / ".metadata").read_text() == "new"
+
+    def test_promotion_replaces_the_destination_rather_than_merging_into_it(self, tmp_path):
+        """A weights-only save over a step that has an optimizer. Copying only the
+        staged files would leave the previous save's optimizer shards and marker
+        in place, and the step would then read as complete while pairing this
+        run's weights with an earlier run's optimizer state."""
+        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
+
+        stage_path = tmp_path / "stage"
+        (stage_path / "ckpt").mkdir(parents=True)
+        (stage_path / "ckpt" / ".metadata").write_text("new")
+        (stage_path / "ckpt" / "__0_0.distcp").write_text("new-weights")
+
+        model_root = tmp_path / "ckpt" / "global_step_10" / "model"
+        for name in ("ckpt", "optimizer"):
+            (model_root / name).mkdir(parents=True)
+            (model_root / name / ".metadata").write_text("previous")
+            (model_root / name / "__0_0.distcp").write_text(f"old-{name}")
+
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
+            patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed: failed),
+        ):
+            _promote_staged_checkpoint(str(stage_path), str(model_root))
+
+        assert not (model_root / "optimizer").exists()
+        assert (model_root / "ckpt" / "__0_0.distcp").read_text() == "new-weights"
+        assert (model_root / "ckpt" / ".metadata").read_text() == "new"
+
+    def test_promotion_leaves_another_modules_directory_alone(self, tmp_path):
+        """The destination emptied is one module's. A multi-module job promotes
+        each module separately, and a sibling is not being written."""
+        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
+
+        stage_path = tmp_path / "stage"
+        (stage_path / "ckpt").mkdir(parents=True)
+        (stage_path / "ckpt" / ".metadata").write_text("new")
+
+        model_root = tmp_path / "ckpt" / "global_step_10" / "model"
+        sibling = model_root / "audio" / "ckpt"
+        sibling.mkdir(parents=True)
+        (sibling / ".metadata").write_text("a finished module")
+
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
+            patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed: failed),
+        ):
+            _promote_staged_checkpoint(str(stage_path), str(model_root / "vision"))
+
+        assert (sibling / ".metadata").read_text() == "a finished module"
+
     def test_unset_stage_dir_writes_straight_to_the_destination(self, tmp_path):
         """Staging is opt-in: unset, both DCP directories and the sidecar write
         straight into ``global_step_N/model/``."""

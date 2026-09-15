@@ -558,7 +558,7 @@ def _prepare_stage_dir(stage_dir: str, path: str) -> str:
     return stage_path
 
 
-def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
+def _promote_staged_checkpoint(stage_path: str, final_path: str, step_root: Optional[str] = None) -> None:
     """Copy a staged checkpoint to its destination, then drop the staged copy.
 
     The staging directory is node-local, so one rank per node copies all of it
@@ -570,13 +570,21 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
 
     ``.metadata`` is what DCP reads as "this DCP directory is complete", and the
     staged tree holds one per directory -- ``ckpt/`` and ``optimizer/``. The
-    destination's old copies go first, before anything is overwritten, and the
-    new ones go last and only if every rank's data landed -- so a reader sees
+    destination is emptied first, before anything is overwritten, and the new
+    markers go last and only if every rank's data landed -- so a reader sees
     either the previous complete checkpoint or none, never a completion marker
-    over data that is only partly there.
+    over data that is only partly there, and never this save's files mixed with
+    a previous one's.
 
-    Nested files are copied in the data phase, before any ``.metadata`` is.
-    ``lr_scheduler.pt`` is one of those files.
+    This is the *only* place a staged save invalidates its destination. Doing it
+    when the save starts, as the unstaged path does, would throw away the
+    previous checkpoint before the new one exists anywhere -- and keeping that
+    checkpoint readable until the last possible moment is what staging is for.
+
+    ``step_root`` is the step directory, given when the destination may hold a
+    pre-split checkpoint whose marker sits there rather than inside
+    ``final_path``. Nested files are copied in the data phase, before any
+    ``.metadata`` is. ``lr_scheduler.pt`` is one of those files.
     """
     metadata_name = DCP_MARKER_FILENAME
     is_node_leader = _local_rank() == 0
@@ -596,13 +604,31 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
                     rels.append(os.path.relpath(os.path.join(dirpath, filename), stage_path))
         return sorted(rels)
 
-    def remove_stale_markers() -> None:
-        """Delete the previous checkpoint's markers before overwriting its shards."""
+    def clear_destination() -> None:
+        """Empty the destination, so the staged tree replaces it rather than merges.
+
+        Deleting only the files about to be overwritten would leave whatever the
+        previous save wrote and this one does not: a weights-only save over a
+        step that has an optimizer keeps that optimizer's shards *and* its
+        ``.metadata``, and the step then reads as a complete checkpoint pairing
+        this run's weights with an earlier run's optimizer.
+
+        Nothing is lost that the destination could still have used. A marker has
+        to go before its shards are overwritten either way, and without one DCP
+        will not read the directory at all.
+
+        One module's directory. A sibling module of the same job lives beside it,
+        is not being written, and keeps everything it has.
+        """
+        # The step may predate this layout, in which case DCP left its marker at
+        # the step root rather than in here. Delete this import (and
+        # veomni/checkpoint/legacy_v0_1_12.py) to drop that layout.
+        from .legacy_v0_1_12 import drop_marker
+
+        shutil.rmtree(final_path, ignore_errors=True)
         os.makedirs(final_path, exist_ok=True)
-        for rel in staged_markers():
-            stale = os.path.join(final_path, rel)
-            if os.path.exists(stale):
-                os.remove(stale)
+        if step_root is not None:
+            drop_marker(step_root)
 
     def copy_this_nodes_files() -> None:
         """Copy every staged file on this node, except the completion markers.
@@ -662,7 +688,7 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
         """
         shutil.rmtree(stage_path, ignore_errors=True)
 
-    _promotion_phase(state, remove_stale_markers, participates=is_coordinator)
+    _promotion_phase(state, clear_destination, participates=is_coordinator)
     _promotion_phase(state, copy_this_nodes_files, participates=is_node_leader)
     _promotion_phase(state, copy_markers, participates=is_coordinator)
     _promotion_phase(state, drop_staged_copy, participates=is_node_leader, always=True)
@@ -769,17 +795,25 @@ class DistributedCheckpointer(CheckpointerBase):
         checkpoint_dir = step_dir(path, global_steps) if global_steps is not None else path
         model_root = model_dir(checkpoint_dir, module)
 
-        # Delete this module's old markers before anything in it is overwritten,
-        # so that a rewrite which fails part-way leaves nothing claiming to be
-        # done. The manifest is not ours; ``GlobalStateCallback`` clears its own.
-        cls._remove_dcp_markers(checkpoint_dir, module)
-
         # Keyed on the module's own run-level path, not just ``path``: a
         # multi-module job calls this once per module, and a single key would have
         # each module clear the previous one's staged files.
         stage_key_path = os.path.join(path, module) if module else path
         stage_path = _prepare_stage_dir(stage_dir, stage_key_path) if stage_dir else None
         write_root = stage_path or model_root
+
+        if stage_path is None:
+            # Nothing stands between this save and the previous checkpoint's
+            # shards, so its markers have to go before the first byte lands --
+            # otherwise a save that dies part-way leaves one describing shards
+            # that are half this step and half the last. A staged save invalidates
+            # its destination in ``_promote_staged_checkpoint`` instead, at the
+            # point where it is about to overwrite it for real.
+            #
+            # The manifest is not ours either way; ``GlobalStateCallback`` clears
+            # the one it writes.
+            cls._remove_dcp_markers(checkpoint_dir, module)
+
         cls._create_checkpoint_dir(write_root)
 
         # Sidecar first, then the DCP directories. Ordering no longer carries the
@@ -821,7 +855,7 @@ class DistributedCheckpointer(CheckpointerBase):
             raise
 
         if stage_path is not None:
-            _promote_staged_checkpoint(stage_path, model_root)
+            _promote_staged_checkpoint(stage_path, model_root, step_root=checkpoint_dir)
 
         logger.info_rank0(f"Saved checkpoint to {model_root}")
 
@@ -829,9 +863,9 @@ class DistributedCheckpointer(CheckpointerBase):
     def _remove_dcp_markers(cls, checkpoint_dir: str, module: str) -> None:
         """Delete the ``.metadata`` files vouching for what this save overwrites.
 
-        DCP writes them again at the end of a successful save, so deleting them
-        costs nothing then -- but a save that dies part-way would otherwise leave
-        a marker describing shards that are half this step and half the last one.
+        The unstaged path's invalidation, run before the first byte lands. A
+        staged save has ``_promote_staged_checkpoint`` do the same job at
+        promotion time, because until then it has overwritten nothing.
 
         Two places to look. This module's ``ckpt/`` and ``optimizer/``, and the
         step root, where an older VeOmni's fused save left the same file. Both

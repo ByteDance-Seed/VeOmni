@@ -131,6 +131,14 @@ otherwise keep the step discoverable through the legacy fallback below), and
 the step is correctly rejected throughout, including in the window where one
 half has been invalidated and the other has not.
 
+With `stage_dir` the model half waits: a staged save has overwritten nothing
+until the copy to the destination, so it invalidates the destination there
+instead of at the start. A staged save that fails leaves the previous checkpoint
+complete and resumable. The copy empties the module's directory first rather
+than writing over it file by file, so a save that drops something the previous
+one wrote — weights without an optimizer, at train end — cannot leave the two
+runs' state mixed in one step.
+
 The cursor files follow the same cadences as the model state, including HF and
 LoRA exports: with `save_steps=100` and an export at train end, step 150 gets
 its `loader/`, `extra_state/` and manifest too, instead of being left invisible
