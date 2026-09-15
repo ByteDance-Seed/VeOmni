@@ -160,6 +160,34 @@ def test_translate_fused_dsa_mask_drops_standard_causal_and_rejects_padding():
     assert translate_fused_dsa_mask(padded, q_len=seq_len, kv_len=seq_len, fused=False, what="x") is padded
 
 
+def test_translate_fused_dsa_mask_rejects_custom_head_and_additive_bias():
+    """Fused rows must not drop a custom head or a nonzero allowed-region bias."""
+    seq_len = 8
+    causal = _additive_causal(1, seq_len)
+    assert is_standard_causal_mask(causal[:, 0], q_len=seq_len, kv_len=seq_len)
+    twin_heads = causal.expand(1, 2, seq_len, seq_len).contiguous()
+    assert not is_standard_causal_mask(twin_heads, q_len=seq_len, kv_len=seq_len)
+    custom_head = causal.expand(1, 2, seq_len, seq_len).clone()
+    custom_head[:, 1, 0, -1] = 0
+    assert not is_standard_causal_mask(custom_head, q_len=seq_len, kv_len=seq_len)
+    with pytest.raises(ValueError, match="eager implementation"):
+        translate_fused_dsa_mask(custom_head, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
+    assert translate_fused_dsa_mask(custom_head, q_len=seq_len, kv_len=seq_len, fused=False, what="x") is custom_head
+
+    biased = causal.clone()
+    biased[..., 1, 0] = 0.5
+    assert not is_standard_causal_mask(biased, q_len=seq_len, kv_len=seq_len)
+    with pytest.raises(ValueError, match="eager implementation"):
+        translate_fused_dsa_mask(biased, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
+    assert translate_fused_dsa_mask(biased, q_len=seq_len, kv_len=seq_len, fused=False, what="x") is biased
+
+    bool_allowed = torch.tril(torch.ones(1, 1, seq_len, seq_len, dtype=torch.bool))
+    bool_blocked = ~bool_allowed
+    assert is_standard_causal_mask(bool_allowed, q_len=seq_len, kv_len=seq_len)
+    assert is_standard_causal_mask(bool_blocked, q_len=seq_len, kv_len=seq_len)
+    assert translate_fused_dsa_mask(bool_allowed, q_len=seq_len, kv_len=seq_len, fused=True, what="x") is None
+
+
 def test_glm_fused_rows_reject_attention_mask_before_vendor_import(monkeypatch):
     """Unsupported masks must not be silently ignored by fused GLM rows."""
     vendor_module = "veomni.ops.kernels.dsa.vendor.flashmla_cudnn"

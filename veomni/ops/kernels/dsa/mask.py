@@ -29,24 +29,29 @@ def is_standard_causal_mask(attention_mask: Tensor | None, *, q_len: int, kv_len
     """Whether ``attention_mask`` is only the lower-triangular causal constraint.
 
     ``None`` is the ``is_causal`` skip used when there is no padding. Additive
-    ``[B, 1, Q, K]`` / ``[B, Q, K]`` masks match the decode-aware triangle
-    ``k > q + kv_len - q_len``. Padding or a custom overlay is not standard.
+    or boolean ``[B, 1, Q, K]`` / ``[B, Q, K]`` masks must match the
+    decode-aware triangle ``k > q + kv_len - q_len`` on every entry.
+    ``H != 1``, padding, a custom overlay, or a nonzero additive bias on an
+    allowed position is not standard.
     """
     if attention_mask is None:
         return True
     mask = attention_mask
     if mask.dim() == 4:
+        if mask.shape[1] != 1:
+            return False
         mask = mask[:, 0]
     if mask.dim() != 3 or mask.shape[-2] != q_len or mask.shape[-1] != kv_len:
         return False
     q_positions = torch.arange(q_len, device=mask.device)[:, None]
     k_positions = torch.arange(kv_len, device=mask.device)[None, :]
-    expected_blocked = k_positions > q_positions + kv_len - q_len
+    expected_blocked = (k_positions > q_positions + kv_len - q_len).unsqueeze(0).expand_as(mask)
     if mask.dtype == torch.bool:
-        blocked = ~mask if bool(mask.diagonal(dim1=-2, dim2=-1).all()) else mask
-    else:
-        blocked = mask < 0
-    return bool(torch.equal(blocked, expected_blocked.unsqueeze(0).expand_as(blocked)))
+        # Accept either convention only when the full triangle matches.
+        return bool(torch.equal(mask, ~expected_blocked) or torch.equal(mask, expected_blocked))
+    allowed = mask == 0
+    blocked = mask < 0
+    return bool(torch.equal(blocked, expected_blocked) and torch.equal(allowed, ~expected_blocked))
 
 
 def translate_fused_dsa_mask(
