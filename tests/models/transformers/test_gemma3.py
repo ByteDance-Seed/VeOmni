@@ -347,3 +347,31 @@ def test_gemma3_flex_matches_math_sdpa_forward_and_backward():
         assert math_gradient is not None and torch.isfinite(math_gradient).all()
         assert flex_gradient is not None and torch.isfinite(flex_gradient).all()
         torch.testing.assert_close(flex_gradient, math_gradient, rtol=7e-2, atol=7e-2)
+
+
+def test_gemma3_sliding_window_cached_decode_matches_hf():
+    """Non-packed decode after a window-length prefill uses HF cache-aware masks."""
+    torch.manual_seed(0)
+    config = _tiny_config()
+    assert config.sliding_window == 8
+    assert config.layer_types == ["sliding_attention", "sliding_attention", "full_attention"]
+
+    hf = HFGemma3ForCausalLM(config).eval()
+    ours = _build_ours(config).eval()
+    ours.load_state_dict(hf.state_dict())
+
+    input_ids = torch.randint(3, config.vocab_size, (2, 10))
+    prefill_ids = input_ids[:, :9]
+    decode_ids = input_ids[:, 9:]
+
+    with torch.no_grad():
+        hf_prefill = hf(input_ids=prefill_ids, use_cache=True)
+        ours_prefill = ours(input_ids=prefill_ids, use_cache=True)
+        hf_decode = hf(input_ids=decode_ids, past_key_values=hf_prefill.past_key_values, use_cache=True)
+        ours_decode = ours(input_ids=decode_ids, past_key_values=ours_prefill.past_key_values, use_cache=True)
+        hf_full = hf(input_ids=input_ids, use_cache=False)
+        ours_full = ours(input_ids=input_ids, use_cache=False)
+
+    torch.testing.assert_close(ours_decode.logits, hf_decode.logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    torch.testing.assert_close(hf_decode.logits, hf_full.logits[:, -1:], atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    torch.testing.assert_close(ours_decode.logits, ours_full.logits[:, -1:], atol=EAGER_ATOL, rtol=EAGER_RTOL)

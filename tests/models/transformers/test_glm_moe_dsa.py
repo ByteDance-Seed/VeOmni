@@ -30,6 +30,7 @@ from tests.models.compare import (
     ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_glm_moe_dsa_config as _tiny_config
+from tests.ops.tol import EAGER_ATOL, EAGER_RTOL
 
 
 def _glm_cls(architecture: str):
@@ -108,3 +109,73 @@ def test_glm_moe_dsa_registry_installs_checkpoint_hooks_and_ep_plan():
         "model.layers.*.mlp.experts.down_proj",
     }
     assert all(placement.dim == 0 for placement in ep_plan.values())
+
+
+def test_glm_moe_dsa_chunked_prefill_and_independent_decode_matches_hf():
+    """Compressed DSA KV lives on past_key_values, not module buffers."""
+    torch.manual_seed(0)
+    config = _tiny_config()
+    hf = HFGlmMoeDsaForCausalLM(config).eval()
+    ours = _build_ours(config).eval()
+    _assert_dsa_wiring(ours.model.layers[0].self_attn)
+    ours.load_state_dict(hf.state_dict())
+    assert not hasattr(ours.model.layers[0].self_attn, "_cached_k_pe")
+    assert not hasattr(ours.model.layers[0].self_attn, "_cached_kv")
+
+    input_ids = torch.randint(3, config.vocab_size, (2, 6))
+    prefix = input_ids[:, :4]
+    suffix = input_ids[:, 4:]
+    independent_ids = torch.randint(3, config.vocab_size, (2, 1))
+
+    with torch.no_grad():
+        hf_prefix = hf(input_ids=prefix, use_cache=True)
+        ours_prefix = ours(input_ids=prefix, use_cache=True)
+        hf_chunk = hf(input_ids=suffix, past_key_values=hf_prefix.past_key_values, use_cache=True)
+        ours_chunk = ours(input_ids=suffix, past_key_values=ours_prefix.past_key_values, use_cache=True)
+        hf_full = hf(input_ids=input_ids, use_cache=False)
+        ours_full = ours(input_ids=input_ids, use_cache=False)
+        hf_independent = hf(input_ids=independent_ids, use_cache=True)
+        ours_independent = ours(input_ids=independent_ids, use_cache=True)
+
+    torch.testing.assert_close(ours_chunk.logits, hf_chunk.logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    torch.testing.assert_close(ours_chunk.logits, ours_full.logits[:, -2:], atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    torch.testing.assert_close(hf_chunk.logits, hf_full.logits[:, -2:], atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    torch.testing.assert_close(ours_independent.logits, hf_independent.logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+
+def test_glm_moe_dsa_cache_reorder_matches_hf():
+    torch.manual_seed(1)
+    config = _tiny_config()
+    hf = HFGlmMoeDsaForCausalLM(config).eval()
+    ours = _build_ours(config).eval()
+    ours.load_state_dict(hf.state_dict())
+
+    input_ids = torch.randint(3, config.vocab_size, (2, 4))
+    decode_ids = torch.randint(3, config.vocab_size, (2, 1))
+    beam_idx = torch.tensor([1, 0])
+
+    with torch.no_grad():
+        hf_prefix = hf(input_ids=input_ids, use_cache=True)
+        ours_prefix = ours(input_ids=input_ids, use_cache=True)
+        hf_prefix.past_key_values.reorder_cache(beam_idx)
+        ours_prefix.past_key_values.reorder_cache(beam_idx)
+        reordered_decode_ids = decode_ids[beam_idx]
+        hf_decode = hf(
+            input_ids=reordered_decode_ids,
+            past_key_values=hf_prefix.past_key_values,
+            use_cache=True,
+        )
+        ours_decode = ours(
+            input_ids=reordered_decode_ids,
+            past_key_values=ours_prefix.past_key_values,
+            use_cache=True,
+        )
+        hf_swapped = hf(input_ids=input_ids[beam_idx], use_cache=True)
+        hf_swapped_decode = hf(
+            input_ids=reordered_decode_ids,
+            past_key_values=hf_swapped.past_key_values,
+            use_cache=True,
+        )
+
+    torch.testing.assert_close(ours_decode.logits, hf_decode.logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    torch.testing.assert_close(ours_decode.logits, hf_swapped_decode.logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)

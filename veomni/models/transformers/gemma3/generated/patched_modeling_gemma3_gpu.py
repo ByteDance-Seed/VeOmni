@@ -10,7 +10,7 @@
 #
 #  Patches applied:
 #    - method_override: Gemma3TextModel.forward
-#      Build full / sliding masks through veomni.ops.mask
+#      Packed masks use veomni.ops.mask; non-packed uses HF cache-aware builders
 #    - method_override: Gemma3ForCausalLM.__init__
 #      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: Gemma3ForCausalLM.forward
@@ -39,6 +39,7 @@ from transformers.masking_utils import (
     blockwise_overlay,
     create_causal_mask,
     create_masks_for_generate,
+    create_sliding_window_causal_mask,
     maybe_pad_block_sequence_ids,
     sliding_window_overlay,
 )
@@ -68,7 +69,7 @@ from transformers.utils.output_capturing import capture_outputs
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.op_utils import attention_op, resolve_op_impl
 from veomni.ops import VeomniOp
-from veomni.ops.mask import causal_mask, packed_causal_mask, sliding_window_mask
+from veomni.ops.mask import packed_causal_mask, sliding_window_mask
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
@@ -556,26 +557,26 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
             position_ids = position_ids.unsqueeze(0)
 
         if not isinstance(causal_mask_mapping := attention_mask, dict):
-            impl = resolve_op_impl("attn_implementation")
-            q_len = inputs_embeds.shape[1]
-            past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
-            kv_len = q_len + past_seen
-            mask_kwargs: dict = {
-                "impl": impl,
-                "device": inputs_embeds.device,
-                "batch_size": inputs_embeds.shape[0],
-                "dtype": inputs_embeds.dtype,
-            }
-            if attention_mask is not None:
-                mask_kwargs["attention_mask"] = attention_mask
-            sliding_kwargs = dict(mask_kwargs)
-            if self.config.use_bidirectional_attention:
-                mask_kwargs["or_mask_function"] = lambda *args: torch.tensor(True, dtype=torch.bool)
-                sliding_kwargs["or_mask_function"] = _bidirectional_window_overlay(self.config.sliding_window)
             cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
             if cu_seq_lens_q is not None:
+                impl = resolve_op_impl("attn_implementation")
+                q_len = inputs_embeds.shape[1]
+                past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+                kv_len = q_len + past_seen
+                packed_kwargs: dict = {
+                    "impl": impl,
+                    "device": inputs_embeds.device,
+                    "batch_size": inputs_embeds.shape[0],
+                    "dtype": inputs_embeds.dtype,
+                }
+                if attention_mask is not None:
+                    packed_kwargs["attention_mask"] = attention_mask
+                sliding_kwargs = dict(packed_kwargs)
+                if self.config.use_bidirectional_attention:
+                    packed_kwargs["or_mask_function"] = lambda *args: torch.tensor(True, dtype=torch.bool)
+                    sliding_kwargs["or_mask_function"] = _bidirectional_window_overlay(self.config.sliding_window)
                 causal_mask_mapping = {
-                    "full_attention": packed_causal_mask(q_len, kv_len, cu_seqlens=cu_seq_lens_q, **mask_kwargs),
+                    "full_attention": packed_causal_mask(q_len, kv_len, cu_seqlens=cu_seq_lens_q, **packed_kwargs),
                     "sliding_attention": sliding_window_mask(
                         q_len,
                         kv_len,
@@ -585,15 +586,28 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
                     ),
                 }
             else:
-                causal_mask_mapping = {
-                    "full_attention": causal_mask(q_len, kv_len, **mask_kwargs),
-                    "sliding_attention": sliding_window_mask(
-                        q_len,
-                        kv_len,
-                        sliding_window=self.config.sliding_window,
-                        **sliding_kwargs,
-                    ),
+                mask_kwargs = {
+                    "config": self.config,
+                    "inputs_embeds": inputs_embeds,
+                    "attention_mask": attention_mask,
+                    "past_key_values": past_key_values,
+                    "position_ids": position_ids,
                 }
+                sliding_mask_kwargs = mask_kwargs.copy()
+                if self.config.use_bidirectional_attention:
+                    mask_kwargs["or_mask_function"] = lambda *args: torch.tensor(True, dtype=torch.bool)
+                    sliding_mask_kwargs["or_mask_function"] = _bidirectional_window_overlay(self.config.sliding_window)
+                # HF builders dispatch on config._attn_implementation; keep it aligned
+                # with the VeOmni attention impl so flex still receives a BlockMask.
+                previous_impl = self.config._attn_implementation
+                self.config._attn_implementation = resolve_op_impl("attn_implementation")
+                try:
+                    causal_mask_mapping = {
+                        "full_attention": create_causal_mask(**mask_kwargs),
+                        "sliding_attention": create_sliding_window_causal_mask(**sliding_mask_kwargs),
+                    }
+                finally:
+                    self.config._attn_implementation = previous_impl
 
         hidden_states = inputs_embeds
         position_embeddings = {}

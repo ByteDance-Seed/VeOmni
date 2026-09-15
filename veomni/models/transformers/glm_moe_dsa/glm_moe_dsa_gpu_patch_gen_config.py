@@ -198,8 +198,6 @@ def glm_moe_dsa_attention_init_patched(self, config: GlmMoeDsaConfig, layer_idx:
     self.scaling = yarn_apply_mscale(config.rope_parameters, self.qk_head_dim ** (-0.5))
     self.skip_topk = config.indexer_types[layer_idx] == "shared"
     self.indexer = None if self.skip_topk else GlmMoeDsaIndexer(config, layer_idx)
-    self.register_buffer("_cached_k_pe", None, persistent=False)
-    self.register_buffer("_cached_kv", None, persistent=False)
     self.veomni_dsa_attention = VeomniOp(
         "dsa_attention",
         "glm",
@@ -209,7 +207,7 @@ def glm_moe_dsa_attention_init_patched(self, config: GlmMoeDsaConfig, layer_idx:
 
 @config.override_method(
     "GlmMoeDsaAttention.forward",
-    description="Always call the local dsa_attention glm VeomniOp",
+    description="DSA consumes compressed K/V from past_key_values.update(), not module buffers",
 )
 def glm_moe_dsa_attention_forward_patched(
     self,
@@ -240,18 +238,13 @@ def glm_moe_dsa_attention_forward_patched(
 
     q_pe, k_pe = apply_rotary_pos_emb_interleave(q_pe, k_pe, cos, sin)
 
-    kv_expanded = self.kv_b_proj(k_compressed)
-    kv_expanded = kv_expanded.view(batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
-    k_nope, value_states = torch.split(kv_expanded, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-    k_nope = k_nope.transpose(1, 2)
-    value_states = value_states.transpose(1, 2)
-
-    k_pe_mqa = k_pe
-    k_pe = k_pe.expand(-1, k_nope.shape[1], -1, -1)
-
-    key_states = torch.cat([k_nope, k_pe], dim=-1)
+    # DSA consumes MQA compressed latents. Keep them on the shared Cache object
+    # (BHSD, concat on seq) instead of module buffers so chunked prefill,
+    # independent requests, and reorder_cache share one lifecycle.
+    k_pe_states = k_pe
+    kv_states = k_compressed.unsqueeze(1)
     if past_key_values is not None:
-        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+        k_pe_states, kv_states = past_key_values.update(k_pe_states, kv_states, self.layer_idx)
 
     if self.indexer is not None:
         indexer_mask = (
@@ -282,17 +275,8 @@ def glm_moe_dsa_attention_forward_patched(
     k_nope_weight = kv_b_weight[:, : self.qk_nope_head_dim, :]
     value_weight = kv_b_weight[:, self.qk_nope_head_dim :, :]
     q_nope_absorbed = torch.einsum("bhsd,hdr->bshr", q_nope, k_nope_weight).contiguous()
-    k_pe_kernel = k_pe_mqa.transpose(1, 2).contiguous()
-    kv_cache = k_compressed.unsqueeze(2).contiguous()
-    if past_key_values is not None:
-        if seq_length > 1:
-            self._cached_k_pe = None
-            self._cached_kv = None
-        if self._cached_k_pe is not None:
-            k_pe_kernel = torch.cat([self._cached_k_pe, k_pe_kernel], dim=1)
-            kv_cache = torch.cat([self._cached_kv, kv_cache], dim=1)
-        self._cached_k_pe = k_pe_kernel
-        self._cached_kv = kv_cache
+    k_pe_kernel = k_pe_states.transpose(1, 2).contiguous()
+    kv_cache = kv_states.transpose(1, 2).contiguous()
 
     compressed_attn_output = self.veomni_dsa_attention(
         q_pe.transpose(1, 2).contiguous(),
