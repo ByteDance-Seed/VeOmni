@@ -93,8 +93,8 @@ def sdpa_attention_forward(
     ``sliding_window`` is shared-signature metadata and is not forwarded. This
     row supports windowed visibility only when it is already encoded in
     ``attention_mask``. ``softcap`` changes logits rather than visibility, so a
-    mask cannot encode it; the argument is accepted for signature compatibility
-    but ignored, and this row does not apply logit softcapping.
+    mask cannot encode it; this row rejects explicit softcapping rather than
+    silently changing attention semantics.
 
     Uses memory-efficient SDPA so a dense bool / additive mask stays valid.
     Flash is not tried. Use ``veomni_flash_attention_*`` when the pattern can
@@ -103,7 +103,10 @@ def sdpa_attention_forward(
     ``skip_ulysses`` opts a call out of sync Ulysses when its tokens are not
     on the SP mesh. Async Ulysses stays outside attention.
     """
-    del sliding_window, softcap
+    del sliding_window
+
+    if softcap is not None:
+        raise ValueError("veomni_sdpa does not support softcap.")
 
     if any(dim == 0 for tensor in (query, key, value) for dim in tensor.shape):
         raise ValueError("SDPA does not support query/key/value tensors with zero dimensions.")

@@ -64,6 +64,20 @@ def test_sdpa_attention_rejects_zero_dimensions():
         sdpa_backend.sdpa_attention_forward(module, query, query, query, attention_mask=None)
 
 
+@pytest.mark.parametrize("softcap", (0.0, 30.0))
+def test_sdpa_attention_rejects_softcap(softcap):
+    query = torch.randn(1, 2, 4, 8)
+    with pytest.raises(ValueError, match="does not support softcap"):
+        sdpa_backend.sdpa_attention_forward(
+            _FakeAttentionModule(),
+            query,
+            query,
+            query,
+            attention_mask=None,
+            softcap=softcap,
+        )
+
+
 def test_sdpa_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
     group = object()
     state = SimpleNamespace(ulysses_group=group, ulysses_size=2)
