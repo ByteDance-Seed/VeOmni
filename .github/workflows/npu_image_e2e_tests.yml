@@ -1,0 +1,125 @@
+name: NPU image system tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Ascend VeOmni image to validate
+        required: true
+        default: quay.io/ascend/veomni:veomni-9.0.0-910b-ubuntu22.04-py3.11-torch2.10.0-latest
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  npu_image_system_tests:
+    name: VeOmni Ascend image ST
+    runs-on: [self-hosted, 910b-8]
+    timeout-minutes: 90
+    # Local CI already runs inside the prepared VeOmni environment, so keep the
+    # job container disabled to avoid pulling the image and creating a sibling container.
+    # container:
+    #   image: ${{ inputs.image }}
+    #   volumes:
+    #     - /usr/local/dcmi:/usr/local/dcmi
+    #     - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi
+    #     - /usr/local/Ascend/driver:/usr/local/Ascend/driver
+    #     - /etc/ascend_install.info:/etc/ascend_install.info:ro
+    #     - /data00/tiger/actions-runner_veomni/proxy/latest_proxy:/tmp/latest_proxy:ro
+    #     - /mnt/veomni_ci:/mnt/veomni_ci:ro
+    #   options: >-
+    #     --cap-add=ALL
+    #     --device /dev/davinci_manager
+    #     --device /dev/devmm_svm
+    #     --device /dev/hisi_hdc
+    #     --device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3
+    #     --device /dev/davinci4 --device /dev/davinci5 --device /dev/davinci6 --device /dev/davinci7
+    #     --device /dev/davinci8 --device /dev/davinci9 --device /dev/davinci10 --device /dev/davinci11
+    #     --device /dev/davinci12 --device /dev/davinci13 --device /dev/davinci14 --device /dev/davinci15
+    #     --shm-size 16g
+    env:
+      IMAGE_PYTHON: /app/.venv/bin/python
+      PYTHONPATH: ${{ github.workspace }}
+      NO_PROXY: localhost,127.0.0.1,hf-mirror.com
+      HF_ENDPOINT: https://hf-mirror.com
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
+      CI_HF_MODELS_DIR: /mnt/veomni_ci/models
+      CI_SAMPLES_DIR: /mnt/veomni_ci/datasets/custom_data/samples
+      CI_DATASET_DIR: /mnt/veomni_ci/datasets
+      HCCL_HOST_SOCKET_PORT_RANGE: auto
+      HCCL_NPU_SOCKET_PORT_RANGE: auto
+      VEOMNI_NPU_IMAGE_GDN: "1"
+
+    steps:
+      - name: Set ASCEND_VISIBLE_DEVICES from runner slice
+        shell: bash
+        run: |
+          set -u
+          name="${RUNNER_NAME:-${HOSTNAME:-}}"
+          cards="0,1,2,3,4,5,6,7"
+          if [[ "$name" =~ ^910b-([0-9]+)$ ]] && (( BASH_REMATCH[1] % 2 != 0 )); then
+            cards="8,9,10,11,12,13,14,15"
+          fi
+          echo "Runner '$name' uses cards $cards"
+          echo "ASCEND_VISIBLE_DEVICES=$cards" | tee -a "$GITHUB_ENV"
+          echo "ASCEND_RT_VISIBLE_DEVICES=$cards" | tee -a "$GITHUB_ENV"
+          echo "PATH=$(dirname "$IMAGE_PYTHON"):$PATH" >> "$GITHUB_ENV"
+
+      - name: Check image environment
+        run: |
+          cat /usr/local/Ascend/ascend-toolkit/latest/"$(uname -i)"-linux/ascend_toolkit_install.info
+          npu-smi info
+          test -x "$IMAGE_PYTHON"
+          command -v torchrun
+          "$IMAGE_PYTHON" -c "import sys, pytest, torch, torch_npu; print(sys.executable); print(pytest.__version__, torch.__version__, getattr(torch_npu, '__version__', 'unknown'))"
+
+      - name: Checkout VeOmni source under test
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          clean: true
+
+      - name: Validate GDN image dependencies
+        run: |
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_fla_npu_installation_contract.py
+
+      - name: Run e2e training tests
+        run: |
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/e2e/test_e2e_parallel.py
+
+      - name: Free NPUs between test steps
+        if: always()
+        run: |
+          npu-smi info || true
+          pids=$(ps -eo pid,args | grep -E 'python.*torchrun|python.*pytest' | grep -v grep | awk '{print $1}' | sort -u | tr '\n' ' ')
+          if [ -n "$pids" ]; then
+            echo "Killing stale NPU processes: $pids"
+            kill -9 $pids 2>/dev/null || true
+            sleep 3
+            npu-smi info || true
+          fi
+
+      - name: Run FSDP equivalence tests
+        run: |
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/distributed/test_fsdp_equivalence.py
+
+      - name: Free NPUs between test steps
+        if: always()
+        run: |
+          npu-smi info || true
+          pids=$(ps -eo pid,args | grep -E 'python.*torchrun|python.*pytest' | grep -v grep | awk '{print $1}' | sort -u | tr '\n' ' ')
+          if [ -n "$pids" ]; then
+            echo "Killing stale NPU processes: $pids"
+            kill -9 $pids 2>/dev/null || true
+            sleep 3
+            npu-smi info || true
+          fi
+
+      - name: Run Wan diffusers test
+        run: |
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/e2e/test_e2e_parallel.py::test_wan_dit_parallel_align

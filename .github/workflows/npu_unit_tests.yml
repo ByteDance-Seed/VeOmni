@@ -151,10 +151,12 @@ jobs:
           uv run --frozen pytest -v -s -x tests/parallel/ulysses/test_ulysses.py
           uv run --frozen pytest -v -s -x tests/parallel/ulysses/test_all_gather.py
           uv run --frozen pytest -v -s -x tests/parallel/ulysses/test_slice_input_tensor.py
+          uv run --frozen pytest -v -s -x tests/parallel/ulysses/test_op_wrapper.py
           uv run --frozen pytest -v -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
           uv run --frozen pytest -v -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
           uv run --frozen pytest -v -s -x tests/parallel/test_ddp_sp_grad_sync.py
           uv run --frozen pytest -v -s -x tests/parallel/test_parallel_state_registry.py
+          uv run --frozen pytest -v -s -x tests/parallel/context_parallel
       - name: Run models tests
         run: |
           uv run --frozen pytest -v -s -x tests/models/test_model_registry.py
@@ -166,9 +168,15 @@ jobs:
           uv run --frozen pytest -v -s -x tests/trainer/test_aux_metrics.py
           uv run --frozen pytest -v -s -x tests/lora/test_vlm_lora.py
           uv run --frozen pytest -v -s -x tests/models/test_checkpoint_tensor_converter.py
+          uv run --frozen pytest -v -s -x tests/models/test_deepseek_v4_liger_ops.py
+          uv run --frozen pytest -v -s -x tests/models/test_generated_call_site_signatures.py
+          uv run --frozen pytest -v -s -x tests/models/test_return_log_probs_e2e_npu.py
       - name: Run fsdp2/extra_parallel+fsdp2 (e.g. ep+fsdp2, mb+fsdp2, ep+emb+fsdp2) clip grad norm test
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
+      - name: Run fsdp2 all ranks or rank0 load model weights
+        run: |
+          uv run --frozen pytest -v -s -x tests/utils/test_rank0_load_and_broadcast_weights.py
       - name: Run MoE ep_sharded_stream_load matrix (non-PEFT)
         # Device-agnostic loader matrix (build_parallelize_model + the 3 weight
         # loaders over EP+FSDP2 on a fake MoE model; no Triton / MoE kernel, so
@@ -187,18 +195,47 @@ jobs:
           uv run --frozen pytest -v -s -x tests/data
       - name: Run ops tests
         run: |
+          uv run --frozen pytest -v -s -x tests/ops/test_chunk_loss.py
+          uv run --frozen pytest -v -s -x tests/ops/test_chunk_topk_distill.py
+          uv run --frozen pytest -v -s -x tests/ops/test_chunked_fused_linear_grad_gating.py
           uv run --frozen pytest -v -s -x tests/ops/test_comp.py
+          uv run --frozen pytest -v -s -x tests/ops/test_eager_kernels_cpu.py
+          uv run --frozen pytest -v -s -x tests/ops/test_expert_scatter_index.py
+          uv run --frozen pytest -v -s -x tests/ops/test_fused_load_balancing_loss.py
           uv run --frozen pytest -v -s -x tests/ops/test_moe_hw_gate.py
+          uv run --frozen pytest -v -s -x tests/ops/test_gdn_ascend_gate.py
+          uv run --frozen pytest -v -s -x tests/ops/test_gdn_varlen_metadata.py
+          uv run --frozen pytest -v -s -x tests/ops/test_kernel_registry_sanity.py
           uv run --frozen pytest -v -s -x tests/ops/test_npu_kernels.py
+          uv run --frozen pytest -v -s -x tests/ops/test_npu_kernels_extended.py
+          uv run --frozen pytest -v -s -x tests/ops/test_seqcls_loss_npu.py
       - name: Run utils tests
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_count_flops.py
+      - name: Run optimizer tests
+        run: |
+          uv run --frozen pytest -v -s -x tests/optim/test_muon_unit.py
+          uv run --frozen pytest -v -s -x tests/distributed/test_muon_zero_comm_shard.py
+          uv run --frozen pytest -v -s -x tests/optim/test_muon_fsdp2_parity.py
+          uv run --frozen pytest -v -s -x tests/optim/test_muon_fsdp2_smoke_npu.py
+          uv run --frozen pytest -v -s -x tests/optim/test_optimizer_vlm_param_groups.py
+      - name: Run LoRA unit and eager tests
+        run: |
+          uv run --frozen pytest -v -s -x tests/lora/test_target_mapping.py
+          uv run --frozen pytest -v -s -x tests/lora/test_veomni_lora_moe_native.py
+          uv run --frozen pytest -v -s -x tests/lora/test_moe_lora_eager.py
       - name: Run LoRA save/load test
         # peft ships under the `npu` extra, so the earlier
         # `uv sync --extra npu --group dev` step already installs it — no extra
         # sync needed here.
         run: |
           uv run --frozen pytest -v -s -x tests/lora/test_lora_trainer_saveload.py
+      - name: Run MoE-LoRA trainer round-trip
+        run: |
+          uv run --frozen pytest -v -s -x tests/lora/test_moe_lora_trainer.py
+      - name: Run MoE-LoRA EP=2 NPU integration and round-trip
+        run: |
+          uv run --frozen pytest -v -s -x tests/lora/test_moe_lora_ep2_npu.py
       - name: Run MoE-LoRA NPU fused vs eager parity
         # Numerical gate for the new NPU fused MoE-LoRA autograd composition
         # (shared + independent; forward + A/B grads; EP=1 vs non-EP).

@@ -36,6 +36,14 @@ _NPU_OPS_DEFAULTS: Dict[str, str] = {
     "load_balancing_loss_implementation": "eager",
 }
 
+_NPU_IMAGE_GDN_ENV = "VEOMNI_NPU_IMAGE_GDN"
+_NPU_IMAGE_GDN_MODELS = {"qwen3_5", "qwen3_5_moe"}
+_NPU_IMAGE_GDN_OVERRIDES = {
+    "rms_norm_gated_implementation": "npu",
+    "causal_conv1d_implementation": "npu",
+    "chunk_gated_delta_rule_implementation": "npu_ascendc",
+}
+
 _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "deepseek_v3": {
         # batch-invariant RMSNorm + deterministic RoPE are GPU-only Triton
@@ -126,10 +134,17 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
 }
 
 
+def is_npu_image_gdn_enabled() -> bool:
+    """Whether the current image test explicitly enables the optional AscendC GDN path."""
+    return os.environ.get(_NPU_IMAGE_GDN_ENV) == "1"
+
+
 def _npu_overrides(model_name: Optional[str]) -> Dict[str, str]:
     merged = dict(_NPU_OPS_DEFAULTS)
     if model_name is not None:
         merged.update(_NPU_PER_MODEL_OVERRIDES.get(model_name, {}))
+        if model_name in _NPU_IMAGE_GDN_MODELS and is_npu_image_gdn_enabled():
+            merged.update(_NPU_IMAGE_GDN_OVERRIDES)
     return merged
 
 
@@ -181,8 +196,9 @@ def make_npu_ops_config(model_name: Optional[str] = None, **overrides) -> OpsImp
     """
     merged = _npu_overrides(model_name)
     merged.update(overrides)
-    # Qwen3.5 GatedDeltaNet ops have no NPU kernel today — pin to eager so the
-    # config validates at parse time.
+    # Keep optional Qwen3.5 GDN dependencies unbound outside the dedicated image
+    # environment. When ``VEOMNI_NPU_IMAGE_GDN=1``, ``_npu_overrides`` has
+    # already selected npu/npu_ascendc and these defaults do not overwrite it.
     merged.setdefault("rms_norm_gated_implementation", "eager")
     merged.setdefault("causal_conv1d_implementation", "eager")
     merged.setdefault("chunk_gated_delta_rule_implementation", "eager")

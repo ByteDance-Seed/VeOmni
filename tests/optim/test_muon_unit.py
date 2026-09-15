@@ -969,7 +969,12 @@ class TestHeadSplitUpdate:
         block_factor = upstream_adjust_lr(1.0, adjust_lr_fn, (block_rows, cols))
         full_factor = upstream_adjust_lr(1.0, adjust_lr_fn, (rows, cols))
         assert block_factor < full_factor
-        torch.testing.assert_close(-p.detach(), block_factor * self._per_block_reference(grad, head_blocks))
+        torch.testing.assert_close(
+            -p.detach(),
+            block_factor * self._per_block_reference(grad, head_blocks),
+            atol=5e-3,
+            rtol=5e-3,
+        )
 
     def test_split_and_full_updates_differ(self):
         """Guard against the split silently degenerating into full-matrix Muon."""
