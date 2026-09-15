@@ -26,14 +26,7 @@ import torch
 from cudnn import DSA
 from flash_mla import flash_mla_sparse_fwd
 
-
-def _local_topk_to_global(topk_indices: torch.Tensor, seqlen_k: int) -> torch.Tensor:
-    if topk_indices.dim() != 3:
-        raise ValueError(f"topk_indices must be [B, S_q, topk], got {tuple(topk_indices.shape)}")
-    batch_offsets = torch.arange(topk_indices.shape[0], device=topk_indices.device, dtype=torch.int32).view(-1, 1, 1)
-    batch_offsets = batch_offsets * int(seqlen_k)
-    topk_i32 = topk_indices.to(torch.int32)
-    return torch.where(topk_i32 >= 0, topk_i32 + batch_offsets, topk_i32)
+from ..topk import local_topk_to_global as _local_topk_to_global
 
 
 def check_sparse_attention_backward_compatible(

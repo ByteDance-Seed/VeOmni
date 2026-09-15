@@ -5,6 +5,25 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from veomni.ops.kernels.dsa.topk import local_topk_to_global
+
+
+def test_local_topk_to_global_masks_out_of_range_indices():
+    """A local index >= kv_len must not wrap into the next batch."""
+    topk_indices = torch.tensor(
+        [
+            [[0, 4, -1], [3, 5, 1]],
+            [[0, 1, 4], [2, -2, 3]],
+        ],
+        dtype=torch.int32,
+    )
+    global_indices = local_topk_to_global(topk_indices, seqlen_k=4)
+    assert global_indices.dtype == torch.int32
+    assert global_indices.tolist() == [
+        [[0, -1, -1], [3, -1, 1]],
+        [[4, 5, -1], [6, -1, 7]],
+    ]
+
 
 @pytest.fixture
 def dsa():
