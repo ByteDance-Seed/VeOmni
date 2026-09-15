@@ -22,11 +22,11 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers.integrations.sdpa_attention import sdpa_attention_forward as hf_sdpa_attention_forward
 
 from .....distributed.parallel_state import get_parallel_state
+from ..helper import reject_sdpa_packed_metadata
 from ..ulysses import (
     prepare_ulysses_qkv,
     restore_ulysses_output,
     should_apply_ulysses,
-    slice_ulysses_head_auxiliary,
 )
 
 
@@ -92,9 +92,10 @@ def sdpa_attention_forward(
 
     ``sliding_window`` is shared-signature metadata and is not forwarded. This
     row supports windowed visibility only when it is already encoded in
-    ``attention_mask``. ``softcap`` changes logits rather than visibility, so a
-    mask cannot encode it; this row rejects explicit softcapping rather than
-    silently changing attention semantics.
+    ``attention_mask``. Packed/varlen metadata is rejected because the SDPA
+    API has no cumulative-length arguments. ``softcap`` changes logits rather
+    than visibility, so a mask cannot encode it; this row rejects explicit
+    softcapping rather than silently changing attention semantics.
 
     Uses memory-efficient SDPA so a dense bool / additive mask stays valid.
     Flash is not tried. Use ``veomni_flash_attention_*`` when the pattern can
@@ -103,10 +104,16 @@ def sdpa_attention_forward(
     ``skip_ulysses`` opts a call out of sync Ulysses when its tokens are not
     on the SP mesh. Async Ulysses stays outside attention.
     """
+    reject_sdpa_packed_metadata(kwargs)
     del sliding_window
 
     if softcap is not None:
         raise ValueError("veomni_sdpa does not support softcap.")
+    if kwargs.get("s_aux") is not None:
+        raise ValueError(
+            "veomni_sdpa does not implement attention sinks (`s_aux`). "
+            "Use veomni_flash_attention_4 or a backend that implements sink-softmax."
+        )
 
     if any(dim == 0 for tensor in (query, key, value) for dim in tensor.shape):
         raise ValueError("SDPA does not support query/key/value tensors with zero dimensions.")
@@ -139,14 +146,6 @@ def sdpa_attention_forward(
             local_query_head_count=query.shape[1],
             group=parallel_state.ulysses_group,
         )
-        if "s_aux" in kwargs:
-            kwargs["s_aux"] = slice_ulysses_head_auxiliary(
-                kwargs["s_aux"],
-                query_head_count=query_head_count,
-                local_query_head_count=query.shape[1],
-                group=parallel_state.ulysses_group,
-            )
-
     with sdpa_kernel(_SDPA_MASK_BACKENDS):
         output, lse = hf_sdpa_attention_forward(
             backend_module,

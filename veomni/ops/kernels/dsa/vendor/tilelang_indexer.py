@@ -91,7 +91,15 @@ class V4IndexerFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_scores, grad_indices):
         index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, topk_indices = ctx.saved_tensors
-        grad_q, grad_w, grad_k = batched_indexer_bwd(index_q, weights, index_k, topk_indices, grad_scores)
+        grad_q, grad_w, grad_k = batched_indexer_bwd(
+            index_q,
+            weights,
+            index_k,
+            topk_indices,
+            grad_scores,
+            cu_seqlen_ks=cu_seqlen_ks,
+            cu_seqlen_ke=cu_seqlen_ke,
+        )
         return grad_q, grad_k, grad_w, None, None, None, None, None
 
 

@@ -29,14 +29,14 @@ from ..ulysses import effective_sequence_lengths
 from .flash import flash_attention_mask_builder
 from .flex import flex_attention_mask_builder
 from .magi import MagiAttentionMask, magi_attention_mask_builder
-from .sdpa import sdpa_attention_mask_builder
+from .sdpa import _dense_attention_mask_builder, sdpa_attention_mask_builder
 
 
 # Flash-like kernels keep causal visibility in ``is_causal`` / varlen kwargs,
 # not a dense mask object. Official ``sageattn`` is flash-like for causal /
 # full on every SM: the public dispatcher takes ``is_causal`` and no dense
 # ``attention_mask``. That is a Sage API fact, not a Wan leftover.
-# Sliding-window and packed patterns are flash-only.
+# SDPA accepts dense masks but has no packed/varlen API.
 _FLASH = frozenset({"flash_attention_2", "flash_attention_3", "flash_attention_4"})
 _SAGE = frozenset({"sage_attention"})
 _FLASH_LIKE_CAUSAL = _FLASH | _SAGE
@@ -97,7 +97,8 @@ def _sdpa_or_eager_mask(
         extra["sliding_window"] = sliding_window
     if cu_seqlens is not None:
         extra["cu_seqlens"] = cu_seqlens
-    mask = sdpa_attention_mask_builder(
+    builder = _dense_attention_mask_builder if backend in _EAGER else sdpa_attention_mask_builder
+    mask = builder(
         batch_size,
         q_len,
         kv_len,
@@ -257,14 +258,17 @@ def packed_causal_mask(
     """Packed causal mask from ``cu_seqlens``.
 
     Flash returns only optional 2D padding metadata; packed lengths stay in
-    kernel kwargs. Flex / SDPA builders receive ``skip_ulysses``. Magi validates
-    ``cu_seqlens`` against the effective post-Ulysses sequence lengths.
+    kernel kwargs. Eager / Flex builders receive ``skip_ulysses``. Magi validates
+    ``cu_seqlens`` against the effective post-Ulysses sequence lengths. SDPA
+    rejects this API because it has no packed/varlen arguments.
     """
     backend = impl.removeprefix("veomni_")
     extra = _compose_or_and(kwargs)
     extra["skip_ulysses"] = skip_ulysses
     if backend in _SAGE:
         raise ValueError("veomni_sage_attention does not support packed_causal_mask")
+    if backend in _SDPA:
+        raise ValueError("SDPA does not support packed_causal_mask; use a packed-capable attention implementation.")
     if backend in _FLASH:
         _require_canonical_causal(backend, extra["mask_function"])
         return flash_attention_mask_builder(
@@ -274,7 +278,7 @@ def packed_causal_mask(
             q_offset=kv_len - q_len,
             **extra,
         )
-    if backend in _SDPA or backend in _EAGER:
+    if backend in _EAGER:
         return _sdpa_or_eager_mask(
             backend,
             batch_size,

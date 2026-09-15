@@ -27,7 +27,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from tests.ops.attention.utils import UlyssesHelperRecorder
 from tests.ops.tol import ATTN_ATOL, ATTN_GRAD_ATOL, ATTN_GRAD_RTOL, ATTN_RTOL
 from tests.ops.utils import is_nvidia_cuda_available
-from veomni.ops import resolve_op
+from veomni.ops import OP_REGISTRY, resolve_op
 from veomni.ops.kernels.attention.standard import flash as flash_backend
 from veomni.utils.device import IS_CUDA_AVAILABLE
 
@@ -217,6 +217,52 @@ def test_registered_fa4_adapter_matches_attention_sink_reference_and_gradients()
             rtol=ATTN_GRAD_RTOL,
             msg=lambda message, tensor_name=name: f"{tensor_name}: {message}",
         )
+
+
+@pytest.mark.parametrize(
+    ("selected", "expected_backend"),
+    (
+        ("veomni_flash_attention_2", "flash_attention_2"),
+        ("veomni_flash_attention_3", "flash_attention_3"),
+        ("veomni_flash_attention_4", "veomni_flash_attention_4"),
+    ),
+)
+@pytest.mark.parametrize(
+    "config_impl",
+    (
+        "veomni_flash_attention_2",
+        "veomni_flash_attention_3",
+        "veomni_flash_attention_4",
+        "eager",
+    ),
+)
+def test_selected_flash_row_pins_backend_when_module_config_differs(
+    monkeypatch, selected, expected_backend, config_impl
+):
+    """Registry/HF selection, not module config, decides the flash vendor token."""
+    captured = {}
+
+    def replacement_backend(query, key, value, attention_mask, **kwargs):
+        captured["attn_implementation"] = kwargs["attn_implementation"]
+        return query
+
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", replacement_backend)
+    monkeypatch.setattr(flash_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
+    wrapper = next(
+        entry.wrapper for entry in OP_REGISTRY.list_entries("attention", "standard") if entry.impl == selected
+    )
+    query = torch.randn(1, 2, 3, 4, dtype=torch.float16)
+
+    wrapper(
+        _FakeAttentionModule(config_impl),
+        query,
+        query,
+        query,
+        None,
+        skip_ulysses=True,
+    )
+
+    assert captured["attn_implementation"] == expected_backend
 
 
 @pytest.mark.parametrize(

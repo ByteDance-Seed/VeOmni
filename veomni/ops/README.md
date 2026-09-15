@@ -189,6 +189,22 @@ into the outer custom-autograd state.
 
 ## Process-wide integrations
 
+The `sdpa` and `veomni_sdpa` attention rows accept ordinary dense attention
+masks but do not expose a packed/varlen API. `packed_causal_mask` rejects these
+implementations, and their attention calls and the VeOmni SDPA mask builder
+reject non-null cumulative-length or varlen maximum-length metadata. Packing
+must use a packed-capable implementation. This follows the public
+[`torch.nn.functional.scaled_dot_product_attention` signature](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html),
+which has `attn_mask` but no `cu_seqlens` arguments. Opaque dense masks are not
+inspected to infer whether they encode sequence boundaries.
+
+The VeOmni SDPA mask builder only honors causal mask-elision hints for the
+canonical causal predicate with equal Q/K lengths and offsets. Bidirectional
+elision requires the canonical bidirectional predicate and an explicit hint.
+Sliding-window and custom predicates always retain an explicit mask, including
+when callers enable skip hints. Transformers still checks padding before any
+permitted elision. Eager shape masks always request an explicit mask.
+
 `install.py` contains idempotent process-wide integration only. Currently it
 registers VeOmni attention names and mask builders on Transformers registries
 and patches the Transformers hub-kernel loader for local FlashAttention

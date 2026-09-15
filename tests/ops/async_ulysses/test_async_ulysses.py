@@ -28,6 +28,11 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from veomni.ops import VeomniOp
+from veomni.ops.kernels.async_ulysses.shared.backward import (
+    linear_backward,
+    linear_input_backward,
+    linear_parameter_backward,
+)
 from veomni.ops.registry import OpEntry, SavedState
 from veomni.utils.device import IS_CUDA_AVAILABLE
 
@@ -38,6 +43,79 @@ _EAGER_ROWS = (
     ("async_ulysses_o", "standard"),
     ("async_ulysses_o", "dit"),
 )
+
+
+def test_linear_backward_matches_autograd_under_cpu_bf16_autocast():
+    """Shared QKV/O backward must accept FP32 saved operands and BF16 grad_output."""
+    torch.manual_seed(6)
+    input_tensor = torch.randn(2, 3, 8, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(12, 8, dtype=torch.float32, requires_grad=True)
+    bias = torch.randn(12, dtype=torch.float32, requires_grad=True)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        output = F.linear(input_tensor, weight, bias)
+    grad_output = torch.randn_like(output)
+    output.backward(grad_output)
+
+    grad_input = linear_input_backward(grad_output, input_tensor.detach(), weight.detach())
+    grad_weight, grad_bias = linear_parameter_backward(
+        grad_output, input_tensor.detach(), weight.detach(), has_bias=True
+    )
+    full_input, full_weight, full_bias = linear_backward(
+        grad_output, input_tensor.detach(), weight.detach(), has_bias=True
+    )
+    torch.testing.assert_close(grad_input, input_tensor.grad)
+    torch.testing.assert_close(grad_weight, weight.grad)
+    torch.testing.assert_close(grad_bias, bias.grad)
+    torch.testing.assert_close(full_input, input_tensor.grad)
+    torch.testing.assert_close(full_weight, weight.grad)
+    torch.testing.assert_close(full_bias, bias.grad)
+
+
+@pytest.mark.parametrize(("op", "variant"), _EAGER_ROWS)
+def test_eager_rows_backward_under_cpu_bf16_autocast(monkeypatch: pytest.MonkeyPatch, op: str, variant: str) -> None:
+    """Each async Ulysses row shares the linear backward helpers."""
+    _mock_identity_comm(monkeypatch)
+    torch.manual_seed(7)
+    batch, seq, hidden = 2, 3, 16
+    head_dim = 4
+    hidden_states = torch.randn(batch, seq, hidden, dtype=torch.float32, requires_grad=True)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        if op == "async_ulysses_qkv":
+            weights = _qkv_weights(hidden, hidden, hidden, dtype=torch.float32)
+            leaves = _leaf(hidden_states, *weights)
+            outputs = VeomniOp(op, variant)(
+                *leaves,
+                None,
+                None,
+                None,
+                None,
+                seq_dimension=1,
+                head_dimension=2,
+                unpadded_dim_size=seq,
+                group=object(),
+                **({"head_dim": head_dim} if variant == "standard" else {}),
+            )
+            loss = sum(output.sum() for output in outputs)
+        else:
+            weight = torch.randn(hidden, hidden, dtype=torch.float32, requires_grad=True)
+            bias = torch.randn(hidden, dtype=torch.float32, requires_grad=True)
+            if variant == "standard":
+                hidden_states = torch.randn(
+                    batch, seq, hidden // head_dim, head_dim, dtype=torch.float32, requires_grad=True
+                )
+            leaves = _leaf(hidden_states, weight, bias)
+            loss = VeomniOp(op, variant)(
+                *leaves,
+                seq_dimension=1,
+                head_dimension=2,
+                unpadded_dim_size=seq,
+                group=object(),
+            ).sum()
+        loss.backward()
+    for tensor in leaves:
+        assert tensor.grad is not None
+        assert tensor.grad.dtype == torch.float32
+        assert torch.isfinite(tensor.grad).all()
 
 
 def _eager_module(op: str, variant: str):
@@ -572,3 +650,14 @@ def test_nested_rms_handle_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.autograd.backward(expected, grad_outputs)
     for actual_input, expected_input in zip(actual_inputs, expected_inputs, strict=True):
         torch.testing.assert_close(actual_input.grad, expected_input.grad)
+
+
+def test_dit_parity_world_size_matches_skip_gate():
+    """The 4-GPU skip and the spawned world size must share one constant."""
+    from tests.ops.async_ulysses.test_async_ulysses_dit_parity import (
+        DIT_SP_WORLD_SIZE,
+        AsyncUlyssesDiTSequenceParallelTest,
+    )
+
+    assert DIT_SP_WORLD_SIZE == 4
+    assert AsyncUlyssesDiTSequenceParallelTest.world_size.fget(object()) == DIT_SP_WORLD_SIZE

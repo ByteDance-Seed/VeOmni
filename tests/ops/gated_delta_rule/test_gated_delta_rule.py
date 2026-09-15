@@ -731,6 +731,56 @@ def test_ensure_varlen_metadata_reuses_precomputed_tables() -> None:
         assert got_list_dict[key] == values
 
 
+@pytest.mark.parametrize(
+    ("cu_seqlens", "expected"),
+    (
+        ([0, 0, 64], [[1, 0]]),
+        ([0, 64, 64, 128], [[0, 0], [2, 0]]),
+        ([0, 0, 0], []),
+        ([0, 128], [[0, 0], [0, 1]]),
+    ),
+)
+def test_prepare_chunk_indices_keeps_original_sequence_ids(cu_seqlens: list[int], expected: list[list[int]]) -> None:
+    """Empty sequences emit no rows, but later IDs are not compacted."""
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import npu_ascendc as m
+
+    boundaries = torch.tensor(cu_seqlens, dtype=torch.long)
+    tensor_rows = m._prepare_chunk_indices(boundaries, chunk_size=64)
+    list_rows = m._prepare_chunk_indices_list(cu_seqlens, chunk_size=64)
+    assert tensor_rows.tolist() == expected
+    assert list_rows == [item for row in expected for item in row]
+
+
+def test_npu_ascendc_rejects_trainable_initial_state(
+    monkeypatch: pytest.MonkeyPatch,
+    _stub_npu_input_guard: None,
+) -> None:
+    """Function.forward disables grad, so the check must use requires_grad."""
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import npu_ascendc as module
+
+    def unexpected_kernel(*args, **kwargs):
+        pytest.fail("trainable initial_state reached the AscendC kernel")
+
+    monkeypatch.setattr(module, "_chunk_fwd", unexpected_kernel)
+    shape = (1, 4, 2, 8)
+    query = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
+    key = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
+    value = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
+    g = torch.randn(shape[:3], dtype=torch.float32, requires_grad=True)
+    beta = torch.randn(shape[:3], dtype=torch.bfloat16, requires_grad=True)
+    initial_state = torch.randn(1, 2, 8, 8, dtype=torch.bfloat16, requires_grad=True)
+    entry = OpEntry(
+        "test_chunk_gdr_h0",
+        "standard",
+        "npu_ascendc",
+        module.forward,
+        module.backward,
+        description="Test trainable initial_state reject",
+    )
+    with pytest.raises(NotImplementedError, match="cannot differentiate initial_state"):
+        entry.wrapper(query, key, value, g, beta, initial_state=initial_state)
+
+
 def test_npu_ascendc_missing_fla_npu_raises_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
     import builtins
     import sys

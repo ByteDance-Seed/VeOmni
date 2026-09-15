@@ -25,6 +25,17 @@ from veomni.utils.device import get_device_type
 DEVICE = get_device_type()
 
 
+def test_fp8_scale_pairing_rejects_e8m0_without_format():
+    from veomni.ops.qat.scale import validate_fp8_scale_pairing
+
+    validate_fp8_scale_pairing(None, torch.float32)
+    validate_fp8_scale_pairing("ue8m0", torch.float8_e8m0fnu)
+    with pytest.raises(AssertionError, match="powers of two"):
+        validate_fp8_scale_pairing(None, torch.float8_e8m0fnu)
+    with pytest.raises(AssertionError, match="float32 and float8_e8m0fnu"):
+        validate_fp8_scale_pairing(None, torch.float16)
+
+
 def test_tilelang_fp4_quant_matches_reference_and_dequantizes():
     require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.qat.quant import fp4_act_quant
@@ -287,3 +298,11 @@ def test_tilelang_fp8_weight_quant_rejects_unsupported_inputs():
     # divide by, so the pairing has to be rejected instead of drifting.
     with pytest.raises(AssertionError, match="powers of two"):
         fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float8_e8m0fnu)
+
+
+def test_tilelang_act_quant_rejects_e8m0_without_format():
+    require_nvidia_cuda("tilelang", min_cc=90)
+    from veomni.ops.qat.quant import act_quant
+
+    with pytest.raises(AssertionError, match="powers of two"):
+        act_quant(torch.empty(4, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float8_e8m0fnu)

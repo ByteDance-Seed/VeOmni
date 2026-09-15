@@ -58,6 +58,17 @@ def test_mask_builder_return_types():
     assert magi.q_ranges.shape == (1, 2)
 
 
+@pytest.mark.parametrize("allow_skip", (None, False, True))
+def test_sdpa_canonical_causal_skip_remains_optional(allow_skip):
+    """Ordinary square causal attention retains its mask-elision optimization."""
+    kwargs = {} if allow_skip is None else {"allow_is_causal_skip": allow_skip}
+    mask = sdpa_attention_mask_builder(1, 4, 4, device="cpu", skip_ulysses=True, **kwargs)
+    if allow_skip is False:
+        torch.testing.assert_close(mask[0, 0], torch.ones(4, 4, dtype=torch.bool).tril())
+    else:
+        assert mask is None
+
+
 def test_flash_mask_builder_preserves_padding_and_elides_all_valid_mask():
     padded = torch.tensor([[1, 1, 1, 0]], dtype=torch.bool)
     torch.testing.assert_close(
@@ -221,8 +232,12 @@ def test_flex_and_sdpa_ulysses_reject_custom_mask_without_metadata(monkeypatch, 
 )
 def test_flex_and_sdpa_ulysses_allow_sliding_window_without_metadata(monkeypatch, builder, module):
     _patch_mask_ulysses(monkeypatch, module, apply=True)
-    mask = builder(1, 4, 4, sliding_window=2, device="cpu", allow_is_causal_skip=False)
+    mask = builder(1, 4, 4, sliding_window=2, device="cpu")
     assert tuple(mask.shape[-2:]) == (8, 8)
+    visible = flex_visible(mask, 8, 8) if builder is flex_attention_mask_builder else mask[0, 0]
+    positions = torch.arange(8)
+    distance = positions[:, None] - positions[None, :]
+    torch.testing.assert_close(visible, (distance >= 0) & (distance < 2))
 
 
 def test_magi_hf_builder_expands_ulysses_local_lengths(monkeypatch):

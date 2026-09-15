@@ -56,10 +56,22 @@ def token_mask(gate_logits: Tensor, attention_mask: Tensor) -> Tensor | None:
     return attention_mask.reshape(-1).to(device=gate_logits.device, dtype=torch.float32).repeat(num_layers)
 
 
-def _safe_grad_scale(grad_output: Tensor, num_experts: int, total_weight: Tensor) -> Tensor:
-    """Scale the backward on-device while mapping zero total weight to zero."""
+def _safe_weight_terms(total_weight: Tensor) -> tuple[Tensor, Tensor]:
+    """Keep zero-weight handling on-device. Do not Python-compare the scalar."""
     has_weight = total_weight != 0
     safe_total_weight = torch.where(has_weight, total_weight, torch.ones_like(total_weight))
+    return has_weight, safe_total_weight
+
+
+def _safe_loss(expert_count: Tensor, router_prob_sum: Tensor, num_experts: int, total_weight: Tensor) -> Tensor:
+    """Switch-Transformer aux loss with a graph-connected zero when nothing is kept."""
+    has_weight, safe_total_weight = _safe_weight_terms(total_weight)
+    return torch.dot(expert_count, router_prob_sum) * (num_experts / safe_total_weight.square()) * has_weight
+
+
+def _safe_grad_scale(grad_output: Tensor, num_experts: int, total_weight: Tensor) -> Tensor:
+    """Scale the backward on-device while mapping zero total weight to zero."""
+    has_weight, safe_total_weight = _safe_weight_terms(total_weight)
     return grad_output * num_experts / safe_total_weight.square() * has_weight
 
 
@@ -90,12 +102,9 @@ def forward(gate_logits: Tensor, attention_mask: Tensor, *, top_k: int) -> tuple
         expert_count.scatter_add_(
             0, selected.reshape(-1), torch.ones(selected.numel(), device=device, dtype=torch.float32)
         )
-        total_weight = torch.tensor(float(token_count), device=device)
+        total_weight = torch.empty((), device=device, dtype=torch.float32).fill_(token_count)
 
-    if total_weight == 0:
-        loss = torch.zeros((), device=device, dtype=torch.float32)
-    else:
-        loss = torch.dot(expert_count, router_prob_sum) * (num_experts / (total_weight * total_weight))
+    loss = _safe_loss(expert_count, router_prob_sum, num_experts, total_weight)
     return loss, SavedState((gate_logits, attention_mask, expert_count, total_weight), _Meta(top_k, mask is not None))
 
 

@@ -49,7 +49,7 @@ def wrapper(
     ``attention_mask`` is the official additive causal / padding mask,
     broadcastable to ``[B, 1, S, T]``.
     """
-    del use_cache, training, attention_dropout
+    del use_cache
     query = torch.cat((q_nope_absorbed, q_pe), dim=-1)
     key = torch.cat((kv_cache.squeeze(2), k_pe.squeeze(2)), dim=-1)
     value = kv_cache.squeeze(2)
@@ -74,5 +74,7 @@ def wrapper(
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask[..., :kv_len]
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_h.dtype)
+    if training and attention_dropout > 0.0:
+        attn_weights = F.dropout(attn_weights, p=attention_dropout, training=True)
     out = torch.matmul(attn_weights, value_h)
     return out.transpose(1, 2).contiguous()
