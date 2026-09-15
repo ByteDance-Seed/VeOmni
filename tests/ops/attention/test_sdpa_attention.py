@@ -142,11 +142,9 @@ def test_sdpa_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
     monkeypatch.setattr(sdpa_backend, "get_parallel_state", lambda: state)
     monkeypatch.setattr(sdpa_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
     monkeypatch.setattr(sdpa_backend, "prepare_ulysses_qkv", recorder.prepare)
-    monkeypatch.setattr(sdpa_backend, "slice_ulysses_head_auxiliary", recorder.slice_auxiliary)
     monkeypatch.setattr(sdpa_backend, "hf_sdpa_attention_forward", fake_backend)
     monkeypatch.setattr(sdpa_backend, "restore_ulysses_output", recorder.restore)
     query = torch.randn(1, 4, 8, 8)
-    auxiliary = torch.arange(4)
 
     output, _ = sdpa_backend.sdpa_attention_forward(
         _FakeAttentionModule(),
@@ -154,14 +152,34 @@ def test_sdpa_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
         query[:, :2],
         query[:, :2],
         attention_mask=None,
-        s_aux=auxiliary,
     )
 
-    assert [call[0] for call in recorder.calls] == ["prepare", "slice", "backend", "restore"]
+    assert [call[0] for call in recorder.calls] == ["prepare", "backend", "restore"]
     assert recorder.calls[0][1].shape == (1, 8, 4, 8)
     assert recorder.calls[0][4:] == (group, 2)
-    torch.testing.assert_close(recorder.calls[2][-1]["s_aux"], auxiliary[:2])
     assert output.shape == (1, 8, 2, 8)
+
+
+def test_sdpa_attention_rejects_s_aux_before_ulysses(monkeypatch):
+    """Sink softmax is not implemented; fail closed before any collective."""
+
+    def unexpected_call(*args, **kwargs):
+        pytest.fail("s_aux reached SDPA Ulysses or backend handling")
+
+    monkeypatch.setattr(sdpa_backend, "get_parallel_state", unexpected_call)
+    monkeypatch.setattr(sdpa_backend, "should_apply_ulysses", unexpected_call)
+    monkeypatch.setattr(sdpa_backend, "prepare_ulysses_qkv", unexpected_call)
+    monkeypatch.setattr(sdpa_backend, "hf_sdpa_attention_forward", unexpected_call)
+    query = torch.randn(1, 2, 4, 8)
+    with pytest.raises(ValueError, match="does not implement attention sinks"):
+        sdpa_backend.sdpa_attention_forward(
+            _FakeAttentionModule(),
+            query,
+            query,
+            query,
+            attention_mask=None,
+            s_aux=torch.arange(2),
+        )
 
 
 def test_sdpa_attention_skip_ulysses_skips_exchange(monkeypatch):

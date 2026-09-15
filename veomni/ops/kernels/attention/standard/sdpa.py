@@ -27,7 +27,6 @@ from ..ulysses import (
     prepare_ulysses_qkv,
     restore_ulysses_output,
     should_apply_ulysses,
-    slice_ulysses_head_auxiliary,
 )
 
 
@@ -110,6 +109,11 @@ def sdpa_attention_forward(
 
     if softcap is not None:
         raise ValueError("veomni_sdpa does not support softcap.")
+    if kwargs.get("s_aux") is not None:
+        raise ValueError(
+            "veomni_sdpa does not implement attention sinks (`s_aux`). "
+            "Use veomni_flash_attention_4 or a backend that implements sink-softmax."
+        )
 
     if any(dim == 0 for tensor in (query, key, value) for dim in tensor.shape):
         raise ValueError("SDPA does not support query/key/value tensors with zero dimensions.")
@@ -142,14 +146,6 @@ def sdpa_attention_forward(
             local_query_head_count=query.shape[1],
             group=parallel_state.ulysses_group,
         )
-        if "s_aux" in kwargs:
-            kwargs["s_aux"] = slice_ulysses_head_auxiliary(
-                kwargs["s_aux"],
-                query_head_count=query_head_count,
-                local_query_head_count=query.shape[1],
-                group=parallel_state.ulysses_group,
-            )
-
     with sdpa_kernel(_SDPA_MASK_BACKENDS):
         output, lse = hf_sdpa_attention_forward(
             backend_module,
