@@ -68,7 +68,7 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import capture_outputs
 
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
-from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl
+from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl, uses_swiglu_mlp
 from veomni.ops import VeomniOp
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
@@ -113,15 +113,17 @@ class Qwen3MLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        return self.veomni_swiglu_mlp(
-            x,
-            self.gate_proj.weight,
-            linear_bias(self.gate_proj),
-            self.up_proj.weight,
-            linear_bias(self.up_proj),
-            self.down_proj.weight,
-            linear_bias(self.down_proj),
-        )
+        if uses_swiglu_mlp(self.config.hidden_act):
+            return self.veomni_swiglu_mlp(
+                x,
+                self.gate_proj.weight,
+                linear_bias(self.gate_proj),
+                self.up_proj.weight,
+                linear_bias(self.up_proj),
+                self.down_proj.weight,
+                linear_bias(self.down_proj),
+            )
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Qwen3RotaryEmbedding(nn.Module):

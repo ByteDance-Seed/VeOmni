@@ -25,7 +25,7 @@
 +#    - method_override: Qwen2MLP.__init__
 +#      Construct a local swiglu_mlp VeomniOp
 +#    - method_override: Qwen2MLP.forward
-+#      Always call the local swiglu_mlp VeomniOp
++#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
 +#    - function_replacement: apply_rotary_pos_emb
 +#      Leftover helper; Attention uses the instance-local rope handle
 +#    - method_override: Qwen2Model.forward
@@ -101,7 +101,7 @@
 +from transformers.utils.output_capturing import capture_outputs
 +
 +from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
-+from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl
++from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl, uses_swiglu_mlp
 +from veomni.ops import VeomniOp
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 +
@@ -119,7 +119,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -42,10 +96,18 @@
+@@ -42,10 +96,20 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -128,19 +128,21 @@
      def forward(self, x):
 -        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 -        return down_proj
-+        return self.veomni_swiglu_mlp(
-+            x,
-+            self.gate_proj.weight,
-+            linear_bias(self.gate_proj),
-+            self.up_proj.weight,
-+            linear_bias(self.up_proj),
-+            self.down_proj.weight,
-+            linear_bias(self.down_proj),
-+        )
++        if uses_swiglu_mlp(self.config.hidden_act):
++            return self.veomni_swiglu_mlp(
++                x,
++                self.gate_proj.weight,
++                linear_bias(self.gate_proj),
++                self.up_proj.weight,
++                linear_bias(self.up_proj),
++                self.down_proj.weight,
++                linear_bias(self.down_proj),
++            )
++        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
  class Qwen2RotaryEmbedding(nn.Module):
-@@ -109,30 +171,22 @@
+@@ -109,30 +173,22 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
@@ -187,7 +189,7 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -172,10 +226,17 @@
+@@ -172,10 +228,17 @@
      return attn_output, attn_weights
 
 
@@ -205,7 +207,7 @@
      def __init__(self, config: Qwen2Config, layer_idx: int):
          super().__init__()
          self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
-@@ -191,6 +252,9 @@
+@@ -191,6 +254,9 @@
          self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
          self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
          self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
@@ -215,7 +217,7 @@
 
      def forward(
          self,
-@@ -208,16 +272,12 @@
+@@ -208,16 +274,12 @@
          value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
          cos, sin = position_embeddings
@@ -234,7 +236,7 @@
              self,
              query_states,
              key_states,
-@@ -225,7 +285,7 @@
+@@ -225,7 +287,7 @@
              attention_mask,
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
@@ -243,7 +245,7 @@
              **kwargs,
          )
 
-@@ -234,22 +294,22 @@
+@@ -234,22 +296,22 @@
          return attn_output, attn_weights
 
 
@@ -275,7 +277,7 @@
 
      def extra_repr(self):
          return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-@@ -317,6 +377,12 @@
+@@ -317,6 +379,12 @@
      }
 
 
@@ -288,7 +290,7 @@
  @auto_docstring
  class Qwen2Model(Qwen2PreTrainedModel):
      def __init__(self, config: Qwen2Config):
-@@ -347,6 +413,7 @@
+@@ -347,6 +415,7 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
@@ -296,7 +298,7 @@
          **kwargs: Unpack[TransformersKwargs],
      ) -> BaseModelOutputWithPast:
          if (input_ids is None) ^ (inputs_embeds is not None):
-@@ -358,14 +425,16 @@
+@@ -358,14 +427,16 @@
          if use_cache and past_key_values is None:
              past_key_values = DynamicCache(config=self.config)
 
@@ -319,7 +321,7 @@
              mask_kwargs = {
                  "config": self.config,
                  "inputs_embeds": inputs_embeds,
-@@ -373,15 +442,14 @@
+@@ -373,15 +444,14 @@
                  "past_key_values": past_key_values,
                  "position_ids": position_ids,
              }
@@ -336,7 +338,7 @@
          position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
          for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
-@@ -392,6 +460,7 @@
+@@ -392,6 +462,7 @@
                  position_ids=position_ids,
                  past_key_values=past_key_values,
                  use_cache=use_cache,
@@ -344,7 +346,7 @@
                  **kwargs,
              )
 
-@@ -400,6 +469,12 @@
+@@ -400,6 +471,12 @@
              last_hidden_state=hidden_states,
              past_key_values=past_key_values if use_cache else None,
          )
@@ -357,7 +359,7 @@
 
 
  @auto_docstring
-@@ -414,8 +489,9 @@
+@@ -414,8 +491,9 @@
          self.model = Qwen2Model(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -369,7 +371,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -429,46 +505,103 @@
+@@ -429,46 +507,103 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -496,7 +498,7 @@
              loss=loss,
              logits=logits,
              past_key_values=outputs.past_key_values,
-@@ -477,16 +610,45 @@
+@@ -477,16 +612,45 @@
          )
 
 

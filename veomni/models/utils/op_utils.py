@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Helpers for constructing ``VeomniOp`` handles.
+"""Helpers for constructing ``VeomniOp`` handles and SwiGLU activation routing.
 
 Read impl names from ``get_ops_config`` at construct time. ``npu`` on
 cross-entropy maps to ``chunk_loss``.
@@ -20,10 +20,55 @@ cross-entropy maps to ``chunk_loss``.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
+import torch
 from torch import Tensor, nn
 
 from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config
+
+
+SWIGLU_HIDDEN_ACTS = frozenset({"silu", "swish"})
+
+
+def uses_swiglu_mlp(hidden_act: str) -> bool:
+    """Whether fused SwiGLU / silu MoE kernels match this ``hidden_act``.
+
+    Those kernels are silu-only. ``swish`` is the same function. Any other
+    activation stays on ``self.act_fn`` instead of teaching fused SwiGLU a
+    generic activation.
+    """
+    return hidden_act in SWIGLU_HIDDEN_ACTS
+
+
+def merged_experts_act_fn_forward(
+    hidden_states: Tensor,
+    top_k_index: Tensor,
+    top_k_weights: Tensor,
+    gate_up_proj: Tensor,
+    down_proj: Tensor,
+    act_fn: Callable[[Tensor], Tensor],
+    num_experts: int,
+) -> Tensor:
+    """HF merged-expert loop: ``down(act_fn(gate) * up)`` then routing weights."""
+    final_hidden_states = hidden_states.new_zeros(hidden_states.shape)
+    with torch.no_grad():
+        expert_mask = nn.functional.one_hot(top_k_index, num_classes=num_experts)
+        expert_mask = expert_mask.permute(2, 1, 0)
+        expert_hit = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero()
+    for expert_idx in expert_hit:
+        expert_idx = expert_idx[0]
+        if expert_idx == num_experts:
+            continue
+        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+        current_state = hidden_states[token_idx]
+        gate, up = nn.functional.linear(current_state, gate_up_proj[expert_idx]).chunk(2, dim=-1)
+        current_hidden_states = act_fn(gate) * up
+        current_hidden_states = nn.functional.linear(current_hidden_states, down_proj[expert_idx])
+        current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+        final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+    return final_hidden_states
 
 
 def resolve_op_impl(field: str, *, npu_as: str | None = None) -> str:

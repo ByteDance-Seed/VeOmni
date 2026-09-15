@@ -95,7 +95,7 @@
 +from transformers.utils.output_capturing import capture_outputs
 +
 +from veomni.models.loss_utils import ForCausalLMLoss
-+from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl
++from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl, uses_swiglu_mlp
 +from veomni.ops import VeomniOp
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 +
@@ -143,7 +143,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -77,11 +103,19 @@
+@@ -77,11 +103,22 @@
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
          self.residual_dropout = config.residual_dropout
@@ -153,20 +153,23 @@
 -        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 -        down_proj = nn.functional.dropout(down_proj, p=self.residual_dropout, training=self.training)
 -        return down_proj
-+        down_proj = self.veomni_swiglu_mlp(
-+            x,
-+            self.gate_proj.weight,
-+            linear_bias(self.gate_proj),
-+            self.up_proj.weight,
-+            linear_bias(self.up_proj),
-+            self.down_proj.weight,
-+            linear_bias(self.down_proj),
-+        )
++        if uses_swiglu_mlp(self.config.hidden_act):
++            down_proj = self.veomni_swiglu_mlp(
++                x,
++                self.gate_proj.weight,
++                linear_bias(self.gate_proj),
++                self.up_proj.weight,
++                linear_bias(self.up_proj),
++                self.down_proj.weight,
++                linear_bias(self.down_proj),
++            )
++        else:
++            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 +        return nn.functional.dropout(down_proj, p=self.residual_dropout, training=self.training)
 
 
  def rotate_half(x):
-@@ -91,30 +125,22 @@
+@@ -91,30 +128,22 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
@@ -213,7 +216,7 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -154,7 +180,14 @@
+@@ -154,7 +183,14 @@
      return attn_output, attn_weights
 
 
@@ -228,7 +231,7 @@
      def __init__(self, config: SeedOssConfig, layer_idx: int):
          super().__init__()
          self.config = config
-@@ -181,6 +214,9 @@
+@@ -181,6 +217,9 @@
          )
 
          self.residual_dropout = config.residual_dropout
@@ -238,7 +241,7 @@
 
      def forward(
          self,
-@@ -198,16 +234,12 @@
+@@ -198,16 +237,12 @@
          value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
          cos, sin = position_embeddings
@@ -257,7 +260,7 @@
              self,
              query_states,
              key_states,
-@@ -418,6 +450,12 @@
+@@ -418,6 +453,12 @@
          )
 
 
@@ -270,7 +273,7 @@
  @auto_docstring
  class SeedOssForCausalLM(SeedOssPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -430,8 +468,9 @@
+@@ -430,8 +471,9 @@
          self.model = SeedOssModel(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -282,7 +285,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -445,53 +484,43 @@
+@@ -445,53 +487,43 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,

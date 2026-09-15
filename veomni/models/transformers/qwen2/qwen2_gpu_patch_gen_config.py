@@ -38,7 +38,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
-from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl
+from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl, uses_swiglu_mlp
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
@@ -65,7 +65,7 @@ config.add_import(
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models.utils.op_utils",
-    names=["attention_op", "linear_bias", "resolve_op_impl"],
+    names=["attention_op", "linear_bias", "resolve_op_impl", "uses_swiglu_mlp"],
 )
 config.add_import(
     "veomni.models.loss_utils",
@@ -110,18 +110,20 @@ def qwen2_mlp_init_patched(self, config):
 
 @config.override_method(
     "Qwen2MLP.forward",
-    description="Always call the local swiglu_mlp VeomniOp",
+    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
 )
 def qwen2_mlp_forward_patched(self, x):
-    return self.veomni_swiglu_mlp(
-        x,
-        self.gate_proj.weight,
-        linear_bias(self.gate_proj),
-        self.up_proj.weight,
-        linear_bias(self.up_proj),
-        self.down_proj.weight,
-        linear_bias(self.down_proj),
-    )
+    if uses_swiglu_mlp(self.config.hidden_act):
+        return self.veomni_swiglu_mlp(
+            x,
+            self.gate_proj.weight,
+            linear_bias(self.gate_proj),
+            self.up_proj.weight,
+            linear_bias(self.up_proj),
+            self.down_proj.weight,
+            linear_bias(self.down_proj),
+        )
+    return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 @config.replace_function(

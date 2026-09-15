@@ -16,7 +16,7 @@
 #    - method_override: SeedOssMLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: SeedOssMLP.forward
-#      Always call the local swiglu_mlp VeomniOp, then residual dropout
+#      Call swiglu_mlp for silu/swish, otherwise self.act_fn, then residual dropout
 #    - function_replacement: apply_rotary_pos_emb
 #      Always call rope full VeomniOp
 #    - method_override: SeedOssForCausalLM.__init__
@@ -60,7 +60,7 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import capture_outputs
 
 from veomni.models.loss_utils import ForCausalLMLoss
-from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl
+from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl, uses_swiglu_mlp
 from veomni.ops import VeomniOp
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
@@ -106,15 +106,18 @@ class SeedOssMLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        down_proj = self.veomni_swiglu_mlp(
-            x,
-            self.gate_proj.weight,
-            linear_bias(self.gate_proj),
-            self.up_proj.weight,
-            linear_bias(self.up_proj),
-            self.down_proj.weight,
-            linear_bias(self.down_proj),
-        )
+        if uses_swiglu_mlp(self.config.hidden_act):
+            down_proj = self.veomni_swiglu_mlp(
+                x,
+                self.gate_proj.weight,
+                linear_bias(self.gate_proj),
+                self.up_proj.weight,
+                linear_bias(self.up_proj),
+                self.down_proj.weight,
+                linear_bias(self.down_proj),
+            )
+        else:
+            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return nn.functional.dropout(down_proj, p=self.residual_dropout, training=self.training)
 
 

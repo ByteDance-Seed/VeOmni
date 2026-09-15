@@ -28,7 +28,7 @@
 +#    - method_override: LlamaMLP.__init__
 +#      Construct a local swiglu_mlp VeomniOp
 +#    - method_override: LlamaMLP.forward
-+#      Always call the local swiglu_mlp VeomniOp
++#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
 +#    - function_replacement: apply_rotary_pos_emb
 +#      Always call rope full VeomniOp
 +#    - method_override: LlamaForCausalLM.__init__
@@ -100,7 +100,7 @@
 +from transformers.utils.output_capturing import capture_outputs
 +
 +from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
-+from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl
++from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl, uses_swiglu_mlp
 +from veomni.ops import VeomniOp
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
@@ -193,7 +193,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -170,10 +192,18 @@
+@@ -170,10 +192,20 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -202,19 +202,21 @@
      def forward(self, x):
 -        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 -        return down_proj
-+        return self.veomni_swiglu_mlp(
-+            x,
-+            self.gate_proj.weight,
-+            linear_bias(self.gate_proj),
-+            self.up_proj.weight,
-+            linear_bias(self.up_proj),
-+            self.down_proj.weight,
-+            linear_bias(self.down_proj),
-+        )
++        if uses_swiglu_mlp(self.config.hidden_act):
++            return self.veomni_swiglu_mlp(
++                x,
++                self.gate_proj.weight,
++                linear_bias(self.gate_proj),
++                self.up_proj.weight,
++                linear_bias(self.up_proj),
++                self.down_proj.weight,
++                linear_bias(self.down_proj),
++            )
++        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -213,10 +243,17 @@
+@@ -213,10 +245,17 @@
      return attn_output, attn_weights
 
 
@@ -232,7 +234,7 @@
      def __init__(self, config: LlamaConfig, layer_idx: int):
          super().__init__()
          self.config = config
-@@ -239,6 +276,9 @@
+@@ -239,6 +278,9 @@
          self.o_proj = nn.Linear(
              config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
          )
@@ -242,7 +244,7 @@
 
      def forward(
          self,
-@@ -256,16 +296,12 @@
+@@ -256,16 +298,12 @@
          value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
          cos, sin = position_embeddings
@@ -261,7 +263,7 @@
              self,
              query_states,
              key_states,
-@@ -417,6 +453,12 @@
+@@ -417,6 +455,12 @@
          )
 
 
@@ -274,7 +276,7 @@
  @auto_docstring
  class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -429,8 +471,9 @@
+@@ -429,8 +473,9 @@
          self.model = LlamaModel(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -286,7 +288,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -444,55 +487,110 @@
+@@ -444,55 +489,110 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,

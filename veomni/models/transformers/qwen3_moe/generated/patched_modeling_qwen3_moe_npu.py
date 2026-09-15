@@ -78,7 +78,15 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss, load_balancing_loss
-from veomni.models.utils.op_utils import attention_op, empty_bias, linear_bias, resolve_moe_impl, resolve_op_impl
+from veomni.models.utils.op_utils import (
+    attention_op,
+    empty_bias,
+    linear_bias,
+    merged_experts_act_fn_forward,
+    resolve_moe_impl,
+    resolve_op_impl,
+    uses_swiglu_mlp,
+)
 from veomni.ops import VeomniOp
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
@@ -243,15 +251,17 @@ class Qwen3MoeMLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        return self.veomni_swiglu_mlp(
-            x,
-            self.gate_proj.weight,
-            linear_bias(self.gate_proj),
-            self.up_proj.weight,
-            linear_bias(self.up_proj),
-            self.down_proj.weight,
-            linear_bias(self.down_proj),
-        )
+        if uses_swiglu_mlp(self.config.hidden_act):
+            return self.veomni_swiglu_mlp(
+                x,
+                self.gate_proj.weight,
+                linear_bias(self.gate_proj),
+                self.up_proj.weight,
+                linear_bias(self.up_proj),
+                self.down_proj.weight,
+                linear_bias(self.down_proj),
+            )
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 # ======================================================================
@@ -271,6 +281,7 @@ class Qwen3MoeExperts(torch.nn.Module):
         )
         self.down_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
+        self.use_swiglu_mlp = uses_swiglu_mlp(config.hidden_act)
         self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
 
     def forward(
@@ -279,6 +290,16 @@ class Qwen3MoeExperts(torch.nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
+        if not self.use_swiglu_mlp:
+            return merged_experts_act_fn_forward(
+                hidden_states,
+                top_k_index,
+                top_k_weights,
+                self.gate_up_proj,
+                self.down_proj,
+                self.act_fn,
+                self.num_experts,
+            )
         unused = empty_bias(self.gate_up_proj)
         return self.veomni_moe(
             hidden_states,

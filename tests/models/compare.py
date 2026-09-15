@@ -325,3 +325,52 @@ def assert_outputs_and_grads_match(
             continue
         assert ours_grads[name].grad is not None, name
         torch.testing.assert_close(ours_grads[name].grad, param.grad, atol=grad_atol, rtol=grad_rtol, msg=name)
+
+
+def assert_module_forward_and_grads_match(
+    hf_module: torch.nn.Module,
+    ours_module: torch.nn.Module,
+    *args: object,
+    atol: float = EAGER_ATOL,
+    rtol: float = EAGER_RTOL,
+    grad_atol: float = EAGER_GRAD_ATOL,
+    grad_rtol: float = EAGER_GRAD_RTOL,
+) -> None:
+    """Compare module outputs plus input and weight gradients against Hugging Face."""
+    hf_args: list[object] = []
+    ours_args: list[object] = []
+    for value in args:
+        if torch.is_tensor(value) and value.is_floating_point():
+            hf_args.append(value.detach().clone().requires_grad_(True))
+            ours_args.append(value.detach().clone().requires_grad_(True))
+        elif torch.is_tensor(value):
+            hf_args.append(value.clone())
+            ours_args.append(value.clone())
+        else:
+            hf_args.append(value)
+            ours_args.append(value)
+
+    hf_module.train()
+    ours_module.train()
+    hf_out = hf_module(*hf_args)
+    ours_out = ours_module(*ours_args)
+    torch.testing.assert_close(ours_out, hf_out, atol=atol, rtol=rtol)
+
+    grad_out = torch.randn_like(hf_out)
+    hf_out.backward(grad_out)
+    ours_out.backward(grad_out.clone())
+    for hf_value, ours_value in zip(hf_args, ours_args, strict=True):
+        if not (torch.is_tensor(hf_value) and hf_value.requires_grad):
+            continue
+        assert ours_value.grad is not None
+        torch.testing.assert_close(ours_value.grad, hf_value.grad, atol=grad_atol, rtol=grad_rtol)
+
+    hf_grads = named_trainable(hf_module)
+    ours_grads = named_trainable(ours_module)
+    assert hf_grads.keys() == ours_grads.keys()
+    for name, param in hf_grads.items():
+        if param.grad is None:
+            assert ours_grads[name].grad is None, name
+            continue
+        assert ours_grads[name].grad is not None, name
+        torch.testing.assert_close(ours_grads[name].grad, param.grad, atol=grad_atol, rtol=grad_rtol, msg=name)

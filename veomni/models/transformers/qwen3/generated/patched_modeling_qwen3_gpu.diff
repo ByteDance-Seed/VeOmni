@@ -35,7 +35,7 @@
 +#    - method_override: Qwen3MLP.__init__
 +#      Construct a local swiglu_mlp VeomniOp
 +#    - method_override: Qwen3MLP.forward
-+#      Always call the local swiglu_mlp VeomniOp
++#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
 +#    - function_replacement: apply_rotary_pos_emb
 +#      Always call rope full VeomniOp
 +#    - method_override: Qwen3Attention.__init__
@@ -104,7 +104,7 @@
 +from transformers.utils.output_capturing import capture_outputs
 +
 +from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
-+from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl
++from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl, uses_swiglu_mlp
 +from veomni.ops import VeomniOp
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 +
@@ -152,7 +152,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -77,10 +110,18 @@
+@@ -77,10 +110,20 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -161,19 +161,21 @@
      def forward(self, x):
 -        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 -        return down_proj
-+        return self.veomni_swiglu_mlp(
-+            x,
-+            self.gate_proj.weight,
-+            linear_bias(self.gate_proj),
-+            self.up_proj.weight,
-+            linear_bias(self.up_proj),
-+            self.down_proj.weight,
-+            linear_bias(self.down_proj),
-+        )
++        if uses_swiglu_mlp(self.config.hidden_act):
++            return self.veomni_swiglu_mlp(
++                x,
++                self.gate_proj.weight,
++                linear_bias(self.gate_proj),
++                self.up_proj.weight,
++                linear_bias(self.up_proj),
++                self.down_proj.weight,
++                linear_bias(self.down_proj),
++            )
++        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
  class Qwen3RotaryEmbedding(nn.Module):
-@@ -144,30 +185,20 @@
+@@ -144,30 +187,20 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
@@ -218,7 +220,7 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -207,12 +238,18 @@
+@@ -207,12 +240,18 @@
      return attn_output, attn_weights
 
 
@@ -239,7 +241,7 @@
          self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
          self.config = config
          self.layer_idx = layer_idx
-@@ -234,9 +271,11 @@
+@@ -234,9 +273,11 @@
          self.o_proj = nn.Linear(
              config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
          )
@@ -253,7 +255,7 @@
 
      def forward(
          self,
-@@ -254,16 +293,12 @@
+@@ -254,16 +295,12 @@
          value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
          cos, sin = position_embeddings
@@ -272,7 +274,7 @@
              self,
              query_states,
              key_states,
-@@ -271,7 +306,7 @@
+@@ -271,7 +308,7 @@
              attention_mask,
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
@@ -281,7 +283,7 @@
              **kwargs,
          )
 
-@@ -427,6 +462,12 @@
+@@ -427,6 +464,12 @@
          )
 
 
@@ -294,7 +296,7 @@
  @auto_docstring
  class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -435,12 +476,13 @@
+@@ -435,12 +478,13 @@
      _fsdp_plan = {"lm_head": "keep_full_weight"}
 
      def __init__(self, config):
@@ -311,7 +313,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -454,61 +496,110 @@
+@@ -454,61 +498,110 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
