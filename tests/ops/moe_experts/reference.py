@@ -32,9 +32,9 @@ def standard_fused_reference(
 ) -> Tensor:
     """Evaluate standard MoE with the routing-before-fc2 fused-kernel order.
 
-    Triton, Quack, and expert-parallel grouped GEMMs use this order. It is
-    algebraically equivalent to routing after a bias-free fc2, although BF16
-    rounding can differ.
+    Triton and Quack use this order. Expert-parallel grouped GEMMs apply routing
+    after fc2; the two orders are algebraically equivalent for a bias-free fc2,
+    although BF16 rounding can differ.
     """
     output = torch.zeros_like(hidden)
     expert_mask = F.one_hot(selected, num_classes=num_experts).permute(2, 1, 0)

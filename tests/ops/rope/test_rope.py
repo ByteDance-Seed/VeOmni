@@ -40,6 +40,7 @@ from tests.ops.tol import (
 )
 from tests.ops.utils import make_grad_leaves
 from veomni.ops import resolve_op
+from veomni.ops.registry import OpEntry
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
@@ -219,37 +220,83 @@ def test_partial_rope_accepts_positional_unsqueeze_dim():
     _assert_pair(op(q, k, cos, sin, 1), op(q, k, cos, sin, unsqueeze_dim=1), atol=0.0, rtol=0.0)
 
 
-def test_fused_rope_rows_fall_back_for_trainable_tables_before_vendor_import():
+@pytest.mark.parametrize(
+    ("implementation", "layout"),
+    (
+        ("full_liger", "full"),
+        ("full_npu", "full"),
+        ("partial_npu", "partial"),
+        ("full_liger", "vision"),
+        ("full_npu", "vision"),
+    ),
+)
+def test_fused_rope_rows_fall_back_for_trainable_tables_before_vendor_import(implementation, layout):
     from veomni.ops.kernels.rope.full import eager as full_eager
     from veomni.ops.kernels.rope.full import liger_kernel as full_liger
     from veomni.ops.kernels.rope.full import npu as full_npu
     from veomni.ops.kernels.rope.partial import eager as partial_eager
     from veomni.ops.kernels.rope.partial import npu as partial_npu
 
-    position_ids = torch.arange(4).unsqueeze(0)
-    q = torch.randn(2, 3, 4, 8)
-    k = torch.randn(2, 2, 4, 8)
-    cos = torch.randn(2, 4, 8, requires_grad=True)
-    sin = torch.randn(2, 4, 8)
-    expected, _ = full_eager.forward(q, k, cos, sin, position_ids, 1)
-    for module in (full_liger, full_npu):
-        actual, _ = module.forward(q, k, cos, sin, position_ids, 1)
-        _assert_pair(actual, expected, atol=0.0, rtol=0.0)
+    modules = {"full_liger": full_liger, "full_npu": full_npu, "partial_npu": partial_npu}
+    eager_modules = {"full": full_eager, "partial": partial_eager, "vision": full_eager}
+    module = modules[implementation]
+    eager_module = eager_modules[layout]
+    wrapper = OpEntry(
+        op="rope_test",
+        variant=layout,
+        impl=implementation,
+        description="Trainable-table fallback probe",
+        forward=module.forward,
+        backward=module.backward,
+    ).wrapper
+    eager_wrapper = OpEntry(
+        op="rope_test",
+        variant=layout,
+        impl="eager",
+        description="Eager fallback reference",
+        forward=eager_module.forward,
+        backward=eager_module.backward,
+    ).wrapper
+    assert wrapper is not None and eager_wrapper is not None
 
-    q_partial = torch.randn(2, 3, 4, 12)
-    k_partial = torch.randn(2, 2, 4, 12)
-    expected, _ = partial_eager.forward(q_partial, k_partial, cos, sin, 1)
-    actual, _ = partial_npu.forward(q_partial, k_partial, cos, sin, 1)
+    torch.manual_seed(2)
+    if layout == "vision":
+        tensors = (
+            torch.randn(4, 3, 8),
+            torch.randn(4, 2, 8),
+            torch.randn(4, 8),
+            torch.randn(4, 8),
+        )
+        optional_args = (torch.arange(4).unsqueeze(0), 1)
+    else:
+        head_dim = 12 if layout == "partial" else 8
+        tensors = (
+            torch.randn(2, 3, 4, head_dim),
+            torch.randn(2, 2, 4, head_dim),
+            torch.randn(2, 4, 8),
+            torch.randn(2, 4, 8),
+        )
+        optional_args = (1,) if layout == "partial" else (torch.arange(4).unsqueeze(0), 1)
+
+    actual_inputs = tuple(tensor.detach().clone().requires_grad_(True) for tensor in tensors)
+    expected_inputs = tuple(tensor.detach().clone().requires_grad_(True) for tensor in tensors)
+    actual = wrapper(*actual_inputs, *optional_args)
+    expected = eager_wrapper(*expected_inputs, *optional_args)
     _assert_pair(actual, expected, atol=0.0, rtol=0.0)
 
-    q_vision = torch.randn(4, 3, 8)
-    k_vision = torch.randn(4, 2, 8)
-    cos_vision = torch.randn(4, 8, requires_grad=True)
-    sin_vision = torch.randn(4, 8)
-    expected, _ = full_eager.forward(q_vision, k_vision, cos_vision, sin_vision, position_ids, 1)
-    for module in (full_liger, full_npu):
-        actual, _ = module.forward(q_vision, k_vision, cos_vision, sin_vision, position_ids, 1)
-        _assert_pair(actual, expected, atol=0.0, rtol=0.0)
+    gradients = tuple(torch.randn_like(output) for output in actual)
+    torch.autograd.backward(actual, gradients)
+    torch.autograd.backward(expected, gradients)
+    for name, actual_input, expected_input in zip(
+        ("query", "key", "cos", "sin"), actual_inputs, expected_inputs, strict=True
+    ):
+        torch.testing.assert_close(
+            actual_input.grad,
+            expected_input.grad,
+            rtol=0,
+            atol=0,
+            msg=lambda message, tensor_name=name: f"{tensor_name}: {message}",
+        )
 
 
 def test_full_liger_falls_back_for_vision_layout_before_vendor_import():

@@ -80,16 +80,14 @@ def _run_fused_vs_eager(impl: str, variant: str, *, concentrated_routing: bool =
     fc1 = (0.05 * torch.randn(E, 2 * I, H, device=device, dtype=dtype)).detach()
     fc2 = (0.05 * torch.randn(E, H, I, device=device, dtype=dtype)).detach()
     loras = _lora_tensors(variant, E=E, H=H, I=I, r=r, device=device, dtype=dtype)
-    train_base_weights = impl == "fused_triton"
-
     hidden_e = hidden.detach().requires_grad_(True)
     hidden_f = hidden.detach().requires_grad_(True)
-    routing_e = routing.detach().clone().requires_grad_(train_base_weights)
-    routing_f = routing.detach().clone().requires_grad_(train_base_weights)
-    fc1_e = fc1.detach().clone().requires_grad_(train_base_weights)
-    fc1_f = fc1.detach().clone().requires_grad_(train_base_weights)
-    fc2_e = fc2.detach().clone().requires_grad_(train_base_weights)
-    fc2_f = fc2.detach().clone().requires_grad_(train_base_weights)
+    routing_e = routing.detach().clone().requires_grad_(True)
+    routing_f = routing.detach().clone().requires_grad_(True)
+    fc1_e = fc1.detach().clone().requires_grad_(True)
+    fc1_f = fc1.detach().clone().requires_grad_(True)
+    fc2_e = fc2.detach().clone().requires_grad_(True)
+    fc2_f = fc2.detach().clone().requires_grad_(True)
     lora_e = [t.detach().clone().requires_grad_(True) for t in loras]
     lora_f = [t.detach().clone().requires_grad_(True) for t in loras]
 
@@ -104,15 +102,12 @@ def _run_fused_vs_eager(impl: str, variant: str, *, concentrated_routing: bool =
     go = (0.1 * torch.randn_like(out_e)).detach()
     out_e.backward(go)
     out_f.backward(go)
-    gradient_pairs = [("hidden_states", hidden_e, hidden_f)]
-    if train_base_weights:
-        gradient_pairs.extend(
-            (
-                ("routing_weights", routing_e, routing_f),
-                ("fc1_1_2_weight", fc1_e, fc1_f),
-                ("fc2_weight", fc2_e, fc2_f),
-            )
-        )
+    gradient_pairs = [
+        ("hidden_states", hidden_e, hidden_f),
+        ("routing_weights", routing_e, routing_f),
+        ("fc1_1_2_weight", fc1_e, fc1_f),
+        ("fc2_weight", fc2_e, fc2_f),
+    ]
     gradient_pairs.extend(zip(_LORA_KEYS, lora_e, lora_f, strict=True))
     for name, eager_input, fused_input in gradient_pairs:
         l2 = _l2_rel(fused_input.grad, eager_input.grad)
@@ -382,7 +377,7 @@ def test_npu_ep_matches_nonep_single_rank(variant, _single_rank_dist):
     dev = torch.device(get_device_type())
     dtype = torch.bfloat16
     B, H, I, E, top_k, r = 32, 64, 96, 4, 2, 8
-    grad_keys = ("hidden_states",) + _LORA_KEYS
+    grad_keys = ("hidden_states", "routing_weights", "fc1_1_2_weight", "fc2_weight", *_LORA_KEYS)
 
     torch.manual_seed(0)
     selected_experts = torch.randint(0, E, (B, top_k), device=dev)
@@ -396,13 +391,16 @@ def test_npu_ep_matches_nonep_single_rank(variant, _single_rank_dist):
         torch.manual_seed(123)
         lora = _build_lora_leaves(variant, E=E, H=H, I=I, r=r, dtype=dtype, device=dev)
         h = hidden_states_base.detach().clone().requires_grad_(True)
+        routing = routing_weights.detach().clone().requires_grad_(True)
+        fc1 = gate_up_proj.detach().clone().requires_grad_(True)
+        fc2 = down_proj.detach().clone().requires_grad_(True)
         kwargs = dict(
             num_experts=E,
-            routing_weights=routing_weights,
+            routing_weights=routing,
             selected_experts=selected_experts,
             hidden_states=h,
-            fc1_1_2_weight=gate_up_proj,
-            fc2_weight=down_proj,
+            fc1_1_2_weight=fc1,
+            fc2_weight=fc2,
             lora_a_gate=lora["lora_a_gate"],
             lora_b_gate=lora["lora_b_gate"],
             lora_a_up=lora["lora_a_up"],
@@ -415,10 +413,10 @@ def test_npu_ep_matches_nonep_single_rank(variant, _single_rank_dist):
             out = _npu_ep_fused_lora_moe_forward(ep_group=None, **kwargs)
         else:
             out = _npu_fused_lora_moe_forward(**kwargs)
-        return out, h, lora
+        return out, (h, routing, fc1, fc2, *(lora[key] for key in _LORA_KEYS))
 
-    nonep_out, nonep_h, nonep_lora = _run(ep=False)
-    ep_out, ep_h, ep_lora = _run(ep=True)
+    nonep_out, nonep_inputs = _run(ep=False)
+    ep_out, ep_inputs = _run(ep=True)
     fwd_l2 = _l2_rel(ep_out.detach(), nonep_out.detach())
     assert fwd_l2 <= _FWD_L2REL_TOL, f"[{variant}] NPU EP-vs-non-EP forward L2 rel {fwd_l2:.4%} > {_FWD_L2REL_TOL:.2%}"
 
@@ -427,14 +425,14 @@ def test_npu_ep_matches_nonep_single_rank(variant, _single_rank_dist):
     nonep_grads = dict(
         zip(
             grad_keys,
-            torch.autograd.grad(nonep_out, [nonep_h] + [nonep_lora[k] for k in _LORA_KEYS], grad_outputs=grad_out),
+            torch.autograd.grad(nonep_out, nonep_inputs, grad_outputs=grad_out),
             strict=True,
         )
     )
     ep_grads = dict(
         zip(
             grad_keys,
-            torch.autograd.grad(ep_out, [ep_h] + [ep_lora[k] for k in _LORA_KEYS], grad_outputs=grad_out),
+            torch.autograd.grad(ep_out, ep_inputs, grad_outputs=grad_out),
             strict=True,
         )
     )

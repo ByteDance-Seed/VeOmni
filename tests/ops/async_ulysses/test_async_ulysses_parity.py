@@ -1,4 +1,4 @@
-"""Four-GPU dense async Ulysses parity against the sync attention path."""
+"""Two-GPU dense async Ulysses parity against the sync attention path."""
 
 import sys
 
@@ -30,6 +30,30 @@ if not _NCCL_AVAILABLE:
     if __name__ == "__main__":
         sys.exit(0)
     pytest.skip("c10d NCCL not available", allow_module_level=True)
+
+
+_PARAMETER_GRAD_TOLERANCES = {
+    "proj_o.weight": (1e-4, 1e-4),
+    "q_proj.weight": (2e-3, 1e-4),
+    "k_proj.weight": (1e-4, 1e-4),
+    "v_proj.weight": (3e-3, 1e-4),
+    "q_norm.weight": (2e-3, 1e-4),
+    "q_norm.bias": (2e-3, 1e-4),
+    "k_norm.weight": (2e-3, 1e-4),
+    "k_norm.bias": (2e-3, 1e-4),
+}
+
+
+def _parameter_gradients(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Clone every trainable parameter gradient covered by the parity test."""
+    parameters = dict(module.named_parameters())
+    return {name: parameters[name].grad.detach().clone() for name in _PARAMETER_GRAD_TOLERANCES}
+
+
+def _assert_parameter_gradients_close(expected: dict[str, torch.Tensor], actual: dict[str, torch.Tensor]) -> None:
+    """Compare distributed parameter gradients with per-parameter tolerances."""
+    for name, (atol, rtol) in _PARAMETER_GRAD_TOLERANCES.items():
+        torch.testing.assert_close(expected[name], actual[name], atol=atol, rtol=rtol, msg=f"{name} gradient")
 
 
 class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
@@ -64,7 +88,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         t = torch.ones_like(output)
         return torch.sum(output * t)
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
     @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses")
     def test_self_attn(self):
         self._get_process_group()
@@ -92,11 +116,10 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         )
         loss_sp = loss_func(sp_rst)
         loss_sp.backward()
-        attn_sp_o_grad = attn_sp.proj_o.weight.grad.detach().clone()
-        attn_sp_q_grad = attn_sp.q_proj.weight.grad.detach().clone()
+        attn_sp_grads = _parameter_gradients(attn_sp)
         part_input_grad = part_input.grad.detach().clone()
-        dist.all_reduce(attn_sp_o_grad)
-        dist.all_reduce(attn_sp_q_grad)
+        for gradient in attn_sp_grads.values():
+            dist.all_reduce(gradient)
         part_input_grad = sync_tensor(part_input_grad, 1)
         part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
@@ -104,16 +127,14 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         dp_rst = attn_dp(full_input, unpad_size)
         loss_dp = loss_func(dp_rst)
         loss_dp.backward()
-        attn_dp_o_grad = attn_dp.proj_o.weight.grad.detach().clone()
-        attn_dp_q_grad = attn_dp.q_proj.weight.grad.detach().clone()
+        attn_dp_grads = _parameter_gradients(attn_dp)
         full_input_grad = full_input.grad.detach().clone()
 
         torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
-        torch.testing.assert_close(attn_dp_o_grad, attn_sp_o_grad, atol=1e-4, rtol=1e-4)
-        torch.testing.assert_close(attn_dp_q_grad, attn_sp_q_grad, atol=2e-3, rtol=1e-4)
+        _assert_parameter_gradients_close(attn_dp_grads, attn_sp_grads)
         torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
     @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses")
     def test_self_attn_padding(self):
         self._get_process_group()
@@ -141,11 +162,10 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         )
         loss_sp = loss_func(sp_rst)
         loss_sp.backward()
-        attn_sp_o_grad = attn_sp.proj_o.weight.grad.detach().clone()
-        attn_sp_q_grad = attn_sp.q_proj.weight.grad.detach().clone()
+        attn_sp_grads = _parameter_gradients(attn_sp)
         part_input_grad = part_input.grad.detach().clone()
-        dist.all_reduce(attn_sp_o_grad)
-        dist.all_reduce(attn_sp_q_grad)
+        for gradient in attn_sp_grads.values():
+            dist.all_reduce(gradient)
         part_input_grad = sync_tensor(part_input_grad, 1)
         part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
@@ -153,13 +173,11 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         dp_rst = attn_dp(full_input, unpad_size)
         loss_dp = loss_func(dp_rst)
         loss_dp.backward()
-        attn_dp_o_grad = attn_dp.proj_o.weight.grad.detach().clone()
-        attn_dp_q_grad = attn_dp.q_proj.weight.grad.detach().clone()
+        attn_dp_grads = _parameter_gradients(attn_dp)
         full_input_grad = full_input.grad.detach().clone()
 
         torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
-        torch.testing.assert_close(attn_dp_o_grad, attn_sp_o_grad, atol=1e-4, rtol=1e-4)
-        torch.testing.assert_close(attn_dp_q_grad, attn_sp_q_grad, atol=2e-3, rtol=1e-4)
+        _assert_parameter_gradients_close(attn_dp_grads, attn_sp_grads)
         torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
 
 
