@@ -66,16 +66,18 @@ def all_reduce(
         return data.tolist()
 
 
-def any_rank_failed(failed: bool) -> bool:
+def any_rank_failed(failed: bool, group: Optional[Any] = None) -> bool:
     """Whether *any* rank hit an error, so every rank can agree on what to do next.
 
     MAX rather than SUM: one failure is enough, and SUM would overflow int32 on a
-    large enough group.
+    large enough group. ``group`` defaults to the training group; a gloo group
+    reduces on CPU, so the device follows its backend.
     """
     if not dist.is_initialized():
         return failed
-    flag = torch.tensor([1 if failed else 0], dtype=torch.int32, device=get_device_type())
-    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    device = "cpu" if group is not None and dist.get_backend(group) == "gloo" else get_device_type()
+    flag = torch.tensor([1 if failed else 0], dtype=torch.int32, device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
     return bool(flag.item())
 
 

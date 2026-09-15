@@ -619,6 +619,8 @@ and is not intended to be captured by `torch.compile`.
 | output_dir | `str` | `"output"` | Path to save model checkpoints. |
 | manager | `str` | `"dcp"` | Checkpoint manager. |
 | save_async | `bool` | `False` | Save checkpoints asynchronously. |
+| stage_dir | `Optional[str]` | `None` | Write the checkpoint here and copy it to `output_dir` afterwards, for a destination slow enough that writing straight to it blocks the training loop past the collective timeout. Nothing is probed: point it at a node-local filesystem that can hold every rank on the node writing the model plus its optimizer state. Cannot be combined with `save_async`. |
+| save_timeout_seconds | `Optional[int]` | `None` | Collective timeout in seconds for the gloo groups that checkpoint saves run their own collectives on: a staged save's copy to `output_dir`, and each `save_async` write. Must outlast the work; unset keeps gloo's 30-minute default. |
 | dcp_save_to_lowest_rank | `bool` | `False` | Write each replicated DCP shard from the lowest global rank that holds it instead of load-balancing across replicas. On a non-shared filesystem this concentrates the deduplicated copy onto the lowest-ranked replica group rather than scattering it across replicas; in the standard HSDP layout (shard within a node, replicate across nodes) that group is one node, which then holds a complete checkpoint. Only affects replicated data — unique expert/tensor/pipeline-parallel shards stay distributed. Leave `False` when `output_dir` is shared. |
 | load_path | `Optional[str]` | `None` | Path to checkpoint for resuming training. Use `"auto"` for auto-detection. |
 | save_steps | `int` | `0` | Steps between checkpoint saves. `0` to disable. |

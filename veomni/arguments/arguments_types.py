@@ -813,6 +813,18 @@ class CheckpointConfig:
             )
         },
     )
+    save_timeout_seconds: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Collective timeout in seconds for the gloo groups checkpoint saves run their "
+                "own collectives on: a staged save's copy to `output_dir`, and each `save_async` "
+                "write. A positive integer that must outlast the work, since the ranks not "
+                "writing wait on it for the whole duration. Unset (default) keeps gloo's "
+                "30-minute default."
+            )
+        },
+    )
     dcp_save_to_lowest_rank: bool = field(
         default=False,
         metadata={
@@ -854,6 +866,15 @@ class CheckpointConfig:
         default=True,
         metadata={"help": "Save the huggingface format weights to the last checkpoint dir."},
     )
+
+    def __post_init__(self):
+        """Reject a ``save_timeout_seconds`` that is not a positive integer."""
+        # ``bool`` is an ``int`` subclass and the parser passes YAML through
+        # untouched: a stray ``true`` would be a one-second timeout.
+        if self.save_timeout_seconds is not None and (
+            type(self.save_timeout_seconds) is not int or self.save_timeout_seconds <= 0
+        ):
+            raise ValueError(f"save_timeout_seconds must be a positive integer, got {self.save_timeout_seconds!r}.")
 
 
 @dataclass
