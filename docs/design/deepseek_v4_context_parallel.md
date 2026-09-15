@@ -207,13 +207,14 @@ The same property constrains tests: a CP test must finish every collective
 before it asserts, or a genuine parity failure on one rank strands the others in
 a watchdog timeout instead of reporting the mismatch.
 
-**The TileLang indexer demotes silently.** `use_tilelang` is a conjunction of
-runtime preconditions and falls back to the eager scorer rather than raising, so
-a parity test can stay green while the kernel it exists to exercise stops
-running. Any test claiming kernel coverage needs a pass-through counter to pin
-it. Nothing currently runs the TileLang indexer inside a bf16 CSA layer under CP
-— layer parity is float32 and the indexer's own test is a bare bf16 module — so
-that pin is what a future test of that combination would need.
+**The TileLang indexer no longer demotes silently.** Selection is
+`dsa_indexer_implementation` through a local `VeomniOp`. Choosing `tilelang`
+resolves that registry row; there is no `use_tilelang` conjunction that falls
+back to the eager scorer. Tests that claim kernel coverage still need a
+pass-through counter, because a CP parity check can stay green if the kernel is
+never entered. Nothing currently runs the TileLang indexer inside a bf16 CSA
+layer under CP — layer parity is float32 and the indexer's own test is a bare
+bf16 module — so that pin is what a future test of that combination would need.
 
 ## Where the implementation diverged from the design and the plan
 

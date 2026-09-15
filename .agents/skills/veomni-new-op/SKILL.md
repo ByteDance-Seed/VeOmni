@@ -6,7 +6,7 @@ description: "Add or optimize a tensor-level kernel in veomni/ops, register its 
 ## Before You Start
 
 1. Read `.agents/knowledge/constraints.md`, especially device guards and patchgen rules.
-2. Read `veomni/ops/README.md` and `docs/design/kernel_selection.md`.
+2. Read `veomni/ops/README.md` and `docs/design/op_selection.md`.
 3. Inspect the closest family under `veomni/ops/kernels/` and its tests under `tests/ops/`.
 
 ## Ops Architecture
@@ -118,7 +118,7 @@ Use these separate mechanisms only when their semantics require them:
 
 1. Update `veomni/ops/README.md` with the family, variants, and supported
    implementations.
-2. Update `docs/design/kernel_selection.md` when selection behavior changes.
+2. Update `docs/design/op_selection.md` when selection behavior changes.
 3. Update `.agents/knowledge/architecture.md` when the layout or call chain
    changes.
 

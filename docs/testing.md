@@ -23,14 +23,15 @@ tests/
 │   ├── diffusers/                  # Diffuser-family parity and contracts
 │   └── refs/                       # Vendored comparison helpers
 │
-├── ops/                            # Registry and tensor-kernel correctness
+├── ops/                            # Registry and tensor-op correctness
 │   ├── base/test_op_entry.py                # Registration, resolution, and generated autograd
 │   ├── attention/                           # Eager/SDPA/Flash/Flex/Magi/Sage contracts
-│   ├── dsa/                                 # DeepSeek/GLM sparse-attention kernels
-│   ├── loss/                                # Cross-entropy and load-balancing kernels
+│   ├── async_ulysses/                       # Async QKV/O registry and parity
+│   ├── dsa/                                 # DeepSeek/GLM sparse-attention ops
+│   ├── loss/                                # Cross-entropy and load-balancing ops
 │   ├── mhc/                                 # mHC eager/TileKernels parity
-│   ├── moe_experts/                         # Eager/Triton/Quack/NPU/MLU expert kernels
-│   └── gated_delta_rule/                    # GatedDeltaNet kernel family
+│   ├── moe_experts/                         # Eager/Triton/Quack/NPU/MLU expert ops
+│   └── gated_delta_rule/                    # GatedDeltaNet op family
 │
 ├── data/                           # Data loading & preprocessing
 │   ├── test_datasets.py            # Dataset loading, filtering, schema validation
@@ -48,12 +49,11 @@ tests/
 ├── parallel/                       # Parallelism primitives
 │   ├── ulysses/                    # Sequence parallelism (Ulysses)
 │   │   ├── test_ulysses.py             # Basic SP attention (4+ GPUs)
-│   │   ├── test_async_ulysses.py       # Dense async SP parity (4+ GPUs)
-│   │   ├── test_async_ulysses_dit.py   # DiT async SP parity (4+ GPUs)
-│   │   ├── test_async_ulysses_grad.py  # Dense async projection grad shapes and bias-index guards
-│   │   ├── test_op_wrapper.py          # No-autograd RMSNorm/RoPE wrappers for async Functions
-│   │   ├── test_backward.py            # Shared async linear/LayerNorm/repeat-KV units
+│   │   ├── test_deepseek_v4_ulysses.py # DeepSeek-V4 SP
 │   │   ├── test_qwen3_5_gated_deltanet_ulysses.py  # Gated DeltaNet + SP
+│   │   ├── test_wan_self_attn_ulysses.py           # Wan self-attention SP
+│   │   ├── test_wan_self_attn_padding_mask.py      # Wan SP padding mask
+│   │   ├── test_wan_ulysses_padding.py             # Wan SP padding
 │   │   ├── test_slice_input_tensor.py  # Input slicing utilities
 │   │   ├── test_all_gather.py          # All-gather collective ops
 │   │   └── utils.py                    # SequenceParallelTest base class
@@ -103,7 +103,7 @@ tests/
 | Category | Directory | GPU Req | Execution | Purpose |
 |---|---|---|---|---|
 | **Models** | `tests/models/` | 0-1 GPU | pytest | Registry/build contracts, model parity, and implementation selection |
-| **Kernels** | `tests/ops/` | 0-1 GPU (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Registry contracts, hardware guards, numerical correctness, and performance |
+| **Ops** | `tests/ops/` | 0-1 GPU (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Registry contracts, hardware guards, numerical correctness, and performance |
 | **Data pipeline** | `tests/data/` | 0-1 GPU | pytest | Data loading, collation, preprocessing |
 | **Parallelism** | `tests/parallel/` | 4-8 GPUs | torchrun / pytest | SP, EP, data-balance primitives |
 | **FSDP correctness** | `tests/distributed/` | 2+ GPUs | torchrun (subprocess + mp.spawn) | Single-GPU vs FSDP2 equivalence, dummy forward |
@@ -271,14 +271,15 @@ by `tests/ops/mhc/test_mhc.py` and requires TileKernels on an SM90+ NVIDIA GPU.
 
 ---
 
-### 11. Kernel Tests (`tests/ops/`)
+### 11. Op Tests (`tests/ops/`)
 
 | Test | Purpose | GPU |
 |---|---|---|
-| `base/test_kernel_entry.py` | Registration, requirements, resolution, and generated autograd | CPU |
+| `base/test_op_entry.py` | Registration, requirements, resolution, and generated autograd | CPU |
+| `async_ulysses/` | Async QKV/O registry rows plus dense and DiT parity | CPU for registry; multi-GPU for parity |
 | `moe_experts/test_moe_experts.py` | Eager/Triton/Quack MoE parity, split/merged weights, and hardware guards | CPU for guards; CUDA for optimized kernels |
 | `dsa/test_dsa*.py` | DSA registry, CPU guards, and TileLang/cuDNN numerical parity | CPU for guards; matching CUDA hardware for optimized kernels |
-| `attention/flash/test_flash_attn_varlen_padding.py` | FlashAttention variable-length padding | CUDA |
+| `attention/flash/test_flash_attention.py` | FlashAttention contracts | CUDA |
 | `attention/magi/` | Magi mask, installer, FA4 metadata, and numerical contracts | CPU for guards; SM90/SM100 for optimized kernels |
 | `batch_invariant/test_batch_invariant.py` | Batch-invariant ATen patch lifecycle and math | CPU for lifecycle; CUDA for Triton kernels |
 
@@ -302,11 +303,9 @@ concatenation, optional-input policy, and gradient fan-out in the model helper.
 | Test | Purpose | GPU |
 |---|---|---|
 | `test_ulysses.py` | Basic Ulysses SP attention | 4+ |
-| `test_async_ulysses.py` | Dense async Ulysses forward/backward parity | 4+ |
-| `test_async_ulysses_dit.py` | DiT async Ulysses forward/backward parity | 4+ |
-| `test_async_ulysses_grad.py` | Dense async projection grad shapes and frozen-weight bias grads | CPU |
-| `test_backward.py` | Shared linear, LayerNorm, and repeated-KV backward units | CUDA for fused LayerNorm; remaining cases use the active device |
+| `test_deepseek_v4_ulysses.py` | DeepSeek-V4 SP | 4+ |
 | `test_qwen3_5_gated_deltanet_ulysses.py` | Gated DeltaNet + SP | 4+ |
+| `test_wan_self_attn_ulysses.py` | Wan self-attention SP | 4+ |
 | `test_slice_input_tensor.py` | SP input slicing utilities | CPU |
 | `test_all_gather.py` | All-gather collective ops | multi |
 | `test_balance_reverse.py` | Encoder data balance recovery | 8 |
@@ -338,7 +337,7 @@ See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_
 | **MoE model** | `tests/e2e/test_e2e_parallel.py` | Set `is_moe=True` to include `ep_size` iteration. |
 | **MoE with fused experts** | `tests/models/base/test_checkpoint_tensor_converter.py` | Add converter tests if a custom `CheckpointTensorConverter` is needed. |
 | **Custom checkpoint layout** | `tests/models/base/test_checkpoint_tensor_converter.py` | Add converter tests for any on-disk HF↔VeOmni key or tensor-layout conversion. |
-| **Custom fused kernels** | `tests/ops/<family>/` | Add kernel-specific correctness and registration tests. |
+| **Custom fused ops** | `tests/ops/<family>/` | Add op-specific correctness and registration tests. |
 | **New data modality** | `tests/data/` | Add data processing and collation tests. |
 
 ### Verification Commands

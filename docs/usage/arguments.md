@@ -167,9 +167,9 @@ own `safetensor_idx_path`.
 
 ### OpsImplementationConfig
 
-`model.ops_implementation.*` — Attention, MoE, and fused kernel implementation.
+`model.ops_implementation.*` — Attention, MoE, and fused op implementation.
 
-Each `*_implementation` field selects the kernel backend for that operation.
+Each `*_implementation` field selects the op implementation for that operation.
 The type is `str` (not `Literal`) so third-party backends can be registered
 without modifying the config class.
 
@@ -208,7 +208,7 @@ NPU validation runs at two times:
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation. Supported public values include `eager`, `sdpa`, `flash_attention_2/3/4`, `flex_attention`, `magi_attention`, and `native-sparse`. Under the VeOmni modeling backend, Flash, Flex, and Magi values resolve to SP-aware registry names. FlexAttention requires a model-provided native `BlockMask`; Ulysses currently requires it to be head-broadcast. MagiAttention requires the optional `--extra magi` install (`uv sync --extra gpu --extra magi`), a model-provided `MagiAttentionMask`, physical batch size 1, `cp_size == 1`, and zero attention dropout; it does not support KV-cache offsets. It uses the CUTLASS overlay on SM90 and CUTE DSL/JIT on SM100+. |
+| attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation. Supported public values include `eager`, `sdpa`, `flash_attention_2/3/4`, `flex_attention`, `magi_attention`, `sage_attention`, and `native-sparse`. Under the VeOmni modeling backend, Flash, Flex, Magi, Sage, and SDPA values rewrite to the matching `veomni_*` registry names. FlexAttention requires a model-provided native `BlockMask`; Ulysses currently requires it to be head-broadcast. MagiAttention requires the optional `--extra magi` install (`uv sync --extra gpu --extra magi`), a model-provided `MagiAttentionMask`, physical batch size 1, `cp_size == 1`, and zero attention dropout; it does not support KV-cache offsets. It uses the CUTLASS overlay on SM90 and CUTE DSL/JIT on SM100+. SageAttention is inference-only and does not take a dense mask. |
 | moe_implementation | `str` | `"fused_triton"` | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+ or MLU); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel; `fused_mlu` uses Apex grouped-GEMM on MLU; `eager` is the reference loop. A value still equal to the GPU default auto-resolves to `fused_npu` on NPU; explicit incompatible non-default overrides raise. |
 | cross_entropy_loss_implementation | `str` | `"liger_kernel"` | Cross-entropy loss. `liger_kernel` (default, GPU only) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `npu` is a back-compat alias for `chunk_loss`. `eager` is `F.cross_entropy`. |
 | rms_norm_implementation | `str` | `"liger_kernel"` | RMSNorm. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
@@ -218,11 +218,11 @@ NPU validation runs at two times:
 | load_balancing_loss_implementation | `str` | `"triton"` | MoE load-balancing loss. `triton` uses the fused GPU kernel; `eager` is the pure-PyTorch reference. On NPU, config normalization maps every value equal to the default `triton` (including an explicit YAML value) to `eager`. |
 | rms_norm_gated_implementation | `str` | `"fla"` | Gated RMSNorm (Qwen3.5 GatedDeltaNet `self.norm`). Known values: `eager`, `fla` (FLA `FusedRMSNormGated`, GPU), `npu`. |
 | causal_conv1d_implementation | `str` | `"fla"` | Varlen depthwise causal conv1d (Qwen3.5 GatedDeltaNet pre-mixer). Known values: `eager`, `fla` (GPU), `npu` (requires `triton-ascend`). `eager` does not support the varlen path. |
-| chunk_gated_delta_rule_implementation | `str` | `"fla"` | Chunk gated delta-rule kernel for Qwen3.5 linear attention. Known values: `eager`, `fla` (GPU), `flash_qla` (NVIDIA SM90-SM100), `npu` (requires `triton-ascend`). `eager` does not support varlen training. |
+| chunk_gated_delta_rule_implementation | `str` | `"fla"` | Chunk gated delta-rule kernel for Qwen3.5 linear attention. Known values: `eager`, `fla` (GPU), `flash_qla` (NVIDIA SM90-SM100), `npu` (requires `triton-ascend`), `npu_ascendc` (AscendC fused `torch.ops.npu.*`; requires `fla_npu` + `triton-ascend`). `eager` does not support varlen training. |
 | dsa_indexer_implementation | `Literal["eager", "cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention top-k indexer implementation. `tilelang` selects the DeepSeek-V4 Lightning Indexer kernel and requires an SM90+ CUDA GPU. |
 | dsa_attention_implementation | `Literal["eager", "flashmla_cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention implementation. `tilelang` selects the DeepSeek-V4 sparse MQA kernel and requires an SM90+ CUDA GPU. |
 | mhc_implementation | `Literal["eager", "tilelang"]` | `"eager"` | DeepSeek V4 manifold-constrained Hyper-Connection implementation. `tilelang` enables the forward/backward path provided by the `tile-kernels` package and requires an SM90+ CUDA GPU. |
-| qat_implementation | `Literal["none", "fp8_blockwise"]` | `"none"` | DeepSeek V4 quantization-aware training recipe. Unlike the other fields this selects a quantization recipe rather than a kernel backend. `fp8_blockwise` fake-quantizes what FP8 inference rounds — linear operands (128x128 weight tiles, 1x128 activation blocks), the NoPE channels of every stored KV entry (1x64), both sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path (FP4 `1x32` groups when the checkpoint's `expert_dtype` is `fp4`, otherwise FP8 tiles) — and requires an SM90+ CUDA GPU. See `veomni/ops/qat/`. |
+| qat_implementation | `Literal["none", "fp8_blockwise"]` | `"none"` | DeepSeek V4 quantization-aware training recipe. Unlike the other fields this selects a quantization recipe rather than an op-registry implementation. `fp8_blockwise` fake-quantizes what FP8 inference rounds — linear operands (128x128 weight tiles, 1x128 activation blocks), the NoPE channels of every stored KV entry (1x64), both sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path (FP4 `1x32` groups when the checkpoint's `expert_dtype` is `fp4`, otherwise FP8 tiles) — and requires an SM90+ CUDA GPU. See `veomni/ops/qat/`. |
 
 #### The Lightning Indexer KL objective (`dsa_indexer_loss`)
 
@@ -246,7 +246,7 @@ model:
 The two are fields of DeepSeek-V4's own config, beside the
 `output_router_logits` / `router_aux_loss_coef` pair that configures the model's
 other auxiliary objective — a training objective is a property of the model,
-while `ops_implementation` selects kernel backends. They are therefore
+while `ops_implementation` selects op implementations. They are therefore
 DeepSeek-V4-only by construction: no other model's config declares them.
 
 | Field | Type | Default | Description |

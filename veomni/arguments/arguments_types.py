@@ -1300,7 +1300,8 @@ class OpsImplementationConfig:
             "(weights per the checkpoint's expert_dtype -- FP4 with 1x32 groups on V4-Flash, "
             "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
             "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
-            "recipe rather than a kernel backend, so it is not an OpSlot -- see veomni/ops/qat/."
+            "recipe rather than an op-registry implementation, so it is not selected through "
+            "VeomniOp -- see veomni/ops/qat/."
         },
     )
 

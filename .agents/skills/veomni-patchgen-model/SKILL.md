@@ -15,7 +15,7 @@ supported transformers-family model. The non-transformers architectures
 
 - `docs/design/patchgen.md` — patchgen DSL, CLI, CI drift check
 - `docs/transformers_v5/transformers_v5_moe_weight_loading.md` — MoE fused-expert layout + runtime converter
-- `docs/transformers_v5/veomni_flash_attention_kernel_adapter.md` — FA custom-name adapter
+- `docs/transformers_v5/veomni_flash_attention_op_adapter.md` — FA custom-name adapter
 - `docs/transformers_v5/testing_new_model.md` — test case SOP for a new model
 
 ## What to read for your model
@@ -295,19 +295,20 @@ duplicating ~hundreds of lines per sibling model.
   through (see qwen3_5_moe), and import cu-free FLA impls via
   `add_post_import_block` with a try/except fallback.
 
-**MoE models** add three more patches here — expert replacement, `_moe_implementation`
-propagation and the expert parallel plan. See `references/moe.md`, "Phase 2 additions".
+**MoE models** add the expert `VeomniOp` replacement and the expert parallel
+plan. See `references/moe.md`, "Phase 2 additions".
 
 **VLM / Omni models** add the SP-aware multimodal forward and the metadata
 precompute contract, and Omni models also prune the speech subtree. See
 `references/multimodal.md`.
 
 **Flash attention**: VeOmni custom names
-(`veomni_flash_attention_{2,3,4}_with_sp`) are handled globally by
+(`veomni_flash_attention_2/3/4`) are handled globally by
 `transformers.integrations.hub_kernels.load_and_register_attn_kernel` adapter —
-**no per-model patching needed**. Just keep `attn_implementation` names unchanged
-in configs. See
-`docs/transformers_v5/veomni_flash_attention_kernel_adapter.md`.
+**no per-model patching needed**. Public short names
+(`flash_attention_2/3/4`, plus flex/magi/sage/sdpa) rewrite to the matching
+`veomni_*` adapter when `MODELING_BACKEND=veomni`. See
+`docs/transformers_v5/veomni_flash_attention_op_adapter.md`.
 
 **Patch comment style:**
 

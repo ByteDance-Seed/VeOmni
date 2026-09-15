@@ -93,7 +93,7 @@ key_features/lora.md
 :maxdepth: 1
 :caption: Design
 
-design/kernel_selection.md
+design/op_selection.md
 design/fused_moe_kernels.md
 design/local_parallel_state.md
 design/patchgen.md

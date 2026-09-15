@@ -654,10 +654,10 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
     dist.broadcast(hidden, src=0)
     dist.broadcast(q_residual, src=0)
 
-    # ``use_tilelang`` degrades to the eager scorer rather than failing when the
-    # canonical positions it checks do not line up, and the eager scorer reads the
-    # global ``position_ids`` and so stays right. Without this count, dropping the
-    # query offset entirely would take the kernel out of the comparison and the
+    # Count kernel entries so the comparison cannot stay green after the
+    # TileLang path is skipped. The eager scorer reads global ``position_ids``
+    # and so stays right even if the query offset is dropped. Without this
+    # count, that skip would take the kernel out of the comparison and the
     # parity below would still hold, pinning nothing about the CP query rebasing.
     kernel_runs = []
     real_kernel = dsv4.v4_lighting_indexer

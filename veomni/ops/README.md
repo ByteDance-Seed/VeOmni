@@ -203,7 +203,7 @@ selected through `VeomniOp`.
 - Registry and generated-autograd contract: `tests/ops/base/test_op_entry.py`
 - Per-family math and hardware behavior: `tests/ops/<family>/`
 - Model-facing integration and helpers: `tests/models/`
-- User-facing selection and lifecycle: `docs/design/kernel_selection.md`
+- User-facing selection and lifecycle: `docs/design/op_selection.md`
 
 When adding a row, test its numerical contract, registration, hardware
 requirement, and optional-package requirements. When adding model-specific

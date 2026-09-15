@@ -202,8 +202,7 @@ For implementation details of each patch, refer to the example docs.
 
 - [ ] `parallel_plan.py` with correct expert weight paths
 - [ ] `get_parallel_plan` wired on the pretrained model base class
-- [ ] Stacked-weight `YourModelExperts` module + a local `moe_experts` `VeomniOp`
-- [ ] `_moe_implementation` propagated from top-level config to text sub-config
+- [ ] Stacked-weight `YourModelExperts` module + a local `moe_experts` `VeomniOp` from `resolve_moe_impl()`
 - [ ] `_init_weights` patched for stacked expert params
 
 ### Omni-modal (audio)
