@@ -18,21 +18,22 @@ import torch
 from tests.ops.moe_experts.reference import standard_fused_reference
 from tests.ops.tol import (
     MOE_EP_PRE_SM90_ATOL,
+    MOE_EP_PRE_SM90_GRAD_FC1_ATOL,
+    MOE_EP_PRE_SM90_GRAD_FC1_RTOL,
+    MOE_EP_PRE_SM90_GRAD_FC2_ATOL,
+    MOE_EP_PRE_SM90_GRAD_FC2_RTOL,
     MOE_EP_SM90_ATOL,
-    MOE_FUSED_GRAD_FC1_ATOL,
-    MOE_FUSED_GRAD_FC1_RTOL,
-    MOE_FUSED_GRAD_FC2_ATOL,
-    MOE_FUSED_GRAD_FC2_RTOL,
+    MOE_EP_SM90_GRAD_FC1_ATOL,
+    MOE_EP_SM90_GRAD_FC1_RTOL,
+    MOE_EP_SM90_GRAD_FC2_ATOL,
+    MOE_EP_SM90_GRAD_FC2_RTOL,
     MOE_FUSED_GRAD_HIDDEN_ATOL,
     MOE_FUSED_GRAD_HIDDEN_RTOL,
-    MOE_FUSED_SWIGLU_GRAD_FC1_ATOL,
-    MOE_FUSED_SWIGLU_GRAD_FC1_RTOL,
-    MOE_FUSED_SWIGLU_GRAD_FC2_ATOL,
-    MOE_FUSED_SWIGLU_GRAD_FC2_RTOL,
     MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL,
     MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL,
     MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
 )
+from tests.ops.utils import assert_close_with_error, assert_reference_signal
 from veomni.distributed.moe import EPGroupGemm, EPMergedFc1GroupGemm
 from veomni.ops.kernels.moe_experts.shared.dispatch import expert_histogram, moe_gather, moe_scatter
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, is_sm90_or_above
@@ -99,17 +100,49 @@ def _ep_atol() -> float:
 
 
 def _ep_gradient_tolerances(swiglu_limit):
+    if is_sm90_or_above():
+        fc1_tol = (MOE_EP_SM90_GRAD_FC1_ATOL, MOE_EP_SM90_GRAD_FC1_RTOL)
+        fc2_tol = (MOE_EP_SM90_GRAD_FC2_ATOL, MOE_EP_SM90_GRAD_FC2_RTOL)
+    else:
+        fc1_tol = (MOE_EP_PRE_SM90_GRAD_FC1_ATOL, MOE_EP_PRE_SM90_GRAD_FC1_RTOL)
+        fc2_tol = (MOE_EP_PRE_SM90_GRAD_FC2_ATOL, MOE_EP_PRE_SM90_GRAD_FC2_RTOL)
     if swiglu_limit is not None:
-        return (
-            (MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL, MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL),
-            (MOE_FUSED_SWIGLU_GRAD_FC1_ATOL, MOE_FUSED_SWIGLU_GRAD_FC1_RTOL),
-            (MOE_FUSED_SWIGLU_GRAD_FC2_ATOL, MOE_FUSED_SWIGLU_GRAD_FC2_RTOL),
-        )
-    return (
-        (MOE_FUSED_GRAD_HIDDEN_ATOL, MOE_FUSED_GRAD_HIDDEN_RTOL),
-        (MOE_FUSED_GRAD_FC1_ATOL, MOE_FUSED_GRAD_FC1_RTOL),
-        (MOE_FUSED_GRAD_FC2_ATOL, MOE_FUSED_GRAD_FC2_RTOL),
-    )
+        hidden_tol = (MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL, MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL)
+    else:
+        hidden_tol = (MOE_FUSED_GRAD_HIDDEN_ATOL, MOE_FUSED_GRAD_HIDDEN_RTOL)
+    return hidden_tol, fc1_tol, fc2_tol
+
+
+def _assert_ep_reference_grads(pairs, hidden_tol, fc1_tol, fc2_tol):
+    """Require useful reference signal, then compare with recorded error."""
+    budgets = {
+        "hidden gradient": hidden_tol,
+        "routing gradient": hidden_tol,
+        "fc1 gradient": fc1_tol,
+        "fc1_1 gradient": fc1_tol,
+        "fc1_2 gradient": fc1_tol,
+        "fc2 gradient": fc2_tol,
+    }
+    for name, actual, expected in pairs:
+        atol, rtol = budgets[name]
+        assert_reference_signal(name, expected, atol, rtol)
+        assert_close_with_error(name, actual, expected, atol=atol, rtol=rtol)
+
+
+def test_ep_weight_grad_budgets_are_platform_specific():
+    """EP weight grads must not reuse the generic fused relative budget."""
+    from tests.ops.tol import MOE_FUSED_GRAD_FC1_ATOL, MOE_FUSED_GRAD_FC2_ATOL
+
+    assert MOE_EP_SM90_GRAD_FC1_ATOL < MOE_FUSED_GRAD_FC1_ATOL
+    assert MOE_EP_SM90_GRAD_FC2_ATOL < MOE_FUSED_GRAD_FC2_ATOL
+    assert MOE_EP_SM90_GRAD_FC1_RTOL == 0
+    assert MOE_EP_SM90_GRAD_FC2_RTOL == 0
+    assert MOE_EP_PRE_SM90_GRAD_FC1_RTOL == 0
+    assert MOE_EP_PRE_SM90_GRAD_FC2_RTOL == 0
+    hidden_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(None)
+    assert fc1_tol[1] == 0
+    assert fc2_tol[1] == 0
+    assert hidden_tol[0] == MOE_FUSED_GRAD_HIDDEN_ATOL
 
 
 @pytest.mark.parametrize("swiglu_limit", [None, 7.0, 10.0])
@@ -344,11 +377,18 @@ def test_ep_vs_non_ep(
     out_ep2 = _gather_tokens_autograd(ep_raw2, routing_ep, scatter_index)
     out_ep2.backward(grad_output)
     hidden_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(swiglu_limit)
-    torch.testing.assert_close(hs_eager.grad, hs_ep.grad, atol=hidden_tol[0], rtol=hidden_tol[1])
-    torch.testing.assert_close(routing_eager.grad, routing_ep.grad, atol=hidden_tol[0], rtol=hidden_tol[1])
-    torch.testing.assert_close(fc2_eager.grad, fc2_ep.grad, atol=fc2_tol[0], rtol=fc2_tol[1])
-    torch.testing.assert_close(fc1_1_eager.grad, fc1_1_ep.grad, atol=fc1_tol[0], rtol=fc1_tol[1])
-    torch.testing.assert_close(fc1_2_eager.grad, fc1_2_ep.grad, atol=fc1_tol[0], rtol=fc1_tol[1])
+    _assert_ep_reference_grads(
+        (
+            ("hidden gradient", hs_ep.grad, hs_eager.grad),
+            ("routing gradient", routing_ep.grad, routing_eager.grad),
+            ("fc2 gradient", fc2_ep.grad, fc2_eager.grad),
+            ("fc1_1 gradient", fc1_1_ep.grad, fc1_1_eager.grad),
+            ("fc1_2 gradient", fc1_2_ep.grad, fc1_2_eager.grad),
+        ),
+        hidden_tol,
+        fc1_tol,
+        fc2_tol,
+    )
 
 
 @pytest.mark.parametrize("swiglu_limit", [None, 7.0, 10.0])
@@ -431,12 +471,14 @@ def test_ep_merged_vs_non_ep(
     out_ep2 = _gather_tokens_autograd(ep_raw2, routing_ep, scatter_index)
     out_ep2.backward(grad_output)
     hidden_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(swiglu_limit)
-    torch.testing.assert_close(hs_eager.grad, hs_ep.grad, atol=hidden_tol[0], rtol=hidden_tol[1])
-    torch.testing.assert_close(routing_eager.grad, routing_ep.grad, atol=hidden_tol[0], rtol=hidden_tol[1])
-    torch.testing.assert_close(fc2_eager.grad, fc2_ep.grad, atol=fc2_tol[0], rtol=fc2_tol[1])
-    torch.testing.assert_close(
-        torch.cat([fc1_1_eager.grad, fc1_2_eager.grad], dim=1),
-        fc1_merged_ep.grad,
-        atol=fc1_tol[0],
-        rtol=fc1_tol[1],
+    _assert_ep_reference_grads(
+        (
+            ("hidden gradient", hs_ep.grad, hs_eager.grad),
+            ("routing gradient", routing_ep.grad, routing_eager.grad),
+            ("fc2 gradient", fc2_ep.grad, fc2_eager.grad),
+            ("fc1 gradient", fc1_merged_ep.grad, torch.cat([fc1_1_eager.grad, fc1_2_eager.grad], dim=1)),
+        ),
+        hidden_tol,
+        fc1_tol,
+        fc2_tol,
     )

@@ -49,7 +49,7 @@ from tests.ops.tol import (
     MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
     MOE_SPLIT_MERGED_GRAD_HIDDEN_RTOL,
 )
-from tests.ops.utils import make_grad_leaf, require_nvidia_cuda
+from tests.ops.utils import assert_reference_signal, make_grad_leaf, require_nvidia_cuda
 from veomni.ops import resolve_op
 from veomni.ops.kernels.moe_experts.shared.indices import build_moe_indices
 from veomni.ops.kernels.moe_experts.standard.npu import _fc1_weight
@@ -337,6 +337,7 @@ def _run_fused_vs_eager(
     routing: Tensor | None = None,
     seed: int = 0,
     device: torch.device | None = None,
+    data_scale: float = 0.4,
 ):
     torch.manual_seed(seed)
     if device is None:
@@ -348,13 +349,13 @@ def _run_fused_vs_eager(
             device = torch.device("cuda")
     dtype = torch.bfloat16
     num_tokens, num_experts, hidden_dim, ffn_dim, top_k = shape
-    hidden = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
+    hidden = data_scale * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
     if routing is None or selected is None:
         routing, selected = _route(num_tokens, num_experts, top_k, device, dtype)
-    fc1_1 = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
-    fc1_2 = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_1 = data_scale * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_2 = data_scale * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
     fc1_12 = torch.cat([fc1_1, fc1_2], dim=1).contiguous()
-    fc2 = 0.1 * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
+    fc2 = data_scale * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
     empty = _empty(device, dtype)
 
     eager = resolve_op("moe_experts", "standard", "eager").wrapper
@@ -380,11 +381,27 @@ def _run_fused_vs_eager(
         hidden_atol, hidden_rtol = MOE_FUSED_GRAD_HIDDEN_ATOL, MOE_FUSED_GRAD_HIDDEN_RTOL
         fc1_atol, fc1_rtol = MOE_FUSED_GRAD_FC1_ATOL, MOE_FUSED_GRAD_FC1_RTOL
         fc2_atol, fc2_rtol = MOE_FUSED_GRAD_FC2_ATOL, MOE_FUSED_GRAD_FC2_RTOL
-    assert torch.allclose(out_e.float(), out_o.float(), atol=fwd_atol, rtol=fwd_rtol)
-
     go = torch.randn_like(out_e)
     out_e.backward(go)
     out_o.backward(go)
+    reference_checks = [
+        ("output", out_e, fwd_atol, fwd_rtol),
+        ("hidden gradient", hidden_e.grad, hidden_atol, hidden_rtol),
+        ("routing gradient", routing_e.grad, hidden_atol, hidden_rtol),
+        ("fc2 gradient", fc2_e.grad, fc2_atol, fc2_rtol),
+    ]
+    if merged:
+        reference_checks.append(("fc1 gradient", fc1_12_e.grad, fc1_atol, fc1_rtol))
+    else:
+        reference_checks.extend(
+            (
+                ("fc1_1 gradient", fc1_1_e.grad, fc1_atol, fc1_rtol),
+                ("fc1_2 gradient", fc1_2_e.grad, fc1_atol, fc1_rtol),
+            )
+        )
+    for name, reference, atol, rtol in reference_checks:
+        assert_reference_signal(name, reference, atol, rtol)
+    assert torch.allclose(out_e.float(), out_o.float(), atol=fwd_atol, rtol=fwd_rtol)
     assert torch.allclose(hidden_e.grad.float(), hidden_o.grad.float(), atol=hidden_atol, rtol=hidden_rtol)
     assert torch.allclose(routing_e.grad.float(), routing_o.grad.float(), atol=hidden_atol, rtol=hidden_rtol)
     assert torch.allclose(fc2_e.grad.float(), fc2_o.grad.float(), atol=fc2_atol, rtol=fc2_rtol)
@@ -482,9 +499,7 @@ def _run_fused_three_way(
         ("fc2 gradient", fc2_e.grad, fc2_atol, fc2_rtol),
     )
     for name, reference, atol, rtol in reference_checks:
-        assert not torch.allclose(torch.zeros_like(reference), reference, atol=atol, rtol=rtol), (
-            f"{name} signal is too small to reject an all-zero implementation"
-        )
+        assert_reference_signal(name, reference, atol, rtol)
     assert torch.allclose(out_m.float(), out_e.float(), atol=fwd_atol, rtol=fwd_rtol)
     assert torch.allclose(hidden_m.grad.float(), hidden_e.grad.float(), atol=hidden_atol, rtol=hidden_rtol)
     assert torch.allclose(routing_m.grad.float(), routing_e.grad.float(), atol=hidden_atol, rtol=hidden_rtol)
@@ -495,6 +510,17 @@ def _run_fused_three_way(
         atol=fc1_atol,
         rtol=fc1_rtol,
     )
+
+
+def test_reference_signal_rejects_all_zero_and_tiny_values():
+    """NPU/MLU comparisons must fail when the reference cannot beat the budget."""
+    zeros = torch.zeros(4, 4)
+    with pytest.raises(AssertionError, match="signal is too small"):
+        assert_reference_signal("zeros", zeros, atol=1e-2, rtol=1e-2)
+    tiny = torch.full((4, 4), 1e-4)
+    with pytest.raises(AssertionError, match="signal is too small"):
+        assert_reference_signal("tiny", tiny, atol=1e-2, rtol=1e-2)
+    assert_reference_signal("ones", torch.ones(4, 4), atol=1e-2, rtol=1e-2)
 
 
 def test_npu_fc1_layout_matches_eager_contract():
@@ -617,6 +643,16 @@ def test_gpt_oss_quack_matches_eager():
         atol=MOE_FUSED_SWIGLU_GRAD_FC2_ATOL,
         rtol=MOE_FUSED_SWIGLU_GRAD_FC2_RTOL,
     )
+
+
+@pytest.mark.skipif(
+    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+    reason="triton fused MoE needs a GPU + triton",
+)
+def test_fused_vs_eager_helper_has_useful_signal_on_cuda():
+    """The NPU/MLU helper must keep a useful reference signal on the GPU path."""
+    _run_fused_vs_eager("fused_triton")
+    _run_fused_vs_eager("fused_triton", merged=True)
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU fused MoE needs torch_npu")

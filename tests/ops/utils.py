@@ -77,3 +77,39 @@ def require_nvidia_cuda(*packages: str, min_cc: int | None = None, max_cc: int |
         pytest.skip(f"test requires SM{min_cc} or later")
     if max_cc is not None and capability > max_cc:
         pytest.skip(f"test requires SM{max_cc} or earlier")
+
+
+def tensor_error_stats(actual: Tensor, expected: Tensor) -> dict[str, float]:
+    """Return max absolute and relative error of ``actual`` versus ``expected``."""
+    actual_f = actual.float()
+    expected_f = expected.float()
+    diff = (actual_f - expected_f).abs()
+    return {
+        "max_abs": diff.max().item(),
+        "max_rel": (diff / expected_f.abs().clamp(min=1e-8)).max().item(),
+    }
+
+
+def assert_reference_signal(name: str, reference: Tensor, atol: float, rtol: float) -> None:
+    """Reject a reference that an all-zero implementation would also match."""
+    assert not torch.allclose(torch.zeros_like(reference), reference, atol=atol, rtol=rtol), (
+        f"{name} signal is too small to reject an all-zero implementation"
+    )
+
+
+def assert_close_with_error(
+    name: str,
+    actual: Tensor,
+    expected: Tensor,
+    *,
+    atol: float,
+    rtol: float,
+) -> None:
+    """Compare tensors and include measured error when the budget fails."""
+    stats = tensor_error_stats(actual, expected)
+    try:
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    except AssertionError as exc:
+        raise AssertionError(
+            f"{name}: max_abs={stats['max_abs']:.6g} max_rel={stats['max_rel']:.6g} (budget atol={atol} rtol={rtol})"
+        ) from exc
