@@ -112,7 +112,13 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, Non
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     if meta.empty:
-        return _eager.backward(grad_output, SavedState(saved.tensors, _eager._Meta(True)))
+        return _eager.backward(
+            grad_output,
+            SavedState(
+                saved.tensors,
+                _eager._Meta(True, meta.hidden_needs_grad, meta.weight_needs_grad),
+            ),
+        )
 
     from liger_kernel.ops.fused_linear_cross_entropy import fused_linear_cross_entropy_backward
 

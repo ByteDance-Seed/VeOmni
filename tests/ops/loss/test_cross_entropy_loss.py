@@ -88,6 +88,50 @@ def test_eager_logits_match_hf(seed, num_tokens, num_classes, ignore_first, num_
     assert torch.allclose(logits_e.grad, logits_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+@pytest.mark.parametrize(
+    ("hidden_requires_grad", "weight_requires_grad", "expected_argnums"),
+    (
+        (True, True, (0, 1)),
+        (True, False, (0,)),
+        (False, True, (1,)),
+        (False, False, None),
+    ),
+    ids=("all-gradients", "frozen-weight", "frozen-hidden", "inference"),
+)
+def test_eager_hidden_skips_unneeded_grad_and_value(
+    monkeypatch: pytest.MonkeyPatch,
+    hidden_requires_grad: bool,
+    weight_requires_grad: bool,
+    expected_argnums: tuple[int, ...] | None,
+):
+    """Function.forward disables grad, so unused V×H grads must use requires_grad."""
+    calls: list[object] = []
+    real = torch.func.grad_and_value
+
+    def wrapped(fn, *args, **kwargs):
+        calls.append(kwargs.get("argnums", args[1] if len(args) > 1 else None))
+        return real(fn, *args, **kwargs)
+
+    monkeypatch.setattr(torch.func, "grad_and_value", wrapped)
+    torch.manual_seed(4)
+    hidden = torch.randn(2, 4, 8, requires_grad=hidden_requires_grad)
+    weight = torch.randn(6, 8, requires_grad=weight_requires_grad)
+    labels = torch.randint(0, 6, (2, 4))
+    loss = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(hidden, labels, weight)
+    assert calls == ([] if expected_argnums is None else [expected_argnums])
+    assert torch.isfinite(loss).all()
+    if hidden_requires_grad or weight_requires_grad:
+        loss.backward()
+    if hidden_requires_grad:
+        assert hidden.grad is not None
+    else:
+        assert hidden.grad is None
+    if weight_requires_grad:
+        assert weight.grad is not None
+    else:
+        assert weight.grad is None
+
+
 def test_eager_fp16_logits_do_not_overflow_outside_cross_entropy():
     logits = torch.ones(128, 1024, dtype=torch.float16)
     labels = torch.zeros(128, dtype=torch.long)
