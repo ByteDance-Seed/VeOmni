@@ -593,9 +593,8 @@ Extra e2e gotchas:
 
 **Acceptance:**
 
-- `test_models_patch` passes for every `(hf_mode, veomni_mode, moe_backend)`
-  combo the filter allows — loss and grad norm match within `(_DEFAULT_RTOL,
-  _DEFAULT_ATOL)`.
+- `test_models_transformers` family parity under `tests/models/transformers/`
+  matches Hugging Face on the eager path for the new architecture.
 - `test_e2e_parallel` passes across all `(sp_size, ep_size)` combos.
 - `make quality` is clean.
 

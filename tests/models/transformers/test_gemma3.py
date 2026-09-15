@@ -64,7 +64,7 @@ def test_gemma3_eager_matches_hf():
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
-    assert_eager_matches_hf(hf, ours, input_ids=input_ids)
+    assert_eager_matches_hf(hf, ours, input_ids=input_ids, logits_equal=True)
 
 
 def test_gemma3_eager_matches_hf_softcap():

@@ -29,17 +29,17 @@ B. **REPLAY-with-native-indices reproduces the native ``(idx, w)`` pair
    bit-for-bit at the experts call site, validated against vanilla HF
    as the oracle.** Combined with a small plumbing assertion that REPLAY
    with alt indices actually substitutes, this verifies the recompute
-   path (``softmax → gather → renorm → cast`` for qwen3_moe; ``gather →
-   renorm → cast`` for qwen3_5_moe) is bytewise equivalent to the native
-   router's internal post-topk math, independent of the indices chosen.
+   path (``softmax → gather → renorm → cast`` for both ``qwen3_moe`` and
+   ``qwen3_5_moe``) is bytewise equivalent to the native router's internal
+   post-topk math, independent of the indices chosen.
 
 The capture-experts pattern in Test B replaces ``block.experts`` with a
 sink that records ``(idx, w)`` and returns zeros. This isolates the
 comparison to RR's actual responsibility — what tuple is fed to the
-experts module — and avoids both expert-weight-layout incompatibilities
-between the locally merged ``gate_up_proj`` class and vanilla HF (separate
-``gate_proj``/``up_proj``), and any potential nondeterminism in
-the fused expert kernel itself.
+experts module — and avoids any potential nondeterminism in the fused
+expert kernel itself. Hugging Face 5.16 already stores merged
+``gate_up_proj`` experts for these families; the sink is not compensating
+for a split ``gate_proj`` / ``up_proj`` layout.
 
 Test A keeps eager experts in the loop (no capture) so the RECORD
 no-perturbation guarantee is verified end-to-end. Optimized expert kernels
@@ -406,11 +406,10 @@ def test_qwen3_5_moe_replay_native_matches_vanilla_hf_at_expert_input():
     _sync_gate_weight(patched, vanilla)
     h = _make_hidden_states(config)
 
-    # See qwen3_moe variant for the dtype-cast rationale. For qwen3_5_moe
-    # the cast is typically a no-op (vanilla HF and patched both end up in
-    # fp32 because the router locally rebinds ``router_logits`` to its
-    # softmax output and casts top-k values to that dtype), but applying it
-    # uniformly future-proofs against either side gaining a perf cast.
+    # See qwen3_moe variant for the dtype-cast rationale. transformers 5.16
+    # Qwen3.5-MoE ``TopKRouter`` returns pre-softmax ``router_logits`` the
+    # same way as Qwen3-MoE, so the patched recompute is also
+    # ``softmax → gather → renorm → cast``.
     idx_vanilla, w_vanilla_native_dtype = _capture_block_experts_inputs(vanilla, h)
 
     idx_patched_off, w_patched_off = _capture_block_experts_inputs(patched, h)
@@ -425,15 +424,9 @@ def test_qwen3_5_moe_replay_native_matches_vanilla_hf_at_expert_input():
     set_active_replay(None)
 
     assert torch.equal(idx_replay, idx_vanilla)
-    # For qwen3_5_moe, the recompute uses ``router_logits`` (which is already
-    # post-softmax due to the latent double-softmax quirk in upstream's
-    # ``Qwen3_5MoeTopKRouter.forward``) — see the comment in
-    # ``qwen3_5_moe_gpu_patch_gen_config.py``. If this assertion fails AFTER
-    # an upstream fix lands, the patch must switch to the qwen3_moe form
-    # (recompute softmax from raw logits).
     assert torch.equal(w_replay, w_vanilla), (
-        "Recompute path (gather + renorm + cast) is not bitwise-equivalent "
-        "to the native router's internal post-topk math."
+        "Recompute path (softmax + gather + renorm + cast) is not "
+        "bitwise-equivalent to the native router's internal post-topk math."
     )
 
     alt = (idx_vanilla + 1) % config.num_experts

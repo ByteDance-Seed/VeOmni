@@ -115,6 +115,7 @@ def test_qwen3_moe_eager_matches_hf():
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    # Merged-expert loop ULP (~1e-7); not bitwise vs Hugging Face.
     assert_eager_matches_hf(hf, ours, input_ids=input_ids)
 
 

@@ -98,6 +98,7 @@ def test_qwen2_5_omni_eager_matches_hf_text_only():
         ours,
         input_ids=input_ids,
         ours_fwd_kwargs=_mask_kwargs(input_ids),
+        logits_equal=True,
     )
 
 
@@ -124,6 +125,7 @@ def test_qwen2_5_omni_eager_matches_hf_image_and_text():
         labels=labels,
         fwd_kwargs=image,
         ours_fwd_kwargs=ours_masks,
+        logits_equal=True,
     )
 
 

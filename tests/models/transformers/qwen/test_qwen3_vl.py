@@ -72,7 +72,7 @@ def test_qwen3_vl_eager_matches_hf_text_only():
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, 100, (2, 8))
-    assert_eager_matches_hf(hf, ours, input_ids=input_ids)
+    assert_eager_matches_hf(hf, ours, input_ids=input_ids, logits_equal=True)
 
 
 @pytest.mark.parametrize("modality", ["image", "video"])
@@ -91,4 +91,5 @@ def test_qwen3_vl_eager_matches_hf_vision_and_text(modality):
     )
     ids = vision_inputs.pop("input_ids")
     labels = vision_inputs.pop("labels")
+    # Vision embed / RoPE ULP (~2e-7); the text-only path above is bitwise.
     assert_eager_matches_hf(hf, ours, input_ids=ids, labels=labels, fwd_kwargs=vision_inputs)

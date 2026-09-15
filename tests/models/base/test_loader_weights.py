@@ -12,7 +12,12 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""models weight I/O: empty init and save/load."""
+"""models weight I/O: empty init and save/load.
+
+Model-level ``weights_path`` loading (dense, merged MoE, VL, Omni) lives in
+``tests/models/base/test_low_precision_oracle.py``. This file only covers the
+tensor I/O primitives.
+"""
 
 from __future__ import annotations
 

@@ -63,7 +63,7 @@ def test_gpt_oss_eager_matches_hf(seq_len, partial_labels):
         labels[:, :4] = -100  # Prompt tokens are visible but not supervised.
         labels[0, 8:10] = -100
     assert_eager_matches_hf(
-        hf, ours, input_ids=input_ids, labels=labels, fwd_kwargs={"attention_mask": attention_mask}
+        hf, ours, input_ids=input_ids, labels=labels, fwd_kwargs={"attention_mask": attention_mask}, logits_equal=True
     )
 
 

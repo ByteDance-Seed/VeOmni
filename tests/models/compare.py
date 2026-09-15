@@ -179,6 +179,34 @@ def qwen_video_inputs(config, input_ids: torch.Tensor, *, split_frames: bool) ->
     }
 
 
+def assert_tensors_match(
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    *,
+    equal: bool,
+    atol: float,
+    rtol: float,
+    what: str,
+) -> None:
+    """Compare tensors bitwise when the family is bit-identical, else ``atol``/``rtol``.
+
+    Eager FP32 logits can match Hugging Face exactly when VeOmni runs the same
+    arithmetic. Loss and gradients stay on ``1e-6`` / ``1e-5`` even then, because
+    the fused CE path and mixed-dtype reductions are not bit-identical.
+    """
+    if equal:
+        if torch.equal(actual, reference):
+            return
+        diff = (actual.float() - reference.float()).abs()
+        mismatched = actual != reference
+        raise AssertionError(
+            f"{what} are not bitwise equal: "
+            f"{int(mismatched.sum().item())}/{actual.numel()} mismatched, "
+            f"max_abs_diff={float(diff.max().item()):.3e}"
+        )
+    torch.testing.assert_close(actual, reference, atol=atol, rtol=rtol, msg=what)
+
+
 def assert_eager_matches_hf(
     hf: torch.nn.Module,
     ours: torch.nn.Module,
@@ -191,8 +219,17 @@ def assert_eager_matches_hf(
     rtol: float = EAGER_RTOL,
     grad_atol: float = EAGER_GRAD_ATOL,
     grad_rtol: float = EAGER_GRAD_RTOL,
+    logits_equal: bool = False,
 ) -> None:
-    """Compare logits, loss and parameter gradients, optionally with masked labels."""
+    """Compare logits, loss and parameter gradients, optionally with masked labels.
+
+    ``logits_equal=True`` is the eager FP32 contract for dense text families
+    whose arithmetic matches Hugging Face. Families that keep ``False`` (the
+    default) stay on ``1e-6`` because MoE expert loops, DSA/MLA, or vision
+    scatter accumulate about 1e-7 ULP; that is still inside the old close
+    bound and is recorded at each call site. Loss and gradients always use
+    ``atol`` / ``grad_atol``.
+    """
     pin_eager_attn_implementation(hf)
     pin_eager_attn_implementation(ours)
 
@@ -203,13 +240,20 @@ def assert_eager_matches_hf(
 
     hf_logits = hf(input_ids=input_ids, use_cache=False, **hf_kwargs).logits
     ours_logits = ours(input_ids=input_ids, use_cache=False, **ours_kwargs).logits
-    torch.testing.assert_close(ours_logits, hf_logits, atol=atol, rtol=rtol)
+    assert_tensors_match(
+        ours_logits,
+        hf_logits,
+        equal=logits_equal,
+        atol=atol,
+        rtol=rtol,
+        what="logits",
+    )
 
     if labels is None:
         labels = input_ids.clone()
     hf_out = hf(input_ids=input_ids, labels=labels, use_cache=False, **hf_kwargs)
     ours_out = ours(input_ids=input_ids, labels=labels, use_cache=False, **ours_kwargs)
-    torch.testing.assert_close(ours_out.loss, hf_out.loss, atol=atol, rtol=rtol)
+    assert_tensors_match(ours_out.loss, hf_out.loss, equal=False, atol=atol, rtol=rtol, what="loss")
     assert ours_out.logits is None
 
     hf_out.loss.backward()

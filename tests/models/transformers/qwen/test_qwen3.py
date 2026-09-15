@@ -87,7 +87,7 @@ def test_qwen3_eager_matches_hf_logits_and_loss():
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
     hf_logits = hf(input_ids=input_ids, use_cache=False).logits
     ours_logits = ours(input_ids=input_ids, use_cache=False).logits
-    torch.testing.assert_close(ours_logits, hf_logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    assert torch.equal(ours_logits, hf_logits)
 
     labels = input_ids.clone()
     hf_out = hf(input_ids=input_ids, labels=labels, use_cache=False)

@@ -1,8 +1,17 @@
-# VeOmni Fused Attention Interface
+# VeOmni Attention Interface
 
-VeOmni registers sequence-parallel FlashAttention, FlexAttention, and
-MagiAttention FFA adapters in Transformers' `ALL_ATTENTION_FUNCTIONS`
-registry. Models continue to select an attention implementation through
+VeOmni registers sequence-parallel FlashAttention, FlexAttention, SDPA,
+SageAttention, and MagiAttention FFA adapters in Transformers'
+`ALL_ATTENTION_FUNCTIONS`. There is no `fused_attention_forward` facade and
+no replaceable module-level `_flash_attention_forward` slots. Patched models
+bind `attention_op()` once in `__init__` / `modify_init` and call
+`self.veomni_attn` from `forward`.
+
+Public names such as `flash_attention_2` rewrite to `veomni_flash_attention_2`
+(not a `_with_sp` suffix). Ulysses wrapping lives inside those registered
+adapters.
+
+Models continue to select an attention implementation through
 `config._attn_implementation`; modeling code stores that choice in a local
 `VeomniOp("attention", "standard", implementation)` handle.
 

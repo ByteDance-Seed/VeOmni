@@ -5,7 +5,7 @@ This section documents VeOmni's integration with HuggingFace
 
 ## Included Notes
 
-- [Fused attention interface](veomni_fused_attention.md): documents the unified Flash/Flex facade, config routing, native BlockMask contract, and Ulysses restrictions.
+- [Attention interface](veomni_fused_attention.md): documents instance-local `VeomniOp` dispatch, config routing, native BlockMask contract, and Ulysses restrictions.
 - [Flash Attention custom-name handling](veomni_flash_attention_op_adapter.md): explains why `_lazy_imports` fails for VeOmni custom attention names and how the local hub-kernel loader adapter resolves it.
 - [MoE weight loading](transformers_v5_moe_weight_loading.md): explains how VeOmni expects MoE expert weights to be laid out and documents qwen3_moe handling.
 - [Testing a new model](testing_new_model.md): SOP for adding registry/parity cases under `tests/models/` and `tests/e2e/test_e2e_parallel.py` when onboarding a new model.

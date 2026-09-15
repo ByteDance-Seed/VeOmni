@@ -151,7 +151,8 @@ contracts beside the maintained implementation.
 | Dimension | Values |
 |---|---|
 | Registry | Model type, supported architectures, aliases, prerequisites |
-| Eager parity | HuggingFace vs VeOmni logits/loss and gradients |
+| Eager parity | HuggingFace vs VeOmni logits/loss and gradients; bitwise logits where the family is bit-identical |
+| Low-precision oracle | BF16 FA2/SDPA vs independent HF, plus `weights_path` loader for dense, merged MoE, VL, Omni |
 | Operator binding | Selectable eager and optimized implementations without fixing a YAML choice |
 | Model contracts | Family-specific routing, masking, multimodal, or checkpoint behavior |
 
@@ -167,7 +168,9 @@ Registry/build coverage is centralized in
 `tests/models/base/test_auto_registry.py`; canonical tiny configs live
 in `tests/models/tiny_configs.py`; family-specific parity and contracts
 live under `tests/models/transformers/` and
-`tests/models/diffusers/`. Optimized operator numerics live under
+`tests/models/diffusers/`. BF16 FA2/SDPA oracles and disk-backed
+`weights_path` loading live in `tests/models/base/test_low_precision_oracle.py`.
+Optimized operator numerics live under
 `tests/ops/`.
 
 DeepSeek-V4- and GLM-MoE-DSA-specific DSA checks live under `tests/ops/dsa/`; optimized numerical

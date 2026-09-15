@@ -120,6 +120,7 @@ def test_qwen3_5_eager_matches_hf_full_attention():
         ours,
         input_ids=input_ids,
         fwd_kwargs={"cu_seq_lens_q": torch.tensor([0, 8], dtype=torch.int32)},
+        logits_equal=True,
     )
 
 
@@ -137,6 +138,7 @@ def test_qwen3_5_eager_matches_hf_linear_attention():
         ours,
         input_ids=input_ids,
         ours_fwd_kwargs={"cu_seq_lens_q": _empty_cu_seq_lens()},
+        logits_equal=True,
     )
 
 
@@ -155,6 +157,7 @@ def test_qwen3_5_eager_matches_hf_mixed_attention():
         ours,
         input_ids=input_ids,
         ours_fwd_kwargs={"cu_seq_lens_q": _empty_cu_seq_lens()},
+        logits_equal=True,
     )
 
 
@@ -170,6 +173,7 @@ def test_qwen3_5_eager_matches_hf_image_and_text():
     ids = image.pop("input_ids")
     labels = image.pop("labels")
     _pin_hf_gdn_to_torch(hf)
+    # Vision masked_scatter ULP (~2e-7); text/GDN paths above are bitwise.
     assert_eager_matches_hf(
         hf,
         ours,

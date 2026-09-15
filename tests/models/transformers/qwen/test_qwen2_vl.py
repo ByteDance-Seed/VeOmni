@@ -60,7 +60,7 @@ def test_qwen2_vl_eager_matches_hf_text_only():
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, 100, (2, 8))
-    assert_eager_matches_hf(hf, ours, input_ids=input_ids)
+    assert_eager_matches_hf(hf, ours, input_ids=input_ids, logits_equal=True)
 
 
 def test_qwen2_vl_eager_matches_hf_image_and_text():
@@ -74,4 +74,4 @@ def test_qwen2_vl_eager_matches_hf_image_and_text():
     image = qwen_image_inputs(config, input_ids)
     ids = image.pop("input_ids")
     labels = image.pop("labels")
-    assert_eager_matches_hf(hf, ours, input_ids=ids, labels=labels, fwd_kwargs=image)
+    assert_eager_matches_hf(hf, ours, input_ids=ids, labels=labels, fwd_kwargs=image, logits_equal=True)
