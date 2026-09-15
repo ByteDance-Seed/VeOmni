@@ -12,6 +12,7 @@ A test that passes locally is not necessarily a test CI runs.
 | `tests/data/` | whole directory, in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
 | `tests/checkpoints/` | whole directory, in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
 | `tests/ops/` | whole directory in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
+| `tests/models/` | whole directory in both `gpu_unit_tests.yml` and `npu_unit_tests.yml` |
 | `tests/parallel/context_parallel/` | whole directory, `gpu_unit_tests.yml` only |
 | everything else | **one `pytest` line per file**, listed in `gpu_unit_tests.yml`, and separately in `npu_unit_tests.yml` when it should run on Ascend |
 | `tests/e2e/test_e2e_parallel.py`, `tests/distributed/test_fsdp_equivalence.py` | `gpu_e2e_test.yml` / `npu_e2e_test.yml` |
@@ -22,7 +23,7 @@ Consequences that cut both ways:
   covered. Adding a workflow line for it is redundant churn.
 - Adding a file anywhere else is **invisible to CI** until it is enumerated —
   usually in two workflows. Roughly thirty existing files under
-  `tests/{trainer,utils,models,lora,distributed,parallel,e2e}` are in exactly
+  `tests/{trainer,utils,tools,lora,distributed,parallel,e2e}` are in exactly
   this state, so "a test file exists for X" does not mean X is guarded.
 - The GPU unit job runs on one self-hosted L20-8 fleet with a 120-minute budget
   and `-x` fail-fast. Every new file pays process startup plus model build, and a
@@ -62,10 +63,11 @@ by a `pytest.param` table, so a new case is a few lines:
 | LoRA / MoE-LoRA | the enumerated `tests/lora/test_*.py` set |
 | End-to-end parallel parity | `tests/e2e/test_e2e_parallel.py` (`text_test_cases` and friends) |
 
-**2. It is a self-contained kernel or data-pipeline unit test → new file under
-`tests/ops/` or `tests/data/`.** Both directories are collected wholesale by the
-GPU and NPU unit workflows, so do not add a per-file workflow entry. Hardware
-markers and dependency guards inside the test decide which cases each job runs.
+**2. It is a self-contained model, kernel, or data-pipeline unit test → new file
+under `tests/models/`, `tests/ops/`, or `tests/data/`.** These directories are
+collected wholesale by the GPU and NPU unit workflows, so do not add a per-file
+workflow entry. Hardware markers and dependency guards inside the test decide
+which cases each job runs.
 
 **3. It genuinely needs a new file elsewhere.** Prefer folding it into an
 enumerated file in the same directory first. If a separate file is warranted

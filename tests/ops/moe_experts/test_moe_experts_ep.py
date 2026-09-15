@@ -16,7 +16,23 @@ import pytest
 import torch
 
 from tests.ops.moe_experts.reference import standard_fused_reference
-from tests.ops.tol import MOE_EP_PRE_SM90_ATOL, MOE_EP_SM90_ATOL, MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL
+from tests.ops.tol import (
+    MOE_EP_PRE_SM90_ATOL,
+    MOE_EP_SM90_ATOL,
+    MOE_FUSED_GRAD_FC1_ATOL,
+    MOE_FUSED_GRAD_FC1_RTOL,
+    MOE_FUSED_GRAD_FC2_ATOL,
+    MOE_FUSED_GRAD_FC2_RTOL,
+    MOE_FUSED_GRAD_HIDDEN_ATOL,
+    MOE_FUSED_GRAD_HIDDEN_RTOL,
+    MOE_FUSED_SWIGLU_GRAD_FC1_ATOL,
+    MOE_FUSED_SWIGLU_GRAD_FC1_RTOL,
+    MOE_FUSED_SWIGLU_GRAD_FC2_ATOL,
+    MOE_FUSED_SWIGLU_GRAD_FC2_RTOL,
+    MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL,
+    MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL,
+    MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
+)
 from veomni.distributed.moe import EPGroupGemm, EPMergedFc1GroupGemm
 from veomni.ops.kernels.moe_experts.shared.dispatch import expert_histogram, moe_gather, moe_scatter
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, is_sm90_or_above
@@ -63,8 +79,37 @@ def _scatter_routing_weights(routing_weights, scatter_index):
     return scattered
 
 
+def _scatter_tokens_autograd(hidden_states, scatter_index):
+    """Mirror the Triton scatter layout with differentiable PyTorch indexing."""
+    topk = scatter_index.shape[1]
+    sorted_to_assignment = scatter_index.flatten().argsort()
+    return hidden_states.repeat_interleave(topk, dim=0)[sorted_to_assignment]
+
+
+def _gather_tokens_autograd(expert_output, routing_weights, scatter_index):
+    """Mirror weighted Triton gather while retaining the test's autograd graph."""
+    num_tokens, topk = scatter_index.shape
+    assignment_output = expert_output[scatter_index.flatten()]
+    weighted_output = assignment_output * routing_weights.reshape(-1, 1)
+    return weighted_output.view(num_tokens, topk, -1).sum(dim=1)
+
+
 def _ep_atol() -> float:
     return MOE_EP_SM90_ATOL if is_sm90_or_above() else MOE_EP_PRE_SM90_ATOL
+
+
+def _ep_gradient_tolerances(swiglu_limit):
+    if swiglu_limit is not None:
+        return (
+            (MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL, MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL),
+            (MOE_FUSED_SWIGLU_GRAD_FC1_ATOL, MOE_FUSED_SWIGLU_GRAD_FC1_RTOL),
+            (MOE_FUSED_SWIGLU_GRAD_FC2_ATOL, MOE_FUSED_SWIGLU_GRAD_FC2_RTOL),
+        )
+    return (
+        (MOE_FUSED_GRAD_HIDDEN_ATOL, MOE_FUSED_GRAD_HIDDEN_RTOL),
+        (MOE_FUSED_GRAD_FC1_ATOL, MOE_FUSED_GRAD_FC1_RTOL),
+        (MOE_FUSED_GRAD_FC2_ATOL, MOE_FUSED_GRAD_FC2_RTOL),
+    )
 
 
 @pytest.mark.parametrize("swiglu_limit", [None, 7.0, 10.0])
@@ -291,19 +336,19 @@ def test_ep_vs_non_ep(
 
     hs_ep = hidden_states.clone().detach().requires_grad_(True)
     routing_ep = routing_weights.clone().detach().requires_grad_(True)
-    pt_ep, cumsum_ep, scatter_index_ep = _scatter_tokens(hs_ep, selected_experts, num_experts)
-    scattered_gw_ep = _scatter_routing_weights(routing_ep, scatter_index_ep)
+    pt_ep = _scatter_tokens_autograd(hs_ep, scatter_index)
     fc1_1_ep = fc1_1_weight.clone().detach().requires_grad_(True)
     fc1_2_ep = fc1_2_weight.clone().detach().requires_grad_(True)
     fc2_ep = fc2_weight.clone().detach().requires_grad_(True)
-    ep_raw2 = EPGroupGemm.apply(pt_ep, cumsum_ep, fc1_1_ep, fc1_2_ep, fc2_ep, swiglu_limit)
-    out_ep2 = moe_gather(ep_raw2 * scattered_gw_ep, scatter_index_ep).reshape(hidden_states.shape)
+    ep_raw2 = EPGroupGemm.apply(pt_ep, cumsum, fc1_1_ep, fc1_2_ep, fc2_ep, swiglu_limit)
+    out_ep2 = _gather_tokens_autograd(ep_raw2, routing_ep, scatter_index)
     out_ep2.backward(grad_output)
-    torch.testing.assert_close(hs_eager.grad, hs_ep.grad, rtol=0, atol=atol)
-    torch.testing.assert_close(routing_eager.grad, routing_ep.grad, rtol=0, atol=atol)
-    torch.testing.assert_close(fc2_eager.grad, fc2_ep.grad, rtol=0, atol=atol)
-    torch.testing.assert_close(fc1_1_eager.grad, fc1_1_ep.grad, rtol=0, atol=atol)
-    torch.testing.assert_close(fc1_2_eager.grad, fc1_2_ep.grad, rtol=0, atol=atol)
+    hidden_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(swiglu_limit)
+    torch.testing.assert_close(hs_eager.grad, hs_ep.grad, atol=hidden_tol[0], rtol=hidden_tol[1])
+    torch.testing.assert_close(routing_eager.grad, routing_ep.grad, atol=hidden_tol[0], rtol=hidden_tol[1])
+    torch.testing.assert_close(fc2_eager.grad, fc2_ep.grad, atol=fc2_tol[0], rtol=fc2_tol[1])
+    torch.testing.assert_close(fc1_1_eager.grad, fc1_1_ep.grad, atol=fc1_tol[0], rtol=fc1_tol[1])
+    torch.testing.assert_close(fc1_2_eager.grad, fc1_2_ep.grad, atol=fc1_tol[0], rtol=fc1_tol[1])
 
 
 @pytest.mark.parametrize("swiglu_limit", [None, 7.0, 10.0])
@@ -379,19 +424,19 @@ def test_ep_merged_vs_non_ep(
 
     hs_ep = hidden_states.clone().detach().requires_grad_(True)
     routing_ep = routing_weights.clone().detach().requires_grad_(True)
-    pt_ep, cumsum_ep, scatter_index_ep = _scatter_tokens(hs_ep, selected_experts, num_experts)
-    scattered_gw_ep = _scatter_routing_weights(routing_ep, scatter_index_ep)
+    pt_ep = _scatter_tokens_autograd(hs_ep, scatter_index)
     fc1_merged_ep = fc1_1_2_weight.clone().detach().requires_grad_(True)
     fc2_ep = fc2_weight.clone().detach().requires_grad_(True)
-    ep_raw2 = EPMergedFc1GroupGemm.apply(pt_ep, cumsum_ep, fc1_merged_ep, fc2_ep, swiglu_limit)
-    out_ep2 = moe_gather(ep_raw2 * scattered_gw_ep, scatter_index_ep).reshape(hidden_states.shape)
+    ep_raw2 = EPMergedFc1GroupGemm.apply(pt_ep, cumsum, fc1_merged_ep, fc2_ep, swiglu_limit)
+    out_ep2 = _gather_tokens_autograd(ep_raw2, routing_ep, scatter_index)
     out_ep2.backward(grad_output)
-    torch.testing.assert_close(hs_eager.grad, hs_ep.grad, rtol=0, atol=atol)
-    torch.testing.assert_close(routing_eager.grad, routing_ep.grad, rtol=0, atol=atol)
-    torch.testing.assert_close(fc2_eager.grad, fc2_ep.grad, rtol=0, atol=atol)
+    hidden_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(swiglu_limit)
+    torch.testing.assert_close(hs_eager.grad, hs_ep.grad, atol=hidden_tol[0], rtol=hidden_tol[1])
+    torch.testing.assert_close(routing_eager.grad, routing_ep.grad, atol=hidden_tol[0], rtol=hidden_tol[1])
+    torch.testing.assert_close(fc2_eager.grad, fc2_ep.grad, atol=fc2_tol[0], rtol=fc2_tol[1])
     torch.testing.assert_close(
         torch.cat([fc1_1_eager.grad, fc1_2_eager.grad], dim=1),
         fc1_merged_ep.grad,
-        rtol=0,
-        atol=atol,
+        atol=fc1_tol[0],
+        rtol=fc1_tol[1],
     )

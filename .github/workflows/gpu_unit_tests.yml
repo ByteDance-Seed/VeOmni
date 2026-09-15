@@ -160,6 +160,7 @@ jobs:
         run: |
           uv run --frozen pytest -s -x tests/distributed/test_async_offload_unit.py
           uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
+          uv run --frozen pytest -s -x tests/distributed/test_hccl_premul_sum.py
           uv run --frozen pytest -s -x tests/distributed/test_torch_compile.py
       - name: Run data tests
         run: |
@@ -171,6 +172,7 @@ jobs:
         # TODO: run all tests under tests/utils/ once all util tests are verified
         run: |
           uv run --frozen pytest -s -x tests/utils/test_count_flops.py
+          uv run --frozen pytest -s -x tests/tools/test_training_utils.py
       - name: Run Muon optimizer tests
         run: |
           uv run --frozen pytest -s -x tests/optim/test_muon_unit.py
