@@ -18,11 +18,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from operator import attrgetter
 
 import pytest
 from transformers import PretrainedConfig
 
-from tests.models.compare import eager_ops_config
+from tests.models.compare import eager_ops_config, ops_config_scope
 from tests.models.tiny_configs import (
     tiny_deepseek_v3_config as _tiny_deepseek_v3_config,
 )
@@ -126,7 +127,8 @@ from veomni.models import (
     check_model_build_prerequisites,
     get_model_class,
 )
-from veomni.ops.config import get_ops_config, set_ops_config
+from veomni.ops import VeomniOp
+from veomni.ops.config import get_ops_config
 
 
 class _UnregisteredConfig(PretrainedConfig):
@@ -147,6 +149,7 @@ class _ModelCase:
     registered_model_aliases: tuple[str, ...] = ()
     processor_class_name: str | None = None
     eager_op_path: str | None = "veomni_ce"
+    isolation_op_path: str | None = None
 
 
 _MODEL_CASES = (
@@ -296,16 +299,19 @@ _MODEL_CASES = (
     ),
     _ModelCase(
         model_type="qwen3_5_moe",
+        isolation_op_path="model.language_model.layers.0.mlp.experts.veomni_moe",
         config_factory=_tiny_qwen3_5_moe_config,
         architectures=("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeModel"),
     ),
     _ModelCase(
         model_type="qwen3_5_moe_text",
+        isolation_op_path="model.layers.0.mlp.experts.veomni_moe",
         config_factory=_tiny_qwen3_5_moe_text_config,
         architectures=("Qwen3_5MoeForCausalLM", "Qwen3_5MoeTextModel"),
     ),
     _ModelCase(
         model_type="qwen3_moe",
+        isolation_op_path="model.layers.0.mlp.experts.veomni_moe",
         config_factory=_tiny_qwen3_moe_config,
         architectures=(
             "Qwen3MoeForCausalLM",
@@ -317,6 +323,7 @@ _MODEL_CASES = (
     ),
     _ModelCase(
         model_type="qwen3_omni_moe",
+        isolation_op_path="thinker.model.layers.0.mlp.experts.veomni_moe",
         config_factory=_tiny_qwen3_omni_moe_config,
         architectures=("Qwen3OmniMoeForConditionalGeneration",),
         has_registered_config=True,
@@ -325,6 +332,7 @@ _MODEL_CASES = (
     ),
     _ModelCase(
         model_type="qwen3_omni_moe_thinker",
+        isolation_op_path="model.layers.0.mlp.experts.veomni_moe",
         config_factory=_tiny_qwen3_omni_moe_thinker_config,
         architectures=("Qwen3OmniMoeThinkerForConditionalGeneration",),
     ),
@@ -341,6 +349,7 @@ _MODEL_CASES = (
     ),
     _ModelCase(
         model_type="qwen3_vl_moe",
+        isolation_op_path="model.language_model.layers.0.mlp.experts.veomni_moe",
         config_factory=_tiny_qwen3_vl_moe_config,
         architectures=(
             "Qwen3VLMoeForConditionalGeneration",
@@ -413,21 +422,15 @@ def test_get_model_class_hf_backend(monkeypatch):
 
 
 def test_build_foundation_model_requires_ops_config():
-    previous = get_ops_config()
-    try:
-        set_ops_config(None)
+    with ops_config_scope(None):
         with pytest.raises(ValueError, match="ops_implementation"):
             build_foundation_model(_tiny_qwen3_config())
-    finally:
-        set_ops_config(previous)
 
 
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
 def test_build_foundation_model_constructs_registered_model(model_case: _ModelCase):
-    previous = get_ops_config()
     cfg = eager_ops_config()
-    try:
-        set_ops_config(None)
+    with ops_config_scope(None):
         model = build_foundation_model(
             model_case.config_factory(model_case.architectures[0]),
             torch_dtype="float32",
@@ -435,14 +438,73 @@ def test_build_foundation_model_constructs_registered_model(model_case: _ModelCa
             ops_implementation=cfg,
         )
         assert get_ops_config() is cfg
-    finally:
-        set_ops_config(previous)
     assert model.__class__.__name__ == model_case.architectures[0]
     if model_case.eager_op_path is not None:
         op = model
         for attribute in model_case.eager_op_path.split("."):
             op = getattr(op, attribute)
         assert op.impl == "eager"
+
+
+_ALTERNATE_OP_IMPLS = {
+    "cross_entropy_loss": ("cross_entropy_loss_implementation", "chunk_loss"),
+    "moe_experts": ("moe_implementation", "fused_triton"),
+    "rms_norm": ("rms_norm_implementation", "liger_kernel"),
+    "attention": ("attn_implementation", "sdpa"),
+}
+
+
+def _op_bindings(model, selected_path):
+    """Snapshot handles and selected implementations, including unrelated model ops."""
+    bindings = {
+        (module_name, attribute): (value, value.impl)
+        for module_name, module in model.named_modules()
+        for attribute, value in vars(module).items()
+        if isinstance(value, VeomniOp)
+    }
+    # Diffusers processors can hold the selected op outside the nn.Module tree.
+    selected = attrgetter(selected_path)(model)
+    module_name, _, attribute = selected_path.rpartition(".")
+    bindings[module_name, attribute] = (selected, selected.impl)
+    return bindings
+
+
+@pytest.mark.parametrize(
+    "model_case",
+    [case for case in _MODEL_CASES if case.eager_op_path is not None],
+    ids=lambda case: case.model_type,
+)
+def test_model_instances_keep_distinct_impls(model_case: _ModelCase, available_nvidia_ops):
+    """Construction and later config changes must not rebind existing instances.
+
+    This checks selection only; platform gates are stubbed and no optimized
+    kernel executes. Family parity and ops tests own numerical execution.
+    """
+    previous = get_ops_config()
+    eager_config = eager_ops_config()
+
+    def construct(config):
+        with ops_config_scope(config):
+            model_config = model_case.config_factory(model_case.architectures[0])
+            return get_model_class(model_config)(model_config)
+
+    eager = construct(eager_config)
+    selected_path = model_case.isolation_op_path or model_case.eager_op_path
+    selected_op = attrgetter(selected_path)
+    assert selected_op(eager).impl == "eager"
+    eager_bindings = _op_bindings(eager, selected_path)
+    field, alternate_impl = _ALTERNATE_OP_IMPLS[selected_op(eager).op]
+    alternate_config = eager_ops_config()
+    setattr(alternate_config, field, alternate_impl)
+    alternate = construct(alternate_config)
+    assert selected_op(alternate).impl == alternate_impl
+    alternate_bindings = _op_bindings(alternate, selected_path)
+
+    for config in (alternate_config, eager_config, None):
+        with ops_config_scope(config):
+            assert _op_bindings(eager, selected_path) == eager_bindings
+            assert _op_bindings(alternate, selected_path) == alternate_bindings
+    assert get_ops_config() is previous
 
 
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
@@ -491,11 +553,9 @@ def test_a_config_that_cannot_ask_for_the_objective_is_left_alone():
 def test_the_generic_hook_reaches_the_model_that_implements_it():
     from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
-    previous = get_ops_config()
     cfg = eager_ops_config()
     cfg.dsa_indexer_implementation = "eager"
-    set_ops_config(cfg)
-    try:
+    with ops_config_scope(cfg):
         config = DeepseekV4Config(
             num_hidden_layers=2,
             layer_types=["compressed_sparse_attention"] * 2,
@@ -503,8 +563,6 @@ def test_the_generic_hook_reaches_the_model_that_implements_it():
         )
         with pytest.raises(ValueError, match="dsa_indexer_implementation"):
             check_model_build_prerequisites(config)
-    finally:
-        set_ops_config(previous)
 
 
 def test_context_parallel_is_refused_on_npu(monkeypatch: pytest.MonkeyPatch):

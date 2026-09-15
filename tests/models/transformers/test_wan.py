@@ -29,6 +29,7 @@ import torch
 from tests.models.compare import (
     assert_outputs_and_grads_match,
     eager_ops_config,
+    ops_config_scope,
 )
 from tests.models.refs.wan import WanConfig as RefWanConfig
 from tests.models.refs.wan import WanModel as RefWanModel
@@ -38,7 +39,6 @@ from veomni.models.transformers.wan import modeling_wan as wan_modeling
 from veomni.models.transformers.wan.config_wan import WanConfig
 from veomni.models.transformers.wan.fa3_fp8 import should_use_fa3_fp8
 from veomni.ops import VeomniOp
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _tiny_ref_config() -> RefWanConfig:
@@ -62,12 +62,8 @@ def _tiny_ref_config() -> RefWanConfig:
 def _build_ours(config: WanConfig, ops: SimpleNamespace | None = None):
     from veomni.models.transformers.wan.modeling_wan import WanModel
 
-    previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
-    try:
+    with ops_config_scope(ops if ops is not None else eager_ops_config()):
         return WanModel(config)
-    finally:
-        set_ops_config(previous)
 
 
 def _wan_inputs(in_dim: int, text_len: int, text_dim: int) -> dict[str, torch.Tensor]:
@@ -192,19 +188,6 @@ def test_wan_constructs_local_kernels():
     assert block.self_attn.norm_q.veomni_rms_norm.impl == "eager"
     assert block.self_attn.attn.veomni_attn.op == "attention"
     assert block.self_attn.attn.veomni_attn.impl == "eager"
-
-
-def test_wan_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_config(), eager_ops_config())
-    other_cfg = eager_ops_config()
-    other_cfg.rms_norm_implementation = "liger_kernel"
-    other = _build_ours(_tiny_config(), other_cfg)
-
-    assert eager.blocks[0].self_attn.norm_q.veomni_rms_norm.impl == "eager"
-    assert other.blocks[0].self_attn.norm_q.veomni_rms_norm.impl == "liger_kernel"
-
-    set_ops_config(other_cfg)
-    assert eager.blocks[0].self_attn.norm_q.veomni_rms_norm.impl == "eager"
 
 
 def test_wan_eager_matches_official():

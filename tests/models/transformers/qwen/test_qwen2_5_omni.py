@@ -39,11 +39,11 @@ from transformers.models.qwen2_5_omni.processing_qwen2_5_omni import (
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
+    ops_config_scope,
     qwen_image_inputs,
 )
 from tests.models.tiny_configs import tiny_qwen2_5_omni_thinker_config as _tiny_thinker_config
 from veomni.ops import VeomniOp
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _build_ours(config: Qwen2_5OmniThinkerConfig, ops: SimpleNamespace | None = None):
@@ -51,12 +51,8 @@ def _build_ours(config: Qwen2_5OmniThinkerConfig, ops: SimpleNamespace | None = 
         Qwen2_5OmniThinkerForConditionalGeneration,
     )
 
-    previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
-    try:
+    with ops_config_scope(ops if ops is not None else eager_ops_config()):
         return Qwen2_5OmniThinkerForConditionalGeneration(config)
-    finally:
-        set_ops_config(previous)
 
 
 def _mask_kwargs(input_ids: torch.Tensor) -> dict:
@@ -72,19 +68,6 @@ def test_qwen2_5_omni_constructs_local_kernels():
     model = _build_ours(_tiny_thinker_config())
     assert isinstance(model.veomni_ce, VeomniOp)
     assert model.veomni_ce.impl == "eager"
-
-
-def test_qwen2_5_omni_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_thinker_config(), eager_ops_config())
-    chunk_cfg = eager_ops_config()
-    chunk_cfg.cross_entropy_loss_implementation = "chunk_loss"
-    chunk = _build_ours(_tiny_thinker_config(), chunk_cfg)
-
-    assert eager.veomni_ce.impl == "eager"
-    assert chunk.veomni_ce.impl == "chunk_loss"
-
-    set_ops_config(chunk_cfg)
-    assert eager.veomni_ce.impl == "eager"
 
 
 def test_qwen2_5_omni_registry_wires_kernel_and_upstream_talker_entries():

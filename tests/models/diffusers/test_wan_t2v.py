@@ -28,6 +28,7 @@ from diffusers import WanTransformer3DModel as OfficialWanTransformer3DModel
 from tests.models.compare import (
     assert_outputs_and_grads_match,
     eager_ops_config,
+    ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_wan_t2v_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_wan_t2v_config as _tiny_config
@@ -35,7 +36,6 @@ from veomni.models.diffusers.wan_t2v.wan_transformer.configuration_wan_transform
     WanTransformer3DModelConfig,
 )
 from veomni.ops import VeomniOp
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 _OFFICIAL_FORWARD = OfficialWanTransformer3DModel.forward
@@ -46,12 +46,8 @@ def _build_ours(config: WanTransformer3DModelConfig, ops: SimpleNamespace | None
         WanTransformer3DModel,
     )
 
-    previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
-    try:
+    with ops_config_scope(ops if ops is not None else eager_ops_config()):
         return WanTransformer3DModel(config)
-    finally:
-        set_ops_config(previous)
 
 
 def test_wan_t2v_configs_roundtrip_through_registry(tmp_path):
@@ -97,19 +93,6 @@ def test_wan_t2v_constructs_local_kernels():
     assert processor.veomni_attn.impl == "eager"
 
 
-def test_wan_t2v_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_config(), eager_ops_config())
-    other_cfg = eager_ops_config()
-    other_cfg.attn_implementation = "sdpa"
-    other = _build_ours(_tiny_config(), other_cfg)
-
-    assert eager.blocks[0].attn1.processor.veomni_attn.impl == "eager"
-    assert other.blocks[0].attn1.processor.veomni_attn.impl == "sdpa"
-
-    set_ops_config(other_cfg)
-    assert eager.blocks[0].attn1.processor.veomni_attn.impl == "eager"
-
-
 def test_wan_t2v_public_training_forward_matches_official(monkeypatch):
     """Compare ragged-sample predictions and mean sample loss through the public entry."""
     from veomni.models import get_model_class
@@ -120,12 +103,8 @@ def test_wan_t2v_public_training_forward_matches_official(monkeypatch):
     # Registry resolution installs the production backbone forward. Restore that
     # class-level patch after this test, including when an assertion fails.
     monkeypatch.setattr(OfficialWanTransformer3DModel, "forward", OfficialWanTransformer3DModel.forward)
-    previous = get_ops_config()
-    set_ops_config(eager_ops_config())
-    try:
+    with ops_config_scope(eager_ops_config()):
         ours = get_model_class(config)(config)
-    finally:
-        set_ops_config(previous)
     ours.load_state_dict(official.state_dict())
     samples = [
         {

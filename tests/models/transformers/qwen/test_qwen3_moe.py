@@ -37,10 +37,10 @@ from tests.models.compare import (
     assert_eager_matches_hf,
     assert_sequence_classification_matches_hf,
     eager_ops_config,
+    ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_qwen3_moe_config as _tiny_config
 from veomni.ops import VeomniOp
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _qwen3_moe_classes():
@@ -72,12 +72,8 @@ def _qwen3_moe_classes():
 
 
 def _construct_ours(model_cls, config: Qwen3MoeConfig, ops: SimpleNamespace | None = None):
-    previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
-    try:
+    with ops_config_scope(ops if ops is not None else eager_ops_config()):
         return model_cls(config)
-    finally:
-        set_ops_config(previous)
 
 
 def _build_ours(config: Qwen3MoeConfig, ops: SimpleNamespace | None = None):
@@ -112,33 +108,16 @@ def test_qwen3_moe_rope_reads_selected_impl(monkeypatch):
     monkeypatch.setattr(modeling, "VeomniOp", StubOp)
     ops = eager_ops_config()
     ops.rotary_pos_emb_implementation = "test_impl"
-    previous = get_ops_config()
-    set_ops_config(ops)
-    try:
+    with ops_config_scope(ops):
         q = torch.randn(1, 2, 4, 8)
         k = torch.randn_like(q)
         cos = torch.randn(1, 4, 8)
         sin = torch.randn_like(cos)
         q_out, k_out = modeling.apply_rotary_pos_emb(q, k, cos, sin)
-    finally:
-        set_ops_config(previous)
 
     assert selected == [("rope", "full", "test_impl")]
     assert q_out is q
     assert k_out is k
-
-
-def test_qwen3_moe_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_config(), eager_ops_config())
-    fused_cfg = eager_ops_config()
-    fused_cfg.moe_implementation = "fused_triton"
-    fused = _build_ours(_tiny_config(), fused_cfg)
-
-    assert eager.model.layers[0].mlp.experts.veomni_moe.impl == "eager"
-    assert fused.model.layers[0].mlp.experts.veomni_moe.impl == "fused_triton"
-
-    set_ops_config(fused_cfg)
-    assert eager.model.layers[0].mlp.experts.veomni_moe.impl == "eager"
 
 
 def test_qwen3_moe_eager_matches_hf():

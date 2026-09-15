@@ -28,10 +28,10 @@ from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCa
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
+    ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_deepseek_v3_config as _tiny_config
 from veomni.ops import VeomniOp
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _dsv3_cls():
@@ -49,12 +49,8 @@ def _dsv3_cls():
 
 
 def _build_ours(config: DeepseekV3Config, ops: SimpleNamespace | None = None):
-    previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
-    try:
+    with ops_config_scope(ops if ops is not None else eager_ops_config()):
         return _dsv3_cls()(config)
-    finally:
-        set_ops_config(previous)
 
 
 def test_deepseek_v3_constructs_local_kernels():
@@ -68,20 +64,6 @@ def test_deepseek_v3_constructs_local_kernels():
     assert moe.mlp.experts.veomni_moe.op == "moe_experts"
     assert moe.mlp.experts.veomni_moe.impl == "eager"
     assert moe.mlp.shared_experts.veomni_swiglu_mlp.op == "swiglu_mlp"
-
-
-def test_deepseek_v3_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_config(), eager_ops_config())
-    chunk_cfg = eager_ops_config()
-    chunk_cfg.cross_entropy_loss_implementation = "chunk_loss"
-    chunk = _build_ours(_tiny_config(), chunk_cfg)
-
-    assert eager.veomni_ce.impl == "eager"
-    assert chunk.veomni_ce.impl == "chunk_loss"
-
-    set_ops_config(chunk_cfg)
-    assert eager.veomni_ce.impl == "eager"
-    assert eager.model.layers[3].mlp.experts.veomni_moe.impl == "eager"
 
 
 def test_deepseek_v3_eager_matches_hf():

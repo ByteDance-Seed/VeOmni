@@ -20,7 +20,6 @@ Direct-import the generated CausalLM. Compare a toy model against HuggingFace.
 from __future__ import annotations
 
 import copy
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -35,11 +34,11 @@ from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
     named_trainable,
+    ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_gemma3_text_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 from veomni.ops import VeomniOp
-from veomni.ops.config import get_ops_config, set_ops_config
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
@@ -48,12 +47,8 @@ def _build_ours(config: Gemma3TextConfig, ops: SimpleNamespace | None = None):
         Gemma3ForCausalLM,
     )
 
-    previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
-    try:
+    with ops_config_scope(ops if ops is not None else eager_ops_config()):
         return Gemma3ForCausalLM(config)
-    finally:
-        set_ops_config(previous)
 
 
 def _flex_ops_config() -> SimpleNamespace:
@@ -62,33 +57,10 @@ def _flex_ops_config() -> SimpleNamespace:
     return config
 
 
-@contextmanager
-def _use_ops(config: SimpleNamespace):
-    previous = get_ops_config()
-    set_ops_config(config)
-    try:
-        yield
-    finally:
-        set_ops_config(previous)
-
-
 def test_gemma3_constructs_local_kernels():
     model = _build_ours(_tiny_config())
     assert isinstance(model.veomni_ce, VeomniOp)
     assert model.veomni_ce.impl == "eager"
-
-
-def test_gemma3_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_config(), eager_ops_config())
-    chunk_cfg = eager_ops_config()
-    chunk_cfg.cross_entropy_loss_implementation = "chunk_loss"
-    chunk = _build_ours(_tiny_config(), chunk_cfg)
-
-    assert eager.veomni_ce.impl == "eager"
-    assert chunk.veomni_ce.impl == "chunk_loss"
-
-    set_ops_config(chunk_cfg)
-    assert eager.veomni_ce.impl == "eager"
 
 
 def test_gemma3_eager_matches_hf():
@@ -191,7 +163,7 @@ def test_gemma3_routes_full_and_sliding_flex_masks(monkeypatch):
     model = _build_ours(config, ops).eval()
     input_ids = torch.randint(3, model.config.vocab_size, (1, 8))
 
-    with _use_ops(ops), torch.no_grad():
+    with ops_config_scope(ops), torch.no_grad():
         output = model(input_ids=input_ids, use_cache=False)
 
     assert torch.isfinite(output.logits).all()
@@ -219,7 +191,7 @@ def test_gemma3_packed_flex_matches_independent_samples_on_cpu():
     second_input_ids = torch.tensor([[8, 9, 10, 11, 12]])
     packed_input_ids = torch.cat((first_input_ids, second_input_ids), dim=1)
 
-    with _use_ops(ops), torch.no_grad():
+    with ops_config_scope(ops), torch.no_grad():
         packed_logits = model(
             input_ids=packed_input_ids,
             attention_mask=torch.ones_like(packed_input_ids),
@@ -262,7 +234,7 @@ def test_gemma3_packed_flex_matches_independent_samples_on_cuda():
         requires_grad=True,
     )
 
-    with _use_ops(ops):
+    with ops_config_scope(ops):
         with torch.no_grad():
             first_logits = model(
                 inputs_embeds=packed_inputs[:, :3].detach(),
@@ -325,7 +297,7 @@ def test_gemma3_builds_global_pack_aware_flex_masks_with_ulysses(monkeypatch):
     model = _build_ours(config, ops).eval()
     local_input_ids = torch.randint(3, model.config.vocab_size, (1, 4))
 
-    with _use_ops(ops), torch.no_grad():
+    with ops_config_scope(ops), torch.no_grad():
         model(
             input_ids=local_input_ids,
             attention_mask=torch.ones(1, 8, dtype=torch.long),
@@ -358,7 +330,7 @@ def test_gemma3_flex_matches_math_sdpa_forward_and_backward():
     flex_inputs = math_inputs.detach().clone().requires_grad_(True)
     with sdpa_kernel(backends=[SDPBackend.MATH]):
         math_logits = math_model(inputs_embeds=math_inputs, use_cache=False).logits
-    with _use_ops(ops):
+    with ops_config_scope(ops):
         flex_logits = flex_model(inputs_embeds=flex_inputs, use_cache=False).logits
 
     torch.testing.assert_close(flex_logits, math_logits, rtol=3e-2, atol=3e-2)

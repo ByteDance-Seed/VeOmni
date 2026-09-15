@@ -41,6 +41,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
+    ops_config_scope,
     pin_eager_attn_implementation,
     qwen_image_inputs,
 )
@@ -51,7 +52,6 @@ from tests.models.tiny_configs import (
     tiny_qwen3_5_moe_text_config as _tiny_text_config,
 )
 from veomni.ops import VeomniOp
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 IMAGE_TOKEN_ID = 120
@@ -75,23 +75,15 @@ def _qwen3_5_moe_classes():
 
 
 def _build_causal(config: Qwen3_5MoeTextConfig, ops: SimpleNamespace | None = None):
-    previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
-    try:
+    with ops_config_scope(ops if ops is not None else eager_ops_config()):
         causal_cls, _ = _qwen3_5_moe_classes()
         return causal_cls(config)
-    finally:
-        set_ops_config(previous)
 
 
 def _build_vlm(config: Qwen3_5MoeConfig, ops: SimpleNamespace | None = None):
-    previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
-    try:
+    with ops_config_scope(ops if ops is not None else eager_ops_config()):
         _, vlm_cls = _qwen3_5_moe_classes()
         return vlm_cls(config)
-    finally:
-        set_ops_config(previous)
 
 
 def _empty_cu_seq_lens() -> torch.Tensor:
@@ -129,19 +121,6 @@ def test_qwen3_5_moe_constructs_local_kernels():
     assert layer0.linear_attn.veomni_rms_norm_gated.impl == "eager"
     assert layer0.mlp.experts.veomni_moe.impl == "eager"
     assert layer0.mlp.experts.veomni_moe.op == "moe_experts"
-
-
-def test_qwen3_5_moe_instances_keep_distinct_impls():
-    eager = _build_causal(_tiny_text_config(layer_types=["full_attention", "full_attention"]))
-    fused_cfg = eager_ops_config()
-    fused_cfg.moe_implementation = "fused_triton"
-    fused = _build_causal(_tiny_text_config(layer_types=["full_attention", "full_attention"]), fused_cfg)
-
-    assert eager.model.layers[0].mlp.experts.veomni_moe.impl == "eager"
-    assert fused.model.layers[0].mlp.experts.veomni_moe.impl == "fused_triton"
-
-    set_ops_config(fused_cfg)
-    assert eager.model.layers[0].mlp.experts.veomni_moe.impl == "eager"
 
 
 def test_qwen3_5_moe_parallel_plans_cover_multimodal_and_text_wrappers():

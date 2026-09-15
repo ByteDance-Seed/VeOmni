@@ -18,9 +18,18 @@ from __future__ import annotations
 
 import pytest
 
+from tests.models.compare import ops_config_scope
 from veomni.ops import VeomniOp
 from veomni.ops import registry as op_registry
+from veomni.ops.config import get_ops_config
 from veomni.ops.platform import GpuKernelRequirement, NvidiaGpuPlatform
+
+
+@pytest.fixture(autouse=True)
+def preserve_ops_config():
+    """Keep each model test's installed config from leaking into the next test."""
+    with ops_config_scope(get_ops_config()):
+        yield
 
 
 @pytest.fixture

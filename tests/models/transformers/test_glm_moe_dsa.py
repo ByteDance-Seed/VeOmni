@@ -27,10 +27,10 @@ from tests.models.compare import (
     assert_eager_matches_hf,
     assert_outputs_and_grads_match,
     eager_ops_config,
+    ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_glm_moe_dsa_config as _tiny_config
 from veomni.ops import VeomniOp
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _glm_cls(architecture: str):
@@ -48,12 +48,8 @@ def _build_ours(
     ops: SimpleNamespace | None = None,
     architecture: str = "GlmMoeDsaForCausalLM",
 ):
-    previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
-    try:
+    with ops_config_scope(ops if ops is not None else eager_ops_config()):
         return _glm_cls(architecture)(config)
-    finally:
-        set_ops_config(previous)
 
 
 def test_glm_moe_dsa_constructs_local_kernels():
@@ -67,20 +63,6 @@ def test_glm_moe_dsa_constructs_local_kernels():
     assert attn.indexer.veomni_dsa_indexer.op == "dsa_indexer"
     assert attn.indexer.veomni_dsa_indexer.variant == "glm"
     assert attn.indexer.veomni_dsa_indexer.impl == "eager"
-
-
-def test_glm_moe_dsa_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_config(), eager_ops_config())
-    chunk_cfg = eager_ops_config()
-    chunk_cfg.cross_entropy_loss_implementation = "chunk_loss"
-    chunk = _build_ours(_tiny_config(), chunk_cfg)
-
-    assert eager.veomni_ce.impl == "eager"
-    assert chunk.veomni_ce.impl == "chunk_loss"
-
-    set_ops_config(chunk_cfg)
-    assert eager.veomni_ce.impl == "eager"
-    assert eager.model.layers[0].self_attn.veomni_dsa_attention.impl == "eager"
 
 
 def test_glm_moe_dsa_eager_matches_hf():

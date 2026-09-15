@@ -33,12 +33,12 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
+    ops_config_scope,
     pin_eager_attn_implementation,
     qwen_image_inputs,
 )
 from tests.models.tiny_configs import tiny_qwen3_vl_moe_config as _tiny_config
 from veomni.ops import VeomniOp
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 IMAGE_TOKEN_ID = 120
@@ -60,12 +60,8 @@ def _qwen3_vl_moe_cls():
 
 
 def _build_ours(config: Qwen3VLMoeConfig, ops: SimpleNamespace | None = None):
-    previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
-    try:
+    with ops_config_scope(ops if ops is not None else eager_ops_config()):
         return _qwen3_vl_moe_cls()(config)
-    finally:
-        set_ops_config(previous)
 
 
 def test_qwen3_vl_moe_constructs_local_kernels():
@@ -77,19 +73,6 @@ def test_qwen3_vl_moe_constructs_local_kernels():
     layer = model.model.language_model.layers[0]
     assert layer.input_layernorm.veomni_rms_norm.impl == "eager"
     assert layer.mlp.experts.veomni_moe.impl == "eager"
-
-
-def test_qwen3_vl_moe_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_config(), eager_ops_config())
-    fused_cfg = eager_ops_config()
-    fused_cfg.moe_implementation = "fused_triton"
-    fused = _build_ours(_tiny_config(), fused_cfg)
-
-    assert eager.model.language_model.layers[0].mlp.experts.veomni_moe.impl == "eager"
-    assert fused.model.language_model.layers[0].mlp.experts.veomni_moe.impl == "fused_triton"
-
-    set_ops_config(fused_cfg)
-    assert eager.model.language_model.layers[0].mlp.experts.veomni_moe.impl == "eager"
 
 
 @torch.no_grad()

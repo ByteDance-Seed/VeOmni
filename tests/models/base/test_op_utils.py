@@ -21,16 +21,40 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.models.compare import eager_ops_config, ops_config_scope
 from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config, set_ops_config
 
 
-@pytest.fixture(autouse=True)
-def _restore_ops_config():
+@pytest.mark.parametrize("initially_configured", [False, True], ids=["none", "existing-config"])
+@pytest.mark.parametrize("fail", [False, True], ids=["normal-exit", "exception"])
+def test_ops_config_scope_restores_nested_bindings(initially_configured, fail):
     previous = get_ops_config()
-    yield
-    set_ops_config(previous)
+    initial = eager_ops_config() if initially_configured else None
+    inner = eager_ops_config()
+    inner.cross_entropy_loss_implementation = "chunk_loss"
+    with ops_config_scope(initial):
+        assert get_ops_config() is initial
+
+        def nested_scope():
+            with ops_config_scope(inner):
+                assert get_ops_config() is inner
+                with ops_config_scope(None):
+                    assert get_ops_config() is None
+                assert get_ops_config() is inner
+                # The scoped code may itself install another config (as model builders do).
+                set_ops_config(eager_ops_config())
+                if fail:
+                    raise RuntimeError("construction failed")
+
+        if fail:
+            with pytest.raises(RuntimeError, match="construction failed"):
+                nested_scope()
+        else:
+            nested_scope()
+        assert get_ops_config() is initial
+    assert get_ops_config() is previous
 
 
 def test_resolve_op_impl_defaults_to_eager():

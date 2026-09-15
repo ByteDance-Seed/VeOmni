@@ -37,10 +37,10 @@ from tests.models.compare import (
     assert_eager_matches_hf,
     assert_sequence_classification_matches_hf,
     eager_ops_config,
+    ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_qwen2_config as _tiny_config
 from veomni.ops import VeomniOp
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _qwen2_classes():
@@ -62,12 +62,8 @@ def _qwen2_classes():
 
 
 def _construct_ours(model_cls, config: Qwen2Config, ops: SimpleNamespace | None = None):
-    previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
-    try:
+    with ops_config_scope(ops if ops is not None else eager_ops_config()):
         return model_cls(config)
-    finally:
-        set_ops_config(previous)
 
 
 def _build_ours(config: Qwen2Config, ops: SimpleNamespace | None = None):
@@ -99,33 +95,16 @@ def test_qwen2_rope_reads_selected_impl(monkeypatch):
     monkeypatch.setattr(modeling, "VeomniOp", StubOp)
     ops = eager_ops_config()
     ops.rotary_pos_emb_implementation = "test_impl"
-    previous = get_ops_config()
-    set_ops_config(ops)
-    try:
+    with ops_config_scope(ops):
         q = torch.randn(1, 2, 4, 8)
         k = torch.randn_like(q)
         cos = torch.randn(1, 4, 8)
         sin = torch.randn_like(cos)
         q_out, k_out = modeling.apply_rotary_pos_emb(q, k, cos, sin)
-    finally:
-        set_ops_config(previous)
 
     assert selected == [("rope", "full", "test_impl")]
     assert q_out is q
     assert k_out is k
-
-
-def test_qwen2_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_config(), eager_ops_config())
-    chunk_cfg = eager_ops_config()
-    chunk_cfg.cross_entropy_loss_implementation = "chunk_loss"
-    chunk = _build_ours(_tiny_config(), chunk_cfg)
-
-    assert eager.veomni_ce.impl == "eager"
-    assert chunk.veomni_ce.impl == "chunk_loss"
-
-    set_ops_config(chunk_cfg)
-    assert eager.veomni_ce.impl == "eager"
 
 
 def test_qwen2_eager_matches_hf():

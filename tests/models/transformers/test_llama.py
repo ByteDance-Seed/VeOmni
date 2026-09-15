@@ -32,10 +32,10 @@ from tests.models.compare import (
     assert_eager_matches_hf,
     assert_sequence_classification_matches_hf,
     eager_ops_config,
+    ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_llama_config as _tiny_config
 from veomni.ops import VeomniOp
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _llama_classes():
@@ -50,13 +50,9 @@ def _llama_classes():
 
 
 def _build_ours(config: LlamaConfig, ops: SimpleNamespace | None = None):
-    previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
-    try:
+    with ops_config_scope(ops if ops is not None else eager_ops_config()):
         causal_cls, _, _, _ = _llama_classes()
         return causal_cls(config)
-    finally:
-        set_ops_config(previous)
 
 
 def test_llama_constructs_local_kernels():
@@ -83,33 +79,16 @@ def test_llama_rope_reads_selected_impl(monkeypatch):
     monkeypatch.setattr(modeling, "VeomniOp", StubOp)
     ops = eager_ops_config()
     ops.rotary_pos_emb_implementation = "test_impl"
-    previous = get_ops_config()
-    set_ops_config(ops)
-    try:
+    with ops_config_scope(ops):
         q = torch.randn(1, 2, 4, 8)
         k = torch.randn_like(q)
         cos = torch.randn(1, 4, 8)
         sin = torch.randn_like(cos)
         q_out, k_out = modeling.apply_rotary_pos_emb(q, k, cos, sin)
-    finally:
-        set_ops_config(previous)
 
     assert selected == [("rope", "full", "test_impl")]
     assert q_out is q
     assert k_out is k
-
-
-def test_llama_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_config(), eager_ops_config())
-    chunk_cfg = eager_ops_config()
-    chunk_cfg.cross_entropy_loss_implementation = "chunk_loss"
-    chunk = _build_ours(_tiny_config(), chunk_cfg)
-
-    assert eager.veomni_ce.impl == "eager"
-    assert chunk.veomni_ce.impl == "chunk_loss"
-
-    set_ops_config(chunk_cfg)
-    assert eager.veomni_ce.impl == "eager"
 
 
 def test_llama_eager_matches_hf():
@@ -127,13 +106,9 @@ def test_llama_base_model_eager_matches_hf():
     torch.manual_seed(0)
     config = _tiny_config()
     hf = HFLlamaModel(config)
-    previous = get_ops_config()
-    set_ops_config(eager_ops_config())
-    try:
+    with ops_config_scope(eager_ops_config()):
         *_, model_cls = _llama_classes()
         ours = model_cls(config)
-    finally:
-        set_ops_config(previous)
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
@@ -146,12 +121,8 @@ def test_llama_base_model_eager_matches_hf():
 def test_llama_seq_cls_matches_hf(supervision):
     torch.manual_seed(0)
     _, seq_cls, _, _ = _llama_classes()
-    previous = get_ops_config()
-    set_ops_config(eager_ops_config())
-    try:
+    with ops_config_scope(eager_ops_config()):
         model = seq_cls(_tiny_config(num_labels=4))
-    finally:
-        set_ops_config(previous)
     assert_sequence_classification_matches_hf(model, supervision=supervision)
 
 
@@ -159,13 +130,9 @@ def test_llama_token_cls_eager_matches_hf():
     torch.manual_seed(0)
     config = _tiny_config(num_labels=4)
     hf = HFLlamaForTokenClassification(config)
-    previous = get_ops_config()
-    set_ops_config(eager_ops_config())
-    try:
+    with ops_config_scope(eager_ops_config()):
         _, _, token_cls, _ = _llama_classes()
         ours = token_cls(config)
-    finally:
-        set_ops_config(previous)
     ours.load_state_dict(hf.state_dict())
     hf.eval()
     ours.eval()

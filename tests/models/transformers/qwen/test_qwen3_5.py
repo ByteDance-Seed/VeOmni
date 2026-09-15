@@ -36,6 +36,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated, to
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
+    ops_config_scope,
     qwen_image_inputs,
 )
 from tests.models.tiny_configs import (
@@ -45,7 +46,6 @@ from tests.models.tiny_configs import (
     tiny_qwen3_5_text_config as _tiny_text_config,
 )
 from veomni.ops import VeomniOp
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 IMAGE_TOKEN_ID = 120
@@ -69,23 +69,15 @@ def _qwen3_5_classes():
 
 
 def _build_causal(config: Qwen3_5TextConfig, ops: SimpleNamespace | None = None):
-    previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
-    try:
+    with ops_config_scope(ops if ops is not None else eager_ops_config()):
         causal_cls, _ = _qwen3_5_classes()
         return causal_cls(config)
-    finally:
-        set_ops_config(previous)
 
 
 def _build_vlm(config: Qwen3_5Config, ops: SimpleNamespace | None = None):
-    previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
-    try:
+    with ops_config_scope(ops if ops is not None else eager_ops_config()):
         _, vlm_cls = _qwen3_5_classes()
         return vlm_cls(config)
-    finally:
-        set_ops_config(previous)
 
 
 def _empty_cu_seq_lens() -> torch.Tensor:
@@ -126,19 +118,6 @@ def test_qwen3_5_constructs_local_kernels():
     assert layer0.linear_attn.veomni_rms_norm_gated.impl == "eager"
     assert layer0.linear_attn.veomni_causal_conv1d.impl == "eager"
     assert layer0.linear_attn.veomni_chunk_gated_delta_rule.impl == "eager"
-
-
-def test_qwen3_5_instances_keep_distinct_impls():
-    eager = _build_causal(_tiny_text_config(layer_types=["full_attention", "full_attention"]))
-    chunk_cfg = eager_ops_config()
-    chunk_cfg.cross_entropy_loss_implementation = "chunk_loss"
-    chunk = _build_causal(_tiny_text_config(layer_types=["full_attention", "full_attention"]), chunk_cfg)
-
-    assert eager.veomni_ce.impl == "eager"
-    assert chunk.veomni_ce.impl == "chunk_loss"
-
-    set_ops_config(chunk_cfg)
-    assert eager.veomni_ce.impl == "eager"
 
 
 def test_qwen3_5_eager_matches_hf_full_attention():

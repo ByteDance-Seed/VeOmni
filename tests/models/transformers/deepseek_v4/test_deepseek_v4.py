@@ -30,10 +30,10 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCa
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
+    ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_deepseek_v4_config as _tiny_config
 from veomni.ops import VeomniOp
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _dsv4_module():
@@ -51,12 +51,8 @@ def _dsv4_cls():
 
 
 def _build_ours(config: DeepseekV4Config, ops: SimpleNamespace | None = None):
-    previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
-    try:
+    with ops_config_scope(ops if ops is not None else eager_ops_config()):
         return _dsv4_cls()(config)
-    finally:
-        set_ops_config(previous)
 
 
 def test_deepseek_v4_constructs_local_kernels():
@@ -102,20 +98,6 @@ def test_deepseek_v4_shared_mlp_passes_swiglu_limit():
     shared.veomni_swiglu_mlp = record
     shared(torch.randn(2, 8, config.hidden_size))
     assert captured["swiglu_limit"] == config.swiglu_limit
-
-
-def test_deepseek_v4_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_config(), eager_ops_config())
-    chunk_cfg = eager_ops_config()
-    chunk_cfg.cross_entropy_loss_implementation = "chunk_loss"
-    chunk = _build_ours(_tiny_config(), chunk_cfg)
-
-    assert eager.veomni_ce.impl == "eager"
-    assert chunk.veomni_ce.impl == "chunk_loss"
-
-    set_ops_config(chunk_cfg)
-    assert eager.veomni_ce.impl == "eager"
-    assert eager.model.layers[0].self_attn.veomni_dsa_attention.impl == "eager"
 
 
 def test_deepseek_v4_routers_use_fp32_projection_under_autocast():

@@ -25,33 +25,25 @@ import torch.nn.functional as F
 from tests.models.compare import (
     assert_outputs_and_grads_match,
     eager_ops_config,
+    ops_config_scope,
 )
 from tests.models.refs import flux as ref_flux
 from tests.models.tiny_configs import tiny_flux_config as _tiny_config
 from veomni.ops import VeomniOp
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _build_ours_rms(dim: int, *, elementwise_affine: bool = True, ops: SimpleNamespace | None = None):
     from veomni.models.transformers.flux.modeling_flux import RMSNorm
 
-    previous = get_ops_config()
-    set_ops_config(ops if ops is not None else eager_ops_config())
-    try:
+    with ops_config_scope(ops if ops is not None else eager_ops_config()):
         return RMSNorm(dim, eps=1e-6, elementwise_affine=elementwise_affine)
-    finally:
-        set_ops_config(previous)
 
 
 def _build_ours_model():
     from veomni.models.transformers.flux.modeling_flux import FluxModel
 
-    previous = get_ops_config()
-    set_ops_config(eager_ops_config())
-    try:
+    with ops_config_scope(eager_ops_config()):
         return FluxModel(_tiny_config())
-    finally:
-        set_ops_config(previous)
 
 
 def _rotary_embedding(seq_len: int, head_dim: int):
@@ -112,19 +104,6 @@ def test_flux_constructs_local_kernels():
     assert unweighted.veomni_rms_norm.variant == "unweighted"
 
 
-def test_flux_instances_keep_distinct_impls():
-    eager = _build_ours_rms(32, ops=eager_ops_config())
-    other_cfg = eager_ops_config()
-    other_cfg.rms_norm_implementation = "liger_kernel"
-    other = _build_ours_rms(32, ops=other_cfg)
-
-    assert eager.veomni_rms_norm.impl == "eager"
-    assert other.veomni_rms_norm.impl == "liger_kernel"
-
-    set_ops_config(other_cfg)
-    assert eager.veomni_rms_norm.impl == "eager"
-
-
 def test_flux_rmsnorm_matches_official():
     torch.manual_seed(0)
     official = ref_flux.RMSNorm(32, eps=1e-6)
@@ -153,12 +132,8 @@ def test_flux_joint_attention_matches_official():
     head_dim = dim // num_heads
     official = ref_flux.FluxJointAttention(dim, dim, num_heads, head_dim)
 
-    previous = get_ops_config()
-    set_ops_config(eager_ops_config())
-    try:
+    with ops_config_scope(eager_ops_config()):
         ours = ours_flux.FluxJointAttention(dim, dim, num_heads, head_dim)
-    finally:
-        set_ops_config(previous)
     ours.load_state_dict(official.state_dict())
 
     hidden_a = torch.randn(2, 4, dim)
@@ -272,12 +247,8 @@ def test_flux_joint_attention_is_non_causal():
     modeling_flux.FLASH_ATTN_2_AVAILABLE = False
     modeling_flux.FLASH_ATTN_3_AVAILABLE = False
     try:
-        previous = get_ops_config()
-        set_ops_config(eager_ops_config())
-        try:
+        with ops_config_scope(eager_ops_config()):
             block = modeling_flux.FluxJointAttention(32, 32, 4, 8).eval()
-        finally:
-            set_ops_config(previous)
 
         text = torch.randn(1, 1, 32)
         image = torch.randn(1, 2, 32)
@@ -298,12 +269,8 @@ def test_flux_single_transformer_block_is_non_causal():
     modeling_flux.FLASH_ATTN_2_AVAILABLE = False
     modeling_flux.FLASH_ATTN_3_AVAILABLE = False
     try:
-        previous = get_ops_config()
-        set_ops_config(eager_ops_config())
-        try:
+        with ops_config_scope(eager_ops_config()):
             block = modeling_flux.FluxSingleTransformerBlock(32, 4).eval()
-        finally:
-            set_ops_config(previous)
 
         hidden_states = torch.randn(1, 3, 3 * 32)
         rotary = _rotary_embedding(3, 8)
