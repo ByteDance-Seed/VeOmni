@@ -650,3 +650,14 @@ def test_nested_rms_handle_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.autograd.backward(expected, grad_outputs)
     for actual_input, expected_input in zip(actual_inputs, expected_inputs, strict=True):
         torch.testing.assert_close(actual_input.grad, expected_input.grad)
+
+
+def test_dit_parity_world_size_matches_skip_gate():
+    """The 4-GPU skip and the spawned world size must share one constant."""
+    from tests.ops.async_ulysses.test_async_ulysses_dit_parity import (
+        DIT_SP_WORLD_SIZE,
+        AsyncUlyssesDiTSequenceParallelTest,
+    )
+
+    assert DIT_SP_WORLD_SIZE == 4
+    assert AsyncUlyssesDiTSequenceParallelTest.world_size.fget(object()) == DIT_SP_WORLD_SIZE
