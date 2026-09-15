@@ -543,6 +543,18 @@ class FSDPConfig:
             )
         },
     )
+    reduce_scatter_transport_dtype: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional BF16 or FP16 wire dtype for FSDP2 ReduceScatter while keeping FP32 reduction "
+                "buffers and accumulation. None or a value equal to mixed_precision.reduce_dtype uses "
+                "the native PyTorch path. The custom path supports only float32 reduction with bfloat16 "
+                "or float16 transport. BF16 preserves the FP32 exponent range; FP16 may overflow values "
+                "outside its finite range."
+            )
+        },
+    )
     max_load_broadcast_size: float = field(
         default=20.0,
         metadata={
@@ -565,6 +577,22 @@ class FSDPConfig:
                 "model.accelerator.fsdp_config.fsdp_mode='eager' is reserved for the "
                 "single-process inference path and is not wired up yet."
             )
+        transport_dtype = self.reduce_scatter_transport_dtype
+        if transport_dtype is not None and transport_dtype not in ("bfloat16", "float16", "float32"):
+            raise ValueError(
+                "reduce_scatter_transport_dtype must be one of 'bfloat16', 'float16', 'float32', or None."
+            )
+        if transport_dtype is not None and transport_dtype != self.mixed_precision.reduce_dtype:
+            if self.fsdp_mode != "fsdp2":
+                raise ValueError("reduce_scatter_transport_dtype requires fsdp_mode='fsdp2'.")
+            if not self.mixed_precision.enable or self.mixed_precision.reduce_dtype != "float32":
+                raise ValueError(
+                    "The custom ReduceScatter transport path supports only mixed-precision FSDP2 with "
+                    "mixed_precision.reduce_dtype='float32' and transport dtype 'bfloat16' or 'float16'. "
+                    "Use None or match reduce_scatter_transport_dtype to reduce_dtype for the native path."
+                )
+            if transport_dtype not in ("bfloat16", "float16"):
+                raise ValueError("An active reduce_scatter_transport_dtype must be 'bfloat16' or 'float16'.")
 
 
 @dataclass
