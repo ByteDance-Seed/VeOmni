@@ -29,6 +29,21 @@ from torch import Tensor
 _fused_layer_norm_cuda = None
 
 
+def _align_linear_backward_dtype(
+    grad_output: Tensor,
+    input_tensor: Tensor,
+    weight: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Promote mixed forward/backward dtypes the way ``F.linear`` autograd does.
+
+    Autocast can save FP32 operands and a lower-precision ``grad_output``.
+    Match ``F.linear`` autograd: compute in ``grad_output`` dtype, then cast
+    grads back to the saved operand dtypes.
+    """
+    compute_dtype = grad_output.dtype
+    return grad_output, input_tensor.to(compute_dtype), weight.to(compute_dtype)
+
+
 def _flatten_linear_operands(
     grad_output: Tensor,
     input_tensor: Tensor,
@@ -47,8 +62,9 @@ def _flatten_linear_operands(
 
 def linear_input_backward(grad_output: Tensor, input_tensor: Tensor, weight: Tensor) -> Tensor:
     """Compute the input gradient of a linear projection."""
+    grad_output, _, weight = _align_linear_backward_dtype(grad_output, input_tensor, weight)
     grad_output_2d, _ = _flatten_linear_operands(grad_output, input_tensor, weight)
-    return (grad_output_2d @ weight).reshape_as(input_tensor)
+    return (grad_output_2d @ weight).reshape_as(input_tensor).to(input_tensor.dtype)
 
 
 def linear_parameter_backward(
@@ -59,9 +75,10 @@ def linear_parameter_backward(
     has_bias: bool,
 ) -> tuple[Tensor, Tensor | None]:
     """Compute the weight and optional bias gradients of a linear projection."""
+    grad_output, input_tensor, _ = _align_linear_backward_dtype(grad_output, input_tensor, weight)
     grad_output_2d, input_2d = _flatten_linear_operands(grad_output, input_tensor, weight)
-    grad_weight = grad_output_2d.transpose(0, 1) @ input_2d
-    grad_bias = grad_output_2d.sum(dim=0) if has_bias else None
+    grad_weight = (grad_output_2d.transpose(0, 1) @ input_2d).to(weight.dtype)
+    grad_bias = grad_output_2d.sum(dim=0).to(weight.dtype) if has_bias else None
     return grad_weight, grad_bias
 
 
@@ -73,10 +90,11 @@ def linear_backward(
     has_bias: bool,
 ) -> tuple[Tensor, Tensor, Tensor | None]:
     """Compute input, weight, and optional bias gradients for a linear projection."""
-    grad_output_2d, input_2d = _flatten_linear_operands(grad_output, input_tensor, weight)
-    grad_input = (grad_output_2d @ weight).reshape_as(input_tensor)
-    grad_weight = grad_output_2d.transpose(0, 1) @ input_2d
-    grad_bias = grad_output_2d.sum(dim=0) if has_bias else None
+    aligned_grad, aligned_input, aligned_weight = _align_linear_backward_dtype(grad_output, input_tensor, weight)
+    grad_output_2d, input_2d = _flatten_linear_operands(aligned_grad, aligned_input, aligned_weight)
+    grad_input = (grad_output_2d @ aligned_weight).reshape_as(input_tensor).to(input_tensor.dtype)
+    grad_weight = (grad_output_2d.transpose(0, 1) @ input_2d).to(weight.dtype)
+    grad_bias = grad_output_2d.sum(dim=0).to(weight.dtype) if has_bias else None
     return grad_input, grad_weight, grad_bias
 
 
