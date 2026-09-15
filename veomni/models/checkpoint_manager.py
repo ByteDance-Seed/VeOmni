@@ -182,6 +182,7 @@ class ModelCheckpointManager:
             save_to_lowest_rank=self.config.dcp_save_to_lowest_rank,
             parallel_state=self.parallel_state,
             stage_dir=self.config.stage_dir,
+            save_timeout_seconds=self.config.save_timeout_seconds,
         )
         helper.empty_cache()
         dist.barrier()
