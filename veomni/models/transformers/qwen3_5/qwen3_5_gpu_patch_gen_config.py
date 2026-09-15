@@ -558,25 +558,27 @@ def qwen3_5_text_model_forward_patched(
     else:
         text_position_ids = None
 
-    causal_mask = create_causal_mask(
-        config=self.config,
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        past_key_values=past_key_values,
-        position_ids=text_position_ids,
-    )
-    linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_key_values)
+    if not isinstance(causal_mask_mapping := attention_mask, dict):
+        mask_kwargs = {
+            "config": self.config,
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "position_ids": text_position_ids,
+        }
+        causal_mask_mapping = {
+            "full_attention": create_causal_mask(**mask_kwargs),
+            "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
+        }
 
     hidden_states = inputs_embeds
     position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
     for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
-        layer_mask = linear_attn_mask if self.config.layer_types[i] == "linear_attention" else causal_mask
-
         hidden_states = decoder_layer(
             hidden_states,
             position_embeddings=position_embeddings,
-            attention_mask=layer_mask,
+            attention_mask=causal_mask_mapping[self.config.layer_types[i]],
             position_ids=text_position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
@@ -590,7 +592,7 @@ def qwen3_5_text_model_forward_patched(
         mtp_context = {
             "inputs_embeds": inputs_embeds,
             "position_embeddings": position_embeddings,
-            "attention_mask": causal_mask,
+            "attention_mask": causal_mask_mapping["full_attention"],
             "position_ids": text_position_ids,
         }
 
@@ -1908,6 +1910,8 @@ def qwen3_5_forconditional_generation_forward_patched(
     if loss_dict is not None:
         output.loss = loss_dict
     return output
+
+
 config.add_import("transformers.utils", names=["logging"])
 config.add_post_import_block("""
 from transformers.utils import logging

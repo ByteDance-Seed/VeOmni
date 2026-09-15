@@ -8,7 +8,10 @@ from transformers import AutoConfig
 
 from veomni.distributed.utils import check_fqn_match
 from veomni.models.checkpoint_tensor_loading import maybe_convert_checkpoint_tensor
-from veomni.models.transformers.qwen3_5_moe import register_qwen3_5_moe_modeling
+from veomni.models.transformers.qwen3_5_moe import (
+    register_qwen3_5_moe_modeling,
+    register_qwen3_5_moe_text_modeling,
+)
 from veomni.models.transformers.qwen3_5_moe.parallel_plan import get_parallel_plan
 from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import Qwen3MoeCheckpointTensorConverter
 from veomni.utils.device import IS_NPU_AVAILABLE
@@ -331,8 +334,18 @@ def test_qwen3_5_moe_registry_attaches_checkpoint_converter():
     assert callable(model_cls._convert_fqn_to_index_mapping)
 
 
-def test_qwen3_5_moe_reuses_checkpoint_converter_for_mtp_experts():
-    model_cls = register_qwen3_5_moe_modeling("Qwen3_5MoeForConditionalGeneration")
+@pytest.mark.parametrize(
+    "registry", [register_qwen3_5_moe_modeling, register_qwen3_5_moe_text_modeling], ids=["conditional", "text"]
+)
+def test_qwen3_5_moe_reuses_checkpoint_converter_for_mtp_experts(registry):
+    model_cls = registry("Qwen3_5MoeForCausalLM")
+    assert callable(model_cls._create_checkpoint_tensor_converter)
+    assert callable(model_cls._convert_fqn_to_index_mapping)
+    mapping = model_cls._convert_fqn_to_index_mapping(
+        {_make_mtp_expert_key(0, "gate_proj"): 7, _make_mtp_expert_key(0, "down_proj"): 9}
+    )
+    assert mapping["mtp.layers.0.mlp.experts.gate_up_proj"] == 7
+    assert mapping["mtp.layers.0.mlp.experts.down_proj"] == 9
     config = SimpleNamespace(text_config=SimpleNamespace(num_experts=NUM_EXPERTS))
     converter = model_cls._create_checkpoint_tensor_converter(SimpleNamespace(config=config, mtp=object()))
     dispatched = {}

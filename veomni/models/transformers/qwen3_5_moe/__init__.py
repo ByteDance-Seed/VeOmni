@@ -91,7 +91,13 @@ def register_qwen3_5_moe_text_modeling(architecture: str):
     else:
         from .generated.patched_modeling_qwen3_5_moe_gpu import Qwen3_5MoeForCausalLM
 
+    from ..qwen3_moe.checkpoint_tensor_converter import convert_qwen3_moe_fqn_to_index_mapping
+
     Qwen3_5MoeForCausalLM._convert_lora_targets_to_parameters = staticmethod(
         _convert_qwen3_5_moe_causal_lora_targets_to_parameters
     )
+    Qwen3_5MoeForCausalLM._create_checkpoint_tensor_converter = staticmethod(
+        _create_qwen3_5_moe_checkpoint_tensor_converter
+    )
+    Qwen3_5MoeForCausalLM._convert_fqn_to_index_mapping = staticmethod(convert_qwen3_moe_fqn_to_index_mapping)
     return Qwen3_5MoeForCausalLM

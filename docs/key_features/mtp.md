@@ -23,7 +23,7 @@ At sequence position `i`, the main head predicts token `i+1`, MTP depth 0 predic
 `i+2`, depth 1 predicts `i+3`, and so on. An inference engine later executes the
 same depth-specific layers one speculative step at a time as its draft model.
 Qwen3.5 checkpoints ship pretrained MTP weights under the `mtp.` prefix, but
-upstream `transformers` 5.9.0 has no MTP module — only
+upstream `transformers` 5.16.1 has no MTP module — only
 `_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]`. Before this feature those
 tensors were loaded and discarded, so continued training silently degraded the
 MTP head relative to the trunk.
@@ -149,9 +149,11 @@ The model flattens batch and depth for one fused loss call, so `mtp_tokens` is t
 exact denominator across all valid depth targets, including under gradient
 accumulation.
 
-`TextTrainer` and `VLMTrainer` configure the template's MTP depth from the
-model config. When MTP is disabled, the depth is zero and no extra batch key is
-emitted, so it cannot leak into `model.forward`.
+`MTPLabelMixin` infers MTP depth from
+`{tokenizer.name_or_path}/config.json`. A Hub identifier or missing config file
+silently yields depth zero; supplying MTP labels in that case makes the MTP
+forward raise because `mtp_labels` is missing. Enabling MTP requires a local
+tokenizer/config path.
 
 ### Loss dictionary contract
 
