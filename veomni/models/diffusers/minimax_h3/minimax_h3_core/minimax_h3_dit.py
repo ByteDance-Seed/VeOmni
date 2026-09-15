@@ -1,3 +1,5 @@
+"""Adapted from https://github.com/MiniMax-AI/MiniMax-H3"""
+
 from __future__ import annotations
 
 import math
@@ -6,19 +8,21 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from veomni.distributed.sequence_parallel.async_ulysses_dit import _AsyncA2A
 from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
 from veomni.distributed.sequence_parallel.ulysses import (
     _all_to_all_single,
+    _AsyncA2A,
     _Gather,
 )
+from veomni.models.utils.op_utils import resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 from .core import attention_forward, gradient_checkpoint_forward
 
 
 if IS_NPU_AVAILABLE:
-    from torch_npu import npu_rms_norm, npu_rotary_mul
+    from torch_npu import npu_rotary_mul
 
 
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
@@ -53,15 +57,22 @@ def unpack_audio(rows: torch.Tensor, audio_channel: int, steps: int, latent_dim:
     return rows.reshape(audio_channel, steps, latent_dim).permute(0, 2, 1).contiguous()
 
 
-class _ASCEND_RMSNorm(nn.RMSNorm):
-    def forward(self, x):
-        return npu_rms_norm(x, self.weight, epsilon=self.eps)[0]
+class VeomniRMSNorm(nn.Module):
+    """``rms_norm`` / ``standard``. Impl from ``rms_norm_implementation``, else eager."""
+
+    def __init__(self, size: int, *, eps: float):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(size))
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the interned ``rms_norm`` handle."""
+        return self.veomni_rms_norm(x, self.weight, eps=self.eps)
 
 
-def _norm(size: int, *, eps: float) -> nn.RMSNorm:
-    if IS_NPU_AVAILABLE:
-        return _ASCEND_RMSNorm(size, eps=eps)
-    return nn.RMSNorm(size, eps=eps)
+def _norm(size: int, *, eps: float) -> VeomniRMSNorm:
+    return VeomniRMSNorm(size, eps=eps)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:

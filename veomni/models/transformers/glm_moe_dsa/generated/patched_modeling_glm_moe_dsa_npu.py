@@ -9,13 +9,20 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: GlmMoeDsaForCausalLM.__init__
+#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: GlmMoeDsaForCausalLM.forward
-#      Support fused cross entropy path in GlmMoeDsaForCausalLM.forward
+#      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
+#    - method_override: GlmMoeDsaForCausalLM.get_parallel_plan
+#      Register GLM-MoE-DSA expert parallel plan for v5 generated modeling
 #
 # ==============================================================================
 
 import math
 from collections.abc import Callable
+
+# Additional imports for patches
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -38,16 +45,10 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
-# Additional import blocks for patches
-# ── OpSlot declarations ──────────────────────────────────────────────────
-# Bound at model-build time by _bind_veomni_ops() in auto.py.
-from veomni.ops.dispatch import OpSlot
-
-# Additional imports for patches
+from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.models.utils.op_utils import resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
-
-
-veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -764,7 +765,7 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] GlmMoeDsaForCausalLM
-# Methods patched: forward
+# Methods patched: __init__, forward, get_parallel_plan
 # ======================================================================
 
 
@@ -780,8 +781,9 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
         self.model = GlmMoeDsaModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Initialize weights and apply final processing
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
 
     @can_return_tuple
@@ -801,8 +803,8 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
     ) -> CausalLMOutputWithPast:
         r"""
         cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-            Indices depicting the position of the input sequence tokens in the sequence. Retained in the
-            signature for callers that pass it positionally; transformers 5.16 moved it into `**kwargs`.
+            Indices depicting the position of input tokens in the sequence. This is
+            retained explicitly for callers that pass it positionally.
         """
         outputs = self.model(
             input_ids=input_ids,
@@ -822,30 +824,14 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
         logits = None
         fused_linear_aux = None
         if labels is not None:
-            # Modification: OpSlot guard for cross-entropy loss.
-            if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.config.vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
-                    **kwargs,
-                )
-            else:
-                logits = self.lm_head(hidden_states)
-                loss, _, fused_linear_aux = self.loss_function(
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.config.vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
-                    **kwargs,
-                )
-                if fused_linear_aux is not None:
-                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
-                    # logits so output mirrors the OpSlot branch's contract.
-                    logits = None
+            loss, logits, fused_linear_aux = self.loss_function(
+                logits=None,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
+            )
         else:
             logits = self.lm_head(hidden_states[:, slice_indices, :])
 
@@ -857,6 +843,11 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def get_parallel_plan(self):
+        from ..parallel_plan import get_parallel_plan as _get_parallel_plan
+
+        return _get_parallel_plan()
 
 
 __all__ = ["GlmMoeDsaPreTrainedModel", "GlmMoeDsaModel", "GlmMoeDsaForCausalLM"]

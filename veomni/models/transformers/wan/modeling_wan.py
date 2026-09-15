@@ -13,14 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Adapted from https://github.com/Wan-Video/Wan2.1/blob/main/wan/modules/model.py"""
+
 import math
 import os
-from typing import Callable, Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 from einops import rearrange
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
@@ -30,95 +32,20 @@ from veomni.distributed.sequence_parallel import (
     get_ulysses_sequence_parallel_world_size,
     slice_input_tensor_scale_grad,
 )
-from veomni.distributed.sequence_parallel.async_ulysses_dit import (
-    async_ulysses_output_projection,
-    async_ulysses_qkv_projection,
-)
 from veomni.distributed.sequence_parallel.utils import padding_tensor_for_seqeunce_parallel
+from veomni.models.utils.op_utils import attention_op, resolve_op_impl
+from veomni.ops import VeomniOp
 
 from ....utils import logging
 from .config_wan import WanConfig
+from .fa3_fp8 import flash_attention_3_fp8, should_use_fa3_fp8
 
 
 logger = logging.get_logger(__name__)
 
-try:
-    import flash_attn_interface
-
-    FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
-    FLASH_ATTN_3_AVAILABLE = False
-
-
-try:
-    from sageattention import sageattn
-
-    SAGE_ATTN_AVAILABLE = True
-except ModuleNotFoundError:
-    SAGE_ATTN_AVAILABLE = False
-
-
-def stochastic_round_tensor(x: torch.Tensor) -> torch.Tensor:
-    """
-    Perform stochastic rounding on a tensor
-    Args:
-        x (torch.Tensor): Input tensor
-    Returns:
-        torch.Tensor: Stochastically rounded integer tensor
-    """
-    floor_x = torch.floor(x)
-    frac = x - floor_x
-    rand_vals = torch.rand_like(x)
-    round_up = rand_vals < frac
-    result = floor_x + round_up.to(x.dtype)
-    return result
-
-
-def symmetric_quantize(x, dtype=torch.float8_e4m3fn):
-    """
-    Dynamic symmetric quantization that supports block-wise quantization under multi-head attention mechanism
-    Args:
-        x: Input tensor [batch_size, seq_len, head_count, head_dim]
-        dtype: Target quantization type, defaults to torch.float8_e4m3fn
-    Returns:
-        x_quantized: Quantized tensor [batch_size, seq_len, head_count, head_dim]
-        scales: Scaling factors for each head [batch_size, head_count]
-    """
-    batch_size, seq_len, head_count, head_dim = x.shape
-    x = x.to(torch.float32)
-    max_vals = x.abs().amax(dim=(1, 3), keepdim=True)  # [batch, 1, head, 1]
-    finfo = torch.finfo(dtype)
-    eps = 1e-12  # Smaller epsilon for better stability
-    scales = (max_vals + eps) / finfo.max  # Ensure non-zero denominator
-    scales = scales.clamp(min=eps)
-    x_scaled = x / scales
-    is_round = True
-    if is_round:
-        x_rounded = stochastic_round_tensor(x_scaled)
-        x_clamped = x_rounded.clamp(min=finfo.min, max=finfo.max)
-    else:
-        x_clamped = x_scaled.clamp(min=finfo.min, max=finfo.max)
-    x_quantized = x_clamped.to(dtype)
-    scales = scales.squeeze((1, 3)).to(torch.float32)
-    return x_quantized, scales
-
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
     return x * (1 + scale) + shift
-
-
-def rearrange_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rerange_type: str, head_dim: int):
-    q = rearrange(q, rerange_type, d=head_dim)
-    k = rearrange(k, rerange_type, d=head_dim)
-    v = rearrange(v, rerange_type, d=head_dim)
-    return q, k, v
-
-
-def gather_seq_scatter_heads_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_dim: int, head_dim: int):
-    q = gather_seq_scatter_heads(q, seq_dim, head_dim)
-    k = gather_seq_scatter_heads(k, seq_dim, head_dim)
-    v = gather_seq_scatter_heads(v, seq_dim, head_dim)
-    return q, k, v
 
 
 def eager_attention_forward(
@@ -151,17 +78,7 @@ def _trim_kv_tail_padding(
     value_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Drop the trailing pad rows an additive tail-padding mask marks, so kernels with no
-    mask argument of their own (flash_attn_func, sageattn) never attend to them.
-
-    ``attention_mask`` here is always the global tail-padding mask built in
-    ``WanModel.forward`` for Ulysses SP (0 for real tokens, ``finfo.min`` for the padded
-    suffix, broadcastable over batch/heads/query-positions) -- never an arbitrary
-    per-position mask -- so "first masked column" is a safe, cheap way to find the valid
-    length. Self-attention gives Q and K the same sequence length, so trimming both by the
-    same amount keeps them aligned. The caller re-pads the output back to the original
-    length with zeros.
-    """
+    """Trim the additive tail-padding mask for backends without mask support."""
     if attention_mask is None:
         return query_states, key_states, value_states, 0
 
@@ -177,76 +94,6 @@ def _trim_kv_tail_padding(
         value_states[..., :valid_len, :],
         pad_size,
     )
-
-
-def wrapped_sageattention(
-    module: nn.Module,
-    query_states: torch.Tensor,
-    key_states: torch.Tensor,
-    value_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    **kwargs,
-):
-    assert SAGE_ATTN_AVAILABLE
-    query_states, key_states, value_states, pad_size = _trim_kv_tail_padding(
-        query_states, key_states, value_states, attention_mask
-    )
-    head_dim = query_states.shape[-1]
-    rerange_type_head_seq = "b n s d -> b s n d"
-    attn_output = sageattn(query_states, key_states, value_states)
-    attn_output = rearrange(attn_output, rerange_type_head_seq, d=head_dim)
-    if pad_size > 0:
-        attn_output = nn.functional.pad(attn_output, (0, 0, 0, 0, 0, pad_size))
-    return attn_output
-
-
-def wrapped_flash_attention_3(
-    module: nn.Module,
-    query_states: torch.Tensor,
-    key_states: torch.Tensor,
-    value_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    last_loss=None,
-    isSelfAttn=False,
-    **kwargs,
-):
-    assert FLASH_ATTN_3_AVAILABLE
-    query_states, key_states, value_states, pad_size = _trim_kv_tail_padding(
-        query_states, key_states, value_states, attention_mask
-    )
-    head_dim = query_states.shape[-1]
-    rerange_type_seq_head = "b n s d -> b s n d"
-
-    q, k, v = rearrange_qkv(query_states, key_states, value_states, rerange_type_seq_head, head_dim=head_dim)
-
-    if isSelfAttn and last_loss is not None:
-        if math.isnan(last_loss):
-            attn_output = flash_attn_interface.flash_attn_func(q, k, v)
-        else:
-            original_q = q
-            original_k = k
-            original_v = v
-            q, qscale = symmetric_quantize(q, dtype=torch.float8_e4m3fn)
-            k, kscale = symmetric_quantize(k, dtype=torch.float8_e4m3fn)
-            v, vscale = symmetric_quantize(v, dtype=torch.float8_e4m3fn)
-            attn_output = flash_attn_interface.flash_attn_func(
-                q,
-                k,
-                v,
-                q_descale=qscale,
-                k_descale=kscale,
-                v_descale=vscale,
-                original_q=original_q,
-                original_k=original_k,
-                original_v=original_v,
-            )
-    else:
-        attn_output = flash_attn_interface.flash_attn_func(q, k, v)
-
-    if pad_size > 0:
-        attn_output = nn.functional.pad(attn_output, (0, 0, 0, 0, 0, pad_size))
-
-    return attn_output
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -278,12 +125,16 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
 
 
 def rope_apply(x, **kwargs):
+    """``rope`` / ``wan`` helper for tests.
+
+    Modeling must call the instance handle bound in ``SelfAttention.__init__``.
+    This helper still constructs a ``VeomniOp`` so standalone tests can apply
+    Wan RoPE without an attention module.
+    """
     freqs = kwargs.pop("freqs")
     head_dim = kwargs.pop("head_dim")
-    x = rearrange(x, "b s (n d) -> b s n d", d=head_dim)
-    x_out = torch.view_as_complex(x.to(torch.float64).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2))
-    x_out = torch.view_as_real(x_out * freqs).flatten(2)
-    return x_out.to(x.dtype)
+    rope = VeomniOp("rope", "wan", resolve_op_impl("rotary_pos_emb_implementation"))
+    return rope(x, freqs, head_dim=head_dim)
 
 
 def pad_freqs(original_tensor, target_len):
@@ -295,50 +146,87 @@ def pad_freqs(original_tensor, target_len):
 
 
 class RMSNorm(nn.Module):
+    """``rms_norm`` / ``standard``. Impl from ``rms_norm_implementation``, else eager."""
+
     def __init__(self, dim, eps=1e-5):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-
-    def norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
 
     def forward(self, x):
-        dtype = x.dtype
-        return self.norm(x.float()).to(dtype) * self.weight
+        """Apply the interned ``rms_norm`` handle."""
+        return self.veomni_rms_norm(x, self.weight, eps=self.eps)
 
 
 class AttentionModule(nn.Module):
+    """``attention`` / ``standard``. Impl from ``attn_implementation``, else eager.
+
+    ``sageattention`` maps to ``veomni_sage_attention``. FA3 self-attn with a
+    finite ``last_loss`` uses the local fp8 helper.
+    """
+
     def __init__(self, config, num_heads, head_dim):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.attention_interface = WAN_ATTENTION_FUNCTIONS[config._attn_implementation]
+        impl = resolve_op_impl("attn_implementation")
+        if impl in {"sageattention", "veomni_sage_attention"}:
+            self.veomni_attn = VeomniOp("attention", "standard", "veomni_sage_attention")
+        else:
+            self.veomni_attn = attention_op()
         self.is_causal = False
         self.config = config
 
     def forward(self, query_states, key_states, value_states, **kwargs):
+        """Run the interned attention handle, or Wan FA3 fp8 when that policy hits."""
         query_states = rearrange(query_states, "b s (n d) -> b n s d", d=self.head_dim)
         key_states = rearrange(key_states, "b s (n d) -> b n s d", d=self.head_dim)
         value_states = rearrange(value_states, "b s (n d) -> b n s d", d=self.head_dim)
 
-        kwargs["attention_mask"] = kwargs.get("attention_mask", None)
+        attention_mask = kwargs.pop("attention_mask", None)
+
+        trim_tail_padding = self.veomni_attn.impl in {
+            "flash_attention_3",
+            "veomni_flash_attention_3",
+            "veomni_sage_attention",
+        }
+        pad_size = 0
+        if trim_tail_padding:
+            query_states, key_states, value_states, pad_size = _trim_kv_tail_padding(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+            )
+            attention_mask = None
 
         deterministic = kwargs.get("deterministic", None)
         if deterministic is None:
             deterministic = os.environ.get("FLASH_ATTENTION_DETERMINISTIC", "0") == "1"
         kwargs["deterministic"] = deterministic
 
-        attn_output = self.attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            **kwargs,
-        )
+        if should_use_fa3_fp8(
+            self.veomni_attn.impl,
+            is_self_attn=bool(kwargs.get("isSelfAttn", False)),
+            last_loss=kwargs.get("last_loss"),
+        ):
+            attn_output = flash_attention_3_fp8(query_states, key_states, value_states)
+        else:
+            attn_output = self.veomni_attn(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                **kwargs,
+            )
 
         if isinstance(attn_output, tuple):
             attn_output = attn_output[0]
+
+        if pad_size > 0:
+            attn_output = nn.functional.pad(attn_output, (0, 0, 0, 0, 0, pad_size))
 
         attn_output = rearrange(attn_output, "b s n d -> b s (n d)")
         return attn_output
@@ -359,14 +247,13 @@ class SelfAttention(nn.Module):
         self.norm_k = RMSNorm(dim, eps=eps)
 
         self.attn = AttentionModule(config, self.num_heads, self.head_dim)
+        self.veomni_rope = VeomniOp("rope", "wan", resolve_op_impl("rotary_pos_emb_implementation"))
         self.sp_async = False
 
     def forward(self, x, freqs, cos, sin, last_loss, self_attn_mask=None):
-        # Ulysses SP redistribution for the sync path: async_ulysses_qkv_projection
-        # already all-to-alls K/V to their full global length internally, so only the
-        # sync (sp_async=False) path needs an explicit gather-seq/scatter-heads here --
-        # without it, each rank's backend attention call only ever sees its own local
-        # SP shard instead of the true full sequence.
+        # Sync Ulysses gathers the full sequence here. The async DiT QKV op
+        # already all-to-alls internally. In both cases attention must not
+        # exchange again, so this call always passes skip_ulysses=True.
         ulysses_enabled = get_parallel_state().ulysses_enabled
 
         if not self.sp_async:
@@ -374,31 +261,46 @@ class SelfAttention(nn.Module):
             k = self.norm_k(self.k(x))
             v = self.v(x)
         else:
-            q, k, v = async_ulysses_qkv_projection(
+            q, k, v = VeomniOp("async_ulysses_qkv", "dit")(
                 hidden_states=x,
                 seq_dimension=1,
                 head_dimension=2,
                 q_weight=self.q.weight,
+                q_bias=self.q.bias,
                 k_weight=self.k.weight,
+                k_bias=self.k.bias,
                 v_weight=self.v.weight,
+                v_bias=self.v.bias,
                 norm_type="rmsnorm",
                 norm_q_weight=self.norm_q.weight,
+                norm_q_bias=None,
                 norm_k_weight=self.norm_k.weight,
+                norm_k_bias=None,
                 normalized_shape=self.dim,
                 eps=1e-6,
                 unpadded_dim_size=x.shape[1] * get_ulysses_sequence_parallel_world_size(),
             )
 
-        q = rope_apply(q, freqs=freqs, cos=cos, sin=sin, head_dim=self.head_dim)
-        k = rope_apply(k, freqs=freqs, cos=cos, sin=sin, head_dim=self.head_dim)
+        q = self.veomni_rope(q, freqs, head_dim=self.head_dim)
+        k = self.veomni_rope(k, freqs, head_dim=self.head_dim)
 
         if not self.sp_async and ulysses_enabled:
             batch_size, local_seq_len = q.shape[0], q.shape[1]
             q, k, v = (t.view(batch_size, local_seq_len, -1, self.head_dim) for t in (q, k, v))
-            q, k, v = gather_seq_scatter_heads_qkv(q, k, v, seq_dim=1, head_dim=2)
+            q = gather_seq_scatter_heads(q, seq_dim=1, head_dim=2)
+            k = gather_seq_scatter_heads(k, seq_dim=1, head_dim=2)
+            v = gather_seq_scatter_heads(v, seq_dim=1, head_dim=2)
             q, k, v = (t.reshape(t.shape[0], t.shape[1], -1) for t in (q, k, v))
 
-        x = self.attn(q, k, v, last_loss=last_loss, isSelfAttn=True, attention_mask=self_attn_mask)
+        x = self.attn(
+            q,
+            k,
+            v,
+            last_loss=last_loss,
+            isSelfAttn=True,
+            attention_mask=self_attn_mask,
+            skip_ulysses=True,
+        )
 
         if not self.sp_async and ulysses_enabled:
             batch_size, full_seq_len = x.shape[0], x.shape[1]
@@ -409,7 +311,7 @@ class SelfAttention(nn.Module):
         if not self.sp_async:
             x = self.o(x)
         else:
-            x = async_ulysses_output_projection(
+            x = VeomniOp("async_ulysses_o", "dit")(
                 hidden_states=x,
                 seq_dimension=1,
                 head_dimension=2,
@@ -688,17 +590,17 @@ class WanModel(PreTrainedModel):
             x = padding_tensor_for_seqeunce_parallel(x, dim=1)
             freqs = padding_tensor_for_seqeunce_parallel(freqs, dim=0)
 
-            # Build one GLOBAL additive mask over the padded tail, identical on every
-            # rank, marking the pad positions so they can't influence real tokens'
-            # attention output. Both self-attention paths now see the true full
-            # sequence before their backend attention call -- the sync path
-            # (`sp_async=False`) all-to-alls Q/K/V via `gather_seq_scatter_heads_qkv`
-            # in `SelfAttention.forward`, and the async path's
-            # `async_ulysses_qkv_projection` does its own internal all-to-all -- so
-            # every rank uses this mask as-is, unsliced. `eager_attention_forward`
-            # reads it directly; `wrapped_flash_attention_3`/`wrapped_sageattention`
-            # trim the K/V tail it marks before calling their kernel (neither takes a
-            # mask argument) and re-pad the output back to `padded_seq_len`.
+            # Build one GLOBAL additive mask over the padded tail, identical on
+            # every rank, marking the pad positions so they cannot influence real
+            # tokens. Both self-attention paths see the true full sequence before
+            # the backend call: the sync path all-to-alls Q/K/V in
+            # `SelfAttention.forward`, and the async DiT QKV op does its own
+            # internal all-to-all. Every rank therefore uses this mask as-is.
+            # Only `eager_attention_forward` reads it today. Official sageattn
+            # has no dense mask, so `veomni_sage_attention` raises if one is
+            # passed. Sage is inference-only; training should use FlashAttention.
+            # FA3/sage trim the K/V tail this mask marks. SP+sage still cannot
+            # honor an additional padding mask beyond that trim.
             if pad_size > 0:
                 self_attn_mask = torch.zeros(1, 1, 1, padded_seq_len, dtype=x.dtype, device=x.device)
                 self_attn_mask[..., padded_seq_len - pad_size :] = torch.finfo(x.dtype).min
@@ -731,14 +633,3 @@ class WanModel(PreTrainedModel):
             x = gather_outputs(x, gather_dim=1, padding_dim=1, unpad_dim_size=unpadded_seq_len)
         x = self.unpatchify(x, (f, h, w))
         return x
-
-
-WAN_ATTENTION_FUNCTIONS: Dict[str, Dict[str, Callable]] = {}
-WAN_ATTENTION_FUNCTIONS.update(ALL_ATTENTION_FUNCTIONS)
-WAN_ATTENTION_FUNCTIONS.update(
-    {
-        "eager": eager_attention_forward,
-        "flash_attention_3": wrapped_flash_attention_3,
-        "sageattention": wrapped_sageattention,
-    }
-)

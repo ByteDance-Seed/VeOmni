@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3-VL NPU build (transformers>=5.16.1).
+Patch configuration for Qwen3-VL NPU VeomniOp replacements.
 
-Inherits every GPU patch from `qwen3_vl_gpu_patch_gen_config` and layers NPU
-kernel replacements on top (npu_rms_norm, npu_rotary_mul for text + vision).
+Inherits every GPU patch from `qwen3_vl_gpu_patch_gen_config`.
 
 Regen command:
 patchgen veomni.models.transformers.qwen3_vl.qwen3_vl_npu_patch_gen_config -o veomni/models/transformers/qwen3_vl/generated --diff
@@ -25,6 +24,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     apply_rotary_pos_emb_patched,
     apply_rotary_pos_emb_vision_patched,
     qwen3_vl_for_conditional_generation_forward_patched,
+    qwen3_vl_for_conditional_generation_init_patched,
     qwen3_vl_get_metadata_collate_func_patched,
     qwen3_vl_get_position_id_func_patched,
     qwen3_vl_model_forward_patched,
@@ -32,6 +32,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_model_get_placeholder_mask_patched,
     qwen3_vl_model_init_patched,
     qwen3_vl_rmsnorm_forward_patched,
+    qwen3_vl_rmsnorm_init_patched,
     qwen3_vl_text_attention_forward_patched,
     qwen3_vl_text_deepstack_process_patched,
     qwen3_vl_vision_attention_forward_patched,
@@ -50,7 +51,7 @@ from veomni.patchgen.patch_spec import PatchConfig
 config = PatchConfig(
     source_module="transformers.models.qwen3_vl.modeling_qwen3_vl",
     target_file="patched_modeling_qwen3_vl_npu.py",
-    description="Qwen3-VL with VeOmni v5 compatibility + NPU fused RMSNorm/RoPE kernels",
+    description="Qwen3-VL with VeOmni v5 patches and VeomniOp NPU replacements",
 )
 
 # Mirror additional imports + post-import helpers from the GPU config so the
@@ -74,9 +75,14 @@ config.override_method(
 # Shared GPU patches (SP / deepstack / fused-CE / async Ulysses / ...)
 # ================================================================
 config.override_method(
+    "Qwen3VLTextRMSNorm.__init__",
+    replacement=qwen3_vl_rmsnorm_init_patched,
+    description="Construct a local rms_norm VeomniOp",
+)
+config.override_method(
     "Qwen3VLTextRMSNorm.forward",
     replacement=qwen3_vl_rmsnorm_forward_patched,
-    description="OpSlot guard for NPU fused RMSNorm (standard formulation)",
+    description="Always call the local rms_norm VeomniOp",
 )
 config.override_method(
     "Qwen3VLVisionAttention.forward",
@@ -108,6 +114,7 @@ config.override_method(
     replacement=qwen3_vl_vision_dummy_forward_patched,
     description="Provide dummy vision forward for FSDP path with SP-aware shape",
 )
+config.adopt_init_modifications(gpu_config)
 config.override_method(
     "Qwen3VLTextAttention.forward",
     replacement=qwen3_vl_text_attention_forward_patched,
@@ -144,17 +151,22 @@ config.override_method(
     description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
 )
 config.override_method(
+    "Qwen3VLForConditionalGeneration.__init__",
+    replacement=qwen3_vl_for_conditional_generation_init_patched,
+    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp",
+)
+config.override_method(
     "Qwen3VLForConditionalGeneration.forward",
     replacement=qwen3_vl_for_conditional_generation_forward_patched,
-    description="Use VeOmni unified fused loss_function path",
+    description="Always call self.loss_function (ForCausalLMLoss + VeomniOp)",
 )
 config.replace_function(
     "apply_rotary_pos_emb",
     replacement=apply_rotary_pos_emb_patched,
-    description="OpSlot guard for NPU fused RoPE",
+    description="Always call rope full VeomniOp",
 )
 config.replace_function(
     "apply_rotary_pos_emb_vision",
     replacement=apply_rotary_pos_emb_vision_patched,
-    description="OpSlot guard for NPU fused vision RoPE",
+    description="Call rope full VeomniOp with rank-3 vision layout",
 )

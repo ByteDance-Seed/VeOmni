@@ -32,12 +32,12 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from ....utils import logging
-from ..._moe_fused_weight_map import (
+from veomni.models.checkpoint.convert import ConvertedCheckpointTensor
+from veomni.models.checkpoint.moe_map import (
     PER_EXPERT_SPLIT_TO_FUSED_PATTERN,
     convert_per_expert_fqn_mapping_to_fused,
 )
-from ...checkpoint_tensor_loading import ConvertedCheckpointTensor
+from veomni.utils import logging
 
 
 logger = logging.get_logger(__name__)

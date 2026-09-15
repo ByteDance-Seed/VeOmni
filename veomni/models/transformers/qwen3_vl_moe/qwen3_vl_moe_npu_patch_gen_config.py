@@ -12,11 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3-VL-MoE NPU build (transformers>=5.16.1).
+Patch configuration for Qwen3-VL-MoE NPU VeomniOp replacements.
 
-Inherits every GPU patch from `qwen3_vl_moe_gpu_patch_gen_config` (which in
-turn reuses the qwen3_vl VLM patches) and layers NPU kernel replacements on
-top (npu_rms_norm, npu_rotary_mul for text + vision).
+Inherits every GPU patch from `qwen3_vl_moe_gpu_patch_gen_config`.
 
 Regen command:
 patchgen veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_npu_patch_gen_config -o veomni/models/transformers/qwen3_vl_moe/generated --diff
@@ -30,6 +28,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_model_get_image_features_patched,
     qwen3_vl_model_get_placeholder_mask_patched,
     qwen3_vl_rmsnorm_forward_patched,
+    qwen3_vl_rmsnorm_init_patched,
     qwen3_vl_text_attention_forward_patched,
     qwen3_vl_text_deepstack_process_patched,
     qwen3_vl_vision_attention_forward_patched,
@@ -42,6 +41,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
 from veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config import (
     PatchedQwen3VLMoeTextExperts,
     qwen3_vl_moe_for_conditional_generation_forward_patched,
+    qwen3_vl_moe_for_conditional_generation_init_patched,
     qwen3_vl_moe_get_parallel_plan_patched,
     qwen3_vl_moe_model_forward_patched,
     qwen3_vl_moe_model_init_patched,
@@ -55,7 +55,7 @@ from veomni.patchgen.patch_spec import PatchConfig
 config = PatchConfig(
     source_module="transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
     target_file="patched_modeling_qwen3_vl_moe_npu.py",
-    description="Qwen3-VL-MoE with VeOmni v5 compatibility + NPU fused RMSNorm/RoPE kernels",
+    description="Qwen3-VL-MoE with VeOmni v5 patches and VeomniOp NPU replacements",
 )
 
 # Mirror additional imports + post-import helpers from the GPU config so the
@@ -81,10 +81,16 @@ config.override_method(
 # ================================================================
 _NAME_MAP = {"Qwen3VL": "Qwen3VLMoe"}
 config.override_method(
+    "Qwen3VLMoeTextRMSNorm.__init__",
+    replacement=qwen3_vl_rmsnorm_init_patched,
+    name_map=_NAME_MAP,
+    description="Construct a local rms_norm VeomniOp",
+)
+config.override_method(
     "Qwen3VLMoeTextRMSNorm.forward",
     replacement=qwen3_vl_rmsnorm_forward_patched,
     name_map=_NAME_MAP,
-    description="OpSlot guard for NPU fused RMSNorm (standard formulation)",
+    description="Always call the local rms_norm VeomniOp",
 )
 config.override_method(
     "Qwen3VLMoeVisionAttention.forward",
@@ -122,6 +128,7 @@ config.override_method(
     name_map=_NAME_MAP,
     description="Provide dummy vision forward for FSDP path with SP-aware shape",
 )
+config.adopt_init_modifications(gpu_config)
 config.override_method(
     "Qwen3VLMoeTextAttention.forward",
     replacement=qwen3_vl_text_attention_forward_patched,
@@ -168,12 +175,17 @@ config.override_method(
 config.replace_class(
     "Qwen3VLMoeTextExperts",
     replacement=PatchedQwen3VLMoeTextExperts,
-    description="Drop @use_experts_implementation decorator and add VeOmni fused MoE dispatch path",
+    description="Drop @use_experts_implementation and always call moe_experts VeomniOp",
+)
+config.override_method(
+    "Qwen3VLMoeForConditionalGeneration.__init__",
+    replacement=qwen3_vl_moe_for_conditional_generation_init_patched,
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 config.override_method(
     "Qwen3VLMoeForConditionalGeneration.forward",
     replacement=qwen3_vl_moe_for_conditional_generation_forward_patched,
-    description="Use VeOmni fused loss_function and MoE aux_loss path",
+    description="Always call ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 config.override_method(
     "Qwen3VLMoeForConditionalGeneration.get_parallel_plan",
@@ -183,10 +195,10 @@ config.override_method(
 config.replace_function(
     "apply_rotary_pos_emb",
     replacement=apply_rotary_pos_emb_patched,
-    description="OpSlot guard for NPU fused RoPE",
+    description="Always call rope full VeomniOp",
 )
 config.replace_function(
     "apply_rotary_pos_emb_vision",
     replacement=apply_rotary_pos_emb_vision_patched,
-    description="OpSlot guard for NPU fused vision RoPE",
+    description="Call rope full VeomniOp with rank-3 vision layout",
 )

@@ -8,12 +8,10 @@ This note documents VeOmni MoE weight-loading expectations under
 Transformers v5 introduced expert-dispatch integration points (`use_experts_implementation` and `ALL_EXPERTS_FUNCTIONS`).
 
 For VeOmni's qwen3_moe path, we use a simpler approach:
-- patch experts behavior in patchgen-generated modeling;
-- call `veomni.ops.fused_moe_forward(...)` explicitly in the patched forward;
-- gate the call on a module-level `OpSlot("moe_experts", "standard")` whose
-  `use_non_eager_impl` flag is bound from
-  `OpsImplementationConfig.moe_implementation` by `_bind_veomni_ops` at
-  model-build time.
+- patch experts behavior in `models` patchgen-generated modeling;
+- construct an instance-local `VeomniOp("moe_experts", "standard", impl)`;
+- always call that handle from the patched expert forward. The eager reference
+  is itself a registry row, so no separate module-global gate is needed.
 
 ## Survey: Qwen MoE Weight Formats
 
@@ -154,15 +152,18 @@ The script auto-detects the input format (fused `gate_up_proj` or legacy separat
 - HuggingFace `from_pretrained()`
 - Inference engines (vLLM, SGLang)
 
-## VeOmni Fused MoE Op Interface
+## VeOmni MoE Kernel Interface
 
-VeOmni fused MoE entrypoint:
-- `veomni.ops.kernels.moe.fused_moe_forward(...)`
+VeOmni models construct the entrypoint with:
+
+```python
+moe = VeomniOp("moe_experts", "standard", implementation)
+```
 
 Current signature supports both split and fused gate/up weights:
 
 ```python
-fused_moe_forward(
+moe(
     num_experts: int,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,

@@ -12,27 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3_5Moe NPU/SP patched modeling generation.
+Patch configuration for Qwen3_5Moe NPU VeomniOp replacements.
 
-Regen command (preferred): `make patchgen` — runs all gen_configs together.
-
-Do NOT regenerate this file in isolation via
-``patchgen veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_npu_patch_gen_config ...``
-This gen_config imports helpers from
-``qwen3_5_moe_gpu_patch_gen_config``; when patchgen runs it alone without
-first running the GPU config, the generated file drops several imports
-(``copy``, ``functools.partial``, ``types.SimpleNamespace``,
-``torch.distributed`` alias, etc.) that are still referenced by the code
-body, producing a NameError at import time. Joint regen via
-``make patchgen`` (which runs ``--all`` in one Python process) populates
-the shared PatchConfig state correctly. This is a pre-existing quirk of
-VeOmni patchgen, not specific to router-replay patches.
-
-Patches applied:
-1. Fused MoE expert replacement (merged gate_up_proj layout).
-2. Device-agnostic GatedDeltaNet init and varlen FLA forward.
-3. DecoderLayer forward with cu_seq_lens_q passthrough.
-4. Fused loss + aux_loss in ForConditionalGeneration.
+Regen command:
+patchgen veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_npu_patch_gen_config -o veomni/models/transformers/qwen3_5_moe/generated --diff
 """
 
 import torch
@@ -64,15 +47,22 @@ from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config imp
     collate_multimodal_metadata,
     get_position_id,
     mm_token_type_ids_from_input_ids,
+    qwen3_5_moe_attention_forward_patched,
     qwen3_5_moe_causal_lm_get_parallel_plan_patched,
     qwen3_5_moe_forcausallm_forward_patched,
+    qwen3_5_moe_forcausallm_init_patched,
     qwen3_5_moe_forconditional_generation_forward_patched,
     qwen3_5_moe_forconditional_generation_get_metadata_collate_func,
     qwen3_5_moe_forconditional_generation_get_position_id_func,
+    qwen3_5_moe_forconditional_generation_init_patched,
     qwen3_5_moe_get_parallel_plan_patched,
     qwen3_5_moe_model_forward_patched,
     qwen3_5_moe_model_init_patched,
+    qwen3_5_moe_rmsnorm_init_patched,
     qwen3_5_moe_sparse_moe_block_forward_patched,
+)
+from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config import (
+    config as gpu_config,
 )
 from veomni.patchgen.patch_spec import PatchConfig
 
@@ -107,40 +97,21 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "MoeCausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
-# NPU has no fla/flash_qla backend registered today; selecting a non-eager
-# linear-attention impl raises at OpSlot.bind() time.
-#
-# transformers 5.16 removed the conditional FLA / causal-conv1d imports,
-# `FusedRMSNormGated` and `is_fast_path_available`, so the previous
-# `drop_import_names` call and `<name> = None` placeholders have nothing left to
-# neutralise and would collide with the new upstream module-level definitions.
-config.add_post_import_block(
-    """
-    # ── OpSlot declarations ──────────────────────────────────────────────────
-    # Bound at model-build time by _bind_veomni_ops() in auto.py.
-    from veomni.ops.dispatch import OpSlot
-    veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
-    veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "partial")
-    veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
-    veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
-    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-    veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
-    veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
-    veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
-    veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
-    """
+config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import(
+    "veomni.models.utils.op_utils",
+    names=["attention_op", "empty_bias", "resolve_op_impl", "resolve_moe_impl"],
 )
-
+config.add_import(
+    "veomni.models.loss_utils",
+    names=["ForCausalLMLoss", "load_balancing_loss"],
+)
 # Dummy definitions for names that exist in the generated file's scope but not here.
 # The patchgen only extracts the function body; these are resolved at codegen time.
 gather_seq_scatter_heads = None
 gather_heads_scatter_seq = None
 gather_outputs = None
 slice_input_tensor = None
-veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
-veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
-veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
-
 # Mirror the qwen3_5 NPU sentinel: this NPU config reuses
 # qwen3_5_vision_model_forward (Patch.5) but does NOT register the
 # Qwen3_5MoeVisionAttention.forward consumer. False suppresses the host sync
@@ -164,21 +135,26 @@ config.add_helper(_Qwen3_5MoeFakeForPosID)
 
 
 config.override_method(
+    "Qwen3_5MoeRMSNorm.__init__",
+    replacement=qwen3_5_moe_rmsnorm_init_patched,
+    description="Construct a local rms_norm qwen3_5 VeomniOp",
+)
+config.override_method(
     "Qwen3_5MoeRMSNorm.forward",
     replacement=qwen3_5_rmsnorm_forward_patched,
-    description="Use fused rmsnorm to impl zero-centered rmsnorm (1+weight centered formulation)",
+    description="Always call the local rms_norm qwen3_5 VeomniOp",
 )
 
 config.replace_function(
     "apply_rotary_pos_emb",
     replacement=apply_rotary_pos_emb,
-    description="Use fused rope to impl partial rotary postion embedding",
+    description="Always call rope partial VeomniOp",
 )
 
 config.replace_function(
     "apply_rotary_pos_emb_vision",
     replacement=apply_rotary_pos_emb_vision,
-    description="Use fused rope to impl rotary postion embedding in vit",
+    description="Call rope full VeomniOp with rank-3 vision layout",
 )
 
 # ── Propagate _moe_implementation from top-level config to text_config ────────
@@ -274,7 +250,7 @@ config.override_method(
 config.replace_class(
     "Qwen3_5MoeExperts",
     replacement=PatchedQwen3_5MoeExperts,
-    description="Remove @use_experts_implementation decorator and add VeOmni fused MoE dispatch path",
+    description="Always call moe_experts VeomniOp on v5 gate_up_proj weights",
 )
 
 
@@ -302,10 +278,6 @@ config.override_method(
     name_map=_NAME_MAP,
     description="Support varlen flash linear attention and Ulysses SP in Qwen3_5MoeGatedDeltaNet.forward",
 )
-
-# NOTE: `Qwen3_5MoeTextModel._update_linear_attn_mask` was removed in
-# transformers 5.16 — see the note in qwen3_5_gpu_patch_gen_config.py.
-
 
 # ── DecoderLayer forward (NPU: plumb precomputed varlen metadata to GDN) ───────
 
@@ -388,23 +360,27 @@ config.override_method(
 )
 
 
-# ── ForCausalLM forward (fused loss + aux_loss) ──────────────────────────────────
-
-
+config.override_method(
+    "Qwen3_5MoeForCausalLM.__init__",
+    replacement=qwen3_5_moe_forcausallm_init_patched,
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
+)
 config.override_method(
     "Qwen3_5MoeForCausalLM.forward",
     replacement=qwen3_5_moe_forcausallm_forward_patched,
-    description="Support fused cross entropy path in Qwen3_5MoeForCausalLM.forward",
+    description="Always call ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 
 
-# ── ForConditionalGeneration forward (fused loss + aux_loss) ─────────────────────
-
-
+config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.__init__",
+    replacement=qwen3_5_moe_forconditional_generation_init_patched,
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
+)
 config.override_method(
     "Qwen3_5MoeForConditionalGeneration.forward",
     replacement=qwen3_5_moe_forconditional_generation_forward_patched,
-    description="Support fused cross entropy path in Qwen3_5MoeForConditionalGeneration.forward",
+    description="Always call ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 
 
@@ -417,9 +393,15 @@ config.override_method(
     description="Register Qwen3_5Moe expert parallel plan for v5 generated modeling",
 )
 
-
 config.override_method(
     "Qwen3_5MoeForCausalLM.get_parallel_plan",
     replacement=qwen3_5_moe_causal_lm_get_parallel_plan_patched,
     description="Register Qwen3_5MoeForCausalLM expert parallel plan for v5 generated modeling",
+)
+
+config.adopt_init_modifications(gpu_config)
+config.override_method(
+    "Qwen3_5MoeAttention.forward",
+    replacement=qwen3_5_moe_attention_forward_patched,
+    description="Always call the local rope and attention VeomniOps",
 )

@@ -54,11 +54,10 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
     def _init_encoders(self, config: MiniMaxH3ConditionModelConfig):
         base = config.base_model_path
 
-        from veomni.models.module_utils import init_empty_weights
-
         from ..minimax_h3_core.minimax_h3_audio_vae import MiniMaxH3AudioVAE
         from ..minimax_h3_core.minimax_h3_text_encoder import MiniMaxH3TextEncoder
         from ..minimax_h3_core.minimax_h3_video_vae import MiniMaxH3VideoVAE
+        from ._module_utils import init_empty_weights
 
         with init_empty_weights():
             self._text_encoder = MiniMaxH3TextEncoder(num_retained_layers=config.text_encoder_num_retained_layers)
@@ -151,7 +150,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         """
         from collections import OrderedDict
 
-        from veomni.models.module_utils import StateDictIterator
+        from ._module_utils import StateDictIterator
 
         total = 0
         for fname in sorted(os.listdir(path)):

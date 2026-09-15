@@ -24,14 +24,13 @@ the same layout ``checkpoint_tensor_converter`` writes when it exports experts.
 Scales are always ``float8_e8m0fnu``, i.e. powers of two by construction, so
 unlike FP8 there is no ``scale_fmt`` to choose.
 
-The TileLang quantizer is SM90-only and BF16-only, so both entry points here
-inherit those restrictions.
+The quantization path requires a BF16 operand on an NVIDIA SM90 or later GPU.
 """
 
 import torch
 from torch.distributed.tensor import DTensor
 
-from ..kernels.deepseek_v4 import fp4_act_quant
+from ._hardware import require_tilelang_sm90
 
 
 __all__ = [
@@ -44,12 +43,19 @@ FP4_BLOCK_SIZE = 32
 
 
 class _Fp4FakeQuantWeight(torch.autograd.Function):
+    """Straight-through FP4 weight fake quantization."""
+
     @staticmethod
     def forward(ctx, weight: torch.Tensor, block_size: int) -> torch.Tensor:
+        """Return the quantize-dequantize round trip for ``weight``."""
+        require_tilelang_sm90()
+        from .quant import fp4_act_quant
+
         return fp4_act_quant(weight.detach(), block_size, dequant=True)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Pass the output gradient straight through to the master weight."""
         return grad_output, None
 
 

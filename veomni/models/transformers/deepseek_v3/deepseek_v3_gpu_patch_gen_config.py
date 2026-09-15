@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -9,40 +9,21 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# See the License for the specific language governing limitations
+# under the License.
 """
-Patch configuration for DeepseekV3 GPU patched modeling generation.
+Patch configuration for DeepseekV3 GPU VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config -o veomni/models/transformers/deepseek_v3/generated --diff
 
-Patches:
-1. ``DeepseekV3Experts`` — drops upstream ``@use_experts_implementation``
-   (which otherwise routes around our fused MoE kernel) and adopts the
-   stacked ``gate_up_proj [E, 2*I, H]`` / ``down_proj [E, H, I]`` layout.
-   Dispatch is OpSlot-guarded (``veomni_moe_experts_forward``): non-eager →
-   ``fused_moe_forward``; eager → per-expert loop. This matches the
-   qwen3_moe dispatch shape (a previous draft keyed on a hand-rolled
-   ``config._moe_implementation`` attribute that was never wired, so EP runs
-   always took the eager loop and crashed on EP-sharded
-   ``gate_up_proj[expert_idx]`` lookups for global expert ids).
-2. ``DeepseekV3TopkRouter.forward`` restores ``torch.autocast(enabled=False)``
-   around the fp32 router F.linear — required for VeRL actor/rollout parity.
-3. ``DeepseekV3ForCausalLM.forward`` — OpSlot guard for fused cross-entropy
-   (``veomni_causal_lm_loss``) + ``CausalLMOutputWithLogProbs`` so callers
-   can read per-token log-probs / entropy alongside the loss.
-4. Register ``get_parallel_plan`` on ``DeepseekV3ForCausalLM``.
-
-Liger kernels (RMSNorm / SwiGLU MLP / rotary) are intentionally NOT baked into
-the generated file: DeepseekV3 runs on deterministic Triton RoPE + batch-invariant
-RMSNorm wired at runtime from ``__init__.py`` (via
-``apply_veomni_deepseek_v3_device_patch`` in ``device_patch.py``) for
-actor/rollout numerical parity, and ``LigerSwiGLUMLP`` rejects the
-``intermediate_size`` kwarg used by ``DeepseekV3MoE.shared_experts``.
+RMS, apply-RoPE, shared-expert SwiGLU, routed experts, and CausalLM always
+call local VeomniOp handles. Deterministic freqs use the local
+``triton_bmm`` when ``rotary_pos_emb_implementation`` is ``triton``.
 """
 
-from typing import Callable
+from functools import partial
+from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -53,70 +34,137 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
-from veomni.ops import fused_moe_forward
-from veomni.ops.dispatch import OpSlot
+from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.models.utils.op_utils import (
+    empty_bias,
+    linear_bias,
+    resolve_moe_impl,
+    resolve_op_impl,
+)
+from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 from veomni.utils.moe_monitor import record_router_indices
 
 
-# ── OpSlot declarations ──────────────────────────────────────────────────────
-# Mirrors the ``add_post_import_block`` content below so the patch function
-# bodies type-check and get IDE completion in this file. The actual runtime
-# slots used by the generated modeling are the ones declared in the post-import
-# block (a separate module scope), and are bound by ``_bind_veomni_ops()`` in
-# ``veomni/models/auto.py`` at model-build time.
-veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
-
-
 config = PatchConfig(
     source_module="transformers.models.deepseek_v3.modeling_deepseek_v3",
     target_file="patched_modeling_deepseek_v3_gpu.py",
-    description="DeepseekV3 with VeOmni fused-MoE + OpSlot-guarded fused-CE patches",
+    description="DeepseekV3 with VeomniOp RMS / RoPE / SwiGLU / MoE / fused loss",
 )
 
-config.add_import("veomni.ops", names=["fused_moe_forward"])
+config.add_import("functools", names=["partial"])
+config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import(
+    "veomni.models.utils.op_utils",
+    names=["empty_bias", "linear_bias", "resolve_op_impl", "resolve_moe_impl"],
+)
+config.add_import(
+    "veomni.models.loss_utils",
+    names=["ForCausalLMLoss"],
+)
 config.add_import("veomni.utils.moe_monitor", names=["record_router_indices"])
-
-# Surface ``CausalLMOutputWithLogProbs`` in the generated file so the patched
-# ``forward`` can return per-token log-probs in the unified output dataclass.
 config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
 
-config.add_post_import_block(
-    """
-    # ── OpSlot declarations ──────────────────────────────────────────────────
-    # Bound at model-build time by _bind_veomni_ops() in auto.py.
-    from veomni.ops.dispatch import OpSlot
-    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-    veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
-    """
+
+@config.override_method(
+    "DeepseekV3RMSNorm.__init__",
+    description="Construct a local rms_norm VeomniOp",
 )
+def deepseek_v3_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+    nn.Module.__init__(self)
+    self.weight = nn.Parameter(torch.ones(hidden_size))
+    self.variance_epsilon = eps
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
 
 
-# ================================================================
-# Patch: DeepseekV3Experts (named ``DeepseekV3NaiveMoe`` before transformers 5.16)
-# 1. Drop upstream ``@use_experts_implementation`` decorator — it dispatches
-#    to ``grouped_mm`` / HF fused paths and bypasses VeOmni's fused MoE.
-# 2. OpSlot guard for fused-MoE: when ``veomni_moe_experts_forward`` is bound
-#    to a non-eager kernel (the ``moe_implementation`` ops-config field is
-#    not ``"eager"``), call ``fused_moe_forward`` with stacked ``gate_up_proj``.
-#    Otherwise fall through to the eager loop. This is the same dispatch
-#    qwen3_moe / qwen3_omni_moe / v4 deepseek_v3 use; an earlier draft of this
-#    patch keyed on a ``config._moe_implementation`` attribute that was never
-#    wired up by the framework, so EP runs always took the eager branch and
-#    crashed on EP-sharded ``gate_up_proj[expert_idx]`` lookups for global
-#    expert ids.
-# Layout matches v5 upstream (direct, no transpose):
-#   gate_up_proj [E, 2*I, H],  down_proj [E, H, I]
-# ================================================================
-@config.replace_class(
-    "DeepseekV3Experts",
-    description="Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path",
+@config.override_method(
+    "DeepseekV3RMSNorm.forward",
+    description="Always call the local rms_norm VeomniOp",
 )
+def deepseek_v3_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
+
+
+@config.override_method(
+    "DeepseekV3RotaryEmbedding.forward",
+    description="Use local triton_bmm for deterministic freqs when rotary impl is triton",
+)
+@torch.no_grad()
+def deepseek_v3_rotary_embedding_forward_patched(self, x, position_ids):
+    inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+    position_ids_expanded = position_ids[:, None, :].float()
+
+    device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+    with maybe_autocast(device_type=device_type, enabled=False):
+        if resolve_op_impl("rotary_pos_emb_implementation") == "triton":
+            from veomni.models.transformers.deepseek_v3.triton_bmm import triton_bmm
+
+            freqs = triton_bmm(
+                inv_freq_expanded.float().contiguous(),
+                position_ids_expanded.float().contiguous(),
+            ).transpose(1, 2)
+        else:
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos() * self.attention_scaling
+        sin = emb.sin() * self.attention_scaling
+
+    return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+@config.replace_function("apply_rotary_pos_emb", description="Always call rope full VeomniOp")
+def apply_rotary_pos_emb_patched(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    impl = resolve_op_impl("rotary_pos_emb_implementation")
+    rope = VeomniOp("rope", "full", "eager" if impl == "triton" else impl)
+    return rope(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+
+
+rotate_half = None  # noqa: E305  resolved from the generated modeling file
+
+
+@config.override_method(
+    "DeepseekV3MLP.__init__",
+    description="Construct a local swiglu_mlp VeomniOp",
+)
+def deepseek_v3_mlp_init_patched(self, config, intermediate_size=None):
+    nn.Module.__init__(self)
+    self.config = config
+    self.hidden_size = config.hidden_size
+    self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
+    self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+    self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+    self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+    self.act_fn = ACT2FN[config.hidden_act]
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+
+
+@config.override_method(
+    "DeepseekV3MLP.forward",
+    description="Always call the local swiglu_mlp VeomniOp",
+)
+def deepseek_v3_mlp_forward_patched(self, x):
+    return self.veomni_swiglu_mlp(
+        x,
+        self.gate_proj.weight,
+        linear_bias(self.gate_proj),
+        self.up_proj.weight,
+        linear_bias(self.up_proj),
+        self.down_proj.weight,
+        linear_bias(self.down_proj),
+    )
+
+
+@config.replace_class("DeepseekV3Experts", description="Always call moe_experts VeomniOp on v5 gate_up_proj weights")
 class PatchedDeepseekV3Experts(nn.Module):
     """Collection of expert weights stored as 3D tensors."""
 
@@ -128,6 +176,7 @@ class PatchedDeepseekV3Experts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
 
     def forward(
         self,
@@ -135,60 +184,27 @@ class PatchedDeepseekV3Experts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        final_hidden_states = torch.zeros_like(hidden_states)
-
-        # Modification: OpSlot guard — use fused MoE kernel when bound.
-        if veomni_moe_experts_forward.use_non_eager_impl:
-            return fused_moe_forward(
-                num_experts=self.num_experts,
-                routing_weights=top_k_weights.to(final_hidden_states.dtype),
-                selected_experts=top_k_index,
-                hidden_states=hidden_states,
-                fc1_1_weight=None,
-                fc1_2_weight=None,
-                fc2_weight=self.down_proj,
-                fc1_1_2_weight=self.gate_up_proj,
-            )
-
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-            current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-
-        return final_hidden_states
+        unused = empty_bias(self.gate_up_proj)
+        return self.veomni_moe(
+            hidden_states,
+            top_k_weights,
+            top_k_index,
+            unused,
+            unused,
+            self.down_proj,
+            self.gate_up_proj,
+            num_experts=self.num_experts,
+        )
 
 
-# ================================================================
-# Patch: DeepseekV3TopkRouter.forward
-# 1. Wrap the router F.linear in ``torch.autocast(enabled=False)`` so the
-#    explicit fp32 cast isn't silently reverted by an outer autocast context.
-#    Required for VeRL actor/rollout numerical parity.
-# ================================================================
 @config.override_method(
     "DeepseekV3TopkRouter.forward",
     description="Disable autocast around fp32 router linear for VeRL actor/rollout parity",
 )
 def deepseek_v3_topk_router_forward_patched(self, hidden_states):
     hidden_states = hidden_states.view(-1, self.hidden_dim)
-    # --- Patch.1 ---
-    # Disable autocast to ensure fp32 computation — autocast overrides
-    # explicit .type(torch.float32) in F.linear, causing precision mismatch
-    # between actor (autocast bf16) and rollout (no autocast, native fp32).
     with torch.autocast(device_type=hidden_states.device.type, enabled=False):
         router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
-    # --- Patch.1 ---
     scores = router_logits.sigmoid()
     scores_for_choice = scores + self.e_score_correction_bias
     group_scores = (
@@ -206,22 +222,11 @@ def deepseek_v3_topk_router_forward_patched(self, hidden_states):
     topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
     topk_weights = scores.gather(1, topk_indices)
     if self.norm_topk_prob:
-        denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
-        topk_weights /= denominator
+        topk_weights /= topk_weights.sum(dim=-1, keepdim=True) + 1e-20
     topk_weights = topk_weights * self.routed_scaling_factor
     return router_logits, topk_weights, topk_indices
 
 
-# ================================================================
-# Patch: DeepseekV3MoE.forward
-# 1. Feed the top-k indices chosen by the router into the MoE load-balance
-#    monitor. Symmetric to the ``maybe_replay_indices`` call other families make
-#    in their SparseMoeBlock patches. No-op when no monitor is active.
-#    transformers 5.16 folded the family-specific top-k math (sigmoid + bias
-#    correction + group routing) from ``DeepseekV3MoE.route_tokens_to_experts``
-#    into ``DeepseekV3TopkRouter.forward``, which now returns
-#    ``(router_logits, topk_weights, topk_indices)``.
-# ================================================================
 @config.override_method(
     "DeepseekV3MoE.forward",
     description="Report top-k indices to the MoE load-balance monitor",
@@ -230,28 +235,31 @@ def deepseek_v3_moe_forward_patched(self, hidden_states):
     residuals = hidden_states
     orig_shape = hidden_states.shape
     _, topk_weights, topk_indices = self.gate(hidden_states)
-    # --- Patch.1 ---
-    # Hand the actual top-k indices used by this layer to the load-balance
-    # monitor. Keyed on ``self.gate`` so the monitor's layer order matches the
-    # router module identity.
     record_router_indices(self.gate, topk_indices)
-    # --- Patch.1 ---
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
     hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)
     hidden_states = hidden_states + self.shared_experts(residuals)
     return hidden_states
 
 
-# ================================================================
-# Patch: DeepseekV3ForCausalLM.forward
-# 1. OpSlot guard for fused cross-entropy loss; falls back to the eager
-#    HF loss path when no fused kernel is bound. Returns the unified
-#    ``CausalLMOutputWithLogProbs`` so callers can read per-token log-probs
-#    and entropy alongside the loss (required by RL/PPO-style trainers).
-# ================================================================
+@config.override_method(
+    "DeepseekV3ForCausalLM.__init__",
+    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp",
+)
+def deepseek_v3_forcausallm_init_patched(self, config):
+    super().__init__(config)
+    self.model = DeepseekV3Model(config)
+    self.vocab_size = config.vocab_size
+    self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+    self.post_init()
+
+
 @config.override_method(
     "DeepseekV3ForCausalLM.forward",
-    description="OpSlot guard for fused cross entropy in DeepseekV3ForCausalLM.forward",
+    description="Always call self.loss_function (ForCausalLMLoss + VeomniOp)",
 )
 def deepseek_v3_forcausallm_forward_patched(
     self,
@@ -268,8 +276,8 @@ def deepseek_v3_forcausallm_forward_patched(
 ) -> CausalLMOutputWithPast:
     r"""
     cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-        Indices depicting the position of the input sequence tokens in the sequence. Retained in the
-        signature for callers that pass it positionally; transformers 5.16 moved it into `**kwargs`.
+        Indices depicting the position of input tokens in the sequence. This is
+        retained explicitly for callers that pass it positionally.
     """
     outputs: BaseModelOutputWithPast = self.model(
         input_ids=input_ids,
@@ -285,45 +293,20 @@ def deepseek_v3_forcausallm_forward_patched(
     hidden_states = outputs.last_hidden_state
     slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
 
-    # --- Patch.1 ---
     loss = None
     logits = None
     fused_linear_aux = None
     if labels is not None:
-        # Modification: OpSlot guard for cross-entropy loss.
-        if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-        else:
-            logits = self.lm_head(hidden_states)
-            # Modification: VeOmni's patched ``loss_function`` (via LOSS_MAPPING,
-            # installed by ``install_loss_mapping`` in
-            # ``veomni/ops/kernels/cross_entropy/__init__.py``) returns
-            # ``(loss, logits, fused_linear_aux)`` — *not* HF's stock single
-            # ``Tensor``. Unpack 4 values to match the OpSlot branch above; we
-            # discard the wrapper's flattened ``logits`` and keep the ones we
-            # already computed at full shape.
-            loss, _, fused_linear_aux = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-            if fused_linear_aux is not None:
-                # fused_linear_aux path empties loss/logits slots; clear the local 3D
-                # logits so output mirrors the OpSlot branch's contract.
-                logits = None
+        loss, logits, fused_linear_aux = self.loss_function(
+            logits=logits,
+            labels=labels,
+            vocab_size=self.config.vocab_size,
+            hidden_states=hidden_states,
+            weights=self.lm_head.weight,
+            **kwargs,
+        )
     else:
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-    # --- Patch.1 ---
 
     return CausalLMOutputWithLogProbs(
         loss=loss,
@@ -335,10 +318,6 @@ def deepseek_v3_forcausallm_forward_patched(
     )
 
 
-# ================================================================
-# Patch: DeepseekV3ForCausalLM.get_parallel_plan
-# 1. Register VeOmni EP parallel plan on the v5 generated class.
-# ================================================================
 @config.override_method(
     "DeepseekV3ForCausalLM.get_parallel_plan",
     description="Register DeepseekV3 expert parallel plan for v5 generated modeling",
@@ -349,5 +328,4 @@ def deepseek_v3_get_parallel_plan_patched(self):
     return _get_parallel_plan()
 
 
-# Silence unused import warnings for symbols referenced only in type hints.
-_ = (Callable,)
+_ = (Callable, Optional)

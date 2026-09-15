@@ -46,14 +46,15 @@ Three signals together cover most of the risk:
    attribute that moved *within* a class (`DeepseekV4Indexer.weights_proj` →
    `indexer.scorer.weights_proj`), and `@auto_docstring` validates patched
    signatures and return-dataclass docstrings while the class body executes, so
-   some breakage only appears at import. `tests/models/test_generated_modeling_imports.py`
+   some breakage only appears at import.
+   `tests/models/transformers/test_generated_modeling_imports.py`
    was added for this: the bitwise logits suite only builds the GPU families that
    have toy configs, so an NPU-only generated file can be broken with no test
    noticing — which is exactly what happened to `patched_modeling_qwen3_5_npu.py`.
 
-The bitwise `tests/models/test_models_logits_equal_v5.py` suite is the gate that
-confirms a migration landed: it builds toy configs (no checkpoints needed) and
-compares VeOmni's generated modeling against pristine HF layer by layer.
+The `tests/models/` family parity tests are the gate that confirms a
+migration landed: they build canonical tiny configs (no checkpoints needed)
+and compare VeOmni's generated modeling against pristine HF behavior.
 
 One trap worth calling out, because ruff, signature diffs and the logits suite
 all miss it: transformers 5.16's `PreTrainedModel._initialize_weights` skips
@@ -118,7 +119,7 @@ exercise their sequence-parallel forward and backward paths.
   conditional imports. `FusedRMSNormGated`, `is_fast_path_available`, and
   `torch_causal_conv1d_update` are gone. The `drop_import_names` call and the
   `<name> = None` post-import placeholders were removed — they had nothing left
-  to neutralise and collided with the new definitions. VeOmni's OpSlot dispatch
+  to neutralise and collided with the new definitions. VeOmni's local `VeomniOp` dispatch
   in `Qwen3_5GatedDeltaNet.__init__` is unchanged in intent.
 - `Qwen3_5DecoderLayer.layer_type` was renamed to `block_type`
   (`Qwen3_5GatedDeltaNet.layer_type` kept its name).
@@ -250,11 +251,13 @@ config does not patch the attention forward at all, and any future DSA family.
 These results describe the original migration before the final patch bump.
 
 - `patchgen --check` — clean, no drift across all 29 configs.
-- `pytest tests/models/test_models_logits_equal_v5.py` — 34/34 pass (19/34
-  before the migration).
-- `pytest tests/models/test_generated_modeling_imports.py` — 29 pass, 1 skipped
+- The then-current bitwise logits suite — 34/34 pass (19/34 before the
+  migration); this coverage now lives in the `tests/models/` family tests.
+- `pytest tests/models/transformers/test_generated_modeling_imports.py`
+  — 29 pass, 1 skipped
   (needs `torch_npu`).
-- `pytest tests/models/test_model_forward_no_implicit_sync.py` initially
+- `pytest tests/models/transformers/test_model_forward_no_implicit_sync.py`
+  initially
   passed after dropping three allowlist entries. Those sites were hidden by
   the `AutoModel` constructor regression, rather than removed upstream.
   Restoring the generated towers makes them observable again; the final

@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Adapted from https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/layers.py"""
+
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -25,15 +27,16 @@ from veomni.distributed.sequence_parallel import (
     gather_seq_scatter_heads,
     slice_input_tensor,
 )
-from veomni.models.transformers.flux.config_flux import FluxConfig
-from veomni.models.transformers.flux.utils_flux import (
+from veomni.models.utils.op_utils import resolve_op_impl
+from veomni.ops import VeomniOp
+
+from .config_flux import FluxConfig
+from .utils_flux import (
     FluxDiTStateDictConverter,
     TileWorker,
     TimestepEmbeddings,
     init_weights_on_device,
 )
-from veomni.utils import logging
-from veomni.utils.import_utils import is_liger_kernel_available
 
 
 try:
@@ -58,12 +61,6 @@ def print_rank_0(message):
             print(message, flush=True)
     else:
         print(message, flush=True)
-
-
-if is_liger_kernel_available():
-    from liger_kernel.transformers.rms_norm import LigerRMSNorm
-
-logger = logging.get_logger(__name__)
 
 
 def gather_seq_scatter_heads_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_dim: int, head_dim: int):
@@ -148,22 +145,24 @@ class AdaLayerNorm(torch.nn.Module):
 
 
 class RMSNorm(torch.nn.Module):
+    """``rms_norm`` / ``standard`` or ``unweighted``. Impl from ``rms_norm_implementation``, else eager."""
+
     def __init__(self, dim, eps, elementwise_affine=True):
         super().__init__()
         self.eps = eps
         if elementwise_affine:
             self.weight = torch.nn.Parameter(torch.ones((dim,)))
+            variant = "standard"
         else:
             self.weight = None
+            variant = "unweighted"
+        self.veomni_rms_norm = VeomniOp("rms_norm", variant, resolve_op_impl("rms_norm_implementation"))
 
     def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        variance = hidden_states.to(torch.float32).square().mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-        hidden_states = hidden_states.to(input_dtype)
-        if self.weight is not None:
-            hidden_states = hidden_states * self.weight
-        return hidden_states
+        """Apply the interned ``rms_norm`` handle."""
+        if self.weight is None:
+            return self.veomni_rms_norm(hidden_states, eps=self.eps)
+        return self.veomni_rms_norm(hidden_states, self.weight, eps=self.eps)
 
 
 def interact_with_ipadapter(hidden_states, q, ip_k, ip_v, scale=1.0):
@@ -455,18 +454,38 @@ class FluxModel(PreTrainedModel):
     def __init__(self, config: FluxConfig, **kwargs):
         super().__init__(config, **kwargs)
 
-        self.pos_embedder = RoPEEmbedding(3072, 10000, [16, 56, 56])
-        self.time_embedder = TimestepEmbeddings(256, 3072)
-        self.guidance_embedder = None if config.disable_guidance_embedder else TimestepEmbeddings(256, 3072)
-        self.pooled_text_embedder = torch.nn.Sequential(
-            torch.nn.Linear(768, 3072), torch.nn.SiLU(), torch.nn.Linear(3072, 3072)
+        hidden_size = config.num_attention_heads * config.attention_head_dim
+        if sum(config.axes_dims_rope) != config.attention_head_dim:
+            raise ValueError(
+                f"sum(axes_dims_rope) must equal attention_head_dim, got "
+                f"{sum(config.axes_dims_rope)} and {config.attention_head_dim}"
+            )
+
+        self.pos_embedder = RoPEEmbedding(hidden_size, config.rope_theta, config.axes_dims_rope)
+        self.time_embedder = TimestepEmbeddings(config.timestep_embedding_dim, hidden_size)
+        self.guidance_embedder = (
+            None
+            if config.disable_guidance_embedder
+            else TimestepEmbeddings(config.timestep_embedding_dim, hidden_size)
         )
-        self.context_embedder = torch.nn.Linear(4096, 3072)
-        self.x_embedder = torch.nn.Linear(config.input_dim, 3072)
-        self.blocks = torch.nn.ModuleList([FluxJointTransformerBlock(3072, 24) for _ in range(config.num_blocks)])
-        self.single_blocks = torch.nn.ModuleList([FluxSingleTransformerBlock(3072, 24) for _ in range(38)])
-        self.final_norm_out = AdaLayerNormContinuous(3072)
-        self.final_proj_out = torch.nn.Linear(3072, 64)
+        self.pooled_text_embedder = torch.nn.Sequential(
+            torch.nn.Linear(config.pooled_projection_dim, hidden_size),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden_size, hidden_size),
+        )
+        self.context_embedder = torch.nn.Linear(config.joint_attention_dim, hidden_size)
+        self.x_embedder = torch.nn.Linear(config.input_dim, hidden_size)
+        self.blocks = torch.nn.ModuleList(
+            [FluxJointTransformerBlock(hidden_size, config.num_attention_heads) for _ in range(config.num_blocks)]
+        )
+        self.single_blocks = torch.nn.ModuleList(
+            [
+                FluxSingleTransformerBlock(hidden_size, config.num_attention_heads)
+                for _ in range(config.num_single_layers)
+            ]
+        )
+        self.final_norm_out = AdaLayerNormContinuous(hidden_size)
+        self.final_proj_out = torch.nn.Linear(hidden_size, config.output_dim)
         self.input_dim = config.input_dim
 
         self.gradient_checkpointing = False
@@ -779,8 +798,3 @@ class FluxModel(PreTrainedModel):
     @staticmethod
     def state_dict_converter():
         return FluxDiTStateDictConverter()
-
-
-if is_liger_kernel_available():
-    RMSNorm = LigerRMSNorm
-    logger.info_rank0("Apply liger kernel to Flux.")

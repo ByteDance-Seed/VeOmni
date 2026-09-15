@@ -1,3 +1,5 @@
+"""Adapted from https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/transformers/transformer_qwenimage.py"""
+
 from __future__ import annotations
 
 import copy

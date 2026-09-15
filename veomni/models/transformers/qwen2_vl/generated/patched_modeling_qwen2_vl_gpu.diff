@@ -1,6 +1,6 @@
 --- a/transformers/models/qwen2_vl/modeling_qwen2_vl.py
 +++ b/patched_modeling_qwen2_vl_gpu.py
-@@ -1,3 +1,169 @@
+@@ -1,3 +1,172 @@
 +# ==============================================================================
 +#  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
 +# ==============================================================================
@@ -12,6 +12,8 @@
 +#  It contains a patched version of the original HuggingFace modeling code.
 +#
 +#  Patches applied:
++#    - init_modification: VisionAttention
++#      Bind instance-local attention VeomniOp
 +#    - method_override: VisionAttention.forward
 +#      Use VeOmni varlen attention types and precomputed max_seqlen to avoid per-layer cpu-gpu sync
 +#    - method_override: Qwen2VisionTransformerPretrainedModel.forward
@@ -28,8 +30,14 @@
 +#      Use VeOmni precomputed position-id function and unified multimodal token ids
 +#    - method_override: Qwen2VLForConditionalGeneration.get_metadata_collate_func
 +#      Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator
++#    - method_override: Qwen2VLForConditionalGeneration.__init__
++#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 +#    - method_override: Qwen2VLForConditionalGeneration.forward
-+#      Use VeOmni unified loss path for Qwen2VLForConditionalGeneration.forward
++#      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
++#    - init_modification: Qwen2VLAttention
++#      Bind instance-local attention VeomniOp
++#    - method_override: Qwen2VLAttention.forward
++#      Always call the local attention VeomniOp
 +#
 +# ==============================================================================
 +
@@ -57,7 +65,7 @@
 +from transformers.modeling_layers import GradientCheckpointingLayer
 +from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
 +from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
++from transformers.modeling_utils import PreTrainedModel
 +from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
 +from transformers.processing_utils import Unpack
 +from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging, torch_compilable_check
@@ -73,18 +81,13 @@
 +
 +from veomni.distributed.parallel_state import get_parallel_state
 +from veomni.distributed.sequence_parallel import gather_outputs, pad_tensor, slice_input_tensor, sp_pad_and_slice
-+
-+# Additional import blocks for patches
-+# ── OpSlot declarations ──────────────────────────────────────────────────
-+# Bound at model-build time by _bind_veomni_ops() in auto.py.
-+from veomni.ops.dispatch import OpSlot
++from veomni.models.loss_utils import ForCausalLMLoss
++from veomni.models.utils.op_utils import attention_op, resolve_op_impl
++from veomni.ops import VeomniOp
 +from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 +from veomni.utils.model_outputs import (
 +    Qwen2VLCausalLMOutputWithLogProbs,
 +)
-+
-+
-+veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 +
 +
 +# ======================================================================
@@ -170,7 +173,7 @@
  # Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
  #
  # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-@@ -17,51 +183,6 @@
+@@ -17,51 +186,6 @@
  # See the License for the specific language governing permissions and
  # limitations under the License.
  """PyTorch Qwen2-VL model."""
@@ -222,20 +225,29 @@
 
 
  logger = logging.get_logger(__name__)
-@@ -339,6 +460,12 @@
+@@ -339,7 +463,14 @@
      return attn_output, attn_weights
 
 
 +# ======================================================================
 +# [MODIFIED CLASS] VisionAttention
-+# Methods patched: forward
++# Methods patched: forward, __init__
 +# ======================================================================
 +
 +
  class VisionAttention(nn.Module):
++    # [modified __init__] Bind instance-local attention VeomniOp
      def __init__(self, config: Qwen2VLVisionConfig) -> None:
          super().__init__()
-@@ -357,8 +484,9 @@
+         self.dim = config.embed_dim
+@@ -352,13 +483,16 @@
+         self.config = config
+         self.attention_dropout = 0.0
+         self.is_causal = False
++        # Bind instance-local attention VeomniOp
++        self.veomni_attn = attention_op()
+
+     def forward(
          self,
          hidden_states: torch.Tensor,
          cu_seqlens: torch.Tensor,
@@ -246,8 +258,14 @@
          **kwargs,
      ) -> torch.Tensor:
          seq_length = hidden_states.shape[0]
-@@ -377,8 +505,7 @@
-         )
+@@ -372,13 +506,10 @@
+         key_states = key_states.transpose(0, 1).unsqueeze(0)
+         value_states = value_states.transpose(0, 1).unsqueeze(0)
+
+-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+-            self.config._attn_implementation, eager_attention_forward
+-        )
++        attention_interface = self.veomni_attn
 
          if is_flash_attention_requested(self.config):
 -            # Flash Attention: Use cu_seqlens for variable length attention
@@ -256,7 +274,7 @@
              attn_output, _ = attention_interface(
                  self,
                  query_states,
-@@ -395,12 +522,10 @@
+@@ -395,12 +526,10 @@
                  **kwargs,
              )
          else:
@@ -269,7 +287,66 @@
              attn_outputs = [
                  attention_interface(
                      self,
-@@ -645,6 +770,12 @@
+@@ -466,12 +595,19 @@
+         return down_proj
+
+
++# ======================================================================
++# [MODIFIED CLASS] Qwen2VLAttention
++# Methods patched: forward, __init__
++# ======================================================================
++
++
+ class Qwen2VLAttention(nn.Module):
+     """
+     Multi-headed attention from 'Attention Is All You Need' paper. Modified to use sliding window attention: Longformer
+     and "Generating Long Sequences with Sparse Transformers".
+     """
+
++    # [modified __init__] Bind instance-local attention VeomniOp
+     def __init__(self, config: Qwen2VLTextConfig, layer_idx: int | None = None):
+         super().__init__()
+         self.config = config
+@@ -504,6 +640,8 @@
+         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
+         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
++        # Bind instance-local attention VeomniOp
++        self.veomni_attn = attention_op()
+
+     def forward(
+         self,
+@@ -516,6 +654,7 @@
+         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+         **kwargs: Unpack[FlashAttentionKwargs],
+     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
++        del output_attentions, use_cache
+         bsz, q_len, _ = hidden_states.size()
+
+         query_states = self.q_proj(hidden_states)
+@@ -534,11 +673,7 @@
+         if past_key_values is not None:
+             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+-            self.config._attn_implementation, eager_attention_forward
+-        )
+-
+-        attn_output, attn_weights = attention_interface(
++        attn_output, attn_weights = self.veomni_attn(
+             self,
+             query_states,
+             key_states,
+@@ -547,7 +682,7 @@
+             dropout=0.0 if not self.training else self.attention_dropout,
+             scaling=self.scaling,
+             sliding_window=self.sliding_window,
+-            position_ids=position_ids,  # pass positions for FA2
++            position_ids=position_ids,
+             **kwargs,
+         )
+
+@@ -645,6 +780,12 @@
              init.copy_(module.inv_freq, inv_freq)
 
 
@@ -282,7 +359,7 @@
  @auto_docstring
  class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
      config: Qwen2VLVisionConfig
-@@ -698,19 +829,86 @@
+@@ -698,19 +839,86 @@
      @capture_outputs
      @auto_docstring
      def forward(
@@ -374,7 +451,7 @@
 
          for blk in self.blocks:
              hidden_states = blk(
-@@ -727,6 +925,47 @@
+@@ -727,6 +935,47 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -422,7 +499,7 @@
 
 
  @auto_docstring
-@@ -842,6 +1081,12 @@
+@@ -842,6 +1091,12 @@
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
          )
@@ -435,7 +512,7 @@
 
 
  @auto_docstring
-@@ -1024,11 +1269,14 @@
+@@ -1024,11 +1279,14 @@
          video_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -454,7 +531,7 @@
 
          return vision_outputs
 
-@@ -1041,11 +1289,14 @@
+@@ -1041,11 +1299,14 @@
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -473,7 +550,7 @@
 
          return vision_outputs
 
-@@ -1149,33 +1400,128 @@
+@@ -1149,33 +1410,128 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
@@ -613,7 +690,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1185,6 +1531,10 @@
+@@ -1185,6 +1541,10 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -624,7 +701,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1193,15 +1543,27 @@
+@@ -1193,15 +1553,27 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -648,12 +725,23 @@
 +
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen2VLForConditionalGeneration
-+# Methods patched: get_position_id_func, get_metadata_collate_func, forward
++# Methods patched: get_position_id_func, get_metadata_collate_func, __init__, forward
 +# ======================================================================
 
 
  class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
-@@ -1251,90 +1613,98 @@
+@@ -1211,7 +1583,9 @@
+         super().__init__(config)
+         self.model = Qwen2VLModel(config)
+         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+-
++        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
++        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
++        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+         self.post_init()
+
+     @auto_docstring
+@@ -1251,90 +1625,82 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -762,33 +850,16 @@
          if labels is not None:
 -            loss = self.loss_function(
 -                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
--            )
++            loss, logits, fused_linear_aux = self.loss_function(
++                logits=logits,
++                labels=labels,
++                vocab_size=self.config.text_config.vocab_size,
++                hidden_states=hidden_states,
++                weights=self.lm_head.weight,
++                **kwargs,
+             )
 -
 -        return Qwen2VLCausalLMOutputWithPast(
-+            # Modification: OpSlot guard for cross-entropy loss.
-+            if veomni_causal_lm_loss.use_non_eager_impl:
-+                loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-+                    logits=logits,
-+                    labels=labels,
-+                    vocab_size=self.config.text_config.vocab_size,
-+                    hidden_states=hidden_states,
-+                    weights=self.lm_head.weight,
-+                    **kwargs,
-+                )
-+            else:
-+                logits = self.lm_head(hidden_states)
-+                loss, _, fused_linear_aux = self.loss_function(
-+                    logits=logits,
-+                    labels=labels,
-+                    vocab_size=self.config.text_config.vocab_size,
-+                    hidden_states=hidden_states,
-+                    weights=self.lm_head.weight,
-+                    **kwargs,
-+                )
-+                if fused_linear_aux is not None:
-+                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
-+                    # logits so output mirrors the OpSlot branch's contract.
-+                    logits = None
 +        else:
 +            # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
 +            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -805,7 +876,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -1514,5 +1884,46 @@
+@@ -1514,5 +1880,46 @@
 
          return input_ids, model_kwargs
 

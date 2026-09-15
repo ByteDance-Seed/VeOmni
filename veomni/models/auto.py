@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Build tokenizer / processor / foundation model from models registries."""
+
+from __future__ import annotations
 
 import functools
-import sys
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from transformers import (
@@ -24,30 +26,31 @@ from transformers import (
     PreTrainedModel,
 )
 
-from ..arguments.arguments_types import OpsImplementationConfig
-from ..distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
-from ..ops.dispatch import OpsConfigSlot, OpSlot
-from ..utils import logging
-from ..utils.device import is_torch_npu_available
-from .loader import BaseModelLoader, get_loader, get_model_config, get_model_processor
+from veomni.distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
+from veomni.models.loader import get_loader
+from veomni.models.registry import get_model_config, get_model_processor
+from veomni.ops.config import get_ops_config, set_ops_config
+from veomni.utils import logging
+from veomni.utils.device import is_torch_npu_available
 
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer, ProcessorMixin
 
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+
+
 logger = logging.get_logger(__name__)
 
-# Models whose forward implements context parallelism. An allow-list rather than
-# a deny-list so that a model has to be ported deliberately: CP is enabled
-# model-agnostically (``ParallelState`` and ``TrainingArguments`` both admit
-# ``cp_size > 1`` for anything), and nothing downstream would notice a model that
-# has not been. ``SequenceParallelCollator`` shards the sequence on
-# ``sp_enabled``, which CP alone turns on, while every unported model gates its
-# sequence-parallel collectives on ``ulysses_enabled``, which CP alone leaves
-# false — so the shards are never gathered, each rank attends only within its own
-# 1/cp_size of the sequence, and the run trains to a plausible loss curve while
-# being silently wrong.
 CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
+
+_VEOMNI_SP_ATTN = (
+    "veomni_flex_attention",
+    "veomni_magi_attention",
+    "veomni_flash_attention_2",
+    "veomni_flash_attention_3",
+    "veomni_flash_attention_4",
+)
 
 
 def check_model_build_prerequisites(config: PretrainedConfig) -> None:
@@ -59,15 +62,14 @@ def check_model_build_prerequisites(config: PretrainedConfig) -> None:
     generic builder, and a list is a thing the next model has to be remembered into.
 
     What a config cannot see on its own is the rest of the run, so the convention is
-    that the hook reads whatever singletons it needs (the installed
-    ``OpsImplementationConfig``, the parallel state) and takes no arguments. Kept as a
-    plain ``getattr`` for the same reason: a config that has nothing to refuse should
-    not have to say so.
+    that the hook reads whatever singletons it needs (the installed ops config,
+    the parallel state) and takes no arguments. Kept as a plain ``getattr`` for the
+    same reason: a config that has nothing to refuse should not have to say so.
 
     ``DeepseekV4Config.validate_build_prerequisites`` is the only implementation
     today. It refuses a Lightning Indexer KL objective configured without the TileLang
     indexer and attention it is defined in terms of -- a disagreement between a model
-    field and two kernel selections, which no single dataclass can see.
+    field and two op selections, which no single dataclass can see.
     """
     validate = getattr(config, "validate_build_prerequisites", None)
     if callable(validate):
@@ -79,12 +81,6 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
 
     A no-op when context parallelism is off, which is every other configuration.
     """
-    # ``build_foundation_model`` runs this for every model, including in processes
-    # that never installed a parallel state -- tests that spawn a multi-rank world
-    # and build a model directly do exactly that. Asking ``get_parallel_state``
-    # there would *construct* a default single-process state, whose ``dp_size=1``
-    # contradicts the real world size and raises on the topology check. No state
-    # installed means no context parallelism to gate.
     if not is_parallel_state_initialized():
         return
 
@@ -106,77 +102,24 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
     )
 
 
-def build_tokenizer(tokenizer_path: str) -> "PreTrainedTokenizer":
-    """
-    Builds the tokenizer.
-    """
+def build_tokenizer(tokenizer_path: str) -> PreTrainedTokenizer:
+    """Build a right-padded tokenizer from ``tokenizer_path``."""
     return AutoTokenizer.from_pretrained(tokenizer_path, padding_side="right", trust_remote_code=True)
 
 
-def build_processor(processor_path: str, **kwargs) -> "ProcessorMixin":
-    """
-    Builds the processor.
-    """
+def build_processor(processor_path: str, **kwargs) -> ProcessorMixin:
+    """Build a right-padded processor from ``processor_path``."""
     return get_model_processor(processor_path, padding_side="right", trust_remote_code=True, **kwargs)
 
 
-def build_config(config_path: str, **config_kwargs) -> "PretrainedConfig":
-    """
-    Builds the model config.
-    """
+def build_config(config_path: str, **config_kwargs) -> PretrainedConfig:
+    """Build a model config from ``config_path``."""
     trust_remote_code = config_kwargs.pop("trust_remote_code", True)
     return get_model_config(config_path, trust_remote_code=trust_remote_code, **config_kwargs)
 
 
-def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bool:
-    """Bind every OpSlot in *modeling_module* from *ops_config*.
-
-    Returns ``True`` if at least one OpSlot was found (and bound).
-    """
-    bound: list[str] = []
-    moe_experts_kernel: Optional[str] = None
-    for name in dir(modeling_module):
-        obj = getattr(modeling_module, name, None)
-        if isinstance(obj, OpsConfigSlot):
-            obj.bind(ops_config)
-            bound.append(f"{obj.field_name} ({obj.value})")
-            continue
-        if not isinstance(obj, OpSlot):
-            continue
-        # ``moe_experts`` reads ``moe_implementation`` (not the
-        # ``{op}_implementation`` convention) and its values carry a
-        # ``fused_`` prefix the registry entries don't. Translate so the
-        # registry lookup finds the kernel and the HardwareRequirement
-        # check fires.
-        if obj.op_name == "moe_experts":
-            impl_name = (
-                "eager"
-                if ops_config.moe_implementation == "eager"
-                else ops_config.moe_implementation.removeprefix("fused_")
-            )
-            if impl_name != "eager" and obj.variant == "standard":
-                moe_experts_kernel = impl_name
-        else:
-            impl_name = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
-        obj.bind(impl_name)
-        bound.append(f"{obj.op_name} ({impl_name})")
-
-    # OpSlot is just an eager-vs-fused guard; inside the fused branch the
-    # generated modeling code dispatches through the module-level pointer
-    # ``veomni.ops.kernels.moe._fused_moe_forward``. Keep the pointer in
-    # sync with the slot's bound kernel; eager leaves it untouched.
-    if moe_experts_kernel is not None:
-        from ..ops.kernels.moe import apply_veomni_fused_moe_patch
-
-        apply_veomni_fused_moe_patch(fused_moe_kernel=moe_experts_kernel)
-
-    if bound:
-        logger.info_rank0(f"OpSlot dispatch bound: {', '.join(bound)}.")
-    return bool(bound)
-
-
-def _validate_attention_parallelism(attn_implementation: Optional[str]) -> None:
-    if attn_implementation not in ("magi_attention", "veomni_magi_attention_with_sp"):
+def _validate_attention_parallelism(attn_implementation: str | None) -> None:
+    if attn_implementation not in ("magi_attention", "veomni_magi_attention"):
         return
 
     cp_size = get_parallel_state().cp_size
@@ -187,14 +130,11 @@ def _validate_attention_parallelism(attn_implementation: Optional[str]) -> None:
 
 
 def build_foundation_model(
-    config_path: Union[str, PretrainedConfig],
-    weights_path: Optional[str] = None,
+    config_path: str | PretrainedConfig,
+    weights_path: str | None = None,
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
-    # ``None`` = "no caller preference" — resolved from ``ops_implementation``
-    # below. A non-None value is treated as an explicit caller override and
-    # preserved as-is (used by callers that pre-installed the ops singleton
-    # via ``apply_ops_config`` and only need to pin attn here).
-    attn_implementation: Optional[
+    attn_implementation: None
+    | (
         Literal[
             "eager",
             "sdpa",
@@ -203,56 +143,38 @@ def build_foundation_model(
             "flash_attention_4",
             "flex_attention",
             "magi_attention",
-            "veomni_flex_attention_with_sp",
-            "veomni_magi_attention_with_sp",
-            "veomni_flash_attention_2_with_sp",
-            "veomni_flash_attention_3_with_sp",
-            "veomni_flash_attention_4_with_sp",
+            "veomni_flash_attention_2",
+            "veomni_flash_attention_3",
+            "veomni_flash_attention_4",
+            "veomni_flex_attention",
+            "veomni_magi_attention",
+            "veomni_sage_attention",
+            "veomni_sdpa",
             "native-sparse",
         ]
-    ] = None,
+    ) = None,
     init_device: Literal["cpu", "cuda", "npu", "mlu", "meta"] = "cuda",
-    config_kwargs: Optional[Dict[str, Any]] = None,
-    encoder_data_balance: Optional[bool] = False,
-    encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
-    ops_implementation: Optional[OpsImplementationConfig] = None,
-) -> "PreTrainedModel":
+    config_kwargs: dict[str, Any] | None = None,
+    encoder_data_balance: bool | None = False,
+    encoder_data_balance_sorting_algo: str | None = "post_mbs_balancing_greedy_without_pad",
+    ops_implementation: OpsImplementationConfig | None = None,
+) -> PreTrainedModel:
+    """Build a foundation model from the models registry.
+
+    Callers must pass ``ops_implementation`` or pre-install a config with
+    ``set_ops_config``. There is no silent all-eager fallback.
     """
-    Builds the foundation model.
-
-    If weights_path is provided, it loads the pre-trained weights, otherwise it initializes weights.
-
-    Ops dispatch: callers must pass ``ops_implementation`` *or* pre-install a
-    singleton via ``apply_ops_config(...)``. There is no silent all-eager
-    fallback — passing neither raises ``ValueError``. Trainers pass
-    ``args.model.ops_implementation``; standalone scripts (``tasks/infer/*``)
-    construct an explicit ``OpsImplementationConfig``. ``DiTTrainer`` builds a
-    condition model first via ``apply_ops_config`` and then calls into here
-    without the kwarg, which is fine — the singleton-already-installed branch
-    leaves it alone.
-    """
-    from ..ops import apply_ops_config
-    from ..ops.config.singleton import get_ops_config
-
     if ops_implementation is not None:
         attn_implementation = ops_implementation.attn_implementation
         _validate_attention_parallelism(attn_implementation)
-        apply_ops_config(ops_implementation)
+        set_ops_config(ops_implementation)
     else:
         installed = get_ops_config()
         if installed is None:
             raise ValueError(
                 "build_foundation_model requires `ops_implementation` (or a prior "
-                "`apply_ops_config(...)` call). Trainers pass "
-                "`args.model.ops_implementation`; standalone scripts must "
-                "construct an `OpsImplementationConfig` explicitly. "
-                "There is no longer a silent all-eager fallback."
+                "`set_ops_config(...)` call). There is no silent all-eager fallback."
             )
-        # Caller pre-installed the singleton (e.g. DiTTrainer building a
-        # condition model). Honour the installed config's attn unless the
-        # caller passed an explicit override — without this, the model
-        # silently uses the loader's HF default instead of the SP-aware
-        # variant the user selected.
         if attn_implementation is None:
             attn_implementation = installed.attn_implementation
         _validate_attention_parallelism(attn_implementation)
@@ -289,24 +211,7 @@ def build_foundation_model(
     else:
         config.encoder_data_balance = False
 
-    loader: Optional[BaseModelLoader] = get_loader(config)
-
-    # ── Pre-init: OpSlot binding ──────────────────────────────────────────
-    # ``get_loader`` -> ``get_model_class`` -> ``MODELING_REGISTRY[...]()``
-    # has already imported the patched modeling module, so ``loader.model_cls``
-    # is in ``sys.modules`` and we can resolve OpSlot bindings *before*
-    # the model is constructed. This matters for slots consumed inside
-    # ``__init__`` (e.g. Qwen3.5's GatedDeltaNet picks between
-    # ``Qwen3_5RMSNormGated`` and ``FusedRMSNormGated`` at init time based
-    # on ``veomni_rms_norm_gated.use_non_eager_impl``); slots consumed only
-    # in ``forward`` would also work post-init, but binding once, here, keeps
-    # the timing uniform. Assumes ``loader.model_cls`` is final at this point —
-    # i.e. no loader rewrites it between here and ``loader.load_model()`` below.
-    model_cls = getattr(loader, "model_cls", None) if loader is not None else None
-    modeling_module = sys.modules.get(model_cls.__module__) if model_cls is not None else None
-    if modeling_module is not None:
-        if _bind_veomni_ops(modeling_module, get_ops_config()):
-            logger.info_rank0("OpSlot-based kernel dispatch active.")
+    loader = get_loader(config)
 
     init_kwargs = {
         "config": config,
@@ -315,15 +220,10 @@ def build_foundation_model(
         "trust_remote_code": True,
     }
 
-    if attn_implementation not in (
-        "veomni_flex_attention_with_sp",
-        "veomni_magi_attention_with_sp",
-        "veomni_flash_attention_2_with_sp",
-        "veomni_flash_attention_3_with_sp",
-        "veomni_flash_attention_4_with_sp",
-    ):
+    if attn_implementation not in _VEOMNI_SP_ATTN:
         logger.warning_rank0(
-            f"building foundation model with attn_implementation: {attn_implementation}.. you are missing sequence parallelism support. Please use a veomni_*_with_sp attention implementation for SP."
+            f"building foundation model with attn_implementation: {attn_implementation}.. "
+            "you are missing sequence parallelism support. Please use a veomni_* attention implementation for SP."
         )
 
     if (init_device == "cpu" and get_parallel_state().global_rank != 0) or init_device == "meta":
@@ -339,8 +239,6 @@ def build_foundation_model(
     )
 
     if is_torch_npu_available():
-        # We override the forward method (on NPU devices) instead of passing CPU FA kwargs directly to the model in the trainer,
-        # due to the behavior in https://github.com/pytorch/pytorch/blob/134179474539648ba7dee1317959529fbd0e7f89/torch/distributed/fsdp/_fully_shard/_fsdp_state.py#L130
         logger.info_rank0(
             "We override the model’s forward method on NPU devices to ensure that the FA kwargs are on CPU, since the npu_fused_attention requires cpu FA kwargs"
         )

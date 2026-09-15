@@ -19,6 +19,8 @@
 #      Permute VeOmni (len, mel) input + SP gather/strip + SP slice + extend cu_seqlens
 #    - method_override: Qwen2_5OmniAudioEncoder.dummy_forward
 #      FSDP dummy forward with conv-weight dtype lookup (no caching) to stay bf16-safe
+#    - init_modification: Qwen2_5OmniVisionAttention
+#      Bind instance-local attention VeomniOp
 #    - method_override: Qwen2_5OmniVisionAttention.forward
 #      Route through VARLEN_ATTENTION_TYPES so veomni_flash_attention_* with cu_seqlens works
 #    - method_override: Qwen2_5OmniVisionEncoder.forward
@@ -33,8 +35,10 @@
 #      Simplify get_audio_features for VeOmni flat (len, mel) inputs — no feature_attention_mask
 #    - method_override: Qwen2_5OmniThinkerForConditionalGeneration.get_position_id_func
 #      Multiprocessing-safe per-sample position-id closure with VeOmni multimodal token ids
+#    - method_override: Qwen2_5OmniThinkerForConditionalGeneration.__init__
+#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: Qwen2_5OmniThinkerForConditionalGeneration.forward
-#      VeOmni SP + FSDP + precomputed masks + fused loss + log-probs / entropy
+#      VeOmni SP + FSDP + precomputed masks + always-call ForCausalLMLoss
 #    - method_override: Qwen2_5OmniForConditionalGeneration.__init__
 #      Skip talker, pin _no_split_modules, drop talker / token2wav keys on state-dict load
 #    - method_override: Qwen2_5OmniForConditionalGeneration.enable_talker
@@ -51,10 +55,17 @@
 #      Expose CPU-side window-attention ViT multimodal-metadata derivation to the VeOmni collator
 #    - method_override: Qwen2_5OmniForConditionalGeneration.get_metadata_collate_func
 #      Delegate ViT multimodal-metadata derivation to the thinker submodule
+#    - init_modification: Qwen2_5OmniAudioAttention
+#      Bind instance-local attention VeomniOp
+#    - method_override: Qwen2_5OmniAudioAttention.forward
+#      Always call the local attention VeomniOp
+#    - init_modification: Qwen2_5OmniAttention
+#      Bind instance-local attention VeomniOp
+#    - method_override: Qwen2_5OmniAttention.forward
+#      Always call the local attention VeomniOp
 #
 # ==============================================================================
 
-# Additional imports for patches
 import copy
 import math
 import warnings
@@ -62,7 +73,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
-from typing import Any
+
+# Additional imports for patches
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -83,7 +96,7 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
     Qwen2_5OmniAudioEncoderConfig,
     Qwen2_5OmniConfig,
@@ -103,7 +116,6 @@ from transformers.utils import (
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import (
     accepts_precomputed_kwargs,
-    get_max_seqlen,
     is_flash_attention_requested,
     maybe_autocast,
     merge_with_config_defaults,
@@ -114,20 +126,15 @@ from transformers.vision_utils import get_vision_position_ids, get_vision_window
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, pad_tensor, slice_input_tensor, unpad_tensor
-from veomni.models.transformers.attention_utils import VARLEN_ATTENTION_TYPES
-
-# Additional import blocks for patches
-# ── OpSlot declarations ──────────────────────────────────────────────────
-# Only the Thinker forward is in VeOmni's training path (Talker / Token2Wav
-# are inference-only speech paths excluded from the generated file).
-from veomni.ops.dispatch import OpSlot
+from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
+from veomni.models.utils.op_utils import attention_op, resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
 
 
-veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-
-
+# Additional import blocks for patches
 def get_position_id(main_func, self, **kwargs):
     """Per-sample position-ids for VeOmni dataloader workers.
 
@@ -449,13 +456,13 @@ class Qwen2_5OmniPreTrainedModelForConditionalGeneration(Qwen2_5OmniPreTrainedMo
     # ================================================================
     def get_rope_index(
         self,
-        input_ids: torch.LongTensor | None = None,
-        image_grid_thw: torch.LongTensor | None = None,
-        video_grid_thw: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
+        input_ids: Optional[torch.LongTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         use_audio_in_video: bool | None = None,
-        audio_seqlens: torch.LongTensor | None = None,
-        second_per_grids: torch.Tensor | None = None,
+        audio_seqlens: Optional[torch.LongTensor] = None,
+        second_per_grids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         spatial_merge_size = self.spatial_merge_size
         image_token_id = self.config.image_token_id
@@ -573,7 +580,7 @@ class Qwen2_5OmniPreTrainedModelForConditionalGeneration(Qwen2_5OmniPreTrainedMo
 
                     elif min_ed == ed_video:
                         # --- Patch.1 ---
-                        # None selects VeOmni's per-video placeholder convention;
+                        # ``None`` selects VeOmni's per-video placeholder convention;
                         # explicit booleans retain HF generation's global contract.
                         video_has_audio = use_audio_in_video
                         if video_has_audio is None:
@@ -753,9 +760,16 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen2_5OmniAudioAttention
+# Methods patched: forward, __init__
+# ======================================================================
+
+
 class Qwen2_5OmniAudioAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
+    # [modified __init__] Bind instance-local attention VeomniOp
     def __init__(
         self,
         config: Qwen2_5OmniAudioEncoderConfig,
@@ -782,16 +796,15 @@ class Qwen2_5OmniAudioAttention(nn.Module):
         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+        # Bind instance-local attention VeomniOp
+        self.veomni_attn = attention_op()
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        max_seqlen: int | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Input shape: Batch x Time x Channel"""
-
         seq_length, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
@@ -802,13 +815,10 @@ class Qwen2_5OmniAudioAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
+        attention_interface = self.veomni_attn
 
         if is_flash_attention_requested(self.config):
-            # Flash Attention: Use cu_seqlens for variable length attention
-            max_seqlen = get_max_seqlen(cu_seqlens, self.config, kwargs={"max_seqlen": max_seqlen})
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
             attn_output, _ = attention_interface(
                 self,
                 query_states,
@@ -825,7 +835,6 @@ class Qwen2_5OmniAudioAttention(nn.Module):
                 **kwargs,
             )
         else:
-            # Other implementations: Process each chunk separately
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
             splits = [
                 torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
@@ -848,7 +857,6 @@ class Qwen2_5OmniAudioAttention(nn.Module):
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.out_proj(attn_output)
-
         return attn_output
 
 
@@ -1315,11 +1323,12 @@ def apply_rotary_pos_emb_vision(tensor: torch.Tensor, freqs: torch.Tensor) -> to
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen2_5OmniVisionAttention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
 class Qwen2_5OmniVisionAttention(nn.Module):
+    # [modified __init__] Bind instance-local attention VeomniOp
     def __init__(self, config: Qwen2_5OmniVisionEncoderConfig = None) -> None:
         super().__init__()
         self.dim = config.hidden_size
@@ -1334,15 +1343,9 @@ class Qwen2_5OmniVisionAttention(nn.Module):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
+        # Bind instance-local attention VeomniOp
+        self.veomni_attn = attention_op()
 
-    # ================================================================
-    # Patch: Qwen2_5OmniVisionAttention.forward
-    # 1. [SP] Dispatch via VARLEN_ATTENTION_TYPES (covers veomni_flash_attention_*
-    #    custom names) instead of v5 upstream `is_flash_attention_requested`,
-    #    which only recognizes HF built-in flash-attention names. Without this
-    #    the SP-appended cu_seqlens padding entry would run through the
-    #    non-varlen split branch and size-mismatch.
-    # ================================================================
     @deprecate_kwarg("rotary_pos_emb", version="v5.20", new_name="position_embeddings")
     def forward(
         self,
@@ -1363,17 +1366,10 @@ class Qwen2_5OmniVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        attention_interface = self.veomni_attn
 
         # --- Patch.1 ---
         if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
-            # Upstream calls `get_max_seqlen(...)` here, which returns None for
-            # VeOmni's custom `veomni_flash_attention_*` names because it gates on
-            # HF's built-in `is_flash_attention_requested`. Honour a caller-supplied
-            # value (upstream threads one down from the encoder, avoiding a host
-            # sync) and otherwise reduce locally.
             if max_seqlen is None:
                 max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
             attn_output, _ = attention_interface(
@@ -1931,12 +1927,19 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim
     return q_embed, k_embed
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen2_5OmniAttention
+# Methods patched: forward, __init__
+# ======================================================================
+
+
 class Qwen2_5OmniAttention(nn.Module):
     """
     Multi-headed attention from 'Attention Is All You Need' paper. Modified to use sliding window attention: Longformer
     and "Generating Long Sequences with Sparse Transformers".
     """
 
+    # [modified __init__] Bind instance-local attention VeomniOp
     def __init__(self, config: Qwen2_5OmniConfig, layer_idx: int | None = None):
         super().__init__()
         self.config = config
@@ -1964,6 +1967,8 @@ class Qwen2_5OmniAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
+        # Bind instance-local attention VeomniOp
+        self.veomni_attn = attention_op()
 
     def forward(
         self,
@@ -1976,6 +1981,7 @@ class Qwen2_5OmniAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
+        del output_attentions, use_cache
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -1994,11 +2000,7 @@ class Qwen2_5OmniAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
             key_states,
@@ -2007,7 +2009,7 @@ class Qwen2_5OmniAttention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
-            position_ids=position_ids,  # pass positions for FA2
+            position_ids=position_ids,
             **kwargs,
         )
 
@@ -2216,7 +2218,7 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen2_5OmniThinkerForConditionalGeneration
-# Methods patched: get_image_features, get_video_features, get_audio_features, get_position_id_func, forward, get_metadata_collate_func
+# Methods patched: get_image_features, get_video_features, get_audio_features, get_position_id_func, __init__, forward, get_metadata_collate_func
 # ======================================================================
 
 
@@ -2232,7 +2234,27 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
     _no_split_modules = ["Qwen2_5OmniAudioEncoder", "Qwen2_5OmniVisionEncoder"]
     _can_compile_fullgraph = True
 
-    def __init__(self, config: Qwen2_5OmniThinkerConfig):
+    # ================================================================
+    # Patch: Qwen2_5OmniThinkerForConditionalGeneration.forward
+    # 1. [Mask] Pop pre-computed image/video/audio masks from kwargs (set by
+    #    VeOmni's process_sample) — avoids extra all_gather for full-mask
+    #    information when using SP.
+    # 2. [SP] gather_outputs on input/image/video/audio embeddings to perform
+    #    the multimodal fill-back on the full sequence, then slice back.
+    # 3. [FSDP] dummy ViT/audio forward on ranks where the modality input is
+    #    None so reduce-scatter stays in sync.
+    # 4. [PosIDs] Transpose precomputed position_ids from (bs, 3, L) to
+    #    (3, bs, L) so the model layer's mrope handler sees the canonical axis
+    #    order.
+    # 5. [Loss] Always call `self.loss_function` (ForCausalLMLoss + VeomniOp).
+    # 6. [Data] Filter zero-length audio_feature_lengths (placeholder entries
+    #    for videos without audio) before forwarding the audio tower.
+    # 7. [LogProbs] Return Qwen2_5OmniThinkerCausalLMOutputWithLogProbs so
+    #    per-token log-probs / entropy ride along as constructor fields —
+    #    mutating after the constructor would break FSDP2's lm_head unshard hook
+    #    on backward.
+    # ================================================================
+    def __init__(self, config):
         super().__init__(config)
         self.audio_tower = Qwen2_5OmniAudioEncoder._from_config(config.audio_config)
         self.visual = Qwen2_5OmniVisionEncoder._from_config(config.vision_config)
@@ -2241,6 +2263,9 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.spatial_merge_size = config.vision_config.spatial_merge_size
         self.rope_deltas = None
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
 
     def get_input_embeddings(self):
@@ -2256,7 +2281,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
 
     # ================================================================
     # Patch: Qwen2_5OmniThinkerForConditionalGeneration.get_video_features
-    # 1. same as get_image_features above — keep pooler_output flat.
+    # Keep the visual output flat for the same reason as get_image_features.
     # ================================================================
     @accepts_precomputed_kwargs(modality="video")
     @can_return_tuple
@@ -2274,18 +2299,12 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             The temporal, height and width of feature shape of each video in LLM.
         """
         pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
-        # --- Patch.1 ---
-        # See get_image_features: upstream 5.16 splits pooler_output per video.
-        # --- Patch.1 ---
         return self.visual(pixel_values_videos, grid_thw=video_grid_thw, **kwargs)
 
     # ================================================================
     # Patch: Qwen2_5OmniThinkerForConditionalGeneration.get_image_features
-    # 1. skip the upstream `torch.split(pooler_output, split_sizes)` that
-    #    transformers 5.16 added — VeOmni needs the flat tensor for the SP
-    #    all-to-all, and the downstream masked_scatter is indexed by a single
-    #    n_image_tokens slice rather than a per-image list. Mirrors the same patch
-    #    on qwen3_vl / qwen3_5.
+    # Keep the visual output flat for VeOmni's SP gather/scatter path instead of
+    # the per-image list introduced by transformers 5.16.
     # ================================================================
     @accepts_precomputed_kwargs(modality="image")
     @can_return_tuple
@@ -2303,12 +2322,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             The temporal, height and width of feature shape of each image in LLM.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
-        # --- Patch.1 ---
-        # vision_outputs = self.visual(pixel_values, grid_thw=image_grid_thw, **kwargs)
-        # split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
-        # vision_outputs.pooler_output = list(torch.split(vision_outputs.pooler_output, split_sizes))
-        # return vision_outputs
-        # --- Patch.1 ---
         return self.visual(pixel_values, grid_thw=image_grid_thw, **kwargs)
 
     # ================================================================
@@ -2433,56 +2446,34 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             position_ids = None
         return position_ids
 
-    # ================================================================
-    # Patch: Qwen2_5OmniThinkerForConditionalGeneration.forward
-    # 1. [Mask] Pop pre-computed image/video/audio masks from kwargs (set by
-    #    VeOmni's process_sample) — avoids extra all_gather for full-mask
-    #    information when using SP.
-    # 2. [SP] gather_outputs on input/image/video/audio embeddings to perform
-    #    the multimodal fill-back on the full sequence, then slice back.
-    # 3. [FSDP] dummy ViT/audio forward on ranks where the modality input is
-    #    None so reduce-scatter stays in sync.
-    # 4. [PosIDs] Transpose precomputed position_ids from (bs, 3, L) to
-    #    (3, bs, L) so the model layer's mrope handler sees the canonical axis
-    #    order.
-    # 5. [Loss] Delegate loss to OpSlot-guarded `veomni_causal_lm_loss` first,
-    #    then fall back to `self.loss_function` (VeOmni's patched LOSS_MAPPING
-    #    returns `(loss, logits, fused_linear_aux)`).
-    # 6. [Data] Filter zero-length audio_feature_lengths (placeholder entries
-    #    for videos without audio) before forwarding the audio tower.
-    # 7. [LogProbs] Return Qwen2_5OmniThinkerCausalLMOutputWithLogProbs so
-    #    per-token log-probs / entropy ride along as constructor fields —
-    #    mutating after the constructor would break FSDP2's lm_head unshard hook
-    #    on backward.
-    # ================================================================
     @can_return_tuple
     @auto_docstring
     def forward(
         self,
-        input_ids: torch.LongTensor | None = None,
-        input_features: torch.FloatTensor | None = None,
-        pixel_values: torch.FloatTensor | None = None,
-        pixel_values_videos: torch.FloatTensor | None = None,
-        image_grid_thw: torch.LongTensor | None = None,
-        video_grid_thw: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
+        input_ids: Optional[torch.LongTensor] = None,
+        input_features: Optional[torch.FloatTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         # --- Patch.1 ---
         # feature_attention_mask removed: VeOmni's collator already produces flat
         # audio_feature_lengths so this signature drops the redundant mask.
         # --- Patch.1 ---
-        audio_feature_lengths: torch.LongTensor | None = None,
-        position_ids: torch.LongTensor | None = None,
+        audio_feature_lengths: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         past_key_values=None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        rope_deltas: torch.LongTensor | None = None,
-        labels: torch.LongTensor | None = None,
-        use_cache: bool | None = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        rope_deltas: Optional[torch.LongTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
         # --- Patch.1 ---
         # use_audio_in_video removed: handled per-video in get_rope_index via
         # the audio_seqlens[audio_idx] == 0 convention.
         # --- Patch.1 ---
-        cache_position: torch.LongTensor | None = None,
-        video_second_per_grid: torch.LongTensor | None = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        video_second_per_grid: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen2_5OmniThinkerCausalLMOutputWithLogProbs:
         r"""
@@ -2626,7 +2617,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 or self.rope_deltas is None
             ):
                 delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
-                # Keep the per-video audio lengths separate from HF's global flag.
                 position_ids, rope_deltas = self.get_rope_index(
                     input_ids=input_ids,
                     image_grid_thw=image_grid_thw,
@@ -2666,36 +2656,15 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         logits = None
         fused_linear_aux = None
         if labels is not None:
-            # Modification: OpSlot guard for cross-entropy loss (chunked fused CE
-            # when bound, falls back to ``self.loss_function`` otherwise).
-            if veomni_causal_lm_loss.use_non_eager_impl:  # noqa: F821 — declared via add_post_import_block
-                loss, logits, fused_linear_aux = veomni_causal_lm_loss(  # noqa: F821
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.config.get_text_config().vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
-                    ignore_index=IGNORE_INDEX,
-                    **kwargs,
-                )
-            else:
-                logits = self.lm_head(hidden_states)
-                # Modification: VeOmni's patched ``loss_function`` (via
-                # LOSS_MAPPING) returns ``(loss, logits, fused_linear_aux)``;
-                # unpack to match the OpSlot branch above.
-                loss, _, fused_linear_aux = self.loss_function(
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.config.get_text_config().vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
-                    ignore_index=IGNORE_INDEX,
-                    **kwargs,
-                )
-                if fused_linear_aux is not None:
-                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
-                    # logits so output mirrors the OpSlot branch's contract.
-                    logits = None
+            loss, logits, fused_linear_aux = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.get_text_config().vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                ignore_index=IGNORE_INDEX,
+                **kwargs,
+            )
         else:
             logits = self.lm_head(hidden_states)
         # --- Patch.5 ---

@@ -9,14 +9,28 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: DeepseekV3RMSNorm.__init__
+#      Construct a local rms_norm VeomniOp
+#    - method_override: DeepseekV3RMSNorm.forward
+#      Always call the local rms_norm VeomniOp
+#    - method_override: DeepseekV3RotaryEmbedding.forward
+#      Use local triton_bmm for deterministic freqs when rotary impl is triton
+#    - function_replacement: apply_rotary_pos_emb
+#      Always call rope full VeomniOp
+#    - method_override: DeepseekV3MLP.__init__
+#      Construct a local swiglu_mlp VeomniOp
+#    - method_override: DeepseekV3MLP.forward
+#      Always call the local swiglu_mlp VeomniOp
 #    - class_replacement: DeepseekV3Experts
-#      Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path
+#      Always call moe_experts VeomniOp on v5 gate_up_proj weights
 #    - method_override: DeepseekV3TopkRouter.forward
 #      Disable autocast around fp32 router linear for VeRL actor/rollout parity
 #    - method_override: DeepseekV3MoE.forward
 #      Report top-k indices to the MoE load-balance monitor
+#    - method_override: DeepseekV3ForCausalLM.__init__
+#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: DeepseekV3ForCausalLM.forward
-#      OpSlot guard for fused cross entropy in DeepseekV3ForCausalLM.forward
+#      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
 #    - method_override: DeepseekV3ForCausalLM.get_parallel_plan
 #      Register DeepseekV3 expert parallel plan for v5 generated modeling
 #
@@ -24,6 +38,9 @@
 
 import math
 from collections.abc import Callable
+
+# Additional imports for patches
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -50,40 +67,38 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
-# Additional imports for patches
-from veomni.ops import fused_moe_forward
-
-# Additional import blocks for patches
-# ── OpSlot declarations ──────────────────────────────────────────────────
-# Bound at model-build time by _bind_veomni_ops() in auto.py.
-from veomni.ops.dispatch import OpSlot
+from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.models.utils.op_utils import empty_bias, linear_bias, resolve_moe_impl, resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 from veomni.utils.moe_monitor import record_router_indices
 
 
-veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV3RMSNorm
+# Methods patched: __init__, forward
+# ======================================================================
 
 
 @use_kernel_forward_from_hub("RMSNorm")
 class DeepseekV3RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
-        """
-        DeepseekV3RMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
+        nn.Module.__init__(self)
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV3RotaryEmbedding
+# Methods patched: forward
+# ======================================================================
 
 
 class DeepseekV3RotaryEmbedding(nn.Module):
@@ -126,16 +141,22 @@ class DeepseekV3RotaryEmbedding(nn.Module):
 
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
+    @torch.no_grad()
     def forward(self, x, position_ids):
-        inv_freq_expanded = (
-            self.inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1).to(dtype=torch.float, device=x.device)
-        )
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        # Disable any outside autocast context if any, to really force fp32
         with maybe_autocast(device_type=device_type, enabled=False):
-            freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
+            if resolve_op_impl("rotary_pos_emb_implementation") == "triton":
+                from veomni.models.transformers.deepseek_v3.triton_bmm import triton_bmm
+
+                freqs = triton_bmm(
+                    inv_freq_expanded.float().contiguous(),
+                    position_ids_expanded.float().contiguous(),
+                ).transpose(1, 2)
+            else:
+                freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
@@ -143,9 +164,15 @@ class DeepseekV3RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV3MLP
+# Methods patched: __init__, forward
+# ======================================================================
+
+
 class DeepseekV3MLP(nn.Module):
     def __init__(self, config, intermediate_size=None):
-        super().__init__()
+        nn.Module.__init__(self)
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
@@ -153,10 +180,18 @@ class DeepseekV3MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        return self.veomni_swiglu_mlp(
+            x,
+            self.gate_proj.weight,
+            linear_bias(self.gate_proj),
+            self.up_proj.weight,
+            linear_bias(self.up_proj),
+            self.down_proj.weight,
+            linear_bias(self.down_proj),
+        )
 
 
 # ======================================================================
@@ -178,21 +213,10 @@ class DeepseekV3TopkRouter(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
         self.e_score_correction_bias = nn.Buffer(torch.zeros(self.num_experts))
 
-    # ================================================================
-    # Patch: DeepseekV3TopkRouter.forward
-    # 1. Wrap the router F.linear in ``torch.autocast(enabled=False)`` so the
-    #    explicit fp32 cast isn't silently reverted by an outer autocast context.
-    #    Required for VeRL actor/rollout numerical parity.
-    # ================================================================
     def forward(self, hidden_states):
         hidden_states = hidden_states.view(-1, self.hidden_dim)
-        # --- Patch.1 ---
-        # Disable autocast to ensure fp32 computation — autocast overrides
-        # explicit .type(torch.float32) in F.linear, causing precision mismatch
-        # between actor (autocast bf16) and rollout (no autocast, native fp32).
         with torch.autocast(device_type=hidden_states.device.type, enabled=False):
             router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
-        # --- Patch.1 ---
         scores = router_logits.sigmoid()
         scores_for_choice = scores + self.e_score_correction_bias
         group_scores = (
@@ -212,8 +236,7 @@ class DeepseekV3TopkRouter(nn.Module):
         topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
         topk_weights = scores.gather(1, topk_indices)
         if self.norm_topk_prob:
-            denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
-            topk_weights /= denominator
+            topk_weights /= topk_weights.sum(dim=-1, keepdim=True) + 1e-20
         topk_weights = topk_weights * self.routed_scaling_factor
         return router_logits, topk_weights, topk_indices
 
@@ -221,25 +244,9 @@ class DeepseekV3TopkRouter(nn.Module):
 # ======================================================================
 # [PATCHED CLASS] DeepseekV3Experts
 # Original class replaced with: PatchedDeepseekV3Experts
-# Reason: Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path
+# Reason: Always call moe_experts VeomniOp on v5 gate_up_proj weights
 # Source: veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config
 # ======================================================================
-# ================================================================
-# Patch: DeepseekV3Experts (named ``DeepseekV3NaiveMoe`` before transformers 5.16)
-# 1. Drop upstream ``@use_experts_implementation`` decorator — it dispatches
-#    to ``grouped_mm`` / HF fused paths and bypasses VeOmni's fused MoE.
-# 2. OpSlot guard for fused-MoE: when ``veomni_moe_experts_forward`` is bound
-#    to a non-eager kernel (the ``moe_implementation`` ops-config field is
-#    not ``"eager"``), call ``fused_moe_forward`` with stacked ``gate_up_proj``.
-#    Otherwise fall through to the eager loop. This is the same dispatch
-#    qwen3_moe / qwen3_omni_moe / v4 deepseek_v3 use; an earlier draft of this
-#    patch keyed on a ``config._moe_implementation`` attribute that was never
-#    wired up by the framework, so EP runs always took the eager branch and
-#    crashed on EP-sharded ``gate_up_proj[expert_idx]`` lookups for global
-#    expert ids.
-# Layout matches v5 upstream (direct, no transpose):
-#   gate_up_proj [E, 2*I, H],  down_proj [E, H, I]
-# ================================================================
 class DeepseekV3Experts(nn.Module):
     """Collection of expert weights stored as 3D tensors."""
 
@@ -251,6 +258,7 @@ class DeepseekV3Experts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
 
     def forward(
         self,
@@ -258,39 +266,17 @@ class DeepseekV3Experts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        final_hidden_states = torch.zeros_like(hidden_states)
-
-        # Modification: OpSlot guard — use fused MoE kernel when bound.
-        if veomni_moe_experts_forward.use_non_eager_impl:
-            return fused_moe_forward(
-                num_experts=self.num_experts,
-                routing_weights=top_k_weights.to(final_hidden_states.dtype),
-                selected_experts=top_k_index,
-                hidden_states=hidden_states,
-                fc1_1_weight=None,
-                fc1_2_weight=None,
-                fc2_weight=self.down_proj,
-                fc1_1_2_weight=self.gate_up_proj,
-            )
-
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-            current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-
-        return final_hidden_states
+        unused = empty_bias(self.gate_up_proj)
+        return self.veomni_moe(
+            hidden_states,
+            top_k_weights,
+            top_k_index,
+            unused,
+            unused,
+            self.down_proj,
+            self.gate_up_proj,
+            num_experts=self.num_experts,
+        )
 
 
 # ======================================================================
@@ -313,26 +299,11 @@ class DeepseekV3MoE(nn.Module):
             config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
         )
 
-    # ================================================================
-    # Patch: DeepseekV3MoE.forward
-    # 1. Feed the top-k indices chosen by the router into the MoE load-balance
-    #    monitor. Symmetric to the ``maybe_replay_indices`` call other families make
-    #    in their SparseMoeBlock patches. No-op when no monitor is active.
-    #    transformers 5.16 folded the family-specific top-k math (sigmoid + bias
-    #    correction + group routing) from ``DeepseekV3MoE.route_tokens_to_experts``
-    #    into ``DeepseekV3TopkRouter.forward``, which now returns
-    #    ``(router_logits, topk_weights, topk_indices)``.
-    # ================================================================
     def forward(self, hidden_states):
         residuals = hidden_states
         orig_shape = hidden_states.shape
         _, topk_weights, topk_indices = self.gate(hidden_states)
-        # --- Patch.1 ---
-        # Hand the actual top-k indices used by this layer to the load-balance
-        # monitor. Keyed on ``self.gate`` so the monitor's layer order matches the
-        # router module identity.
         record_router_indices(self.gate, topk_indices)
-        # --- Patch.1 ---
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)
         hidden_states = hidden_states + self.shared_experts(residuals)
@@ -399,30 +370,21 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-@use_kernel_forward_from_hub("rotary_pos_emb")
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+# ======================================================================
+# [PATCHED FUNCTION] apply_rotary_pos_emb
+# Reason: Always call rope full VeomniOp
+# Source: veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config
+# ======================================================================
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    impl = resolve_op_impl("rotary_pos_emb_implementation")
+    rope = VeomniOp("rope", "full", "eager" if impl == "triton" else impl)
+    return rope(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
 def apply_rotary_pos_emb_interleave(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -754,7 +716,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] DeepseekV3ForCausalLM
-# Methods patched: forward, get_parallel_plan
+# Methods patched: __init__, forward, get_parallel_plan
 # ======================================================================
 
 
@@ -770,17 +732,11 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         self.model = DeepseekV3Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Initialize weights and apply final processing
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
 
-    # ================================================================
-    # Patch: DeepseekV3ForCausalLM.forward
-    # 1. OpSlot guard for fused cross-entropy loss; falls back to the eager
-    #    HF loss path when no fused kernel is bound. Returns the unified
-    #    ``CausalLMOutputWithLogProbs`` so callers can read per-token log-probs
-    #    and entropy alongside the loss (required by RL/PPO-style trainers).
-    # ================================================================
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -798,8 +754,8 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
     ) -> CausalLMOutputWithPast:
         r"""
         cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-            Indices depicting the position of the input sequence tokens in the sequence. Retained in the
-            signature for callers that pass it positionally; transformers 5.16 moved it into `**kwargs`.
+            Indices depicting the position of input tokens in the sequence. This is
+            retained explicitly for callers that pass it positionally.
         """
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
@@ -815,45 +771,20 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         hidden_states = outputs.last_hidden_state
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
 
-        # --- Patch.1 ---
         loss = None
         logits = None
         fused_linear_aux = None
         if labels is not None:
-            # Modification: OpSlot guard for cross-entropy loss.
-            if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.config.vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
-                    **kwargs,
-                )
-            else:
-                logits = self.lm_head(hidden_states)
-                # Modification: VeOmni's patched ``loss_function`` (via LOSS_MAPPING,
-                # installed by ``install_loss_mapping`` in
-                # ``veomni/ops/kernels/cross_entropy/__init__.py``) returns
-                # ``(loss, logits, fused_linear_aux)`` — *not* HF's stock single
-                # ``Tensor``. Unpack 4 values to match the OpSlot branch above; we
-                # discard the wrapper's flattened ``logits`` and keep the ones we
-                # already computed at full shape.
-                loss, _, fused_linear_aux = self.loss_function(
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.config.vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
-                    **kwargs,
-                )
-                if fused_linear_aux is not None:
-                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
-                    # logits so output mirrors the OpSlot branch's contract.
-                    logits = None
+            loss, logits, fused_linear_aux = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
+            )
         else:
             logits = self.lm_head(hidden_states[:, slice_indices, :])
-        # --- Patch.1 ---
 
         return CausalLMOutputWithLogProbs(
             loss=loss,
@@ -864,10 +795,6 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
         )
 
-    # ================================================================
-    # Patch: DeepseekV3ForCausalLM.get_parallel_plan
-    # 1. Register VeOmni EP parallel plan on the v5 generated class.
-    # ================================================================
     def get_parallel_plan(self):
         from ..parallel_plan import get_parallel_plan as _get_parallel_plan
 

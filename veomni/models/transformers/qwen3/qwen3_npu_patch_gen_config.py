@@ -9,15 +9,15 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# See the License for the specific language governing limitations
+# under the License.
 """
-Patch configuration for Qwen3 NPU OpSlot-based kernel replacements.
+Patch configuration for Qwen3 NPU VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models.transformers.qwen3.qwen3_npu_patch_gen_config -o veomni/models/transformers/qwen3/generated --diff
 
-This mirrors the runtime GPU patch in
+This mirrors the GPU patch in
 veomni/models/transformers/qwen3/qwen3_gpu_patch_gen_config.py.
 
 This file itself is not runnable. It's used to generate the runnable explicitly patched modeling file
@@ -26,9 +26,15 @@ This file itself is not runnable. It's used to generate the runnable explicitly 
 
 from veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config import (
     apply_rotary_pos_emb_patched,
+    qwen3_attention_forward_patched,
+    qwen3_attention_init_patched,
     qwen3_forcausallm_forward_patched,
+    qwen3_forcausallm_init_patched,
     qwen3_mlp_forward_patched,
+    qwen3_mlp_init_patched,
     qwen3_rmsnorm_forward_patched,
+    qwen3_rmsnorm_init_patched,
+    qwen3_seq_cls_init_patched,
     qwen3forsequenceclassification_forward_patched,
 )
 from veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config import (
@@ -40,65 +46,67 @@ from veomni.patchgen.patch_spec import PatchConfig
 config = PatchConfig(
     source_module="transformers.models.qwen3.modeling_qwen3",
     target_file="patched_modeling_qwen3_npu.py",
-    description="Qwen3 with OpSlot-based NPU kernel replacements",
+    description="Qwen3 with VeomniOp-based NPU kernel replacements",
 )
 
-# Mirror additional imports + post-import helpers from the GPU config so the
-# generated file is self-contained (same SP helpers, same rot_pos_ids /
-# async ulysses / get_position_id helpers).
 config.additional_imports.extend(gpu_config.additional_imports)
 config.post_import_blocks.extend(gpu_config.post_import_blocks)
 config.helpers.extend(gpu_config.helpers)
-# Propagate the GPU config's dropped imports (e.g. ``Qwen3CausalLMOutputWithPast``,
-# now superseded by ``Qwen3CausalLMOutputWithLogProbs`` for the FSDP2-safe
-# pre-backward unshard hook on ``lm_head``).
 config.drop_imported_names.update(gpu_config.drop_imported_names)
 
 
-# ── RMSNorm (OpSlot guard, functional NPU kernel) ──────────────────────────
-
-
+config.override_method(
+    "Qwen3RMSNorm.__init__",
+    replacement=qwen3_rmsnorm_init_patched,
+    description="Construct a local rms_norm VeomniOp",
+)
 config.override_method(
     "Qwen3RMSNorm.forward",
     replacement=qwen3_rmsnorm_forward_patched,
-    description="OpSlot guard for NPU fused RMSNorm (standard formulation)",
+    description="Always call the local rms_norm VeomniOp",
 )
-
-
-# ── SwiGLU MLP (OpSlot guard, functional NPU kernel) ───────────────────────
-
-
+config.override_method(
+    "Qwen3MLP.__init__",
+    replacement=qwen3_mlp_init_patched,
+    description="Construct a local swiglu_mlp VeomniOp",
+)
 config.override_method(
     "Qwen3MLP.forward",
     replacement=qwen3_mlp_forward_patched,
-    description="OpSlot guard for NPU fused SwiGLU MLP",
+    description="Always call the local swiglu_mlp VeomniOp",
 )
-
-
-# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
-
-
 config.replace_function(
     "apply_rotary_pos_emb",
     replacement=apply_rotary_pos_emb_patched,
-    description="OpSlot guard for NPU fused RoPE",
+    description="Always call rope full VeomniOp",
 )
-
-
-# ── Qwen3ForCausalLM.forward (fused cross-entropy via OpSlot) ────────────────
-
-
+config.override_method(
+    "Qwen3Attention.__init__",
+    replacement=qwen3_attention_init_patched,
+    description="Construct local rope and attention VeomniOps",
+)
+config.override_method(
+    "Qwen3Attention.forward",
+    replacement=qwen3_attention_forward_patched,
+    description="Always call the local rope and attention VeomniOps",
+)
+config.override_method(
+    "Qwen3ForCausalLM.__init__",
+    replacement=qwen3_forcausallm_init_patched,
+    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp",
+)
 config.override_method(
     "Qwen3ForCausalLM.forward",
     replacement=qwen3_forcausallm_forward_patched,
-    description="OpSlot guard for fused cross entropy in Qwen3ForCausalLM.forward",
+    description="Always call self.loss_function (ForCausalLMLoss + VeomniOp)",
 )
-
-# ── Qwen3ForSequenceClassification.forward (fused cross-entropy via OpSlot) ──
-
-
+config.override_method(
+    "Qwen3ForSequenceClassification.__init__",
+    replacement=qwen3_seq_cls_init_patched,
+    description="Bind ForSequenceClassificationLoss to a local cross_entropy_loss VeomniOp",
+)
 config.override_method(
     "Qwen3ForSequenceClassification.forward",
     replacement=qwen3forsequenceclassification_forward_patched,
-    description="OpSlot guard for fused cross entropy in Qwen3ForSequenceClassification.forward",
+    description="Always call self.loss_function (seq-cls helper + VeomniOp)",
 )
