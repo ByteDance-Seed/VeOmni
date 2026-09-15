@@ -105,14 +105,12 @@ class _AlignConditionModel:
         self.generator.manual_seed(seed + dp_rank)
         self.dropout = torch.nn.Dropout(DROPOUT_P)
 
-    # -- job-level checkpoint protocol ------------------------------------
     def rng_state_dict(self) -> Dict[str, torch.Tensor]:
         return {"generator": self.generator.get_state()}
 
     def load_rng_state_dict(self, state: Dict[str, torch.Tensor]) -> None:
         self.generator.set_state(state["generator"])
 
-    # -- per-step sampling -------------------------------------------------
     def process_condition(self, hidden_states=None, encoder_hidden_states=None, latents=None, **kwargs):
         # The DiT model consumes one tensor per sample (it zips these lists in
         # its forward), so the outputs keep the same list layout as the real
@@ -243,11 +241,6 @@ def main():
 
     args: VeOmniDiTArguments = parse_args(VeOmniDiTArguments)
     _build_trainer_class()(args).train()
-
-
-# ---------------------------------------------------------------------------
-# pytest side
-# ---------------------------------------------------------------------------
 
 
 def _output_dir(run: str) -> str:
