@@ -259,6 +259,9 @@ class TextDPOTrainer:
     def save_hf_or_lora(self, state, stage: str = "step_end") -> None:
         self.policy_model.save_hf_or_lora(state, stage=stage)
 
+    def wait_for_pending_save(self) -> None:
+        self.policy_model.wait_for_pending_save()
+
     def save_model_assets(self) -> None:
         self.policy_model.save_model_assets()
 

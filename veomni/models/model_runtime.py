@@ -536,8 +536,18 @@ class VeOmniModelRuntime:
         self.checkpoint.save_dcp(state)
 
     def save_hf_or_lora(self, state: "TrainerState", stage: str = "step_end") -> None:
-        """Export this model in whichever format it was trained in."""
+        """Export this model in whichever format it was trained in.
+
+        An in-flight async DCP must be on disk before conversion reads it, so
+        this drains first. ``_prepare_export`` waits again if it has to write
+        a DCP of its own.
+        """
+        self.checkpoint.wait_for_pending_save()
         self.checkpoint.save_hf_or_lora(state, stage=stage)
+
+    def wait_for_pending_save(self) -> None:
+        """Block until this model's in-flight async save is on disk, if any."""
+        self.checkpoint.wait_for_pending_save()
 
     def save_model_assets(self) -> None:
         """Write the tokenizer/processor/config sidecars that an export needs."""

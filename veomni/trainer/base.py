@@ -529,6 +529,10 @@ class BaseTrainer(Stateful, ABC):
         """Export this job's weights in whichever format the model was trained in."""
         self.model.save_hf_or_lora(state, stage=stage)
 
+    def wait_for_pending_save(self) -> None:
+        """Drain this job's in-flight async checkpoint writes, if any."""
+        self.model.wait_for_pending_save()
+
     def save_model_assets(self) -> None:
         """Write this job's tokenizer/config sidecars.
 

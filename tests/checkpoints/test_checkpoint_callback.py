@@ -248,12 +248,12 @@ class TestCheckpointCallbackTrainEndWait:
 
         cb.on_train_end(TrainerState(global_step=60))
 
-        trainer.model.checkpoint.wait_for_pending_save.assert_called_once_with()
+        trainer.wait_for_pending_save.assert_called_once_with()
 
     def test_train_end_propagates_async_save_failure(self, mock_helper):
         trainer = _make_mock_trainer(save_async=True)
         trainer.args.train.checkpoint.save_hf_weights = False
-        trainer.model.checkpoint.wait_for_pending_save.side_effect = RuntimeError("HDFS write failed")
+        trainer.wait_for_pending_save.side_effect = RuntimeError("HDFS write failed")
         cb = CheckpointCallback(trainer)
 
         with pytest.raises(RuntimeError, match="HDFS write failed"):
@@ -267,7 +267,7 @@ class TestCheckpointCallbackTrainEndWait:
 
         cb.on_train_end(TrainerState(global_step=60))
 
-        trainer.model.checkpoint.wait_for_pending_save.assert_called_once_with()
+        trainer.wait_for_pending_save.assert_called_once_with()
 
 
 @patch("veomni.models.checkpoint_manager.build_checkpointer")

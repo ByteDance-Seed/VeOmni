@@ -64,7 +64,6 @@ class CheckpointCallback(Callback):
         helper.empty_cache()
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
-        self.trainer.model.checkpoint.wait_for_pending_save()
         if self.save_hf_weights:
             if state.global_step != self._last_hf_step:
                 self._save_hf(state, stage="train_end")
@@ -73,6 +72,9 @@ class CheckpointCallback(Callback):
                     f"Skipping duplicate HF checkpoint save at train_end (global_step {state.global_step} "
                     f"already saved)."
                 )
+                self.trainer.wait_for_pending_save()
+        else:
+            self.trainer.wait_for_pending_save()
 
     def on_step_end(self, state: TrainerState, **kwargs):
         if self.dcp_every_n_steps and state.global_step % self.dcp_every_n_steps == 0:
