@@ -26,8 +26,9 @@ from transformers.modeling_utils import PreTrainedModel
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
+    gather_heads_scatter_seq,
     gather_outputs,
-    get_ulysses_sequence_parallel_rank,
+    gather_seq_scatter_heads,
     get_ulysses_sequence_parallel_world_size,
     slice_input_tensor_scale_grad,
 )
@@ -244,15 +245,10 @@ class SelfAttention(nn.Module):
         self.sp_async = False
 
     def forward(self, x, freqs, cos, sin, last_loss, self_attn_mask=None):
-        if self_attn_mask is not None and not self.sp_async:
-            # The sync path attends only over this rank's local SP shard (see
-            # AttentionModule), so the global tail-padding mask built in
-            # WanModel.forward must be narrowed to this rank's own segment --
-            # every shard is equal-size since it was padded to a multiple of
-            # sp_size before slicing.
-            sp_rank = get_ulysses_sequence_parallel_rank()
-            local_len = x.shape[1]
-            self_attn_mask = self_attn_mask[..., sp_rank * local_len : (sp_rank + 1) * local_len]
+        # Sync Ulysses gathers the full sequence here. The async DiT QKV op
+        # already all-to-alls internally. In both cases attention must not
+        # exchange again, so this call always passes skip_ulysses=True.
+        ulysses_enabled = get_parallel_state().ulysses_enabled
 
         if not self.sp_async:
             q = self.norm_q(self.q(x))
@@ -264,11 +260,16 @@ class SelfAttention(nn.Module):
                 seq_dimension=1,
                 head_dimension=2,
                 q_weight=self.q.weight,
+                q_bias=self.q.bias,
                 k_weight=self.k.weight,
+                k_bias=self.k.bias,
                 v_weight=self.v.weight,
+                v_bias=self.v.bias,
                 norm_type="rmsnorm",
                 norm_q_weight=self.norm_q.weight,
+                norm_q_bias=None,
                 norm_k_weight=self.norm_k.weight,
+                norm_k_bias=None,
                 normalized_shape=self.dim,
                 eps=1e-6,
                 unpadded_dim_size=x.shape[1] * get_ulysses_sequence_parallel_world_size(),
@@ -277,7 +278,29 @@ class SelfAttention(nn.Module):
         q = rope_apply(q, freqs=freqs, cos=cos, sin=sin, head_dim=self.head_dim)
         k = rope_apply(k, freqs=freqs, cos=cos, sin=sin, head_dim=self.head_dim)
 
-        x = self.attn(q, k, v, last_loss=last_loss, isSelfAttn=True, attention_mask=self_attn_mask)
+        if not self.sp_async and ulysses_enabled:
+            batch_size, local_seq_len = q.shape[0], q.shape[1]
+            q, k, v = (t.view(batch_size, local_seq_len, -1, self.head_dim) for t in (q, k, v))
+            q = gather_seq_scatter_heads(q, seq_dim=1, head_dim=2)
+            k = gather_seq_scatter_heads(k, seq_dim=1, head_dim=2)
+            v = gather_seq_scatter_heads(v, seq_dim=1, head_dim=2)
+            q, k, v = (t.reshape(t.shape[0], t.shape[1], -1) for t in (q, k, v))
+
+        x = self.attn(
+            q,
+            k,
+            v,
+            last_loss=last_loss,
+            isSelfAttn=True,
+            attention_mask=self_attn_mask,
+            skip_ulysses=True,
+        )
+
+        if not self.sp_async and ulysses_enabled:
+            batch_size, full_seq_len = x.shape[0], x.shape[1]
+            x = x.view(batch_size, full_seq_len, -1, self.head_dim)
+            x = gather_heads_scatter_seq(x, seq_dim=1, head_dim=2)
+            x = x.reshape(x.shape[0], x.shape[1], -1)
 
         if not self.sp_async:
             x = self.o(x)
@@ -562,23 +585,16 @@ class WanModel(PreTrainedModel):
             freqs = padding_tensor_for_seqeunce_parallel(freqs, dim=0)
 
             # Build one GLOBAL additive mask over the padded tail, identical on
-            # every rank, marking the pad positions so they can't influence real
-            # tokens' attention output. `SelfAttention.forward` adapts it to
-            # whichever shape its attention call actually needs:
-            #   - sync path (`sp_async=False`, the only path Wan uses today):
-            #     each attention backend here runs on the LOCAL SP shard only,
-            #     so only the LAST rank's shard ever contains padding --
-            #     `SelfAttention` slices this mask down to its own local segment.
-            #   - async path (`sp_async=True`): `async_ulysses_qkv_projection`
-            #     all-to-alls K/V to their full GLOBAL length on every rank (its
-            #     own unpad call is a no-op here since it's told the padded, not
-            #     true, length), so every rank needs the full mask as-is.
-            # Only `eager_attention_forward` reads this today. Official
-            # ``sageattn`` has no dense mask, so ``veomni_sage_attention``
-            # raises if one is passed. Sage is inference-only; training
-            # should use FlashAttention. FA3 historically dropped the mask.
-            # SP+sage therefore cannot honor this pad mask.
-            # See PR #1139 for the scope of what remains unmasked.
+            # every rank, marking the pad positions so they cannot influence real
+            # tokens. Both self-attention paths see the true full sequence before
+            # the backend call: the sync path all-to-alls Q/K/V in
+            # `SelfAttention.forward`, and the async DiT QKV op does its own
+            # internal all-to-all. Every rank therefore uses this mask as-is.
+            # Only `eager_attention_forward` reads it today. Official sageattn
+            # has no dense mask, so `veomni_sage_attention` raises if one is
+            # passed. Sage is inference-only; training should use FlashAttention.
+            # FA3/sage trim the K/V tail this mask marks. SP+sage still cannot
+            # honor an additional padding mask beyond that trim.
             if pad_size > 0:
                 self_attn_mask = torch.zeros(1, 1, 1, padded_seq_len, dtype=x.dtype, device=x.device)
                 self_attn_mask[..., padded_seq_len - pad_size :] = torch.finfo(x.dtype).min

@@ -19,6 +19,7 @@ Compare a toy DiT against ``tests/models/refs/wan.py``.
 
 from __future__ import annotations
 
+import inspect
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -178,6 +179,50 @@ def test_wan_fa3_skips_fp8_outside_policy(monkeypatch, available_nvidia_ops, kwa
     output = attn(hidden, hidden, hidden, **kwargs)
     assert called["generic"] is True
     assert output.shape == (1, 8, 32)
+
+
+def test_wan_async_self_attn_passes_dit_qkv_biases(monkeypatch):
+    """The Wan async call site must supply every required DiT QKV argument.
+
+    Ops-level DiT tests construct the op themselves and therefore cannot catch a
+    missing `q_bias` / `k_bias` / `v_bias` / `norm_q_bias` / `norm_k_bias` here.
+    """
+    from veomni.models.transformers.wan.modeling_wan import SelfAttention, precompute_freqs_cis
+    from veomni.ops.kernels.async_ulysses.qkv_proj.dit.eager import forward as dit_qkv_forward
+
+    captured = {}
+    original_op = wan_modeling.VeomniOp
+
+    class CaptureOp:
+        def __init__(self, op, variant, impl="eager"):
+            self.op = op
+            self.variant = variant
+            self.impl = impl
+            self._inner = None if op in {"async_ulysses_qkv", "async_ulysses_o"} else original_op(op, variant, impl)
+
+        def __call__(self, *args, **kwargs):
+            if self.op == "async_ulysses_qkv":
+                captured["qkv"] = inspect.signature(dit_qkv_forward).bind(*args, **kwargs)
+                hidden = captured["qkv"].arguments["hidden_states"]
+                return hidden, hidden, hidden
+            if self.op == "async_ulysses_o":
+                return kwargs["hidden_states"]
+            return self._inner(*args, **kwargs)
+
+    monkeypatch.setattr(wan_modeling, "VeomniOp", CaptureOp)
+    with ops_config_scope(eager_ops_config()):
+        attn = SelfAttention(SimpleNamespace(_attn_implementation="eager"), dim=32, num_heads=4)
+    attn.sp_async = True
+    hidden = torch.randn(1, 8, 32)
+    freqs = precompute_freqs_cis(8, end=8).reshape(8, 1, -1)
+    attn(hidden, freqs, cos=None, sin=None, last_loss=None)
+
+    arguments = captured["qkv"].arguments
+    assert arguments["q_bias"] is attn.q.bias
+    assert arguments["k_bias"] is attn.k.bias
+    assert arguments["v_bias"] is attn.v.bias
+    assert arguments["norm_q_bias"] is None
+    assert arguments["norm_k_bias"] is None
 
 
 def test_wan_eager_matches_official():
