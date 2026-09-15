@@ -61,6 +61,9 @@ from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config imp
     qwen3_5_moe_rmsnorm_init_patched,
     qwen3_5_moe_sparse_moe_block_forward_patched,
 )
+from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config import (
+    config as gpu_config,
+)
 from veomni.patchgen.patch_spec import PatchConfig
 
 
@@ -396,8 +399,9 @@ config.override_method(
     description="Register Qwen3_5MoeForCausalLM expert parallel plan for v5 generated modeling",
 )
 
+config.adopt_init_modifications(gpu_config)
 config.override_method(
     "Qwen3_5MoeAttention.forward",
     replacement=qwen3_5_moe_attention_forward_patched,
-    description="Dispatch attention through the interned VeomniOp",
+    description="Always call the local rope and attention VeomniOps",
 )

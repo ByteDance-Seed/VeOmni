@@ -18,7 +18,7 @@
 #    - method_override: Qwen2MLP.forward
 #      Always call the local swiglu_mlp VeomniOp
 #    - function_replacement: apply_rotary_pos_emb
-#      Always call rope full VeomniOp
+#      Leftover helper; Attention uses the instance-local rope handle
 #    - method_override: Qwen2Model.forward
 #      Support SP in Qwen2Model.forward
 #    - method_override: Qwen2ForCausalLM.__init__
@@ -33,8 +33,10 @@
 #      Construct the local base model for token classification
 #    - method_override: Qwen2ForQuestionAnswering.__init__
 #      Construct the local base model for question answering
+#    - init_modification: Qwen2Attention
+#      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen2Attention.forward
-#      Dispatch attention through the interned VeomniOp
+#      Always call the local rope and attention VeomniOps
 #
 # ==============================================================================
 
@@ -171,7 +173,7 @@ def rotate_half(x):
 
 # ======================================================================
 # [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: Always call rope full VeomniOp
+# Reason: Leftover helper; Attention uses the instance-local rope handle
 # Source: veomni.models.transformers.qwen2.qwen2_gpu_patch_gen_config
 # ======================================================================
 def apply_rotary_pos_emb(
@@ -226,7 +228,7 @@ def eager_attention_forward(
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen2Attention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
@@ -234,6 +236,7 @@ def eager_attention_forward(
 class Qwen2Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: Qwen2Config, layer_idx: int):
         super().__init__()
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
@@ -249,6 +252,9 @@ class Qwen2Attention(nn.Module):
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
+        self.veomni_attn = attention_op()
 
     def forward(
         self,
@@ -266,12 +272,12 @@ class Qwen2Attention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_op()(
+        attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
             key_states,

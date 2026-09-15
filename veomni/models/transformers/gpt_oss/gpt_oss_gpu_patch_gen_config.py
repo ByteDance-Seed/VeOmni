@@ -277,9 +277,15 @@ def gpt_oss_forcausallm_forward_patched(
     )
 
 
+@config.modify_init("GptOssAttention", description="Bind instance-local attention VeomniOp")
+def gpt_oss_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_attn = attention_op()
+
+
 @config.override_method(
     "GptOssAttention.forward",
-    description="Dispatch attention through the interned VeomniOp",
+    description="Always call the local attention VeomniOp",
 )
 def gpt_oss_attention_forward_patched(
     self,
@@ -297,12 +303,13 @@ def gpt_oss_attention_forward_patched(
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     cos, sin = position_embeddings
+    # HF GPT-OSS RoPE uses half-dim cos/sin, not rope/full.
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_output, attn_weights = attention_op()(
+    attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
         key_states,

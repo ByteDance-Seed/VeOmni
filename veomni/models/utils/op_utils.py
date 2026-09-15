@@ -42,9 +42,9 @@ def resolve_op_impl(field: str, *, npu_as: str | None = None) -> str:
 def attention_op() -> VeomniOp:
     """Return the interned standard-attention op for the active impl.
 
-    Missing ops config resolves to ``eager``. Construct in ``__init__``
-    when the attention module is already patched; otherwise call this in
-    ``forward``. The handle is interned either way.
+    Missing ops config resolves to ``eager``. Construct this only in
+    ``__init__`` / ``modify_init`` and store the handle on ``self``.
+    Do not call it from ``forward``.
     """
     return VeomniOp("attention", "standard", resolve_op_impl("attn_implementation"))
 

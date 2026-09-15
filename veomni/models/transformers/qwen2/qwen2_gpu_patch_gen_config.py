@@ -124,7 +124,9 @@ def qwen2_mlp_forward_patched(self, x):
     )
 
 
-@config.replace_function("apply_rotary_pos_emb", description="Always call rope full VeomniOp")
+@config.replace_function(
+    "apply_rotary_pos_emb", description="Leftover helper; Attention uses the instance-local rope handle"
+)
 def apply_rotary_pos_emb_patched(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -376,9 +378,16 @@ def qwen2_for_question_answering_init_patched(self, config):
     self.post_init()
 
 
+@config.modify_init("Qwen2Attention", description="Bind instance-local rope and attention VeomniOps")
+def qwen2_attention_bind_ops(original_init, self, config, layer_idx):
+    original_init(self, config, layer_idx)
+    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
+    self.veomni_attn = attention_op()
+
+
 @config.override_method(
     "Qwen2Attention.forward",
-    description="Dispatch attention through the interned VeomniOp",
+    description="Always call the local rope and attention VeomniOps",
 )
 def qwen2_attention_forward_patched(
     self,
@@ -396,12 +405,12 @@ def qwen2_attention_forward_patched(
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_output, attn_weights = attention_op()(
+    attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
         key_states,

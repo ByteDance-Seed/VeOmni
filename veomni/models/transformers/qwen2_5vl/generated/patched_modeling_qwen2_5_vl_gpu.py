@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - init_modification: Qwen2_5_VLVisionAttention
+#      Bind instance-local attention VeomniOp
 #    - method_override: Qwen2_5_VLVisionAttention.forward
 #      Use precomputed max_seqlen passed from outer forward to avoid per-layer CPU-GPU sync
 #    - method_override: Qwen2_5_VLVisionBlock.forward
@@ -33,8 +35,10 @@
 #      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
 #    - method_override: Qwen2_5_VLForConditionalGeneration.get_metadata_collate_func
 #      Expose CPU-side window-attention ViT multimodal-metadata derivation to the VeOmni collator
+#    - init_modification: Qwen2_5_VLAttention
+#      Bind instance-local attention VeomniOp
 #    - method_override: Qwen2_5_VLAttention.forward
-#      Dispatch attention through the interned VeomniOp
+#      Always call the local attention VeomniOp
 #
 # ==============================================================================
 
@@ -437,11 +441,12 @@ def eager_attention_forward(
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen2_5_VLVisionAttention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
 class Qwen2_5_VLVisionAttention(nn.Module):
+    # [modified __init__] Bind instance-local attention VeomniOp
     def __init__(self, config: Qwen2_5_VLVisionConfig) -> None:
         super().__init__()
         self.dim = config.hidden_size
@@ -454,12 +459,9 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
+        # Bind instance-local attention VeomniOp
+        self.veomni_attn = attention_op()
 
-    # ================================================================
-    # Patch: Qwen2_5_VLVisionAttention.forward
-    # 1. accept precomputed max_seqlen from outer forward to avoid
-    #    per-layer `(cu_seqlens[1:] - cu_seqlens[:-1]).max()` CPU-GPU sync
-    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -482,7 +484,7 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = attention_op()
+        attention_interface = self.veomni_attn
 
         if is_flash_attention_requested(self.config):
             # --- Patch.1 ---
@@ -1044,7 +1046,7 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen2_5_VLAttention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
@@ -1054,6 +1056,7 @@ class Qwen2_5_VLAttention(nn.Module):
     and "Generating Long Sequences with Sparse Transformers".
     """
 
+    # [modified __init__] Bind instance-local attention VeomniOp
     def __init__(self, config: Qwen2_5_VLTextConfig, layer_idx: int | None = None):
         super().__init__()
         self.config = config
@@ -1086,6 +1089,8 @@ class Qwen2_5_VLAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
+        # Bind instance-local attention VeomniOp
+        self.veomni_attn = attention_op()
 
     def forward(
         self,
@@ -1117,7 +1122,7 @@ class Qwen2_5_VLAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_op()(
+        attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
             key_states,

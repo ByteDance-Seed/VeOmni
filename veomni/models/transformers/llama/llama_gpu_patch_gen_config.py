@@ -269,9 +269,16 @@ def llamaforsequenceclassification_forward_patched(
     )
 
 
+@config.modify_init("LlamaAttention", description="Bind instance-local rope and attention VeomniOps")
+def llama_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
+    self.veomni_attn = attention_op()
+
+
 @config.override_method(
     "LlamaAttention.forward",
-    description="Dispatch attention through the interned VeomniOp",
+    description="Always call the local rope and attention VeomniOps",
 )
 def llama_attention_forward_patched(
     self,
@@ -289,12 +296,12 @@ def llama_attention_forward_patched(
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_output, attn_weights = attention_op()(
+    attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
         key_states,

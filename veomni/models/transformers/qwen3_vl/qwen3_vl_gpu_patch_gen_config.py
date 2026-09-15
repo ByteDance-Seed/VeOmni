@@ -37,8 +37,6 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     BaseModelOutputWithDeepstackFeatures,
     Qwen3VLModel,
     Qwen3VLModelOutputWithPast,
-    apply_rotary_pos_emb,
-    apply_rotary_pos_emb_vision,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
@@ -270,9 +268,9 @@ def _qwen3_vl_async_ulysses_attention_forward(
     cos = gather_outputs(cos, gather_dim=1, group=get_parallel_state().sp_group)
     sin = gather_outputs(sin, gather_dim=1, group=get_parallel_state().sp_group)
 
-    query_states, key_states = apply_rotary_pos_emb(q, k, cos, sin)
+    query_states, key_states = self.veomni_rope(q, k, cos, sin)
 
-    attention_interface = attention_op()
+    attention_interface = self.veomni_attn
     attn_output, attn_weights = attention_interface(
         self,
         query_states,
@@ -386,6 +384,13 @@ def collate_multimodal_metadata(batch, sp_pad):
 #    `(cu_seqlens[1:] - cu_seqlens[:-1]).max()` CPU-GPU sync happens once
 #    (hoisted to the outer visual forward) instead of once per layer
 # ================================================================
+@config.modify_init("Qwen3VLVisionAttention", description="Bind instance-local rope and attention VeomniOps")
+def qwen3_vl_vision_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
+    self.veomni_attn = attention_op()
+
+
 @config.override_method(
     "Qwen3VLVisionAttention.forward",
     description="Use precomputed max_seqlen passed from outer forward to hoist CPU-GPU sync out of the layer loop",
@@ -406,13 +411,13 @@ def qwen3_vl_vision_attention_forward_patched(
         self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
     )
     cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
     query_states = query_states.transpose(0, 1).unsqueeze(0)
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = attention_op()
+    attention_interface = self.veomni_attn
 
     if is_flash_attention_requested(self.config):
         # --- Patch.1 ---
@@ -862,6 +867,13 @@ def qwen3_vl_vision_dummy_forward_patched(self):
 #    `get_parallel_state().async_enabled` is True; otherwise fall
 #    through to the upstream logic unchanged
 # ================================================================
+@config.modify_init("Qwen3VLTextAttention", description="Bind instance-local rope and attention VeomniOps")
+def qwen3_vl_text_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
+    self.veomni_attn = attention_op()
+
+
 @config.override_method(
     "Qwen3VLTextAttention.forward",
     description="Route through async Ulysses fused QKV/Output projection when async_enabled",
@@ -894,13 +906,13 @@ def qwen3_vl_text_attention_forward_patched(
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
     if past_key_values is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-    attention_interface = attention_op()
+    attention_interface = self.veomni_attn
 
     attn_output, attn_weights = attention_interface(
         self,

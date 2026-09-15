@@ -545,6 +545,12 @@ def qwen3_omni_moe_get_rope_index_patched(
 #    dispatch the SP-appended cu_seqlens-padding entry would run through the
 #    non-varlen split branch and size-mismatch.
 # ================================================================
+@config.modify_init("Qwen3OmniMoeVisionAttention", description="Bind instance-local attention VeomniOp")
+def qwen3_omni_moe_vision_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_attn = attention_op()
+
+
 @config.override_method(
     "Qwen3OmniMoeVisionAttention.forward",
     description="Route through VARLEN_ATTENTION_TYPES so veomni_flash_attention_* with cu_seqlens works",
@@ -568,7 +574,7 @@ def qwen3_omni_moe_vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = attention_op()
+    attention_interface = self.veomni_attn
 
     # --- Patch.1 ---
     if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
@@ -1784,9 +1790,15 @@ def qwen3_omni_moe_text_get_parallel_plan_patched(self):
     return _get_text_parallel_plan()
 
 
+@config.modify_init("Qwen3OmniMoeAudioAttention", description="Bind instance-local attention VeomniOp")
+def qwen3_omni_moe_audio_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_attn = attention_op()
+
+
 @config.override_method(
     "Qwen3OmniMoeAudioAttention.forward",
-    description="Dispatch audio attention through the interned VeomniOp",
+    description="Always call the local attention VeomniOp",
 )
 def qwen3_omni_moe_audio_attention_forward_patched(
     self,
@@ -1804,7 +1816,7 @@ def qwen3_omni_moe_audio_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = attention_op()
+    attention_interface = self.veomni_attn
 
     if is_flash_attention_requested(self.config):
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
@@ -1847,9 +1859,16 @@ def qwen3_omni_moe_audio_attention_forward_patched(
     return attn_output
 
 
+@config.modify_init("Qwen3OmniMoeThinkerTextAttention", description="Bind instance-local rope and attention VeomniOps")
+def qwen3_omni_moe_thinker_text_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
+    self.veomni_attn = attention_op()
+
+
 @config.override_method(
     "Qwen3OmniMoeThinkerTextAttention.forward",
-    description="Dispatch thinker attention through the interned VeomniOp",
+    description="Always call the local rope and attention VeomniOps",
 )
 def qwen3_omni_moe_thinker_text_attention_forward_patched(
     self,
@@ -1867,12 +1886,12 @@ def qwen3_omni_moe_thinker_text_attention_forward_patched(
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_output, attn_weights = attention_op()(
+    attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
         key_states,

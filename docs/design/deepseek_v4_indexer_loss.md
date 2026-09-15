@@ -245,9 +245,9 @@ predicate, because neither keeps the model config: both take a config in
 `__init__` and retain only scalars off it. Giving them one means patching
 `__init__`, and the only route patchgen offers is `override_method` on it —
 restating the whole upstream body for one attribute, as the NPU config does for
-its `position_bias` sharding. (`modify_init` reads like the tool for this and is
-not: it is declared in `patch_spec.py` and unimplemented in the generator, so it
-silently produces nothing.) Threading the decision is both smaller and stronger:
+its `position_bias` sharding. `modify_init` now inlines extra `__init__`
+statements after the upstream body, so a one-attribute bind no longer needs a
+full `__init__` restatement. Threading the decision is both smaller and stronger:
 one evaluation per layer per forward cannot disagree with itself mid-call, and the
 HCA compressor takes the same parameter and ignores it only because its shared
 call site demands one signature —

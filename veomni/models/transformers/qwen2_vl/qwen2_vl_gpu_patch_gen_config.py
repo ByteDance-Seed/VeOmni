@@ -99,6 +99,12 @@ config.add_import(
 config.drop_import_names("Qwen2VLCausalLMOutputWithPast")
 
 
+@config.modify_init("VisionAttention", description="Bind instance-local attention VeomniOp")
+def qwen2_vl_vision_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_attn = attention_op()
+
+
 @config.override_method(
     "VisionAttention.forward",
     description="Use VeOmni varlen attention types and precomputed max_seqlen to avoid per-layer cpu-gpu sync",
@@ -123,7 +129,7 @@ def vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = attention_op()
+    attention_interface = self.veomni_attn
 
     if is_flash_attention_requested(self.config):
         # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
@@ -765,9 +771,15 @@ def qwen2vl_for_conditional_generation_forward_patched(
     )
 
 
+@config.modify_init("Qwen2VLAttention", description="Bind instance-local attention VeomniOp")
+def qwen2_vl_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_attn = attention_op()
+
+
 @config.override_method(
     "Qwen2VLAttention.forward",
-    description="Dispatch attention through the interned VeomniOp",
+    description="Always call the local attention VeomniOp",
 )
 def qwen2_vl_attention_forward_patched(
     self,
@@ -799,7 +811,7 @@ def qwen2_vl_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_output, attn_weights = attention_op()(
+    attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
         key_states,

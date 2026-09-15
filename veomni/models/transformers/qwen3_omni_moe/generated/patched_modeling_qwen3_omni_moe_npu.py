@@ -13,6 +13,8 @@
 #      Drop Qwen3OmniMoeCode2Wav branch since the class is excluded from the generated file
 #    - method_override: Qwen3OmniMoePreTrainedModelForConditionalGeneration.get_rope_index
 #      Per-video use_audio_in_video via audio_seqlens + None attention_mask tolerance
+#    - init_modification: Qwen3OmniMoeVisionAttention
+#      Bind instance-local attention VeomniOp
 #    - method_override: Qwen3OmniMoeVisionAttention.forward
 #      Route through VARLEN_ATTENTION_TYPES so veomni_flash_attention_* with cu_seqlens works
 #    - method_override: Qwen3OmniMoeVisionEncoder.forward
@@ -59,10 +61,14 @@
 #      Register the standalone Qwen3-Omni-MoE thinker expert parallel plan
 #    - method_override: Qwen3OmniMoeThinkerTextModel.get_parallel_plan
 #      Register the standalone Qwen3-Omni-MoE text expert parallel plan
+#    - init_modification: Qwen3OmniMoeAudioAttention
+#      Bind instance-local attention VeomniOp
 #    - method_override: Qwen3OmniMoeAudioAttention.forward
-#      Dispatch audio attention through the interned VeomniOp
+#      Always call the local attention VeomniOp
+#    - init_modification: Qwen3OmniMoeThinkerTextAttention
+#      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3OmniMoeThinkerTextAttention.forward
-#      Dispatch thinker attention through the interned VeomniOp
+#      Always call the local rope and attention VeomniOps
 #    - function_replacement: apply_rotary_pos_emb_vision
 #      Replace with the fusion operator on Ascend.
 #    - method_override: Qwen3OmniMoeThinkerTextRMSNorm.forward
@@ -637,13 +643,14 @@ def eager_attention_forward(
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3OmniMoeAudioAttention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
 class Qwen3OmniMoeAudioAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
+    # [modified __init__] Bind instance-local attention VeomniOp
     def __init__(self, config):
         super().__init__()
         self.embed_dim = config.d_model
@@ -666,6 +673,8 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+        # Bind instance-local attention VeomniOp
+        self.veomni_attn = attention_op()
 
     def forward(
         self,
@@ -683,7 +692,7 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = attention_op()
+        attention_interface = self.veomni_attn
 
         if is_flash_attention_requested(self.config):
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
@@ -1095,11 +1104,12 @@ def apply_rotary_pos_emb_vision(
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3OmniMoeVisionAttention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
 class Qwen3OmniMoeVisionAttention(nn.Module):
+    # [modified __init__] Bind instance-local attention VeomniOp
     def __init__(self, config: Qwen3OmniMoeVisionEncoderConfig) -> None:
         super().__init__()
         self.dim = config.hidden_size
@@ -1112,15 +1122,9 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
+        # Bind instance-local attention VeomniOp
+        self.veomni_attn = attention_op()
 
-    # ================================================================
-    # Patch: Qwen3OmniMoeVisionAttention.forward
-    # 1. [SP] Dispatch via VARLEN_ATTENTION_TYPES (covers veomni_flash_attention_*
-    #    custom names) instead of v5 upstream `is_flash_attention_requested`,
-    #    which only recognizes HF built-in flash attention names. Without this
-    #    dispatch the SP-appended cu_seqlens-padding entry would run through the
-    #    non-varlen split branch and size-mismatch.
-    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1140,7 +1144,7 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = attention_op()
+        attention_interface = self.veomni_attn
 
         # --- Patch.1 ---
         if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
@@ -1779,7 +1783,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3OmniMoeThinkerTextAttention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
@@ -1787,6 +1791,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 class Qwen3OmniMoeThinkerTextAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config, layer_idx):
         super().__init__()
         self.config = config
@@ -1816,6 +1821,9 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
             self.head_dim, eps=config.rms_norm_eps
         )  # thus post q_norm does not need reshape
         self.sliding_window = None
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
+        self.veomni_attn = attention_op()
 
     def forward(
         self,
@@ -1833,12 +1841,12 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_op()(
+        attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
             key_states,

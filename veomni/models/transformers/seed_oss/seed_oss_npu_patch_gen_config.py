@@ -83,8 +83,9 @@ config.override_method(
     description="Always call self.loss_function (ForCausalLMLoss + VeomniOp)",
 )
 
+config.adopt_init_modifications(gpu_config)
 config.override_method(
     "SeedOssAttention.forward",
     replacement=seed_oss_attention_forward_patched,
-    description="Dispatch attention through the interned VeomniOp",
+    description="Always call the local rope and attention VeomniOps",
 )

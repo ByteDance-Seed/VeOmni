@@ -1,6 +1,6 @@
 --- a/transformers/models/llama/modeling_llama.py
 +++ b/patched_modeling_llama_gpu.py
-@@ -1,70 +1,94 @@
+@@ -1,70 +1,96 @@
 -# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 +# ==============================================================================
 +#  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
@@ -39,8 +39,10 @@
 +#      Bind ForSequenceClassificationLoss to a local cross_entropy_loss VeomniOp
 +#    - method_override: LlamaForSequenceClassification.forward
 +#      Always call self.loss_function (seq-cls helper + VeomniOp)
++#    - init_modification: LlamaAttention
++#      Bind instance-local rope and attention VeomniOps
 +#    - method_override: LlamaAttention.forward
-+#      Dispatch attention through the interned VeomniOp
++#      Always call the local rope and attention VeomniOps
  #
 -# Unless required by applicable law or agreed to in writing, software
 -# distributed under the License is distributed on an "AS IS" BASIS,
@@ -134,7 +136,7 @@
 
      def extra_repr(self):
          return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-@@ -134,35 +158,31 @@
+@@ -134,35 +160,31 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
@@ -191,7 +193,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -170,10 +190,18 @@
+@@ -170,10 +192,18 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -212,20 +214,41 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -213,6 +241,12 @@
+@@ -213,10 +243,17 @@
      return attn_output, attn_weights
 
 
 +# ======================================================================
 +# [MODIFIED CLASS] LlamaAttention
-+# Methods patched: forward
++# Methods patched: forward, __init__
 +# ======================================================================
 +
 +
  @use_kernelized_func(apply_rotary_pos_emb)
  class LlamaAttention(nn.Module):
      """Multi-headed attention from 'Attention Is All You Need' paper"""
-@@ -261,11 +295,7 @@
+
++    # [modified __init__] Bind instance-local rope and attention VeomniOps
+     def __init__(self, config: LlamaConfig, layer_idx: int):
+         super().__init__()
+         self.config = config
+@@ -239,6 +276,9 @@
+         self.o_proj = nn.Linear(
+             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+         )
++        # Bind instance-local rope and attention VeomniOps
++        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
++        self.veomni_attn = attention_op()
+
+     def forward(
+         self,
+@@ -256,16 +296,12 @@
+         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+         cos, sin = position_embeddings
+-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
++        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
+
          if past_key_values is not None:
              key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
@@ -234,11 +257,11 @@
 -        )
 -
 -        attn_output, attn_weights = attention_interface(
-+        attn_output, attn_weights = attention_op()(
++        attn_output, attn_weights = self.veomni_attn(
              self,
              query_states,
              key_states,
-@@ -417,6 +447,12 @@
+@@ -417,6 +453,12 @@
          )
 
 
@@ -251,7 +274,7 @@
  @auto_docstring
  class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -429,8 +465,9 @@
+@@ -429,8 +471,9 @@
          self.model = LlamaModel(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -263,7 +286,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -444,55 +481,110 @@
+@@ -444,55 +487,110 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,

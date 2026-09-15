@@ -906,6 +906,12 @@ def qwen3_5_vision_model_dummy_forward(self):
     return self(hidden_states=pixel_values, grid_thw=grid_thw, vit_metadata=vit_metadata)
 
 
+@config.modify_init("Qwen3_5VisionAttention", description="Bind instance-local attention VeomniOp")
+def qwen3_5_vision_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_attn = attention_op()
+
+
 @config.override_method(
     "Qwen3_5VisionAttention.forward",
     description=(
@@ -933,7 +939,7 @@ def qwen3_5_vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = attention_op()
+    attention_interface = self.veomni_attn
 
     if is_flash_attention_requested(self.config):
         # Modification: prefer the int max_seqlen pre-computed once in
@@ -1566,9 +1572,16 @@ def qwen3_5_forconditional_generation_forward_patched(
     )
 
 
+@config.modify_init("Qwen3_5Attention", description="Bind instance-local rope and attention VeomniOps")
+def qwen3_5_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
+    self.veomni_attn = attention_op()
+
+
 @config.override_method(
     "Qwen3_5Attention.forward",
-    description="Dispatch attention through the interned VeomniOp",
+    description="Always call the local rope and attention VeomniOps",
 )
 def qwen3_5_attention_forward_patched(
     self,
@@ -1589,12 +1602,12 @@ def qwen3_5_attention_forward_patched(
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_output, attn_weights = attention_op()(
+    attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
         key_states,

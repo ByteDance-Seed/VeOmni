@@ -199,6 +199,12 @@ _MODEL_CASES = (
     ),
     _ModelCase(
         model_type="gemma3_text",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("model.layers.0.self_attn.veomni_rope", "rope"),
+            ("model.layers.0.self_attn.veomni_attn", "attention"),
+        ),
+        isolation_op_path="model.layers.0.self_attn.veomni_attn",
         config_factory=_tiny_gemma3_text_config,
         architectures=("Gemma3ForCausalLM", "Gemma3TextModel"),
     ),
@@ -208,7 +214,9 @@ _MODEL_CASES = (
             ("veomni_ce", "cross_entropy_loss"),
             ("veomni_lb", "load_balancing_loss"),
             ("model.layers.0.mlp.experts.veomni_moe", "moe_experts"),
+            ("model.layers.0.self_attn.veomni_attn", "attention"),
         ),
+        isolation_op_path="model.layers.0.self_attn.veomni_attn",
         config_factory=_tiny_gpt_oss_config,
         architectures=(
             "GptOssForCausalLM",
@@ -233,7 +241,10 @@ _MODEL_CASES = (
             ("veomni_ce", "cross_entropy_loss"),
             ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
             ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.0.self_attn.veomni_rope", "rope"),
+            ("model.layers.0.self_attn.veomni_attn", "attention"),
         ),
+        isolation_op_path="model.layers.0.self_attn.veomni_attn",
         config_factory=_tiny_llama_config,
         architectures=(
             "LlamaForCausalLM",
@@ -256,7 +267,10 @@ _MODEL_CASES = (
             ("veomni_ce", "cross_entropy_loss"),
             ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
             ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.0.self_attn.veomni_rope", "rope"),
+            ("model.layers.0.self_attn.veomni_attn", "attention"),
         ),
+        isolation_op_path="model.layers.0.self_attn.veomni_attn",
         config_factory=_tiny_seed_oss_config,
         architectures=(
             "SeedOssForCausalLM",
@@ -272,7 +286,10 @@ _MODEL_CASES = (
             ("veomni_ce", "cross_entropy_loss"),
             ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
             ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.0.self_attn.veomni_rope", "rope"),
+            ("model.layers.0.self_attn.veomni_attn", "attention"),
         ),
+        isolation_op_path="model.layers.0.self_attn.veomni_attn",
         config_factory=_tiny_qwen2_config,
         architectures=(
             "Qwen2ForCausalLM",
@@ -284,6 +301,12 @@ _MODEL_CASES = (
     ),
     _ModelCase(
         model_type="qwen2_vl",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("model.visual.blocks.0.attn.veomni_attn", "attention"),
+            ("model.language_model.layers.0.self_attn.veomni_attn", "attention"),
+        ),
+        isolation_op_path="model.language_model.layers.0.self_attn.veomni_attn",
         config_factory=_tiny_qwen2_vl_config,
         architectures=("Qwen2VLForConditionalGeneration", "Qwen2VLModel"),
         has_registered_config=True,
@@ -401,6 +424,8 @@ _MODEL_CASES = (
             ("veomni_lb", "load_balancing_loss"),
             ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
             ("model.layers.0.mlp.experts.veomni_moe", "moe_experts"),
+            ("model.layers.0.self_attn.veomni_rope", "rope"),
+            ("model.layers.0.self_attn.veomni_attn", "attention"),
         ),
         isolation_op_path="model.layers.0.mlp.experts.veomni_moe",
         config_factory=_tiny_qwen3_moe_config,
@@ -447,7 +472,12 @@ _MODEL_CASES = (
         eager_ops=(
             ("veomni_ce", "cross_entropy_loss"),
             ("model.language_model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.language_model.layers.0.self_attn.veomni_rope", "rope"),
+            ("model.language_model.layers.0.self_attn.veomni_attn", "attention"),
+            ("model.visual.blocks.0.attn.veomni_rope", "rope"),
+            ("model.visual.blocks.0.attn.veomni_attn", "attention"),
         ),
+        isolation_op_path="model.language_model.layers.0.self_attn.veomni_attn",
         config_factory=_tiny_qwen3_vl_config,
         architectures=("Qwen3VLForConditionalGeneration", "Qwen3VLModel"),
     ),
@@ -474,7 +504,8 @@ _MODEL_CASES = (
         has_registered_config=True,
         registered_config_aliases=("LTXVideoConditionModel",),
         registered_model_aliases=("LTXVideoConditionModel",),
-        eager_ops=(),
+        eager_ops=(("transformer_blocks.0.veomni_rms_norm_unweighted", "rms_norm"),),
+        isolation_op_path="transformer_blocks.0.veomni_rms_norm_unweighted",
     ),
     _ModelCase(
         model_type="MiniMaxH3DiTModel",
@@ -499,7 +530,10 @@ _MODEL_CASES = (
         eager_ops=(
             ("blocks.0.self_attn.norm_q.veomni_rms_norm", "rms_norm"),
             ("blocks.0.self_attn.attn.veomni_attn", "attention"),
+            ("blocks.0.self_attn.veomni_rope", "rope"),
         ),
+        # wan rope has no liger row; isolate via attention (sdpa) and keep rope in eager_ops
+        isolation_op_path="blocks.0.self_attn.attn.veomni_attn",
         config_factory=_tiny_wan_config,
         architectures=("WanModel",),
         has_registered_config=True,
@@ -564,6 +598,7 @@ _ALTERNATE_OP_IMPLS = {
     "moe_experts": ("moe_implementation", "fused_triton"),
     "rms_norm": ("rms_norm_implementation", "liger_kernel"),
     "attention": ("attn_implementation", "sdpa"),
+    "rope": ("rotary_pos_emb_implementation", "liger_kernel"),
 }
 
 

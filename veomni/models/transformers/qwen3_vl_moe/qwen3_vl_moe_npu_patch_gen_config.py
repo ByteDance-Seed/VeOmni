@@ -128,6 +128,7 @@ config.override_method(
     name_map=_NAME_MAP,
     description="Provide dummy vision forward for FSDP path with SP-aware shape",
 )
+config.adopt_init_modifications(gpu_config)
 config.override_method(
     "Qwen3VLMoeTextAttention.forward",
     replacement=qwen3_vl_text_attention_forward_patched,

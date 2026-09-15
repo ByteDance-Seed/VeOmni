@@ -15,8 +15,10 @@
 #      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: Gemma3ForCausalLM.forward
 #      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
+#    - init_modification: Gemma3Attention
+#      Bind instance-local rope and attention VeomniOps
 #    - method_override: Gemma3Attention.forward
-#      Dispatch attention through the interned VeomniOp
+#      Always call the local rope and attention VeomniOps
 #
 # ==============================================================================
 
@@ -322,7 +324,7 @@ def eager_attention_forward(
 
 # ======================================================================
 # [MODIFIED CLASS] Gemma3Attention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
@@ -330,6 +332,7 @@ def eager_attention_forward(
 class Gemma3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: Gemma3TextConfig, layer_idx: int):
         super().__init__()
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
@@ -359,6 +362,9 @@ class Gemma3Attention(nn.Module):
 
         self.q_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
+        self.veomni_attn = attention_op()
 
     def forward(
         self,
@@ -379,12 +385,12 @@ class Gemma3Attention(nn.Module):
         key_states = self.k_norm(key_states)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_op()(
+        attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
             key_states,

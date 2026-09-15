@@ -12,8 +12,9 @@ from veomni.ops import VeomniOp
 def rms_norm(x: torch.Tensor, weight: torch.Tensor | None = None, eps: float = 1e-6) -> torch.Tensor:
     """Root-mean-square (RMS) normalize `x` over its last dimension.
 
-    Always calls the interned ``VeomniOp`` handle. Missing weight uses
-    the ``unweighted`` variant.
+    Standalone helper for tests. Modeling must call an instance-local
+    ``VeomniOp`` bound in the owner module's ``__init__``. Missing weight
+    uses the ``unweighted`` variant.
     """
     impl = resolve_op_impl("rms_norm_implementation")
     if weight is None:

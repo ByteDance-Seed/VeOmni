@@ -39,8 +39,10 @@
 #      Construct the local base model for question answering
 #    - method_override: Qwen3MoeForCausalLM.get_parallel_plan
 #      Register Qwen3Moe expert parallel plan for v5 generated modeling
+#    - init_modification: Qwen3MoeAttention
+#      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3MoeAttention.forward
-#      Dispatch attention through the interned VeomniOp
+#      Always call the local rope and attention VeomniOps
 #
 # ==============================================================================
 
@@ -145,7 +147,7 @@ def eager_attention_forward(
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3MoeAttention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
@@ -153,6 +155,7 @@ def eager_attention_forward(
 class Qwen3MoeAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: Qwen3MoeConfig, layer_idx: int):
         super().__init__()
         self.config = config
@@ -178,6 +181,9 @@ class Qwen3MoeAttention(nn.Module):
         self.q_norm = Qwen3MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
         self.k_norm = Qwen3MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = getattr(config, "sliding_window", None)
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
+        self.veomni_attn = attention_op()
 
     def forward(
         self,
@@ -195,12 +201,12 @@ class Qwen3MoeAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_op()(
+        attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
             key_states,

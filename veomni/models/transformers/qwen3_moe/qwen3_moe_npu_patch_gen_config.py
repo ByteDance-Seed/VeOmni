@@ -156,8 +156,9 @@ config.override_method(
     description="Register Qwen3Moe expert parallel plan for v5 generated modeling",
 )
 
+config.adopt_init_modifications(gpu_config)
 config.override_method(
     "Qwen3MoeAttention.forward",
     replacement=qwen3_moe_attention_forward_patched,
-    description="Dispatch attention through the interned VeomniOp",
+    description="Always call the local rope and attention VeomniOps",
 )

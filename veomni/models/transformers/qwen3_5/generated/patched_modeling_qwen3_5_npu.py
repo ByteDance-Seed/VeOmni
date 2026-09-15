@@ -55,8 +55,12 @@
 #      Bind ForCausalLMLoss VeomniOp on Qwen3_5ForConditionalGeneration
 #    - method_override: Qwen3_5ForConditionalGeneration.forward
 #      Always call ForCausalLMLoss VeomniOp
+#    - init_modification: Qwen3_5VisionAttention
+#      Bind instance-local attention VeomniOp
+#    - init_modification: Qwen3_5Attention
+#      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3_5Attention.forward
-#      Dispatch attention through the interned VeomniOp
+#      Always call the local rope and attention VeomniOps
 #
 # ==============================================================================
 
@@ -880,13 +884,14 @@ def eager_attention_forward(
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5Attention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
 class Qwen3_5Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: Qwen3_5Config, layer_idx: int):
         super().__init__()
         self.config = config
@@ -910,6 +915,9 @@ class Qwen3_5Attention(nn.Module):
         )
         self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
         self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
+        self.veomni_attn = attention_op()
 
     def forward(
         self,
@@ -932,12 +940,12 @@ class Qwen3_5Attention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_op()(
+        attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
             key_states,
@@ -1170,7 +1178,14 @@ def apply_rotary_pos_emb_vision(
     return rope(q, k, cos, sin)
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3_5VisionAttention
+# Methods patched: __init__
+# ======================================================================
+
+
 class Qwen3_5VisionAttention(nn.Module):
+    # [modified __init__] Bind instance-local attention VeomniOp
     def __init__(self, config: Qwen3_5VisionConfig) -> None:
         super().__init__()
         self.dim = config.hidden_size
@@ -1183,6 +1198,8 @@ class Qwen3_5VisionAttention(nn.Module):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
+        # Bind instance-local attention VeomniOp
+        self.veomni_attn = attention_op()
 
     def forward(
         self,

@@ -125,7 +125,12 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
 
 
 def rope_apply(x, **kwargs):
-    """``rope`` / ``wan``. Impl from ``rotary_pos_emb_implementation``, else eager."""
+    """``rope`` / ``wan`` helper for tests.
+
+    Modeling must call the instance handle bound in ``SelfAttention.__init__``.
+    This helper still constructs a ``VeomniOp`` so standalone tests can apply
+    Wan RoPE without an attention module.
+    """
     freqs = kwargs.pop("freqs")
     head_dim = kwargs.pop("head_dim")
     rope = VeomniOp("rope", "wan", resolve_op_impl("rotary_pos_emb_implementation"))
@@ -242,6 +247,7 @@ class SelfAttention(nn.Module):
         self.norm_k = RMSNorm(dim, eps=eps)
 
         self.attn = AttentionModule(config, self.num_heads, self.head_dim)
+        self.veomni_rope = VeomniOp("rope", "wan", resolve_op_impl("rotary_pos_emb_implementation"))
         self.sp_async = False
 
     def forward(self, x, freqs, cos, sin, last_loss, self_attn_mask=None):
@@ -275,8 +281,8 @@ class SelfAttention(nn.Module):
                 unpadded_dim_size=x.shape[1] * get_ulysses_sequence_parallel_world_size(),
             )
 
-        q = rope_apply(q, freqs=freqs, cos=cos, sin=sin, head_dim=self.head_dim)
-        k = rope_apply(k, freqs=freqs, cos=cos, sin=sin, head_dim=self.head_dim)
+        q = self.veomni_rope(q, freqs, head_dim=self.head_dim)
+        k = self.veomni_rope(k, freqs, head_dim=self.head_dim)
 
         if not self.sp_async and ulysses_enabled:
             batch_size, local_seq_len = q.shape[0], q.shape[1]

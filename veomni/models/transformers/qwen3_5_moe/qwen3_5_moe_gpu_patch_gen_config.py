@@ -49,18 +49,20 @@ from transformers.utils import TransformersKwargs
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
+    qwen3_5_attention_bind_ops,
     qwen3_5_gated_deltanet_forward_patched,
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_vision_attention_bind_ops,
     qwen3_5_vision_attention_forward_patched,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
     qwen3_5_vision_model_rot_pos_emb,
 )
-from veomni.models.utils.op_utils import attention_op, empty_bias, resolve_moe_impl, resolve_op_impl
+from veomni.models.utils.op_utils import empty_bias, resolve_moe_impl, resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -253,6 +255,11 @@ config.override_method(
     description="Add dummy_forward to prevent FSDP reduce-scatter hang on uneven multimodal batches.",
 )
 
+config.modify_init(
+    "Qwen3_5MoeVisionAttention",
+    replacement=qwen3_5_vision_attention_bind_ops,
+    description="Bind instance-local attention VeomniOp",
+)
 config.override_method(
     "Qwen3_5MoeVisionAttention.forward",
     replacement=qwen3_5_vision_attention_forward_patched,
@@ -1042,9 +1049,16 @@ def qwen3_5_moe_causal_lm_get_parallel_plan_patched(self):
     return _get_causal_lm_parallel_plan()
 
 
+config.modify_init(
+    "Qwen3_5MoeAttention",
+    replacement=qwen3_5_attention_bind_ops,
+    description="Bind instance-local rope and attention VeomniOps",
+)
+
+
 @config.override_method(
     "Qwen3_5MoeAttention.forward",
-    description="Dispatch attention through the interned VeomniOp",
+    description="Always call the local rope and attention VeomniOps",
 )
 def qwen3_5_moe_attention_forward_patched(
     self,
@@ -1065,12 +1079,12 @@ def qwen3_5_moe_attention_forward_patched(
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_output, attn_weights = attention_op()(
+    attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
         key_states,

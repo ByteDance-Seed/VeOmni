@@ -57,6 +57,9 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_rot_pos_emb,
 )
+from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
+    config as gpu_config,
+)
 from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
@@ -825,8 +828,9 @@ class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Causal
     """
 
 
+config.adopt_init_modifications(gpu_config)
 config.override_method(
     "Qwen3_5Attention.forward",
     replacement=qwen3_5_attention_forward_patched,
-    description="Dispatch attention through the interned VeomniOp",
+    description="Always call the local rope and attention VeomniOps",
 )

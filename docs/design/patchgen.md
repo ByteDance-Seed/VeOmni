@@ -363,13 +363,14 @@ output = generator.generate(
 
 ### Init Modification
 
-Modify `__init__` methods without replacing the entire class:
+Modify `__init__` methods without replacing the entire class. Extra statements
+after `original_init(...)` are inlined into the upstream body:
 
 ```python
-@config.modify_init("Qwen3Attention")
-def modified_init(original_init, self, config, layer_idx):
-    original_init(self, config, layer_idx)
-    self.custom_attr = some_value
+@config.modify_init("Qwen2Attention")
+def bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_attn = attention_op()
 ```
 
 ## CLI Reference

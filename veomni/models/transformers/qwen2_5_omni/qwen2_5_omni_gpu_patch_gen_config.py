@@ -702,6 +702,12 @@ def qwen2_5_omni_audio_dummy_forward_patched(self):
 #    the SP-appended cu_seqlens padding entry would run through the
 #    non-varlen split branch and size-mismatch.
 # ================================================================
+@config.modify_init("Qwen2_5OmniVisionAttention", description="Bind instance-local attention VeomniOp")
+def qwen2_5_omni_vision_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_attn = attention_op()
+
+
 @config.override_method(
     "Qwen2_5OmniVisionAttention.forward",
     description="Route through VARLEN_ATTENTION_TYPES so veomni_flash_attention_* with cu_seqlens works",
@@ -725,7 +731,7 @@ def qwen2_5_omni_vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = attention_op()
+    attention_interface = self.veomni_attn
 
     # --- Patch.1 ---
     if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
@@ -1711,9 +1717,15 @@ def qwen2_5_omni_top_get_metadata_collate_func_patched(self):
     return self.thinker.get_metadata_collate_func()
 
 
+@config.modify_init("Qwen2_5OmniAudioAttention", description="Bind instance-local attention VeomniOp")
+def qwen2_5_omni_audio_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_attn = attention_op()
+
+
 @config.override_method(
     "Qwen2_5OmniAudioAttention.forward",
-    description="Dispatch audio attention through the interned VeomniOp",
+    description="Always call the local attention VeomniOp",
 )
 def qwen2_5_omni_audio_attention_forward_patched(
     self,
@@ -1731,7 +1743,7 @@ def qwen2_5_omni_audio_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = attention_op()
+    attention_interface = self.veomni_attn
 
     if is_flash_attention_requested(self.config):
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
@@ -1774,9 +1786,15 @@ def qwen2_5_omni_audio_attention_forward_patched(
     return attn_output
 
 
+@config.modify_init("Qwen2_5OmniAttention", description="Bind instance-local attention VeomniOp")
+def qwen2_5_omni_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_attn = attention_op()
+
+
 @config.override_method(
     "Qwen2_5OmniAttention.forward",
-    description="Dispatch thinker attention through the interned VeomniOp",
+    description="Always call the local attention VeomniOp",
 )
 def qwen2_5_omni_attention_forward_patched(
     self,
@@ -1808,7 +1826,7 @@ def qwen2_5_omni_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_output, attn_weights = attention_op()(
+    attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
         key_states,

@@ -23,8 +23,10 @@
 #      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: SeedOssForCausalLM.forward
 #      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
+#    - init_modification: SeedOssAttention
+#      Bind instance-local rope and attention VeomniOps
 #    - method_override: SeedOssAttention.forward
-#      Dispatch attention through the interned VeomniOp
+#      Always call the local rope and attention VeomniOps
 #
 # ==============================================================================
 
@@ -180,11 +182,12 @@ def eager_attention_forward(
 
 # ======================================================================
 # [MODIFIED CLASS] SeedOssAttention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
 class SeedOssAttention(nn.Module):
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: SeedOssConfig, layer_idx: int):
         super().__init__()
         self.config = config
@@ -211,6 +214,9 @@ class SeedOssAttention(nn.Module):
         )
 
         self.residual_dropout = config.residual_dropout
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
+        self.veomni_attn = attention_op()
 
     def forward(
         self,
@@ -228,12 +234,12 @@ class SeedOssAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_op()(
+        attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
             key_states,

@@ -27,6 +27,10 @@
 #      VeOmni SP + deepstack + precomputed max_seqlen; return BaseModelOutputWithDeepstackFeatures
 #    - method_override: Qwen3VLVisionModel.dummy_forward
 #      Provide dummy vision forward for FSDP path with SP-aware shape
+#    - init_modification: Qwen3VLVisionAttention
+#      Bind instance-local rope and attention VeomniOps
+#    - init_modification: Qwen3VLTextAttention
+#      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3VLTextAttention.forward
 #      Route through async Ulysses fused QKV/Output projection when async_enabled
 #    - method_override: Qwen3VLTextModel._deepstack_process
@@ -203,9 +207,9 @@ def _qwen3_vl_async_ulysses_attention_forward(
     cos = gather_outputs(cos, gather_dim=1, group=get_parallel_state().sp_group)
     sin = gather_outputs(sin, gather_dim=1, group=get_parallel_state().sp_group)
 
-    query_states, key_states = apply_rotary_pos_emb(q, k, cos, sin)
+    query_states, key_states = self.veomni_rope(q, k, cos, sin)
 
-    attention_interface = attention_op()
+    attention_interface = self.veomni_attn
     attn_output, attn_weights = attention_interface(
         self,
         query_states,
@@ -461,11 +465,12 @@ def eager_attention_forward(
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3VLVisionAttention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
 class Qwen3VLVisionAttention(nn.Module):
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: Qwen3VLVisionConfig) -> None:
         super().__init__()
         self.dim = config.hidden_size
@@ -478,13 +483,10 @@ class Qwen3VLVisionAttention(nn.Module):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
+        self.veomni_attn = attention_op()
 
-    # ================================================================
-    # Patch: Qwen3VLVisionAttention.forward
-    # 1. accept precomputed max_seqlen from outer forward so the
-    #    `(cu_seqlens[1:] - cu_seqlens[:-1]).max()` CPU-GPU sync happens once
-    #    (hoisted to the outer visual forward) instead of once per layer
-    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -501,13 +503,13 @@ class Qwen3VLVisionAttention(nn.Module):
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = attention_op()
+        attention_interface = self.veomni_attn
 
         if is_flash_attention_requested(self.config):
             # --- Patch.1 ---
@@ -733,7 +735,7 @@ def apply_rotary_pos_emb(
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3VLTextAttention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
@@ -741,6 +743,7 @@ def apply_rotary_pos_emb(
 class Qwen3VLTextAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: Qwen3VLTextConfig, layer_idx: int):
         super().__init__()
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
@@ -768,14 +771,10 @@ class Qwen3VLTextAttention(nn.Module):
         self.k_norm = Qwen3VLTextRMSNorm(
             self.head_dim, eps=config.rms_norm_eps
         )  # thus post q_norm does not need reshape
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
+        self.veomni_attn = attention_op()
 
-    # ================================================================
-    # Patch: Qwen3VLTextAttention.forward
-    # 1. route through the async Ulysses fused QKV/Output projection path
-    #    (defined via add_post_import_block as a module-level helper) when
-    #    `get_parallel_state().async_enabled` is True; otherwise fall
-    #    through to the upstream logic unchanged
-    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -804,13 +803,13 @@ class Qwen3VLTextAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attention_interface = attention_op()
+        attention_interface = self.veomni_attn
 
         attn_output, attn_weights = attention_interface(
             self,

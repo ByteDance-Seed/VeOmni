@@ -19,6 +19,8 @@
 #      Permute VeOmni (len, mel) input + SP gather/strip + SP slice + extend cu_seqlens
 #    - method_override: Qwen2_5OmniAudioEncoder.dummy_forward
 #      FSDP dummy forward with conv-weight dtype lookup (no caching) to stay bf16-safe
+#    - init_modification: Qwen2_5OmniVisionAttention
+#      Bind instance-local attention VeomniOp
 #    - method_override: Qwen2_5OmniVisionAttention.forward
 #      Route through VARLEN_ATTENTION_TYPES so veomni_flash_attention_* with cu_seqlens works
 #    - method_override: Qwen2_5OmniVisionEncoder.forward
@@ -53,10 +55,14 @@
 #      Expose CPU-side window-attention ViT multimodal-metadata derivation to the VeOmni collator
 #    - method_override: Qwen2_5OmniForConditionalGeneration.get_metadata_collate_func
 #      Delegate ViT multimodal-metadata derivation to the thinker submodule
+#    - init_modification: Qwen2_5OmniAudioAttention
+#      Bind instance-local attention VeomniOp
 #    - method_override: Qwen2_5OmniAudioAttention.forward
-#      Dispatch audio attention through the interned VeomniOp
+#      Always call the local attention VeomniOp
+#    - init_modification: Qwen2_5OmniAttention
+#      Bind instance-local attention VeomniOp
 #    - method_override: Qwen2_5OmniAttention.forward
-#      Dispatch thinker attention through the interned VeomniOp
+#      Always call the local attention VeomniOp
 #
 # ==============================================================================
 
@@ -756,13 +762,14 @@ def eager_attention_forward(
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen2_5OmniAudioAttention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
 class Qwen2_5OmniAudioAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
+    # [modified __init__] Bind instance-local attention VeomniOp
     def __init__(
         self,
         config: Qwen2_5OmniAudioEncoderConfig,
@@ -789,6 +796,8 @@ class Qwen2_5OmniAudioAttention(nn.Module):
         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+        # Bind instance-local attention VeomniOp
+        self.veomni_attn = attention_op()
 
     def forward(
         self,
@@ -806,7 +815,7 @@ class Qwen2_5OmniAudioAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = attention_op()
+        attention_interface = self.veomni_attn
 
         if is_flash_attention_requested(self.config):
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
@@ -1314,11 +1323,12 @@ def apply_rotary_pos_emb_vision(tensor: torch.Tensor, freqs: torch.Tensor) -> to
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen2_5OmniVisionAttention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
 class Qwen2_5OmniVisionAttention(nn.Module):
+    # [modified __init__] Bind instance-local attention VeomniOp
     def __init__(self, config: Qwen2_5OmniVisionEncoderConfig = None) -> None:
         super().__init__()
         self.dim = config.hidden_size
@@ -1333,15 +1343,9 @@ class Qwen2_5OmniVisionAttention(nn.Module):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
+        # Bind instance-local attention VeomniOp
+        self.veomni_attn = attention_op()
 
-    # ================================================================
-    # Patch: Qwen2_5OmniVisionAttention.forward
-    # 1. [SP] Dispatch via VARLEN_ATTENTION_TYPES (covers veomni_flash_attention_*
-    #    custom names) instead of v5 upstream `is_flash_attention_requested`,
-    #    which only recognizes HF built-in flash-attention names. Without this
-    #    the SP-appended cu_seqlens padding entry would run through the
-    #    non-varlen split branch and size-mismatch.
-    # ================================================================
     @deprecate_kwarg("rotary_pos_emb", version="v5.20", new_name="position_embeddings")
     def forward(
         self,
@@ -1362,7 +1366,7 @@ class Qwen2_5OmniVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = attention_op()
+        attention_interface = self.veomni_attn
 
         # --- Patch.1 ---
         if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
@@ -1925,7 +1929,7 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen2_5OmniAttention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
@@ -1935,6 +1939,7 @@ class Qwen2_5OmniAttention(nn.Module):
     and "Generating Long Sequences with Sparse Transformers".
     """
 
+    # [modified __init__] Bind instance-local attention VeomniOp
     def __init__(self, config: Qwen2_5OmniConfig, layer_idx: int | None = None):
         super().__init__()
         self.config = config
@@ -1962,6 +1967,8 @@ class Qwen2_5OmniAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
+        # Bind instance-local attention VeomniOp
+        self.veomni_attn = attention_op()
 
     def forward(
         self,
@@ -1993,7 +2000,7 @@ class Qwen2_5OmniAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_op()(
+        attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
             key_states,

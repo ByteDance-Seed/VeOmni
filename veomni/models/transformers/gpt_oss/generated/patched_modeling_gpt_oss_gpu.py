@@ -21,8 +21,10 @@
 #      Bind ForCausalLMLoss and load_balancing_loss VeomniOps
 #    - method_override: GptOssForCausalLM.forward
 #      Always call ForCausalLMLoss and load_balancing_loss VeomniOps
+#    - init_modification: GptOssAttention
+#      Bind instance-local attention VeomniOp
 #    - method_override: GptOssAttention.forward
-#      Dispatch attention through the interned VeomniOp
+#      Always call the local attention VeomniOp
 #
 # ==============================================================================
 
@@ -272,7 +274,7 @@ def eager_attention_forward(
 
 # ======================================================================
 # [MODIFIED CLASS] GptOssAttention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
@@ -280,6 +282,7 @@ def eager_attention_forward(
 class GptOssAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
+    # [modified __init__] Bind instance-local attention VeomniOp
     def __init__(self, config: GptOssConfig, layer_idx: int):
         super().__init__()
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
@@ -304,6 +307,8 @@ class GptOssAttention(nn.Module):
         )
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
         self.sinks = nn.Parameter(torch.empty(config.num_attention_heads))
+        # Bind instance-local attention VeomniOp
+        self.veomni_attn = attention_op()
 
     def forward(
         self,
@@ -321,12 +326,13 @@ class GptOssAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
+        # HF GPT-OSS RoPE uses half-dim cos/sin, not rope/full.
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_op()(
+        attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
             key_states,
