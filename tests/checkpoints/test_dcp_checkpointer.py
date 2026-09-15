@@ -885,6 +885,7 @@ class TestWaitForPendingSave:
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
         DistributedCheckpointer._save_futures = {}
+        DistributedCheckpointer._async_process_groups = {}
 
     def test_noop_when_no_pending_save(self):
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
@@ -914,7 +915,30 @@ class TestWaitForPendingSave:
         assert DistributedCheckpointer._save_futures == {}
         # The reduction is the synchronization callers rely on before their next
         # collective; it replaces the barrier this used to end with.
-        agreed.assert_called_once_with(False)
+        agreed.assert_called_once_with(False, group=None)
+
+    @patch("veomni.checkpoint.dcp_checkpointer.dist")
+    def test_a_drain_agrees_on_the_slots_own_group(self, mock_dist):
+        """The write ran on the slot's gloo group and the ranks leave it as far
+        apart as their writes finished. Agreeing on the training backend instead
+        puts that wait where the NCCL watchdog aborts the process over it."""
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_dist.is_initialized.return_value = True
+        mock_dist.get_rank.return_value = 0
+
+        slot_group = object()
+        DistributedCheckpointer._async_process_groups = {"ckpt": slot_group}
+
+        DistributedCheckpointer._save_futures = {"ckpt": MagicMock()}
+        with patch("veomni.utils.dist_utils.any_rank_failed", return_value=False) as agreed:
+            DistributedCheckpointer._drain_slot("ckpt")
+        agreed.assert_called_once_with(False, group=slot_group)
+
+        DistributedCheckpointer._save_futures = {"ckpt": MagicMock()}
+        with patch("veomni.utils.dist_utils.any_rank_failed", return_value=False) as agreed:
+            DistributedCheckpointer.wait_for_pending_save()
+        agreed.assert_called_once_with(False, group=slot_group)
 
     @patch("veomni.checkpoint.dcp_checkpointer.dist")
     def test_a_peers_failure_raises_here_too(self, mock_dist):
@@ -1024,7 +1048,7 @@ class TestWaitForPendingSave:
             with pytest.raises(CheckpointException):
                 DistributedCheckpointer._drain_slot("ckpt")
 
-        agreed.assert_called_once_with(True)
+        agreed.assert_called_once_with(True, group=None)
         assert DistributedCheckpointer._save_futures == {}
 
     def test_no_collective_when_dist_not_initialized(self):
@@ -1075,6 +1099,26 @@ class TestWaitForPendingSave:
 
         DistributedCheckpointer._save_futures = {}
         DistributedCheckpointer._async_process_groups = {}
+
+    @patch("veomni.checkpoint.dcp_checkpointer.dcp")
+    @patch("veomni.checkpoint.dcp_checkpointer.dist")
+    def test_a_slot_group_takes_the_save_timeout(self, mock_dist, mock_dcp):
+        """An async write waits on its slot's group like staging does, so it gets the same deadline."""
+        from datetime import timedelta
+
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_dist.is_initialized.return_value = True
+        DistributedCheckpointer._save_futures = {}
+        DistributedCheckpointer._async_process_groups = {}
+        try:
+            DistributedCheckpointer.execute_save(
+                save_state={}, storage_writer=MagicMock(), save_async=True, slot="ckpt", timeout_seconds=1800
+            )
+            assert mock_dist.new_group.call_args.kwargs == {"backend": "gloo", "timeout": timedelta(seconds=1800)}
+        finally:
+            DistributedCheckpointer._save_futures = {}
+            DistributedCheckpointer._async_process_groups = {}
 
 
 class TestDcpToHfDtypeConversion:
@@ -1374,7 +1418,9 @@ class TestLrSchedulerSaveLoad:
 
         saved_scheduler = MagicMock()
         saved_scheduler.state_dict.return_value = {"last_epoch": 10}
-        with patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed: failed):
+        with patch(
+            "veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed, group=None: failed
+        ):
             DistributedCheckpointer._save_lr_scheduler(str(tmp_path), {"lr_scheduler": saved_scheduler})
 
         saved_scheduler.state_dict.assert_not_called()
@@ -1476,7 +1522,7 @@ class TestPromoteStagedCheckpoint:
         directly.
         """
         with patch("veomni.utils.dist_utils.get_device_type", return_value="cpu"):
-            with patch("veomni.utils.dist_utils.dist.all_reduce", side_effect=lambda t, op=None: None):
+            with patch("veomni.utils.dist_utils.dist.all_reduce", side_effect=lambda t, op=None, group=None: None):
                 yield
 
     @pytest.fixture
@@ -1648,7 +1694,8 @@ class TestPromoteStagedCheckpoint:
             stage_path, final_path = make_staged(f"{label}-{role}")
             seen = []
 
-            def reduction(failed, _seen=seen):
+            def reduction(failed, group=None, _seen=seen):
+                """Record this rank's flag, and report a peer's failure from ``peer_fails_from`` on."""
                 _seen.append(failed)
                 if peer_fails_from is not None and len(_seen) >= peer_fails_from:
                     return True
@@ -1688,9 +1735,9 @@ class TestPromoteStagedCheckpoint:
 
         for role, r in results.items():
             assert r["raised"], f"{role} must raise once a peer failed"
-            # One collective per phase, four phases -- including on the role that
+            # One collective per phase, three phases -- including on the role that
             # does no work at all.
-            assert r["reductions"] == 4, f"{role} ran {r['reductions']} collectives: {results}"
+            assert r["reductions"] == 3, f"{role} ran {r['reductions']} collectives: {results}"
             assert not os.path.exists(os.path.join(r["final"], ".metadata")), f"{role} left a marker behind"
 
     def test_every_role_sees_a_failed_metadata_copy(self, make_staged):
@@ -1708,7 +1755,7 @@ class TestPromoteStagedCheckpoint:
 
         for role, r in results.items():
             assert r["raised"], f"{role} must raise after a failed marker copy"
-            assert r["reductions"] == 4, f"{role} did not finish the cleanup reduction: {results}"
+            assert r["reductions"] == 3, f"{role} did not reach the marker reduction: {results}"
             assert not os.path.exists(os.path.join(r["final"], ".metadata")), f"{role} left a marker"
 
         # The roles that copy data must still have copied all of it; only the
@@ -1772,6 +1819,121 @@ class TestPromoteStagedCheckpoint:
 
         assert not os.path.exists(os.path.join(final_path, ".metadata"))
 
+    def test_a_group_failure_still_frees_the_scratch_disk(self, staged):
+        """A gloo timeout raises out of a phase; the staged copy must not outlive it."""
+        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
+
+        stage_path, final_path = staged
+        calls = []
+
+        def broken_group(failed, group=None):
+            """Fail the way a timed-out gloo group does, on the first reduction."""
+            calls.append(failed)
+            raise RuntimeError("Timed out waiting 5000ms for recv operation to complete")
+
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True),
+            patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=broken_group),
+            pytest.raises(RuntimeError, match="Timed out"),
+        ):
+            _promote_staged_checkpoint(stage_path, final_path)
+
+        assert not os.path.exists(stage_path), "the staged copy outlived a broken group"
+        assert not os.path.exists(os.path.join(final_path, ".metadata")), "published over a broken group"
+        assert len(calls) == 1, f"the promotion went on past a broken group: {calls}"
+
+    def test_a_group_failure_after_the_markers_retracts_them(self, staged):
+        """The markers are copied *before* the phase that agrees on them, so a
+        failure of the agreement itself would leave them standing over a save that
+        never finished. A step being rewritten still carries the previous run's
+        manifest until its cursor files are rewritten, and manifest plus marker is
+        what resume reads as complete -- pairing this run's model state with the
+        earlier run's cursor."""
+        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
+
+        stage_path, final_path = staged
+        calls = []
+
+        def fails_the_closing_reduction(failed, group=None):
+            """Agree twice, then fail the way a timed-out gloo group does."""
+            calls.append(failed)
+            if len(calls) == 3:
+                raise RuntimeError("Timed out waiting 5000ms for recv operation to complete")
+            return False
+
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True),
+            patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=fails_the_closing_reduction),
+            pytest.raises(RuntimeError, match="Timed out"),
+        ):
+            _promote_staged_checkpoint(stage_path, final_path)
+
+        assert len(calls) == 3, f"the marker phase did not run: {calls}"
+        assert not os.path.exists(os.path.join(final_path, ".metadata")), (
+            "a marker outlived the agreement that was meant to publish it"
+        )
+        # The data is left where it is: without a marker the destination reads as
+        # incomplete, and the next save clears it.
+        assert os.path.exists(os.path.join(final_path, "__0_0.distcp"))
+        assert not os.path.exists(stage_path)
+
+    def test_markers_are_retracted_even_if_the_staged_tree_is_already_gone(self, staged):
+        """The marker list is taken before the phases, not when the retraction runs.
+
+        Retraction and the staged tree's removal both live in the same
+        ``finally``, and on a shared staging directory a peer's node leader can
+        get to the tree first. Deriving the list at retraction time would then
+        find nothing to retract and leave the markers standing."""
+        import shutil as _shutil
+
+        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
+
+        stage_path, final_path = staged
+        calls = []
+
+        def loses_the_stage_tree_then_fails(failed, group=None):
+            """Agree twice, then fail with the staged tree already swept away."""
+            calls.append(failed)
+            if len(calls) == 3:
+                _shutil.rmtree(stage_path, ignore_errors=True)
+                raise RuntimeError("Timed out waiting 5000ms for recv operation to complete")
+            return False
+
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True),
+            patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
+            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=loses_the_stage_tree_then_fails),
+            pytest.raises(RuntimeError, match="Timed out"),
+        ):
+            _promote_staged_checkpoint(stage_path, final_path)
+
+        assert not os.path.exists(os.path.join(final_path, ".metadata")), (
+            "the retraction depended on the staged tree that had already been swept"
+        )
+
+    def test_a_broken_group_keeps_this_ranks_error_as_the_cause(self):
+        """A drain whose slot group timed out must not report the timeout alone.
+
+        The group breaking is downstream of the save failing, so raising the
+        group's error by itself hides what actually went wrong."""
+        from veomni.utils.dist_utils import raise_if_any_rank_failed
+
+        save_error = RuntimeError("disk full while writing shard 3")
+
+        def broken_group(failed, group=None):
+            raise RuntimeError("Timed out waiting 5000ms for recv operation to complete")
+
+        with patch("veomni.utils.dist_utils.any_rank_failed", side_effect=broken_group):
+            with pytest.raises(RuntimeError, match="Timed out") as raised:
+                raise_if_any_rank_failed(save_error, "a pending async DCP save (ckpt)")
+
+        assert raised.value.__cause__ is save_error
+
     def test_any_rank_failed_is_a_max_reduction(self):
         """One failing rank must make every rank see a failure."""
         import torch as _torch
@@ -1782,14 +1944,28 @@ class TestPromoteStagedCheckpoint:
             assert any_rank_failed(True) is True
             assert any_rank_failed(False) is False
 
-        def fake_all_reduce(tensor, op=None):
+        seen_groups = []
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            """Check the op, record the group, and report a failure."""
             assert op is _torch.distributed.ReduceOp.MAX, "must be MAX; SUM would overflow on many ranks"
+            assert tensor.device.type == "cpu"
+            seen_groups.append(group)
             tensor.fill_(1)
 
+        gloo_group = object()
         with patch("veomni.utils.dist_utils.dist.is_initialized", return_value=True):
-            with patch("veomni.utils.dist_utils.get_device_type", return_value="cpu"):
-                with patch("veomni.utils.dist_utils.dist.all_reduce", side_effect=fake_all_reduce):
+            with patch("veomni.utils.dist_utils.dist.all_reduce", side_effect=fake_all_reduce):
+                with patch("veomni.utils.dist_utils.get_device_type", return_value="cpu"):
                     assert any_rank_failed(False) is True
+                # gloo cannot reduce accelerator tensors (NPU included), so a gloo
+                # group must never ask for the accelerator's device.
+                with (
+                    patch("veomni.utils.dist_utils.dist.get_backend", return_value="gloo"),
+                    patch("veomni.utils.dist_utils.get_device_type", side_effect=AssertionError("asked for a device")),
+                ):
+                    assert any_rank_failed(False, group=gloo_group) is True
+        assert seen_groups == [None, gloo_group], "the reduction must run on the group it was handed"
 
     def test_non_leader_non_coordinator_ranks_touch_nothing(self, staged):
         """Ranks other than the node leaders and the coordinator only participate in barriers."""
@@ -1900,7 +2076,7 @@ class TestStageDirValidation:
         """The rank that actually failed reports what happened, not the peer message."""
         from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
 
-        with patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda f: f):
+        with patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda f, group=None: f):
             with patch("veomni.checkpoint.dcp_checkpointer.os.makedirs", side_effect=OSError("No space left")):
                 with pytest.raises(OSError, match="No space left"):
                     _prepare_stage_dir(str(tmp_path), "/remote/ckpt")
@@ -1933,7 +2109,7 @@ class TestStageDirValidation:
             patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
             patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0),
             patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
-            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed: failed),
+            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed, group=None: failed),
             patch.object(DistributedCheckpointer, "execute_save", side_effect=OSError("dcp write failed")),
             patch.object(DistributedCheckpointer, "_create_storage_writer"),
             patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
@@ -1970,7 +2146,7 @@ class TestStageDirValidation:
             patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
             patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0),
             patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
-            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed: failed),
+            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed, group=None: failed),
             patch.object(DistributedCheckpointer, "execute_save", side_effect=OSError("dcp write failed")),
             patch.object(DistributedCheckpointer, "_create_storage_writer"),
             patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
@@ -2006,7 +2182,7 @@ class TestStageDirValidation:
         with (
             patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
             patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
-            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed: failed),
+            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed, group=None: failed),
         ):
             _promote_staged_checkpoint(str(stage_path), str(step_root / "model"), step_root=str(step_root))
 
@@ -2034,7 +2210,7 @@ class TestStageDirValidation:
         with (
             patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
             patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
-            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed: failed),
+            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed, group=None: failed),
         ):
             _promote_staged_checkpoint(str(stage_path), str(model_root))
 
@@ -2059,7 +2235,7 @@ class TestStageDirValidation:
         with (
             patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
             patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
-            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed: failed),
+            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed, group=None: failed),
         ):
             _promote_staged_checkpoint(str(stage_path), str(model_root / "vision"))
 
@@ -2274,6 +2450,45 @@ class TestStageDirValidation:
 
         assert [call.kwargs["slot"] for call in execute_save.call_args_list] == ["ckpt"]
 
+    def test_preparation_reduces_on_the_group_it_is_handed(self, tmp_path):
+        """The staging directory's agreement belongs on the stage group like the promotion's."""
+        from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
+
+        group = object()
+        with patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", return_value=False) as agreed:
+            _prepare_stage_dir(str(tmp_path), "/remote/ckpt", group=group)
+
+        assert agreed.call_args.kwargs["group"] is group
+
+    def test_staging_runs_on_the_stage_group(self, tmp_path):
+        """On the training backend, a copy outlasting the watchdog aborts the process."""
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        group = object()
+        with (
+            patch.object(DistributedCheckpointer, "execute_save") as execute_save,
+            patch.object(DistributedCheckpointer, "_create_storage_writer"),
+            patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
+            patch.object(DistributedCheckpointer, "_get_stage_process_group", return_value=group) as get_group,
+            patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+            patch(
+                "veomni.checkpoint.dcp_checkpointer._prepare_stage_dir", return_value=str(tmp_path / "s")
+            ) as prepare,
+            patch("veomni.checkpoint.dcp_checkpointer._promote_staged_checkpoint") as promote,
+        ):
+            DistributedCheckpointer.save(
+                path=str(tmp_path / "ckpt"),
+                state={"model": MagicMock()},
+                global_steps=10,
+                stage_dir=str(tmp_path / "stage"),
+                save_timeout_seconds=1800,
+            )
+
+        assert get_group.call_args.args == (1800,)
+        assert prepare.call_args.kwargs["group"] is group
+        assert promote.call_args.kwargs["group"] is group
+        assert {call.kwargs["timeout_seconds"] for call in execute_save.call_args_list} == {1800}
+
     def test_stage_key_does_not_collide_across_similar_paths(self):
         """Separator substitution maps /tmp/a_b/c and /tmp/a/b_c onto one directory."""
         from veomni.checkpoint.dcp_checkpointer import _stage_key
@@ -2403,3 +2618,169 @@ class TestResumeDiscovery:
         Path(marker_path(str(step))).write_text("legacy")
 
         assert self._validate(step) is None
+
+
+def _staged_promotion_worker(rank: int, world_size: int, base: str, scenario: str) -> None:
+    """One rank of the real promotion check; see ``TestPromotionAcrossRanks``."""
+    import shutil
+    import time
+
+    from veomni.checkpoint import dcp_checkpointer as module
+
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = os.environ["_TEST_MASTER_PORT"]
+    os.environ["LOCAL_RANK"] = str(rank)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+    stage, final = os.path.join(base, "stage"), os.path.join(base, "final")
+    if rank == 0:
+        os.makedirs(stage, exist_ok=True)
+        for name in ("__0_0.distcp", ".metadata"):
+            with open(os.path.join(stage, name), "w") as f:
+                f.write(name)
+    dist.barrier()
+
+    real_copy = shutil.copyfile
+
+    def instrumented_copy(src, dst):
+        """Copy for real, except where the scenario makes rank 0 fail or stall."""
+        if scenario == "copy_fails" and rank == 0:
+            raise OSError("simulated: destination is full")
+        if scenario == "outlives_timeout" and rank == 0:
+            time.sleep(5)
+        return real_copy(src, dst)
+
+    checkpointer = module.DistributedCheckpointer
+    checkpointer._stage_process_group = None
+    group = checkpointer._get_stage_process_group(2 if scenario == "outlives_timeout" else 120)
+    assert group is not None and group is not dist.group.WORLD, "staging must not run on the training group"
+
+    raised = None
+    with patch.object(module.shutil, "copyfile", instrumented_copy):
+        try:
+            module._promote_staged_checkpoint(stage, final, group=group)
+        except BaseException as e:  # noqa: BLE001 - asserted by the test
+            raised = f"{type(e).__name__} (runtime_error={isinstance(e, RuntimeError)}): {e}"
+
+    with open(os.path.join(base, f"outcome_{rank}"), "w") as f:
+        f.write(raised or "completed")
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+class TestPromotionAcrossRanks:
+    """The promotion, run for real on four ranks over its own gloo group.
+
+    Mocked reductions pin the bookkeeping. They cannot show that the group is
+    separate from the training backend's, or that its timeout is what a rank left
+    behind actually hits -- which is what this group exists for.
+    """
+
+    @staticmethod
+    def _run(tmp_path, scenario):
+        """Spawn four ranks for ``scenario`` and return each rank's outcome."""
+        from tests.tools.launch_utils import find_free_port
+
+        base = str(tmp_path / scenario)
+        os.makedirs(base, exist_ok=True)
+        os.environ["_TEST_MASTER_PORT"] = str(find_free_port())
+        mp.spawn(_staged_promotion_worker, args=(4, base, scenario), nprocs=4, join=True)
+        return base, [open(os.path.join(base, f"outcome_{r}")).read() for r in range(4)]
+
+    def test_promotion_completes_on_every_rank(self, tmp_path):
+        """Every rank finishes, the checkpoint lands with its marker, and the staged copy is freed."""
+        base, outcomes = self._run(tmp_path, "ok")
+
+        assert outcomes == ["completed"] * 4, outcomes
+        assert sorted(os.listdir(os.path.join(base, "final"))) == [".metadata", "__0_0.distcp"]
+        assert not os.path.exists(os.path.join(base, "stage")), "the staged copy was not freed"
+
+    def test_one_ranks_failure_stops_every_rank_without_a_marker(self, tmp_path):
+        """One rank's failed copy fails every rank and publishes no marker."""
+        base, outcomes = self._run(tmp_path, "copy_fails")
+
+        assert all(o != "completed" for o in outcomes), outcomes
+        assert "destination is full" in outcomes[0]
+        assert not os.path.exists(os.path.join(base, "final", ".metadata")), "published after a failed copy"
+        assert not os.path.exists(os.path.join(base, "stage")), "the staged copy was not freed"
+
+    def test_a_rank_that_outlives_the_group_timeout_fails_instead_of_hanging(self, tmp_path):
+        """The deadline lives in the group, so every rank gives up on the same collective."""
+        base, outcomes = self._run(tmp_path, "outlives_timeout")
+
+        assert all(o != "completed" for o in outcomes), outcomes
+        assert not os.path.exists(os.path.join(base, "final", ".metadata")), "published over a timed-out group"
+        assert not os.path.exists(os.path.join(base, "stage")), "the staged copy outlived a timed-out group"
+        # A collective timeout surfaces as a RuntimeError; its message is the backend's to change.
+        assert any("runtime_error=True" in o for o in outcomes), outcomes
+
+
+class TestSaveTimeoutConfig:
+    """``CheckpointConfig`` rejects a timeout that cannot mean what it says."""
+
+    @pytest.mark.parametrize("timeout", [0, -1, True, 1800.5, "1800"])
+    def test_non_positive_or_non_integer_timeout_is_rejected(self, timeout):
+        """The parser passes YAML scalars through, and ``true`` is an ``int`` to Python."""
+        from veomni.arguments.arguments_types import CheckpointConfig
+
+        with pytest.raises(ValueError, match="save_timeout_seconds must be a positive integer"):
+            CheckpointConfig(save_timeout_seconds=timeout)
+
+    def test_unset_timeout_defers_to_gloo(self):
+        """Unset leaves gloo's own default in place."""
+        from datetime import timedelta
+
+        from veomni.arguments.arguments_types import CheckpointConfig
+        from veomni.checkpoint.dcp_checkpointer import _gloo_timeout
+
+        assert CheckpointConfig().save_timeout_seconds is None
+        # ``new_group(timeout=None)`` is what falls back to the backend default.
+        assert _gloo_timeout(None) is None
+        assert _gloo_timeout(1800) == timedelta(seconds=1800)
+
+    # An empty ``stage_dir`` is what the checkpointer reads as unset, so it has
+    # nothing to bound either.
+    @pytest.mark.parametrize("disabled", [{}, {"stage_dir": ""}])
+    def test_a_timeout_with_nothing_to_bound_warns(self, disabled):
+        """Neither path is on, so no gloo group is created and the value is inert."""
+        from veomni.arguments.arguments_types import CheckpointConfig
+
+        with patch("veomni.arguments.arguments_types.logger") as logger:
+            CheckpointConfig(save_timeout_seconds=1800, **disabled)
+
+        logger.warning_rank0.assert_called_once()
+        assert "no effect" in logger.warning_rank0.call_args[0][0]
+
+    def test_the_forbidden_pair_is_rejected_at_startup(self):
+        """``save`` rejects it too, but only when the first checkpoint is due."""
+        from veomni.arguments.arguments_types import CheckpointConfig
+
+        with pytest.raises(ValueError, match="stage_dir cannot be combined with save_async"):
+            CheckpointConfig(stage_dir="/scratch/ckpt", save_async=True)
+
+    def test_a_numpy_integer_is_an_integer(self):
+        """The guard is against ``bool`` and ``float``, not against every integer.
+
+        A numpy scalar is not an ``int`` subclass, so an isinstance check would
+        reject 1800 with a message saying it must be a positive integer."""
+        from datetime import timedelta
+
+        import numpy as np
+
+        from veomni.arguments.arguments_types import CheckpointConfig
+        from veomni.checkpoint.dcp_checkpointer import _gloo_timeout
+
+        config = CheckpointConfig(stage_dir="/scratch/ckpt", save_timeout_seconds=np.int64(1800))
+        # Normalized, because ``timedelta(seconds=...)`` rejects a numpy scalar.
+        assert type(config.save_timeout_seconds) is int
+        assert _gloo_timeout(config.save_timeout_seconds) == timedelta(seconds=1800)
+
+    @pytest.mark.parametrize("enabled", [{"stage_dir": "/scratch/ckpt"}, {"save_async": True}])
+    def test_a_timeout_either_path_uses_is_not_warned_about(self, enabled):
+        from veomni.arguments.arguments_types import CheckpointConfig
+
+        with patch("veomni.arguments.arguments_types.logger") as logger:
+            CheckpointConfig(save_timeout_seconds=1800, **enabled)
+
+        logger.warning_rank0.assert_not_called()
