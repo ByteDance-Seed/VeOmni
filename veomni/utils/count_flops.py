@@ -944,13 +944,14 @@ class VeomniFlopsCounter:
         return vit_flops
 
     @staticmethod
-    def _compute_hybrid_attn_params(config):
+    def _compute_hybrid_attn_params(config, full_attention_types=("full_attention",)):
         """
         Compute hybrid attention (full + GatedDeltaNet) linear param count and layer info.
 
         Layers alternate between full attention and GatedDeltaNet (linear attention). The
-        per-layer schedule is read from `config.layer_types` ("full_attention" /
-        "linear_attention"); the typical pattern is (interval - 1) linear layers followed
+        per-layer schedule is read from `config.layer_types`. Full-attention layer names
+        are supplied by the caller because some model configs normalize them to a
+        model-specific value. The typical pattern is (interval - 1) linear layers followed
         by 1 full attention layer.
 
         Full attention (Qwen3_5Attention) projections:
@@ -990,7 +991,7 @@ class VeomniFlopsCounter:
         num_hidden_layers = config.num_hidden_layers
         layer_types = getattr(config, "layer_types", None)
         if layer_types is not None:
-            num_full_attn_layers = sum(t == "full_attention" for t in layer_types)
+            num_full_attn_layers = sum(t in full_attention_types for t in layer_types)
             num_linear_attn_layers = sum(t == "linear_attention" for t in layer_types)
         else:
             full_attention_interval = getattr(config, "full_attention_interval", None)
@@ -1122,7 +1123,10 @@ class VeomniFlopsCounter:
         num_hidden_layers = text_config.num_hidden_layers
 
         attn_linear_N, num_full_attn_layers, num_linear_attn_layers, head_dim, num_attention_heads = (
-            self._compute_hybrid_attn_params(text_config)
+            self._compute_hybrid_attn_params(
+                text_config,
+                full_attention_types=("full_attention", "qwen_sparse_attention"),
+            )
         )
 
         # QSA indexer projection on every full-attention layer.

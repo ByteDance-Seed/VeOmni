@@ -355,6 +355,18 @@ class TestQwen4ExpFlops:
         assert flops == pytest.approx(10_515_264 / 1e12, rel=1e-9)
         assert promised_flops == 1000.0
 
+    def test_transformers_normalized_layer_types(self, qwen4_exp_counter):
+        expected_flops, _ = qwen4_exp_counter.estimate_flops([12, 5], delta_time=1.0)
+        config = deepcopy(qwen4_exp_counter.config)
+        config.text_config.layer_types = [
+            "qwen_sparse_attention" if layer_type == "full_attention" else layer_type
+            for layer_type in config.text_config.layer_types
+        ]
+
+        actual_flops, _ = VeomniFlopsCounter(config).estimate_flops([12, 5], delta_time=1.0)
+
+        assert actual_flops == expected_flops
+
     def test_qsa_selected_token_budget(self, qwen4_exp_counter):
         counter = qwen4_exp_counter
 
