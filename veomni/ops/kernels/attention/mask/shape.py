@@ -60,7 +60,7 @@ def _compose_or_and(kwargs: dict[str, Any]) -> dict[str, Any]:
 
 
 def _to_eager_additive(mask: torch.Tensor | None, dtype: torch.dtype) -> torch.Tensor | None:
-    """HF eager adds the mask onto scores, so keep 0 / -inf rather than bool."""
+    """HF eager adds the mask onto scores, so keep 0 / ``finfo.min`` rather than bool."""
     if mask is None:
         return None
     if mask.dtype.is_floating_point:

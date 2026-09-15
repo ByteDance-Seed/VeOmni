@@ -228,9 +228,10 @@ class _Meta:
 def forward(x: Tensor, freqs: Tensor, *, head_dim: int) -> tuple[Tensor, SavedState]:
     """Fused interleaved RoPE. ``freqs`` is split into real/imag ``cos`` / ``sin``.
 
-    Empty ``x`` falls back to the eager pair. ``freqs`` is treated as fixed:
-    backward uses the conjugate rotation for ``dx`` and returns no frequency
-    gradient.
+    Empty ``x`` falls back to the eager pair and keeps its input rank.
+    Non-empty outputs are rank-3 after ``flatten(2)``. ``freqs`` is treated
+    as fixed: backward uses the conjugate rotation for ``dx`` and returns no
+    frequency gradient.
     """
     if x.numel() == 0:
         output, saved = _eager.forward(x, freqs, head_dim=head_dim)

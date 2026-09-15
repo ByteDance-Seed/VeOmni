@@ -46,9 +46,12 @@ def wrapper(
     """Compute GLM DSA scores and causal top-k compressed-KV indices.
 
     ``q`` is ``[B, S, H, D]``. ``k`` is ``[B, T, D]`` or ``[B, T, 1, D]``.
-    ``w`` is ``[B, S, H]``. Returns ``[B, S, top_k]`` ``torch.int32`` indices.
-    ``ratio`` is accepted for API parity with cuDNN. The eager implementation
-    applies causality through ``attention_mask``, not ``ratio``.
+    ``w`` is ``[B, S, H]``. Returns ``[B, S, K]`` ``torch.int32`` indices
+    where ``K = min(top_k, T)``. The ReLU / weighted-sum scores follow
+    HuggingFace ``GlmMoeDsaIndexer.forward``. Causal masking through
+    ``attention_mask`` or ``position_ids`` is VeOmni, not a copy of that
+    module. ``ratio`` is accepted for API parity with cuDNN. The eager
+    path applies causality through ``attention_mask``, not ``ratio``.
     ``qhead_per_kv_head`` is unused.
     """
     del ratio, qhead_per_kv_head, use_cache

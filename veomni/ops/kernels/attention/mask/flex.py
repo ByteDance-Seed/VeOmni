@@ -47,10 +47,12 @@ def flex_attention_mask_builder(
 
     Expand local lengths to the Ulysses-global sequence only when the
     adapter would gather Q/K/V itself: sync Ulysses and not
-    ``skip_ulysses``. Async Ulysses keeps local tokens, so the mask stays
-    local too. Explicit cumulative lengths are sufficient packed-sequence
-    metadata and do not require an additional 2D mask. Canonical masks can be
-    rebuilt from global lengths; custom predicates require global metadata.
+    ``skip_ulysses``. Async Ulysses gathers before attention, so the
+    lengths already passed in are the effective/global ones and the mask
+    is built at that scale. Explicit cumulative lengths are sufficient
+    packed-sequence metadata and do not require an additional 2D mask.
+    Canonical masks can be rebuilt from global lengths; custom predicates
+    require global metadata.
     """
     sliding_window = kwargs.pop("sliding_window", None)
     if cu_seqlens_k is None:

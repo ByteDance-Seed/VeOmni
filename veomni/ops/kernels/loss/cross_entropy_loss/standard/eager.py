@@ -109,9 +109,11 @@ def forward(
 ) -> tuple[Tensor, SavedState]:
     """Token-level CE. Empty ``weight`` means ``hidden`` is already logits.
 
-    Label shift and SP reduction stay in the caller. ``torch.func.grad_and_value``
-    builds its own graph and ignores ``no_grad``, so unused ``V×H`` weight
-    grads are skipped from ``requires_grad`` rather than ``is_grad_enabled()``.
+    This logits path is eager-only. ``liger_kernel`` and ``chunk_loss`` reject
+    empty ``weight``. Label shift and SP reduction stay in the caller.
+    ``torch.func.grad_and_value`` builds its own graph and ignores ``no_grad``,
+    so unused ``V×H`` weight grads are skipped from ``requires_grad`` rather
+    than ``is_grad_enabled()``.
     """
     has_weight = weight.numel() > 0
     hidden_needs_grad = hidden.requires_grad
