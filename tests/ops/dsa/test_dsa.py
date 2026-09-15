@@ -509,6 +509,54 @@ def test_dsa_attention_glm_eager_matches_hf_mask_path():
         torch.testing.assert_close(actual, expected, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+def test_dsa_attention_glm_eager_training_dropout_zeros_output_and_grads():
+    """HF-style post-softmax dropout: p=1 trains to zero, eval keeps the mass."""
+    ones = torch.ones(1, 1, 1, 1)
+    indices = torch.zeros(1, 1, 1, dtype=torch.int32)
+    q_pe, k_pe, kv_cache, q_nope = make_grad_leaves(ones, ones, ones, ones)
+
+    dropped = resolve_op("dsa_attention", "glm", "eager").wrapper(
+        q_pe,
+        k_pe,
+        kv_cache,
+        q_nope,
+        indices,
+        softmax_scale=1.0,
+        training=True,
+        attention_dropout=1.0,
+    )
+    assert torch.equal(dropped, torch.zeros_like(dropped))
+    grads = torch.autograd.grad(dropped, (q_pe, k_pe, kv_cache, q_nope), torch.ones_like(dropped), allow_unused=True)
+    for grad in grads:
+        assert grad is not None
+        assert torch.equal(grad, torch.zeros_like(grad))
+
+    kept = resolve_op("dsa_attention", "glm", "eager").wrapper(
+        ones,
+        ones,
+        ones,
+        ones,
+        indices,
+        softmax_scale=1.0,
+        training=False,
+        attention_dropout=1.0,
+    )
+    assert torch.equal(kept, ones)
+
+
+def test_dsa_attention_glm_eager_out_of_range_index_does_not_cross_batch():
+    """A local index >= kv_len is dropped instead of attending into the next batch."""
+    q_pe = torch.ones(2, 1, 1, 1)
+    k_pe = torch.ones(2, 2, 1, 1)
+    kv_cache = torch.tensor([[[[1.0]], [[2.0]]], [[[100.0]], [[200.0]]]])
+    q_nope = torch.ones(2, 1, 1, 1)
+    # Batch 0 selects local 0 (value 1) and OOB 2, which would be batch 1 key 0 if flattened.
+    indices = torch.tensor([[[0, 2]], [[0, 1]]], dtype=torch.int32)
+    out = resolve_op("dsa_attention", "glm", "eager").wrapper(q_pe, k_pe, kv_cache, q_nope, indices, softmax_scale=0.0)
+    assert torch.equal(out[0], torch.ones(1, 1, 1))
+    assert torch.equal(out[1], torch.full((1, 1, 1), 150.0))
+
+
 @pytest.mark.skipif(
     not _GLM_FUSED_HARDWARE_AVAILABLE,
     reason="GLM fused DSA requires an SM90+ NVIDIA GPU",
