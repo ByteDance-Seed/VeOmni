@@ -57,7 +57,7 @@ _DEEPSEEK_V4_TILELANG_TRAINING_ARGS = [
 ]
 
 
-def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
+def _materialize_weights_dir(config_path: str, output_path: str) -> Path:
     # Seed CPU RNG and init on CPU so the materialized checkpoint is bit-identical
     # across pytest invocations *and* across GPU architectures (L20 in CI vs A100
     # locally). Without this, the four sub-runs (sp/ep grid) shared weights within
@@ -73,7 +73,7 @@ def _materialize_weights_dir(config_path: str, output_path: str, save_original_f
         ops_implementation=make_eager_ops_config(),
     )
 
-    model.save_pretrained(output_path, save_original_format=save_original_format)
+    model.save_pretrained(output_path, save_original_format=True)
 
 
 def main(
@@ -92,17 +92,7 @@ def main(
     test_path = f"./{model_name}"
     os.makedirs(test_path, exist_ok=True)
 
-    # Models with stacked 3D expert params (gate_up_proj [E, 2*I, H], down_proj [E, H, I]):
-    #
-    # - qwen3_5_moe: native HF safetensor format is already stacked. HF's save_pretrained() with
-    #   save_original_format=True calls revert_weight_conversion() that splits them into per-expert
-    #   keys (experts.*.gate_proj.weight, etc.), but VeOmni has no runtime converter for this model.
-    #   Disable save_original_format to save in native stacked format.
-    #
-    # - qwen3_moe (v5): VeOmni registers a runtime CheckpointTensorConverter that merges per-expert
-    #   HF keys back to fused format at load time, so save_original_format=True works correctly.
-    save_original_format = model_name != "qwen3_5_moe"
-    _materialize_weights_dir(config_path, test_path, save_original_format=save_original_format)
+    _materialize_weights_dir(config_path, test_path)
 
     test_tasks = [task_name]
     command_list = prepare_exec_cmd(
