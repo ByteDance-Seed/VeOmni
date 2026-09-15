@@ -48,7 +48,6 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import (
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, torch_compilable_check
 
-from veomni.distributed.moe.comm import all_to_all
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -90,6 +89,7 @@ config.add_post_import_block(
 # OpSlots are declared in the generated module's post-import block.
 veomni_causal_conv1d = None
 veomni_chunk_gated_delta_rule = None
+all_to_all = None
 
 
 # ================================================================
