@@ -22,6 +22,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers.integrations.sdpa_attention import sdpa_attention_forward as hf_sdpa_attention_forward
 
 from .....distributed.parallel_state import get_parallel_state
+from ..helper import reject_sdpa_packed_metadata
 from ..ulysses import (
     prepare_ulysses_qkv,
     restore_ulysses_output,
@@ -92,9 +93,10 @@ def sdpa_attention_forward(
 
     ``sliding_window`` is shared-signature metadata and is not forwarded. This
     row supports windowed visibility only when it is already encoded in
-    ``attention_mask``. ``softcap`` changes logits rather than visibility, so a
-    mask cannot encode it; this row rejects explicit softcapping rather than
-    silently changing attention semantics.
+    ``attention_mask``. Packed/varlen metadata is rejected because the SDPA
+    API has no cumulative-length arguments. ``softcap`` changes logits rather
+    than visibility, so a mask cannot encode it; this row rejects explicit
+    softcapping rather than silently changing attention semantics.
 
     Uses memory-efficient SDPA so a dense bool / additive mask stays valid.
     Flash is not tried. Use ``veomni_flash_attention_*`` when the pattern can
@@ -103,6 +105,7 @@ def sdpa_attention_forward(
     ``skip_ulysses`` opts a call out of sync Ulysses when its tokens are not
     on the SP mesh. Async Ulysses stays outside attention.
     """
+    reject_sdpa_packed_metadata(kwargs)
     del sliding_window
 
     if softcap is not None:

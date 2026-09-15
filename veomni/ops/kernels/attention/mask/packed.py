@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Shared packed-sequence predicates for SDPA and FlexAttention masks."""
+"""Shared packed-sequence predicates for eager and FlexAttention masks."""
 
 from collections.abc import Callable
 
@@ -47,11 +47,11 @@ def packed_mask_function(
     if cu_seqlens_k is not None and not isinstance(cu_seqlens_k, Tensor):
         raise TypeError(f"cu_seqlens_k must be a torch.Tensor, got {type(cu_seqlens_k).__name__}")
     if cu_seqlens_k is None and q_length != kv_length:
-        raise ValueError("packed SDPA/FlexAttention with q_length != kv_length requires cu_seqlens_k")
+        raise ValueError("packed eager/FlexAttention with q_length != kv_length requires cu_seqlens_k")
     cu_seqlens_k = cu_seqlens if cu_seqlens_k is None else cu_seqlens_k
     if cu_seqlens.numel() != cu_seqlens_k.numel():
         raise ValueError(
-            "packed SDPA/FlexAttention requires the same number of query and key segments, got "
+            "packed eager/FlexAttention requires the same number of query and key segments, got "
             f"{cu_seqlens.numel() - 1} and {cu_seqlens_k.numel() - 1}"
         )
 
