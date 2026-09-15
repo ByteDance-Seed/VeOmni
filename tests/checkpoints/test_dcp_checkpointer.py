@@ -1533,7 +1533,7 @@ class TestPromoteStagedCheckpoint:
         assert order[-1] == ".metadata"
 
     def test_nested_sidecar_is_copied_before_metadata(self, tmp_path):
-        """A nested file is copied with the shards, before ``.metadata`` is published."""
+        """A nested file is copied with the shards, before any ``.metadata`` is."""
         import shutil as _shutil
 
         from veomni.checkpoint.dcp_checkpointer import _LR_SCHEDULER_FILENAME, _promote_staged_checkpoint
@@ -1626,12 +1626,12 @@ class TestPromoteStagedCheckpoint:
 
         Copies run for real unless ``fails(role, dst)`` says otherwise, so the
         assertions look at files that were actually written or actually withheld.
-        A no-op copy mock would make "no marker was published" true for the wrong
+        A no-op copy mock would make "no marker was written" true for the wrong
         reason.
 
         ``peer_fails_from`` is the 1-based reduction index from which the group
         reports failure -- i.e. which phase a *different* rank broke in. Phase 1
-        closes reduction 1, so a copy failure is 2 and a publish failure is 3;
+        closes reduction 1, so a copy failure is 2 and a marker failure is 3;
         reporting earlier would skip the phase under test.
         """
         import shutil as _shutil
@@ -1687,10 +1687,10 @@ class TestPromoteStagedCheckpoint:
             # One collective per phase, four phases -- including on the role that
             # does no work at all.
             assert r["reductions"] == 4, f"{role} ran {r['reductions']} collectives: {results}"
-            assert not os.path.exists(os.path.join(r["final"], ".metadata")), f"{role} published a marker"
+            assert not os.path.exists(os.path.join(r["final"], ".metadata")), f"{role} left a marker behind"
 
     def test_every_role_sees_a_failed_metadata_copy(self, make_staged):
-        """Publishing is part of the save, so its failure cannot stay with the coordinator.
+        """The marker copy is part of the save, so its failure cannot stay with the coordinator.
 
         The coordinator's marker copy really is attempted and really does fail,
         leaving a partial file behind, so this also covers that cleanup.
@@ -1703,18 +1703,18 @@ class TestPromoteStagedCheckpoint:
         )
 
         for role, r in results.items():
-            assert r["raised"], f"{role} must raise after a failed publish"
+            assert r["raised"], f"{role} must raise after a failed marker copy"
             assert r["reductions"] == 4, f"{role} did not finish the cleanup reduction: {results}"
             assert not os.path.exists(os.path.join(r["final"], ".metadata")), f"{role} left a marker"
 
-        # The roles that copy data must still have copied all of it; only
-        # publishing broke. Checking the exact set keeps this sensitive to a
+        # The roles that copy data must still have copied all of it; only the
+        # marker copy broke. Checking the exact set keeps this sensitive to a
         # partial copy, which "something was written" would not catch.
         for role in self._COPYING_ROLES:
             copied = sorted(n for n in os.listdir(results[role]["final"]) if n.endswith(".distcp"))
             assert copied == ["__0_0.distcp", "__0_1.distcp"], f"{role} copied {copied}"
 
-    def test_a_failing_publish_leaves_no_partial_marker(self, staged):
+    def test_a_failing_marker_copy_leaves_no_partial_marker(self, staged):
         """copyfile creates the destination before writing, so a half marker is possible."""
         from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
 
@@ -1983,12 +1983,12 @@ class TestStageDirValidation:
         prepare.assert_not_called()
         promote.assert_not_called()
 
-    def test_rewriting_a_step_unpublishes_it_first(self, tmp_path):
+    def test_rewriting_a_step_removes_its_manifest_first(self, tmp_path):
         """A restarted run reaches the same step again and writes over it. Until
         that finishes, what is on disk is neither the old checkpoint nor the new
-        one, so the marker the first attempt left has to go before the first byte
-        lands — otherwise a rewrite that fails leaves ``load_path: auto``
-        pointing at half a checkpoint. Dropping the nested ``.metadata`` during
+        one, so the manifest the first attempt left has to go before the first
+        byte lands — otherwise a rewrite that fails leaves ``load_path: auto``
+        pointing at half a checkpoint. Deleting the nested ``.metadata`` during
         promotion does not cover this: the manifest is what discovery reads."""
         from veomni.checkpoint import layout
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
@@ -2016,12 +2016,106 @@ class TestStageDirValidation:
                 global_steps=10,
             )
 
-        # Gone before the shards are touched, and still gone afterwards:
-        # republishing belongs to GlobalStateCallback, once every rank is done.
+        # Gone before the shards are touched, and still gone afterwards: writing
+        # it back belongs to GlobalStateCallback, once every rank is done.
         assert seen == [False]
         assert not os.path.exists(layout.manifest_path(step_root))
 
-    def test_a_rank_that_cannot_unpublish_fails_the_group(self, tmp_path):
+    def test_rewriting_a_legacy_step_drops_its_marker_too(self, tmp_path):
+        """A pre-split step is vouched for by a ``.metadata`` at its root. Writing
+        the current layout over it leaves that file untouched — nothing in this
+        layout puts a marker there — so resume discovery would keep accepting the
+        step through its legacy fallback while the rewrite is half done."""
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+        from veomni.checkpoint.legacy_v0_1_12 import marker_path
+
+        final = tmp_path / "ckpt"
+        step_root = final / "global_step_10"
+        step_root.mkdir(parents=True)
+        legacy_marker = Path(marker_path(str(step_root)))
+        legacy_marker.write_text("written by an older VeOmni")
+
+        with (
+            patch.object(DistributedCheckpointer, "execute_save"),
+            patch.object(DistributedCheckpointer, "_create_storage_writer"),
+            patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
+            patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+        ):
+            DistributedCheckpointer.save(
+                path=str(final),
+                state={"model": MagicMock()},
+                save_async=False,
+                global_steps=10,
+            )
+
+        assert not legacy_marker.exists()
+
+    def test_rewriting_a_step_drops_the_modules_own_markers(self, tmp_path):
+        """DCP rewrites ``.metadata`` at the end of a successful save, so a save
+        that dies part-way would otherwise leave one describing shards that are
+        half this step and half the last. Discovery reads those markers, so the
+        step has to stop carrying them the moment it stops being true."""
+        from veomni.checkpoint import layout
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        final = tmp_path / "ckpt"
+        step_root = str(final / "global_step_10")
+        markers = [Path(p) for p in (layout.weights_dir(step_root), layout.optimizer_dir(step_root))]
+        for directory in markers:
+            directory.mkdir(parents=True)
+            (directory / layout.DCP_MARKER_FILENAME).write_text("from the previous run")
+
+        seen = []
+        with (
+            patch.object(
+                DistributedCheckpointer,
+                "execute_save",
+                side_effect=lambda **kw: seen.append([(d / layout.DCP_MARKER_FILENAME).exists() for d in markers]),
+            ),
+            patch.object(DistributedCheckpointer, "_create_storage_writer"),
+            patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
+            patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+            patch("veomni.checkpoint.dcp_checkpointer.OptimizerState"),
+        ):
+            DistributedCheckpointer.save(
+                path=str(final),
+                state={"model": MagicMock(), "optimizer": MagicMock()},
+                save_async=False,
+                global_steps=10,
+            )
+
+        assert seen == [[False, False], [False, False]]
+
+    def test_rewriting_a_step_leaves_another_modules_markers_alone(self, tmp_path):
+        """Only the module being written loses its markers. A sibling's
+        checkpoint is not being overwritten, and deleting its marker would
+        strand a module that is still perfectly complete."""
+        from veomni.checkpoint import layout
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        final = tmp_path / "ckpt"
+        step_root = str(final / "global_step_10")
+        sibling = Path(layout.weights_dir(step_root, "audio"))
+        sibling.mkdir(parents=True)
+        (sibling / layout.DCP_MARKER_FILENAME).write_text("a finished module")
+
+        with (
+            patch.object(DistributedCheckpointer, "execute_save"),
+            patch.object(DistributedCheckpointer, "_create_storage_writer"),
+            patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
+            patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+        ):
+            DistributedCheckpointer.save(
+                path=str(final),
+                state={"model": MagicMock()},
+                save_async=False,
+                global_steps=10,
+                module="vision",
+            )
+
+        assert (sibling / layout.DCP_MARKER_FILENAME).exists()
+
+    def test_a_rank_that_cannot_remove_the_markers_fails_the_group(self, tmp_path):
         """One rank owns the marker, so a failure to remove it starts out visible
         to that rank alone. Left there, its peers walk into ``dcp.save`` on a
         collective it never joins."""
@@ -2034,7 +2128,7 @@ class TestStageDirValidation:
             patch("veomni.utils.dist_utils.any_rank_failed", return_value=True),
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,
         ):
-            with pytest.raises(RuntimeError, match="unpublishing the checkpoint manifest"):
+            with pytest.raises(RuntimeError, match="removing the old checkpoint markers"):
                 DistributedCheckpointer.save(
                     path=str(final),
                     state={"model": MagicMock()},
@@ -2043,7 +2137,7 @@ class TestStageDirValidation:
                 )
 
         # A non-zero rank never touches the file, and still raises — and nothing
-        # was written into a step that is no longer safely published.
+        # was written into a step whose markers may still be standing.
         execute_save.assert_not_called()
 
     def test_save_without_optimizer_writes_only_the_weights(self, tmp_path):
@@ -2089,3 +2183,109 @@ class TestStageDirValidation:
                 stage_dir=str(tmp_path / "stage"),
             )
         assert not final.exists()
+
+
+class TestResumeDiscovery:
+    """Which ``global_step_{N}/`` directories ``load_path: auto`` accepts.
+
+    A current-layout step is two independent halves, and both have to be down:
+    ``checkpoint_manifest.json`` for the per-rank cursor, and DCP's ``.metadata``
+    for each directory the manifest says a module wrote. A pre-split step has
+    neither and is recognised by the ``.metadata`` that used to sit at its root.
+    """
+
+    @staticmethod
+    def _validate(step_dir_path):
+        from veomni.utils.checkpoint_utils import _validate_dcp_checkpoint_entry
+
+        return _validate_dcp_checkpoint_entry(str(step_dir_path.parent), step_dir_path.name)
+
+    @staticmethod
+    def _write_dcp(step, module="", optimizer=True):
+        """Stand in for a finished DCP: the markers are all discovery reads."""
+        from veomni.checkpoint import layout
+
+        dirs = [layout.weights_dir(str(step), module)]
+        if optimizer:
+            dirs.append(layout.optimizer_dir(str(step), module))
+        for directory in dirs:
+            os.makedirs(directory, exist_ok=True)
+            Path(directory, layout.DCP_MARKER_FILENAME).write_text("done")
+
+    def test_a_complete_step_is_accepted(self, tmp_path):
+        from veomni.checkpoint import layout
+
+        step = tmp_path / "global_step_10"
+        self._write_dcp(step)
+        layout.write_manifest(str(step), global_step=10, world_size=1)
+
+        assert self._validate(step) == 10
+
+    def test_a_step_without_a_manifest_is_skipped(self, tmp_path):
+        """The shards are down but no rank wrote its cursor, so there is nothing
+        to resume the dataloader or the step counter from."""
+        step = tmp_path / "global_step_10"
+        self._write_dcp(step)
+
+        assert self._validate(step) is None
+
+    def test_a_step_whose_shards_are_still_streaming_is_skipped(self, tmp_path):
+        """The manifest lands as soon as the cursor does, which under
+        ``save_async`` is long before the shards finish. It cannot stand for the
+        step on its own -- this is the case that makes the async write worth
+        having, and the one that would silently resume half a checkpoint."""
+        from veomni.checkpoint import layout
+
+        step = tmp_path / "global_step_10"
+        os.makedirs(layout.weights_dir(str(step)))
+        layout.write_manifest(str(step), global_step=10, world_size=1)
+
+        assert self._validate(step) is None
+
+    def test_a_step_missing_one_modules_shards_is_skipped(self, tmp_path):
+        """The manifest names the modules, so discovery checks each without
+        walking the tree — and a job is not resumable on half its models."""
+        from veomni.checkpoint import layout
+
+        step = tmp_path / "global_step_10"
+        self._write_dcp(step, module="vision")
+        os.makedirs(layout.weights_dir(str(step), "audio"))
+        layout.write_manifest(str(step), global_step=10, world_size=1, modules=["vision", "audio"])
+
+        assert self._validate(step) is None
+
+    def test_a_step_saved_without_an_optimizer_is_accepted(self, tmp_path):
+        """The export at train end drops the optimizer, so a step can be complete
+        without one. Demanding a marker in a directory that does not exist would
+        make such a step permanently unresumable."""
+        from veomni.checkpoint import layout
+
+        step = tmp_path / "global_step_10"
+        self._write_dcp(step, optimizer=False)
+        layout.write_manifest(str(step), global_step=10, world_size=1)
+
+        assert self._validate(step) == 10
+
+    def test_a_legacy_step_is_accepted_by_its_own_marker(self, tmp_path):
+        from veomni.checkpoint.legacy_v0_1_12 import marker_path
+
+        step = tmp_path / "global_step_10"
+        step.mkdir()
+        Path(marker_path(str(step))).write_text("legacy")
+
+        assert self._validate(step) == 10
+
+    def test_a_legacy_step_being_rewritten_is_skipped(self, tmp_path):
+        """The current layout never writes a ``.metadata`` at the step root, so
+        one sitting beside a ``model/`` means a rewrite landed on a pre-split
+        step and did not finish. The loader prefers the new tree and would fail
+        on whatever part of it never arrived, so the old marker must not keep the
+        step discoverable."""
+        from veomni.checkpoint import layout
+        from veomni.checkpoint.legacy_v0_1_12 import marker_path
+
+        step = tmp_path / "global_step_10"
+        (step / layout.MODEL_DIRNAME / layout.WEIGHTS_DIRNAME).mkdir(parents=True)
+        Path(marker_path(str(step))).write_text("legacy")
+
+        assert self._validate(step) is None

@@ -26,7 +26,6 @@ Two blobs, two owners:
 On-disk layout: ``docs/usage/checkpoint.md``.
 """
 
-import os
 from typing import TYPE_CHECKING, Optional
 
 import torch.distributed as dist
@@ -73,7 +72,7 @@ class ModelCheckpointManager:
 
     ``loader/`` and ``extra_state/`` are written by
     :class:`~veomni.trainer.callbacks.global_state_callback.GlobalStateCallback`,
-    which also publishes the step's ``checkpoint_manifest.json``.
+    which also writes the step's ``checkpoint_manifest.json``.
 
     A subclass managing one module of a multi-module model sets
     :attr:`module_name`; every path below then nests one level deeper, and
@@ -98,6 +97,15 @@ class ModelCheckpointManager:
 
     @property
     def last_saved_step(self) -> int:
+        """Last step this run handed to the checkpointer, for same-step dedupe.
+
+        Says nothing about what is on disk -- under ``save_async`` the shards are
+        still being written when ``save_dcp`` returns. It answers the one
+        question the filesystem cannot: whether *this* run wrote the step. A
+        complete checkpoint left at the same step by an earlier run looks
+        identical from the outside but holds different weights, so
+        :meth:`_prepare_export` overwrites rather than trusting what it finds.
+        """
         return self._last_saved_step
 
     @property
@@ -129,6 +137,7 @@ class ModelCheckpointManager:
         return self.config.load_path
 
     def wait_for_pending_save(self) -> None:
+        """Block until the in-flight async save is on disk, if there is one."""
         self.checkpointer.wait_for_pending_save()
 
     def load(self) -> None:
@@ -187,10 +196,10 @@ class ModelCheckpointManager:
         holds the weights alone.
 
         The DCP written here can land on a step the save cadence never reaches.
-        ``GlobalStateCallback.on_train_end`` finishes such a step off with the
-        cursor files and the manifest, so it resumes like any other.
+        ``GlobalStateCallback`` finishes such a step off with the cursor files
+        and the manifest, so it resumes like any other.
         """
-        if not os.path.exists(self.save_dir(state)):
+        if self._last_saved_step != state.global_step:
             dist.barrier()
             self.save_dcp(state)
 
@@ -220,7 +229,6 @@ class ModelCheckpointManager:
         )
         helper.empty_cache()
         dist.barrier()
-        self._last_saved_step = state.global_step
 
     def save_lora(self, state: "TrainerState", stage: str = "step_end", adapter_name: str = "default") -> None:
         from ..utils.save_safetensor_utils import save_lora_adapter_with_dcp
@@ -233,7 +241,6 @@ class ModelCheckpointManager:
         )
         helper.empty_cache()
         dist.barrier()
-        self._last_saved_step = state.global_step
 
     def save_hf_or_lora(self, state: "TrainerState", stage: str = "step_end") -> None:
         if self.trainable_only:

@@ -349,7 +349,6 @@ class TestModelCheckpointManagerSaveContract:
         mock_build_ckpt.return_value = MagicMock()
         manager = ModelCheckpointManager(trainer)
         state = TrainerState(global_step=10)
-        (tmp_path / "checkpoints" / "global_step_10" / "model").mkdir(parents=True)
 
         with patch("veomni.utils.save_safetensor_utils.save_lora_adapter_with_dcp") as save_adapter:
             manager.save_lora(state)
@@ -359,6 +358,61 @@ class TestModelCheckpointManagerSaveContract:
         assert save_path == manager.lora_export_dir(state)
         assert save_path != manager.hf_export_dir(state)
         assert save_path != manager.save_dir(state)
+
+    def test_export_rewrites_a_step_this_run_did_not_save(
+        self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps, tmp_path
+    ):
+        """A ``model/`` an interrupted save left behind is indistinguishable from
+        a finished one, and its weights belong to a trajectory this run
+        abandoned. Skipping the save on the strength of that directory would
+        export stale weights and leave the step's record set without anything
+        having finished writing it. This run's own record is what decides."""
+        trainer = _make_mock_trainer(save_path=str(tmp_path / "checkpoints"))
+        mock_build_ckpt.return_value = MagicMock()
+        manager = ModelCheckpointManager(trainer)
+        state = TrainerState(global_step=10)
+        # What an interrupted save leaves: the tree, and no completion marker.
+        (tmp_path / "checkpoints" / "global_step_10" / "model" / "ckpt").mkdir(parents=True)
+
+        with patch("veomni.utils.save_safetensor_utils.save_lora_adapter_with_dcp"):
+            manager.save_lora(state)
+
+        assert manager.checkpointer.save.call_count == 1
+        assert manager.last_saved_step == 10
+
+    def test_export_does_not_repeat_the_save_this_run_just_made(
+        self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps, tmp_path
+    ):
+        """The other half of the same rule: the cadence already wrote this step
+        in this process, so the export must not write it a second time."""
+        trainer = _make_mock_trainer(save_path=str(tmp_path / "checkpoints"))
+        mock_build_ckpt.return_value = MagicMock()
+        manager = ModelCheckpointManager(trainer)
+        state = TrainerState(global_step=10)
+
+        manager.save_dcp(state)
+        with patch("veomni.utils.save_safetensor_utils.save_lora_adapter_with_dcp"):
+            manager.save_lora(state)
+
+        assert manager.checkpointer.save.call_count == 1
+
+    def test_an_export_alone_does_not_advance_the_record(
+        self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps, tmp_path
+    ):
+        """``last_saved_step`` is read as 'this step's DCP is on disk', so only a
+        DCP save may move it. Here the save is stubbed out, standing in for any
+        path that exports without writing one: the export must not leave the
+        record claiming a step it did not write."""
+        trainer = _make_mock_trainer(save_path=str(tmp_path / "checkpoints"))
+        mock_build_ckpt.return_value = MagicMock()
+        manager = ModelCheckpointManager(trainer)
+
+        with patch.object(manager, "save_dcp") as save_dcp:
+            with patch("veomni.utils.save_safetensor_utils.save_lora_adapter_with_dcp"):
+                manager.save_lora(TrainerState(global_step=10))
+
+        save_dcp.assert_called_once()
+        assert manager.last_saved_step == -1
 
 
 @patch("veomni.trainer.callbacks.global_state_callback.dist")
@@ -380,7 +434,12 @@ class TestGlobalStateCallbackJobState:
         assert "environ_meter" in global_state
         assert "torch_rng_state" in global_state
 
-    def test_save_waits_for_pending_dcp(self, mock_dist, tmp_path):
+    def test_save_does_not_wait_for_a_pending_dcp(self, mock_dist, tmp_path):
+        """The cursor does not depend on the shards, and the manifest beside it
+        claims only the cursor — the model state answers for itself through DCP's
+        own markers. Waiting here is what used to leave ``save_async`` with
+        nothing to overlap: the drain landed in the same ``on_step_end`` that
+        issued the write."""
         mock_dist.is_initialized.return_value = False
         trainer = _make_mock_trainer(save_path=str(tmp_path))
         trainer.train_dataloader = None
@@ -390,27 +449,23 @@ class TestGlobalStateCallbackJobState:
 
         cb.save_global_state(TrainerState(global_step=10))
 
-        trainer.checkpoint.wait_for_pending_save.assert_called_once_with()
+        trainer.checkpoint.wait_for_pending_save.assert_not_called()
         step = tmp_path / "global_step_10"
         assert (step / "extra_state" / "rank_0.pt").is_file()
         assert (step / "loader" / "rank_0.pt").is_file()
-        # The manifest is the step's completion marker and must come last, after
-        # the DCP drain above and both per-rank files.
+        # Last, after both per-rank files: it is what says they are down.
         assert (step / "checkpoint_manifest.json").is_file()
 
-    def test_train_end_publishes_a_step_the_export_wrote(self, mock_dist, tmp_path):
-        """An HF export writes the step's DCP when the step has none, which puts
-        a complete ``model/`` at a step the cadence never reached — 150 for
-        ``save_steps=100``. Without the cursor files and the manifest that step is
-        invisible to ``load_path: auto``, and a resume goes back to 100 to
-        retrain weights that are already on disk."""
+    def test_train_end_writes_the_cursor_for_the_export_that_follows(self, mock_dist, tmp_path):
+        """A run ending off the cadence still exports, and that export writes the
+        step's DCP (``ModelCheckpointManager._prepare_export``). Model state at a
+        step with no cursor beside it is a step nothing can resume from, so the
+        cursor follows the export."""
         mock_dist.is_initialized.return_value = False
         trainer = _make_mock_trainer(save_path=str(tmp_path))
         trainer.train_dataloader = None
         trainer.data_iterator = None
         trainer.environ_meter.state_dict.return_value = {}
-        # What the manager records after the export's DCP save, on every rank.
-        trainer.checkpoint.last_saved_step = 150
         cb = GlobalStateCallback(trainer)
         cb._last_saved_step = 100
 
@@ -420,44 +475,40 @@ class TestGlobalStateCallbackJobState:
         assert (step / "extra_state" / "rank_0.pt").is_file()
         assert (step / "checkpoint_manifest.json").is_file()
 
-    def test_an_export_off_the_cadence_publishes_its_step(self, mock_dist, tmp_path):
-        """Same hole mid-run: an export cadence of its own (``hf_save_steps``
-        shorter than ``save_steps``) writes a full ``model/`` at a step this
-        callback would otherwise skip."""
+    def test_an_export_cadence_of_its_own_pulls_the_cursor_along(self, mock_dist, tmp_path):
+        """Same reasoning mid-run: ``hf_save_steps`` shorter than ``save_steps``
+        puts a DCP at steps the DCP cadence never reaches."""
         mock_dist.is_initialized.return_value = False
         trainer = _make_mock_trainer(save_path=str(tmp_path))
         trainer.train_dataloader = None
         trainer.data_iterator = None
         trainer.environ_meter.state_dict.return_value = {}
-        trainer.checkpoint.last_saved_step = 3
+        trainer.args.train.checkpoint.hf_save_steps = 3
         cb = GlobalStateCallback(trainer)
 
-        # Not a multiple of save_steps=5, so nothing but the export put a
-        # checkpoint here.
+        # Not a multiple of save_steps=5, so only the export puts anything here.
         cb.on_step_end(TrainerState(global_step=3))
 
         assert (tmp_path / "global_step_3" / "checkpoint_manifest.json").is_file()
 
-    def test_train_end_leaves_an_already_published_step_alone(self, mock_dist, tmp_path):
-        """Training that ends on a cadence step is already published; rewriting
+    def test_train_end_leaves_an_already_written_step_alone(self, mock_dist, tmp_path):
+        """Training that ends on a cadence step already has its cursor; rewriting
         it would cost a second dataloader-state dump for nothing."""
         mock_dist.is_initialized.return_value = False
         trainer = _make_mock_trainer(save_path=str(tmp_path))
-        trainer.checkpoint.last_saved_step = 200
         cb = GlobalStateCallback(trainer)
         cb._last_saved_step = 200
 
         cb.on_train_end(TrainerState(global_step=200))
 
-        trainer.checkpoint.wait_for_pending_save.assert_not_called()
         assert not (tmp_path / "global_step_200").exists()
 
-    def test_train_end_skips_a_step_with_no_model_checkpoint(self, mock_dist, tmp_path):
-        """No export and no cadence save at the final step: publishing it would
-        advertise a step whose ``model/`` was never written."""
+    def test_train_end_writes_nothing_when_the_run_does_not_export(self, mock_dist, tmp_path):
+        """With ``save_hf_weights`` off nothing writes a DCP at train end, so a
+        cursor there would describe a step that has no model state."""
         mock_dist.is_initialized.return_value = False
         trainer = _make_mock_trainer(save_path=str(tmp_path))
-        trainer.checkpoint.last_saved_step = 100
+        trainer.args.train.checkpoint.save_hf_weights = False
         cb = GlobalStateCallback(trainer)
         cb._last_saved_step = 100
 

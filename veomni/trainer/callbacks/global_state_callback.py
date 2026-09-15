@@ -21,11 +21,12 @@ the part a job may want to replace or drop on its own: an Energon or
 multisource-sampler state is large, and resuming weights onto a different
 dataset means keeping ``extra_state/`` while discarding ``loader/``.
 
-This callback also publishes ``checkpoint_manifest.json``. It runs after
-:mod:`~veomni.trainer.callbacks.checkpoint_callback` in the dispatch list, so by
-the time it finishes it is the last writer of the step's resume tree — which is
-exactly what the marker has to attest to. Model weights, optimizer, HF/LoRA
-export and the tokenizer/config sidecars are scheduled by that other callback.
+This callback also writes ``checkpoint_manifest.json``, which records that the
+files above are down and names the modules the job saved. It says nothing about
+the model state: that is covered by DCP's own ``.metadata``, one per directory,
+and a step counts as resumable only when both are there. Model weights,
+optimizer, HF/LoRA export and the tokenizer/config sidecars are scheduled by
+:mod:`~veomni.trainer.callbacks.checkpoint_callback`, on the same cadences.
 
 On-disk contract: ``docs/usage/checkpoint.md``.
 """
@@ -67,8 +68,17 @@ class GlobalStateCallback(Callback):
     def __init__(self, trainer: "BaseTrainer"):
         super().__init__(trainer)
         args: "VeOmniArguments" = self.trainer.args
-        self.every_n_steps = args.train.checkpoint.save_steps
-        self.every_n_epochs = args.train.checkpoint.save_epochs
+        # The same cadences ``CheckpointCallback`` runs on, read from the same
+        # config. An HF export writes the step's DCP whether or not the DCP
+        # cadence reaches that step (``ModelCheckpointManager._prepare_export``),
+        # so the cursor has to follow both: model state at a step with no cursor
+        # beside it is a step nothing can resume from.
+        ckpt = args.train.checkpoint
+        self.dcp_every_n_steps = ckpt.save_steps
+        self.dcp_every_n_epochs = ckpt.save_epochs
+        self.save_hf_weights = ckpt.save_hf_weights
+        self.hf_every_n_steps = ckpt.hf_save_steps
+        self.hf_every_n_epochs = ckpt.hf_save_epochs
         self._last_saved_step: int = -1
 
     @property
@@ -79,43 +89,32 @@ class GlobalStateCallback(Callback):
         self.load_global_state()
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
-        due = bool(self.every_n_steps) and state.global_step % self.every_n_steps == 0
-        if due or self._model_saved_but_unpublished(state):
+        dcp_due = self.dcp_every_n_steps and state.global_step % self.dcp_every_n_steps == 0
+        hf_due = self.save_hf_weights and self.hf_every_n_steps and state.global_step % self.hf_every_n_steps == 0
+        if dcp_due or hf_due:
             self.save_global_state(state)
 
     def on_epoch_end(self, state: TrainerState, **kwargs) -> None:
-        due = bool(self.every_n_epochs) and (state.epoch + 1) % self.every_n_epochs == 0
-        if (due or self._model_saved_but_unpublished(state)) and state.global_step != self._last_saved_step:
-            self.save_global_state(state)
+        dcp_due = self.dcp_every_n_epochs and (state.epoch + 1) % self.dcp_every_n_epochs == 0
+        hf_due = self.save_hf_weights and self.hf_every_n_epochs and (state.epoch + 1) % self.hf_every_n_epochs == 0
+        if dcp_due or hf_due:
+            if state.global_step != self._last_saved_step:
+                self.save_global_state(state)
+            else:
+                logger.info_rank0(
+                    f"Skipping duplicate trainer state save at epoch_end (global_step {state.global_step} "
+                    f"already saved at step_end)."
+                )
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
-        if self._model_saved_but_unpublished(state):
-            self.save_global_state(state)
-
-    def _model_saved_but_unpublished(self, state: TrainerState) -> bool:
-        """Whether this step has model state on disk that nothing has published.
-
-        An HF or LoRA export writes the step's DCP when the step does not
-        already have one (``ModelCheckpointManager._prepare_export``), so an
-        export cadence of its own — or an export at train end — puts a complete
-        ``model/`` at a step this callback never ran for. Without the cursor
-        files and the manifest that step is invisible to ``load_path: auto``,
-        and a resume goes back to the last cadence step to retrain weights that
-        are already on disk. Publishing it costs two small per-rank files beside
-        an export that already holds the whole model.
-
-        What decides is the manager's record of its last save rather than a
-        probe of the filesystem: every rank runs the same save calls and so
-        agrees on it, whereas a directory one rank wrote need not be visible to
-        the others — and ranks disagreeing here would split on a collective.
-
-        Read defensively, like ``module_names`` above: a trainer whose manager
-        does not report a last save keeps the cadence-only behaviour rather than
-        failing.
-        """
-        checkpoint = getattr(self.trainer, "checkpoint", None)
-        saved = getattr(checkpoint, "last_saved_step", None)
-        return saved == state.global_step and saved != self._last_saved_step
+        if self.save_hf_weights:
+            if state.global_step != self._last_saved_step:
+                self.save_global_state(state)
+            else:
+                logger.info_rank0(
+                    f"Skipping duplicate trainer state save at train_end (global_step {state.global_step} "
+                    f"already saved)."
+                )
 
     def state_dict(self, state: TrainerState) -> Dict[str, Any]:
         if hasattr(self.trainer, "data_iterator") and hasattr(self.trainer.data_iterator, "state_dict"):
@@ -147,15 +146,14 @@ class GlobalStateCallback(Callback):
         return [name] if name else []
 
     def save_global_state(self, state: TrainerState) -> None:
-        # Drain a pending async DCP save first. CheckpointCallback returns while
-        # that write is still in flight; a cursor file that lands before the
-        # shards would resume a step whose weights never made it to disk. The
-        # manifest published below depends on this too: it claims the whole step
-        # is on disk, which is false while a shard write is still running.
-        checkpoint = getattr(self.trainer, "checkpoint", None)
-        if checkpoint is not None:
-            checkpoint.wait_for_pending_save()
+        """Write this rank's cursor files, then record that they are down.
 
+        Nothing here waits on the DCP. The cursor does not depend on those
+        shards, and the manifest written at the end claims only what this method
+        wrote -- the model state answers for itself, through the ``.metadata``
+        DCP puts in each directory it owns. Blocking for an async save here is
+        what used to leave ``save_async`` overlapping nothing.
+        """
         args: "VeOmniArguments" = self.trainer.args
         step_root = layout.step_dir(args.train.checkpoint.save_path, state.global_step)
         payload = self.state_dict(state)
@@ -163,10 +161,11 @@ class GlobalStateCallback(Callback):
         extra_payload = {key: value for key, value in payload.items() if key not in _LOADER_KEYS}
 
         # Each rank writes its own files, so a full disk or a bad pickle starts out
-        # visible to that rank alone. Reduce before the manifest: a rank that
-        # raised here would otherwise leave its peers publishing a step whose
-        # state is incomplete, or waiting in a collective it never reaches.
-        write_error: Optional[BaseException] = None
+        # visible to that rank alone. Reduce before the manifest: the manifest
+        # claims every rank's cursor is down, and rank 0 only knows about its own.
+        # A rank that raised here would otherwise leave its peers recording a step
+        # whose state is incomplete, or waiting in a collective it never reaches.
+        write_error: Optional[Exception] = None
         try:
             for path, blob in (
                 (layout.loader_path(step_root, self.rank), loader_payload),
@@ -174,13 +173,15 @@ class GlobalStateCallback(Callback):
             ):
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 torch.save(blob, path)
-        except BaseException as e:  # noqa: BLE001 - re-raised once every rank has agreed
+        except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
             logger.error(f"[RANK {self.rank}] failed to write trainer state under {step_root}", exc_info=True)
             write_error = e
         raise_if_any_rank_failed(write_error, "writing the trainer state")
 
-        # Every rank's files are down by now, so the step can be advertised.
-        manifest_error: Optional[BaseException] = None
+        # Every rank's cursor is down by now, so the trainer-level half of the
+        # step can be recorded. It names the modules so that whoever validates
+        # the step can find their markers without walking the tree.
+        manifest_error: Optional[Exception] = None
         if self.rank == 0:
             try:
                 layout.write_manifest(
@@ -189,10 +190,10 @@ class GlobalStateCallback(Callback):
                     world_size=args.train.world_size,
                     modules=self.module_names(),
                 )
-            except BaseException as e:  # noqa: BLE001 - re-raised once every rank has agreed
-                logger.error(f"[RANK {self.rank}] failed to publish the manifest under {step_root}", exc_info=True)
+            except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
+                logger.error(f"[RANK {self.rank}] failed to write the manifest under {step_root}", exc_info=True)
                 manifest_error = e
-        raise_if_any_rank_failed(manifest_error, "publishing the checkpoint manifest")
+        raise_if_any_rank_failed(manifest_error, "writing the checkpoint manifest")
 
         self._last_saved_step = state.global_step
 
@@ -228,7 +229,7 @@ class GlobalStateCallback(Callback):
         # the reduction below treats absence as "resume weights only", which would
         # silently drop a corrupt cursor. Reduce the read failure separately, and
         # before that reduction, so a rank that raised cannot strand its peers.
-        read_error: Optional[BaseException] = None
+        read_error: Optional[Exception] = None
         current_state = legacy_state = None
         try:
             current_state = self._read_current(load_path)
@@ -238,7 +239,7 @@ class GlobalStateCallback(Callback):
                 from ...checkpoint.legacy_v0_1_12 import apply_legacy_global_state
 
                 legacy_state = apply_legacy_global_state(load_path, self.rank)
-        except BaseException as e:  # noqa: BLE001 - re-raised once every rank has agreed
+        except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
             logger.error(f"[RANK {self.rank}] failed to read trainer state under {load_path}", exc_info=True)
             read_error = e
         raise_if_any_rank_failed(read_error, "reading the trainer state")

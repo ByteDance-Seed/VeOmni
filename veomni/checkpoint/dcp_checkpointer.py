@@ -48,16 +48,18 @@ from ..utils.device import empty_cache, synchronize
 from ..utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
 from .checkpointer import CheckpointerBase
 from .layout import (
-    LR_SCHEDULER_FILENAME as _LR_SCHEDULER_FILENAME,
-)
-from .layout import (
+    DCP_MARKER_FILENAME,
     OPTIMIZER_DIRNAME,
     WEIGHTS_DIRNAME,
-    invalidate_manifest,
+    dcp_markers,
     model_dir,
     optimizer_dir,
+    remove_manifest,
     step_dir,
     weights_dir,
+)
+from .layout import (
+    LR_SCHEDULER_FILENAME as _LR_SCHEDULER_FILENAME,
 )
 
 
@@ -509,6 +511,10 @@ def _promotion_phase(state: _Promotion, work, *, participates: bool, always: boo
     keeps the counts equal by construction rather than by inspection.
 
     ``always`` marks a phase that must run even after a failure -- cleanup.
+
+    ``BaseException`` because ``work`` is arbitrary and the guarantee above is
+    structural: anything that escapes this catch skips the reduction, and the
+    ranks that did reach it wait for a peer that has already left.
     """
     if participates and (always or not state.failed):
         try:
@@ -541,12 +547,12 @@ def _prepare_stage_dir(stage_dir: str, path: str) -> str:
     ``dcp.save`` on a collective that never arrives.
     """
     stage_path = os.path.join(stage_dir, _STAGE_ROOT, _stage_key(path))
-    error: Optional[BaseException] = None
+    error: Optional[Exception] = None
     if _local_rank() == 0:
         try:
             shutil.rmtree(stage_path, ignore_errors=True)
             os.makedirs(stage_path, exist_ok=True)
-        except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
+        except Exception as e:  # noqa: BLE001 - raised once every rank has agreed
             error = e
     if any_rank_failed(error is not None):
         raise error or RuntimeError(f"another rank could not prepare a staging directory under {stage_dir}")
@@ -570,10 +576,10 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
     either the previous complete checkpoint or none, never a completion marker
     over data that is only partly there.
 
-    Nested files are copied in the data phase, before any ``.metadata`` is
-    published. ``lr_scheduler.pt`` is one of those files.
+    Nested files are copied in the data phase, before any ``.metadata`` is.
+    ``lr_scheduler.pt`` is one of those files.
     """
-    metadata_name = ".metadata"
+    metadata_name = DCP_MARKER_FILENAME
     is_node_leader = _local_rank() == 0
     is_coordinator = (not dist.is_initialized()) or dist.get_rank() == 0
     state = _Promotion()
@@ -582,7 +588,7 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
         """Relative path of every ``.metadata`` in the staged tree.
 
         DCP writes the marker from its coordinator rank, so only that rank has
-        them staged -- which is also the only rank that drops and publishes them.
+        them staged -- which is also the only rank that deletes and copies them.
         """
         rels: list[str] = []
         for dirpath, _dirnames, filenames in os.walk(stage_path):
@@ -591,8 +597,8 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
                     rels.append(os.path.relpath(os.path.join(dirpath, filename), stage_path))
         return sorted(rels)
 
-    def drop_stale_marker() -> None:
-        """Stop advertising the previous checkpoint before overwriting its shards."""
+    def remove_stale_markers() -> None:
+        """Delete the previous checkpoint's markers before overwriting its shards."""
         os.makedirs(final_path, exist_ok=True)
         for rel in staged_markers():
             stale = os.path.join(final_path, rel)
@@ -625,22 +631,22 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
             with ThreadPoolExecutor(max_workers=min(16, len(names))) as pool:
                 list(pool.map(_copy, names))
 
-    def publish_marker() -> None:
-        """Publish the completion markers, or leave none behind if that fails."""
-        published: list[str] = []
+    def copy_markers() -> None:
+        """Copy the completion markers last, or leave none behind if that fails."""
+        copied: list[str] = []
         try:
             for rel in staged_markers():
                 dst = os.path.join(final_path, rel)
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copyfile(os.path.join(stage_path, rel), dst)
-                published.append(dst)
+                copied.append(dst)
         except BaseException:
             # copyfile creates the destination before writing it, so a failure
             # can leave a truncated marker -- worse than none, since DCP would
             # read it as a complete directory. Earlier markers go too: half a
             # model is not resumable, and leaving one valid directory behind
             # would misreport which part survived.
-            for dst in published + [os.path.join(final_path, rel) for rel in staged_markers()]:
+            for dst in copied + [os.path.join(final_path, rel) for rel in staged_markers()]:
                 try:
                     if os.path.exists(dst):
                         os.remove(dst)
@@ -657,9 +663,9 @@ def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
         """
         shutil.rmtree(stage_path, ignore_errors=True)
 
-    _promotion_phase(state, drop_stale_marker, participates=is_coordinator)
+    _promotion_phase(state, remove_stale_markers, participates=is_coordinator)
     _promotion_phase(state, copy_this_nodes_files, participates=is_node_leader)
-    _promotion_phase(state, publish_marker, participates=is_coordinator)
+    _promotion_phase(state, copy_markers, participates=is_coordinator)
     _promotion_phase(state, drop_staged_copy, participates=is_node_leader, always=True)
 
     if state.error is not None:
@@ -740,7 +746,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 instead of writing straight to ``path``. Intended for a destination far
                 slower than local disk. The whole ``model/`` subtree — both DCP
                 directories and the scheduler sidecar — lands under the staging
-                directory and is copied together, with every ``.metadata`` published
+                directory and is copied together, with every ``.metadata`` copied
                 last. Staging is keyed per module as well as per run, so two modules
                 of one job do not sweep each other's staged files. The caller
                 owns the choice: this does not probe
@@ -764,11 +770,9 @@ class DistributedCheckpointer(CheckpointerBase):
         checkpoint_dir = step_dir(path, global_steps) if global_steps is not None else path
         model_root = model_dir(checkpoint_dir, module)
 
-        # Unpublish the step before anything in it is overwritten. Dropping the
-        # nested ``.metadata`` during promotion is not enough on its own: the
-        # step-level manifest is what resume discovery reads, so a rewrite that
-        # fails part-way would otherwise leave it pointing at half a checkpoint.
-        cls._unpublish_step(checkpoint_dir)
+        # Delete the old markers before anything in the step is overwritten, so
+        # that a rewrite which fails part-way leaves nothing claiming to be done.
+        cls._remove_completion_markers(checkpoint_dir, module)
 
         # Keyed on the module's own run-level path, not just ``path``: a
         # multi-module job calls this once per module, and a single key would have
@@ -822,25 +826,39 @@ class DistributedCheckpointer(CheckpointerBase):
         logger.info_rank0(f"Saved checkpoint to {model_root}")
 
     @classmethod
-    def _unpublish_step(cls, checkpoint_dir: str) -> None:
-        """Drop the step's completion marker before writing into the step.
+    def _remove_completion_markers(cls, checkpoint_dir: str, module: str) -> None:
+        """Delete every marker that vouches for what this save will overwrite.
 
-        One rank owns the file, so only that rank removes it, and the reduction
-        turns a failure there into one every rank sees: a manifest that outlives
-        the checkpoint it describes is the one thing resume discovery cannot
-        detect on its own.
+        Three of them: the step's manifest, this module's ``.metadata`` files,
+        and the one an older VeOmni would have left at the step root. DCP writes
+        its own again at the end of a successful save, so deleting them costs
+        nothing then -- but a save that dies part-way would otherwise leave a
+        marker describing shards that are half this step and half the last one.
 
-        Republishing belongs to ``GlobalStateCallback``, once every module and
-        every rank has written its part.
+        Only this module's. A sibling module is not being rewritten and its
+        markers still hold.
+
+        One rank owns these files, so only that rank deletes them, and the
+        reduction turns a failure there into one every rank sees. Writing them
+        back belongs to DCP and to ``GlobalStateCallback``, each for its part.
         """
+        # The step being overwritten may predate this layout, in which case it
+        # carries a marker of its own. Delete this import (and
+        # veomni/checkpoint/legacy_v0_1_12.py) to drop that layout.
+        from .legacy_v0_1_12 import drop_marker
+
         is_coordinator = (not dist.is_initialized()) or dist.get_rank() == 0
-        error: Optional[BaseException] = None
+        error: Optional[Exception] = None
         if is_coordinator:
             try:
-                invalidate_manifest(checkpoint_dir)
-            except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
+                remove_manifest(checkpoint_dir)
+                drop_marker(checkpoint_dir)
+                for marker in dcp_markers(checkpoint_dir, [module]):
+                    if os.path.exists(marker):
+                        os.remove(marker)
+            except Exception as e:  # noqa: BLE001 - raised once every rank has agreed
                 error = e
-        raise_if_any_rank_failed(error, f"unpublishing the checkpoint manifest under {checkpoint_dir}")
+        raise_if_any_rank_failed(error, f"removing the old checkpoint markers under {checkpoint_dir}")
 
     @classmethod
     def load(
@@ -941,10 +959,10 @@ class DistributedCheckpointer(CheckpointerBase):
         single-model job, and at ``<step>/<module>/`` for SeedOmni V2. Neither has
         a ``model/`` subtree, which is what tells the two apart.
         """
-        if os.path.exists(os.path.join(weights_dir(path, module), ".metadata")):
+        if os.path.exists(os.path.join(weights_dir(path, module), DCP_MARKER_FILENAME)):
             return None
         legacy_dir = os.path.join(path, module) if module else path
-        if os.path.exists(os.path.join(legacy_dir, ".metadata")):
+        if os.path.exists(os.path.join(legacy_dir, DCP_MARKER_FILENAME)):
             return legacy_dir
         return None
 
@@ -1085,7 +1103,7 @@ class DistributedCheckpointer(CheckpointerBase):
         rank still joins the reduction afterwards: a failed write must not let
         peers enter the DCP collective alone.
         """
-        error: Optional[BaseException] = None
+        error: Optional[Exception] = None
         is_writer = (not dist.is_initialized()) or dist.get_rank() == 0
         if is_writer:
             try:
@@ -1095,7 +1113,7 @@ class DistributedCheckpointer(CheckpointerBase):
                     lr_scheduler = state[_LR_SCHEDULER_KEY]
                     if lr_scheduler is not None:
                         torch.save(lr_scheduler.state_dict(), os.path.join(checkpoint_dir, _LR_SCHEDULER_FILENAME))
-            except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
+            except Exception as e:  # noqa: BLE001 - raised once every rank has agreed
                 error = e
         if any_rank_failed(error is not None):
             raise error or RuntimeError("another rank could not save lr_scheduler")

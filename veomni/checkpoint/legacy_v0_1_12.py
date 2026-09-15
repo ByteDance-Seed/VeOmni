@@ -14,11 +14,14 @@
 
 """Resume checkpoints written before the current on-disk layout.
 
-**Delete this file** (and the two imports that load it) to drop that
-compatibility. Call sites:
+**Delete this file** (and the imports that load it) to drop that compatibility.
+Call sites:
 
-* ``DistributedCheckpointer._load_lr_scheduler``
-* ``GlobalStateCallback.load_global_state``
+* ``DistributedCheckpointer._load_lr_scheduler`` — the scheduler pickle
+* ``GlobalStateCallback.load_global_state`` — the job cursor
+* ``DistributedCheckpointer._remove_completion_markers`` — deletes the old
+  marker when a legacy step is overwritten
+* ``_validate_dcp_checkpoint_entry`` — accepts a legacy step for resume
 
 On-disk contract and removal notes: ``docs/usage/checkpoint.md``.
 
@@ -53,10 +56,38 @@ logger = logging.get_logger(__name__)
 _EXTRA_STATE_DIR = "extra_state"
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 _TRAINER_STATE_FORMAT = "trainer_state_rank_{}.pt"
+_MARKER_FILENAME = ".metadata"
 
 
 def extra_state_path(checkpoint_dir: str, rank: int) -> str:
     return os.path.join(checkpoint_dir, _EXTRA_STATE_DIR, _EXTRA_STATE_FORMAT.format(rank))
+
+
+def marker_path(step_root: str) -> str:
+    """Where a pre-split checkpoint carried its completion marker.
+
+    DCP writes ``.metadata`` into the directory it owns, and in these layouts
+    that directory *was* the step root. The current layout keeps its copies
+    inside ``model/``, so a file at this path can only have come from an older
+    VeOmni -- which is what makes it safe to read as "this step is legacy", and
+    safe to delete when the step is being rewritten.
+
+    A path, not a probe: discovery walks HDFS as well as local disks and brings
+    its own filesystem calls.
+    """
+    return os.path.join(step_root, _MARKER_FILENAME)
+
+
+def drop_marker(step_root: str) -> None:
+    """Delete a pre-split step's marker, before that step is overwritten.
+
+    Without this a current-layout write over a legacy step leaves the old marker
+    in place: the step has no manifest, so it is not complete, yet discovery
+    would still accept it through the fallback this module exists for.
+    """
+    path = marker_path(step_root)
+    if os.path.exists(path):
+        os.remove(path)
 
 
 def _rank() -> int:
@@ -140,7 +171,9 @@ def apply_legacy_global_state(load_path: str, rank: int) -> dict[str, Any] | Non
 __all__ = [
     "apply_legacy_global_state",
     "apply_legacy_lr_scheduler",
+    "drop_marker",
     "extra_state_path",
+    "marker_path",
     "read_extra_state",
     "trainer_state_path",
 ]

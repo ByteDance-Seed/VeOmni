@@ -99,27 +99,42 @@ stays a single path for the whole job.
 
 ## Completion
 
-`checkpoint_manifest.json` is the step's completion marker. `.metadata` cannot
-serve as one: it marks a single DCP directory, and there are at least two per
-module plus the per-rank cursor files that DCP knows nothing about. Module
-`.metadata` files are not interchangeable either — in
-`configs/seed_omni/Janus/janus_1.3b/train/modules_train.yaml`, `janus_siglip`
+A step is complete when two independent things are on disk, each written by
+whoever owns it:
+
+- **`checkpoint_manifest.json`** — written by rank 0 once every rank's `loader/`
+  and `extra_state/` files are down. It covers the trainer-level state and
+  nothing else; it also names the modules the job saved, so a reader knows which
+  markers to look for without walking the tree.
+- **`.metadata` in every DCP directory** — written by DCP itself, one per
+  `model/<name>/ckpt/` and `model/<name>/optimizer/`, at the end of that
+  directory's save.
+
+Neither marker can stand in for the other. The manifest is written while the
+async DCP saves may still be in flight, so it says nothing about the model; a
+`.metadata` covers one directory and knows nothing about the loader, the job
+cursor, or its sibling modules. Module markers are not interchangeable either —
+in `configs/seed_omni/Janus/janus_1.3b/train/modules_train.yaml`, `janus_siglip`
 runs DDP while `janus_llama` runs FSDP2, so each records a different topology.
 
-Rank 0 writes the manifest only after every module's DCP save has returned and
-every rank's `loader/` and `extra_state/` files are on disk. Resume discovery
-accepts a `global_step_{N}/` directory only when the manifest is present, so a
-crash mid-save leaves a directory that is skipped rather than half-loaded.
-Rewriting a step — a restarted run reaching the same step again — removes the
-manifest before touching anything under it, so an interrupted rewrite cannot
-leave the old marker standing over new, partial data.
+Resume discovery accepts a `global_step_{N}/` directory only when both halves
+are there, so a crash mid-save leaves a directory that is skipped rather than
+half-loaded.
 
-A step is also published when an HF or LoRA export writes its DCP outside the
-save cadence: with `save_steps=100` and an export at train end, step 150 gets
-its cursor files and manifest too, instead of being left invisible to resume.
+Rewriting a step — a restarted run reaching the same step again — deletes its
+markers first, so an interrupted rewrite cannot leave a stale one standing over
+new, partial data. All three go: the manifest, the module's `.metadata` files,
+and the `.metadata` at the step root that an older VeOmni would have left, which
+would otherwise keep the step discoverable through the legacy fallback below.
+
+The cursor files follow the same cadences as the model state, including HF and
+LoRA exports: with `save_steps=100` and an export at train end, step 150 gets
+its `loader/`, `extra_state/` and manifest too, instead of being left invisible
+to resume.
 
 Checkpoints from older layouts have no manifest; discovery falls back to a
-`.metadata` at the step root, which is how those steps were published. See
+`.metadata` at the step root, which is what marked those steps complete, but
+only while the step is still entirely pre-split. See
 [Resuming older checkpoints](#resuming-older-checkpoints).
 
 ## Staged and asynchronous saves
@@ -134,15 +149,17 @@ avoid.
 With `stage_dir` (synchronous), the whole `model/` subtree — both DCP
 directories and `lr_scheduler.pt` — is written to node-local scratch and copied
 into the step directory afterwards, with every `.metadata` copied last. The
-staging directory is not part of the published checkpoint.
+staging directory is never part of the checkpoint itself.
 
 With `save_async` (unstaged), `model/` is written in place and the call returns
 while the DCP write is still in flight. `lr_scheduler.pt` is written first, by
 rank 0, before either DCP save starts. Weights and optimizer are two independent
 saves, each holding its own future and its own Gloo process group so they
-overlap rather than serialise. The manifest write drains both first, which keeps
-the marker from appearing before the shards it claims are complete; a drain that
-finds a failed save raises on every rank, not just the one that saw it.
+overlap rather than serialise. Nothing downstream waits for them: the cursor
+files and the manifest claim only what they cover, and the shards answer for
+themselves through the `.metadata` DCP writes last. Pending saves are drained at
+the next save of the same kind and at train end; a drain that finds a failed
+save raises on every rank, not just the one that saw it.
 
 ## Resuming older checkpoints
 
@@ -152,7 +169,7 @@ always win — a fallback is consulted only when the current path is absent.
 
 | Missing in the current layout | Falls back to |
 |-------------------------------|---------------|
-| `checkpoint_manifest.json` (discovery, `load_path: auto`) | `.metadata` at the step root, which is how an older step was published |
+| `checkpoint_manifest.json` (discovery, `load_path: auto`) | `.metadata` at the step root, which is what marked an older step complete — unless the step also has a `model/`, which means a current-layout rewrite landed on it and did not finish |
 | `model/ckpt/.metadata` | `.metadata` at the step root; weights and optimizer are both read from that fused directory |
 | `model/lr_scheduler.pt` | `lr_scheduler.pt` at the step root, then the 0.1.12 pickle's `lr_scheduler` key |
 | `loader/rank_{R}.pt`, `extra_state/rank_{R}.pt` | `trainer_state_rank_{R}.pt`, then the 0.1.12 pickle's job cursor when `global_step` is present |
