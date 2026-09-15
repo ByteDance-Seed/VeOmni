@@ -17,6 +17,24 @@ from veomni.trainer.callbacks.checkpoint_callback import (
     CheckpointCallback,
 )
 from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+from veomni.utils.device import get_device_rng_state
+
+
+class _StubConditionModel:
+    """Stand-in for a DiT condition model that owns a noise/timestep generator."""
+
+    def __init__(self, seed: int = 2024):
+        self.generator = torch.Generator(device="cpu")
+        self.generator.manual_seed(seed)
+
+    def rng_state_dict(self):
+        return {"generator": self.generator.get_state()}
+
+    def load_rng_state_dict(self, state):
+        self.generator.set_state(state["generator"])
+
+    def draw_noise(self):
+        return torch.randn(4, generator=self.generator)
 
 
 def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
@@ -60,6 +78,10 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
     trainer.start_epoch = 0
     trainer.start_step = 0
     trainer.checkpoint = MagicMock()
+    # Non-DiT trainers have no condition model. Set it explicitly: an
+    # auto-created MagicMock attribute is not picklable and would slip a mock
+    # into the checkpoint payload instead of the ``None`` the loader skips.
+    trainer.condition_model = None
 
     return trainer
 
@@ -362,6 +384,116 @@ class TestGlobalStateCallbackJobState:
         assert "train_dataloader" in global_state
         assert "environ_meter" in global_state
         assert "torch_rng_state" in global_state
+        assert "device_rng_state" in global_state
+
+    def test_state_dict_omits_condition_model_rng_without_condition_model(self, mock_dist):
+        trainer = _make_mock_trainer()
+        cb = GlobalStateCallback(trainer)
+
+        global_state = cb.state_dict(TrainerState(global_step=10))
+
+        assert global_state["condition_model_rng_state"] is None
+
+    def test_state_dict_persists_condition_model_rng(self, mock_dist):
+        trainer = _make_mock_trainer()
+        trainer.condition_model = _StubConditionModel()
+        cb = GlobalStateCallback(trainer)
+
+        global_state = cb.state_dict(TrainerState(global_step=10))
+
+        assert set(global_state["condition_model_rng_state"]) == {"generator"}
+
+    def test_state_dict_warns_when_condition_model_misses_rng_dict(self, mock_dist):
+        """A generator-owning condition model with no rng_state_dict is worth a warning."""
+        trainer = _make_mock_trainer()
+
+        class _GeneratorOnly:
+            generator = torch.Generator()
+
+        trainer.condition_model = _GeneratorOnly()
+        cb = GlobalStateCallback(trainer)
+
+        with patch("veomni.trainer.callbacks.global_state_callback.logger.warning_rank0") as mock_warn:
+            global_state = cb.state_dict(TrainerState(global_step=10))
+
+        mock_warn.assert_called_once()
+        assert global_state["condition_model_rng_state"] is None
+
+    def test_load_resumes_noise_and_device_rng_streams(self, mock_dist, tmp_path):
+        """A resumed run must continue the noise stream, not replay its start."""
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = str(tmp_path)
+        trainer.train_dataloader = None
+        trainer.data_iterator = None
+        trainer.environ_meter.state_dict.return_value = {}
+        condition_model = _StubConditionModel()
+        trainer.condition_model = condition_model
+
+        # Three steps' worth of noise, then checkpoint mid-run.
+        for _ in range(3):
+            condition_model.draw_noise()
+        cb = GlobalStateCallback(trainer)
+        payload = cb.state_dict(TrainerState(global_step=3))
+
+        # The uninterrupted run would have drawn exactly this next.
+        reference = torch.Generator(device="cpu")
+        reference.set_state(condition_model.generator.get_state())
+        expected_next_noise = torch.randn(4, generator=reference)
+        torch.save(payload, tmp_path / "trainer_state_rank_0.pt")
+
+        # Drift both streams the way the rest of a continuing run would.
+        condition_model.draw_noise()
+        torch.randn(8)
+
+        assert GlobalStateCallback(trainer).load_global_state() is not None
+
+        assert torch.equal(condition_model.draw_noise(), expected_next_noise)
+        assert torch.equal(get_device_rng_state(), payload["device_rng_state"])
+        assert torch.equal(torch.get_rng_state(), payload["torch_rng_state"])
+
+    def test_load_tolerates_checkpoint_without_rng_fields(self, mock_dist, tmp_path):
+        """Checkpoints written before the rng fields existed must still load."""
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = str(tmp_path)
+        trainer.train_dataloader = None
+        torch.save(
+            {
+                "global_step": 7,
+                "train_dataloader": None,
+                "environ_meter": {},
+                "channel_loss_callback": {},
+                "torch_rng_state": torch.get_rng_state(),
+            },
+            tmp_path / "trainer_state_rank_0.pt",
+        )
+
+        GlobalStateCallback(trainer).load_global_state()
+
+        assert trainer.state.global_step == 7
+
+    def test_load_warns_when_condition_model_cannot_restore_rng(self, mock_dist, tmp_path):
+        """State for an absent condition model is a warning, not a crash."""
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = str(tmp_path)
+        trainer.train_dataloader = None
+        torch.save(
+            {
+                "global_step": 7,
+                "train_dataloader": None,
+                "environ_meter": {},
+                "channel_loss_callback": {},
+                "torch_rng_state": torch.get_rng_state(),
+                "condition_model_rng_state": {"generator": _StubConditionModel().rng_state_dict()["generator"]},
+            },
+            tmp_path / "trainer_state_rank_0.pt",
+        )
+
+        GlobalStateCallback(trainer).load_global_state()
+
+        assert trainer.state.global_step == 7
 
     def test_save_waits_for_pending_dcp(self, mock_dist, tmp_path):
         mock_dist.is_initialized.return_value = False

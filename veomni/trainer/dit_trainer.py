@@ -321,6 +321,10 @@ class DiTTrainer:
             self.condition_model = model_class._from_config(condition_cfg)
             self.condition_model.to(get_device_type())
             logger.info_rank0("Condition model loaded.")
+        # The condition model owns the noise/timestep generators, which are part
+        # of the job cursor. ``GlobalStateCallback`` runs on the reused
+        # ``BaseTrainer`` instance, so expose the model there as well.
+        self.base.condition_model = self.condition_model
 
     def _freeze_model_module(self):
         self.condition_model.requires_grad_(False)
