@@ -403,6 +403,22 @@ class TestGlobalStateCallbackJobState:
 
         assert set(global_state["condition_model_rng_state"]) == {"generator"}
 
+    def test_state_dict_warns_when_condition_model_misses_rng_dict(self, mock_dist):
+        """A generator-owning condition model with no rng_state_dict is worth a warning."""
+        trainer = _make_mock_trainer()
+
+        class _GeneratorOnly:
+            generator = torch.Generator()
+
+        trainer.condition_model = _GeneratorOnly()
+        cb = GlobalStateCallback(trainer)
+
+        with patch("veomni.trainer.callbacks.global_state_callback.logger.warning_rank0") as mock_warn:
+            global_state = cb.state_dict(TrainerState(global_step=10))
+
+        mock_warn.assert_called_once()
+        assert global_state["condition_model_rng_state"] is None
+
     def test_load_resumes_noise_and_device_rng_streams(self, mock_dist, tmp_path):
         """A resumed run must continue the noise stream, not replay its start."""
         mock_dist.is_initialized.return_value = False

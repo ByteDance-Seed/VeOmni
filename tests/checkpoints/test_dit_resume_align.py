@@ -16,8 +16,7 @@
 
 A diffusion trainer draws its noise and timestep ids inside
 ``condition_model.process_condition``, either from a per-run ``torch.Generator``
-(Wan, Qwen-Image) or from the accelerator's default RNG (LTX2, MiniMax-H3,
-SeedVR2). Neither is model state, so the job-level checkpoint has to carry both
+(Wan, Qwen-Image) or from the accelerator's default RNG (LTX2, MiniMax-H3). Neither is model state, so the job-level checkpoint has to carry both
 across a resume. When it does not, the resumed process — whose condition model
 was just constructed and re-seeded — replays the stream from the *start* of the
 run at the first resumed step.
@@ -127,7 +126,7 @@ class _AlignConditionModel:
             timestep_id = int(torch.randint(0, TIMESTEP_CHOICES, (1,), generator=self.generator).item())
             # A second draw from the device default RNG, so the accelerator
             # stream is part of the signature too. This is the branch that
-            # LTX2 / MiniMax-H3 / SeedVR2 rely on.
+            # LTX2 / MiniMax-H3 rely on.
             device_draw = torch.randn(4, device=sample.device)
             # Active dropout (the condition model is never ``eval()``-ed) draws
             # another slice out of the same device stream, before backward.

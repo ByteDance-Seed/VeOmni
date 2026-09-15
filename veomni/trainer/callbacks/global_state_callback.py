@@ -111,6 +111,19 @@ class GlobalStateCallback(Callback):
         # and the loader skips it.
         condition_model = self._condition_model()
         rng_state_dict = getattr(condition_model, "rng_state_dict", None)
+        if (
+            condition_model is not None
+            and rng_state_dict is None
+            and getattr(condition_model, "generator", None) is not None
+        ):
+            # A condition model holding its own ``torch.Generator`` but not exposing
+            # ``rng_state_dict`` would silently replay its stream from the
+            # construction-time seed on every resume. The device default stream, the
+            # other source, is already covered by ``device_rng_state``.
+            logger.warning_rank0(
+                "Condition model owns a ``generator`` but exposes no ``rng_state_dict``; "
+                "its noise/timestep stream will not be restored across a resume."
+            )
 
         return {
             "global_step": state.global_step,
