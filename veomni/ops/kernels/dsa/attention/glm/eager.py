@@ -41,7 +41,8 @@ def wrapper(
     use_cache: bool = False,
     training: bool = False,
     attention_dropout: float = 0.0,
-) -> Tensor:
+    return_attn_weights: bool = False,
+) -> Tensor | tuple[Tensor, Tensor]:
     """Compute GLM sparse attention from split NoPE/RoPE query and KV tensors.
 
     ``q_pe`` / ``q_nope_absorbed`` are ``[B, S, H, D]``. ``k_pe`` and
@@ -76,5 +77,7 @@ def wrapper(
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_h.dtype)
     if training and attention_dropout > 0.0:
         attn_weights = F.dropout(attn_weights, p=attention_dropout, training=True)
-    out = torch.matmul(attn_weights, value_h)
-    return out.transpose(1, 2).contiguous()
+    out = torch.matmul(attn_weights, value_h).transpose(1, 2).contiguous()
+    if return_attn_weights:
+        return out, attn_weights
+    return out

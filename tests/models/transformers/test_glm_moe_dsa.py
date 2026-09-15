@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaForCausalLM as HFGlmMoeDsaForCausalLM
@@ -179,3 +180,108 @@ def test_glm_moe_dsa_cache_reorder_matches_hf():
 
     torch.testing.assert_close(ours_decode.logits, hf_decode.logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
     torch.testing.assert_close(ours_decode.logits, hf_swapped_decode.logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+
+class _FusedAttentionSpy:
+    impl = "flashmla_cudnn"
+
+    def __init__(self):
+        self.kwargs = None
+
+    def __call__(self, *args, **kwargs):
+        self.kwargs = kwargs
+        return torch.zeros_like(args[3])
+
+
+class _FusedIndexerSpy:
+    impl = "cudnn"
+
+    def __init__(self, topk: int):
+        self.topk = topk
+        self.kwargs = None
+
+    def __call__(self, *args, **kwargs):
+        self.kwargs = kwargs
+        query = args[0]
+        return torch.zeros(query.shape[0], query.shape[1], self.topk, dtype=torch.int32, device=query.device)
+
+
+def test_glm_moe_dsa_fused_drops_standard_causal_mask_and_rejects_padding():
+    from veomni.utils.device import IS_NPU_AVAILABLE
+
+    if IS_NPU_AVAILABLE:
+        pytest.skip("NPU GLM keeps the Hugging Face attention path")
+    config = _tiny_config()
+    model = _build_ours(config)
+    model.eval()
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    attn_spy = _FusedAttentionSpy()
+    indexer_spy = _FusedIndexerSpy(config.index_topk)
+    model.model.layers[0].self_attn.veomni_dsa_attention = attn_spy
+    model.model.layers[0].self_attn.indexer.veomni_dsa_indexer = indexer_spy
+    model(input_ids=input_ids, use_cache=False)
+    assert attn_spy.kwargs is not None and attn_spy.kwargs["attention_mask"] is None
+    assert indexer_spy.kwargs is not None and indexer_spy.kwargs["attention_mask"] is None
+
+    padded = torch.ones(2, 8, dtype=torch.long)
+    padded[:, -2:] = 0
+    with pytest.raises(ValueError, match="eager implementation"):
+        model(input_ids=input_ids, attention_mask=padded, use_cache=False)
+
+
+def test_glm_moe_dsa_eager_dropout_train_eval_seed_and_grads():
+    config = _tiny_config()
+    config.attention_dropout = 0.5
+    model = _build_ours(config)
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    model.train()
+    torch.manual_seed(1)
+    train_a = model(input_ids=input_ids, use_cache=False).logits
+    torch.manual_seed(2)
+    train_b = model(input_ids=input_ids, use_cache=False).logits
+    assert not torch.allclose(train_a, train_b)
+    model.eval()
+    with torch.no_grad():
+        torch.manual_seed(1)
+        eval_a = model(input_ids=input_ids, use_cache=False).logits
+        torch.manual_seed(2)
+        eval_b = model(input_ids=input_ids, use_cache=False).logits
+    torch.testing.assert_close(eval_a, eval_b)
+    model.train()
+    torch.manual_seed(3)
+    logits = model(input_ids=input_ids, use_cache=False).logits
+    grads = torch.autograd.grad(
+        logits.sum(),
+        [param for param in model.parameters() if param.requires_grad],
+        allow_unused=True,
+    )
+    assert any(grad is not None and grad.abs().sum() > 0 for grad in grads)
+
+
+def test_glm_moe_dsa_eager_output_attentions_matches_hf():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    hf = HFGlmMoeDsaForCausalLM(config)
+    ours = _build_ours(config)
+    ours.load_state_dict(hf.state_dict())
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    hf_out = hf(input_ids=input_ids, use_cache=False, output_attentions=True)
+    ours_out = ours(input_ids=input_ids, use_cache=False, output_attentions=True)
+    assert ours_out.attentions is not None and ours_out.attentions != ()
+    assert len(ours_out.attentions) == config.num_hidden_layers
+    assert len(hf_out.attentions) == config.num_hidden_layers
+    for ours_weights, hf_weights in zip(ours_out.attentions, hf_out.attentions, strict=True):
+        assert ours_weights.shape == hf_weights.shape
+        torch.testing.assert_close(ours_weights, hf_weights, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+
+def test_glm_moe_dsa_fused_rejects_output_attentions():
+    from veomni.utils.device import IS_NPU_AVAILABLE
+
+    if IS_NPU_AVAILABLE:
+        pytest.skip("NPU GLM keeps the Hugging Face attention path")
+    config = _tiny_config()
+    model = _build_ours(config)
+    model.model.layers[0].self_attn.veomni_dsa_attention = _FusedAttentionSpy()
+    with pytest.raises(ValueError, match="output_attentions=True"):
+        model(input_ids=torch.randint(3, config.vocab_size, (2, 8)), use_cache=False, output_attentions=True)

@@ -1336,7 +1336,18 @@ def deepseek_v4_eager_attention_forward_patched(
     dropout: float | int = 0.0,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
-    del value, dropout
+    del value
+    fused = module.veomni_dsa_attention.impl != "eager"
+    output_attentions = bool(kwargs.get("output_attentions", False)) or bool(
+        getattr(module.config, "output_attentions", False)
+    )
+    if fused and dropout:
+        raise ValueError("tilelang DeepSeek-V4 sparse attention requires dropout=0; use the eager implementation.")
+    if fused and output_attentions:
+        raise ValueError(
+            "tilelang DeepSeek-V4 sparse attention does not support output_attentions=True; "
+            "use the eager implementation."
+        )
     topk_indices = kwargs.get("sparse_topk_indices")
     if topk_indices is None:
         batch, _, seq_len, _ = query.shape
@@ -1380,6 +1391,7 @@ def deepseek_v4_eager_attention_forward_patched(
             topk_indices,
             sm_scale=scaling,
             return_lse=True,
+            dropout=dropout,
         )
         # The compressed entries are the *trailing* range of the index tensor:
         # both ``build_sparse_attention_indices`` and
@@ -1404,14 +1416,19 @@ def deepseek_v4_eager_attention_forward_patched(
         tiny = torch.finfo(torch.float32).tiny
         target = torch.where(target_mass > tiny, target / target_mass.clamp_min(tiny), 0.0)
         return attn_output, None, target
-    attn_output = module.veomni_dsa_attention(
+    attn_result = module.veomni_dsa_attention(
         query.transpose(1, 2).contiguous(),
         key[:, 0].contiguous(),
         sinks,
         topk_indices,
         sm_scale=scaling,
+        dropout=dropout,
+        return_attn_weights=output_attentions,
     )
-    return attn_output, None
+    if output_attentions:
+        attn_output, attn_weights = attn_result
+        return attn_output, attn_weights
+    return attn_result, None
 
 
 # ================================================================

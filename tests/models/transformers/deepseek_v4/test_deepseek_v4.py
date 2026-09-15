@@ -231,3 +231,64 @@ def test_deepseek_v4_eager_matches_hf_aux_loss():
     assert hf_out.aux_loss is not None
     torch.testing.assert_close(ours_out.aux_loss, hf_out.aux_loss, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(ours_out.loss, hf_out.loss, atol=1e-6, rtol=1e-6)
+
+
+class _FusedDsv4AttentionSpy:
+    impl = "tilelang"
+
+    def __call__(self, *args, **kwargs):
+        raise AssertionError("fused DeepSeek-V4 attention should have raised before the kernel call")
+
+
+def test_deepseek_v4_eager_dropout_train_eval_seed_and_grads():
+    config = _tiny_config()
+    config.attention_dropout = 0.5
+    model = _build_ours(config)
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    model.train()
+    torch.manual_seed(1)
+    train_a = model(input_ids=input_ids, use_cache=False).logits
+    torch.manual_seed(2)
+    train_b = model(input_ids=input_ids, use_cache=False).logits
+    assert not torch.allclose(train_a, train_b)
+    model.eval()
+    with torch.no_grad():
+        torch.manual_seed(1)
+        eval_a = model(input_ids=input_ids, use_cache=False).logits
+        torch.manual_seed(2)
+        eval_b = model(input_ids=input_ids, use_cache=False).logits
+    torch.testing.assert_close(eval_a, eval_b)
+    model.train()
+    torch.manual_seed(3)
+    logits = model(input_ids=input_ids, use_cache=False).logits
+    grads = torch.autograd.grad(
+        logits.sum(),
+        [param for param in model.parameters() if param.requires_grad],
+        allow_unused=True,
+    )
+    assert any(grad is not None and grad.abs().sum() > 0 for grad in grads)
+
+
+def test_deepseek_v4_eager_output_attentions_matches_hf():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    hf = HFDeepseekV4ForCausalLM(config)
+    ours = _build_ours(config)
+    ours.load_state_dict(hf.state_dict())
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    hf_out = hf(input_ids=input_ids, use_cache=False, output_attentions=True)
+    ours_out = ours(input_ids=input_ids, use_cache=False, output_attentions=True)
+    assert ours_out.attentions is not None and ours_out.attentions != ()
+    assert len(ours_out.attentions) == config.num_hidden_layers
+    assert len(hf_out.attentions) == config.num_hidden_layers
+    for ours_weights, hf_weights in zip(ours_out.attentions, hf_out.attentions, strict=True):
+        assert ours_weights.shape == hf_weights.shape
+        torch.testing.assert_close(ours_weights, hf_weights, atol=1e-4, rtol=1e-4)
+
+
+def test_deepseek_v4_fused_rejects_output_attentions():
+    config = _tiny_config()
+    model = _build_ours(config)
+    model.model.layers[0].self_attn.veomni_dsa_attention = _FusedDsv4AttentionSpy()
+    with pytest.raises(ValueError, match="output_attentions=True"):
+        model(input_ids=torch.randint(3, config.vocab_size, (2, 8)), use_cache=False, output_attentions=True)

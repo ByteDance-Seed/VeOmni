@@ -50,6 +50,7 @@ from veomni.ops.kernels.dsa.attention.deepseek_v4 import tilelang as deepseek_v4
 from veomni.ops.kernels.dsa.attention.glm import flashmla_cudnn as glm_fused_attention
 from veomni.ops.kernels.dsa.indexer.deepseek_v4 import tilelang as deepseek_v4_fused_indexer
 from veomni.ops.kernels.dsa.indexer.glm import cudnn as glm_fused_indexer
+from veomni.ops.kernels.dsa.mask import is_standard_causal_mask, translate_fused_dsa_mask
 
 
 # Installed Transformers implementations provide the DeepSeek-V4 and GLM eager references.
@@ -137,6 +138,28 @@ def _hf_glm_indexer_indices(
     return index_scores.topk(min(top_k, index_scores.shape[-1]), dim=-1).indices.to(torch.int32)
 
 
+def _additive_causal(batch: int, seq_len: int) -> Tensor:
+    blocked = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1)
+    mask = torch.zeros(batch, 1, seq_len, seq_len)
+    return mask.masked_fill(blocked, float("-inf"))
+
+
+def test_translate_fused_dsa_mask_drops_standard_causal_and_rejects_padding():
+    seq_len = 8
+    causal = _additive_causal(1, seq_len)
+    assert is_standard_causal_mask(None, q_len=seq_len, kv_len=seq_len)
+    assert is_standard_causal_mask(causal, q_len=seq_len, kv_len=seq_len)
+    assert translate_fused_dsa_mask(causal, q_len=seq_len, kv_len=seq_len, fused=True, what="x") is None
+    assert translate_fused_dsa_mask(causal, q_len=seq_len, kv_len=seq_len, fused=False, what="x") is causal
+
+    padded = causal.clone()
+    padded[..., :, -1] = float("-inf")
+    assert not is_standard_causal_mask(padded, q_len=seq_len, kv_len=seq_len)
+    with pytest.raises(ValueError, match="eager implementation"):
+        translate_fused_dsa_mask(padded, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
+    assert translate_fused_dsa_mask(padded, q_len=seq_len, kv_len=seq_len, fused=False, what="x") is padded
+
+
 def test_glm_fused_rows_reject_attention_mask_before_vendor_import(monkeypatch):
     """Unsupported masks must not be silently ignored by fused GLM rows."""
     vendor_module = "veomni.ops.kernels.dsa.vendor.flashmla_cudnn"
@@ -156,6 +179,28 @@ def test_glm_fused_rows_reject_attention_mask_before_vendor_import(monkeypatch):
     with pytest.raises(ValueError, match="does not support attention_mask"):
         glm_fused_indexer.wrapper(tensor, tensor, tensor, 1, attention_mask=attention_mask)
 
+    assert vendor_module not in sys.modules
+
+
+def test_glm_fused_attention_rejects_dropout_and_output_attentions_before_vendor_import(monkeypatch):
+    vendor_module = "veomni.ops.kernels.dsa.vendor.flashmla_cudnn"
+    monkeypatch.delitem(sys.modules, vendor_module, raising=False)
+    tensor = torch.empty(0)
+    with pytest.raises(ValueError, match="attention_dropout=0"):
+        glm_fused_attention.wrapper(tensor, tensor, tensor, tensor, tensor, training=True, attention_dropout=0.5)
+    with pytest.raises(ValueError, match="output_attentions=True"):
+        glm_fused_attention.wrapper(tensor, tensor, tensor, tensor, tensor, return_attn_weights=True)
+    assert vendor_module not in sys.modules
+
+
+def test_deepseek_v4_fused_attention_rejects_dropout_and_output_attentions_before_vendor_import(monkeypatch):
+    vendor_module = "veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla"
+    monkeypatch.delitem(sys.modules, vendor_module, raising=False)
+    tensor = torch.empty(0)
+    with pytest.raises(ValueError, match="dropout=0"):
+        deepseek_v4_fused_attention.wrapper(tensor, tensor, tensor, tensor, dropout=0.5)
+    with pytest.raises(ValueError, match="output_attentions=True"):
+        deepseek_v4_fused_attention.wrapper(tensor, tensor, tensor, tensor, return_attn_weights=True)
     assert vendor_module not in sys.modules
 
 
@@ -284,6 +329,50 @@ def test_dsa_attention_deepseek_v4_eager_matches_hf():
     assert torch.allclose(q_e.grad, q_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     assert torch.allclose(kv_e.grad, kv_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     assert torch.allclose(sink_e.grad, sink_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+def test_dsa_attention_deepseek_v4_eager_dropout_seed_and_eval_and_grads():
+    def _inputs(requires_grad: bool):
+        torch.manual_seed(0)
+        q = torch.randn(2, 4, 2, 8)
+        kv = torch.randn(2, 6, 8)
+        sink = torch.randn(2)
+        indices = torch.arange(3, dtype=torch.int32).view(1, 1, 3).expand(2, 4, 3).contiguous()
+        if requires_grad:
+            q, kv, sink = (tensor.requires_grad_(True) for tensor in (q, kv, sink))
+        return q, kv, sink, indices
+
+    eager = resolve_op("dsa_attention", "deepseek_v4", "eager").wrapper
+    q, kv, sink, indices = _inputs(False)
+    torch.manual_seed(1)
+    train_a = eager(q, kv, sink, indices, sm_scale=0.5, dropout=0.5)
+    torch.manual_seed(2)
+    train_b = eager(q, kv, sink, indices, sm_scale=0.5, dropout=0.5)
+    assert not torch.allclose(train_a, train_b)
+    eval_out = eager(q, kv, sink, indices, sm_scale=0.5, dropout=0.0)
+    torch.manual_seed(3)
+    still_eval = eager(q, kv, sink, indices, sm_scale=0.5, dropout=0.0)
+    torch.testing.assert_close(eval_out, still_eval)
+    q, kv, sink, indices = _inputs(True)
+    torch.manual_seed(4)
+    dropped, weights = eager(q, kv, sink, indices, sm_scale=0.5, dropout=0.5, return_attn_weights=True)
+    grads = torch.autograd.grad(dropped.sum(), (q, kv, sink))
+    assert all(grad is not None and torch.isfinite(grad).all() for grad in grads)
+    assert weights.shape == (2, 2, 4, 6)
+
+    q_h, kv_h, sink_h, indices = _inputs(True)
+    module = _HFAttentionModule(sink_h, 2)
+    module.train()
+    query = q_h.transpose(1, 2).contiguous()
+    key = kv_h.unsqueeze(1).contiguous()
+    mask = _official_topk_additive_mask(indices, kv_h.shape[1], query.dtype)
+    torch.manual_seed(5)
+    hf_out, hf_weights = eager_attention_forward(module, query, key, key, mask, 0.5, dropout=0.5)
+    q_e, kv_e, sink_e, _ = _inputs(True)
+    torch.manual_seed(5)
+    ours, ours_weights = eager(q_e, kv_e, sink_e, indices, sm_scale=0.5, dropout=0.5, return_attn_weights=True)
+    torch.testing.assert_close(ours, hf_out, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    torch.testing.assert_close(ours_weights, hf_weights, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
 
 def test_dsa_attention_deepseek_v4_eager_preserves_repeated_candidate_slots():
@@ -542,6 +631,48 @@ def test_dsa_attention_glm_eager_training_dropout_zeros_output_and_grads():
         attention_dropout=1.0,
     )
     assert torch.equal(kept, ones)
+
+
+def test_dsa_attention_glm_eager_dropout_seed_and_eval_and_grads():
+    def _inputs(requires_grad: bool):
+        torch.manual_seed(0)
+        tensors = [
+            torch.randn(1, 4, 2, 4),
+            torch.randn(1, 4, 1, 4),
+            torch.randn(1, 4, 1, 4),
+            torch.randn(1, 4, 2, 4),
+        ]
+        if requires_grad:
+            tensors = [tensor.requires_grad_(True) for tensor in tensors]
+        indices = torch.arange(4, dtype=torch.int32).view(1, 1, 4).expand(1, 4, 4).contiguous()
+        return *tensors, indices
+
+    eager = resolve_op("dsa_attention", "glm", "eager").wrapper
+    q_pe, k_pe, kv_cache, q_nope, indices = _inputs(False)
+    torch.manual_seed(1)
+    train_a = eager(q_pe, k_pe, kv_cache, q_nope, indices, softmax_scale=0.5, training=True, attention_dropout=0.5)
+    torch.manual_seed(2)
+    train_b = eager(q_pe, k_pe, kv_cache, q_nope, indices, softmax_scale=0.5, training=True, attention_dropout=0.5)
+    assert not torch.allclose(train_a, train_b)
+    eval_out = eager(q_pe, k_pe, kv_cache, q_nope, indices, softmax_scale=0.5, training=False, attention_dropout=0.5)
+    no_drop = eager(q_pe, k_pe, kv_cache, q_nope, indices, softmax_scale=0.5, training=False, attention_dropout=0.0)
+    torch.testing.assert_close(eval_out, no_drop)
+    q_pe, k_pe, kv_cache, q_nope, indices = _inputs(True)
+    torch.manual_seed(3)
+    dropped, weights = eager(
+        q_pe,
+        k_pe,
+        kv_cache,
+        q_nope,
+        indices,
+        softmax_scale=0.5,
+        training=True,
+        attention_dropout=0.5,
+        return_attn_weights=True,
+    )
+    grads = torch.autograd.grad(dropped.sum(), (q_pe, k_pe, kv_cache, q_nope))
+    assert all(grad is not None and torch.isfinite(grad).all() for grad in grads)
+    assert weights.shape == (1, 2, 4, 4)
 
 
 def test_dsa_attention_glm_eager_out_of_range_index_does_not_cross_batch():

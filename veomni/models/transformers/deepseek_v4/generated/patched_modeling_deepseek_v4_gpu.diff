@@ -1082,7 +1082,7 @@
  def eager_attention_forward(
      module: nn.Module,
      query: torch.Tensor,
-@@ -714,26 +1273,83 @@
+@@ -714,26 +1273,100 @@
      scaling: float,
      dropout: float | int = 0.0,
      **kwargs,
@@ -1107,7 +1107,18 @@
 -    attn_output = attn_output.transpose(1, 2).contiguous()
 -    return attn_output, attn_weights
 +) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
-+    del value, dropout
++    del value
++    fused = module.veomni_dsa_attention.impl != "eager"
++    output_attentions = bool(kwargs.get("output_attentions", False)) or bool(
++        getattr(module.config, "output_attentions", False)
++    )
++    if fused and dropout:
++        raise ValueError("tilelang DeepSeek-V4 sparse attention requires dropout=0; use the eager implementation.")
++    if fused and output_attentions:
++        raise ValueError(
++            "tilelang DeepSeek-V4 sparse attention does not support output_attentions=True; "
++            "use the eager implementation."
++        )
 +    topk_indices = kwargs.get("sparse_topk_indices")
 +    if topk_indices is None:
 +        batch, _, seq_len, _ = query.shape
@@ -1151,6 +1162,7 @@
 +            topk_indices,
 +            sm_scale=scaling,
 +            return_lse=True,
++            dropout=dropout,
 +        )
 +        # The compressed entries are the *trailing* range of the index tensor:
 +        # both ``build_sparse_attention_indices`` and
@@ -1175,18 +1187,23 @@
 +        tiny = torch.finfo(torch.float32).tiny
 +        target = torch.where(target_mass > tiny, target / target_mass.clamp_min(tiny), 0.0)
 +        return attn_output, None, target
-+    attn_output = module.veomni_dsa_attention(
++    attn_result = module.veomni_dsa_attention(
 +        query.transpose(1, 2).contiguous(),
 +        key[:, 0].contiguous(),
 +        sinks,
 +        topk_indices,
 +        sm_scale=scaling,
++        dropout=dropout,
++        return_attn_weights=output_attentions,
 +    )
-+    return attn_output, None
++    if output_attentions:
++        attn_output, attn_weights = attn_result
++        return attn_output, attn_weights
++    return attn_result, None
 
 
  COMPRESSOR_CLASSES = {
-@@ -741,6 +1357,12 @@
+@@ -741,6 +1374,12 @@
      "compressed_sparse_attention": DeepseekV4CSACompressor,
      "heavily_compressed_attention": DeepseekV4HCACompressor,
  }
@@ -1199,7 +1216,7 @@
 
 
  class DeepseekV4Attention(nn.Module):
-@@ -758,16 +1380,21 @@
+@@ -758,16 +1397,21 @@
      * 3 different cache mechanisms, sliding, sliding+CSA, sliding+HCA.
      """
 
@@ -1226,7 +1243,7 @@
          self.head_dim = config.head_dim
          self.sliding_window = config.sliding_window
          self.attention_dropout = config.attention_dropout
-@@ -788,6 +1415,11 @@
+@@ -788,6 +1432,11 @@
          self.compressor = (
              COMPRESSOR_CLASSES[self.layer_type](config) if self.layer_type != "sliding_attention" else None
          )
@@ -1238,7 +1255,7 @@
 
      def forward(
          self,
-@@ -796,48 +1428,180 @@
+@@ -796,48 +1445,180 @@
          position_ids: torch.Tensor,
          attention_mask: torch.Tensor | None,
          past_key_values: Cache | None = None,
@@ -1441,7 +1458,7 @@
              self,
              q,
              kv,
-@@ -846,22 +1610,40 @@
+@@ -846,22 +1627,40 @@
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
              sliding_window=self.sliding_window,
@@ -1493,7 +1510,7 @@
 
 
  class DeepseekV4HyperConnection(nn.Module):
-@@ -897,8 +1679,11 @@
+@@ -897,8 +1696,11 @@
                                                                                              (stream mixer)
      """
 
@@ -1507,7 +1524,7 @@
          self.hc_mult = config.hc_mult
          self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
          self.hc_eps = config.hc_eps
-@@ -906,65 +1691,69 @@
+@@ -906,65 +1708,69 @@
          mix = (2 + self.hc_mult) * self.hc_mult
          self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * config.hidden_size))
          self.base = nn.Parameter(torch.empty(mix))
@@ -1619,7 +1636,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -973,18 +1762,45 @@
+@@ -973,18 +1779,45 @@
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
          self.limit = config.swiglu_limit
@@ -1672,7 +1689,7 @@
          super().__init__()
          self.num_experts = config.num_local_experts
          self.hidden_dim = config.hidden_size
-@@ -993,32 +1809,36 @@
+@@ -993,32 +1826,36 @@
          self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
          self.act_fn = ACT2FN[config.hidden_act]
          self.limit = config.swiglu_limit
@@ -1732,7 +1749,7 @@
 
 
  class DeepseekV4TopKRouter(nn.Module):
-@@ -1032,14 +1852,28 @@
+@@ -1032,14 +1869,28 @@
          self.routed_scaling_factor = config.routed_scaling_factor
          self.e_score_correction_bias = nn.Buffer(torch.zeros(self.num_experts))
 
@@ -1764,7 +1781,7 @@
 
 
  class DeepseekV4HashRouter(nn.Module):
-@@ -1062,12 +1896,18 @@
+@@ -1062,12 +1913,18 @@
          self.tid2eid = nn.Buffer(torch.zeros(config.vocab_size, self.top_k, dtype=torch.long), persistent=True)
 
      def forward(
@@ -1785,7 +1802,7 @@
          weights = scores.gather(1, indices)
          weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
          return logits, weights * self.routed_scaling_factor, indices
-@@ -1093,6 +1933,12 @@
+@@ -1093,6 +1950,12 @@
          return routed + self.shared_experts(residual)
 
 
@@ -1798,7 +1815,7 @@
  class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
      r"""DeepSeek-V4 decoder block (paper §2). Differs from a classic residual block in
      two places:
-@@ -1107,7 +1953,7 @@
+@@ -1107,7 +1970,7 @@
 
      """
 
@@ -1807,7 +1824,7 @@
          super().__init__()
          self.layer_idx = layer_idx
          self.self_attn = DeepseekV4Attention(config, layer_idx)
-@@ -1116,32 +1962,42 @@
+@@ -1116,32 +1979,42 @@
          self.post_attention_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
          self.attn_hc = DeepseekV4HyperConnection(config)
          self.ffn_hc = DeepseekV4HyperConnection(config)
@@ -1866,7 +1883,7 @@
 
 
  @auto_docstring
-@@ -1252,6 +2108,12 @@
+@@ -1252,6 +2125,12 @@
                  init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
@@ -1879,7 +1896,7 @@
  @auto_docstring
  class DeepseekV4Model(DeepseekV4PreTrainedModel):
      def __init__(self, config: DeepseekV4Config):
-@@ -1271,6 +2133,16 @@
+@@ -1271,6 +2150,16 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1896,7 +1913,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1283,38 +2155,159 @@
+@@ -1283,38 +2172,159 @@
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -2066,7 +2083,7 @@
                  hidden_states,
                  position_embeddings=position_embeddings,
                  position_ids=position_ids,
-@@ -1323,9 +2316,50 @@
+@@ -1323,9 +2333,50 @@
                  past_key_values=past_key_values,
                  **kwargs,
              )
@@ -2118,7 +2135,7 @@
 
 
  def load_balancing_loss_func(
-@@ -1397,6 +2431,12 @@
+@@ -1397,6 +2448,12 @@
      return overall_loss * num_experts
 
 
@@ -2131,7 +2148,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1404,6 +2444,9 @@
+@@ -1404,6 +2461,9 @@
      _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
      _fsdp_plan = {"lm_head": "keep_full_weight"}
 
@@ -2141,7 +2158,7 @@
      def __init__(self, config):
          super().__init__(config)
          self.model = DeepseekV4Model(config)
-@@ -1412,54 +2455,37 @@
+@@ -1412,54 +2472,37 @@
          self.router_aux_loss_coef = config.router_aux_loss_coef
          self.num_experts = config.num_local_experts
          self.num_experts_per_tok = config.num_experts_per_tok
@@ -2215,7 +2232,7 @@
              input_ids=input_ids,
              attention_mask=attention_mask,
              position_ids=position_ids,
-@@ -1471,26 +2497,68 @@
+@@ -1471,26 +2514,68 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -2291,7 +2308,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1498,7 +2566,18 @@
+@@ -1498,7 +2583,18 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,

@@ -35,6 +35,7 @@ from transformers.utils import TransformersKwargs
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
+from veomni.ops.kernels.dsa.mask import translate_fused_dsa_mask
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
     CausalLMOutputWithLogProbs,
@@ -62,6 +63,10 @@ config.add_import(
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
+)
+config.add_import(
+    "veomni.ops.kernels.dsa.mask",
+    names=["translate_fused_dsa_mask"],
 )
 apply_rotary_pos_emb_interleave = None  # noqa: E305  resolved from the generated modeling file
 yarn_apply_mscale = None
@@ -127,6 +132,14 @@ def glm_moe_dsa_indexer_forward_patched(
         k = past_key_values.update_indexer(k, self.layer_idx)
 
     weights = self.weights_proj(hidden_states.to(self.weights_proj.weight.dtype)).float() * (self.n_heads**-0.5)
+    kv_len = k.shape[1]
+    attention_mask = translate_fused_dsa_mask(
+        attention_mask,
+        q_len=seq_len,
+        kv_len=kv_len,
+        fused=self.veomni_dsa_indexer.impl != "eager",
+        what="cuDNN GLM sparse-attention indexer",
+    )
     return self.veomni_dsa_indexer(
         q,
         k,
@@ -277,8 +290,24 @@ def glm_moe_dsa_attention_forward_patched(
     q_nope_absorbed = torch.einsum("bhsd,hdr->bshr", q_nope, k_nope_weight).contiguous()
     k_pe_kernel = k_pe_states.transpose(1, 2).contiguous()
     kv_cache = kv_states.transpose(1, 2).contiguous()
-
-    compressed_attn_output = self.veomni_dsa_attention(
+    output_attentions = bool(kwargs.get("output_attentions", False)) or bool(
+        getattr(self.config, "output_attentions", False)
+    )
+    fused_attention = self.veomni_dsa_attention.impl != "eager"
+    if fused_attention and output_attentions:
+        raise ValueError(
+            "flashmla_cudnn GLM sparse attention does not support output_attentions=True; "
+            "use the eager implementation."
+        )
+    attention_mask = translate_fused_dsa_mask(
+        attention_mask,
+        q_len=seq_length,
+        kv_len=k_pe_kernel.shape[1],
+        fused=fused_attention,
+        what="flashmla_cudnn GLM sparse attention",
+    )
+    attention_dropout = 0.0 if not self.training else self.attention_dropout
+    attn_result = self.veomni_dsa_attention(
         q_pe.transpose(1, 2).contiguous(),
         k_pe_kernel,
         kv_cache,
@@ -288,12 +317,18 @@ def glm_moe_dsa_attention_forward_patched(
         attention_mask=attention_mask,
         use_cache=past_key_values is not None,
         training=self.training,
-        attention_dropout=self.attention_dropout,
+        attention_dropout=attention_dropout,
+        return_attn_weights=output_attentions,
     )
+    if output_attentions:
+        compressed_attn_output, attn_weights = attn_result
+    else:
+        compressed_attn_output = attn_result
+        attn_weights = None
     attn_output = torch.einsum("bshr,hvr->bshv", compressed_attn_output, value_weight)
     attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
     attn_output = self.o_proj(attn_output)
-    return attn_output, None, topk_indices
+    return attn_output, attn_weights, topk_indices
 
 
 @config.override_method(

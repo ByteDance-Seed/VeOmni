@@ -52,7 +52,9 @@ def wrapper(
     topk_idxs: Tensor,
     sm_scale: float | None = None,
     return_lse: bool = False,
-) -> Tensor | tuple[Tensor, Tensor]:
+    dropout: float = 0.0,
+    return_attn_weights: bool = False,
+) -> Tensor | tuple[Tensor, ...]:
     """Sparse MQA with HF sink-softmax math.
 
     ``q`` is ``[B, S, H, D]``, ``kv`` is ``[B, S_kv, D]``, ``attn_sink`` is
@@ -76,11 +78,19 @@ def wrapper(
     combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
     probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
     scores = probs[..., :-1]
-    attn_output = torch.matmul(scores.to(value_states.dtype), value_states)
+    if dropout > 0.0:
+        scores = F.dropout(scores, p=dropout, training=True)
+    attn_weights_out = scores.to(value_states.dtype)
+    attn_output = torch.matmul(attn_weights_out, value_states)
     out = attn_output.transpose(1, 2).contiguous()
-    if not return_lse:
-        return out
-    lse = (
-        torch.logsumexp(torch.cat([attn_weights.float(), sinks.float()], dim=-1), dim=-1) * math.log2(math.e)
-    ).transpose(1, 2)
-    return out, lse.detach()
+    extras: tuple[Tensor, ...] = ()
+    if return_lse:
+        lse = (
+            torch.logsumexp(torch.cat([attn_weights.float(), sinks.float()], dim=-1), dim=-1) * math.log2(math.e)
+        ).transpose(1, 2)
+        extras += (lse.detach(),)
+    if return_attn_weights:
+        extras += (attn_weights_out,)
+    if extras:
+        return (out, *extras)
+    return out
