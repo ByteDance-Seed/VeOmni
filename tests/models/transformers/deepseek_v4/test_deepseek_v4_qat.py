@@ -396,7 +396,7 @@ def test_expert_weight_gradients_survive_the_straight_through_estimator():
     )
     torch.manual_seed(0)
     experts = modeling_gpu.DeepseekV4Experts(config).to(device=DEVICE, dtype=torch.bfloat16)
-    experts.veomni_moe = VeomniOp("moe_experts", "standard", "triton")
+    experts.veomni_moe = VeomniOp("moe_experts", "standard", "fused_triton")
     with torch.no_grad():
         experts.gate_up_proj.normal_(std=0.05)
         experts.down_proj.normal_(std=0.05)

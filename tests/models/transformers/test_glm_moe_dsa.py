@@ -51,14 +51,25 @@ def _build_ours(
         return _glm_cls(architecture)(config)
 
 
+def _assert_dsa_wiring(attn) -> None:
+    """GPU patches bind DSA ops; NPU generated modeling keeps the HF attention path."""
+    from veomni.utils.device import IS_NPU_AVAILABLE
+
+    if IS_NPU_AVAILABLE:
+        assert not hasattr(attn, "veomni_dsa_attention")
+        assert attn.indexer is not None
+        assert not hasattr(attn.indexer, "veomni_dsa_indexer")
+        return
+    assert attn.veomni_dsa_attention.variant == "glm"
+    assert attn.indexer.veomni_dsa_indexer.variant == "glm"
+
+
 def test_glm_moe_dsa_eager_matches_hf():
     torch.manual_seed(0)
     config = _tiny_config()
     hf = HFGlmMoeDsaForCausalLM(config)
     ours = _build_ours(config)
-    attn = ours.model.layers[0].self_attn
-    assert attn.veomni_dsa_attention.variant == "glm"
-    assert attn.indexer.veomni_dsa_indexer.variant == "glm"
+    _assert_dsa_wiring(ours.model.layers[0].self_attn)
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
@@ -70,6 +81,7 @@ def test_glm_moe_dsa_base_model_eager_matches_hf():
     config = _tiny_config("GlmMoeDsaModel")
     hf = HFGlmMoeDsaModel(config)
     ours = _build_ours(config, architecture="GlmMoeDsaModel")
+    _assert_dsa_wiring(ours.layers[0].self_attn)
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
