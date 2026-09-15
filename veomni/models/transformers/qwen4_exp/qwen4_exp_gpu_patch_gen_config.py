@@ -30,6 +30,7 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.qwen4_exp.modeling_qwen4_exp import (
@@ -38,7 +39,12 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import (
     Qwen4ExpModelOutputWithPast,
     Qwen4ExpTextModel,
     Qwen4ExpVisionModel,
+    apply_mask_to_padding_states,
+    causal_conv1d_fn,
+    causal_conv1d_update,
     load_balancing_loss_func,
+    torch_chunk_gated_delta_rule,
+    torch_recurrent_gated_delta_rule,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, torch_compilable_check
@@ -48,6 +54,7 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
+from veomni.utils.seqlen_pos_transform_utils import culen2pos
 
 
 config = PatchConfig(
@@ -65,6 +72,7 @@ config.add_import("veomni.distributed.moe.comm", names=["all_to_all"])
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 config.add_import("veomni.utils.model_outputs", names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin"])
+config.add_import("veomni.utils.seqlen_pos_transform_utils", names=["culen2pos"])
 config.add_post_import_block(
     """
     # Bound by ``_bind_veomni_ops`` before model construction. Qwen4-Exp
@@ -74,8 +82,15 @@ config.add_post_import_block(
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+    veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
+    veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
     """
 )
+
+
+# OpSlots are declared in the generated module's post-import block.
+veomni_causal_conv1d = None
+veomni_chunk_gated_delta_rule = None
 
 
 # ================================================================

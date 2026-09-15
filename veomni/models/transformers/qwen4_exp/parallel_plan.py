@@ -3,6 +3,15 @@ from torch.distributed._tensor import Shard
 from ....distributed.parallel_plan import ParallelPlan
 
 
+class Qwen4ExpParallelPlan(ParallelPlan):
+    """Allow Qwen4-Exp's optional PLE dimension to be absent at runtime."""
+
+    def apply(self, model, extra_parallel_fsdp_device_mesh):
+        meshes = dict.fromkeys(self.extra_parallel_plan)
+        meshes.update(extra_parallel_fsdp_device_mesh)
+        return super().apply(model, meshes)
+
+
 def get_parallel_plan():
     """Shard PLE tables over ``ple`` and routed experts over ``ep``.
 
@@ -22,7 +31,7 @@ def get_parallel_plan():
     persistent_modules = {
         "ple": {"model.language_model.layers.*.ple.ple_embedding": 1},
     }
-    parallel_plan = ParallelPlan(
+    parallel_plan = Qwen4ExpParallelPlan(
         extra_parallel_plan={"ple": ple_plan, "ep": ep_plan},
         extra_parallel_persistent_modules=persistent_modules,
     )
