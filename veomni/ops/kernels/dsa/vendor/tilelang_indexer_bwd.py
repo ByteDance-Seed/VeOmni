@@ -20,6 +20,8 @@ import tilelang as tl
 import tilelang.language as T
 import torch
 
+from ..topk import mask_topk_indices_to_query_range
+
 BF16 = T.bfloat16
 FP32 = T.float32
 INT32 = T.int32
@@ -216,7 +218,15 @@ def indexer_bwd_interface(
     return grad_q, grad_w, grad_k
 
 
-def batched_indexer_bwd(index_q, weights, index_k, topk_indices, grad_scores):
+def batched_indexer_bwd(
+    index_q,
+    weights,
+    index_k,
+    topk_indices,
+    grad_scores,
+    cu_seqlen_ks=None,
+    cu_seqlen_ke=None,
+):
     """Batched backward: loops over batch dim.
 
     Args:
@@ -225,12 +235,19 @@ def batched_indexer_bwd(index_q, weights, index_k, topk_indices, grad_scores):
         index_k: [seqlen_kv, batch, dim] bf16
         topk_indices: [batch, seqlen, topk] int32
         grad_scores: [batch, seqlen, topk] fp32
+        cu_seqlen_ks / cu_seqlen_ke: optional packed per-query KV window [seqlen]
 
     Returns:
         grad_q: [seqlen, batch, heads, dim] bf16
         grad_w: [seqlen, batch, heads] fp32
         grad_k: [seqlen_kv, batch, dim] fp32
     """
+    if (cu_seqlen_ks is None) != (cu_seqlen_ke is None):
+        raise ValueError("cu_seqlen_ks and cu_seqlen_ke must be provided together")
+    if cu_seqlen_ks is not None:
+        topk_indices, grad_scores = mask_topk_indices_to_query_range(
+            topk_indices, cu_seqlen_ks, cu_seqlen_ke, grad_scores
+        )
     seqlen, batch, heads, dim = index_q.shape
     seq_len_kv = index_k.shape[0]
 

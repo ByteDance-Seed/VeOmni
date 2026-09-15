@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from veomni.ops.kernels.dsa.topk import local_topk_to_global
+from veomni.ops.kernels.dsa.topk import local_topk_to_global, mask_topk_indices_to_query_range
 
 
 def test_local_topk_to_global_masks_out_of_range_indices():
@@ -23,6 +23,22 @@ def test_local_topk_to_global_masks_out_of_range_indices():
         [[0, -1, -1], [3, -1, 1]],
         [[4, 5, -1], [6, -1, 7]],
     ]
+
+
+def test_mask_topk_indices_to_query_range_drops_invisible_keys():
+    """A globally legal index outside [ks, ke) must not reach indexer backward."""
+    topk_indices = torch.tensor(
+        [
+            [[0, 3], [1, 2]],
+        ],
+        dtype=torch.int32,
+    )
+    grad_scores = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    ks = torch.tensor([0, 2], dtype=torch.int32)
+    ke = torch.tensor([2, 4], dtype=torch.int32)
+    masked, masked_grad = mask_topk_indices_to_query_range(topk_indices, ks, ke, grad_scores)
+    assert masked.tolist() == [[[0, -1], [-1, 2]]]
+    assert masked_grad.tolist() == [[[1.0, 0.0], [0.0, 4.0]]]
 
 
 @pytest.fixture
