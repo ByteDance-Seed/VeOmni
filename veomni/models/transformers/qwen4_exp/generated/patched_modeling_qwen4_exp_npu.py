@@ -13,12 +13,20 @@
 #      Make the upstream reverse-embedding error path ruff-compliant
 #    - method_override: Qwen4ExpModel.__init__
 #      Build local patched submodels and propagate the VeOmni MoE implementation
+#    - method_override: Qwen4ExpTextGatedDeltaNet.__init__
+#      Bind instance-local GDN kernels used by packed varlen training
+#    - method_override: Qwen4ExpTextGatedDeltaNet.forward
+#      Reset Qwen4-Exp GDN convolution and recurrent state at packed boundaries
 #    - class_replacement: Qwen4ExpTextExperts
 #      Use the VeOmni MoE OpSlot while preserving Qwen4-Exp fused expert weights
 #    - class_replacement: Qwen4ExpTextNGramEmbedding
 #      Use checkpoint-native row-sharded PLE tables with distributed lookup
+#    - method_override: Qwen4ExpTextPLELayer._short_conv
+#      Reset the Qwen4-Exp PLE dilated convolution at packed boundaries
 #    - method_override: Qwen4ExpTextPLELayer.forward
-#      Match PLE lookup results to the mixed-precision activation dtype before communication
+#      Use mixed-precision PLE lookup values and reset state at packed boundaries
+#    - method_override: Qwen4ExpTextDecoderLayer.forward
+#      Pass packed sequence boundaries to Qwen4-Exp GDN and PLE
 #    - method_override: Qwen4ExpVisionModel.dummy_forward
 #      Add a config-derived dummy vision forward for rank-asymmetric FSDP batches
 #    - method_override: Qwen4ExpForConditionalGeneration.get_position_id_func
@@ -99,21 +107,47 @@ from veomni.distributed.parallel_state import get_parallel_state
 
 # Additional import blocks for patches
 # Bound by ``_bind_veomni_ops`` before model construction. Qwen4-Exp
-# currently uses the upstream eager/SDPA QSA implementation; only the
-# expert and loss paths opt into VeOmni kernels in this initial port.
+# keeps the upstream eager/SDPA QSA implementation while expert, loss,
+# and GDN paths can opt into VeOmni kernels.
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
+from veomni.utils.seqlen_pos_transform_utils import culen2pos, pos2culen
 
 
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
+veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
 
 
 # ======================================================================
 # [HELPERS] Module-level helpers injected via config.add_helper
 # ======================================================================
+
+
+# ================================================================
+# Helpers: packed-sequence boundaries
+# ================================================================
+def _qwen4_exp_validate_packed_seq_lens(
+    packed_seq_lens: tuple[int, ...] | list[int] | None,
+    batch_size: int,
+    sequence_length: int,
+) -> tuple[int, ...]:
+    """Validate the collator-provided segment lengths used by stateful token mixers."""
+    if packed_seq_lens is None:
+        raise ValueError("Qwen4-Exp VeOmni training requires packed sequence lengths.")
+    if batch_size != 1:
+        raise ValueError("Qwen4-Exp packed sequence metadata currently requires batch_size=1.")
+
+    lengths = tuple(int(length) for length in packed_seq_lens)
+    if not lengths or any(length <= 0 for length in lengths) or sum(lengths) != sequence_length:
+        raise ValueError(
+            "Qwen4-Exp packed sequence lengths must be positive and cover the complete sequence; "
+            f"got {lengths} for sequence_length={sequence_length}."
+        )
+    return lengths
 
 
 # ================================================================
@@ -129,6 +163,8 @@ veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 #    all-gathering parameters.
 # 5. Cast lookup results to the requested compute dtype before communicating
 #    them, while retaining FP32 master parameters.
+# 6. Require explicit packed boundaries and reset n-gram history for every
+#    segment; recurrent-cache and non-varlen paths are intentionally unsupported.
 # ================================================================
 class _Qwen4ExpScaleGradient(torch.autograd.Function):
     """Leave lookup values unchanged and average their backward contribution."""
@@ -160,7 +196,7 @@ def qwen4_exp_get_position_id(main_func, self, **kwargs):
 
 
 def qwen4_exp_collate_metadata(batch, _sp_pad):
-    """Mark the packed position-id layout without relying on ambiguous tensor shapes."""
+    """Mark the packed position-id layout without adding model-specific boundaries."""
     batch["qwen4_exp_position_ids_layout"] = "batch_first"
 
 
@@ -496,11 +532,23 @@ def torch_recurrent_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen4ExpTextGatedDeltaNet
+# Methods patched: __init__, forward
+# ======================================================================
+
+
 @use_kernelized_func(
     [torch_recurrent_gated_delta_rule, torch_chunk_gated_delta_rule, causal_conv1d_fn, causal_conv1d_update]
 )
 class Qwen4ExpTextGatedDeltaNet(nn.Module):
-    def __init__(self, config: Qwen4ExpTextConfig, layer_idx: int):
+    # ================================================================
+    # Patch: Qwen4ExpTextGatedDeltaNet
+    # 1. Use the bound varlen kernels for both single- and multi-segment batches.
+    # 2. Run eager fallbacks independently per segment when fused kernels are absent.
+    # 3. Require VeOmni packing metadata and reject recurrent cache state.
+    # ================================================================
+    def __init__(self, config, layer_idx):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_v_heads = config.linear_num_value_heads
@@ -515,7 +563,6 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
         self.activation = config.hidden_act
         self.layer_norm_epsilon = config.rms_norm_eps
 
-        # QKV
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv1d = nn.Conv1d(
             in_channels=self.conv_dim,
@@ -525,25 +572,21 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
             groups=self.conv_dim,
             padding=self.conv_kernel_size - 1,
         )
-
-        # time step projection (discretization)
-        # instantiate once and copy inv_dt in init_weights of PretrainedModel
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
-
-        # Lower bound kept away from 0 so log(A) never becomes -inf
         A = torch.empty(self.num_v_heads).uniform_(0.01, 16)
         self.A_log = nn.Parameter(torch.log(A))
         self.norm = Qwen4ExpTextRMSNormGated(
             self.head_v_dim, eps=self.layer_norm_epsilon, activation=config.output_gate_type or config.hidden_act
         )
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
-
         self.layer_type = config.layer_types[layer_idx]
-
         self.in_proj_qkv = nn.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
         self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+
+        self.veomni_causal_conv1d_fn = veomni_causal_conv1d.bound_kernel()
+        self.veomni_chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel()
 
     @force_accelerate_hooks("conv1d")
     def forward(
@@ -551,115 +594,98 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         cache_params: Cache | None = None,
         attention_mask: torch.Tensor | None = None,
+        linear_attn_cu_seq_lens_q: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ):
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
-
-        # Set up dimensions for reshapes later
         batch_size, seq_len, _ = hidden_states.shape
-        use_precomputed_states = cache_params is not None and cache_params.has_previous_state(
-            self.layer_idx, state_idx=0
+        # --- Patch.3 ---
+        if linear_attn_cu_seq_lens_q is None:
+            raise ValueError("Qwen4-Exp GDN requires linear_attn_cu_seq_lens_q for VeOmni varlen training.")
+        packed_seq_lens = _qwen4_exp_validate_packed_seq_lens(
+            linear_attn_cu_seq_lens_q.diff().tolist(), batch_size, seq_len
         )
+        if cache_params is not None:
+            raise ValueError("Qwen4-Exp varlen GDN training does not support recurrent cache state.")
+        # --- Patch.3 ---
 
         mixed_qkv = self.in_proj_qkv(hidden_states)
-        mixed_qkv = mixed_qkv.transpose(1, 2)
-
-        z = self.in_proj_z(hidden_states)
-        z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
-
+        z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
 
-        if use_precomputed_states and seq_len == 1 and not cache_params.layers[self.layer_idx].record_past:
-            conv_state = cache_params.layers[self.layer_idx].conv_states[0]
-            # Single-token cached decode: the fused per-step kernel updates the conv state in-place.
-            mixed_qkv = causal_conv1d_update(
-                mixed_qkv,
-                conv_state,
-                self.conv1d.weight.squeeze(1),
-                self.conv1d.bias,
-                self.activation,
-            )
-        else:
-            if cache_params is not None:
-                mixed_qkv = cache_params.update_conv_state(
-                    mixed_qkv, self.layer_idx, conv_kernel_size=self.conv_kernel_size
-                )
-
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv,
-                self.conv1d.weight.squeeze(1),
-                self.conv1d.bias,
+        if self.veomni_causal_conv1d_fn is not None:
+            mixed_qkv = self.veomni_causal_conv1d_fn(
+                x=mixed_qkv,
+                weight=self.conv1d.weight.squeeze(1),
+                bias=self.conv1d.bias,
                 activation=self.activation,
-                **kwargs,
+                seq_idx=None,
+                backend="triton",
+                cu_seqlens=linear_attn_cu_seq_lens_q,
+            )[0]
+        else:
+            mixed_qkv = torch.cat(
+                [
+                    causal_conv1d_fn(
+                        segment.transpose(1, 2),
+                        self.conv1d.weight.squeeze(1),
+                        self.conv1d.bias,
+                        activation=self.activation,
+                    ).transpose(1, 2)
+                    for segment in mixed_qkv.split(packed_seq_lens, dim=1)
+                ],
+                dim=1,
             )
 
-            # Drop the additional previous states
-            if cache_params is not None:
-                mixed_qkv = mixed_qkv[:, :, -seq_len:]
-
-        mixed_qkv = mixed_qkv.transpose(1, 2)
-        query, key, value = torch.split(
-            mixed_qkv,
-            [
-                self.key_dim,
-                self.key_dim,
-                self.value_dim,
-            ],
-            dim=-1,
-        )
-
-        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
-
+        query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim).contiguous()
+        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim).contiguous()
+        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim).contiguous()
         beta = b.sigmoid()
-        # If the model is loaded in fp16, without the .float() here, A might be -inf
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        recurrent_state = cache_params.layers[self.layer_idx].recurrent_states[0] if use_precomputed_states else None
-        if use_precomputed_states and seq_len == 1:
-            core_attn_out, last_recurrent_state = torch_recurrent_gated_delta_rule(
+        if self.veomni_chunk_gated_delta_rule is not None:
+            core_attn_out, _ = self.veomni_chunk_gated_delta_rule(
                 query,
                 key,
                 value,
                 g=g,
                 beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=cache_params is not None,
+                initial_state=None,
+                output_final_state=False,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens=kwargs.pop("cu_seq_lens_q", None),
-                **kwargs,
+                cu_seqlens=linear_attn_cu_seq_lens_q,
             )
         else:
-            core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=cache_params is not None,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=kwargs.pop("cu_seq_lens_q", None),
-                **kwargs,
-            )
+            outputs = []
+            for q_segment, k_segment, v_segment, g_segment, beta_segment in zip(
+                query.split(packed_seq_lens, dim=1),
+                key.split(packed_seq_lens, dim=1),
+                value.split(packed_seq_lens, dim=1),
+                g.split(packed_seq_lens, dim=1),
+                beta.split(packed_seq_lens, dim=1),
+                strict=True,
+            ):
+                segment_output, _ = torch_chunk_gated_delta_rule(
+                    q_segment,
+                    k_segment,
+                    v_segment,
+                    g=g_segment,
+                    beta=beta_segment,
+                    initial_state=None,
+                    output_final_state=False,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                outputs.append(segment_output)
+            core_attn_out = torch.cat(outputs, dim=1)
 
-        # Update cache
-        if cache_params is not None:
-            cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
-
-        # reshape input data into 2D tensor
-        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
-        z = z.reshape(-1, self.head_v_dim)
-        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = self.norm(core_attn_out.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim))
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
-
-        output = self.out_proj(core_attn_out)
-        return output
+        return self.out_proj(core_attn_out)
 
 
 def rotate_half(x):
@@ -1334,27 +1360,23 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         input_ids: torch.Tensor,
         past_key_values: Cache | None,
         output_dtype: torch.dtype | None = None,
+        cu_seq_lens_q: torch.Tensor | None = None,
     ) -> torch.Tensor:
         input_ids = input_ids.long()
-        if past_key_values is not None and past_key_values.has_previous_state(self.layer_idx, state_idx=2):
-            previous_context = past_key_values.layers[self.layer_idx].conv_states[2].clone()
-        else:
-            previous_context = input_ids.new_full((input_ids.shape[0], self.context_len), self.eos_token_id)
+        if cu_seq_lens_q is None:
+            raise ValueError("Qwen4-Exp PLE n-gram history requires cu_seq_lens_q for VeOmni varlen training.")
+        packed_seq_lens = _qwen4_exp_validate_packed_seq_lens(
+            cu_seq_lens_q.diff().tolist(), input_ids.shape[0], input_ids.shape[1]
+        )
+        # --- Patch.6 ---
         if past_key_values is not None:
-            input_ids_to_cache = input_ids
-            if (
-                not past_key_values.has_previous_state(self.layer_idx, state_idx=2)
-                and input_ids.shape[1] < self.context_len
-            ):
-                input_ids_to_cache = torch.nn.functional.pad(
-                    input_ids_to_cache, (self.context_len - input_ids.shape[1], 0), value=self.eos_token_id
-                )
-            _ = past_key_values.update_conv_state(
-                input_ids_to_cache, self.layer_idx, state_idx=2, conv_kernel_size=self.context_len
-            )
-
-        token_history = torch.cat([previous_context, input_ids], dim=-1)
-        shifted_tokens = [self._shift_right_ignore_eos(token_history, shift) for shift in range(self.ngram_size)]
+            raise ValueError("Qwen4-Exp varlen PLE n-gram history does not support cache state.")
+        input_segments = input_ids.split(packed_seq_lens, dim=1)
+        shifted_tokens = [
+            torch.cat([self._shift_right_ignore_eos(segment, shift) for segment in input_segments], dim=1)
+            for shift in range(self.ngram_size)
+        ]
+        # --- Patch.6 ---
         blocks = []
         for ngram in range(2, self.ngram_size + 1):
             start_idx = (ngram - 2) * self.heads_per_ngram
@@ -1367,7 +1389,7 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
             ngram_ids = torch.remainder(mixed_ids.unsqueeze(-1), head_vocab_sizes.view(1, 1, -1))
             blocks.append(ngram_ids + head_offsets.view(1, 1, -1))
 
-        ngram_ids = torch.cat(blocks, dim=-1)[:, -input_ids.shape[1] :]
+        ngram_ids = torch.cat(blocks, dim=-1)
         original_shape = ngram_ids.shape
         flat_ids = ngram_ids.reshape(-1)
         shard_ids = torch.div(flat_ids, self.rows_per_checkpoint_shard, rounding_mode="floor")
@@ -1380,7 +1402,7 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen4ExpTextPLELayer
-# Methods patched: forward
+# Methods patched: _short_conv, forward
 # ======================================================================
 
 
@@ -1417,39 +1439,50 @@ class Qwen4ExpTextPLELayer(nn.Module):
             bias=False,
         )
 
-    def _short_conv(self, hidden_states: torch.Tensor, past_key_values: Cache | None) -> torch.Tensor:
-        seq_len = hidden_states.shape[1]
-        hidden_states = hidden_states.transpose(1, 2)
-
-        if past_key_values is not None:
-            hidden_states = past_key_values.update_conv_state(
-                hidden_states, self.layer_idx, state_idx=1, conv_kernel_size=self.short_conv_state_len
-            )
-
-        # We always pad and slice due to the dilation in the conv, to make sure we have enough states
-        hidden_states = F.pad(hidden_states, (self.short_conv_state_len, 0))
-        hidden_states = hidden_states[..., -(self.short_conv_state_len + seq_len) :]
-
-        # We cannot use the usual functions/kernels here for the short conv as the conv1d has dilation
-        hidden_states = F.silu(self.conv1d(hidden_states))
-
-        hidden_states = hidden_states.transpose(1, 2)
-        return hidden_states
-
     # ================================================================
-    # Patch: Qwen4ExpTextPLELayer.forward
-    # 1. Keep FP32 PLE master weights while casting sparse lookup results to the
+    # Patch: Qwen4ExpTextPLELayer._short_conv / forward
+    # 1. Require explicit packed boundaries and reset the dilated convolution for
+    #    every segment, including single-segment varlen batches.
+    # 2. Keep FP32 PLE master weights while casting sparse lookup results to the
     #    activation dtype before the result all-to-all and downstream projections.
+    # 3. Reject recurrent cache state; this modeling is training-only.
     # ================================================================
+    def _short_conv(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_values: Cache | None,
+        cu_seq_lens_q: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if cu_seq_lens_q is None:
+            raise ValueError("Qwen4-Exp PLE convolution requires cu_seq_lens_q for VeOmni varlen training.")
+        packed_seq_lens = _qwen4_exp_validate_packed_seq_lens(
+            cu_seq_lens_q.diff().tolist(), hidden_states.shape[0], hidden_states.shape[1]
+        )
+        # --- Patch.1 / Patch.3 ---
+        if past_key_values is not None:
+            raise ValueError("Qwen4-Exp varlen PLE convolution does not support cache state.")
+        outputs = []
+        for segment in hidden_states.split(packed_seq_lens, dim=1):
+            conv_input = F.pad(segment.transpose(1, 2), (self.short_conv_state_len, 0))
+            outputs.append(F.silu(self.conv1d(conv_input)).transpose(1, 2))
+        return torch.cat(outputs, dim=1)
+        # --- Patch.1 / Patch.3 ---
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         past_key_values: Cache | None,
         conv_mask: torch.Tensor | None = None,
+        cu_seq_lens_q: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # --- Patch.1 ---
-        embeddings = self.ple_embedding(input_ids, past_key_values, output_dtype=hidden_states.dtype)
+        embeddings = self.ple_embedding(
+            input_ids,
+            past_key_values,
+            output_dtype=hidden_states.dtype,
+            cu_seq_lens_q=cu_seq_lens_q,
+        )
         # --- Patch.1 ---
         key_normed = self.norm_key(self.key_proj(embeddings)).unflatten(-1, (self.hc_count, self.hidden_size))
         value = self.value_proj(embeddings)
@@ -1462,8 +1495,18 @@ class Qwen4ExpTextPLELayer(nn.Module):
         if conv_mask is not None:
             gated_value = apply_mask_to_padding_states(gated_value, conv_mask)
             gated_value_normed = apply_mask_to_padding_states(gated_value_normed, conv_mask)
-        output = gated_value + self._short_conv(gated_value_normed, past_key_values)
+        output = gated_value + self._short_conv(
+            gated_value_normed,
+            past_key_values,
+            cu_seq_lens_q=cu_seq_lens_q,
+        )
         return output
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen4ExpTextDecoderLayer
+# Methods patched: forward
+# ======================================================================
 
 
 class Qwen4ExpTextDecoderLayer(GradientCheckpointingLayer):
@@ -1481,6 +1524,10 @@ class Qwen4ExpTextDecoderLayer(GradientCheckpointingLayer):
         self.attn_hyper_connection = Qwen4ExpTextGatedResidual(config)
         self.mlp_hyper_connection = Qwen4ExpTextGatedResidual(config)
 
+    # ================================================================
+    # Patch: Qwen4ExpTextDecoderLayer.forward
+    # 1. Thread the collator's packed boundaries into both stateful token mixers.
+    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1491,15 +1538,25 @@ class Qwen4ExpTextDecoderLayer(GradientCheckpointingLayer):
         ple_input_ids: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.FloatTensor:
+        cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
         if self.ple is not None:
             hidden_states = hidden_states + self.ple(
-                hidden_states, ple_input_ids, past_key_values, conv_mask=conv_mask
+                hidden_states,
+                ple_input_ids,
+                past_key_values,
+                conv_mask=conv_mask,
+                cu_seq_lens_q=cu_seq_lens_q,
             )
 
         hidden_states, hyper_input, injection_weights = self.attn_hyper_connection(hidden_states)
         if self.layer_type == "linear_attention":
+            linear_attn_cu_seq_lens_q = kwargs.pop("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
             hidden_states = self.linear_attn(
-                hidden_states, cache_params=past_key_values, attention_mask=conv_mask, **kwargs
+                hidden_states,
+                cache_params=past_key_values,
+                attention_mask=conv_mask,
+                linear_attn_cu_seq_lens_q=linear_attn_cu_seq_lens_q,
+                **kwargs,
             )
         else:
             hidden_states, _ = self.self_attn(
@@ -1515,10 +1572,8 @@ class Qwen4ExpTextDecoderLayer(GradientCheckpointingLayer):
 
         hidden_states, hyper_input, injection_weights = self.mlp_hyper_connection(hidden_states)
         hidden_states = self.mlp(hidden_states)
-
         injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
-        hidden_states = hyper_input + injection.flatten(-2)
-        return hidden_states
+        return hyper_input + injection.flatten(-2)
 
 
 @auto_docstring
@@ -2575,6 +2630,9 @@ class Qwen4ExpModel(Qwen4ExpPreTrainedModel):
     # 3. Touch missing vision modalities on FSDP ranks.
     # 4. Reject SP until PLE context and QSA global-index semantics are implemented.
     # 5. Accept VeOmni's batch-first precomputed M-RoPE layout.
+    # 6. Infer varlen boundaries from position_ids when absent, reject cache paths,
+    #    and prepend scalar text positions so three-axis M-RoPE produces a packed
+    #    causal mask inside Qwen4ExpTextModel.
     # ================================================================
     @auto_docstring
     @can_return_tuple
@@ -2611,6 +2669,10 @@ class Qwen4ExpModel(Qwen4ExpPreTrainedModel):
         position_ids_layout = kwargs.pop("qwen4_exp_position_ids_layout", None)
         if position_ids_layout not in (None, "batch_first"):
             raise ValueError(f"Unsupported Qwen4-Exp position_ids layout: {position_ids_layout!r}")
+        if position_ids is None:
+            raise ValueError("Qwen4-Exp VeOmni training requires precomputed position_ids.")
+        if past_key_values is not None:
+            raise ValueError("Qwen4-Exp VeOmni varlen training does not support cache state.")
         if image_mask is None or video_mask is None:
             fallback_image_mask, fallback_video_mask = self.get_placeholder_mask(input_ids, inputs_embeds)
             image_mask = fallback_image_mask.squeeze(-1) if image_mask is None else image_mask
@@ -2664,21 +2726,8 @@ class Qwen4ExpModel(Qwen4ExpPreTrainedModel):
             inputs_embeds = inputs_embeds + fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             # --- Patch.3 ---
 
-        if position_ids is None:
-            tensor_attention_mask = (
-                attention_mask.get("full_attention") if isinstance(attention_mask, dict) else attention_mask
-            )
-            position_ids = self.compute_3d_position_ids(
-                input_ids=input_ids,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                inputs_embeds=inputs_embeds,
-                attention_mask=tensor_attention_mask,
-                past_key_values=past_key_values,
-                mm_token_type_ids=mm_token_type_ids,
-            )
         # --- Patch.5 ---
-        elif position_ids_layout == "batch_first":
+        if position_ids_layout == "batch_first":
             if (
                 position_ids.ndim != 3
                 or position_ids.shape[0] != inputs_embeds.shape[0]
@@ -2690,10 +2739,30 @@ class Qwen4ExpModel(Qwen4ExpPreTrainedModel):
             position_ids = position_ids.transpose(0, 1).contiguous()
         # --- Patch.5 ---
 
+        # --- Patch.6 ---
+        cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
+        if cu_seq_lens_q is None:
+            cu_seq_lens_q = pos2culen(position_ids[0])
+            kwargs["cu_seq_lens_q"] = cu_seq_lens_q
+        kwargs.setdefault("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
+        _qwen4_exp_validate_packed_seq_lens(
+            cu_seq_lens_q.diff().tolist(), inputs_embeds.shape[0], inputs_embeds.shape[1]
+        )
+        if position_ids.shape[0] == 3:
+            text_position_ids = culen2pos(cu_seq_lens_q)
+            text_position_ids = text_position_ids.to(device=position_ids.device, dtype=position_ids.dtype)
+            if tuple(text_position_ids.shape) != tuple(position_ids.shape[1:]):
+                raise ValueError(
+                    "Qwen4-Exp text position ids must have shape (batch, sequence) matching the M-RoPE positions; "
+                    f"got {tuple(text_position_ids.shape)} and {tuple(position_ids.shape[1:])}."
+                )
+            position_ids = torch.cat((text_position_ids.unsqueeze(0), position_ids), dim=0)
+
+        # --- Patch.6 ---
         outputs = self.language_model(
             input_ids=None,
             position_ids=position_ids,
-            attention_mask=attention_mask,
+            attention_mask=None,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             ple_input_ids=ple_input_ids,
