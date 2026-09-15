@@ -58,7 +58,6 @@ _DEEPSEEK_V4_TILELANG_TRAINING_ARGS = [
 
 _QWEN4_EXP_CONFIG = "./tests/toy_config/qwen4_exp_toy/config.json"
 _ACCELERATOR = get_torch_device()
-_QWEN4_EXP_GDN_IMPL = "npu" if IS_NPU_AVAILABLE else "fla"
 _QWEN4_EXP_TRAINING_ARGS = [
     "--model.ops_implementation.attn_implementation=eager",
     "--model.ops_implementation.cross_entropy_loss_implementation=eager",
@@ -67,14 +66,15 @@ _QWEN4_EXP_TRAINING_ARGS = [
     "--model.ops_implementation.rotary_pos_emb_implementation=eager",
     "--model.ops_implementation.rotary_pos_emb_vision_implementation=eager",
     "--model.ops_implementation.load_balancing_loss_implementation=eager",
-    f"--model.ops_implementation.rms_norm_gated_implementation={_QWEN4_EXP_GDN_IMPL}",
-    f"--model.ops_implementation.causal_conv1d_implementation={_QWEN4_EXP_GDN_IMPL}",
-    f"--model.ops_implementation.chunk_gated_delta_rule_implementation={_QWEN4_EXP_GDN_IMPL}",
+    "--model.ops_implementation.rms_norm_gated_implementation=eager",
+    "--model.ops_implementation.causal_conv1d_implementation=eager",
+    "--model.ops_implementation.chunk_gated_delta_rule_implementation=eager",
     "--model.accelerator.extra_parallel_names=ple",
     "--model.accelerator.extra_parallel_sizes=2",
     "--model.accelerator.extra_parallel_placement_innermost=false",
     "--model.broadcast_model_weights_from_rank0=false",
     "--model.ep_sharded_stream_load=true",
+    "--train.enable_batch_invariant_mode=False",
 ]
 
 
