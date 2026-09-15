@@ -18,17 +18,17 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
    - Manual edits are silently overwritten on the next patchgen run.
    - To change generated behavior, edit the patch spec (`patch_spec.py`) or the modeling patch file (`modeling_*_patch.py`).
 
-4. **Transformers version: pinned to v5.9.0**
-   - VeOmni installs `transformers==5.9.0` via the `transformers-stable`
+4. **Transformers version: pinned to v5.16.1**
+   - VeOmni installs `transformers==5.16.1` via the `transformers-stable`
      default dependency group in `pyproject.toml`.
    - The legacy v4 path was removed; all modeling under
      `veomni/models/transformers/<m>/` is patchgen-generated.
    - `is_transformers_version_greater_or_equal_to()` from
      `veomni/utils/import_utils.py` is retained only for forward-looking
      gates (for HF APIs newer than the current pin) — do **not** add new
-     version gates for versions `<= 5.9.0` (the legacy `>= 5.0.0` …
-     `>= 5.8.x` interval is dead code).
-   - Patchgen regeneration must be done with `transformers==5.9.0` installed.
+     version gates for versions `<= 5.16.1` (the legacy `>= 5.0.0` …
+     `>= 5.15.x` interval is dead code).
+   - Patchgen regeneration must be done with `transformers==5.16.1` installed.
 
 ## Distributed Training
 
@@ -160,11 +160,22 @@ Core files:
 16. **DCP checkpoint keys must match model state dict**
     - `veomni/checkpoint/dcp_checkpointer.py` uses PyTorch's DCP (`torch.distributed.checkpoint`).
     - Renaming model parameters or changing the model structure between save and load breaks checkpoint loading.
-    - Extra state is saved per-rank via `_EXTRA_STATE_FORMAT` — changing rank count requires checkpoint resharding.
 
 17. **Checkpoint save/load requires all ranks to participate**
     - DCP operations are collective — all ranks must call save/load simultaneously.
     - Calling checkpoint operations from only rank 0 causes deadlocks.
+    - ``lr_scheduler.pt`` is replicated: rank 0 writes the file, but every rank
+      still joins the save reduction and the promotion collectives. The sidecar
+      is written before ``dcp.save`` / ``dcp.async_save``, so DCP's ``.metadata``
+      (the resume completeness marker) lands last. Each step writes a new
+      ``global_step_{N}/``; a failed save has no ``.metadata`` and is skipped.
+      A resume that expects a scheduler and finds no ``lr_scheduler.pt`` falls
+      back to ``extra_state/`` via ``veomni/checkpoint/legacy_v0_1_12.py``
+      (VeOmni 0.1.12). Delete that module and its two imports to drop the
+      fallback; the load then raises.
+    - ``trainer_state_rank_{R}.pt`` stays per-rank: the dataloader cursor and RNG
+      are rank-local. Changing world size still requires a matching cursor file
+      per rank. On-disk layout: ``docs/usage/checkpoint.md``.
 
 18. **Distributed HF safetensors consolidation must support non-floating tensors**
     - PyTorch 2.9–2.11 computes consolidated tensor byte sizes with `torch.finfo`, which crashes for valid integer and boolean buffers such as DeepSeek V4 `tid2eid`.
@@ -208,7 +219,7 @@ Core files:
 
 26. **DCP full resume skips HF weight materialization**
     - When `train.checkpoint.load_path` is set and the run is not LoRA/PEFT, `BaseTrainer` / omni train pass `should_skip_hf_weight_load=True` into `build_parallelize_model`, which forwards it to `parallelize_model_fsdp2` / `parallelize_model_ddp`.
-    - The model is materialized without an HF weight read; parameters are restored by DCP in `CheckpointerCallback.on_train_begin`.
+    - The model is materialized without an HF weight read; parameters are restored by DCP in `CheckpointCallback.on_train_begin`.
     - Materialize through `_to_empty_preserving_nonpersistent_buffers()`, never bare `to_empty()`, on the random-init path as much as the resume path. `init_empty_weights()` patches `register_parameter` only, so a meta-built model holds *real* buffer values and `to_empty()` swaps every one for uninitialized memory. What restores them is narrower than it looks: DCP saves `state_dict()`, which omits `persistent=False`, and HF's `_init_weights` recomputes a rope table only for a module exposing `original_inv_freq` — which leaves Gemma3's per-layer-type `{type}_inv_freq`, its `embed_scale` and the Omni audio tower's sinusoidal `positional_embedding` with nothing behind them. A buffer built from a parameter is itself on meta, has no data to copy out of, and is skipped with a warning; no model registers one today. Note `veomni/models/module_utils.py` has the same unguarded pattern on the HF-load path.
     - LoRA/PEFT must not set `should_skip_hf_weight_load` (and `_materialize_and_load_weights()` raises if both are set): LoRA DCP is trainable-only and still needs the HF base from `model.model_path`.
     - After DCP load, `empty_cache()` is called to reduce first-step NCCL OOM risk from allocator fragmentation on near-OOM MoE jobs.

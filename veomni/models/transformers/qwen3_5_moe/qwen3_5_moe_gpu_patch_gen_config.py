@@ -58,7 +58,6 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
-    qwen3_5_text_model_update_linear_attn_mask,
     qwen3_5_vision_attention_forward_patched,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
@@ -103,31 +102,15 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "MoeCausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
-config.drop_import_names(
-    "FusedRMSNormGated",
-    "causal_conv1d_fn",
-    "causal_conv1d_update",
-    "chunk_gated_delta_rule",
-    "fused_recurrent_gated_delta_rule",
-)
-config.add_post_import_block(
-    """
-    # Selection of FusedRMSNormGated / causal_conv1d / chunk_gated_delta_rule
-    # has moved into OpSlot guards below (driven by OpsImplementationConfig).
-    # These None placeholders preserve two pieces of the original module:
-    #   (1) the upstream HF top-level
-    #       `is_fast_path_available = all((causal_conv1d_fn, ...))` resolves
-    #       to False, keeping the legacy warning behaviour; and
-    #   (2) the decode-only `*_update` / `fused_recurrent_*` aliases satisfy
-    #       the `<fla_name> or <torch_fallback>` assignments in __init__
-    #       (the precomputed-state path raises NotImplementedError anyway).
-    FusedRMSNormGated = None
-    causal_conv1d_fn = None
-    causal_conv1d_update = None
-    chunk_gated_delta_rule = None
-    fused_recurrent_gated_delta_rule = None
-    """
-)
+# transformers 5.16 removed the conditional FLA / causal-conv1d imports,
+# `FusedRMSNormGated` and `is_fast_path_available`; `causal_conv1d_fn` /
+# `causal_conv1d_update` / `torch_chunk_gated_delta_rule` /
+# `torch_recurrent_gated_delta_rule` are now module-level torch implementations
+# carrying `@use_kernel_func_from_hub_with_fallback(...)`. The previous
+# `drop_import_names` call and `<name> = None` placeholders therefore have
+# nothing left to neutralise and would collide with those definitions. VeOmni's
+# kernel selection still runs through the OpSlot guards declared below (shared
+# with the qwen3_5 config via `qwen3_5_gated_deltanet_init_patched`).
 config.add_post_import_block(
     """
     # ── OpSlot declarations ──────────────────────────────────────────────────
@@ -779,11 +762,10 @@ config.override_method(
     description="Support varlen flash linear attention and Ulysses SP in Qwen3_5MoeGatedDeltaNet.forward",
 )
 
-config.override_method(
-    "Qwen3_5MoeTextModel._update_linear_attn_mask",
-    replacement=qwen3_5_text_model_update_linear_attn_mask,
-    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
-)
+# NOTE: `Qwen3_5MoeTextModel._update_linear_attn_mask` was removed in
+# transformers 5.16 — `Qwen3_5MoeTextModel.forward` now builds a per-attention-
+# type mask mapping via `create_causal_mask` / `create_recurrent_attention_mask`.
+# See the matching note in qwen3_5_gpu_patch_gen_config.py.
 
 
 # ── DecoderLayer forward ────────────────────────────────────────────────────────
@@ -816,7 +798,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
     linear_attn_cu_seq_lens_q = kwargs.pop("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
 
     # Token Mixer
-    if self.layer_type == "linear_attention":
+    if self.block_type == "linear_attention":
         # Modification: pass linear-attention cu_seqlens through to Qwen3_5MoeGatedDeltaNet.forward.
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
@@ -825,7 +807,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
             attention_mask=attention_mask,
             cu_seq_lens_q=linear_attn_cu_seq_lens_q,
         )
-    elif self.layer_type == "full_attention":
+    elif self.block_type == "full_attention":
         # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
@@ -1006,6 +988,11 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> Qwen3_5MoeCausalLMOutputWithLogProbs:
+    r"""
+    cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+        Indices depicting the position of the input sequence tokens in the sequence. Retained in the
+        signature for callers that pass it positionally; transformers 5.16 moved it into `**kwargs`.
+    """
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,

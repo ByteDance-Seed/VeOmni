@@ -35,6 +35,23 @@ Phase 5: Test and document             -> pending
 
 4. **Identify required patches**: VeOmni uses a patchgen system (`veomni/patchgen/`) to generate model patches from the HuggingFace modeling. Check whether a sibling model already has a config you can extend via `name_map` — that is usually the difference between a 60-line config and a 1000-line one.
 
+5. **Compare checkpoint keys** against the supported upstream version and any
+   existing VeOmni model. Apply the decision rule below before resolving a mismatch.
+
+### Checkpoint key conflicts require a user decision
+
+When upstream model, VeOmni model, or checkpoint parameter keys disagree, show
+the concrete old/new keys and explain the impact on weight loading, export,
+and optimizer/DCP resume. Ask the user how to resolve the conflict before
+implementing a rename, alias, or compatibility mapping. Do not silently retain
+an obsolete model hierarchy just to preserve checkpoint keys.
+
+If the user has already chosen a resolution in the current task, apply it
+without asking again. When that choice is to follow current upstream keys,
+keep those keys in the model and handle approved legacy-key conversion in the
+checkpoint layer. Verify the chosen direction with strict loading and
+checkpoint round-trip tests; do not hide mismatches with `strict=False`.
+
 ## Phase 2: Modeling — hand off to `/veomni-patchgen-model`
 
 1. **Create the model directory**: `veomni/models/transformers/<model_name>/`.
