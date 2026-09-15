@@ -1,3 +1,5 @@
+"""FlashMLA forward and cuDNN backward adapter contract tests for GLM DSA."""
+
 from types import SimpleNamespace
 
 import pytest
@@ -127,44 +129,27 @@ def test_flash_mla_sparse_forward_returns_lse(monkeypatch, dsa):
     assert torch.equal(result["lse"], expected_lse)
 
 
-def test_flash_mla_sparse_forward_compatibility_rejects_unaligned_topk(dsa):
-    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
+@pytest.mark.parametrize(
+    ("rope_dim", "topk", "with_sink", "expected_reason"),
+    (
+        (64, 64, False, "multiple of 128"),
+        (32, 128, False, "packed q/k dim 576"),
+        (64, 128, True, "learnable_sink"),
+    ),
+    ids=("unaligned-topk", "unsupported-packed-dim", "learnable-sink"),
+)
+def test_flash_mla_sparse_forward_compatibility_rejections(dsa, rope_dim, topk, with_sink, expected_reason):
+    q_pe = torch.empty(1, 2, 128, rope_dim, dtype=torch.bfloat16)
+    k_pe = torch.empty(1, 4, 1, rope_dim, dtype=torch.bfloat16)
     kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
     q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 64, dtype=torch.int32)
-
-    compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(q_pe, k_pe, kv_cache, q_nope, gather)
-
-    assert not compatible
-    assert "multiple of 128" in reason
-
-
-def test_flash_mla_sparse_forward_compatibility_rejects_unsupported_packed_dim(dsa):
-    q_pe = torch.empty(1, 2, 128, 32, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 32, dtype=torch.bfloat16)
-    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
-    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
-
-    compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(q_pe, k_pe, kv_cache, q_nope, gather)
-
-    assert not compatible
-    assert "packed q/k dim 576" in reason
-
-
-def test_flash_mla_sparse_forward_compatibility_rejects_sink(dsa):
-    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
-    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
-    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
-    sink = torch.zeros(128, dtype=torch.bfloat16)
+    gather = torch.zeros(1, 2, topk, dtype=torch.int32)
+    sink = torch.zeros(128, dtype=torch.bfloat16) if with_sink else None
 
     compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(q_pe, k_pe, kv_cache, q_nope, gather, sink)
 
     assert not compatible
-    assert "learnable_sink" in reason
+    assert expected_reason in reason
 
 
 def test_pack_flash_mla_tensors_for_sparse_backward(dsa):
@@ -241,33 +226,18 @@ def test_flash_mla_sparse_attention_with_cudnn_backward_splits_gradients(monkeyp
     assert torch.equal(k_pe.grad, torch.full_like(k_pe, 4.0))
 
 
-def test_sparse_attention_backward_compatibility_rejects_expanded_kv_layout(dsa):
+@pytest.mark.parametrize(
+    ("kv_shape", "value_dim", "expected_reason"),
+    (
+        ((2, 4, 7, 5), 5, "unified K=V"),
+        ((2, 7, 5), 6, "value dim"),
+    ),
+    ids=("expanded-kv", "split-value-dim"),
+)
+def test_sparse_attention_backward_compatibility_rejections(dsa, kv_shape, value_dim, expected_reason):
     q = torch.empty(2, 3, 4, 5, dtype=torch.bfloat16)
-    expanded_key = torch.empty(2, 4, 7, 5, dtype=torch.bfloat16)
-    out = torch.empty(2, 3, 4, 5, dtype=torch.bfloat16)
-    dout = torch.empty_like(out)
-    lse = torch.empty(2, 3, 4, dtype=torch.float32)
-    attn_sink = torch.empty(4, dtype=torch.float32)
-    topk_indices = torch.zeros(2, 3, 2, dtype=torch.long)
-
-    compatible, reason = dsa.check_sparse_attention_backward_compatible(
-        q,
-        expanded_key,
-        out,
-        dout,
-        lse,
-        attn_sink,
-        topk_indices,
-    )
-
-    assert not compatible
-    assert "unified K=V" in reason
-
-
-def test_sparse_attention_backward_compatibility_rejects_split_value_dim(dsa):
-    q = torch.empty(2, 3, 4, 5, dtype=torch.bfloat16)
-    kv = torch.empty(2, 7, 5, dtype=torch.bfloat16)
-    out = torch.empty(2, 3, 4, 6, dtype=torch.bfloat16)
+    kv = torch.empty(kv_shape, dtype=torch.bfloat16)
+    out = torch.empty(2, 3, 4, value_dim, dtype=torch.bfloat16)
     dout = torch.empty_like(out)
     lse = torch.empty(2, 3, 4, dtype=torch.float32)
     attn_sink = torch.empty(4, dtype=torch.float32)
@@ -284,4 +254,4 @@ def test_sparse_attention_backward_compatibility_rejects_split_value_dim(dsa):
     )
 
     assert not compatible
-    assert "value dim" in reason
+    assert expected_reason in reason

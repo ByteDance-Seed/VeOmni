@@ -12,16 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Stable grouping and inverse-permutation tests for expert scatter indices.
-
-The Triton and Quack MoE paths require tokens to be grouped by expert while
-preserving source order within each expert. ``scatter_index`` is the inverse
-of that stable grouping permutation. An independent double-``argsort`` oracle
-checks the exact mapping in addition to the structural invariants.
-
-All checks run on CPU: the helper is device-agnostic (composes ``argsort`` +
-``arange`` + scatter) and the semantic parity is what matters downstream.
-"""
+"""Expert scatter-index parity, inverse-permutation, and stability tests."""
 
 import pytest
 import torch
@@ -49,15 +40,22 @@ def test_scatter_index_matches_argsort_argsort(num_tokens, num_experts, topk):
     torch.manual_seed(0xC0FFEE)
     expert_index = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int64)
 
-    _, scatter_index = compute_expert_scatter_index(expert_index)
+    sorted_order, scatter_index = compute_expert_scatter_index(expert_index)
     reference = _reference_scatter_index(expert_index)
 
+    assert sorted_order.shape == (num_tokens * topk,)
+    assert sorted_order.dtype == torch.int64
+    assert sorted_order.device == expert_index.device
     assert scatter_index.shape == expert_index.shape
     assert scatter_index.dtype == torch.int32
+    assert scatter_index.device == expert_index.device
     assert torch.equal(scatter_index, reference), (
         f"scatter_index mismatch for shape ({num_tokens}, {topk}), "
         f"num_experts={num_experts}. got={scatter_index}, ref={reference}"
     )
+    flat_scatter = scatter_index.flatten().to(torch.int64)
+    expected_order = torch.arange(sorted_order.numel(), device=expert_index.device)
+    assert torch.equal(sorted_order[flat_scatter], expected_order)
 
 
 def test_sorted_order_is_stable_and_experts_are_contiguous():
@@ -77,23 +75,3 @@ def test_sorted_order_is_stable_and_experts_are_contiguous():
         assert torch.all(positions[1:] > positions[:-1]), (
             f"stability violated for expert {expert.item()}: {positions.tolist()}"
         )
-
-
-def test_scatter_index_dtype_and_device_preserved():
-    expert_index = torch.tensor([[0, 3, 2], [1, 0, 2]], dtype=torch.int64)
-    sorted_order, scatter_index = compute_expert_scatter_index(expert_index)
-
-    assert sorted_order.dtype == torch.int64
-    assert scatter_index.dtype == torch.int32
-    assert scatter_index.device == expert_index.device
-
-
-def test_scatter_index_inverts_sorted_order():
-    torch.manual_seed(42)
-    expert_index = torch.randint(0, 8, (33, 3), dtype=torch.int64)
-
-    sorted_order, scatter_index = compute_expert_scatter_index(expert_index)
-    count = sorted_order.numel()
-    flat_scatter = scatter_index.flatten().to(torch.int64)
-
-    assert torch.equal(sorted_order[flat_scatter], torch.arange(count, dtype=torch.int64))

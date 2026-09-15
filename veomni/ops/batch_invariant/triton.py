@@ -263,7 +263,6 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
     Args:
         input: Input tensor
         dim: Dimension along which to compute log_softmax (only -1 or last dim supported)
-    >> Stashed changes
     Returns:
         Tensor with log_softmax applied along the specified dimension
     """

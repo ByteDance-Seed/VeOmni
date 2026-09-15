@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Public mask APIs. Implementation lives under ``kernels/attention/mask``."""
+"""Public attention-mask builders and mask value types."""
 
 from .kernels.attention.mask import (
     MagiAttentionMask,

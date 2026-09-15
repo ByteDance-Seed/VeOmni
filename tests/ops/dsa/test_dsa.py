@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""DSA registry, eager vs HuggingFace, then TileLang vs that eager."""
+"""DSA adapter contracts, eager/reference parity, and fused-backend parity."""
 
 from __future__ import annotations
 
@@ -39,7 +39,12 @@ from tests.ops.tol import (
     EAGER_GRAD_RTOL,
     EAGER_RTOL,
 )
-from tests.ops.utils import cosine_similarity, is_nvidia_cuda_available, make_grad_leaves
+from tests.ops.utils import (
+    assert_gradient_direction_and_scale,
+    cosine_similarity,
+    is_nvidia_cuda_available,
+    make_grad_leaves,
+)
 from veomni.ops import resolve_op
 from veomni.ops.kernels.dsa.attention.deepseek_v4 import tilelang as deepseek_v4_fused_attention
 from veomni.ops.kernels.dsa.attention.glm import flashmla_cudnn as glm_fused_attention
@@ -378,16 +383,21 @@ def test_dsa_indexer_deepseek_v4_eager_matches_hf():
     q_sbhd = torch.randn(seq_len, batch, heads, dim)
     k_tbd = torch.randn(seq_len // compress, batch, dim)
     weights = torch.randn(seq_len, batch, heads) * 0.01
-    q_bshd = q_sbhd.permute(1, 0, 2, 3).contiguous()
-    compressed_kv = k_tbd.transpose(0, 1).contiguous()
-    weights_bsh = weights.permute(1, 0, 2).contiguous()
     softmax_scale = dim**-0.5
 
-    hf_scores, hf_indices = _hf_dsv4_indexer_scores(q_bshd, compressed_kv, weights_bsh, compress, topk)
+    q_h, k_h, weights_h = make_grad_leaves(q_sbhd, k_tbd, weights)
+    hf_scores, hf_indices = _hf_dsv4_indexer_scores(
+        q_h.permute(1, 0, 2, 3).contiguous(),
+        k_h.transpose(0, 1).contiguous(),
+        weights_h.permute(1, 0, 2).contiguous(),
+        compress,
+        topk,
+    )
+    q_e, k_e, weights_e = make_grad_leaves(q_sbhd, k_tbd, weights)
     ours_scores, ours_indices = resolve_op("dsa_indexer", "deepseek_v4", "eager").wrapper(
-        q_sbhd,
-        k_tbd,
-        weights * softmax_scale,
+        q_e,
+        k_e,
+        weights_e * softmax_scale,
         compress,
         topk,
     )
@@ -397,6 +407,18 @@ def test_dsa_indexer_deepseek_v4_eager_matches_hf():
     hf_topk_scores = torch.gather(hf_scores, dim=-1, index=safe)
     hf_topk_scores = torch.where(valid, hf_topk_scores, float("-inf"))
     torch.testing.assert_close(ours_scores, hf_topk_scores, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    grad_output = torch.randn_like(ours_scores).masked_fill(~valid, 0)
+    hf_grads = torch.autograd.grad(
+        (hf_topk_scores.masked_fill(~valid, 0) * grad_output).sum(),
+        (q_h, k_h, weights_h),
+    )
+    eager_grads = torch.autograd.grad(
+        (ours_scores.masked_fill(~valid, 0) * grad_output).sum(),
+        (q_e, k_e, weights_e),
+    )
+    for actual, expected in zip(eager_grads, hf_grads, strict=True):
+        torch.testing.assert_close(actual, expected, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
 @pytest.mark.parametrize("packed", (False, True))
@@ -459,9 +481,10 @@ def test_dsa_attention_glm_eager_matches_hf_mask_path():
     kv_cache = torch.randn(batch, kv_len, 1, d_nope)
     indices = torch.randint(kv_len, (batch, seq_len, topk), dtype=torch.int32)
     scale = 0.1
-    query = torch.cat((q_nope, q_pe), dim=-1)
-    key = torch.cat((kv_cache.squeeze(2), k_pe.squeeze(2)), dim=-1)
-    value = kv_cache.squeeze(2)
+    q_pe_h, k_pe_h, kv_h, q_nope_h = make_grad_leaves(q_pe, k_pe, kv_cache, q_nope)
+    query = torch.cat((q_nope_h, q_pe_h), dim=-1)
+    key = torch.cat((kv_h.squeeze(2), k_pe_h.squeeze(2)), dim=-1)
+    value = kv_h.squeeze(2)
     # Official GlmMoeDsaAttention.forward: fill -inf, scatter 0 at top-k.
     index_mask = torch.full((batch, seq_len, kv_len), float("-inf"), dtype=query.dtype)
     index_mask.scatter_(-1, indices.long(), 0.0)
@@ -473,10 +496,17 @@ def test_dsa_attention_glm_eager_matches_hf_mask_path():
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_h.dtype)
     hf_out = torch.matmul(attn_weights, value_h).transpose(1, 2).contiguous()
 
+    q_pe_e, k_pe_e, kv_e, q_nope_e = make_grad_leaves(q_pe, k_pe, kv_cache, q_nope)
     ours = resolve_op("dsa_attention", "glm", "eager").wrapper(
-        q_pe, k_pe, kv_cache, q_nope, indices, softmax_scale=scale
+        q_pe_e, k_pe_e, kv_e, q_nope_e, indices, softmax_scale=scale
     )
-    assert torch.allclose(ours, hf_out, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    torch.testing.assert_close(ours, hf_out, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    grad_output = torch.randn_like(ours)
+    hf_grads = torch.autograd.grad(hf_out, (q_pe_h, k_pe_h, kv_h, q_nope_h), grad_outputs=grad_output)
+    eager_grads = torch.autograd.grad(ours, (q_pe_e, k_pe_e, kv_e, q_nope_e), grad_outputs=grad_output)
+    for actual, expected in zip(eager_grads, hf_grads, strict=True):
+        torch.testing.assert_close(actual, expected, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
 @pytest.mark.skipif(
@@ -613,9 +643,10 @@ def test_dsa_attention_glm_eager_matches_official_hf_causal_plus_scatter():
     indices = torch.randint(seq_len, (batch, seq_len, topk), dtype=torch.int32)
     indices[..., 0] = 0
     scale = 0.1
-    query = torch.cat((q_nope, q_pe), dim=-1)
-    key = torch.cat((kv_cache.squeeze(2), k_pe.squeeze(2)), dim=-1)
-    value = kv_cache.squeeze(2)
+    q_pe_h, k_pe_h, kv_h, q_nope_h = make_grad_leaves(q_pe, k_pe, kv_cache, q_nope)
+    query = torch.cat((q_nope_h, q_pe_h), dim=-1)
+    key = torch.cat((kv_h.squeeze(2), k_pe_h.squeeze(2)), dim=-1)
+    value = kv_h.squeeze(2)
     index_mask = torch.full((batch, seq_len, seq_len), float("-inf"), dtype=query.dtype)
     index_mask.scatter_(-1, indices.long(), 0.0)
     combined = index_mask.unsqueeze(1) + causal[..., :seq_len]
@@ -626,16 +657,23 @@ def test_dsa_attention_glm_eager_matches_official_hf_causal_plus_scatter():
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_h.dtype)
     hf_out = torch.matmul(attn_weights, value_h).transpose(1, 2).contiguous()
 
+    q_pe_e, k_pe_e, kv_e, q_nope_e = make_grad_leaves(q_pe, k_pe, kv_cache, q_nope)
     ours = resolve_op("dsa_attention", "glm", "eager").wrapper(
-        q_pe,
-        k_pe,
-        kv_cache,
-        q_nope,
+        q_pe_e,
+        k_pe_e,
+        kv_e,
+        q_nope_e,
         indices,
         softmax_scale=scale,
         attention_mask=causal,
     )
     torch.testing.assert_close(ours, hf_out, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    grad_output = torch.randn_like(ours)
+    hf_grads = torch.autograd.grad(hf_out, (q_pe_h, k_pe_h, kv_h, q_nope_h), grad_outputs=grad_output)
+    eager_grads = torch.autograd.grad(ours, (q_pe_e, k_pe_e, kv_e, q_nope_e), grad_outputs=grad_output)
+    for actual, expected in zip(eager_grads, hf_grads, strict=True):
+        torch.testing.assert_close(actual, expected, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
 @pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="DeepSeek V4 TileLang requires SM90+ NVIDIA CUDA")
@@ -662,7 +700,7 @@ def test_dsa_attention_tilelang_matches_eager():
     actual.backward(grad)
     for actual_grad, expected_grad in zip((q_t.grad, kv_t.grad, sink_t.grad), (q_e.grad, kv_e.grad, sink_e.grad)):
         assert actual_grad is not None and expected_grad is not None
-        assert cosine_similarity(actual_grad, expected_grad) > 0.95
+        assert_gradient_direction_and_scale(actual_grad, expected_grad, min_cosine=0.95, norm_rtol=0.25)
     # dAttnSink is accumulated by an atomic under a replicated T.Parallel loop, so a
     # lost replication guard would scale it by the warp count -- which cosine, being
     # scale-invariant, cannot see.
@@ -692,4 +730,4 @@ def test_dsa_indexer_tilelang_matches_eager():
     actual_scores.backward(grad)
     for actual_grad, expected_grad in zip((q_t.grad, k_t.grad, w_t.grad), (q_e.grad, k_e.grad, w_e.grad)):
         assert actual_grad is not None and expected_grad is not None
-        assert cosine_similarity(actual_grad, expected_grad) > 0.95
+        assert_gradient_direction_and_scale(actual_grad, expected_grad, min_cosine=0.95, norm_rtol=0.25)

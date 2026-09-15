@@ -55,11 +55,12 @@ def wrapper(
     cu_seqlen_ks: Tensor | None = None,
     cu_seqlen_ke: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """HF indexer scores on the kernel face.
+    """Compute HF-aligned index scores and selected compressed-KV indices.
 
     ``index_q`` is ``[S, B, H, D]``, ``index_k`` is ``[S_kv, B, D]``,
-    ``weights`` is ``[S, B, H]``. Returns ``(index_score, topk_indices)``
-    with shapes ``[B, S, topk]``.
+    ``weights`` is ``[S, B, H]``. Returns scores and indices with shape
+    ``[B, S, K]``. ``K`` is the supplied ``topk_indices`` width when present;
+    otherwise it is ``min(topk, S_kv)``.
     """
     if (cu_seqlen_ks is None) != (cu_seqlen_ke is None):
         raise ValueError("cu_seqlen_ks and cu_seqlen_ke must be provided together")

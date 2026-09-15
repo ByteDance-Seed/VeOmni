@@ -257,9 +257,26 @@ def test_magi_attention_rejects_global_ranges_when_ulysses_is_off(monkeypatch):
 
 
 @pytest.mark.skipif(not _MAGI_FFA_AVAILABLE, reason=_MAGI_FFA_REASON)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("mask_case", ("causal", "full", "2d_mask"))
-def test_magi_attention_matches_math_sdpa(monkeypatch, mask_case, dtype):
+@pytest.mark.parametrize(
+    ("mask_case", "dtype", "sequence_length", "query_heads", "kv_heads", "head_dim"),
+    (
+        *(
+            pytest.param(mask_case, dtype, 128, 4, 2, 64, id=f"{mask_case}-{dtype_name}")
+            for mask_case in ("causal", "full", "2d_mask")
+            for dtype, dtype_name in ((torch.bfloat16, "bf16"), (torch.float16, "fp16"))
+        ),
+        pytest.param("2d_mask", torch.bfloat16, 4096, 28, 4, 128, id="2d-mask-production-bf16"),
+    ),
+)
+def test_magi_attention_matches_math_sdpa(
+    monkeypatch,
+    mask_case,
+    dtype,
+    sequence_length,
+    query_heads,
+    kv_heads,
+    head_dim,
+):
     device = torch.device(get_device_type())
     monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state())
     kernel_mode, build_flags = magi_kernel.prepare_kernel(device)
@@ -271,8 +288,6 @@ def test_magi_attention_matches_math_sdpa(monkeypatch, mask_case, dtype):
     ):
         pytest.skip("The installed CUTLASS overlay does not include FP16 kernels.")
 
-    sequence_length = 128
-    query_heads, kv_heads, head_dim = 4, 2, 64
     generator = torch.Generator(device=device).manual_seed(9300)
     query, key, value = (
         torch.randn((1, heads, sequence_length, head_dim), device=device, dtype=dtype, generator=generator)

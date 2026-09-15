@@ -313,26 +313,28 @@ def test_packed_mask_uses_post_ulysses_lengths(monkeypatch, impl):
     torch.testing.assert_close(visible, expected)
 
 
-def test_magi_packed_rejects_incomplete_query_coverage():
-    with pytest.raises(ValueError, match=r"cu_seqlens_q must end at the full sequence length \(8\)"):
+@pytest.mark.parametrize(
+    ("cu_seqlens", "cu_seqlens_k", "match"),
+    (
+        (torch.tensor([0, 4]), None, r"cu_seqlens_q must end at the full sequence length \(8\)"),
+        (
+            torch.tensor([0, 8]),
+            torch.tensor([0, 4]),
+            r"cu_seqlens_k must end at the full sequence length \(8\)",
+        ),
+    ),
+    ids=("query", "key"),
+)
+def test_magi_packed_rejects_incomplete_coverage(cu_seqlens, cu_seqlens_k, match):
+    kwargs = {} if cu_seqlens_k is None else {"cu_seqlens_k": cu_seqlens_k}
+    with pytest.raises(ValueError, match=match):
         packed_causal_mask(
             8,
             8,
             impl="magi_attention",
             device="cpu",
-            cu_seqlens=torch.tensor([0, 4]),
-        )
-
-
-def test_magi_packed_rejects_incomplete_key_coverage():
-    with pytest.raises(ValueError, match=r"cu_seqlens_k must end at the full sequence length \(8\)"):
-        packed_causal_mask(
-            8,
-            8,
-            impl="magi_attention",
-            device="cpu",
-            cu_seqlens=torch.tensor([0, 8]),
-            cu_seqlens_k=torch.tensor([0, 4]),
+            cu_seqlens=cu_seqlens,
+            **kwargs,
         )
 
 
@@ -350,46 +352,43 @@ def test_packed_mask_rejects_invalid_cumulative_lengths(impl, cu_seqlens, error,
 
 
 @pytest.mark.parametrize(
-    ("mask_builder", "impl"),
+    ("mask_builder", "impl", "kwargs", "custom_arg"),
     (
-        (causal_mask, "flash_attention_2"),
-        (causal_mask, "veomni_sage_attention"),
-        (causal_mask, "magi_attention"),
+        pytest.param(causal_mask, "flash_attention_2", {}, "or_mask_function", id="causal-flash"),
+        pytest.param(causal_mask, "veomni_sage_attention", {}, "or_mask_function", id="causal-sage"),
+        pytest.param(causal_mask, "magi_attention", {}, "or_mask_function", id="causal-magi"),
+        pytest.param(
+            packed_causal_mask,
+            "flash_attention_2",
+            {"cu_seqlens": torch.tensor([0, 4])},
+            "and_mask_function",
+            id="packed-flash",
+        ),
+        pytest.param(
+            packed_causal_mask,
+            "magi_attention",
+            {"cu_seqlens": torch.tensor([0, 4])},
+            "and_mask_function",
+            id="packed-magi",
+        ),
+        pytest.param(
+            sliding_window_mask,
+            "flash_attention_2",
+            {"sliding_window": 2},
+            "or_mask_function",
+            id="sliding-flash",
+        ),
     ),
 )
-def test_shape_mask_rejects_unrepresentable_custom_visibility(mask_builder, impl):
+def test_shape_mask_rejects_unrepresentable_custom_visibility(mask_builder, impl, kwargs, custom_arg):
+    call_kwargs = {**kwargs, custom_arg: lambda *args: torch.tensor(True)}
     with pytest.raises(ValueError, match="custom mask_function"):
         mask_builder(
             4,
             4,
             impl=impl,
             device="cpu",
-            or_mask_function=lambda *args: torch.tensor(True),
-        )
-
-
-@pytest.mark.parametrize("impl", ("flash_attention_2", "magi_attention"))
-def test_packed_shape_mask_rejects_unrepresentable_custom_visibility(impl):
-    with pytest.raises(ValueError, match="custom mask_function"):
-        packed_causal_mask(
-            4,
-            4,
-            impl=impl,
-            device="cpu",
-            cu_seqlens=torch.tensor([0, 4]),
-            and_mask_function=lambda *args: torch.tensor(True),
-        )
-
-
-def test_flash_sliding_shape_mask_rejects_unrepresentable_custom_visibility():
-    with pytest.raises(ValueError, match="custom mask_function"):
-        sliding_window_mask(
-            4,
-            4,
-            impl="flash_attention_2",
-            device="cpu",
-            sliding_window=2,
-            or_mask_function=lambda *args: torch.tensor(True),
+            **call_kwargs,
         )
 
 

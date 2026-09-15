@@ -56,9 +56,11 @@ def wrapper(
     """Sparse MQA with HF sink-softmax math.
 
     ``q`` is ``[B, S, H, D]``, ``kv`` is ``[B, S_kv, D]``, ``attn_sink`` is
-    ``[H]``, ``topk_idxs`` is ``[B, S, topk]``. Repeated valid indices retain
-    their per-slot softmax multiplicity, matching the TileLang row. When
-    requested, LSE is detached and returned in base-2 units.
+    ``[H]``, and ``topk_idxs`` is ``[B, S, K]``. ``K`` is the selected
+    candidate width and need not equal the indexer's requested ``topk``.
+    Repeated valid indices retain their per-slot softmax multiplicity, matching
+    the TileLang row. When requested, LSE is detached and returned in base-2
+    units.
     """
     scale = q.shape[-1] ** -0.5 if sm_scale is None else sm_scale
     query = q.transpose(1, 2).contiguous()

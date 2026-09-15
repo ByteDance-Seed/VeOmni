@@ -27,12 +27,13 @@ def wrapper(
     sm_scale: float | None = None,
     return_lse: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor]:
-    """Sparse MQA. Same face as the eager row.
+    """Run TileLang sparse MQA over selected KV candidate slots.
 
     ``q`` is ``[B, S, H, D]``, ``kv`` is ``[B, S_kv, D]``, ``attn_sink`` is
-    ``[H]``, ``topk_idxs`` is ``[B, S, topk]``. Each valid candidate slot
-    participates independently, including repeated indices. When requested,
-    LSE is detached and returned in base-2 units.
+    ``[H]``, and ``topk_idxs`` is ``[B, S, K]``. ``K`` is the selected
+    candidate width and need not equal the indexer's requested ``topk``. Each
+    valid candidate slot participates independently, including repeated
+    indices. When requested, LSE is detached and returned in base-2 units.
     """
     from ...vendor.tilelang_sparse_mla import sparse_attn_tilelang
 

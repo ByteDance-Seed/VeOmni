@@ -144,28 +144,17 @@ def test_apply_veomni_attention_patch_is_idempotent():
         assert ALL_ATTENTION_FUNCTIONS[name] is forward
 
 
-def test_apply_ops_patch_delegates_attention_registration(monkeypatch):
+@pytest.mark.parametrize(("backend", "expected_calls"), (("veomni", (True,)), ("hf", ())))
+def test_apply_ops_patch_respects_modeling_backend(monkeypatch, backend, expected_calls):
     from veomni.ops import install
 
     calls = []
-    monkeypatch.setattr(install, "get_env", lambda _name: "veomni")
+    monkeypatch.setattr(install, "get_env", lambda _name: backend)
     monkeypatch.setattr(install, "apply_veomni_attention_patch", lambda: calls.append(True))
 
     install.apply_ops_patch()
 
-    assert calls == [True]
-
-
-def test_apply_ops_patch_skips_hf_backend(monkeypatch):
-    from veomni.ops import install
-
-    calls = []
-    monkeypatch.setattr(install, "get_env", lambda _name: "hf")
-    monkeypatch.setattr(install, "apply_veomni_attention_patch", lambda: calls.append(True))
-
-    install.apply_ops_patch()
-
-    assert calls == []
+    assert tuple(calls) == expected_calls
 
 
 def eager_attention_forward(module, query, key, value, attention_mask, **kwargs):

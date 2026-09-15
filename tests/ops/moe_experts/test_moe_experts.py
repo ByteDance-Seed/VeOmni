@@ -19,12 +19,12 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
 from transformers import GptOssConfig, Qwen3MoeConfig
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
 
+from tests.ops.moe_experts.reference import standard_fused_reference
 from tests.ops.tol import (
     EAGER_ATOL,
     EAGER_GRAD_ATOL,
@@ -65,41 +65,6 @@ def _route(num_tokens: int, num_experts: int, top_k: int, device: torch.device |
     logits = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
     routing_weights, selected_experts = torch.topk(torch.softmax(logits, dim=-1), top_k, dim=-1)
     return routing_weights.to(dtype), selected_experts
-
-
-def _standard_fused_ref(
-    hidden: Tensor,
-    routing: Tensor,
-    selected: Tensor,
-    fc1_1: Tensor,
-    fc1_2: Tensor,
-    fc2: Tensor,
-    *,
-    num_experts: int,
-    swiglu_limit: float | None = None,
-) -> Tensor:
-    """Fused operator-order reference for ``moe_experts`` ``standard``.
-
-    Routing weights scale the SwiGLU intermediate, then ``fc2``. Triton
-    and Quack non-EP rows use this order. NPU applies routing after fc2.
-    """
-    output = torch.zeros_like(hidden)
-    expert_mask = F.one_hot(selected, num_classes=num_experts).permute(2, 1, 0)
-    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-    for expert_idx in expert_hit:
-        idx = int(expert_idx[0].item())
-        top_k_pos, token_idx = torch.where(expert_mask[idx])
-        x = hidden[token_idx]
-        gate = F.linear(x, fc1_1[idx])
-        up = F.linear(x, fc1_2[idx])
-        if swiglu_limit is not None:
-            gate = gate.clamp(max=swiglu_limit)
-            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-        y = F.silu(gate) * up
-        y = y * routing[token_idx, top_k_pos, None]
-        y = F.linear(y, fc2[idx])
-        output.index_add_(0, token_idx, y.to(output.dtype))
-    return output
 
 
 def _gpt_oss_hf_loop(
@@ -196,8 +161,8 @@ def test_standard_eager_matches_hf_qwen3_moe_experts():
         gu_e,
         num_experts=num_experts,
     )
-    # Pre-fc2 vs post-fc2 routing is algebraically the same without down bias,
-    # but the multiply order leaves a few ulps.
+    # Moving routing across bias-free fc2 is equivalent in real arithmetic.
+    # Floating-point operation order still changes rounding, especially in BF16.
     assert torch.allclose(out_e, out_h, atol=1e-5, rtol=1e-5)
 
     go = torch.randn_like(out_e)
@@ -219,7 +184,15 @@ def test_eager_matches_fused_reference():
     fc2 = torch.randn(num_experts, hidden_dim, ffn_dim)
 
     hidden_h, routing_h, fc1_1_h, fc1_2_h, fc2_h = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
-    out_h = _standard_fused_ref(hidden_h, routing_h, selected, fc1_1_h, fc1_2_h, fc2_h, num_experts=num_experts)
+    out_h = standard_fused_reference(
+        hidden_h,
+        routing_h,
+        selected,
+        fc1_1_h,
+        fc1_2_h,
+        fc2_h,
+        num_experts=num_experts,
+    )
 
     hidden_e, routing_e, fc1_1_e, fc1_2_e, fc2_e = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
     out_e = resolve_op("moe_experts", "standard", "eager").wrapper(

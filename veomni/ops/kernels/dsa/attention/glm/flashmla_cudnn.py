@@ -32,7 +32,7 @@ def wrapper(
     training: bool = False,
     attention_dropout: float = 0.0,
 ) -> Tensor:
-    """FlashMLA sparse prefill with cuDNN backward. Same face as eager.
+    """Run FlashMLA sparse prefill with a cuDNN backward pass.
 
     ``q_pe`` / ``q_nope_absorbed`` are ``[B, S, H, D]``. ``k_pe`` and
     ``kv_cache`` are MQA ``[B, S_kv, 1, D]``.

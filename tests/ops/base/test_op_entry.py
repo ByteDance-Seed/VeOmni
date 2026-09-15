@@ -427,9 +427,18 @@ class TestGeneratedWrapper:
         summed, prod = entry.wrapper(x, y)
         assert isinstance(summed, Tensor)
         assert isinstance(prod, Tensor)
-        (summed + prod).sum().backward()
-        assert x.grad is not None
-        assert y.grad is not None
+        torch.testing.assert_close(summed, x + y)
+        torch.testing.assert_close(prod, x * y)
+
+        grad_sum = torch.randn_like(summed)
+        grad_prod = torch.randn_like(prod)
+        grad_x, grad_y = torch.autograd.grad(
+            (summed, prod),
+            (x, y),
+            grad_outputs=(grad_sum, grad_prod),
+        )
+        torch.testing.assert_close(grad_x, grad_sum + y * grad_prod)
+        torch.testing.assert_close(grad_y, grad_sum + x * grad_prod)
 
     def test_singleton_tuple_output_preserves_backward_structure(self):
         def singleton_forward(x: Tensor) -> tuple[tuple[Tensor], SavedState]:

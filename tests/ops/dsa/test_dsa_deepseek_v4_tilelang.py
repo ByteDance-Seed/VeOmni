@@ -259,12 +259,11 @@ def test_tilelang_bwd_cta_threads_respects_warp_tile_bound(block_H, block_size, 
 
 
 def test_tilelang_sparse_attention_backward_matches_reference_on_wide_head_tile():
-    """Cover the head tile that gets the widened CTA; the rest of this file does not.
+    """Exercise the first head tile that widens the backward CTA to 256 threads.
 
     ``bwd`` derives its CTA width from ``block_H = min(64, max(next_power_of_2(H), 16))``,
-    and every other TileLang test here uses 8 heads, i.e. block_H=16, which keeps the
-    historical 128 threads. 32 heads is the smallest tile that actually widens to 256,
-    so without this case the wide path is never run.
+    and eight heads yields ``block_H=16`` and a 128-thread CTA. Thirty-two heads
+    is the smallest case that reaches the 256-thread path.
     """
     require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla import sparse_attn_tilelang
@@ -327,27 +326,3 @@ def test_tilelang_sparse_attention_backward_shares_kernel_across_kv_lengths(monk
             assert cosine_similarity(actual_grad, expected_grad) > 0.95
 
     assert set(requested_kv_lengths) == {kv_block}
-
-
-@pytest.mark.parametrize("kv_len", (48, 129, 1024))
-def test_tilelang_sparse_attention_backward_matches_reference_across_kv_lengths(kv_len):
-    require_nvidia_cuda("tilelang", min_cc=90)
-    from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla import sparse_attn_tilelang
-
-    batch, seqlen, heads, dim, topk = 1, 32, 8, 512, 64
-    scale = dim**-0.5
-    torch.manual_seed(4)
-    q = torch.randn(batch, seqlen, heads, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
-    kv = torch.randn(batch, kv_len, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
-    sinks = torch.randn(heads, device=DEVICE, requires_grad=True)
-    indices = torch.randint(kv_len, (batch, seqlen, topk), device=DEVICE, dtype=torch.int32)
-    indices[..., -2:] = kv_len
-
-    actual = sparse_attn_tilelang(q, kv, sinks, indices, scale)
-    expected = _sparse_attention_reference(q, kv, sinks, indices, scale)
-    grad = torch.randn_like(actual)
-    expected_grads = torch.autograd.grad((expected * grad.float()).sum(), (q, kv, sinks))
-    actual.backward(grad)
-    assert kv.grad.shape == kv.shape
-    for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
-        assert cosine_similarity(actual_grad, expected_grad) > 0.95

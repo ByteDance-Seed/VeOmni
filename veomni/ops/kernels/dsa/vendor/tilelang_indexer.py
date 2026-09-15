@@ -113,13 +113,16 @@ def v4_lighting_indexer(
         weights:       [seqlen, batch, heads]        fp32
         compress_ratio: compression ratio (4 for C4 layers)
         topk:          number of top-k indices to select
-        topk_indices:  optional pre-computed topk indices [batch, seqlen, topk] int32
+        topk_indices:  optional pre-computed indices [batch, seqlen, K] int32
         cu_seqlen_ks: optional packed compressed-KV start per query [seqlen] int32
         cu_seqlen_ke: optional packed compressed-KV end per query [seqlen] int32
 
     Returns:
-        index_score:  [batch, seqlen, topk] fp32
-        topk_indices: [batch, seqlen, topk] int32
+        index_score:  [batch, seqlen, K] fp32
+        topk_indices: [batch, seqlen, K] int32
+
+        K is the supplied ``topk_indices`` width when present; otherwise it is
+        ``min(topk, seqlen_kv)``.
     """
     heads = index_q.shape[2]
     if heads > 64 or heads % 8 != 0:

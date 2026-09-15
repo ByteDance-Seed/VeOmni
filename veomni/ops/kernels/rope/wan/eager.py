@@ -36,7 +36,8 @@ def forward(x: Tensor, freqs: Tensor, *, head_dim: int) -> tuple[Tensor, SavedSt
     """Complex-multiply ``x`` by ``freqs`` after viewing each head as complex.
 
     ``head_dim`` is the last-axis size used to unflatten heads. Empty ``x``
-    is returned unchanged. Backward conjugates ``freqs``.
+    is returned unchanged. ``freqs`` is treated as fixed: backward conjugates
+    it to compute ``dx`` and does not return a frequency gradient.
     """
     if x.numel() == 0:
         return x, SavedState((freqs,), _Meta(True, head_dim))

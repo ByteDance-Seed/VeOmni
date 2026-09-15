@@ -20,6 +20,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils._python_dispatch import TorchDispatchMode
 from transformers.loss.loss_utils import fixed_cross_entropy
 
 from tests.ops.tol import (
@@ -37,22 +38,48 @@ from veomni.ops import resolve_op
 from veomni.utils.device import IS_CUDA_AVAILABLE
 
 
+class _FullWeightAddCounter(TorchDispatchMode):
+    def __init__(self, weight_shape):
+        super().__init__()
+        self.weight_shape = weight_shape
+        self.out_of_place_adds = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        del types
+        output = func(*args, **(kwargs or {}))
+        if func == torch.ops.aten.add.Tensor and isinstance(output, Tensor) and output.shape == self.weight_shape:
+            self.out_of_place_adds += 1
+        return output
+
+
 def _empty_weight(device: torch.device | str) -> Tensor:
     return torch.empty(0, device=device)
 
 
-def test_eager_matches_hf_logits():
-    torch.manual_seed(0)
-    logits = torch.randn(8, 16, dtype=torch.float32)
-    labels = torch.randint(0, 16, (8,))
-    labels[0] = -100
+@pytest.mark.parametrize(
+    ("seed", "num_tokens", "num_classes", "ignore_first", "num_items_in_batch"),
+    (
+        (0, 8, 16, True, None),
+        (2, 10, 7, False, 6),
+    ),
+    ids=("mean-reduction", "explicit-item-count"),
+)
+def test_eager_logits_match_hf(seed, num_tokens, num_classes, ignore_first, num_items_in_batch):
+    torch.manual_seed(seed)
+    logits = torch.randn(num_tokens, num_classes, dtype=torch.float32)
+    labels = torch.randint(0, num_classes, (num_tokens,))
+    if ignore_first:
+        labels[0] = -100
 
     logits_h = make_grad_leaf(logits)
-    out_h = fixed_cross_entropy(logits_h, labels)
+    out_h = fixed_cross_entropy(logits_h, labels, num_items_in_batch=num_items_in_batch)
 
     logits_e = make_grad_leaf(logits)
     out_e = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(
-        logits_e, labels, _empty_weight(logits.device)
+        logits_e,
+        labels,
+        _empty_weight(logits.device),
+        num_items_in_batch=num_items_in_batch,
     )
     assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
@@ -176,25 +203,6 @@ def test_eager_matches_hf_hidden_weight():
     assert torch.allclose(weight_e.grad, weight_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-def test_eager_matches_hf_num_items():
-    torch.manual_seed(2)
-    logits = torch.randn(10, 7, dtype=torch.float32)
-    labels = torch.randint(0, 7, (10,))
-    num_items = 6
-
-    logits_h = make_grad_leaf(logits)
-    out_h = fixed_cross_entropy(logits_h, labels, num_items_in_batch=num_items)
-    logits_e = make_grad_leaf(logits)
-    out_e = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(
-        logits_e, labels, _empty_weight(logits.device), num_items_in_batch=num_items
-    )
-    assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
-
-    out_h.backward()
-    out_e.backward()
-    assert torch.allclose(logits_e.grad, logits_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-
-
 def test_chunk_loss_matches_eager_with_uneven_valid_tokens():
     eager = resolve_op("cross_entropy_loss", "standard", "eager").wrapper
     other = resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper
@@ -207,7 +215,10 @@ def test_chunk_loss_matches_eager_with_uneven_valid_tokens():
     hidden_e, weight_e = make_grad_leaf(hidden), make_grad_leaf(weight)
     hidden_o, weight_o = make_grad_leaf(hidden), make_grad_leaf(weight)
     out_e = eager(hidden_e, labels, weight_e)
-    out_o = other(hidden_o, labels, weight_o, chunk_size=7)
+    counter = _FullWeightAddCounter(weight.shape)
+    with counter:
+        out_o = other(hidden_o, labels, weight_o, chunk_size=7)
+    assert counter.out_of_place_adds == 0
     assert torch.allclose(out_e, out_o, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     out_e.backward()
@@ -216,40 +227,7 @@ def test_chunk_loss_matches_eager_with_uneven_valid_tokens():
     assert torch.allclose(weight_e.grad, weight_o.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-def test_chunk_loss_accumulates_weight_gradient_without_full_size_temporary():
-    from torch.utils._python_dispatch import TorchDispatchMode
-
-    from veomni.ops.kernels.loss.cross_entropy_loss.standard import chunk_loss
-
-    weight_shape = (16, 8)
-
-    class FullWeightAddCounter(TorchDispatchMode):
-        def __init__(self):
-            super().__init__()
-            self.out_of_place_adds = 0
-
-        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-            del types
-            output = func(*args, **(kwargs or {}))
-            if func == torch.ops.aten.add.Tensor and isinstance(output, Tensor) and output.shape == weight_shape:
-                self.out_of_place_adds += 1
-            return output
-
-    torch.manual_seed(8)
-    hidden = torch.randn(1, 4, weight_shape[1])
-    labels = torch.randint(0, weight_shape[0], (1, 4))
-    weight = torch.randn(weight_shape)
-    counter = FullWeightAddCounter()
-
-    with counter:
-        chunk_loss.forward(hidden, labels, weight, chunk_size=2)
-
-    assert counter.out_of_place_adds == 0
-
-
 def test_chunk_loss_does_not_copy_full_noncontiguous_hidden():
-    from torch.utils._python_dispatch import TorchDispatchMode
-
     from veomni.ops.kernels.loss.cross_entropy_loss.standard import chunk_loss
 
     hidden_shape = (2, 7, 4)
@@ -307,13 +285,6 @@ def test_chunk_loss_empty_returns_connected_zero():
     loss.backward()
     torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden))
     torch.testing.assert_close(weight.grad, torch.zeros_like(weight))
-
-
-def test_chunk_loss_requires_weight():
-    with pytest.raises(RuntimeError, match="nonempty ``weight``"):
-        resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper(
-            torch.randn(4, 8), torch.zeros(4, dtype=torch.long), _empty_weight("cpu")
-        )
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
@@ -374,12 +345,24 @@ def test_liger_matches_eager(
             assert other_input.grad is None
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
-def test_liger_requires_weight():
-    pytest.importorskip("liger_kernel")
+@pytest.mark.parametrize(
+    ("impl", "device"),
+    (
+        pytest.param("chunk_loss", "cpu", id="chunk-loss"),
+        pytest.param(
+            "liger_kernel",
+            "cuda",
+            marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU"),
+            id="liger",
+        ),
+    ),
+)
+def test_hidden_state_implementations_require_weight(impl: str, device: str):
+    if impl == "liger_kernel":
+        pytest.importorskip("liger_kernel")
     with pytest.raises(RuntimeError, match="nonempty ``weight``"):
-        resolve_op("cross_entropy_loss", "standard", "liger_kernel").wrapper(
-            torch.randn(4, 8, device="cuda"),
-            torch.zeros(4, dtype=torch.long, device="cuda"),
-            _empty_weight("cuda"),
+        resolve_op("cross_entropy_loss", "standard", impl).wrapper(
+            torch.randn(4, 8, device=device),
+            torch.zeros(4, dtype=torch.long, device=device),
+            _empty_weight(device),
         )

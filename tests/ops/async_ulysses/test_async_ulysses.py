@@ -176,24 +176,40 @@ def test_standard_qkv_rejects_nondivisible_kv_heads(monkeypatch: pytest.MonkeyPa
         )
 
 
+@pytest.mark.parametrize(
+    ("variant", "seed", "hidden", "head_dim", "key_value_size"),
+    (
+        ("standard", 6101, 20, 5, 10),
+        ("dit", 6102, 16, 4, 16),
+    ),
+)
 @pytest.mark.parametrize("norm_type", [None, "rmsnorm"])
-def test_standard_qkv_matches_sequential(monkeypatch: pytest.MonkeyPatch, norm_type: str | None) -> None:
+def test_qkv_matches_sequential(
+    monkeypatch: pytest.MonkeyPatch,
+    variant: str,
+    seed: int,
+    hidden: int,
+    head_dim: int,
+    key_value_size: int,
+    norm_type: str | None,
+) -> None:
     _mock_identity_comm(monkeypatch)
-    torch.manual_seed(6101)
-    batch, seq, hidden, head_dim = 2, 3, 20, 5
-    query_size, key_value_size = 20, 10
+    torch.manual_seed(seed)
+    batch, seq = 2, 3
     eps = 1e-6
     hidden_states = torch.randn(batch, seq, hidden, dtype=torch.float64, requires_grad=True)
-    q_weight, q_bias, k_weight, k_bias, v_weight, v_bias = _qkv_weights(hidden, query_size, key_value_size)
-    norm_q = torch.randn(head_dim, dtype=torch.float64, requires_grad=True) if norm_type else None
-    norm_k = torch.randn(head_dim, dtype=torch.float64, requires_grad=True) if norm_type else None
+    q_weight, q_bias, k_weight, k_bias, v_weight, v_bias = _qkv_weights(hidden, hidden, key_value_size)
+    norm_size = head_dim if variant == "standard" else hidden
+    norm_q = torch.randn(norm_size, dtype=torch.float64, requires_grad=True) if norm_type else None
+    norm_k = torch.randn(norm_size, dtype=torch.float64, requires_grad=True) if norm_type else None
 
     kernel_in = _leaf(hidden_states, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias)
     kernel_norms = _leaf(*(tensor for tensor in (norm_q, norm_k) if tensor is not None))
     seq_in = _leaf(hidden_states, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias)
     seq_norms = _leaf(*(tensor for tensor in (norm_q, norm_k) if tensor is not None))
 
-    kernel_q, kernel_k, kernel_v = VeomniOp("async_ulysses_qkv", "standard")(
+    kwargs = {"head_dim": head_dim} if variant == "standard" else {}
+    kernel_q, kernel_k, kernel_v = VeomniOp("async_ulysses_qkv", variant)(
         *kernel_in,
         kernel_norms[0] if kernel_norms else None,
         None,
@@ -202,19 +218,21 @@ def test_standard_qkv_matches_sequential(monkeypatch: pytest.MonkeyPatch, norm_t
         seq_dimension=1,
         head_dimension=2,
         unpadded_dim_size=seq,
-        head_dim=head_dim,
         group=object(),
         norm_type=norm_type,
-        normalized_shape=head_dim if norm_type else None,
+        normalized_shape=norm_size if norm_type else None,
         eps=eps if norm_type else None,
+        **kwargs,
     )
-    seq_q, seq_k, seq_v = _sequential_standard_qkv(
+    sequential = _sequential_standard_qkv if variant == "standard" else _sequential_dit_qkv
+    sequential_kwargs = {"head_dim": head_dim} if variant == "standard" else {}
+    seq_q, seq_k, seq_v = sequential(
         *seq_in,
         seq_norms[0] if seq_norms else None,
         seq_norms[1] if seq_norms else None,
-        head_dim=head_dim,
         norm_type=norm_type,
         eps=eps,
+        **sequential_kwargs,
     )
     torch.testing.assert_close(kernel_q, seq_q)
     torch.testing.assert_close(kernel_k, seq_k)
@@ -266,53 +284,6 @@ def test_standard_qkv_repeated_kv_heads_matches_sequential(monkeypatch: pytest.M
     torch.autograd.backward(expected, grad_outputs)
     for actual_input, expected_input in zip(actual_inputs, expected_inputs, strict=True):
         torch.testing.assert_close(actual_input.grad, expected_input.grad)
-
-
-@pytest.mark.parametrize("norm_type", [None, "rmsnorm"])
-def test_dit_qkv_matches_sequential(monkeypatch: pytest.MonkeyPatch, norm_type: str | None) -> None:
-    _mock_identity_comm(monkeypatch)
-    torch.manual_seed(6102)
-    batch, seq, hidden = 2, 3, 16
-    eps = 1e-6
-    hidden_states = torch.randn(batch, seq, hidden, dtype=torch.float64, requires_grad=True)
-    q_weight, q_bias, k_weight, k_bias, v_weight, v_bias = _qkv_weights(hidden, hidden, hidden)
-    norm_q = torch.randn(hidden, dtype=torch.float64, requires_grad=True) if norm_type else None
-    norm_k = torch.randn(hidden, dtype=torch.float64, requires_grad=True) if norm_type else None
-
-    kernel_in = _leaf(hidden_states, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias)
-    kernel_norms = _leaf(*(tensor for tensor in (norm_q, norm_k) if tensor is not None))
-    seq_in = _leaf(hidden_states, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias)
-    seq_norms = _leaf(*(tensor for tensor in (norm_q, norm_k) if tensor is not None))
-
-    kernel_q, kernel_k, kernel_v = VeomniOp("async_ulysses_qkv", "dit")(
-        *kernel_in,
-        kernel_norms[0] if kernel_norms else None,
-        None,
-        kernel_norms[1] if kernel_norms else None,
-        None,
-        seq_dimension=1,
-        head_dimension=2,
-        unpadded_dim_size=seq,
-        group=object(),
-        norm_type=norm_type,
-        normalized_shape=hidden if norm_type else None,
-        eps=eps if norm_type else None,
-    )
-    seq_q, seq_k, seq_v = _sequential_dit_qkv(
-        *seq_in,
-        seq_norms[0] if seq_norms else None,
-        seq_norms[1] if seq_norms else None,
-        norm_type=norm_type,
-        eps=eps,
-    )
-    torch.testing.assert_close(kernel_q, seq_q)
-    torch.testing.assert_close(kernel_k, seq_k)
-    torch.testing.assert_close(kernel_v, seq_v)
-
-    (kernel_q.sum() + kernel_k.sum() + kernel_v.sum()).backward()
-    (seq_q.sum() + seq_k.sum() + seq_v.sum()).backward()
-    for actual, expected in zip(kernel_in + kernel_norms, seq_in + seq_norms, strict=True):
-        torch.testing.assert_close(actual.grad, expected.grad)
 
 
 @pytest.mark.parametrize("variant", ("standard", "dit"))
@@ -416,45 +387,34 @@ def test_qkv_layer_norm_matches_sequential(monkeypatch: pytest.MonkeyPatch, vari
         torch.testing.assert_close(actual_input.grad, expected_input.grad, atol=2e-6, rtol=2e-5)
 
 
-def test_standard_o_matches_sequential(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("variant", "seed", "hidden", "out_dim"),
+    (
+        ("standard", 6103, 20, 7),
+        ("dit", 6104, 16, 16),
+    ),
+)
+def test_output_projection_matches_sequential(
+    monkeypatch: pytest.MonkeyPatch,
+    variant: str,
+    seed: int,
+    hidden: int,
+    out_dim: int,
+) -> None:
     _mock_identity_comm(monkeypatch)
-    torch.manual_seed(6103)
-    batch, seq, heads, head_dim, out_dim = 2, 3, 4, 5, 7
-    hidden = torch.randn(batch, seq, heads, head_dim, dtype=torch.float64, requires_grad=True)
-    weight = torch.randn(out_dim, heads * head_dim, dtype=torch.float64, requires_grad=True)
-    bias = torch.randn(out_dim, dtype=torch.float64, requires_grad=True)
-
-    k_hidden, k_weight, k_bias = _leaf(hidden, weight, bias)
-    s_hidden, s_weight, s_bias = _leaf(hidden, weight, bias)
-    actual = VeomniOp("async_ulysses_o", "standard")(
-        k_hidden,
-        k_weight,
-        k_bias,
-        seq_dimension=1,
-        head_dimension=2,
-        unpadded_dim_size=seq,
-        group=object(),
+    torch.manual_seed(seed)
+    batch, seq, heads, head_dim = 2, 3, 4, 5
+    hidden_states = (
+        torch.randn(batch, seq, heads, head_dim, dtype=torch.float64, requires_grad=True)
+        if variant == "standard"
+        else torch.randn(batch, seq, hidden, dtype=torch.float64, requires_grad=True)
     )
-    expected = F.linear(s_hidden.view(batch, seq, -1), s_weight, s_bias)
-    torch.testing.assert_close(actual, expected)
-    actual.sum().backward()
-    expected.sum().backward()
-    torch.testing.assert_close(k_hidden.grad, s_hidden.grad)
-    torch.testing.assert_close(k_weight.grad, s_weight.grad)
-    torch.testing.assert_close(k_bias.grad, s_bias.grad)
-
-
-def test_dit_o_matches_sequential(monkeypatch: pytest.MonkeyPatch) -> None:
-    _mock_identity_comm(monkeypatch)
-    torch.manual_seed(6104)
-    batch, seq, hidden, out_dim = 2, 3, 16, 16
-    hidden_states = torch.randn(batch, seq, hidden, dtype=torch.float64, requires_grad=True)
     weight = torch.randn(out_dim, hidden, dtype=torch.float64, requires_grad=True)
     bias = torch.randn(out_dim, dtype=torch.float64, requires_grad=True)
 
     k_hidden, k_weight, k_bias = _leaf(hidden_states, weight, bias)
     s_hidden, s_weight, s_bias = _leaf(hidden_states, weight, bias)
-    actual = VeomniOp("async_ulysses_o", "dit")(
+    actual = VeomniOp("async_ulysses_o", variant)(
         k_hidden,
         k_weight,
         k_bias,
@@ -463,7 +423,8 @@ def test_dit_o_matches_sequential(monkeypatch: pytest.MonkeyPatch) -> None:
         unpadded_dim_size=seq,
         group=object(),
     )
-    expected = F.linear(s_hidden, s_weight, s_bias)
+    sequential_hidden = s_hidden.flatten(start_dim=2) if variant == "standard" else s_hidden
+    expected = F.linear(sequential_hidden, s_weight, s_bias)
     torch.testing.assert_close(actual, expected)
     actual.sum().backward()
     expected.sum().backward()
@@ -504,27 +465,6 @@ def test_output_projection_empty_sequence_matches_sequential(
     expected.sum().backward()
     for actual_input, expected_input in zip(actual_inputs, expected_inputs, strict=True):
         torch.testing.assert_close(actual_input.grad, expected_input.grad)
-
-
-def test_output_projection_weight_bias_grad_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
-    _mock_identity_comm(monkeypatch)
-    batch, seq, heads, head_dim, out_dim = 2, 3, 4, 5, 7
-    hidden = torch.randn(batch, seq, heads, head_dim, requires_grad=True)
-    weight = torch.randn(out_dim, heads * head_dim, requires_grad=True)
-    bias = torch.randn(out_dim, requires_grad=True)
-    VeomniOp("async_ulysses_o", "standard")(
-        hidden,
-        weight,
-        bias,
-        seq_dimension=1,
-        head_dimension=2,
-        unpadded_dim_size=seq,
-        group=object(),
-    ).sum().backward()
-    assert weight.grad is not None
-    assert weight.grad.shape == weight.shape
-    assert bias.grad is not None
-    assert bias.grad.shape == bias.shape
 
 
 def test_output_projection_bias_grad_when_weight_frozen(monkeypatch: pytest.MonkeyPatch) -> None:

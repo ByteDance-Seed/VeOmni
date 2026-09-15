@@ -90,8 +90,11 @@ def sdpa_attention_forward(
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run Transformers SDPA with optional Ulysses exchange.
 
-    Visibility lives on ``attention_mask``. ``sliding_window`` / ``softcap`` are
-    not SDPA kwargs; drop them if the mask already encodes the pattern.
+    ``sliding_window`` is shared-signature metadata and is not forwarded. This
+    row supports windowed visibility only when it is already encoded in
+    ``attention_mask``. ``softcap`` changes logits rather than visibility, so a
+    mask cannot encode it; the argument is accepted for signature compatibility
+    but ignored, and this row does not apply logit softcapping.
 
     Uses memory-efficient SDPA so a dense bool / additive mask stays valid.
     Flash is not tried. Use ``veomni_flash_attention_*`` when the pattern can

@@ -39,6 +39,24 @@ def cosine_similarity(actual: Tensor, expected: Tensor) -> float:
     return F.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0).item()
 
 
+def assert_gradient_direction_and_scale(
+    actual: Tensor,
+    expected: Tensor,
+    *,
+    min_cosine: float,
+    norm_rtol: float,
+) -> None:
+    """Check both direction and norm for an approximate fused gradient."""
+    assert torch.isfinite(actual).all()
+    assert cosine_similarity(actual, expected) > min_cosine
+    torch.testing.assert_close(
+        actual.float().norm(),
+        expected.float().norm(),
+        rtol=norm_rtol,
+        atol=1e-6,
+    )
+
+
 def is_nvidia_cuda_available(*, min_cc: int | None = None, max_cc: int | None = None) -> bool:
     """Return whether an NVIDIA CUDA device satisfies the compute-capability range."""
     if not IS_CUDA_AVAILABLE or torch.version.hip is not None:

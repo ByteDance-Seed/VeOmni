@@ -24,7 +24,11 @@ from . import eager as _eager
 
 
 def forward(x: Tensor, freqs: Tensor, *, head_dim: int) -> tuple[Tensor, SavedState]:
-    """NPU interleaved RoPE. Empty inputs and backward reuse the eager pair."""
+    """Apply NPU interleaved RoPE with fixed, non-differentiable ``freqs``.
+
+    Empty inputs and backward reuse the eager pair. Backward returns ``dx``
+    without a frequency gradient.
+    """
     if x.numel() == 0:
         return _eager.forward(x, freqs, head_dim=head_dim)
 

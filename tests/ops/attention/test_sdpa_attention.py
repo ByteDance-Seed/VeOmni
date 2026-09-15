@@ -57,18 +57,6 @@ def test_sdpa_attention_forward_square_causal_layout():
     assert torch.isfinite(output).all()
 
 
-def test_sdpa_attention_forward_accepts_dense_mask():
-    module = _FakeAttentionModule()
-    query = torch.randn(1, 2, 4, 8)
-    attention_mask = torch.tril(torch.ones(1, 1, 4, 4, dtype=torch.bool))
-    output, lse = sdpa_backend.sdpa_attention_forward(
-        module, query, query, query, attention_mask=attention_mask, dropout=0.0
-    )
-    assert output.shape == (1, 4, 2, 8)
-    assert lse is None
-    assert torch.isfinite(output).all()
-
-
 def test_sdpa_attention_rejects_zero_dimensions():
     module = _FakeAttentionModule()
     query = torch.randn(1, 0, 4, 8)
@@ -242,7 +230,7 @@ def test_sdpa_attention_matches_math_reference(mask_case):
     module = _FakeAttentionModule()
     module.num_key_value_groups = query_heads // kv_heads
     sdpa_qkv = clone_qkv(query, key, value)
-    sdpa_output, _ = sdpa_backend.sdpa_attention_forward(
+    sdpa_output, lse = sdpa_backend.sdpa_attention_forward(
         module,
         *sdpa_qkv,
         attention_mask=dense,
@@ -251,6 +239,7 @@ def test_sdpa_attention_matches_math_reference(mask_case):
     )
     sdpa_gradients = torch.autograd.grad(sdpa_output, sdpa_qkv, output_gradient)
 
+    assert lse is None
     torch.testing.assert_close(sdpa_output, reference_output, rtol=EAGER_RTOL, atol=EAGER_ATOL)
     for name, gradient, reference_gradient in zip(
         ("query", "key", "value"),
