@@ -65,7 +65,7 @@ from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..optim import build_lr_scheduler, build_optimizer
-from ..utils import helper, logging
+from ..utils import helper, logging, recompute_utils
 from ..utils.checkpoint_utils import should_skip_hf_weight_load
 from ..utils.device import (
     get_device_type,
@@ -574,6 +574,21 @@ class BaseTrainer(Stateful, ABC):
                 "skipping HF weight materialization before checkpoint restore."
             )
 
+        # Recomputation strategy for this run: how many trailing blocks recompute
+        # at all, and how many of those — from the front of that range — run SAC
+        # instead of full recomputation.
+        gc_cfg = args.train.gradient_checkpointing
+        recompute_policy = recompute_utils.build_policy(
+            enabled=gc_cfg.enable,
+            enable_reentrant=gc_cfg.enable_reentrant,
+            early_stop=gc_cfg.early_stop,
+            extra_op_names=gc_cfg.selective_ops,
+            recompute_last_n_layers=gc_cfg.recompute_last_n_layers,
+            selective_n_layers=gc_cfg.selective_n_layers,
+            offload_active=offload_config.enable_activation,
+            compile_enabled=args.train.torch_compile.enable,
+        )
+
         # Parallelize model
         self.model = build_parallelize_model(
             self.model,
@@ -582,12 +597,13 @@ class BaseTrainer(Stateful, ABC):
             should_skip_hf_weight_load=skip_hf_weight_load,
             enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
-            enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
+            enable_gradient_checkpointing=gc_cfg.enable,
             basic_modules=list(
                 set(getattr(self.model, "_no_split_modules", None) or []) | set(args.model.basic_modules)
             ),
-            enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
-            early_stop=args.train.gradient_checkpointing.early_stop,
+            recompute_policy=recompute_policy,
+            enable_reentrant=gc_cfg.enable_reentrant,
+            early_stop=gc_cfg.early_stop,
             enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
             enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
             broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
@@ -600,23 +616,6 @@ class BaseTrainer(Stateful, ABC):
             **kwargs,
         )
         self.model.train()
-
-        # SAC process-level switch, read by recompute_utils.checkpoint_forward.
-        # gradient_checkpoint_layers → which blocks recompute;
-        # selective_gradient_checkpoint_layers → which of those run SAC.
-        from veomni.utils import recompute_utils
-
-        gc_cfg = args.train.gradient_checkpointing
-        recompute_utils.configure(
-            enabled=bool(
-                gc_cfg.enable
-                and (gc_cfg.selective or gc_cfg.selective_gradient_checkpoint_layers)
-                and not gc_cfg.enable_reentrant
-            ),
-            extra_op_names=gc_cfg.selective_ops,
-            gradient_checkpoint_layers=gc_cfg.gradient_checkpoint_layers,
-            selective_gradient_checkpoint_layers=gc_cfg.selective_gradient_checkpoint_layers,
-        )
 
     def _build_optimizer(self):
         args: VeOmniArguments = self.args

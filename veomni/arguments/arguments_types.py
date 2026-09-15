@@ -400,13 +400,32 @@ class GradientCheckpointingConfig:
             )
         },
     )
-    selective: bool = field(
-        default=False,
+    recompute_last_n_layers: int = field(
+        default=-1,
         metadata={
             "help": (
-                "Selective activation checkpointing: keep attention-op outputs "
-                "(default set), recompute the rest (GEMM/MLP). Requires "
-                "enable=True and enable_reentrant=False."
+                "How many layers recompute, counted from the last block: -1 = "
+                "all layers (default), 0 = none, N = the last N layers. Values "
+                "above the model depth mean all layers. Applies to every model: "
+                "the framework finds the block stack itself (_no_split_modules / "
+                "basic_modules) and folds sibling stacks into one sequence."
+            )
+        },
+    )
+    selective_n_layers: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Selective activation checkpointing (SAC): how many of the "
+                "recomputed layers run SAC instead of full recompute, counted "
+                "from the front of the recompute range. 0 = off (default), N = "
+                "the first N recomputed layers, a value at or above the model "
+                "depth = every recomputed layer. Requires enable=True and "
+                "enable_reentrant=False; on a 20-layer model with "
+                "recompute_last_n_layers=-1, 10 = layers 0-9 SAC, 10-19 full "
+                "recompute. Applies to every model that checkpoints through HF "
+                "layers or through self._gradient_checkpointing_func; a model "
+                "calling torch.utils.checkpoint directly is reported and skipped."
             )
         },
     )
@@ -419,28 +438,16 @@ class GradientCheckpointingConfig:
             )
         },
     )
-    gradient_checkpoint_layers: list = field(
-        default_factory=list,
-        metadata={
-            "help": (
-                "Layers to recompute (empty = all layers, the default). Each "
-                "entry: int or inclusive range 'a-b', e.g. [0, '2-9'] = layers "
-                "0 and 2..9 only."
-            )
-        },
-    )
-    selective_gradient_checkpoint_layers: list = field(
-        default_factory=list,
-        metadata={
-            "help": (
-                "Layers to run selective checkpointing (SAC) among recomputed "
-                "layers. Each entry: int or inclusive range 'a-b'. Empty = "
-                "follow 'selective' (SAC everywhere). Example: [10, '11-19'] on "
-                "a 20-layer model = layers 0-9 full recompute, 10-19 SAC. "
-                "Ignored when selective is off."
-            )
-        },
-    )
+
+    def __post_init__(self) -> None:
+        # YAML values reach the dataclass untyped (parser only casts CLI args),
+        # so a quoted "10" would blow up later inside the forward pass.
+        for name in ("recompute_last_n_layers", "selective_n_layers"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    f"train.gradient_checkpointing.{name} must be an integer, got {value!r} ({type(value).__name__})"
+                )
 
 
 @dataclass

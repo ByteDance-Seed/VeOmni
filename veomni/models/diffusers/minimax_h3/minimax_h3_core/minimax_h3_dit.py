@@ -613,7 +613,6 @@ class MiniMaxH3DiT(nn.Module):
                 cu_seqlens=cu_bounds,
                 max_seqlen=max_seqlen,
                 use_ulysses=sp_world > 1,
-                layer_index=i,  # positive layer selection (configure gradient_checkpoint_layers)
             )
 
         if self._block_offload_enabled:
