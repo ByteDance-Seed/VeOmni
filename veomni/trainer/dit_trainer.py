@@ -190,14 +190,6 @@ class DiTModelRuntime(VeOmniModelRuntime):
 
     condition_model: PreTrainedModel = None
 
-    @property
-    def training_task(self) -> str:
-        return self.train.training_task
-
-    @property
-    def trains_the_dit(self) -> bool:
-        return self.training_task in ("offline_training", "online_training")
-
     def _build_model(self):
         logger.info_rank0("Build model")
         args: DiTModelArguments = self.args
@@ -210,8 +202,8 @@ class DiTModelRuntime(VeOmniModelRuntime):
         self.model_config = dit_config
         logger.info_rank0(f"Detected DiT model type: {dit_config.model_type}.")
         self._build_condition_model(dit_config.condition_model_type)
-        if self.trains_the_dit:
-            logger.info_rank0(f"Task: {self.training_task}, prepare dit model.")
+        if self.train.training_task != "offline_embedding":
+            logger.info_rank0(f"Task: {self.train.training_task}, prepare dit model.")
             self.model = build_foundation_model(
                 config_path=args.config_path,
                 weights_path=args.model_path,
@@ -223,7 +215,7 @@ class DiTModelRuntime(VeOmniModelRuntime):
             self.model_config = getattr(self.model, "config", None)
         else:
             self.model = None
-            logger.info_rank0(f"Task: {self.training_task}, dit model is not prepared.")
+            logger.info_rank0(f"Task: {self.train.training_task}, dit model is not prepared.")
 
     def _build_condition_model(self, condition_model_type: str) -> None:
         args: DiTModelArguments = self.args
@@ -234,7 +226,7 @@ class DiTModelRuntime(VeOmniModelRuntime):
             **args.condition_model_cfg,
         )
         model_class = MODELING_REGISTRY[condition_model_type]()
-        if self.training_task == "offline_training":
+        if self.train.training_task == "offline_training":
             self.condition_model = model_class._from_config(condition_cfg, meta_init=True)
             logger.info_rank0("Condition model loaded with empty weights.")
         else:
@@ -245,12 +237,12 @@ class DiTModelRuntime(VeOmniModelRuntime):
     def _freeze_model_module(self):
         self.condition_model.requires_grad_(False)
 
-        if self.trains_the_dit:
+        if self.train.training_task != "offline_embedding":
             super()._freeze_model_module()
 
     def _build_parallelized_model(self) -> None:
         """``offline_embedding`` builds no DiT, so there is nothing to wrap."""
-        if self.trains_the_dit:
+        if self.train.training_task != "offline_embedding":
             super()._build_parallelized_model()
 
     def _build_model_assets(self) -> None:
@@ -260,24 +252,28 @@ class DiTModelRuntime(VeOmniModelRuntime):
         exporting: ``offline_embedding`` builds no DiT at all, it writes cached
         condition embeddings, which need no model sidecars.
         """
-        self.model_assets = [self.model_config] if self.trains_the_dit else []
+        self.model_assets = [self.model_config] if self.train.training_task != "offline_embedding" else []
 
     def _build_optimizer(self, param_groups=None) -> None:
         """``offline_embedding`` trains nothing, so there is nothing to optimize."""
-        if self.trains_the_dit:
+        if self.train.training_task != "offline_embedding":
             super()._build_optimizer(param_groups=param_groups)
 
     def load(self) -> None:
-        if self.trains_the_dit:
+        if self.train.training_task != "offline_embedding":
             super().load()
 
     def save_dcp(self, state) -> None:
-        if self.trains_the_dit:
+        if self.train.training_task != "offline_embedding":
             super().save_dcp(state)
 
     def save_hf_or_lora(self, state, stage: str = "step_end") -> None:
-        if self.trains_the_dit:
+        if self.train.training_task != "offline_embedding":
             super().save_hf_or_lora(state, stage=stage)
+
+    def save_model_assets(self) -> None:
+        if self.train.training_task != "offline_embedding":
+            super().save_model_assets()
 
 
 class DiTTrainer:
@@ -320,7 +316,7 @@ class DiTTrainer:
         # rewrite _build_dataloader, build dataloader only on sp_rank_0 to save memory
         self._build_dataloader()
 
-        if self.trains_the_dit:
+        if self.training_task != "offline_embedding":
             self.base._build_lr_scheduler()
             self.base._build_training_context()
 
@@ -329,10 +325,6 @@ class DiTTrainer:
     @property
     def condition_model(self) -> PreTrainedModel:
         return self.base.model.condition_model
-
-    @property
-    def trains_the_dit(self) -> bool:
-        return self.base.model.trains_the_dit
 
     def _build_model_runtime(self) -> DiTModelRuntime:
         """Build (and own) this job's DiT. Override to swap in another runtime."""

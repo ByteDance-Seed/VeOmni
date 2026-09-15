@@ -16,8 +16,8 @@
 
 This owns the every-N-steps / epochs cadence and the one-shot sidecar export.
 *What* is written is :meth:`BaseTrainer.save_dcp` /
-:meth:`~BaseTrainer.save_hf_or_lora` / :meth:`~BaseTrainer.load`, which fan
-out to the model handles, plus :meth:`VeOmniModelRuntime.save_model_assets`.
+:meth:`~BaseTrainer.save_hf_or_lora` / :meth:`~BaseTrainer.load` /
+:meth:`~BaseTrainer.save_model_assets`, which fan out to the model handles.
 *How* belongs to each model's
 :class:`~veomni.models.checkpoint_manager.ModelCheckpointManager`.
 
@@ -59,7 +59,7 @@ class CheckpointCallback(Callback):
         self._last_hf_step: int = -1
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
-        self.trainer.model.save_model_assets()
+        self.trainer.save_model_assets()
         self.trainer.load()
         helper.empty_cache()
 

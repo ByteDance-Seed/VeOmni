@@ -65,9 +65,6 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
     trainer.start_epoch = 0
     trainer.start_step = 0
     trainer.checkpoint = MagicMock()
-    # Single-model job: the real manager's class default, which keeps the
-    # manifest's module list empty. The manager lives on the runtime handle.
-    trainer.model.checkpoint.module_name = ""
 
     return trainer
 
@@ -230,7 +227,7 @@ class TestCheckpointCallbackTrainBegin:
     def test_on_train_begin_exports_assets_then_loads(self, mock_helper):
         trainer = _make_mock_trainer()
         order = []
-        trainer.model.save_model_assets.side_effect = lambda: order.append("assets")
+        trainer.save_model_assets.side_effect = lambda: order.append("assets")
         trainer.load.side_effect = lambda: order.append("load")
         cb = CheckpointCallback(trainer)
 
@@ -324,6 +321,18 @@ class TestModelCheckpointManagerSaveContract:
         rebuilt = model_dir(step_dir(call.args[0], call.kwargs["global_steps"]), call.kwargs["module"])
         assert rebuilt == "/remote/run/global_step_10/model"
         assert rebuilt == manager.save_dir(state)
+
+    def test_model_assets_nest_under_the_module_name(self, mock_helper, mock_dist, mock_build_ckpt):
+        runtime = _make_mock_runtime()
+        mock_build_ckpt.return_value = MagicMock()
+        manager = ModelCheckpointManager(runtime)
+        assert manager.assets_dir() == runtime.train.checkpoint.model_assets_dir
+
+        class Named(ModelCheckpointManager):
+            module_name = "vision_encoder"
+
+        named = Named(runtime)
+        assert named.assets_dir() == f"{runtime.train.checkpoint.model_assets_dir}/vision_encoder"
 
     def test_save_forwards_lr_scheduler_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
         runtime = _make_mock_runtime()

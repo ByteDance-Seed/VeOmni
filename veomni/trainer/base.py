@@ -529,6 +529,14 @@ class BaseTrainer(Stateful, ABC):
         """Export this job's weights in whichever format the model was trained in."""
         self.model.save_hf_or_lora(state, stage=stage)
 
+    def save_model_assets(self) -> None:
+        """Write this job's tokenizer/config sidecars.
+
+        The fan-out is the point: a trainer holding a second model extends this
+        to export both, and the callback that triggers it keeps knowing only *when*.
+        """
+        self.model.save_model_assets()
+
     def on_train_begin(self):
         for callback in self._callbacks:
             callback.on_train_begin(self.state)

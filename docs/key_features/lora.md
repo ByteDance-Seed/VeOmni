@@ -270,7 +270,7 @@ Output structure for each checkpoint:
 │       └── lora_ckpt/                   ← the inference artifact
 │           ├── adapter_config.json      ← PEFT-format; MoE mode in its `veomni_lora` block
 │           └── adapter_model.safetensors
-└── model_assets/
+└── model_assets/                   # or model_assets/<module>/ in a multi-module job
 ```
 
 The adapter export sits in its own `lora_ckpt/`, not in with the resume state and

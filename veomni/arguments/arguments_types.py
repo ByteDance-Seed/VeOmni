@@ -1028,6 +1028,8 @@ class TrainingArguments:
             self.dataloader_batch_size = self.global_batch_size // acc.dp_size  # = micro bsz * grad accu
 
     def _resolve_checkpoint_paths(self):
+        from ..checkpoint.layout import ASSETS_DIRNAME
+
         ckpt = self.checkpoint
 
         if ckpt.load_path == "auto":
@@ -1053,10 +1055,10 @@ class TrainingArguments:
         # │   ├── global_step_100/
         # │   └── global_step_200/
         # │       └── hf_ckpt/      # HF safetensors saved under the last checkpoint folder
-        # └── model_assets/
+        # └── model_assets/         # or model_assets/<module>/ in a multi-module job
         # See docs/usage/checkpoint.md.
         ckpt.save_path = os.path.join(ckpt.output_dir, "checkpoints")
-        ckpt.model_assets_dir = os.path.join(ckpt.output_dir, "model_assets")
+        ckpt.model_assets_dir = os.path.join(ckpt.output_dir, ASSETS_DIRNAME)
 
     def _resolve_profile(self):
         if self.profile.enable:

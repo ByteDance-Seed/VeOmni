@@ -546,5 +546,5 @@ class VeOmniModelRuntime:
         from .module_utils import save_model_assets as write_model_assets
 
         if self.train.global_rank == 0:
-            write_model_assets(self.train.checkpoint.model_assets_dir, self.model_assets)
+            write_model_assets(self.checkpoint.assets_dir(), self.model_assets)
         dist.barrier()

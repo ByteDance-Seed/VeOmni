@@ -132,6 +132,15 @@ class ModelCheckpointManager:
         """Where this step's PEFT adapter export lives."""
         return layout.lora_export_dir(self.step_dir(state), self.module_name)
 
+    def assets_dir(self) -> str:
+        """Where this model's config/tokenizer/processor sidecars live.
+
+        Once per run, at the output root — not inside a step. Nested under
+        :attr:`module_name` so two modules cannot overwrite each other's
+        ``config.json``.
+        """
+        return layout.assets_dir(self.config.model_assets_dir, self.module_name)
+
     def load_dir(self) -> Optional[str]:
         """Step directory to resume from.
 
