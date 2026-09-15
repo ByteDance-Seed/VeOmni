@@ -781,6 +781,35 @@ def test_npu_ascendc_rejects_trainable_initial_state(
         entry.wrapper(query, key, value, g, beta, initial_state=initial_state)
 
 
+def test_npu_ascendc_rejects_final_state_when_inputs_require_grad(
+    monkeypatch: pytest.MonkeyPatch,
+    _stub_npu_input_guard: None,
+) -> None:
+    """A final-state-only loss cannot silently drop dht and keep Q/K/V grads."""
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import npu_ascendc as module
+
+    def unexpected_kernel(*args, **kwargs):
+        pytest.fail("output_final_state reached the AscendC kernel")
+
+    monkeypatch.setattr(module, "_chunk_fwd", unexpected_kernel)
+    shape = (1, 4, 2, 8)
+    query = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
+    key = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
+    value = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
+    g = torch.randn(shape[:3], dtype=torch.float32, requires_grad=True)
+    beta = torch.randn(shape[:3], dtype=torch.bfloat16, requires_grad=True)
+    entry = OpEntry(
+        "test_chunk_gdr_dht",
+        "standard",
+        "npu_ascendc",
+        module.forward,
+        module.backward,
+        description="Test trainable final-state reject",
+    )
+    with pytest.raises(NotImplementedError, match="cannot differentiate the final state"):
+        entry.wrapper(query, key, value, g, beta, output_final_state=True)
+
+
 def test_npu_ascendc_missing_fla_npu_raises_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
     import builtins
     import sys

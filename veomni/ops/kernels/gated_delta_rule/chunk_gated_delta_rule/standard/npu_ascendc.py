@@ -506,8 +506,10 @@ def forward(
 
     Empty or omitted *initial_state* / *cu_seqlens* are unused. Unused final
     state is an empty tensor so the registry output stays tensors-only. The
-    fused backward does not produce ``dh0``. Extra NPU varlen tables are
-    accepted; missing keys are filled from ``cu_seqlens``.
+    fused backward does not produce ``dh0`` or consume ``dht``. Trainable
+    ``initial_state`` and ``output_final_state=True`` with trainable inputs
+    are rejected. Extra NPU varlen tables are accepted; missing keys are
+    filled from ``cu_seqlens``.
     """
     from ...vendor.triton.utils import input_guard
 
@@ -548,6 +550,13 @@ def forward(
             "npu_ascendc chunk_gated_delta_rule cannot differentiate initial_state "
             "(the AscendC backward returns no dh0, same as MindSpeed-MM). Detach "
             "initial_state, or use the 'npu' (Triton) backend if you need that gradient."
+        )
+    inputs_need_grad = any(tensor.requires_grad for tensor in (query, key, value, g, beta))
+    if output_final_state and inputs_need_grad:
+        raise NotImplementedError(
+            "npu_ascendc chunk_gated_delta_rule cannot differentiate the final state "
+            "(the AscendC backward drops dht). Set output_final_state=False, or use "
+            "the 'npu' (Triton) backend if you need a final-state loss."
         )
 
     cu_opt = optional_tensor(cu_seqlens)

@@ -127,6 +127,28 @@ def test_magi_attention_preserves_ffa_layout_and_scale(monkeypatch):
     assert lse.shape == (1, 4, 8)
 
 
+def test_magi_attention_rejects_s_aux_before_ulysses(monkeypatch):
+    """Sink softmax is not implemented; fail closed before any collective."""
+
+    def unexpected_call(*args, **kwargs):
+        pytest.fail("s_aux reached Magi Ulysses or FA4 handling")
+
+    monkeypatch.setattr(magi_backend, "get_parallel_state", unexpected_call)
+    monkeypatch.setattr(magi_backend, "should_apply_ulysses", unexpected_call)
+    monkeypatch.setattr(magi_backend, "prepare_ulysses_qkv", unexpected_call)
+    monkeypatch.setattr(magi_backend, "_magi_attention_forward", unexpected_call)
+    query = torch.randn(1, 4, 8, 16)
+    with pytest.raises(ValueError, match="does not implement attention sinks"):
+        magi_backend.magi_attention_forward(
+            _FakeAttentionModule(),
+            query,
+            query,
+            query,
+            _causal_mask(8),
+            s_aux=torch.arange(4),
+        )
+
+
 def test_magi_attention_rejects_unsupported_features(monkeypatch):
     monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state())
     query = torch.randn(1, 4, 8, 16)
