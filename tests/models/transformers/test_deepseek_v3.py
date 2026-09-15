@@ -31,7 +31,6 @@ from tests.models.compare import (
     ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_deepseek_v3_config as _tiny_config
-from veomni.ops import VeomniOp
 
 
 def _dsv3_cls():
@@ -51,19 +50,6 @@ def _dsv3_cls():
 def _build_ours(config: DeepseekV3Config, ops: SimpleNamespace | None = None):
     with ops_config_scope(ops if ops is not None else eager_ops_config()):
         return _dsv3_cls()(config)
-
-
-def test_deepseek_v3_constructs_local_kernels():
-    model = _build_ours(_tiny_config())
-    assert isinstance(model.veomni_ce, VeomniOp)
-    assert model.veomni_ce.impl == "eager"
-    dense = model.model.layers[0]
-    assert dense.input_layernorm.veomni_rms_norm.impl == "eager"
-    assert dense.mlp.veomni_swiglu_mlp.op == "swiglu_mlp"
-    moe = model.model.layers[3]
-    assert moe.mlp.experts.veomni_moe.op == "moe_experts"
-    assert moe.mlp.experts.veomni_moe.impl == "eager"
-    assert moe.mlp.shared_experts.veomni_swiglu_mlp.op == "swiglu_mlp"
 
 
 def test_deepseek_v3_eager_matches_hf():

@@ -44,7 +44,6 @@ from tests.models.compare import (
     qwen_image_inputs,
 )
 from tests.models.tiny_configs import tiny_qwen3_omni_moe_thinker_config as _tiny_thinker_config
-from veomni.ops import VeomniOp
 
 
 IMAGE_TOKEN_ID = 120
@@ -90,17 +89,6 @@ def _mask_kwargs(input_ids: torch.Tensor) -> dict:
         "video_mask": zeros,
         "audio_mask": zeros,
     }
-
-
-def test_qwen3_omni_moe_constructs_local_kernels():
-    model = _build_ours(_tiny_thinker_config())
-    assert isinstance(model.veomni_ce, VeomniOp)
-    assert model.veomni_ce.impl == "eager"
-    assert isinstance(model.veomni_lb, VeomniOp)
-    assert model.veomni_lb.impl == "eager"
-    layer = model.model.layers[0]
-    assert layer.mlp.experts.veomni_moe.impl == "eager"
-    assert layer.mlp.experts.veomni_moe.op == "moe_experts"
 
 
 def test_qwen3_omni_moe_parallel_plans_cover_all_kernel_load_entries():

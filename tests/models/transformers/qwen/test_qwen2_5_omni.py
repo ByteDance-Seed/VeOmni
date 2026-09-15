@@ -43,7 +43,6 @@ from tests.models.compare import (
     qwen_image_inputs,
 )
 from tests.models.tiny_configs import tiny_qwen2_5_omni_thinker_config as _tiny_thinker_config
-from veomni.ops import VeomniOp
 
 
 def _build_ours(config: Qwen2_5OmniThinkerConfig, ops: SimpleNamespace | None = None):
@@ -62,12 +61,6 @@ def _mask_kwargs(input_ids: torch.Tensor) -> dict:
         "video_mask": zeros,
         "audio_mask": zeros,
     }
-
-
-def test_qwen2_5_omni_constructs_local_kernels():
-    model = _build_ours(_tiny_thinker_config())
-    assert isinstance(model.veomni_ce, VeomniOp)
-    assert model.veomni_ce.impl == "eager"
 
 
 def test_qwen2_5_omni_registry_wires_kernel_and_upstream_talker_entries():

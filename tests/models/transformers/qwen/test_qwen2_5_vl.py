@@ -39,7 +39,6 @@ from tests.models.compare import (
     qwen_video_inputs,
 )
 from tests.models.tiny_configs import tiny_qwen2_5_vl_config as _tiny_config
-from veomni.ops import VeomniOp
 
 
 def _build_ours(config: Qwen2_5_VLConfig, ops: SimpleNamespace | None = None):
@@ -57,12 +56,6 @@ def _mask_kwargs(input_ids: torch.Tensor) -> dict:
         "image_mask": zeros,
         "video_mask": zeros,
     }
-
-
-def test_qwen2_5_vl_constructs_local_kernels():
-    model = _build_ours(_tiny_config())
-    assert isinstance(model.veomni_ce, VeomniOp)
-    assert model.veomni_ce.impl == "eager"
 
 
 def test_qwen2_5_vl_eager_matches_hf_text_only():

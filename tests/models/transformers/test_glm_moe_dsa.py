@@ -30,7 +30,6 @@ from tests.models.compare import (
     ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_glm_moe_dsa_config as _tiny_config
-from veomni.ops import VeomniOp
 
 
 def _glm_cls(architecture: str):
@@ -52,24 +51,14 @@ def _build_ours(
         return _glm_cls(architecture)(config)
 
 
-def test_glm_moe_dsa_constructs_local_kernels():
-    model = _build_ours(_tiny_config())
-    assert isinstance(model.veomni_ce, VeomniOp)
-    assert model.veomni_ce.impl == "eager"
-    attn = model.model.layers[0].self_attn
-    assert attn.veomni_dsa_attention.op == "dsa_attention"
-    assert attn.veomni_dsa_attention.variant == "glm"
-    assert attn.veomni_dsa_attention.impl == "eager"
-    assert attn.indexer.veomni_dsa_indexer.op == "dsa_indexer"
-    assert attn.indexer.veomni_dsa_indexer.variant == "glm"
-    assert attn.indexer.veomni_dsa_indexer.impl == "eager"
-
-
 def test_glm_moe_dsa_eager_matches_hf():
     torch.manual_seed(0)
     config = _tiny_config()
     hf = HFGlmMoeDsaForCausalLM(config)
     ours = _build_ours(config)
+    attn = ours.model.layers[0].self_attn
+    assert attn.veomni_dsa_attention.variant == "glm"
+    assert attn.indexer.veomni_dsa_indexer.variant == "glm"
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8))

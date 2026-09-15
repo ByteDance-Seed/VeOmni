@@ -35,7 +35,6 @@ from tests.models.tiny_configs import tiny_wan_t2v_config as _tiny_config
 from veomni.models.diffusers.wan_t2v.wan_transformer.configuration_wan_transformer import (
     WanTransformer3DModelConfig,
 )
-from veomni.ops import VeomniOp
 
 
 _OFFICIAL_FORWARD = OfficialWanTransformer3DModel.forward
@@ -83,14 +82,6 @@ def test_wan_t2v_condition_builds_from_registered_class_without_assets(monkeypat
 
     assert type(model) is modeling_wan_condition.WanTransformer3DConditionModel
     assert model.config.model_type == "WanTransformer3DConditionModel"
-
-
-def test_wan_t2v_constructs_local_kernels():
-    model = _build_ours(_tiny_config())
-    processor = model.blocks[0].attn1.processor
-    assert isinstance(processor.veomni_attn, VeomniOp)
-    assert processor.veomni_attn.op == "attention"
-    assert processor.veomni_attn.impl == "eager"
 
 
 def test_wan_t2v_public_training_forward_matches_official(monkeypatch):

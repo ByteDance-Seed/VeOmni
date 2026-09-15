@@ -33,7 +33,6 @@ from tests.models.compare import (
     ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_deepseek_v4_config as _tiny_config
-from veomni.ops import VeomniOp
 
 
 def _dsv4_module():
@@ -55,40 +54,11 @@ def _build_ours(config: DeepseekV4Config, ops: SimpleNamespace | None = None):
         return _dsv4_cls()(config)
 
 
-def test_deepseek_v4_constructs_local_kernels():
-    model = _build_ours(_tiny_config())
-    assert isinstance(model.veomni_ce, VeomniOp)
-    assert model.veomni_ce.impl == "eager"
-    assert isinstance(model.veomni_lb, VeomniOp)
-    assert model.config.layer_types == [
-        "heavily_compressed_attention",
-        "heavily_compressed_attention",
-        "heavily_compressed_attention",
-        "compressed_sparse_attention",
-    ]
-    assert model.config.mlp_layer_types == ["hash_moe", "hash_moe", "hash_moe", "moe"]
-    layer = model.model.layers[0]
-    assert layer.input_layernorm.veomni_rms_norm.impl == "eager"
-    assert layer.input_layernorm.veomni_rms_norm.variant == "deepseek_v4"
-    assert layer.self_attn.q_b_norm.veomni_unweighted_rms_norm.impl == "eager"
-    assert layer.self_attn.q_b_norm.veomni_unweighted_rms_norm.variant == "unweighted"
-    assert layer.attn_hc.veomni_mhc_pre.op == "mhc"
-    assert layer.veomni_mhc_post.variant == "post"
-    assert layer.self_attn.veomni_dsa_attention.op == "dsa_attention"
-    assert layer.self_attn.veomni_dsa_attention.variant == "deepseek_v4"
-    csa = model.model.layers[3].self_attn.compressor
-    assert csa.indexer.veomni_dsa_indexer.op == "dsa_indexer"
-    assert csa.indexer.veomni_dsa_indexer.variant == "deepseek_v4"
-    assert layer.mlp.experts.veomni_moe.op == "moe_experts"
-    assert layer.mlp.shared_experts.veomni_swiglu_mlp.op == "swiglu_mlp"
-    assert layer.mlp.shared_experts.limit == model.config.swiglu_limit
-    assert model.model.hc_head.veomni_mhc_head.variant == "head"
-
-
 def test_deepseek_v4_shared_mlp_passes_swiglu_limit():
     config = _tiny_config()
     model = _build_ours(config)
     shared = model.model.layers[0].mlp.shared_experts
+    assert shared.limit == config.swiglu_limit
     captured: dict = {}
 
     def record(x, *args, **kwargs):
@@ -223,6 +193,16 @@ def test_deepseek_v4_eager_matches_hf(seq_len):
     config = _tiny_config()
     hf = HFDeepseekV4ForCausalLM(config)
     ours = _build_ours(config)
+    # Keep both attention and routing layouts exercised by the numerical comparison.
+    assert config.layer_types == ["heavily_compressed_attention"] * 3 + ["compressed_sparse_attention"]
+    assert config.mlp_layer_types == ["hash_moe"] * 3 + ["moe"]
+    layer = ours.model.layers[0]
+    assert layer.input_layernorm.veomni_rms_norm.variant == "deepseek_v4"
+    assert layer.self_attn.q_b_norm.veomni_unweighted_rms_norm.variant == "unweighted"
+    assert layer.veomni_mhc_post.variant == "post"
+    assert layer.self_attn.veomni_dsa_attention.variant == "deepseek_v4"
+    assert ours.model.layers[3].self_attn.compressor.indexer.veomni_dsa_indexer.variant == "deepseek_v4"
+    assert ours.model.hc_head.veomni_mhc_head.variant == "head"
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, seq_len))

@@ -38,7 +38,6 @@ from tests.models.compare import (
 )
 from tests.models.tiny_configs import tiny_gemma3_text_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
-from veomni.ops import VeomniOp
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
@@ -55,12 +54,6 @@ def _flex_ops_config() -> SimpleNamespace:
     config = eager_ops_config()
     config.attn_implementation = "veomni_flex_attention"
     return config
-
-
-def test_gemma3_constructs_local_kernels():
-    model = _build_ours(_tiny_config())
-    assert isinstance(model.veomni_ce, VeomniOp)
-    assert model.veomni_ce.impl == "eager"
 
 
 def test_gemma3_eager_matches_hf():

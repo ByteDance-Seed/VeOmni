@@ -39,7 +39,6 @@ from tests.models.compare import (
     qwen_video_inputs,
 )
 from tests.models.tiny_configs import tiny_qwen3_vl_config as _tiny_config
-from veomni.ops import VeomniOp
 
 
 IMAGE_TOKEN_ID = 120
@@ -63,14 +62,6 @@ def _qwen3_vl_cls():
 def _build_ours(config: Qwen3VLConfig, ops: SimpleNamespace | None = None):
     with ops_config_scope(ops if ops is not None else eager_ops_config()):
         return _qwen3_vl_cls()(config)
-
-
-def test_qwen3_vl_constructs_local_kernels():
-    model = _build_ours(_tiny_config())
-    assert isinstance(model.veomni_ce, VeomniOp)
-    assert model.veomni_ce.impl == "eager"
-    layer = model.model.language_model.layers[0]
-    assert layer.input_layernorm.veomni_rms_norm.impl == "eager"
 
 
 def test_qwen3_vl_eager_matches_hf_text_only():

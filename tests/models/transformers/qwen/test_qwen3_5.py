@@ -45,7 +45,6 @@ from tests.models.tiny_configs import (
 from tests.models.tiny_configs import (
     tiny_qwen3_5_text_config as _tiny_text_config,
 )
-from veomni.ops import VeomniOp
 
 
 IMAGE_TOKEN_ID = 120
@@ -108,18 +107,6 @@ def _pin_hf_gdn_to_torch(model: torch.nn.Module) -> None:
             gdn.norm = replacement
 
 
-def test_qwen3_5_constructs_local_kernels():
-    model = _build_causal(_tiny_text_config(layer_types=["linear_attention", "full_attention"]))
-    assert isinstance(model.veomni_ce, VeomniOp)
-    assert model.veomni_ce.impl == "eager"
-    layer0 = model.model.layers[0]
-    assert layer0.input_layernorm.veomni_rms_norm.impl == "eager"
-    assert layer0.input_layernorm.veomni_rms_norm.variant == "qwen3_5"
-    assert layer0.linear_attn.veomni_rms_norm_gated.impl == "eager"
-    assert layer0.linear_attn.veomni_causal_conv1d.impl == "eager"
-    assert layer0.linear_attn.veomni_chunk_gated_delta_rule.impl == "eager"
-
-
 def test_qwen3_5_eager_matches_hf_full_attention():
     torch.manual_seed(0)
     config = _tiny_text_config(layer_types=["full_attention", "full_attention"])
@@ -158,6 +145,7 @@ def test_qwen3_5_eager_matches_hf_mixed_attention():
     config = _tiny_text_config(layer_types=["linear_attention", "linear_attention", "full_attention"])
     hf = HFQwen3_5ForCausalLM(config)
     ours = _build_causal(config)
+    assert ours.model.layers[0].input_layernorm.veomni_rms_norm.variant == "qwen3_5"
     ours.load_state_dict(hf.state_dict())
 
     _pin_hf_gdn_to_torch(hf)

@@ -40,7 +40,6 @@ from tests.models.compare import (
     ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_qwen3_moe_config as _tiny_config
-from veomni.ops import VeomniOp
 
 
 def _qwen3_moe_classes():
@@ -79,18 +78,6 @@ def _construct_ours(model_cls, config: Qwen3MoeConfig, ops: SimpleNamespace | No
 def _build_ours(config: Qwen3MoeConfig, ops: SimpleNamespace | None = None):
     causal_cls, *_ = _qwen3_moe_classes()
     return _construct_ours(causal_cls, config, ops)
-
-
-def test_qwen3_moe_constructs_local_kernels():
-    model = _build_ours(_tiny_config())
-    assert isinstance(model.veomni_ce, VeomniOp)
-    assert model.veomni_ce.impl == "eager"
-    assert isinstance(model.veomni_lb, VeomniOp)
-    assert model.veomni_lb.impl == "eager"
-    layer = model.model.layers[0]
-    assert layer.input_layernorm.veomni_rms_norm.impl == "eager"
-    assert layer.mlp.experts.veomni_moe.impl == "eager"
-    assert layer.mlp.experts.veomni_moe.op == "moe_experts"
 
 
 def test_qwen3_moe_rope_reads_selected_impl(monkeypatch):

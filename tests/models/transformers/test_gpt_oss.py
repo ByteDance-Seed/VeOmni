@@ -32,7 +32,6 @@ from tests.models.compare import (
     ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_gpt_oss_config as _tiny_config
-from veomni.ops import VeomniOp
 
 
 def _build_ours(config: GptOssConfig, ops: SimpleNamespace | None = None):
@@ -44,18 +43,6 @@ def _build_ours(config: GptOssConfig, ops: SimpleNamespace | None = None):
         return GptOssForCausalLM(config)
 
 
-def test_gpt_oss_constructs_local_kernels():
-    model = _build_ours(_tiny_config())
-    assert isinstance(model.veomni_ce, VeomniOp)
-    assert model.veomni_ce.impl == "eager"
-    assert isinstance(model.veomni_lb, VeomniOp)
-    assert model.veomni_lb.impl == "eager"
-    layer = model.model.layers[0]
-    assert layer.mlp.experts.veomni_moe.impl == "eager"
-    assert layer.mlp.experts.veomni_moe.op == "moe_experts"
-    assert layer.mlp.experts.veomni_moe.variant == "gpt_oss"
-
-
 @pytest.mark.parametrize(
     "seq_len,partial_labels", [(7, False), (17, True)], ids=["within-window", "padded-beyond-window"]
 )
@@ -64,6 +51,7 @@ def test_gpt_oss_eager_matches_hf(seq_len, partial_labels):
     config = _tiny_config()
     hf = HFGptOssForCausalLM(config)
     ours = _build_ours(config)
+    assert ours.model.layers[0].mlp.experts.veomni_moe.variant == "gpt_oss"
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, seq_len))

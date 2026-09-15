@@ -51,7 +51,6 @@ from tests.models.tiny_configs import (
 from tests.models.tiny_configs import (
     tiny_qwen3_5_moe_text_config as _tiny_text_config,
 )
-from veomni.ops import VeomniOp
 
 
 IMAGE_TOKEN_ID = 120
@@ -109,20 +108,6 @@ def _pin_hf_gdn_to_torch(model: torch.nn.Module) -> None:
             gdn.norm = replacement
 
 
-def test_qwen3_5_moe_constructs_local_kernels():
-    model = _build_causal(_tiny_text_config(layer_types=["linear_attention", "full_attention"]))
-    assert isinstance(model.veomni_ce, VeomniOp)
-    assert model.veomni_ce.impl == "eager"
-    assert isinstance(model.veomni_lb, VeomniOp)
-    assert model.veomni_lb.impl == "eager"
-    layer0 = model.model.layers[0]
-    assert layer0.input_layernorm.veomni_rms_norm.impl == "eager"
-    assert layer0.input_layernorm.veomni_rms_norm.variant == "qwen3_5"
-    assert layer0.linear_attn.veomni_rms_norm_gated.impl == "eager"
-    assert layer0.mlp.experts.veomni_moe.impl == "eager"
-    assert layer0.mlp.experts.veomni_moe.op == "moe_experts"
-
-
 def test_qwen3_5_moe_parallel_plans_cover_multimodal_and_text_wrappers():
     causal_cls, conditional_cls = _qwen3_5_moe_classes()
 
@@ -177,6 +162,7 @@ def test_qwen3_5_moe_eager_matches_hf_mixed_attention():
     config = _tiny_text_config(layer_types=["linear_attention", "linear_attention", "full_attention"])
     hf = HFQwen3_5MoeForCausalLM(config)
     ours = _build_causal(config)
+    assert ours.model.layers[0].input_layernorm.veomni_rms_norm.variant == "qwen3_5"
     ours.load_state_dict(hf.state_dict())
 
     _pin_hf_gdn_to_torch(hf)

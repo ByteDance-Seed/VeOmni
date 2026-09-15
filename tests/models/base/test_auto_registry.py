@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""models auto / registry construct helpers."""
+"""Model registration, public construction, and instance-local op selection."""
 
 from __future__ import annotations
 
@@ -148,13 +148,21 @@ class _ModelCase:
     registered_config_aliases: tuple[str, ...] = ()
     registered_model_aliases: tuple[str, ...] = ()
     processor_class_name: str | None = None
-    eager_op_path: str | None = "veomni_ce"
+    # Representative integration points, not an exhaustive snapshot of model internals.
+    eager_ops: tuple[tuple[str, str], ...] = (("veomni_ce", "cross_entropy_loss"),)
     isolation_op_path: str | None = None
 
 
 _MODEL_CASES = (
     _ModelCase(
         model_type="deepseek_v3",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.3.mlp.experts.veomni_moe", "moe_experts"),
+            ("model.layers.3.mlp.shared_experts.veomni_swiglu_mlp", "swiglu_mlp"),
+        ),
         config_factory=_tiny_deepseek_v3_config,
         architectures=(
             "DeepseekV3ForCausalLM",
@@ -165,16 +173,29 @@ _MODEL_CASES = (
     ),
     _ModelCase(
         model_type="deepseek_v4",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("veomni_lb", "load_balancing_loss"),
+            ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.layers.0.self_attn.q_b_norm.veomni_unweighted_rms_norm", "rms_norm"),
+            ("model.layers.0.attn_hc.veomni_mhc_pre", "mhc"),
+            ("model.layers.0.veomni_mhc_post", "mhc"),
+            ("model.layers.0.self_attn.veomni_dsa_attention", "dsa_attention"),
+            ("model.layers.3.self_attn.compressor.indexer.veomni_dsa_indexer", "dsa_indexer"),
+            ("model.layers.0.mlp.experts.veomni_moe", "moe_experts"),
+            ("model.layers.0.mlp.shared_experts.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.hc_head.veomni_mhc_head", "mhc"),
+        ),
         config_factory=_tiny_deepseek_v4_config,
         architectures=("DeepseekV4ForCausalLM", "DeepseekV4Model"),
         has_registered_config=True,
     ),
     _ModelCase(
         model_type="flux",
+        eager_ops=(("blocks.0.attn.norm_q_a.veomni_rms_norm", "rms_norm"),),
         config_factory=_tiny_flux_config,
         architectures=("FluxModel",),
         has_registered_config=True,
-        eager_op_path="blocks.0.attn.norm_q_a.veomni_rms_norm",
     ),
     _ModelCase(
         model_type="gemma3_text",
@@ -183,6 +204,11 @@ _MODEL_CASES = (
     ),
     _ModelCase(
         model_type="gpt_oss",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("veomni_lb", "load_balancing_loss"),
+            ("model.layers.0.mlp.experts.veomni_moe", "moe_experts"),
+        ),
         config_factory=_tiny_gpt_oss_config,
         architectures=(
             "GptOssForCausalLM",
@@ -193,11 +219,21 @@ _MODEL_CASES = (
     ),
     _ModelCase(
         model_type="glm_moe_dsa",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("model.layers.0.self_attn.veomni_dsa_attention", "dsa_attention"),
+            ("model.layers.0.self_attn.indexer.veomni_dsa_indexer", "dsa_indexer"),
+        ),
         config_factory=_tiny_glm_moe_dsa_config,
         architectures=("GlmMoeDsaForCausalLM", "GlmMoeDsaModel"),
     ),
     _ModelCase(
         model_type="llama",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+        ),
         config_factory=_tiny_llama_config,
         architectures=(
             "LlamaForCausalLM",
@@ -212,10 +248,15 @@ _MODEL_CASES = (
         architectures=("MoVQGAN",),
         has_registered_config=True,
         processor_class_name="MoVQGANProcessor",
-        eager_op_path=None,
+        eager_ops=(),
     ),
     _ModelCase(
         model_type="seed_oss",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+        ),
         config_factory=_tiny_seed_oss_config,
         architectures=(
             "SeedOssForCausalLM",
@@ -227,6 +268,11 @@ _MODEL_CASES = (
     ),
     _ModelCase(
         model_type="qwen2",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+        ),
         config_factory=_tiny_qwen2_config,
         architectures=(
             "Qwen2ForCausalLM",
@@ -251,11 +297,11 @@ _MODEL_CASES = (
     ),
     _ModelCase(
         model_type="qwen2_5_omni",
+        eager_ops=(("thinker.veomni_ce", "cross_entropy_loss"),),
         config_factory=_tiny_qwen2_5_omni_config,
         architectures=("Qwen2_5OmniForConditionalGeneration",),
         has_registered_config=True,
         processor_class_name="Qwen2_5OmniProcessor",
-        eager_op_path="thinker.veomni_ce",
     ),
     _ModelCase(
         model_type="qwen2_5_omni_thinker",
@@ -266,10 +312,17 @@ _MODEL_CASES = (
         model_type="qwen2_5_omni_text",
         config_factory=_tiny_qwen2_5_omni_text_config,
         architectures=("Qwen2_5OmniThinkerTextModel",),
-        eager_op_path=None,
+        eager_ops=(),
     ),
     _ModelCase(
         model_type="qwen3",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.0.self_attn.veomni_rope", "rope"),
+            ("model.layers.0.self_attn.veomni_attn", "attention"),
+        ),
         config_factory=_tiny_qwen3_config,
         architectures=(
             "Qwen3ForCausalLM",
@@ -280,6 +333,13 @@ _MODEL_CASES = (
     ),
     _ModelCase(
         model_type="qwen3_5",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("model.language_model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.language_model.layers.0.linear_attn.veomni_rms_norm_gated", "rms_norm_gated"),
+            ("model.language_model.layers.0.linear_attn.veomni_causal_conv1d", "causal_conv1d"),
+            ("model.language_model.layers.0.linear_attn.veomni_chunk_gated_delta_rule", "chunk_gated_delta_rule"),
+        ),
         config_factory=_tiny_qwen3_5_config,
         architectures=(
             "Qwen3_5ForConditionalGeneration",
@@ -290,6 +350,13 @@ _MODEL_CASES = (
     ),
     _ModelCase(
         model_type="qwen3_5_text",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.layers.0.linear_attn.veomni_rms_norm_gated", "rms_norm_gated"),
+            ("model.layers.0.linear_attn.veomni_causal_conv1d", "causal_conv1d"),
+            ("model.layers.0.linear_attn.veomni_chunk_gated_delta_rule", "chunk_gated_delta_rule"),
+        ),
         config_factory=_tiny_qwen3_5_text_config,
         architectures=(
             "Qwen3_5ForCausalLM",
@@ -299,18 +366,42 @@ _MODEL_CASES = (
     ),
     _ModelCase(
         model_type="qwen3_5_moe",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("veomni_lb", "load_balancing_loss"),
+            ("model.language_model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.language_model.layers.0.mlp.experts.veomni_moe", "moe_experts"),
+            ("model.language_model.layers.0.linear_attn.veomni_rms_norm_gated", "rms_norm_gated"),
+            ("model.language_model.layers.0.linear_attn.veomni_causal_conv1d", "causal_conv1d"),
+            ("model.language_model.layers.0.linear_attn.veomni_chunk_gated_delta_rule", "chunk_gated_delta_rule"),
+        ),
         isolation_op_path="model.language_model.layers.0.mlp.experts.veomni_moe",
         config_factory=_tiny_qwen3_5_moe_config,
         architectures=("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeModel"),
     ),
     _ModelCase(
         model_type="qwen3_5_moe_text",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("veomni_lb", "load_balancing_loss"),
+            ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.layers.0.mlp.experts.veomni_moe", "moe_experts"),
+            ("model.layers.0.linear_attn.veomni_rms_norm_gated", "rms_norm_gated"),
+            ("model.layers.0.linear_attn.veomni_causal_conv1d", "causal_conv1d"),
+            ("model.layers.0.linear_attn.veomni_chunk_gated_delta_rule", "chunk_gated_delta_rule"),
+        ),
         isolation_op_path="model.layers.0.mlp.experts.veomni_moe",
         config_factory=_tiny_qwen3_5_moe_text_config,
         architectures=("Qwen3_5MoeForCausalLM", "Qwen3_5MoeTextModel"),
     ),
     _ModelCase(
         model_type="qwen3_moe",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("veomni_lb", "load_balancing_loss"),
+            ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.layers.0.mlp.experts.veomni_moe", "moe_experts"),
+        ),
         isolation_op_path="model.layers.0.mlp.experts.veomni_moe",
         config_factory=_tiny_qwen3_moe_config,
         architectures=(
@@ -323,15 +414,24 @@ _MODEL_CASES = (
     ),
     _ModelCase(
         model_type="qwen3_omni_moe",
+        eager_ops=(
+            ("thinker.veomni_ce", "cross_entropy_loss"),
+            ("thinker.veomni_lb", "load_balancing_loss"),
+            ("thinker.model.layers.0.mlp.experts.veomni_moe", "moe_experts"),
+        ),
         isolation_op_path="thinker.model.layers.0.mlp.experts.veomni_moe",
         config_factory=_tiny_qwen3_omni_moe_config,
         architectures=("Qwen3OmniMoeForConditionalGeneration",),
         has_registered_config=True,
         processor_class_name="Qwen3OmniMoeProcessor",
-        eager_op_path="thinker.veomni_ce",
     ),
     _ModelCase(
         model_type="qwen3_omni_moe_thinker",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("veomni_lb", "load_balancing_loss"),
+            ("model.layers.0.mlp.experts.veomni_moe", "moe_experts"),
+        ),
         isolation_op_path="model.layers.0.mlp.experts.veomni_moe",
         config_factory=_tiny_qwen3_omni_moe_thinker_config,
         architectures=("Qwen3OmniMoeThinkerForConditionalGeneration",),
@@ -340,15 +440,25 @@ _MODEL_CASES = (
         model_type="qwen3_omni_moe_text",
         config_factory=_tiny_qwen3_omni_moe_text_config,
         architectures=("Qwen3OmniMoeThinkerTextModel",),
-        eager_op_path=None,
+        eager_ops=(),
     ),
     _ModelCase(
         model_type="qwen3_vl",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("model.language_model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+        ),
         config_factory=_tiny_qwen3_vl_config,
         architectures=("Qwen3VLForConditionalGeneration", "Qwen3VLModel"),
     ),
     _ModelCase(
         model_type="qwen3_vl_moe",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("veomni_lb", "load_balancing_loss"),
+            ("model.language_model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.language_model.layers.0.mlp.experts.veomni_moe", "moe_experts"),
+        ),
         isolation_op_path="model.language_model.layers.0.mlp.experts.veomni_moe",
         config_factory=_tiny_qwen3_vl_moe_config,
         architectures=(
@@ -364,7 +474,7 @@ _MODEL_CASES = (
         has_registered_config=True,
         registered_config_aliases=("LTXVideoConditionModel",),
         registered_model_aliases=("LTXVideoConditionModel",),
-        eager_op_path=None,
+        eager_ops=(),
     ),
     _ModelCase(
         model_type="MiniMaxH3DiTModel",
@@ -373,7 +483,7 @@ _MODEL_CASES = (
         has_registered_config=True,
         registered_config_aliases=("MiniMaxH3ConditionModel",),
         registered_model_aliases=("MiniMaxH3ConditionModel",),
-        eager_op_path=None,
+        eager_ops=(),
     ),
     _ModelCase(
         model_type="QwenImageTransformer2DModel",
@@ -382,23 +492,26 @@ _MODEL_CASES = (
         has_registered_config=True,
         registered_config_aliases=("QwenImageConditionModel",),
         registered_model_aliases=("QwenImageConditionModel",),
-        eager_op_path=None,
+        eager_ops=(),
     ),
     _ModelCase(
         model_type="wan",
+        eager_ops=(
+            ("blocks.0.self_attn.norm_q.veomni_rms_norm", "rms_norm"),
+            ("blocks.0.self_attn.attn.veomni_attn", "attention"),
+        ),
         config_factory=_tiny_wan_config,
         architectures=("WanModel",),
         has_registered_config=True,
-        eager_op_path="blocks.0.self_attn.norm_q.veomni_rms_norm",
     ),
     _ModelCase(
         model_type="WanTransformer3DModel",
+        eager_ops=(("blocks.0.attn1.processor.veomni_attn", "attention"),),
         config_factory=_tiny_wan_t2v_config,
         architectures=("WanTransformer3DModel",),
         has_registered_config=True,
         registered_config_aliases=("WanTransformer3DConditionModel",),
         registered_model_aliases=("WanTransformer3DConditionModel",),
-        eager_op_path="blocks.0.attn1.processor.veomni_attn",
     ),
 )
 
@@ -439,11 +552,11 @@ def test_build_foundation_model_constructs_registered_model(model_case: _ModelCa
         )
         assert get_ops_config() is cfg
     assert model.__class__.__name__ == model_case.architectures[0]
-    if model_case.eager_op_path is not None:
-        op = model
-        for attribute in model_case.eager_op_path.split("."):
-            op = getattr(op, attribute)
-        assert op.impl == "eager"
+    for path, expected_op in model_case.eager_ops:
+        op = attrgetter(path)(model)
+        assert isinstance(op, VeomniOp), path
+        assert op.op == expected_op, path
+        assert op.impl == "eager", path
 
 
 _ALTERNATE_OP_IMPLS = {
@@ -471,7 +584,7 @@ def _op_bindings(model, selected_path):
 
 @pytest.mark.parametrize(
     "model_case",
-    [case for case in _MODEL_CASES if case.eager_op_path is not None],
+    [case for case in _MODEL_CASES if case.eager_ops],
     ids=lambda case: case.model_type,
 )
 def test_model_instances_keep_distinct_impls(model_case: _ModelCase, available_nvidia_ops):
@@ -489,7 +602,7 @@ def test_model_instances_keep_distinct_impls(model_case: _ModelCase, available_n
             return get_model_class(model_config)(model_config)
 
     eager = construct(eager_config)
-    selected_path = model_case.isolation_op_path or model_case.eager_op_path
+    selected_path = model_case.isolation_op_path or model_case.eager_ops[0][0]
     selected_op = attrgetter(selected_path)
     assert selected_op(eager).impl == "eager"
     eager_bindings = _op_bindings(eager, selected_path)

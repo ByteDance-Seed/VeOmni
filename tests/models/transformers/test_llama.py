@@ -35,7 +35,6 @@ from tests.models.compare import (
     ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_llama_config as _tiny_config
-from veomni.ops import VeomniOp
 
 
 def _llama_classes():
@@ -53,15 +52,6 @@ def _build_ours(config: LlamaConfig, ops: SimpleNamespace | None = None):
     with ops_config_scope(ops if ops is not None else eager_ops_config()):
         causal_cls, _, _, _ = _llama_classes()
         return causal_cls(config)
-
-
-def test_llama_constructs_local_kernels():
-    model = _build_ours(_tiny_config())
-    assert isinstance(model.veomni_ce, VeomniOp)
-    assert model.veomni_ce.impl == "eager"
-    layer = model.model.layers[0]
-    assert layer.input_layernorm.veomni_rms_norm.impl == "eager"
-    assert layer.mlp.veomni_swiglu_mlp.impl == "eager"
 
 
 def test_llama_rope_reads_selected_impl(monkeypatch):

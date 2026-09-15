@@ -37,7 +37,6 @@ from tests.models.compare import (
     qwen_image_inputs,
 )
 from tests.models.tiny_configs import tiny_qwen2_vl_config as _tiny_config
-from veomni.ops import VeomniOp
 
 
 IMAGE_TOKEN_ID = 120
@@ -51,12 +50,6 @@ def _build_ours(config: Qwen2VLConfig, ops: SimpleNamespace | None = None):
 
     with ops_config_scope(ops if ops is not None else eager_ops_config()):
         return Qwen2VLForConditionalGeneration(config)
-
-
-def test_qwen2_vl_constructs_local_kernels():
-    model = _build_ours(_tiny_config())
-    assert isinstance(model.veomni_ce, VeomniOp)
-    assert model.veomni_ce.impl == "eager"
 
 
 def test_qwen2_vl_eager_matches_hf_text_only():

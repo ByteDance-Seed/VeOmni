@@ -19,6 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -29,7 +30,6 @@ from tests.models.compare import (
 )
 from tests.models.refs import flux as ref_flux
 from tests.models.tiny_configs import tiny_flux_config as _tiny_config
-from veomni.ops import VeomniOp
 
 
 def _build_ours_rms(dim: int, *, elementwise_affine: bool = True, ops: SimpleNamespace | None = None):
@@ -94,27 +94,25 @@ def test_flux_repository_config_loads_through_registry():
     assert get_model_class(config).__name__ == "FluxModel"
 
 
-def test_flux_constructs_local_kernels():
-    weighted = _build_ours_rms(32)
-    unweighted = _build_ours_rms(32, elementwise_affine=False)
-    assert isinstance(weighted.veomni_rms_norm, VeomniOp)
-    assert weighted.veomni_rms_norm.op == "rms_norm"
-    assert weighted.veomni_rms_norm.variant == "standard"
-    assert weighted.veomni_rms_norm.impl == "eager"
-    assert unweighted.veomni_rms_norm.variant == "unweighted"
-
-
-def test_flux_rmsnorm_matches_official():
+@pytest.mark.parametrize("elementwise_affine", [True, False], ids=["weighted", "unweighted"])
+def test_flux_rmsnorm_matches_official(elementwise_affine):
     torch.manual_seed(0)
-    official = ref_flux.RMSNorm(32, eps=1e-6)
-    ours = _build_ours_rms(32)
-    ours.weight.data.copy_(official.weight.data)
+    official = ref_flux.RMSNorm(32, eps=1e-6, elementwise_affine=elementwise_affine)
+    ours = _build_ours_rms(32, elementwise_affine=elementwise_affine)
+    assert ours.veomni_rms_norm.variant == ("standard" if elementwise_affine else "unweighted")
+    if elementwise_affine:
+        with torch.no_grad():
+            official.weight.uniform_(0.5, 1.5)
+            ours.weight.copy_(official.weight)
     hidden = torch.randn(2, 4, 32)
+    official_input = hidden.clone().requires_grad_()
+    ours_input = hidden.clone().requires_grad_()
 
     def call(module):
-        return module(hidden)
+        return module(ours_input if module is ours else official_input)
 
     assert_outputs_and_grads_match(official, ours, call)
+    torch.testing.assert_close(ours_input.grad, official_input.grad)
 
 
 def test_flux_joint_attention_matches_official():

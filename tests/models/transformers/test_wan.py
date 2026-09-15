@@ -38,7 +38,6 @@ from veomni.models.transformers.wan import fa3_fp8
 from veomni.models.transformers.wan import modeling_wan as wan_modeling
 from veomni.models.transformers.wan.config_wan import WanConfig
 from veomni.models.transformers.wan.fa3_fp8 import should_use_fa3_fp8
-from veomni.ops import VeomniOp
 
 
 def _tiny_ref_config() -> RefWanConfig:
@@ -179,15 +178,6 @@ def test_wan_fa3_skips_fp8_outside_policy(monkeypatch, available_nvidia_ops, kwa
     output = attn(hidden, hidden, hidden, **kwargs)
     assert called["generic"] is True
     assert output.shape == (1, 8, 32)
-
-
-def test_wan_constructs_local_kernels():
-    model = _build_ours(_tiny_config())
-    block = model.blocks[0]
-    assert isinstance(block.self_attn.norm_q.veomni_rms_norm, VeomniOp)
-    assert block.self_attn.norm_q.veomni_rms_norm.impl == "eager"
-    assert block.self_attn.attn.veomni_attn.op == "attention"
-    assert block.self_attn.attn.veomni_attn.impl == "eager"
 
 
 def test_wan_eager_matches_official():

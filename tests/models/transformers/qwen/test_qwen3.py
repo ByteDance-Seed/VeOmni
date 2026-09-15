@@ -34,7 +34,6 @@ from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RT
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.data.data_collator import MainCollator
 from veomni.models import build_foundation_model
-from veomni.ops import VeomniOp
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
@@ -76,17 +75,6 @@ def _build_qwen3(config: Qwen3Config, ops: SimpleNamespace | None = None):
 
 def _named_trainable(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     return {name: param for name, param in model.named_parameters() if param.requires_grad}
-
-
-def test_qwen3_constructs_local_kernels():
-    model = _build_qwen3(_tiny_config())
-    assert model.veomni_ce.impl == "eager"
-    assert isinstance(model.veomni_ce, VeomniOp)
-    layer = model.model.layers[0]
-    assert layer.input_layernorm.veomni_rms_norm.impl == "eager"
-    assert layer.mlp.veomni_swiglu_mlp.impl == "eager"
-    assert layer.self_attn.veomni_rope.impl == "eager"
-    assert layer.self_attn.veomni_attn.impl == "eager"
 
 
 def test_qwen3_eager_matches_hf_logits_and_loss():
