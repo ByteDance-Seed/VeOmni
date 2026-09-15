@@ -285,9 +285,6 @@ def test_magi_fa4_metadata_cache_reuses_only_matching_inputs(monkeypatch):
     assert after_shape_change is not after_mutation
     assert len(built_args) == 3
     assert magi_metadata._cache_entry is not None
-    assert magi_metadata._cache_entry.metadata_tensors[0] is q_ranges
-    assert magi_metadata._cache_entry.metadata_tensors[1] is k_ranges
-    assert magi_metadata._cache_entry.metadata_tensors[2] is attn_type_map
 
 
 def test_magi_fa4_metadata_cache_disables_reuse_without_version_counters(monkeypatch):

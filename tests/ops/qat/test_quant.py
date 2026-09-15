@@ -25,67 +25,40 @@ from veomni.utils.device import get_device_type
 DEVICE = get_device_type()
 
 
-def test_tilelang_act_quant_shapes_scales_and_dequant():
+@pytest.mark.parametrize("block_size", (64, 128), ids=("block64", "block128"))
+@pytest.mark.parametrize(
+    ("scale_fmt", "scale_dtype"),
+    ((None, torch.float32), ("ue8m0", torch.float8_e8m0fnu)),
+    ids=("exact-scale", "ue8m0"),
+)
+def test_tilelang_act_quant_matches_reference_and_dequantizes(block_size, scale_fmt, scale_dtype):
     require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.qat.quant import act_quant
 
     torch.manual_seed(2)
-    x = torch.randn(3, 256, device=DEVICE, dtype=torch.bfloat16)
-    quantized, scales = act_quant(x, block_size=128)
+    x = torch.randn(256, 3, device=DEVICE, dtype=torch.bfloat16).t()
+    x[0].zero_()
+    assert not x.is_contiguous()
+    original = x.clone()
+    kwargs = {"block_size": block_size, "scale_fmt": scale_fmt, "scale_dtype": scale_dtype}
+    quantized, scales = act_quant(x, **kwargs)
 
     assert quantized.shape == x.shape
     assert quantized.dtype == torch.float8_e4m3fn
-    assert scales.shape == (3, 2)
-    expected_quantized, expected_scales = reference_act_quant(x, block_size=128)
-    assert torch.equal(scales, expected_scales)
+    assert scales.shape == (3, 256 // block_size)
+    assert scales.dtype == scale_dtype
+    expected_quantized, expected_scales = reference_act_quant(x, **kwargs)
+    if scale_dtype == torch.float8_e8m0fnu:
+        assert torch.equal(scales.view(torch.uint8), expected_scales.view(torch.uint8))
+    else:
+        assert torch.equal(scales, expected_scales)
     assert torch.equal(quantized.view(torch.uint8), expected_quantized.view(torch.uint8))
-    expected_dequantized = reference_act_quant(x, block_size=128, dequant=True)
-    actual_dequantized = (quantized.float() * scales.repeat_interleave(128, dim=-1)).to(torch.bfloat16)
-    torch.testing.assert_close(actual_dequantized, expected_dequantized, rtol=0, atol=0)
-
-    x_mx = x.clone()
-    x_mx[0].zero_()
-    quantized_mx, scales_mx = act_quant(
-        x_mx,
-        block_size=128,
-        scale_fmt="ue8m0",
-        scale_dtype=torch.float8_e8m0fnu,
-    )
-    expected_quantized_mx, expected_scales_mx = reference_act_quant(
-        x_mx,
-        block_size=128,
-        scale_fmt="ue8m0",
-        scale_dtype=torch.float8_e8m0fnu,
-    )
-    assert torch.equal(scales_mx.view(torch.uint8), expected_scales_mx.view(torch.uint8))
-    assert torch.equal(quantized_mx.view(torch.uint8), expected_quantized_mx.view(torch.uint8))
-
-
-def test_tilelang_act_quant_dequant_fuses_the_round_trip():
-    require_nvidia_cuda("tilelang", min_cc=90)
-    from veomni.ops.qat.quant import act_quant
-
-    torch.manual_seed(2)
-    x = torch.randn(3, 256, device=DEVICE, dtype=torch.bfloat16)
-    x[0].zero_()
-
-    for scale_fmt in (None, "ue8m0"):
-        quantized, scales = act_quant(x, block_size=128, scale_fmt=scale_fmt)
-        expected = (quantized.float() * scales.repeat_interleave(128, dim=-1)).to(torch.bfloat16)
-        original = x.clone()
-        result = act_quant(x, block_size=128, scale_fmt=scale_fmt, dequant=True)
-
-        assert result.dtype == torch.bfloat16
-        assert torch.equal(result, expected)
-        assert result.data_ptr() != x.data_ptr()
-        assert torch.equal(x, original)
-
-    transposed = torch.randn(256, 3, device=DEVICE, dtype=torch.bfloat16).t()
-    assert not transposed.is_contiguous()
-    assert torch.equal(
-        act_quant(transposed, block_size=128, scale_fmt="ue8m0", dequant=True),
-        act_quant(transposed.contiguous(), block_size=128, scale_fmt="ue8m0", dequant=True),
-    )
+    dequantized = act_quant(x, dequant=True, **kwargs)
+    expected_dequantized = reference_act_quant(x, dequant=True, **kwargs)
+    assert dequantized.dtype == torch.bfloat16
+    assert torch.equal(dequantized, expected_dequantized)
+    assert dequantized.data_ptr() != x.data_ptr()
+    assert torch.equal(x, original)
 
 
 def _weight_quant_test_input():

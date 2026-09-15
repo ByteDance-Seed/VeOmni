@@ -82,7 +82,7 @@ def _install_fake_quant_backend(monkeypatch, calls: list[str]) -> None:
 
 
 def test_qat_entry_points_reject_pre_sm90_before_vendor_import(monkeypatch):
-    """Every QAT path checks hardware before entering the shared TileLang backend."""
+    """Every quantizing QAT path checks hardware before entering TileLang."""
     vendor_calls = []
     _install_fake_quant_backend(monkeypatch, vendor_calls)
     monkeypatch.setattr(type(qat_hardware.NVIDIA_SM90_PLUS), "matches", lambda self: False)
@@ -114,14 +114,11 @@ def test_qat_entry_points_reach_vendor_backend_after_sm90_check(monkeypatch):
 
 @pytest.fixture
 def reference_quantizers(monkeypatch):
-    """Swap the SM90 TileLang quantizers for the torch stand-ins above.
+    """Replace hardware-backed FP8 quantizers with independent torch oracles.
 
-    Everything `fp8_blockwise` adds on top of the kernel call is hardware
-    independent -- the copy that shields the caller's tensor from the in-place
-    write, the straight-through gradient, the tile dequantization layout, the
-    parameter substitution -- and that is what the tests using this fixture
-    cover. `test_reference_quantizers_match_the_tilelang_kernels` pins the
-    stand-ins to the real kernels wherever those can run.
+    This keeps facade behavior CPU-testable while preserving reference
+    quantize-dequantize numerics for layout, prefix, straight-through gradients,
+    and temporary parameter substitution assertions.
     """
     monkeypatch.setattr(fp8_blockwise, "act_quant", reference_act_quant)
     monkeypatch.setattr(fp8_blockwise, "fp8_weight_quant", reference_fp8_weight_quant)
@@ -136,6 +133,30 @@ def _weight_qdq(weight, block_size=128, round_scale=True):
     rows, cols = weight.shape
     tiles = quantized.float().view(rows // block_size, block_size, cols // block_size, block_size)
     return (tiles * scales[:, None, :, None]).view(rows, cols).to(weight.dtype)
+
+
+def _fake_quant(kind, tensor):
+    return fp8_fake_quant_act(tensor) if kind == "activation" else fp8_fake_quant_weight(tensor)
+
+
+def _fake_quant_reference(kind, tensor):
+    return _act_qdq(tensor) if kind == "activation" else _weight_qdq(tensor)
+
+
+def _fake_quant_input(kind, *, non_contiguous=False, requires_grad=False):
+    if kind == "activation":
+        tensor = (
+            torch.randn(4, 8, 128, dtype=torch.bfloat16).transpose(0, 1)
+            if non_contiguous
+            else torch.randn(4, 256, dtype=torch.bfloat16)
+        )
+    else:
+        tensor = (
+            torch.randn(256, 128, dtype=torch.bfloat16).t()
+            if non_contiguous
+            else torch.randn(128, 256, dtype=torch.bfloat16)
+        )
+    return tensor.requires_grad_(requires_grad)
 
 
 class _GroupedLinear(nn.Linear):
@@ -220,39 +241,37 @@ def test_fake_quant_act_dequantizes_in_place_of_its_input(reference_quantizers):
     )
 
 
-def test_fake_quant_act_leaves_its_input_untouched(reference_quantizers):
-    # The wrapper asks for `dequant=True` precisely because the in-place mode
-    # would overwrite the tensor it is handed, and that tensor is the graph's own
-    # activation -- every other consumer of it would read quantized values.
+@pytest.mark.parametrize("kind", ("activation", "weight"))
+def test_fake_quant_leaves_its_input_untouched(reference_quantizers, kind):
     torch.manual_seed(4)
-    x = torch.randn(4, 256, dtype=torch.bfloat16, requires_grad=True)
-    original = x.detach().clone()
+    tensor = _fake_quant_input(kind, requires_grad=True)
+    original = tensor.detach().clone()
 
-    quantized = fp8_fake_quant_act(x)
+    quantized = _fake_quant(kind, tensor)
 
-    assert torch.equal(x.detach(), original)
-    assert quantized.data_ptr() != x.data_ptr()
+    assert torch.equal(tensor.detach(), original)
+    assert quantized.data_ptr() != tensor.data_ptr()
     assert not torch.equal(quantized.detach(), original)
 
 
-def test_fake_quant_act_accepts_a_non_contiguous_input(reference_quantizers):
-    # `fp8_fake_quant_act_prefix` slices the last dimension, and attention hands
-    # over transposed head layouts, so neither caller can promise contiguity.
+@pytest.mark.parametrize("kind", ("activation", "weight"))
+def test_fake_quant_accepts_a_non_contiguous_operand(reference_quantizers, kind):
     torch.manual_seed(5)
-    x = torch.randn(4, 8, 128, dtype=torch.bfloat16).transpose(0, 1)
-    assert not x.is_contiguous()
+    tensor = _fake_quant_input(kind, non_contiguous=True)
+    assert not tensor.is_contiguous()
 
-    torch.testing.assert_close(fp8_fake_quant_act(x), _act_qdq(x), rtol=0, atol=0)
+    torch.testing.assert_close(_fake_quant(kind, tensor), _fake_quant_reference(kind, tensor), rtol=0, atol=0)
 
 
-def test_fake_quant_act_passes_the_gradient_straight_through(reference_quantizers):
+@pytest.mark.parametrize("kind", ("activation", "weight"))
+def test_fake_quant_passes_the_gradient_straight_through(reference_quantizers, kind):
     torch.manual_seed(6)
-    x = torch.randn(4, 256, dtype=torch.bfloat16, requires_grad=True)
-    grad = torch.randn(4, 256, dtype=torch.bfloat16)
+    tensor = _fake_quant_input(kind, requires_grad=True)
+    grad = torch.randn_like(tensor)
 
-    fp8_fake_quant_act(x).backward(grad)
+    _fake_quant(kind, tensor).backward(grad)
 
-    assert torch.equal(x.grad, grad)
+    assert torch.equal(tensor.grad, grad)
 
 
 def test_fake_quant_act_prefix_quantizes_only_the_leading_slice(reference_quantizers):
@@ -298,42 +317,6 @@ def test_fake_quant_weight_dequantizes_each_tile_with_its_own_scale(reference_qu
     assert actual.shape == weight.shape
     assert actual.dtype == torch.bfloat16
     torch.testing.assert_close(actual, _weight_qdq(weight), rtol=0, atol=0)
-
-
-def test_fake_quant_weight_leaves_its_input_untouched(reference_quantizers):
-    # The tensor reaching this wrapper is a live parameter, so the fused
-    # quantizer must read it and write elsewhere. Getting this wrong would
-    # rewrite the master weight mid-step rather than fail.
-    torch.manual_seed(10)
-    weight = torch.randn(128, 256, dtype=torch.bfloat16, requires_grad=True)
-    original = weight.detach().clone()
-
-    quantized = fp8_fake_quant_weight(weight)
-
-    assert torch.equal(weight.detach(), original)
-    assert quantized.data_ptr() != weight.data_ptr()
-    assert not torch.equal(quantized.detach(), original)
-
-
-def test_fake_quant_weight_accepts_a_non_contiguous_weight(reference_quantizers):
-    # A transposed weight reaches the quantizer from layers that store their
-    # projection the other way round; the clone has to normalize the layout
-    # rather than let the kernel reinterpret the strides.
-    torch.manual_seed(10)
-    weight = torch.randn(256, 128, dtype=torch.bfloat16).t()
-    assert not weight.is_contiguous()
-
-    torch.testing.assert_close(fp8_fake_quant_weight(weight), _weight_qdq(weight), rtol=0, atol=0)
-
-
-def test_fake_quant_weight_passes_the_gradient_straight_through(reference_quantizers):
-    torch.manual_seed(11)
-    weight = torch.randn(128, 256, dtype=torch.bfloat16, requires_grad=True)
-    grad = torch.randn(128, 256, dtype=torch.bfloat16)
-
-    fp8_fake_quant_weight(weight).backward(grad)
-
-    assert torch.equal(weight.grad, grad)
 
 
 def test_fake_quant_weight_round_trips_within_one_e4m3_ulp(reference_quantizers):

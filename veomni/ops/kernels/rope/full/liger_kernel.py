@@ -61,9 +61,11 @@ def forward(
 
     ``unsqueeze_dim`` is the HF broadcast axis and therefore the q/k layout:
     ``1`` is ``[B, H, S, D]``, ``2`` is ``[B, S, H, D]``. Liger only speaks
-    ``[B, H, S, D]``, so ``2`` is transposed in and out. Any other value,
-    rank-3 vision input, empty input, or trainable rotary table falls back
-    to the eager pair.
+    ``[B, H, S, D]``, so ``2`` is transposed in and out. Its fused path also
+    requires full-width Llama-style ``cos`` and ``sin`` tables whose second
+    half duplicates the first; Liger reads only the first half. Any other
+    ``unsqueeze_dim``, rank-3 vision input, empty input, or trainable rotary
+    table falls back to the eager pair.
     """
     if (
         _eager._is_vision_layout(q, k, cos, sin)

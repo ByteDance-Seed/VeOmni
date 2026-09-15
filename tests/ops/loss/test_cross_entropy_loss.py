@@ -20,6 +20,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils._python_dispatch import TorchDispatchMode
 from transformers.loss.loss_utils import fixed_cross_entropy
 
 from tests.ops.tol import (
@@ -35,6 +36,20 @@ from tests.ops.tol import (
 from tests.ops.utils import make_grad_leaf
 from veomni.ops import resolve_op
 from veomni.utils.device import IS_CUDA_AVAILABLE
+
+
+class _FullWeightAddCounter(TorchDispatchMode):
+    def __init__(self, weight_shape):
+        super().__init__()
+        self.weight_shape = weight_shape
+        self.out_of_place_adds = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        del types
+        output = func(*args, **(kwargs or {}))
+        if func == torch.ops.aten.add.Tensor and isinstance(output, Tensor) and output.shape == self.weight_shape:
+            self.out_of_place_adds += 1
+        return output
 
 
 def _empty_weight(device: torch.device | str) -> Tensor:
@@ -200,7 +215,10 @@ def test_chunk_loss_matches_eager_with_uneven_valid_tokens():
     hidden_e, weight_e = make_grad_leaf(hidden), make_grad_leaf(weight)
     hidden_o, weight_o = make_grad_leaf(hidden), make_grad_leaf(weight)
     out_e = eager(hidden_e, labels, weight_e)
-    out_o = other(hidden_o, labels, weight_o, chunk_size=7)
+    counter = _FullWeightAddCounter(weight.shape)
+    with counter:
+        out_o = other(hidden_o, labels, weight_o, chunk_size=7)
+    assert counter.out_of_place_adds == 0
     assert torch.allclose(out_e, out_o, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     out_e.backward()
@@ -209,40 +227,7 @@ def test_chunk_loss_matches_eager_with_uneven_valid_tokens():
     assert torch.allclose(weight_e.grad, weight_o.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-def test_chunk_loss_accumulates_weight_gradient_without_full_size_temporary():
-    from torch.utils._python_dispatch import TorchDispatchMode
-
-    from veomni.ops.kernels.loss.cross_entropy_loss.standard import chunk_loss
-
-    weight_shape = (16, 8)
-
-    class FullWeightAddCounter(TorchDispatchMode):
-        def __init__(self):
-            super().__init__()
-            self.out_of_place_adds = 0
-
-        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-            del types
-            output = func(*args, **(kwargs or {}))
-            if func == torch.ops.aten.add.Tensor and isinstance(output, Tensor) and output.shape == weight_shape:
-                self.out_of_place_adds += 1
-            return output
-
-    torch.manual_seed(8)
-    hidden = torch.randn(1, 4, weight_shape[1])
-    labels = torch.randint(0, weight_shape[0], (1, 4))
-    weight = torch.randn(weight_shape)
-    counter = FullWeightAddCounter()
-
-    with counter:
-        chunk_loss.forward(hidden, labels, weight, chunk_size=2)
-
-    assert counter.out_of_place_adds == 0
-
-
 def test_chunk_loss_does_not_copy_full_noncontiguous_hidden():
-    from torch.utils._python_dispatch import TorchDispatchMode
-
     from veomni.ops.kernels.loss.cross_entropy_loss.standard import chunk_loss
 
     hidden_shape = (2, 7, 4)

@@ -221,3 +221,54 @@ def test_real_handler_matches_torch_output_gradient_and_dispatcher(op_name, monk
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
     for actual_input, expected_input in zip(actual_inputs, expected_inputs, strict=True):
         torch.testing.assert_close(actual_input.grad, expected_input.grad, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="batch-invariant handlers require CUDA + Triton")
+@pytest.mark.parametrize("op_name", ("mm", "addmm", "log_softmax", "mean"))
+def test_real_handler_is_invariant_to_batch_partition(op_name):
+    """A sample and its input gradient are bit-identical across batch partitions."""
+    batch_patch.disable_batch_invariant_mode()
+    torch.manual_seed(23)
+
+    if op_name in {"mm", "addmm"}:
+        values = torch.randn(7, 29, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(29, 23, device="cuda", dtype=torch.bfloat16)
+        if op_name == "mm":
+
+            def operation(value):
+                return torch.mm(value, weight)
+
+        else:
+            bias = torch.randn(23, device="cuda", dtype=torch.bfloat16)
+
+            def operation(value):
+                return torch.addmm(bias, value, weight)
+
+    elif op_name == "log_softmax":
+        values = torch.randn(7, 37, device="cuda", dtype=torch.float32)
+
+        def operation(value):
+            return torch.log_softmax(value, dim=-1)
+
+    else:
+        values = torch.randn(7, 11, 13, device="cuda", dtype=torch.float32)
+
+        def operation(value):
+            return torch.mean(value, dim=1, keepdim=True)
+
+    with batch_patch.set_batch_invariant_mode():
+        joint_input = values.detach().clone().requires_grad_(True)
+        joint_output = operation(joint_input)
+        grad_output = torch.randn_like(joint_output)
+        joint_gradient = torch.autograd.grad(joint_output, joint_input, grad_output)[0]
+
+        partition_outputs = []
+        partition_gradients = []
+        for value, gradient in zip(values.split((2, 5)), grad_output.split((2, 5)), strict=True):
+            partition_input = value.detach().clone().requires_grad_(True)
+            partition_output = operation(partition_input)
+            partition_outputs.append(partition_output)
+            partition_gradients.append(torch.autograd.grad(partition_output, partition_input, gradient)[0])
+
+    assert torch.equal(joint_output, torch.cat(partition_outputs))
+    assert torch.equal(joint_gradient, torch.cat(partition_gradients))

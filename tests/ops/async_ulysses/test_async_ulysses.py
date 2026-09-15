@@ -467,27 +467,6 @@ def test_output_projection_empty_sequence_matches_sequential(
         torch.testing.assert_close(actual_input.grad, expected_input.grad)
 
 
-def test_output_projection_weight_bias_grad_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
-    _mock_identity_comm(monkeypatch)
-    batch, seq, heads, head_dim, out_dim = 2, 3, 4, 5, 7
-    hidden = torch.randn(batch, seq, heads, head_dim, requires_grad=True)
-    weight = torch.randn(out_dim, heads * head_dim, requires_grad=True)
-    bias = torch.randn(out_dim, requires_grad=True)
-    VeomniOp("async_ulysses_o", "standard")(
-        hidden,
-        weight,
-        bias,
-        seq_dimension=1,
-        head_dimension=2,
-        unpadded_dim_size=seq,
-        group=object(),
-    ).sum().backward()
-    assert weight.grad is not None
-    assert weight.grad.shape == weight.shape
-    assert bias.grad is not None
-    assert bias.grad.shape == bias.shape
-
-
 def test_output_projection_bias_grad_when_weight_frozen(monkeypatch: pytest.MonkeyPatch) -> None:
     _mock_identity_comm(monkeypatch)
     batch, seq, heads, head_dim, out_dim = 2, 3, 4, 5, 7

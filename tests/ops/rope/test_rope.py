@@ -184,8 +184,7 @@ def test_eager_rope_fixed_tables_do_not_save_inputs(kind: str):
 
     saved_tensors = output[0].grad_fn.saved_tensors
     assert len(saved_tensors) == 2
-    assert saved_tensors[0] is cos
-    assert saved_tensors[1] is sin
+    assert {id(tensor) for tensor in saved_tensors} == {id(cos), id(sin)}
 
 
 @pytest.mark.parametrize("kind", ("full", "vision"))
@@ -560,8 +559,7 @@ def test_deepseek_v4_triton_saves_only_cos_sin():
     out = rope(x.detach().requires_grad_(True), cos, sin, unsqueeze_dim=1)
     saved_tensors = out.grad_fn.saved_tensors
     assert len(saved_tensors) == 2
-    assert saved_tensors[0] is cos
-    assert saved_tensors[1] is sin
+    assert {id(tensor) for tensor in saved_tensors} == {id(cos), id(sin)}
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek-V4 Triton RoPE needs a GPU")

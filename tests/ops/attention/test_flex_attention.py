@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 from types import SimpleNamespace
 
 import pytest
@@ -62,6 +63,15 @@ class _ToyAttentionLayer(nn.Module):
             self.v_proj(hidden_states).view(batch_size, sequence_length, self.kv_heads, self.head_dim).transpose(1, 2)
         )
         return query, key, value
+
+
+@pytest.fixture
+def cleanup_compiled_cuda_state():
+    """Release production-shape Flex state before later GPU tests run."""
+    yield
+    torch.compiler.reset()
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def _causal_block_mask(sequence_length: int, device: torch.device):
@@ -310,10 +320,10 @@ def test_flex_attention_matches_math_sdpa(mask_case):
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FlexAttention numerical comparison requires CUDA")
-def test_flex_toy_layer_matches_math_sdpa():
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16), ids=("fp16", "bf16"))
+def test_flex_toy_layer_matches_math_sdpa(dtype, cleanup_compiled_cuda_state):
     device = torch.device(get_device_type())
-    dtype = torch.bfloat16
-    hidden_size, query_heads, kv_heads, head_dim, sequence_length = 256, 4, 2, 64, 128
+    hidden_size, query_heads, kv_heads, head_dim, sequence_length = 3584, 28, 4, 128, 4096
     torch.manual_seed(29)
     math_layer = (
         _ToyAttentionLayer(hidden_size, query_heads, kv_heads, head_dim).to(device=device, dtype=dtype).train()
@@ -322,8 +332,8 @@ def test_flex_toy_layer_matches_math_sdpa():
     hidden = torch.randn(1, sequence_length, hidden_size, device=device, dtype=dtype)
     math_hidden = hidden.detach().clone().requires_grad_(True)
     flex_hidden = hidden.detach().clone().requires_grad_(True)
-    dense = dense_mask("causal", sequence_length, device)
-    block_mask = flex_mask("causal", sequence_length, device)
+    dense = dense_mask("2d_mask", sequence_length, device)
+    block_mask = flex_mask("2d_mask", sequence_length, device)
     scaling = head_dim**-0.5
 
     math_query, math_key, math_value = math_layer.qkv(math_hidden)
@@ -345,5 +355,6 @@ def test_flex_toy_layer_matches_math_sdpa():
     output_gradient = torch.randn_like(math_logits)
     math_gradients = torch.autograd.grad(math_logits, (math_hidden, *math_layer.parameters()), output_gradient)
     flex_gradients = torch.autograd.grad(flex_logits, (flex_hidden, *flex_layer.parameters()), output_gradient)
+    gradient_atol = ATTN_BF16_GRAD_ATOL if dtype == torch.bfloat16 else ATTN_GRAD_ATOL
     for math_gradient, flex_gradient in zip(math_gradients, flex_gradients, strict=True):
-        torch.testing.assert_close(flex_gradient, math_gradient, rtol=ATTN_GRAD_RTOL, atol=ATTN_GRAD_ATOL)
+        torch.testing.assert_close(flex_gradient, math_gradient, rtol=ATTN_GRAD_RTOL, atol=gradient_atol)

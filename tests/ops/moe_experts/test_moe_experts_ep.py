@@ -8,14 +8,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""EP-local grouped GEMM vs split/merged layouts and the non-EP fused path."""
+"""EP-local grouped GEMM parity across split/merged layouts and a PyTorch oracle."""
 
 from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F
 
+from tests.ops.moe_experts.reference import standard_fused_reference
 from tests.ops.tol import MOE_EP_PRE_SM90_ATOL, MOE_EP_SM90_ATOL, MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL
 from veomni.distributed.moe import EPGroupGemm, EPMergedFc1GroupGemm
 from veomni.ops.kernels.moe_experts.shared.dispatch import expert_histogram, moe_gather, moe_scatter
@@ -28,36 +28,6 @@ def _skip_if_unsupported():
         pytest.skip("CUDA is required for fused MoE EP tests.")
     if not is_fused_moe_available():
         pytest.skip("Triton fused MoE is not available in this environment.")
-
-
-def _eager_moe_forward(
-    num_experts: int,
-    routing_weights: torch.Tensor,
-    selected_experts: torch.Tensor,
-    hidden_states: torch.Tensor,
-    fc1_1_weight: torch.Tensor,
-    fc1_2_weight: torch.Tensor,
-    fc2_weight: torch.Tensor,
-    swiglu_limit: float | None = None,
-) -> torch.Tensor:
-    """Fused operator-order eager reference. Routing scales the SwiGLU intermediate."""
-    output = torch.zeros_like(hidden_states)
-    expert_mask = F.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
-    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-    for expert_idx in expert_hit:
-        idx = int(expert_idx[0].item())
-        top_k_pos, token_idx = torch.where(expert_mask[idx])
-        x = hidden_states[token_idx]
-        gate = F.linear(x, fc1_1_weight[idx])
-        up = F.linear(x, fc1_2_weight[idx])
-        if swiglu_limit is not None:
-            gate = gate.clamp(max=swiglu_limit)
-            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-        y = F.silu(gate) * up
-        y = y * routing_weights[token_idx, top_k_pos, None]
-        y = F.linear(y, fc2_weight[idx])
-        output.index_add_(0, token_idx, y.to(output.dtype))
-    return output
 
 
 def _make_ep_inputs(num_tokens, num_experts, hidden_dim, ffn_dim, seed):
@@ -279,15 +249,15 @@ def test_ep_vs_non_ep(
 
     scatter_output, cumsum, scatter_index = _scatter_tokens(hidden_states, selected_experts, num_experts)
     scattered_gw = _scatter_routing_weights(routing_weights, scatter_index)
-    out_eager = _eager_moe_forward(
-        num_experts,
+    out_eager = standard_fused_reference(
+        hidden_states,
         routing_weights,
         selected_experts,
-        hidden_states,
         fc1_1_weight,
         fc1_2_weight,
         fc2_weight,
-        swiglu_limit,
+        num_experts=num_experts,
+        swiglu_limit=swiglu_limit,
     )
     ep_raw = EPGroupGemm.apply(
         scatter_output.clone().detach(),
@@ -305,15 +275,15 @@ def test_ep_vs_non_ep(
     fc1_1_eager = fc1_1_weight.clone().detach().requires_grad_(True)
     fc1_2_eager = fc1_2_weight.clone().detach().requires_grad_(True)
     fc2_eager = fc2_weight.clone().detach().requires_grad_(True)
-    out_e = _eager_moe_forward(
-        num_experts,
+    out_e = standard_fused_reference(
+        hs_eager,
         routing_weights,
         selected_experts,
-        hs_eager,
         fc1_1_eager,
         fc1_2_eager,
         fc2_eager,
-        swiglu_limit,
+        num_experts=num_experts,
+        swiglu_limit=swiglu_limit,
     )
     out_e.sum().backward()
 
@@ -360,15 +330,15 @@ def test_ep_merged_vs_non_ep(
 
     scatter_output, cumsum, scatter_index = _scatter_tokens(hidden_states, selected_experts, num_experts)
     scattered_gw = _scatter_routing_weights(routing_weights, scatter_index)
-    out_eager = _eager_moe_forward(
-        num_experts,
+    out_eager = standard_fused_reference(
+        hidden_states,
         routing_weights,
         selected_experts,
-        hidden_states,
         fc1_1_weight,
         fc1_2_weight,
         fc2_weight,
-        swiglu_limit,
+        num_experts=num_experts,
+        swiglu_limit=swiglu_limit,
     )
     ep_raw = EPMergedFc1GroupGemm.apply(
         scatter_output.clone().detach(),
@@ -385,15 +355,15 @@ def test_ep_merged_vs_non_ep(
     fc1_1_eager = fc1_1_weight.clone().detach().requires_grad_(True)
     fc1_2_eager = fc1_2_weight.clone().detach().requires_grad_(True)
     fc2_eager = fc2_weight.clone().detach().requires_grad_(True)
-    out_e = _eager_moe_forward(
-        num_experts,
+    out_e = standard_fused_reference(
+        hs_eager,
         routing_weights,
         selected_experts,
-        hs_eager,
         fc1_1_eager,
         fc1_2_eager,
         fc2_eager,
-        swiglu_limit,
+        num_experts=num_experts,
+        swiglu_limit=swiglu_limit,
     )
     out_e.sum().backward()
 

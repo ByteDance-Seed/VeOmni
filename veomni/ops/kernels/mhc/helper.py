@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""First-party mHC helpers.
+"""First-party mHC math and TileKernels input validation helpers.
 
-Eager inlines unweighted RMSNorm. TileLang adapters share the SM90 / bf16 /
-``hc_mult=4`` guard used by TileKernels.
+Eager inlines unweighted RMSNorm. TileLang adapters validate CUDA placement,
+BF16 dtype, rank-4 layout, and ``hc_mult=4`` here. Registry requirements
+separately restrict those rows to NVIDIA SM90 or later and require the
+``tile_kernels`` package.
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ def unweighted_rms(x: Tensor, eps: float) -> Tensor:
 
 
 def require_tilelang_input(x: Tensor, hc_mult: int) -> None:
-    """Reject layouts TileKernels mHC cannot train."""
+    """Validate tensor placement, dtype, shape, and hyper-connection width."""
     if not x.is_cuda:
         raise ValueError("TileKernels mHC requires a CUDA tensor")
     if x.dtype != torch.bfloat16:

@@ -170,18 +170,23 @@ def test_rms_norm_gated_npu_zero_gate_is_zero():
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="rms_norm_gated npu needs torch_npu")
-@pytest.mark.parametrize("eps", [1e-5, 1e-6, 1e-7])
-def test_rms_norm_gated_npu_uses_eps(eps):
+def test_rms_norm_gated_npu_uses_eps():
     eager = resolve_op("rms_norm_gated", "standard", "eager").wrapper
     other = resolve_op("rms_norm_gated", "standard", "npu").wrapper
-    torch.manual_seed(1)
-    x = torch.randn(1, 4, 32, device="npu", dtype=torch.bfloat16)
-    gate = torch.randn_like(x)
-    weight = torch.randn(32, device="npu", dtype=torch.bfloat16)
+    x = torch.linspace(-1e-3, 1e-3, 32).to(device="npu", dtype=torch.bfloat16)
+    x = x.reshape(1, 1, 32).expand(1, 4, 32).contiguous()
+    gate = torch.linspace(-1.0, 1.0, 32).to(device="npu", dtype=torch.bfloat16)
+    gate = gate.reshape(1, 1, 32).expand_as(x).contiguous()
+    weight = torch.ones(32, device="npu", dtype=torch.bfloat16)
 
-    out_e = eager(x, gate, weight, eps=eps)
-    out_o = other(x, gate, weight, eps=eps)
-    assert torch.allclose(out_o.float(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
+    outputs = []
+    for eps in (1e-5, 1e-6, 1e-7):
+        out_e = eager(x, gate, weight, eps=eps)
+        out_o = other(x, gate, weight, eps=eps)
+        assert torch.allclose(out_o.float(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
+        outputs.append(out_o)
+
+    assert all(not torch.equal(left, right) for left, right in zip(outputs, outputs[1:], strict=True))
 
 
 def _hf_qwen3_5_prefill_causal_conv1d(x: Tensor, weight: Tensor, bias: Tensor, *, kernel_size: int) -> Tensor:
