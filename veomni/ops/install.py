@@ -30,7 +30,7 @@ from .kernels.attention.mask.flash import flash_attention_mask_builder
 from .kernels.attention.mask.flex import flex_attention_mask_builder
 from .kernels.attention.mask.magi import magi_attention_mask_builder
 from .kernels.attention.mask.sdpa import sdpa_attention_mask_builder
-from .kernels.attention.standard.flash import flash_attention_forward
+from .kernels.attention.standard.flash import bind_flash_attention_forward
 from .kernels.attention.standard.flex import flex_attention_forward
 from .kernels.attention.standard.magi import magi_attention_forward
 from .kernels.attention.standard.sage import sage_attention_forward
@@ -42,9 +42,21 @@ logger = logging.get_logger(__name__)
 # Every ``veomni_*`` attention name has a matching mask builder. Flash and
 # Sage preserve 2D padding metadata, while causal stays in ``is_causal``.
 _VEOMNI_HF_PATCHES: tuple[tuple[str, Callable[..., Any], Callable[..., Any]], ...] = (
-    ("veomni_flash_attention_2", flash_attention_forward, flash_attention_mask_builder),
-    ("veomni_flash_attention_3", flash_attention_forward, flash_attention_mask_builder),
-    ("veomni_flash_attention_4", flash_attention_forward, flash_attention_mask_builder),
+    (
+        "veomni_flash_attention_2",
+        bind_flash_attention_forward("veomni_flash_attention_2"),
+        flash_attention_mask_builder,
+    ),
+    (
+        "veomni_flash_attention_3",
+        bind_flash_attention_forward("veomni_flash_attention_3"),
+        flash_attention_mask_builder,
+    ),
+    (
+        "veomni_flash_attention_4",
+        bind_flash_attention_forward("veomni_flash_attention_4"),
+        flash_attention_mask_builder,
+    ),
     ("veomni_flex_attention", flex_attention_forward, flex_attention_mask_builder),
     ("veomni_magi_attention", magi_attention_forward, magi_attention_mask_builder),
     ("veomni_sage_attention", sage_attention_forward, flash_attention_mask_builder),
