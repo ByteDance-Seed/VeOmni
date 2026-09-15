@@ -12,6 +12,7 @@ import triton
 import triton.language as tl
 
 from ...utils.device import get_compute_units
+from .support import addmm_can_fuse_bias, mean_keep_fp32_until_divide
 
 
 def _matmul_launch_metadata(grid: Callable[..., Any], kernel: Any, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -435,8 +436,15 @@ def mm_batch_invariant(a, b):
     return matmul_persistent(a, b)
 
 
-def addmm_batch_invariant(bias, a, b):
-    """Implement ``aten::addmm`` with fused bias in persistent matmul."""
+def addmm_batch_invariant(bias, a, b, *, beta=1, alpha=1):
+    """Implement ``aten::addmm``. Unsupported bias/scale pairs fall back to ``mm``."""
+    if not addmm_can_fuse_bias(bias, b.shape[1], beta=beta, alpha=alpha):
+        output = mm_batch_invariant(a, b)
+        if alpha != 1:
+            output = output * alpha
+        if bias is not None:
+            output = output + (bias if beta == 1 else bias * beta)
+        return output
     return matmul_persistent(a, b, bias=bias)
 
 
@@ -455,10 +463,7 @@ def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = 
         assert input.dtype in {torch.float16, torch.bfloat16, torch.float32}, "only float types supported for now"
         if len(dim) == 0:
             dim = list(range(input.ndim))
-        n_elems = 1
-        for d in dim:
-            n_elems *= input.shape[d]
-        return torch.sum(input, dim=dim, keepdim=keepdim, dtype=torch.float32).to(dtype or input.dtype) / n_elems
+        return mean_keep_fp32_until_divide(input, dim, keepdim=keepdim, dtype=dtype)
 
 
 AttentionBlockSize = namedtuple("AttentionBlockSize", ["block_m", "block_n"])

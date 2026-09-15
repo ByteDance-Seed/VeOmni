@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from veomni.ops.batch_invariant import patch as batch_patch
+from veomni.ops.batch_invariant.support import addmm_can_fuse_bias, mean_keep_fp32_until_divide
 from veomni.utils.device import IS_CUDA_AVAILABLE
 
 
@@ -272,3 +273,43 @@ def test_real_handler_is_invariant_to_batch_partition(op_name):
 
     assert torch.equal(joint_output, torch.cat(partition_outputs))
     assert torch.equal(joint_gradient, torch.cat(partition_gradients))
+
+
+def test_mean_keep_fp32_until_divide_avoids_fp16_overflow():
+    values = torch.ones(256, 256, dtype=torch.float16)
+    overflowed = torch.sum(values, dim=(0, 1), dtype=torch.float32).to(torch.float16) / values.numel()
+    assert not torch.isfinite(overflowed)
+    actual = mean_keep_fp32_until_divide(values, (0, 1))
+    assert actual.dtype == torch.float16
+    torch.testing.assert_close(actual, torch.ones((), dtype=torch.float16))
+
+
+@pytest.mark.parametrize(
+    ("bias_factory", "n", "beta", "alpha", "expected"),
+    (
+        (lambda: torch.randn(4), 4, 1, 1, True),
+        (lambda: None, 4, 1, 1, True),
+        (lambda: torch.randn(1), 4, 1, 1, False),
+        (lambda: torch.randn(4, 1).expand(4, 4)[0], 4, 1, 1, False),
+        (lambda: torch.randn(4), 4, 0, 1, False),
+        (lambda: torch.randn(4), 4, 1, 2, False),
+        (lambda: torch.randn(2, 4), 4, 1, 1, False),
+    ),
+    ids=("contig-1d", "no-bias", "broadcast-len1", "nonunit-stride", "beta0", "alpha2", "2d-bias"),
+)
+def test_addmm_can_fuse_bias_rejects_unsupported_pairs(bias_factory, n, beta, alpha, expected):
+    bias = bias_factory()
+    assert addmm_can_fuse_bias(bias, n, beta=beta, alpha=alpha) is expected
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="addmm fallback uses the Triton mm path")
+def test_addmm_falls_back_for_alpha_and_broadcast_bias():
+    from veomni.ops.batch_invariant.triton import addmm_batch_invariant, mm_batch_invariant
+
+    torch.manual_seed(3)
+    a = torch.randn(5, 7, device="cuda", dtype=torch.float32)
+    b = torch.randn(7, 4, device="cuda", dtype=torch.float32)
+    bias = torch.tensor([2.0], device="cuda")
+    actual = addmm_batch_invariant(bias, a, b, beta=0.5, alpha=2)
+    expected = 2 * mm_batch_invariant(a, b) + 0.5 * bias
+    torch.testing.assert_close(actual, expected)
