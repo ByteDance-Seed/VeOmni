@@ -272,12 +272,13 @@ def test_ep_vs_non_ep(
     torch.testing.assert_close(out_eager, out_ep, rtol=0, atol=atol)
 
     hs_eager = hidden_states.clone().detach().requires_grad_(True)
+    routing_eager = routing_weights.clone().detach().requires_grad_(True)
     fc1_1_eager = fc1_1_weight.clone().detach().requires_grad_(True)
     fc1_2_eager = fc1_2_weight.clone().detach().requires_grad_(True)
     fc2_eager = fc2_weight.clone().detach().requires_grad_(True)
     out_e = standard_fused_reference(
         hs_eager,
-        routing_weights,
+        routing_eager,
         selected_experts,
         fc1_1_eager,
         fc1_2_eager,
@@ -285,14 +286,21 @@ def test_ep_vs_non_ep(
         num_experts=num_experts,
         swiglu_limit=swiglu_limit,
     )
-    out_e.sum().backward()
+    grad_output = torch.randn_like(out_e)
+    out_e.backward(grad_output)
 
-    pt_ep = scatter_output.clone().detach().requires_grad_(True)
+    hs_ep = hidden_states.clone().detach().requires_grad_(True)
+    routing_ep = routing_weights.clone().detach().requires_grad_(True)
+    pt_ep, cumsum_ep, scatter_index_ep = _scatter_tokens(hs_ep, selected_experts, num_experts)
+    scattered_gw_ep = _scatter_routing_weights(routing_ep, scatter_index_ep)
     fc1_1_ep = fc1_1_weight.clone().detach().requires_grad_(True)
     fc1_2_ep = fc1_2_weight.clone().detach().requires_grad_(True)
     fc2_ep = fc2_weight.clone().detach().requires_grad_(True)
-    ep_raw2 = EPGroupGemm.apply(pt_ep, cumsum, fc1_1_ep, fc1_2_ep, fc2_ep, swiglu_limit)
-    ep_raw2.backward(scattered_gw.expand_as(ep_raw2).contiguous())
+    ep_raw2 = EPGroupGemm.apply(pt_ep, cumsum_ep, fc1_1_ep, fc1_2_ep, fc2_ep, swiglu_limit)
+    out_ep2 = moe_gather(ep_raw2 * scattered_gw_ep, scatter_index_ep).reshape(hidden_states.shape)
+    out_ep2.backward(grad_output)
+    torch.testing.assert_close(hs_eager.grad, hs_ep.grad, rtol=0, atol=atol)
+    torch.testing.assert_close(routing_eager.grad, routing_ep.grad, rtol=0, atol=atol)
     torch.testing.assert_close(fc2_eager.grad, fc2_ep.grad, rtol=0, atol=atol)
     torch.testing.assert_close(fc1_1_eager.grad, fc1_1_ep.grad, rtol=0, atol=atol)
     torch.testing.assert_close(fc1_2_eager.grad, fc1_2_ep.grad, rtol=0, atol=atol)
@@ -352,12 +360,13 @@ def test_ep_merged_vs_non_ep(
     torch.testing.assert_close(out_eager, out_ep, rtol=0, atol=atol)
 
     hs_eager = hidden_states.clone().detach().requires_grad_(True)
+    routing_eager = routing_weights.clone().detach().requires_grad_(True)
     fc1_1_eager = fc1_1_weight.clone().detach().requires_grad_(True)
     fc1_2_eager = fc1_2_weight.clone().detach().requires_grad_(True)
     fc2_eager = fc2_weight.clone().detach().requires_grad_(True)
     out_e = standard_fused_reference(
         hs_eager,
-        routing_weights,
+        routing_eager,
         selected_experts,
         fc1_1_eager,
         fc1_2_eager,
@@ -365,13 +374,20 @@ def test_ep_merged_vs_non_ep(
         num_experts=num_experts,
         swiglu_limit=swiglu_limit,
     )
-    out_e.sum().backward()
+    grad_output = torch.randn_like(out_e)
+    out_e.backward(grad_output)
 
-    pt_ep = scatter_output.clone().detach().requires_grad_(True)
+    hs_ep = hidden_states.clone().detach().requires_grad_(True)
+    routing_ep = routing_weights.clone().detach().requires_grad_(True)
+    pt_ep, cumsum_ep, scatter_index_ep = _scatter_tokens(hs_ep, selected_experts, num_experts)
+    scattered_gw_ep = _scatter_routing_weights(routing_ep, scatter_index_ep)
     fc1_merged_ep = fc1_1_2_weight.clone().detach().requires_grad_(True)
     fc2_ep = fc2_weight.clone().detach().requires_grad_(True)
-    ep_raw2 = EPMergedFc1GroupGemm.apply(pt_ep, cumsum, fc1_merged_ep, fc2_ep, swiglu_limit)
-    ep_raw2.backward(scattered_gw.expand_as(ep_raw2).contiguous())
+    ep_raw2 = EPMergedFc1GroupGemm.apply(pt_ep, cumsum_ep, fc1_merged_ep, fc2_ep, swiglu_limit)
+    out_ep2 = moe_gather(ep_raw2 * scattered_gw_ep, scatter_index_ep).reshape(hidden_states.shape)
+    out_ep2.backward(grad_output)
+    torch.testing.assert_close(hs_eager.grad, hs_ep.grad, rtol=0, atol=atol)
+    torch.testing.assert_close(routing_eager.grad, routing_ep.grad, rtol=0, atol=atol)
     torch.testing.assert_close(fc2_eager.grad, fc2_ep.grad, rtol=0, atol=atol)
     torch.testing.assert_close(
         torch.cat([fc1_1_eager.grad, fc1_2_eager.grad], dim=1),

@@ -27,7 +27,14 @@ from torch.nn.attention.flex_attention import create_block_mask
 
 from tests.ops.attention.attention_cases import clone_qkv, dense_mask, flex_mask, math_sdpa_reference
 from tests.ops.attention.utils import UlyssesHelperRecorder
-from tests.ops.tol import ATTN_ATOL, ATTN_BF16_GRAD_ATOL, ATTN_GRAD_ATOL, ATTN_GRAD_RTOL, ATTN_RTOL
+from tests.ops.tol import (
+    ATTN_ATOL,
+    ATTN_BF16_GRAD_ATOL,
+    ATTN_GRAD_ATOL,
+    ATTN_GRAD_RTOL,
+    ATTN_LSE_RTOL,
+    ATTN_RTOL,
+)
 from veomni.ops.kernels.attention.standard import flex as flex_backend
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
@@ -289,7 +296,7 @@ def test_flex_attention_matches_math_sdpa(mask_case):
     block_mask = flex_mask(mask_case, sequence_length, device)
 
     reference_qkv = clone_qkv(query, key, value)
-    reference_output, _ = math_sdpa_reference(*reference_qkv, dense, scaling=scaling)
+    reference_output, reference_lse = math_sdpa_reference(*reference_qkv, dense, scaling=scaling)
     reference_gradients = torch.autograd.grad(reference_output, reference_qkv, output_gradient)
 
     flex_qkv = clone_qkv(query, key, value)
@@ -303,7 +310,7 @@ def test_flex_attention_matches_math_sdpa(mask_case):
 
     torch.testing.assert_close(flex_output, reference_output, rtol=ATTN_RTOL, atol=ATTN_ATOL)
     assert flex_lse is not None
-    assert torch.isfinite(flex_lse).all()
+    torch.testing.assert_close(flex_lse.float(), reference_lse.float(), rtol=ATTN_LSE_RTOL, atol=ATTN_ATOL)
     for name, flex_gradient, reference_gradient in zip(
         ("query", "key", "value"),
         flex_gradients,

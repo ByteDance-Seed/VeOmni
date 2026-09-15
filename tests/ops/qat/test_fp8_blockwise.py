@@ -22,13 +22,16 @@ import torch
 from torch import nn
 
 import veomni.ops.qat as qat
-from tests.ops.qat.reference import reference_act_quant, reference_fp8_weight_quant
+from tests.ops.qat.reference import reference_act_quant, reference_fp4_act_quant, reference_fp8_weight_quant
 from tests.ops.utils import require_nvidia_cuda
 from veomni.ops.qat import _hardware as qat_hardware
 from veomni.ops.qat import (
+    fp4_blockwise,
+    fp4_fake_quant_weight,
     fp8_blockwise,
     fp8_fake_quant_act,
     fp8_fake_quant_act_prefix,
+    fp8_fake_quant_stacked_weight,
     fp8_fake_quant_weight,
     qat_linear,
 )
@@ -122,6 +125,15 @@ def reference_quantizers(monkeypatch):
     """
     monkeypatch.setattr(fp8_blockwise, "act_quant", reference_act_quant)
     monkeypatch.setattr(fp8_blockwise, "fp8_weight_quant", reference_fp8_weight_quant)
+
+
+@pytest.fixture
+def reference_fp4_quantizer(monkeypatch):
+    """Route the FP4 facade through the independent Torch reference on CPU."""
+    backend = ModuleType("veomni.ops.qat.quant")
+    backend.fp4_act_quant = reference_fp4_act_quant
+    monkeypatch.setitem(sys.modules, "veomni.ops.qat.quant", backend)
+    monkeypatch.setattr(fp4_blockwise, "require_tilelang_sm90", lambda: None)
 
 
 def _act_qdq(x, block_size=128, round_scale=True):
@@ -351,6 +363,39 @@ def test_fake_quant_weight_scales_each_tile_independently(reference_quantizers):
     assert (dequantized[:128, :128] == 0).all()
 
 
+def test_fp4_fake_quant_matches_independent_reference_and_passes_gradient(reference_fp4_quantizer):
+    torch.manual_seed(13)
+    weight = torch.randn(2, 3, 64, dtype=torch.bfloat16)
+    weight[0].mul_(1e-3)
+    weight[1, 0, 7] = 500.0
+    actual_weight = weight.detach().clone().requires_grad_(True)
+    grad_output = torch.randn_like(actual_weight)
+
+    actual = fp4_fake_quant_weight(actual_weight)
+    expected = reference_fp4_act_quant(weight, dequant=True)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert not torch.equal(actual, weight)
+
+    actual.backward(grad_output)
+    assert torch.equal(actual_weight.grad, grad_output)
+
+
+def test_stacked_fp8_weight_matches_per_expert_reference_and_passes_gradient(reference_quantizers):
+    torch.manual_seed(14)
+    weight = torch.randn(3, 128, 256, dtype=torch.bfloat16)
+    weight[0].mul_(1e-3)
+    weight[1].mul_(1e3)
+    actual_weight = weight.detach().clone().requires_grad_(True)
+    grad_output = torch.randn_like(actual_weight)
+
+    actual = fp8_fake_quant_stacked_weight(actual_weight)
+    expected = torch.stack([reference_fp8_weight_quant(expert, scale_fmt="ue8m0", dequant=True) for expert in weight])
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    actual.backward(grad_output)
+    assert torch.equal(actual_weight.grad, grad_output)
+
+
 def test_qat_linear_disabled_is_a_transparent_wrapper():
     # The whole point of the `enabled` flag: a converted call site stays valid,
     # and free, when QAT is off -- including on hosts without the kernels.
@@ -455,9 +500,43 @@ def test_qat_linear_runs_on_the_tilelang_kernels():
     linear = nn.Linear(256, 128, bias=False, device=DEVICE, dtype=torch.bfloat16)
     x = torch.randn(8, 256, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
 
+    grad_output = torch.randn(8, 128, device=DEVICE, dtype=torch.bfloat16)
     actual = qat_linear(linear, x)
-    actual.sum().backward()
+    actual.backward(grad_output)
 
-    expected = nn.functional.linear(fp8_fake_quant_act(x.detach()), fp8_fake_quant_weight(linear.weight.detach()))
+    quantized_x = reference_act_quant(x.detach(), scale_fmt="ue8m0", dequant=True)
+    quantized_weight = reference_fp8_weight_quant(linear.weight.detach(), scale_fmt="ue8m0", dequant=True)
+    expected = nn.functional.linear(quantized_x, quantized_weight)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    assert x.grad is not None and linear.weight.grad is not None
+    torch.testing.assert_close(x.grad, grad_output @ quantized_weight, rtol=0, atol=0)
+    torch.testing.assert_close(linear.weight.grad, grad_output.t() @ quantized_x, rtol=0, atol=0)
+
+
+def test_fp4_fake_quant_runs_on_tilelang_with_reference_forward_and_gradient():
+    require_nvidia_cuda("tilelang", min_cc=90)
+    torch.manual_seed(22)
+    weight = torch.randn(2, 3, 64, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    grad_output = torch.randn_like(weight)
+
+    actual = fp4_fake_quant_weight(weight)
+    expected = reference_fp4_act_quant(weight.detach(), dequant=True)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    actual.backward(grad_output)
+    assert torch.equal(weight.grad, grad_output)
+
+
+def test_stacked_fp8_weight_runs_on_tilelang_with_per_expert_reference_and_gradient():
+    require_nvidia_cuda("tilelang", min_cc=90)
+    torch.manual_seed(23)
+    weight = torch.randn(2, 128, 256, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    grad_output = torch.randn_like(weight)
+
+    actual = fp8_fake_quant_stacked_weight(weight)
+    expected = torch.stack(
+        [reference_fp8_weight_quant(expert.detach(), scale_fmt="ue8m0", dequant=True) for expert in weight]
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    actual.backward(grad_output)
+    assert torch.equal(weight.grad, grad_output)

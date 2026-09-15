@@ -186,7 +186,7 @@ def test_rms_norm_gated_npu_uses_eps():
         assert torch.allclose(out_o.float(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
         outputs.append(out_o)
 
-    assert all(not torch.equal(left, right) for left, right in zip(outputs, outputs[1:], strict=True))
+    assert all(not torch.equal(left, right) for left, right in zip(outputs[:-1], outputs[1:], strict=True))
 
 
 def _hf_qwen3_5_prefill_causal_conv1d(x: Tensor, weight: Tensor, bias: Tensor, *, kernel_size: int) -> Tensor:

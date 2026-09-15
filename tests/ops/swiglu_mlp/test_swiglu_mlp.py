@@ -215,17 +215,22 @@ def test_eager_matches_swiglu_limit():
     )
     config._experts_implementation = "eager"
     experts = DeepseekV4Experts(config)
-    nn.init.normal_(experts.gate_up_proj, std=0.1)
+    nn.init.normal_(experts.gate_up_proj, std=0.5)
     nn.init.normal_(experts.down_proj, std=0.1)
     x = torch.randn(2, 16, hidden, dtype=torch.float32)
     selected = torch.zeros(tokens, 1, dtype=torch.long)
     routing = torch.ones(tokens, 1, dtype=torch.float32)
 
+    gate_w, up_w = experts.gate_up_proj[0].detach().chunk(2, dim=0)
+    gate = F.linear(x, gate_w)
+    up = F.linear(x, up_w)
+    assert torch.any(gate > limit)
+    assert torch.any(up.abs() > limit)
+
     x_h = x.detach().requires_grad_(True)
     out_h = experts(x_h.reshape(tokens, hidden), selected, routing).reshape_as(x)
 
     x_e = x.detach().requires_grad_(True)
-    gate_w, up_w = experts.gate_up_proj[0].detach().chunk(2, dim=0)
     down_w = experts.down_proj[0].detach()
     gate_e = nn.Parameter(gate_w.clone())
     up_e = nn.Parameter(up_w.clone())

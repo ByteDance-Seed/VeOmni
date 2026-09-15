@@ -17,12 +17,44 @@
 import pytest
 import torch
 
-from tests.ops.qat.reference import reference_act_quant, reference_fp8_weight_quant
+from tests.ops.qat.reference import reference_act_quant, reference_fp4_act_quant, reference_fp8_weight_quant
 from tests.ops.utils import require_nvidia_cuda
 from veomni.utils.device import get_device_type
 
 
 DEVICE = get_device_type()
+
+
+def test_tilelang_fp4_quant_matches_reference_and_dequantizes():
+    require_nvidia_cuda("tilelang", min_cc=90)
+    from veomni.ops.qat.quant import fp4_act_quant
+
+    torch.manual_seed(1)
+    rounding_ties = torch.tensor((0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0)).repeat(8)
+    x = torch.stack(
+        (
+            torch.zeros(64),
+            torch.full((64,), 1e-8),
+            torch.linspace(-7.0, 7.0, 64),
+            rounding_ties,
+            torch.randn(64),
+        )
+    ).to(device=DEVICE, dtype=torch.bfloat16)
+    x[-1, 9] = 500.0
+    quantized, scales = fp4_act_quant(x)
+    reference_quantized, reference_scales = reference_fp4_act_quant(x)
+
+    assert quantized.shape == (5, 32)
+    assert quantized.dtype == torch.float4_e2m1fn_x2
+    assert scales.shape == (5, 2)
+    assert scales.dtype == torch.float8_e8m0fnu
+    assert torch.equal(quantized.view(torch.uint8), reference_quantized.view(torch.uint8))
+    assert torch.equal(scales.view(torch.uint8), reference_scales.view(torch.uint8))
+
+    dequantized = fp4_act_quant(x, dequant=True)
+    expected_dequantized = reference_fp4_act_quant(x, dequant=True)
+    assert dequantized.dtype == torch.bfloat16
+    assert torch.equal(dequantized, expected_dequantized)
 
 
 @pytest.mark.parametrize("block_size", (64, 128), ids=("block64", "block128"))
