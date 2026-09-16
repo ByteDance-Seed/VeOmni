@@ -25,6 +25,7 @@ from veomni.models.checkpoint.convert import (
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
 )
+from veomni.models.checkpoint.expert_fusion import PerExpertSplitToFusedConverter
 from veomni.models.transformers.deepseek_v3.checkpoint_tensor_converter import (
     DeepseekV3CheckpointTensorConverter,
     convert_deepseek_v3_fqn_to_index_mapping,
@@ -392,6 +393,9 @@ class TestQwen3MoeConverterIntegration:
 _ROUTED_EXPERT_CONVERTER_CASES = (
     pytest.param(DeepseekV3CheckpointTensorConverter, id="deepseek_v3"),
     pytest.param(GlmMoeDsaCheckpointTensorConverter, id="glm_moe_dsa"),
+    pytest.param(Qwen3MoeCheckpointTensorConverter, id="qwen3_moe"),
+    pytest.param(Qwen3OmniMoeCheckpointTensorConverter, id="qwen3_omni_moe"),
+    pytest.param(PerExpertSplitToFusedConverter, id="shared_base"),
 )
 
 
@@ -451,6 +455,20 @@ class TestRoutedExpertCheckpointTensorConverter:
 
         with pytest.raises(RuntimeError, match="incomplete checkpoint detected"):
             converter.finalize()
+
+    @pytest.mark.parametrize("converter_cls", _ROUTED_EXPERT_CONVERTER_CASES)
+    def test_fused_keys_pass_through_without_buffering(self, converter_cls):
+        converter = converter_cls(num_experts=NUM_EXPERTS)
+        prefix = "model.layers.0.mlp"
+        gate_up = torch.randn(NUM_EXPERTS, 2 * INTERMEDIATE_DIM, HIDDEN_DIM)
+        down = torch.randn(NUM_EXPERTS, HIDDEN_DIM, INTERMEDIATE_DIM)
+
+        gate_up_res = maybe_convert_checkpoint_tensor(f"{prefix}.experts.gate_up_proj", gate_up, converter)
+        down_res = maybe_convert_checkpoint_tensor(f"{prefix}.experts.down_proj", down, converter)
+
+        assert gate_up_res is not None and torch.equal(gate_up_res.tensor, gate_up)
+        assert down_res is not None and torch.equal(down_res.tensor, down)
+        assert converter.finalize() == []
 
     @pytest.mark.parametrize(
         ("factory", "converter_cls", "convert_mapping"),

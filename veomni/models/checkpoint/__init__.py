@@ -29,6 +29,7 @@ from .convert import (
     resolve_fqn_to_index_mapping_for_save,
     shard_index_from_filename,
 )
+from .expert_fusion import PerExpertSplitToFusedConverter
 from .manager import ModelCheckpointManager
 from .moe_map import (
     PER_EXPERT_SPLIT_TO_FUSED_PATTERN,
@@ -50,6 +51,7 @@ __all__ = [
     "FqnToIndexMappingConverter",
     "ModelCheckpointManager",
     "PER_EXPERT_SPLIT_TO_FUSED_PATTERN",
+    "PerExpertSplitToFusedConverter",
     "checkpoint_converter_is_dim0_zero_pad",
     "convert_per_expert_fqn_mapping_to_fused",
     "export_weights",
