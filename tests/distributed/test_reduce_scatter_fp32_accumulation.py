@@ -1,10 +1,13 @@
 import copy
 import gc
 import os
+from datetime import timedelta
+from pathlib import Path
 
 import pytest
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.device_mesh import init_device_mesh
@@ -15,12 +18,10 @@ from veomni.distributed import torch_parallelize
 from veomni.distributed.fsdp2 import reduce_scatter as reduce_scatter_module
 from veomni.distributed.fsdp2.reduce_scatter import (
     FP32ReduceScatterWithLowPrecisionTransport,
+    ReduceScatterTransportPolicy,
     register_fp32_reduce_scatter_with_low_precision_transport,
 )
-from veomni.distributed.torch_parallelize import (
-    _configure_fsdp_gradient_reduction,
-    _reduce_scatter_group_size,
-)
+from veomni.distributed.torch_parallelize import _configure_fsdp_gradient_reduction
 from veomni.utils import device as device_utils
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
@@ -152,11 +153,8 @@ def test_registers_only_selected_fsdp_modules_and_moves_scaling_into_hook(monkey
     assert model.fsdp2.force_sum_reductions == []
 
 
-@pytest.mark.parametrize(
-    "reduce_scatter_group_size",
-    [1, 2],
-)
-def test_fsdp_gradient_scaling_uses_custom_path_only_when_needed(reduce_scatter_group_size):
+@pytest.mark.parametrize("use_low_precision_transport", [False, True])
+def test_fsdp_gradient_scaling_uses_custom_path_only_when_needed(use_low_precision_transport):
     class FakeFSDPModule:
         def __init__(self) -> None:
             self.gradient_divide_factors = []
@@ -169,11 +167,11 @@ def test_fsdp_gradient_scaling_uses_custom_path_only_when_needed(reduce_scatter_
     _configure_fsdp_gradient_reduction(
         module,
         gradient_divide_factor=8.0,
-        reduce_scatter_group_size=reduce_scatter_group_size,
+        use_low_precision_transport=use_low_precision_transport,
         transport_reduction_scales=reduction_scales,
     )
 
-    if reduce_scatter_group_size == 1:
+    if not use_low_precision_transport:
         assert module.gradient_divide_factors == [8.0]
         assert reduction_scales == {}
     else:
@@ -181,29 +179,141 @@ def test_fsdp_gradient_scaling_uses_custom_path_only_when_needed(reduce_scatter_
         assert reduction_scales == {module: 0.125}
 
 
+class _FakeReductionMesh:
+    def __init__(self, shard_group, replica_group=None):
+        self.groups = {"dp_shard_sp": shard_group}
+        if replica_group is not None:
+            self.groups = {"dp_replicate": replica_group, **self.groups}
+        self.mesh_dim_names = tuple(self.groups)
+
+    def get_group(self, name):
+        return self.groups[name]
+
+
 @pytest.mark.parametrize(
-    ("mesh_dim_names", "sizes", "expected"),
+    ("contents", "expected"),
     [
-        (("dp_shard",), {"dp_shard": 8}, 8),
-        (("dp_replicate", "dp_shard"), {"dp_replicate": 2, "dp_shard": 4}, 4),
+        ("9B1E4328-5347-4C5D-8E18-492833332CA1\n", "9b1e4328-5347-4c5d-8e18-492833332ca1"),
+        ("", None),
+        ("not-a-node-id", None),
+        ("00000000-0000-0000-0000-000000000000", None),
+        ("ffffffff-ffff-ffff-ffff-ffffffffffff", None),
     ],
 )
-def test_reduce_scatter_group_size_uses_last_mesh_dimension(mesh_dim_names, sizes, expected):
-    class FakeMeshDimension:
-        def __init__(self, size):
-            self._size = size
+def test_node_identity_requires_valid_kernel_boot_id(monkeypatch, contents, expected):
+    def read_text(path):
+        assert str(path) == "/proc/sys/kernel/random/boot_id"
+        return contents
 
-        def size(self):
-            return self._size
+    monkeypatch.setattr(Path, "read_text", read_text)
+    assert reduce_scatter_module._get_node_id() == expected
 
-    class FakeMesh:
-        def __init__(self):
-            self.mesh_dim_names = mesh_dim_names
 
-        def __getitem__(self, name):
-            return FakeMeshDimension(sizes[name])
+def test_unreadable_node_identity_does_not_trust_environment(monkeypatch):
+    def read_text(path):
+        raise PermissionError("kernel identity unavailable")
 
-    assert _reduce_scatter_group_size(FakeMesh()) == expected
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setenv("HOSTNAME", "apparently-shared-node")
+    monkeypatch.setenv("NODE_NAME", "apparently-shared-node")
+    assert reduce_scatter_module._get_node_id() is None
+
+
+@pytest.mark.parametrize(
+    ("node_ids", "expected"),
+    [(["node-a", "node-a"], True), (["node-a", "node-b"], False), (["node-a", None], False)],
+)
+def test_transport_policy_uses_actual_group_and_caches_decision(monkeypatch, node_ids, expected):
+    group = object()
+    calls = []
+    identity_reads = []
+
+    def get_node_id():
+        identity_reads.append(True)
+        return node_ids[0]
+
+    def gather(output, value, *, group):
+        calls.append((group, value))
+        output[:] = node_ids
+
+    monkeypatch.setattr(reduce_scatter_module, "_get_node_id", get_node_id)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 0)
+    # Group members need not be contiguous global ranks.
+    monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: [1, 7])
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    policy = ReduceScatterTransportPolicy()
+    assert policy.can_use(_FakeReductionMesh(group)) is expected
+    assert policy.can_use(_FakeReductionMesh(group)) is expected
+    assert calls == [(group, node_ids[0])]
+    assert identity_reads == [True]
+
+
+@pytest.mark.parametrize("has_replica_group", [False, True])
+def test_singleton_transport_policy_does_not_communicate(monkeypatch, has_replica_group):
+    def fail_gather(*args, **kwargs):
+        raise AssertionError("singleton shard groups do not need topology communication")
+
+    monkeypatch.setattr(reduce_scatter_module, "_get_node_id", lambda: None)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 1)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: [0])
+    monkeypatch.setattr(dist, "all_gather_object", fail_gather)
+    mesh = _FakeReductionMesh(object(), object() if has_replica_group else None)
+    assert not ReduceScatterTransportPolicy().can_use(mesh)
+
+
+def test_transport_policy_does_not_hide_collective_failures(monkeypatch):
+    def fail_gather(*args, **kwargs):
+        raise RuntimeError("topology collective failed")
+
+    monkeypatch.setattr(reduce_scatter_module, "_get_node_id", lambda: None)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(dist, "all_gather_object", fail_gather)
+    with pytest.raises(RuntimeError, match="topology collective failed"):
+        ReduceScatterTransportPolicy().can_use(_FakeReductionMesh(object()))
+
+
+@pytest.mark.parametrize("local_ids", [["node-a", "node-a"], ["node-a", "node-b"], [None, None]])
+@pytest.mark.parametrize("peer_status", ["node_local", "cross_node", "unknown"])
+def test_hsdp_replica_consensus_runs_even_for_rejected_shard(monkeypatch, local_ids, peer_status):
+    shard_group, replica_group = object(), object()
+    calls = []
+
+    def gather(output, value, *, group):
+        calls.append(group)
+        output[:] = local_ids if group is shard_group else [value, peer_status]
+
+    monkeypatch.setattr(reduce_scatter_module, "_get_node_id", lambda: local_ids[0])
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 1)
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    policy = ReduceScatterTransportPolicy()
+    mesh = _FakeReductionMesh(shard_group, replica_group)
+    expected = local_ids == ["node-a", "node-a"] and peer_status == "node_local"
+    assert policy.can_use(mesh) is expected
+    assert policy.can_use(mesh) is expected
+    assert calls == [shard_group, replica_group]
+
+
+def test_hsdp_decision_cache_includes_replica_group(monkeypatch):
+    shard_group, replica_a, replica_b = object(), object(), object()
+    calls = []
+
+    def gather(output, value, *, group):
+        calls.append(group)
+        output[:] = [value, "cross_node" if group is replica_b else value]
+
+    monkeypatch.setattr(reduce_scatter_module, "_get_node_id", lambda: "node-a")
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 1)
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    policy = ReduceScatterTransportPolicy()
+    assert policy.can_use(_FakeReductionMesh(shard_group))
+    assert policy.can_use(_FakeReductionMesh(shard_group, replica_a))
+    assert not policy.can_use(_FakeReductionMesh(shard_group, replica_b))
+    assert policy.can_use(_FakeReductionMesh(shard_group, replica_a))
+    assert calls == [shard_group, replica_a, replica_b]
 
 
 def test_reduce_scatter_transport_config_and_native_fallback():
@@ -337,6 +447,7 @@ def test_native_transport_does_not_register_custom_collective(monkeypatch, trans
     def fail_registration(*args, **kwargs):
         raise AssertionError("matching dtypes must not register a custom ReduceScatter")
 
+    monkeypatch.setattr(torch_parallelize, "ReduceScatterTransportPolicy", fail_registration)
     monkeypatch.setattr(
         torch_parallelize,
         "register_fp32_reduce_scatter_with_low_precision_transport",
@@ -364,20 +475,13 @@ def test_native_transport_does_not_register_custom_collective(monkeypatch, trans
     ],
 )
 @pytest.mark.parametrize("transport_dtype", ["bfloat16", "float16"])
-def test_parallelize_registers_active_transport_for_fsdp_and_hsdp(monkeypatch, mesh_dim_names, sizes, transport_dtype):
-    class FakeMeshDimension:
-        def __init__(self, size):
-            self._size = size
-
-        def size(self):
-            return self._size
-
+@pytest.mark.parametrize("node_local", [False, True])
+def test_parallelize_registers_transport_only_for_eligible_fsdp_and_hsdp(
+    monkeypatch, mesh_dim_names, sizes, transport_dtype, node_local
+):
     class FakeMesh:
         def __init__(self):
             self.mesh_dim_names = mesh_dim_names
-
-        def __getitem__(self, name):
-            return FakeMeshDimension(sizes[name])
 
         def size(self):
             result = 1
@@ -391,12 +495,19 @@ def test_parallelize_registers_active_transport_for_fsdp_and_hsdp(monkeypatch, m
         fsdp_mesh = FakeMesh()
 
     registration_calls = []
+    topology_calls = []
+
+    class FakeTransportPolicy:
+        def can_use(self, mesh):
+            topology_calls.append(mesh)
+            return node_local
 
     def record_registration(model, *, transport_dtype, reduction_scales):
         registration_calls.append((model, transport_dtype, dict(reduction_scales)))
         return len(reduction_scales)
 
     monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: ParallelState())
+    monkeypatch.setattr(torch_parallelize, "ReduceScatterTransportPolicy", FakeTransportPolicy)
     monkeypatch.setattr(device_utils, "IS_CUDA_AVAILABLE", True)
     monkeypatch.setattr(torch_parallelize, "fully_shard", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch_parallelize, "_materialize_and_load_weights", lambda *args, **kwargs: None)
@@ -419,7 +530,152 @@ def test_parallelize_registers_active_transport_for_fsdp_and_hsdp(monkeypatch, m
     )
 
     assert result is model
-    assert registration_calls == [(model, getattr(torch, transport_dtype), {model: 0.25})]
+    assert registration_calls == [(model, getattr(torch, transport_dtype), {model: 0.25} if node_local else {})]
+    assert topology_calls == [ParallelState.fsdp_mesh]
+
+
+@pytest.mark.parametrize("dense_eligible", [False, True])
+@pytest.mark.parametrize("expert_eligible", [False, True])
+def test_parallelize_checks_dense_and_expert_meshes_independently(monkeypatch, dense_eligible, expert_eligible):
+    class FakeMesh:
+        mesh_dim_names = ("ep_fsdp", "ep")
+
+        def __init__(self, shard_mesh=None):
+            self.shard_mesh = shard_mesh
+
+        def __getitem__(self, names):
+            assert names == ("ep_fsdp",)
+            return self.shard_mesh
+
+        def size(self):
+            return 4
+
+    dense_mesh, expert_mesh = FakeMesh(), FakeMesh()
+
+    class ParallelState:
+        any_extra_parallel_enabled = True
+        extra_parallel_names = ["ep"]
+        fsdp_mesh = dense_mesh
+        extra_parallel_fsdp_device_mesh = {"ep": FakeMesh(expert_mesh)}
+
+        def extra_parallel_enabled(self, name):
+            return True
+
+        def extra_parallel_gradient_divide_factor(self, name):
+            return 8.0
+
+    class ToyDecoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = nn.Linear(2, 2)
+            self.high_precision = nn.LayerNorm(2)
+
+    model = nn.Module()
+    model.decoder = ToyDecoder()
+    model._no_split_modules = ["ToyDecoder"]
+    model.get_ignore_modules_in_mixed_precision = lambda: (nn.LayerNorm,)
+    factors = []
+    model.decoder.experts.set_gradient_divide_factor = factors.append
+
+    class FakePlan:
+        extra_parallel_plan = {"ep": {}}
+
+        def apply(self, model, meshes):
+            return {}
+
+        def get_extra_parallel_fsdp_no_shard_info(self, model, name):
+            return {"decoder.experts": model.decoder.experts}
+
+    topology_calls = []
+
+    class FakeTransportPolicy:
+        def can_use(self, mesh):
+            topology_calls.append(mesh)
+            assert mesh in (dense_mesh, expert_mesh)
+            return dense_eligible if mesh is dense_mesh else expert_eligible
+
+    registration_calls = []
+    wrapping_calls = {}
+
+    def record_registration(model, *, transport_dtype, reduction_scales):
+        registration_calls.append(dict(reduction_scales))
+        return len(reduction_scales)
+
+    def record_wrap(module, **kwargs):
+        wrapping_calls[module] = kwargs
+
+    monkeypatch.setattr(torch_parallelize, "get_parallel_state", ParallelState)
+    monkeypatch.setattr(torch_parallelize, "get_runtime_parallel_plan", lambda model: FakePlan())
+    monkeypatch.setattr(torch_parallelize, "ReduceScatterTransportPolicy", FakeTransportPolicy)
+    monkeypatch.setattr(device_utils, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(torch_parallelize, "fully_shard", record_wrap)
+    monkeypatch.setattr(torch_parallelize, "_materialize_and_load_weights", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        torch_parallelize, "register_fp32_reduce_scatter_with_low_precision_transport", record_registration
+    )
+
+    assert (
+        torch_parallelize.parallelize_model_fsdp2(
+            model,
+            mixed_precision=MixedPrecisionConfig(param_dtype="bfloat16", reduce_dtype="float32"),
+            reduce_scatter_transport_dtype="bfloat16",
+            init_device="meta",
+        )
+        is model
+    )
+    expected_scales = {model.decoder: 0.25, model: 0.25} if dense_eligible else {}
+    if expert_eligible:
+        expected_scales[model.decoder.experts] = 0.125
+    assert registration_calls == [expected_scales]
+    assert factors == ([] if expert_eligible else [8.0])
+    assert topology_calls == [dense_mesh, expert_mesh]
+    assert wrapping_calls[model.decoder.experts]["mesh"] is expert_mesh
+    assert "mp_policy" not in wrapping_calls[model.decoder.high_precision]
+    assert model.decoder.high_precision not in expected_scales
+
+
+def _run_transport_policy_gloo(rank, rendezvous):
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=4, timeout=timedelta(seconds=60)
+    )
+    original_get_node_id = reduce_scatter_module._get_node_id
+    original_gather = dist.all_gather_object
+    try:
+        from torch.distributed.device_mesh import DeviceMesh
+
+        # Synthetic node identities isolate placement/consensus logic; all workers run locally.
+        # Noncontiguous shard rows ensure rank arithmetic cannot substitute for actual groups.
+        mesh = DeviceMesh("cpu", [[0, 2], [1, 3]], mesh_dim_names=("replica", "shard"))
+        for identities, expected in (
+            (["node-a", "node-b", "node-a", "node-b"], True),
+            (["node-a", "node-b", "node-a", "node-c"], False),
+            (["node-a", "node-b", "node-a", None], False),
+        ):
+            calls = []
+
+            def recording_gather(output, value, *, group, calls=calls):
+                calls.append(group)
+                return original_gather(output, value, group=group)
+
+            reduce_scatter_module._get_node_id = lambda identities=identities: identities[rank]
+            dist.all_gather_object = recording_gather
+            policy = ReduceScatterTransportPolicy()
+            assert policy.can_use(mesh) is expected
+            assert policy.can_use(mesh) is expected
+            assert calls == [mesh.get_group("shard"), mesh.get_group("replica")]
+            decisions = [None] * 4
+            original_gather(decisions, policy.can_use(mesh))
+            assert decisions == [expected] * 4
+    finally:
+        reduce_scatter_module._get_node_id = original_get_node_id
+        dist.all_gather_object = original_gather
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="requires the CPU Gloo backend")
+def test_transport_policy_gloo_noncontiguous_hsdp_consensus(tmp_path):
+    mp.spawn(_run_transport_policy_gloo, args=(str(tmp_path / "rendezvous"),), nprocs=4, join=True)
 
 
 def _run_reduce_scatter_nccl() -> None:
@@ -547,6 +803,79 @@ def _run_fsdp2_optimizer_step() -> None:
 
     assert all_reduce_dtypes == [torch.float32]
     torch.testing.assert_close(custom.weight.grad.to_local(), baseline.weight.grad.to_local(), rtol=5e-6, atol=5e-6)
+    _run_transport_policy_fsdp2_gradients(mesh, hsdp_mesh, device)
+
+
+def _run_transport_policy_fsdp2_gradients(fsdp_mesh, hsdp_mesh, device):
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    original_get_node_id = reduce_scatter_module._get_node_id
+    original_comm_class = reduce_scatter_module.FP32ReduceScatterWithLowPrecisionTransport
+    calls = []
+
+    class RecordingReduceScatter(original_comm_class):
+        def __call__(self, output_tensor, input_tensor, group, op, async_op=False):
+            calls.append((input_tensor.dtype, op))
+            return super().__call__(output_tensor, input_tensor, group, op, async_op)
+
+    boot_ids = [None] * world_size
+    dist.all_gather_object(boot_ids, original_get_node_id())
+    real_node_local = None not in boot_ids and len(set(boot_ids)) == 1
+    # Synthetic identities exercise cross-node fallback on single-node GPU CI;
+    # this verifies NCCL integration and gradient scaling, not multi-node performance.
+    cases = (
+        (fsdp_mesh, None, real_node_local),
+        (fsdp_mesh, ["node-a"] * 4, True),
+        (fsdp_mesh, ["node-a", "node-a", "node-b", "node-b"], False),
+        (fsdp_mesh, ["node-a", "node-a", "node-a", None], False),
+        (hsdp_mesh, ["node-a", "node-a", "node-b", "node-b"], True),
+        (hsdp_mesh, ["node-a", "node-a", "node-b", "node-c"], False),
+        (hsdp_mesh, ["node-a", "node-a", "node-b", None], False),
+    )
+    try:
+        reduce_scatter_module.FP32ReduceScatterWithLowPrecisionTransport = RecordingReduceScatter
+        for mesh, identities, expected in cases:
+            reduce_scatter_module._get_node_id = (
+                original_get_node_id if identities is None else lambda identities=identities: identities[rank]
+            )
+            topology_policy = ReduceScatterTransportPolicy()
+            enabled = topology_policy.can_use(mesh)
+            assert enabled is expected
+            assert topology_policy.can_use(mesh) is expected
+            decisions = [None] * world_size
+            dist.all_gather_object(decisions, enabled)
+            assert decisions == [expected] * world_size
+
+            torch.manual_seed(137)
+            baseline = nn.Linear(16, 8, bias=False, device=device)
+            candidate = copy.deepcopy(baseline)
+            mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+            fully_shard(baseline, mesh=mesh, mp_policy=mp_policy)
+            fully_shard(candidate, mesh=mesh, mp_policy=mp_policy)
+            registered = register_fp32_reduce_scatter_with_low_precision_transport(
+                candidate,
+                transport_dtype=torch.bfloat16,
+                reduction_scales={candidate: 1.0 / mesh.size()} if enabled else {},
+            )
+            assert registered == int(expected)
+
+            torch.manual_seed(700 + rank)
+            inputs = torch.randn(4, 16, device=device, dtype=torch.bfloat16)
+            calls.clear()
+            baseline(inputs).float().square().sum().backward()
+            candidate(inputs).float().square().sum().backward()
+            assert bool(calls) is expected
+            assert all(dtype == torch.float32 and op == dist.ReduceOp.SUM for dtype, op in calls)
+            baseline_grad = baseline.weight.grad.to_local()
+            candidate_grad = candidate.weight.grad.to_local()
+            assert baseline_grad.dtype == candidate_grad.dtype == torch.float32
+            torch.testing.assert_close(candidate_grad, baseline_grad, rtol=5e-6, atol=5e-6)
+            del baseline, candidate, baseline_grad, candidate_grad, inputs
+            gc.collect()
+            dist.barrier(device_ids=[device.index])
+    finally:
+        reduce_scatter_module._get_node_id = original_get_node_id
+        reduce_scatter_module.FP32ReduceScatterWithLowPrecisionTransport = original_comm_class
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="requires four CUDA devices")
