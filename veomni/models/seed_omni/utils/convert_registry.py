@@ -2,7 +2,7 @@
 
 Each model family registers a converter under its upstream HuggingFace
 ``model_type`` (read from ``config.json`` at ``model_path``).  The unified
-entry point is :func:`convert_checkpoint` (CLI: ``scripts/convert_model.py``).
+entry point is :func:`convert_checkpoint` (CLI: ``scripts/seed_omni/convert_model.py``).
 """
 
 from __future__ import annotations
