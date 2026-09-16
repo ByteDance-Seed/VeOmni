@@ -242,6 +242,13 @@ class DeepseekV41LlmConfig(PretrainedConfig):
         """Alias ``DeepseekV4Experts`` reads for the routed-expert count."""
         return self.n_routed_experts
 
+    @property
+    def mlp_bias(self) -> bool:
+        """``DeepseekV4MLP`` passes this to its three projections. Constant rather
+        than a field: no released V4.1 expert carries a bias, and making it
+        settable would offer a shape the checkpoint cannot fill."""
+        return False
+
     def moe_config_for_layer(self, layer_idx: int) -> tuple:
         """``(n_routed, n_activated)`` -- the draft stages have their own, smaller MoE."""
         if layer_idx < self.num_hidden_layers:

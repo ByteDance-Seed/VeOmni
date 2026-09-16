@@ -52,9 +52,22 @@ DeepseekV4UnweightedRMSNorm = _generated.DeepseekV4UnweightedRMSNorm
 #: written as a module, with the same weight layout.
 DeepseekV4GroupedLinear = _generated.DeepseekV4GroupedLinear
 
+#: Stacked routed experts: ``gate_up_proj [E, 2I, H]``, ``down_proj [E, H, I]``,
+#: the fused-MoE OpSlot path, fp4 weight QAT keyed on ``expert_dtype``, and the
+#: ``swiglu_limit`` clamp. V4.1 changes none of it. Reads the config as
+#: ``num_local_experts`` / ``intermediate_size`` / ``hidden_act``, which
+#: :class:`DeepseekV41LlmConfig` exposes as properties over its own field names.
+DeepseekV4Experts = _generated.DeepseekV4Experts
+
+#: The shared expert -- one SwiGLU FFN with the same two-sided clamp on ``up``
+#: and one-sided on ``gate``, and FP8 QAT on all three projections.
+DeepseekV4MLP = _generated.DeepseekV4MLP
+
 
 __all__ = [
+    "DeepseekV4Experts",
     "DeepseekV4GroupedLinear",
+    "DeepseekV4MLP",
     "DeepseekV4RMSNorm",
     "DeepseekV4UnweightedRMSNorm",
 ]
