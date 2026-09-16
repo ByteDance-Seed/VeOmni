@@ -644,6 +644,96 @@ def test_train_node_runner_records_transitions_and_losses():
     assert [t for t in trace if t.startswith("loss:")] == [f"loss:{n}" for n in g.execution_order]
 
 
+# ── Generation FSM (graph only: it selects nodes, it never calls one) ─────────
+
+
+def _two_state_graph() -> GenerationGraph:
+    """``s1`` watches one signal and falls back to ``default``; ``s2`` has a two-node body."""
+    return GenerationGraph(
+        {
+            "initial": "s1",
+            "states": {
+                "s1": {
+                    "body": [{"from": "a", "to": "end"}],
+                    "transitions": [
+                        {"condition": {"type": "module_signal", "key": "watched"}, "next_state": "s2"},
+                        {"condition": {"type": "default"}, "next_state": "s2"},
+                    ],
+                },
+                "s2": {
+                    "body": [{"from": "c", "to": "d"}, {"from": "d", "to": "end"}],
+                    "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
+                },
+            },
+        }
+    )
+
+
+def test_body_runs_in_declared_order():
+    g = _two_state_graph()
+    ctx: dict = {}
+    assert [n.name for n in g.iter_nodes(ctx)] == ["a.generate"]
+    g.maybe_transition(ctx)
+    assert [n.name for n in g.iter_nodes(ctx)] == ["c.generate", "d.generate"]
+
+
+def test_signal_mid_body_stops_the_rest_of_the_body():
+    """A node saying 'done' ends the body it was running in, not just its own edge."""
+    g = _two_state_graph()
+    ctx: dict = {}
+    g.maybe_transition(ctx)  # leave s1 for s2 on default
+
+    ran = []
+    for node in g.iter_nodes(ctx):
+        ran.append(node.name)
+        ctx["module_signal"] = "watched"  # as if the node wrote it
+    assert ran == ["c.generate"]
+
+
+def test_matched_signal_fires_its_transition_and_clears_the_signal():
+    g = _two_state_graph()
+    ctx = {"module_signal": "watched"}
+    fired = g.maybe_transition(ctx)
+    assert (fired.to_state, fired.condition) == ("s2", "module_signal(watched)")
+    assert "module_signal" not in ctx
+
+
+def test_unmatched_signal_is_cleared_by_the_default_transition():
+    """A signal is one-shot per body, whichever transition consumes the state.
+
+    A module may emit a signal the current state does not name — it leaves on
+    ``default`` instead. Were the key left behind, ``iter_nodes`` would see it
+    as "stop" after the first node of every later body, for the rest of the run.
+    """
+    g = _two_state_graph()
+    ctx = {"module_signal": "not_watched_here"}
+
+    fired = g.maybe_transition(ctx)
+    assert (fired.to_state, fired.condition) == ("s2", "default")
+    assert "module_signal" not in ctx
+    assert [n.name for n in g.iter_nodes(ctx)] == ["c.generate", "d.generate"]
+
+
+def test_a_feedback_edge_does_not_gate_its_destination():
+    """``to: X`` *after* X's own turn as a source is feedback, not an input.
+
+    It updates ctx for the next iteration, so X must still run on first sight
+    rather than waiting on an edge that only exists to feed the round after it.
+    """
+    g = GenerationGraph(
+        {
+            "initial": "s1",
+            "states": {
+                "s1": {
+                    "body": [{"from": "d", "to": "end"}, {"from": "c", "to": "d"}],
+                    "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
+                }
+            },
+        }
+    )
+    assert [n.name for n in g.iter_nodes({})] == ["d.generate", "c.generate"]
+
+
 # ── Mermaid visualisation ────────────────────────────────────────────────────
 
 
