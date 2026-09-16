@@ -254,7 +254,7 @@ def distributed_worker():
         get_torch_device().set_device(rank)
     device = torch.device(device_type if device_type == "cpu" else f"{device_type}:{rank}")
     dist.init_process_group(
-        "gloo" if device_type == "cpu" else {"cuda": "nccl", "npu": "hccl", "mlu": "cncl"}[device_type],
+        "gloo" if device_type == "cpu" else get_dist_comm_backend(),
         timeout=timedelta(seconds=120),
     )
     world = dist.get_world_size()
