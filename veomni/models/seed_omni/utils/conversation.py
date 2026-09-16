@@ -157,7 +157,7 @@ def build_conversation(
     return parts
 
 
-# ── Training batch helpers (unified with inference ConversationItem) ────────
+# Training batch helpers, unified with the inference ConversationItem.
 
 
 def iter_desired_items(

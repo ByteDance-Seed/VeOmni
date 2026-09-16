@@ -156,7 +156,16 @@ def get_model_processor(processor_path: str, **kwargs):
             # (read from the module's ``config.json``), not by processor class
             # name — consult the OMNI registry first.
             try:
-                cfg_dict, _ = PretrainedConfig.get_config_dict(processor_path)
+                # Forward the hub-resolution options the caller gave
+                # ``AutoProcessor``; without them a private repo or a pinned
+                # revision fails this read, and the `except` below turns that
+                # into a silent "not an omni module" verdict.
+                hub_kwargs = {
+                    key: kwargs[key]
+                    for key in ("token", "revision", "cache_dir", "subfolder", "local_files_only")
+                    if key in kwargs
+                }
+                cfg_dict, _ = PretrainedConfig.get_config_dict(processor_path, **hub_kwargs)
                 omni_model_type = cfg_dict.get("model_type")
             except Exception:
                 omni_model_type = None

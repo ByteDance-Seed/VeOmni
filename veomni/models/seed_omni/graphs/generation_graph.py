@@ -136,9 +136,6 @@ DONE_STATE_NAME: str = "done"
 FSM_SIGNAL_KEY: str = "module_signal"
 
 
-# ── Condition helpers ─────────────────────────────────────────────────────────
-
-
 _KNOWN_CONDITION_TYPES = frozenset({"module_signal", "default"})
 
 
@@ -186,9 +183,6 @@ class FiredTransition:
     from_state: str
     to_state: str
     condition: str  # human-readable condition description, e.g. ``module_signal(text_done)``
-
-
-# ── State ─────────────────────────────────────────────────────────────────────
 
 
 class _State:
@@ -248,9 +242,6 @@ class _State:
                     f"unconditionally, so the {len(self.transitions) - i - 1} transition(s) after "
                     f"it would never run). Move `default` to the end of `{name}.transitions`."
                 )
-
-
-# ── GenerationGraph ───────────────────────────────────────────────────────────
 
 
 class GenerationGraph:
@@ -324,8 +315,6 @@ class GenerationGraph:
         # Runtime state — reset before each generate call.
         self._current: str = self._initial
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
-
     def reset(self) -> None:
         """Reset FSM to the initial state for a new generation request."""
         self._current = self._initial
@@ -333,8 +322,6 @@ class GenerationGraph:
     def is_done(self) -> bool:
         """Return True when the FSM has reached the framework-injected terminal state."""
         return self._current == self._done_sentinel
-
-    # ── Step & Transition ─────────────────────────────────────────────────────
 
     def iter_nodes(self, ctx: Dict[str, Any]) -> Iterator[NodeDef]:
         """Yield the nodes to run for ONE iteration of the current state body.
@@ -369,6 +356,15 @@ class GenerationGraph:
         """
         state = self._current_state
         executed: set = set()
+
+        # A signal is one-shot per body pass, and this pass owns the clearing.
+        # :meth:`maybe_transition` pops the signal it acts on, but it runs
+        # between passes and only when some transition matches. A state that
+        # stays put until one named signal fires — every AR decode loop — has
+        # no `default` to fall through, so a signal it does not watch survives
+        # into here and stops the body after its first node, on this pass and
+        # every pass after it, until `max_new_tokens` runs out.
+        ctx.pop(FSM_SIGNAL_KEY, None)
 
         # Per-node first appearance as `from_` in body — distinguishes
         # **feed-forward** edges (with `to: X` *before* X's first `from_`
@@ -442,9 +438,9 @@ class GenerationGraph:
         emit a signal that no condition in the current state names — a decoder
         setting ``image_complete`` in a state that only watches ``text_done`` —
         and the state then leaves on its ``default`` transition. Leaving the key
-        behind would make ``iter_nodes`` return after the first node of every
-        later body for the rest of the run, and would spuriously fire any later
-        state that does name that signal.
+        behind would spuriously fire any later state that does name that signal.
+        (The body pass clears a leftover signal of its own accord, so a stale
+        key cannot truncate a later body.)
         """
         state = self._current_state
         for trans in state.transitions:
@@ -457,8 +453,6 @@ class GenerationGraph:
                     condition=trans.condition.describe(),
                 )
         return None
-
-    # ── Accessors ─────────────────────────────────────────────────────────────
 
     @property
     def initial_state(self) -> str:
@@ -475,8 +469,6 @@ class GenerationGraph:
     def state_node_sequence(self, state_name: str) -> List[str]:
         """Return the derived node-execution sequence for a given state."""
         return list(self._states[state_name].node_sequence)
-
-    # ── Visualization ─────────────────────────────────────────────────────────
 
     def to_mermaid(self, title: Optional[str] = None) -> str:
         """Render the FSM as a Mermaid ``flowchart LR`` with body subgraphs.
@@ -513,7 +505,7 @@ class GenerationGraph:
 
         done_name = self._done_sentinel
 
-        # ── Entry / terminal markers (small circles) ──────────────────────────
+        # Entry / terminal markers (small circles).
         lines.append('    fsm_start(("▶")):::fsm_start')
         has_done_target = done_name is not None and any(
             trans.next_state == done_name for state in self._states.values() for trans in state.transitions
@@ -521,7 +513,7 @@ class GenerationGraph:
         if has_done_target:
             lines.append('    fsm_done(("⏹")):::fsm_terminal')
 
-        # ── Body subgraphs (skip the done state — empty body, no value) ───────
+        # Skip the done state: empty body, no value.
         drawn: List[str] = []
         for name, state in self._states.items():
             if name == done_name:
@@ -541,11 +533,10 @@ class GenerationGraph:
                 lines.append(f"        {name}__{_mermaid_id(e.from_)} --> {name}__{_mermaid_id(e.to)}")
             lines.append("    end")
 
-        # ── Entry edge ────────────────────────────────────────────────────────
         if self._initial in self._states and self._initial != done_name:
             lines.append(f"    fsm_start ==> state_{self._initial}")
 
-        # ── State transitions (thick ==> arrows with quoted condition labels) ─
+        # Thick ==> arrows carry the quoted condition labels.
         for name in drawn:
             for trans in self._states[name].transitions:
                 if trans.next_state == done_name:
@@ -555,7 +546,6 @@ class GenerationGraph:
                 cond = trans.condition.describe()
                 lines.append(f'    state_{name} ==>|"{cond}"| {target}')
 
-        # ── Class definitions / styling ──────────────────────────────────────
         lines += [
             "    classDef body_node fill:#fff,stroke:#666",
             "    classDef fsm_start fill:#dff,stroke:#06c,stroke-width:2px",
@@ -567,8 +557,6 @@ class GenerationGraph:
             lines.append(f"    style state_{self._initial} fill:#eef,stroke:#06c,stroke-width:2px")
 
         return "\n".join(lines)
-
-    # ── Internal ──────────────────────────────────────────────────────────────
 
     @property
     def _current_state(self) -> _State:

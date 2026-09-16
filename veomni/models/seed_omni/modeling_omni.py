@@ -80,6 +80,17 @@ _OMNI_CONFIG_OVERRIDE_KEYS = frozenset(
     }
 )
 
+# What ``PreTrainedModel._from_config`` pops for itself; anything else it is
+# handed reaches the model's ``__init__``.
+_FROM_CONFIG_KWARG_NAMES = frozenset(
+    {
+        "dtype",
+        "torch_dtype",
+        "attn_implementation",
+        "experts_implementation",
+    }
+)
+
 
 class OmniModel(PreTrainedModel):
     """Pure SeedOmni modeling runtime over already-built sub-modules.
@@ -193,7 +204,11 @@ class OmniModel(PreTrainedModel):
             for key, value in config_overrides.items():
                 setattr(config, key, value)
 
-        checkpoint_root = getattr(config, "_name_or_path", None) or str(pretrained_model_name_or_path)
+        # The argument the caller passed wins over the config's origin. An
+        # ``OmniConfig`` carries the path it was loaded from, so a config reused
+        # against another root — the documented ``config=`` path above — would
+        # otherwise pull every sub-module's weights from the old checkpoint.
+        checkpoint_root = str(pretrained_model_name_or_path or "") or getattr(config, "_name_or_path", None)
         modules = cls._load_modules(
             config,
             checkpoint_root=checkpoint_root,
@@ -222,6 +237,19 @@ class OmniModel(PreTrainedModel):
         if ops.attn_implementation is not None:
             load_kwargs["attn_implementation"] = ops.attn_implementation
         return load_kwargs
+
+    @staticmethod
+    def _init_only_load_kwargs(load_kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Narrow module load options to what ``_from_config`` consumes.
+
+        ``from_pretrained`` turns an unrecognized kwarg into a config override,
+        but ``_from_config`` hands everything it does not pop straight to the
+        model's ``__init__``. Forwarding a global weight-loading option such as
+        ``device_map`` — which :meth:`build_foundation_model` documents and
+        ``tasks/omni`` passes — would raise a ``TypeError`` there, and placement
+        means nothing on a path that loads no weights.
+        """
+        return {key: value for key, value in load_kwargs.items() if key in _FROM_CONFIG_KWARG_NAMES}
 
     @classmethod
     def _load_modules(
@@ -253,7 +281,9 @@ class OmniModel(PreTrainedModel):
                 if pretrained:
                     modules[name] = mod_cls.from_pretrained(module_path, config=entry, **load_kwargs)
                 else:
-                    modules[name] = mod_cls._from_config(entry, **load_kwargs)
+                    # ``entry`` is hydrated, so it already carries this module's
+                    # ``model_config`` overrides.
+                    modules[name] = mod_cls._from_config(entry, **cls._init_only_load_kwargs(load_kwargs))
                 continue
             model_type = read_model_type(module_path)
             mod_cls = OMNI_MODEL_REGISTRY[model_type]()
@@ -265,7 +295,9 @@ class OmniModel(PreTrainedModel):
             else:
                 cfg_cls = mod_cls.config_class
                 sub_config = cfg_cls.from_pretrained(module_path)
-                modules[name] = mod_cls._from_config(sub_config, **config.module_model_config(name))
+                for key, value in config.module_model_config(name).items():
+                    setattr(sub_config, key, value)
+                modules[name] = mod_cls._from_config(sub_config, **cls._init_only_load_kwargs(load_kwargs))
         return modules
 
     @staticmethod
@@ -426,8 +458,6 @@ class OmniModel(PreTrainedModel):
 
         return {"loss": _sum_losses(self._losses), "losses": dict(self._losses)}
 
-    # ── Inference ─────────────────────────────────────────────────────────────
-
     def reset(self) -> None:
         """Clear per-conversation inference runtime state."""
         self.generation_graph.reset()
@@ -539,8 +569,6 @@ class OmniModel(PreTrainedModel):
 
         return list(self._generated)
 
-    # ── Utilities ─────────────────────────────────────────────────────────────
-
     def named_omni_modules(self) -> Iterator[tuple[str, nn.Module]]:
         """Yield ``(name, module)`` for every graph participant."""
         for name in self._module_names:
@@ -566,9 +594,6 @@ class OmniModel(PreTrainedModel):
             if get_assets is not None:
                 assets.extend(get_assets())
         return assets
-
-
-# ── helpers ───────────────────────────────────────────────────────────────────
 
 
 def _sum_losses(losses: dict[str, Any]) -> Any | None:

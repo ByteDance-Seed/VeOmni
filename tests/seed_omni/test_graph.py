@@ -30,9 +30,6 @@ from veomni.trainer.callbacks.omni_callbacks import GraphProfileCallback
 from veomni.trainer.omni.omni_trainer import OmniTrainer
 
 
-# ── NodeDef parsing ───────────────────────────────────────────────────────────
-
-
 def test_from_endpoint_default_method():
     n = NodeDef.from_endpoint("ar_llm", default_method="forward")
     assert n.module == "ar_llm" and n.method == "forward"
@@ -58,9 +55,6 @@ def test_from_endpoint_rejects_reserved_end():
 def test_from_endpoint_rejects_empty():
     with pytest.raises(ValueError, match="non-empty 'module"):
         NodeDef.from_endpoint("   ", default_method="forward")
-
-
-# ── EdgeDef parsing ───────────────────────────────────────────────────────────
 
 
 def test_parse_edge():
@@ -91,9 +85,6 @@ def test_parse_edge_rejects_missing_endpoints():
         EdgeDef.parse({"from": "a"}, default_method="forward")
 
 
-# ── Fixtures ──────────────────────────────────────────────────────────────────
-
-
 def _janus_joint_edges() -> list[dict]:
     """Janus joint training edges: vq_decoder appears under TWO methods.
 
@@ -117,9 +108,6 @@ def _understanding_only_edges() -> list[dict]:
     ]
 
 
-# ── Validation ────────────────────────────────────────────────────────────────
-
-
 def test_missing_edges_raises():
     with pytest.raises(ValueError, match="non-empty `training_graph`"):
         TrainingGraph([])
@@ -140,9 +128,6 @@ def test_single_node_with_only_end_edge():
     g = TrainingGraph([{"from": "ar_llm", "to": "end"}])
     assert g.execution_order == ["ar_llm.forward"]
     assert g.sources == ["ar_llm.forward"] and g.sinks == ["ar_llm.forward"]
-
-
-# ── Topological order ─────────────────────────────────────────────────────────
 
 
 def test_understanding_only_topological_order():
@@ -170,9 +155,6 @@ def test_cycle_in_active_set_raises():
         )
 
 
-# ── Sources / sinks ───────────────────────────────────────────────────────────
-
-
 def test_sources_and_sinks_understanding_only():
     g = TrainingGraph(_understanding_only_edges())
     assert set(g.sources) == {"vision_encoder.forward", "vq_decoder.forward"}
@@ -185,9 +167,6 @@ def test_sources_and_sinks_janus_joint():
     assert set(g.sources) == {"vision_encoder.forward", "vq_decoder.encode"}
     # vq_decoder.gen_loss is the only sink (its only outgoing edge goes to `end`).
     assert g.sinks == ["vq_decoder.gen_loss"]
-
-
-# ── module / method accessors ────────────────────────────────────────────────
 
 
 def test_module_and_method_lookup():
@@ -203,9 +182,6 @@ def test_module_lookup_raises_for_unknown():
     g = TrainingGraph(_janus_joint_edges())
     with pytest.raises(KeyError):
         g.module_of("not_a_node")
-
-
-# ── Execution lifecycle (cursor + step + maybe_transition) ────────────────────
 
 
 class _FakeOmniModule(nn.Module, TrainingModuleMixin, BaseMixin, InferenceModuleMixin):
@@ -644,7 +620,7 @@ def test_train_node_runner_records_transitions_and_losses():
     assert [t for t in trace if t.startswith("loss:")] == [f"loss:{n}" for n in g.execution_order]
 
 
-# ── Generation FSM (graph only: it selects nodes, it never calls one) ─────────
+# Generation FSM tests below drive the graph only: it selects nodes, it never calls one.
 
 
 def _two_state_graph() -> GenerationGraph:
@@ -714,6 +690,43 @@ def test_unmatched_signal_is_cleared_by_the_default_transition():
     assert [n.name for n in g.iter_nodes(ctx)] == ["c.generate", "d.generate"]
 
 
+def test_a_signal_no_transition_consumes_does_not_wedge_the_next_pass():
+    """A loop state must keep running its whole body after an unwatched signal.
+
+    A state that stays put until one named signal fires — the shape of every AR
+    decode loop — has no ``default`` to fall through, so ``maybe_transition``
+    matches nothing and pops nothing. If the body pass did not clear the signal
+    itself, the next pass would stop after its first node, and every pass after
+    that, burning steps up to ``max_new_tokens`` while the graph made no
+    progress and raised nothing.
+    """
+    g = GenerationGraph(
+        {
+            "initial": "loop",
+            "states": {
+                "loop": {
+                    "body": [{"from": "c", "to": "d"}, {"from": "d", "to": "end"}],
+                    "transitions": [
+                        {"condition": {"type": "module_signal", "key": "watched"}, "next_state": "done"},
+                    ],
+                },
+            },
+        }
+    )
+    ctx: dict = {}
+
+    # Pass 1: a node emits a signal this state does not watch.
+    ran = [node.name for node in g.iter_nodes(ctx)]
+    ctx["module_signal"] = "not_watched_here"
+    assert ran == ["c.generate", "d.generate"]
+
+    assert g.maybe_transition(ctx) is None  # nothing matches, so nothing pops
+    assert g.current_state_name == "loop"
+
+    # Pass 2 must be a full body, not a single node.
+    assert [node.name for node in g.iter_nodes(ctx)] == ["c.generate", "d.generate"]
+
+
 def test_a_feedback_edge_does_not_gate_its_destination():
     """``to: X`` *after* X's own turn as a source is feedback, not an input.
 
@@ -732,9 +745,6 @@ def test_a_feedback_edge_does_not_gate_its_destination():
         }
     )
     assert [n.name for n in g.iter_nodes({})] == ["d.generate", "c.generate"]
-
-
-# ── Mermaid visualisation ────────────────────────────────────────────────────
 
 
 def test_to_mermaid_janus_joint_contains_node_labels_and_end_sink():

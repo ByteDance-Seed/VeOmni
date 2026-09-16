@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -94,8 +95,18 @@ class _FakeModule(nn.Module):
 
     @classmethod
     def _from_config(cls, config, **kwargs):
-        """Mirrors ``PreTrainedModel._from_config`` — real modules have no public ``from_config``."""
-        return cls(config)
+        """Mirrors ``PreTrainedModel._from_config`` — real modules have no public ``from_config``.
+
+        Including the part that matters here: it pops the handful of options it
+        understands and hands everything else to ``__init__``, so a caller that
+        forwards a weight-loading option gets a ``TypeError``.
+        """
+        captured = getattr(cls, "_captured_from_config_kwargs", [])
+        captured.append(dict(kwargs))
+        cls._captured_from_config_kwargs = captured
+        for key in ("dtype", "torch_dtype", "attn_implementation", "experts_implementation"):
+            kwargs.pop(key, None)
+        return cls(config, **kwargs)
 
     @classmethod
     def from_pretrained(cls, module_path, **kwargs):
@@ -221,6 +232,81 @@ def test_omni_model_from_config_builds_unweighted_modules(registry_mock, _read_m
     model = OmniModel.from_config(config, checkpoint_root=tmp_path)
 
     assert set(model.modules_dict) == {"encoder", "decoder"}
+
+
+def test_a_module_configured_outside_the_root_keeps_its_own_path(tmp_path):
+    """Hydration must leave a module that lives elsewhere alone.
+
+    Hydrating an entry replaces it with a ``PretrainedConfig``, and
+    ``module_subfolder`` resolves those back to the bare module name. So a
+    module hydrated from a configured custom path would have its weights
+    looked up under ``root/<name>`` regardless — a directory that, for a module
+    living outside the root, does not exist.
+    """
+    _write_omni_checkpoint(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    _write_module_stub(elsewhere)
+    config_path = tmp_path / "config.json"
+    raw = json.loads(config_path.read_text())
+    raw["modules"]["encoder"] = {"model": {"model_path": str(elsewhere)}}
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    shutil.rmtree(tmp_path / "encoder")
+
+    config = OmniConfig.from_pretrained(tmp_path)
+
+    assert config.resolve_module_path(str(tmp_path), "encoder") == str(elsewhere)
+
+
+@patch("veomni.models.seed_omni.modeling_omni.read_model_type", return_value="fake_omni_module")
+@patch("veomni.models.seed_omni.modeling_omni.OMNI_MODEL_REGISTRY")
+def test_from_config_forwards_load_kwargs_to_unweighted_modules(registry_mock, _read_model_type, tmp_path):
+    """Building without weights must honour the load options ``__init__`` sees.
+
+    The descriptor branch is the one that reads each module's ``config.json``
+    off disk; it used to pass only the per-module ``model_config`` overrides,
+    dropping the caller's ``dtype`` and any ``attn_implementation`` persisted
+    in ``ops_implementation``. It must not swing the other way either: a global
+    weight-placement option like ``device_map`` reaches ``__init__`` through
+    ``_from_config`` and would raise there.
+    """
+    _write_omni_checkpoint(tmp_path)
+    config = OmniConfig.from_pretrained(tmp_path)
+    config.modules = {name: {"subfolder": name} for name in config.module_names}  # keep the descriptor branch
+
+    fake_cls = _FakeModule
+    fake_cls._captured_from_config_kwargs = []
+    registry_mock.__getitem__.return_value = MagicMock(return_value=fake_cls)
+
+    OmniModel.from_config(config, checkpoint_root=tmp_path, dtype="bfloat16", device_map="auto")
+
+    assert fake_cls._captured_from_config_kwargs
+    assert all(captured == {"dtype": "bfloat16"} for captured in fake_cls._captured_from_config_kwargs)
+
+
+@patch("veomni.models.seed_omni.modeling_omni.read_model_type", return_value="fake_omni_module")
+@patch("veomni.models.seed_omni.modeling_omni.OMNI_MODEL_REGISTRY")
+def test_from_pretrained_root_argument_wins_over_the_config_origin(registry_mock, _read_model_type, tmp_path):
+    """Weights come from the root the caller names, not the config's birthplace.
+
+    ``config=`` is a documented way to load weights under an already-resolved
+    config, and a config that has been through ``PreTrainedModel.from_pretrained``
+    carries that call's path in ``_name_or_path``. Preferring the remembered
+    path would quietly load every sub-module from the earlier checkpoint.
+    """
+    origin, target = tmp_path / "origin", tmp_path / "target"
+    _write_omni_checkpoint(origin)
+    _write_omni_checkpoint(target)
+
+    config = OmniConfig.from_pretrained(origin)
+    config.name_or_path = str(origin)  # what transformers stamps on after a model load
+
+    fake_cls = _FakeModule
+    fake_cls._captured_kwargs = {}
+    registry_mock.__getitem__.return_value = MagicMock(return_value=fake_cls)
+
+    OmniModel.from_pretrained(target, config=config)
+
+    assert set(fake_cls._captured_kwargs) == {str(target / "encoder"), str(target / "decoder")}
 
 
 def _minimal_generation_graph(*, module: str = "encoder") -> dict:

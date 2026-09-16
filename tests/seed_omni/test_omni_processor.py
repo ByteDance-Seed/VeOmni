@@ -1,6 +1,9 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from veomni.models.seed_omni.configuration_omni import OmniConfig
+from veomni.models.seed_omni.processing.binding import bind_module_assets
 from veomni.models.seed_omni.processing_omni import OmniProcessor
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 
@@ -34,6 +37,19 @@ def test_omni_processor_builds_conversation_and_runs_preprocessors_in_order():
     assert conversation[0].type == "image"
     assert conversation[1].type == "text"
     assert conversation[1].value == "hello"
+
+
+def test_omni_processor_rejects_videos_instead_of_dropping_them():
+    """A request that cannot be honoured must say so, not come back text-only.
+
+    Nothing turns videos into conversation items yet. Discarding the argument
+    would hand back a request built from the prompt alone, which looks like a
+    successful call.
+    """
+    processor = OmniProcessor({"a": _RecordingPreprocessor("only", [])})
+
+    with pytest.raises(NotImplementedError, match="videos"):
+        processor(text="hello", videos=["/tmp/fake.mp4"])
 
 
 def test_omni_processor_preprocess_mutates_existing_conversation():
@@ -142,3 +158,45 @@ def test_omni_processor_from_config_forwards_module_processor_config(mock_read_m
         config_overrides={},
         packed_preprocess=True,
     )
+
+
+class _TwoAssetPreprocessor:
+    def __init__(self) -> None:
+        self._tokenizer = "preprocessor-tokenizer"
+        self._image_processor = "image-processor"
+
+
+class _AssetHolder:
+    """Stand-in for a module model: ``tokenizer`` is settable, as on the real ones."""
+
+    def __init__(self) -> None:
+        self._tokenizer = None
+        self._image_processor = None
+
+
+def test_bind_module_assets_fills_the_assets_a_caller_did_not_set():
+    """One hand-set asset must not cost the module its others.
+
+    Module models expose a public ``tokenizer`` setter, so ``_tokenizer`` can
+    already hold a value when binding runs. Treating "some asset is set" as
+    "this module is bound" would skip the whole copy and leave the module
+    without its image processor, which only surfaces as a failure much later
+    inside ``forward``.
+    """
+    model = _AssetHolder()
+    model._tokenizer = "caller-tokenizer"
+
+    bind_module_assets(model, preprocessor=_TwoAssetPreprocessor())
+
+    assert model._image_processor == "image-processor"
+    assert model._tokenizer == "caller-tokenizer"  # the caller's asset wins
+
+
+def test_bind_module_assets_is_a_noop_the_second_time():
+    model = _AssetHolder()
+    bind_module_assets(model, preprocessor=_TwoAssetPreprocessor())
+    model._image_processor = "swapped-later"
+
+    bind_module_assets(model, preprocessor=_TwoAssetPreprocessor())
+
+    assert model._image_processor == "swapped-later"

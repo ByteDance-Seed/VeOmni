@@ -29,6 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from veomni.ops.kernels.embed import AllToAllEmbedding, VocabParallelLinear
+from veomni.utils.device import get_device_type
 
 
 VOCAB, HIDDEN = 5, 4
@@ -36,8 +37,18 @@ VOCAB, HIDDEN = 5, 4
 
 @pytest.fixture
 def table() -> torch.Tensor:
-    # float64 so gradcheck's finite differences are meaningful.
+    # float64 so gradcheck's finite differences are meaningful. These stay on
+    # CPU: float64 autograd is what the reference comparison needs and is not
+    # dependably supported on every accelerator this repo targets. The device
+    # parity of the dispatch itself is covered in float32 below.
     return torch.arange(VOCAB * HIDDEN, dtype=torch.float64).reshape(VOCAB, HIDDEN)
+
+
+def _device() -> torch.device:
+    # Route through ``veomni.utils.device.get_device_type`` so the test follows
+    # the selected accelerator and passes the device-api-check sanity job
+    # (which forbids hardcoded device strings in tests).
+    return torch.device(get_device_type())
 
 
 def test_embedding_forward_matches_dense(table):
@@ -100,3 +111,38 @@ def test_linear_gradcheck(table):
     hidden = torch.randn(2, HIDDEN, dtype=torch.float64, requires_grad=True)
     weight = table.clone().requires_grad_(True)
     assert torch.autograd.gradcheck(lambda h, w: VocabParallelLinear.apply(None, h, w), (hidden, weight))
+
+
+def test_ops_match_dense_on_the_selected_device():
+    """Both ops on the accelerator the GPU / NPU jobs actually select.
+
+    The rest of this file pins the numerics in CPU float64. Index dispatch and
+    the buffer writes behind it are device code, so run them where they ship.
+    """
+    device = _device()
+    ids = torch.tensor([0, 3, 1, 3], device=device)
+    weight = torch.arange(VOCAB * HIDDEN, dtype=torch.float32, device=device).reshape(VOCAB, HIDDEN)
+    hidden = torch.randn(2, HIDDEN, dtype=torch.float32, device=device)
+
+    assert torch.equal(AllToAllEmbedding.apply(None, ids, weight), F.embedding(ids, weight))
+
+    sharded_w = weight.clone().requires_grad_(True)
+    dense_w = weight.clone().requires_grad_(True)
+    grad = torch.randn(4, HIDDEN, dtype=torch.float32, device=device)
+    (AllToAllEmbedding.apply(None, ids, sharded_w) * grad).sum().backward()
+    (F.embedding(ids, dense_w) * grad).sum().backward()
+    assert torch.allclose(sharded_w.grad, dense_w.grad)
+
+    assert torch.allclose(VocabParallelLinear.apply(None, hidden, weight), F.linear(hidden, weight))
+
+
+def test_embedding_rejects_out_of_range_ids_instead_of_returning_garbage(table):
+    """A negative id must fail, not silently produce an uninitialized row.
+
+    Ids are bucketed by rank with a floor division, so a negative id lands in
+    bucket -1 — a bucket nothing collects. It would drop out of the dispatch
+    before the local-range check below could see it, leaving its row of the
+    ``empty`` output at whatever the buffer held.
+    """
+    with pytest.raises(RuntimeError, match="local index out of range"):
+        AllToAllEmbedding.apply(None, torch.tensor([0, -1]), table)

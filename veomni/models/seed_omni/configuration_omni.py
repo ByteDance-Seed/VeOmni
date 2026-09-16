@@ -360,6 +360,14 @@ class OmniConfig(PretrainedConfig):
                 continue
             overrides = self.module_model_config(name)
             subfolder = self.module_checkpoint_subfolder(name)
+            # The checkpoint layout, deliberately, and not
+            # ``resolve_module_path``: hydrating an entry replaces it with a
+            # ``PretrainedConfig``, for which ``module_subfolder`` resolves back
+            # to the bare module name. Hydrating from a configured custom path
+            # would therefore pair that path's config with `root/<name>`'s
+            # weights — or point at a directory that does not exist at all.
+            # A module configured to live outside the root has no `config.json`
+            # here, stays an unhydrated descriptor, and loads from its own path.
             module_dir = os.path.join(root, subfolder)
             config_path = os.path.join(module_dir, "config.json")
             if not os.path.isfile(config_path):

@@ -25,7 +25,10 @@ from .base import ModulePreprocessorBase
 # directly on the model (``self._image_processor``, ``self.tokenizer``, …).
 MODULE_ASSET_ATTRS = ("_processor", "_image_processor", "_video_processor", "_tokenizer", "_chat_template")
 
-_BOUND_CHECK_ATTRS = ("_image_processor", "_video_processor", "_tokenizer")
+# Set once this function has run a preprocessor's assets onto a model, so a
+# second bind is a no-op without having to guess which assets that module's
+# preprocessor was supposed to provide.
+_BOUND_FLAG_ATTR = "_omni_assets_bound"
 
 
 def bind_module_assets(
@@ -43,10 +46,15 @@ def bind_module_assets(
     (``_image_processor``, ``_tokenizer``, …) onto the instance names that
     ``forward`` / ``generate`` already read — no rebuild at bind time.
 
-    No-op when the module declares no ``preprocessor_class``, assets are already
-    bound, or ``from_pretrained`` returns ``None`` (modules with no CPU worker).
+    An asset already on ``model`` wins — a caller that set ``model.tokenizer``
+    by hand keeps it, and still gets the module's other assets. Each asset is
+    considered on its own: keying the whole bind on "some asset is set" would
+    let one pre-set attribute (``tokenizer`` has a public setter) silently cost
+    a module its image / video processors. No-op when the module declares no
+    ``preprocessor_class``, when assets were already bound here, or when
+    ``from_pretrained`` returns ``None`` (modules with no CPU worker).
     """
-    if any(getattr(model, attr, None) is not None for attr in _BOUND_CHECK_ATTRS):
+    if getattr(model, _BOUND_FLAG_ATTR, False):
         return
 
     if preprocessor is None:
@@ -59,8 +67,9 @@ def bind_module_assets(
         return
 
     for attr in MODULE_ASSET_ATTRS:
-        if hasattr(preprocessor, attr):
+        if hasattr(preprocessor, attr) and getattr(model, attr, None) is None:
             setattr(model, attr, getattr(preprocessor, attr))
+    setattr(model, _BOUND_FLAG_ATTR, True)
 
 
 __all__ = ["MODULE_ASSET_ATTRS", "bind_module_assets"]
