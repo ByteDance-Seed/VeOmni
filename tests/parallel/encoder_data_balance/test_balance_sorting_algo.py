@@ -1,5 +1,6 @@
 import random
 
+import pytest
 import torch
 
 from veomni.utils.data_balance.balance_sorting_algo import SORTING_ALGO_FUNC
@@ -136,3 +137,96 @@ def test_post_mbs_balancing_greedy_matches_tensor_argmin_reference():
     data_list, normalized_table = Qwen3VLEncoderDataBalance.rank_table_mapping(rank_table, dp_rank=2)
     assert all(torch.equal(actual, expected) for actual, expected in zip(normalized_table, reference))
     assert all(index.dtype == torch.long for index in data_list)
+
+
+@pytest.mark.parametrize("lengths,replicas", [([], 8), ([7], 8), ([0, 0], 4), ([9, 9, 9, 9], 2)])
+def test_sorter_empty_and_small_batches(lengths, replicas):
+    table = torch.tensor([[i, n] for i, n in enumerate(lengths)], dtype=torch.long).reshape(-1, 2)
+    result = SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](table, replicas, dim=1)
+    assert len(result) == replicas
+    assert all(bucket.ndim == 2 and bucket.shape[1] == 2 for bucket in result)
+    assert all(bucket.dtype == table.dtype and bucket.device == table.device for bucket in result)
+    recovered = torch.cat(result)
+    assert torch.equal(recovered[torch.argsort(recovered[:, 0])], table)
+
+
+def test_linear_and_quadratic_costs_assign_differently():
+    table = torch.tensor([[i, n] for i, n in enumerate([10, 9, 8, 7, 6])])
+    sorter = SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"]
+    quadratic = sorter(table, 2, 1)
+    linear = sorter(table, 2, 1, cost_exponent=1)
+    callable_linear = sorter(table, 2, 1, cost_fn=lambda lengths: lengths)
+    assert [b[:, 0].tolist() for b in quadratic] == [[0, 3], [1, 2, 4]]
+    assert [b[:, 0].tolist() for b in linear] == [[0, 3, 4], [1, 2]]
+    assert all(torch.equal(a, b) for a, b in zip(linear, callable_linear))
+
+
+def test_custom_costs_not_sorted_by_length_or_squared_twice():
+    table = torch.tensor([[i, n] for i, n in enumerate([1, 2, 3, 4, 5])])
+    result = SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](
+        table,
+        2,
+        1,
+        cost_fn=lambda lengths: torch.tensor([10, 9, 8, 7, 6]),
+    )
+    assert [b[:, 0].tolist() for b in result] == [[0, 3, 4], [1, 2]]
+
+
+def test_custom_large_integer_costs_preserve_order():
+    table = torch.tensor([[0, 1], [1, 1]])
+    result = SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](
+        table,
+        2,
+        1,
+        cost_fn=lambda lengths: torch.tensor([2**60, 2**60 + 1]),
+    )
+    assert [b[:, 0].tolist() for b in result] == [[1], [0]]
+
+
+@pytest.mark.parametrize("exponent", [-1, float("inf"), float("nan")])
+def test_invalid_exponent(exponent):
+    with pytest.raises(ValueError):
+        SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](
+            torch.tensor([[1]]),
+            2,
+            0,
+            cost_exponent=exponent,
+        )
+
+
+def test_overflowing_cost():
+    with pytest.raises(ValueError):
+        SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](
+            torch.tensor([[2]]),
+            2,
+            0,
+            cost_exponent=1024,
+        )
+
+
+@pytest.mark.parametrize(
+    "costs", [torch.tensor([-1.0]), torch.tensor([float("nan")]), torch.tensor([float("inf")]), torch.ones(1, 1), [1]]
+)
+def test_invalid_callable_costs(costs):
+    with pytest.raises(ValueError):
+        SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](
+            torch.tensor([[1]]),
+            2,
+            0,
+            cost_fn=lambda lengths: costs,
+        )
+
+
+@pytest.mark.parametrize(
+    "table,replicas,dim",
+    [
+        (torch.ones(2), 2, 0),
+        (torch.ones(2, 1), 0, 0),
+        (torch.ones(2, 1), 2, 1),
+        (torch.tensor([[-1]]), 2, 0),
+        (torch.tensor([[float("nan")]]), 2, 0),
+    ],
+)
+def test_invalid_sorter_inputs(table, replicas, dim):
+    with pytest.raises(ValueError):
+        SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](table, replicas, dim)
