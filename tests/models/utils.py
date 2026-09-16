@@ -126,6 +126,7 @@ MODEL_TO_DATASET = {
     "qwen3_vl_moe": "qwen3vl",
     "qwen2_vl": "qwen2vl",
     "qwen2_5_vl": "qwen2vl",
+    "qwen4_exp": "qwen4exp",
     "qwen2_5_omni": "qwen2omni",
     "qwen3_omni_moe": "qwen3omni",
 }
