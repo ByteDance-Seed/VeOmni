@@ -163,8 +163,8 @@ class ModuleDataBalancer:
             costs = tuple(float(c) for c in costs)
             if len(costs) != len(outputs) or any(not math.isfinite(c) or c < 0 for c in costs):
                 raise ValueError("Expected one finite nonnegative cost per item.")
-        except (TypeError, ValueError, OverflowError) as exc:
-            error = str(exc)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
             costs = ()
         local = (schema, lengths, outputs, costs, error)
         # Only small host metadata uses object collectives; tensor payloads never
