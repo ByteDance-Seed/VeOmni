@@ -438,9 +438,9 @@ class GenerationGraph:
         emit a signal that no condition in the current state names — a decoder
         setting ``image_complete`` in a state that only watches ``text_done`` —
         and the state then leaves on its ``default`` transition. Leaving the key
-        behind would make ``iter_nodes`` return after the first node of every
-        later body for the rest of the run, and would spuriously fire any later
-        state that does name that signal.
+        behind would spuriously fire any later state that does name that signal.
+        (The body pass clears a leftover signal of its own accord, so a stale
+        key cannot truncate a later body.)
         """
         state = self._current_state
         for trans in state.transitions:
