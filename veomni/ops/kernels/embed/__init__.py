@@ -51,7 +51,13 @@ class AllToAllEmbedding(torch.autograd.Function):
         num_input_ids = input_flat.shape[0]
 
         # --- Dispatching logic: which rank owns each id ---
-        id_rank = torch.clamp_max(input_flat // vocab_size_per_rank, emb_size - 1)
+        # Clamped at both ends so every id lands in exactly one rank bucket.
+        # Floor division sends a negative id to bucket -1, which no bucket
+        # collects, so the id would drop out of the dispatch entirely and leave
+        # its row of the `torch.empty` output uninitialized. Out-of-range ids
+        # now fail in the gather below — where an ordinary embedding fails —
+        # instead of silently returning garbage.
+        id_rank = torch.clamp(input_flat // vocab_size_per_rank, min=0, max=emb_size - 1)
         index = torch.arange(num_input_ids, device=input_flat.device)
         rank_index = [index[id_rank == i] for i in range(emb_size)]
         send_rank_count_list = [int(len(ri)) for ri in rank_index]
