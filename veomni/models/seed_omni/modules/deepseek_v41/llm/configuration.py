@@ -37,6 +37,11 @@ So the schedule is kept in V4.1's own vocabulary -- per-layer integer ratios --
 and the classes that read it are local. The pieces that do *not* depend on the
 schedule (mHC math, the MoE experts and their fp4 QAT hooks, the RMS norms) are
 still imported from ``deepseek_v4``; see ``modeling.py``.
+
+Two MoE fields are read differently by the two implementations, so the V4 router
+is subclassed rather than imported outright. V4 renormalises the top-k weights
+unconditionally; V4.1 does it only when ``norm_topk_prob and num_experts_per_tok
+> 1``. And V4 has no ``gate_temp`` at all, which is the same as a hardcoded 1.0.
 """
 
 from typing import List, Optional
@@ -87,6 +92,7 @@ class DeepseekV41LlmConfig(PretrainedConfig):
         topk_method: str = "noaux_tc",
         norm_topk_prob: bool = True,
         routed_scaling_factor: float = 1.5,
+        gate_temp: float = 1.0,
         expert_dtype: str = "fp4",
         # Attention schedule
         sliding_window: int = 128,
@@ -156,6 +162,10 @@ class DeepseekV41LlmConfig(PretrainedConfig):
         self.topk_method = topk_method
         self.norm_topk_prob = norm_topk_prob
         self.routed_scaling_factor = routed_scaling_factor
+        # Absent from the released config.json, so it always resolves to the reference
+        # ModelArgs default. Declared anyway: a checkpoint that ships a non-unit value
+        # would otherwise be dropped on load and change routing silently.
+        self.gate_temp = gate_temp
         self.expert_dtype = expert_dtype
 
         self.sliding_window = sliding_window
