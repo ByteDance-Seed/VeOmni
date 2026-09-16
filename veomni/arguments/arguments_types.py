@@ -813,6 +813,18 @@ class CheckpointConfig:
             )
         },
     )
+    save_timeout_seconds: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Collective timeout in seconds for the gloo groups checkpoint saves run their "
+                "own collectives on: a staged save's copy to `output_dir`, and each `save_async` "
+                "write. A positive integer that must outlast the work, since the ranks not "
+                "writing wait on it for the whole duration. Unset (default) keeps gloo's "
+                "30-minute default."
+            )
+        },
+    )
     dcp_save_to_lowest_rank: bool = field(
         default=False,
         metadata={
@@ -854,6 +866,48 @@ class CheckpointConfig:
         default=True,
         metadata={"help": "Save the huggingface format weights to the last checkpoint dir."},
     )
+
+    def __post_init__(self):
+        """Reject a save configuration that cannot do what it says.
+
+        ``DistributedCheckpointer.save`` rejects ``stage_dir`` with
+        ``save_async`` too, but not until the first checkpoint is due -- a
+        ``save_steps``-long wait to be told the configuration was never valid.
+        """
+        if self.stage_dir and self.save_async:
+            raise ValueError(
+                "stage_dir cannot be combined with save_async: the staged copy is dropped when the save "
+                "returns, which an in-flight write would then be reading from."
+            )
+
+        if self.save_timeout_seconds is None:
+            return
+
+        # ``bool`` is an ``int`` subclass and the parser passes YAML through
+        # untouched: a stray ``true`` would be a one-second timeout. ``__index__``
+        # rather than ``isinstance(int)`` because a numpy scalar -- what a
+        # programmatic caller tends to hold -- is not an ``int`` subclass but is
+        # an integer in every way that matters here; ``float`` has no ``__index__``.
+        if (
+            isinstance(self.save_timeout_seconds, bool)
+            or not hasattr(self.save_timeout_seconds, "__index__")
+            or self.save_timeout_seconds <= 0
+        ):
+            raise ValueError(f"save_timeout_seconds must be a positive integer, got {self.save_timeout_seconds!r}.")
+
+        # Normalized here so everything downstream holds a builtin ``int``:
+        # ``timedelta(seconds=...)`` rejects a numpy scalar outright.
+        self.save_timeout_seconds = int(self.save_timeout_seconds)
+
+        # It only bounds the gloo groups those two paths create; a direct
+        # synchronous save has none and keeps the training backend's timeout.
+        # Truthiness rather than ``is None``: an empty ``stage_dir`` is what the
+        # checkpointer reads as unset, so it creates no group here either.
+        if not self.stage_dir and not self.save_async:
+            logger.warning_rank0(
+                f"save_timeout_seconds={self.save_timeout_seconds} has no effect: it bounds the gloo "
+                "groups used by `stage_dir` and `save_async`, and neither is enabled."
+            )
 
 
 @dataclass
