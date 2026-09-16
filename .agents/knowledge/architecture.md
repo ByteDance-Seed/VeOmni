@@ -151,6 +151,20 @@ YAML Config -> VeOmniArguments -> Trainer
 6. Load weights (`load_model_weights()` or `rank0_load_and_broadcast_weights()`)
 7. Apply parallelization (`build_parallelize_model()`)
 
+## DiT Remove-Padding Interface
+
+`model.use_remove_padding` is DiT-only and defaults to false. The shared contract
+lives in `veomni/models/diffusers/packing.py`; no built-in model opts in yet.
+`DiTTrainer` checks config constraints before distributed setup, resolves model
+and condition capabilities through the existing registry before loading weights,
+and configures a supporting model before wrapping. Its enabled forward path calls
+`condition_model.prepare_samples` and passes native dict/list `DiffusionSample`
+pytrees through the root model. `DiffusionBatchOutput` preserves sample order and
+per-sample losses, reduced by sample count and then accumulation count. Packing,
+validity masks, attention boundaries and output reconstruction remain model-owned;
+this interface neither uses MainCollator nor enables dynamic batching. See
+`docs/usage/diffusion_remove_padding.md` for the initial support envelope.
+
 ## Parallelization Flow
 
 VeOmni uses FSDP2 exclusively.
