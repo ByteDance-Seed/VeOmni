@@ -193,7 +193,11 @@ class OmniModel(PreTrainedModel):
             for key, value in config_overrides.items():
                 setattr(config, key, value)
 
-        checkpoint_root = getattr(config, "_name_or_path", None) or str(pretrained_model_name_or_path)
+        # The argument the caller passed wins over the config's origin. An
+        # ``OmniConfig`` carries the path it was loaded from, so a config reused
+        # against another root — the documented ``config=`` path above — would
+        # otherwise pull every sub-module's weights from the old checkpoint.
+        checkpoint_root = str(pretrained_model_name_or_path or "") or getattr(config, "_name_or_path", None)
         modules = cls._load_modules(
             config,
             checkpoint_root=checkpoint_root,
@@ -265,7 +269,7 @@ class OmniModel(PreTrainedModel):
             else:
                 cfg_cls = mod_cls.config_class
                 sub_config = cfg_cls.from_pretrained(module_path)
-                modules[name] = mod_cls._from_config(sub_config, **config.module_model_config(name))
+                modules[name] = mod_cls._from_config(sub_config, **load_kwargs)
         return modules
 
     @staticmethod
