@@ -221,6 +221,43 @@ def test_prepare_dense_attention_inputs_keeps_positive_additive_bias(impl):
     assert _mask_kept(packed_mask, 3, 2)
 
 
+@pytest.mark.parametrize("impl", ["sdpa", "veomni_sdpa"])
+def test_packed_sdpa_fully_masked_row_matches_separate_outputs_and_grads(impl):
+    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+
+    query = torch.zeros(1, 1, 4, 1)
+    values = torch.tensor([0.0, 1.0, 10.0, 20.0]).view(1, 1, 4, 1).requires_grad_()
+    separate_values = values.detach().clone().requires_grad_()
+    existing = torch.zeros(1, 1, 4, 4).masked_fill(~torch.ones(4, 4, dtype=torch.bool).tril(), float("-inf"))
+    existing[:, :, 0, :] = float("-inf")
+    _, mask = prepare_dense_attention_inputs(
+        {"cu_seq_lens_q": torch.tensor([0, 2, 4], dtype=torch.int32)},
+        impl=impl,
+        attention_mask=existing,
+        hidden_states=torch.zeros(1, 4, 1),
+    )
+    actual = torch.nn.functional.scaled_dot_product_attention(query, query, values, attn_mask=mask)
+    expected = torch.cat(
+        [
+            torch.nn.functional.scaled_dot_product_attention(
+                query[:, :, start : start + 2],
+                query[:, :, start : start + 2],
+                separate_values[:, :, start : start + 2],
+                attn_mask=existing[:, :, start : start + 2, start : start + 2],
+            )
+            for start in (0, 2)
+        ],
+        dim=2,
+    )
+    torch.testing.assert_close(actual, expected)
+    assert actual[0, 0, 0, 0].item() == 0.0
+    # A loss on the first sample must not backpropagate into the second sample.
+    actual[:, :, :2].sum().backward()
+    expected[:, :, :2].sum().backward()
+    torch.testing.assert_close(values.grad, separate_values.grad)
+    torch.testing.assert_close(values.grad[:, :, 2:], torch.zeros_like(values.grad[:, :, 2:]))
+
+
 def test_prepare_dense_attention_inputs_rejects_cached_packed_sequences():
     from veomni.models.utils.op_utils import prepare_dense_attention_inputs
 

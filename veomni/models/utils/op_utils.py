@@ -249,7 +249,9 @@ def _merge_dense_attention_masks(existing: Tensor, packed: Tensor) -> Tensor:
     if existing.dtype == torch.bool:
         return existing & packed_keep
     block = existing.new_full((), torch.finfo(existing.dtype).min)
-    return torch.where(packed_keep, existing, block)
+    # Never weaken an existing -inf to a finite sentinel: an all-masked row
+    # would then attend to those finite positions, including other samples.
+    return torch.where(packed_keep, existing, torch.minimum(existing, block))
 
 
 def drop_packed_attention_metadata(kwargs: dict, *, impl: str) -> dict:
