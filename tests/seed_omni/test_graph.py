@@ -233,11 +233,6 @@ class _FakeOmniModule(nn.Module, TrainingModuleMixin, BaseMixin, InferenceModule
         cl.append(f"{self.name}.generate")
         return {"conversation_list": cl}
 
-    def generate_via_forward(self, **kwargs):
-        out = self.forward(**kwargs)
-        out["conversation_list"].append(f"{self.name}.generate_via_forward")
-        return out
-
 
 def _fake_modules(g: TrainingGraph) -> dict:
     return {name: _FakeOmniModule(name) for name in {g.module_of(n) for n in g.execution_order}}
@@ -355,6 +350,96 @@ def test_graph_profiler_can_append_request_peak_memory(monkeypatch):
 
     assert device.reset_calls == 1
     assert profiler.save_records() == ["forward:run_ar.forward | peak_allocated_gb=2.000 | peak_reserved_gb=3.000"]
+
+
+# ── Generation FSM (graph only: it selects nodes, it never calls one) ─────────
+
+
+def _two_state_graph() -> GenerationGraph:
+    """``s1`` watches one signal and falls back to ``default``; ``s2`` has a two-node body."""
+    return GenerationGraph(
+        {
+            "initial": "s1",
+            "states": {
+                "s1": {
+                    "body": [{"from": "a", "to": "end"}],
+                    "transitions": [
+                        {"condition": {"type": "module_signal", "key": "watched"}, "next_state": "s2"},
+                        {"condition": {"type": "default"}, "next_state": "s2"},
+                    ],
+                },
+                "s2": {
+                    "body": [{"from": "c", "to": "d"}, {"from": "d", "to": "end"}],
+                    "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
+                },
+            },
+        }
+    )
+
+
+def test_body_runs_in_declared_order():
+    g = _two_state_graph()
+    ctx: dict = {}
+    assert [n.name for n in g.iter_nodes(ctx)] == ["a.generate"]
+    g.maybe_transition(ctx)
+    assert [n.name for n in g.iter_nodes(ctx)] == ["c.generate", "d.generate"]
+
+
+def test_signal_mid_body_stops_the_rest_of_the_body():
+    """A node saying 'done' ends the body it was running in, not just its own edge."""
+    g = _two_state_graph()
+    ctx: dict = {}
+    g.maybe_transition(ctx)  # leave s1 for s2 on default
+
+    ran = []
+    for node in g.iter_nodes(ctx):
+        ran.append(node.name)
+        ctx["module_signal"] = "watched"  # as if the node wrote it
+    assert ran == ["c.generate"]
+
+
+def test_matched_signal_fires_its_transition_and_clears_the_signal():
+    g = _two_state_graph()
+    ctx = {"module_signal": "watched"}
+    fired = g.maybe_transition(ctx)
+    assert (fired.to_state, fired.condition) == ("s2", "module_signal(watched)")
+    assert "module_signal" not in ctx
+
+
+def test_unmatched_signal_is_cleared_by_the_default_transition():
+    """A signal is one-shot per body, whichever transition consumes the state.
+
+    A module may emit a signal the current state does not name — it leaves on
+    ``default`` instead. Were the key left behind, ``iter_nodes`` would see it
+    as "stop" after the first node of every later body, for the rest of the run.
+    """
+    g = _two_state_graph()
+    ctx = {"module_signal": "not_watched_here"}
+
+    fired = g.maybe_transition(ctx)
+    assert (fired.to_state, fired.condition) == ("s2", "default")
+    assert "module_signal" not in ctx
+    assert [n.name for n in g.iter_nodes(ctx)] == ["c.generate", "d.generate"]
+
+
+def test_a_feedback_edge_does_not_gate_its_destination():
+    """``to: X`` *after* X's own turn as a source is feedback, not an input.
+
+    It updates ctx for the next iteration, so X must still run on first sight
+    rather than waiting on an edge that only exists to feed the round after it.
+    """
+    g = GenerationGraph(
+        {
+            "initial": "s1",
+            "states": {
+                "s1": {
+                    "body": [{"from": "d", "to": "end"}, {"from": "c", "to": "d"}],
+                    "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
+                }
+            },
+        }
+    )
+    assert [n.name for n in g.iter_nodes({})] == ["d.generate", "c.generate"]
 
 
 # ── Mermaid visualisation ────────────────────────────────────────────────────
