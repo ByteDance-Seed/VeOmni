@@ -7,8 +7,8 @@
 # Prerequisite -- split the released checkpoint into the four module folders.
 # The converter streams through the shards rather than building the model, so
 # it does not need the weights to fit in RAM, but it does dequantise fp8/fp4 to
-# bf16 and the output is roughly three times the 510 GB input:
-#   python -m veomni.models.seed_omni.modules.deepseek_v41.convert_model \
+# bf16 and the output is roughly three times the 478 GB input:
+#   python scripts/convert_model.py \
 #     --model_path /mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash \
 #     --output_dir /mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash
 #
