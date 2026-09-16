@@ -198,3 +198,20 @@ def test_cache_mode_is_checked_once_per_offline_method() -> None:
     module.pre_forward("online_process", conversation_list=conversation)
 
     assert calls == ["offline_encode", "online_process"]
+
+
+def test_offline_cache_writer_refuses_a_directory_that_already_has_shards(tmp_path) -> None:
+    """Reusing a cache directory must fail, not blend two runs together.
+
+    Shard names are a pure function of rank and write order, so a second run
+    overwrites the low shards and leaves the high ones. ``finalize`` then
+    renumbers everything it finds into one contiguous range, presenting the
+    previous run's leftovers as part of this cache.
+    """
+    from veomni.models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
+
+    SeedOmniOfflineCacheWriter(str(tmp_path))  # empty directory is fine
+    (tmp_path / "shard_000000.parquet").write_bytes(b"")
+
+    with pytest.raises(FileExistsError, match="already contains"):
+        SeedOmniOfflineCacheWriter(str(tmp_path))
