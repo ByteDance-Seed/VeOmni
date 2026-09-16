@@ -13,8 +13,11 @@
 # limitations under the License.
 
 
+import logging
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Mapping
+from uuid import UUID
 
 import torch
 import torch.distributed as dist
@@ -22,6 +25,70 @@ from torch.distributed.fsdp import FSDPModule
 
 
 _SUPPORTED_TRANSPORT_DTYPES = frozenset((torch.bfloat16, torch.float16))
+logger = logging.getLogger(__name__)
+
+
+def _get_node_id() -> str | None:
+    """Use the Linux kernel boot identity, not a container hostname or rank layout."""
+    try:
+        node_id = UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return str(node_id) if node_id.int not in (0, (1 << 128) - 1) else None
+
+
+class ReduceScatterTransportPolicy:
+    """Cache placement decisions during one model's FSDP initialization."""
+
+    def __init__(self) -> None:
+        self._node_id = _get_node_id()
+        self._shard_status: dict[dist.ProcessGroup, str] = {}
+        self._decisions: dict[tuple[dist.ProcessGroup, dist.ProcessGroup | None], bool] = {}
+
+    def can_use(self, mesh) -> bool:
+        shard_group = mesh.get_group(mesh.mesh_dim_names[-1])
+        replica_group = mesh.get_group(mesh.mesh_dim_names[0]) if len(mesh.mesh_dim_names) == 2 else None
+        key = (shard_group, replica_group)
+        if key in self._decisions:
+            return self._decisions[key]
+
+        shard_size = dist.get_world_size(shard_group)
+        if shard_group not in self._shard_status:
+            if shard_size == 1:
+                status = "single_rank"
+            else:
+                node_ids = [None] * shard_size
+                # Unavailable identity is a collective fallback; communication failures must propagate.
+                dist.all_gather_object(node_ids, self._node_id, group=shard_group)
+                status = "unknown" if None in node_ids else "node_local" if len(set(node_ids)) == 1 else "cross_node"
+            self._shard_status[shard_group] = status
+        status = self._shard_status[shard_group]
+
+        if replica_group is not None and shard_size > 1:
+            # Never skip this on a rejected shard row: HSDP peers must agree on
+            # the custom scaling/force-SUM contract before their native AllReduce.
+            statuses = [None] * dist.get_world_size(replica_group)
+            dist.all_gather_object(statuses, status, group=replica_group)
+            if "unknown" in statuses:
+                status = "unknown"
+            elif "cross_node" in statuses:
+                status = "cross_node"
+
+        enabled = status == "node_local"
+        self._decisions[key] = enabled
+        if dist.get_rank(shard_group) == 0:
+            ranks = dist.get_process_group_ranks(shard_group)
+            if enabled:
+                logger.info(f"Low-precision ReduceScatter transport enabled for node-local shard group {ranks}.")
+            elif status == "single_rank":
+                logger.info(f"Using native ReduceScatter for single-rank shard group {ranks}.")
+            else:
+                reason = "node identity is unavailable" if status == "unknown" else "a shard group spans nodes"
+                logger.warning(
+                    f"Using native ReduceScatter for shard group {ranks}: {reason} in this FSDP mesh. "
+                    "Replica-linked shard groups retain consistent native scaling."
+                )
+        return enabled
 
 
 class FP32ReduceScatterWithLowPrecisionTransport:

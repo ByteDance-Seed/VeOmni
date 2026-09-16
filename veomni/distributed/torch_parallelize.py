@@ -32,7 +32,10 @@ from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_lo
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
-from .fsdp2.reduce_scatter import register_fp32_reduce_scatter_with_low_precision_transport
+from .fsdp2.reduce_scatter import (
+    ReduceScatterTransportPolicy,
+    register_fp32_reduce_scatter_with_low_precision_transport,
+)
 from .parallel_plan import ParallelPlan, get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
 from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_runtime
@@ -316,20 +319,14 @@ def _configure_fsdp_gradient_reduction(
     module: FSDPModule,
     *,
     gradient_divide_factor: float,
-    reduce_scatter_group_size: int,
+    use_low_precision_transport: bool,
     transport_reduction_scales: dict[nn.Module, float],
 ) -> None:
-    if reduce_scatter_group_size > 1:
+    if use_low_precision_transport:
         transport_reduction_scales[module] = 1.0 / gradient_divide_factor
     else:
-        # FSDP does not call the custom hook for a single-rank shard group, so
-        # that path must retain its native divide factor.
+        # Singleton, cross-node and unknown-placement groups keep native scaling.
         module.set_gradient_divide_factor(gradient_divide_factor)
-
-
-def _reduce_scatter_group_size(mesh) -> int:
-    """Return the shard-dimension size for 1D FSDP or 2D HSDP meshes."""
-    return mesh[mesh.mesh_dim_names[-1]].size()
 
 
 def parallelize_model_fsdp2(
@@ -664,7 +661,13 @@ def parallelize_model_fsdp2(
     layer_pairs_list = [(fqn, layer_pairs[fqn]) for fqn in sorted_fqn_list]
     if use_low_precision_transport:
         transport_reduction_scales = {}
-        fsdp_reduce_scatter_group_size = _reduce_scatter_group_size(parallel_state.fsdp_mesh)
+        transport_policy = ReduceScatterTransportPolicy()
+        fsdp_transport_enabled = transport_policy.can_use(parallel_state.fsdp_mesh)
+        extra_parallel_transport_enabled = {
+            para: transport_policy.can_use(para_kwargs["mesh"])
+            for para, para_kwargs in extra_parallel_fsdp_kwargs.items()
+            if para_kwargs is not None
+        }
         fsdp_reduction_scale = 1.0 / parallel_state.fsdp_mesh.size()
     else:
         transport_reduction_scales = None
@@ -704,7 +707,7 @@ def parallelize_model_fsdp2(
                     _configure_fsdp_gradient_reduction(
                         _para_mod,
                         gradient_divide_factor=gradient_divide_factor,
-                        reduce_scatter_group_size=_reduce_scatter_group_size(extra_parallel_fsdp_kwargs[para]["mesh"]),
+                        use_low_precision_transport=extra_parallel_transport_enabled[para],
                         transport_reduction_scales=transport_reduction_scales,
                     )
                 layer_mod._fsdp_modules.append(_para_mod)
@@ -726,7 +729,7 @@ def parallelize_model_fsdp2(
         #      no need to shard layer_mod again.
         if not isinstance(layer_mod, FSDPModule):
             fully_shard(layer_mod, **fsdp_kwargs)
-            if transport_reduction_scales is not None and fsdp_reduce_scatter_group_size > 1:
+            if transport_reduction_scales is not None and fsdp_transport_enabled:
                 transport_reduction_scales[layer_mod] = fsdp_reduction_scale
             layer_mod._fsdp_modules.append(layer_mod)
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
@@ -750,7 +753,7 @@ def parallelize_model_fsdp2(
 
     if use_low_precision_transport:
         assert transport_reduction_scales is not None
-        if fsdp_reduce_scatter_group_size > 1:
+        if fsdp_transport_enabled:
             transport_reduction_scales[model] = fsdp_reduction_scale
         registered = register_fp32_reduce_scatter_with_low_precision_transport(
             model,
@@ -758,7 +761,7 @@ def parallelize_model_fsdp2(
             reduction_scales=transport_reduction_scales,
         )
         logger.info_rank0(
-            f"Enabled {reduce_scatter_transport_dtype} ReduceScatter transport with FP32 output on "
+            f"Registered {reduce_scatter_transport_dtype} ReduceScatter transport with FP32 output on "
             f"{registered} FSDP module{'s' if registered != 1 else ''}."
         )
 
