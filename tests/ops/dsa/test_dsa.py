@@ -51,6 +51,7 @@ from veomni.ops.kernels.dsa.attention.glm import flashmla_cudnn as glm_fused_att
 from veomni.ops.kernels.dsa.indexer.deepseek_v4 import tilelang as deepseek_v4_fused_indexer
 from veomni.ops.kernels.dsa.indexer.glm import cudnn as glm_fused_indexer
 from veomni.ops.kernels.dsa.mask import (
+    CUSTOM,
     STANDARD_CAUSAL,
     copy_dsa_mask_provenance,
     create_standard_causal_mask,
@@ -237,9 +238,15 @@ def test_create_standard_causal_mask_marks_only_when_attention_mask_is_none():
         translate_fused_dsa_mask(padded, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
 
 
-def test_create_standard_causal_mask_does_not_mark_packed_position_ids():
+def test_create_standard_causal_mask_marks_packed_and_overlay_as_custom(monkeypatch):
     from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
+    from veomni.ops.kernels.dsa import mask as mask_mod
+
+    def unexpected_scan(*args, **kwargs):
+        pytest.fail("packed or overlay DSA masks must not scan tensor values")
+
+    monkeypatch.setattr(mask_mod, "is_standard_causal_mask", unexpected_scan)
     seq_len = 4
     config = GlmMoeDsaConfig(
         vocab_size=32,
@@ -251,18 +258,27 @@ def test_create_standard_causal_mask_does_not_mark_packed_position_ids():
     )
     embeds = torch.randn(1, seq_len, config.hidden_size)
     position_ids = torch.tensor([[0, 1, 0, 1]])
-    mask = create_standard_causal_mask(
+    packed = create_standard_causal_mask(
         config=config,
         inputs_embeds=embeds,
         attention_mask=None,
         past_key_values=None,
         position_ids=position_ids,
     )
-    assert mask is not None
-    assert dsa_mask_provenance(mask) is None
-    assert not is_standard_causal_mask(mask, q_len=seq_len, kv_len=seq_len)
+    overlay = create_standard_causal_mask(
+        config=config,
+        inputs_embeds=embeds,
+        attention_mask=None,
+        past_key_values=None,
+        position_ids=torch.arange(seq_len).unsqueeze(0),
+        or_mask_function=lambda *args: True,
+    )
+    assert packed is not None and dsa_mask_provenance(packed) == CUSTOM
+    assert overlay is not None and dsa_mask_provenance(overlay) == CUSTOM
     with pytest.raises(ValueError, match="eager implementation"):
-        translate_fused_dsa_mask(mask, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
+        translate_fused_dsa_mask(packed, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
+    with pytest.raises(ValueError, match="eager implementation"):
+        translate_fused_dsa_mask(overlay, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
 
 
 def test_copy_dsa_mask_provenance_survives_head_slice(monkeypatch):

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
 from torch import Tensor
 
 from .....registry import SavedState
@@ -40,6 +41,7 @@ def forward(
     *,
     ignore_index: int = -100,
     num_items_in_batch: int | Tensor | None = None,
+    grad_enabled: bool | None = None,
 ) -> tuple[Tensor, SavedState]:
     """Liger fused linear + CE. ``weight`` must be present.
 
@@ -48,9 +50,14 @@ def forward(
     HF ``fixed_cross_entropy``: mean over non-ignored tokens, or
     ``sum / num_items_in_batch``. A zero explicit count uses one, matching the
     eager row's connected-zero behavior. Empty ``hidden`` falls back to eager.
+    Unused grads require both ``requires_grad`` and the caller's
+    ``is_grad_enabled()``.
     """
     if weight.numel() == 0:
         raise RuntimeError("liger_kernel requires a nonempty ``weight`` (fused-linear path)")
+    compute_grads = torch.is_grad_enabled() if grad_enabled is None else grad_enabled
+    hidden_needs_grad = _eager._needs_input_grad(hidden, compute_grads)
+    weight_needs_grad = _eager._needs_input_grad(weight, compute_grads)
     if hidden.numel() == 0:
         output, saved = _eager.forward(
             hidden,
@@ -58,18 +65,15 @@ def forward(
             weight,
             ignore_index=ignore_index,
             num_items_in_batch=num_items_in_batch,
-            # Function.forward is always no_grad; keep the same requires_grad gate.
-            grad_enabled=hidden.requires_grad or weight.requires_grad,
+            grad_enabled=compute_grads,
         )
-        return output, SavedState(saved.tensors, _Meta(True, hidden.requires_grad, weight.requires_grad))
+        return output, SavedState(saved.tensors, _Meta(True, hidden_needs_grad, weight_needs_grad))
 
     from liger_kernel.ops.fused_linear_cross_entropy import fused_linear_cross_entropy_forward
 
     hidden_flat, labels_flat = _eager.flatten_tokens(hidden, labels)
     # ``Function.forward`` runs with autograd disabled. A fresh ``contiguous()``
     # copy then has ``requires_grad=False``, and Liger skips grad buffers.
-    hidden_needs_grad = hidden.requires_grad
-    weight_needs_grad = weight.requires_grad
     hidden_flat = hidden_flat.contiguous()
     weight_c = weight.contiguous()
     # Liger gates both grad buffers on the input's ``requires_grad`` flag.

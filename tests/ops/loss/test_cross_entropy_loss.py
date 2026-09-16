@@ -132,8 +132,87 @@ def test_eager_hidden_skips_unneeded_grad_and_value(
         assert weight.grad is None
 
 
-def test_eager_skips_grad_and_value_under_no_grad(monkeypatch: pytest.MonkeyPatch):
-    """Trainable leaves under a real no_grad must not build a VJP graph."""
+@pytest.mark.parametrize(
+    "impl",
+    (
+        pytest.param("eager", id="eager"),
+        pytest.param("chunk_loss", id="chunk-loss"),
+        pytest.param(
+            "liger_kernel",
+            marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU"),
+            id="liger-kernel",
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    ("hidden_requires_grad", "weight_requires_grad", "expected_argnums"),
+    (
+        (True, True, (0, 1)),
+        (True, False, (0,)),
+        (False, True, (1,)),
+        (False, False, None),
+    ),
+    ids=("all-gradients", "frozen-weight", "frozen-hidden", "inference"),
+)
+def test_ce_rows_skip_unneeded_grads(
+    monkeypatch: pytest.MonkeyPatch,
+    impl: str,
+    hidden_requires_grad: bool,
+    weight_requires_grad: bool,
+    expected_argnums: tuple[int, ...] | None,
+):
+    """Every CE row honors caller mode and per-input requires_grad."""
+    if impl == "liger_kernel":
+        pytest.importorskip("liger_kernel")
+    calls: list[object] = []
+    real = torch.func.grad_and_value
+
+    def wrapped(fn, *args, **kwargs):
+        calls.append(kwargs.get("argnums", args[1] if len(args) > 1 else None))
+        return real(fn, *args, **kwargs)
+
+    monkeypatch.setattr(torch.func, "grad_and_value", wrapped)
+    torch.manual_seed(4)
+    device = "cuda" if impl == "liger_kernel" else "cpu"
+    dtype = torch.bfloat16 if impl == "liger_kernel" else torch.float32
+    hidden = torch.randn(2, 4, 8, device=device, dtype=dtype, requires_grad=hidden_requires_grad)
+    weight = torch.randn(6, 8, device=device, dtype=dtype, requires_grad=weight_requires_grad)
+    labels = torch.randint(0, 6, (2, 4), device=device)
+    loss = resolve_op("cross_entropy_loss", "standard", impl).wrapper(hidden, labels, weight)
+    if impl != "liger_kernel":
+        if expected_argnums is None:
+            assert calls == []
+        else:
+            assert calls and all(call == expected_argnums for call in calls)
+    assert loss.requires_grad is (hidden_requires_grad or weight_requires_grad)
+    if hidden_requires_grad or weight_requires_grad:
+        loss.backward()
+    if hidden_requires_grad:
+        assert hidden.grad is not None
+    else:
+        assert hidden.grad is None
+    if weight_requires_grad:
+        assert weight.grad is not None
+    else:
+        assert weight.grad is None
+
+
+@pytest.mark.parametrize(
+    "impl",
+    (
+        pytest.param("eager", id="eager"),
+        pytest.param("chunk_loss", id="chunk-loss"),
+        pytest.param(
+            "liger_kernel",
+            marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU"),
+            id="liger-kernel",
+        ),
+    ),
+)
+def test_ce_rows_skip_grads_under_no_grad(monkeypatch: pytest.MonkeyPatch, impl: str):
+    """Trainable leaves under a real no_grad must not build unused grad buffers."""
+    if impl == "liger_kernel":
+        pytest.importorskip("liger_kernel")
     calls: list[object] = []
     real = torch.func.grad_and_value
 
@@ -143,12 +222,15 @@ def test_eager_skips_grad_and_value_under_no_grad(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(torch.func, "grad_and_value", wrapped)
     torch.manual_seed(5)
-    hidden = torch.randn(2, 4, 8, requires_grad=True)
-    weight = torch.randn(6, 8, requires_grad=True)
-    labels = torch.randint(0, 6, (2, 4))
+    device = "cuda" if impl == "liger_kernel" else "cpu"
+    dtype = torch.bfloat16 if impl == "liger_kernel" else torch.float32
+    hidden = torch.randn(2, 4, 8, device=device, dtype=dtype, requires_grad=True)
+    weight = torch.randn(6, 8, device=device, dtype=dtype, requires_grad=True)
+    labels = torch.randint(0, 6, (2, 4), device=device)
     with torch.no_grad():
-        loss = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(hidden, labels, weight)
-    assert calls == []
+        loss = resolve_op("cross_entropy_loss", "standard", impl).wrapper(hidden, labels, weight)
+    if impl != "liger_kernel":
+        assert calls == []
     assert loss.requires_grad is False
     assert torch.isfinite(loss).all()
 

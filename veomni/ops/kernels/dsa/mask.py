@@ -76,14 +76,19 @@ def _position_ids_reset_within_row(position_ids: Tensor | None) -> bool:
     return bool((ids[..., 1:] - ids[..., :-1] <= 0).any())
 
 
-def create_standard_causal_mask(*args, **kwargs) -> Tensor | None:
-    """HF ``create_causal_mask``, marked only for an unmarked standard triangle.
+def _has_mask_overlay(**kwargs: object) -> bool:
+    """HF extras that overlay a non-standard triangle onto the causal mask."""
+    return any(
+        kwargs.get(name) is not None for name in ("or_mask_function", "and_mask_function", "block_sequence_ids")
+    )
 
-    A 2-D padding mask, other explicit ``attention_mask``, or packed
-    ``position_ids`` that reset inside a row can still produce a causal
-    triangle with extra blocked positions. Those outputs stay unmarked so
-    fused translate falls back to ``is_standard_causal_mask`` instead of
-    dropping them as standard causal.
+
+def create_standard_causal_mask(*args, **kwargs) -> Tensor | None:
+    """HF ``create_causal_mask``, marked only for a no-padding standard triangle.
+
+    Packed ``position_ids`` and HF overlay kwargs are marked custom so fused
+    translate can reject them without scanning the 4-D mask. A 2-D padding mask
+    stays unmarked and still goes through ``is_standard_causal_mask``.
     """
     from transformers.masking_utils import create_causal_mask
 
@@ -94,7 +99,9 @@ def create_standard_causal_mask(*args, **kwargs) -> Tensor | None:
     position_ids = kwargs.get("position_ids")
     if position_ids is None and len(args) >= 5:
         position_ids = args[4]
-    if attention_mask is None and not _position_ids_reset_within_row(position_ids):
+    if mask is not None and (_has_mask_overlay(**kwargs) or _position_ids_reset_within_row(position_ids)):
+        return mark_custom_dsa_mask(mask)
+    if attention_mask is None:
         return mark_standard_causal_mask(mask)
     return mask
 

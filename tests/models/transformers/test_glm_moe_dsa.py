@@ -351,9 +351,13 @@ def test_glm_moe_dsa_fused_rejects_packed_position_ids():
         pytest.skip("NPU GLM keeps the Hugging Face attention path")
     config = _tiny_config()
     model = _build_ours(config).eval()
-    model.model.layers[0].self_attn.veomni_dsa_attention = _FusedAttentionSpy()
-    model.model.layers[0].self_attn.indexer.veomni_dsa_indexer = _FusedIndexerSpy(config.index_topk)
+    attn_spy = _FusedAttentionSpy()
+    indexer_spy = _FusedIndexerSpy(config.index_topk)
+    model.model.layers[0].self_attn.veomni_dsa_attention = attn_spy
+    model.model.layers[0].self_attn.indexer.veomni_dsa_indexer = indexer_spy
     input_ids = torch.randint(3, config.vocab_size, (1, 8))
     position_ids = torch.tensor([[0, 1, 0, 1, 0, 1, 0, 1]])
     with pytest.raises(ValueError, match="eager implementation"):
         model(input_ids=input_ids, position_ids=position_ids, use_cache=False)
+    assert attn_spy.kwargs is None
+    assert indexer_spy.kwargs is None
