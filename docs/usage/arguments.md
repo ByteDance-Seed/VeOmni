@@ -593,6 +593,11 @@ buffers. Under HSDP, only eligible shard-group ReduceScatter uses the low-precis
 group AllReduce remains native FP32. When the transport and reduction dtypes match, VeOmni does not register
 the custom collective or alter native gradient scaling and reduction behavior.
 
+![Native FP32 ReduceScatter compared with node-local BF16 or FP16 all-to-all transport followed by local FP32 sum and scaling. Both paths retain FP32 ReduceScatter input and output. HSDP replica AllReduce remains native FP32, using SUM on the custom path because full-mesh scaling is applied in the ReduceScatter hook. Parameter AllGather is unchanged.](../assets/reduce_scatter_transport.png)
+
+*Mechanism overview: only the transport buffers use the matching 16-bit dtype. The custom path preserves
+the FP32 ReduceScatter interface, but may use a different FP32 addition order from the native collective.*
+
 At model initialization, VeOmni checks each module's actual ReduceScatter process group, including the
 combined shard/sequence-parallel group and any expert-specific shard groups. Multi-rank groups are eligible
 only when every member reports the same valid Linux kernel boot ID (`/proc/sys/kernel/random/boot_id`).
