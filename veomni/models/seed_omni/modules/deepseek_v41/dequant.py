@@ -1,0 +1,146 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Undo the released DeepSeek-V4.1 checkpoint's two quantizations.
+
+The checkpoint ships every dense projection as fp8 with a block scale, and the
+routed experts as fp4 packed two values to a byte with a block scale of their
+own. Training wants bf16 master weights in both cases -- the fp4 QAT in
+``DeepseekV4Experts`` fake-quantizes *from* bf16, so handing it fp4 storage
+would quantize an already-quantized tensor and lose a second time.
+
+Both routines follow ``inference/convert.py`` and the released
+``config.json``'s ``quantization_config``: block size ``[32, 32]``, scale
+format ``ue8m0``. The block size is read from the config rather than assumed,
+because the same file also admits ``[128, 128]`` and the reference asserts on
+exactly those two.
+
+The fp4 value table is not a computation: e2m1 has 16 representable values and
+the table lists them in bit order, sign in the high bit. It is reproduced here
+rather than derived so that it can be compared against the reference's copy
+element by element.
+"""
+
+from __future__ import annotations
+
+from typing import Sequence, Tuple
+
+import torch
+
+
+#: e2m1 in bit order: 8 magnitudes, then the same 8 negated. From
+#: ``inference/convert.py``; ``tests`` asserts the two agree.
+FP4_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+
+def fp4_table(device: torch.device | None = None) -> torch.Tensor:
+    return torch.tensor(FP4_VALUES, dtype=torch.float32, device=device)
+
+
+def dequant_fp8_blockwise(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """``[out, in]`` fp8 plus its ``[out/bo, in/bi]`` block scale -> ``out_dtype``.
+
+    The block shape is inferred from the two tensors rather than passed in: the
+    checkpoint's own scale tensor is the authority on how its weight was
+    blocked, and a config value that disagreed with it would silently rescale
+    every block. The reference derives it the same way and asserts the result is
+    one of the two shapes it supports.
+    """
+    if weight.ndim != 2 or scale.ndim != 2:
+        raise ValueError(f"expected 2-D weight and scale, got {tuple(weight.shape)} and {tuple(scale.shape)}")
+    if weight.size(0) % scale.size(0) or weight.size(1) % scale.size(1):
+        raise ValueError(
+            f"weight {tuple(weight.shape)} is not an integer number of blocks of scale {tuple(scale.shape)}"
+        )
+    out_block = weight.size(0) // scale.size(0)
+    in_block = weight.size(1) // scale.size(1)
+    if (out_block, in_block) not in ((32, 32), (128, 128)):
+        raise ValueError(
+            f"unsupported fp8 block {(out_block, in_block)}: the released checkpoint uses (32, 32) and the "
+            "reference also accepts (128, 128). A different block here means the scale was read for the "
+            "wrong tensor, which would rescale every block rather than fail."
+        )
+    blocked = weight.unflatten(0, (-1, out_block)).unflatten(-1, (-1, in_block)).float()
+    blocked = blocked * scale[:, None, :, None].float()
+    return blocked.flatten(2, 3).flatten(0, 1).to(out_dtype)
+
+
+def dequant_fp4_blockwise(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """``[out, in/2]`` packed e2m1 plus its block scale -> ``[out, in]`` ``out_dtype``.
+
+    Two values to a byte, **low nibble first**: the reference stacks
+    ``[table[low], table[high]]`` and flattens, so within a byte the lower index
+    along the input dimension is the low nibble. Swapping them transposes every
+    adjacent pair of input features, which no shape check would catch.
+    """
+    if packed.dtype not in (torch.int8, torch.uint8):
+        raise ValueError(f"packed fp4 must arrive as int8/uint8, got {packed.dtype}")
+    if packed.ndim != 2:
+        raise ValueError(f"expected a 2-D packed weight, got {tuple(packed.shape)}")
+
+    as_bytes = packed.view(torch.uint8)
+    low = as_bytes & 0x0F
+    high = (as_bytes >> 4) & 0x0F
+    table = fp4_table(packed.device)
+    values = torch.stack([table[low.long()], table[high.long()]], dim=-1).flatten(1)
+
+    out_dim, in_dim = values.shape
+    if scale.size(0) != out_dim or in_dim % scale.size(1):
+        raise ValueError(f"fp4 scale {tuple(scale.shape)} does not block the unpacked weight {(out_dim, in_dim)}")
+    in_block = in_dim // scale.size(1)
+    values = values.unflatten(-1, (-1, in_block)) * scale.float()[:, :, None]
+    return values.flatten(1).to(out_dtype)
+
+
+def fuse_gate_up(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """``w1`` and ``w3`` -> the ``[2I, H]`` slab ``DeepseekV4Experts`` expects.
+
+    Order is not a convention to pick: ``_apply_gate`` does
+    ``gate, up = gate_up.chunk(2, dim=-1)`` on the *output* of the projection,
+    so the gate rows come first. Reversing them swaps which half gets the
+    one-sided clamp and which gets the two-sided one -- the model still runs,
+    and the outputs are wrong everywhere the clamp binds.
+    """
+    if gate.shape != up.shape:
+        raise ValueError(f"w1 {tuple(gate.shape)} and w3 {tuple(up.shape)} must match")
+    return torch.cat([gate, up], dim=0)
+
+
+def stack_experts(per_expert: Sequence[torch.Tensor]) -> torch.Tensor:
+    """``[E, ...]`` from one tensor per expert, in expert-index order."""
+    return torch.stack(list(per_expert), dim=0)
+
+
+def split_block_shape(weight: torch.Tensor, scale: torch.Tensor) -> Tuple[int, int]:
+    """The ``(out, in)`` block the scale implies. Exposed for diagnostics."""
+    return weight.size(0) // scale.size(0), weight.size(1) // scale.size(1)
+
+
+__all__ = [
+    "FP4_VALUES",
+    "dequant_fp4_blockwise",
+    "dequant_fp8_blockwise",
+    "fp4_table",
+    "fuse_gate_up",
+    "split_block_shape",
+    "stack_experts",
+]
