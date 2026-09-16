@@ -264,6 +264,28 @@ def test_omni_config_save_pretrained_writes_graph_sidecars(tmp_path):
     assert "flowchart" in training_mmd
 
 
+def test_inference_only_config_saves_without_a_training_diagram(tmp_path):
+    """No ``training_graph`` must cost the save nothing but the training diagram.
+
+    ``from_dict`` defaults ``training_graph`` to ``[]``, which is what an
+    inference-only checkpoint round-trips as, and ``TrainingGraph`` rejects an
+    empty edge list. The diagrams are written last, so rendering one
+    unconditionally aborted the save after every real artifact — including, via
+    ``OmniModel.save_pretrained``, each module's weights — was already on disk.
+    """
+    config = OmniConfig.from_dict(
+        {"modules": {"encoder": {"subfolder": "encoder"}}, "generation_graphs": _minimal_generation_graphs()}
+    )
+    assert config.training_graph == []
+
+    config.save_pretrained(tmp_path)
+
+    assert (tmp_path / "config.json").exists()
+    assert (tmp_path / GRAPH_VIS_SUBDIR / generation_mmd_filename("infer_gen")).exists()
+    assert not (tmp_path / GRAPH_VIS_SUBDIR / TRAINING_MMD_FILENAME).exists()
+    assert OmniConfig.from_pretrained(tmp_path).training_graph == []
+
+
 @patch("veomni.models.seed_omni.modeling_omni.read_model_type", return_value="fake_omni_module")
 @patch("veomni.models.seed_omni.modeling_omni.OMNI_MODEL_REGISTRY")
 def test_omni_model_save_pretrained_roundtrip_layout(registry_mock, _read_model_type, tmp_path):

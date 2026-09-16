@@ -85,12 +85,23 @@ def save_graph_mermaid_diagrams(
     training_title: str = "Training graph",
     generation_title: str = "Generation graph",
 ) -> list[str]:
-    """Write ``graphs/training.mmd`` plus one ``graphs/generation_<infer_type>.mmd`` per scenario."""
-    vis_dir = os.path.join(str(save_directory), GRAPH_VIS_SUBDIR)
-    training_path = os.path.join(vis_dir, TRAINING_MMD_FILENAME)
-    write_mermaid_file(training_path, render_training_mermaid(config, title=training_title))
+    """Write ``graphs/training.mmd`` plus one ``graphs/generation_<infer_type>.mmd`` per scenario.
 
-    paths = [training_path]
+    A config with no ``training_graph`` gets no training diagram rather than an
+    error: an inference-only checkpoint legitimately has none, and
+    :class:`TrainingGraph` rejects an empty edge list. These files are
+    diagnostics, so demanding a graph the config does not claim to have would
+    fail a ``save_pretrained`` over a picture — after every real artifact,
+    including each module's weights, is already on disk.
+    """
+    vis_dir = os.path.join(str(save_directory), GRAPH_VIS_SUBDIR)
+
+    paths = []
+    if config.training_graph:
+        training_path = os.path.join(vis_dir, TRAINING_MMD_FILENAME)
+        write_mermaid_file(training_path, render_training_mermaid(config, title=training_title))
+        paths.append(training_path)
+
     for infer_type in config.infer_types:
         path = os.path.join(vis_dir, generation_mmd_filename(infer_type))
         body = render_generation_mermaid(config, title=f"{generation_title} — {infer_type}", infer_type=infer_type)
