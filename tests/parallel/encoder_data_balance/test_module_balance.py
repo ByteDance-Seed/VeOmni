@@ -56,7 +56,7 @@ def test_bad_splits():
         ModuleDataBalancer(None).balance({"x": torch.ones(3, 2)}, {"x": [2]}, [1])
 
 
-@pytest.mark.parametrize("invalid", ["fields", "input", "output", "scalar", "overflow"])
+@pytest.mark.parametrize("invalid", ["fields", "input", "output", "scalar", "overflow", "callback"])
 def test_invalid_metadata_is_shared_before_raising(monkeypatch, invalid):
     group = object()
     gathered_calls = []
@@ -77,10 +77,14 @@ def test_invalid_metadata_is_shared_before_raising(monkeypatch, invalid):
         outputs = [None]
     elif invalid == "scalar":
         tensors = {"x": torch.tensor(1.0)}
-    else:
+    elif invalid == "overflow":
         lengths = {"x": [float("inf")]}
+
+    def cost_callback(_):
+        raise RuntimeError("cost callback failure")
+
     with pytest.raises(ValueError, match="metadata"):
-        ModuleDataBalancer(group).balance(tensors, lengths, outputs)
+        ModuleDataBalancer(group, cost_callback if invalid == "callback" else None).balance(tensors, lengths, outputs)
     assert len(gathered_calls) == 1
     assert gathered_calls[0][4] is not None
 
@@ -304,7 +308,17 @@ def distributed_worker():
                 f"DP{world // sp_size}/SP{sp_size}: roundtrip, deepstack, gradients, empty ranks, token totals passed",
                 flush=True,
             )
+
         # One bad owner must fail *every* rank before a payload collective.
+        def rank_local_cost_failure(_, owner=owner):
+            if owner == 0:
+                raise RuntimeError("owner callback failure")
+            return [1]
+
+        with pytest.raises(ValueError, match="RuntimeError"):
+            ModuleDataBalancer(dp_group, rank_local_cost_failure).balance(
+                {"x": torch.ones(1, 2, device=device)}, {"x": [1]}, [1]
+            )
         with pytest.raises(ValueError, match="metadata"):
             ModuleDataBalancer(dp_group).balance(
                 {"x": torch.ones(1, 2, device=device)}, {"x": [1]}, [1], costs=[-1 if owner == 0 else 1]
@@ -370,6 +384,16 @@ def distributed_worker():
                 module = DeclaredModule()
                 with module.data_balance_scope(), pytest.raises(ValueError, match="metadata"):
                     module.data_balance_pre("encode", tensors, metadata)
+            from dataclasses import replace
+
+            module = DeclaredModule()
+            module.data_balance_specs = {
+                "encode": replace(DeclaredModule.data_balance_specs["encode"], cost_fn=rank_local_cost_failure)
+            }
+            with module.data_balance_scope(), pytest.raises(ValueError, match="metadata"):
+                module.data_balance_pre(
+                    "encode", {"x": torch.ones(1, 2, device=device)}, {"input": [1], "output": [1], "metric": [1]}
+                )
     dist.destroy_process_group()
 
 

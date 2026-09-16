@@ -127,7 +127,7 @@ class DataBalanceMixin:
             lengths = torch.tensor(metadata[spec.cost_lengths_key], dtype=torch.float64)
             costs = spec.cost_fn(lengths) if spec.cost_fn is not None else lengths.pow(spec.cost_exponent)
             costs = costs.tolist() if isinstance(costs, torch.Tensor) else (() if costs is None else costs)
-        except (KeyError, TypeError, ValueError, OverflowError):
+        except Exception:
             # A nonfinite sentinel fails even for an owner with zero items.
             costs = [float("nan")]
         if method in self._data_balance_plans:
