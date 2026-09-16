@@ -313,9 +313,7 @@ def moe_scatter(x: torch.Tensor, index: torch.Tensor, out_dtype=None):
     topk = index.shape[1]
     out_dtype = out_dtype or x.dtype
     out = torch.empty(M * topk, N, dtype=out_dtype, device=x.device)
-    # The scatter index is constructed as a permutation by the caller.
-    # Asserting a lambda never evaluated this invariant and breaks Dynamo's
-    # tracing of the enclosing autograd.Function.
+    assert lambda: index.unique().numel() == M * topk, "Holes in output?"
 
     grid = lambda meta: (M, triton.cdiv(N, meta["BLOCK_N"]))  # noqa
     with get_torch_device().device(x.device):
