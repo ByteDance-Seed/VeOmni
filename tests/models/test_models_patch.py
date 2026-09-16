@@ -510,7 +510,12 @@ def test_models_patch_fwd_bwd(
     model_config = trainer.model.model_config
 
     # Release the first build before the loop rebuilds through the same handle.
+    # Optimizer / scheduler still hold the first model's parameters, so drop
+    # all three before `prepare_data` allocates the dummy batch.
     trainer.model.model = None
+    trainer.model.optimizer = None
+    trainer.model.lr_scheduler = None
+    _release_device_memory()
     # Upstream DeepSeek-V4 eager attention does not consume packed cu-seqlens.
     # Comparing it with VeOmni's boundary-aware packed path on two concatenated
     # samples would therefore compare different attention semantics. Keep this
