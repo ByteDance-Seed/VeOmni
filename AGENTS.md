@@ -19,6 +19,7 @@ On session start, read the following:
 - `.agents/knowledge/cpu_only_env.md` — what can be verified without a GPU/NPU; read when running on a CPU-only machine
 
 Read on demand:
+- `.agents/knowledge/dev_box_env.md` — proxy and PATH facts that make network or CLI failures look like outages; read when a download, a Hub-backed test, or an installed CLI fails
 - `.agents/knowledge/testing.md` — how CI selects tests, and how to decide whether a change needs one; read before adding or wiring a test
 - `.agents/knowledge/multimodal_metadata.md` — multimodal metadata precompute contract; read before touching VLM/Omni collators, ViT forwards, or the model metadata hooks
 
