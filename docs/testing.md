@@ -203,6 +203,23 @@ is relative L2 <= two BF16 epsilons and peak error <= four BF16 epsilons of the
 reference peak. These local gates do not qualify whole-model numerical training
 correctness or the SM90+ optimized kernels.
 
+Controlled development runs also recorded full FP32 master parameters and
+pre-/post-clipping gradients from the actual two-step trainer. Initial weights,
+buffers, optimizer settings, RNG fingerprints and every rank's micro-batches
+matched. First-step AdamW replay and clipping agreed with the observed states,
+but raw gradient relative L2 differed by about 4.61% for EP2 versus EP1 and
+5.81% for Inductor versus eager. These are observed differences, not passing
+whole-model numerical tolerances.
+
+For eager EP2, replaying EP1's expert selections reduced the final layer's
+expert-gradient difference from about 13.2% to 2.8%, and the global difference
+to 3.03%. The EP1 self-replay retained bit-identical parameter states. This
+shows that discrete routing contributes to the difference without explaining
+all of it. The first expert's actual training inputs and output cotangents also
+passed the existing FP32-reference output/VJP budgets at EP1 and EP2. Those
+bounded checks support the local operator contract; they do not establish
+whole-model convergence or explain the compiled path's remaining differences.
+
 ---
 
 ### 2. VLM Trainer Test (`tests/models/test_vlm_trainer.py`)
