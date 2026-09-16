@@ -222,14 +222,17 @@ def test_prepare_dense_attention_inputs_keeps_positive_additive_bias(impl):
 
 
 @pytest.mark.parametrize("impl", ["sdpa", "veomni_sdpa"])
-def test_packed_sdpa_fully_masked_row_matches_separate_outputs_and_grads(impl):
+@pytest.mark.parametrize("sample_start", [0, 2])
+def test_packed_sdpa_fully_masked_row_matches_separate_outputs_and_grads(impl, sample_start):
     from veomni.models.utils.op_utils import prepare_dense_attention_inputs
 
     query = torch.zeros(1, 1, 4, 1)
     values = torch.tensor([0.0, 1.0, 10.0, 20.0]).view(1, 1, 4, 1).requires_grad_()
     separate_values = values.detach().clone().requires_grad_()
     existing = torch.zeros(1, 1, 4, 4).masked_fill(~torch.ones(4, 4, dtype=torch.bool).tril(), float("-inf"))
-    existing[:, :, 0, :] = float("-inf")
+    # Mask this query's own sample; earlier samples remain visible in the
+    # incoming triangle and must be blocked by packed isolation itself.
+    existing[:, :, sample_start, sample_start : sample_start + 2] = float("-inf")
     _, mask = prepare_dense_attention_inputs(
         {"cu_seq_lens_q": torch.tensor([0, 2, 4], dtype=torch.int32)},
         impl=impl,
@@ -250,12 +253,14 @@ def test_packed_sdpa_fully_masked_row_matches_separate_outputs_and_grads(impl):
         dim=2,
     )
     torch.testing.assert_close(actual, expected)
-    assert actual[0, 0, 0, 0].item() == 0.0
-    # A loss on the first sample must not backpropagate into the second sample.
-    actual[:, :, :2].sum().backward()
-    expected[:, :, :2].sum().backward()
+    assert actual[0, 0, sample_start, 0].item() == 0.0
+    # A loss on either sample must not backpropagate into the other sample.
+    actual[:, :, sample_start : sample_start + 2].sum().backward()
+    expected[:, :, sample_start : sample_start + 2].sum().backward()
     torch.testing.assert_close(values.grad, separate_values.grad)
-    torch.testing.assert_close(values.grad[:, :, 2:], torch.zeros_like(values.grad[:, :, 2:]))
+    other_start = 2 - sample_start
+    other_grad = values.grad[:, :, other_start : other_start + 2]
+    torch.testing.assert_close(other_grad, torch.zeros_like(other_grad))
 
 
 def test_prepare_dense_attention_inputs_rejects_cached_packed_sequences():
