@@ -58,8 +58,15 @@ def dequant_fp8_blockwise(
     The block shape is inferred from the two tensors rather than passed in: the
     checkpoint's own scale tensor is the authority on how its weight was
     blocked, and a config value that disagreed with it would silently rescale
-    every block. The reference derives it the same way and asserts the result is
-    one of the two shapes it supports.
+    every block. The reference derives it the same way.
+
+    Two block shapes occur, and the difference is structural rather than a
+    tuning choice. The 2-D projections are blocked squarely, ``(32, 32)`` --
+    which is the case the reference asserts on, because ``wo_a`` is the only
+    tensor it dequantizes. The engram tables are blocked ``(1, 32)``: one scale
+    per row per 32 columns. A row of an embedding table is an independent
+    memory, so sharing an exponent across 32 unrelated rows would cost range on
+    every one of them.
     """
     if weight.ndim != 2 or scale.ndim != 2:
         raise ValueError(f"expected 2-D weight and scale, got {tuple(weight.shape)} and {tuple(scale.shape)}")
@@ -69,11 +76,12 @@ def dequant_fp8_blockwise(
         )
     out_block = weight.size(0) // scale.size(0)
     in_block = weight.size(1) // scale.size(1)
-    if (out_block, in_block) not in ((32, 32), (128, 128)):
+    if in_block not in (32, 128) or out_block not in (1, 32, 128):
         raise ValueError(
-            f"unsupported fp8 block {(out_block, in_block)}: the released checkpoint uses (32, 32) and the "
-            "reference also accepts (128, 128). A different block here means the scale was read for the "
-            "wrong tensor, which would rescale every block rather than fail."
+            f"unsupported fp8 block {(out_block, in_block)}: the released checkpoint uses (32, 32) for the "
+            "projections and (1, 32) for the engram tables, and the reference also accepts (128, 128). A "
+            "block outside that set means the scale was read for the wrong tensor, which would rescale "
+            "every block rather than fail."
         )
     blocked = weight.unflatten(0, (-1, out_block)).unflatten(-1, (-1, in_block)).float()
     blocked = blocked * scale[:, None, :, None].float()

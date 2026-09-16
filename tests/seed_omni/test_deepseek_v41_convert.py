@@ -40,6 +40,7 @@ from veomni.models.seed_omni.modules.deepseek_v41.convert_model import (
     convert_llm,
     convert_vision,
 )
+from veomni.models.seed_omni.modules.deepseek_v41.dequant import dequant_fp8_blockwise
 
 
 HIDDEN = 64
@@ -227,6 +228,54 @@ class TestShardWriter:
     def test_an_empty_module_is_refused(self, tmp_path):
         with pytest.raises(RuntimeError, match="no tensors were written"):
             ShardWriter(str(tmp_path / "out")).finalize()
+
+
+class TestChunkedDequantization:
+    """The engram tables are 98 GB of fp8 each, so the ordinary path's float32
+    intermediate is 393 GB before the bf16 result is allocated. Chunking has to
+    give the same answer, which it only does while chunks stay aligned to the
+    scale blocks."""
+
+    @staticmethod
+    def _write_fp8_table(path, rows, cols, out_block):
+        weight, scale = fp8_pair(rows, cols, block=32)
+        # fp8_pair blocks squarely; re-block the rows to the shape under test.
+        scale = torch.rand(rows // out_block, cols // 32, dtype=torch.float32) + 0.5
+        os.makedirs(path, exist_ok=True)
+        save_file(
+            {"t.weight": weight, "t.scale": scale},
+            os.path.join(path, "model.safetensors"),
+            metadata={"format": "pt"},
+        )
+        json.dump(
+            {
+                "metadata": {"total_size": 0},
+                "weight_map": dict.fromkeys(("t.weight", "t.scale"), "model.safetensors"),
+            },
+            open(os.path.join(path, "model.safetensors.index.json"), "w"),
+        )
+        return weight, scale
+
+    @pytest.mark.parametrize("out_block", [1, 32])
+    def test_chunked_matches_whole(self, tmp_path, out_block):
+        path = str(tmp_path / "ckpt")
+        weight, scale = self._write_fp8_table(path, rows=256, cols=64, out_block=out_block)
+        source = TensorSource(path)
+        chunked = source.get_dequantized_in_row_chunks("t.weight", chunk_bytes=2 * 64 * 4)
+        source.close()
+        assert torch.equal(chunked, dequant_fp8_blockwise(weight, scale, torch.bfloat16))
+
+    def test_a_per_row_scale_is_accepted(self):
+        """``(1, 32)`` is the engram tables' real blocking: one exponent per row
+        per 32 columns, because a row of an embedding table is an independent
+        memory."""
+        weight = torch.zeros(8, 64, dtype=torch.float8_e4m3fn)
+        dequant_fp8_blockwise(weight, torch.ones(8, 2), torch.bfloat16)
+
+    def test_a_block_outside_the_released_set_is_refused(self):
+        weight = torch.zeros(8, 64, dtype=torch.float8_e4m3fn)
+        with pytest.raises(ValueError, match="unsupported fp8 block"):
+            dequant_fp8_blockwise(weight, torch.ones(4, 2), torch.bfloat16)
 
 
 class TestDestinationsWithoutMemoryMapping:

@@ -91,6 +91,11 @@ SHARD_BYTES = 5 * 1000**3
 #: trainer both assume bf16 master weights.
 MASTER_DTYPE = torch.bfloat16
 
+#: Roughly how much float32 a chunked dequantization holds at once. Small
+#: enough to be noise next to a 197 GB output, large enough that a 384M-row
+#: table is a few hundred reads rather than a few hundred thousand.
+CHUNK_BYTES = 1 * 1000**3
+
 
 class ShardWriter:
     """Accumulate tensors and flush them to numbered safetensors shards.
@@ -264,6 +269,48 @@ class TensorSource:
             return dequant_fp4_blockwise(weight, scale, MASTER_DTYPE)
         return dequant_fp8_blockwise(weight, scale, MASTER_DTYPE)
 
+    def get_dequantized_in_row_chunks(self, name: str, chunk_bytes: int = CHUNK_BYTES) -> torch.Tensor:
+        """Same result as :meth:`get_dequantized`, without a float32 copy of the whole tensor.
+
+        For the engram tables this is the difference between running and not:
+        each is 98 GB of fp8, so the ordinary path's float32 intermediate is
+        393 GB before the bf16 result is even allocated. Rows are read straight
+        off disk a chunk at a time through ``get_slice``, so the fp8 side is
+        never fully resident either -- only the bf16 output is.
+
+        Chunks are whole numbers of scale blocks. A chunk that split one would
+        pair rows with a neighbouring block's exponent, which rescales them
+        rather than failing.
+        """
+        weight_slice = self._slice(name)
+        scale_name = _scale_name(name)
+        if scale_name not in self.weight_map:
+            return self.get(name).to(MASTER_DTYPE)
+        scale_slice = self._slice(scale_name)
+
+        rows, cols = weight_slice.get_shape()
+        out_block = rows // scale_slice.get_shape()[0]
+        chunk_rows = max(out_block, (chunk_bytes // (cols * 4) // out_block) * out_block)
+
+        out = torch.empty((rows, cols), dtype=MASTER_DTYPE)
+        for start in range(0, rows, chunk_rows):
+            stop = min(start + chunk_rows, rows)
+            out[start:stop] = dequant_fp8_blockwise(
+                weight_slice[start:stop],
+                scale_slice[start // out_block : stop // out_block],
+                MASTER_DTYPE,
+            )
+            gc.collect()
+        return out
+
+    def _slice(self, name: str):
+        file_name = self.weight_map[name]
+        handle = self._handles.get(file_name)
+        if handle is None:
+            handle = safe_open(os.path.join(self.model_path, file_name), framework="pt", device="cpu")
+            self._handles[file_name] = handle
+        return handle.get_slice(name)
+
     def close(self) -> None:
         self._handles.clear()
 
@@ -386,7 +433,7 @@ def convert_ngram(source: TensorSource, output_dir: str, config, model_path: str
     for table_index, layer_id in enumerate(config.layer_ids):
         writer.add(
             f"tables.{table_index}.weight",
-            source.get_dequantized(f"layers.{layer_id}.engram.embed.weight"),
+            source.get_dequantized_in_row_chunks(f"layers.{layer_id}.engram.embed.weight"),
         )
         gc.collect()
     return writer.finalize(config)
