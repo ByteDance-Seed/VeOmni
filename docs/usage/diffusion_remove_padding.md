@@ -36,8 +36,9 @@ This is an overlay on a DiT recipe, not a runnable built-in model example.
 The initial trainer envelope requires:
 
 - FSDP2, with Ulysses, CP, TP, PP and extra-parallel sizes equal to one.
-- Offline training, fixed positive sample counts, complete microbatches, and
-  `global_batch_size` divisible by `micro_batch_size * dp_size`.
+- Offline training, fixed positive integer sample counts (not booleans or floats),
+  complete microbatches, and `global_batch_size` divisible by
+  `micro_batch_size * dp_size`. An unspecified global size is derived normally.
 - No LoRA, parameter/activation offload, or torch.compile until these combinations
   receive model-specific validation.
 
@@ -165,4 +166,7 @@ Every future consumer must verify:
 CPU protocol regressions live in `tests/trainer/test_diffusion_remove_padding.py`
 and are listed explicitly in both GPU and NPU unit-test workflows. The test-only
 consumer exercises real trainer dispatch, root hooks and sample-mean gradient
-accumulation without opting any production model in.
+accumulation without opting any production model in. It uses an ordinary CPU
+module, not FSDP2. A real FSDP2 mixed-precision optimizer-step regression for the
+shared input/output protocol remains required before claiming distributed support,
+independently of the later model-specific packing tests.

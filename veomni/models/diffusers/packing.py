@@ -90,8 +90,12 @@ def validate_diffusion_remove_padding_config(args: "VeOmniDiTArguments") -> None
         raise ValueError("model.use_remove_padding requires train.dyn_bsz=false; dynamic batching is independent.")
     if train.bsz_warmup_ratio != 0:
         raise ValueError("model.use_remove_padding does not support batch-size warmup.")
-    if train.micro_batch_size < 1:
-        raise ValueError("model.use_remove_padding requires a positive micro_batch_size.")
+    for name in ("micro_batch_size", "global_batch_size"):
+        value = getattr(train, name)
+        if name == "global_batch_size" and value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"model.use_remove_padding requires train.{name} to be a positive integer.")
     if train.global_batch_size is not None and train.global_batch_size % (train.micro_batch_size * acc.dp_size):
         raise ValueError("global_batch_size must be a multiple of micro_batch_size * dp_size.")
     if not args.data.dataloader.drop_last:

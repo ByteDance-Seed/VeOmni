@@ -110,6 +110,38 @@ def test_unsupported_execution_rejected_before_distributed_setup(monkeypatch, pa
     _api().validate_diffusion_remove_padding_config(args)
 
 
+@pytest.mark.parametrize("field_name", ["micro_batch_size", "global_batch_size"])
+@pytest.mark.parametrize("value", [0, -2, 2.0, 1.5, True, False])
+@pytest.mark.parametrize("entrypoint", ["parse", "setup"])
+def test_batch_sizes_require_positive_integers(tmp_path, monkeypatch, field_name, value, entrypoint):
+    args = _args()
+    setup = Mock(side_effect=AssertionError("must fail before distributed setup"))
+    monkeypatch.setattr(dit_module.BaseTrainer, "_setup", setup)
+    if entrypoint == "parse":
+        config = asdict(args)
+        config["train"][field_name] = value
+        path = tmp_path / "dit.yaml"
+        path.write_text(yaml.safe_dump(config))
+        monkeypatch.setattr(sys, "argv", ["train_dit", str(path)])
+        with pytest.raises(ValueError, match="positive integer"):
+            parse_args(VeOmniDiTArguments)
+    else:
+        setattr(args.train, field_name, value)
+        with pytest.raises(ValueError, match="positive integer"):
+            DiTTrainer(args)
+    setup.assert_not_called()
+
+
+def test_unspecified_global_batch_size_is_derived():
+    args = VeOmniDiTArguments(
+        model=DiTModelArguments(config_path="unused", use_remove_padding=True),
+        data=DiTDataArguments(train_path="unused"),
+        train=DiTTrainingArguments(training_task="offline_training", dyn_bsz=False, micro_batch_size=2),
+    )
+    assert args.train.global_batch_size == 2 * args.model.accelerator.dp_size
+    assert args.train.gradient_accumulation_steps == 1
+
+
 def test_setup_preserves_enabled_microbatch_and_disabled_behavior(monkeypatch):
     monkeypatch.setattr(dit_module.BaseTrainer, "_setup", lambda self: None)
     monkeypatch.setattr(dit_module, "get_parallel_state", lambda: SimpleNamespace(dp_size=1))
