@@ -19,9 +19,39 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from veomni.distributed.offloading import build_activation_offloading_context, custom_save_on_cpu
 from veomni.trainer.omni.omni_trainer import cascade_module_reshard
+
+
+@pytest.mark.parametrize("num_micro_steps", [1, 2, 4])
+def test_forward_backward_step_averages_accumulated_gradients(num_micro_steps):
+    from veomni.trainer.omni.omni_trainer import OmniTrainer
+
+    parameter = torch.nn.Parameter(torch.tensor(2.0))
+    trainer = object.__new__(OmniTrainer)
+    trainer.args = SimpleNamespace(train=SimpleNamespace(enable_batch_invariant_mode=False))
+    trainer.preforward = lambda batch: batch
+    trainer._cascade_module_reshard = lambda *args: None
+    trainer.fwd_activation_offload_ctx = nullcontext()
+    trainer.bwd_activation_offload_ctx = nullcontext()
+
+    def forward(batch):
+        loss = (parameter * batch["input"]).square()
+        return {"loss": loss, "losses": {"node": loss}}
+
+    trainer.model = SimpleNamespace(forward=forward)
+    inputs = torch.arange(1, num_micro_steps + 1, dtype=torch.float32)
+    reference = parameter.detach().clone().requires_grad_()
+    (reference * inputs).square().mean().backward()
+    for micro_step, value in enumerate(inputs):
+        loss, losses = trainer.forward_backward_step(
+            {"input": value}, micro_step=micro_step, num_micro_steps=num_micro_steps
+        )
+        torch.testing.assert_close(loss.detach(), (parameter.detach() * value).square())
+        assert losses["node"] is loss
+    torch.testing.assert_close(parameter.grad, reference.grad)
 
 
 class _FakeModuleRuntime:
