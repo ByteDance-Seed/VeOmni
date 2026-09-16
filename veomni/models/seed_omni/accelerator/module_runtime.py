@@ -265,10 +265,11 @@ class ModuleRuntime(VeOmniModelRuntime):
         label = type(model).__name__
         if getattr(type(model), "preprocessor_class", None) is None:
             return
-        if any(
-            getattr(model, attr, None) is not None for attr in ("_image_processor", "_video_processor", "_tokenizer")
-        ):
-            return  # already bound by an earlier `from_pretrained` (e.g. eager inference)
+        # No "already bound?" test here: `bind_module_assets` is idempotent and
+        # decides per asset. Reading "some asset is set" as "this module is
+        # bound" is what used to cost a text encoder its image and video
+        # processors once anything had set its tokenizer -- the public
+        # `tokenizer` setter does exactly that.
         try:
             from ..processing.binding import bind_module_assets
 
