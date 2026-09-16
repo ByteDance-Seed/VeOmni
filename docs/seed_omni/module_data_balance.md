@@ -93,8 +93,17 @@ PR1 is [#1191](https://github.com/ByteDance-Seed/VeOmni/pull/1191). The full lau
 loss/token parity gate above is verified; final regression and review remain
 required before submitting this integration.
 Bagel SP inverse permutation and skewed per-rank wall-time/MFU remain PR3,
-after mixin-contract review. V1 migration/deletion remains PR4; this change does
-not claim that legacy retirement or the whole issue is complete.
+after mixin-contract review.
+
+The legacy `Qwen3VLEncoderDataBalance` compatibility entry points now delegate
+to the same `ModuleDataBalancer` and immutable `BalancePlan`: there is no second
+all-to-all transport. They retain independent image/video slots, raw-patch
+quadratic scheduling costs, spatially merged output splits and deepstack VJPs.
+Only new module consumers use the declarative API; the compatibility shim still
+captures its construction-time DP group and replaces a slot on repeated calls.
+It is not an invitation to wire legacy opt-in flags into SeedOmni V2.
+Bagel, production performance and eventual removal of compatibility flags/shim
+remain separate work; this change does not claim the whole issue is complete.
 
 Tensor fields must agree on trailing shape, dtype and `requires_grad` across
 the DP group, including empty owners. Rank-asymmetric autograd would omit
