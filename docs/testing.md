@@ -177,6 +177,13 @@ eager DSA/mHC with fused routed experts, so it does not qualify the SM90+
 kernel paths. The CPU duplicate-hash-route regression verifies that EP split
 counts match unique token/expert dispatch pairs; repeated routing weights are
 summed when combining outputs.
+The GPU CI also enumerates `test_deepseek_v4_expert_parallel_fixed_route_vjp_matches_fp32_reference`
+in `tests/models/test_deepseek_v4_fused_moe.py`: four-rank EP=4, unequal token
+payloads, ordinary and duplicate expert slots, and three held-out seeds. Output,
+input/routing gradients and expert-weight gradients are compared with a global
+FP32 mathematical VJP using the same BF16 bit patterns and the rounding budget
+described below. This isolates expert transport/kernel numerics, not FSDP2
+gradient averaging or whole-model optimizer trajectories.
 
 `test_deepseek_v4_compiled_fsdp2_training_alignment` in the same file compares
 eager and fullgraph Inductor through four-rank packed FSDP2 training, with
