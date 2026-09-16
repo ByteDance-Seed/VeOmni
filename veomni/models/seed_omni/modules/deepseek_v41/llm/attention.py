@@ -202,6 +202,33 @@ class CompressionPlan:
         return (groups >= self.range_starts.unsqueeze(-1)) & (groups < self.range_ends.unsqueeze(-1))
 
 
+def sequence_slices_from_positions(position_ids: torch.Tensor) -> Tuple[Tuple[int, int], ...]:
+    """Recover the packed samples' ``[start, end)`` spans from their positions.
+
+    The packed collator restarts ``position_ids`` at zero on each sample, so a
+    zero is a boundary and there is nothing else to plumb. Deriving the spans
+    here rather than threading them down from the collator keeps the one thing
+    that must agree -- which tokens belong to which sample -- reading from a
+    single source: the same tensor the causal masks and the sliding window
+    already use. A separately-passed span list could disagree with the positions,
+    and the model would compress across a boundary while the window did not.
+
+    An unpacked row has one zero, at index 0, and comes back as the single span
+    covering it. That is the same construction rather than a special case.
+    """
+    if position_ids.ndim != 2:
+        raise ValueError(f"expected [batch, seq_len] position ids, got {position_ids.ndim} dims")
+    seq_len = position_ids.shape[1]
+    starts = (position_ids[0] == 0).nonzero(as_tuple=True)[0].tolist()
+    if not starts or starts[0] != 0:
+        raise ValueError(
+            "position ids must start a sample at index 0; got a row whose first position is "
+            f"{int(position_ids[0, 0])}. Decode-time offsets are not a training input."
+        )
+    ends = starts[1:] + [seq_len]
+    return tuple(zip(starts, ends))
+
+
 def build_compression_plans(
     config: DeepseekV41LlmConfig,
     position_ids: torch.Tensor,
@@ -836,4 +863,5 @@ __all__ = [
     "build_compression_plans",
     "indexer_kl_terms",
     "select_candidate_blocks",
+    "sequence_slices_from_positions",
 ]
