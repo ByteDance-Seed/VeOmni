@@ -26,8 +26,16 @@ class DeepseekV41NgramConfig(PretrainedConfig):
     ``text_config``; none is invented here. The row counts in
     ``num_embeddings`` are *derived* upstream rather than free parameters --
     each engram layer draws ``(max_ngram_size - 1) * n_heads`` distinct primes
-    just above ``vocab_size`` and sums them -- so they are stored rather than
-    recomputed, and :meth:`validate_bucket_layout` checks the two agree.
+    just above ``hash_vocab_size`` and sums them -- so they are stored rather
+    than recomputed, and :meth:`validate_bucket_layout` checks the two agree.
+
+    **Two vocabulary sizes, and they are three orders of magnitude apart.**
+    ``vocab_size`` (129280) is the tokenizer's, and is what ``token_map`` is
+    indexed by. ``hash_vocab_size`` (16000000) is the base the bucket primes are
+    drawn above, and has nothing to do with how many tokens exist. The released
+    config keeps them apart as ``vocab_size`` and ``engram_vocab_size``; folding
+    them into one field sizes ``token_map`` at 16M int64 rows and makes the
+    convert step demand a tokenizer with 16M tokens.
 
     ``wkv`` and the gate are deliberately NOT here: they read the backbone's
     mHC residual stream and therefore belong to ``deepseek_v41_llm`` (the
@@ -48,7 +56,8 @@ class DeepseekV41NgramConfig(PretrainedConfig):
         max_ngram_size: int = 4,
         n_heads: int = 8,
         head_dim: int = 256,
-        vocab_size: int = 16000000,
+        vocab_size: int = 129280,
+        hash_vocab_size: int = 16000000,
         compressed_vocab_size: int = 99092,
         pad_token_id: int = 2,
         freeze: bool = False,
@@ -60,6 +69,7 @@ class DeepseekV41NgramConfig(PretrainedConfig):
         self.n_heads = n_heads
         self.head_dim = head_dim
         self.vocab_size = vocab_size
+        self.hash_vocab_size = hash_vocab_size
         self.compressed_vocab_size = compressed_vocab_size
         self.freeze = freeze
         super().__init__(pad_token_id=pad_token_id, **kwargs)
@@ -84,11 +94,11 @@ class DeepseekV41NgramConfig(PretrainedConfig):
                 f"num_embeddings has {len(self.num_embeddings)} entries but layer_ids has "
                 f"{len(self.layer_ids)}: one table per engram layer is required."
             )
-        floor = self.n_hash_cols * self.vocab_size
+        floor = self.n_hash_cols * self.hash_vocab_size
         for layer_id, rows in zip(self.layer_ids, self.num_embeddings):
             if rows < floor:
                 raise ValueError(
                     f"engram layer {layer_id}: num_embeddings={rows} is below the "
-                    f"{self.n_hash_cols} x vocab_size={self.vocab_size} = {floor} floor, so the "
+                    f"{self.n_hash_cols} x hash_vocab_size={self.hash_vocab_size} = {floor} floor, so the "
                     "drawn primes cannot fit. A truncated table silently reads wrong rows."
                 )

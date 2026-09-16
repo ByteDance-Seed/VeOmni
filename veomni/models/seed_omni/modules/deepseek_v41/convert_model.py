@@ -374,8 +374,11 @@ def convert_ngram(source: TensorSource, output_dir: str, config, model_path: str
         )
     if len(lookup) != config.vocab_size:
         raise ValueError(
-            f"the tokenizer has {len(lookup)} tokens but the config declares vocab_size="
-            f"{config.vocab_size}; token_map is indexed by raw token id."
+            f"the tokenizer at {model_path} has {len(lookup)} tokens but the config declares "
+            f"vocab_size={config.vocab_size}. token_map is indexed by raw token id, so a short map "
+            "would index out of bounds on the tail of the vocabulary and a long one would bake rows "
+            "no token can reach. (This is the tokenizer's size, not hash_vocab_size="
+            f"{config.hash_vocab_size}, which is the base the bucket primes are drawn above.)"
         )
 
     writer = ShardWriter(os.path.join(output_dir, "deepseek_v41_ngram"))
@@ -517,7 +520,10 @@ def _build_configs(hf_config: Dict[str, Any]):
         max_ngram_size=text["engram_max_ngram_size"],
         n_heads=text["engram_n_heads"],
         head_dim=text["engram_head_dim"],
-        vocab_size=text["engram_vocab_size"],
+        # Two different sizes: the tokenizer's, which indexes token_map, and the
+        # base the bucket primes are drawn above. See DeepseekV41NgramConfig.
+        vocab_size=text["vocab_size"],
+        hash_vocab_size=text["engram_vocab_size"],
         compressed_vocab_size=text["engram_compressed_vocab_size"],
         pad_token_id=text["engram_pad_token_id"],
     )

@@ -223,6 +223,7 @@ class TestMaskReachesTheHashing:
             n_heads=2,
             head_dim=8,
             vocab_size=64,
+            hash_vocab_size=64,
             compressed_vocab_size=32,
             pad_token_id=PAD,
         )
@@ -235,6 +236,49 @@ class TestMaskReachesTheHashing:
         compressed = model.compress(ids, mask)
         assert (compressed[0, 2:5] == DEAD).all()
         assert (compressed[0, :2] != DEAD).all() and compressed[0, 5] != DEAD
+
+
+class TestTheTwoVocabSizes:
+    """``vocab_size`` (129280, the tokenizer's) and ``hash_vocab_size``
+    (16000000, the base the bucket primes are drawn above) are unrelated
+    quantities three orders of magnitude apart. Folding them into one field
+    sizes ``token_map`` at 16M int64 rows and makes the convert step ask for a
+    tokenizer with 16M tokens -- which is how this was found."""
+
+    @staticmethod
+    def _config(**overrides):
+        from veomni.models.seed_omni.modules.deepseek_v41.ngram.configuration import DeepseekV41NgramConfig
+
+        fields = dict(
+            layer_ids=[0],
+            num_embeddings=[1024],
+            max_ngram_size=4,
+            n_heads=2,
+            head_dim=8,
+            vocab_size=64,
+            hash_vocab_size=64,
+            compressed_vocab_size=32,
+            pad_token_id=PAD,
+        )
+        fields.update(overrides)
+        return DeepseekV41NgramConfig(**fields)
+
+    def test_released_defaults_keep_them_apart(self):
+        config = self._config(vocab_size=129280, hash_vocab_size=16000000, num_embeddings=[384006168])
+        assert (config.vocab_size, config.hash_vocab_size) == (129280, 16000000)
+
+    def test_token_map_is_sized_by_the_tokenizer(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.ngram.modeling import DeepseekV41Ngram
+
+        model = DeepseekV41Ngram(self._config(vocab_size=48, hash_vocab_size=64))
+        assert model.token_map.shape == (48,)
+
+    def test_the_bucket_floor_follows_the_hash_base(self):
+        """``num_embeddings`` sized against the tokenizer instead would pass a
+        floor 250x too low and leave the tables reading wrong rows."""
+        with pytest.raises(ValueError, match="hash_vocab_size"):
+            self._config(hash_vocab_size=1024, num_embeddings=[1024]).validate_bucket_layout()
+        self._config(hash_vocab_size=64, num_embeddings=[1024]).validate_bucket_layout()
 
 
 class TestFreeze:
@@ -256,6 +300,7 @@ class TestFreeze:
             n_heads=2,
             head_dim=8,
             vocab_size=64,
+            hash_vocab_size=64,
             compressed_vocab_size=32,
             pad_token_id=PAD,
             freeze=freeze,

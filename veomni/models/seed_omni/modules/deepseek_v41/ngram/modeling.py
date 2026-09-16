@@ -74,7 +74,9 @@ class DeepseekV41Ngram(OmniPreTrainedModel):
 
         self.tables = nn.ModuleList([nn.Embedding(rows, config.head_dim) for rows in config.num_embeddings])
 
-        primes = build_bucket_primes(len(config.layer_ids), config.max_ngram_size, config.n_heads, config.vocab_size)
+        primes = build_bucket_primes(
+            len(config.layer_ids), config.max_ngram_size, config.n_heads, config.hash_vocab_size
+        )
         self.register_buffer("primes", torch.tensor(primes), persistent=False)
         self.register_buffer("offsets", build_bucket_offsets(primes), persistent=False)
         self.register_buffer(
@@ -83,6 +85,7 @@ class DeepseekV41Ngram(OmniPreTrainedModel):
             persistent=False,
         )
         # Persistent: produced by the convert step from the tokenizer (see class docstring).
+        # Sized by the *tokenizer's* vocab, not the hash base -- it is indexed by raw token id.
         self.register_buffer("token_map", torch.zeros(config.vocab_size, dtype=torch.int64), persistent=True)
         self.post_init()
 
