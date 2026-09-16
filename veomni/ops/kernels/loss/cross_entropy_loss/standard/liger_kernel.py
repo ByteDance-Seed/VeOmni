@@ -72,16 +72,14 @@ def forward(
     from liger_kernel.ops.fused_linear_cross_entropy import fused_linear_cross_entropy_forward
 
     hidden_flat, labels_flat = _eager.flatten_tokens(hidden, labels)
-    # ``Function.forward`` runs with autograd disabled. A fresh ``contiguous()``
-    # copy then has ``requires_grad=False``, and Liger skips grad buffers.
-    hidden_flat = hidden_flat.contiguous()
-    weight_c = weight.contiguous()
-    # Liger gates both grad buffers on the input's ``requires_grad`` flag.
-    # Force it on when either input needs a gradient, then discard unrequested
-    # gradients in ``backward``.
-    if (hidden_needs_grad or weight_needs_grad) and not hidden_flat.requires_grad:
+    # Liger reads tensor ``requires_grad``, not the caller ``no_grad``. A
+    # contiguous trainable leaf is a no-op copy and would still allocate the
+    # ``V×H`` weight buffer. Detach first, then re-enable only requested grads.
+    hidden_flat = hidden_flat.detach().contiguous()
+    weight_c = weight.detach().contiguous()
+    if hidden_needs_grad or weight_needs_grad:
         hidden_flat.requires_grad_(True)
-    if weight_needs_grad and not weight_c.requires_grad:
+    if weight_needs_grad:
         weight_c.requires_grad_(True)
     reduction = "sum" if num_items_in_batch is not None else "mean"
     loss, _z_loss, _token_accuracy, grad_hidden, grad_weight, _grad_bias = fused_linear_cross_entropy_forward(

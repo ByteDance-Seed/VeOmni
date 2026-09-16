@@ -238,6 +238,15 @@ def test_create_standard_causal_mask_marks_only_when_attention_mask_is_none():
         translate_fused_dsa_mask(padded, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
 
 
+def _overlay_false(batch_idx, head_idx, q_idx, kv_idx):
+    """HF overlay that returns a 0-d bool tensor on the query device."""
+    del batch_idx, head_idx
+    index = q_idx if torch.is_tensor(q_idx) else kv_idx
+    if torch.is_tensor(index):
+        return index.new_zeros((), dtype=torch.bool)
+    return torch.zeros((), dtype=torch.bool)
+
+
 def test_create_standard_causal_mask_marks_packed_and_overlay_as_custom(monkeypatch):
     from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
@@ -278,17 +287,47 @@ def test_create_standard_causal_mask_marks_packed_and_overlay_as_custom(monkeypa
         attention_mask=None,
         past_key_values=None,
         position_ids=torch.arange(seq_len).unsqueeze(0),
-        or_mask_function=lambda *args: torch.tensor(True, dtype=torch.bool),
+        or_mask_function=_overlay_false,
+    )
+    positional_overlay = create_standard_causal_mask(
+        config,
+        embeds,
+        None,
+        None,
+        torch.arange(seq_len).unsqueeze(0),
+        _overlay_false,
+    )
+    bidirectional_config = GlmMoeDsaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        attn_implementation="eager",
+    )
+    bidirectional_config.is_causal = False
+    bidirectional = create_standard_causal_mask(
+        config=bidirectional_config,
+        inputs_embeds=embeds,
+        attention_mask=None,
+        past_key_values=None,
+        position_ids=torch.arange(seq_len).unsqueeze(0),
     )
     assert packed is not None and dsa_mask_provenance(packed) == CUSTOM
     assert gapped is not None and dsa_mask_provenance(gapped) == CUSTOM
     assert overlay is not None and dsa_mask_provenance(overlay) == CUSTOM
+    assert positional_overlay is not None and dsa_mask_provenance(positional_overlay) == CUSTOM
+    assert bidirectional is not None and dsa_mask_provenance(bidirectional) == CUSTOM
     with pytest.raises(ValueError, match="eager implementation"):
         translate_fused_dsa_mask(packed, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
     with pytest.raises(ValueError, match="eager implementation"):
         translate_fused_dsa_mask(gapped, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
     with pytest.raises(ValueError, match="eager implementation"):
         translate_fused_dsa_mask(overlay, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
+    with pytest.raises(ValueError, match="eager implementation"):
+        translate_fused_dsa_mask(positional_overlay, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
+    with pytest.raises(ValueError, match="eager implementation"):
+        translate_fused_dsa_mask(bidirectional, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
 
 
 def test_copy_dsa_mask_provenance_survives_head_slice(monkeypatch):

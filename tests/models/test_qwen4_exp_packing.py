@@ -1,4 +1,3 @@
-import copy
 import importlib
 
 import torch
@@ -44,7 +43,8 @@ def test_qwen4_exp_packed_matches_separate_outputs_and_gradients():
         config.use_cache = False
         text_model_cls = _load_text_model_class()
         packed_model = text_model_cls(config).float().eval()
-        separate_model = copy.deepcopy(packed_model)
+        separate_model = text_model_cls(config).float().eval()
+        separate_model.load_state_dict(packed_model.state_dict())
 
         packed_seq_lens = (5, 7)
         input_ids = torch.randint(0, config.vocab_size, (1, sum(packed_seq_lens)))

@@ -248,6 +248,44 @@ def test_qwen3_5_sdpa_packed_sequences_are_isolated(ops_factory):
 @pytest.mark.parametrize(
     "ops_factory",
     [
+        lambda: _sdpa_simple_ops(),
+        lambda: _sdpa_public_ops(),
+    ],
+    ids=["sdpa", "veomni_sdpa"],
+)
+def test_qwen3_5_sdpa_editing_first_packed_sample_does_not_move_second(ops_factory):
+    torch.manual_seed(0)
+    ops = ops_factory()
+    config = _tiny_text_config(layer_types=["full_attention", "full_attention"])
+    model = _build_causal(config, ops).eval()
+    packed_input_ids = torch.tensor([[5, 6, 7, 8, 9, 10, 11, 12]])
+    edited_input_ids = packed_input_ids.clone()
+    edited_input_ids[0, 0] = 20
+    packed_position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
+    packed_cu = torch.tensor([0, 4, 8], dtype=torch.int32)
+    attention_mask = torch.ones_like(packed_input_ids)
+    with ops_config_scope(ops), torch.no_grad():
+        base_logits = model(
+            input_ids=packed_input_ids,
+            attention_mask=attention_mask,
+            position_ids=packed_position_ids,
+            cu_seq_lens_q=packed_cu,
+            use_cache=False,
+        ).logits
+        edited_logits = model(
+            input_ids=edited_input_ids,
+            attention_mask=attention_mask,
+            position_ids=packed_position_ids,
+            cu_seq_lens_q=packed_cu,
+            use_cache=False,
+        ).logits
+    torch.testing.assert_close(base_logits[:, 4:], edited_logits[:, 4:], rtol=1e-5, atol=1e-5)
+    assert not torch.equal(base_logits[:, :4], edited_logits[:, :4])
+
+
+@pytest.mark.parametrize(
+    "ops_factory",
+    [
         lambda: eager_ops_config(),
         lambda: _sdpa_simple_ops(),
         lambda: _sdpa_public_ops(),

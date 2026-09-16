@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeConfig,
@@ -237,3 +238,97 @@ def test_qwen3_5_moe_sdpa_full_attention_accepts_single_sequence_cu_seq_lens_q()
             cu_seq_lens_q=torch.tensor([0, 32], dtype=torch.int32),
         )
     assert torch.isfinite(output.logits).all()
+
+
+def _sdpa_simple_ops():
+    ops = eager_ops_config()
+    ops.attn_implementation = "sdpa"
+    return ops
+
+
+def _sdpa_public_ops():
+    from tests.tools.training_utils import make_eager_ops_config
+
+    return make_eager_ops_config(attn_implementation="sdpa")
+
+
+@pytest.mark.parametrize(
+    "ops_factory",
+    [
+        lambda: _sdpa_simple_ops(),
+        lambda: _sdpa_public_ops(),
+    ],
+    ids=["sdpa", "veomni_sdpa"],
+)
+def test_qwen3_5_moe_sdpa_packed_sequences_are_isolated(ops_factory):
+    torch.manual_seed(0)
+    ops = ops_factory()
+    config = _tiny_text_config(layer_types=["full_attention", "full_attention"])
+    model = _build_causal(config, ops).eval()
+    first_input_ids = torch.tensor([[5, 6, 7, 8]])
+    second_input_ids = torch.tensor([[9, 10, 11, 12]])
+    packed_input_ids = torch.cat((first_input_ids, second_input_ids), dim=1)
+    packed_position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
+    packed_cu = torch.tensor([0, 4, 8], dtype=torch.int32)
+    with ops_config_scope(ops), torch.no_grad():
+        packed_logits = model(
+            input_ids=packed_input_ids,
+            attention_mask=torch.ones_like(packed_input_ids),
+            position_ids=packed_position_ids,
+            cu_seq_lens_q=packed_cu,
+            use_cache=False,
+        ).logits
+        first_logits = model(
+            input_ids=first_input_ids,
+            attention_mask=torch.ones_like(first_input_ids),
+            position_ids=torch.arange(4).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 4], dtype=torch.int32),
+            use_cache=False,
+        ).logits
+        second_logits = model(
+            input_ids=second_input_ids,
+            attention_mask=torch.ones_like(second_input_ids),
+            position_ids=torch.arange(4).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 4], dtype=torch.int32),
+            use_cache=False,
+        ).logits
+    torch.testing.assert_close(packed_logits[:, :4], first_logits, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(packed_logits[:, 4:], second_logits, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "ops_factory",
+    [
+        lambda: _sdpa_simple_ops(),
+        lambda: _sdpa_public_ops(),
+    ],
+    ids=["sdpa", "veomni_sdpa"],
+)
+def test_qwen3_5_moe_sdpa_editing_first_packed_sample_does_not_move_second(ops_factory):
+    torch.manual_seed(0)
+    ops = ops_factory()
+    config = _tiny_text_config(layer_types=["full_attention", "full_attention"])
+    model = _build_causal(config, ops).eval()
+    packed_input_ids = torch.tensor([[5, 6, 7, 8, 9, 10, 11, 12]])
+    edited_input_ids = packed_input_ids.clone()
+    edited_input_ids[0, 0] = 20
+    packed_position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
+    packed_cu = torch.tensor([0, 4, 8], dtype=torch.int32)
+    attention_mask = torch.ones_like(packed_input_ids)
+    with ops_config_scope(ops), torch.no_grad():
+        base_logits = model(
+            input_ids=packed_input_ids,
+            attention_mask=attention_mask,
+            position_ids=packed_position_ids,
+            cu_seq_lens_q=packed_cu,
+            use_cache=False,
+        ).logits
+        edited_logits = model(
+            input_ids=edited_input_ids,
+            attention_mask=attention_mask,
+            position_ids=packed_position_ids,
+            cu_seq_lens_q=packed_cu,
+            use_cache=False,
+        ).logits
+    torch.testing.assert_close(base_logits[:, 4:], edited_logits[:, 4:], rtol=1e-5, atol=1e-5)
+    assert not torch.equal(base_logits[:, :4], edited_logits[:, :4])

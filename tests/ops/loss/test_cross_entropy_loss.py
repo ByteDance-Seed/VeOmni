@@ -235,6 +235,63 @@ def test_ce_rows_skip_grads_under_no_grad(monkeypatch: pytest.MonkeyPatch, impl:
     assert torch.isfinite(loss).all()
 
 
+def test_liger_adapter_detaches_vendor_inputs_when_grad_disabled(monkeypatch: pytest.MonkeyPatch):
+    """Adapter contract: vendor sees detached inputs when the caller disables grads."""
+    liger_ce = pytest.importorskip("liger_kernel.ops.fused_linear_cross_entropy")
+    from veomni.ops.kernels.loss.cross_entropy_loss.standard import liger_kernel as liger_row
+
+    captured: dict[str, object] = {}
+
+    def spy(_input, weight, target, **kwargs):
+        captured["input_requires_grad"] = _input.requires_grad
+        captured["weight_requires_grad"] = weight.requires_grad
+        captured["grad_weight"] = None
+        return _input.new_zeros(()), None, None, None, None, None
+
+    monkeypatch.setattr(liger_ce, "fused_linear_cross_entropy_forward", spy)
+    hidden = torch.randn(2, 4, 8, requires_grad=True)
+    weight = torch.randn(6, 8, requires_grad=True)
+    labels = torch.randint(0, 6, (2, 4))
+    loss, _saved = liger_row.forward(hidden, labels, weight, grad_enabled=False)
+    assert captured["input_requires_grad"] is False
+    assert captured["weight_requires_grad"] is False
+    assert captured["grad_weight"] is None
+    assert loss.requires_grad is False
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
+def test_liger_skips_vendor_weight_grad_buffer_under_no_grad(monkeypatch: pytest.MonkeyPatch):
+    """Detach vendor inputs so Liger does not allocate the ``V×H`` weight buffer."""
+    pytest.importorskip("liger_kernel")
+    from liger_kernel.ops import fused_linear_cross_entropy as liger_ce
+
+    captured: dict[str, object] = {}
+    real = liger_ce.fused_linear_cross_entropy_forward
+
+    def spy(*args, **kwargs):
+        hidden = args[0] if args else kwargs["_input"]
+        weight = args[1] if len(args) > 1 else kwargs["weight"]
+        result = real(*args, **kwargs)
+        captured["input_requires_grad"] = hidden.requires_grad
+        captured["weight_requires_grad"] = weight.requires_grad
+        captured["grad_hidden"] = result[3]
+        captured["grad_weight"] = result[4]
+        return result
+
+    monkeypatch.setattr(liger_ce, "fused_linear_cross_entropy_forward", spy)
+    torch.manual_seed(6)
+    hidden = torch.randn(2, 4, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(6, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.randint(0, 6, (2, 4), device="cuda")
+    with torch.no_grad():
+        loss = resolve_op("cross_entropy_loss", "standard", "liger_kernel").wrapper(hidden, labels, weight)
+    assert captured["input_requires_grad"] is False
+    assert captured["weight_requires_grad"] is False
+    assert captured["grad_weight"] is None
+    assert loss.requires_grad is False
+    assert torch.isfinite(loss).all()
+
+
 def test_eager_fp16_logits_do_not_overflow_outside_cross_entropy():
     logits = torch.ones(128, 1024, dtype=torch.float16)
     labels = torch.zeros(128, dtype=torch.long)

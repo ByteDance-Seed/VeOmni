@@ -80,32 +80,62 @@ def _position_ids_break_standard_causal(position_ids: Tensor | None) -> bool:
     return bool((ids[..., 1:] - ids[..., :-1] != 1).any())
 
 
-def _has_mask_overlay(**kwargs: object) -> bool:
+_CREATE_CAUSAL_MASK_POSITIONALS = (
+    "config",
+    "inputs_embeds",
+    "attention_mask",
+    "past_key_values",
+    "position_ids",
+    "or_mask_function",
+    "and_mask_function",
+    "block_sequence_ids",
+)
+
+
+def _bound_create_causal_mask_args(*args: object, **kwargs: object) -> dict[str, object]:
+    """Map HF positional ``create_causal_mask`` args onto the keyword names."""
+    bound = dict(kwargs)
+    for name, value in zip(_CREATE_CAUSAL_MASK_POSITIONALS, args, strict=False):
+        bound.setdefault(name, value)
+    return bound
+
+
+def _has_mask_overlay(bound: dict[str, object]) -> bool:
     """HF extras that overlay a non-standard triangle onto the causal mask."""
-    return any(
-        kwargs.get(name) is not None for name in ("or_mask_function", "and_mask_function", "block_sequence_ids")
-    )
+    return any(bound.get(name) is not None for name in ("or_mask_function", "and_mask_function", "block_sequence_ids"))
+
+
+def _breaks_standard_causal(bound: dict[str, object]) -> bool:
+    """Whether HF would build anything other than a plain causal triangle."""
+    config = bound.get("config")
+    if config is not None and not getattr(config, "is_causal", True):
+        return True
+    if _has_mask_overlay(bound):
+        return True
+    position_ids = bound.get("position_ids")
+    return _position_ids_break_standard_causal(position_ids if isinstance(position_ids, Tensor) else None)
 
 
 def create_standard_causal_mask(*args, **kwargs) -> Tensor | None:
     """HF ``create_causal_mask``, marked only for a no-padding standard triangle.
 
-    Packed ``position_ids`` and HF overlay kwargs are marked custom so fused
-    translate can reject them without scanning the 4-D mask. A 2-D padding mask
-    stays unmarked and still goes through ``is_standard_causal_mask``.
+    Packed ``position_ids``, overlay functions passed by name or position,
+    ``config.is_causal=False``, and HF overlay kwargs are marked custom so
+    fused translate can reject them without scanning the 4-D mask. A 2-D
+    padding mask stays unmarked and still goes through ``is_standard_causal_mask``.
     """
     from transformers.masking_utils import create_causal_mask
 
-    mask = create_causal_mask(*args, **kwargs)
-    attention_mask = kwargs.get("attention_mask")
-    if attention_mask is None and len(args) >= 3:
-        attention_mask = args[2]
-    position_ids = kwargs.get("position_ids")
-    if position_ids is None and len(args) >= 5:
-        position_ids = args[4]
-    if mask is not None and (_has_mask_overlay(**kwargs) or _position_ids_break_standard_causal(position_ids)):
+    bound = _bound_create_causal_mask_args(*args, **kwargs)
+    if _breaks_standard_causal(bound):
+        # Bidirectional skip is ``None``, the same sentinel fused DSA uses for
+        # standard causal. Force a materialized mask and mark it custom.
+        mask = create_causal_mask(*args, **{**kwargs, "allow_is_causal_skip": False})
+        if mask is None:
+            raise ValueError("non-standard causal mask must materialize so fused DSA can reject it")
         return mark_custom_dsa_mask(mask)
-    if attention_mask is None:
+    mask = create_causal_mask(*args, **kwargs)
+    if bound.get("attention_mask") is None:
         return mark_standard_causal_mask(mask)
     return mask
 
