@@ -225,7 +225,7 @@ class GlobalStateCallback(Callback):
         if os.path.exists(loader_file):
             merged.update(torch.load(loader_file, map_location="cpu", weights_only=False))
         else:
-            logger.warning_rank0(f"No dataloader cursor at {loader_file}; the dataloader restarts from its beginning.")
+            logger.warning(f"No dataloader cursor at {loader_file}; the dataloader restarts from its beginning.")
         return merged
 
     def load_global_state(self) -> Optional[Dict[str, Any]]:

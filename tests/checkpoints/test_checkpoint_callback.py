@@ -64,7 +64,7 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
     trainer.state = TrainerState()
     trainer.start_epoch = 0
     trainer.start_step = 0
-    trainer.checkpoint = MagicMock()
+    trainer.model.checkpoint = MagicMock()
 
     return trainer
 
@@ -468,7 +468,7 @@ class TestGlobalStateCallbackJobState:
 
         cb.save_global_state(TrainerState(global_step=10))
 
-        trainer.checkpoint.wait_for_pending_save.assert_not_called()
+        trainer.model.checkpoint.wait_for_pending_save.assert_not_called()
         step = tmp_path / "global_step_10"
         assert (step / "extra_state" / "rank_0.pt").is_file()
         assert (step / "loader" / "rank_0.pt").is_file()

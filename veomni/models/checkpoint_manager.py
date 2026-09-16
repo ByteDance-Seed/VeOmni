@@ -89,15 +89,22 @@ class ModelCheckpointManager:
         self.runtime = runtime
         self.config: "CheckpointConfig" = runtime.train.checkpoint
         self._last_saved_step: int = -1
-        # This runtime's mesh, looked up by name at construction — not the
-        # ambient get_parallel_state(). build_checkpoint() runs outside the
-        # runtime's use_parallel_state scope, so ambient is still "base" while
-        # a DPO policy or an Omni module is registered under its own name.
-        self.parallel_state = runtime.parallel_state
         self.checkpointer: CheckpointerBase = build_checkpointer(
             ckpt_manager=self.config.manager,
             dist_backend=runtime.args.accelerator.fsdp_config.fsdp_mode,
         )
+
+    @property
+    def parallel_state(self):
+        """This model's mesh, via the runtime's by-name registry lookup.
+
+        Not the ambient ``get_parallel_state()``: ``build_checkpoint()`` runs
+        outside the runtime's ``use_parallel_state`` scope, so ambient is still
+        ``"base"`` while a DPO policy or an Omni module is registered under its
+        own name. A property rather than a cached object, so a re-registered
+        mesh is picked up the same way ``VeOmniModelRuntime.parallel_state`` is.
+        """
+        return self.runtime.parallel_state
 
     @property
     def last_saved_step(self) -> int:

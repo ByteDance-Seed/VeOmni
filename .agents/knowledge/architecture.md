@@ -129,7 +129,7 @@ BaseRLTrainer (ABC)  subclasses BaseTrainer
 
 then, outside that scope (these do not need ambient groups):
 - `_build_model_assets()` -> the preprocessor this model reads inputs through, the `model_assets` sidecars an export writes beside its weights, and `chat_template` when the job named one
-- `build_checkpoint()` -> a `ModelCheckpointManager` that caches `runtime.parallel_state` (by-name lookup), not the ambient mesh — construction sits outside the with-block, so ambient is still `"base"`
+- `build_checkpoint()` -> a `ModelCheckpointManager` that reads `runtime.parallel_state` (by-name lookup) on every access, not the ambient mesh — construction sits outside the with-block, so ambient is still `"base"`
 
 and past construction:
 - `_build_lr_scheduler(total_steps)` -> left to the trainer, since `total_steps` is only known once the dataset is built
