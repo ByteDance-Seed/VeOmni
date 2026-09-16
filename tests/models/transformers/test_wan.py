@@ -262,6 +262,35 @@ def test_wan_async_self_attn_uses_full_sequence_freqs(monkeypatch):
     assert output.shape == (1, full_seq, dim)
 
 
+def test_rope_freqs_for_block_matches_sp_async():
+    from veomni.models.transformers.wan.modeling_wan import _rope_freqs_for_block, precompute_freqs_cis
+
+    freqs_full = precompute_freqs_cis(8, end=32).reshape(32, 1, -1)
+    freqs_local = freqs_full[:8]
+    full, cos_full, _ = _rope_freqs_for_block(freqs_full, freqs_local, sp_async=True)
+    local, cos_local, _ = _rope_freqs_for_block(freqs_full, freqs_local, sp_async=False)
+    assert full.shape[0] == 32
+    assert local.shape[0] == 8
+    assert cos_full.shape[0] == 32
+    assert cos_local.shape[0] == 8
+
+
+def test_wan_mixed_sp_async_is_rejected_under_ulysses(monkeypatch):
+    from veomni.models.transformers.wan.modeling_wan import WanModel
+
+    class FakeState:
+        ulysses_enabled = True
+
+    monkeypatch.setattr(wan_modeling, "get_parallel_state", lambda: FakeState())
+    config = _tiny_config()
+    with ops_config_scope(eager_ops_config()):
+        model = WanModel(config)
+    model.blocks[0].self_attn.sp_async = False
+    model.blocks[1].self_attn.sp_async = True
+    with pytest.raises(ValueError, match="same SelfAttention.sp_async mode"):
+        model(**_wan_inputs(in_dim=4, text_len=8, text_dim=16))
+
+
 def test_wan_eager_matches_official():
     torch.manual_seed(0)
     official = RefWanModel(_tiny_ref_config())

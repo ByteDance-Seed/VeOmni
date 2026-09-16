@@ -265,3 +265,25 @@ def test_qwen3_omni_moe_merged_experts_match_hf_for_hidden_act(hidden_act):
     config.hidden_act = hidden_act
     hf, ours, counter = _pair(Qwen3OmniMoeThinkerTextExperts, HFQwen3OmniMoeThinkerTextExperts, config)
     _assert_matches(hf, ours, counter, *_moe_expert_inputs(config))
+
+
+def test_merged_experts_act_fn_forward_rejects_ep_sharded_weights_without_ep():
+    from transformers.activations import ACT2FN
+
+    from veomni.models.utils.op_utils import merged_experts_act_fn_forward
+
+    hidden = torch.randn(3, 4)
+    top_k_index = torch.tensor([[3], [3], [3]], dtype=torch.long)
+    top_k_weights = torch.ones(3, 1)
+    gate_up_proj = torch.randn(2, 8, 4)
+    down_proj = torch.randn(2, 4, 4)
+    with pytest.raises(ValueError, match="expert-parallel sharded weights"):
+        merged_experts_act_fn_forward(
+            hidden,
+            top_k_index,
+            top_k_weights,
+            gate_up_proj,
+            down_proj,
+            ACT2FN["gelu"],
+            num_experts=4,
+        )

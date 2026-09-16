@@ -106,7 +106,7 @@ def test_resolve_moe_impl_reads_ops_config():
     assert resolve_moe_impl() == "eager"
 
 
-@pytest.mark.parametrize("impl", ["eager", "sdpa"])
+@pytest.mark.parametrize("impl", ["eager", "sdpa", "veomni_sdpa"])
 def test_drop_packed_attention_metadata_strips_gdn_keys_for_sdpa_and_eager(impl):
     from veomni.models.utils.op_utils import drop_packed_attention_metadata
 
@@ -119,6 +119,41 @@ def test_drop_packed_attention_metadata_strips_gdn_keys_for_sdpa_and_eager(impl)
     assert "cu_seq_lens_q" not in filtered
     assert "max_length_q" not in filtered
     assert filtered["keep"] == 1
+    assert "cu_seq_lens_q" in kwargs
+
+
+def test_prepare_dense_attention_inputs_builds_packed_mask_for_multi_segment():
+    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+
+    hidden = torch.randn(1, 8, 4)
+    kwargs = {"cu_seq_lens_q": torch.tensor([0, 4, 8], dtype=torch.int32), "keep": 1}
+    attention_mask = torch.ones(1, 8, dtype=torch.long)
+    filtered, packed_mask = prepare_dense_attention_inputs(
+        kwargs, impl="veomni_sdpa", attention_mask=attention_mask, hidden_states=hidden
+    )
+    assert "cu_seq_lens_q" not in filtered
+    assert filtered["keep"] == 1
+    assert packed_mask is not None
+    assert packed_mask.shape[-2:] == (8, 8)
+    # Token 4 (start of sample 1) must not see token 0 (sample 0).
+    q4_k0 = packed_mask[0, 0, 4, 0] if packed_mask.dtype == torch.bool else packed_mask[0, 0, 4, 0]
+    if packed_mask.dtype == torch.bool:
+        assert not bool(q4_k0)
+    else:
+        assert q4_k0 < 0
+
+
+def test_prepare_dense_attention_inputs_strips_single_segment_without_replacing_mask():
+    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+
+    hidden = torch.randn(1, 8, 4)
+    kwargs = {"cu_seq_lens_q": torch.tensor([0, 8], dtype=torch.int32)}
+    attention_mask = torch.ones(1, 8, dtype=torch.long)
+    filtered, mask = prepare_dense_attention_inputs(
+        kwargs, impl="sdpa", attention_mask=attention_mask, hidden_states=hidden
+    )
+    assert "cu_seq_lens_q" not in filtered
+    assert mask is attention_mask
 
 
 def test_drop_packed_attention_metadata_keeps_keys_for_flash():

@@ -265,18 +265,28 @@ def test_create_standard_causal_mask_marks_packed_and_overlay_as_custom(monkeypa
         past_key_values=None,
         position_ids=position_ids,
     )
+    gapped = create_standard_causal_mask(
+        config=config,
+        inputs_embeds=embeds,
+        attention_mask=None,
+        past_key_values=None,
+        position_ids=torch.tensor([[0, 1, 4, 5]]),
+    )
     overlay = create_standard_causal_mask(
         config=config,
         inputs_embeds=embeds,
         attention_mask=None,
         past_key_values=None,
         position_ids=torch.arange(seq_len).unsqueeze(0),
-        or_mask_function=lambda *args: True,
+        or_mask_function=lambda *args: torch.tensor(True, dtype=torch.bool),
     )
     assert packed is not None and dsa_mask_provenance(packed) == CUSTOM
+    assert gapped is not None and dsa_mask_provenance(gapped) == CUSTOM
     assert overlay is not None and dsa_mask_provenance(overlay) == CUSTOM
     with pytest.raises(ValueError, match="eager implementation"):
         translate_fused_dsa_mask(packed, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
+    with pytest.raises(ValueError, match="eager implementation"):
+        translate_fused_dsa_mask(gapped, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
     with pytest.raises(ValueError, match="eager implementation"):
         translate_fused_dsa_mask(overlay, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
 

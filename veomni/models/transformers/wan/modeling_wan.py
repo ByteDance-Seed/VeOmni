@@ -453,6 +453,12 @@ class Head(nn.Module):
         return self.head(modulated)
 
 
+def _rope_freqs_for_block(freqs_full: torch.Tensor, freqs_local: torch.Tensor, sp_async: bool):
+    """Pick full-sequence freqs for async DiT QKV, local freqs for sync Ulysses."""
+    freqs = freqs_full if sp_async else freqs_local
+    return freqs, freqs.real.squeeze().contiguous(), freqs.imag.squeeze().contiguous()
+
+
 class WanModel(PreTrainedModel):
     config_class = WanConfig
     _supports_flash_attn_2 = True
@@ -583,6 +589,12 @@ class WanModel(PreTrainedModel):
         unpadded_seq_len = x.shape[1]
         self_attn_mask = None
         if get_parallel_state().ulysses_enabled:
+            async_flags = [bool(getattr(block.self_attn, "sp_async", False)) for block in self.blocks]
+            if any(async_flags) and not all(async_flags):
+                raise ValueError(
+                    "Wan Ulysses requires every block to use the same SelfAttention.sp_async mode; "
+                    "mixed sync/async blocks disagree on whether hidden states and RoPE freqs are local or full-sequence."
+                )
             sp_size = get_ulysses_sequence_parallel_world_size()
             pad_size = (sp_size - unpadded_seq_len % sp_size) % sp_size
             padded_seq_len = unpadded_seq_len + pad_size
@@ -606,29 +618,30 @@ class WanModel(PreTrainedModel):
                 self_attn_mask[..., padded_seq_len - pad_size :] = torch.finfo(x.dtype).min
 
             x = slice_input_tensor_scale_grad(x, dim=1)
-            # Async DiT QKV already returns the full sequence. RoPE must see
-            # matching full-length freqs; slicing here is only for the sync path.
-            if not any(getattr(block.self_attn, "sp_async", False) for block in self.blocks):
-                freqs = slice_input_tensor_scale_grad(freqs, dim=0)
-
-        cos = freqs.real.squeeze().contiguous()
-        sin = freqs.imag.squeeze().contiguous()
+            # Async DiT QKV already returns the full sequence. Sync blocks keep
+            # the local slice. Select freqs per block rather than with ``any()``.
+            freqs_local = slice_input_tensor_scale_grad(freqs, dim=0)
+        else:
+            freqs_local = freqs
 
         for block in self.blocks:
+            freqs_b, cos_b, sin_b = _rope_freqs_for_block(
+                freqs, freqs_local, getattr(block.self_attn, "sp_async", False)
+            )
             if self.training and self.gradient_checkpointing:
                 x = self._gradient_checkpointing_func(
                     block.__call__,
                     x,
                     context,
                     t_mod,
-                    freqs,
-                    cos,
-                    sin,
+                    freqs_b,
+                    cos_b,
+                    sin_b,
                     last_loss=last_loss,
                     self_attn_mask=self_attn_mask,
                 )
             else:
-                x = block(x, context, t_mod, freqs, cos, sin, last_loss=last_loss, self_attn_mask=self_attn_mask)
+                x = block(x, context, t_mod, freqs_b, cos_b, sin_b, last_loss=last_loss, self_attn_mask=self_attn_mask)
 
         x = self.head(x, t)
 

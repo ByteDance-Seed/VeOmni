@@ -42,6 +42,40 @@ def uses_swiglu_mlp(hidden_act: str) -> bool:
     return hidden_act in SWIGLU_HIDDEN_ACTS
 
 
+class _MergedExpertsActFnEP:
+    """Local non-SiLU expert math on tokens already dispatched by EP."""
+
+    @staticmethod
+    def apply(
+        permute_tokens: Tensor,
+        cumsum: Tensor,
+        gate_up_proj: Tensor,
+        down_proj: Tensor,
+        act_fn: Callable[[Tensor], Tensor],
+    ) -> Tensor:
+        """Run ``down(act_fn(gate) * up)`` on each local expert slice.
+
+        Routing weights are applied later by ``tokens_post_all2all``.
+        """
+        num_local = gate_up_proj.shape[0]
+        ends = cumsum.to(dtype=torch.long)
+        starts = permute_tokens.new_zeros(num_local, dtype=torch.long)
+        if num_local > 1:
+            starts[1:] = ends[:-1]
+        output = permute_tokens.new_zeros(permute_tokens.shape)
+        for expert_idx in range(num_local):
+            start = int(starts[expert_idx])
+            end = int(ends[expert_idx])
+            if end <= start:
+                continue
+            current_state = permute_tokens[start:end]
+            gate, up = nn.functional.linear(current_state, gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            current_hidden_states = act_fn(gate) * up
+            current_hidden_states = nn.functional.linear(current_hidden_states, down_proj[expert_idx])
+            output[start:end] = current_hidden_states.to(output.dtype)
+        return output
+
+
 def merged_experts_act_fn_forward(
     hidden_states: Tensor,
     top_k_index: Tensor,
@@ -51,7 +85,35 @@ def merged_experts_act_fn_forward(
     act_fn: Callable[[Tensor], Tensor],
     num_experts: int,
 ) -> Tensor:
-    """HF merged-expert loop: ``down(act_fn(gate) * up)`` then routing weights."""
+    """HF merged-expert loop: ``down(act_fn(gate) * up)`` then routing weights.
+
+    Expert-parallel shards store only local rows on ``gate_up_proj``. Those
+    tokens must go through the same EP dispatch as ``veomni_moe``; indexing
+    with global expert ids would read past the local shard.
+    """
+    local_experts = gate_up_proj.shape[0]
+    if local_experts != num_experts:
+        from veomni.distributed.moe import dispatch_to_ep_class
+        from veomni.distributed.parallel_state import get_parallel_state
+
+        state = get_parallel_state()
+        if not state.ep_enabled or local_experts != num_experts // state.ep_size:
+            raise ValueError(
+                "non-SiLU MoE fallback received expert-parallel sharded weights "
+                f"(local {local_experts} vs global {num_experts}). "
+                "Enable EP so tokens are dispatched to local experts, or use silu."
+            )
+        return dispatch_to_ep_class(
+            _MergedExpertsActFnEP,
+            num_experts,
+            top_k_weights,
+            top_k_index,
+            hidden_states,
+            gate_up_proj,
+            down_proj,
+            act_fn,
+        )
+
     final_hidden_states = hidden_states.new_zeros(hidden_states.shape)
     with torch.no_grad():
         expert_mask = nn.functional.one_hot(top_k_index, num_classes=num_experts)
@@ -107,18 +169,99 @@ PACKED_ATTENTION_METADATA_KEYS = frozenset(
         "max_seqlen_k",
     }
 )
+DENSE_ATTENTION_IMPLS = frozenset({"eager", "sdpa"})
+
+
+def _canonical_attn_impl(impl: str) -> str:
+    """Strip the public ``veomni_`` prefix used by ``OpsImplementationConfig``."""
+    return impl.removeprefix("veomni_")
+
+
+def _multi_segment_cu_seqlens(kwargs: dict) -> Tensor | None:
+    """Return packed cumulative lengths when they encode more than one sample."""
+    for key in ("cu_seq_lens_q", "cu_seqlens_q", "cu_seqlens"):
+        value = kwargs.get(key)
+        if torch.is_tensor(value) and value.numel() >= 3:
+            return value
+    return None
+
+
+def dense_packed_attention_mask(
+    *,
+    q_len: int,
+    kv_len: int,
+    cu_seqlens: Tensor,
+    attention_mask: Tensor | None,
+    batch_size: int,
+    impl: str,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> Tensor:
+    """Dense packed causal mask for SDPA/eager, which have no varlen kwargs.
+
+    A 2-D padding mask is composed with packed isolation. A 4-D triangle from
+    ``create_causal_mask`` does not isolate samples and is replaced.
+    """
+    from veomni.ops.kernels.attention.mask.sdpa import _dense_attention_mask_builder
+    from veomni.ops.kernels.attention.mask.shape import _to_eager_additive
+
+    padding = attention_mask if attention_mask is not None and attention_mask.ndim == 2 else None
+    mask = _dense_attention_mask_builder(
+        batch_size,
+        q_len,
+        kv_len,
+        q_offset=kv_len - q_len,
+        attention_mask=padding,
+        cu_seqlens=cu_seqlens,
+        device=device,
+        allow_is_causal_skip=False,
+    )
+    if _canonical_attn_impl(impl) == "eager":
+        return _to_eager_additive(mask, dtype)
+    return mask
 
 
 def drop_packed_attention_metadata(kwargs: dict, *, impl: str) -> dict:
     """Strip GDN/varlen metadata that SDPA and eager attention reject.
 
-    Flash and other packed-capable impls keep the keys. Linear-attention
-    layers should pass ``cu_seq_lens_q`` explicitly instead of through this
-    filter.
+    ``veomni_sdpa`` is the public builder alias of ``sdpa``. Flash and other
+    packed-capable impls keep the keys. Linear-attention layers should pass
+    ``cu_seq_lens_q`` explicitly instead of through this filter.
     """
-    if impl in {"eager", "sdpa"}:
+    if _canonical_attn_impl(impl) in DENSE_ATTENTION_IMPLS:
         return {key: value for key, value in kwargs.items() if key not in PACKED_ATTENTION_METADATA_KEYS}
     return kwargs
+
+
+def prepare_dense_attention_inputs(
+    kwargs: dict,
+    *,
+    impl: str,
+    attention_mask: Tensor | None,
+    hidden_states: Tensor,
+) -> tuple[dict, Tensor | None]:
+    """Drop packed kwargs for SDPA/eager, after building an isolating dense mask.
+
+    Single-segment or empty ``cu_seq_lens_q`` can be stripped as-is. True
+    packed inputs need a dense mask first; dropping lengths alone lets a
+    2-D all-ones mask cross-attend across samples.
+    """
+    if _canonical_attn_impl(impl) not in DENSE_ATTENTION_IMPLS:
+        return kwargs, attention_mask
+    cu_seqlens = _multi_segment_cu_seqlens(kwargs)
+    if cu_seqlens is not None:
+        q_len = hidden_states.shape[1]
+        attention_mask = dense_packed_attention_mask(
+            q_len=q_len,
+            kv_len=q_len,
+            cu_seqlens=cu_seqlens,
+            attention_mask=attention_mask,
+            batch_size=hidden_states.shape[0],
+            impl=impl,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+    return drop_packed_attention_metadata(kwargs, impl=impl), attention_mask
 
 
 def resolve_moe_impl() -> str:

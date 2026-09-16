@@ -129,9 +129,9 @@ from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_se
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models.utils.op_utils import (
     attention_op,
-    drop_packed_attention_metadata,
     empty_bias,
     merged_experts_act_fn_forward,
+    prepare_dense_attention_inputs,
     resolve_moe_impl,
     resolve_op_impl,
     uses_swiglu_mlp,
@@ -1200,8 +1200,11 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
         elif self.block_type == "full_attention":
             # Self Attention. SDPA/eager reject GDN cu_seq_lens metadata.
             attn_impl = getattr(getattr(self, "self_attn", None), "veomni_attn", None)
-            attn_kwargs = drop_packed_attention_metadata(
-                kwargs, impl=attn_impl.impl if attn_impl is not None else "eager"
+            attn_kwargs, attention_mask = prepare_dense_attention_inputs(
+                kwargs,
+                impl=attn_impl.impl if attn_impl is not None else "eager",
+                attention_mask=attention_mask,
+                hidden_states=hidden_states,
             )
             hidden_states, _ = self.self_attn(
                 hidden_states=hidden_states,

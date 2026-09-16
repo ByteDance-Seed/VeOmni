@@ -66,14 +66,18 @@ def copy_dsa_mask_provenance(source: Tensor | None, dest: Tensor | None) -> Tens
     return dest
 
 
-def _position_ids_reset_within_row(position_ids: Tensor | None) -> bool:
-    """Whether any row resets, as packed sequences do at sample boundaries."""
+def _position_ids_break_standard_causal(position_ids: Tensor | None) -> bool:
+    """Whether any row is not a unit-increment sequence, matching HF packed detection.
+
+    HF treats ``diff != 1`` as a sample boundary. A reset (``<= 0``) and a gap
+    such as ``[[0, 1, 4, 5]]`` are both packed, not a standard causal triangle.
+    """
     if position_ids is None or not torch.is_tensor(position_ids) or position_ids.numel() <= 1:
         return False
     ids = position_ids if position_ids.dim() > 1 else position_ids.unsqueeze(0)
     if ids.shape[-1] <= 1:
         return False
-    return bool((ids[..., 1:] - ids[..., :-1] <= 0).any())
+    return bool((ids[..., 1:] - ids[..., :-1] != 1).any())
 
 
 def _has_mask_overlay(**kwargs: object) -> bool:
@@ -99,7 +103,7 @@ def create_standard_causal_mask(*args, **kwargs) -> Tensor | None:
     position_ids = kwargs.get("position_ids")
     if position_ids is None and len(args) >= 5:
         position_ids = args[4]
-    if mask is not None and (_has_mask_overlay(**kwargs) or _position_ids_reset_within_row(position_ids)):
+    if mask is not None and (_has_mask_overlay(**kwargs) or _position_ids_break_standard_causal(position_ids)):
         return mark_custom_dsa_mask(mask)
     if attention_mask is None:
         return mark_standard_causal_mask(mask)

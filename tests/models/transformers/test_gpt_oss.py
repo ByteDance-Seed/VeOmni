@@ -33,14 +33,6 @@ from tests.models.compare import (
     ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_gpt_oss_config as _tiny_config
-from tests.ops.tol import (
-    MOE_FUSED_SWIGLU_ATOL,
-    MOE_FUSED_SWIGLU_GRAD_FC1_ATOL,
-    MOE_FUSED_SWIGLU_GRAD_FC1_RTOL,
-    MOE_FUSED_SWIGLU_GRAD_FC2_ATOL,
-    MOE_FUSED_SWIGLU_GRAD_FC2_RTOL,
-    MOE_FUSED_SWIGLU_RTOL,
-)
 from veomni.utils.import_utils import is_quack_gemm_available
 
 
@@ -107,6 +99,12 @@ def test_gpt_oss_fused_quack_matches_eager():
     fused = _build_ours(config, fused_ops).to(device=device, dtype=dtype)
     fused.load_state_dict(eager.state_dict())
     assert fused.model.layers[0].mlp.experts.veomni_moe.impl == "fused_quack"
+    with torch.no_grad():
+        for eager_layer, fused_layer in zip(eager.model.layers, fused.model.layers):
+            eager_layer.mlp.experts.gate_up_proj_bias.uniform_(-0.5, 0.5)
+            eager_layer.mlp.experts.down_proj_bias.uniform_(-0.5, 0.5)
+            fused_layer.mlp.experts.gate_up_proj_bias.copy_(eager_layer.mlp.experts.gate_up_proj_bias)
+            fused_layer.mlp.experts.down_proj_bias.copy_(eager_layer.mlp.experts.down_proj_bias)
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8), device=device)
     labels = input_ids.clone()
@@ -117,8 +115,8 @@ def test_gpt_oss_fused_quack_matches_eager():
     torch.testing.assert_close(
         fused_logits.float(),
         eager_logits.float(),
-        atol=MOE_FUSED_SWIGLU_ATOL,
-        rtol=MOE_FUSED_SWIGLU_RTOL,
+        atol=8e-3,
+        rtol=8e-3,
     )
 
     eager_out = eager(input_ids=input_ids, labels=labels, use_cache=False)
@@ -126,8 +124,8 @@ def test_gpt_oss_fused_quack_matches_eager():
     torch.testing.assert_close(
         fused_out.loss.float(),
         eager_out.loss.float(),
-        atol=MOE_FUSED_SWIGLU_ATOL,
-        rtol=MOE_FUSED_SWIGLU_RTOL,
+        atol=8e-3,
+        rtol=8e-3,
     )
     eager_out.loss.backward()
     fused_out.loss.backward()
@@ -139,7 +137,7 @@ def test_gpt_oss_fused_quack_matches_eager():
         fused_grad = fused_grads[name].grad
         assert fused_grad is not None, name
         if "gate_up" in name:
-            atol, rtol = MOE_FUSED_SWIGLU_GRAD_FC1_ATOL, MOE_FUSED_SWIGLU_GRAD_FC1_RTOL
+            atol, rtol = 2e-2, 2e-2
         else:
-            atol, rtol = MOE_FUSED_SWIGLU_GRAD_FC2_ATOL, MOE_FUSED_SWIGLU_GRAD_FC2_RTOL
+            atol, rtol = 1e-2, 1e-2
         torch.testing.assert_close(fused_grad.float(), param.grad.float(), atol=atol, rtol=rtol, msg=name)

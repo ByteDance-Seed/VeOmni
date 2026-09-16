@@ -47,7 +47,11 @@ from transformers.utils import TransformersKwargs
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import sp_pad_and_slice
 from veomni.models.loss_utils import ForCausalLMLoss
-from veomni.models.utils.op_utils import attention_op, drop_packed_attention_metadata, resolve_op_impl
+from veomni.models.utils.op_utils import (
+    attention_op,
+    prepare_dense_attention_inputs,
+    resolve_op_impl,
+)
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -107,7 +111,7 @@ config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_I
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models.utils.op_utils",
-    names=["attention_op", "drop_packed_attention_metadata", "resolve_op_impl"],
+    names=["attention_op", "prepare_dense_attention_inputs", "resolve_op_impl"],
 )
 config.add_import(
     "veomni.models.loss_utils",
@@ -494,7 +498,12 @@ def qwen3_5_decoder_layer_forward_patched(
     elif self.block_type == "full_attention":
         # Self Attention. SDPA/eager reject GDN cu_seq_lens metadata.
         attn_impl = getattr(getattr(self, "self_attn", None), "veomni_attn", None)
-        attn_kwargs = drop_packed_attention_metadata(kwargs, impl=attn_impl.impl if attn_impl is not None else "eager")
+        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
+            kwargs,
+            impl=attn_impl.impl if attn_impl is not None else "eager",
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+        )
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
