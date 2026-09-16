@@ -118,8 +118,7 @@ live on `model.*` — see the **Model** section above.
 DPO-specific hyperparameters, accessed via `dpo_config.*`.  
 Root config: `VeOmniDPOArguments` (extends `VeOmniArguments`).
 
-* `DPOConfig` — `dpo_config.*`
-* `reference_model` — optional `ModelArguments` for the frozen reference. Omit to reuse `model`. This is a full config (same shape as `model`), not a partial overlay.
+* `DPOConfig` — `dpo_config.*`. The frozen reference always copies `model`; a custom `reference_model` config is not supported.
 
 ---
 
@@ -735,9 +734,4 @@ derived argument groups below.
 | average_log_prob | `bool` | `False` | If `True`, average log probs per token instead of summing. |
 | refer_model_precision | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype used to load the frozen reference model. |
 
-`reference_model.*` — optional full `ModelArguments` for the frozen reference. Omit the block to reuse `model`. To use a different checkpoint, set the whole model-level block (paths and any accelerator that should differ):
-
-```yaml
-reference_model:
-  model_path: ./sft-checkpoint
-```
+The frozen reference always copies `model`. A custom `reference_model` config is not supported.
