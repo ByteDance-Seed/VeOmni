@@ -99,6 +99,11 @@ def _loss_logits(
     )
 
 
+def _needs_input_grad(tensor: Tensor, grad_enabled: bool) -> bool:
+    """``grad_and_value`` ignores outer ``no_grad``; both flags must agree."""
+    return bool(tensor.requires_grad and grad_enabled)
+
+
 def forward(
     hidden: Tensor,
     labels: Tensor,
@@ -106,18 +111,21 @@ def forward(
     *,
     ignore_index: int = -100,
     num_items_in_batch: int | Tensor | None = None,
+    grad_enabled: bool | None = None,
 ) -> tuple[Tensor, SavedState]:
     """Token-level CE. Empty ``weight`` means ``hidden`` is already logits.
 
     This logits path is eager-only. ``liger_kernel`` and ``chunk_loss`` reject
     empty ``weight``. Label shift and SP reduction stay in the caller.
     ``torch.func.grad_and_value`` builds its own graph and ignores ``no_grad``,
-    so unused ``V×H`` weight grads are skipped from ``requires_grad`` rather
-    than ``is_grad_enabled()``.
+    so unused ``V×H`` grads require both ``requires_grad`` and the caller's
+    ``is_grad_enabled()``. The generated wrapper passes that flag because
+    ``Function.forward`` itself always runs under ``no_grad``.
     """
     has_weight = weight.numel() > 0
-    hidden_needs_grad = hidden.requires_grad
-    weight_needs_grad = has_weight and weight.requires_grad
+    compute_grads = torch.is_grad_enabled() if grad_enabled is None else grad_enabled
+    hidden_needs_grad = _needs_input_grad(hidden, compute_grads)
+    weight_needs_grad = has_weight and _needs_input_grad(weight, compute_grads)
     if has_weight:
         if hidden_needs_grad and weight_needs_grad:
             (grad_hidden, grad_weight), loss = torch.func.grad_and_value(_loss_hidden_weight, argnums=(0, 1))(

@@ -132,6 +132,27 @@ def test_eager_hidden_skips_unneeded_grad_and_value(
         assert weight.grad is None
 
 
+def test_eager_skips_grad_and_value_under_no_grad(monkeypatch: pytest.MonkeyPatch):
+    """Trainable leaves under a real no_grad must not build a VJP graph."""
+    calls: list[object] = []
+    real = torch.func.grad_and_value
+
+    def wrapped(fn, *args, **kwargs):
+        calls.append(kwargs.get("argnums", args[1] if len(args) > 1 else None))
+        return real(fn, *args, **kwargs)
+
+    monkeypatch.setattr(torch.func, "grad_and_value", wrapped)
+    torch.manual_seed(5)
+    hidden = torch.randn(2, 4, 8, requires_grad=True)
+    weight = torch.randn(6, 8, requires_grad=True)
+    labels = torch.randint(0, 6, (2, 4))
+    with torch.no_grad():
+        loss = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(hidden, labels, weight)
+    assert calls == []
+    assert loss.requires_grad is False
+    assert torch.isfinite(loss).all()
+
+
 def test_eager_fp16_logits_do_not_overflow_outside_cross_entropy():
     logits = torch.ones(128, 1024, dtype=torch.float16)
     labels = torch.zeros(128, dtype=torch.long)

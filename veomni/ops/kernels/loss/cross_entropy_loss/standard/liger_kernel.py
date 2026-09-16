@@ -53,7 +53,13 @@ def forward(
         raise RuntimeError("liger_kernel requires a nonempty ``weight`` (fused-linear path)")
     if hidden.numel() == 0:
         output, saved = _eager.forward(
-            hidden, labels, weight, ignore_index=ignore_index, num_items_in_batch=num_items_in_batch
+            hidden,
+            labels,
+            weight,
+            ignore_index=ignore_index,
+            num_items_in_batch=num_items_in_batch,
+            # Function.forward is always no_grad; keep the same requires_grad gate.
+            grad_enabled=hidden.requires_grad or weight.requires_grad,
         )
         return output, SavedState(saved.tensors, _Meta(True, hidden.requires_grad, weight.requires_grad))
 

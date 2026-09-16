@@ -437,12 +437,15 @@ def mm_batch_invariant(a, b):
 
 
 def addmm_batch_invariant(bias, a, b, *, beta=1, alpha=1):
-    """Implement ``aten::addmm``. Unsupported bias/scale pairs fall back to ``mm``."""
+    """Implement ``aten::addmm``. Unsupported bias/scale pairs fall back to ``mm``.
+
+    ``beta == 0`` skips bias entirely, including a NaN-filled tensor.
+    """
     if not addmm_can_fuse_bias(bias, b.shape[1], beta=beta, alpha=alpha):
         output = mm_batch_invariant(a, b)
         if alpha != 1:
             output = output * alpha
-        if bias is not None:
+        if beta != 0 and bias is not None:
             output = output + (bias if beta == 1 else bias * beta)
         return output
     return matmul_persistent(a, b, bias=bias)
@@ -458,7 +461,7 @@ def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = 
     """Implement ``aten::mean.dim`` with deterministic reduction behavior."""
     assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
     if len(dim) == 1:
-        return mean_dim(input, dim[0], keepdim=keepdim)
+        return mean_dim(input, dim[0], keepdim=keepdim, dtype=dtype)
     else:
         assert input.dtype in {torch.float16, torch.bfloat16, torch.float32}, "only float types supported for now"
         if len(dim) == 0:

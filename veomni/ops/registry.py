@@ -54,11 +54,13 @@ class SavedState:
 def _make_autograd_fn(raw_forward: Callable, raw_backward: Callable) -> Callable:
     """Build a modeling wrapper from raw ``forward`` / ``backward``."""
 
+    raw_parameters = signature(raw_forward).parameters
     positional_parameters = tuple(
         parameter
-        for parameter in signature(raw_forward).parameters.values()
+        for parameter in raw_parameters.values()
         if parameter.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)
     )
+    accepts_grad_enabled = "grad_enabled" in raw_parameters
 
     class _OpFn(torch.autograd.Function):
         """Generated Function that calls the raw pair and unpacks ``SavedState``."""
@@ -110,6 +112,10 @@ def _make_autograd_fn(raw_forward: Callable, raw_backward: Callable) -> Callable
                 bound_tensors.append(parameter.default)
             else:
                 break
+        # Function.forward always runs under no_grad. Opt-in raw pairs that
+        # accept ``grad_enabled`` still see the caller's autograd mode.
+        if accepts_grad_enabled:
+            attrs.setdefault("grad_enabled", torch.is_grad_enabled())
         return _OpFn.apply(*bound_tensors, attrs)
 
     return wrapper

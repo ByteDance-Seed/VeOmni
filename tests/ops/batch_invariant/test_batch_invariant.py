@@ -284,6 +284,20 @@ def test_mean_keep_fp32_until_divide_avoids_fp16_overflow():
     torch.testing.assert_close(actual, torch.ones((), dtype=torch.float16))
 
 
+def test_mean_batch_invariant_single_dim_forwards_dtype(monkeypatch):
+    """Single-dim mean must honor an explicit dtype, not only the multi-dim path."""
+    from veomni.ops.batch_invariant import triton as module
+
+    def fake_mean_dim(input, dim, keepdim=False, dtype=None):
+        return input.mean(dim=dim, keepdim=keepdim, dtype=dtype)
+
+    monkeypatch.setattr(module, "mean_dim", fake_mean_dim)
+    values = torch.ones(4, 8, dtype=torch.float16)
+    actual = module.mean_batch_invariant(values, (1,), dtype=torch.float32)
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, torch.ones(4, dtype=torch.float32))
+
+
 @pytest.mark.parametrize(
     ("bias_factory", "n", "beta", "alpha", "expected"),
     (
@@ -313,3 +327,19 @@ def test_addmm_falls_back_for_alpha_and_broadcast_bias():
     actual = addmm_batch_invariant(bias, a, b, beta=0.5, alpha=2)
     expected = 2 * mm_batch_invariant(a, b) + 0.5 * bias
     torch.testing.assert_close(actual, expected)
+
+
+def test_addmm_beta_zero_skips_nan_bias(monkeypatch):
+    """beta=0 must not read bias. Do not use a patched aten::addmm as the oracle."""
+    from veomni.ops.batch_invariant import triton as module
+
+    monkeypatch.setattr(module, "mm_batch_invariant", lambda left, right: left @ right)
+    torch.manual_seed(4)
+    a = torch.randn(5, 7)
+    b = torch.randn(7, 4)
+    bias = torch.full((4,), float("nan"))
+    actual = module.addmm_batch_invariant(bias, a, b, beta=0)
+    expected = torch.addmm(bias, a, b, beta=0)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual, a @ b)
