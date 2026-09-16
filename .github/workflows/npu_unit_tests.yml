@@ -161,6 +161,7 @@ jobs:
           uv run --frozen pytest -v -s -x tests/models/test_generated_modeling_imports.py
           uv run --frozen pytest -v -s -x tests/models/test_transformers_upgrade_compat.py
           uv run --frozen pytest -v -s -x tests/models/test_models_patch.py
+          uv run --frozen pytest -v -s -x tests/models/test_deepseek_v4_fused_moe.py::test_deepseek_v4_duplicate_hash_routes_match_ep_dispatch_splits
           uv run --frozen pytest -v -s -x tests/models/test_padded_packed_loss.py
           uv run --frozen pytest -v -s -x tests/models/test_vlm_trainer.py
           uv run --frozen pytest -v -s -x tests/trainer/test_aux_metrics.py
