@@ -51,6 +51,10 @@ from veomni.ops.kernels.dsa.attention.glm import flashmla_cudnn as glm_fused_att
 from veomni.ops.kernels.dsa.indexer.deepseek_v4 import tilelang as deepseek_v4_fused_indexer
 from veomni.ops.kernels.dsa.indexer.glm import cudnn as glm_fused_indexer
 from veomni.ops.kernels.dsa.mask import (
+    STANDARD_CAUSAL,
+    copy_dsa_mask_provenance,
+    create_standard_causal_mask,
+    dsa_mask_provenance,
     is_standard_causal_mask,
     mark_custom_dsa_mask,
     mark_standard_causal_mask,
@@ -192,6 +196,58 @@ def test_translate_fused_dsa_mask_rejects_custom_head_and_additive_bias():
     assert is_standard_causal_mask(bool_allowed, q_len=seq_len, kv_len=seq_len)
     assert is_standard_causal_mask(bool_blocked, q_len=seq_len, kv_len=seq_len)
     assert translate_fused_dsa_mask(bool_allowed, q_len=seq_len, kv_len=seq_len, fused=True, what="x") is None
+
+
+def test_create_standard_causal_mask_marks_only_when_attention_mask_is_none():
+    from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
+
+    seq_len = 8
+    config = GlmMoeDsaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        attn_implementation="eager",
+    )
+    embeds = torch.randn(1, seq_len, config.hidden_size)
+    position_ids = torch.arange(seq_len).unsqueeze(0)
+    unmarked_padding = torch.ones(1, seq_len, dtype=torch.long)
+    unmarked_padding[:, -2:] = 0
+    marked = create_standard_causal_mask(
+        config=config,
+        inputs_embeds=embeds,
+        attention_mask=None,
+        past_key_values=None,
+        position_ids=position_ids,
+    )
+    padded = create_standard_causal_mask(
+        config=config,
+        inputs_embeds=embeds,
+        attention_mask=unmarked_padding,
+        past_key_values=None,
+        position_ids=position_ids,
+    )
+    assert marked is not None
+    assert dsa_mask_provenance(marked) == STANDARD_CAUSAL
+    assert padded is not None
+    assert dsa_mask_provenance(padded) is None
+    assert translate_fused_dsa_mask(marked, q_len=seq_len, kv_len=seq_len, fused=True, what="x") is None
+    with pytest.raises(ValueError, match="eager implementation"):
+        translate_fused_dsa_mask(padded, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
+
+
+def test_copy_dsa_mask_provenance_survives_head_slice(monkeypatch):
+    from veomni.ops.kernels.dsa import mask as mask_mod
+
+    def unexpected_scan(*args, **kwargs):
+        pytest.fail("sliced marked DSA masks must not scan tensor values")
+
+    monkeypatch.setattr(mask_mod, "is_standard_causal_mask", unexpected_scan)
+    marked = mark_standard_causal_mask(torch.full((1, 1, 4, 4), 7.0))
+    sliced = copy_dsa_mask_provenance(marked, marked[:, 0, :, :])
+    assert dsa_mask_provenance(marked[:, 0, :, :]) is None
+    assert translate_fused_dsa_mask(sliced, q_len=4, kv_len=4, fused=True, what="x") is None
 
 
 def test_translate_fused_dsa_mask_honors_provenance_without_scanning(monkeypatch):

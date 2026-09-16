@@ -54,11 +54,35 @@ def dsa_mask_provenance(mask: Tensor | None) -> str | None:
     return provenance if isinstance(provenance, str) else None
 
 
+def copy_dsa_mask_provenance(source: Tensor | None, dest: Tensor | None) -> Tensor | None:
+    """Re-attach provenance after a slice or unsqueeze that drops tensor attrs."""
+    if dest is None:
+        return None
+    provenance = dsa_mask_provenance(source) if source is not None else None
+    if provenance == STANDARD_CAUSAL:
+        return mark_standard_causal_mask(dest)
+    if provenance == CUSTOM:
+        return mark_custom_dsa_mask(dest)
+    return dest
+
+
 def create_standard_causal_mask(*args, **kwargs) -> Tensor | None:
-    """HF ``create_causal_mask`` plus standard-causal provenance."""
+    """HF ``create_causal_mask``, marked only when no dense/padding mask is supplied.
+
+    A 2-D padding mask or other explicit ``attention_mask`` can still produce a
+    causal triangle with extra blocked columns. Those outputs stay unmarked so
+    fused translate falls back to ``is_standard_causal_mask`` instead of
+    dropping them as standard causal.
+    """
     from transformers.masking_utils import create_causal_mask
 
-    return mark_standard_causal_mask(create_causal_mask(*args, **kwargs))
+    mask = create_causal_mask(*args, **kwargs)
+    attention_mask = kwargs.get("attention_mask")
+    if attention_mask is None and len(args) >= 3:
+        attention_mask = args[2]
+    if attention_mask is None:
+        return mark_standard_causal_mask(mask)
+    return mask
 
 
 def is_standard_causal_mask(attention_mask: Tensor | None, *, q_len: int, kv_len: int) -> bool:

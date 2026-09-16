@@ -35,7 +35,7 @@ from transformers.utils import TransformersKwargs
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.dsa.mask import translate_fused_dsa_mask
+from veomni.ops.kernels.dsa.mask import copy_dsa_mask_provenance, translate_fused_dsa_mask
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
     CausalLMOutputWithLogProbs,
@@ -66,8 +66,12 @@ config.add_import(
 )
 config.add_import(
     "veomni.ops.kernels.dsa.mask",
-    names=["translate_fused_dsa_mask"],
+    names=["copy_dsa_mask_provenance", "create_standard_causal_mask", "translate_fused_dsa_mask"],
 )
+# Model.forward still calls create_causal_mask; bind it to the provenance
+# wrapper so a no-padding HF causal mask can be dropped without a host scan.
+config.drop_import_names("create_causal_mask")
+config.add_post_import_block("create_causal_mask = create_standard_causal_mask")
 apply_rotary_pos_emb_interleave = None  # noqa: E305  resolved from the generated modeling file
 yarn_apply_mscale = None
 GlmMoeDsaRMSNorm = None
@@ -267,6 +271,7 @@ def glm_moe_dsa_attention_forward_patched(
             if attention_mask is not None
             else None
         )
+        indexer_mask = copy_dsa_mask_provenance(attention_mask, indexer_mask)
         topk_indices = self.indexer(
             hidden_states,
             q_resid,

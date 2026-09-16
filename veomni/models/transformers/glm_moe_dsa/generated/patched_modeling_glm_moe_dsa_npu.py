@@ -32,7 +32,6 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_experts_implementation, use_kernel_forward_from_hub
-from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
@@ -48,7 +47,12 @@ from transformers.utils.output_capturing import capture_outputs
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
+from veomni.ops.kernels.dsa.mask import create_standard_causal_mask
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
+
+
+# Additional import blocks for patches
+create_causal_mask = create_standard_causal_mask
 
 
 @use_kernel_forward_from_hub("RMSNorm")

@@ -32,6 +32,7 @@ from tests.models.compare import (
 )
 from tests.models.tiny_configs import tiny_glm_moe_dsa_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_RTOL
+from veomni.utils.device import IS_CUDA_AVAILABLE
 
 
 def _glm_cls(architecture: str):
@@ -228,6 +229,61 @@ def test_glm_moe_dsa_fused_drops_standard_causal_mask_and_rejects_padding():
     padded[:, -2:] = 0
     with pytest.raises(ValueError, match="eager implementation"):
         model(input_ids=input_ids, attention_mask=padded, use_cache=False)
+
+
+def test_glm_moe_dsa_fused_forward_uses_marked_causal_mask(monkeypatch):
+    """The generated GLM path must drop a no-padding causal mask without scanning."""
+    from veomni.ops.kernels.dsa import mask as mask_mod
+    from veomni.utils.device import IS_NPU_AVAILABLE
+
+    if IS_NPU_AVAILABLE:
+        pytest.skip("NPU GLM keeps the Hugging Face attention path")
+
+    def unexpected_scan(*args, **kwargs):
+        pytest.fail("GLM fused forward must drop a marked standard causal mask without scanning")
+
+    monkeypatch.setattr(mask_mod, "is_standard_causal_mask", unexpected_scan)
+    config = _tiny_config()
+    model = _build_ours(config)
+    model.eval()
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    attn_spy = _FusedAttentionSpy()
+    indexer_spy = _FusedIndexerSpy(config.index_topk)
+    model.model.layers[0].self_attn.veomni_dsa_attention = attn_spy
+    model.model.layers[0].self_attn.indexer.veomni_dsa_indexer = indexer_spy
+    model(input_ids=input_ids, use_cache=False)
+    assert attn_spy.kwargs is not None and attn_spy.kwargs["attention_mask"] is None
+    assert indexer_spy.kwargs is not None and indexer_spy.kwargs["attention_mask"] is None
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="CUDA GLM fused forward provenance")
+def test_glm_moe_dsa_fused_cuda_forward_does_not_scan_standard_causal(monkeypatch):
+    """GPU modeling must drop the generated causal mask without scanning it.
+
+    HuggingFace ``create_causal_mask`` still does a packed-sequence ``.all()``
+    host check. That is a separate HF-verbatim sync, not the DSA mask scan.
+    """
+    from veomni.ops.kernels.dsa import mask as mask_mod
+    from veomni.utils.device import IS_NPU_AVAILABLE
+
+    if IS_NPU_AVAILABLE:
+        pytest.skip("NPU GLM keeps the Hugging Face attention path")
+
+    def unexpected_scan(*args, **kwargs):
+        pytest.fail("GLM fused CUDA forward must drop a marked standard causal mask without scanning")
+
+    monkeypatch.setattr(mask_mod, "is_standard_causal_mask", unexpected_scan)
+    config = _tiny_config()
+    model = _build_ours(config).cuda()
+    model.eval()
+    input_ids = torch.randint(3, config.vocab_size, (2, 8), device="cuda")
+    attn_spy = _FusedAttentionSpy()
+    indexer_spy = _FusedIndexerSpy(config.index_topk)
+    model.model.layers[0].self_attn.veomni_dsa_attention = attn_spy
+    model.model.layers[0].self_attn.indexer.veomni_dsa_indexer = indexer_spy
+    model(input_ids=input_ids, use_cache=False)
+    assert attn_spy.kwargs is not None and attn_spy.kwargs["attention_mask"] is None
+    assert indexer_spy.kwargs is not None and indexer_spy.kwargs["attention_mask"] is None
 
 
 def test_glm_moe_dsa_eager_dropout_train_eval_seed_and_grads():
