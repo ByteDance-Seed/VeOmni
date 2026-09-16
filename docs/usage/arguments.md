@@ -564,7 +564,7 @@ configured and never round-trip through a saved config.
 | ulysses_size | `int` | `1` | Ulysses sequence parallel size. |
 | enable_async | `bool` | `False` | Enable async Ulysses. |
 | cp_size | `int` | `1` | Ring-attention context parallel size. |
-| init_device | `Literal["cuda", "meta", "npu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2 and also works for multi-rank DDP; a run with no FSDP wrap (`fsdp_size == 1`) must name an accelerator. |
+| init_device | `Literal["cuda", "meta", "npu", "mlu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2 and also works for multi-rank DDP; a run with no FSDP wrap (`fsdp_size == 1`) must name an accelerator. |
 | fsdp_config | `FSDPConfig` | — | FSDP sharding configuration. |
 | offload_config | `OffloadConfig` | — | Activation offload settings. |
 | gradient_checkpointing | `GradientCheckpointingConfig` | — | Activation recomputation settings. |
@@ -592,6 +592,9 @@ directly into the FP32 output. This allocates low-precision send and receive buf
 group ReduceScatter uses the low-precision transport; the replicate-group AllReduce remains native FP32. When
 the transport and reduction dtypes match, VeOmni does not register the custom collective or alter native gradient
 scaling and reduction behavior.
+
+Modules excluded via `modules_to_ignore_in_mixed_precision` deliberately retain native FP32 communication:
+their gradients are genuine FP32 values, so low-precision transport would discard the precision they preserve.
 
 `bfloat16` is the recommended transport dtype because it retains FP32's exponent range. `float16` can be
 faster on some systems, but casting the FP32 reduction buffer follows normal IEEE FP16 semantics: finite

@@ -69,6 +69,7 @@ class FP32ReduceScatterWithLowPrecisionTransport:
             )
 
         if async_op:
+            # FSDP2 calls synchronously on its reduction stream; stream events provide overlap.
             raise NotImplementedError("Low-precision transport ReduceScatter does not support async_op=True.")
 
         if input_tensor.device != output_tensor.device:
@@ -119,6 +120,7 @@ def register_fp32_reduce_scatter_with_low_precision_transport(
     count = 0
     for module in model.modules():
         if isinstance(module, FSDPModule) and module in reduction_scales:
+            # Together these disable FSDP pre/post scaling and force SUM; the hook owns all scaling.
             module.set_gradient_divide_factor(1.0)
             module.set_force_sum_reduction_for_comms(True)
             comm = FP32ReduceScatterWithLowPrecisionTransport(

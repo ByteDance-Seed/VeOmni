@@ -732,6 +732,8 @@ def parallelize_model_fsdp2(
             for sub_mod in layer_mod.modules():
                 if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
                     fully_shard(sub_mod, **fsdp_kwargs_without_mp)
+                    # Keep these modules off transport_reduction_scales: their genuine FP32
+                    # gradients need native FP32 communication, not a lossy wire cast.
                     layer_mod._fsdp_modules.append(sub_mod)
 
         # Shard everything else in the module:
