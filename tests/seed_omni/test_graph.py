@@ -20,9 +20,6 @@ from veomni.models.seed_omni.utils import graph_profiler
 from veomni.models.seed_omni.utils.graph_profiler import GraphProfiler
 
 
-# ── NodeDef parsing ───────────────────────────────────────────────────────────
-
-
 def test_from_endpoint_default_method():
     n = NodeDef.from_endpoint("ar_llm", default_method="forward")
     assert n.module == "ar_llm" and n.method == "forward"
@@ -48,9 +45,6 @@ def test_from_endpoint_rejects_reserved_end():
 def test_from_endpoint_rejects_empty():
     with pytest.raises(ValueError, match="non-empty 'module"):
         NodeDef.from_endpoint("   ", default_method="forward")
-
-
-# ── EdgeDef parsing ───────────────────────────────────────────────────────────
 
 
 def test_parse_edge():
@@ -81,9 +75,6 @@ def test_parse_edge_rejects_missing_endpoints():
         EdgeDef.parse({"from": "a"}, default_method="forward")
 
 
-# ── Fixtures ──────────────────────────────────────────────────────────────────
-
-
 def _janus_joint_edges() -> list[dict]:
     """Janus joint training edges: vq_decoder appears under TWO methods.
 
@@ -107,9 +98,6 @@ def _understanding_only_edges() -> list[dict]:
     ]
 
 
-# ── Validation ────────────────────────────────────────────────────────────────
-
-
 def test_missing_edges_raises():
     with pytest.raises(ValueError, match="non-empty `training_graph`"):
         TrainingGraph([])
@@ -130,9 +118,6 @@ def test_single_node_with_only_end_edge():
     g = TrainingGraph([{"from": "ar_llm", "to": "end"}])
     assert g.execution_order == ["ar_llm.forward"]
     assert g.sources == ["ar_llm.forward"] and g.sinks == ["ar_llm.forward"]
-
-
-# ── Topological order ─────────────────────────────────────────────────────────
 
 
 def test_understanding_only_topological_order():
@@ -160,9 +145,6 @@ def test_cycle_in_active_set_raises():
         )
 
 
-# ── Sources / sinks ───────────────────────────────────────────────────────────
-
-
 def test_sources_and_sinks_understanding_only():
     g = TrainingGraph(_understanding_only_edges())
     assert set(g.sources) == {"vision_encoder.forward", "vq_decoder.forward"}
@@ -175,9 +157,6 @@ def test_sources_and_sinks_janus_joint():
     assert set(g.sources) == {"vision_encoder.forward", "vq_decoder.encode"}
     # vq_decoder.gen_loss is the only sink (its only outgoing edge goes to `end`).
     assert g.sinks == ["vq_decoder.gen_loss"]
-
-
-# ── module / method accessors ────────────────────────────────────────────────
 
 
 def test_module_and_method_lookup():
@@ -193,9 +172,6 @@ def test_module_lookup_raises_for_unknown():
     g = TrainingGraph(_janus_joint_edges())
     with pytest.raises(KeyError):
         g.module_of("not_a_node")
-
-
-# ── Execution lifecycle (cursor + step + maybe_transition) ────────────────────
 
 
 class _FakeOmniModule(nn.Module, TrainingModuleMixin, BaseMixin, InferenceModuleMixin):
@@ -352,7 +328,7 @@ def test_graph_profiler_can_append_request_peak_memory(monkeypatch):
     assert profiler.save_records() == ["forward:run_ar.forward | peak_allocated_gb=2.000 | peak_reserved_gb=3.000"]
 
 
-# ── Generation FSM (graph only: it selects nodes, it never calls one) ─────────
+# Generation FSM tests below drive the graph only: it selects nodes, it never calls one.
 
 
 def _two_state_graph() -> GenerationGraph:
@@ -440,9 +416,6 @@ def test_a_feedback_edge_does_not_gate_its_destination():
         }
     )
     assert [n.name for n in g.iter_nodes({})] == ["d.generate", "c.generate"]
-
-
-# ── Mermaid visualisation ────────────────────────────────────────────────────
 
 
 def test_to_mermaid_janus_joint_contains_node_labels_and_end_sink():

@@ -426,8 +426,6 @@ class OmniModel(PreTrainedModel):
 
         return {"loss": _sum_losses(self._losses), "losses": dict(self._losses)}
 
-    # ── Inference ─────────────────────────────────────────────────────────────
-
     def reset(self) -> None:
         """Clear per-conversation inference runtime state."""
         self.generation_graph.reset()
@@ -539,8 +537,6 @@ class OmniModel(PreTrainedModel):
 
         return list(self._generated)
 
-    # ── Utilities ─────────────────────────────────────────────────────────────
-
     def named_omni_modules(self) -> Iterator[tuple[str, nn.Module]]:
         """Yield ``(name, module)`` for every graph participant."""
         for name in self._module_names:
@@ -566,9 +562,6 @@ class OmniModel(PreTrainedModel):
             if get_assets is not None:
                 assets.extend(get_assets())
         return assets
-
-
-# ── helpers ───────────────────────────────────────────────────────────────────
 
 
 def _sum_losses(losses: dict[str, Any]) -> Any | None:

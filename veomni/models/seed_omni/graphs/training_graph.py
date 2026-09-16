@@ -136,8 +136,6 @@ class TrainingGraph:
         # ``maybe_transition`` advances it. Reset before each forward pass.
         self._cursor: int = 0
 
-    # ── public API ────────────────────────────────────────────────────────────
-
     @property
     def execution_order(self) -> List[str]:
         """Active node names in dependency-safe execution order. Excludes ``end``."""
@@ -175,7 +173,7 @@ class TrainingGraph:
             raise KeyError(f"'{node}' is not an active node. Active: {sorted(self._node_by_name)}.")
         return n.method
 
-    # ── Lifecycle (mirror of GenerationGraph) ───────────────────────────────────
+    # Lifecycle: mirror of GenerationGraph.
 
     def reset(self) -> None:
         """Re-point the cursor at the first node for a fresh forward pass.
@@ -201,7 +199,7 @@ class TrainingGraph:
             raise RuntimeError("TrainingGraph.current_node_name: cursor past the last node (graph is done).")
         return self._execution_order[self._cursor]
 
-    # ── Step & Transition (mirror of GenerationGraph) ───────────────────────────
+    # Step & transition: mirror of GenerationGraph.
 
     def iter_nodes(self) -> Iterator[NodeDef]:
         """Yield each active node in execution order (selection only — no forward).
@@ -226,8 +224,6 @@ class TrainingGraph:
         """
         self._cursor += 1
         return not self.is_done()
-
-    # ── visualization ────────────────────────────────────────────────────────
 
     def to_mermaid(
         self,
@@ -341,8 +337,6 @@ class TrainingGraph:
             "    classDef end_sink fill:#eee,stroke:#333,stroke-width:1px,stroke-dasharray:3 3",
         ]
         return "\n".join(lines)
-
-    # ── internal ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def _edge_label(e: EdgeDef) -> str:

@@ -330,9 +330,6 @@ def ForSequenceClassificationLoss(
     return loss, logits, None
 
 
-# ── LOSS_MAPPING installation ────────────────────────────────────────────────
-
-
 def _resolve_cross_entropy_fn(impl: str) -> Callable:
     """Return the inner CE kernel callable for ``impl`` (one of
     ``"eager"`` / ``"liger_kernel"``). The ``chunk_loss`` and legacy ``npu``
@@ -523,8 +520,6 @@ def install_loss_mapping(impl: str = "eager") -> str:
     LOSS_MAPPING["ForSequenceClassification"] = partial(ForSequenceClassificationLoss, cross_entropy_fn=ce_fn)
     return f"CrossEntropy ({impl})"
 
-
-# ── OpSlot kernel registration ───────────────────────────────────────────────
 
 from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
 
