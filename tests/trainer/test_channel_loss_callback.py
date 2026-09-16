@@ -93,6 +93,7 @@ class _TinyLossModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.tensor(1.0))
+        self.parallel_state = object()
 
     def forward(self, x, use_cache=False):
         return SimpleNamespace(loss=(self.weight * x).sum())
@@ -889,8 +890,8 @@ def test_dpo_forward_backward_scopes_channel_loss_to_policy_model(monkeypatch):
     _stub_parallel_state(monkeypatch)
     cfg = ChannelLossConfig(enable=True, interval=1)
     state = TrainerState(global_step=1)
-    policy_model = object()
-    reference_model = object()
+    policy_model = SimpleNamespace(parallel_state=object())
+    reference_model = SimpleNamespace(parallel_state=object())
     base = SimpleNamespace(
         args=SimpleNamespace(
             train=SimpleNamespace(channel_loss=cfg, enable_batch_invariant_mode=False),
@@ -961,6 +962,7 @@ def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
             super().__init__()
             self.scale = torch.nn.Parameter(torch.tensor(1.0))
             self.loss_calls = 0
+            self.parallel_state = object()
 
         def loss_function(self, logits, labels, vocab_size, **kwargs):
             self.loss_calls += 1

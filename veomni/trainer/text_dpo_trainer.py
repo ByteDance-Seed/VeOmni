@@ -420,16 +420,14 @@ class TextDPOTrainer:
             if channel_loss_callback is not None:
                 channel_loss_callback.strip_model_inputs(micro_batch)
 
-            reference_name = getattr(self.reference_model, "model_name", "reference")
-            with torch.no_grad(), use_parallel_state(reference_name):
+            with torch.no_grad(), use_parallel_state(self.reference_model.parallel_state):
                 ref_chosen_logps, ref_rejected_logps = self.concatenated_forward(self.reference_model, micro_batch)
 
             channel_forward_context = (
                 channel_loss_callback.model_forward_context() if channel_loss_callback is not None else nullcontext()
             )
-            policy_name = getattr(self.policy_model, "model_name", "policy")
             with (
-                use_parallel_state(policy_name),
+                use_parallel_state(self.policy_model.parallel_state),
                 self.base.model_fwd_context,
                 set_batch_invariant_mode(args.train.enable_batch_invariant_mode),
                 channel_forward_context,
@@ -459,7 +457,7 @@ class TextDPOTrainer:
             }
 
             with (
-                use_parallel_state(policy_name),
+                use_parallel_state(self.policy_model.parallel_state),
                 self.base.model_bwd_context,
                 set_batch_invariant_mode(args.train.enable_batch_invariant_mode),
             ):

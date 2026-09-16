@@ -517,7 +517,7 @@ class DiTTrainer:
         with torch.no_grad():
             micro_batch = self.condition_model.process_condition(**micro_batch)
 
-        with use_parallel_state("base"), self.base.model_fwd_context:
+        with use_parallel_state(self.base.model.parallel_state), self.base.model_fwd_context:
             outputs = self.base.model(**micro_batch)
 
         loss: torch.Tensor
@@ -525,7 +525,7 @@ class DiTTrainer:
         # DiT postforward does not read ambient ParallelState.
         loss, loss_dict = self.postforward(outputs, micro_batch)
 
-        with use_parallel_state("base"), self.base.model_bwd_context:
+        with use_parallel_state(self.base.model.parallel_state), self.base.model_bwd_context:
             loss.backward()
 
         del micro_batch
@@ -535,7 +535,7 @@ class DiTTrainer:
         self.base.state.global_step += 1
 
         # SP broadcast of micro_batches
-        with use_parallel_state("base"):
+        with use_parallel_state(self.base.model.parallel_state):
             if get_parallel_state().sp_enabled:
                 if get_parallel_state().sp_rank == 0:
                     micro_batches = next(data_iterator)

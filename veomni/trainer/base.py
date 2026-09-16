@@ -652,18 +652,18 @@ class BaseTrainer(Stateful, ABC):
                 channel_loss_callback.model_forward_context() if channel_loss_callback is not None else nullcontext()
             )
             with (
-                use_parallel_state("base"),
+                use_parallel_state(self.model.parallel_state),
                 self.model_fwd_context,
                 set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
                 channel_forward_context,
             ):
                 outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
-            with use_parallel_state("base"):
+            with use_parallel_state(self.model.parallel_state):
                 loss, loss_dict, aux_metrics = self.postforward(outputs, micro_batch)
 
             with (
-                use_parallel_state("base"),
+                use_parallel_state(self.model.parallel_state),
                 self.model_bwd_context,
                 set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
             ):
