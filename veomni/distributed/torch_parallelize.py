@@ -27,6 +27,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
 from ..arguments import MixedPrecisionConfig
+from ..arguments.arguments_types import validate_reduce_scatter_transport
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
@@ -331,13 +332,6 @@ def _reduce_scatter_group_size(mesh) -> int:
     return mesh[mesh.mesh_dim_names[-1]].size()
 
 
-def _uses_low_precision_reduce_scatter_transport(
-    transport_dtype: Optional[str],
-    reduce_dtype: Optional[str],
-) -> bool:
-    return transport_dtype is not None and transport_dtype != reduce_dtype
-
-
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str] = None,
@@ -375,20 +369,8 @@ def parallelize_model_fsdp2(
     """
     parallel_state = get_parallel_state()
 
-    use_low_precision_transport = reduce_scatter_transport_dtype is not None and (
-        _uses_low_precision_reduce_scatter_transport(
-            reduce_scatter_transport_dtype,
-            getattr(mixed_precision, "reduce_dtype", None),
-        )
-    )
+    use_low_precision_transport = validate_reduce_scatter_transport(reduce_scatter_transport_dtype, mixed_precision)
     if use_low_precision_transport:
-        if not mixed_precision.enable or mixed_precision.reduce_dtype != "float32":
-            raise ValueError(
-                "The custom ReduceScatter transport path supports only mixed precision with "
-                "reduce_dtype='float32' and transport dtype 'bfloat16' or 'float16'."
-            )
-        if reduce_scatter_transport_dtype not in ("bfloat16", "float16"):
-            raise ValueError("Low-precision ReduceScatter transport must use transport dtype 'bfloat16' or 'float16'.")
         if get_device_type() != "cuda":
             raise RuntimeError("Low-precision ReduceScatter transport is only supported on CUDA/NCCL.")
     elif reduce_scatter_transport_dtype is not None:

@@ -503,6 +503,34 @@ class MixedPrecisionConfig:
         _check_dtype(self.output_dtype)
 
 
+def validate_reduce_scatter_transport(
+    transport_dtype: Optional[str],
+    mixed_precision: MixedPrecisionConfig,
+    *,
+    fsdp_mode: str = "fsdp2",
+) -> bool:
+    """Validate transport precision and return whether the custom path is active."""
+    if transport_dtype is not None and transport_dtype not in ("bfloat16", "float16", "float32"):
+        raise ValueError("reduce_scatter_transport_dtype must be one of 'bfloat16', 'float16', 'float32', or None.")
+    if transport_dtype is None or transport_dtype == mixed_precision.reduce_dtype:
+        return False
+    if fsdp_mode != "fsdp2":
+        raise ValueError("reduce_scatter_transport_dtype requires fsdp_mode='fsdp2'.")
+    if not mixed_precision.enable or mixed_precision.reduce_dtype != "float32":
+        raise ValueError(
+            "The custom ReduceScatter transport path supports only mixed-precision FSDP2 with "
+            "mixed_precision.reduce_dtype='float32' and transport dtype 'bfloat16' or 'float16'. "
+            "Use None or match reduce_scatter_transport_dtype to reduce_dtype for the native path."
+        )
+    if transport_dtype != mixed_precision.param_dtype:
+        raise ValueError(
+            "The custom ReduceScatter transport path requires reduce_scatter_transport_dtype to match "
+            "mixed_precision.param_dtype ('bfloat16' or 'float16') to avoid lossy gradient conversion; "
+            f"got transport dtype {transport_dtype!r} and param_dtype {mixed_precision.param_dtype!r}."
+        )
+    return True
+
+
 @dataclass
 class FSDPConfig:
     """model.accelerator.fsdp_config.* — FSDP sharding configuration."""
@@ -550,8 +578,8 @@ class FSDPConfig:
                 "Optional BF16 or FP16 wire dtype for FSDP2 ReduceScatter while keeping FP32 reduction "
                 "buffers and accumulation. None or a value equal to mixed_precision.reduce_dtype uses "
                 "the native PyTorch path. The custom path supports only float32 reduction with bfloat16 "
-                "or float16 transport. BF16 preserves the FP32 exponent range; FP16 may overflow values "
-                "outside its finite range."
+                "or float16 transport matching mixed_precision.param_dtype to avoid lossy gradient "
+                "conversion. FP32 modules excluded from mixed precision keep native communication."
             )
         },
     )
@@ -577,22 +605,9 @@ class FSDPConfig:
                 "model.accelerator.fsdp_config.fsdp_mode='eager' is reserved for the "
                 "single-process inference path and is not wired up yet."
             )
-        transport_dtype = self.reduce_scatter_transport_dtype
-        if transport_dtype is not None and transport_dtype not in ("bfloat16", "float16", "float32"):
-            raise ValueError(
-                "reduce_scatter_transport_dtype must be one of 'bfloat16', 'float16', 'float32', or None."
-            )
-        if transport_dtype is not None and transport_dtype != self.mixed_precision.reduce_dtype:
-            if self.fsdp_mode != "fsdp2":
-                raise ValueError("reduce_scatter_transport_dtype requires fsdp_mode='fsdp2'.")
-            if not self.mixed_precision.enable or self.mixed_precision.reduce_dtype != "float32":
-                raise ValueError(
-                    "The custom ReduceScatter transport path supports only mixed-precision FSDP2 with "
-                    "mixed_precision.reduce_dtype='float32' and transport dtype 'bfloat16' or 'float16'. "
-                    "Use None or match reduce_scatter_transport_dtype to reduce_dtype for the native path."
-                )
-            if transport_dtype not in ("bfloat16", "float16"):
-                raise ValueError("An active reduce_scatter_transport_dtype must be 'bfloat16' or 'float16'.")
+        validate_reduce_scatter_transport(
+            self.reduce_scatter_transport_dtype, self.mixed_precision, fsdp_mode=self.fsdp_mode
+        )
 
 
 @dataclass

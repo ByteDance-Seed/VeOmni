@@ -582,7 +582,7 @@ configured and never round-trip through a saved config.
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |
 | offload | `bool` | `False` | Enable CPU offload. |
 | offload_pin_memory | `bool` | `True` | Pin the CPU offload buffers, matching torch's `CPUOffloadPolicy` default. Set `False` to keep offloaded shards pageable, so a large-MoE job is not charged non-reclaimable Shmem. |
-| reduce_scatter_transport_dtype | `Optional[str]` | `None` | Optional `bfloat16` or `float16` wire dtype for FSDP2 ReduceScatter while keeping `mixed_precision.reduce_dtype: float32`. `None` or a value equal to `reduce_dtype` uses native PyTorch communication. |
+| reduce_scatter_transport_dtype | `Optional[str]` | `None` | Optional `bfloat16` or `float16` wire dtype, matching `mixed_precision.param_dtype`, for FSDP2 ReduceScatter while keeping `mixed_precision.reduce_dtype: float32`. `None` or a value equal to `reduce_dtype` uses native PyTorch communication. |
 | max_load_broadcast_size | `float` | `20.0` | Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting. |
 | mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |
 
@@ -596,9 +596,20 @@ scaling and reduction behavior.
 Modules excluded via `modules_to_ignore_in_mixed_precision` deliberately retain native FP32 communication:
 their gradients are genuine FP32 values, so low-precision transport would discard the precision they preserve.
 
-`bfloat16` is the recommended transport dtype because it retains FP32's exponent range. `float16` can be
-faster on some systems, but casting the FP32 reduction buffer follows normal IEEE FP16 semantics: finite
-values with magnitude above `65504` become infinity. Use FP16 only when gradient ranges are known to be safe.
+The custom path requires `reduce_scatter_transport_dtype == mixed_precision.param_dtype`: use `bfloat16`
+transport for BF16 parameters and `float16` transport for FP16 parameters. Mismatched parameter/transport
+dtypes, including FP32 parameters or an unset `param_dtype`, are rejected rather than silently compressing
+genuine FP32 gradients or converting between the two 16-bit formats. Finite gradients computed in the matching
+16-bit dtype round-trip through the FP32 reduction buffer exactly. The final reduction need not be bitwise
+identical to native FP32 ReduceScatter because the FP32 addition order may differ.
+
+This exact-conversion argument does not cover externally modified FP32 gradients or delayed ReduceScatter
+via PyTorch's `set_requires_gradient_sync(False)`, which may accumulate gradients in FP32 before transport.
+VeOmni's gradient accumulation retains per-microbatch ReduceScatter and only defers HSDP AllReduce.
+
+FP16 still has its usual finite range: values above `65504` may overflow during gradient computation. The
+transport option does not make an overflowing FP16 workload safe. Native fallback configurations do not
+require the parameter and transport dtypes to match.
 
 The supported combinations are intentionally narrow:
 
@@ -606,7 +617,7 @@ The supported combinations are intentionally narrow:
 | --- | --- | --- |
 | Any supported dtype | `None` | Native PyTorch path |
 | Any supported dtype | Same as `reduce_dtype` | Native PyTorch path |
-| `float32` | `bfloat16` or `float16` | With `mixed_precision.enable: true`, custom low-precision transport with FP32 accumulation and output; FP16 has the range limitation described above |
+| `float32` | `bfloat16` or `float16` | With `mixed_precision.enable: true` and `param_dtype` matching transport, custom low-precision transport with FP32 accumulation and output; otherwise rejected |
 | `bfloat16` | `float16` | Unsupported: both use two bytes per value, while BF16-to-FP16 may overflow |
 | `float16` | `bfloat16` | Unsupported: both use two bytes per value and provide no traffic reduction |
 
