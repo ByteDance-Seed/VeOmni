@@ -170,6 +170,32 @@ Registry binding plus mHC pre/post/head forward and backward parity are covered
 by `tests/ops/test_mhc_tile_kernels.py`, which requires TileKernels on an SM90+
 NVIDIA GPU for kernel execution.
 
+DeepSeek-V4 expert-parallel training is exercised separately by
+`tests/e2e/test_e2e_parallel.py::test_deepseek_v4_expert_parallel_alignment`:
+four-rank FSDP2, SP=1, EP=1 versus EP=2, and two optimizer steps. This uses
+eager DSA/mHC with fused routed experts, so it does not qualify the SM90+
+kernel paths. The CPU duplicate-hash-route regression verifies that EP split
+counts match unique token/expert dispatch pairs; repeated routing weights are
+summed when combining outputs.
+
+`test_deepseek_v4_compiled_fsdp2_training_alignment` in the same file compares
+eager and fullgraph Inductor through four-rank packed FSDP2 training, with
+static 512-token shapes and EP/SP disabled. Loss and gradient norm are checked
+at `rtol=atol=1e-3`; this checks aggregate training metrics, not per-parameter
+update alignment, convergence or bitwise equivalence.
+It keeps DSA/mHC/norm/shared MLP/loss eager and routed experts fused. Enabled
+ExtraParallel with compilation remains rejected. Single-device decoder trace
+and gradient checks live in `tests/distributed/test_torch_compile.py`.
+Backend `eager` capture requires exact loss/all-gradient equality. The Inductor
+execution gate requires finite loss, identical used-parameter coverage, finite
+gradients and an actual AdamW update; it does not treat eager BF16 as an exact
+numerical oracle. A separate held-out fixed-route expert test compares output,
+input/routing gradients and both expert-weight gradients against FP32 PyTorch
+math with the same promoted BF16 inputs/weights/cotangent. Its per-tensor budget
+is relative L2 <= two BF16 epsilons and peak error <= four BF16 epsilons of the
+reference peak. These local gates do not qualify whole-model numerical training
+correctness or the SM90+ optimized kernels.
+
 ---
 
 ### 2. VLM Trainer Test (`tests/models/test_vlm_trainer.py`)
