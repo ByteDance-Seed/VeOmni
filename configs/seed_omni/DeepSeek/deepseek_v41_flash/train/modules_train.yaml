@@ -1,0 +1,55 @@
+# Per-module overrides for DeepSeek-V4.1-Flash. Sizes and the parallelism each
+# one needs differ by two orders of magnitude across these four, so almost
+# nothing here is shareable with the top-level accelerator.
+#
+#   vision          0.49 B   FSDP2 alone
+#   text_encoder    1.32 B   emb   (vocab-parallel wte + CE head)
+#   ngram         196.61 B   emb   (row-sharded tables, frozen)
+#   llm           550.56 B   ep    (543.4 B of it is routed experts)
+#
+# The `emb` group size must match across `ngram` and `text_encoder` only in the
+# sense that each is sized to its own table; they are separate meshes.
+
+deepseek_v41_vision:
+  model_path: deepseek_v41_vision
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+deepseek_v41_text_encoder:
+  model_path: deepseek_v41_text_encoder
+  accelerator:
+    extra_parallel_sizes: [8]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_ngram:
+  model_path: deepseek_v41_ngram
+  model_config:
+    # G1: full-parameter training with the tables frozen. This is honoured by
+    # `DeepseekV41Ngram.freeze_model`; without that method the field would be
+    # accepted and ignored, and AdamW would allocate moments for 196.6 B rows.
+    freeze: true
+  accelerator:
+    # Row-sharded over 8 ranks -> ~46 GiB each in bf16. The lookup is an
+    # all-to-all gather, bit-identical to the full-table result.
+    extra_parallel_sizes: [8]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_llm:
+  model_path: deepseek_v41_llm
+  accelerator:
+    ep_size: 8
+    ep_outside: false
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2

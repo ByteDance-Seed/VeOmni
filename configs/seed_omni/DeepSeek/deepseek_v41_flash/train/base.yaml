@@ -1,0 +1,97 @@
+# VeOmni training config for OmniModel V2 -- DeepSeek-V4.1-Flash (multimodal MoE).
+#
+# Launch training:
+#   bash train.sh tasks/omni/train_omni.py \
+#     configs/seed_omni/DeepSeek/deepseek_v41_flash/train/base.yaml
+#
+# Prerequisite -- split the released checkpoint into the four module folders.
+# The converter streams through the shards rather than building the model, so
+# it does not need the weights to fit in RAM, but it does dequantise fp8/fp4 to
+# bf16 and the output is roughly three times the 510 GB input:
+#   python -m veomni.models.seed_omni.modules.deepseek_v41.convert_model \
+#     --model_path /mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash \
+#     --output_dir /mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash
+#
+# There is no inference graph yet: the attention stack carries no KV cache, so
+# `infer_graph` is deliberately absent rather than pointing at a stub.
+
+model:
+  model_path: /mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash
+  model_config:
+    modules: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/modules_train.yaml
+    train_graph: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/graph_train.yaml
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+  accelerator:
+    init_device: meta
+    # Ulysses is not available here: `deepseek_v41_llm` raises on sp_size > 1,
+    # because its compression groups and candidate blocks are built from the
+    # whole sequence in Python before any kernel runs. Raising `ulysses_size`
+    # fails at the first forward rather than producing wrong numbers.
+    ulysses_size: 1
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: true
+      reshard_after_backward: true
+      forward_prefetch: true
+      offload: false
+      max_load_broadcast_size: 20.0
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+    offload_config:
+      enable_activation: false
+      activation_gpu_limit: 0.0
+
+  optimizer:
+    type: adamw
+    # An SFT rate for a 749 B model, an order below the 1e-4 the smaller
+    # SeedOmni configs use.
+    lr: 1.0e-5
+    lr_min: 1.0e-7
+    lr_start: 0.0
+    lr_warmup_ratio: 0.03
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    no_decay_params: []
+    no_decay_modules: []
+
+data:
+  data_type: seedomni
+  max_seq_len: 4096
+  train_path: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/data.yaml
+  datasets_type: iterable
+  multisource_datasets_type: veomni_weighted_multisource
+  train_sample: 1000000
+  dataloader:
+    type: native
+    num_workers: 4
+    drop_last: true
+    pin_memory: true
+    prefetch_factor: 2
+
+train:
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: false
+
+  checkpoint:
+    output_dir: outputs/deepseek_v41_flash_omni_sft
+    save_steps: 500
+    save_epochs: 0
+    # The module folders this writes are the training layout, not the released
+    # one; re-exporting to the released fp8/fp4 packing is a separate step.
+    save_hf_weights: false
+  wandb:
+    enable: true
+    project: VeOmni_omni
+    name: deepseek_v41_flash_omni_sft

@@ -86,6 +86,16 @@ class DeepseekV41Ngram(OmniPreTrainedModel):
         self.register_buffer("token_map", torch.zeros(config.vocab_size, dtype=torch.int64), persistent=True)
         self.post_init()
 
+    def freeze_model(self) -> None:
+        """When ``config.freeze``, freeze the tables -- which is the whole module.
+
+        The runtime calls this only if it exists (``model_runtime._freeze_model_module``
+        looks the attribute up), so a config field without this method would be
+        accepted and ignored.
+        """
+        if self.config.freeze:
+            self.tables.requires_grad_(False)
+
     @property
     def compressed_pad_id(self) -> torch.Tensor:
         """The pad token in the *compressed* id space -- what a blocked lookback slot becomes."""

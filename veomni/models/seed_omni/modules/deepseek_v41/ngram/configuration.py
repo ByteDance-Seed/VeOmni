@@ -32,6 +32,11 @@ class DeepseekV41NgramConfig(PretrainedConfig):
     ``wkv`` and the gate are deliberately NOT here: they read the backbone's
     mHC residual stream and therefore belong to ``deepseek_v41_llm`` (the
     lookup is the module boundary; see the G1 design doc).
+
+    ``freeze`` covers the whole module, because the tables are its only
+    parameters. G1 settled on full-parameter training with these frozen: they
+    are 196.6B of the 749B, and an optimizer that steps them would need moment
+    buffers for a tensor that is a memory rather than a learned transform.
     """
 
     model_type = "deepseek_v41_ngram"
@@ -46,6 +51,7 @@ class DeepseekV41NgramConfig(PretrainedConfig):
         vocab_size: int = 16000000,
         compressed_vocab_size: int = 99092,
         pad_token_id: int = 2,
+        freeze: bool = False,
         **kwargs,
     ):
         self.layer_ids = list(layer_ids) if layer_ids is not None else [1, 14]
@@ -55,6 +61,7 @@ class DeepseekV41NgramConfig(PretrainedConfig):
         self.head_dim = head_dim
         self.vocab_size = vocab_size
         self.compressed_vocab_size = compressed_vocab_size
+        self.freeze = freeze
         super().__init__(pad_token_id=pad_token_id, **kwargs)
 
     @property

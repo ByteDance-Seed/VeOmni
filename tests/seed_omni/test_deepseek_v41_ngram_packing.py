@@ -235,3 +235,48 @@ class TestMaskReachesTheHashing:
         compressed = model.compress(ids, mask)
         assert (compressed[0, 2:5] == DEAD).all()
         assert (compressed[0, :2] != DEAD).all() and compressed[0, 5] != DEAD
+
+
+class TestFreeze:
+    """``freeze: true`` in a module config is only honoured when the module
+    implements ``freeze_model`` -- the runtime looks the attribute up rather
+    than requiring it, so a missing method is accepted and silently ignored.
+    G1 settled on training these tables frozen, so that silence would cost
+    optimizer state for 196.6B parameters before anyone noticed."""
+
+    @staticmethod
+    def _build(freeze: bool):
+        from veomni.models.seed_omni.modules.deepseek_v41.ngram.configuration import DeepseekV41NgramConfig
+        from veomni.models.seed_omni.modules.deepseek_v41.ngram.modeling import DeepseekV41Ngram
+
+        config = DeepseekV41NgramConfig(
+            layer_ids=[0],
+            num_embeddings=[1024],
+            max_ngram_size=4,
+            n_heads=2,
+            head_dim=8,
+            vocab_size=64,
+            compressed_vocab_size=32,
+            pad_token_id=PAD,
+            freeze=freeze,
+        )
+        return DeepseekV41Ngram(config)
+
+    def test_the_runtime_can_find_the_hook(self):
+        assert callable(getattr(self._build(freeze=True), "freeze_model", None))
+
+    def test_freeze_reaches_every_parameter(self):
+        model = self._build(freeze=True)
+        model.freeze_model()
+        assert [p.requires_grad for p in model.parameters()] == [False]
+
+    def test_the_tables_are_the_whole_module(self):
+        """Freezing ``tables`` is freezing the module only while that holds; a
+        parameter added outside them would quietly stay trainable."""
+        names = [name for name, _ in self._build(freeze=False).named_parameters()]
+        assert names and all(name.startswith("tables.") for name in names)
+
+    def test_default_leaves_the_tables_trainable(self):
+        model = self._build(freeze=False)
+        model.freeze_model()
+        assert all(p.requires_grad for p in model.parameters())
