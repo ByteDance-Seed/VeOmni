@@ -185,40 +185,13 @@ FP32 mathematical VJP using the same BF16 bit patterns and the rounding budget
 described below. This isolates expert transport/kernel numerics, not FSDP2
 gradient averaging or whole-model optimizer trajectories.
 
-`tests/e2e/test_e2e_parallel.py::test_deepseek_v4_compiled_fsdp2_training_alignment` compares
-eager and fullgraph Inductor through four-rank packed FSDP2 training, with
-static 512-token shapes and EP/SP disabled. Loss and gradient norm are checked
-at `rtol=atol=1e-3`; this checks aggregate training metrics, not per-parameter
-update alignment, convergence or bitwise equivalence.
-It keeps DSA/mHC/norm/shared MLP/loss eager and routed experts fused. Enabled
-ExtraParallel with compilation remains rejected. Single-device decoder trace
-and gradient checks live in `tests/distributed/test_torch_compile.py`.
-Backend `eager` capture requires exact loss/all-gradient equality. The Inductor
-execution gate requires finite loss, identical used-parameter coverage, finite
-gradients and an actual AdamW update; it does not treat eager BF16 as an exact
-numerical oracle. A separate held-out fixed-route expert test compares output,
-input/routing gradients and both expert-weight gradients against FP32 PyTorch
-math with the same promoted BF16 inputs/weights/cotangent. Its per-tensor budget
-is relative L2 <= two BF16 epsilons and peak error <= four BF16 epsilons of the
-reference peak. These local gates do not qualify whole-model numerical training
-correctness or the SM90+ optimized kernels.
-
-Controlled development runs also recorded full FP32 master parameters and
-pre-/post-clipping gradients from the actual two-step trainer. Initial weights,
-buffers, optimizer settings, RNG fingerprints and every rank's micro-batches
-matched. First-step AdamW replay and clipping agreed with the observed states,
-but raw gradient relative L2 differed by about 4.61% for EP2 versus EP1 and
-5.81% for Inductor versus eager. These are observed differences, not passing
-whole-model numerical tolerances.
-
-For eager EP2, replaying EP1's expert selections reduced the final layer's
-expert-gradient difference from about 13.2% to 2.8%, and the global difference
-to 3.03%. The EP1 self-replay retained bit-identical parameter states. This
-shows that discrete routing contributes to the difference without explaining
-all of it. The first expert's actual training inputs and output cotangents also
-passed the existing FP32-reference output/VJP budgets at EP1 and EP2. Those
-bounded checks support the local operator contract; they do not establish
-whole-model convergence or explain the compiled path's remaining differences.
+Controlled two-step BF16 FSDP2 runs matched initial FP32 master weights,
+buffers, optimizer settings and every rank's micro-batches. Aggregate execution
+gates passed, but whole-model pre-clipping gradient relative L2 differed by
+about 4.61% for EP2 versus EP1. First-step AdamW replay and clipping passed their
+scoped oracles; whole-model update parity and convergence remain unqualified.
+Replaying EP1's expert selections reduced global gradient difference to 3.03%,
+so discrete routing contributes without explaining the entire discrepancy.
 
 ---
 
