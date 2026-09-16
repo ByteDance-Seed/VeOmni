@@ -94,6 +94,33 @@ def attention_op() -> VeomniOp:
     return VeomniOp("attention", "standard", resolve_op_impl("attn_implementation"))
 
 
+PACKED_ATTENTION_METADATA_KEYS = frozenset(
+    {
+        "cu_seqlens",
+        "cu_seqlens_q",
+        "cu_seqlens_k",
+        "cu_seq_lens_q",
+        "cu_seq_lens_k",
+        "max_length_q",
+        "max_length_k",
+        "max_seqlen_q",
+        "max_seqlen_k",
+    }
+)
+
+
+def drop_packed_attention_metadata(kwargs: dict, *, impl: str) -> dict:
+    """Strip GDN/varlen metadata that SDPA and eager attention reject.
+
+    Flash and other packed-capable impls keep the keys. Linear-attention
+    layers should pass ``cu_seq_lens_q`` explicitly instead of through this
+    filter.
+    """
+    if impl in {"eager", "sdpa"}:
+        return {key: value for key, value in kwargs.items() if key not in PACKED_ATTENTION_METADATA_KEYS}
+    return kwargs
+
+
 def resolve_moe_impl() -> str:
     """Return the active ``moe_experts`` impl from the ops config."""
     return resolve_op_impl("moe_implementation")

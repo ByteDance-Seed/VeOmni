@@ -237,6 +237,34 @@ def test_create_standard_causal_mask_marks_only_when_attention_mask_is_none():
         translate_fused_dsa_mask(padded, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
 
 
+def test_create_standard_causal_mask_does_not_mark_packed_position_ids():
+    from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
+
+    seq_len = 4
+    config = GlmMoeDsaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        attn_implementation="eager",
+    )
+    embeds = torch.randn(1, seq_len, config.hidden_size)
+    position_ids = torch.tensor([[0, 1, 0, 1]])
+    mask = create_standard_causal_mask(
+        config=config,
+        inputs_embeds=embeds,
+        attention_mask=None,
+        past_key_values=None,
+        position_ids=position_ids,
+    )
+    assert mask is not None
+    assert dsa_mask_provenance(mask) is None
+    assert not is_standard_causal_mask(mask, q_len=seq_len, kv_len=seq_len)
+    with pytest.raises(ValueError, match="eager implementation"):
+        translate_fused_dsa_mask(mask, q_len=seq_len, kv_len=seq_len, fused=True, what="x")
+
+
 def test_copy_dsa_mask_provenance_survives_head_slice(monkeypatch):
     from veomni.ops.kernels.dsa import mask as mask_mod
 

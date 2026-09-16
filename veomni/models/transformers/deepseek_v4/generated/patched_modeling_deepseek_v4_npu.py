@@ -147,6 +147,13 @@ from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indic
 # ======================================================================
 
 
+def _deepseek_v4_rope_op() -> VeomniOp:
+    impl = resolve_op_impl("rotary_pos_emb_implementation")
+    if impl in {"npu", "liger_kernel"}:
+        impl = "eager"
+    return VeomniOp("rope", "deepseek_v4", impl)
+
+
 def veomni_qat_linear(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """Run a deployment FP8 GEMM recipe when DeepSeek-V4 QAT is enabled."""
     return qat_linear(linear, x, enabled=resolve_qat_impl() == "fp8_blockwise")
@@ -488,11 +495,7 @@ def rotate_half(x):
 def apply_rotary_pos_emb(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
 ) -> torch.Tensor:
-    impl = resolve_op_impl("rotary_pos_emb_implementation")
-    if impl in {"npu", "liger_kernel"}:
-        impl = "eager"
-    rope = VeomniOp("rope", "deepseek_v4", impl)
-    return rope(x, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    return _deepseek_v4_rope_op()(x, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
 # ======================================================================
@@ -533,6 +536,7 @@ class DeepseekV4HCACompressor(nn.Module):
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.position_bias._veomni_fsdp_shard_dim = 1
+        self.veomni_rope = _deepseek_v4_rope_op()
 
     # ================================================================
     # NPU-only: packed compressed-attention gradient-participation anchor
@@ -616,7 +620,7 @@ class DeepseekV4HCACompressor(nn.Module):
                 position_ids,
                 rate_metadata,
                 overlap=False,
-                apply_rope=apply_rotary_pos_emb,
+                apply_rope=self.veomni_rope,
             )
             if compressed.shape[1] == 0:
                 anchor = (self.kv_norm(kv[..., : self.head_dim]).sum() + gate.sum() + self.position_bias.sum()) * 0.0
@@ -652,7 +656,7 @@ class DeepseekV4HCACompressor(nn.Module):
             positions = torch.arange(n_windows, device=compressed.device)
             positions = (positions * self.compress_rate + first_window_position).unsqueeze(0).expand(batch, -1)
             cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
-            compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+            compressed = self.veomni_rope(compressed.unsqueeze(1), cos, sin).squeeze(1)
         else:
             compressed = (
                 empty_compressed_rows(chunk_kv, chunk_gate, self.head_dim)
@@ -759,6 +763,7 @@ class DeepseekV4Indexer(nn.Module):
             "deepseek_v4",
             resolve_op_impl("dsa_indexer_implementation"),
         )
+        self.veomni_rope = _deepseek_v4_rope_op()
 
     def forward(
         self,
@@ -857,7 +862,7 @@ class DeepseekV4Indexer(nn.Module):
                 position_ids,
                 rate_metadata,
                 overlap=True,
-                apply_rope=apply_rotary_pos_emb,
+                apply_rope=self.veomni_rope,
             )
             chunk_kv = chunk_gate = None
             first_window_position = 0
@@ -917,7 +922,7 @@ class DeepseekV4Indexer(nn.Module):
             positions = positions * self.compress_rate + first_window_position
             positions = positions.unsqueeze(0).expand(batch, -1)
             cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
-            compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+            compressed = self.veomni_rope(compressed.unsqueeze(1), cos, sin).squeeze(1)
         else:
             compressed = (
                 empty_compressed_rows(chunk_kv, chunk_gate, self.head_dim)
@@ -934,7 +939,7 @@ class DeepseekV4Indexer(nn.Module):
 
         cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
         q = veomni_qat_linear(self.q_b_proj, q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
-        q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
+        q = self.veomni_rope(q, cos_q, sin_q).transpose(1, 2)
         q = veomni_qat_fake_quant_act(q)
         weights = self.scorer.weights_proj(hidden_states).float() * (
             self.scorer.weights_scaling * self.scorer.softmax_scale
@@ -1051,6 +1056,7 @@ class DeepseekV4CSACompressor(nn.Module):
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.indexer = DeepseekV4Indexer(config)
         self.position_bias._veomni_fsdp_shard_dim = 1
+        self.veomni_rope = _deepseek_v4_rope_op()
 
     def forward(
         self,
@@ -1123,7 +1129,7 @@ class DeepseekV4CSACompressor(nn.Module):
                 position_ids,
                 rate_metadata,
                 overlap=True,
-                apply_rope=apply_rotary_pos_emb,
+                apply_rope=self.veomni_rope,
             )
             # The indexer submodule is intentionally NOT anchored here: its outputs
             # are non-differentiable top-k indices, so its params already receive no
@@ -1202,7 +1208,7 @@ class DeepseekV4CSACompressor(nn.Module):
             positions = positions * self.compress_rate + first_window_position
             positions = positions.unsqueeze(0).expand(batch, -1)
             cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
-            compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+            compressed = self.veomni_rope(compressed.unsqueeze(1), cos, sin).squeeze(1)
         else:
             compressed = (
                 empty_compressed_rows(chunk_kv, chunk_gate, self.head_dim)
@@ -1426,6 +1432,7 @@ class DeepseekV4Attention(nn.Module):
             "deepseek_v4",
             resolve_op_impl("dsa_attention_implementation"),
         )
+        self.veomni_rope = _deepseek_v4_rope_op()
 
     def forward(
         self,
@@ -1445,10 +1452,10 @@ class DeepseekV4Attention(nn.Module):
         q_residual = self.q_a_norm(veomni_qat_linear(self.q_a_proj, hidden_states))
         q = self.q_b_norm(veomni_qat_linear(self.q_b_proj, q_residual).view(*hidden_shape))
         q = q.transpose(1, 2)
-        q = apply_rotary_pos_emb(q, cos, sin)
+        q = self.veomni_rope(q, cos, sin)
 
         kv = self.kv_norm(veomni_qat_linear(self.kv_proj, hidden_states)).view(*hidden_shape).transpose(1, 2)
-        kv = apply_rotary_pos_emb(kv, cos, sin)
+        kv = self.veomni_rope(kv, cos, sin)
         kv = veomni_qat_fake_quant_kv(kv, self.config.qk_rope_head_dim)
 
         if past_key_values is not None:
@@ -1637,7 +1644,7 @@ class DeepseekV4Attention(nn.Module):
                 attn_output, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group
             )
 
-        attn_output = apply_rotary_pos_emb(attn_output.transpose(1, 2), cos, -sin).transpose(1, 2)
+        attn_output = self.veomni_rope(attn_output.transpose(1, 2), cos, -sin).transpose(1, 2)
         grouped = attn_output.reshape(*input_shape, self.config.o_groups, -1)
         grouped = veomni_qat_linear(self.o_a_proj, grouped).flatten(2)
         output = veomni_qat_linear(self.o_b_proj, grouped)

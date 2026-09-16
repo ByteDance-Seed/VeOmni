@@ -222,3 +222,18 @@ def test_qwen3_5_moe_eager_matches_hf_aux_loss():
     assert hf_out.aux_loss is not None
     torch.testing.assert_close(ours_out.aux_loss, hf_out.aux_loss, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(ours_out.loss, hf_out.loss, atol=1e-6, rtol=1e-6)
+
+
+def test_qwen3_5_moe_sdpa_full_attention_accepts_single_sequence_cu_seq_lens_q():
+    ops = eager_ops_config()
+    ops.attn_implementation = "sdpa"
+    config = _tiny_text_config(layer_types=["full_attention", "full_attention"])
+    ours = _build_causal(config, ops).eval()
+    input_ids = torch.randint(3, config.vocab_size, (1, 32))
+    with ops_config_scope(ops), torch.no_grad():
+        output = ours(
+            input_ids=input_ids,
+            use_cache=False,
+            cu_seq_lens_q=torch.tensor([0, 32], dtype=torch.int32),
+        )
+    assert torch.isfinite(output.logits).all()

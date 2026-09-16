@@ -476,6 +476,30 @@ def extra_init_statements(patch: Patch) -> str:
     return "\n".join(ast.unparse(stmt) for stmt in extras)
 
 
+def function_body_indent(source: str) -> int:
+    """Indent of the first executable statement, not the last source line.
+
+    A trailing ``if cond:`` body is nested deeper. ``modify_init`` extras must
+    stay at the function-body indent so they always run.
+    """
+    tree = parse_source_to_ast(source)
+    func = next((node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+    if func is None:
+        raise CodegenError("modify_init extras need a function body to indent against")
+    body = list(func.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    if body:
+        return body[0].col_offset
+    def_line = next(line for line in source.splitlines() if line.lstrip().startswith(("def ", "async def ")))
+    return len(def_line) - len(def_line.lstrip()) + 4
+
+
 def strip_patch_decorators(source: str) -> str:
     """Remove patch decorator lines from replacement source code.
 
@@ -1123,8 +1147,7 @@ class ModelingCodeGenerator:
             )
         )
         extras = extra_init_statements(patch)
-        last_code = next(line for line in reversed(original.splitlines()) if line.strip())
-        indent = len(last_code) - len(last_code.lstrip())
+        indent = function_body_indent(original)
         comment = patch.description or "Instance-local VeomniOp handles"
         extra_block = textwrap.indent(f"# {comment}\n{extras}", " " * indent)
         header = f"# [modified __init__] {comment}"

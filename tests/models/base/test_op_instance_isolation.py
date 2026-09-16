@@ -28,6 +28,9 @@ import torch
 
 from tests.models.compare import eager_ops_config, ops_config_scope, qwen_image_inputs
 from tests.models.tiny_configs import (
+    tiny_deepseek_v3_config,
+    tiny_deepseek_v4_config,
+    tiny_gemma3_text_config,
     tiny_glm_moe_dsa_config,
     tiny_qwen2_config,
     tiny_qwen2_vl_config,
@@ -217,3 +220,95 @@ def test_glm_moe_dsa_forward_keeps_construction_impls():
         alt_cfg=_attn_cfg("sdpa"),
         poison_cfg=_poison_cfg(),
     )
+
+
+def test_gemma3_text_forward_keeps_construction_impls():
+    from veomni.models.transformers.gemma3.generated.patched_modeling_gemma3_gpu import Gemma3ForCausalLM
+
+    config = tiny_gemma3_text_config()
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    _assert_isolated(
+        build=lambda: Gemma3ForCausalLM(config),
+        run=lambda model: model(input_ids=input_ids, use_cache=False),
+        attn_paths=("model.layers.0.self_attn.veomni_attn",),
+        sticky_paths=("model.layers.0.self_attn.veomni_rope",),
+        eager_cfg=_attn_cfg("eager"),
+        alt_cfg=_attn_cfg("sdpa"),
+        poison_cfg=_poison_cfg(),
+    )
+
+
+def test_gemma3_eager_instance_keeps_first_token_causal_after_global_sdpa_switch():
+    from veomni.models.transformers.gemma3.generated.patched_modeling_gemma3_gpu import Gemma3ForCausalLM
+
+    config = tiny_gemma3_text_config()
+    with ops_config_scope(_attn_cfg("eager")):
+        model = Gemma3ForCausalLM(config).eval()
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    mutated = input_ids.clone()
+    mutated[:, -1] = (mutated[:, -1] + 3) % config.vocab_size
+    sdpa_cfg = _attn_cfg("sdpa")
+    with torch.no_grad(), ops_config_scope(sdpa_cfg):
+        logits = model(input_ids=input_ids, use_cache=False).logits
+        mutated_logits = model(input_ids=mutated, use_cache=False).logits
+    torch.testing.assert_close(logits[:, 0], mutated_logits[:, 0])
+
+
+def test_deepseek_v3_rope_keeps_construction_impl():
+    from veomni.utils.device import IS_NPU_AVAILABLE
+
+    if IS_NPU_AVAILABLE:
+        from veomni.models.transformers.deepseek_v3.generated.patched_modeling_deepseek_v3_npu import (
+            DeepseekV3ForCausalLM,
+        )
+    else:
+        from veomni.models.transformers.deepseek_v3.generated.patched_modeling_deepseek_v3_gpu import (
+            DeepseekV3ForCausalLM,
+        )
+
+    config = tiny_deepseek_v3_config()
+    if hasattr(config, "rope_interleave"):
+        config.rope_interleave = False
+    eager_cfg = eager_ops_config()
+    poison = eager_ops_config()
+    poison.rotary_pos_emb_implementation = "triton"
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    with ops_config_scope(eager_cfg):
+        model = DeepseekV3ForCausalLM(config).eval()
+    assert model.model.layers[0].self_attn.veomni_rope.impl == "eager"
+    assert model.model.rotary_emb.veomni_rope_use_triton is False
+    with torch.no_grad(), ops_config_scope(eager_cfg):
+        reference = model(input_ids=input_ids, use_cache=False).logits
+    with torch.no_grad(), ops_config_scope(poison):
+        isolated = model(input_ids=input_ids, use_cache=False).logits
+        assert model.model.layers[0].self_attn.veomni_rope.impl == "eager"
+        assert model.model.rotary_emb.veomni_rope_use_triton is False
+    torch.testing.assert_close(isolated, reference)
+
+
+def test_deepseek_v4_rope_keeps_construction_impl():
+    from veomni.utils.device import IS_NPU_AVAILABLE
+
+    if IS_NPU_AVAILABLE:
+        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_npu import (
+            DeepseekV4ForCausalLM,
+        )
+    else:
+        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+            DeepseekV4ForCausalLM,
+        )
+
+    config = tiny_deepseek_v4_config()
+    eager_cfg = eager_ops_config()
+    poison = eager_ops_config()
+    poison.rotary_pos_emb_implementation = "triton"
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    with ops_config_scope(eager_cfg):
+        model = DeepseekV4ForCausalLM(config).eval()
+    assert model.model.layers[0].self_attn.veomni_rope.impl == "eager"
+    with torch.no_grad(), ops_config_scope(eager_cfg):
+        reference = model(input_ids=input_ids, use_cache=False).logits
+    with torch.no_grad(), ops_config_scope(poison):
+        isolated = model(input_ids=input_ids, use_cache=False).logits
+        assert model.model.layers[0].self_attn.veomni_rope.impl == "eager"
+    torch.testing.assert_close(isolated, reference)

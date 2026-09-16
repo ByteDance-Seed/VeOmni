@@ -182,3 +182,18 @@ def test_qwen3_5_eager_matches_hf_image_and_text():
         fwd_kwargs=image,
         ours_fwd_kwargs={"cu_seq_lens_q": _empty_cu_seq_lens()},
     )
+
+
+def test_qwen3_5_sdpa_full_attention_accepts_single_sequence_cu_seq_lens_q():
+    ops = eager_ops_config()
+    ops.attn_implementation = "sdpa"
+    config = _tiny_text_config(layer_types=["full_attention", "full_attention"])
+    ours = _build_causal(config, ops).eval()
+    input_ids = torch.randint(3, config.vocab_size, (1, 32))
+    with ops_config_scope(ops), torch.no_grad():
+        output = ours(
+            input_ids=input_ids,
+            use_cache=False,
+            cu_seq_lens_q=torch.tensor([0, 32], dtype=torch.int32),
+        )
+    assert torch.isfinite(output.logits).all()

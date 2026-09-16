@@ -28,7 +28,6 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4CSACache,
     DeepseekV4HCACache,
     DeepseekV4IndexerScorer,
-    apply_rotary_pos_emb,
 )
 
 from veomni.models.transformers.deepseek_v4.packed_utils import (
@@ -254,6 +253,7 @@ def deepseek_v4_hca_compressor_init_patched(self, config: "DeepseekV4Config") ->
     self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
     self.rotary_emb = DeepseekV4RotaryEmbedding(config)
     self.position_bias._veomni_fsdp_shard_dim = 1
+    self.veomni_rope = _deepseek_v4_rope_op()
 
 
 @config.override_method("DeepseekV4Indexer.__init__", description=_POSITION_BIAS_SHARD_DIM_DESCRIPTION)
@@ -276,6 +276,7 @@ def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config") -> None:
         "deepseek_v4",
         resolve_op_impl("dsa_indexer_implementation"),
     )
+    self.veomni_rope = _deepseek_v4_rope_op()
 
 
 @config.override_method("DeepseekV4CSACompressor.__init__", description=_POSITION_BIAS_SHARD_DIM_DESCRIPTION)
@@ -290,6 +291,7 @@ def deepseek_v4_csa_compressor_init_patched(self, config: "DeepseekV4Config") ->
     self.rotary_emb = DeepseekV4RotaryEmbedding(config)
     self.indexer = DeepseekV4Indexer(config)
     self.position_bias._veomni_fsdp_shard_dim = 1
+    self.veomni_rope = _deepseek_v4_rope_op()
 
 
 # ================================================================
@@ -378,7 +380,7 @@ def deepseek_v4_hca_compressor_forward_patched(
             position_ids,
             rate_metadata,
             overlap=False,
-            apply_rope=apply_rotary_pos_emb,
+            apply_rope=self.veomni_rope,
         )
         if compressed.shape[1] == 0:
             anchor = (self.kv_norm(kv[..., : self.head_dim]).sum() + gate.sum() + self.position_bias.sum()) * 0.0
@@ -414,7 +416,7 @@ def deepseek_v4_hca_compressor_forward_patched(
         positions = torch.arange(n_windows, device=compressed.device)
         positions = (positions * self.compress_rate + first_window_position).unsqueeze(0).expand(batch, -1)
         cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
-        compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+        compressed = self.veomni_rope(compressed.unsqueeze(1), cos, sin).squeeze(1)
     else:
         compressed = (
             empty_compressed_rows(chunk_kv, chunk_gate, self.head_dim)
@@ -524,7 +526,7 @@ def deepseek_v4_csa_compressor_forward_patched(
             position_ids,
             rate_metadata,
             overlap=True,
-            apply_rope=apply_rotary_pos_emb,
+            apply_rope=self.veomni_rope,
         )
         # The indexer submodule is intentionally NOT anchored here: its outputs
         # are non-differentiable top-k indices, so its params already receive no
@@ -599,7 +601,7 @@ def deepseek_v4_csa_compressor_forward_patched(
         positions = positions * self.compress_rate + first_window_position
         positions = positions.unsqueeze(0).expand(batch, -1)
         cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
-        compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+        compressed = self.veomni_rope(compressed.unsqueeze(1), cos, sin).squeeze(1)
     else:
         compressed = (
             empty_compressed_rows(chunk_kv, chunk_gate, self.head_dim)

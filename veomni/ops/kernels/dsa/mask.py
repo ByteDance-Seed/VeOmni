@@ -66,11 +66,22 @@ def copy_dsa_mask_provenance(source: Tensor | None, dest: Tensor | None) -> Tens
     return dest
 
 
-def create_standard_causal_mask(*args, **kwargs) -> Tensor | None:
-    """HF ``create_causal_mask``, marked only when no dense/padding mask is supplied.
+def _position_ids_reset_within_row(position_ids: Tensor | None) -> bool:
+    """Whether any row resets, as packed sequences do at sample boundaries."""
+    if position_ids is None or not torch.is_tensor(position_ids) or position_ids.numel() <= 1:
+        return False
+    ids = position_ids if position_ids.dim() > 1 else position_ids.unsqueeze(0)
+    if ids.shape[-1] <= 1:
+        return False
+    return bool((ids[..., 1:] - ids[..., :-1] <= 0).any())
 
-    A 2-D padding mask or other explicit ``attention_mask`` can still produce a
-    causal triangle with extra blocked columns. Those outputs stay unmarked so
+
+def create_standard_causal_mask(*args, **kwargs) -> Tensor | None:
+    """HF ``create_causal_mask``, marked only for an unmarked standard triangle.
+
+    A 2-D padding mask, other explicit ``attention_mask``, or packed
+    ``position_ids`` that reset inside a row can still produce a causal
+    triangle with extra blocked positions. Those outputs stay unmarked so
     fused translate falls back to ``is_standard_causal_mask`` instead of
     dropping them as standard causal.
     """
@@ -80,7 +91,10 @@ def create_standard_causal_mask(*args, **kwargs) -> Tensor | None:
     attention_mask = kwargs.get("attention_mask")
     if attention_mask is None and len(args) >= 3:
         attention_mask = args[2]
-    if attention_mask is None:
+    position_ids = kwargs.get("position_ids")
+    if position_ids is None and len(args) >= 5:
+        position_ids = args[4]
+    if attention_mask is None and not _position_ids_reset_within_row(position_ids):
         return mark_standard_causal_mask(mask)
     return mask
 

@@ -114,7 +114,14 @@ from veomni.distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
-from veomni.models.utils.op_utils import attention_op, empty_bias, resolve_moe_impl, resolve_op_impl
+from veomni.models.utils.op_utils import (
+    attention_op,
+    empty_bias,
+    merged_experts_act_fn_forward,
+    resolve_moe_impl,
+    resolve_op_impl,
+    uses_swiglu_mlp,
+)
 
 # Additional imports for patches
 from veomni.ops import VeomniOp
@@ -401,6 +408,7 @@ class Qwen3VLMoeTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
+        self.use_swiglu_mlp = uses_swiglu_mlp(config.hidden_act)
         self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
 
     def forward(
@@ -409,6 +417,16 @@ class Qwen3VLMoeTextExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
+        if not self.use_swiglu_mlp:
+            return merged_experts_act_fn_forward(
+                hidden_states,
+                top_k_index,
+                top_k_weights,
+                self.gate_up_proj,
+                self.down_proj,
+                self.act_fn,
+                self.num_experts,
+            )
         unused = empty_bias(self.gate_up_proj)
         return self.veomni_moe(
             hidden_states,

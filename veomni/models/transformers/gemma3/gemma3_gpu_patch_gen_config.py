@@ -102,9 +102,18 @@ def gemma3_textmodel_forward_patched(
         position_ids = position_ids.unsqueeze(0)
 
     if not isinstance(causal_mask_mapping := attention_mask, dict):
+        # Mask builders must follow this instance's attention impl. Reading the
+        # global ops config would let SDPA return None while eager attention
+        # still needs a causal triangle.
+        attn_impl = resolve_op_impl("attn_implementation")
+        for layer in self.layers[: self.config.num_hidden_layers]:
+            handle = getattr(getattr(layer, "self_attn", None), "veomni_attn", None)
+            if handle is not None:
+                attn_impl = handle.impl
+                break
         cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
         if cu_seq_lens_q is not None:
-            impl = resolve_op_impl("attn_implementation")
+            impl = attn_impl
             q_len = inputs_embeds.shape[1]
             past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
             kv_len = q_len + past_seen
@@ -143,9 +152,9 @@ def gemma3_textmodel_forward_patched(
                 mask_kwargs["or_mask_function"] = lambda *args: torch.tensor(True, dtype=torch.bool)
                 sliding_mask_kwargs["or_mask_function"] = _bidirectional_window_overlay(self.config.sliding_window)
             # HF builders dispatch on config._attn_implementation; keep it aligned
-            # with the VeOmni attention impl so flex still receives a BlockMask.
+            # with this instance's attention impl so flex still receives a BlockMask.
             previous_impl = self.config._attn_implementation
-            self.config._attn_implementation = resolve_op_impl("attn_implementation")
+            self.config._attn_implementation = attn_impl
             try:
                 causal_mask_mapping = {
                     "full_attention": create_causal_mask(**mask_kwargs),

@@ -64,6 +64,7 @@ from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config imp
 from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config import (
     config as gpu_config,
 )
+from veomni.models.utils.op_utils import drop_packed_attention_metadata
 from veomni.patchgen.patch_spec import PatchConfig
 
 
@@ -100,7 +101,15 @@ config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", 
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models.utils.op_utils",
-    names=["attention_op", "empty_bias", "resolve_op_impl", "resolve_moe_impl"],
+    names=[
+        "attention_op",
+        "drop_packed_attention_metadata",
+        "empty_bias",
+        "resolve_op_impl",
+        "resolve_moe_impl",
+        "merged_experts_act_fn_forward",
+        "uses_swiglu_mlp",
+    ],
 )
 config.add_import(
     "veomni.models.loss_utils",
@@ -325,7 +334,9 @@ def qwen3_5_moe_decoder_layer_forward_patched(
             chunk_indices_list=linear_attn_chunk_indices_list,
         )
     elif self.block_type == "full_attention":
-        # Self Attention
+        # Self Attention. SDPA/eager reject GDN cu_seq_lens metadata.
+        attn_impl = getattr(getattr(self, "self_attn", None), "veomni_attn", None)
+        attn_kwargs = drop_packed_attention_metadata(kwargs, impl=attn_impl.impl if attn_impl is not None else "eager")
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -333,7 +344,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
             past_key_values=past_key_values,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
-            **kwargs,
+            **attn_kwargs,
         )
 
     hidden_states = residual + hidden_states

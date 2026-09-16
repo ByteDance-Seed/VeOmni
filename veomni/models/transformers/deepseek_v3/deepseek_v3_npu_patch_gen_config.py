@@ -24,6 +24,8 @@ the installed ops config. No local ``triton_bmm`` on NPU.
 from veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config import (
     PatchedDeepseekV3Experts,
     apply_rotary_pos_emb_patched,
+    deepseek_v3_attention_bind_ops,
+    deepseek_v3_attention_forward_patched,
     deepseek_v3_forcausallm_forward_patched,
     deepseek_v3_forcausallm_init_patched,
     deepseek_v3_get_parallel_plan_patched,
@@ -32,6 +34,7 @@ from veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config imp
     deepseek_v3_moe_forward_patched,
     deepseek_v3_rmsnorm_forward_patched,
     deepseek_v3_rmsnorm_init_patched,
+    deepseek_v3_rotary_embedding_bind_ops,
     deepseek_v3_rotary_embedding_forward_patched,
     deepseek_v3_topk_router_forward_patched,
 )
@@ -65,12 +68,27 @@ config.override_method(
 config.override_method(
     "DeepseekV3RotaryEmbedding.forward",
     replacement=deepseek_v3_rotary_embedding_forward_patched,
-    description="Use local triton_bmm for deterministic freqs when rotary impl is triton",
+    description="Use construct-time triton_bmm choice for deterministic freqs",
+)
+config.modify_init(
+    "DeepseekV3RotaryEmbedding",
+    replacement=deepseek_v3_rotary_embedding_bind_ops,
+    description="Capture rotary freq impl at construct time",
 )
 config.replace_function(
     "apply_rotary_pos_emb",
     replacement=apply_rotary_pos_emb_patched,
     description="Always call rope full VeomniOp",
+)
+config.modify_init(
+    "DeepseekV3Attention",
+    replacement=deepseek_v3_attention_bind_ops,
+    description="Bind instance-local rope VeomniOp",
+)
+config.override_method(
+    "DeepseekV3Attention.forward",
+    replacement=deepseek_v3_attention_forward_patched,
+    description="Always call the local rope VeomniOp on the non-interleaved path",
 )
 config.override_method(
     "DeepseekV3MLP.__init__",

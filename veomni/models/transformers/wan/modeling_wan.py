@@ -606,7 +606,10 @@ class WanModel(PreTrainedModel):
                 self_attn_mask[..., padded_seq_len - pad_size :] = torch.finfo(x.dtype).min
 
             x = slice_input_tensor_scale_grad(x, dim=1)
-            freqs = slice_input_tensor_scale_grad(freqs, dim=0)
+            # Async DiT QKV already returns the full sequence. RoPE must see
+            # matching full-length freqs; slicing here is only for the sync path.
+            if not any(getattr(block.self_attn, "sp_async", False) for block in self.blocks):
+                freqs = slice_input_tensor_scale_grad(freqs, dim=0)
 
         cos = freqs.real.squeeze().contiguous()
         sin = freqs.imag.squeeze().contiguous()

@@ -21,7 +21,7 @@ quantizing one tensor too few still produces a plausible loss curve, it just
 trains for a kernel nobody deploys. So the coverage tests read the generated
 source instead of running it, and fail on any site they have not been told about.
 
-Numerics live in ``tests/ops/test_qat_fp8_blockwise.py``; what is checked here is
+Numerics live in ``tests/ops/qat/test_fp8_blockwise.py``; what is checked here is
 the wiring, plus the two properties that distinguish the recipes from each other
 (the KV split at the RoPE boundary, and the indexer covering the whole head).
 """

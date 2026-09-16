@@ -104,3 +104,25 @@ def test_resolve_moe_impl_reads_ops_config():
     assert resolve_moe_impl() == "fused_triton"
     set_ops_config(SimpleNamespace(moe_implementation="eager"))
     assert resolve_moe_impl() == "eager"
+
+
+@pytest.mark.parametrize("impl", ["eager", "sdpa"])
+def test_drop_packed_attention_metadata_strips_gdn_keys_for_sdpa_and_eager(impl):
+    from veomni.models.utils.op_utils import drop_packed_attention_metadata
+
+    kwargs = {
+        "cu_seq_lens_q": torch.tensor([0, 32], dtype=torch.int32),
+        "max_length_q": 32,
+        "keep": 1,
+    }
+    filtered = drop_packed_attention_metadata(kwargs, impl=impl)
+    assert "cu_seq_lens_q" not in filtered
+    assert "max_length_q" not in filtered
+    assert filtered["keep"] == 1
+
+
+def test_drop_packed_attention_metadata_keeps_keys_for_flash():
+    from veomni.models.utils.op_utils import drop_packed_attention_metadata
+
+    kwargs = {"cu_seq_lens_q": torch.tensor([0, 32], dtype=torch.int32)}
+    assert drop_packed_attention_metadata(kwargs, impl="flash_attention_2") is kwargs

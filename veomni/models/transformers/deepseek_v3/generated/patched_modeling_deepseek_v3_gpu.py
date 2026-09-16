@@ -13,10 +13,16 @@
 #      Construct a local rms_norm VeomniOp
 #    - method_override: DeepseekV3RMSNorm.forward
 #      Always call the local rms_norm VeomniOp
+#    - init_modification: DeepseekV3RotaryEmbedding
+#      Capture rotary freq impl at construct time
 #    - method_override: DeepseekV3RotaryEmbedding.forward
-#      Use local triton_bmm for deterministic freqs when rotary impl is triton
+#      Use construct-time triton_bmm choice for deterministic freqs
 #    - function_replacement: apply_rotary_pos_emb
 #      Always call rope full VeomniOp
+#    - init_modification: DeepseekV3Attention
+#      Bind instance-local rope VeomniOp
+#    - method_override: DeepseekV3Attention.forward
+#      Always call the local rope VeomniOp on the non-interleaved path
 #    - method_override: DeepseekV3MLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: DeepseekV3MLP.forward
@@ -51,7 +57,6 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_causal_mask
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import (
     GenericForSequenceClassification,
     GenericForTokenClassification,
@@ -82,6 +87,16 @@ from veomni.utils.moe_monitor import record_router_indices
 
 
 # ======================================================================
+# [HELPERS] Module-level helpers injected via config.add_helper
+# ======================================================================
+
+
+def _deepseek_v3_rope_op() -> VeomniOp:
+    impl = resolve_op_impl("rotary_pos_emb_implementation")
+    return VeomniOp("rope", "full", "eager" if impl == "triton" else impl)
+
+
+# ======================================================================
 # [MODIFIED CLASS] DeepseekV3RMSNorm
 # Methods patched: __init__, forward
 # ======================================================================
@@ -104,11 +119,13 @@ class DeepseekV3RMSNorm(nn.Module):
 
 # ======================================================================
 # [MODIFIED CLASS] DeepseekV3RotaryEmbedding
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
 class DeepseekV3RotaryEmbedding(nn.Module):
+    # [modified __init__] Capture rotary freq impl at construct time
+    @deprecate_kwarg("device", version="5.18")
     @deprecate_kwarg("device", version="5.18")
     def __init__(self, config: DeepseekV3Config, device=None):
         super().__init__()
@@ -125,6 +142,8 @@ class DeepseekV3RotaryEmbedding(nn.Module):
 
         self.inv_freq = nn.Buffer(inv_freq, persistent=False)
         self.original_inv_freq = nn.Buffer(inv_freq.clone(), persistent=False)
+        # Capture rotary freq impl at construct time
+        self.veomni_rope_use_triton = resolve_op_impl("rotary_pos_emb_implementation") == "triton"
 
     @staticmethod
     @deprecate_kwarg("device", version="5.18")
@@ -155,7 +174,7 @@ class DeepseekV3RotaryEmbedding(nn.Module):
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
         with maybe_autocast(device_type=device_type, enabled=False):
-            if resolve_op_impl("rotary_pos_emb_implementation") == "triton":
+            if self.veomni_rope_use_triton:
                 from veomni.models.transformers.deepseek_v3.triton_bmm import triton_bmm
 
                 freqs = triton_bmm(
@@ -402,9 +421,7 @@ def apply_rotary_pos_emb(
     sin: torch.Tensor,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    impl = resolve_op_impl("rotary_pos_emb_implementation")
-    rope = VeomniOp("rope", "full", "eager" if impl == "triton" else impl)
-    return rope(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    return _deepseek_v3_rope_op()(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
 def apply_rotary_pos_emb_interleave(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -446,9 +463,16 @@ def apply_rotary_pos_emb_interleave(q, k, cos, sin, position_ids=None, unsqueeze
     return q_embed, k_embed
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV3Attention
+# Methods patched: forward, __init__
+# ======================================================================
+
+
 class DeepseekV3Attention(nn.Module):
     """Multi-headed Latent Attention (MLA) from Deepseek V2"""
 
+    # [modified __init__] Bind instance-local rope VeomniOp
     def __init__(self, config: DeepseekV3Config, layer_idx: int):
         super().__init__()
         self.config = config
@@ -503,6 +527,8 @@ class DeepseekV3Attention(nn.Module):
         )
 
         self.scaling = yarn_apply_mscale(config.rope_parameters, self.qk_head_dim ** (-0.5))
+        # Bind instance-local rope VeomniOp
+        self.veomni_rope = _deepseek_v3_rope_op()
 
     def expand_kv(self, kv_nope: torch.Tensor, k_rot: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Expands the compressed latents into key and value states. Args:
@@ -529,7 +555,7 @@ class DeepseekV3Attention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
         batch_size, seq_length = hidden_states.shape[:-1]
         query_shape = (batch_size, seq_length, -1, self.qk_head_dim)
@@ -544,28 +570,23 @@ class DeepseekV3Attention(nn.Module):
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         kv_nope, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_nope = self.kv_a_layernorm(kv_nope)
-        # Both latents are viewed as single-head, 4D tensors so all cache layers handle them correctly
         kv_nope = kv_nope.view(batch_size, 1, seq_length, self.kv_lora_rank)
         k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
 
         cos, sin = position_embeddings
-        if self.config.rope_interleave:  # support using interleaved weights for efficiency
+        if self.config.rope_interleave:
             q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin)
         else:
-            q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
+            q_rot, k_rot = self.veomni_rope(q_rot, k_rot, cos, sin)
 
-        # Cache read / write is performed while latent KV is still compressed
         if past_key_values is not None:
             kv_nope, k_rot = past_key_values.update(kv_nope, k_rot, self.layer_idx)
 
         query_states = torch.cat((q_pass, q_rot), dim=-1)
-
         key_states, value_states = self.expand_kv(kv_nope, k_rot)
-
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
         )
-
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -576,7 +597,6 @@ class DeepseekV3Attention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
-
         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights

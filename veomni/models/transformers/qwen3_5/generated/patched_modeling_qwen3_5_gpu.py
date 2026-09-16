@@ -115,7 +115,7 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 from veomni.models.loss_utils import ForCausalLMLoss
-from veomni.models.utils.op_utils import attention_op, resolve_op_impl
+from veomni.models.utils.op_utils import attention_op, drop_packed_attention_metadata, resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutputMixin
@@ -1088,7 +1088,11 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
                 cu_seq_lens_q=linear_attn_cu_seq_lens_q,
             )
         elif self.block_type == "full_attention":
-            # Self Attention
+            # Self Attention. SDPA/eager reject GDN cu_seq_lens metadata.
+            attn_impl = getattr(getattr(self, "self_attn", None), "veomni_attn", None)
+            attn_kwargs = drop_packed_attention_metadata(
+                kwargs, impl=attn_impl.impl if attn_impl is not None else "eager"
+            )
             hidden_states, _ = self.self_attn(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -1096,7 +1100,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
                 past_key_values=past_key_values,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
-                **kwargs,
+                **attn_kwargs,
             )
 
         hidden_states = residual + hidden_states

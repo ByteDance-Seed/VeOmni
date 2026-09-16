@@ -225,6 +225,43 @@ def test_wan_async_self_attn_passes_dit_qkv_biases(monkeypatch):
     assert arguments["norm_k_bias"] is None
 
 
+def test_wan_async_self_attn_uses_full_sequence_freqs(monkeypatch):
+    """Async DiT QKV returns the gathered sequence. RoPE must use full freqs."""
+    from veomni.models.transformers.wan.modeling_wan import SelfAttention, precompute_freqs_cis
+
+    original_op = wan_modeling.VeomniOp
+    full_seq = 32
+    local_seq = 8
+    dim = 32
+    head_dim = 8
+
+    class FullSeqOp:
+        def __init__(self, op, variant, impl="eager"):
+            self.op = op
+            self.variant = variant
+            self.impl = impl
+            self._inner = None if op in {"async_ulysses_qkv", "async_ulysses_o"} else original_op(op, variant, impl)
+
+        def __call__(self, *args, **kwargs):
+            if self.op == "async_ulysses_qkv":
+                hidden = kwargs["hidden_states"]
+                assert hidden.shape[1] == local_seq
+                full = hidden.new_empty(hidden.shape[0], full_seq, hidden.shape[2])
+                return full, full.clone(), full.clone()
+            if self.op == "async_ulysses_o":
+                return kwargs["hidden_states"]
+            return self._inner(*args, **kwargs)
+
+    monkeypatch.setattr(wan_modeling, "VeomniOp", FullSeqOp)
+    with ops_config_scope(eager_ops_config()):
+        attn = SelfAttention(SimpleNamespace(_attn_implementation="eager"), dim=dim, num_heads=4)
+    attn.sp_async = True
+    hidden = torch.randn(1, local_seq, dim)
+    freqs = precompute_freqs_cis(head_dim, end=full_seq).reshape(full_seq, 1, -1)
+    output = attn(hidden, freqs, cos=None, sin=None, last_loss=None)
+    assert output.shape == (1, full_seq, dim)
+
+
 def test_wan_eager_matches_official():
     torch.manual_seed(0)
     official = RefWanModel(_tiny_ref_config())
