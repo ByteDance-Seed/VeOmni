@@ -64,6 +64,12 @@ def test_deepseek_v4_routers_use_fp32_projection_under_autocast():
     )
     topk_router = dsv4.DeepseekV4TopKRouter(config).to(torch.bfloat16)
     hash_router = dsv4.DeepseekV4HashRouter(config).to(torch.bfloat16)
+    # Standalone routers allocate empty weights; only the enclosing model
+    # initializes them. Do not let allocator contents decide this comparison.
+    generator = torch.Generator().manual_seed(42)
+    with torch.no_grad():
+        for router in (topk_router, hash_router):
+            router.weight.copy_(torch.randn(router.weight.shape, generator=generator, dtype=torch.bfloat16))
     hidden_states = torch.linspace(-1.0, 1.0, 24, dtype=torch.bfloat16).reshape(1, 3, 8)
     input_ids = torch.tensor([[0, 1, 2]])
 
