@@ -50,7 +50,13 @@ from veomni.ops.kernels.dsa.attention.deepseek_v4 import tilelang as deepseek_v4
 from veomni.ops.kernels.dsa.attention.glm import flashmla_cudnn as glm_fused_attention
 from veomni.ops.kernels.dsa.indexer.deepseek_v4 import tilelang as deepseek_v4_fused_indexer
 from veomni.ops.kernels.dsa.indexer.glm import cudnn as glm_fused_indexer
-from veomni.ops.kernels.dsa.mask import is_standard_causal_mask, translate_fused_dsa_mask
+from veomni.ops.kernels.dsa.mask import (
+    is_standard_causal_mask,
+    mark_custom_dsa_mask,
+    mark_standard_causal_mask,
+    translate_fused_dsa_mask,
+)
+from veomni.utils.device import IS_CUDA_AVAILABLE
 
 
 # Installed Transformers implementations provide the DeepSeek-V4 and GLM eager references.
@@ -186,6 +192,37 @@ def test_translate_fused_dsa_mask_rejects_custom_head_and_additive_bias():
     assert is_standard_causal_mask(bool_allowed, q_len=seq_len, kv_len=seq_len)
     assert is_standard_causal_mask(bool_blocked, q_len=seq_len, kv_len=seq_len)
     assert translate_fused_dsa_mask(bool_allowed, q_len=seq_len, kv_len=seq_len, fused=True, what="x") is None
+
+
+def test_translate_fused_dsa_mask_honors_provenance_without_scanning(monkeypatch):
+    """Marked masks must not scan GPU values. Unmarked masks still fall back."""
+    from veomni.ops.kernels.dsa import mask as mask_mod
+
+    def unexpected_scan(*args, **kwargs):
+        pytest.fail("marked DSA masks must not scan tensor values")
+
+    monkeypatch.setattr(mask_mod, "is_standard_causal_mask", unexpected_scan)
+    garbage = torch.full((1, 1, 4, 4), 7.0)
+    assert (
+        translate_fused_dsa_mask(mark_standard_causal_mask(garbage), q_len=4, kv_len=4, fused=True, what="x") is None
+    )
+    with pytest.raises(ValueError, match="eager implementation"):
+        translate_fused_dsa_mask(mark_custom_dsa_mask(garbage.clone()), q_len=4, kv_len=4, fused=True, what="x")
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="sync-debug for a materialized CUDA causal mask")
+@pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype feature")
+def test_marked_standard_causal_fused_translate_does_not_synchronize():
+    """A provenance-marked causal mask must drop to None without a host sync."""
+    seq_len = 8
+    causal = mark_standard_causal_mask(_additive_causal(1, seq_len).cuda())
+    torch.cuda.synchronize()
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        assert translate_fused_dsa_mask(causal, q_len=seq_len, kv_len=seq_len, fused=True, what="x") is None
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
 
 
 def test_glm_fused_rows_reject_attention_mask_before_vendor_import(monkeypatch):

@@ -27,7 +27,13 @@ from types import SimpleNamespace
 import torch
 
 from tests.models.compare import eager_ops_config, ops_config_scope, qwen_image_inputs
-from tests.models.tiny_configs import tiny_qwen2_config, tiny_qwen2_vl_config, tiny_wan_config
+from tests.models.tiny_configs import (
+    tiny_glm_moe_dsa_config,
+    tiny_qwen2_config,
+    tiny_qwen2_vl_config,
+    tiny_qwen3_moe_config,
+    tiny_wan_config,
+)
 from veomni.ops import VeomniOp
 
 
@@ -63,6 +69,9 @@ def _poison_cfg() -> SimpleNamespace:
     cfg.rotary_pos_emb_implementation = "liger_kernel"
     cfg.rotary_pos_emb_vision_implementation = "npu"
     cfg.rms_norm_implementation = "liger_kernel"
+    cfg.moe_implementation = "fused_triton"
+    cfg.dsa_indexer_implementation = "cudnn"
+    cfg.dsa_attention_implementation = "flashmla_cudnn"
     return cfg
 
 
@@ -166,6 +175,44 @@ def test_wan_condition_forward_keeps_construction_impls():
         run=lambda model: model(**inputs),
         attn_paths=("blocks.0.self_attn.attn.veomni_attn",),
         sticky_paths=("blocks.0.self_attn.veomni_rope",),
+        eager_cfg=_attn_cfg("eager"),
+        alt_cfg=_attn_cfg("sdpa"),
+        poison_cfg=_poison_cfg(),
+    )
+
+
+def test_qwen3_moe_text_forward_keeps_construction_impls():
+    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import Qwen3MoeForCausalLM
+
+    config = tiny_qwen3_moe_config()
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    _assert_isolated(
+        build=lambda: Qwen3MoeForCausalLM(config),
+        run=lambda model: model(input_ids=input_ids, use_cache=False),
+        attn_paths=("model.layers.0.self_attn.veomni_attn",),
+        sticky_paths=(
+            "model.layers.0.self_attn.veomni_rope",
+            "model.layers.0.mlp.experts.veomni_moe",
+        ),
+        eager_cfg=_attn_cfg("eager"),
+        alt_cfg=_attn_cfg("sdpa"),
+        poison_cfg=_poison_cfg(),
+    )
+
+
+def test_glm_moe_dsa_forward_keeps_construction_impls():
+    from veomni.models.transformers.glm_moe_dsa.generated.patched_modeling_glm_moe_dsa_gpu import GlmMoeDsaForCausalLM
+
+    config = tiny_glm_moe_dsa_config()
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    _assert_isolated(
+        build=lambda: GlmMoeDsaForCausalLM(config),
+        run=lambda model: model(input_ids=input_ids, use_cache=False),
+        attn_paths=(),
+        sticky_paths=(
+            "model.layers.0.self_attn.veomni_dsa_attention",
+            "model.layers.0.self_attn.indexer.veomni_dsa_indexer",
+        ),
         eager_cfg=_attn_cfg("eager"),
         alt_cfg=_attn_cfg("sdpa"),
         poison_cfg=_poison_cfg(),

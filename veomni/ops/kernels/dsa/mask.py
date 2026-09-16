@@ -25,6 +25,42 @@ import torch
 from torch import Tensor
 
 
+STANDARD_CAUSAL = "standard_causal"
+CUSTOM = "custom"
+_PROVENANCE_ATTR = "_veomni_dsa_mask_provenance"
+
+
+def mark_standard_causal_mask(mask: Tensor | None) -> Tensor | None:
+    """Record that ``mask`` is the shape-API standard causal triangle."""
+    if mask is not None:
+        setattr(mask, _PROVENANCE_ATTR, STANDARD_CAUSAL)
+    return mask
+
+
+def mark_custom_dsa_mask(mask: Tensor) -> Tensor:
+    """Record that ``mask`` is caller-declared custom or unknown-unsafe."""
+    setattr(mask, _PROVENANCE_ATTR, CUSTOM)
+    return mask
+
+
+def dsa_mask_provenance(mask: Tensor | None) -> str | None:
+    """Return the attached provenance, or ``None`` when the mask is unmarked.
+
+    ``None`` itself is the fused ``is_causal`` skip and counts as standard.
+    """
+    if mask is None:
+        return STANDARD_CAUSAL
+    provenance = getattr(mask, _PROVENANCE_ATTR, None)
+    return provenance if isinstance(provenance, str) else None
+
+
+def create_standard_causal_mask(*args, **kwargs) -> Tensor | None:
+    """HF ``create_causal_mask`` plus standard-causal provenance."""
+    from transformers.masking_utils import create_causal_mask
+
+    return mark_standard_causal_mask(create_causal_mask(*args, **kwargs))
+
+
 def is_standard_causal_mask(attention_mask: Tensor | None, *, q_len: int, kv_len: int) -> bool:
     """Whether ``attention_mask`` is only the lower-triangular causal constraint.
 
@@ -66,9 +102,19 @@ def translate_fused_dsa_mask(
 
     Fused rows must not see padding or custom masks. Those cases raise and tell
     the caller to use the eager implementation instead of ignoring the mask.
+    A marked standard-causal mask is dropped without scanning the tensor.
+    Unmarked masks still go through ``is_standard_causal_mask``.
     """
     if not fused:
         return attention_mask
+    provenance = dsa_mask_provenance(attention_mask)
+    if provenance == STANDARD_CAUSAL:
+        return None
+    if provenance == CUSTOM:
+        raise ValueError(
+            f"{what} fused implementation only accepts the standard causal mask; "
+            "padding or custom masks require the eager implementation."
+        )
     if is_standard_causal_mask(attention_mask, q_len=q_len, kv_len=kv_len):
         return None
     raise ValueError(
