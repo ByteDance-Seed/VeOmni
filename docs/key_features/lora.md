@@ -8,9 +8,10 @@ significantly reduced GPU memory.
 LoRA is implemented by VeOmni's **own** stack, `veomni.lora` — a PEFT-free
 [`peft.PeftModel`](https://huggingface.co/docs/peft) replacement (`VeOmniLoraModel` /
 `VeOmniLoraConfig`). It supports PEFT's main features, adds MoE-LoRA and EP-LoRA, and is
-FSDP2-native. Crucially it stays **format-compatible** with PEFT: it reads and writes
-standard `adapter_config.json` + `adapter_model.{safetensors,bin}` files, so adapters
-train-here / load-there interchangeably with stock `peft`.
+FSDP2-native. Crucially it stays **format-compatible** with PEFT: VeOmni writes
+`adapter_config.json` + `adapter_model.safetensors`, and loads either that or a
+legacy PEFT `adapter_model.bin`, so adapters train-here / load-there interchangeably
+with stock `peft`.
 
 ---
 
@@ -442,7 +443,7 @@ At resume, `VeOmniLoraModel.from_pretrained` reads `adapter_config.json`: the
 stock-PEFT adapter (no `veomni_lora` block) is loaded, the MoE mode is inferred from the
 on-disk LoRA tensor shapes (3-D per-expert → independent, 2-D → shared).
 
-The MoE-LoRA tensors in `adapter_model.bin` use PEFT-aligned FQNs
+The MoE-LoRA tensors in `adapter_model.safetensors` use PEFT-aligned FQNs
 (`base_model.model.<...>.<spec>.lora_A.<adapter>.weight`), so third-party PEFT tooling
 (HuggingFace Hub, `peft.PeftModel.from_pretrained`) can also load the file — though without
 VeOmni's wrappers re-installed first, the MoE-LoRA half of the keys will be dropped as
@@ -715,6 +716,6 @@ torchrun --nproc_per_node=4 tests/lora/test_moe_lora_trainer.py \
 ```
 
 **What the round-trip test verifies:**
-1. Writer trains `max_steps=4`, writes DCP shards at step 2 / step 4 and the HF LoRA adapter (`adapter_config.json` with the `veomni_lora` block + `adapter_model.bin`, no sidecar) at the same cadence; snapshots the full LoRA tensors at `on_train_begin` and `on_train_end`.
+1. Writer trains `max_steps=4`, writes DCP shards at step 2 / step 4 and the HF LoRA adapter (`adapter_config.json` with the `veomni_lora` block + `adapter_model.safetensors`, no sidecar) at the same cadence; snapshots the full LoRA tensors at `on_train_begin` and `on_train_end`.
 2. DCP-resume subprocess loads the step-2 DCP shard, continues to step 4, and the resulting LoRA tensors must be **bit-exact** vs the writer's `on_train_end` snapshot (DCP ships model + optimizer + RNG + dataloader state).
 3. LoRA-adapter-resume subprocess loads the step-4 HF adapter via `model.lora_config.lora_adapter`, and the resulting `on_train_begin` snapshot (= post-load, pre-train) must be bit-exact vs the writer's `on_train_end` snapshot in bf16 (the on-disk adapter dtype).

@@ -233,19 +233,15 @@ VeOmni offers unified multimodal transform functions in [veomni/data/data_transf
 1. `process_sample_qwen_vl` for Qwen2-VL, Qwen2.5-VL, Qwen3-VL, and Qwen3.5
 2. `process_sample_qwen_omni` for Qwen2.5-Omni and Qwen3-Omni-MoE
 
-Example usage in `_build_data_transform` in [veomni/trainer/vlm_trainer.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/vlm_trainer.py).
+Example usage in `_build_data_transform` in [veomni/trainer/vlm_trainer.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/vlm_trainer.py) — the runtime already owns the processor and template:
 ```python
-from veomni.data import build_chat_template, build_data_transform
-from veomni.models import build_processor
+from veomni.data import build_data_transform
 
-processor = build_processor(args.model.tokenizer_path)
-chat_template = build_chat_template(args.model.chat_template, processor)
-position_id_func = model.get_position_id_func()
 transform = build_data_transform(
     model.config.model_type,
-    processor=processor,
-    chat_template=chat_template,
-    position_id_func=position_id_func,
+    processor=model.processor,
+    chat_template=model.chat_template,
+    position_id_func=model.get_position_id_func(),
     **args.data.mm_configs,
 )
 ```

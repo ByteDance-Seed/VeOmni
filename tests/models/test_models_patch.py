@@ -19,6 +19,7 @@ from veomni.arguments import (
     TrainingArguments,
 )
 from veomni.data.data_collator import MainCollator
+from veomni.models.model_runtime import VeOmniModelRuntime
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.utils.device import IS_NPU_AVAILABLE, empty_cache, get_device_type, synchronize
 from veomni.utils.env import get_env
@@ -149,6 +150,13 @@ def _release_device_memory():
     empty_cache()
 
 
+class _NoParallelRuntime(VeOmniModelRuntime):
+    """Patch-alignment CI compares kernels on an unwrapped module."""
+
+    def _build_parallelized_model(self) -> None:
+        pass
+
+
 class TrainerTest(BaseTrainer):
     def __init__(self, hf_model_mode: ModelMode, trainer_config: VeOmniArguments):
         os.environ["RANK"] = "0"
@@ -159,6 +167,13 @@ class TrainerTest(BaseTrainer):
         set_environ_param(hf_model_mode)
         _apply_patches()
         super().__init__(trainer_config)
+
+    def _build_model_runtime(self, model_name: str = "base") -> VeOmniModelRuntime:
+        return _NoParallelRuntime(
+            self.args.model,
+            model_name=model_name,
+            train=self.args.train,
+        )
 
     def _init_callbacks(self):
         pass
