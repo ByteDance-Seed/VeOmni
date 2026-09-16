@@ -248,9 +248,9 @@ def chunk_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
 
 def chunk_scaled_dot_kkt_fwd(
     k: torch.Tensor,
-    g: Optional[torch.Tensor] = None,
+    g: torch.Tensor,
+    beta: torch.Tensor,
     gk: Optional[torch.Tensor] = None,
-    beta: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.Tensor] = None,
     chunk_size: int = 64,
@@ -262,10 +262,10 @@ def chunk_scaled_dot_kkt_fwd(
     Args:
         k (torch.Tensor):
             The key tensor of shape `[B, H, T, K]`.
+        g (torch.Tensor):
+            The cumulative sum of the gate tensor of shape `[B, T, H]`.
         beta (torch.Tensor):
             The beta tensor of shape `[B, T, H]`.
-        g (torch.Tensor):
-            The cumulative sum of the gate tensor of shape `[B, T, H]`. Default: `None`.
         gk (torch.Tensor):
             The cumulative sum of the gate tensor of shape `[B, T, H, K]` applied to the key tensor. Default: `None`.
         cu_seqlens (torch.LongTensor):
@@ -282,6 +282,8 @@ def chunk_scaled_dot_kkt_fwd(
     B, H, T, K = k.shape
     BT = chunk_size
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+    if g is None or beta is None:
+        raise TypeError("chunk_scaled_dot_kkt_fwd requires g and beta tensors")
     beta = beta.transpose(1, 2).contiguous()
     g = g.transpose(1, 2).contiguous()
     BK = 128

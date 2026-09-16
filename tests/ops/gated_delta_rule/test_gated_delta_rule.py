@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import inspect
 import sys
 from importlib import import_module
 from types import ModuleType
@@ -828,3 +829,20 @@ def test_npu_ascendc_missing_fla_npu_raises_actionable(monkeypatch: pytest.Monke
 
     with pytest.raises(RuntimeError, match="npu_ascendc"):
         m._ensure_fla_npu_registered()
+
+
+@pytest.mark.parametrize(
+    "module_path",
+    (
+        "veomni.ops.kernels.gated_delta_rule.vendor.triton.chunk_scaled_dot_kkt",
+        "veomni.ops.kernels.gated_delta_rule.vendor.triton_core.chunk_scaled_dot_kkt",
+    ),
+)
+def test_chunk_scaled_dot_kkt_fwd_requires_g_and_beta(module_path: str) -> None:
+    module = import_module(module_path)
+    params = inspect.signature(module.chunk_scaled_dot_kkt_fwd).parameters
+    assert params["g"].default is inspect.Parameter.empty
+    assert params["beta"].default is inspect.Parameter.empty
+    dummy = torch.zeros(1, 1, 1, 1)
+    with pytest.raises(TypeError, match="requires g and beta"):
+        module.chunk_scaled_dot_kkt_fwd(dummy, None, None)
