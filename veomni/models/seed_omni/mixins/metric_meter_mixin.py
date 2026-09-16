@@ -126,7 +126,8 @@ class MetricMeterMixin:
 
         Canonical path: drain the FULL, SP-invariant lengths a module stashed via
         :meth:`metric_meter_set_seqlens` in its ``pre_forward``. A call-site that
-        ``decode``) returns ``[]`` and contributes nothing — so ``data`` is unused.
+        stashed nothing (a module with no ``pre_forward`` for it, e.g. ``decode``)
+        returns ``[]`` and contributes nothing — so ``data`` is unused.
 
         This unified stash replaces the old per-module readers that measured the
         post-``pre_forward`` kwargs directly: under SP those kwargs are this rank's
