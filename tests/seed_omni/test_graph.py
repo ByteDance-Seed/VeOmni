@@ -398,6 +398,43 @@ def test_unmatched_signal_is_cleared_by_the_default_transition():
     assert [n.name for n in g.iter_nodes(ctx)] == ["c.generate", "d.generate"]
 
 
+def test_a_signal_no_transition_consumes_does_not_wedge_the_next_pass():
+    """A loop state must keep running its whole body after an unwatched signal.
+
+    A state that stays put until one named signal fires — the shape of every AR
+    decode loop — has no ``default`` to fall through, so ``maybe_transition``
+    matches nothing and pops nothing. If the body pass did not clear the signal
+    itself, the next pass would stop after its first node, and every pass after
+    that, burning steps up to ``max_new_tokens`` while the graph made no
+    progress and raised nothing.
+    """
+    g = GenerationGraph(
+        {
+            "initial": "loop",
+            "states": {
+                "loop": {
+                    "body": [{"from": "c", "to": "d"}, {"from": "d", "to": "end"}],
+                    "transitions": [
+                        {"condition": {"type": "module_signal", "key": "watched"}, "next_state": "done"},
+                    ],
+                },
+            },
+        }
+    )
+    ctx: dict = {}
+
+    # Pass 1: a node emits a signal this state does not watch.
+    ran = [node.name for node in g.iter_nodes(ctx)]
+    ctx["module_signal"] = "not_watched_here"
+    assert ran == ["c.generate", "d.generate"]
+
+    assert g.maybe_transition(ctx) is None  # nothing matches, so nothing pops
+    assert g.current_state_name == "loop"
+
+    # Pass 2 must be a full body, not a single node.
+    assert [node.name for node in g.iter_nodes(ctx)] == ["c.generate", "d.generate"]
+
+
 def test_a_feedback_edge_does_not_gate_its_destination():
     """``to: X`` *after* X's own turn as a source is feedback, not an input.
 
