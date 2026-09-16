@@ -54,6 +54,28 @@ def test_forward_backward_step_averages_accumulated_gradients(num_micro_steps):
     torch.testing.assert_close(parameter.grad, reference.grad)
 
 
+@pytest.mark.parametrize("sp_size", [1, 2, 4])
+def test_qwen_packed_text_meter_counts_full_length_once(monkeypatch, sp_size):
+    from veomni.models.seed_omni.mixins.metric_meter_mixin import MetricMeterMixin
+    from veomni.models.seed_omni.modules.qwen3vl.text_encoder.accelerated import packed
+
+    class MeteredPacked(packed.PackedTrainingMixin, MetricMeterMixin):
+        device = torch.device("cpu")
+
+        def estimate_flops(self, seqlens):
+            return float(sum(seqlens))
+
+    monkeypatch.setattr(packed, "get_parallel_state", lambda: SimpleNamespace(sp_size=sp_size, sp_group=None))
+    monkeypatch.setattr(packed, "sp_pad", lambda tensor, **kwargs: tensor)
+    monkeypatch.setattr(packed, "slice_input_tensor", lambda tensor, **kwargs: tensor[: tensor.numel() // sp_size])
+    module = MeteredPacked()
+    data = module.pack_encode_pre(packed_input_ids=torch.arange(7).view(1, 7))
+    module.metric_meter_add("pack_encode", data)
+    module.metric_meter_add("pack_decode", {})
+    assert module.metric_meter_collect() == (7.0, [7])
+    assert module.metric_meter_collect() == (0.0, [])
+
+
 class _FakeModuleRuntime:
     def __init__(self) -> None:
         self.reshard_calls: list[bool] = []
