@@ -173,7 +173,7 @@ STEP=outputs/qwen3_0.6b_omni_sft/checkpoints/global_step_500
 ASM=outputs/qwen3_0.6b_omni_sft/infer_ckpt/global_step_500
 mkdir -p "$ASM"
 for m in qwen3_text_encoder qwen3_llm; do
-  ln -sfn "$(realpath "$STEP/$m/hf_ckpt")" "$ASM/$m"
+  ln -sfn "$(realpath "$STEP/hf_ckpt/$m")" "$ASM/$m"
 done
 # then: --infer.model_path "$ASM"
 ```
@@ -356,7 +356,7 @@ python tasks/omni/infer_omni.py \
 ```
 
 To infer from a **trained** checkpoint (per-module weights live under
-`<step>/<module>/hf_ckpt/`), point `--infer.model_path` at the checkpoint step
+`<step>/hf_ckpt/<module>/`), point `--infer.model_path` at the checkpoint step
 dir and override each module's `model_path` **relative to that root** — do NOT
 repeat the `--infer.model_path` prefix. Per-module override paths are joined
 under `--infer.model_path` unless they are absolute (start with `/`); passing a
@@ -372,9 +372,9 @@ python tasks/omni/infer_omni.py \
   --infer.image /path/to/image.jpg \
   --infer.prompt "What is in this image?" \
   --infer.output_dir qwen3_vit_out \
-  --infer.modules.qwen3vl_vision.model.model_path qwen3vl_vision/hf_ckpt \
-  --infer.modules.qwen3_text_encoder.model.model_path qwen3_text_encoder/hf_ckpt \
-  --infer.modules.qwen3_llm.model.model_path qwen3_llm/hf_ckpt
+  --infer.modules.qwen3vl_vision.model.model_path hf_ckpt/qwen3vl_vision \
+  --infer.modules.qwen3_text_encoder.model.model_path hf_ckpt/qwen3_text_encoder \
+  --infer.modules.qwen3_llm.model.model_path hf_ckpt/qwen3_llm
 ```
 
 > **Scope**: this is a deliberately minimal setup (frozen ViT blocks + frozen LLM

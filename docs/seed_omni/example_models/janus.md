@@ -217,7 +217,7 @@ The commands below mirror those scripts.
 ### 5.1 Inferring from a trained checkpoint
 
 Training writes each module's HF weights one level deeper, under
-`<output_dir>/checkpoints/global_step_N/<module>/hf_ckpt/`. Assemble a flat root
+`<output_dir>/checkpoints/global_step_N/hf_ckpt/<module>/`. Assemble a flat root
 the loader understands by linking each module's `hf_ckpt/` to `<root>/<module>`:
 
 ```bash
@@ -225,7 +225,7 @@ STEP=outputs/janus_1.3b_omni_sft/checkpoints/global_step_20
 ASM=outputs/janus_1.3b_omni_sft/infer_ckpt/global_step_20
 mkdir -p "$ASM"
 for m in janus_siglip janus_vqvae janus_text_encoder janus_llama; do
-  ln -sfn "$(realpath "$STEP/$m/hf_ckpt")" "$ASM/$m"
+  ln -sfn "$(realpath "$STEP/hf_ckpt/$m")" "$ASM/$m"
 done
 ```
 
