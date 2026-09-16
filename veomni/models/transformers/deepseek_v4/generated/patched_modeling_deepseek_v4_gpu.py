@@ -2269,10 +2269,9 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                     "padding through cu_seq_lens_q, which the sparse path reads, instead of a "
                     "dense mask, which it drops."
                 )
-            # Metadata is indexed by global positions / cu-seqlens; under SP the
-            # collator already provides full-sequence cu-seqlens while local embeds
-            # are only one shard, so materialize a full-length reference tensor.
-            metadata_reference = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, inputs_embeds.shape[-1])
+            # The helper only reads device/dtype from this tensor. A full-length
+            # hidden placeholder would allocate B×S×H bytes that nothing reads.
+            metadata_reference = inputs_embeds.new_empty(())
             kwargs["packed_compression_metadata"] = build_packed_compression_metadata(
                 metadata_reference,
                 full_position_ids,

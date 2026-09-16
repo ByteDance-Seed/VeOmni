@@ -148,7 +148,7 @@ FlexAttention requires a model-provided native `BlockMask`; VeOmni does not
 construct model-specific visibility. With Ulysses enabled, the mask must be
 head-broadcast (`BlockMask.shape[1] == 1`) because rank-local head indices are
 not rebased for head-specific masks. See
-`docs/transformers_v5/veomni_fused_attention.md` for the full contract.
+`docs/transformers_v5/veomni_attention_interface.md` for the full contract.
 
 ### Key files
 

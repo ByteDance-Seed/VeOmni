@@ -40,7 +40,8 @@ def packed_mask_function(
     tensor cannot classify both sides. Map every query to its position in the
     corresponding key segment before evaluating the causal/sliding predicate;
     queries are the suffix of each key segment, matching cached-attention
-    ``q_offset=kv_length-q_length`` semantics.
+    ``q_offset=kv_length-q_length`` semantics. Self-attention that shares one
+    ``cu_seqlens`` object at equal Q/K lengths validates and expands it once.
     """
     if not isinstance(cu_seqlens, Tensor):
         raise TypeError(f"cu_seqlens must be a torch.Tensor, got {type(cu_seqlens).__name__}")
@@ -56,10 +57,16 @@ def packed_mask_function(
         )
 
     device = torch.device(device)
+    share_qk = cu_seqlens is cu_seqlens_k and q_length == kv_length
     cu_seqlens_q = _validated_cu_seqlens(cu_seqlens, q_length, device)
-    cu_seqlens_k = _validated_cu_seqlens(cu_seqlens_k, kv_length, device)
-    q_segment_ids = _segment_ids(cu_seqlens_q, q_length, device)
-    k_segment_ids = _segment_ids(cu_seqlens_k, kv_length, device)
+    if share_qk:
+        cu_seqlens_k = cu_seqlens_q
+        q_segment_ids = _segment_ids(cu_seqlens_q, q_length, device)
+        k_segment_ids = q_segment_ids
+    else:
+        cu_seqlens_k = _validated_cu_seqlens(cu_seqlens_k, kv_length, device)
+        q_segment_ids = _segment_ids(cu_seqlens_q, q_length, device)
+        k_segment_ids = _segment_ids(cu_seqlens_k, kv_length, device)
 
     q_positions = torch.arange(q_length, device=device)
     q_starts = cu_seqlens_q[:-1]

@@ -88,6 +88,12 @@ def test_eager_logits_match_hf(seed, num_tokens, num_classes, ignore_first, num_
     assert torch.allclose(logits_e.grad, logits_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+_CHUNK_LOSS_SKIP_SIZE = 2
+_CHUNK_LOSS_SKIP_SEQ = 5
+_CHUNK_LOSS_SKIP_CHUNKS = (_CHUNK_LOSS_SKIP_SEQ + _CHUNK_LOSS_SKIP_SIZE - 1) // _CHUNK_LOSS_SKIP_SIZE
+
+
+@pytest.mark.parametrize("impl", ("eager", "chunk_loss"))
 @pytest.mark.parametrize(
     ("hidden_requires_grad", "weight_requires_grad", "expected_argnums"),
     (
@@ -98,8 +104,9 @@ def test_eager_logits_match_hf(seed, num_tokens, num_classes, ignore_first, num_
     ),
     ids=("all-gradients", "frozen-weight", "frozen-hidden", "inference"),
 )
-def test_eager_hidden_skips_unneeded_grad_and_value(
+def test_hidden_skips_unneeded_grad_and_value(
     monkeypatch: pytest.MonkeyPatch,
+    impl: str,
     hidden_requires_grad: bool,
     weight_requires_grad: bool,
     expected_argnums: tuple[int, ...] | None,
@@ -114,11 +121,15 @@ def test_eager_hidden_skips_unneeded_grad_and_value(
 
     monkeypatch.setattr(torch.func, "grad_and_value", wrapped)
     torch.manual_seed(4)
-    hidden = torch.randn(2, 4, 8, requires_grad=hidden_requires_grad)
+    hidden = torch.randn(2, _CHUNK_LOSS_SKIP_SEQ, 8, requires_grad=hidden_requires_grad)
     weight = torch.randn(6, 8, requires_grad=weight_requires_grad)
-    labels = torch.randint(0, 6, (2, 4))
-    loss = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(hidden, labels, weight)
-    assert calls == ([] if expected_argnums is None else [expected_argnums])
+    labels = torch.randint(0, 6, (2, _CHUNK_LOSS_SKIP_SEQ))
+    kwargs = {"chunk_size": _CHUNK_LOSS_SKIP_SIZE} if impl == "chunk_loss" else {}
+    loss = resolve_op("cross_entropy_loss", "standard", impl).wrapper(hidden, labels, weight, **kwargs)
+    expected = [] if expected_argnums is None else [expected_argnums]
+    if impl == "chunk_loss":
+        expected = expected * _CHUNK_LOSS_SKIP_CHUNKS
+    assert calls == expected
     assert torch.isfinite(loss).all()
     if hidden_requires_grad or weight_requires_grad:
         loss.backward()
@@ -132,7 +143,8 @@ def test_eager_hidden_skips_unneeded_grad_and_value(
         assert weight.grad is None
 
 
-def test_eager_skips_grad_and_value_under_no_grad(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("impl", ("eager", "chunk_loss"))
+def test_skips_grad_and_value_under_no_grad(monkeypatch: pytest.MonkeyPatch, impl: str):
     """Trainable leaves under a real no_grad must not build a VJP graph."""
     calls: list[object] = []
     real = torch.func.grad_and_value
@@ -143,11 +155,12 @@ def test_eager_skips_grad_and_value_under_no_grad(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(torch.func, "grad_and_value", wrapped)
     torch.manual_seed(5)
-    hidden = torch.randn(2, 4, 8, requires_grad=True)
+    hidden = torch.randn(2, _CHUNK_LOSS_SKIP_SEQ, 8, requires_grad=True)
     weight = torch.randn(6, 8, requires_grad=True)
-    labels = torch.randint(0, 6, (2, 4))
+    labels = torch.randint(0, 6, (2, _CHUNK_LOSS_SKIP_SEQ))
+    kwargs = {"chunk_size": _CHUNK_LOSS_SKIP_SIZE} if impl == "chunk_loss" else {}
     with torch.no_grad():
-        loss = resolve_op("cross_entropy_loss", "standard", "eager").wrapper(hidden, labels, weight)
+        loss = resolve_op("cross_entropy_loss", "standard", impl).wrapper(hidden, labels, weight, **kwargs)
     assert calls == []
     assert loss.requires_grad is False
     assert torch.isfinite(loss).all()

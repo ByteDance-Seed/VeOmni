@@ -253,6 +253,46 @@ def test_magi_cached_causal_uses_bottom_right_alignment(impl):
     torch.testing.assert_close(materialize_magi_mask(shaped, 2, 4)[0, 0], expected)
 
 
+def test_packed_self_attention_reuses_shared_cu_seqlens(monkeypatch):
+    """Self-attention shares one cu_seqlens object; validate and expand it once."""
+    from veomni.ops.kernels.attention.mask import packed as packed_mask
+
+    counts = {"validated": 0, "segment_ids": 0}
+    real_validated = packed_mask._validated_cu_seqlens
+    real_segment_ids = packed_mask._segment_ids
+
+    def counting_validated(cu_seqlens, length, device):
+        counts["validated"] += 1
+        return real_validated(cu_seqlens, length, device)
+
+    def counting_segment_ids(cu_seqlens, length, device):
+        counts["segment_ids"] += 1
+        return real_segment_ids(cu_seqlens, length, device)
+
+    monkeypatch.setattr(packed_mask, "_validated_cu_seqlens", counting_validated)
+    monkeypatch.setattr(packed_mask, "_segment_ids", counting_segment_ids)
+
+    shared = torch.tensor([0, 2, 4], dtype=torch.int32)
+    kwargs = {
+        "mask_function": lambda *args: True,
+        "q_length": 4,
+        "kv_length": 4,
+        "q_offset": 0,
+        "kv_offset": 0,
+        "device": "cpu",
+    }
+    packed_mask.packed_mask_function(cu_seqlens=shared, cu_seqlens_k=None, **kwargs)
+    assert counts == {"validated": 1, "segment_ids": 1}
+
+    counts["validated"] = counts["segment_ids"] = 0
+    packed_mask.packed_mask_function(cu_seqlens=shared, cu_seqlens_k=shared, **kwargs)
+    assert counts == {"validated": 1, "segment_ids": 1}
+
+    counts["validated"] = counts["segment_ids"] = 0
+    packed_mask.packed_mask_function(cu_seqlens=shared, cu_seqlens_k=shared.clone(), **kwargs)
+    assert counts == {"validated": 2, "segment_ids": 2}
+
+
 def test_magi_packed_aligns_with_from_cu_seqlens():
     cu_seqlens = torch.tensor([0, 2, 4])
     built = MagiAttentionMask.from_cu_seqlens(cu_seqlens)

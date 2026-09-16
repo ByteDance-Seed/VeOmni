@@ -1929,7 +1929,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1283,38 +2161,159 @@
+@@ -1283,38 +2161,158 @@
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -2036,10 +2036,9 @@
 +                    "padding through cu_seq_lens_q, which the sparse path reads, instead of a "
 +                    "dense mask, which it drops."
 +                )
-+            # Metadata is indexed by global positions / cu-seqlens; under SP the
-+            # collator already provides full-sequence cu-seqlens while local embeds
-+            # are only one shard, so materialize a full-length reference tensor.
-+            metadata_reference = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, inputs_embeds.shape[-1])
++            # The helper only reads device/dtype from this tensor. A full-length
++            # hidden placeholder would allocate B×S×H bytes that nothing reads.
++            metadata_reference = inputs_embeds.new_empty(())
 +            kwargs["packed_compression_metadata"] = build_packed_compression_metadata(
 +                metadata_reference,
 +                full_position_ids,
@@ -2099,7 +2098,7 @@
                  hidden_states,
                  position_embeddings=position_embeddings,
                  position_ids=position_ids,
-@@ -1323,9 +2322,50 @@
+@@ -1323,9 +2321,50 @@
                  past_key_values=past_key_values,
                  **kwargs,
              )
@@ -2151,7 +2150,7 @@
 
 
  def load_balancing_loss_func(
-@@ -1397,6 +2437,12 @@
+@@ -1397,6 +2436,12 @@
      return overall_loss * num_experts
 
 
@@ -2164,7 +2163,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1404,6 +2450,9 @@
+@@ -1404,6 +2449,9 @@
      _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
      _fsdp_plan = {"lm_head": "keep_full_weight"}
 
@@ -2174,7 +2173,7 @@
      def __init__(self, config):
          super().__init__(config)
          self.model = DeepseekV4Model(config)
-@@ -1412,54 +2461,37 @@
+@@ -1412,54 +2460,37 @@
          self.router_aux_loss_coef = config.router_aux_loss_coef
          self.num_experts = config.num_local_experts
          self.num_experts_per_tok = config.num_experts_per_tok
@@ -2248,7 +2247,7 @@
              input_ids=input_ids,
              attention_mask=attention_mask,
              position_ids=position_ids,
-@@ -1471,26 +2503,68 @@
+@@ -1471,26 +2502,68 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -2324,7 +2323,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1498,7 +2572,18 @@
+@@ -1498,7 +2571,18 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,

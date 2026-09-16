@@ -115,6 +115,33 @@ def test_compressed_slots_are_lifted_by_the_full_kv_length_not_the_query_length(
     assert torch.all(shard[..., -1:] == SEQ_LEN)
 
 
+def test_packed_compression_metadata_ignores_reference_shape():
+    """A scalar reference must match a full hidden placeholder, including block bias."""
+    position_ids = _packed_position_ids()
+    slices = ((0, 38), (38, 64))
+    full = torch.zeros(1, SEQ_LEN, 16, dtype=torch.bfloat16)
+    scalar = full.new_empty(())
+    from_full = build_packed_compression_metadata(
+        full,
+        position_ids,
+        slices,
+        compress_rates=(4,),
+        block_bias_rates=(4,),
+    )[4]
+    from_scalar = build_packed_compression_metadata(
+        scalar,
+        position_ids,
+        slices,
+        compress_rates=(4,),
+        block_bias_rates=(4,),
+    )[4]
+    assert from_full.keys() == from_scalar.keys()
+    for key in from_full:
+        torch.testing.assert_close(from_scalar[key], from_full[key])
+        assert from_scalar[key].dtype == from_full[key].dtype
+        assert from_scalar[key].device == from_full[key].device
+
+
 def test_shard_packed_compression_metadata_keeps_global_compressed_slots():
     reference = torch.zeros(1, SEQ_LEN, 4)
     position_ids = _packed_position_ids()

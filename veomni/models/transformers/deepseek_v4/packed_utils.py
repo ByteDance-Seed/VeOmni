@@ -28,7 +28,11 @@ def build_packed_compression_metadata(
     compress_rates: tuple[int, ...],
     block_bias_rates: tuple[int, ...] = (),
 ) -> dict[int, dict[str, torch.Tensor]]:
-    """Build reusable packed window indices, ranges, and masks once per forward."""
+    """Build reusable packed window indices, ranges, and masks once per forward.
+
+    ``reference`` supplies device and dtype only. Its shape is unused, so a
+    scalar placeholder is enough; do not allocate a full hidden-state tensor.
+    """
     metadata = {}
     for compress_rate in dict.fromkeys(compress_rates):
         window_starts_list = [
