@@ -385,7 +385,6 @@ class BaseTrainer(Stateful, ABC):
             self.args.model,
             model_name=model_name,
             train=self.args.train,
-            chat_template_name=self.args.data.chat_template,
         )
 
     def _build_lr_scheduler(self):
@@ -529,6 +528,18 @@ class BaseTrainer(Stateful, ABC):
         """Export this job's weights in whichever format the model was trained in."""
         self.model.save_hf_or_lora(state, stage=stage)
 
+    def wait_for_pending_save(self) -> None:
+        """Drain this job's in-flight async checkpoint writes, if any."""
+        self.model.wait_for_pending_save()
+
+    def save_model_assets(self) -> None:
+        """Write this job's tokenizer/config sidecars.
+
+        The fan-out is the point: a trainer holding a second model extends this
+        to export both, and the callback that triggers it keeps knowing only *when*.
+        """
+        self.model.save_model_assets()
+
     def on_train_begin(self):
         for callback in self._callbacks:
             callback.on_train_begin(self.state)
@@ -640,18 +651,18 @@ class BaseTrainer(Stateful, ABC):
                 channel_loss_callback.model_forward_context() if channel_loss_callback is not None else nullcontext()
             )
             with (
-                use_parallel_state("base"),
+                use_parallel_state(self.model.parallel_state),
                 self.model_fwd_context,
                 set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
                 channel_forward_context,
             ):
                 outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
-            with use_parallel_state("base"):
+            with use_parallel_state(self.model.parallel_state):
                 loss, loss_dict, aux_metrics = self.postforward(outputs, micro_batch)
 
             with (
-                use_parallel_state("base"),
+                use_parallel_state(self.model.parallel_state),
                 self.model_bwd_context,
                 set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
             ):

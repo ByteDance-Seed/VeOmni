@@ -105,6 +105,7 @@ class VeomniFlopsCounter:
             "qwen3_5_text": self._estimate_qwen3_5_family_flops,
             "qwen3_5_moe": self._estimate_qwen3_5_family_flops,
             "qwen3_5_moe_text": self._estimate_qwen3_5_family_flops,
+            "qwen4_exp": self._estimate_qwen4_exp_flops,
             "gpt_oss": self._estimate_gpt_oss_flops,
         }
 
@@ -943,13 +944,14 @@ class VeomniFlopsCounter:
         return vit_flops
 
     @staticmethod
-    def _compute_hybrid_attn_params(config):
+    def _compute_hybrid_attn_params(config, full_attention_types=("full_attention",)):
         """
         Compute hybrid attention (full + GatedDeltaNet) linear param count and layer info.
 
         Layers alternate between full attention and GatedDeltaNet (linear attention). The
-        per-layer schedule is read from `config.layer_types` ("full_attention" /
-        "linear_attention"); the typical pattern is (interval - 1) linear layers followed
+        per-layer schedule is read from `config.layer_types`. Full-attention layer names
+        are supplied by the caller because some model configs normalize them to a
+        model-specific value. The typical pattern is (interval - 1) linear layers followed
         by 1 full attention layer.
 
         Full attention (Qwen3_5Attention) projections:
@@ -989,7 +991,7 @@ class VeomniFlopsCounter:
         num_hidden_layers = config.num_hidden_layers
         layer_types = getattr(config, "layer_types", None)
         if layer_types is not None:
-            num_full_attn_layers = sum(t == "full_attention" for t in layer_types)
+            num_full_attn_layers = sum(t in full_attention_types for t in layer_types)
             num_linear_attn_layers = sum(t == "linear_attention" for t in layer_types)
         else:
             full_attention_interval = getattr(config, "full_attention_interval", None)
@@ -1071,6 +1073,124 @@ class VeomniFlopsCounter:
             * tokens_sum
             * num_gdn_layers
         )
+
+    @staticmethod
+    def _compute_qsa_attention_score_sum(batch_seqlens, compress_ratio, token_budget):
+        """Count the causal query-key pairs selected by Qwen4-Exp QSA.
+
+        QSA partitions every query's visible prefix into complete compressed
+        blocks, selects at most ``token_budget // compress_ratio`` blocks, and
+        keeps the incomplete tail. The current eager/SDPA implementation uses
+        a dense mask, but MFU counts useful model FLOPs rather than redundant
+        implementation work.
+        """
+        if compress_ratio <= 0:
+            raise ValueError(f"QSA compression ratio must be positive, got {compress_ratio}.")
+        if token_budget <= 0:
+            raise ValueError(f"QSA token budget must be positive, got {token_budget}.")
+
+        block_topk = token_budget // compress_ratio
+        score_sum = 0
+        for seqlen in batch_seqlens:
+            quotient, remainder = divmod(seqlen, compress_ratio)
+            if quotient <= block_topk:
+                capped_block_sum = compress_ratio * quotient * (quotient - 1) // 2
+                capped_block_sum += quotient * (remainder + 1)
+            else:
+                capped_block_sum = compress_ratio * block_topk * (block_topk - 1) // 2
+                capped_block_sum += block_topk * (seqlen - block_topk * compress_ratio + 1)
+
+            tail_sum = quotient * compress_ratio * (compress_ratio - 1) // 2
+            tail_sum += remainder * (remainder + 1) // 2
+            score_sum += compress_ratio * capped_block_sum + tail_sum
+
+        return score_sum
+
+    def _estimate_qwen4_exp_flops(
+        self,
+        tokens_sum,
+        batch_seqlens,
+        delta_time,
+        **kargs,
+    ):
+        """Estimate useful training FLOPs for Qwen4-Exp.
+
+        PLE embedding tables are sparse lookups and are intentionally excluded.
+        Their trainable projections and depthwise convolution are included.
+        """
+        text_config = self.config.text_config
+        hidden_size = text_config.hidden_size
+        num_hidden_layers = text_config.num_hidden_layers
+
+        attn_linear_N, num_full_attn_layers, num_linear_attn_layers, head_dim, num_attention_heads = (
+            self._compute_hybrid_attn_params(
+                text_config,
+                full_attention_types=("full_attention", "qwen_sparse_attention"),
+            )
+        )
+
+        # QSA indexer projection on every full-attention layer.
+        indexer_linear_N = hidden_size * (text_config.indexer_n_heads + text_config.indexer_kv_heads)
+        indexer_linear_N *= text_config.indexer_head_dim * num_full_attn_layers
+
+        # Every layer computes router logits, top-k routed experts, one shared
+        # expert, and the shared-expert scalar gate.
+        moe_router_N = hidden_size * text_config.num_experts
+        moe_expert_N = hidden_size * text_config.moe_intermediate_size * text_config.num_experts_per_tok * 3
+        shared_expert_N = hidden_size * text_config.shared_expert_intermediate_size * 3
+        shared_expert_gate_N = hidden_size
+        moe_N = (moe_router_N + moe_expert_N + shared_expert_N + shared_expert_gate_N) * num_hidden_layers
+
+        # Two mHC mappings per decoder layer, plus the final mixer without an
+        # injection projection.
+        hc_hidden_size = text_config.hc_count * hidden_size
+        mhc_mapping_N = 2 * hc_hidden_size * text_config.hc_lowrank
+        mhc_mapping_N += hc_hidden_size * text_config.hc_count
+        mhc_final_N = 2 * hc_hidden_size * text_config.hc_lowrank
+        mhc_N = 2 * mhc_mapping_N * num_hidden_layers + mhc_final_N
+
+        # PLE table lookup is not a matmul. Count only the key/value projections
+        # and the depthwise convolution at configured PLE layers.
+        ple_N = text_config.ple_embed_dim * (hc_hidden_size + hidden_size)
+        ple_N += hc_hidden_size * text_config.ple_conv_kernel_size
+        ple_N *= len(text_config.ple_layer_ids)
+
+        lm_head_N = self._compute_lm_head_params(hidden_size, text_config.vocab_size)
+        trainable_linear_N = attn_linear_N + moe_N + mhc_N + ple_N + lm_head_N
+        linear_flops = 6 * trainable_linear_N * tokens_sum
+        # Top-k indices are discrete and no indexer loss is exposed, so this
+        # branch is forward-only during SFT.
+        linear_flops += 2 * indexer_linear_N * tokens_sum
+
+        qsa_score_sum = self._compute_qsa_attention_score_sum(
+            batch_seqlens,
+            text_config.indexer_compress_ratio,
+            text_config.indexer_budget,
+        )
+        qsa_attention_flops = 12 * qsa_score_sum * head_dim * num_attention_heads * num_full_attn_layers
+
+        # The indexer scores every query against all complete compressed blocks.
+        indexer_score_sum = self._compute_compressed_attention_score_sum(
+            batch_seqlens, text_config.indexer_compress_ratio
+        )
+        indexer_flops = (
+            2 * indexer_score_sum * text_config.indexer_head_dim * text_config.indexer_n_heads * num_full_attn_layers
+        )
+
+        gdn_recurrence_flops = self._compute_gdn_recurrence_flops(text_config, tokens_sum, num_linear_attn_layers)
+
+        images_seqlens = kargs.get("images_seqlens", None)
+        if images_seqlens:
+            vit_flops = self._estimate_qwen3_vit_flop(
+                images_seqlens,
+                getattr(self.config, "vision_config", None),
+                freeze_vit=kargs.get("freeze_vit", False),
+            )
+        else:
+            vit_flops = 0
+
+        flops_all_token = linear_flops + qsa_attention_flops + indexer_flops + gdn_recurrence_flops + vit_flops
+        return flops_all_token * (1.0 / delta_time) / 1e12
 
     def _estimate_qwen3_next_flops(
         self,

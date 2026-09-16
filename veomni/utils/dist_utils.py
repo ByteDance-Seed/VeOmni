@@ -66,6 +66,35 @@ def all_reduce(
         return data.tolist()
 
 
+def any_rank_failed(failed: bool) -> bool:
+    """Whether *any* rank hit an error, so every rank can agree on what to do next.
+
+    MAX rather than SUM: one failure is enough, and SUM would overflow int32 on a
+    large enough group.
+    """
+    if not dist.is_initialized():
+        return failed
+    flag = torch.tensor([1 if failed else 0], dtype=torch.int32, device=get_device_type())
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    return bool(flag.item())
+
+
+def raise_if_any_rank_failed(error: Optional[BaseException], what: str) -> None:
+    """Turn one rank's error into an error on every rank.
+
+    Work that is split across ranks -- one rank writes a replicated file, one
+    leader per node copies a directory, one rank's async save fails -- starts out
+    visible to a single rank. Raising only there leaves the peers to walk into
+    the next collective alone, which hangs until the backend times out instead of
+    failing the step.
+
+    The reduction inside is itself the synchronization point, and every rank
+    reaches it on every path, so it replaces rather than accompanies a barrier.
+    """
+    if any_rank_failed(error is not None):
+        raise error or RuntimeError(f"{what} failed on another rank")
+
+
 @contextmanager
 def main_process_first(local_only: bool = True) -> None:
     """

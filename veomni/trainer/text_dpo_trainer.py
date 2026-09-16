@@ -16,7 +16,7 @@ import copy
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Tuple
 
 import torch
 import torch.nn as nn
@@ -39,26 +39,6 @@ from .base import BaseTrainer, VeOmniIter
 logger = logging.get_logger(__name__)
 
 _NON_MODEL_KEYS = set()
-
-
-def _assert_matching_dpo_parallelism(policy_acc, reference_acc) -> None:
-    """Fail before build when the reference would gather a different token partition.
-
-    ``SequenceParallelCollator`` slices the packed batch with the policy SP size.
-    ``concatenated_forward`` then gathers with each runtime's own ParallelState.
-    A reference whose ``ulysses_size * cp_size`` or ``dp_size`` differs from the
-    policy would gather a different partition and split it with the policy's
-    ``seq_lens``.
-    """
-    policy_sp = policy_acc.ulysses_size * policy_acc.cp_size
-    reference_sp = reference_acc.ulysses_size * reference_acc.cp_size
-    if (policy_sp, policy_acc.dp_size) != (reference_sp, reference_acc.dp_size):
-        raise ValueError(
-            "DPO reference accelerator topology must match the policy: "
-            f"policy has ulysses_size*cp_size={policy_sp}, dp_size={policy_acc.dp_size}; "
-            f"reference has ulysses_size*cp_size={reference_sp}, dp_size={reference_acc.dp_size}. "
-            "SequenceParallelCollator slices the packed batch with the policy SP size."
-        )
 
 
 def _build_dpo_labels_list(
@@ -144,27 +124,21 @@ class DPOConfig:
 
 @dataclass
 class VeOmniDPOArguments(VeOmniArguments):
-    """Root config for DPO training — extends VeOmniArguments with DPO hyperparameters."""
+    """Root config for DPO training — extends VeOmniArguments with DPO hyperparameters.
+
+    The frozen reference always copies ``model``. A custom reference-model
+    config is not supported.
+    """
 
     dpo_config: DPOConfig = field(default_factory=DPOConfig)
-    reference_model: Optional[ModelArguments] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Model-level args for the frozen DPO reference. "
-                "Omit to reuse `model`. This is a full config, not a partial overlay."
-            )
-        },
-    )
 
 
 class DPOReferenceModelRuntime(VeOmniModelRuntime):
     """Frozen DPO reference: same model build as the policy, then eval.
 
-    Construction takes this model's *own* arguments, so the reference can
-    load a different checkpoint or accelerator than the policy. Frozen-eval
-    knobs (no LoRA / AMP / recompute / compile) are applied here, not by
-    rewriting the caller's config.
+    Always copies the policy's ``model`` args. A custom reference-model
+    config is not supported. Frozen-eval knobs (no LoRA / AMP / recompute /
+    compile) are applied here, not by rewriting the caller's config.
 
     Init only builds the module. Optimizer, assets, and checkpoint stay
     uncalled — callbacks only ever fan out to the policy.
@@ -186,7 +160,6 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
         self.args = args
         self.model_name = model_name
         self.train = train
-        self.chat_template_name = None
         self._torch_dtype = torch_dtype
         self.setup()
         with use_parallel_state(self.model_name):
@@ -259,6 +232,12 @@ class TextDPOTrainer:
     def save_hf_or_lora(self, state, stage: str = "step_end") -> None:
         self.policy_model.save_hf_or_lora(state, stage=stage)
 
+    def wait_for_pending_save(self) -> None:
+        self.policy_model.wait_for_pending_save()
+
+    def save_model_assets(self) -> None:
+        self.policy_model.save_model_assets()
+
     def _build_data_transform(self):
         args: VeOmniDPOArguments = self.base.args
         self.base.data_transform = build_data_transform(
@@ -278,14 +257,12 @@ class TextDPOTrainer:
     def _build_reference_model_runtime(self) -> DPOReferenceModelRuntime:
         """Build the frozen reference as its own runtime.
 
-        ``reference_model`` is a full model-level config when set; otherwise
-        the policy's ``model`` is reused.
+        Always copies the policy's ``model``. Custom reference-model config
+        is not supported.
         """
         args: VeOmniDPOArguments = self.base.args
-        reference_args = args.reference_model or args.model
-        _assert_matching_dpo_parallelism(args.model.accelerator, reference_args.accelerator)
         return DPOReferenceModelRuntime(
-            reference_args,
+            args.model,
             "reference",
             train=args.train,
             torch_dtype=args.dpo_config.refer_model_precision,
@@ -414,16 +391,14 @@ class TextDPOTrainer:
             if channel_loss_callback is not None:
                 channel_loss_callback.strip_model_inputs(micro_batch)
 
-            reference_name = getattr(self.reference_model, "model_name", "reference")
-            with torch.no_grad(), use_parallel_state(reference_name):
+            with torch.no_grad(), use_parallel_state(self.reference_model.parallel_state):
                 ref_chosen_logps, ref_rejected_logps = self.concatenated_forward(self.reference_model, micro_batch)
 
             channel_forward_context = (
                 channel_loss_callback.model_forward_context() if channel_loss_callback is not None else nullcontext()
             )
-            policy_name = getattr(self.policy_model, "model_name", "policy")
             with (
-                use_parallel_state(policy_name),
+                use_parallel_state(self.policy_model.parallel_state),
                 self.base.model_fwd_context,
                 set_batch_invariant_mode(args.train.enable_batch_invariant_mode),
                 channel_forward_context,
@@ -453,7 +428,7 @@ class TextDPOTrainer:
             }
 
             with (
-                use_parallel_state(policy_name),
+                use_parallel_state(self.policy_model.parallel_state),
                 self.base.model_bwd_context,
                 set_batch_invariant_mode(args.train.enable_batch_invariant_mode),
             ):

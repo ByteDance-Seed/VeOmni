@@ -111,6 +111,27 @@ class CheckpointTensorConverter(Protocol):
         """
         ...
 
+    def should_skip_without_loading(self, name: str) -> bool:
+        """Optional streaming capability: whether ``name`` can be discarded
+        without materializing its checkpoint tensor.
+
+        This is intended for checkpoint-only subtrees that the live model does
+        not construct (for example an explicitly unsupported auxiliary head).
+        The regular loader still calls :meth:`convert` after reading the tensor;
+        streaming loaders may use this hook to avoid the read entirely.
+        Implementing this method is optional and a missing method means
+        ``False``.
+        """
+        ...
+
+    def record_skip_without_loading(self, name: str) -> None:
+        """Optional notification after a streaming loader skipped ``name``.
+
+        Converters can use this to retain their usual finalize-time accounting
+        without forcing the tensor to be read. Implementing it is optional.
+        """
+        ...
+
 
 def checkpoint_converter_is_dim0_zero_pad(
     converter: Optional["CheckpointTensorConverter"],
@@ -126,6 +147,29 @@ def checkpoint_converter_is_dim0_zero_pad(
         return False
     fn = getattr(converter, "is_dim0_zero_pad", None)
     return bool(fn(name)) if callable(fn) else False
+
+
+def checkpoint_converter_should_skip_without_loading(
+    converter: Optional["CheckpointTensorConverter"],
+    name: str,
+) -> bool:
+    """Whether a streaming loader may discard ``name`` before reading it."""
+    if converter is None or not converter.can_handle(name):
+        return False
+    fn = getattr(converter, "should_skip_without_loading", None)
+    return bool(fn(name)) if callable(fn) else False
+
+
+def checkpoint_converter_record_skip_without_loading(
+    converter: Optional["CheckpointTensorConverter"],
+    name: str,
+) -> None:
+    """Notify a converter that a tensor was skipped by a streaming loader."""
+    if converter is None:
+        return
+    fn = getattr(converter, "record_skip_without_loading", None)
+    if callable(fn):
+        fn(name)
 
 
 def get_checkpoint_tensor_converter(

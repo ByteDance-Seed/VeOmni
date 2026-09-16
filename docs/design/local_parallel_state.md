@@ -84,8 +84,10 @@ only registers that model's mesh. The build scope is `VeOmniModelRuntime.__init_
 which wraps meta-init, freeze, parallelize, and optimizer in
 `use_parallel_state(<its own name>)` — a no-op for a single-model job, and the
 mechanism by which sibling modules each build over their own mesh. At run time,
-only operations that depend on ambient groups are scoped: model forward,
-post-forward loss handling, backward, and gradient clipping.
+`forward_backward_step` wraps `use_parallel_state(self.model.parallel_state)`
+around forward, post-forward, and backward so none of them hard-code a name.
+A job with several models overrides the step and wraps each model's
+forward/reduce/backward itself. Gradient clipping is owned by the runtime.
 
 When an API accepts an explicit process group, prefer passing the group from
 `get_parallel_state_by_name("base")` instead of opening a broader context.

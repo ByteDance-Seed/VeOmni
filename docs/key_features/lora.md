@@ -8,9 +8,10 @@ significantly reduced GPU memory.
 LoRA is implemented by VeOmni's **own** stack, `veomni.lora` — a PEFT-free
 [`peft.PeftModel`](https://huggingface.co/docs/peft) replacement (`VeOmniLoraModel` /
 `VeOmniLoraConfig`). It supports PEFT's main features, adds MoE-LoRA and EP-LoRA, and is
-FSDP2-native. Crucially it stays **format-compatible** with PEFT: it reads and writes
-standard `adapter_config.json` + `adapter_model.{safetensors,bin}` files, so adapters
-train-here / load-there interchangeably with stock `peft`.
+FSDP2-native. Crucially it stays **format-compatible** with PEFT: VeOmni writes
+`adapter_config.json` + `adapter_model.safetensors`, and loads either that or a
+legacy PEFT `adapter_model.bin`, so adapters train-here / load-there interchangeably
+with stock `peft`.
 
 ---
 
@@ -86,7 +87,7 @@ model:
     rank: 64
     alpha: 32
     lora_modules: [q_proj, k_proj, v_proj, o_proj]
-    lora_adapter: ./exp/my_run/checkpoints/global_step_500   # HF adapter dir to resume from
+    lora_adapter: ./exp/my_run/checkpoints/global_step_500/lora_ckpt   # HF adapter dir to resume from
 ```
 
 ---
@@ -231,11 +232,12 @@ infix (PEFT convention — e.g. `lora_A.weight`), whereas the live model stores 
 `CheckpointCallback` decides *when* to save and calls `trainer.save_dcp`, which fans out to
 `trainer.model.save_dcp` and lands in `ModelCheckpointManager`
 (`veomni/models/checkpoint_manager.py`). That writes the
-distributed model and optimizer via PyTorch DCP, plus a replicated `lr_scheduler.pt`
-beside the shards. For LoRA training the DCP stores the trainable adapter parameters
-and optimizer state; the frozen base is reloaded from `model.model_path`.
-global_state (dataloader cursor, rng, meters) is written separately by
-`GlobalStateCallback` as `trainer_state_rank_{R}.pt`.
+weights to `model/ckpt/` and the optimizer to `model/optimizer/` — two separate DCP
+directories — plus a replicated `model/lr_scheduler.pt`. For LoRA training the DCP
+stores only the trainable adapter parameters and optimizer state; the frozen base is
+reloaded from `model.model_path`. Job-level state is written separately by
+`GlobalStateCallback`, as `loader/rank_{R}.pt` for the dataloader cursor and
+`extra_state/rank_{R}.pt` for the step counter, rng and meters.
 
 ### HF LoRA adapter (inference artifact)
 
@@ -258,15 +260,23 @@ Output structure for each checkpoint:
 ```
 <output_dir>/
 ├── checkpoints/
-│   └── global_step_N/          ← DCP + LoRA adapter (one directory per step)
-│       ├── __0_0.distcp
-│       ├── .metadata
-│       ├── lr_scheduler.pt
-│       ├── trainer_state_rank_{R}.pt
-│       ├── adapter_config.json     ← PEFT-format; MoE mode in its `veomni_lora` block
-│       └── adapter_model.safetensors
-└── model_assets/
+│   └── global_step_N/                   ← one directory per step
+│       ├── checkpoint_manifest.json
+│       ├── model/
+│       │   ├── ckpt/                    ← adapter weights, DCP
+│       │   ├── optimizer/               ← adapter optimizer state, DCP
+│       │   └── lr_scheduler.pt
+│       ├── loader/rank_{R}.pt
+│       ├── extra_state/rank_{R}.pt
+│       └── lora_ckpt/                   ← the inference artifact
+│           ├── adapter_config.json      ← PEFT-format; MoE mode in its `veomni_lora` block
+│           └── adapter_model.safetensors
+└── model_assets/                   # or model_assets/<module>/ in a multi-module job
 ```
+
+The adapter export sits in its own `lora_ckpt/`, not in with the resume state and
+not in `hf_ckpt/`: a future LoRA merge writes an adapter *and* a merged full-model
+export for the same step, and a reader has to tell them apart by path.
 
 Full file-by-file contract: [Checkpoint layout](../usage/checkpoint.md).
 
@@ -416,12 +426,13 @@ Both modes work with FSDP2 + EP. EP requires a fused forward path:
 A MoE-LoRA run writes only the two standard PEFT artefacts — **no sidecar**:
 
 ```
-<output_dir>/checkpoints/global_step_N/
+<output_dir>/checkpoints/global_step_N/lora_ckpt/
 ├── adapter_config.json     # PEFT-format; MoE mode/rank/alpha in its `veomni_lora` block
 └── adapter_model.safetensors
 ```
 
-(Same `global_step_N` directory as the DCP shards. See [Checkpoint layout](../usage/checkpoint.md).)
+(Same `global_step_N` directory as the resume state, one level over from it. See
+[Checkpoint layout](../usage/checkpoint.md).)
 
 A stock-PEFT adapter that only has `adapter_model.bin` still loads: `from_pretrained`
 uses the same fallback.
@@ -432,7 +443,7 @@ At resume, `VeOmniLoraModel.from_pretrained` reads `adapter_config.json`: the
 stock-PEFT adapter (no `veomni_lora` block) is loaded, the MoE mode is inferred from the
 on-disk LoRA tensor shapes (3-D per-expert → independent, 2-D → shared).
 
-The MoE-LoRA tensors in `adapter_model.bin` use PEFT-aligned FQNs
+The MoE-LoRA tensors in `adapter_model.safetensors` use PEFT-aligned FQNs
 (`base_model.model.<...>.<spec>.lora_A.<adapter>.weight`), so third-party PEFT tooling
 (HuggingFace Hub, `peft.PeftModel.from_pretrained`) can also load the file — though without
 VeOmni's wrappers re-installed first, the MoE-LoRA half of the keys will be dropped as
@@ -601,7 +612,7 @@ checkpoints remain auto-detected through `train.checkpoint.load_path: auto`.
 ```yaml
 model:
   lora_config:
-    lora_adapter: ./exp/qwen3_moe_lora/checkpoints/global_step_500
+    lora_adapter: ./exp/qwen3_moe_lora/checkpoints/global_step_500/lora_ckpt
 ```
 
 ```shell
@@ -668,7 +679,7 @@ bash train.sh tasks/train_dit.py configs/dit/qwen_image_lora.yaml \
     --train.num_train_epochs 3
 ```
 
-`CheckpointCallback` writes the trained adapter to `${output_dir}/checkpoints/global_step_${step}/{adapter_config.json, adapter_model.safetensors}`, which is the standard PEFT format consumable by `PeftModel.from_pretrained` and `diffusers`' `pipeline.transformer.load_lora_adapter` (the adapter keys carry the `base_model.model.` prefix expected by `peft`). Loading a PEFT-trained adapter still accepts `adapter_model.bin`.
+`CheckpointCallback` writes the trained adapter to `${output_dir}/checkpoints/global_step_${step}/lora_ckpt/{adapter_config.json, adapter_model.safetensors}`, which is the standard PEFT format consumable by `PeftModel.from_pretrained` and `diffusers`' `pipeline.transformer.load_lora_adapter` (the adapter keys carry the `base_model.model.` prefix expected by `peft`). Loading a PEFT-trained adapter still accepts `adapter_model.bin`.
 
 ---
 
@@ -707,6 +718,6 @@ torchrun --nproc_per_node=4 tests/lora/test_moe_lora_trainer.py \
 ```
 
 **What the round-trip test verifies:**
-1. Writer trains `max_steps=4`, writes DCP shards at step 2 / step 4 and the HF LoRA adapter (`adapter_config.json` with the `veomni_lora` block + `adapter_model.bin`, no sidecar) at the same cadence; snapshots the full LoRA tensors at `on_train_begin` and `on_train_end`.
+1. Writer trains `max_steps=4`, writes DCP shards at step 2 / step 4 and the HF LoRA adapter (`adapter_config.json` with the `veomni_lora` block + `adapter_model.safetensors`, no sidecar) at the same cadence; snapshots the full LoRA tensors at `on_train_begin` and `on_train_end`.
 2. DCP-resume subprocess loads the step-2 DCP shard, continues to step 4, and the resulting LoRA tensors must be **bit-exact** vs the writer's `on_train_end` snapshot (DCP ships model + optimizer + RNG + dataloader state).
 3. LoRA-adapter-resume subprocess loads the step-4 HF adapter via `model.lora_config.lora_adapter`, and the resulting `on_train_begin` snapshot (= post-load, pre-train) must be bit-exact vs the writer's `on_train_end` snapshot in bf16 (the on-disk adapter dtype).

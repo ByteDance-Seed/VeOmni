@@ -218,7 +218,7 @@ transform = build_data_transform(
 from veomni.data import build_data_transform
 from veomni.data.chat_template import build_chat_template
 
-chat_template = build_chat_template(args.data.chat_template, tokenizer)
+chat_template = build_chat_template(args.model.chat_template, tokenizer)
 transform = build_data_transform(
     "conversation",
     chat_template=chat_template,
@@ -233,19 +233,15 @@ VeOmni offers unified multimodal transform functions in [veomni/data/data_transf
 1. `process_sample_qwen_vl` for Qwen2-VL, Qwen2.5-VL, Qwen3-VL, and Qwen3.5
 2. `process_sample_qwen_omni` for Qwen2.5-Omni and Qwen3-Omni-MoE
 
-Example usage in `_build_data_transform` in [veomni/trainer/vlm_trainer.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/vlm_trainer.py).
+Example usage in `_build_data_transform` in [veomni/trainer/vlm_trainer.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/vlm_trainer.py) — the runtime already owns the processor and template:
 ```python
-from veomni.data import build_chat_template, build_data_transform
-from veomni.models import build_processor
+from veomni.data import build_data_transform
 
-processor = build_processor(args.model.tokenizer_path)
-chat_template = build_chat_template(args.data.chat_template, processor)
-position_id_func = model.get_position_id_func()
 transform = build_data_transform(
     model.config.model_type,
-    processor=processor,
-    chat_template=chat_template,
-    position_id_func=position_id_func,
+    processor=model.processor,
+    chat_template=model.chat_template,
+    position_id_func=model.get_position_id_func(),
     **args.data.mm_configs,
 )
 ```
@@ -262,7 +258,7 @@ Multimodal dataset transform follows the similar pipeline:
 ### Chat Template
 VeOmni default supports several chat templates, text-only and multimodal alike, all registered in [veomni/data/chat_template.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/chat_template.py) and built by name through the single `build_chat_template` entrypoint.
 
-In a training job you do not call it yourself: the model runtime builds the template named by `data.chat_template` right after it loads the preprocessor, and exposes it as `model.chat_template` for the data transform to read. Leave `chat_template` unset when the job needs none — plaintext and diffusion data carry no conversation to lay out, and a Qwen-Omni model formats prompts through its processor's own template.
+In a training job you do not call it yourself: the model runtime builds the template named by `model.chat_template` right after it loads the preprocessor, and exposes it as `model.chat_template` for the data transform to read. Leave `chat_template` unset when the job needs none — plaintext and diffusion data carry no conversation to lay out, and a Qwen-Omni model formats prompts through its processor's own template.
 
 You can add your custom chat template by implementing the `ChatTemplate` class — or `MultimodalChatTemplate` if it needs the per-modality token counts. A `ChatTemplate` is built from a tokenizer; a `MultimodalChatTemplate` is built from the processor instead, since laying out placeholders also needs the grid parameters the processor used.
 **Custom Template Implementation**:  
