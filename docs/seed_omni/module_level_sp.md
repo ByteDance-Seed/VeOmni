@@ -4,7 +4,7 @@
 >
 > **现状**：代码即 Arch B —— 全局统一 outer SP，dataloader 按 SP 组**复制**数据，每个开 SP 的模块把复制样本**切 1/sp**、跑**一次**前向、再 **all-gather** 回全序列。Arch A 的 looped/offload/ckpt/gather-to-owner/`fsdp2_ac_patch` 全部删除。
 >
-> **尚未实现（未来工作，见 §8）**：per-module data-balance（scatter item / gather embed）、dataloader 级 compute 均衡 packing、音视频 halo 处理。当前所有模块一律 uniform SP-slice。
+> **Data balance status**: Qwen3-VL now combines uniform SP slicing with cross-DP whole-item balancing through the shared declarative mixin. Dataloader compute packing, Bagel item-to-SP balancing and audio/video halo handling remain future work (§8).
 >
 > 实验数字（Arch A 时代，作为放弃 Arch A 的证据）：[sp_loop_memory_experiments.md](./sp_loop_memory_experiments.md)。配置约定：`.agents/skills/seedomni-v2/references/per-module-parallel.md`。
 
@@ -61,7 +61,7 @@ encoder 与 LLM 的输出都 all-gather 回**全序列**（每卡相同），emb
 
 - **块对角模块**（每张图/每段独立，无 cross-item attention）+ 切分对齐 item 边界 → **SP-slice ≡ data-balance**：每个 item 只算一次、不触发 all-to-all。SigLIP / VQVAE 走的正是 batch 维 SP-slice（复制 batch → 切 1/sp 张图 → all-gather），等价于「每卡分一份图」的 data-balance。
 - **负载均衡上 SP-slice 严格更优**：等 token 切 → 永远均衡，单图也四等分**无 bubble**，只需在总长补 ≤ `sp` 个 token 的 tiny dummy（一次，不是每图）。反而是 **data-balance（整 item 分配）才会 bubble**（单图 / item 数 < sp / item 不等大）。
-- 因此：**若 encoder 是 SP-aware（全局注意力 + 无 halo，如 ViT），全局 SP-slice 一把梭即可，data-balance 冗余。** 这正是当前实现的选择：所有模块 uniform SP-slice。
+- Token-wise SP slicing balances work **within one SP group**. Different DP groups can still have different image workloads. Qwen3-VL therefore balances whole items across its module-local DP group before SP slicing, then reverses the exchange after SP gather. These two operations address different dimensions of imbalance.
 
 ---
 
@@ -79,7 +79,7 @@ encoder 与 LLM 的输出都 all-gather 回**全序列**（每卡相同），emb
 
 - **「per-module 不同 SP size + outer=1 + loop」这个具体机制：已放弃并删除。**
 - **「module-level 意识」仍必要**，但正确形态是：**每模块的并行策略（SP-slice / data-balance / replicate，由计算结构推出），在一个 uniform outer SP mesh 之下**。
-- 当前实现只做了 **SP-slice**（所有模块一致）。真正需要 per-module 决策的，几乎只剩一个二元判断：**这个模块的 attention 能否/是否 SP-aware（全局+无 halo）** —— 能则 SP-slice，不能则 data-balance（未来）。
+- `DataBalanceMixin` now declares structure, item fields, costs and output splits; the resolver derives `sp_slice`, `dp_balance` or `replicate`. Qwen3-VL is the first integrated consumer. Its cross-DP optimization composes with the primary SP strategy; other modules require their own validated declarations.
 
 ---
 
@@ -103,11 +103,18 @@ encoder 与 LLM 的输出都 all-gather 回**全序列**（每卡相同），emb
 - `sequence_parallel/data.py` 的 `sp_gather_seqs` / `sp_take_own_seq` / `sp_broadcast_from_rank` / `sp_gather_to_owner` / `_GatherConcatSP` / `_sp_unify_dtype` 等 Arch A 重分发原语。
 - `OmniTrainer` 的 outer-SP=1 **硬禁**，改为**驱动** uniform outer SP（由各模块继承 outer `accelerator.ulysses_size` 达成）。
 
+**Implemented shared data-balance path**:
+
+- The module-independent sorter accepts cost exponents or callables. `ModuleDataBalancer` owns whole-item exchanges and immutable `BalancePlan` inverse routing.
+- Qwen3-VL declares its item fields and frame-wise attention cost through `DataBalanceMixin`. Hooks resolve the module's current DP group, balance before SP slicing, and restore after SP gather. Full original token lengths remain the metering input.
+- `Qwen3VLEncoderDataBalance` now delegates to that shared transport. Its legacy `balance_data` / `data_bridge` entry points retain separate image/video slots and merged/deepstack output restoration; there is no second all-to-all implementation. The old V1 flag plumbing remains a separately scoped compatibility cleanup.
+- See [declarative encoder data balance](./module_data_balance.md) for actual ordinary/packed trainer on/off loss and token-count validation and performance limitations.
+
 **未来工作（尚未实现）**：
 
 - dataloader 级 **compute 均衡 packing**（跨样本 compute 方差）。
-- encoder 的 **data-balance**（scatter item / gather embed）路径，用于 conv/局部/SP-unaware（音视频）模块。
-- 音视频 encoder 的 halo 处理 / SP-unaware 判定与自动策略选择。
+- Bagel NaViT item-to-SP assignment and inverse permutation, after mixin-contract review; production-scale skew and MFU evaluation.
+- Additional conv/local/audio/video consumer declarations, and audio/video halo handling where token slicing is appropriate.
 
 ---
 
