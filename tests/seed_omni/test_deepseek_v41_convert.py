@@ -27,6 +27,7 @@ output; loading it against the real module definitions is what catches one.
 
 import json
 import os
+import tempfile
 
 import pytest
 import torch
@@ -226,6 +227,70 @@ class TestShardWriter:
     def test_an_empty_module_is_refused(self, tmp_path):
         with pytest.raises(RuntimeError, match="no tensors were written"):
             ShardWriter(str(tmp_path / "out")).finalize()
+
+
+class TestDestinationsWithoutMemoryMapping:
+    """``save_file`` serializes through a memory map, which the HDFS FUSE mount
+    refuses with ``OSError 38`` -- and that mount is where this model's output
+    has to go, since 1.5 TB does not fit locally. The writer probes for that and
+    stages each shard through local scratch instead."""
+
+    @staticmethod
+    def _reject_mmap_under(monkeypatch, directory):
+        """Make ``save_file`` behave like the FUSE mount for one directory."""
+        import veomni.models.seed_omni.modules.deepseek_v41.convert_model as convert_module
+
+        real_save_file = convert_module.save_file
+
+        def guarded(tensors, path, **kwargs):
+            if os.path.realpath(path).startswith(os.path.realpath(str(directory))):
+                raise OSError(38, "Function not implemented")
+            return real_save_file(tensors, path, **kwargs)
+
+        monkeypatch.setattr(convert_module, "save_file", guarded)
+
+    def test_a_local_directory_needs_no_staging(self, tmp_path):
+        assert ShardWriter(str(tmp_path / "out"))._stage is False
+
+    def test_a_destination_that_refuses_the_map_is_detected(self, tmp_path, monkeypatch):
+        out = tmp_path / "out"
+        out.mkdir()
+        self._reject_mmap_under(monkeypatch, out)
+        assert ShardWriter(str(out))._stage is True
+
+    def test_staged_shards_arrive_intact(self, tmp_path, monkeypatch):
+        out = tmp_path / "out"
+        out.mkdir()
+        self._reject_mmap_under(monkeypatch, out)
+
+        writer = ShardWriter(str(out), shard_bytes=64)
+        written = {f"t{i}": torch.full((32,), float(i)) for i in range(4)}
+        for name, tensor in written.items():
+            writer.add(name, tensor)
+        assert writer.finalize() == 4
+
+        index = json.load(open(out / "model.safetensors.index.json"))
+        read_back = {}
+        for file_name in set(index["weight_map"].values()):
+            read_back.update(load_file(str(out / file_name)))
+        assert set(read_back) == set(written)
+        for name, tensor in written.items():
+            assert torch.equal(read_back[name], tensor)
+
+    def test_scratch_is_not_left_behind(self, tmp_path, monkeypatch):
+        """The staging copy is the one that could silently fill the local disk
+        over a 1.5 TB run."""
+        out = tmp_path / "out"
+        out.mkdir()
+        self._reject_mmap_under(monkeypatch, out)
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "scratch"))
+        (tmp_path / "scratch").mkdir()
+
+        writer = ShardWriter(str(out), shard_bytes=64)
+        for i in range(4):
+            writer.add(f"t{i}", torch.zeros(32))
+        writer.finalize()
+        assert os.listdir(tmp_path / "scratch") == []
 
 
 class TestTensorSource:

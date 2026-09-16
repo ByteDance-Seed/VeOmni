@@ -71,6 +71,8 @@ from __future__ import annotations
 import gc
 import json
 import os
+import shutil
+import tempfile
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -97,6 +99,15 @@ class ShardWriter:
     written under provisional names and renamed once it is. Writing them with a
     guessed count and fixing the index afterwards would leave file names that
     disagree with their own index on any failure between the two.
+
+    ``save_file`` serializes through a memory map, which the HDFS FUSE mount
+    does not implement (``OSError 38``) -- and that is where a 749 B model's
+    output has to go, because it does not fit on the local disk. So the writer
+    probes the destination once with a one-tensor file: where the map works it
+    writes shards in place, and where it does not it writes each shard to local
+    scratch and moves it across. Peak local use is then one shard rather than
+    the whole module. The probe is a capability test rather than a path
+    heuristic because the same mount type can be configured either way.
     """
 
     def __init__(self, output_dir: str, shard_bytes: int = SHARD_BYTES) -> None:
@@ -108,6 +119,19 @@ class ShardWriter:
         self._total_bytes = 0
         self._shard_index = 0
         os.makedirs(output_dir, exist_ok=True)
+        self._stage = not self._destination_takes_a_memory_map(output_dir)
+
+    @staticmethod
+    def _destination_takes_a_memory_map(output_dir: str) -> bool:
+        probe = os.path.join(output_dir, ".shard_writer_probe.safetensors")
+        try:
+            save_file({"probe": torch.zeros(1, dtype=torch.uint8)}, probe, metadata={"format": "pt"})
+        except Exception:
+            return False
+        finally:
+            if os.path.exists(probe):
+                os.remove(probe)
+        return True
 
     def add(self, name: str, tensor: torch.Tensor) -> None:
         if name in self._weight_map or name in self._pending:
@@ -124,13 +148,30 @@ class ShardWriter:
         if not self._pending:
             return
         path = os.path.join(self.output_dir, self._provisional(self._shard_index))
-        save_file(self._pending, path, metadata={"format": "pt"})
+        if self._stage:
+            self._save_via_scratch(path)
+        else:
+            save_file(self._pending, path, metadata={"format": "pt"})
         for name in self._pending:
             self._weight_map[name] = self._shard_index
         self._pending.clear()
         self._pending_bytes = 0
         self._shard_index += 1
         gc.collect()
+
+    def _save_via_scratch(self, path: str) -> None:
+        """Write the shard locally, then move it to ``path``.
+
+        The scratch file is removed on failure so a retry does not inherit a
+        half-written shard under a name the index will later claim is complete.
+        """
+        scratch_dir = tempfile.mkdtemp(prefix="shard_writer_")
+        scratch = os.path.join(scratch_dir, os.path.basename(path))
+        try:
+            save_file(self._pending, scratch, metadata={"format": "pt"})
+            shutil.move(scratch, path)
+        finally:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
 
     @staticmethod
     def _provisional(index: int) -> str:
