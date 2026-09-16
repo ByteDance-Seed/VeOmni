@@ -122,10 +122,12 @@ from veomni.models.transformers.deepseek_v4.packed_utils import (
     build_packed_sparse_attention_indices,
     build_sparse_attention_indices,
     compress_packed_windows,
+    ensure_unmasked_packed_attention,
     isolate_packed_causal_mask_,
     mask_sparse_attention_indices,
     packed_compressed_block_bias,
     packed_compressed_causal_ranges,
+    resolve_packed_sequence_slices,
     shard_packed_compression_metadata,
 )
 from veomni.models.utils.op_utils import empty_bias, linear_bias, resolve_moe_impl, resolve_op_impl, resolve_qat_impl
@@ -2148,7 +2150,8 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
 
     # ================================================================
     # Patch: DeepseekV4Model.forward
-    # 1. Convert collator-provided cu-seqlens into reusable packed slices once.
+    # 1. Prefer collator-provided packed_sequence_slices; derive them from
+    #    cu_seq_lens_q only when that host metadata is missing.
     # 2. Keep use_cache=False forwards stateless so the TileLang indexer can run.
     # 3. Under Ulysses SP the collator keeps full ``attention_mask`` /
     #    ``cu_seq_lens_*`` while slicing ``input_ids`` / local ``position_ids``.
@@ -2224,15 +2227,16 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         # the O(S^2) mask and block bias are skipped entirely on that path.
         mask_free_sparse = False
 
+        packed_sequence_slices = kwargs.get("packed_sequence_slices")
         cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
-        if isinstance(cu_seq_lens_q, torch.Tensor) and inputs_embeds.shape[0] == 1:
-            boundaries = cu_seq_lens_q.detach().cpu().tolist()
-            if boundaries[0] != 0 or boundaries[-1] != full_seq_len:
-                raise ValueError(
-                    "DeepSeek V4 packed cu_seq_lens_q must span the full sequence; "
-                    f"got {boundaries} for length {full_seq_len}"
-                )
-            packed_sequence_slices = tuple(zip(boundaries[:-1], boundaries[1:], strict=True))
+        if inputs_embeds.shape[0] == 1 and (
+            packed_sequence_slices is not None or isinstance(cu_seq_lens_q, torch.Tensor)
+        ):
+            packed_sequence_slices = resolve_packed_sequence_slices(
+                packed_sequence_slices,
+                cu_seq_lens_q if isinstance(cu_seq_lens_q, torch.Tensor) else None,
+                full_seq_len,
+            )
             kwargs["packed_sequence_slices"] = packed_sequence_slices
             compress_rates = tuple(self.config.compress_rates.values())
             hca_rate = self.config.compress_rates["heavily_compressed_attention"]
@@ -2247,28 +2251,17 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 and inputs_embeds.dtype == torch.bfloat16
                 and inputs_embeds.is_cuda
             )
-            # Dropping the mask is only sound if it masked nothing out. The check on
-            # ``boundaries`` above already establishes that every position belongs to
-            # some sequence, so a zero here contradicts the caller's own cu-seqlens --
-            # but ``build_packed_sparse_attention_indices`` rebuilds candidates from
-            # ``position_ids`` alone, so an unnoticed zero would silently make a padded
-            # token attendable and move the loss. VeOmni's collator guarantees all-ones
-            # on this path (see ``data_collator.py``: SP slices ``input_ids`` but keeps
-            # the full mask), yet this is a public entry point, so verify rather than
-            # trust. Reading the mask costs one device sync on a branch that already
-            # pays for ``cu_seq_lens_q.cpu()`` a few lines up, so this adds no new
-            # class of stall.
-            if mask_free_sparse and isinstance(attention_mask, torch.Tensor) and not bool(attention_mask.all()):
-                raise ValueError(
-                    "DeepSeek V4 packed attention received an attention_mask with masked-out "
-                    "positions alongside cu_seq_lens_q that span the full sequence. Express "
-                    "padding through cu_seq_lens_q, which the sparse path reads, instead of a "
-                    "dense mask, which it drops."
+            # Dropping the mask is only sound if it masked nothing out. VeOmni's
+            # collator records that on CPU as ``attention_mask_is_all_ones``. A GPU
+            # ``attention_mask.all()`` is reserved for CPU masks and sync-debug.
+            if mask_free_sparse:
+                ensure_unmasked_packed_attention(
+                    attention_mask,
+                    attention_mask_is_all_ones=kwargs.get("attention_mask_is_all_ones"),
                 )
-            # Metadata is indexed by global positions / cu-seqlens; under SP the
-            # collator already provides full-sequence cu-seqlens while local embeds
-            # are only one shard, so materialize a full-length reference tensor.
-            metadata_reference = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, inputs_embeds.shape[-1])
+            # The helper only reads device/dtype from this tensor. A full-length
+            # hidden placeholder would allocate B×S×H bytes that nothing reads.
+            metadata_reference = inputs_embeds.new_empty(())
             kwargs["packed_compression_metadata"] = build_packed_compression_metadata(
                 metadata_reference,
                 full_position_ids,

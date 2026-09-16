@@ -28,6 +28,7 @@ from ..utils import logging
 from ..utils.constants import IGNORE_INDEX, MODALITY
 from ..utils.seqlen_pos_transform_utils import (
     coalesce_tail_padding_cu_seqlens,
+    packed_sequence_slices_from_cu_seqlens,
     prepare_fa_kwargs_from_position_ids,
     valid_seqlens_from_cu_seqlens,
 )
@@ -62,8 +63,9 @@ def add_flash_attention_kwargs_from_position_ids(
 
     Args:
         batch: The batch dictionary containing position_ids. Will be modified in-place to add
-               cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k, and
-               linear_attn_cu_seq_lens_q. When ``linear_attn_tail_padding_length > 0``,
+               cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k,
+               linear_attn_cu_seq_lens_q, packed_sequence_slices, and
+               attention_mask_is_all_ones. When ``linear_attn_tail_padding_length > 0``,
                also stores ``tail_padding_length`` (0-d ``torch.int32`` tensor) so
                downstream valid-seqlens helpers can strip the coalesced pad segment and
                distributed/PP stages preserve the metadata.
@@ -99,6 +101,12 @@ def add_flash_attention_kwargs_from_position_ids(
     batch["max_length_q"] = max_length_q
     batch["max_length_k"] = max_length_k
     batch["linear_attn_cu_seq_lens_q"] = cu_seq_lens_q
+    batch["packed_sequence_slices"] = packed_sequence_slices_from_cu_seqlens(cu_seq_lens_q)
+    attention_mask = batch.get("attention_mask")
+    if isinstance(attention_mask, torch.Tensor) and attention_mask.device.type == "cpu":
+        batch["attention_mask_is_all_ones"] = bool(attention_mask.all())
+    else:
+        batch["attention_mask_is_all_ones"] = True
 
     return cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k
 

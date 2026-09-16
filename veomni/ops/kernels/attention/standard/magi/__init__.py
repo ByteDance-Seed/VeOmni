@@ -20,9 +20,9 @@ import torch
 
 from ......distributed.parallel_state import get_parallel_state
 from ......utils.device import IS_CUDA_AVAILABLE, get_device_type
-from ...helper import require_all
 from ...mask.magi import MagiAttentionMask
 from ...ulysses import prepare_ulysses_qkv, restore_ulysses_output, should_apply_ulysses
+from ._metadata import ensure_range_bounds
 
 
 def _resolve_magi_backend(device: torch.device) -> Callable:
@@ -157,14 +157,7 @@ def magi_attention_forward(
     query = query.squeeze(0)
     key = key.squeeze(0)
     value = value.squeeze(0)
-    require_all(
-        attention_mask.q_ranges[:, 1] <= query.shape[0],
-        f"MagiAttention q_ranges must end within the post-exchange query length ({query.shape[0]}).",
-    )
-    require_all(
-        attention_mask.k_ranges[:, 1] <= key.shape[0],
-        f"MagiAttention k_ranges must end within the post-exchange key length ({key.shape[0]}).",
-    )
+    ensure_range_bounds(query, key, attention_mask.q_ranges, attention_mask.k_ranges)
 
     output, meta = _magi_attention_forward(
         query,

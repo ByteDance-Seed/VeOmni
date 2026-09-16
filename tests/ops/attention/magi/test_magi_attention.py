@@ -27,6 +27,7 @@ from tests.ops.attention.attention_cases import clone_qkv, dense_mask, magi_mask
 from tests.ops.tol import ATTN_ATOL, ATTN_BF16_GRAD_ATOL, ATTN_GRAD_ATOL, ATTN_GRAD_RTOL, ATTN_LSE_RTOL, ATTN_RTOL
 from veomni.ops.kernels.attention.standard import magi as magi_backend
 from veomni.ops.kernels.attention.standard.magi import _kernel as magi_kernel
+from veomni.ops.kernels.attention.standard.magi import _metadata as magi_metadata
 from veomni.ops.mask import MagiAttentionMask
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
@@ -76,6 +77,11 @@ _MAGI_FFA_AVAILABLE = _magi_ffa_available()
 _MAGI_FFA_REASON = (
     "MagiAttention numerical tests require a supported NVIDIA GPU with its CUTLASS overlay or CUTE DSL/JIT backend"
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_magi_metadata_cache(monkeypatch):
+    monkeypatch.setattr(magi_metadata, "_cache_entry", None)
 
 
 def test_magi_attention_preserves_ffa_layout_and_scale(monkeypatch):
@@ -276,6 +282,55 @@ def test_magi_attention_rejects_global_ranges_when_ulysses_is_off(monkeypatch):
             query,
             _causal_mask(8),
         )
+
+
+def _count_range_bound_reductions(monkeypatch) -> dict[str, int]:
+    """Count ``require_all`` launches used by cached Magi range-endpoint checks."""
+    counts = {"require_all": 0}
+    real_require_all = magi_metadata.require_all
+
+    def counting_require_all(condition, message):
+        counts["require_all"] += 1
+        return real_require_all(condition, message)
+
+    monkeypatch.setattr(magi_metadata, "require_all", counting_require_all)
+    return counts
+
+
+def _run_mocked_magi_layer(monkeypatch, query: torch.Tensor, attention_mask: MagiAttentionMask) -> None:
+    monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state())
+    monkeypatch.setattr(
+        magi_backend,
+        "_magi_attention_forward",
+        lambda query, key, value, *args, **kwargs: (query, SimpleNamespace(lse=None)),
+    )
+    magi_backend.magi_attention_forward(
+        _FakeAttentionModule(),
+        query,
+        query[:, :2],
+        query[:, :2],
+        attention_mask,
+    )
+
+
+def test_magi_attention_range_bound_cache_hit_miss_and_mutation(monkeypatch):
+    """Same mask across layers checks once; in-place range or seq-len changes recheck.
+
+    CUDA saves later ``.all()`` launches, not host synchronizations.
+    """
+    counts = _count_range_bound_reductions(monkeypatch)
+    attention_mask = _causal_mask(8)
+    for _ in range(3):
+        _run_mocked_magi_layer(monkeypatch, torch.randn(1, 4, 8, 16), attention_mask)
+    assert counts["require_all"] == 2
+
+    attention_mask.q_ranges[0, 1] = 7
+    _run_mocked_magi_layer(monkeypatch, torch.randn(1, 4, 8, 16), attention_mask)
+    _run_mocked_magi_layer(monkeypatch, torch.randn(1, 4, 8, 16), attention_mask)
+    assert counts["require_all"] == 4
+
+    _run_mocked_magi_layer(monkeypatch, torch.randn(1, 4, 16, 16), attention_mask)
+    assert counts["require_all"] == 6
 
 
 @pytest.mark.skipif(not _MAGI_FFA_AVAILABLE, reason=_MAGI_FFA_REASON)

@@ -307,6 +307,26 @@ def test_magi_hf_builder_does_not_recover_packed_visibility_from_position_ids():
         create_causal_mask(config, embeds, attention_mask, None, packed_position_ids)
 
 
+def test_magi_hf_builder_ignores_packed_boundary_kwargs():
+    """The HF builder is unpacked-only; packed isolation needs from_cu_seqlens."""
+    cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
+    mask = magi_attention_mask_builder(
+        1,
+        4,
+        4,
+        device="cpu",
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+        q_ranges=torch.tensor([[0, 2], [2, 4]], dtype=torch.int32),
+        k_ranges=torch.tensor([[0, 2], [2, 4]], dtype=torch.int32),
+    )
+    assert mask.q_ranges.tolist() == [[0, 4]]
+    assert mask.k_ranges.tolist() == [[0, 4]]
+    packed = MagiAttentionMask.from_cu_seqlens(cu_seqlens)
+    assert packed.q_ranges.tolist() == [[0, 2], [2, 4]]
+    assert packed.k_ranges.tolist() == [[0, 2], [2, 4]]
+
+
 def test_magi_from_ranges_casts_ffa_contract():
     mask = MagiAttentionMask.from_ranges(
         torch.tensor([[0, 4]]),

@@ -474,7 +474,7 @@ patchgen --list
 > helpers, and pass `cu_seq_lens_q` into mask construction. The wrappers add
 > packed-sample boundaries to the native mask so tokens from different samples
 > cannot attend to each other. See the
-> [FlexAttention integration guide](../transformers_v5/veomni_fused_attention.md#integrating-a-new-patchgen-model).
+> [FlexAttention integration guide](../transformers_v5/veomni_attention_interface.md#integrating-a-new-patchgen-model).
 
 ## Using patchgen from a dependent project
 

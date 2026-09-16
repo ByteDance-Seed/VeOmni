@@ -110,13 +110,16 @@ The current adapter requires `cp_size == 1`, batch size 1, zero attention dropou
 
 ### Unified MagiAttention mask builder
 
-VeOmni registers `magi_attention_mask_builder` as the Transformers mask builder for `veomni_magi_attention`. Canonical unpacked causal and bidirectional models that call the Transformers mask registry without a 2D attention mask can therefore select MagiAttention without defining another mask builder. Models with richer visibility call the same builder directly with one of these metadata forms:
+VeOmni registers `magi_attention_mask_builder` as the Transformers mask builder for `veomni_magi_attention`. Canonical unpacked causal and bidirectional models that call the Transformers mask registry without a 2D attention mask can therefore select MagiAttention without defining another mask builder. The registered builder only consumes `q_length`, `kv_length`, HF offsets, `mask_function`, and `device`. It always returns one unpacked range pair `[[0, q_length]]` / `[[0, kv_length]]`. Passing `cu_seq_lens_q`, `cu_seq_lens_k`, `q_ranges`, or `k_ranges` as extra kwargs is ignored and drops packed sample isolation.
 
-- `cu_seq_lens_q` and `cu_seq_lens_k` for packed causal or bidirectional sequences;
-- explicit `q_ranges`, `k_ranges`, and `attn_type_map` for mixed or asymmetric visibility;
-- `q_length` and `kv_length` for one unpacked sequence.
+Packed and mixed visibility must use the mask constructors, not the HF builder:
 
-The builder deliberately does not materialize or reverse-engineer an arbitrary Transformers `mask_function`. Predicate-to-range conversion would require an O(sequence length squared) dense mask and cannot preserve every model-specific visibility rule efficiently. A 2D attention mask also does not expose packed boundaries because VeOmni uses an all-ones mask and records boundaries in `position_ids` and precomputed cumulative sequence lengths. Registry calls with a 2D mask but without explicit range metadata are rejected rather than silently allowing cross-sample attention. Models with packed, sliding-window, prefix, multimodal, or mixed visibility must pass declarative metadata explicitly.
+- `MagiAttentionMask.from_cu_seqlens` for packed causal or bidirectional sequences
+- `MagiAttentionMask.from_ranges` for mixed or asymmetric visibility
+
+The shape helper `packed_causal_mask(..., impl="magi_attention")` already routes through `from_cu_seqlens`.
+
+The builder deliberately does not materialize or reverse-engineer an arbitrary Transformers `mask_function`. Predicate-to-range conversion would require an O(sequence length squared) dense mask and cannot preserve every model-specific visibility rule efficiently. A 2D attention mask also does not expose packed boundaries because VeOmni uses an all-ones mask and records boundaries in `position_ids` and precomputed cumulative sequence lengths. Registry calls with a 2D mask are rejected rather than silently allowing cross-sample attention.
 
 The optional `magi` extra requires `gpu` (`veomni[gpu]`) and installs MagiAttention and the CUTE DSL/JIT dependencies used on SM100 and newer GPUs:
 
@@ -163,8 +166,10 @@ With Ulysses, the ranges describe the full sequence after the
 sequence-gather/head-scatter exchange and must be identical on every Ulysses
 rank. A layer that passes `skip_ulysses=True` must build local ranges by passing
 the same flag to `create_magi_mask`. The forward adapter validates range
-endpoints against the actual post-exchange query and key lengths before
-launching the kernel. A future Magi Context Parallel implementation may reuse
+endpoints against the actual post-exchange query and key lengths, and caches
+that check with the FA4 metadata while the mask tensors and Q/K shape stay
+unchanged. On CUDA this skips later `.all()` reductions; it does not remove a
+host sync. A future Magi Context Parallel implementation may reuse
 this mask carrier, but distributed dispatch/calc/undispatch and `cp_size > 1`
 are outside the current contract.
 
