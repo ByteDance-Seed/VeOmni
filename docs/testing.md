@@ -185,7 +185,7 @@ FP32 mathematical VJP using the same BF16 bit patterns and the rounding budget
 described below. This isolates expert transport/kernel numerics, not FSDP2
 gradient averaging or whole-model optimizer trajectories.
 
-`test_deepseek_v4_compiled_fsdp2_training_alignment` in the same file compares
+`tests/e2e/test_e2e_parallel.py::test_deepseek_v4_compiled_fsdp2_training_alignment` compares
 eager and fullgraph Inductor through four-rank packed FSDP2 training, with
 static 512-token shapes and EP/SP disabled. Loss and gradient norm are checked
 at `rtol=atol=1e-3`; this checks aggregate training metrics, not per-parameter
