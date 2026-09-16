@@ -170,7 +170,16 @@ class OmniProcessor:
         Returns a dict suitable for :meth:`OmniModel.generate` —
         ``{"conversation_list": [...]}`` (a single conversation).
         """
-        del videos  # video inputs follow the same path once callers pass PIL/VideoInputs
+        if videos is not None:
+            # The parameter is here because video follows the same conversation
+            # path as images once callers pass PIL / VideoInputs, but nothing
+            # builds video items yet — say so rather than return a text-only
+            # request as if the videos had been read.
+            raise NotImplementedError(
+                "`videos` is not supported yet by SeedOmni V2 request building. Pass video "
+                "frames as `images`, or build the conversation items directly and call "
+                "`preprocess`."
+            )
 
         image_items = _normalize_images(images) if images is not None else []
         conversation = build_conversation(prompt=text, images=image_items)
