@@ -166,8 +166,10 @@ With Ulysses, the ranges describe the full sequence after the
 sequence-gather/head-scatter exchange and must be identical on every Ulysses
 rank. A layer that passes `skip_ulysses=True` must build local ranges by passing
 the same flag to `create_magi_mask`. The forward adapter validates range
-endpoints against the actual post-exchange query and key lengths before
-launching the kernel. A future Magi Context Parallel implementation may reuse
+endpoints against the actual post-exchange query and key lengths, and caches
+that check with the FA4 metadata while the mask tensors and Q/K shape stay
+unchanged. On CUDA this skips later `.all()` reductions; it does not remove a
+host sync. A future Magi Context Parallel implementation may reuse
 this mask carrier, but distributed dispatch/calc/undispatch and `cp_size > 1`
 are outside the current contract.
 
