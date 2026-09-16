@@ -385,7 +385,6 @@ class BaseTrainer(Stateful, ABC):
             self.args.model,
             model_name=model_name,
             train=self.args.train,
-            chat_template_name=self.args.data.chat_template,
         )
 
     def _build_lr_scheduler(self):

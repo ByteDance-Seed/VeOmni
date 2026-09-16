@@ -243,7 +243,6 @@ class VLMTrainer:
             self.base.args.model,
             "base",
             train=self.base.args.train,
-            chat_template_name=self.base.args.data.chat_template,
         )
 
     def _build_data_transform(self):

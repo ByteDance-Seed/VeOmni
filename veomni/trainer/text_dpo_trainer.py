@@ -186,7 +186,6 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
         self.args = args
         self.model_name = model_name
         self.train = train
-        self.chat_template_name = None
         self._torch_dtype = torch_dtype
         self.setup()
         with use_parallel_state(self.model_name):

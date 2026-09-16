@@ -177,10 +177,8 @@ To implement a specific training task (like VLM training), compose a `BaseTraine
 1. **`_build_model_runtime(self)`**:
    Return the runtime that owns this job's model. Auxiliary components — tokenizer, processor, chat template — are built there rather than on the trainer, so override `VeOmniModelRuntime._build_model_assets` on a runtime subclass if a model needs different ones.
    ```python
-   def _build_model_runtime(self) -> MyModelRuntime:
-       return MyModelRuntime(
-           self.args.model, "base", train=self.args.train, chat_template_name=self.args.data.chat_template
-       )
+    def _build_model_runtime(self) -> MyModelRuntime:
+        return MyModelRuntime(self.args.model, "base", train=self.args.train)
    ```
 
 2. **`VeOmniModelRuntime._freeze_model_module` / `_build_optimizer`**:

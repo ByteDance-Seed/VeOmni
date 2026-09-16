@@ -1527,6 +1527,16 @@ class BaseModelArguments:
             )
         },
     )
+    chat_template: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Registered chat-template name used to lay conversations out into training samples. "
+                "Leave unset for data with no conversation structure (plaintext, diffusion) or for a "
+                "model that formats prompts through its own processor (Qwen-Omni)."
+            )
+        },
+    )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
@@ -1740,10 +1750,6 @@ class DataArguments:
     text_keys: str = field(
         default=None,
         metadata={"help": "Key to get text from the training data."},
-    )
-    chat_template: str = field(
-        default="default",
-        metadata={"help": "Chat template to use."},
     )
     max_seq_len: int = field(
         default=2048,

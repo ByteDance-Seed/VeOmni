@@ -26,11 +26,11 @@ model:
       fsdp_mode: fsdp2
       mixed_precision:
         enable: true
+  chat_template: chatml
 
 data:
   train_path: ./ultrafeedback_binarized
   data_type: dpo
-  chat_template: chatml
   max_seq_len: 2048
   train_size: 20000000
   dyn_bsz_buffer_size: 200

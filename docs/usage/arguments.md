@@ -158,6 +158,7 @@ own `safetensor_idx_path`.
 | model_config | `Optional[Dict]` | `{}` | Values used to override the loaded foundation-model config. |
 | processor_config | `Optional[Dict]` | `{}` | Kwargs used to override the loaded processor / tokenizer config. See below. |
 | tokenizer_path | `Optional[str]` | `None` | Path to the tokenizer. Defaults to `config_path`. |
+| chat_template | `Optional[str]` | `None` | Registered chat-template name used to lay conversations out into training samples. Leave unset for data with no conversation structure (plaintext, diffusion) or for a model that formats prompts through its own processor (Qwen-Omni). |
 | safetensor_idx_path | `Optional[str]` | `None` | Path to `model.safetensors.index.json`. |
 | basic_modules | `Optional[List[str]]` | `[]` | Additional modules beyond `_no_split_modules` to shard in FSDP. |
 | lora_config | `Optional[Dict]` | `{}` | Native VeOmni LoRA configuration. See the LoRA feature guide. |
@@ -367,7 +368,6 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | source_name | `str` | `None` | Dataset name. Loaded from multisource YAML if multisource is enabled. |
 | dyn_bsz_buffer_size | `int` | `200` | Buffer size for dynamic batch size. |
 | text_keys | `str` | `None` | Key to retrieve text from data. Auto-resolved: `"content_split"` for plaintext, `"messages"` for conversation, `"text"` for classification, `"chosen"` for DPO. |
-| chat_template | `Optional[str]` | `None` | Chat template used to lay conversations out into training samples. Leave unset for data with no conversation structure (plaintext, diffusion) or for a model that formats prompts through its own processor (Qwen-Omni). |
 | max_seq_len | `int` | `2048` | Maximum sequence length. |
 | silent_exception | `bool` | `False` | Whether to ignore exceptions when loading data. |
 | dataloader | `DataloaderConfig` | — | DataLoader construction parameters. |
