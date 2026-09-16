@@ -95,6 +95,9 @@ class _FakeModule(nn.Module):
     @classmethod
     def _from_config(cls, config, **kwargs):
         """Mirrors ``PreTrainedModel._from_config`` — real modules have no public ``from_config``."""
+        captured = getattr(cls, "_captured_from_config_kwargs", [])
+        captured.append(dict(kwargs))
+        cls._captured_from_config_kwargs = captured
         return cls(config)
 
     @classmethod
@@ -221,6 +224,83 @@ def test_omni_model_from_config_builds_unweighted_modules(registry_mock, _read_m
     model = OmniModel.from_config(config, checkpoint_root=tmp_path)
 
     assert set(model.modules_dict) == {"encoder", "decoder"}
+
+
+def test_config_hydrates_a_module_from_its_configured_path(tmp_path):
+    """Hydration reads the directory the weights will come from.
+
+    ``OmniModel._load_modules`` resolves a module's path through
+    ``resolve_module_path``, which honours a configured custom / absolute path.
+    Hydrating from ``root/<name>`` instead would pair the architecture config
+    of one directory with the weights of another whenever both exist.
+    """
+    _write_omni_checkpoint(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    _write_module_stub(elsewhere)
+    (elsewhere / "config.json").write_text(
+        json.dumps({"model_type": "fake_omni_module", "hidden_size": 128}),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "config.json"
+    raw = json.loads(config_path.read_text())
+    raw["modules"]["encoder"] = {"model": {"model_path": str(elsewhere)}}
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    config = OmniConfig.from_pretrained(tmp_path)
+
+    # `root/encoder/config.json` also exists, and says 4.
+    assert config.modules["encoder"].hidden_size == 128
+    assert config.modules["decoder"].hidden_size == 4
+
+
+@patch("veomni.models.seed_omni.modeling_omni.read_model_type", return_value="fake_omni_module")
+@patch("veomni.models.seed_omni.modeling_omni.OMNI_MODEL_REGISTRY")
+def test_from_config_forwards_load_kwargs_to_unweighted_modules(registry_mock, _read_model_type, tmp_path):
+    """Building without weights must honour the same load options as with them.
+
+    The descriptor branch is the one that reads each module's ``config.json``
+    off disk; it used to pass only the per-module ``model_config`` overrides,
+    dropping the caller's global kwargs and any ``attn_implementation``
+    persisted in ``ops_implementation``.
+    """
+    _write_omni_checkpoint(tmp_path)
+    config = OmniConfig.from_pretrained(tmp_path)
+    config.modules = {name: {"subfolder": name} for name in config.module_names}  # keep the descriptor branch
+
+    fake_cls = _FakeModule
+    fake_cls._captured_from_config_kwargs = []
+    registry_mock.__getitem__.return_value = MagicMock(return_value=fake_cls)
+
+    OmniModel.from_config(config, checkpoint_root=tmp_path, dtype="bfloat16")
+
+    assert fake_cls._captured_from_config_kwargs
+    assert all(captured["dtype"] == "bfloat16" for captured in fake_cls._captured_from_config_kwargs)
+
+
+@patch("veomni.models.seed_omni.modeling_omni.read_model_type", return_value="fake_omni_module")
+@patch("veomni.models.seed_omni.modeling_omni.OMNI_MODEL_REGISTRY")
+def test_from_pretrained_root_argument_wins_over_the_config_origin(registry_mock, _read_model_type, tmp_path):
+    """Weights come from the root the caller names, not the config's birthplace.
+
+    ``config=`` is a documented way to load weights under an already-resolved
+    config, and a config that has been through ``PreTrainedModel.from_pretrained``
+    carries that call's path in ``_name_or_path``. Preferring the remembered
+    path would quietly load every sub-module from the earlier checkpoint.
+    """
+    origin, target = tmp_path / "origin", tmp_path / "target"
+    _write_omni_checkpoint(origin)
+    _write_omni_checkpoint(target)
+
+    config = OmniConfig.from_pretrained(origin)
+    config.name_or_path = str(origin)  # what transformers stamps on after a model load
+
+    fake_cls = _FakeModule
+    fake_cls._captured_kwargs = {}
+    registry_mock.__getitem__.return_value = MagicMock(return_value=fake_cls)
+
+    OmniModel.from_pretrained(target, config=config)
+
+    assert set(fake_cls._captured_kwargs) == {str(target / "encoder"), str(target / "decoder")}
 
 
 def _minimal_generation_graph(*, module: str = "encoder") -> dict:

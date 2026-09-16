@@ -360,7 +360,13 @@ class OmniConfig(PretrainedConfig):
                 continue
             overrides = self.module_model_config(name)
             subfolder = self.module_checkpoint_subfolder(name)
-            module_dir = os.path.join(root, subfolder)
+            # Same resolution the weights use in ``OmniModel._load_modules``, so
+            # a module pointed at a custom / absolute path is hydrated from that
+            # path. Deriving the directory from the module name alone would read
+            # `root/<name>/config.json` while the weights came from elsewhere.
+            # A declared-but-empty entry has no configured path, so it keeps the
+            # checkpoint layout (``module_subfolder`` rejects it outright).
+            module_dir = os.path.join(root, subfolder) if entry is None else self.resolve_module_path(root, name)
             config_path = os.path.join(module_dir, "config.json")
             if not os.path.isfile(config_path):
                 hydrated[name] = entry if entry is not None else {"subfolder": subfolder}
