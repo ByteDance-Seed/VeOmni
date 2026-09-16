@@ -7,7 +7,7 @@ under ``veomni/models/seed_omni/modules/<family>/convert_model.py``.
 
 Usage::
 
-    python scripts/convert_model.py \\
+    python scripts/seed_omni/convert_model.py \\
         --model_path /mnt/hdfs/veomni/models/transformers/Janus-1.3B \\
         --output_dir /mnt/hdfs/veomni/models/seed_omni/janus_1.3b
 """
