@@ -44,11 +44,16 @@ def pack_llm_conversations_for_forward(
     for sample in conversations:
         sample_lengths = 0
         for item in sample:
-            if item.role == "dummy":
+            if is_dummy(item):
                 continue
             embeds = item.value
             embeds_length = embeds.size(0)
-            chunk_attention_mask = item.meta.pop("attention_mask", None)
+            # Read, don't consume: packing is not the item's last reader.
+            # scatter_llm_hidden_states writes hidden states back onto these same
+            # items, and any second forward over one conversation (a re-forward,
+            # a reference pass) would otherwise pack it with a fabricated
+            # all-ones mask the second time, silently.
+            chunk_attention_mask = item.meta.get("attention_mask")
             if chunk_attention_mask is None:
                 chunk_attention_mask = torch.ones(embeds_length, dtype=torch.long, device=device)
             inputs_embeds_list.append(embeds.to(device))
