@@ -2,10 +2,17 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
-from veomni.utils.device import MOE_TRITON_DEVICE_TYPES
+from veomni.utils.device import (
+    IS_CUDA_AVAILABLE,
+    MOE_TRITON_DEVICE_TYPES,
+    get_device_type,
+    get_dist_comm_backend,
+    get_torch_device,
+)
 
 
 def _deepseek_v4_experts_reference(
@@ -72,6 +79,143 @@ def test_deepseek_v4_duplicate_hash_routes_match_ep_dispatch_splits(monkeypatch)
     assert sum(inputs) == dispatched.shape[0] == 4
     torch.testing.assert_close(counts, torch.tensor([[2, 0], [2, 0]]))
     torch.testing.assert_close(totals, torch.tensor([4, 0]))
+
+
+def _run_deepseek_v4_ep_fixed_route_vjp(rank, world_size, init_file, seed):
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.distributed.parallel_state import ParallelState, _init_parallel_state, use_parallel_state
+    from veomni.models import build_foundation_model
+    from veomni.ops.kernels.moe.group_gemm import group_gemm_fused_moe_forward
+
+    device_type = get_device_type()
+    get_torch_device().set_device(rank)
+    dist.init_process_group(
+        get_dist_comm_backend(), init_method=f"file://{init_file}", rank=rank, world_size=world_size
+    )
+    torch.manual_seed(seed)
+    torch.set_float32_matmul_precision("highest")
+    with use_parallel_state(ParallelState(dp_size=world_size, dp_shard_size=world_size)):
+        model = build_foundation_model(
+            config_path="tests/toy_config/deepseek_v4_toy",
+            weights_path=None,
+            torch_dtype="bfloat16",
+            init_device=device_type,
+            ops_implementation=make_eager_ops_config(moe_implementation="fused_triton"),
+        ).train()
+        with torch.no_grad():
+            for module in model.modules():
+                if hasattr(module, "tid2eid"):
+                    table = module.tid2eid
+                    table.copy_(
+                        (
+                            torch.arange(table.shape[0], device=table.device)[:, None]
+                            + torch.arange(table.shape[1], device=table.device)[None, :]
+                        )
+                        % module.num_experts
+                    )
+        expert = model.model.layers[3].mlp.experts
+        captured = {}
+
+        def capture(_module, args, kwargs, output):
+            for i, name in enumerate(("hidden_states", "top_k_index", "top_k_weights")):
+                captured[name] = (args[i] if len(args) > i else kwargs[name]).detach().clone()
+            output.register_hook(lambda grad: captured.update(cotangent=grad.detach().clone()))
+
+        handle = expert.register_forward_hook(capture, with_kwargs=True)
+        ids = torch.arange(64, device=device_type).view(1, 64)
+        model(input_ids=ids, labels=ids, use_cache=False).loss.backward()
+        handle.remove()
+    full_gate_up = expert.gate_up_proj.detach().clone()
+    full_down = expert.down_proj.detach().clone()
+    limit = expert.limit
+    del model
+    for value in (*captured.values(), full_gate_up, full_down):
+        dist.broadcast(value, src=0)
+    state = _init_parallel_state(
+        dp_size=world_size,
+        dp_shard_size=world_size,
+        device_type=device_type,
+        extra_parallel_sizes=(world_size,),
+        name=None,
+    )
+    local_experts = full_gate_up.shape[0] // world_size
+    expert_slice = slice(state.ep_rank * local_experts, (state.ep_rank + 1) * local_experts)
+    offsets = (0, 9, 24, 41, 64)
+    token_slice = slice(offsets[rank], offsets[rank + 1])
+    for duplicate_slots in (False, True):
+        indices = captured["top_k_index"].clone()
+        if duplicate_slots:
+            indices[::8, 1] = indices[::8, 0]
+        route_bits = captured["top_k_weights"].to(torch.bfloat16)
+        hidden = captured["hidden_states"][token_slice].detach().clone().requires_grad_()
+        route = route_bits[token_slice].detach().clone().requires_grad_()
+        gate_up = full_gate_up[expert_slice].detach().clone().requires_grad_()
+        down = full_down[expert_slice].detach().clone().requires_grad_()
+        with use_parallel_state(state):
+            output = group_gemm_fused_moe_forward(
+                num_experts=full_gate_up.shape[0],
+                routing_weights=route,
+                selected_experts=indices[token_slice],
+                hidden_states=hidden,
+                fc1_1_weight=None,
+                fc1_2_weight=None,
+                fc1_1_2_weight=gate_up,
+                fc2_weight=down,
+                swiglu_limit=limit,
+            )
+            output.backward(captured["cotangent"][token_slice])
+        ref_hidden = captured["hidden_states"].float().detach().requires_grad_()
+        ref_route = route_bits.float().detach().requires_grad_()
+        ref_gate_up = full_gate_up.float().detach().requires_grad_()
+        ref_down = full_down.float().detach().requires_grad_()
+        ref_output = _deepseek_v4_experts_reference(
+            num_experts=full_gate_up.shape[0],
+            routing_weights=ref_route,
+            selected_experts=indices,
+            hidden_states=ref_hidden,
+            gate_up_proj=ref_gate_up,
+            down_proj=ref_down,
+            swiglu_limit=limit,
+        )
+        ref_output.backward(captured["cotangent"].float())
+        pairs = {
+            "output": (output, ref_output[token_slice]),
+            "hidden_grad": (hidden.grad, ref_hidden.grad[token_slice]),
+            "route_grad": (route.grad, ref_route.grad[token_slice]),
+            # Global reference VJP sums cotangents from EVERY source rank.
+            # Direct EP has no FSDP gradient averaging to undo here.
+            "gate_up_grad": (gate_up.grad, ref_gate_up.grad[expert_slice]),
+            "down_grad": (down.grad, ref_down.grad[expert_slice]),
+        }
+        for name, (actual, expected) in pairs.items():
+            context = (seed, rank, duplicate_slots, name)
+            assert actual is not None and expected is not None, context
+            assert actual.shape == expected.shape, context
+            assert torch.isfinite(actual).all() and torch.isfinite(expected).all(), context
+            delta = actual.double() - expected.double()
+            relative_l2 = delta.norm() / expected.double().norm().clamp_min(1e-30)
+            # Same multi-stage BF16 rounding budget as the non-EP oracle;
+            # discovery seed0 is excluded from these held-out cases.
+            eps = torch.finfo(torch.bfloat16).eps
+            assert relative_l2 <= 2 * eps, (context, relative_l2.item())
+            assert delta.abs().max() <= 4 * eps * expected.double().abs().max(), context
+        dist.barrier()
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not IS_CUDA_AVAILABLE or torch.version.hip is not None or get_torch_device().device_count() < 4,
+    reason="DeepSeek V4 EP expert oracle requires four NVIDIA CUDA devices",
+)
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_deepseek_v4_expert_parallel_fixed_route_vjp_matches_fp32_reference(seed, tmp_path):
+    """Check all-to-all output and four VJPs, unequal splits and duplicate slots."""
+    torch.multiprocessing.spawn(
+        _run_deepseek_v4_ep_fixed_route_vjp,
+        args=(4, str(tmp_path / "rendezvous"), seed),
+        nprocs=4,
+        join=True,
+    )
 
 
 def test_deepseek_v4_routers_use_fp32_projection_under_autocast():
