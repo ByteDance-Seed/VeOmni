@@ -28,12 +28,19 @@ class AllToAllEmbedding(torch.autograd.Function):
     order. Backward routes the per-token grads back the same way and index-adds
     them into the local shard — so the shard's gradient is complete after the
     backward all-to-all (no separate all-reduce / FSDP reduce-scatter needed).
+
+    A single shard (no group, or a group of one) owns the whole table, so each
+    exchange below becomes the identity and is aliased rather than performed.
+    Note it is aliased and not merely skipped: every collective here writes into
+    a freshly ``empty`` buffer, so dropping the call alone would return
+    uninitialized memory forward and a silently all-zero table gradient back.
     """
 
     @staticmethod
     def forward(ctx, group: "dist.ProcessGroup", input_tensor: torch.Tensor, embedding_table: torch.Tensor):
         emb_size = dist.get_world_size(group) if group else 1
         emb_rank = dist.get_rank(group) if group else 0
+        sharded = emb_size > 1
 
         vocab_size_per_rank = embedding_table.shape[0]
         start_id = emb_rank * vocab_size_per_rank
@@ -51,17 +58,19 @@ class AllToAllEmbedding(torch.autograd.Function):
         full_rank_index = torch.cat(rank_index, dim=0)
 
         # --- 1st collective: exchange per-pair counts ---
-        send_rank_count = torch.tensor(send_rank_count_list, device=input_flat.device)
-        all_send_rank_count = [torch.zeros_like(send_rank_count) for _ in range(emb_size)]
-        if group:
+        if sharded:
+            send_rank_count = torch.tensor(send_rank_count_list, device=input_flat.device)
+            all_send_rank_count = [torch.zeros_like(send_rank_count) for _ in range(emb_size)]
             dist.all_gather(all_send_rank_count, send_rank_count, group=group)
-        all_send_rank_count = torch.stack(all_send_rank_count, dim=0)
-        receive_rank_count_list = [int(x) for x in all_send_rank_count[:, emb_rank].tolist()]
+            all_send_rank_count = torch.stack(all_send_rank_count, dim=0)
+            receive_rank_count_list = [int(x) for x in all_send_rank_count[:, emb_rank].tolist()]
+        else:
+            receive_rank_count_list = send_rank_count_list
 
         # --- 2nd collective: exchange token ids ---
         send_ids = input_flat[full_rank_index].contiguous()
-        recv_ids = torch.empty(sum(receive_rank_count_list), dtype=input_flat.dtype, device=input_flat.device)
-        if group:
+        if sharded:
+            recv_ids = torch.empty(sum(receive_rank_count_list), dtype=input_flat.dtype, device=input_flat.device)
             dist.all_to_all_single(
                 recv_ids,
                 send_ids,
@@ -69,6 +78,8 @@ class AllToAllEmbedding(torch.autograd.Function):
                 input_split_sizes=send_rank_count_list,
                 group=group,
             )
+        else:
+            recv_ids = send_ids
 
         # --- Local lookup on this rank's shard ---
         local_indices = recv_ids - start_id
@@ -87,8 +98,8 @@ class AllToAllEmbedding(torch.autograd.Function):
         embs = torch.nn.functional.embedding(local_indices, embedding_table)
 
         # --- 3rd collective: ship looked-up embeddings back ---
-        embs_recv = torch.empty(num_input_ids, embedding_dim, dtype=embs.dtype, device=embs.device)
-        if group:
+        if sharded:
+            embs_recv = torch.empty(num_input_ids, embedding_dim, dtype=embs.dtype, device=embs.device)
             dist.all_to_all_single(
                 embs_recv,
                 embs.contiguous(),
@@ -96,6 +107,8 @@ class AllToAllEmbedding(torch.autograd.Function):
                 input_split_sizes=receive_rank_count_list,
                 group=group,
             )
+        else:
+            embs_recv = embs
 
         # --- Reassemble to original input order ---
         output = torch.empty(num_input_ids, embedding_dim, dtype=embs.dtype, device=embs.device)
@@ -105,6 +118,7 @@ class AllToAllEmbedding(torch.autograd.Function):
 
         ctx.save_for_backward(local_indices, full_rank_index)
         ctx.group = group
+        ctx.sharded = sharded
         ctx.embedding_table_shape = embedding_table.shape
         ctx.receive_rank_count_list = receive_rank_count_list
         ctx.send_rank_count_list = send_rank_count_list
@@ -121,13 +135,13 @@ class AllToAllEmbedding(torch.autograd.Function):
 
         grad_output_flat = grad_output.reshape(-1, embedding_dim)
         grad_send_buf = grad_output_flat[full_rank_index].contiguous()
-        grad_recv_buf = torch.empty(
-            sum(receive_rank_count_list),
-            embedding_dim,
-            dtype=grad_output.dtype,
-            device=grad_output.device,
-        )
-        if group:
+        if ctx.sharded:
+            grad_recv_buf = torch.empty(
+                sum(receive_rank_count_list),
+                embedding_dim,
+                dtype=grad_output.dtype,
+                device=grad_output.device,
+            )
             dist.all_to_all_single(
                 grad_recv_buf,
                 grad_send_buf,
@@ -135,6 +149,8 @@ class AllToAllEmbedding(torch.autograd.Function):
                 input_split_sizes=send_rank_count_list,
                 group=group,
             )
+        else:
+            grad_recv_buf = grad_send_buf
 
         grad_embedding_table = torch.zeros(embedding_table_shape, device=grad_output.device, dtype=grad_output.dtype)
         if grad_recv_buf.numel() > 0:
