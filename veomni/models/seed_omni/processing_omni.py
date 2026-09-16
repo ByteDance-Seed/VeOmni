@@ -170,7 +170,7 @@ class OmniProcessor:
         Returns a dict suitable for :meth:`OmniModel.generate` —
         ``{"conversation_list": [...]}`` (a single conversation).
         """
-        if videos is not None:
+        if videos:
             # The parameter is here because video follows the same conversation
             # path as images once callers pass PIL / VideoInputs, but nothing
             # builds video items yet — say so rather than return a text-only
