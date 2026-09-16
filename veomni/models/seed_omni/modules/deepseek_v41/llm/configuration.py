@@ -106,6 +106,8 @@ class DeepseekV41LlmConfig(PretrainedConfig):
         candidate_source_layer_id: int = 20,
         candidate_topk_blocks: int = 2048,
         candidate_block_size: int = 8,
+        dsa_indexer_loss: bool = False,
+        dsa_indexer_loss_coef: float = 1.0,
         # mHC
         hc_mult: int = 4,
         hc_sinkhorn_iters: int = 20,
@@ -181,6 +183,13 @@ class DeepseekV41LlmConfig(PretrainedConfig):
         self.candidate_source_layer_id = candidate_source_layer_id
         self.candidate_topk_blocks = candidate_topk_blocks
         self.candidate_block_size = candidate_block_size
+        # Training-only, with no field in the released config. The indexer emits
+        # indices, so nothing reaches its weights through the attention output;
+        # this auxiliary KL is the only gradient they ever get. Off by default
+        # because it costs a second kernel pass, on for any run that means to
+        # train the indexer rather than inherit it.
+        self.dsa_indexer_loss = dsa_indexer_loss
+        self.dsa_indexer_loss_coef = dsa_indexer_loss_coef
 
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters

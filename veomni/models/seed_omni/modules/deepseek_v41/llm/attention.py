@@ -66,7 +66,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-from ......ops.kernels.deepseek_v4 import sparse_attn_tilelang
+from ......ops.kernels.deepseek_v4 import sparse_attn_tilelang, sparse_mqa_target_fwd
 from .configuration import DeepseekV41LlmConfig
 from .quantization import fake_quant_act, fake_quant_kv, fake_quant_linear
 from .reuse import DeepseekV4GroupedLinear, DeepseekV4RMSNorm
@@ -97,6 +97,73 @@ class SharedAttentionState:
     index_k: Optional[torch.Tensor] = None
     topk_idxs: Optional[torch.Tensor] = None
     candidates: Optional[torch.Tensor] = None
+
+
+@dataclass
+class IndexerLossTerms:
+    """One layer's contribution to the indexer objective.
+
+    ``kl`` is summed over query rows and carries the graph; ``uniform`` is the
+    zero-information reference the KL has to be read against, detached because it
+    is a metric and must never reach the objective. Both are summed over exactly
+    the same rows, so their ratio at the end is a ratio of means -- averaging
+    per-row ``kl / uniform`` instead would be dominated by the rows with the
+    smallest reference, and would still land in ``[0, 1]`` looking plausible.
+    """
+
+    kl: torch.Tensor
+    uniform: torch.Tensor
+
+
+def indexer_kl_terms(index_score: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-query ``KL(target || softmax(index_score))``, and its uniform reference.
+
+    Ported from ``deepseek_v4``'s helper of the same name, which is DeepSeek-V3.2
+    eq. (4); it is a pure function of two tensors and nothing in it is specific to
+    either model's layer schedule.
+
+    Args:
+        index_score: ``[B, S, C]`` indexer scores at the selected slots, ``-inf``
+            at misses.
+        target: ``[B, S, C]`` fp32, zero at misses, and per row either
+            L1-normalised or identically zero where the teacher had no mass.
+
+    Returns:
+        ``(kl, uniform_kl)``, both ``[B, S]`` fp32, the second detached.
+    """
+    # A query whose compressed slots are all misses scores every one of them
+    # -inf, and log_softmax of such a row is NaN. Masking after the fact is not
+    # enough: log_softmax's backward computes `g - softmax * g.sum(-1)` with
+    # `softmax = exp(NaN)`, so even the zero gradient such a row receives comes
+    # back NaN, and the indexer's backward propagates it because it forms
+    # `grad * relu(logits)` and `NaN * 0` is NaN. Neutralise on the way in. This
+    # is the common case rather than a corner: the first `ratio - 1` positions of
+    # every packed sample have no complete compression group behind them.
+    scoreable = torch.isfinite(index_score)
+    # Two ways a row has nothing to teach, and both have to leave *both* terms.
+    # A row scored entirely -inf is the NaN case above. A row the teacher gave no
+    # mass would otherwise contribute 0 to the KL and a full log(n) to the
+    # reference -- which is not a student that captured everything, it is a row
+    # with nothing to capture, and leaving it in the denominator alone flatters
+    # the captured fraction by exactly the rows where the objective did no work.
+    nothing_to_learn = ~scoreable.any(-1, keepdim=True) | (target.sum(-1, keepdim=True) <= 0)
+    scores = torch.where(nothing_to_learn, 0.0, index_score.float())
+    log_q = torch.log_softmax(scores, dim=-1)
+    log_target = torch.log(target.clamp_min(torch.finfo(torch.float32).tiny))
+    # log_q is -inf exactly where target is 0, and `0 * -inf` is NaN, so the
+    # zero-mass slots are masked rather than merely multiplied out.
+    contributions = torch.where(target > 0, target * (log_target - log_q), 0.0)
+    # The scale to read the KL against: log(n_candidates) - H(target) is what a
+    # student would pay knowing the candidate set and nothing about which slot
+    # matters. A plateau of 0.021 means one thing against a reference of 0.374
+    # and another against 0.02.
+    neg_entropy = (target * log_target).sum(-1)
+    uniform_kl = torch.where(
+        nothing_to_learn.squeeze(-1),
+        0.0,
+        torch.log(scoreable.sum(-1).clamp_min(1).to(torch.float32)) + neg_entropy,
+    )
+    return contributions.sum(-1), uniform_kl.detach()
 
 
 @dataclass
@@ -456,8 +523,13 @@ class DeepseekV41Indexer(nn.Module):
         shared: SharedAttentionState,
         cos: torch.Tensor,
         sin: torch.Tensor,
-    ) -> torch.Tensor:
-        """``[B, S, index_topk]`` int32 group indices, ``-1`` where nothing was reachable."""
+        return_scores: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """``[B, S, index_topk]`` int32 group indices, ``-1`` where nothing was reachable.
+
+        With ``return_scores``, also the student distribution the indexer loss
+        trains: this layer's own score at each selected slot.
+        """
         batch, seq_len, _ = hidden_states.shape
         device = hidden_states.device
         compressed_len = plan.compressed_len
@@ -475,6 +547,7 @@ class DeepseekV41Indexer(nn.Module):
             chunk = (chunk.float().relu() * weights[:, begin:end].float().unsqueeze(-1)).sum(dim=2)
             scores[:, begin:end] = chunk.masked_fill(~visible[begin:end], -torch.inf)
 
+        ranked = scores
         if self.is_candidate_source:
             shared.candidates = select_candidate_blocks(
                 scores, plan.range_ends, self.candidate_topk_blocks, self.candidate_block_size
@@ -485,10 +558,14 @@ class DeepseekV41Indexer(nn.Module):
                     f"Layer {self.layer_idx} indexes inside the candidate blocks but none were published; "
                     "candidate_source_layer_id must name a layer in index_source_layer_ids"
                 )
-            scores = scores.masked_fill(~shared.candidates, -torch.inf)
+            # Ranked by the masked scores, but `scores` is kept unmasked for the
+            # student below: the candidate mask is a prefilter over *which* slots
+            # get considered, not part of the distribution being trained, and the
+            # raw score is the quantity whose ranking the KL is trying to fix.
+            ranked = scores.masked_fill(~shared.candidates, -torch.inf)
 
         topk = min(self.index_topk, compressed_len)
-        selected = scores.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+        selected = ranked.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
         # A row with fewer reachable groups than `topk` has `topk` picked anyway,
         # padded with entries scored at -inf; marking them misses is what keeps
         # the attention from reading a group the query cannot see. The filter is
@@ -497,7 +574,13 @@ class DeepseekV41Indexer(nn.Module):
         # does pad with merely-visible entries. At the shipped settings that
         # cannot arise -- 16384 candidate positions against an index_topk of 512.
         reachable = visible.unsqueeze(0).expand(batch, -1, -1).gather(-1, selected)
-        return selected.to(torch.int32).masked_fill(~reachable, -1)
+        topk_idxs = selected.to(torch.int32).masked_fill(~reachable, -1)
+        if not return_scores:
+            return topk_idxs, None
+        # -inf at the misses, so `indexer_kl_terms` counts the row's candidates
+        # from the finite entries and the teacher's zero mass there cancels.
+        student = scores.gather(-1, selected).masked_fill(~reachable, -torch.inf)
+        return topk_idxs, student
 
 
 class DeepseekV41Attention(nn.Module):
@@ -547,6 +630,22 @@ class DeepseekV41Attention(nn.Module):
         """Compressed layers use the YaRN schedule; pure sliding-window layers do not."""
         return self.compress_ratio > 0
 
+    @property
+    def builds_indexer_loss(self) -> bool:
+        """Whether this layer produces an indexer KL this forward.
+
+        Only a layer owning an indexer has a student to train. A non-positive
+        coefficient counts as off rather than as a zero-weighted term: ``loss +
+        0.0 * kl`` is the right value but still builds the graph, so the backward
+        writes a zero ``grad`` onto every indexer parameter -- and an optimizer
+        that decays whatever it steps would then apply weight decay to parameters
+        the objective deliberately left alone, at the full price of the teacher
+        kernel.
+        """
+        if self.indexer is None or not getattr(self.config, "dsa_indexer_loss", False):
+            return False
+        return getattr(self.config, "dsa_indexer_loss_coef", 1.0) > 0
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -554,7 +653,14 @@ class DeepseekV41Attention(nn.Module):
         rotary_emb: DeepseekV41RotaryEmbedding,
         shared: SharedAttentionState,
         plans: Dict[int, CompressionPlan],
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[IndexerLossTerms]]:
+        """``[B, S, hidden]``, and this layer's indexer KL when it builds one.
+
+        The second value is ``None`` for every layer that owns no indexer and for
+        every forward with the objective off, but the arity does not change --
+        the alternative is three call sites each re-deriving which layers return
+        what, and a stale copy in any one of them is an unpacking error.
+        """
         batch, seq_len, _ = hidden_states.shape
         cos, sin = rotary_emb(position_ids, compressed=self.rope_is_compressed)
 
@@ -566,26 +672,79 @@ class DeepseekV41Attention(nn.Module):
         kv = apply_interleaved_rope(kv, cos, sin)
         kv = fake_quant_kv(kv, self.rope_head_dim)
 
+        student = None
         topk_idxs = self._window_indices(position_ids, seq_len)
         if self.compress_ratio:
-            compress_kv, compress_idxs = self._compressed_kv(
+            compress_kv, compress_idxs, student = self._compressed_kv(
                 hidden_states, q_residual, position_ids, rotary_emb, shared, plans, offset=seq_len
             )
             kv = torch.cat([kv, compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
 
-        output = sparse_attn_tilelang(
-            query.contiguous(),
-            kv.contiguous(),
-            self.attn_sink.float().contiguous(),
-            topk_idxs.contiguous(),
-            self.softmax_scale,
-        )
+        query = query.contiguous()
+        kv = kv.contiguous()
+        topk_idxs = topk_idxs.contiguous()
+        sink = self.attn_sink.float().contiguous()
+
+        indexer_loss = None
+        if student is None:
+            output = sparse_attn_tilelang(query, kv, sink, topk_idxs, self.softmax_scale)
+        else:
+            output, lse = sparse_attn_tilelang(query, kv, sink, topk_idxs, self.softmax_scale, return_lse=True)
+            indexer_loss = self._indexer_loss(query, kv, topk_idxs, lse, student)
+
         # The KV is cached in one shared rotated form, so the query's rotation is
         # removed from the output rather than never applied.
         output = apply_interleaved_rope(output, cos.unsqueeze(-2), -sin.unsqueeze(-2))
         grouped = self.wo_a(output.reshape(batch, seq_len, self.n_groups, -1))
-        return self.wo_b(grouped.flatten(2))
+        return self.wo_b(grouped.flatten(2)), indexer_loss
+
+    def _indexer_loss(
+        self,
+        query: torch.Tensor,
+        kv: torch.Tensor,
+        topk_idxs: torch.Tensor,
+        lse: torch.Tensor,
+        student: torch.Tensor,
+    ) -> IndexerLossTerms:
+        """Score the indexer against the attention it feeds.
+
+        The teacher is the attention's own mass on each selected compressed slot,
+        read off the log-sum-exp the forward already computed. That LSE is the
+        true denominator only because ``topk_idxs`` spans the sliding window as
+        well as the compressed entries and the kernel folds the sink into the
+        same sum: a second forward over the compressed slice alone would produce
+        a plausible, decreasing loss that trains the indexer toward the wrong
+        distribution.
+
+        The compressed entries are the *trailing* range of the index tensor,
+        because the forward above concatenates window then compressed. The width
+        is read off the student so that slot ``j`` of the teacher pairs with
+        ``student[..., j]``, and it is checked rather than asserted -- ``python
+        -O`` strips an assert, and this is the only thing between the teacher's
+        slice and the sliding-window slots.
+
+        In V4.1 the indexer is shared, so this trains it on the *source* layer's
+        attention; the layers reusing the selection have their own distributions
+        and no say. That is inherent to one indexer serving several layers.
+        """
+        width = student.shape[-1]
+        if width > topk_idxs.shape[-1]:
+            raise RuntimeError(
+                f"the indexer scored {width} slots but the attention selected {topk_idxs.shape[-1]} in total; "
+                "the compressed slice cannot be wider than the concatenation holding it"
+            )
+        target = sparse_mqa_target_fwd(query, kv, topk_idxs[:, :, -width:].contiguous(), lse, self.softmax_scale)
+        # A row the teacher gave no mass goes out as exactly zero rather than as
+        # `0 / tiny`. Dividing by the clamp raises the denominator instead of the
+        # numerator, so a row whose mass is denormal rather than zero comes back
+        # summing to something in (0, 1) -- neither a distribution nor an absence
+        # of one, and the KL would weight it as though it were the former.
+        mass = target.sum(-1, keepdim=True)
+        tiny = torch.finfo(torch.float32).tiny
+        target = torch.where(mass > tiny, target / mass.clamp_min(tiny), 0.0)
+        kl, uniform = indexer_kl_terms(student, target)
+        return IndexerLossTerms(kl=kl.sum(), uniform=uniform.sum())
 
     def _window_indices(self, position_ids: torch.Tensor, seq_len: int) -> torch.Tensor:
         """``[B, S, min(window, S)]`` int32: this query's own causal window.
@@ -611,7 +770,7 @@ class DeepseekV41Attention(nn.Module):
         shared: SharedAttentionState,
         plans: Dict[int, CompressionPlan],
         offset: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """The shared compressed KV and this layer's selection into it.
 
         The ordering here is the one invariant worth stating: a source layer's
@@ -637,6 +796,7 @@ class DeepseekV41Attention(nn.Module):
                 "kv_source_layer_ids must contain a layer at or before it"
             )
 
+        student: Optional[torch.Tensor] = None
         if self.indexer is not None:
             if shared.index_k is None:
                 raise RuntimeError(
@@ -644,7 +804,16 @@ class DeepseekV41Attention(nn.Module):
                     "every index source must be at or after a kv source"
                 )
             cos, sin = rotary_emb(position_ids, compressed=True)
-            shared.topk_idxs = self.indexer(hidden_states, q_residual, shared.index_k, plan, shared, cos, sin)
+            shared.topk_idxs, student = self.indexer(
+                hidden_states,
+                q_residual,
+                shared.index_k,
+                plan,
+                shared,
+                cos,
+                sin,
+                return_scores=self.builds_indexer_loss,
+            )
         elif shared.topk_idxs is None:
             raise RuntimeError(
                 f"Layer {self.layer_idx} reuses a top-k selection but none has been published; "
@@ -652,7 +821,7 @@ class DeepseekV41Attention(nn.Module):
             )
 
         selection = torch.where(shared.topk_idxs >= 0, shared.topk_idxs + offset, -1)
-        return shared.compress_kv, selection
+        return shared.compress_kv, selection, student
 
 
 __all__ = [
@@ -661,8 +830,10 @@ __all__ = [
     "DeepseekV41Compressor",
     "DeepseekV41Indexer",
     "DeepseekV41RotaryEmbedding",
+    "IndexerLossTerms",
     "SharedAttentionState",
     "apply_interleaved_rope",
     "build_compression_plans",
+    "indexer_kl_terms",
     "select_candidate_blocks",
 ]

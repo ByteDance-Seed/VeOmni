@@ -40,6 +40,7 @@ from veomni.models.seed_omni.modules.deepseek_v41.llm.attention import (
     SharedAttentionState,
     apply_interleaved_rope,
     build_compression_plans,
+    indexer_kl_terms,
 )
 from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig
 
@@ -247,7 +248,7 @@ class TestIndexerContract:
         for param in indexer.parameters():
             param.data.normal_(0, 0.05)
         hidden, q_residual, plan, index_k, cos, sin = self._indexer_inputs(config)
-        selected = indexer(hidden, q_residual, index_k, plan, SharedAttentionState(), cos, sin)
+        selected, _ = indexer(hidden, q_residual, index_k, plan, SharedAttentionState(), cos, sin)
 
         visible = plan.visibility_mask(hidden.device)
         for query in range(selected.shape[1]):
@@ -266,7 +267,7 @@ class TestIndexerContract:
         shared = SharedAttentionState()
         shared.candidates = torch.zeros(1, hidden.shape[1], plan.compressed_len, dtype=torch.bool)
         shared.candidates[..., sorted(allowed)] = True
-        selected = consumer(hidden, q_residual, index_k, plan, shared, cos, sin)
+        selected, _ = consumer(hidden, q_residual, index_k, plan, shared, cos, sin)
 
         visible = plan.visibility_mask(hidden.device)
         for query in range(selected.shape[1]):
@@ -300,7 +301,7 @@ class TestIndexerContract:
         shared = SharedAttentionState()
         shared.candidates = torch.zeros(1, hidden.shape[1], plan.compressed_len, dtype=torch.bool)
         shared.candidates[..., :1] = True  # a single candidate, against index_topk=4
-        selected = consumer(hidden, q_residual, index_k, plan, shared, cos, sin)
+        selected, _ = consumer(hidden, q_residual, index_k, plan, shared, cos, sin)
 
         visible = plan.visibility_mask(hidden.device)
         last = selected.shape[1] - 1
@@ -314,6 +315,87 @@ class TestIndexerContract:
         hidden, q_residual, plan, index_k, cos, sin = self._indexer_inputs(config)
         with pytest.raises(RuntimeError, match="candidate blocks but none were published"):
             consumer(hidden, q_residual, index_k, plan, SharedAttentionState(), cos, sin)
+
+
+class TestIndexerKL:
+    """The auxiliary objective, checked against distributions with known answers.
+
+    The indexer emits indices, so nothing reaches its weights through the
+    attention output; this KL is the only gradient they ever get, and a wrong one
+    would still produce a decreasing curve.
+    """
+
+    def test_perfect_student_pays_nothing(self):
+        torch.manual_seed(0)
+        target = torch.rand(2, 5, 8)
+        target = target / target.sum(-1, keepdim=True)
+        kl, _ = indexer_kl_terms(target.log(), target)
+        torch.testing.assert_close(kl, torch.zeros_like(kl), atol=1e-5, rtol=0)
+
+    def test_uniform_student_pays_exactly_the_reference(self):
+        """A student that knows only the candidate set is what the reference prices."""
+        torch.manual_seed(0)
+        target = torch.rand(2, 5, 8)
+        target = target / target.sum(-1, keepdim=True)
+        kl, uniform = indexer_kl_terms(torch.zeros_like(target), target)
+        torch.testing.assert_close(kl, uniform, atol=1e-5, rtol=0)
+
+    def test_divergences_are_non_negative(self):
+        torch.manual_seed(0)
+        target = torch.rand(2, 5, 8)
+        target = target / target.sum(-1, keepdim=True)
+        kl, uniform = indexer_kl_terms(torch.randn(2, 5, 8), target)
+        assert bool((kl >= 0).all()) and bool((uniform >= 0).all())
+
+    def test_a_row_with_no_teacher_mass_is_excluded_from_both_terms(self):
+        target = torch.zeros(1, 2, 4)
+        # Deliberately not uniform: the reference prices how much there was to
+        # learn, so a uniform target would legitimately price at zero and the row
+        # would be indistinguishable from the excluded one above it.
+        target[0, 1] = torch.tensor([0.7, 0.1, 0.1, 0.1])
+        kl, uniform = indexer_kl_terms(torch.randn(1, 2, 4), target)
+        assert kl[0, 0] == 0 and uniform[0, 0] == 0
+        assert uniform[0, 1] > 0
+
+    def test_a_uniform_teacher_had_nothing_to_teach(self):
+        """The reference is what there *was* to learn, so it is zero for a flat target."""
+        target = torch.full((1, 1, 4), 0.25)
+        _, uniform = indexer_kl_terms(torch.randn(1, 1, 4), target)
+        torch.testing.assert_close(uniform, torch.zeros_like(uniform), atol=1e-6, rtol=0)
+
+    def test_an_all_miss_row_does_not_produce_nan_gradients(self):
+        """`log_softmax` of an all -inf row is NaN, and its backward stays NaN.
+
+        The first ``ratio - 1`` positions of every packed sample have no complete
+        compression group behind them, so this is the common case rather than a
+        corner one -- a NaN here poisons the indexer's whole backward.
+        """
+        student = torch.randn(1, 2, 4, requires_grad=True)
+        masked = student.masked_fill(
+            torch.tensor([[[True] * 4, [False] * 4]]),
+            -torch.inf,
+        )
+        target = torch.zeros(1, 2, 4)
+        target[0, 1] = 0.25
+        kl, _ = indexer_kl_terms(masked, target)
+        kl.sum().backward()
+        assert bool(student.grad.isfinite().all())
+
+    def test_the_objective_is_off_by_default(self):
+        config = make_config()
+        assert not config.dsa_indexer_loss
+        assert not DeepseekV41Attention(config, layer_idx=0).builds_indexer_loss
+
+    def test_a_non_positive_coefficient_counts_as_off(self):
+        """`loss + 0.0 * kl` still builds the graph and writes zero grads, which an
+        optimizer that decays whatever it steps would then decay."""
+        config = make_config(dsa_indexer_loss=True, dsa_indexer_loss_coef=0.0)
+        assert not DeepseekV41Attention(config, layer_idx=0).builds_indexer_loss
+
+    def test_only_indexer_owning_layers_build_it(self):
+        config = make_config(dsa_indexer_loss=True)
+        building = {idx for idx in range(N_LAYERS) if DeepseekV41Attention(config, idx).builds_indexer_loss}
+        assert building == set(config.index_source_layer_ids)
 
 
 class TestSharedStateContract:
