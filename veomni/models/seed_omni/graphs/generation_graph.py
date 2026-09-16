@@ -357,6 +357,15 @@ class GenerationGraph:
         state = self._current_state
         executed: set = set()
 
+        # A signal is one-shot per body pass, and this pass owns the clearing.
+        # :meth:`maybe_transition` pops the signal it acts on, but it runs
+        # between passes and only when some transition matches. A state that
+        # stays put until one named signal fires — every AR decode loop — has
+        # no `default` to fall through, so a signal it does not watch survives
+        # into here and stops the body after its first node, on this pass and
+        # every pass after it, until `max_new_tokens` runs out.
+        ctx.pop(FSM_SIGNAL_KEY, None)
+
         # Per-node first appearance as `from_` in body — distinguishes
         # **feed-forward** edges (with `to: X` *before* X's first `from_`
         # position; these must complete before X runs) from
