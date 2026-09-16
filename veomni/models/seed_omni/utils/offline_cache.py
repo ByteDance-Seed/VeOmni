@@ -43,7 +43,31 @@ class SeedOmniOfflineCacheWriter:
         self.buffer: list[dict[str, bytes]] = []
         self.rows_written = 0
         os.makedirs(save_path, exist_ok=True)
+        self._reject_existing_shards()
         logger.info_rank0(f"SeedOmni offline cache writer saving parquet shards under {save_path}.")
+
+    def _reject_existing_shards(self) -> None:
+        """Refuse to write into a directory that already holds cache shards.
+
+        Shard names are a pure function of rank and write order, so a second
+        run over the same directory overwrites the low shards and leaves the
+        high ones behind. :meth:`_compact_shard_names` then renumbers whatever
+        it finds into one contiguous range, quietly presenting the leftovers of
+        the earlier run as part of this cache.
+
+        Every rank checks the same directory before any of them flushes, so
+        this fails on all ranks together rather than deadlocking one of them.
+        """
+        existing = [
+            name for name in os.listdir(self.save_path) if name.startswith("shard_") and name.endswith(".parquet")
+        ]
+        if existing:
+            raise FileExistsError(
+                f"SeedOmni offline cache directory '{self.save_path}' already contains "
+                f"{len(existing)} shard(s). Writing here would overwrite some and silently "
+                f"keep the rest. Point `save_path` at a new directory, or delete the existing "
+                f"shards first."
+            )
 
     @staticmethod
     def _cpu_recursive(value: Any) -> Any:
