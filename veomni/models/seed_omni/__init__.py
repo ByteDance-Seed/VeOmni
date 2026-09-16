@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# ── SeedOmni V2 public API ──────────────────────────────────────────────────
 # Exports cluster around three concerns:
 #
 #   1. Core graph / runtime types (:class:`OmniConfig`, :class:`OmniModel`,
