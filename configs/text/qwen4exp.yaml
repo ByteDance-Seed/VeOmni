@@ -1,0 +1,46 @@
+model:
+  model_path: Qwen/Qwen3.8-Flash-Next
+  ops_implementation:
+    attn_implementation: sdpa
+    moe_implementation: fused_triton
+  accelerator:
+    ulysses_size: 1
+    cp_size: 1
+    ep_size: 4
+    extra_parallel_names: [ple]
+    extra_parallel_sizes: [8]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+
+data:
+  train_path: tulu-3-sft-mixture/data
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 16384
+  train_size: 750000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  wandb:
+    enable: false
+    project: VeOmni
+    name: qwen4-exp-sft-internal
+  freeze_vit: false
+  num_train_epochs: 2
+  micro_batch_size: 1
+  global_batch_size: null
+  max_steps: 10
+  checkpoint:
+    output_dir: qwen4-exp-sft-internal
+    manager: dcp
+    save_hf_weights: false
