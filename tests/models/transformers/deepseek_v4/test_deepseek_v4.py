@@ -293,3 +293,38 @@ def test_deepseek_v4_fused_rejects_output_attentions():
     model.model.layers[0].self_attn.veomni_dsa_attention = _FusedDsv4AttentionSpy()
     with pytest.raises(ValueError, match="output_attentions=True"):
         model(input_ids=torch.randint(3, config.vocab_size, (2, 8)), use_cache=False, output_attentions=True)
+
+
+def test_deepseek_v4_packed_public_entry_validates_cu_seqlens():
+    config = _tiny_config()
+    model = _build_ours(config).eval()
+    input_ids = torch.randint(3, config.vocab_size, (1, 8))
+    with pytest.raises(ValueError, match="must span the full sequence"):
+        model(input_ids=input_ids, cu_seq_lens_q=torch.tensor([0, 4], dtype=torch.int32), use_cache=False)
+
+
+def test_deepseek_v4_packed_forward_uses_host_slices(monkeypatch):
+    from veomni.models.transformers.deepseek_v4 import packed_utils as packed_utils_mod
+
+    calls = {"from_cu": 0}
+    real = packed_utils_mod.packed_sequence_slices_from_cu_seqlens
+
+    def counting(cu_seqlens):
+        calls["from_cu"] += 1
+        return real(cu_seqlens)
+
+    monkeypatch.setattr(packed_utils_mod, "packed_sequence_slices_from_cu_seqlens", counting)
+    config = _tiny_config()
+    model = _build_ours(config).eval()
+    input_ids = torch.randint(3, config.vocab_size, (1, 8))
+    position_ids = torch.cat([torch.arange(4), torch.arange(4)]).view(1, 8)
+    with torch.no_grad():
+        model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            packed_sequence_slices=((0, 4), (4, 8)),
+            attention_mask_is_all_ones=True,
+            cu_seq_lens_q=torch.tensor([0, 8], dtype=torch.int32),
+            use_cache=False,
+        )
+    assert calls["from_cu"] == 0

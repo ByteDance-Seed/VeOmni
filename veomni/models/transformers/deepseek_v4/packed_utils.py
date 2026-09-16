@@ -19,6 +19,77 @@ from typing import Callable, NamedTuple
 import torch
 
 from veomni.distributed.context_parallel import empty_compressed_rows, rebase_window_indices
+from veomni.utils.seqlen_pos_transform_utils import packed_sequence_slices_from_cu_seqlens
+
+
+_PACKED_MASK_ERROR = (
+    "DeepSeek V4 packed attention received an attention_mask with masked-out "
+    "positions alongside cu_seq_lens_q that span the full sequence. Express "
+    "padding through cu_seq_lens_q, which the sparse path reads, instead of a "
+    "dense mask, which it drops."
+)
+
+
+def resolve_packed_sequence_slices(
+    packed_sequence_slices: tuple[tuple[int, int], ...] | None,
+    cu_seq_lens_q: torch.Tensor | None,
+    sequence_length: int,
+) -> tuple[tuple[int, int], ...] | None:
+    """Prefer host slices; copy GPU ``cu_seq_lens_q`` only when slices are missing.
+
+    Training collators pass ``packed_sequence_slices`` as Python tuples. The
+    public model entry may still receive only a GPU cumulative-length tensor;
+    that fallback is allowed to synchronize.
+    """
+    if packed_sequence_slices is not None:
+        _require_slices_span_sequence(packed_sequence_slices, sequence_length)
+        return packed_sequence_slices
+    if not isinstance(cu_seq_lens_q, torch.Tensor):
+        return None
+    host = cu_seq_lens_q if cu_seq_lens_q.device.type == "cpu" else cu_seq_lens_q.detach().cpu()
+    slices = packed_sequence_slices_from_cu_seqlens(host)
+    _require_slices_span_sequence(slices, sequence_length)
+    return slices
+
+
+def ensure_unmasked_packed_attention(
+    attention_mask: torch.Tensor | None,
+    *,
+    attention_mask_is_all_ones: bool | None,
+) -> None:
+    """Refuse a dense mask with zeros before the sparse path drops it.
+
+    The collator records ``attention_mask_is_all_ones`` on CPU. A GPU
+    ``attention_mask.all()`` stays off the training hot path: only a CPU mask
+    or CUDA sync-debug mode still reduces the tensor.
+    """
+    if attention_mask_is_all_ones is True:
+        return
+    if attention_mask_is_all_ones is False:
+        raise ValueError(_PACKED_MASK_ERROR)
+    if not isinstance(attention_mask, torch.Tensor):
+        return
+    if attention_mask.device.type != "cpu" and not _cuda_sync_debug_enabled():
+        return
+    if not bool(attention_mask.all()):
+        raise ValueError(_PACKED_MASK_ERROR)
+
+
+def _require_slices_span_sequence(slices: tuple[tuple[int, int], ...], sequence_length: int) -> None:
+    boundaries = [slices[0][0], *(end for _, end in slices)] if slices else []
+    if not slices or boundaries[0] != 0 or boundaries[-1] != sequence_length:
+        raise ValueError(
+            "DeepSeek V4 packed cu_seq_lens_q must span the full sequence; "
+            f"got {boundaries} for length {sequence_length}"
+        )
+
+
+def _cuda_sync_debug_enabled() -> bool:
+    cuda = getattr(torch, "cuda", None)
+    if cuda is None or not cuda.is_available():
+        return False
+    getter = getattr(cuda, "get_sync_debug_mode", None)
+    return bool(getter is not None and getter())
 
 
 def build_packed_compression_metadata(
@@ -416,10 +487,12 @@ __all__ = [
     "build_packed_sparse_attention_indices",
     "build_sparse_attention_indices",
     "compress_packed_windows",
+    "ensure_unmasked_packed_attention",
     "isolate_packed_causal_mask_",
     "mask_sparse_attention_indices",
     "packed_compressed_block_bias",
     "packed_compressed_causal_ranges",
+    "resolve_packed_sequence_slices",
     "scatter_topk_block_bias",
     "shard_packed_compression_metadata",
 ]
