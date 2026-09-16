@@ -347,6 +347,19 @@ class VeomniOp:
         self._entry = resolve_op(op, variant, impl)
         type(self)._intern[(op, variant, impl)] = self
 
+    def __copy__(self):
+        """Interned handles are identity-copied."""
+        return self
+
+    def __deepcopy__(self, memo):
+        """Interned handles are shared across deepcopy, including nn.Module clones."""
+        memo[id(self)] = self
+        return self
+
+    def __reduce__(self):
+        """Rebuild through interned ``(op, variant, impl)`` rather than a bare ``__new__``."""
+        return (VeomniOp, (self.op, self.variant, self.impl))
+
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Call ``entry.wrapper``. Tensors are positional, non-tensors are keywords."""
         if self._entry.wrapper is None:

@@ -62,18 +62,19 @@ class _MergedExpertsActFnEP:
         starts = permute_tokens.new_zeros(num_local, dtype=torch.long)
         if num_local > 1:
             starts[1:] = ends[:-1]
-        output = permute_tokens.new_zeros(permute_tokens.shape)
+        pieces: list[Tensor] = []
         for expert_idx in range(num_local):
             start = int(starts[expert_idx])
             end = int(ends[expert_idx])
-            if end <= start:
-                continue
             current_state = permute_tokens[start:end]
             gate, up = nn.functional.linear(current_state, gate_up_proj[expert_idx]).chunk(2, dim=-1)
             current_hidden_states = act_fn(gate) * up
             current_hidden_states = nn.functional.linear(current_hidden_states, down_proj[expert_idx])
-            output[start:end] = current_hidden_states.to(output.dtype)
-        return output
+            pieces.append(current_hidden_states.to(permute_tokens.dtype))
+        output = torch.cat(pieces, dim=0)
+        # Empty ranks still have to keep ``permute_tokens`` on the graph so the
+        # EP all-to-all backward runs on every rank.
+        return output + permute_tokens * 0
 
 
 def merged_experts_act_fn_forward(
@@ -199,8 +200,8 @@ def dense_packed_attention_mask(
 ) -> Tensor:
     """Dense packed causal mask for SDPA/eager, which have no varlen kwargs.
 
-    A 2-D padding mask is composed with packed isolation. A 4-D triangle from
-    ``create_causal_mask`` does not isolate samples and is replaced.
+    A 2-D padding mask is composed with packed isolation. A 3-D/4-D mask is
+    merged afterwards so padding and custom overlays are not replaced.
     """
     from veomni.ops.kernels.attention.mask.sdpa import _dense_attention_mask_builder
     from veomni.ops.kernels.attention.mask.shape import _to_eager_additive
@@ -217,8 +218,38 @@ def dense_packed_attention_mask(
         allow_is_causal_skip=False,
     )
     if _canonical_attn_impl(impl) == "eager":
-        return _to_eager_additive(mask, dtype)
+        mask = _to_eager_additive(mask, dtype)
+    if attention_mask is not None and attention_mask.ndim >= 3:
+        return _merge_dense_attention_masks(attention_mask, mask)
     return mask
+
+
+def _merge_dense_attention_masks(existing: Tensor, packed: Tensor) -> Tensor:
+    """Keep positions allowed only by both ``existing`` and packed isolation."""
+    packed_view = packed
+    while packed_view.ndim < existing.ndim:
+        packed_view = packed_view.unsqueeze(1)
+    while packed_view.ndim > existing.ndim:
+        if packed_view.shape[1] != 1:
+            raise ValueError(
+                f"cannot align packed mask {tuple(packed_view.shape)} with existing {tuple(existing.shape)}"
+            )
+        packed_view = packed_view.squeeze(1)
+    if packed_view.shape[-2:] != existing.shape[-2:]:
+        raise ValueError(
+            f"packed mask q/kv {tuple(packed_view.shape[-2:])} does not match existing {tuple(existing.shape[-2:])}"
+        )
+    packed_view = packed_view.expand_as(existing)
+    if existing.dtype == torch.bool:
+        packed_keep = packed_view if packed_view.dtype == torch.bool else packed_view >= 0
+        return existing & packed_keep.to(dtype=torch.bool)
+    if packed_view.dtype == torch.bool:
+        from veomni.ops.kernels.attention.mask.shape import _to_eager_additive
+
+        packed_view = _to_eager_additive(packed_view, existing.dtype)
+        packed_view = packed_view.expand_as(existing)
+    packed_view = packed_view.to(device=existing.device, dtype=existing.dtype)
+    return torch.minimum(existing, packed_view)
 
 
 def drop_packed_attention_metadata(kwargs: dict, *, impl: str) -> dict:
@@ -244,16 +275,30 @@ def prepare_dense_attention_inputs(
 
     Single-segment or empty ``cu_seq_lens_q`` can be stripped as-is. True
     packed inputs need a dense mask first; dropping lengths alone lets a
-    2-D all-ones mask cross-attend across samples.
+    2-D all-ones mask cross-attend across samples. An existing 4-D mask is
+    merged with packed isolation so padding and overlays stay in place.
     """
     if _canonical_attn_impl(impl) not in DENSE_ATTENTION_IMPLS:
         return kwargs, attention_mask
     cu_seqlens = _multi_segment_cu_seqlens(kwargs)
     if cu_seqlens is not None:
         q_len = hidden_states.shape[1]
+        kv_len = q_len
+        if attention_mask is not None and attention_mask.ndim >= 3:
+            kv_len = attention_mask.shape[-1]
+            if attention_mask.shape[-2] != q_len:
+                raise ValueError(
+                    "packed SDPA/eager attention requires the existing mask query length "
+                    f"to match hidden_states, got {attention_mask.shape[-2]} and {q_len}"
+                )
+        if kv_len != q_len:
+            raise ValueError(
+                "packed SDPA/eager attention does not support cached sequences "
+                f"(q_len={q_len}, kv_len={kv_len}); use a packed-capable impl or disable cache"
+            )
         attention_mask = dense_packed_attention_mask(
             q_len=q_len,
-            kv_len=q_len,
+            kv_len=kv_len,
             cu_seqlens=cu_seqlens,
             attention_mask=attention_mask,
             batch_size=hidden_states.shape[0],

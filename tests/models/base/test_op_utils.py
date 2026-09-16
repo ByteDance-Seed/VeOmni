@@ -143,6 +143,13 @@ def test_prepare_dense_attention_inputs_builds_packed_mask_for_multi_segment():
         assert q4_k0 < 0
 
 
+def _mask_kept(mask: torch.Tensor, query: int, key: int) -> bool:
+    value = mask[0, 0, query, key] if mask.ndim == 4 else mask[0, query, key]
+    if mask.dtype == torch.bool:
+        return bool(value)
+    return float(value) >= 0
+
+
 def test_prepare_dense_attention_inputs_strips_single_segment_without_replacing_mask():
     from veomni.models.utils.op_utils import prepare_dense_attention_inputs
 
@@ -154,6 +161,73 @@ def test_prepare_dense_attention_inputs_strips_single_segment_without_replacing_
     )
     assert "cu_seq_lens_q" not in filtered
     assert mask is attention_mask
+
+
+def test_prepare_dense_attention_inputs_keeps_2d_padding_inside_packed_sample():
+    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+
+    hidden = torch.randn(1, 8, 4)
+    kwargs = {"cu_seq_lens_q": torch.tensor([0, 4, 8], dtype=torch.int32)}
+    attention_mask = torch.ones(1, 8, dtype=torch.long)
+    attention_mask[0, 1] = 0
+    _, packed_mask = prepare_dense_attention_inputs(
+        kwargs, impl="sdpa", attention_mask=attention_mask, hidden_states=hidden
+    )
+    assert packed_mask is not None
+    assert not _mask_kept(packed_mask, 2, 1)
+    assert not _mask_kept(packed_mask, 4, 0)
+    assert _mask_kept(packed_mask, 2, 0)
+
+
+def test_prepare_dense_attention_inputs_merges_4d_padding_with_packed_isolation():
+    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+
+    hidden = torch.randn(1, 8, 4)
+    kwargs = {"cu_seq_lens_q": torch.tensor([0, 4, 8], dtype=torch.int32)}
+    query = torch.arange(8)[:, None]
+    key = torch.arange(8)[None, :]
+    existing = (key <= query).view(1, 1, 8, 8)
+    existing = existing.clone()
+    existing[..., :, 1] = False
+    _, packed_mask = prepare_dense_attention_inputs(kwargs, impl="sdpa", attention_mask=existing, hidden_states=hidden)
+    assert packed_mask is not None
+    assert packed_mask.dtype == torch.bool
+    assert not _mask_kept(packed_mask, 4, 0)
+    assert not _mask_kept(packed_mask, 2, 1)
+    assert _mask_kept(packed_mask, 2, 0)
+    assert _mask_kept(packed_mask, 5, 4)
+
+
+def test_prepare_dense_attention_inputs_rejects_cached_packed_sequences():
+    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+
+    hidden = torch.randn(1, 8, 4)
+    kwargs = {"cu_seq_lens_q": torch.tensor([0, 4, 8], dtype=torch.int32)}
+    attention_mask = torch.ones(1, 1, 8, 16)
+    with pytest.raises(ValueError, match="does not support cached sequences"):
+        prepare_dense_attention_inputs(kwargs, impl="sdpa", attention_mask=attention_mask, hidden_states=hidden)
+
+
+def test_merged_experts_act_fn_ep_keeps_empty_tokens_on_graph():
+    from veomni.models.utils.op_utils import _MergedExpertsActFnEP
+
+    hidden = 4
+    permute_tokens = torch.zeros(0, hidden, dtype=torch.float32, requires_grad=True)
+    cumsum = torch.zeros(2, dtype=torch.long)
+    gate_up_proj = torch.randn(2, hidden * 2, hidden, requires_grad=True)
+    down_proj = torch.randn(2, hidden, hidden, requires_grad=True)
+    output = _MergedExpertsActFnEP.apply(
+        permute_tokens,
+        cumsum,
+        gate_up_proj,
+        down_proj,
+        torch.nn.functional.silu,
+    )
+    assert output.shape == (0, hidden)
+    assert output.requires_grad
+    output.sum().backward()
+    assert permute_tokens.grad is not None
+    assert permute_tokens.grad.shape == permute_tokens.shape
 
 
 def test_drop_packed_attention_metadata_keeps_keys_for_flash():

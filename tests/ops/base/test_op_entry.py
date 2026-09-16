@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import copy
+import pickle
 from inspect import Parameter, signature
 
 import pytest
@@ -513,3 +515,12 @@ class TestVeomniOp:
     def test_intern_by_triple(self):
         register_op("add", "standard", "eager", _add_forward, _add_backward, description=_TEST_DESCRIPTION)
         assert VeomniOp("add", "standard") is VeomniOp("add", "standard", "eager")
+
+    def test_copy_deepcopy_and_pickle_return_interned_handle(self):
+        register_op("add", "standard", "eager", _add_forward, _add_backward, description=_TEST_DESCRIPTION)
+        handle = VeomniOp("add", "standard", "eager")
+        assert copy.copy(handle) is handle
+        assert copy.deepcopy(handle) is handle
+        cloned = copy.deepcopy({"op": handle})
+        assert cloned["op"] is handle
+        assert pickle.loads(pickle.dumps(handle)) is handle

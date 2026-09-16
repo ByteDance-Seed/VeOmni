@@ -20,6 +20,7 @@ full-attention text, linear-attention (GDN) text, and image+text.
 
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -242,6 +243,66 @@ def test_qwen3_5_sdpa_packed_sequences_are_isolated(ops_factory):
         ).logits
     torch.testing.assert_close(packed_logits[:, :4], first_logits, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(packed_logits[:, 4:], second_logits, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "ops_factory",
+    [
+        lambda: eager_ops_config(),
+        lambda: _sdpa_simple_ops(),
+        lambda: _sdpa_public_ops(),
+    ],
+    ids=["eager", "sdpa", "veomni_sdpa"],
+)
+def test_qwen3_5_packed_padding_matches_separate_logits_and_grads(ops_factory):
+    torch.manual_seed(0)
+    ops = ops_factory()
+    config = _tiny_text_config(layer_types=["full_attention", "full_attention"])
+    packed_model = _build_causal(config, ops).float()
+    separate_model = copy.deepcopy(packed_model)
+    first_input_ids = torch.tensor([[5, 6, 7, 8]])
+    second_input_ids = torch.tensor([[9, 10, 11, 12]])
+    packed_input_ids = torch.cat((first_input_ids, second_input_ids), dim=1)
+    first_attention_mask = torch.tensor([[1, 0, 1, 1]])
+    second_attention_mask = torch.ones(1, 4, dtype=torch.long)
+    packed_attention_mask = torch.cat((first_attention_mask, second_attention_mask), dim=1)
+    packed_position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
+    packed_cu = torch.tensor([0, 4, 8], dtype=torch.int32)
+    with ops_config_scope(ops):
+        packed_logits = packed_model(
+            input_ids=packed_input_ids,
+            attention_mask=packed_attention_mask,
+            position_ids=packed_position_ids,
+            cu_seq_lens_q=packed_cu,
+            use_cache=False,
+        ).logits
+        first_logits = separate_model(
+            input_ids=first_input_ids,
+            attention_mask=first_attention_mask,
+            position_ids=torch.arange(4).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 4], dtype=torch.int32),
+            use_cache=False,
+        ).logits
+        second_logits = separate_model(
+            input_ids=second_input_ids,
+            attention_mask=second_attention_mask,
+            position_ids=torch.arange(4).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 4], dtype=torch.int32),
+            use_cache=False,
+        ).logits
+        separate_logits = torch.cat((first_logits, second_logits), dim=1)
+        torch.testing.assert_close(packed_logits, separate_logits, rtol=1e-5, atol=1e-5)
+        loss_weights = torch.randn_like(packed_logits)
+        (packed_logits * loss_weights).sum().backward()
+        (separate_logits * loss_weights).sum().backward()
+        packed_grads = {name: parameter.grad for name, parameter in packed_model.named_parameters()}
+        separate_grads = {name: parameter.grad for name, parameter in separate_model.named_parameters()}
+        assert packed_grads.keys() == separate_grads.keys()
+        for name in packed_grads:
+            assert (packed_grads[name] is None) == (separate_grads[name] is None), name
+            if packed_grads[name] is None:
+                continue
+            torch.testing.assert_close(packed_grads[name], separate_grads[name], rtol=1e-4, atol=1e-5)
 
 
 def _sdpa_simple_ops():
