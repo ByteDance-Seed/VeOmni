@@ -405,8 +405,8 @@ class OmniConfig(PretrainedConfig):
                 raise ValueError(
                     f"{path} uses the single-graph `generation_graph:` layout, which is no longer supported. "
                     "A checkpoint now stores every scenario under `generation_graphs: {<infer_type>: <fsm>}` "
-                    "and selects one via `infer_type`. Re-export the checkpoint with "
-                    "scripts/seed_omni/export_omni_checkpoint.py."
+                    "and selects one via `infer_type`. Nest the existing FSM under the `infer_type` it "
+                    "was exported for, or re-export the checkpoint."
                 )
             raise ValueError(f"Malformed generation-graph sidecar {path}: missing top-level `generation_graphs:` key.")
         graphs = payload["generation_graphs"]
