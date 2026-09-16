@@ -265,7 +265,12 @@ class TrainingMixin(TrainingModuleMixin):
         """
         loss: torch.Tensor | None = None
         logits: torch.Tensor | None = None
-        target_labels = labels if labels is not None else shift_labels
+        # Whatever the loss will actually score, so the row filter of (d) and
+        # the (c) denominator agree with it. ``ForCausalLMLoss`` gives explicit
+        # ``shift_labels`` precedence over ``labels``, so a caller passing both
+        # would otherwise have its rows dropped, and its supervised tokens
+        # counted, against the unshifted tensor the loss then ignores.
+        target_labels = shift_labels if shift_labels is not None else labels
         fsdp_group = get_parallel_state().fsdp_group
         num_supervised_tokens = None if target_labels is None else (target_labels != IGNORE_INDEX).sum()
 
