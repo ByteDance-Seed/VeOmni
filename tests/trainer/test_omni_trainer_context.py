@@ -19,9 +19,61 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from veomni.distributed.offloading import build_activation_offloading_context, custom_save_on_cpu
 from veomni.trainer.omni.omni_trainer import cascade_module_reshard
+
+
+@pytest.mark.parametrize("num_micro_steps", [1, 2, 4])
+def test_forward_backward_step_averages_accumulated_gradients(num_micro_steps):
+    from veomni.trainer.omni.omni_trainer import OmniTrainer
+
+    parameter = torch.nn.Parameter(torch.tensor(2.0))
+    trainer = object.__new__(OmniTrainer)
+    trainer.args = SimpleNamespace(train=SimpleNamespace(enable_batch_invariant_mode=False))
+    trainer.preforward = lambda batch: batch
+    trainer._cascade_module_reshard = lambda *args: None
+    trainer.fwd_activation_offload_ctx = nullcontext()
+    trainer.bwd_activation_offload_ctx = nullcontext()
+
+    def forward(batch):
+        loss = (parameter * batch["input"]).square()
+        return {"loss": loss, "losses": {"node": loss}}
+
+    trainer.model = SimpleNamespace(forward=forward)
+    inputs = torch.arange(1, num_micro_steps + 1, dtype=torch.float32)
+    reference = parameter.detach().clone().requires_grad_()
+    (reference * inputs).square().mean().backward()
+    for micro_step, value in enumerate(inputs):
+        loss, losses = trainer.forward_backward_step(
+            {"input": value}, micro_step=micro_step, num_micro_steps=num_micro_steps
+        )
+        torch.testing.assert_close(loss.detach(), (parameter.detach() * value).square())
+        assert losses["node"] is loss
+    torch.testing.assert_close(parameter.grad, reference.grad)
+
+
+@pytest.mark.parametrize("sp_size", [1, 2, 4])
+def test_qwen_packed_text_meter_counts_full_length_once(monkeypatch, sp_size):
+    from veomni.models.seed_omni.mixins.metric_meter_mixin import MetricMeterMixin
+    from veomni.models.seed_omni.modules.qwen3vl.text_encoder.accelerated import packed
+
+    class MeteredPacked(packed.PackedTrainingMixin, MetricMeterMixin):
+        device = torch.device("cpu")
+
+        def estimate_flops(self, seqlens):
+            return float(sum(seqlens))
+
+    monkeypatch.setattr(packed, "get_parallel_state", lambda: SimpleNamespace(sp_size=sp_size, sp_group=None))
+    monkeypatch.setattr(packed, "sp_pad", lambda tensor, **kwargs: tensor)
+    monkeypatch.setattr(packed, "slice_input_tensor", lambda tensor, **kwargs: tensor[: tensor.numel() // sp_size])
+    module = MeteredPacked()
+    data = module.pack_encode_pre(packed_input_ids=torch.arange(7).view(1, 7))
+    module.metric_meter_add("pack_encode", data)
+    module.metric_meter_add("pack_decode", {})
+    assert module.metric_meter_collect() == (7.0, [7])
+    assert module.metric_meter_collect() == (0.0, [])
 
 
 class _FakeModuleRuntime:

@@ -12,6 +12,8 @@ import torch
 from .......distributed.parallel_state import get_parallel_state
 from .......distributed.sequence_parallel import gather_outputs, sp_pad_and_slice
 from .....mixins.base_mixin import BaseMixin
+from .....mixins.data_balance_mixin import DataBalanceMixin, DataBalanceSpec, ItemTensorField, ModuleStructure
+from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem, iter_desired_items
 from ..configuration import Qwen3VLVisionEncoderConfig
@@ -81,6 +83,11 @@ class TrainingMixin(TrainingModuleMixin):
             spatial_merge_size=merge,
         )
         self._visual_output_slots = output_slots
+        if grid_thw is not None:
+            pixel_values, grid_thw, balanced = self._balance_vision_inputs("forward", pixel_values, grid_thw)
+            # A dummy owner can receive real items; encode the routed contents,
+            # never short-circuit based on the original owner's dummy flag.
+            dummy = dummy and not balanced
         # ViT metadata (cu_seqlens). ``build_qwen3vl_vit_metadata`` itself appends the sp-pad
         # tail segment when SP is enabled, so it matches the sliced patches below.
         vit_metadata = build_qwen3vl_vit_metadata(grid_thw.tolist(), merge) if grid_thw is not None else None
@@ -139,6 +146,10 @@ class TrainingMixin(TrainingModuleMixin):
             image_embeds = _gather(image_embeds)
             deepstack_features = [_gather(layer) for layer in deepstack_features]
 
+        restored = self.data_balance_post(
+            "forward", {"image_embeds": image_embeds, "deepstack_features": deepstack_features}
+        )
+        image_embeds, deepstack_features = restored["image_embeds"], restored["deepstack_features"]
         conversation = self._conversation_carrier
         output_slots = self._visual_output_slots
         self._conversation_carrier = None
@@ -159,7 +170,66 @@ class TrainingMixin(TrainingModuleMixin):
         return {"pixel_values": pixel_values, "image_grid_thw": image_grid_thw, "vit_metadata": vit_metadata}
 
 
-class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin):
+class BalanceMixin(DataBalanceMixin):
+    """Qwen owns only its item schema; routing and inverse live on the shared mixin."""
+
+    _vision_balance_spec = DataBalanceSpec(
+        fields=(ItemTensorField("pixel_values", "patch_lengths"), ItemTensorField("image_grid_thw", "item_lengths")),
+        output_names=("image_embeds", "deepstack_features"),
+        output_lengths_key="merged_lengths",
+        cost_lengths_key="attention_costs",
+        structure=ModuleStructure(global_attention=True, non_overlapping_patchify=True),
+        cost_exponent=1,
+    )
+    data_balance_specs = {"forward": _vision_balance_spec, "pack_encode": _vision_balance_spec}
+
+    def _balance_vision_inputs(self, method: str, pixels: torch.Tensor, grid: torch.Tensor) -> tuple:
+        # Worker-built geometry is the authoritative cost signal. Stash original
+        # full lengths for token accounting before routing or SP padding/slicing.
+        grid_list = grid.tolist()
+        patch_lengths = [t * h * w for t, h, w in grid_list]
+        merged_lengths = [n // self.config.vision_config.spatial_merge_size**2 for n in patch_lengths]
+        merge_area = self.config.vision_config.spatial_merge_size**2
+        # The ViT attends within each frame, not across the whole video clip.
+        # Keep frame lengths for FLOPs and clip output lengths for inverse splits.
+        self.metric_meter_set_seqlens(method, [h * w // merge_area for t, h, w in grid_list for _ in range(t)])
+        inputs, balanced = self.data_balance_pre(
+            method,
+            {"pixel_values": pixels, "image_grid_thw": grid},
+            {
+                "patch_lengths": patch_lengths,
+                "item_lengths": [1] * len(grid_list),
+                "merged_lengths": merged_lengths,
+                "attention_costs": [t * (h * w // merge_area) ** 2 for t, h, w in grid_list],
+            },
+        )
+        return inputs["pixel_values"], inputs["image_grid_thw"], balanced
+
+
+class MeterMixin(MetricMeterMixin):
+    """Merged-token accounting and this vision tower's theoretical FLOPs only."""
+
+    def estimate_flops(self, seqlens: list[int]) -> float:
+        cfg = self.config.vision_config
+        merge_area = cfg.spatial_merge_size**2
+        dim = cfg.hidden_size
+        patch_params = dim * cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size**2
+        block_params = 4 * dim**2 + 2 * dim * cfg.intermediate_size
+        merger_dim = dim * merge_area
+        merger_params = merger_dim * (merger_dim + cfg.out_hidden_size)
+        merger_count = 1 + len(cfg.deepstack_visual_indexes)
+        tokens = sum(seqlens)
+        # Patch/block work runs on raw tokens; mergers run on merged tokens.
+        # freeze_model freezes the tower but leaves the final merger trainable.
+        frozen = self.config.freeze
+        tower_factor = 2 if frozen else 6
+        merger_flops = merger_params * tokens * (6 + tower_factor * (merger_count - 1))
+        dense = tower_factor * (patch_params + cfg.depth * block_params) * tokens * merge_area
+        attention = (4 if frozen else 12) * dim * cfg.depth * sum((n * merge_area) ** 2 for n in seqlens)
+        return (dense + attention + merger_flops) / 1e12
+
+
+class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin, BalanceMixin, MeterMixin):
     """``generate()`` already lives on the native :class:`~.modeling.Qwen3VLVisionEncoder`
     (via its own :class:`~.modeling.InferenceMixin`), so no ``InferenceMixin`` is needed here.
     """
