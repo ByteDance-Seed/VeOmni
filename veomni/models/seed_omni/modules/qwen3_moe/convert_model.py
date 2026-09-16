@@ -1,7 +1,7 @@
 """Split a Qwen3-MoE checkpoint into SeedOmni V2 module subfolders.
 
 Registered under ``OMNI_CONVERT_REGISTRY["qwen3_moe"]`` and dispatched by
-``scripts/convert_model.py`` (via :func:`convert_checkpoint`).
+``scripts/seed_omni/convert_model.py`` (via :func:`convert_checkpoint`).
 
 The upstream is a standard HF checkpoint (``Qwen3MoeForCausalLM``); no DeepSeek
 -> HF pre-step is needed (unlike Janus).  ``Qwen3MoeForCausalLM.from_pretrained``

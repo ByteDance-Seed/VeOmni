@@ -38,7 +38,7 @@ dispatches to `modules/qwen3_moe/convert_model.py`, splitting the weights into
 `qwen3_text_encoder/` (embeddings + tokenizer) and `qwen3_moe_llm/` (MoE backbone).
 
 ```bash
-python scripts/convert_model.py \
+python scripts/seed_omni/convert_model.py \
   --model_path /mnt/hdfs/veomni/models/Qwen3-30B-A3B \
   --output_dir /mnt/hdfs/user_dir/omni_v2/ckpt/Qwen3-30B-A3B
 ```

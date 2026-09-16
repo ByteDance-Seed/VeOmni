@@ -100,7 +100,7 @@ Entry points (already updated on this branch; mirror in yours if you forked them
 from veomni.trainer.omni import OmniTrainer
 # tasks/omni/infer_omni.py
 from veomni.trainer.omni import OmniInferencer
-# scripts/convert_model.py
+# scripts/seed_omni/convert_model.py
 from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
 ```
 

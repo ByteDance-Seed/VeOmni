@@ -39,7 +39,7 @@ reads `model_type` from the HF `config.json` and dispatches to the Janus family
 converter.
 
 ```bash
-python scripts/convert_model.py \
+python scripts/seed_omni/convert_model.py \
   --model_path /mnt/hdfs/user_dir/veomni_omni/models/transformers/Janus-1.3B \
   --output_dir /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
 ```

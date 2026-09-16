@@ -37,7 +37,7 @@ Qwen3 family converter (`modules/qwen3/convert_model.py`), splitting the weights
 into `qwen3_text_encoder/` (embeddings + tokenizer) and `qwen3_llm/` (backbone).
 
 ```bash
-python scripts/convert_model.py \
+python scripts/seed_omni/convert_model.py \
   --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-0.6B \
   --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
 ```
@@ -286,12 +286,12 @@ tower in:
 
 ```bash
 # text LLM -> qwen3_llm/ + qwen3_text_encoder/
-python scripts/convert_model.py --model_type qwen3 \
+python scripts/seed_omni/convert_model.py \
   --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-0.6B \
   --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-visual-instruction-tuning
 
 # Qwen3-VL -> qwen3vl_vision/ (+ others); keep only the vision tower
-python scripts/convert_model.py --model_type qwen3_vl \
+python scripts/seed_omni/convert_model.py \
   --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-VL-2B-Instruct \
   --output_dir /tmp/qwen3vl_split
 cp -r /tmp/qwen3vl_split/qwen3vl_vision \

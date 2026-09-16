@@ -1,7 +1,7 @@
 """Split a Qwen3-VL checkpoint into SeedOmni V2 module subfolders.
 
 Registered under ``OMNI_CONVERT_REGISTRY["qwen3_vl"]`` and dispatched by
-``scripts/convert_model.py`` (via :func:`convert_checkpoint`).
+``scripts/seed_omni/convert_model.py`` (via :func:`convert_checkpoint`).
 
 Output layout::
 

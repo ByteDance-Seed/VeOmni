@@ -4,7 +4,7 @@
 The launcher YAML — the same ``base.yaml`` used for a training or inference trial —
 is the source of truth for graphs, ``infer_type``, ``generation_kwargs``, and module
 layout.  ``model.model_path`` in that YAML (or a CLI override) points at the weight
-root: a split checkpoint from ``scripts/convert_model.py`` (module subfolders only),
+root: a split checkpoint from ``scripts/seed_omni/convert_model.py`` (module subfolders only),
 an assembled training step, or an existing omni root whose weights you want to
 re-package under an updated config projection.
 

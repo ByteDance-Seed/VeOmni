@@ -9,7 +9,7 @@
 #     --infer.output_dir qwen3_out
 #
 # Prerequisite — split the upstream Qwen3 checkpoint:
-#   python scripts/convert_model.py \
+#   python scripts/seed_omni/convert_model.py \
 #     --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-0.6B \
 #     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
 

@@ -52,7 +52,7 @@ the weights into `qwen3vl_vision/`, `qwen3vl_text_encoder/` (embeddings +
 tokenizer) and `qwen3vl_llm/` (backbone).
 
 ```bash
-python scripts/convert_model.py \
+python scripts/seed_omni/convert_model.py \
   --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-VL-2B-Instruct \
   --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct
 ```
