@@ -132,7 +132,7 @@ class InferenceMixin:
             logits = self._top_p_filter(logits, top_p)
         probs = F.softmax(logits, dim=-1)
         token = torch.multinomial(probs, num_samples=1)
-        return token
+        return int(token.item())
 
     def _token_id_tensor(self, token_id: int) -> torch.Tensor:
         device = self.device
