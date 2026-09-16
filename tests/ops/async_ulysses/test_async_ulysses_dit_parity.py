@@ -210,6 +210,14 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
         t = torch.ones_like(output)
         return torch.sum(output * t)
 
+    def _configure_repro(self) -> None:
+        """Seed the worker. Do not set cuDNN flags: pytest freezes them."""
+        set_seed(seed=0, full_determinism=False)
+        try:
+            enable_high_precision_for_bf16()
+        except RuntimeError:
+            pass
+
     @pytest.mark.skipif(
         get_torch_device().device_count() < DIT_SP_WORLD_SIZE,
         reason=f"device_count should be >= {DIT_SP_WORLD_SIZE}",
@@ -218,6 +226,7 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
     def test_self_attn_dit(self):
         """Compare DiT async and sync attention outputs and grads."""
         self._get_process_group()
+        self._configure_repro()
         sp_group = get_ulysses_sequence_parallel_group()
         full_input = self._get_input_data()
         unpad_size = full_input.size(1)
@@ -302,6 +311,7 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
     def test_self_attn_dit_padding(self):
         """Same comparison with a sequence length that needs SP padding."""
         self._get_process_group()
+        self._configure_repro()
         sp_group = get_ulysses_sequence_parallel_group()
         full_input = self._get_input_data_for_padding()
         unpad_size = full_input.size(1)
@@ -391,9 +401,9 @@ if __name__ == "__main__":
     assert not get_torch_device()._initialized, (
         "test_distributed must not have initialized CUDA context on main process"
     )
-
-    set_seed(seed=0, full_determinism=True)
-    enable_high_precision_for_bf16()
+    # Do not set cuDNN flags or CUDA seeds here. Both initialize a context on
+    # the parent and trip the assert above on reruns. Workers call
+    # ``_configure_repro`` after the process group is up.
     from torch.testing._internal.common_utils import run_tests
 
     run_tests()

@@ -223,6 +223,8 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None]:
         raise ValueError(f"gate_logits must be [N, E], got {tuple(gate_logits.shape)}")
     concatenated = gate_logits.contiguous()
     token_count, num_experts = concatenated.shape
+    if token_count == 0:
+        return torch.zeros_like(gate_logits), None
     grad_logits = torch.empty_like(concatenated, dtype=torch.float32)
     block_e = triton.next_power_of_2(num_experts)
     grad_scale = _eager._safe_grad_scale(grad_output, num_experts, total_weight)

@@ -41,6 +41,49 @@ def test_mask_topk_indices_to_query_range_drops_invisible_keys():
     assert masked_grad.tolist() == [[[1.0, 0.0], [0.0, 4.0]]]
 
 
+def test_v4_indexer_function_backward_masks_out_of_window_slots(monkeypatch):
+    """A globally legal index outside [ks, ke) must not reach the bwd kernel."""
+    pytest.importorskip("tilelang")
+    from veomni.ops.kernels.dsa.vendor import tilelang_indexer as indexer
+    from veomni.ops.kernels.dsa.vendor import tilelang_indexer_bwd as bwd
+
+    seen: dict[str, torch.Tensor] = {}
+
+    def fake_interface(index_q, weights, index_k, topk_indices, grad_scores):
+        seen["topk"] = topk_indices.detach().clone()
+        seen["grad"] = grad_scores.detach().clone()
+        valid = topk_indices >= 0
+        scale = grad_scores.masked_fill(~valid, 0).sum()
+        return (
+            torch.ones_like(index_q) * scale,
+            torch.ones_like(weights, dtype=torch.float32) * scale,
+            torch.ones_like(index_k, dtype=torch.float32) * scale,
+        )
+
+    monkeypatch.setattr(bwd, "indexer_bwd_interface", fake_interface)
+
+    seqlen, batch, heads, dim, kv_len = 2, 1, 8, 32, 4
+    index_q = torch.zeros(seqlen, batch, heads, dim)
+    index_k = torch.zeros(kv_len, batch, dim)
+    weights = torch.zeros(seqlen, batch, heads)
+    topk_indices = torch.tensor([[[0, 3], [1, 2]]], dtype=torch.int32)
+    grad_scores = torch.tensor([[[1.0, 100.0], [100.0, 1.0]]])
+    ks = torch.tensor([0, 2], dtype=torch.int32)
+    ke = torch.tensor([2, 4], dtype=torch.int32)
+
+    ctx = type("Ctx", (), {})()
+    ctx.saved_tensors = (index_q, index_k, weights, ks, ke, topk_indices)
+    ctx.compress_ratio = 1
+    ctx.topk = 2
+    grad_q, grad_k, grad_w, *_ = indexer.V4IndexerFunction.backward(ctx, grad_scores, None)
+
+    assert seen["topk"].tolist() == [[0, -1], [-1, 2]]
+    assert seen["grad"].tolist() == [[1.0, 0.0], [0.0, 1.0]]
+    torch.testing.assert_close(grad_q, torch.full_like(index_q, 2.0))
+    torch.testing.assert_close(grad_w, torch.full_like(weights, 2.0))
+    torch.testing.assert_close(grad_k, torch.ones(kv_len, batch, dim) * 2.0)
+
+
 @pytest.fixture
 def dsa():
     return pytest.importorskip("veomni.ops.kernels.dsa.vendor.flashmla_cudnn")

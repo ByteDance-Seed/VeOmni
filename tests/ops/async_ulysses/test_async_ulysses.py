@@ -661,3 +661,4 @@ def test_dit_parity_world_size_matches_skip_gate():
 
     assert DIT_SP_WORLD_SIZE == 4
     assert AsyncUlyssesDiTSequenceParallelTest.world_size.fget(object()) == DIT_SP_WORLD_SIZE
+    assert callable(AsyncUlyssesDiTSequenceParallelTest._configure_repro)

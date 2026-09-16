@@ -209,6 +209,20 @@ def test_triton_matches_eager(use_mask: bool, num_experts, top_k, num_layers, ba
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs a GPU")
+def test_triton_zero_tokens_returns_connected_zero():
+    pytest.importorskip("triton")
+    gate_logits = torch.randn(0, 4, device="cuda", requires_grad=True)
+    output = resolve_op("load_balancing_loss", "standard", "triton").wrapper(
+        gate_logits, _empty_mask(gate_logits.device), top_k=2
+    )
+    assert output.item() == 0.0
+    output.backward()
+    assert gate_logits.grad is not None
+    assert gate_logits.grad.shape == gate_logits.shape
+    assert torch.count_nonzero(gate_logits.grad) == 0
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs a GPU")
 def test_triton_all_masked_returns_zero_with_zero_grad():
     pytest.importorskip("triton")
     gate_logits = torch.randn(8, 4, device="cuda", requires_grad=True)
