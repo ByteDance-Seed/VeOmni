@@ -178,8 +178,9 @@ When `--train.checkpoint.save_hf_weights true` is set, each save produces a dire
 ```
 exp/Wan2.1-T2V-1.3B-Diffusers_lora/checkpoints/
 └── global_step_200/
-    ├── adapter_config.json
-    └── adapter_model.safetensors
+    └── lora_ckpt/
+        ├── adapter_config.json
+        └── adapter_model.safetensors
 ```
 
 ---
@@ -234,7 +235,7 @@ from diffusers import AutoencoderKLWan, WanPipeline
 from diffusers.utils import export_to_video
 
 model_id = "./Wan2.1-T2V-1.3B-Diffusers"
-lora_dir = "./exp/Wan2.1-T2V-1.3B-Diffusers_lora/checkpoints/global_step_200"
+lora_dir = "./exp/Wan2.1-T2V-1.3B-Diffusers_lora/checkpoints/global_step_200/lora_ckpt"
 
 vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32)
 pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=torch.bfloat16)

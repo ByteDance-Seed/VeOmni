@@ -94,8 +94,9 @@ class VeOmniModelRuntime:
     config. ``train`` comes alongside because a handful of decisions are
     genuinely job-wide: where checkpoints are written, and whether a resume path
     makes the initial HF weight load redundant (see :attr:`skip_hf_weight_load`).
-    ``chat_template_name`` likewise — the job picks it (``data.chat_template``),
-    but only the runtime holds the preprocessor to build it from.
+    Which chat template to build is on this model's arguments
+    (``model.chat_template``); only the runtime holds the preprocessor to
+    build it from.
 
     A model whose build differs (a VLM freezing its tower, a DiT carrying a
     condition model) subclasses this and overrides the step that differs, rather
@@ -119,7 +120,6 @@ class VeOmniModelRuntime:
     checkpoint: Optional["ModelCheckpointManager"] = None
     tokenizer: Optional[Any] = None
     processor: Optional[Any] = None
-    chat_template_name: Optional[str] = None
     chat_template: Optional["ChatTemplate"] = None
     model_assets: List[Any] = []
 
@@ -129,12 +129,10 @@ class VeOmniModelRuntime:
         model_name: str = "base",
         *,
         train: "TrainingArguments",
-        chat_template_name: Optional[str] = None,
     ):
         self.args = args
         self.model_name = model_name
         self.train = train
-        self.chat_template_name = chat_template_name
         self.setup()
         with use_parallel_state(self.model_name):
             self._build_model()
@@ -224,7 +222,7 @@ class VeOmniModelRuntime:
         """Load the preprocessor this model reads its inputs through.
 
         Also assembles :attr:`model_assets`, the sidecars an export writes beside
-        this model's weights, and :attr:`chat_template` when the job named one.
+        this model's weights, and :attr:`chat_template` when this model named one.
         The config is always among the sidecars; the preprocessor joins it if
         there was one to load. The chat template is not in that list and is not
         written onto the tokenizer: it is a data-layout choice, so an export
@@ -258,7 +256,7 @@ class VeOmniModelRuntime:
         do, and the template how a *conversation* becomes a training sample —
         including the assistant-only label mask that no jinja can express. A
         trainer therefore never assembles one; it reads :attr:`chat_template`
-        the way it reads :attr:`tokenizer`. Stays ``None`` when the job names
+        the way it reads :attr:`tokenizer`. Stays ``None`` when this model names
         none (plaintext, diffusion, a Qwen-Omni model that formats through its
         processor) and, with a warning, when a name *was* given but nothing
         loaded to build it from. A job that needs a template and named none
@@ -285,20 +283,20 @@ class VeOmniModelRuntime:
                 self.tokenizer = loaded
             self.model_assets.append(loaded)
 
-        if not self.chat_template_name:
+        if not self.args.chat_template:
             return
 
         preprocessor = self.processor or self.tokenizer
         if preprocessor is None:
             logger.warning_once(
-                f"{type(self).__name__}: chat template {self.chat_template_name!r} was requested but no "
+                f"{type(self).__name__}: chat template {self.args.chat_template!r} was requested but no "
                 "preprocessor loaded to build it from; leaving it unset."
             )
             return
 
         from ..data.chat_template import build_chat_template
 
-        self.chat_template = build_chat_template(self.chat_template_name, preprocessor)
+        self.chat_template = build_chat_template(self.args.chat_template, preprocessor)
 
     def _build_parallelized_model(self) -> None:
         """FSDP2/DDP-wrap the model and load its weights.
@@ -544,7 +542,7 @@ class VeOmniModelRuntime:
         """
         from .checkpoint_manager import ModelCheckpointManager
 
-        self.checkpoint = ModelCheckpointManager(self, self.train.checkpoint)
+        self.checkpoint = ModelCheckpointManager(self)
 
     def load(self) -> None:
         """Restore this model and its optimizer from the configured load path.
@@ -559,8 +557,18 @@ class VeOmniModelRuntime:
         self.checkpoint.save_dcp(state)
 
     def save_hf_or_lora(self, state: "TrainerState", stage: str = "step_end") -> None:
-        """Export this model in whichever format it was trained in."""
+        """Export this model in whichever format it was trained in.
+
+        An in-flight async DCP must be on disk before conversion reads it, so
+        this drains first. ``_prepare_export`` waits again if it has to write
+        a DCP of its own.
+        """
+        self.checkpoint.wait_for_pending_save()
         self.checkpoint.save_hf_or_lora(state, stage=stage)
+
+    def wait_for_pending_save(self) -> None:
+        """Block until this model's in-flight async save is on disk, if any."""
+        self.checkpoint.wait_for_pending_save()
 
     def save_model_assets(self) -> None:
         """Write the tokenizer/processor/config sidecars that an export needs."""
@@ -569,5 +577,5 @@ class VeOmniModelRuntime:
         from .module_utils import save_model_assets as write_model_assets
 
         if self.train.global_rank == 0:
-            write_model_assets(self.train.checkpoint.model_assets_dir, self.model_assets)
+            write_model_assets(self.checkpoint.assets_dir(), self.model_assets)
         dist.barrier()

@@ -6,6 +6,7 @@ from typing import Any, Dict
 import torch
 
 from veomni.arguments import parse_args
+from veomni.distributed.parallel_state import use_parallel_state
 from veomni.trainer.callbacks import Callback, TrainerState
 from veomni.trainer.dit_trainer import DiTModelRuntime, DiTTrainer, VeOmniDiTArguments
 
@@ -77,12 +78,12 @@ class TestDiTTrainer(DiTTrainer):
     # ------------------------------------------------------------------
     def forward_backward_step(self, micro_batch: Dict[str, Any]) -> tuple:
         micro_batch = self.preforward(micro_batch)
-        with self.base.model_fwd_context:
+        with use_parallel_state(self.base.model.parallel_state), self.base.model_fwd_context:
             outputs = self.base.model(**micro_batch)
 
         loss, loss_dict = self.postforward(outputs, micro_batch)
 
-        with self.base.model_bwd_context:
+        with use_parallel_state(self.base.model.parallel_state), self.base.model_bwd_context:
             loss.backward()
 
         return loss, loss_dict

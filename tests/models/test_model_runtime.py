@@ -177,18 +177,17 @@ class TestHowATrainerHoldsItsModel:
         # is stubbed down to what it records, because this is about what the
         # trainer hands over, not about the model that gets built out of it.
         args = SimpleNamespace(
-            model=SimpleNamespace(name="model args"),
-            data=SimpleNamespace(chat_template="chatml"),
+            model=SimpleNamespace(name="model args", chat_template="chatml"),
+            data=SimpleNamespace(),
             train=SimpleNamespace(checkpoint=SimpleNamespace(load_path="/ckpt")),
         )
         trainer = BaseTrainer.__new__(BaseTrainer)
         trainer.args = args
 
-        def record_only(runtime, args, model_name="base", *, train=None, chat_template_name=None):
+        def record_only(runtime, args, model_name="base", *, train=None):
             runtime.args = args
             runtime.model_name = model_name
             runtime.train = train
-            runtime.chat_template_name = chat_template_name
 
         monkeypatch.setattr(VeOmniModelRuntime, "__init__", record_only)
 
@@ -199,8 +198,8 @@ class TestHowATrainerHoldsItsModel:
         assert runtime.model_name == "base"
         assert trainer._build_model_runtime("policy").model_name == "policy"
         assert runtime.train is args.train, "and the job-wide half it still needs"
-        assert runtime.chat_template_name == "chatml", (
-            "including which chat template to build, since only the runtime holds the preprocessor to build it from"
+        assert runtime.args.chat_template == "chatml", (
+            "which chat template to build lives on the model slice, since only the runtime holds the preprocessor"
         )
 
     def test_a_trainer_is_not_itself_a_model_runtime(self):

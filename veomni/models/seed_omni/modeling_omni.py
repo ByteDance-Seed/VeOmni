@@ -329,6 +329,19 @@ class OmniModel(PreTrainedModel):
         safe_serialization / max_shard_size:
             Forwarded to each sub-module's ``save_pretrained`` when
             ``save_module_weights=True``.
+
+        Rank-0 writes and returns; the other ranks return immediately and this
+        does **not** barrier. The caller owns the barrier, because it is the one
+        that knows what the other ranks go on to do —
+        :meth:`OmniTrainer.save_model_assets` barriers right after. Without one,
+        a rank can read a half-written directory.
+
+        For the same reason ``save_module_weights=True`` is for an unsharded
+        model only: a sub-module's ``state_dict`` over DTensor parameters is
+        collective, so calling it on rank 0 alone would hang. Assets
+        (``save_module_weights=False``) are plain host-side objects and are safe
+        on a sharded model. Weight export from a sharded model goes through the
+        checkpoint manager instead.
         """
         if is_main_process is None:
             is_main_process = not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0

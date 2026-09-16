@@ -55,11 +55,11 @@ model:
       offload: false
       mixed_precision:
         enable: true
+  chat_template: chatml
 
 data:
   train_path: tulu-3-sft-mixture
   data_type: conversation
-  chat_template: chatml
   max_seq_len: 1024
   train_size: 750000
   text_keys: messages

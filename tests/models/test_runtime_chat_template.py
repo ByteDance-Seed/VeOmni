@@ -35,13 +35,12 @@ class _Processor:
 def _stub_runtime(name, *, processor=None, tokenizer=None):
     """Enough of a runtime for ``build_model_assets``'s template step."""
     return SimpleNamespace(
-        chat_template_name=name,
         processor=processor,
         tokenizer=tokenizer,
         chat_template=None,
         model_config=object(),
         model_assets=None,
-        args=SimpleNamespace(tokenizer_path="tok", processor_config=None),
+        args=SimpleNamespace(tokenizer_path="tok", processor_config=None, chat_template=name),
     )
 
 

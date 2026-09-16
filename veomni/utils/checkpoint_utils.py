@@ -38,21 +38,27 @@ def should_skip_hf_weight_load(load_path: Optional[str], lora_config: Any) -> bo
 
 
 def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
-    """Return the checkpoint step if the entry is a valid DCP checkpoint, otherwise None.
+    """Return the checkpoint step if the entry is a complete checkpoint, else None.
 
-    Two on-disk layouts are valid here:
+    A step in the current layout is resumable when both of its halves are down:
+    ``checkpoint_manifest.json`` for the per-rank cursor files, and DCP's
+    ``.metadata`` for each directory the manifest says a module wrote. Neither
+    covers the other — the manifest is written the moment the cursor lands, while
+    the shards beside it may still be streaming out of an async save, and a
+    module's markers say nothing about the cursor.
 
-    * Classic single-model VeOmni: the DCP shards land directly under
-      ``global_step_N/`` (``global_step_N/.metadata``).
-    * SeedOmni V2 (``OmniTrainer``): each module gets its own nested DCP
-      checkpoint (``global_step_N/<module_name>/.metadata``), so there is no
-      ``.metadata`` directly under ``global_step_N/``. The orchestrator's own
-      ``global_step_N/trainer_state.pt`` (written by
-      ``OmniGlobalStateCallback.save_global_state`` in the same step as the
-      per-module DCP saves) is used as the step-completeness marker instead —
-      cheaper than enumerating and stat-ing every module subfolder, and it is
-      exactly the file :meth:`OmniGlobalStateCallback.load_global_state` reads
-      when it later resumes from this same path.
+    SeedOmni V2 (``OmniTrainer``) does not write a manifest: its orchestrator
+    state is ``global_step_N/trainer_state.pt``, written by
+    ``OmniGlobalStateCallback.save_global_state`` in the same step as the
+    per-module DCP saves, and it is exactly the file
+    :meth:`OmniGlobalStateCallback.load_global_state` reads when it resumes from
+    this path. Until that callback moves onto the manifest, the file stands in
+    for one.
+
+    A pre-split checkpoint has no manifest and is recognised by the ``.metadata``
+    that used to sit at the step root, but only while the step is *entirely*
+    pre-split. Drop that branch together with
+    ``veomni/checkpoint/legacy_v0_1_12.py``.
     """
     if not entry.startswith(_GLOBAL_STEP_PREFIX):
         return None
@@ -67,12 +73,32 @@ def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
     if not isdir(checkpoint_path):
         return None
 
-    metadata_path = os.path.join(checkpoint_path, ".metadata")
-    trainer_state_path = os.path.join(checkpoint_path, "trainer_state.pt")
-    if not exists(metadata_path) and not exists(trainer_state_path):
-        return None
+    # Imported here rather than at module scope: ``veomni.checkpoint.layout``
+    # imports this module for the step-directory prefix.
+    from ..checkpoint.layout import MODEL_DIRNAME, checkpoint_is_complete
 
-    return step
+    # Both halves, not just the manifest: the manifest lands as soon as the
+    # cursor files do, while the shards of an async save are still streaming.
+    if checkpoint_is_complete(checkpoint_path):
+        return step
+
+    # SeedOmni V2's stand-in for the manifest; see the docstring.
+    if exists(os.path.join(checkpoint_path, "trainer_state.pt")):
+        return step
+
+    # Delete this import (and veomni/checkpoint/legacy_v0_1_12.py) to stop
+    # accepting pre-split checkpoints. A ``model/`` beside the old marker means a
+    # current-layout write landed on such a step and did not finish — the step
+    # has no manifest, so it is not complete, and the loader would take the new
+    # tree in preference and fail on whatever part of it never arrived. The old
+    # marker describes data that write has already begun overwriting, so it
+    # cannot vouch for the step.
+    from ..checkpoint.legacy_v0_1_12 import marker_path
+
+    if exists(marker_path(checkpoint_path)) and not isdir(os.path.join(checkpoint_path, MODEL_DIRNAME)):
+        return step
+
+    return None
 
 
 def get_last_iteration(output_dir, is_rank0: bool):
@@ -108,7 +134,7 @@ def dcp_get_last_iteration(output_dir):
             valid_steps.append(step)
 
     if not valid_steps:
-        logger.warning_rank0("Provided checkpoint path exists but there are no valid DCP .metadata")
+        logger.warning_rank0("Provided checkpoint path exists but holds no completed checkpoint")
         return None
 
     logger.info_rank0(f"found valid previously saved checkpointed steps: {checkpoints_dir}/global_step_{valid_steps}")

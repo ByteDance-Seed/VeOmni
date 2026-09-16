@@ -189,7 +189,7 @@ STEP=outputs/qwen3vl_2b_omni_sft/checkpoints/global_step_500
 ASM=outputs/qwen3vl_2b_omni_sft/infer_ckpt/global_step_500
 mkdir -p "$ASM"
 for m in qwen3vl_vision qwen3vl_text_encoder qwen3vl_llm; do
-  ln -sfn "$(realpath "$STEP/$m/hf_ckpt")" "$ASM/$m"
+  ln -sfn "$(realpath "$STEP/hf_ckpt/$m")" "$ASM/$m"
 done
 # then: --model.model_path "$ASM"
 ```

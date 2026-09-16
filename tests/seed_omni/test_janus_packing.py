@@ -198,6 +198,13 @@ def _defer_runtime(name: str, model, *, ulysses_size: int = 1):
         model_path=f"/tmp/{name}",
         lora_config=None,
         basic_modules=[],
+        # Weight-load policy sits on ``ModelArguments``, not on the accelerator
+        # block: broadcast vs per-rank streaming is how this unit ingests its
+        # checkpoint, not a mesh dimension. Both readers
+        # (``OmniModelRuntime._parallelize_composed_model`` and
+        # ``VeOmniModelRuntime._parallelize``) take them off ``args``.
+        broadcast_model_weights_from_rank0=False,
+        ep_sharded_stream_load=False,
         optimizer=SimpleNamespace(type="adamw", muon_expert_zero_comm=False),
         accelerator=SimpleNamespace(
             init_device="meta",
@@ -206,8 +213,6 @@ def _defer_runtime(name: str, model, *, ulysses_size: int = 1):
             cp_size=1,
             tp_size=1,
             pp_size=1,
-            broadcast_model_weights_from_rank0=False,
-            ep_sharded_stream_load=False,
             torch_compile=CompileConfig(),
             gradient_checkpointing=SimpleNamespace(enable=False, enable_reentrant=False, early_stop=True),
             fsdp_config=SimpleNamespace(
@@ -233,6 +238,8 @@ def _omni_runtime_args(*, accelerator=None, optimizer=None):
     return SimpleNamespace(
         accelerator=accelerator or composer.accelerator,
         optimizer=optimizer if optimizer is not None else composer.optimizer,
+        broadcast_model_weights_from_rank0=composer.broadcast_model_weights_from_rank0,
+        ep_sharded_stream_load=composer.ep_sharded_stream_load,
     )
 
 

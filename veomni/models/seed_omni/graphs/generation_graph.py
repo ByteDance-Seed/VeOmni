@@ -435,14 +435,21 @@ class GenerationGraph:
         else ``None``. The caller may format a transition trace from the
         returned value.
 
-        For ``module_signal`` transitions ``context["module_signal"]`` is popped
-        before the state switch.
+        ``context["module_signal"]`` is popped before the state switch whichever
+        transition fires, not only a ``module_signal`` one. A signal is one-shot
+        per body iteration: it is how the node that just ran says "stop this
+        body", and :meth:`iter_nodes` reads it as exactly that. A module may
+        emit a signal that no condition in the current state names — a decoder
+        setting ``image_complete`` in a state that only watches ``text_done`` —
+        and the state then leaves on its ``default`` transition. Leaving the key
+        behind would make ``iter_nodes`` return after the first node of every
+        later body for the rest of the run, and would spuriously fire any later
+        state that does name that signal.
         """
         state = self._current_state
         for trans in state.transitions:
             if trans.condition.check(context):
-                if trans.condition.type == "module_signal":
-                    context.pop(FSM_SIGNAL_KEY, None)
+                context.pop(FSM_SIGNAL_KEY, None)
                 self._transition_to(trans.next_state, context)
                 return FiredTransition(
                     from_state=state.name,
