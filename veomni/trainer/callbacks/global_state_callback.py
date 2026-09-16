@@ -71,15 +71,6 @@ class GlobalStateCallback(Callback):
     def rank(self) -> int:
         return self.trainer.args.train.global_rank
 
-    def _condition_model(self) -> Any:
-        """Return the diffusion condition model, if this job has one.
-
-        DiT trainers reuse a ``BaseTrainer`` instance they never subclass, so the
-        condition model — which owns the noise/timestep generators — is attached
-        as ``condition_model`` on that instance. Other trainers never set it.
-        """
-        return getattr(self.trainer, "condition_model", None)
-
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         self.load_global_state()
 
@@ -103,28 +94,6 @@ class GlobalStateCallback(Callback):
         channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
         channel_loss_state = channel_loss_callback.state_dict() if channel_loss_callback is not None else {}
 
-        # Diffusion condition models sample noise and timesteps from the device
-        # default RNG or from a per-run ``torch.Generator``; neither is model
-        # state, so both belong in the job cursor alongside the CPU generator.
-        # Without them a resumed run replays the start of the run's noise stream
-        # instead of continuing it. ``None`` means "not applicable / unsupported"
-        # and the loader skips it.
-        condition_model = self._condition_model()
-        rng_state_dict = getattr(condition_model, "rng_state_dict", None)
-        if (
-            condition_model is not None
-            and rng_state_dict is None
-            and getattr(condition_model, "generator", None) is not None
-        ):
-            # A condition model holding its own ``torch.Generator`` but not exposing
-            # ``rng_state_dict`` would silently replay its stream from the
-            # construction-time seed on every resume. The device default stream, the
-            # other source, is already covered by ``device_rng_state``.
-            logger.warning_rank0(
-                "Condition model owns a ``generator`` but exposes no ``rng_state_dict``; "
-                "its noise/timestep stream will not be restored across a resume."
-            )
-
         return {
             "global_step": state.global_step,
             "train_dataloader": train_dataloader_state,
@@ -132,7 +101,6 @@ class GlobalStateCallback(Callback):
             "channel_loss_callback": channel_loss_state,
             "torch_rng_state": torch.get_rng_state(),
             "device_rng_state": get_device_rng_state(),
-            "condition_model_rng_state": None if rng_state_dict is None else rng_state_dict(),
         }
 
     def save_global_state(self, state: TrainerState) -> None:
@@ -187,16 +155,6 @@ class GlobalStateCallback(Callback):
         # ``.get`` keeps checkpoints written before these fields existed loadable;
         # the device namespace may also not support RNG state at all.
         set_device_rng_state(global_state.get("device_rng_state"))
-        condition_model_rng_state = global_state.get("condition_model_rng_state")
-        if condition_model_rng_state is not None:
-            loader = getattr(self._condition_model(), "load_rng_state_dict", None)
-            if loader is None:
-                logger.warning_rank0(
-                    "Checkpoint carries condition-model RNG state but the model cannot restore it; "
-                    "the resumed run may replay its initial noise stream."
-                )
-            else:
-                loader(condition_model_rng_state)
         if self.trainer.start_step == 0 and self.trainer.train_dataloader is not None:
             iter(self.trainer.train_dataloader)
 

@@ -103,15 +103,44 @@ class ModelCheckpointManager:
         return os.path.join(load_path, self.checkpoint_subfolder) if self.checkpoint_subfolder else load_path
 
     def _extra_state(self, state: "TrainerState") -> Dict[str, Any]:
-        """Model-bound state to store beside the weights."""
+        """Model-bound state to store beside the weights.
+
+        The condition model's noise/timestep generator is model-bound state, not
+        job-cursor state, so it is persisted here alongside the lr scheduler.
+        """
         lr_scheduler = self.trainer.lr_scheduler
-        return {"lr_scheduler": None if lr_scheduler is None else lr_scheduler.state_dict()}
+        condition_model = getattr(self.trainer, "condition_model", None)
+        rng_state_dict = getattr(condition_model, "rng_state_dict", None)
+        if (
+            condition_model is not None
+            and rng_state_dict is None
+            and getattr(condition_model, "generator", None) is not None
+        ):
+            logger.warning_rank0(
+                "Condition model owns a ``generator`` but exposes no ``rng_state_dict``; "
+                "its noise/timestep stream will not be restored across a resume."
+            )
+        return {
+            "lr_scheduler": None if lr_scheduler is None else lr_scheduler.state_dict(),
+            "condition_model_rng_state": None if rng_state_dict is None else rng_state_dict(),
+        }
 
     def _load_extra_state(self, extra_state: Dict[str, Any]) -> None:
         lr_state = extra_state.get("lr_scheduler")
         lr_scheduler = self.trainer.lr_scheduler
         if lr_state is not None and lr_scheduler is not None:
             lr_scheduler.load_state_dict(lr_state)
+
+        condition_model_rng_state = extra_state.get("condition_model_rng_state")
+        if condition_model_rng_state is not None:
+            loader = getattr(getattr(self.trainer, "condition_model", None), "load_rng_state_dict", None)
+            if loader is None:
+                logger.warning_rank0(
+                    "Checkpoint carries condition-model RNG state but the model cannot restore it; "
+                    "the resumed run may replay its initial noise stream."
+                )
+            else:
+                loader(condition_model_rng_state)
 
         # Pre-split DCP extra_state also held the job cursor. New writes do not;
         # GlobalStateCallback owns that file. Restore the old blob so a mid-job

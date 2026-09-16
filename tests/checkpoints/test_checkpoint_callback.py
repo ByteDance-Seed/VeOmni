@@ -324,7 +324,9 @@ class TestModelCheckpointManagerSaveContract:
         call = manager.checkpointer.save.call_args
         assert f"{call.args[0]}/{_GLOBAL_STEP_PREFIX}{call.kwargs['global_steps']}" == "/remote/run/global_step_10"
 
-    def test_extra_state_is_only_the_scheduler(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
+    def test_extra_state_is_only_the_scheduler_and_condition_model_rng(
+        self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps
+    ):
         trainer = _make_mock_trainer()
         mock_build_ckpt.return_value = MagicMock()
         manager = ModelCheckpointManager(trainer)
@@ -332,8 +334,73 @@ class TestModelCheckpointManagerSaveContract:
         manager.save_dcp(TrainerState(global_step=10))
 
         extra_state = manager.checkpointer.save.call_args.args[1]["extra_state"]
-        assert set(extra_state) == {"lr_scheduler"}
+        assert set(extra_state) == {"lr_scheduler", "condition_model_rng_state"}
         assert extra_state["lr_scheduler"] == {"lr": 1e-4}
+        assert extra_state["condition_model_rng_state"] is None
+
+    def test_extra_state_persists_condition_model_rng(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
+        trainer = _make_mock_trainer()
+        trainer.condition_model = _StubConditionModel()
+        mock_build_ckpt.return_value = MagicMock()
+        manager = ModelCheckpointManager(trainer)
+
+        extra_state = manager._extra_state(TrainerState(global_step=10))
+
+        assert set(extra_state["condition_model_rng_state"]) == {"generator"}
+
+    def test_extra_state_warns_when_condition_model_misses_rng_dict(
+        self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps
+    ):
+        trainer = _make_mock_trainer()
+
+        class _GeneratorOnly:
+            generator = torch.Generator()
+
+        trainer.condition_model = _GeneratorOnly()
+        mock_build_ckpt.return_value = MagicMock()
+        manager = ModelCheckpointManager(trainer)
+
+        with patch("veomni.models.checkpoint_manager.logger.warning_rank0") as mock_warn:
+            extra_state = manager._extra_state(TrainerState(global_step=10))
+
+        mock_warn.assert_called_once()
+        assert extra_state["condition_model_rng_state"] is None
+
+    def test_load_extra_state_restores_condition_model_rng(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
+        trainer = _make_mock_trainer()
+        condition_model = _StubConditionModel()
+        trainer.condition_model = condition_model
+        mock_build_ckpt.return_value = MagicMock()
+        manager = ModelCheckpointManager(trainer)
+
+        for _ in range(3):
+            condition_model.draw_noise()
+        rng_state = condition_model.rng_state_dict()
+        reference = torch.Generator(device="cpu")
+        reference.set_state(condition_model.generator.get_state())
+        expected_next_noise = torch.randn(4, generator=reference)
+
+        condition_model.draw_noise()
+        manager._load_extra_state({"lr_scheduler": {"lr": 1e-4}, "condition_model_rng_state": rng_state})
+
+        assert torch.equal(condition_model.draw_noise(), expected_next_noise)
+
+    def test_load_extra_state_warns_when_condition_model_cannot_restore_rng(
+        self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps
+    ):
+        trainer = _make_mock_trainer()
+        mock_build_ckpt.return_value = MagicMock()
+        manager = ModelCheckpointManager(trainer)
+
+        with patch("veomni.models.checkpoint_manager.logger.warning_rank0") as mock_warn:
+            manager._load_extra_state(
+                {
+                    "lr_scheduler": {"lr": 1e-4},
+                    "condition_model_rng_state": {"generator": torch.Generator().get_state()},
+                }
+            )
+
+        mock_warn.assert_called_once()
 
     def test_legacy_extra_state_restores_the_job_cursor(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
         """Checkpoints written by CheckpointerCallback still resume the cursor."""
@@ -386,69 +453,31 @@ class TestGlobalStateCallbackJobState:
         assert "torch_rng_state" in global_state
         assert "device_rng_state" in global_state
 
-    def test_state_dict_omits_condition_model_rng_without_condition_model(self, mock_dist):
+    def test_state_dict_has_no_condition_model_rng(self, mock_dist):
         trainer = _make_mock_trainer()
         cb = GlobalStateCallback(trainer)
 
         global_state = cb.state_dict(TrainerState(global_step=10))
 
-        assert global_state["condition_model_rng_state"] is None
+        assert "condition_model_rng_state" not in global_state
 
-    def test_state_dict_persists_condition_model_rng(self, mock_dist):
-        trainer = _make_mock_trainer()
-        trainer.condition_model = _StubConditionModel()
-        cb = GlobalStateCallback(trainer)
-
-        global_state = cb.state_dict(TrainerState(global_step=10))
-
-        assert set(global_state["condition_model_rng_state"]) == {"generator"}
-
-    def test_state_dict_warns_when_condition_model_misses_rng_dict(self, mock_dist):
-        """A generator-owning condition model with no rng_state_dict is worth a warning."""
-        trainer = _make_mock_trainer()
-
-        class _GeneratorOnly:
-            generator = torch.Generator()
-
-        trainer.condition_model = _GeneratorOnly()
-        cb = GlobalStateCallback(trainer)
-
-        with patch("veomni.trainer.callbacks.global_state_callback.logger.warning_rank0") as mock_warn:
-            global_state = cb.state_dict(TrainerState(global_step=10))
-
-        mock_warn.assert_called_once()
-        assert global_state["condition_model_rng_state"] is None
-
-    def test_load_resumes_noise_and_device_rng_streams(self, mock_dist, tmp_path):
-        """A resumed run must continue the noise stream, not replay its start."""
+    def test_load_resumes_device_and_cpu_rng_streams(self, mock_dist, tmp_path):
+        """A resumed run must continue the device and CPU rng streams, not replay."""
         mock_dist.is_initialized.return_value = False
         trainer = _make_mock_trainer()
         trainer.args.train.checkpoint.load_path = str(tmp_path)
         trainer.train_dataloader = None
         trainer.data_iterator = None
         trainer.environ_meter.state_dict.return_value = {}
-        condition_model = _StubConditionModel()
-        trainer.condition_model = condition_model
-
-        # Three steps' worth of noise, then checkpoint mid-run.
-        for _ in range(3):
-            condition_model.draw_noise()
         cb = GlobalStateCallback(trainer)
         payload = cb.state_dict(TrainerState(global_step=3))
-
-        # The uninterrupted run would have drawn exactly this next.
-        reference = torch.Generator(device="cpu")
-        reference.set_state(condition_model.generator.get_state())
-        expected_next_noise = torch.randn(4, generator=reference)
         torch.save(payload, tmp_path / "trainer_state_rank_0.pt")
 
         # Drift both streams the way the rest of a continuing run would.
-        condition_model.draw_noise()
         torch.randn(8)
 
         assert GlobalStateCallback(trainer).load_global_state() is not None
 
-        assert torch.equal(condition_model.draw_noise(), expected_next_noise)
         assert torch.equal(get_device_rng_state(), payload["device_rng_state"])
         assert torch.equal(torch.get_rng_state(), payload["torch_rng_state"])
 
@@ -465,28 +494,6 @@ class TestGlobalStateCallbackJobState:
                 "environ_meter": {},
                 "channel_loss_callback": {},
                 "torch_rng_state": torch.get_rng_state(),
-            },
-            tmp_path / "trainer_state_rank_0.pt",
-        )
-
-        GlobalStateCallback(trainer).load_global_state()
-
-        assert trainer.state.global_step == 7
-
-    def test_load_warns_when_condition_model_cannot_restore_rng(self, mock_dist, tmp_path):
-        """State for an absent condition model is a warning, not a crash."""
-        mock_dist.is_initialized.return_value = False
-        trainer = _make_mock_trainer()
-        trainer.args.train.checkpoint.load_path = str(tmp_path)
-        trainer.train_dataloader = None
-        torch.save(
-            {
-                "global_step": 7,
-                "train_dataloader": None,
-                "environ_meter": {},
-                "channel_loss_callback": {},
-                "torch_rng_state": torch.get_rng_state(),
-                "condition_model_rng_state": {"generator": _StubConditionModel().rng_state_dict()["generator"]},
             },
             tmp_path / "trainer_state_rank_0.pt",
         )
