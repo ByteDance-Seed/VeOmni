@@ -21,7 +21,8 @@ from veomni.distributed.torch_parallelize import (
     _reduce_scatter_group_size,
     _uses_low_precision_reduce_scatter_transport,
 )
-from veomni.utils.device import IS_CUDA_AVAILABLE
+from veomni.utils import device as device_utils
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -344,7 +345,7 @@ def test_parallelize_registers_active_transport_for_fsdp_and_hsdp(monkeypatch, m
         return len(reduction_scales)
 
     monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: ParallelState())
-    monkeypatch.setattr(torch_parallelize, "get_device_type", lambda: "cuda")
+    monkeypatch.setattr(device_utils, "IS_CUDA_AVAILABLE", True)
     monkeypatch.setattr(torch_parallelize, "fully_shard", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch_parallelize, "_materialize_and_load_weights", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -372,7 +373,7 @@ def test_parallelize_registers_active_transport_for_fsdp_and_hsdp(monkeypatch, m
 def _run_reduce_scatter_nccl() -> None:
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
+    device = torch.device(get_device_type(), int(os.environ.get("LOCAL_RANK", rank)))
     shard_numel = 4096
     values = torch.arange(world_size * shard_numel, device=device, dtype=torch.float32)
     for dtype in (torch.bfloat16, torch.float16):
@@ -391,8 +392,8 @@ def _run_reduce_scatter_nccl() -> None:
 def _run_fsdp2_optimizer_step() -> None:
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
-    mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp_shard",))
+    device = torch.device(get_device_type(), int(os.environ.get("LOCAL_RANK", rank)))
+    mesh = init_device_mesh(get_device_type(), (world_size,), mesh_dim_names=("dp_shard",))
 
     class RecordingReduceScatter(FP32ReduceScatterWithLowPrecisionTransport):
         def __init__(self, transport_dtype, reduction_scale):
@@ -461,7 +462,7 @@ def _run_fsdp2_optimizer_step() -> None:
     torch.testing.assert_close(custom_grad, baseline_grad, rtol=0, atol=0)
 
     hsdp_mesh = init_device_mesh(
-        "cuda",
+        get_device_type(),
         (2, 2),
         mesh_dim_names=("dp_replicate", "dp_shard"),
     )
