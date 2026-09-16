@@ -64,6 +64,7 @@ class CheckpointerBase(ABC):
         save_to_lowest_rank: bool = False,
         parallel_state=None,
         stage_dir: Optional[str] = None,
+        save_timeout_seconds: Optional[int] = None,
     ):
         """Persist training state to ``path``.
 
@@ -80,6 +81,8 @@ class CheckpointerBase(ABC):
             parallel_state: Parallelism layout the state was sharded under.
             stage_dir: Write under this directory and copy to ``path`` afterwards,
                 for a destination far slower than local disk.
+            save_timeout_seconds: Collective timeout for the groups the backend runs
+                its own save collectives on. Backends without such groups ignore this.
         """
         return
 

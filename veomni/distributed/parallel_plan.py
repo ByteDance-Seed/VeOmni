@@ -160,6 +160,21 @@ class ParallelPlan:
         for fqn, param in model.named_parameters():
             assert hasattr(param, "spec_info"), f"Internal Error: {fqn=} with {param=} is omitted"
 
+        # A parameter registered under several names is reported once by
+        # ``named_parameters``, so the loops above keyed ``fqn2spec_info`` by whichever
+        # name came first. State dicts are not deduplicated: they carry every name.
+        # ``_apply_extra_parallel_dim`` looks each name up here and silently skips the
+        # ones it does not find, so an unregistered alias of a sharded parameter is
+        # written to DCP with the ExtraParallel dimension still collapsed -- an
+        # ``[E/ep, ...]`` local shard recorded as the whole ``[E, ...]`` tensor -- and on
+        # resume that truncated shard is assigned over the correctly assembled parameter,
+        # leaving every rank with one rank's experts. The spec describes the parameter
+        # rather than the name, so an alias reuses the one already resolved for it.
+        for fqn, param in model.named_parameters(remove_duplicate=False):
+            spec_info = getattr(param, "spec_info", None)
+            if spec_info is not None and fqn not in fqn2spec_info:
+                fqn2spec_info[fqn] = spec_info
+
         model._fqn2spec_info = fqn2spec_info
         return fqn2spec_info
 
