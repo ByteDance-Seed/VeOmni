@@ -217,15 +217,19 @@ def dense_packed_attention_mask(
         device=device,
         allow_is_causal_skip=False,
     )
+    if attention_mask is not None and attention_mask.ndim >= 3:
+        mask = _merge_dense_attention_masks(attention_mask, mask)
     if _canonical_attn_impl(impl) == "eager":
         mask = _to_eager_additive(mask, dtype)
-    if attention_mask is not None and attention_mask.ndim >= 3:
-        return _merge_dense_attention_masks(attention_mask, mask)
     return mask
 
 
 def _merge_dense_attention_masks(existing: Tensor, packed: Tensor) -> Tensor:
-    """Keep positions allowed only by both ``existing`` and packed isolation."""
+    """Block packed-forbidden positions; keep existing values on the rest.
+
+    Packed isolation is a visibility overlay. Allowed positions retain padding
+    and additive bias from ``existing`` instead of being clipped to zero.
+    """
     packed_view = packed
     while packed_view.ndim < existing.ndim:
         packed_view = packed_view.unsqueeze(1)
@@ -240,16 +244,12 @@ def _merge_dense_attention_masks(existing: Tensor, packed: Tensor) -> Tensor:
             f"packed mask q/kv {tuple(packed_view.shape[-2:])} does not match existing {tuple(existing.shape[-2:])}"
         )
     packed_view = packed_view.expand_as(existing)
+    packed_keep = packed_view if packed_view.dtype == torch.bool else packed_view >= 0
+    packed_keep = packed_keep.to(dtype=torch.bool)
     if existing.dtype == torch.bool:
-        packed_keep = packed_view if packed_view.dtype == torch.bool else packed_view >= 0
-        return existing & packed_keep.to(dtype=torch.bool)
-    if packed_view.dtype == torch.bool:
-        from veomni.ops.kernels.attention.mask.shape import _to_eager_additive
-
-        packed_view = _to_eager_additive(packed_view, existing.dtype)
-        packed_view = packed_view.expand_as(existing)
-    packed_view = packed_view.to(device=existing.device, dtype=existing.dtype)
-    return torch.minimum(existing, packed_view)
+        return existing & packed_keep
+    block = existing.new_full((), torch.finfo(existing.dtype).min)
+    return torch.where(packed_keep, existing, block)
 
 
 def drop_packed_attention_metadata(kwargs: dict, *, impl: str) -> dict:

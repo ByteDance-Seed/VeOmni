@@ -179,23 +179,46 @@ def test_prepare_dense_attention_inputs_keeps_2d_padding_inside_packed_sample():
     assert _mask_kept(packed_mask, 2, 0)
 
 
-def test_prepare_dense_attention_inputs_merges_4d_padding_with_packed_isolation():
+@pytest.mark.parametrize("impl", ["sdpa", "eager", "veomni_sdpa"])
+def test_prepare_dense_attention_inputs_merges_4d_padding_with_packed_isolation(impl):
     from veomni.models.utils.op_utils import prepare_dense_attention_inputs
 
     hidden = torch.randn(1, 8, 4)
     kwargs = {"cu_seq_lens_q": torch.tensor([0, 4, 8], dtype=torch.int32)}
     query = torch.arange(8)[:, None]
     key = torch.arange(8)[None, :]
-    existing = (key <= query).view(1, 1, 8, 8)
-    existing = existing.clone()
+    existing = (key <= query).view(1, 1, 8, 8).clone()
     existing[..., :, 1] = False
-    _, packed_mask = prepare_dense_attention_inputs(kwargs, impl="sdpa", attention_mask=existing, hidden_states=hidden)
+    _, packed_mask = prepare_dense_attention_inputs(kwargs, impl=impl, attention_mask=existing, hidden_states=hidden)
     assert packed_mask is not None
-    assert packed_mask.dtype == torch.bool
+    if impl == "eager":
+        assert packed_mask.dtype.is_floating_point
+    else:
+        assert packed_mask.dtype == torch.bool
     assert not _mask_kept(packed_mask, 4, 0)
     assert not _mask_kept(packed_mask, 2, 1)
     assert _mask_kept(packed_mask, 2, 0)
     assert _mask_kept(packed_mask, 5, 4)
+
+
+@pytest.mark.parametrize("impl", ["sdpa", "eager"])
+def test_prepare_dense_attention_inputs_keeps_positive_additive_bias(impl):
+    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+
+    hidden = torch.randn(1, 4, 4)
+    kwargs = {"cu_seq_lens_q": torch.tensor([0, 2, 4], dtype=torch.int32)}
+    query = torch.arange(4, dtype=torch.long)[:, None]
+    key = torch.arange(4, dtype=torch.long)[None, :]
+    allowed = key <= query
+    existing = torch.where(allowed, torch.zeros((), dtype=torch.float32), torch.finfo(torch.float32).min)
+    existing = existing.view(1, 1, 4, 4).clone()
+    existing[0, 0, 1, 0] = 2.0
+    _, packed_mask = prepare_dense_attention_inputs(kwargs, impl=impl, attention_mask=existing, hidden_states=hidden)
+    assert packed_mask is not None
+    assert packed_mask.dtype.is_floating_point
+    torch.testing.assert_close(packed_mask[0, 0, 1, 0], existing.new_tensor(2.0))
+    assert not _mask_kept(packed_mask, 2, 0)
+    assert _mask_kept(packed_mask, 3, 2)
 
 
 def test_prepare_dense_attention_inputs_rejects_cached_packed_sequences():
