@@ -150,8 +150,9 @@ def test_sorter_empty_and_small_batches(lengths, replicas):
     assert torch.equal(recovered[torch.argsort(recovered[:, 0])], table)
 
 
-def test_linear_and_quadratic_costs_assign_differently():
-    table = torch.tensor([[i, n] for i, n in enumerate([10, 9, 8, 7, 6])])
+@pytest.mark.parametrize("device", list(dict.fromkeys(["cpu", get_device_type()])))
+def test_linear_and_quadratic_costs_assign_differently(device):
+    table = torch.tensor([[i, n] for i, n in enumerate([10, 9, 8, 7, 6])], device=device)
     sorter = SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"]
     quadratic = sorter(table, 2, 1)
     linear = sorter(table, 2, 1, cost_exponent=1)
@@ -161,24 +162,26 @@ def test_linear_and_quadratic_costs_assign_differently():
     assert all(torch.equal(a, b) for a, b in zip(linear, callable_linear))
 
 
-def test_custom_costs_not_sorted_by_length_or_squared_twice():
-    table = torch.tensor([[i, n] for i, n in enumerate([1, 2, 3, 4, 5])])
+@pytest.mark.parametrize("device", list(dict.fromkeys(["cpu", get_device_type()])))
+def test_custom_costs_not_sorted_by_length_or_squared_twice(device):
+    table = torch.tensor([[i, n] for i, n in enumerate([1, 2, 3, 4, 5])], device=device)
     result = SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](
         table,
         2,
         1,
-        cost_fn=lambda lengths: torch.tensor([10, 9, 8, 7, 6]),
+        cost_fn=lambda lengths: torch.tensor([10, 9, 8, 7, 6], device=lengths.device),
     )
     assert [b[:, 0].tolist() for b in result] == [[0, 3, 4], [1, 2]]
 
 
-def test_custom_large_integer_costs_preserve_order():
-    table = torch.tensor([[0, 1], [1, 1]])
+@pytest.mark.parametrize("device", list(dict.fromkeys(["cpu", get_device_type()])))
+def test_custom_large_integer_costs_preserve_order(device):
+    table = torch.tensor([[0, 1], [1, 1]], device=device)
     result = SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](
         table,
         2,
         1,
-        cost_fn=lambda lengths: torch.tensor([2**60, 2**60 + 1]),
+        cost_fn=lambda lengths: torch.tensor([2**60, 2**60 + 1], device=lengths.device),
     )
     assert [b[:, 0].tolist() for b in result] == [[1], [0]]
 
