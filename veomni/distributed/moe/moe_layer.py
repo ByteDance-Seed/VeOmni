@@ -53,7 +53,10 @@ def preprocess(
     ep_size = ep_group.size()
     num_local_experts = num_experts // ep_size
     rank = dist.get_rank(ep_group)
-    num_local_tokens_per_expert = expert_mask.sum(dim=(1, 2))
+    # Dispatch sends one copy per (token, expert), not per top-k slot.
+    # Hash routers can select the same expert twice; unpermute already sums
+    # their routing weights, so the collective splits must deduplicate too.
+    num_local_tokens_per_expert = expert_mask.any(dim=1).sum(dim=1)
 
     # [ep_size] represent the number of sum tokens in each rank
     input_splits = num_local_tokens_per_expert.reshape(ep_size, num_local_experts).sum(dim=1).tolist()

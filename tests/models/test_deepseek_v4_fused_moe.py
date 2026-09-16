@@ -53,6 +53,27 @@ def test_deepseek_v4_test_overrides_follow_active_device(monkeypatch, device_typ
     assert f"--model.ops_implementation.moe_implementation={expected_moe}" in overrides
 
 
+def test_deepseek_v4_duplicate_hash_routes_match_ep_dispatch_splits(monkeypatch):
+    import veomni.distributed.moe.moe_layer as moe
+
+    selected = torch.tensor([[0, 0], [0, 2], [3, 3]])
+    mask = F.one_hot(selected, num_classes=4).permute(2, 1, 0)
+    group = SimpleNamespace(size=lambda: 2)
+    monkeypatch.setattr(moe.dist, "get_rank", lambda _group: 0)
+
+    def gather(output, counts, group):
+        output.copy_(counts.expand(2, -1))
+
+    monkeypatch.setattr(moe.dist, "all_gather_into_tensor", gather)
+    inputs, outputs, counts, totals = moe.preprocess(mask, 4, group)
+    dispatched, _ = moe.permute(torch.ones(3, 2), mask.sum(dim=1))
+    assert inputs == [2, 2]
+    assert outputs == [2, 2]
+    assert sum(inputs) == dispatched.shape[0] == 4
+    torch.testing.assert_close(counts, torch.tensor([[2, 0], [2, 0]]))
+    torch.testing.assert_close(totals, torch.tensor([4, 0]))
+
+
 def test_deepseek_v4_routers_use_fp32_projection_under_autocast():
     config = SimpleNamespace(
         num_experts_per_tok=2,
