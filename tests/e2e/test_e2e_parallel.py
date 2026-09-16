@@ -513,6 +513,55 @@ def test_text_parallel_smoke(
     )
 
 
+@pytest.mark.skipif(
+    not IS_CUDA_AVAILABLE or _ACCELERATOR.device_count() < 4,
+    reason="DeepSeek V4 compiled trainer parity requires four CUDA devices",
+)
+def test_deepseek_v4_compiled_fsdp2_training_alignment(dummy_deepseek_v4_dense_packed_text_dataset, tmp_path):
+    """Compare eager/Inductor through packed FSDP2 training, with EP off."""
+    config = "./tests/toy_config/deepseek_v4_toy"
+    weights = tmp_path / "weights"
+    _materialize_weights_dir(config, str(weights))
+    results = {}
+    for enabled in (False, True):
+        name = "inductor" if enabled else "eager"
+        output = tmp_path / name
+        cmd = build_torchrun_cmd(
+            script="tests/train_scripts/train_text_test.py",
+            config_path=config,
+            model_path=str(weights),
+            train_path=dummy_deepseek_v4_dense_packed_text_dataset,
+            output_dir=str(output),
+            parallel_config=ParallelConfig(sp_size=1, ep_size=1, fsdp_mode="fsdp2"),
+            nproc=4,
+            model_name="deepseek_v4",
+            extra_args=[
+                "--data.max_seq_len=512",
+                "--data.dataloader.num_workers=0",
+                "--train.dyn_bsz=True",
+                "--train.pad_to_length=True",
+                f"--model.accelerator.torch_compile.enable={enabled}",
+                "--model.accelerator.torch_compile.fullgraph=True",
+                "--model.ops_implementation.rms_norm_implementation=eager",
+                "--model.ops_implementation.swiglu_mlp_implementation=eager",
+                "--model.ops_implementation.cross_entropy_loss_implementation=eager",
+                "--model.ops_implementation.rotary_pos_emb_implementation=eager",
+                "--model.ops_implementation.dsa_indexer_implementation=eager",
+                "--model.ops_implementation.dsa_attention_implementation=eager",
+                "--model.ops_implementation.mhc_implementation=eager",
+            ],
+        )
+        subprocess.run(cmd, check=True)
+        with open(output / "log_dict.json") as f:
+            results[name] = json.load(f)
+        assert results[name] and all(
+            len(values) == 2 and torch.isfinite(torch.tensor(values)).all() for values in results[name].values()
+        )
+    for metric in results["eager"]:
+        print_comparison_table(results, metric, title="DeepSeek V4 FSDP2 compile")
+    compare_metrics(results, rtol=1e-3, atol=1e-3)
+
+
 @_deepseek_v4_tilelang_skip
 @pytest.mark.parametrize("dataset_fixture, case_args", deepseek_v4_tilelang_dyn_bsz_test_cases)
 def test_deepseek_v4_tilelang_dyn_bsz_smoke(

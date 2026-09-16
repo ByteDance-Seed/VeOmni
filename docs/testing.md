@@ -170,6 +170,31 @@ Registry binding plus mHC pre/post/head forward and backward parity are covered
 by `tests/ops/test_mhc_tile_kernels.py`, which requires TileKernels on an SM90+
 NVIDIA GPU for kernel execution.
 
+`tests/e2e/test_e2e_parallel.py::test_deepseek_v4_compiled_fsdp2_training_alignment` compares
+eager and fullgraph Inductor through four-rank packed FSDP2 training, with
+static 512-token shapes and EP/SP disabled. Loss and gradient norm are checked
+at `rtol=atol=1e-3`; this checks aggregate training metrics, not per-parameter
+update alignment, convergence or bitwise equivalence.
+It keeps DSA/mHC/norm/shared MLP/loss eager and routed experts fused. Enabled
+ExtraParallel with compilation remains rejected. Single-device decoder trace
+and gradient checks live in `tests/distributed/test_torch_compile.py`.
+Backend `eager` capture requires exact loss/all-gradient equality. The Inductor
+execution gate requires finite loss, identical used-parameter coverage, finite
+gradients and an actual AdamW update; it does not treat eager BF16 as an exact
+numerical oracle. A separate held-out fixed-route expert test compares output,
+input/routing gradients and both expert-weight gradients against FP32 PyTorch
+math with the same promoted BF16 inputs/weights/cotangent. Its per-tensor budget
+is relative L2 <= two BF16 epsilons and peak error <= four BF16 epsilons of the
+reference peak. These local gates do not qualify whole-model numerical training
+correctness or the SM90+ optimized kernels.
+
+Controlled two-step BF16 FSDP2 runs matched initial FP32 master weights,
+buffers, optimizer settings and every rank's micro-batches. Aggregate execution
+gates passed, but whole-model pre-clipping gradient relative L2 differed by
+about 5.81% for Inductor versus eager. First-step AdamW replay and clipping
+passed their scoped oracles; whole-model update parity and convergence remain
+unqualified. See the separate EP validation PR for expert transport validation.
+
 ---
 
 ### 2. VLM Trainer Test (`tests/models/test_vlm_trainer.py`)
