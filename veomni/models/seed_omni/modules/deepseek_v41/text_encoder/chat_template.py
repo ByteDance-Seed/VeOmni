@@ -471,6 +471,39 @@ class DeepseekV41ChatTemplate(TextEncoderChatTemplate):
             body += EOS_TOKEN
         return [self._build_conversation_item("text", body, "assistant", loss_mask=1)]
 
+    def tokenize(self, parts: List[ConversationItem]) -> None:
+        """The base tokenize, plus a surviving copy of the ids in ``meta``.
+
+        ``encode`` overwrites each text item's ``value`` with its embedding, so
+        after it runs the ids are gone from the carrier. The n-gram node needs
+        them -- it hashes token ids, not embeddings -- and without this copy it
+        would only be correct when the graph executor happened to schedule it
+        before the text encoder. Both nodes depend on the vision node and on
+        nothing else, so that ordering is not something the DAG guarantees.
+
+        BAGEL's template stashes ids the same way and for the same reason.
+        """
+        super().tokenize(parts)
+        for part in parts:
+            if part.type == "text":
+                part.meta["input_ids"] = part.value.detach().clone()
+
+    @staticmethod
+    def merge_text_embeds(parts: List[ConversationItem]) -> List[ConversationItem]:
+        """The base merge, keeping the stashed ids in step with ``value``.
+
+        The base concatenates ``value`` / ``labels`` / ``attention_mask``; the
+        copy above has to travel with them. Leaving it out would not shorten
+        anything or raise -- the merged item would simply carry the first
+        segment's ids, and every n-gram past the join would be hashed from the
+        wrong tokens.
+        """
+        merged = TextEncoderChatTemplate.merge_text_embeds(parts)
+        for part in merged:
+            if part.type == "text" and "input_ids" in part.meta:
+                part.meta["input_ids"] = part.value.detach().clone()
+        return merged
+
     def apply_generation_prompt(self, sample: List[ConversationItem]) -> List[ConversationItem]:
         """No-op: :meth:`apply_chat_template` already ends on the assistant header.
 
