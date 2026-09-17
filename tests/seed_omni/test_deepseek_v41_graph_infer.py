@@ -35,7 +35,11 @@ import yaml
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
 
 
-GRAPH_PATH = Path("configs/seed_omni/DeepSeek/deepseek_v41_flash/infer/graph_infer.yaml")
+CONFIG_ROOT = Path("configs/seed_omni/DeepSeek/deepseek_v41_flash")
+GRAPH_PATH = CONFIG_ROOT / "infer/graph_infer.yaml"
+MODULES_INFER_PATH = CONFIG_ROOT / "infer/modules_infer_eager.yaml"
+MODULES_TRAIN_PATH = CONFIG_ROOT / "train/modules_train.yaml"
+BASE_PATH = CONFIG_ROOT / "train/base.yaml"
 
 # A bare module endpoint in a generation graph defaults to `.generate`, and the
 # node pool keys on the resolved endpoint, so that is what `iter_nodes` yields.
@@ -108,6 +112,45 @@ class TestGraphShape:
             types = [t["condition"]["type"] for t in state["transitions"]]
             if "default" in types:
                 assert types[-1] == "default", f"state '{name}' has transitions after its default"
+
+    def test_the_launcher_points_at_this_graph(self):
+        """A dangling `infer_graph` path only surfaces when inference launches.
+
+        The graph file and the launcher that names it are edited apart, and
+        nothing else reads the two together -- a rename leaves the FSM tests
+        above passing against a file no run would load.
+        """
+        base = yaml.safe_load(BASE_PATH.read_text())
+        declared = base["model"]["model_config"]["infer_graph"]
+        assert declared, "base.yaml declares no infer_graph"
+        for scenario, path in declared.items():
+            assert Path(path).is_file(), f"scenario '{scenario}' points at a missing file: {path}"
+        assert str(GRAPH_PATH) in set(declared.values())
+
+    def test_the_eager_module_file_covers_the_graphs_nodes(self):
+        """Every node the FSM runs needs a module entry, and nothing needs more."""
+        modules = yaml.safe_load(MODULES_INFER_PATH.read_text())
+        graph = GenerationGraph(yaml.safe_load(GRAPH_PATH.read_text()))
+        used = set()
+        for state in ("prompt_encode", "text_ar"):
+            graph._transition_to(state, {})
+            used |= {name.split(".")[0] for name in order(graph)}
+        assert set(modules) == used
+
+    def test_inference_module_paths_match_training(self):
+        """Both files name folders the converter writes; a typo is a load error."""
+        train = yaml.safe_load(MODULES_TRAIN_PATH.read_text())
+        infer = yaml.safe_load(MODULES_INFER_PATH.read_text())
+        assert set(infer) == set(train)
+        for name, spec in infer.items():
+            assert spec["model_path"] == train[name]["model_path"], name
+
+    def test_inference_leaves_gradient_checkpointing_off(self):
+        """There is no backward to trade against; on, it recomputes for nothing."""
+        infer = yaml.safe_load(MODULES_INFER_PATH.read_text())
+        for name, spec in infer.items():
+            checkpointing = spec.get("accelerator", {}).get("gradient_checkpointing", {})
+            assert checkpointing.get("enable") is False, f"'{name}' leaves gradient checkpointing on"
 
     def test_every_module_in_the_graph_is_a_real_module(self, graph):
         from veomni.models.seed_omni.modules import OMNI_MODEL_REGISTRY

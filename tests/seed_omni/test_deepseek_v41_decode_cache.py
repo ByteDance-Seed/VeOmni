@@ -51,7 +51,9 @@ from veomni.models.seed_omni.modules.deepseek_v41.llm.decode import (
     decode_backbone_step,
     dense_sparse_attn,
 )
-from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import DeepseekV41Backbone
+from veomni.models.seed_omni.modules.deepseek_v41.llm.inference import build_image_mask
+from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import DeepseekV41Backbone, DeepseekV41Llm
+from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
 HIDDEN = 64
@@ -312,6 +314,122 @@ class TestBackboneDecodeMatchesPrefill:
                 0,
                 DeepseekV41DecodeCache.empty(config),
             )
+
+
+class TestGenerateMatchesTeacherForcing:
+    """``generate`` end to end, against the forward it has to agree with.
+
+    The steps above test the pieces; this drives the module the FSM drives, so
+    it also covers what only the wiring can get wrong -- the carrier walk, the
+    cache being created and kept on the module, the position counter advancing
+    once per step, and the ``output`` item the text encoder samples from.
+
+    The text encoder is not in the loop, so its half of the contract is played
+    by hand: it overwrites the tail item's value with the next token's
+    embedding, which is exactly what ``DeepseekV41TextEncoder.generate`` does
+    after sampling.
+    """
+
+    def _llm(self, config, seed=0):
+        torch.manual_seed(seed)
+        model = DeepseekV41Llm(config).double()
+        for param in model.parameters():
+            param.data.normal_(0, 0.05)
+        for layer in model.model.layers:
+            layer.self_attn.attn_sink.data.normal_(0, 0.5)
+        return model.eval()
+
+    def _ngram_embeds(self, config, seq_len):
+        cols = (config.engram_max_ngram_size - 1) * config.engram_n_heads
+        return [
+            torch.randn(1, seq_len, cols, config.engram_head_dim, dtype=torch.float64) for _ in config.engram_layer_ids
+        ]
+
+    @torch.no_grad()
+    def test_a_prompt_then_steps_matches_one_forward(self):
+        config = make_backbone_config()
+        model = self._llm(config)
+        torch.manual_seed(1)
+        embeds = torch.randn(1, SEQ_LEN, HIDDEN, dtype=torch.float64)
+        ngram_embeds = self._ngram_embeds(config, SEQ_LEN)
+
+        expected = model(
+            inputs_embeds=embeds,
+            position_ids=torch.arange(SEQ_LEN).unsqueeze(0),
+            ngram_embeds=ngram_embeds,
+        )["hidden_states"]
+
+        prompt_len = 5
+        carrier = [ConversationItem(type="text", value=embeds[0, :prompt_len], role="user")]
+        outputs = model.generate(
+            conversation_list=carrier,
+            ngram_embeds=[e[:, :prompt_len] for e in ngram_embeds],
+        )
+        carrier = outputs["conversation_list"]
+        assert carrier[-1].type == "output"
+        torch.testing.assert_close(carrier[-1].value[0], expected[0, prompt_len - 1], **FP32_POOLED)
+
+        for position in range(prompt_len, SEQ_LEN):
+            # Standing in for the text encoder: it samples a token and writes
+            # that token's embedding onto this same item.
+            carrier[-1].value = embeds[0, position : position + 1]
+            carrier = model.generate(
+                conversation_list=carrier,
+                ngram_embeds=[e[:, position : position + 1] for e in ngram_embeds],
+            )["conversation_list"]
+            torch.testing.assert_close(carrier[-1].value[0], expected[0, position], **FP32_POOLED)
+
+    @torch.no_grad()
+    def test_reset_lets_a_second_conversation_start_clean(self):
+        """Without it the next request decodes against this one's window.
+
+        Nothing would raise: the cache is the right shape and the positions keep
+        counting, so the second conversation would simply attend to the first
+        one's tokens and read fluently.
+        """
+        config = make_backbone_config()
+        model = self._llm(config)
+        torch.manual_seed(2)
+        embeds = torch.randn(1, 4, HIDDEN, dtype=torch.float64)
+        ngram_embeds = self._ngram_embeds(config, 4)
+
+        def run():
+            carrier = [ConversationItem(type="text", value=embeds[0], role="user")]
+            return model.generate(conversation_list=carrier, ngram_embeds=ngram_embeds)["conversation_list"][-1].value
+
+        first = run()
+        assert model._next_position == 4
+        model.reset_global_inference_state()
+        assert model._decode_cache is None and model._next_position == 0
+        torch.testing.assert_close(run(), first, **EXACT)
+
+    @torch.no_grad()
+    def test_a_carrier_that_does_not_end_on_output_is_refused(self):
+        config = make_backbone_config()
+        model = self._llm(config)
+        embeds = torch.randn(1, 4, HIDDEN, dtype=torch.float64)
+        ngram_embeds = self._ngram_embeds(config, 4)
+        carrier = [ConversationItem(type="text", value=embeds[0], role="user")]
+        model.generate(conversation_list=carrier, ngram_embeds=ngram_embeds)
+
+        carrier.append(ConversationItem(type="text", value=embeds[0, :1], role="user"))
+        with pytest.raises(ValueError, match="'output' item"):
+            model.generate(conversation_list=carrier, ngram_embeds=ngram_embeds)
+
+    def test_the_image_mask_is_none_without_an_image(self):
+        """None, not all-false: the MoE bias and the Engram gate both skip on None."""
+        carrier = [ConversationItem(type="text", value=torch.zeros(3, HIDDEN), role="user")]
+        assert build_image_mask(carrier, torch.device("cpu")) is None
+
+    def test_the_image_mask_spans_the_image_item(self):
+        carrier = [
+            ConversationItem(type="text", value=torch.zeros(2, HIDDEN), role="user"),
+            ConversationItem(type="image", value=torch.zeros(3, HIDDEN), role="user"),
+            ConversationItem(type="text", value=torch.zeros(1, HIDDEN), role="user"),
+        ]
+        mask = build_image_mask(carrier, torch.device("cpu"))
+        assert mask.shape == (1, 6)
+        assert mask[0].tolist() == [False, False, True, True, True, False]
 
 
 class TestStarvedCandidates:

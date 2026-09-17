@@ -12,14 +12,13 @@
 #     --model_path /mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash \
 #     --output_dir /mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash
 #
-# There is no inference graph yet: the attention stack carries no KV cache, so
-# `infer_graph` is deliberately absent rather than pointing at a stub.
-
 model:
   model_path: /mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash
   model_config:
     modules: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/modules_train.yaml
     train_graph: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/graph_train.yaml
+    infer_graph:
+      vision_understanding: configs/seed_omni/DeepSeek/deepseek_v41_flash/infer/graph_infer.yaml
   ops_implementation:
     attn_implementation: flash_attention_2
 
