@@ -5,10 +5,10 @@
 This document walks through the specific patches applied to integrate **Qwen3-VL MoE** into VeOmni. It is a concrete example of the patterns described in [guide_and_checklist.md](./guide_and_checklist.md), covering FSDP, Sequence Parallelism, Expert Parallelism, and model registration.
 
 > **Scope note:** VeOmni now ships patchgen-generated modeling files under
-> `veomni/models_kernel/transformers/<model>/generated/`, so the actual code lives in
-> [veomni/models_kernel/transformers/qwen3_vl_moe/qwen3_vl_moe_gpu_patch_gen_config.py](../../../veomni/models_kernel/transformers/qwen3_vl_moe/qwen3_vl_moe_gpu_patch_gen_config.py)
+> `veomni/models/transformers/<model>/generated/`, so the actual code lives in
+> [veomni/models/transformers/qwen3_vl_moe/qwen3_vl_moe_gpu_patch_gen_config.py](../../../veomni/models/transformers/qwen3_vl_moe/qwen3_vl_moe_gpu_patch_gen_config.py)
 > rather than the runtime `apply_veomni_*_patch()` helpers shown below. The
-> patterns (FSDP dummy forward, SP slicing, fused MoE, EP plan) are unchanged;
+> patterns (FSDP dummy forward, SP slicing, MoE `VeomniOp`, EP plan) are unchanged;
 > what has changed is *where* the patches are declared (in the patchgen config
 > and emitted into `generated/`) rather than applied at import time. See
 > [the patchgen design guide](../../design/patchgen.md) and
@@ -218,66 +218,44 @@ def get_parallel_plan():
     return ParallelPlan(extra_parallel_plan={"ep": ep_plan})
 ```
 
-### 3.2 Fused MoE Forward
+### 3.2 MoE experts `VeomniOp`
 
-Qwen3-VL MoE uses a fused `gate_up_proj` tensor of shape `(num_experts, hidden_size, 2 * expert_dim)`. The `fused_moe_forward` kernel expects `(num_experts, expert_dim, hidden_size)`, so split and transpose before calling:
-
-```python
-def fused_moe_forward(self, hidden_states, router_weights, router_indices, routing_weights):
-    hidden_states = hidden_states.reshape(-1, self.hidden_size)
-
-    # Split the fused gate_up_proj along the last dim
-    gate_proj = self.gate_up_proj[..., : self.expert_dim]   # (num_experts, hidden_size, expert_dim)
-    up_proj   = self.gate_up_proj[..., self.expert_dim :]   # (num_experts, hidden_size, expert_dim)
-
-    # Transpose to (num_experts, expert_dim, hidden_size) as expected by fused_moe_forward
-    gate_proj_t = gate_proj.transpose(1, 2).contiguous()
-    up_proj_t   = up_proj.transpose(1, 2).contiguous()
-    down_proj_t = self.down_proj.transpose(1, 2).contiguous()  # (num_experts, hidden_size, expert_dim)
-
-    next_states = fused_moe_forward(
-        module=self,
-        num_experts=self.num_experts,
-        routing_weights=routing_weights,   # compact top-k weights, not the full scatter tensor
-        selected_experts=router_indices,
-        hidden_states=hidden_states,
-        fc1_1_weight=gate_proj_t,
-        fc1_2_weight=up_proj_t,
-        fc2_weight=down_proj_t,
-    )
-    next_states = next_states.view(batch_size, -1, self.hidden_size)
-    return next_states
-```
-
-The `SparseMoeBlock` must pass the compact top-k `routing_weights` (not the full scatter tensor) to `Experts.forward`:
+Qwen3-VL MoE already stores a fused `gate_up_proj` of shape `[E, 2*I, H]`. Replace the experts class so it always calls a local `moe_experts` handle. Pass the merged tensor as `fc1_1_2_weight` and leave the split `fc1_*` slots empty. `eager` is a registered row, not a `super().forward` fallback.
 
 ```python
-def Qwen3VLMoeTextSparseMoeBlock_forward(self, hidden_states):
-    batch_size = hidden_states.shape[0]
-    hidden_states = hidden_states.reshape(-1, self.hidden_size)
-    router_logits = self.gate(hidden_states)
-    routing_weights = torch.nn.functional.softmax(router_logits, dim=-1, dtype=torch.float)
-    routing_weights, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)
-    routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-    routing_weights = routing_weights.to(hidden_states.dtype)
-    router_weights = torch.zeros_like(router_logits).scatter_(1, router_indices, routing_weights)
-    hidden_states = hidden_states.reshape(batch_size, -1, self.hidden_size)
-    # Pass compact routing_weights (top-k) as 4th arg for fused path
-    routed_out = self.experts(hidden_states, router_weights, router_indices, routing_weights)
-    return routed_out, router_logits
+from veomni.models.utils.op_utils import empty_bias, resolve_moe_impl
+from veomni.ops import VeomniOp
+
+
+class Qwen3VLMoeTextExperts(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_dim = config.moe_intermediate_size
+        self.gate_up_proj = nn.Parameter(
+            torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim)
+        )
+        self.down_proj = nn.Parameter(
+            torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
+        )
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        unused = empty_bias(self.gate_up_proj)
+        return self.veomni_moe(
+            hidden_states,
+            top_k_weights,
+            top_k_index,
+            unused,
+            unused,
+            self.down_proj,
+            self.gate_up_proj,
+            num_experts=self.num_experts,
+        )
 ```
 
-In `Qwen3VLMoeTextExperts.forward`, dispatch based on `moe_implementation`:
-
-```python
-def forward(self, hidden_states, router_weights, router_indices, routing_weights=None):
-    if self.training and self.moe_implementation == "fused":
-        return self.fused_moe_forward(hidden_states, router_weights, router_indices, routing_weights)
-    else:
-        assert not get_parallel_state().ep_enabled or not self.training, \
-            "_moe_implementation='eager' does not support EP"
-        return super().forward(hidden_states, router_weights, router_indices)
-```
+Use `@config.replace_class("Qwen3VLMoeTextExperts")` so the upstream `@use_experts_implementation` decorator is dropped. The SparseMoeBlock keeps passing compact top-k index/weight tensors into `Experts.forward`; do not reconstruct a full scatter tensor, split/transpose `gate_up_proj`, or call a public `fused_moe_forward`.
 
 ---
 
@@ -321,14 +299,14 @@ outputs = self.language_model(..., **kwargs)
 
 ## 5. Model Registration
 
-In [veomni/models_kernel/transformers/__init__.py](../../../veomni/models_kernel/transformers/__init__.py):
+In [veomni/models/transformers/__init__.py](../../../veomni/models/transformers/__init__.py):
 ```python
 from . import qwen3_vl_moe
 ```
 
 In your model's `__init__.py`:
 ```python
-from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
 
 @MODEL_CONFIG_REGISTRY.register("qwen3_vl_moe")
 def register_qwen3_vl_moe_config():

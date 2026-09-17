@@ -5,8 +5,8 @@
 > follow a different integration pattern from the LLM/VLM guide.
 
 For reference, the complete Wan2.1 I2V integration lives in:
-- `veomni/models_kernel/diffusers/wan_t2v/wan_condition/` — condition model
-- `veomni/models_kernel/diffusers/wan_t2v/wan_transformer/` — transformer model
+- `veomni/models/diffusers/wan_t2v/wan_condition/` — condition model
+- `veomni/models/diffusers/wan_t2v/wan_transformer/` — transformer model
 
 ---
 
@@ -138,8 +138,8 @@ Qwen-Image follows the same condition/transformer split as Wan, with a
 text-to-image condition model and a trainable `QwenImageTransformer2DModel`
 wrapper:
 
-- `veomni/models_kernel/diffusers/qwen_image/qwen_image_condition/`
-- `veomni/models_kernel/diffusers/qwen_image/qwen_image_transformer/`
+- `veomni/models/diffusers/qwen_image/qwen_image_condition/`
+- `veomni/models/diffusers/qwen_image/qwen_image_transformer/`
 - `configs/dit/qwen_image_sft.yaml`
 
 Qwen-Image supports GPU FSDP2 full-parameter training and Ulysses sequence
@@ -214,26 +214,26 @@ the diffusers `__init__` runs.
 ## Step 1: Create the Directory Structure
 
 ```bash
-mkdir -p veomni/models_kernel/diffusers/your_dit/your_condition/
-mkdir -p veomni/models_kernel/diffusers/your_dit/your_transformer/
+mkdir -p veomni/models/diffusers/your_dit/your_condition/
+mkdir -p veomni/models/diffusers/your_dit/your_transformer/
 
-touch veomni/models_kernel/diffusers/your_dit/__init__.py
-touch veomni/models_kernel/diffusers/your_dit/your_condition/__init__.py
-touch veomni/models_kernel/diffusers/your_dit/your_condition/configuration_your_condition.py
-touch veomni/models_kernel/diffusers/your_dit/your_condition/modeling_your_condition.py
-touch veomni/models_kernel/diffusers/your_dit/your_transformer/__init__.py
-touch veomni/models_kernel/diffusers/your_dit/your_transformer/configuration_your_transformer.py
-touch veomni/models_kernel/diffusers/your_dit/your_transformer/modeling_your_transformer.py
+touch veomni/models/diffusers/your_dit/__init__.py
+touch veomni/models/diffusers/your_dit/your_condition/__init__.py
+touch veomni/models/diffusers/your_dit/your_condition/configuration_your_condition.py
+touch veomni/models/diffusers/your_dit/your_condition/modeling_your_condition.py
+touch veomni/models/diffusers/your_dit/your_transformer/__init__.py
+touch veomni/models/diffusers/your_dit/your_transformer/configuration_your_transformer.py
+touch veomni/models/diffusers/your_dit/your_transformer/modeling_your_transformer.py
 ```
 
-Then add your module to `veomni/models_kernel/diffusers/__init__.py`:
+Then add your module to `veomni/models/diffusers/__init__.py`:
 
 ```python
 from . import your_dit
 ```
 
 Also expose the diffusers registration side effects from
-`veomni/models_kernel/__init__.py`:
+`veomni/models/__init__.py`:
 
 ```python
 from . import diffusers, transformers
@@ -340,8 +340,8 @@ separately for logging/visualization).
 ## Step 4: Register the Condition Model
 
 ```python
-# veomni/models_kernel/diffusers/your_dit/your_condition/__init__.py
-from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+# veomni/models/diffusers/your_dit/your_condition/__init__.py
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 @MODEL_CONFIG_REGISTRY.register("YourConditionModel")
 def register_config():
@@ -640,8 +640,8 @@ For diffusers models this is done via an **attention processor** installed with
 ## Step 10: Register the Transformer Model
 
 ```python
-# veomni/models_kernel/diffusers/your_dit/your_transformer/__init__.py
-from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+# veomni/models/diffusers/your_dit/your_transformer/__init__.py
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 @MODEL_CONFIG_REGISTRY.register("YourTransformerModel")
 def register_config():
@@ -739,9 +739,9 @@ Copy the remaining fields from the Diffusers transformer config into the same JS
 
 ### Any New DiT Model
 
-- [ ] `veomni/models_kernel/diffusers/your_dit/__init__.py` (imports sub-packages)
-- [ ] `veomni/models_kernel/diffusers/__init__.py` updated with `from . import your_dit`
-- [ ] `veomni/models_kernel/__init__.py` imports `diffusers` so registration runs
+- [ ] `veomni/models/diffusers/your_dit/__init__.py` (imports sub-packages)
+- [ ] `veomni/models/diffusers/__init__.py` updated with `from . import your_dit`
+- [ ] `veomni/models/__init__.py` imports `diffusers` so registration runs
 - [ ] Condition model config: `PretrainedConfig` subclass with `get_config_dict` override
 - [ ] Condition model: `get_condition()` and `process_condition()` implemented
 - [ ] Condition model registered in `MODEL_CONFIG_REGISTRY` and `MODELING_REGISTRY`

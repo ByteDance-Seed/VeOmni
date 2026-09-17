@@ -24,26 +24,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).parents[2]
 TEXT_SUFFIXES = {".md", ".py", ".toml", ".yaml", ".yml"}
 MODEL_ENTRY_ROOTS = (REPO_ROOT / "tasks", REPO_ROOT / "veomni" / "trainer")
-# These integration tests still exercise model families that are not registered
-# in models_kernel. Remove each exemption with that model family's migration.
-RETAINED_MODEL_CONSUMER_TESTS = {
-    Path("tests/data/multimodal/test_vlm_data_process.py"),
-    Path("tests/distributed/test_dummy_forward.py"),
-    Path("tests/distributed/test_torch_compile.py"),
-    Path("tests/lora/test_moe_lora_ep_sharded_stream_load.py"),
-    Path("tests/lora/test_moe_lora_trainer.py"),
-    Path("tests/lora/test_qwen3_5_moe_lora.py"),
-    Path("tests/lora/test_vlm_lora.py"),
-    Path("tests/lora/utils.py"),
-    Path("tests/optim/test_muon_fsdp2_parity.py"),
-    Path("tests/optim/test_muon_fsdp2_smoke.py"),
-    Path("tests/parallel/ulysses/test_wan_self_attn_ulysses.py"),
-    Path("tests/utils/test_model_loader.py"),
-}
 
 
 def _active_text_files() -> list[Path]:
-    """Return maintained text files outside the model tree retained for comparison."""
+    """Return maintained text files outside the legacy model tests."""
     files: list[Path] = []
     for root_name in (
         ".agents/knowledge",
@@ -59,7 +43,7 @@ def _active_text_files() -> list[Path]:
             if not path.is_file() or path.suffix not in TEXT_SUFFIXES:
                 continue
             relative = path.relative_to(REPO_ROOT)
-            if relative.parts[:2] in {("tests", "models"), ("veomni", "models")}:
+            if relative.parts[:2] == ("tests", "models"):
                 continue
             files.append(path)
     files.append(REPO_ROOT / "pyproject.toml")
@@ -68,13 +52,6 @@ def _active_text_files() -> list[Path]:
     files.append(REPO_ROOT / "AGENTS.md")
     files.append(REPO_ROOT / "README.md")
     return sorted(set(files))
-
-
-def _is_retained_legacy_model_reference(path: Path, line: str) -> bool:
-    """Allow tooling rules that still inspect the retained model comparison tree."""
-    if path == REPO_ROOT / "tests/special_sanity/check_device_api_usage.py":
-        return line.strip().startswith('"veomni/' + "models/")
-    return False
 
 
 def test_active_tree_uses_ops_architecture_paths():
@@ -86,10 +63,7 @@ def test_active_tree_uses_ops_architecture_paths():
         relative = path.relative_to(REPO_ROOT)
         text = path.read_text(encoding="utf-8")
         for line_number, line in enumerate(text.splitlines(), start=1):
-            if _is_retained_legacy_model_reference(path, line):
-                continue
-            retained_model_consumer = relative in RETAINED_MODEL_CONSUMER_TESTS and model_package.search(line)
-            if removed_ops_package.search(line) or (model_package.search(line) and not retained_model_consumer):
+            if removed_ops_package.search(line) or model_package.search(line):
                 stale.append(f"{relative}:{line_number}: {line.strip()}")
 
     assert not stale, "Stale architecture paths:\n" + "\n".join(stale)

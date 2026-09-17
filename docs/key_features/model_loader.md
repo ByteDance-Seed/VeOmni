@@ -18,8 +18,8 @@ To enable users to quickly train models from HuggingFace and flexibly train cust
 
 Users can directly load models from HuggingFace and start the training process by specifying the model name or model path. Additionally, they can implement their own custom models or enhance existing HuggingFace models with advanced features such as sequence parallelism or expert parallelism. Custom modeling can be implemented in one of the supported modeling paths:
 
-- `veomni/models_kernel/transformers/`
-- `veomni/models_kernel/diffusers/`
+- `veomni/models/transformers/`
+- `veomni/models/diffusers/`
 
 
 
@@ -27,7 +27,7 @@ Users can directly load models from HuggingFace and start the training process b
 
 ### 1. Create Your Model Implementation
 
-Create a model package under `veomni/models_kernel/transformers/`. Declare
+Create a model package under `veomni/models/transformers/`. Declare
 model changes in a patchgen config and generate the modeling file; do not edit
 the generated output directly.
 
@@ -53,8 +53,8 @@ You can also use the model configuration from HuggingFace if you are only modify
 Register the generated model class from the package's `__init__.py`:
 
 ```python
-# veomni/models_kernel/transformers/your_custom_model/__init__.py
-from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+# veomni/models/transformers/your_custom_model/__init__.py
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 from .configuration_your_custom_model import YourCustomConfig
 
@@ -71,7 +71,7 @@ def register_modeling(architecture: str):
     return YourCustomModel
 ```
 
-Import the package from `veomni/models_kernel/transformers/__init__.py` so the
+Import the package from `veomni/models/transformers/__init__.py` so the
 decorators run at package import time. See the
 [new-model guide](../usage/support_new_models/guide_and_checklist.md) for the
 patchgen config and validation workflow.
@@ -81,7 +81,7 @@ patchgen config and validation workflow.
 The framework will automatically handle model loading based on the configuration. You can load your model using:
 
 ```python
-from veomni.models_kernel import build_foundation_model
+from veomni.models import build_foundation_model
 
 model = build_foundation_model(
     config_path=args.model.config_path,

@@ -54,11 +54,13 @@ class SavedState:
 def _make_autograd_fn(raw_forward: Callable, raw_backward: Callable) -> Callable:
     """Build a modeling wrapper from raw ``forward`` / ``backward``."""
 
+    raw_parameters = signature(raw_forward).parameters
     positional_parameters = tuple(
         parameter
-        for parameter in signature(raw_forward).parameters.values()
+        for parameter in raw_parameters.values()
         if parameter.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)
     )
+    accepts_grad_enabled = "grad_enabled" in raw_parameters
 
     class _OpFn(torch.autograd.Function):
         """Generated Function that calls the raw pair and unpacks ``SavedState``."""
@@ -110,6 +112,10 @@ def _make_autograd_fn(raw_forward: Callable, raw_backward: Callable) -> Callable
                 bound_tensors.append(parameter.default)
             else:
                 break
+        # Function.forward always runs under no_grad. Opt-in raw pairs that
+        # accept ``grad_enabled`` still see the caller's autograd mode.
+        if accepts_grad_enabled:
+            attrs.setdefault("grad_enabled", torch.is_grad_enabled())
         return _OpFn.apply(*bound_tensors, attrs)
 
     return wrapper
@@ -340,6 +346,19 @@ class VeomniOp:
         self.impl = impl
         self._entry = resolve_op(op, variant, impl)
         type(self)._intern[(op, variant, impl)] = self
+
+    def __copy__(self):
+        """Interned handles are identity-copied."""
+        return self
+
+    def __deepcopy__(self, memo):
+        """Interned handles are shared across deepcopy, including nn.Module clones."""
+        memo[id(self)] = self
+        return self
+
+    def __reduce__(self):
+        """Rebuild through interned ``(op, variant, impl)`` rather than a bare ``__new__``."""
+        return (VeomniOp, (self.op, self.variant, self.impl))
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Call ``entry.wrapper``. Tensors are positional, non-tensors are keywords."""

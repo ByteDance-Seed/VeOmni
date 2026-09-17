@@ -5,10 +5,10 @@
 This document provides in-depth implementation details for each patch applied in the **Qwen3-Omni-MoE** integration — VeOmni's most complex model type, covering image, video, and audio modalities with MoE and Expert Parallelism. Use this alongside [guide_and_checklist.md](./guide_and_checklist.md).
 
 > **Scope note:** VeOmni now ships patchgen-generated modeling files under
-> `veomni/models_kernel/transformers/<model>/generated/`. The actual patches live in
-> [veomni/models_kernel/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models_kernel/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py)
+> `veomni/models/transformers/<model>/generated/`. The actual patches live in
+> [veomni/models/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py)
 > rather than the runtime `apply_veomni_*_patch()` helpers shown below. The
-> patterns (config fix, FSDP dummy, SP, fused MoE, EP plan, processor patch)
+> patterns (config fix, FSDP dummy, SP, MoE `VeomniOp`, EP plan, processor patch)
 > are unchanged; what has changed is *where* the patches are declared
 > (declarative patchgen config emitted into `generated/`) rather than applied
 > at import time. See
@@ -199,59 +199,54 @@ if sp_enabled and pixel_values is not None:
 
 ---
 
-## P7. MoE: Fused Forward + Stacked Expert Weights
+## P7. MoE: Stacked Expert Weights + `VeomniOp`
 
-The standard HuggingFace MoE uses `nn.ModuleList` of individual expert MLPs. VeOmni replaces this with a single module holding stacked 3D weight tensors — required by both the fused triton kernel and EP sharding:
+The standard HuggingFace MoE uses `nn.ModuleList` of individual expert MLPs. VeOmni replaces this with a single module holding stacked 3D weight tensors and an instance-local `moe_experts` handle. `eager` is a registered row, not a separate `ModuleList` fork. EP sharding also requires the stacked layout.
 
 ```python
+from veomni.models.utils.op_utils import empty_bias, resolve_moe_impl
+from veomni.ops import VeomniOp
+
+
 class YourModelExperts(nn.Module):
     def __init__(self, config):
         super().__init__()
-        num_experts = config.num_experts
-        intermediate_size = config.moe_intermediate_size
-        hidden_size = config.hidden_size
-        # Shape: (num_experts, out_dim, in_dim)
-        self.gate_proj = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
-        self.up_proj   = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
-        self.down_proj = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_dim = config.moe_intermediate_size
+        # v5 fused layout: [E, 2*I, H] / [E, H, I]
+        self.gate_up_proj = nn.Parameter(
+            torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim)
+        )
+        self.down_proj = nn.Parameter(
+            torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
+        )
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
 
-    def forward(self, hidden_states, routing_weights, selected_experts, num_experts):
-        return fused_moe_forward(
-            num_experts=num_experts,
-            routing_weights=routing_weights,
-            selected_experts=selected_experts,
-            hidden_states=hidden_states,
-            fc1_1_weight=self.gate_proj,
-            fc1_2_weight=self.up_proj,
-            fc2_weight=self.down_proj,
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        unused = empty_bias(self.gate_up_proj)
+        return self.veomni_moe(
+            hidden_states,
+            top_k_weights,
+            top_k_index,
+            unused,
+            unused,
+            self.down_proj,
+            self.gate_up_proj,
+            num_experts=self.num_experts,
         )
 ```
 
-Keep the original `nn.ModuleList` path for `moe_implementation="eager"` (which does not support EP):
+Use `@config.replace_class("<M>Experts")` so the upstream `@use_experts_implementation` decorator is dropped. Pass the merged `gate_up_proj` as `fc1_1_2_weight`; leave the split `fc1_*` slots empty. Do not branch on `_moe_implementation in {"eager", "fused"}` or call a public `fused_moe_forward`.
 
-```python
-if self._moe_implementation == "fused":
-    self.experts = YourModelExperts(config)
-elif self._moe_implementation == "eager":
-    self.experts = nn.ModuleList([ExpertMLP(config) for _ in range(num_experts)])
-```
+Also patch `_init_weights` for the stacked parameters:
 
-> **If the model uses a fused `gate_up_proj`** (shape `(num_experts, hidden, 2 * expert_dim)`, e.g. Qwen3-VL MoE), split it before calling `fused_moe_forward`:
-> ```python
-> gate_proj_t = self.gate_up_proj[..., :expert_dim].transpose(1, 2).contiguous()
-> up_proj_t   = self.gate_up_proj[..., expert_dim:].transpose(1, 2).contiguous()
-> down_proj_t = self.down_proj.transpose(1, 2).contiguous()
-> ```
-> The transpose is needed because the checkpoint stores `(num_experts, hidden, expert_dim)` while `fused_moe_forward` expects `(num_experts, expert_dim, hidden)`.
-
-Also patch `_init_weights` for the stacked parameter:
 ```python
 @torch.no_grad()
 def custom_init_weights(self, module):
-    super(HFPreTrainedModel, self)._init_weights(module)
+    super()._init_weights(module)
     if isinstance(module, YourModelExperts):
-        nn.init.normal_(module.gate_proj, std=self.config.initializer_range)
-        nn.init.normal_(module.up_proj,   std=self.config.initializer_range)
+        nn.init.normal_(module.gate_up_proj, std=self.config.initializer_range)
         nn.init.normal_(module.down_proj, std=self.config.initializer_range)
 ```
 
@@ -304,18 +299,20 @@ if position_ids is not None and position_ids.ndim == 3 and position_ids.shape[1]
 
 ## P11. VeOmni Loss Utility
 
-Replace the model's built-in CE loss with the models-kernel helper and an
+Replace the model's built-in CE loss with the VeOmni model helper and an
 instance-local registry handle to get fused selection and correct SP loss reduction:
 
 ```python
 from functools import partial
 
+from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
-from veomni.models_kernel.loss_utils import ForCausalLMLoss
 
 # In the model constructor:
-self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", implementation)
-self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
 
 if labels is not None:
     loss, logits, aux = self.loss_function(
@@ -371,7 +368,7 @@ class YourModel(hf_your_model.YourModel):
 ### Three-Level Strategy
 
 ```
-Level 1 — Unit (single GPU, no real weights)   → tests/models/
+Level 1 — Registry/model parity                → tests/models/
 Level 2 — Parallel alignment (multi-GPU)        → tests/e2e/test_e2e_parallel.py
 Level 3 — End-to-end training (real data/ckpt)  → tests/e2e/test_e2e_training.py
 ```
@@ -382,7 +379,9 @@ Pass Level 1 before running Level 2, and Level 2 before Level 3.
 
 #### Toy Config
 
-Add a toy `config.json` (and `preprocessor_config.json` for multimodal) to `tests/toy_config/your_model_toy/` with drastically reduced sizes:
+Add one canonical tiny-config factory to `tests/models/tiny_configs.py`
+and reuse it from the registry and family tests. Keep dimensions small while
+retaining architecture-specific schedules and shape constraints:
 
 | Field | Real Qwen3-Omni-MoE | Toy version |
 |---|---|---|
@@ -393,7 +392,8 @@ Add a toy `config.json` (and `preprocessor_config.json` for multimodal) to `test
 
 For omni-modal models, copy `preprocessor_config.json` from the real model as-is — feature extractor parameters (mel bins, sample rate, patch size) are not reducible.
 
-Reference: [`tests/toy_config/qwen3omni_toy/config.json`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tests/toy_config/qwen3omni_toy/config.json)
+Reference: `tiny_qwen3_omni_moe_config` in
+`tests/models/tiny_configs.py`.
 
 #### Dummy Dataset
 
@@ -412,39 +412,25 @@ elif task_type == "your_model":
     return DummyYourModelDataset(size=size, seq_length=max_seq_len, patch_size=16)
 ```
 
-#### Forward/Backward Patch Test
+#### Registry and Forward/Backward Tests
 
-Add to `TEST_CASES` in [tests/models/test_models_patch.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/tests/models/test_models_patch.py):
+Add the model type, supported architectures, aliases, and prerequisites to
+`tests/models/base/test_auto_registry.py`. Add eager parity and
+model-specific contracts to the corresponding family test under
+`tests/models/transformers/qwen/`:
 
 ```python
-pytest.param(
-    "./tests/toy_config/your_model_toy",
-    is_moe,
-    _DEFAULT_RTOL,
-    _DEFAULT_ATOL,
-    id="your_model_type",   # must match model_type in config.json
+_ModelCase(
+    model_type="your_model_type",
+    config_factory=tiny_your_model_config,
+    architectures=("YourModelForConditionalGeneration",),
 ),
-```
-
-Also add `MODEL_TO_DATASET` entry and (for omni models) `parse_token_id_from_config` branch to [tests/models/utils.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/tests/models/utils.py):
-
-```python
-# MODEL_TO_DATASET
-"your_model_type": "your_dataset_key",
-
-# parse_token_id_from_config — omni models with nested thinker_config
-if model_config.model_type in ["qwen2_5_omni", "qwen3_omni_moe", "your_omni_model"]:
-    token_ids_dict = {
-        "image_token_id": model_config.thinker_config.image_token_id,
-        "video_token_id": model_config.thinker_config.video_token_id,
-        "audio_token_id": model_config.thinker_config.audio_token_id,
-    }
 ```
 
 Run:
 ```bash
 source .venv/bin/activate
-pytest -s tests/models/test_models_patch.py -k your_model_type
+pytest -s tests/models -k your_model_type
 ```
 
 ### Level 2 — Parallel Alignment Test
@@ -507,13 +493,11 @@ pytest -s tests/e2e/test_e2e_training.py -k your_model
 
 | What to add | Location | Required for |
 |---|---|---|
-| Toy `config.json` | `tests/toy_config/your_model_toy/` | All levels |
-| `preprocessor_config.json` | `tests/toy_config/your_model_toy/` | Multimodal |
+| Canonical tiny-config factory | `tests/models/tiny_configs.py` | Level 1 |
 | `DummyYourModelDataset` | `veomni/data/dummy_dataset.py` | Multimodal |
 | `build_dummy_dataset` entry | `veomni/data/dummy_dataset.py` | Multimodal |
-| `MODEL_TO_DATASET` entry | `tests/models/utils.py` | Level 1 |
-| `parse_token_id_from_config` branch | `tests/models/utils.py` | Omni-modal |
-| `pytest.param` in `TEST_CASES` | `tests/models/test_models_patch.py` | Level 1 |
+| Registry case | `tests/models/base/test_auto_registry.py` | Level 1 |
+| Family parity/contract tests | `tests/models/transformers/` | Level 1 |
 | `pytest.param` in `*_test_cases` | `tests/e2e/test_e2e_parallel.py` | Level 2 |
 | Dataset fixture | `tests/e2e/test_e2e_parallel.py` | Level 2 |
 | Test function | `tests/e2e/test_e2e_parallel.py` | Level 2 |

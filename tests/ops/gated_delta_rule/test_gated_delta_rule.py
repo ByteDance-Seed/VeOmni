@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import ast
 import sys
 from importlib import import_module
+from pathlib import Path
 from types import ModuleType
 
 import pytest
@@ -52,6 +54,15 @@ _FLA_DEVICE_CASES = (
     pytest.param("cuda", marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FLA needs a CUDA GPU")),
     pytest.param("mlu", marks=pytest.mark.skipif(not IS_MLU_AVAILABLE, reason="FLA needs an MLU")),
 )
+_TRITON_UTILS_MODULE = "veomni.ops.kernels.gated_delta_rule.vendor.triton.utils"
+
+
+@pytest.fixture
+def _stub_npu_input_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide the only vendored Triton utility used by mocked NPU wrappers."""
+    triton_utils = ModuleType(_TRITON_UTILS_MODULE)
+    triton_utils.input_guard = lambda fn: fn
+    monkeypatch.setitem(sys.modules, _TRITON_UTILS_MODULE, triton_utils)
 
 
 def _require_npu_gdr_dependencies(*, ascendc: bool = False) -> None:
@@ -161,18 +172,23 @@ def test_rms_norm_gated_npu_zero_gate_is_zero():
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="rms_norm_gated npu needs torch_npu")
-@pytest.mark.parametrize("eps", [1e-5, 1e-6, 1e-7])
-def test_rms_norm_gated_npu_uses_eps(eps):
+def test_rms_norm_gated_npu_uses_eps():
     eager = resolve_op("rms_norm_gated", "standard", "eager").wrapper
     other = resolve_op("rms_norm_gated", "standard", "npu").wrapper
-    torch.manual_seed(1)
-    x = torch.randn(1, 4, 32, device="npu", dtype=torch.bfloat16)
-    gate = torch.randn_like(x)
-    weight = torch.randn(32, device="npu", dtype=torch.bfloat16)
+    x = torch.linspace(-1e-3, 1e-3, 32).to(device="npu", dtype=torch.bfloat16)
+    x = x.reshape(1, 1, 32).expand(1, 4, 32).contiguous()
+    gate = torch.linspace(-1.0, 1.0, 32).to(device="npu", dtype=torch.bfloat16)
+    gate = gate.reshape(1, 1, 32).expand_as(x).contiguous()
+    weight = torch.ones(32, device="npu", dtype=torch.bfloat16)
 
-    out_e = eager(x, gate, weight, eps=eps)
-    out_o = other(x, gate, weight, eps=eps)
-    assert torch.allclose(out_o.float(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
+    outputs = []
+    for eps in (1e-5, 1e-6, 1e-7):
+        out_e = eager(x, gate, weight, eps=eps)
+        out_o = other(x, gate, weight, eps=eps)
+        assert torch.allclose(out_o.float(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
+        outputs.append(out_o)
+
+    assert all(not torch.equal(left, right) for left, right in zip(outputs[:-1], outputs[1:], strict=True))
 
 
 def _hf_qwen3_5_prefill_causal_conv1d(x: Tensor, weight: Tensor, bias: Tensor, *, kernel_size: int) -> Tensor:
@@ -386,11 +402,10 @@ def test_chunk_gated_delta_rule_adapter_forwards_scale(
 def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
     impl: str,
     monkeypatch: pytest.MonkeyPatch,
+    _stub_npu_input_guard: None,
 ) -> None:
     """Exercise the NPU raw-pair autograd glue without requiring NPU hardware."""
     module = import_module(f"veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.{impl}")
-    triton_utils = import_module("veomni.ops.kernels.gated_delta_rule.vendor.triton.utils")
-    monkeypatch.setattr(triton_utils, "input_guard", lambda fn: fn)
 
     head_first = impl == "npu_ascendc"
     explicit_scale = 0.375
@@ -459,12 +474,13 @@ def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
     assert seen_scales == [("forward", explicit_scale), ("backward", explicit_scale)]
 
 
-def test_npu_ascendc_packed_backward_reuses_normalized_cu_seqlens(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_npu_ascendc_packed_backward_reuses_normalized_cu_seqlens(
+    monkeypatch: pytest.MonkeyPatch,
+    _stub_npu_input_guard: None,
+) -> None:
     """Backward receives the accelerator/int64 boundaries used by forward."""
     from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import npu_ascendc as module
 
-    triton_utils = import_module("veomni.ops.kernels.gated_delta_rule.vendor.triton.utils")
-    monkeypatch.setattr(triton_utils, "input_guard", lambda fn: fn)
     observed: dict[str, Tensor] = {}
 
     def fake_chunk_fwd(query, key, value, g, beta, scale, initial_state, output_final_state, cu_seqlens, *args):
@@ -717,6 +733,85 @@ def test_ensure_varlen_metadata_reuses_precomputed_tables() -> None:
         assert got_list_dict[key] == values
 
 
+@pytest.mark.parametrize(
+    ("cu_seqlens", "expected"),
+    (
+        ([0, 0, 64], [[1, 0]]),
+        ([0, 64, 64, 128], [[0, 0], [2, 0]]),
+        ([0, 0, 0], []),
+        ([0, 128], [[0, 0], [0, 1]]),
+    ),
+)
+def test_prepare_chunk_indices_keeps_original_sequence_ids(cu_seqlens: list[int], expected: list[list[int]]) -> None:
+    """Empty sequences emit no rows, but later IDs are not compacted."""
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import npu_ascendc as m
+
+    boundaries = torch.tensor(cu_seqlens, dtype=torch.long)
+    tensor_rows = m._prepare_chunk_indices(boundaries, chunk_size=64)
+    list_rows = m._prepare_chunk_indices_list(cu_seqlens, chunk_size=64)
+    assert tensor_rows.tolist() == expected
+    assert list_rows == [item for row in expected for item in row]
+
+
+def test_npu_ascendc_rejects_trainable_initial_state(
+    monkeypatch: pytest.MonkeyPatch,
+    _stub_npu_input_guard: None,
+) -> None:
+    """Function.forward disables grad, so the check must use requires_grad."""
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import npu_ascendc as module
+
+    def unexpected_kernel(*args, **kwargs):
+        pytest.fail("trainable initial_state reached the AscendC kernel")
+
+    monkeypatch.setattr(module, "_chunk_fwd", unexpected_kernel)
+    shape = (1, 4, 2, 8)
+    query = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
+    key = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
+    value = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
+    g = torch.randn(shape[:3], dtype=torch.float32, requires_grad=True)
+    beta = torch.randn(shape[:3], dtype=torch.bfloat16, requires_grad=True)
+    initial_state = torch.randn(1, 2, 8, 8, dtype=torch.bfloat16, requires_grad=True)
+    entry = OpEntry(
+        "test_chunk_gdr_h0",
+        "standard",
+        "npu_ascendc",
+        module.forward,
+        module.backward,
+        description="Test trainable initial_state reject",
+    )
+    with pytest.raises(NotImplementedError, match="cannot differentiate initial_state"):
+        entry.wrapper(query, key, value, g, beta, initial_state=initial_state)
+
+
+def test_npu_ascendc_rejects_final_state_when_inputs_require_grad(
+    monkeypatch: pytest.MonkeyPatch,
+    _stub_npu_input_guard: None,
+) -> None:
+    """A final-state-only loss cannot silently drop dht and keep Q/K/V grads."""
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import npu_ascendc as module
+
+    def unexpected_kernel(*args, **kwargs):
+        pytest.fail("output_final_state reached the AscendC kernel")
+
+    monkeypatch.setattr(module, "_chunk_fwd", unexpected_kernel)
+    shape = (1, 4, 2, 8)
+    query = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
+    key = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
+    value = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
+    g = torch.randn(shape[:3], dtype=torch.float32, requires_grad=True)
+    beta = torch.randn(shape[:3], dtype=torch.bfloat16, requires_grad=True)
+    entry = OpEntry(
+        "test_chunk_gdr_dht",
+        "standard",
+        "npu_ascendc",
+        module.forward,
+        module.backward,
+        description="Test trainable final-state reject",
+    )
+    with pytest.raises(NotImplementedError, match="cannot differentiate the final state"):
+        entry.wrapper(query, key, value, g, beta, output_final_state=True)
+
+
 def test_npu_ascendc_missing_fla_npu_raises_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
     import builtins
     import sys
@@ -735,3 +830,27 @@ def test_npu_ascendc_missing_fla_npu_raises_actionable(monkeypatch: pytest.Monke
 
     with pytest.raises(RuntimeError, match="npu_ascendc"):
         m._ensure_fla_npu_registered()
+
+
+@pytest.mark.parametrize(
+    "module_path",
+    (
+        "veomni.ops.kernels.gated_delta_rule.vendor.triton.chunk_scaled_dot_kkt",
+        "veomni.ops.kernels.gated_delta_rule.vendor.triton_core.chunk_scaled_dot_kkt",
+    ),
+)
+def test_chunk_scaled_dot_kkt_fwd_requires_g_and_beta(module_path: str) -> None:
+    """Pin the vendor signature without importing Triton driver helpers."""
+    source_path = Path(__file__).resolve().parents[3].joinpath(*module_path.split(".")).with_suffix(".py")
+    source = source_path.read_text(encoding="utf-8")
+    function = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "chunk_scaled_dot_kkt_fwd"
+    )
+    positional = function.args.args
+    defaults = [None] * (len(positional) - len(function.args.defaults)) + list(function.args.defaults)
+    by_name = {arg.arg: default for arg, default in zip(positional, defaults, strict=True)}
+    assert by_name["g"] is None
+    assert by_name["beta"] is None
+    assert "requires g and beta" in source

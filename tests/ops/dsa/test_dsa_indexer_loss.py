@@ -17,6 +17,7 @@
 import pytest
 import torch
 
+from tests.ops.tol import ATTN_ATOL, ATTN_RTOL
 from tests.ops.utils import require_nvidia_cuda
 from veomni.utils.device import get_device_type
 
@@ -26,31 +27,27 @@ DEVICE = get_device_type()
 _VENDOR_TARGET = "veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_target"
 
 
-def test_wrapper_rejects_pre_sm90_before_import(monkeypatch):
+@pytest.mark.parametrize(
+    ("hip_version", "compute_capability", "match"),
+    (
+        (None, 89, "SM90 or later"),
+        ("6.0", 90, "NVIDIA CUDA"),
+    ),
+    ids=("pre-sm90", "rocm"),
+)
+def test_wrapper_rejects_unsupported_nvidia_platform_before_import(
+    monkeypatch, hip_version, compute_capability, match
+):
     import sys
 
     sys.modules.pop(_VENDOR_TARGET, None)
     import veomni.ops.kernels.dsa.sparse_mqa_target as target
 
+    monkeypatch.setattr(target.torch.version, "hip", hip_version, raising=False)
     monkeypatch.setattr(target, "IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr(target, "get_gpu_compute_capability", lambda: 89)
+    monkeypatch.setattr(target, "get_gpu_compute_capability", lambda: compute_capability)
 
-    with pytest.raises(RuntimeError, match="SM90 or later"):
-        target.sparse_mqa_target_fwd(torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0))
-    assert _VENDOR_TARGET not in sys.modules
-
-
-def test_wrapper_rejects_rocm_before_import(monkeypatch):
-    import sys
-
-    sys.modules.pop(_VENDOR_TARGET, None)
-    import veomni.ops.kernels.dsa.sparse_mqa_target as target
-
-    monkeypatch.setattr(target.torch.version, "hip", "6.0", raising=False)
-    monkeypatch.setattr(target, "IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr(target, "get_gpu_compute_capability", lambda: 90)
-
-    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+    with pytest.raises(RuntimeError, match=match):
         target.sparse_mqa_target_fwd(torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0))
     assert _VENDOR_TARGET not in sys.modules
 
@@ -317,8 +314,12 @@ def test_sparse_attn_returns_non_differentiable_lse():
 
     out_only = sparse_attn_tilelang(q, kv, sink, topk, d**-0.5)
     out, lse = sparse_attn_tilelang(q, kv, sink, topk, d**-0.5, return_lse=True)
+    _, eager_lse = VeomniOp("dsa_attention", "deepseek_v4", "eager")(
+        q.detach(), kv.detach(), sink.detach(), topk, d**-0.5, return_lse=True
+    )
 
     torch.testing.assert_close(out_only, out)
+    torch.testing.assert_close(lse, eager_lse, atol=ATTN_ATOL, rtol=ATTN_RTOL)
     assert lse.shape == (b, s, heads)
     assert lse.dtype == torch.float32
     assert not lse.requires_grad, "the LSE feeds a detached teacher and must not open a path back into attention"

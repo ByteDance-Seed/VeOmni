@@ -45,8 +45,7 @@ import transformers
 import yaml
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
-from veomni.models_kernel import MODELING_REGISTRY
-from veomni.models_kernel import build_foundation_model as build_kernel_foundation_model
+from veomni.models import MODELING_REGISTRY, build_foundation_model
 from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
@@ -165,11 +164,10 @@ def fused_npu_moe_ops() -> OpsImplementationConfig:
 
 
 def build_lora_test_model(config_path: str, **kwargs):
-    """Build a registered model family through ``models_kernel``.
+    """Build a registered model family through ``veomni.models``.
 
-    LoRA tests span model families that are moving to ``models_kernel`` in
-    separate changes. Skip pending families until their registration lands;
-    the same test activates automatically once the family is registered.
+    LoRA tests may receive an unsupported toy configuration, so skip model
+    types that are not present in the public registry.
     """
     config_file = Path(config_path)
     if config_file.is_dir():
@@ -177,9 +175,9 @@ def build_lora_test_model(config_path: str, **kwargs):
     model_type = yaml.safe_load(config_file.read_text(encoding="utf-8"))["model_type"]
 
     if model_type not in MODELING_REGISTRY.valid_keys():
-        pytest.skip(f"{model_type}: not registered in veomni.models_kernel yet")
+        pytest.skip(f"{model_type}: not registered in veomni.models yet")
 
-    return build_kernel_foundation_model(config_path=config_path, **kwargs)
+    return build_foundation_model(config_path=config_path, **kwargs)
 
 
 def build_toy(toy_dir: str, *, ops: OpsImplementationConfig | None = None):

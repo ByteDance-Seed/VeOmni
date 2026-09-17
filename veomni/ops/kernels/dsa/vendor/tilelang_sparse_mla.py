@@ -51,20 +51,21 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
 
 
 def sparse_attn_tilelang(q, kv, attn_sink, topk_idxs, sm_scale=None, return_lse=False):
-    """Sparse MQA over the top-k gathered KV entries.
+    """Sparse MQA over selected gathered KV entries.
 
     Args:
         q:          [B, S, H, D] bf16
         kv:         [B, S_kv, D] bf16
         attn_sink:  [H] fp32
-        topk_idxs:  [B, S, topk] int32
+        topk_idxs:  [B, S, K] int32, where K is the selected candidate width
         sm_scale:   softmax scale, defaults to ``1/sqrt(D)``
-        return_lse: also return the log-sum-exp the forward already computed.
+        return_lse: also return the detached base-2 log-sum-exp already computed.
             The indexer's teacher distribution needs it to renormalize the
             sparse scores, and the kernel writes it either way.
 
     Returns:
-        [B, S, H, D] bf16, or that and the [B, S, H] fp32 LSE when ``return_lse``
+        [B, S, H, D] bf16, or that and the detached [B, S, H] fp32 base-2
+        LSE when ``return_lse``
     """
     # The kernels are compiled for bf16 operands. Callers run under autocast,
     # whose fp32 op policy (sum, rsqrt, ...) can silently promote an upstream

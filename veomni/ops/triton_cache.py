@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compile-once cache for Triton JIT factories.
+"""Cache for Triton JIT factory functions.
 
 Not a kernel registry. A factory is a no-arg function that imports Triton,
-defines one ``@triton.jit`` kernel, and returns it. First call compiles;
-later calls reuse the same object. Launch stays ``factory()[grid](...)``.
+defines one ``@triton.jit`` kernel, and returns it. ``functools.cache``
+memoizes that factory so the kernel object is built once. Compilation still
+happens on the first launch with a concrete shape, not when the factory is
+first called. Launch stays ``factory()[grid](...)``.
 """
 
 from __future__ import annotations
@@ -30,5 +32,8 @@ F = TypeVar("F", bound=Callable[[], Callable])
 
 
 def cached_triton_kernel(factory: F) -> F:
-    """Run ``factory`` once; later calls reuse the compiled JIT kernel."""
+    """Run ``factory`` once; later calls reuse the same JIT kernel object.
+
+    The factory return is cached. Triton compiles on first launch.
+    """
     return cache(factory)  # type: ignore[return-value]

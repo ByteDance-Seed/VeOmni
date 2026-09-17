@@ -19,12 +19,12 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
 from transformers import GptOssConfig, Qwen3MoeConfig
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
 
+from tests.ops.moe_experts.reference import standard_fused_reference
 from tests.ops.tol import (
     EAGER_ATOL,
     EAGER_GRAD_ATOL,
@@ -49,7 +49,7 @@ from tests.ops.tol import (
     MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
     MOE_SPLIT_MERGED_GRAD_HIDDEN_RTOL,
 )
-from tests.ops.utils import make_grad_leaf, require_nvidia_cuda
+from tests.ops.utils import assert_reference_signal, make_grad_leaf, require_nvidia_cuda
 from veomni.ops import resolve_op
 from veomni.ops.kernels.moe_experts.shared.indices import build_moe_indices
 from veomni.ops.kernels.moe_experts.standard.npu import _fc1_weight
@@ -65,41 +65,6 @@ def _route(num_tokens: int, num_experts: int, top_k: int, device: torch.device |
     logits = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
     routing_weights, selected_experts = torch.topk(torch.softmax(logits, dim=-1), top_k, dim=-1)
     return routing_weights.to(dtype), selected_experts
-
-
-def _standard_fused_ref(
-    hidden: Tensor,
-    routing: Tensor,
-    selected: Tensor,
-    fc1_1: Tensor,
-    fc1_2: Tensor,
-    fc2: Tensor,
-    *,
-    num_experts: int,
-    swiglu_limit: float | None = None,
-) -> Tensor:
-    """Fused operator-order reference for ``moe_experts`` ``standard``.
-
-    Routing weights scale the SwiGLU intermediate, then ``fc2``. Triton
-    and Quack non-EP rows use this order. NPU applies routing after fc2.
-    """
-    output = torch.zeros_like(hidden)
-    expert_mask = F.one_hot(selected, num_classes=num_experts).permute(2, 1, 0)
-    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-    for expert_idx in expert_hit:
-        idx = int(expert_idx[0].item())
-        top_k_pos, token_idx = torch.where(expert_mask[idx])
-        x = hidden[token_idx]
-        gate = F.linear(x, fc1_1[idx])
-        up = F.linear(x, fc1_2[idx])
-        if swiglu_limit is not None:
-            gate = gate.clamp(max=swiglu_limit)
-            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-        y = F.silu(gate) * up
-        y = y * routing[token_idx, top_k_pos, None]
-        y = F.linear(y, fc2[idx])
-        output.index_add_(0, token_idx, y.to(output.dtype))
-    return output
 
 
 def _gpt_oss_hf_loop(
@@ -196,8 +161,8 @@ def test_standard_eager_matches_hf_qwen3_moe_experts():
         gu_e,
         num_experts=num_experts,
     )
-    # Pre-fc2 vs post-fc2 routing is algebraically the same without down bias,
-    # but the multiply order leaves a few ulps.
+    # Moving routing across bias-free fc2 is equivalent in real arithmetic.
+    # Floating-point operation order still changes rounding, especially in BF16.
     assert torch.allclose(out_e, out_h, atol=1e-5, rtol=1e-5)
 
     go = torch.randn_like(out_e)
@@ -219,7 +184,15 @@ def test_eager_matches_fused_reference():
     fc2 = torch.randn(num_experts, hidden_dim, ffn_dim)
 
     hidden_h, routing_h, fc1_1_h, fc1_2_h, fc2_h = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
-    out_h = _standard_fused_ref(hidden_h, routing_h, selected, fc1_1_h, fc1_2_h, fc2_h, num_experts=num_experts)
+    out_h = standard_fused_reference(
+        hidden_h,
+        routing_h,
+        selected,
+        fc1_1_h,
+        fc1_2_h,
+        fc2_h,
+        num_experts=num_experts,
+    )
 
     hidden_e, routing_e, fc1_1_e, fc1_2_e, fc2_e = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
     out_e = resolve_op("moe_experts", "standard", "eager").wrapper(
@@ -364,6 +337,7 @@ def _run_fused_vs_eager(
     routing: Tensor | None = None,
     seed: int = 0,
     device: torch.device | None = None,
+    data_scale: float = 0.4,
 ):
     torch.manual_seed(seed)
     if device is None:
@@ -375,13 +349,13 @@ def _run_fused_vs_eager(
             device = torch.device("cuda")
     dtype = torch.bfloat16
     num_tokens, num_experts, hidden_dim, ffn_dim, top_k = shape
-    hidden = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
+    hidden = data_scale * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
     if routing is None or selected is None:
         routing, selected = _route(num_tokens, num_experts, top_k, device, dtype)
-    fc1_1 = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
-    fc1_2 = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_1 = data_scale * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_2 = data_scale * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
     fc1_12 = torch.cat([fc1_1, fc1_2], dim=1).contiguous()
-    fc2 = 0.1 * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
+    fc2 = data_scale * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
     empty = _empty(device, dtype)
 
     eager = resolve_op("moe_experts", "standard", "eager").wrapper
@@ -407,11 +381,27 @@ def _run_fused_vs_eager(
         hidden_atol, hidden_rtol = MOE_FUSED_GRAD_HIDDEN_ATOL, MOE_FUSED_GRAD_HIDDEN_RTOL
         fc1_atol, fc1_rtol = MOE_FUSED_GRAD_FC1_ATOL, MOE_FUSED_GRAD_FC1_RTOL
         fc2_atol, fc2_rtol = MOE_FUSED_GRAD_FC2_ATOL, MOE_FUSED_GRAD_FC2_RTOL
-    assert torch.allclose(out_e.float(), out_o.float(), atol=fwd_atol, rtol=fwd_rtol)
-
     go = torch.randn_like(out_e)
     out_e.backward(go)
     out_o.backward(go)
+    reference_checks = [
+        ("output", out_e, fwd_atol, fwd_rtol),
+        ("hidden gradient", hidden_e.grad, hidden_atol, hidden_rtol),
+        ("routing gradient", routing_e.grad, hidden_atol, hidden_rtol),
+        ("fc2 gradient", fc2_e.grad, fc2_atol, fc2_rtol),
+    ]
+    if merged:
+        reference_checks.append(("fc1 gradient", fc1_12_e.grad, fc1_atol, fc1_rtol))
+    else:
+        reference_checks.extend(
+            (
+                ("fc1_1 gradient", fc1_1_e.grad, fc1_atol, fc1_rtol),
+                ("fc1_2 gradient", fc1_2_e.grad, fc1_atol, fc1_rtol),
+            )
+        )
+    for name, reference, atol, rtol in reference_checks:
+        assert_reference_signal(name, reference, atol, rtol)
+    assert torch.allclose(out_e.float(), out_o.float(), atol=fwd_atol, rtol=fwd_rtol)
     assert torch.allclose(hidden_e.grad.float(), hidden_o.grad.float(), atol=hidden_atol, rtol=hidden_rtol)
     assert torch.allclose(routing_e.grad.float(), routing_o.grad.float(), atol=hidden_atol, rtol=hidden_rtol)
     assert torch.allclose(fc2_e.grad.float(), fc2_o.grad.float(), atol=fc2_atol, rtol=fc2_rtol)
@@ -431,6 +421,8 @@ def _run_fused_three_way(
     routing: Tensor | None = None,
     seed: int = 0,
     device: torch.device | None = None,
+    data_scale: float = 0.1,
+    require_active_clamp: bool = False,
 ):
     """Compare one fused implementation's split and merged layouts with eager."""
     torch.manual_seed(seed)
@@ -438,17 +430,24 @@ def _run_fused_three_way(
         device = torch.device("cuda")
     dtype = torch.bfloat16
     num_tokens, num_experts, hidden_dim, ffn_dim, top_k = shape
-    hidden = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
+    hidden = data_scale * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
     if routing is None or selected is None:
         routing, selected = _route(num_tokens, num_experts, top_k, device, dtype)
-    fc1_1 = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
-    fc1_2 = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_1 = data_scale * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_2 = data_scale * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
     fc1_12 = torch.cat([fc1_1, fc1_2], dim=1).contiguous()
-    fc2 = 0.1 * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
+    fc2 = data_scale * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
     empty = _empty(device, dtype)
     fused = resolve_op("moe_experts", "standard", impl).wrapper
     eager = resolve_op("moe_experts", "standard", "eager").wrapper
     kwargs = {"num_experts": num_experts, "swiglu_limit": swiglu_limit}
+
+    if require_active_clamp:
+        assert swiglu_limit is not None
+        routed_hidden = hidden[:, None, :].expand(-1, top_k, -1)
+        gate = torch.einsum("tkh,tkfh->tkf", routed_hidden, fc1_1[selected])
+        up = torch.einsum("tkh,tkfh->tkf", routed_hidden, fc1_2[selected])
+        assert (gate > swiglu_limit).any() or (up.abs() > swiglu_limit).any()
 
     hidden_s, routing_s, fc1_1_s, fc1_2_s, fc2_s = map(make_grad_leaf, (hidden, routing, fc1_1, fc1_2, fc2))
     hidden_m, routing_m, fc1_12_m, fc2_m = map(make_grad_leaf, (hidden, routing, fc1_12, fc2))
@@ -491,6 +490,16 @@ def _run_fused_three_way(
         hidden_atol, hidden_rtol = MOE_FUSED_GRAD_HIDDEN_ATOL, MOE_FUSED_GRAD_HIDDEN_RTOL
         fc1_atol, fc1_rtol = MOE_FUSED_GRAD_FC1_ATOL, MOE_FUSED_GRAD_FC1_RTOL
         fc2_atol, fc2_rtol = MOE_FUSED_GRAD_FC2_ATOL, MOE_FUSED_GRAD_FC2_RTOL
+    reference_checks = (
+        ("output", out_e, fwd_atol, fwd_rtol),
+        ("hidden gradient", hidden_e.grad, hidden_atol, hidden_rtol),
+        ("routing gradient", routing_e.grad, hidden_atol, hidden_rtol),
+        ("fc1_1 gradient", fc1_1_e.grad, fc1_atol, fc1_rtol),
+        ("fc1_2 gradient", fc1_2_e.grad, fc1_atol, fc1_rtol),
+        ("fc2 gradient", fc2_e.grad, fc2_atol, fc2_rtol),
+    )
+    for name, reference, atol, rtol in reference_checks:
+        assert_reference_signal(name, reference, atol, rtol)
     assert torch.allclose(out_m.float(), out_e.float(), atol=fwd_atol, rtol=fwd_rtol)
     assert torch.allclose(hidden_m.grad.float(), hidden_e.grad.float(), atol=hidden_atol, rtol=hidden_rtol)
     assert torch.allclose(routing_m.grad.float(), routing_e.grad.float(), atol=hidden_atol, rtol=hidden_rtol)
@@ -501,6 +510,17 @@ def _run_fused_three_way(
         atol=fc1_atol,
         rtol=fc1_rtol,
     )
+
+
+def test_reference_signal_rejects_all_zero_and_tiny_values():
+    """NPU/MLU comparisons must fail when the reference cannot beat the budget."""
+    zeros = torch.zeros(4, 4)
+    with pytest.raises(AssertionError, match="signal is too small"):
+        assert_reference_signal("zeros", zeros, atol=1e-2, rtol=1e-2)
+    tiny = torch.full((4, 4), 1e-4)
+    with pytest.raises(AssertionError, match="signal is too small"):
+        assert_reference_signal("tiny", tiny, atol=1e-2, rtol=1e-2)
+    assert_reference_signal("ones", torch.ones(4, 4), atol=1e-2, rtol=1e-2)
 
 
 def test_npu_fc1_layout_matches_eager_contract():
@@ -518,7 +538,12 @@ def test_npu_fc1_layout_matches_eager_contract():
 )
 @pytest.mark.parametrize("swiglu_limit", (None, 1.0))
 def test_triton_split_and_merged_match_eager(swiglu_limit: float | None):
-    _run_fused_three_way("fused_triton", swiglu_limit=swiglu_limit)
+    _run_fused_three_way(
+        "fused_triton",
+        swiglu_limit=swiglu_limit,
+        data_scale=0.4,
+        require_active_clamp=swiglu_limit is not None,
+    )
 
 
 @pytest.mark.skipif(
@@ -552,7 +577,12 @@ def test_triton_split_and_merged_match_eager_larger_gpu():
 @pytest.mark.skipif(not is_quack_gemm_available(), reason="quack fused MoE needs SM90+")
 @pytest.mark.parametrize("swiglu_limit", (None, 1.0))
 def test_quack_split_and_merged_match_eager(swiglu_limit: float | None):
-    _run_fused_three_way("fused_quack", swiglu_limit=swiglu_limit)
+    _run_fused_three_way(
+        "fused_quack",
+        swiglu_limit=swiglu_limit,
+        data_scale=0.4,
+        require_active_clamp=swiglu_limit is not None,
+    )
 
 
 @pytest.mark.skipif(not is_quack_gemm_available(), reason="gpt_oss quack needs SM90+")
@@ -613,6 +643,16 @@ def test_gpt_oss_quack_matches_eager():
         atol=MOE_FUSED_SWIGLU_GRAD_FC2_ATOL,
         rtol=MOE_FUSED_SWIGLU_GRAD_FC2_RTOL,
     )
+
+
+@pytest.mark.skipif(
+    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+    reason="triton fused MoE needs a GPU + triton",
+)
+def test_fused_vs_eager_helper_has_useful_signal_on_cuda():
+    """The NPU/MLU helper must keep a useful reference signal on the GPU path."""
+    _run_fused_vs_eager("fused_triton")
+    _run_fused_vs_eager("fused_triton", merged=True)
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU fused MoE needs torch_npu")

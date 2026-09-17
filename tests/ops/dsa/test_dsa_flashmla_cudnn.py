@@ -1,7 +1,87 @@
+"""FlashMLA forward and cuDNN backward adapter contract tests for GLM DSA."""
+
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+from veomni.ops.kernels.dsa.topk import local_topk_to_global, mask_topk_indices_to_query_range
+
+
+def test_local_topk_to_global_masks_out_of_range_indices():
+    """A local index >= kv_len must not wrap into the next batch."""
+    topk_indices = torch.tensor(
+        [
+            [[0, 4, -1], [3, 5, 1]],
+            [[0, 1, 4], [2, -2, 3]],
+        ],
+        dtype=torch.int32,
+    )
+    global_indices = local_topk_to_global(topk_indices, seqlen_k=4)
+    assert global_indices.dtype == torch.int32
+    assert global_indices.tolist() == [
+        [[0, -1, -1], [3, -1, 1]],
+        [[4, 5, -1], [6, -1, 7]],
+    ]
+
+
+def test_mask_topk_indices_to_query_range_drops_invisible_keys():
+    """A globally legal index outside [ks, ke) must not reach indexer backward."""
+    topk_indices = torch.tensor(
+        [
+            [[0, 3], [1, 2]],
+        ],
+        dtype=torch.int32,
+    )
+    grad_scores = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    ks = torch.tensor([0, 2], dtype=torch.int32)
+    ke = torch.tensor([2, 4], dtype=torch.int32)
+    masked, masked_grad = mask_topk_indices_to_query_range(topk_indices, ks, ke, grad_scores)
+    assert masked.tolist() == [[[0, -1], [-1, 2]]]
+    assert masked_grad.tolist() == [[[1.0, 0.0], [0.0, 4.0]]]
+
+
+def test_v4_indexer_function_backward_masks_out_of_window_slots(monkeypatch):
+    """A globally legal index outside [ks, ke) must not reach the bwd kernel."""
+    pytest.importorskip("tilelang")
+    from veomni.ops.kernels.dsa.vendor import tilelang_indexer as indexer
+    from veomni.ops.kernels.dsa.vendor import tilelang_indexer_bwd as bwd
+
+    seen: dict[str, torch.Tensor] = {}
+
+    def fake_interface(index_q, weights, index_k, topk_indices, grad_scores):
+        seen["topk"] = topk_indices.detach().clone()
+        seen["grad"] = grad_scores.detach().clone()
+        valid = topk_indices >= 0
+        scale = grad_scores.masked_fill(~valid, 0).sum()
+        return (
+            torch.ones_like(index_q) * scale,
+            torch.ones_like(weights, dtype=torch.float32) * scale,
+            torch.ones_like(index_k, dtype=torch.float32) * scale,
+        )
+
+    monkeypatch.setattr(bwd, "indexer_bwd_interface", fake_interface)
+
+    seqlen, batch, heads, dim, kv_len = 2, 1, 8, 32, 4
+    index_q = torch.zeros(seqlen, batch, heads, dim)
+    index_k = torch.zeros(kv_len, batch, dim)
+    weights = torch.zeros(seqlen, batch, heads)
+    topk_indices = torch.tensor([[[0, 3], [1, 2]]], dtype=torch.int32)
+    grad_scores = torch.tensor([[[1.0, 100.0], [100.0, 1.0]]])
+    ks = torch.tensor([0, 2], dtype=torch.int32)
+    ke = torch.tensor([2, 4], dtype=torch.int32)
+
+    ctx = type("Ctx", (), {})()
+    ctx.saved_tensors = (index_q, index_k, weights, ks, ke, topk_indices)
+    ctx.compress_ratio = 1
+    ctx.topk = 2
+    grad_q, grad_k, grad_w, *_ = indexer.V4IndexerFunction.backward(ctx, grad_scores, None)
+
+    assert seen["topk"].tolist() == [[0, -1], [-1, 2]]
+    assert seen["grad"].tolist() == [[1.0, 0.0], [0.0, 1.0]]
+    torch.testing.assert_close(grad_q, torch.full_like(index_q, 2.0))
+    torch.testing.assert_close(grad_w, torch.full_like(weights, 2.0))
+    torch.testing.assert_close(grad_k, torch.ones(kv_len, batch, dim) * 2.0)
 
 
 @pytest.fixture
@@ -35,6 +115,24 @@ def test_indexer_select_topk_uses_cudnn_score_wrapper(monkeypatch, dsa):
 
     assert indices.dtype == torch.long
     assert indices.tolist() == [[[1, 2], [0, 2]]]
+
+
+def test_indexer_select_topk_invalidates_non_finite_scores(monkeypatch, dsa):
+    scores = torch.tensor([[[0.0, float("-inf"), float("-inf")]]], dtype=torch.float32)
+
+    monkeypatch.setattr(
+        dsa,
+        "DSA",
+        SimpleNamespace(indexer_forward_wrapper=lambda *args, **kwargs: {"scores": scores}),
+    )
+
+    indices = dsa.indexer_select_topk(
+        torch.empty(1, 1, 1, 1),
+        torch.empty(1, 3, 1),
+        torch.empty(1, 1, 1),
+        3,
+    )
+    assert indices.tolist() == [[[0, -1, -1]]]
 
 
 def test_sparse_attention_backward_flattens_batched_inputs(monkeypatch, dsa):
@@ -127,44 +225,27 @@ def test_flash_mla_sparse_forward_returns_lse(monkeypatch, dsa):
     assert torch.equal(result["lse"], expected_lse)
 
 
-def test_flash_mla_sparse_forward_compatibility_rejects_unaligned_topk(dsa):
-    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
+@pytest.mark.parametrize(
+    ("rope_dim", "topk", "with_sink", "expected_reason"),
+    (
+        (64, 64, False, "multiple of 128"),
+        (32, 128, False, "packed q/k dim 576"),
+        (64, 128, True, "learnable_sink"),
+    ),
+    ids=("unaligned-topk", "unsupported-packed-dim", "learnable-sink"),
+)
+def test_flash_mla_sparse_forward_compatibility_rejections(dsa, rope_dim, topk, with_sink, expected_reason):
+    q_pe = torch.empty(1, 2, 128, rope_dim, dtype=torch.bfloat16)
+    k_pe = torch.empty(1, 4, 1, rope_dim, dtype=torch.bfloat16)
     kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
     q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 64, dtype=torch.int32)
-
-    compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(q_pe, k_pe, kv_cache, q_nope, gather)
-
-    assert not compatible
-    assert "multiple of 128" in reason
-
-
-def test_flash_mla_sparse_forward_compatibility_rejects_unsupported_packed_dim(dsa):
-    q_pe = torch.empty(1, 2, 128, 32, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 32, dtype=torch.bfloat16)
-    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
-    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
-
-    compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(q_pe, k_pe, kv_cache, q_nope, gather)
-
-    assert not compatible
-    assert "packed q/k dim 576" in reason
-
-
-def test_flash_mla_sparse_forward_compatibility_rejects_sink(dsa):
-    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
-    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
-    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
-    sink = torch.zeros(128, dtype=torch.bfloat16)
+    gather = torch.zeros(1, 2, topk, dtype=torch.int32)
+    sink = torch.zeros(128, dtype=torch.bfloat16) if with_sink else None
 
     compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(q_pe, k_pe, kv_cache, q_nope, gather, sink)
 
     assert not compatible
-    assert "learnable_sink" in reason
+    assert expected_reason in reason
 
 
 def test_pack_flash_mla_tensors_for_sparse_backward(dsa):
@@ -241,33 +322,18 @@ def test_flash_mla_sparse_attention_with_cudnn_backward_splits_gradients(monkeyp
     assert torch.equal(k_pe.grad, torch.full_like(k_pe, 4.0))
 
 
-def test_sparse_attention_backward_compatibility_rejects_expanded_kv_layout(dsa):
+@pytest.mark.parametrize(
+    ("kv_shape", "value_dim", "expected_reason"),
+    (
+        ((2, 4, 7, 5), 5, "unified K=V"),
+        ((2, 7, 5), 6, "value dim"),
+    ),
+    ids=("expanded-kv", "split-value-dim"),
+)
+def test_sparse_attention_backward_compatibility_rejections(dsa, kv_shape, value_dim, expected_reason):
     q = torch.empty(2, 3, 4, 5, dtype=torch.bfloat16)
-    expanded_key = torch.empty(2, 4, 7, 5, dtype=torch.bfloat16)
-    out = torch.empty(2, 3, 4, 5, dtype=torch.bfloat16)
-    dout = torch.empty_like(out)
-    lse = torch.empty(2, 3, 4, dtype=torch.float32)
-    attn_sink = torch.empty(4, dtype=torch.float32)
-    topk_indices = torch.zeros(2, 3, 2, dtype=torch.long)
-
-    compatible, reason = dsa.check_sparse_attention_backward_compatible(
-        q,
-        expanded_key,
-        out,
-        dout,
-        lse,
-        attn_sink,
-        topk_indices,
-    )
-
-    assert not compatible
-    assert "unified K=V" in reason
-
-
-def test_sparse_attention_backward_compatibility_rejects_split_value_dim(dsa):
-    q = torch.empty(2, 3, 4, 5, dtype=torch.bfloat16)
-    kv = torch.empty(2, 7, 5, dtype=torch.bfloat16)
-    out = torch.empty(2, 3, 4, 6, dtype=torch.bfloat16)
+    kv = torch.empty(kv_shape, dtype=torch.bfloat16)
+    out = torch.empty(2, 3, 4, value_dim, dtype=torch.bfloat16)
     dout = torch.empty_like(out)
     lse = torch.empty(2, 3, 4, dtype=torch.float32)
     attn_sink = torch.empty(4, dtype=torch.float32)
@@ -284,4 +350,4 @@ def test_sparse_attention_backward_compatibility_rejects_split_value_dim(dsa):
     )
 
     assert not compatible
-    assert "value dim" in reason
+    assert expected_reason in reason

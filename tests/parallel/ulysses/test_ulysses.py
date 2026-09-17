@@ -19,7 +19,6 @@ if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backen
 
 import pytest
 import torch.distributed as dist
-from torch.testing._internal.common_utils import run_tests
 from transformers.masking_utils import create_causal_mask
 
 from veomni.distributed.sequence_parallel.comm import (
@@ -536,4 +535,6 @@ if __name__ == "__main__":
 
     set_seed(seed=0, full_determinism=True)
     enable_high_precision_for_bf16()
+    from torch.testing._internal.common_utils import run_tests
+
     run_tests()

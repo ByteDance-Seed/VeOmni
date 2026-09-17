@@ -1,4 +1,3 @@
-import copy
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
@@ -216,7 +215,7 @@ def test_compile_decoder_blocks_targets_qwen3_vl_text_layers_only(monkeypatch):
 
 @pytest.mark.parametrize("use_checkpoint", [False, True])
 def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
-    from veomni.models_kernel.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
         Qwen3VLTextConfig,
         Qwen3VLTextDecoderLayer,
         Qwen3VLTextRotaryEmbedding,
@@ -241,7 +240,8 @@ def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
     config._attn_implementation = "eager"
 
     eager_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0)
-    compiled_layer = copy.deepcopy(eager_layer)
+    compiled_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0)
+    compiled_layer.load_state_dict(eager_layer.state_dict())
     if use_checkpoint:
         for layer in (eager_layer, compiled_layer):
             layer.gradient_checkpointing = True
@@ -279,7 +279,7 @@ def test_qwen3_vl_compiled_decoder_matches_eager_packed_flash_attention():
     pytest.importorskip("flash_attn")
 
     from veomni.data.data_collator import add_flash_attention_kwargs_from_position_ids
-    from veomni.models_kernel.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
         Qwen3VLTextConfig,
         Qwen3VLTextDecoderLayer,
         Qwen3VLTextRotaryEmbedding,
@@ -306,7 +306,8 @@ def test_qwen3_vl_compiled_decoder_matches_eager_packed_flash_attention():
     config._attn_implementation = "flash_attention_2"
 
     eager_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0).to(device=device, dtype=dtype)
-    compiled_layer = copy.deepcopy(eager_layer)
+    compiled_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0).to(device=device, dtype=dtype)
+    compiled_layer.load_state_dict(eager_layer.state_dict())
     compiled_model = ToyQwen3VLModel(compiled_layer)
     hidden_states_eager = torch.randn(1, 7, config.hidden_size, device=device, dtype=dtype, requires_grad=True)
     hidden_states_compiled = hidden_states_eager.detach().clone().requires_grad_(True)

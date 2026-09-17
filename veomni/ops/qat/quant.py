@@ -38,6 +38,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from .scale import validate_fp8_scale_pairing
+
 
 tilelang.set_log_level("WARNING")
 
@@ -148,6 +150,7 @@ def act_quant(
     """
     N = x.size(-1)
     assert N % block_size == 0
+    validate_fp8_scale_pairing(scale_fmt, scale_dtype)
     tl_dtype = FE8M0 if scale_dtype == torch.float8_e8m0fnu else FP32
     z = x.contiguous()
     y = torch.empty_like(z) if dequant else torch.empty_like(z, dtype=torch.float8_e4m3fn)
@@ -262,14 +265,7 @@ def fp8_weight_quant(
     """
     assert x.dim() == 2, f"fp8_weight_quant expects a 2D weight, got shape {tuple(x.shape)}"
     assert x.dtype == torch.bfloat16, f"fp8_weight_quant expects a bfloat16 weight, got {x.dtype}"
-    assert scale_dtype in (torch.float32, torch.float8_e8m0fnu), (
-        f"fp8_weight_quant supports float32 and float8_e8m0fnu scales, got {scale_dtype}"
-    )
-    # Without rounding, the stored E8M0 scale would differ from the FP32 scale
-    # the kernel divides by, so dequantization would silently drift.
-    assert scale_dtype != torch.float8_e8m0fnu or scale_fmt is not None, (
-        'float8_e8m0fnu scales only represent powers of two: pass scale_fmt (DeepSeek V4 uses "ue8m0")'
-    )
+    validate_fp8_scale_pairing(scale_fmt, scale_dtype)
     M, N = x.shape
     assert M % block_size == 0 and N % block_size == 0, (
         f"weight shape {(M, N)} is not divisible by block_size {block_size}"

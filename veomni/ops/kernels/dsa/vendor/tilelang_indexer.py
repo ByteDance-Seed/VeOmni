@@ -91,7 +91,15 @@ class V4IndexerFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_scores, grad_indices):
         index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, topk_indices = ctx.saved_tensors
-        grad_q, grad_w, grad_k = batched_indexer_bwd(index_q, weights, index_k, topk_indices, grad_scores)
+        grad_q, grad_w, grad_k = batched_indexer_bwd(
+            index_q,
+            weights,
+            index_k,
+            topk_indices,
+            grad_scores,
+            cu_seqlen_ks=cu_seqlen_ks,
+            cu_seqlen_ke=cu_seqlen_ke,
+        )
         return grad_q, grad_k, grad_w, None, None, None, None, None
 
 
@@ -113,13 +121,16 @@ def v4_lighting_indexer(
         weights:       [seqlen, batch, heads]        fp32
         compress_ratio: compression ratio (4 for C4 layers)
         topk:          number of top-k indices to select
-        topk_indices:  optional pre-computed topk indices [batch, seqlen, topk] int32
+        topk_indices:  optional pre-computed indices [batch, seqlen, K] int32
         cu_seqlen_ks: optional packed compressed-KV start per query [seqlen] int32
         cu_seqlen_ke: optional packed compressed-KV end per query [seqlen] int32
 
     Returns:
-        index_score:  [batch, seqlen, topk] fp32
-        topk_indices: [batch, seqlen, topk] int32
+        index_score:  [batch, seqlen, K] fp32
+        topk_indices: [batch, seqlen, K] int32
+
+        K is the supplied ``topk_indices`` width when present; otherwise it is
+        ``min(topk, seqlen_kv)``.
     """
     heads = index_q.shape[2]
     if heads > 64 or heads % 8 != 0:

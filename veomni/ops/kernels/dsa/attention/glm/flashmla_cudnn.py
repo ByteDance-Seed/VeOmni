@@ -31,8 +31,9 @@ def wrapper(
     use_cache: bool = False,
     training: bool = False,
     attention_dropout: float = 0.0,
+    return_attn_weights: bool = False,
 ) -> Tensor:
-    """FlashMLA sparse prefill with cuDNN backward. Same face as eager.
+    """Run FlashMLA sparse prefill with a cuDNN backward pass.
 
     ``q_pe`` / ``q_nope_absorbed`` are ``[B, S, H, D]``. ``k_pe`` and
     ``kv_cache`` are MQA ``[B, S_kv, 1, D]``.
@@ -41,6 +42,11 @@ def wrapper(
     """
     if attention_mask is not None:
         raise ValueError("flashmla_cudnn GLM sparse attention does not support attention_mask.")
+    if return_attn_weights:
+        raise ValueError(
+            "flashmla_cudnn GLM sparse attention does not support output_attentions=True; "
+            "use the eager implementation."
+        )
     if use_cache:
         raise ValueError("flashmla_cudnn GLM sparse attention does not support KV cache.")
     if training and attention_dropout != 0:

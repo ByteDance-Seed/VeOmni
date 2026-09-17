@@ -36,7 +36,7 @@ from veomni.utils.device import (
 )
 
 
-_PATCHED_MODULE = "veomni.models_kernel.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
+_PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
 
 
 def _cuda_device_count() -> int:
@@ -206,7 +206,7 @@ def _init_cp_attention(
     from transformers import AutoConfig
 
     from veomni.distributed.parallel_state import _init_parallel_state
-    from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.ops.config import set_ops_config
 
     _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
@@ -488,8 +488,8 @@ def _run_compressor_cp(
 
     from transformers import AutoConfig
 
-    from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
-    from veomni.models_kernel.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
 
     _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
 
@@ -634,8 +634,8 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
 
     from transformers import AutoConfig
 
-    from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
-    from veomni.models_kernel.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
     from veomni.ops.config import set_ops_config
 
     _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
@@ -654,10 +654,10 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
     dist.broadcast(hidden, src=0)
     dist.broadcast(q_residual, src=0)
 
-    # ``use_tilelang`` degrades to the eager scorer rather than failing when the
-    # canonical positions it checks do not line up, and the eager scorer reads the
-    # global ``position_ids`` and so stays right. Without this count, dropping the
-    # query offset entirely would take the kernel out of the comparison and the
+    # Count kernel entries so the comparison cannot stay green after the
+    # TileLang path is skipped. The eager scorer reads global ``position_ids``
+    # and so stays right even if the query offset is dropped. Without this
+    # count, that skip would take the kernel out of the comparison and the
     # parity below would still hold, pinning nothing about the CP query rebasing.
     kernel_runs = []
     real_kernel = dsv4.v4_lighting_indexer
@@ -766,7 +766,7 @@ def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int, 
     """
     from transformers import AutoConfig
 
-    from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
@@ -833,7 +833,7 @@ def test_deepseek_v4_cp_rejects_a_narrow_shard(kind):
     """
     from transformers import AutoConfig
 
-    from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
     class_name, role = _WINDOW_COMPRESSORS[kind]
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
@@ -877,7 +877,7 @@ def _build_toy_model(seq_len: int):
     """A whole toy model on CPU plus one batch of ids, for the model-forward guards."""
     from transformers import AutoConfig
 
-    from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
@@ -1250,7 +1250,7 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
 
     from transformers import AutoConfig
 
-    from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.ops.config import set_ops_config
 
     _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)

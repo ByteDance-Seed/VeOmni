@@ -319,7 +319,7 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
         o:         [B, S, H, D] bf16 (forward output)
         do:        [B, S, H, D] bf16 (grad of output)
         topk_idxs: [B, S, topk] int32
-        lse:       [B, S, H] fp32 (log-sum-exp from forward)
+        lse:       [B, S, H] fp32 (base-2 log-sum-exp from forward)
         sm_scale:  float or None
 
     Returns:

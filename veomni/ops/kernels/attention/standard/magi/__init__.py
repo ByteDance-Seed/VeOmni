@@ -20,9 +20,9 @@ import torch
 
 from ......distributed.parallel_state import get_parallel_state
 from ......utils.device import IS_CUDA_AVAILABLE, get_device_type
-from ...helper import require_all
 from ...mask.magi import MagiAttentionMask
 from ...ulysses import prepare_ulysses_qkv, restore_ulysses_output, should_apply_ulysses
+from ._metadata import ensure_range_bounds
 
 
 def _resolve_magi_backend(device: torch.device) -> Callable:
@@ -110,9 +110,15 @@ def magi_attention_forward(
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run MagiAttention FFA for CP1 with optional VeOmni Ulysses exchange.
 
-    ``skip_ulysses`` opts a call out of sync Ulysses when its tokens are not
-    on the SP mesh. Async Ulysses stays outside attention.
+    ``skip_ulysses`` opts a call out when it already gathered or its tokens
+    are not on the SP mesh. FA4 is called with
+    ``sink=None``; a provided ``s_aux`` is rejected instead of dropped.
     """
+    if kwargs.get("s_aux") is not None:
+        raise ValueError(
+            "veomni_magi_attention does not implement attention sinks (`s_aux`). "
+            "Use veomni_flash_attention_4 or a backend that implements sink-softmax."
+        )
     del module, kwargs
 
     if not isinstance(attention_mask, MagiAttentionMask):
@@ -151,14 +157,7 @@ def magi_attention_forward(
     query = query.squeeze(0)
     key = key.squeeze(0)
     value = value.squeeze(0)
-    require_all(
-        attention_mask.q_ranges[:, 1] <= query.shape[0],
-        f"MagiAttention q_ranges must end within the post-exchange query length ({query.shape[0]}).",
-    )
-    require_all(
-        attention_mask.k_ranges[:, 1] <= key.shape[0],
-        f"MagiAttention k_ranges must end within the post-exchange key length ({key.shape[0]}).",
-    )
+    ensure_range_bounds(query, key, attention_mask.q_ranges, attention_mask.k_ranges)
 
     output, meta = _magi_attention_forward(
         query,

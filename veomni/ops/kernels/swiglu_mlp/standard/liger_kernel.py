@@ -37,16 +37,17 @@ def forward(
     if x.numel() == 0:
         return _eager.forward(x, gate_w, gate_b, up_w, up_b, down_w, down_b, swiglu_limit=swiglu_limit)
 
+    gate = _eager.linear(x, gate_w, gate_b)
+    up = _eager.linear(x, up_w, up_b)
+    projection_dtype = gate.dtype
     meta = _eager._Meta(
         empty=False,
         swiglu_limit=swiglu_limit,
+        projection_dtype=projection_dtype,
         has_gate_bias=gate_b.numel() > 0,
         has_up_bias=up_b.numel() > 0,
         has_down_bias=down_b.numel() > 0,
     )
-
-    gate = _eager.linear(x, gate_w, gate_b)
-    up = _eager.linear(x, up_w, up_b)
     if swiglu_limit is not None:
         gate = gate.float()
         up = up.float()
@@ -73,7 +74,11 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
 
     x, gate_w, gate_b, up_w, up_b, down_w, down_b, gate, up, hidden, saved_gate, saved_up = saved.tensors
     grad_hidden, grad_down_w, grad_down_b = _eager.linear_backward(
-        grad_output, hidden, down_w, has_bias=meta.has_down_bias
+        grad_output,
+        hidden,
+        down_w,
+        has_bias=meta.has_down_bias,
+        compute_dtype=grad_output.dtype,
     )
 
     from liger_kernel.ops.swiglu import swiglu_backward
@@ -82,14 +87,30 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
         grad_hidden = grad_hidden.to(dtype=saved_gate.dtype)
     grad_gate_c, grad_up_c = swiglu_backward(saved_gate, saved_up, grad_hidden.contiguous())
     if meta.swiglu_limit is not None:
-        grad_gate = _eager.unclamp_gate(grad_gate_c.to(dtype=gate.dtype), gate, meta.swiglu_limit).to(dtype=x.dtype)
-        grad_up = _eager.unclamp_up(grad_up_c.to(dtype=up.dtype), up, meta.swiglu_limit).to(dtype=x.dtype)
+        grad_gate = _eager.unclamp_gate(grad_gate_c.to(dtype=gate.dtype), gate, meta.swiglu_limit).to(
+            dtype=meta.projection_dtype
+        )
+        grad_up = _eager.unclamp_up(grad_up_c.to(dtype=up.dtype), up, meta.swiglu_limit).to(
+            dtype=meta.projection_dtype
+        )
     else:
         grad_gate = grad_gate_c
         grad_up = grad_up_c
 
-    grad_x_gate, grad_gate_w, grad_gate_b = _eager.linear_backward(grad_gate, x, gate_w, has_bias=meta.has_gate_bias)
-    grad_x_up, grad_up_w, grad_up_b = _eager.linear_backward(grad_up, x, up_w, has_bias=meta.has_up_bias)
+    grad_x_gate, grad_gate_w, grad_gate_b = _eager.linear_backward(
+        grad_gate,
+        x,
+        gate_w,
+        has_bias=meta.has_gate_bias,
+        compute_dtype=meta.projection_dtype,
+    )
+    grad_x_up, grad_up_w, grad_up_b = _eager.linear_backward(
+        grad_up,
+        x,
+        up_w,
+        has_bias=meta.has_up_bias,
+        compute_dtype=meta.projection_dtype,
+    )
     return (
         grad_x_gate + grad_x_up,
         grad_gate_w,

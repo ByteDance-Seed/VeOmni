@@ -51,7 +51,7 @@ def _registered_implementations(op: str) -> set[str]:
 
 
 def test_yaml_op_implementation_names_are_registered():
-    """Keep repository configs on canonical registry names instead of private aliases."""
+    """Reject in-tree op selections that do not name a registered implementation."""
     invalid: list[str] = []
     for root in (REPO_ROOT / "configs", REPO_ROOT / "tests"):
         for path in sorted(root.rglob("*.yaml")):

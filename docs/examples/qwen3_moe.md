@@ -72,61 +72,42 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
 ```
 
-- Combine Qwen3MoeMLP to Qwen3MoeExperts, then use fused moe operator
+- Combine the per-expert MLPs into stacked `Qwen3MoeExperts` weights and always call a local `moe_experts` `VeomniOp`. `eager` is a registered row, not a separate `ModuleList` path.
 
 ```python
+from veomni.models.utils.op_utils import empty_bias, resolve_moe_impl
+from veomni.ops import VeomniOp
+
+
 class Qwen3MoeExperts(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_experts
         self.hidden_dim = config.hidden_size
-        self.intermediate_size = config.moe_intermediate_size
-        self.gate_proj = torch.nn.Parameter(
-            torch.empty(self.num_experts, self.intermediate_size, self.hidden_dim),
-            requires_grad=True,
-        )
-        self.up_proj = torch.nn.Parameter(
-            torch.empty(self.num_experts, self.intermediate_size, self.hidden_dim),
-            requires_grad=True,
+        self.intermediate_dim = config.moe_intermediate_size
+        self.gate_up_proj = torch.nn.Parameter(
+            torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim)
         )
         self.down_proj = torch.nn.Parameter(
-            torch.empty(self.num_experts, self.hidden_dim, self.intermediate_size),
-            requires_grad=True,
+            torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
         )
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
 
-    def forward(self, hidden_states, expert_idx=None, cumsum=None):
-        gate_proj_out = torch.matmul(hidden_states, self.gate_proj[expert_idx].transpose(0, 1))
-        up_proj_out = torch.matmul(hidden_states, self.up_proj[expert_idx].transpose(0, 1))
-
-        out = self.act_fn(gate_proj_out) * up_proj_out
-        out = torch.matmul(out, self.down_proj[expert_idx].transpose(0, 1))
-        return out
-
-
-class Qwen3MoeSparseFusedMoeBlock(nn.Module):
-    def __init__(self, config):
-
-            ...
-
-      self.experts = Qwen3MoeExperts(config)
-
-    def forward(self, hidden_states, expert_idx=None, routing_weights=None, selected_experts=None) -> torch.Tensor:
-
-          ...
-
-        out = fused_moe_forward(
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        unused = empty_bias(self.gate_up_proj)
+        return self.veomni_moe(
+            hidden_states,
+            top_k_weights,
+            top_k_index,
+            unused,
+            unused,
+            self.down_proj,
+            self.gate_up_proj,
             num_experts=self.num_experts,
-            routing_weights=routing_weights,
-            selected_experts=selected_experts,
-            hidden_states=hidden_states,
-            fc1_1_weight=self.gate_proj,
-            fc1_2_weight=self.up_proj,
-            fc2_weight=self.down_proj,
         )
-      return out
-
 ```
+
+See `veomni/models/transformers/qwen3_moe/qwen3_moe_gpu_patch_gen_config.py` for the live patch. Selection comes from `model.ops_implementation.moe_implementation`.
 
 3. Train qwen3 moe model
 ```

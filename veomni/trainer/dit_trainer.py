@@ -34,7 +34,7 @@ from ..data import build_data_transform, build_dataloader
 from ..data.data_collator import DataCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
-from ..models_kernel import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY, build_config, build_foundation_model
+from ..models import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY, build_config, build_foundation_model
 from ..ops.config import set_ops_config
 from ..utils import helper
 from ..utils.device import (

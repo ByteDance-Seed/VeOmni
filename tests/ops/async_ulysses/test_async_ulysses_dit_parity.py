@@ -12,7 +12,6 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from torch.testing._internal.common_utils import run_tests
 
 from tests.parallel.ulysses.utils import SequenceParallelTest, sync_tensor
 from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
@@ -172,8 +171,15 @@ class AttentionDiT(nn.Module):
         return x
 
 
+DIT_SP_WORLD_SIZE = 4
+
+
 class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
     """DiT async QKV/O vs sync gather/scatter, including QK-norm grads."""
+
+    @property
+    def world_size(self):
+        return DIT_SP_WORLD_SIZE
 
     @staticmethod
     def _get_input_data():
@@ -204,11 +210,23 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
         t = torch.ones_like(output)
         return torch.sum(output * t)
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    def _configure_repro(self) -> None:
+        """Seed the worker. Do not set cuDNN flags: pytest freezes them."""
+        set_seed(seed=0, full_determinism=False)
+        try:
+            enable_high_precision_for_bf16()
+        except RuntimeError:
+            pass
+
+    @pytest.mark.skipif(
+        get_torch_device().device_count() < DIT_SP_WORLD_SIZE,
+        reason=f"device_count should be >= {DIT_SP_WORLD_SIZE}",
+    )
     @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses dit")
     def test_self_attn_dit(self):
         """Compare DiT async and sync attention outputs and grads."""
         self._get_process_group()
+        self._configure_repro()
         sp_group = get_ulysses_sequence_parallel_group()
         full_input = self._get_input_data()
         unpad_size = full_input.size(1)
@@ -285,11 +303,15 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
         )
         _assert_close_with_diagnostics("input.grad", full_input_grad, part_input_grad, atol=1e-4, rtol=1e-4)
 
-    @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
+    @pytest.mark.skipif(
+        get_torch_device().device_count() < DIT_SP_WORLD_SIZE,
+        reason=f"device_count should be >= {DIT_SP_WORLD_SIZE}",
+    )
     @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses dit")
     def test_self_attn_dit_padding(self):
         """Same comparison with a sequence length that needs SP padding."""
         self._get_process_group()
+        self._configure_repro()
         sp_group = get_ulysses_sequence_parallel_group()
         full_input = self._get_input_data_for_padding()
         unpad_size = full_input.size(1)
@@ -379,7 +401,9 @@ if __name__ == "__main__":
     assert not get_torch_device()._initialized, (
         "test_distributed must not have initialized CUDA context on main process"
     )
+    # Do not set cuDNN flags or CUDA seeds here. Both initialize a context on
+    # the parent and trip the assert above on reruns. Workers call
+    # ``_configure_repro`` after the process group is up.
+    from torch.testing._internal.common_utils import run_tests
 
-    set_seed(seed=0, full_determinism=True)
-    enable_high_precision_for_bf16()
     run_tests()

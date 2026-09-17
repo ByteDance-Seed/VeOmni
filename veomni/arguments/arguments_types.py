@@ -790,7 +790,13 @@ class CheckpointConfig:
     )
     save_async: bool = field(
         default=False,
-        metadata={"help": "Whether to save checkpoint asynchronously."},
+        metadata={
+            "help": (
+                "Return from the checkpoint save while the write is still in flight. "
+                "Cannot be combined with `stage_dir`: the staged copy is dropped when the "
+                "save returns, which an in-flight write would then be reading from."
+            )
+        },
     )
     stage_dir: Optional[str] = field(
         default=None,
@@ -1043,11 +1049,12 @@ class TrainingArguments:
                 logger.warning("load_checkpoint_path should be under output_dir.")
 
         # output_dir/
-        # ├── checkpoints/          # DCP training checkpoints (model + optimizer + extra_state)
+        # ├── checkpoints/          # DCP: model + optimizer + lr_scheduler.pt + trainer_state
         # │   ├── global_step_100/
         # │   └── global_step_200/
         # │       └── hf_ckpt/      # HF safetensors saved under the last checkpoint folder
         # └── model_assets/
+        # See docs/usage/checkpoint.md.
         ckpt.save_path = os.path.join(ckpt.output_dir, "checkpoints")
         ckpt.model_assets_dir = os.path.join(ckpt.output_dir, "model_assets")
 
@@ -1300,7 +1307,8 @@ class OpsImplementationConfig:
             "(weights per the checkpoint's expert_dtype -- FP4 with 1x32 groups on V4-Flash, "
             "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
             "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
-            "recipe rather than a kernel backend, so it is not an OpSlot -- see veomni/ops/qat/."
+            "recipe rather than an op-registry implementation, so it is not selected through "
+            "VeomniOp -- see veomni/ops/qat/."
         },
     )
 
@@ -1532,7 +1540,7 @@ class BaseModelArguments:
         cache = BaseModelArguments._fqn_to_index_mapping_cache
         if idx_path not in cache:
             if os.path.exists(idx_path):
-                from ..models_kernel.checkpoint import parse_fqn_to_index_mapping_from_json
+                from ..models.checkpoint import parse_fqn_to_index_mapping_from_json
 
                 cache[idx_path] = parse_fqn_to_index_mapping_from_json(idx_path)
             else:
@@ -1568,7 +1576,7 @@ class ModelArguments(BaseModelArguments):
     ep_sharded_stream_load: bool = field(
         default=False,
         metadata={
-            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
+            "help": "Opt-in fast/low-memory loader for large ExtraParallel-sharded checkpoint tensors (for example MoE experts or PLE embedding tables): each rank reads only its dim-0 slice straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
         },
     )
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
@@ -1584,6 +1592,19 @@ class ModelArguments(BaseModelArguments):
             "model.broadcast_model_weights_from_rank0=False "
             "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
         )
+
+        extra_parallel_sizes = dict(zip(self.accelerator.extra_parallel_names, self.accelerator.extra_parallel_sizes))
+        ple_size = extra_parallel_sizes.get("ple", 1)
+        if ple_size > 1:
+            if self.accelerator.dp_shard_size % ple_size != 0:
+                raise ValueError(
+                    f"PLE size ({ple_size}) must divide the FSDP shard size ({self.accelerator.dp_shard_size})."
+                )
+            if not self.ep_sharded_stream_load:
+                raise ValueError(
+                    "PLE two-dimensional parallelism requires model.ep_sharded_stream_load=true so each rank "
+                    "reads only its local row-by-column checkpoint rectangle."
+                )
 
 
 # ================================ Data Arguments ======================================

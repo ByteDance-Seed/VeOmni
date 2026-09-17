@@ -27,9 +27,11 @@ from .....registry import SavedState
 
 @dataclass(frozen=True)
 class _Meta:
-    """Whether ``weight`` was a real projection matrix."""
+    """Whether ``weight`` was a real projection matrix, and which grads to keep."""
 
     has_weight: bool
+    hidden_needs_grad: bool = True
+    weight_needs_grad: bool = True
 
 
 def flatten_tokens(hidden: Tensor, labels: Tensor) -> tuple[Tensor, Tensor]:
@@ -97,6 +99,11 @@ def _loss_logits(
     )
 
 
+def _needs_input_grad(tensor: Tensor, grad_enabled: bool) -> bool:
+    """``grad_and_value`` ignores outer ``no_grad``; both flags must agree."""
+    return bool(tensor.requires_grad and grad_enabled)
+
+
 def forward(
     hidden: Tensor,
     labels: Tensor,
@@ -104,31 +111,71 @@ def forward(
     *,
     ignore_index: int = -100,
     num_items_in_batch: int | Tensor | None = None,
+    grad_enabled: bool | None = None,
 ) -> tuple[Tensor, SavedState]:
     """Token-level CE. Empty ``weight`` means ``hidden`` is already logits.
 
-    Label shift and SP reduction stay in the caller. Grads are taken through
-    ``F.linear`` + ``F.cross_entropy``, then scaled in backward.
+    This logits path is eager-only. ``liger_kernel`` and ``chunk_loss`` reject
+    empty ``weight``. Label shift and SP reduction stay in the caller.
+    ``torch.func.grad_and_value`` builds its own graph and ignores ``no_grad``,
+    so unused ``V×H`` grads require both ``requires_grad`` and the caller's
+    ``is_grad_enabled()``. The generated wrapper passes that flag because
+    ``Function.forward`` itself always runs under ``no_grad``.
     """
     has_weight = weight.numel() > 0
+    compute_grads = torch.is_grad_enabled() if grad_enabled is None else grad_enabled
+    hidden_needs_grad = _needs_input_grad(hidden, compute_grads)
+    weight_needs_grad = has_weight and _needs_input_grad(weight, compute_grads)
     if has_weight:
-        (grad_hidden, grad_weight), loss = torch.func.grad_and_value(_loss_hidden_weight, argnums=(0, 1))(
-            hidden, weight, labels, ignore_index, num_items_in_batch
+        if hidden_needs_grad and weight_needs_grad:
+            (grad_hidden, grad_weight), loss = torch.func.grad_and_value(_loss_hidden_weight, argnums=(0, 1))(
+                hidden, weight, labels, ignore_index, num_items_in_batch
+            )
+        elif hidden_needs_grad:
+            (grad_hidden,), loss = torch.func.grad_and_value(_loss_hidden_weight, argnums=(0,))(
+                hidden, weight, labels, ignore_index, num_items_in_batch
+            )
+            grad_weight = None
+        elif weight_needs_grad:
+            (grad_weight,), loss = torch.func.grad_and_value(_loss_hidden_weight, argnums=(1,))(
+                hidden, weight, labels, ignore_index, num_items_in_batch
+            )
+            grad_hidden = None
+        else:
+            loss = _loss_hidden_weight(hidden, weight, labels, ignore_index, num_items_in_batch)
+            grad_hidden = None
+            grad_weight = None
+        return loss, SavedState(
+            (
+                grad_hidden if grad_hidden is not None else hidden.new_empty(0),
+                grad_weight if grad_weight is not None else weight.new_empty(0),
+            ),
+            _Meta(True, hidden_needs_grad, weight_needs_grad),
         )
-        return loss, SavedState((grad_hidden, grad_weight), _Meta(True))
 
-    (grad_hidden,), loss = torch.func.grad_and_value(_loss_logits, argnums=(0,))(
-        hidden, labels, ignore_index, num_items_in_batch
+    if hidden_needs_grad:
+        (grad_hidden,), loss = torch.func.grad_and_value(_loss_logits, argnums=(0,))(
+            hidden, labels, ignore_index, num_items_in_batch
+        )
+    else:
+        loss = _loss_logits(hidden, labels, ignore_index, num_items_in_batch)
+        grad_hidden = None
+    return loss, SavedState(
+        (grad_hidden if grad_hidden is not None else hidden.new_empty(0),),
+        _Meta(False, hidden_needs_grad, False),
     )
-    return loss, SavedState((grad_hidden,), _Meta(False))
 
 
-def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None, Tensor | None]:
+def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, None, Tensor | None]:
     """Return ``(grad_hidden, None, grad_weight_or_None)``. Labels are constants."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     if meta.has_weight:
         grad_hidden, grad_weight = saved.tensors
-        return grad_hidden * grad_output, None, grad_weight * grad_output
+        return (
+            grad_hidden * grad_output if meta.hidden_needs_grad else None,
+            None,
+            grad_weight * grad_output if meta.weight_needs_grad else None,
+        )
     (grad_hidden,) = saved.tensors
-    return grad_hidden * grad_output, None, None
+    return (grad_hidden * grad_output if meta.hidden_needs_grad else None), None, None

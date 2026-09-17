@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 import torch
 from torch import Tensor
+from torch.utils._python_dispatch import TorchDispatchMode
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     load_balancing_loss_func as hf_load_balancing_loss,
 )
@@ -44,6 +45,16 @@ _CONFIGS = [
     (60, 8, 28, 2, 4096),
     (128, 4, 32, 1, 8192),
 ]
+
+
+class _NoDeviceScalar(TorchDispatchMode):
+    """Fail if a kernel reads a device tensor as a Python scalar."""
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        del types
+        if func is torch.ops.aten._local_scalar_dense.default:
+            raise RuntimeError("load-balancing loss read a device scalar")
+        return func(*args, **(kwargs or {}))
 
 
 def _empty_mask(device: torch.device | str) -> Tensor:
@@ -98,6 +109,34 @@ def test_eager_all_masked_returns_zero_with_zero_grad():
     assert output.item() == 0.0
     output.backward()
     assert torch.count_nonzero(gate_logits.grad) == 0
+
+
+def test_eager_zero_tokens_returns_connected_zero():
+    gate_logits = torch.randn(0, 4, requires_grad=True)
+    output = resolve_op("load_balancing_loss", "standard", "eager").wrapper(
+        gate_logits, _empty_mask(gate_logits.device), top_k=2
+    )
+    assert output.item() == 0.0
+    output.backward()
+    assert gate_logits.grad is not None
+    assert gate_logits.grad.shape == gate_logits.shape
+    assert torch.count_nonzero(gate_logits.grad) == 0
+
+
+@pytest.mark.parametrize(
+    ("rows", "attention_mask"),
+    (
+        (8, torch.empty(0, dtype=torch.float32)),
+        (8, torch.zeros(2, 4)),
+        (8, torch.ones(2, 4)),
+        (0, torch.empty(0, dtype=torch.float32)),
+    ),
+    ids=("no-mask", "all-masked", "kept", "zero-tokens"),
+)
+def test_eager_forward_does_not_read_device_scalar(rows: int, attention_mask: Tensor):
+    gate_logits = torch.randn(rows, 4, requires_grad=True)
+    with _NoDeviceScalar():
+        resolve_op("load_balancing_loss", "standard", "eager").wrapper(gate_logits, attention_mask, top_k=2)
 
 
 @pytest.mark.parametrize("use_mask", (False, True))
@@ -170,6 +209,20 @@ def test_triton_matches_eager(use_mask: bool, num_experts, top_k, num_layers, ba
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs a GPU")
+def test_triton_zero_tokens_returns_connected_zero():
+    pytest.importorskip("triton")
+    gate_logits = torch.randn(0, 4, device="cuda", requires_grad=True)
+    output = resolve_op("load_balancing_loss", "standard", "triton").wrapper(
+        gate_logits, _empty_mask(gate_logits.device), top_k=2
+    )
+    assert output.item() == 0.0
+    output.backward()
+    assert gate_logits.grad is not None
+    assert gate_logits.grad.shape == gate_logits.shape
+    assert torch.count_nonzero(gate_logits.grad) == 0
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs a GPU")
 def test_triton_all_masked_returns_zero_with_zero_grad():
     pytest.importorskip("triton")
     gate_logits = torch.randn(8, 4, device="cuda", requires_grad=True)
@@ -183,7 +236,7 @@ def test_triton_all_masked_returns_zero_with_zero_grad():
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="load-balancing backward sync check needs CUDA")
 @pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype feature")
 @pytest.mark.parametrize("impl", ("eager", "triton"))
-def test_load_balancing_backward_cuda_does_not_synchronize(impl: str):
+def test_load_balancing_cuda_does_not_synchronize(impl: str):
     if impl == "triton":
         pytest.importorskip("triton")
     op = resolve_op("load_balancing_loss", "standard", impl).wrapper
@@ -194,14 +247,13 @@ def test_load_balancing_backward_cuda_does_not_synchronize(impl: str):
     torch.cuda.synchronize()
 
     gate_logits = torch.randn(8, 4, device="cuda", requires_grad=True)
-    output = op(gate_logits, attention_mask, top_k=2)
-    grad_output = torch.ones_like(output)
     torch.cuda.synchronize()
 
     previous_mode = torch.cuda.get_sync_debug_mode()
     torch.cuda.set_sync_debug_mode("error")
     try:
-        output.backward(grad_output)
+        output = op(gate_logits, attention_mask, top_k=2)
+        output.backward(torch.ones_like(output))
     finally:
         torch.cuda.set_sync_debug_mode(previous_mode)
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dense async Ulysses output projection: A2A heads-to-seq, then linear."""
+"""Async Ulysses output projection: scatter sequence, gather heads, then linear."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ def forward(
     unpadded_dim_size: int,
     group: Any = None,
 ) -> tuple[Tensor, SavedState]:
-    """All-to-all seq-to-heads, flatten heads, then the output linear."""
+    """Scatter sequence and gather heads, flatten the heads, then apply the output linear."""
     sp_group = get_ulysses_sequence_parallel_group() if group is None else group
     hidden_states = padding_tensor_for_seqeunce_parallel(hidden_states, seq_dimension)
     hidden_states = all_to_all_tensor(

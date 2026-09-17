@@ -14,6 +14,7 @@
 
 """FlashAttention backend loading and SP-aware adapter implementation."""
 
+from collections.abc import Callable
 from typing import Optional
 
 import torch
@@ -30,6 +31,61 @@ from ..ulysses import (
 
 
 logger = logging.get_logger(__name__)
+
+
+def flash_kernel_implementation(implementation: str) -> str:
+    """Map a selected VeOmni or Transformers flash name to the vendor token.
+
+    FA2 and FA3 have dedicated branches in Transformers' ``_lazy_imports``, so
+    the plain names resolve without the hub-kernel path. FA4 has no such
+    branch; keeping the VeOmni name lets the
+    ``load_and_register_attn_kernel`` monkey-patch load ``flash_attn.cute``
+    locally.
+    """
+    if "flash_attention_2" in implementation:
+        return "flash_attention_2"
+    if "flash_attention_3" in implementation:
+        return "flash_attention_3"
+    if "flash_attention_4" in implementation:
+        return implementation
+    raise ValueError(f"unknown attn_implementation for veomni_flash_attention: {implementation}")
+
+
+def bind_flash_attention_forward(implementation: str) -> Callable[..., tuple[torch.Tensor, None]]:
+    """Return an adapter that always dispatches the selected flash row."""
+
+    def bound_flash_attention_forward(
+        module: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        dropout: float = 0.0,
+        scaling: Optional[float] = None,
+        sliding_window: Optional[int] = None,
+        softcap: Optional[float] = None,
+        skip_ulysses: bool = False,
+        **kwargs,
+    ) -> tuple[torch.Tensor, None]:
+        """Run the shared flash adapter with a pinned implementation name."""
+        return flash_attention_forward(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            dropout=dropout,
+            scaling=scaling,
+            sliding_window=sliding_window,
+            softcap=softcap,
+            skip_ulysses=skip_ulysses,
+            implementation=implementation,
+            **kwargs,
+        )
+
+    bound_flash_attention_forward.__name__ = f"flash_attention_forward_{implementation}"
+    bound_flash_attention_forward.__qualname__ = bound_flash_attention_forward.__name__
+    return bound_flash_attention_forward
 
 
 def flash_attention_forward(
@@ -56,16 +112,17 @@ def flash_attention_forward(
        via ``cu_seqlens`` (varlen path) and do not need the top-left causal mask
        workaround required by some older Transformers models.
 
-    2. **Ulysses sequence-parallelism** — when Ulysses SP is on and async is
-       off, the full Q/K/V sequence is gathered across SP ranks before the
-       kernel call and the output is scattered back afterwards. Async SP and
-       ``ulysses_size == 1`` leave the layout unchanged. ``skip_ulysses`` is
-       an opt-out for a call whose tokens are not on the SP mesh, such as
-       Wan cross-attn. Async Ulysses stays outside attention.
+    2. **Ulysses sequence-parallelism** — when Ulysses SP is on, the full
+       Q/K/V sequence is gathered across SP ranks before the kernel call
+       and the output is scattered back afterwards. ``ulysses_size == 1``
+       leaves the layout unchanged. ``skip_ulysses`` opts out a call that
+       already gathered, or whose tokens are not on the SP mesh, such as
+       Wan cross-attn or Qwen3-VL text async.
 
-    3. **FA backend selection** — the implementation name stored in
-       ``module.config._attn_implementation`` is mapped to the token that
-       Transformers' ``lazy_import_flash_attention`` expects:
+    3. **FA backend selection** — the selected registry / HF name is mapped to
+       the token that Transformers' ``lazy_import_flash_attention`` expects.
+       Bound wrappers from ``bind_flash_attention_forward`` pin that name so a
+       mismatched ``module.config._attn_implementation`` cannot rewrite it.
 
        * FA2/FA3 → plain name (``"flash_attention_2"`` / ``"flash_attention_3"``)
          because ``_lazy_imports`` has an explicit branch for each and resolves
@@ -143,25 +200,10 @@ def flash_attention_forward(
                 group=parallel_state.ulysses_group,
             )
 
-    # Resolve the token that will be passed to Transformers' lazy_import_flash_attention.
-    #
-    # FA2 and FA3 have dedicated branches in transformers' _lazy_imports, so we
-    # use the plain transformers names and they are resolved without hitting the
-    # hub-kernel path.
-    #
-    # FA4 has no such branch; unrecognised names fall through to the hub-kernel
-    # loader. By keeping the VeOmni name here, our monkey-patch of
-    # ``load_and_register_attn_kernel`` intercepts it and loads
-    # ``flash_attn.cute`` locally.
-    impl = module.config._attn_implementation
-    if "flash_attention_2" in impl:
-        fa_kernel_implementation = "flash_attention_2"
-    elif "flash_attention_3" in impl:
-        fa_kernel_implementation = "flash_attention_3"
-    elif "flash_attention_4" in impl:
-        fa_kernel_implementation = impl
-    else:
-        raise ValueError(f"unknown attn_implementation for veomni_flash_attention: {impl}")
+    selected = kwargs.pop("implementation", None)
+    if selected is None:
+        selected = module.config._attn_implementation
+    fa_kernel_implementation = flash_kernel_implementation(selected)
 
     # MLA models can use a smaller value head than their Q/K head. Transformers
     # handles this in its stock wrapper; this replacement must preserve it.

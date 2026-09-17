@@ -26,13 +26,25 @@ def wrapper(
     topk_idxs: Tensor,
     sm_scale: float | None = None,
     return_lse: bool = False,
+    dropout: float = 0.0,
+    return_attn_weights: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor]:
-    """Sparse MQA. Same face as the eager row.
+    """Run TileLang sparse MQA over selected KV candidate slots.
 
     ``q`` is ``[B, S, H, D]``, ``kv`` is ``[B, S_kv, D]``, ``attn_sink`` is
-    ``[H]``, ``topk_idxs`` is ``[B, S, topk]``. Each valid candidate slot
-    participates independently, including repeated indices.
+    ``[H]``, and ``topk_idxs`` is ``[B, S, K]``. ``K`` is the selected
+    candidate width and need not equal the indexer's requested ``topk``. Each
+    valid candidate slot participates independently, including repeated
+    indices. When requested, LSE is detached and returned in base-2 units.
     """
+    if dropout:
+        raise ValueError("tilelang DeepSeek-V4 sparse attention requires dropout=0.")
+    if return_attn_weights:
+        raise ValueError(
+            "tilelang DeepSeek-V4 sparse attention does not support output_attentions=True; "
+            "use the eager implementation."
+        )
+
     from ...vendor.tilelang_sparse_mla import sparse_attn_tilelang
 
     return sparse_attn_tilelang(q, kv, attn_sink, topk_idxs, sm_scale, return_lse)

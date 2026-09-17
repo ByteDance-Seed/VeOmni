@@ -33,12 +33,12 @@ def wrapper(
     position_ids: Tensor | None = None,
     use_cache: bool = False,
 ) -> Tensor:
-    """cuDNN FE indexer top-k. Same face as the eager row.
+    """Select GLM DSA top-k compressed-KV indices with cuDNN FE.
 
     ``q`` is ``[B, S, H, D]``, ``k`` is ``[B, T, D]`` or ``[B, T, 1, D]``,
-    ``w`` is ``[B, S, H]``. Returns ``[B, S, top_k]`` long indices.
-    cuDNN applies causality through ``ratio`` but cannot represent an
-    additional padding or additive mask.
+    ``w`` is ``[B, S, H]``. Returns ``[B, S, K]`` ``torch.int32`` indices
+    where ``K = min(top_k, T)``. cuDNN applies causality through ``ratio``
+    but cannot represent an additional padding or additive mask.
     """
     del position_ids
     if attention_mask is not None:

@@ -20,7 +20,7 @@ veomni/
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
 │   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
-├── models_kernel/      Model loading, patchgen configs, and kernel-aware modeling
+├── models/      Model loading, patchgen configs, and kernel-aware modeling
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
 │   ├── registry.py     Import-time model/config/processor registries
 │   ├── checkpoint/     Weight I/O, tensor conversion, and ModelCheckpointManager
@@ -91,7 +91,7 @@ BaseTrainer (ABC)
 - `train_step()` -> single training step (forward + backward + update)
 - `training_loop()` -> main loop with callbacks
 
-**Checkpointing**: `CheckpointCallback` owns cadence for DCP, HF/LoRA, and the one-shot tokenizer/config sidecars; `GlobalStateCallback` owns the job cursor; `BaseTrainer.load` / `save_dcp` / `save_hf_or_lora` / `save_model_assets` fan out; `ModelCheckpointManager` (`veomni/models_kernel/checkpoint/manager.py`) owns DCP / HF / LoRA I/O, drain-async, `empty_cache`, barrier, and directory layout. Job cursor (dataloader, rng, meters) is not in DCP extra_state.
+**Checkpointing**: `CheckpointCallback` owns cadence for DCP, HF/LoRA, and the one-shot tokenizer/config sidecars; `GlobalStateCallback` owns the job cursor; `BaseTrainer.load` / `save_dcp` / `save_hf_or_lora` / `save_model_assets` fan out; `ModelCheckpointManager` (`veomni/models/checkpoint/manager.py`) owns DCP / HF / LoRA I/O, drain-async, `empty_cache`, barrier, and directory layout. The scheduler is a single `lr_scheduler.pt` next to the DCP shards; the job cursor is `trainer_state_rank_{R}.pt`. VeOmni 0.1.12 `extra_state/` resume is `veomni/checkpoint/legacy_v0_1_12.py` (delete that file to drop it). On-disk layout: `docs/usage/checkpoint.md`.
 
 Subclasses override specific methods (e.g., `compute_loss()`, custom data transforms) rather than the entire training loop.
 
@@ -122,7 +122,7 @@ YAML Config -> VeOmniArguments -> Trainer
 
 ## Model Loading Flow
 
-1. `models_kernel.build_foundation_model()` installs the supplied ops selection.
+1. `models.build_foundation_model()` installs the supplied ops selection.
 2. Read `config.json` -> `AutoConfig.from_pretrained()` -> check `MODEL_CONFIG_REGISTRY`.
 3. Determine the model class via `MODELING_REGISTRY` (keyed by `model_type`); an unregistered model fails explicitly unless `MODELING_BACKEND=hf` selects the upstream class.
 4. Instantiate model on meta device (`init_empty_weights()`)
@@ -148,6 +148,15 @@ VeOmni uses FSDP2 exclusively.
    - `fully_shard()` on root model
 4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention; the FSDP shard mesh fuses with SP mesh (`dp_shard_sp`)
 5. EP token routing is in model MoE code + `moe_layer.py` using `ep_group` from `ParallelState`
+6. Qwen4-Exp PLE is a model-specific exception: its embedding tables remain
+   persistent DTensors on the full `(ple_fsdp, ple)` mesh with placements
+   `[Shard(1), Shard(0)]`. FSDP2 ignores those parameters, and PLE routes sparse
+   lookup requests/results over the flattened 2D mesh. This does not enable
+   general tensor parallelism; `tp_size` remains 1.
+7. Qwen4-Exp can enable PLE and EP together. Its PLE tables and MoE expert
+   tensors are disjoint `ParallelPlan` entries and use independent
+   `(ple_fsdp, ple)` and `(ep_fsdp, ep)` mesh views; shared parameter ownership
+   across enabled ExtraParallel dimensions is invalid.
 
 ## Config Structure
 
@@ -169,7 +178,7 @@ configs/
 
 ```
 tests/
-├── models_kernel/  Kernel-aware model loading, integration, and helper tests
+├── models/  Kernel-aware model loading, integration, and helper tests
 ├── kernels/        Registry contracts and per-family kernel tests
 ├── data/           Data pipeline, collator, transform tests
 ├── parallel/       Distributed parallelism tests (ulysses, data balance)
@@ -191,7 +200,7 @@ tests/
 
 | Change in | Test command |
 |-----------|-------------|
-| `veomni/models_kernel/` | `pytest tests/models_kernel/` |
+| `veomni/models/` | `pytest tests/models/` |
 | `veomni/ops/` | `pytest tests/ops/` |
 | `veomni/data/` | `pytest tests/data/` |
 | `veomni/distributed/` | `pytest tests/parallel/ tests/distributed/` |

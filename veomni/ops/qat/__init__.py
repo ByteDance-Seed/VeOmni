@@ -21,8 +21,10 @@ quantization recipe rather than a selectable op implementation.
 The recipes implemented so far are DeepSeek-V4's: block-wise FP8 everywhere
 except the routed experts of a V4-Flash checkpoint, whose weights are FP4. Both
 reuse the V4 TileLang quantizers in :mod:`veomni.ops.qat.quant`, so training
-stays bit-aligned with inference by construction. They are SM90-only and loaded
-lazily, so importing this package on CPU or NPU stays free.
+stays bit-aligned with inference by construction. Quantizing calls require an
+NVIDIA SM90 or later GPU and load the backend lazily, so importing this package
+on CPU or NPU stays free. ``qat_linear(..., enabled=False)`` bypasses
+quantization and its hardware and dependency checks.
 """
 
 from ._hardware import require_tilelang_sm90

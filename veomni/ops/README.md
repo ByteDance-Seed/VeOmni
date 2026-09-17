@@ -2,7 +2,7 @@
 
 `veomni.ops` owns VeOmni's tensor-level operation registry and concrete kernel
 implementations. Model-specific input normalization, Hugging Face-compatible
-signatures, and loss policy belong in `veomni.models_kernel`.
+signatures, and loss policy belong in `veomni.models`.
 
 Importing `veomni.ops` registers every built-in op family and applies
 the process-wide attention integration from `install.py`.
@@ -57,7 +57,8 @@ when the selected implementation runs.
 
 DeepSeek-V4 `dsa_attention` treats `topk_idxs` as candidate slots. Repeated
 valid indices participate once per occurrence, matching the TileLang kernel;
-invalid sentinel entries contribute no attention mass.
+invalid sentinel entries contribute no attention mass. With `return_lse=True`,
+both implementations return a detached base-2 log-sum-exp tensor.
 
 The registry is the source of truth for the exact rows available in a given
 revision:
@@ -151,7 +152,7 @@ Models construct a local handle once and call it directly:
 
 ```python
 from veomni.ops import VeomniOp
-from veomni.models_kernel.utils.op_utils import resolve_op_impl
+from veomni.models.utils.op_utils import resolve_op_impl
 
 
 self.veomni_rms_norm = VeomniOp(
@@ -164,7 +165,7 @@ hidden_states = self.veomni_rms_norm(hidden_states, self.weight, eps=self.varian
 ```
 
 `VeomniOp` resolves its row at construction, is interned by the public
-triple, and always calls the row's wrapper. `models_kernel.build_foundation_model`
+triple, and always calls the row's wrapper. `models.build_foundation_model`
 installs the `OpsImplementationConfig` object in `ops/config.py` before
 constructing the model.
 
@@ -173,9 +174,9 @@ it is not a collection of model-specific adapters. Transformations that vary
 by consumer stay with that consumer. For example:
 
 - causal shifting and sequence-parallel loss reduction live in
-  `models_kernel/loss_utils/cross_entropy_loss.py`;
+  `models/loss_utils/cross_entropy_loss.py`;
 - concatenating per-layer router logits and applying attention masks live in
-  `models_kernel/loss_utils/load_balancing_loss.py`;
+  `models/loss_utils/load_balancing_loss.py`;
 - generated model patches construct the appropriate variant and translate
   model-owned parameters into its tensor contract.
 
@@ -187,6 +188,22 @@ and `take_inner` so nested `SavedState` tensors and metadata can be flattened
 into the outer custom-autograd state.
 
 ## Process-wide integrations
+
+The `sdpa` and `veomni_sdpa` attention rows accept ordinary dense attention
+masks but do not expose a packed/varlen API. `packed_causal_mask` rejects these
+implementations, and their attention calls and the VeOmni SDPA mask builder
+reject non-null cumulative-length or varlen maximum-length metadata. Packing
+must use a packed-capable implementation. This follows the public
+[`torch.nn.functional.scaled_dot_product_attention` signature](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html),
+which has `attn_mask` but no `cu_seqlens` arguments. Opaque dense masks are not
+inspected to infer whether they encode sequence boundaries.
+
+The VeOmni SDPA mask builder only honors causal mask-elision hints for the
+canonical causal predicate with equal Q/K lengths and offsets. Bidirectional
+elision requires the canonical bidirectional predicate and an explicit hint.
+Sliding-window and custom predicates always retain an explicit mask, including
+when callers enable skip hints. Transformers still checks padding before any
+permitted elision. Eager shape masks always request an explicit mask.
 
 `install.py` contains idempotent process-wide integration only. Currently it
 registers VeOmni attention names and mask builders on Transformers registries
@@ -201,10 +218,10 @@ selected through `VeomniOp`.
 
 - Registry and generated-autograd contract: `tests/ops/base/test_op_entry.py`
 - Per-family math and hardware behavior: `tests/ops/<family>/`
-- Model-facing integration and helpers: `tests/models_kernel/`
-- User-facing selection and lifecycle: `docs/design/kernel_selection.md`
+- Model-facing integration and helpers: `tests/models/`
+- User-facing selection and lifecycle: `docs/design/op_selection.md`
 
 When adding a row, test its numerical contract, registration, hardware
 requirement, and optional-package requirements. When adding model-specific
-argument policy, test it in `tests/models_kernel` rather than duplicating it in
+argument policy, test it in `tests/models` rather than duplicating it in
 the raw-kernel suite.

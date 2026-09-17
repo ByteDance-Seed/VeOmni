@@ -247,8 +247,21 @@ def test_default_magi_backend_attn_forward_meta_import_skips_query_device(monkey
     assert active_devices == []
 
 
+def _count_range_bound_reductions(monkeypatch) -> dict[str, int]:
+    counts = {"require_all": 0}
+    real_require_all = magi_metadata.require_all
+
+    def counting_require_all(condition, message):
+        counts["require_all"] += 1
+        return real_require_all(condition, message)
+
+    monkeypatch.setattr(magi_metadata, "require_all", counting_require_all)
+    return counts
+
+
 def test_magi_fa4_metadata_cache_reuses_only_matching_inputs(monkeypatch):
     built_args = []
+    counts = _count_range_bound_reductions(monkeypatch)
 
     def fake_build(*args):
         built_arg = object()
@@ -265,6 +278,11 @@ def test_magi_fa4_metadata_cache_reuses_only_matching_inputs(monkeypatch):
 
     first = magi_metadata.get_or_prepare_attn_arg(query, key, q_ranges, k_ranges, attn_type_map)
     second = magi_metadata.get_or_prepare_attn_arg(query, key, q_ranges, k_ranges, attn_type_map)
+    third = magi_metadata.get_or_prepare_attn_arg(query, key, q_ranges, k_ranges, attn_type_map)
+
+    assert first is second is third
+    assert len(built_args) == 1
+    assert counts["require_all"] == 2
 
     q_ranges[0, 1] = 7
     after_mutation = magi_metadata.get_or_prepare_attn_arg(query, key, q_ranges, k_ranges, attn_type_map)
@@ -279,15 +297,44 @@ def test_magi_fa4_metadata_cache_reuses_only_matching_inputs(monkeypatch):
         attn_type_map,
     )
 
-    assert first is second
     assert after_mutation is repeated_after_mutation
     assert first is not after_mutation
     assert after_shape_change is not after_mutation
     assert len(built_args) == 3
+    assert counts["require_all"] == 6
     assert magi_metadata._cache_entry is not None
-    assert magi_metadata._cache_entry.metadata_tensors[0] is q_ranges
-    assert magi_metadata._cache_entry.metadata_tensors[1] is k_ranges
-    assert magi_metadata._cache_entry.metadata_tensors[2] is attn_type_map
+
+
+def test_magi_fa4_range_bounds_are_not_rechecked_before_prepare(monkeypatch):
+    """Adapter validation and FA4 prepare share one cache, including CUTLASS head-dim buckets."""
+    counts = _count_range_bound_reductions(monkeypatch)
+    monkeypatch.setattr(magi_metadata, "_prepare_attn_arg", lambda *args: object())
+    query = torch.randn(8, 4, 16)
+    key = torch.randn(8, 2, 16)
+    q_ranges = torch.tensor([[0, 8]], dtype=torch.int32)
+    k_ranges = torch.tensor([[0, 8]], dtype=torch.int32)
+    attn_type_map = torch.tensor([1], dtype=torch.int32)
+
+    magi_metadata.ensure_range_bounds(query, key, q_ranges, k_ranges)
+    first = magi_metadata.get_or_prepare_attn_arg(
+        query,
+        key,
+        q_ranges,
+        k_ranges,
+        attn_type_map,
+        metadata_head_dim=128,
+    )
+    second = magi_metadata.get_or_prepare_attn_arg(
+        query,
+        key,
+        q_ranges,
+        k_ranges,
+        attn_type_map,
+        metadata_head_dim=128,
+    )
+
+    assert first is second
+    assert counts["require_all"] == 2
 
 
 def test_magi_fa4_metadata_cache_disables_reuse_without_version_counters(monkeypatch):

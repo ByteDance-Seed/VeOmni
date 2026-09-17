@@ -33,7 +33,7 @@ from tests.ops.tol import (
     MHC_FUSED_GRAD_COSINE,
     MHC_FUSED_RTOL,
 )
-from tests.ops.utils import cosine_similarity, is_nvidia_cuda_available, make_grad_leaves
+from tests.ops.utils import assert_gradient_direction_and_scale, is_nvidia_cuda_available, make_grad_leaves
 from veomni.ops import resolve_op
 
 
@@ -108,13 +108,19 @@ def test_mhc_pre_eager_matches_hf():
     assert torch.allclose(comb_e, comb_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
     assert torch.allclose(collapsed_e, collapsed_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
-    go = torch.randn_like(collapsed_e)
-    collapsed_h.backward(go)
-    collapsed_e.backward(go)
-    assert torch.allclose(x_e.grad, x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-    assert torch.allclose(fn_e.grad, hc.fn.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-    assert torch.allclose(scale_e.grad, hc.scale.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-    assert torch.allclose(base_e.grad, hc.base.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    grad_outputs = tuple(torch.randn_like(output) for output in (post_e, comb_e, collapsed_e))
+    hf_grads = torch.autograd.grad(
+        (post_h, comb_h, collapsed_h),
+        (x_h, hc.fn, hc.scale, hc.base),
+        grad_outputs=grad_outputs,
+    )
+    eager_grads = torch.autograd.grad(
+        (post_e, comb_e, collapsed_e),
+        (x_e, fn_e, scale_e, base_e),
+        grad_outputs=grad_outputs,
+    )
+    for actual, expected in zip(eager_grads, hf_grads, strict=True):
+        torch.testing.assert_close(actual, expected, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
 def test_mhc_post_eager_matches_hf():
@@ -216,8 +222,12 @@ def test_mhc_tilelang_pre_post_matches_eager():
     other_grads = torch.autograd.grad((y_o * grad).sum(), (x_o, fn_o, scale_o, base_o))
     eager_grads = torch.autograd.grad((y_e * grad).sum(), (x_e, fn_e, scale_e, base_e))
     for actual, expected in zip(other_grads, eager_grads, strict=True):
-        assert torch.isfinite(actual).all()
-        assert cosine_similarity(actual, expected) > MHC_FUSED_GRAD_COSINE
+        assert_gradient_direction_and_scale(
+            actual,
+            expected,
+            min_cosine=MHC_FUSED_GRAD_COSINE,
+            norm_rtol=0.25,
+        )
 
 
 @pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="TileKernels mHC requires an SM90+ NVIDIA CUDA GPU")
@@ -243,5 +253,9 @@ def test_mhc_tilelang_head_matches_eager():
     other_grads = torch.autograd.grad((y_o * grad).sum(), (x_o, fn_o, scale_o, base_o))
     eager_grads = torch.autograd.grad((y_e * grad).sum(), (x_e, fn_e, scale_e, base_e))
     for actual, expected in zip(other_grads, eager_grads, strict=True):
-        assert torch.isfinite(actual).all()
-        assert cosine_similarity(actual, expected) > MHC_FUSED_GRAD_COSINE
+        assert_gradient_direction_and_scale(
+            actual,
+            expected,
+            min_cosine=MHC_FUSED_GRAD_COSINE,
+            norm_rtol=0.25,
+        )

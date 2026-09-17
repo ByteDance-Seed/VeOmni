@@ -8,15 +8,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""EP-local grouped GEMM vs split/merged layouts and the non-EP fused path."""
+"""EP-local grouped GEMM parity across split/merged layouts and a PyTorch oracle."""
 
 from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F
 
-from tests.ops.tol import MOE_EP_PRE_SM90_ATOL, MOE_EP_SM90_ATOL, MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL
+from tests.ops.moe_experts.reference import standard_fused_reference
+from tests.ops.tol import (
+    MOE_EP_PRE_SM90_ATOL,
+    MOE_EP_PRE_SM90_GRAD_FC1_ATOL,
+    MOE_EP_PRE_SM90_GRAD_FC1_RTOL,
+    MOE_EP_PRE_SM90_GRAD_FC2_ATOL,
+    MOE_EP_PRE_SM90_GRAD_FC2_RTOL,
+    MOE_EP_SM90_ATOL,
+    MOE_EP_SM90_GRAD_FC1_ATOL,
+    MOE_EP_SM90_GRAD_FC1_RTOL,
+    MOE_EP_SM90_GRAD_FC2_ATOL,
+    MOE_EP_SM90_GRAD_FC2_RTOL,
+    MOE_FUSED_GRAD_HIDDEN_ATOL,
+    MOE_FUSED_GRAD_HIDDEN_RTOL,
+    MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL,
+    MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL,
+    MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
+)
+from tests.ops.utils import assert_close_with_error, assert_reference_signal
 from veomni.distributed.moe import EPGroupGemm, EPMergedFc1GroupGemm
 from veomni.ops.kernels.moe_experts.shared.dispatch import expert_histogram, moe_gather, moe_scatter
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, is_sm90_or_above
@@ -28,36 +45,6 @@ def _skip_if_unsupported():
         pytest.skip("CUDA is required for fused MoE EP tests.")
     if not is_fused_moe_available():
         pytest.skip("Triton fused MoE is not available in this environment.")
-
-
-def _eager_moe_forward(
-    num_experts: int,
-    routing_weights: torch.Tensor,
-    selected_experts: torch.Tensor,
-    hidden_states: torch.Tensor,
-    fc1_1_weight: torch.Tensor,
-    fc1_2_weight: torch.Tensor,
-    fc2_weight: torch.Tensor,
-    swiglu_limit: float | None = None,
-) -> torch.Tensor:
-    """Fused operator-order eager reference. Routing scales the SwiGLU intermediate."""
-    output = torch.zeros_like(hidden_states)
-    expert_mask = F.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
-    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-    for expert_idx in expert_hit:
-        idx = int(expert_idx[0].item())
-        top_k_pos, token_idx = torch.where(expert_mask[idx])
-        x = hidden_states[token_idx]
-        gate = F.linear(x, fc1_1_weight[idx])
-        up = F.linear(x, fc1_2_weight[idx])
-        if swiglu_limit is not None:
-            gate = gate.clamp(max=swiglu_limit)
-            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-        y = F.silu(gate) * up
-        y = y * routing_weights[token_idx, top_k_pos, None]
-        y = F.linear(y, fc2_weight[idx])
-        output.index_add_(0, token_idx, y.to(output.dtype))
-    return output
 
 
 def _make_ep_inputs(num_tokens, num_experts, hidden_dim, ffn_dim, seed):
@@ -93,8 +80,69 @@ def _scatter_routing_weights(routing_weights, scatter_index):
     return scattered
 
 
+def _scatter_tokens_autograd(hidden_states, scatter_index):
+    """Mirror the Triton scatter layout with differentiable PyTorch indexing."""
+    topk = scatter_index.shape[1]
+    sorted_to_assignment = scatter_index.flatten().argsort()
+    return hidden_states.repeat_interleave(topk, dim=0)[sorted_to_assignment]
+
+
+def _gather_tokens_autograd(expert_output, routing_weights, scatter_index):
+    """Mirror weighted Triton gather while retaining the test's autograd graph."""
+    num_tokens, topk = scatter_index.shape
+    assignment_output = expert_output[scatter_index.flatten()]
+    weighted_output = assignment_output * routing_weights.reshape(-1, 1)
+    return weighted_output.view(num_tokens, topk, -1).sum(dim=1)
+
+
 def _ep_atol() -> float:
     return MOE_EP_SM90_ATOL if is_sm90_or_above() else MOE_EP_PRE_SM90_ATOL
+
+
+def _ep_gradient_tolerances(swiglu_limit):
+    if is_sm90_or_above():
+        fc1_tol = (MOE_EP_SM90_GRAD_FC1_ATOL, MOE_EP_SM90_GRAD_FC1_RTOL)
+        fc2_tol = (MOE_EP_SM90_GRAD_FC2_ATOL, MOE_EP_SM90_GRAD_FC2_RTOL)
+    else:
+        fc1_tol = (MOE_EP_PRE_SM90_GRAD_FC1_ATOL, MOE_EP_PRE_SM90_GRAD_FC1_RTOL)
+        fc2_tol = (MOE_EP_PRE_SM90_GRAD_FC2_ATOL, MOE_EP_PRE_SM90_GRAD_FC2_RTOL)
+    if swiglu_limit is not None:
+        hidden_tol = (MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL, MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL)
+    else:
+        hidden_tol = (MOE_FUSED_GRAD_HIDDEN_ATOL, MOE_FUSED_GRAD_HIDDEN_RTOL)
+    return hidden_tol, fc1_tol, fc2_tol
+
+
+def _assert_ep_reference_grads(pairs, hidden_tol, fc1_tol, fc2_tol):
+    """Require useful reference signal, then compare with recorded error."""
+    budgets = {
+        "hidden gradient": hidden_tol,
+        "routing gradient": hidden_tol,
+        "fc1 gradient": fc1_tol,
+        "fc1_1 gradient": fc1_tol,
+        "fc1_2 gradient": fc1_tol,
+        "fc2 gradient": fc2_tol,
+    }
+    for name, actual, expected in pairs:
+        atol, rtol = budgets[name]
+        assert_reference_signal(name, expected, atol, rtol)
+        assert_close_with_error(name, actual, expected, atol=atol, rtol=rtol)
+
+
+def test_ep_weight_grad_budgets_are_platform_specific():
+    """EP weight grads must not reuse the generic fused relative budget."""
+    from tests.ops.tol import MOE_FUSED_GRAD_FC1_ATOL, MOE_FUSED_GRAD_FC2_ATOL
+
+    assert MOE_EP_SM90_GRAD_FC1_ATOL < MOE_FUSED_GRAD_FC1_ATOL
+    assert MOE_EP_SM90_GRAD_FC2_ATOL < MOE_FUSED_GRAD_FC2_ATOL
+    assert MOE_EP_SM90_GRAD_FC1_RTOL == 0
+    assert MOE_EP_SM90_GRAD_FC2_RTOL == 0
+    assert MOE_EP_PRE_SM90_GRAD_FC1_RTOL == 0
+    assert MOE_EP_PRE_SM90_GRAD_FC2_RTOL == 0
+    hidden_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(None)
+    assert fc1_tol[1] == 0
+    assert fc2_tol[1] == 0
+    assert hidden_tol[0] == MOE_FUSED_GRAD_HIDDEN_ATOL
 
 
 @pytest.mark.parametrize("swiglu_limit", [None, 7.0, 10.0])
@@ -279,15 +327,15 @@ def test_ep_vs_non_ep(
 
     scatter_output, cumsum, scatter_index = _scatter_tokens(hidden_states, selected_experts, num_experts)
     scattered_gw = _scatter_routing_weights(routing_weights, scatter_index)
-    out_eager = _eager_moe_forward(
-        num_experts,
+    out_eager = standard_fused_reference(
+        hidden_states,
         routing_weights,
         selected_experts,
-        hidden_states,
         fc1_1_weight,
         fc1_2_weight,
         fc2_weight,
-        swiglu_limit,
+        num_experts=num_experts,
+        swiglu_limit=swiglu_limit,
     )
     ep_raw = EPGroupGemm.apply(
         scatter_output.clone().detach(),
@@ -302,30 +350,45 @@ def test_ep_vs_non_ep(
     torch.testing.assert_close(out_eager, out_ep, rtol=0, atol=atol)
 
     hs_eager = hidden_states.clone().detach().requires_grad_(True)
+    routing_eager = routing_weights.clone().detach().requires_grad_(True)
     fc1_1_eager = fc1_1_weight.clone().detach().requires_grad_(True)
     fc1_2_eager = fc1_2_weight.clone().detach().requires_grad_(True)
     fc2_eager = fc2_weight.clone().detach().requires_grad_(True)
-    out_e = _eager_moe_forward(
-        num_experts,
-        routing_weights,
-        selected_experts,
+    out_e = standard_fused_reference(
         hs_eager,
+        routing_eager,
+        selected_experts,
         fc1_1_eager,
         fc1_2_eager,
         fc2_eager,
-        swiglu_limit,
+        num_experts=num_experts,
+        swiglu_limit=swiglu_limit,
     )
-    out_e.sum().backward()
+    grad_output = torch.randn_like(out_e)
+    out_e.backward(grad_output)
 
-    pt_ep = scatter_output.clone().detach().requires_grad_(True)
+    hs_ep = hidden_states.clone().detach().requires_grad_(True)
+    routing_ep = routing_weights.clone().detach().requires_grad_(True)
+    pt_ep = _scatter_tokens_autograd(hs_ep, scatter_index)
     fc1_1_ep = fc1_1_weight.clone().detach().requires_grad_(True)
     fc1_2_ep = fc1_2_weight.clone().detach().requires_grad_(True)
     fc2_ep = fc2_weight.clone().detach().requires_grad_(True)
     ep_raw2 = EPGroupGemm.apply(pt_ep, cumsum, fc1_1_ep, fc1_2_ep, fc2_ep, swiglu_limit)
-    ep_raw2.backward(scattered_gw.expand_as(ep_raw2).contiguous())
-    torch.testing.assert_close(fc2_eager.grad, fc2_ep.grad, rtol=0, atol=atol)
-    torch.testing.assert_close(fc1_1_eager.grad, fc1_1_ep.grad, rtol=0, atol=atol)
-    torch.testing.assert_close(fc1_2_eager.grad, fc1_2_ep.grad, rtol=0, atol=atol)
+    out_ep2 = _gather_tokens_autograd(ep_raw2, routing_ep, scatter_index)
+    out_ep2.backward(grad_output)
+    hidden_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(swiglu_limit)
+    _assert_ep_reference_grads(
+        (
+            ("hidden gradient", hs_ep.grad, hs_eager.grad),
+            ("routing gradient", routing_ep.grad, routing_eager.grad),
+            ("fc2 gradient", fc2_ep.grad, fc2_eager.grad),
+            ("fc1_1 gradient", fc1_1_ep.grad, fc1_1_eager.grad),
+            ("fc1_2 gradient", fc1_2_ep.grad, fc1_2_eager.grad),
+        ),
+        hidden_tol,
+        fc1_tol,
+        fc2_tol,
+    )
 
 
 @pytest.mark.parametrize("swiglu_limit", [None, 7.0, 10.0])
@@ -360,15 +423,15 @@ def test_ep_merged_vs_non_ep(
 
     scatter_output, cumsum, scatter_index = _scatter_tokens(hidden_states, selected_experts, num_experts)
     scattered_gw = _scatter_routing_weights(routing_weights, scatter_index)
-    out_eager = _eager_moe_forward(
-        num_experts,
+    out_eager = standard_fused_reference(
+        hidden_states,
         routing_weights,
         selected_experts,
-        hidden_states,
         fc1_1_weight,
         fc1_2_weight,
         fc2_weight,
-        swiglu_limit,
+        num_experts=num_experts,
+        swiglu_limit=swiglu_limit,
     )
     ep_raw = EPMergedFc1GroupGemm.apply(
         scatter_output.clone().detach(),
@@ -382,30 +445,40 @@ def test_ep_merged_vs_non_ep(
     torch.testing.assert_close(out_eager, out_ep, rtol=0, atol=atol)
 
     hs_eager = hidden_states.clone().detach().requires_grad_(True)
+    routing_eager = routing_weights.clone().detach().requires_grad_(True)
     fc1_1_eager = fc1_1_weight.clone().detach().requires_grad_(True)
     fc1_2_eager = fc1_2_weight.clone().detach().requires_grad_(True)
     fc2_eager = fc2_weight.clone().detach().requires_grad_(True)
-    out_e = _eager_moe_forward(
-        num_experts,
-        routing_weights,
-        selected_experts,
+    out_e = standard_fused_reference(
         hs_eager,
+        routing_eager,
+        selected_experts,
         fc1_1_eager,
         fc1_2_eager,
         fc2_eager,
-        swiglu_limit,
+        num_experts=num_experts,
+        swiglu_limit=swiglu_limit,
     )
-    out_e.sum().backward()
+    grad_output = torch.randn_like(out_e)
+    out_e.backward(grad_output)
 
-    pt_ep = scatter_output.clone().detach().requires_grad_(True)
+    hs_ep = hidden_states.clone().detach().requires_grad_(True)
+    routing_ep = routing_weights.clone().detach().requires_grad_(True)
+    pt_ep = _scatter_tokens_autograd(hs_ep, scatter_index)
     fc1_merged_ep = fc1_1_2_weight.clone().detach().requires_grad_(True)
     fc2_ep = fc2_weight.clone().detach().requires_grad_(True)
     ep_raw2 = EPMergedFc1GroupGemm.apply(pt_ep, cumsum, fc1_merged_ep, fc2_ep, swiglu_limit)
-    ep_raw2.backward(scattered_gw.expand_as(ep_raw2).contiguous())
-    torch.testing.assert_close(fc2_eager.grad, fc2_ep.grad, rtol=0, atol=atol)
-    torch.testing.assert_close(
-        torch.cat([fc1_1_eager.grad, fc1_2_eager.grad], dim=1),
-        fc1_merged_ep.grad,
-        rtol=0,
-        atol=atol,
+    out_ep2 = _gather_tokens_autograd(ep_raw2, routing_ep, scatter_index)
+    out_ep2.backward(grad_output)
+    hidden_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(swiglu_limit)
+    _assert_ep_reference_grads(
+        (
+            ("hidden gradient", hs_ep.grad, hs_eager.grad),
+            ("routing gradient", routing_ep.grad, routing_eager.grad),
+            ("fc2 gradient", fc2_ep.grad, fc2_eager.grad),
+            ("fc1 gradient", fc1_merged_ep.grad, torch.cat([fc1_1_eager.grad, fc1_2_eager.grad], dim=1)),
+        ),
+        hidden_tol,
+        fc1_tol,
+        fc2_tol,
     )

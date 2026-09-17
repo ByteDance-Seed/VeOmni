@@ -87,6 +87,19 @@ MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL = 3e-2
 MOE_SPLIT_MERGED_GRAD_HIDDEN_RTOL = 3e-2
 MOE_EP_SM90_ATOL = 4e-3
 MOE_EP_PRE_SM90_ATOL = 3.2e-2
+# EP weight-grad budgets are platform-specific. SM90 keeps the historical
+# split-vs-merged scale (atol=4e-3, rtol=0). Pre-SM90 uses A100 SM80
+# measurements on this workload (random cotangent, autograd scatter/gather):
+# FC1 max_abs=1.17e-2, FC2 max_abs=7.81e-3, then ~1.5x headroom. rtol=0 so
+# near-zero entries cannot hide behind a relative allowance.
+MOE_EP_SM90_GRAD_FC1_ATOL = 4e-3
+MOE_EP_SM90_GRAD_FC1_RTOL = 0.0
+MOE_EP_SM90_GRAD_FC2_ATOL = 4e-3
+MOE_EP_SM90_GRAD_FC2_RTOL = 0.0
+MOE_EP_PRE_SM90_GRAD_FC1_ATOL = 1.8e-2
+MOE_EP_PRE_SM90_GRAD_FC1_RTOL = 0.0
+MOE_EP_PRE_SM90_GRAD_FC2_ATOL = 1.2e-2
+MOE_EP_PRE_SM90_GRAD_FC2_RTOL = 0.0
 
 GDN_FUSED_ATOL = 2e-2
 GDN_FUSED_RTOL = 2e-2

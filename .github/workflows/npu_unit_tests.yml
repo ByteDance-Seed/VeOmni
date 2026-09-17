@@ -157,14 +157,10 @@ jobs:
           uv run --frozen pytest -v -s -x tests/parallel/test_parallel_state_registry.py
       - name: Run models tests
         run: |
-          uv run --frozen pytest -v -s -x tests/models_kernel
-          uv run --frozen pytest -v -s -x tests/models/test_model_registry.py
-          uv run --frozen pytest -v -s -x tests/models/test_models_patch.py
-          uv run --frozen pytest -v -s -x tests/models/test_padded_packed_loss.py
-          uv run --frozen pytest -v -s -x tests/models/test_vlm_trainer.py
+          uv run --frozen pytest -v -s -x tests/models
+          uv run --frozen pytest -v -s -x tests/trainer/test_vlm_trainer.py
           uv run --frozen pytest -v -s -x tests/trainer/test_aux_metrics.py
           uv run --frozen pytest -v -s -x tests/lora/test_vlm_lora.py
-          uv run --frozen pytest -v -s -x tests/models/test_checkpoint_tensor_converter.py
       - name: Run fsdp2/extra_parallel+fsdp2 (e.g. ep+fsdp2, mb+fsdp2, ep+emb+fsdp2) clip grad norm test
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
@@ -181,6 +177,7 @@ jobs:
         run: |
           uv run --frozen pytest -v -s -x tests/distributed/test_async_offload_unit.py
           uv run --frozen pytest -v -s -x tests/distributed/test_dummy_forward.py
+          uv run --frozen pytest -v -s -x tests/distributed/test_hccl_premul_sum.py
       - name: Run data tests
         run: |
           uv run --frozen pytest -v -s -x tests/data
@@ -190,17 +187,13 @@ jobs:
       - name: Run utils tests
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_count_flops.py
+          uv run --frozen pytest -v -s -x tests/tools/test_training_utils.py
       - name: Run LoRA save/load test
         # peft ships under the `npu` extra, so the earlier
         # `uv sync --extra npu --group dev` step already installs it — no extra
         # sync needed here.
         run: |
           uv run --frozen pytest -v -s -x tests/lora/test_lora_trainer_saveload.py
-      - name: Run moe_experts_lora NPU fused vs eager parity
-        # Numerical gate for NPU fused MoE-LoRA (shared + independent; forward +
-        # hidden/A/B grads; EP=1 vs non-EP). Lives with the kernel family.
-        run: |
-          uv run --frozen pytest -v -s -x tests/ops/moe_experts_lora/test_moe_experts_lora.py
       - name: Run MoE-LoRA ep_sharded_stream_load (PEFT, EP=2)
         # Exercises the PEFT ep_sharded adapter streaming *and* the NPU
         # fused MoE-LoRA EP kernel (fused_npu): the test auto-selects

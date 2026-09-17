@@ -29,6 +29,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from ...topk import mask_unselectable_topk_indices
+
 
 def wrapper(
     q: Tensor,
@@ -43,12 +45,18 @@ def wrapper(
     position_ids: Tensor | None = None,
     use_cache: bool = False,
 ) -> Tensor:
-    """Official GLM indexer scores. Same face as cuDNN ``indexer_select_topk``.
+    """Compute GLM DSA scores and causal top-k compressed-KV indices.
 
     ``q`` is ``[B, S, H, D]``. ``k`` is ``[B, T, D]`` or ``[B, T, 1, D]``.
-    ``w`` is ``[B, S, H]``. Returns top-k indices ``[B, S, top_k]`` as long.
-    ``ratio`` is accepted for call-face parity with cuDNN. Official eager
-    applies causality through ``attention_mask``, not ``ratio``.
+    ``w`` is ``[B, S, H]``. Returns ``[B, S, K]`` ``torch.int32`` indices
+    where ``K = min(top_k, T)``. Invisible keys, including future positions
+    after the causal fill, are ``-1``. The ReLU / weighted-sum scores follow
+    HuggingFace ``GlmMoeDsaIndexer.forward``. Causal masking through
+    ``attention_mask`` or ``position_ids`` is VeOmni, not a copy of that
+    module. HuggingFace still returns future indices when fewer than ``K``
+    keys remain visible; fused attention here requires the ``-1`` sentinel.
+    ``ratio`` is accepted for API parity with cuDNN. The eager
+    path applies causality through ``attention_mask``, not ``ratio``.
     ``qhead_per_kv_head`` is unused.
     """
     del ratio, qhead_per_kv_head, use_cache
@@ -67,4 +75,5 @@ def wrapper(
         causal = key_positions[None, None, :] > position_ids[:, :, None]
         index_scores = index_scores.masked_fill(causal, float("-inf"))
     top_k = min(int(top_k), index_scores.shape[-1])
-    return index_scores.topk(top_k, dim=-1).indices.to(torch.int32)
+    topk_out = index_scores.topk(top_k, dim=-1)
+    return mask_unselectable_topk_indices(topk_out.values, topk_out.indices).to(torch.int32)

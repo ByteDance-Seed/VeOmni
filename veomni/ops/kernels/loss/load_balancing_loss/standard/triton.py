@@ -175,11 +175,14 @@ def forward(gate_logits: Tensor, attention_mask: Tensor, *, top_k: int) -> tuple
 
     if has_mask:
         total_weight = mask_weights.sum()
-        if total_weight == 0:
-            output, saved = _eager.forward(gate_logits, attention_mask, top_k=top_k)
-            return output, SavedState(saved.tensors, _Meta(top_k, True))
     else:
-        total_weight = torch.tensor(float(token_count), device=device)
+        total_weight = torch.empty((), device=device, dtype=torch.float32).fill_(token_count)
+
+    if token_count == 0:
+        expert_count = torch.zeros(num_experts, device=device, dtype=torch.float32)
+        router_prob_sum = torch.zeros(num_experts, device=device, dtype=torch.float32)
+        loss = _eager._safe_loss(expert_count, router_prob_sum, num_experts, total_weight)
+        return loss, SavedState((gate_logits, attention_mask, expert_count, total_weight), _Meta(top_k, has_mask))
 
     num_blocks = triton.cdiv(token_count, BLOCK_N)
     block_e = triton.next_power_of_2(num_experts)
@@ -205,7 +208,7 @@ def forward(gate_logits: Tensor, attention_mask: Tensor, *, top_k: int) -> tuple
 
     expert_count = partial_expert_count.sum(0)
     router_prob_sum = partial_router_prob_sum.sum(0)
-    loss = torch.dot(expert_count, router_prob_sum) * (num_experts / (total_weight * total_weight))
+    loss = _eager._safe_loss(expert_count, router_prob_sum, num_experts, total_weight)
     return loss, SavedState((gate_logits, attention_mask, expert_count, total_weight), _Meta(top_k, has_mask))
 
 
@@ -220,6 +223,8 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None]:
         raise ValueError(f"gate_logits must be [N, E], got {tuple(gate_logits.shape)}")
     concatenated = gate_logits.contiguous()
     token_count, num_experts = concatenated.shape
+    if token_count == 0:
+        return torch.zeros_like(gate_logits), None
     grad_logits = torch.empty_like(concatenated, dtype=torch.float32)
     block_e = triton.next_power_of_2(num_experts)
     grad_scale = _eager._safe_grad_scale(grad_output, num_experts, total_weight)

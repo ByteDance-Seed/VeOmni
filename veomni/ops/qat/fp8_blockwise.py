@@ -29,8 +29,9 @@ Every scale is derived from its own block's amax, and ``ue8m0`` rounds that
 scale up, so ``x / scale`` stays inside the representable FP8 range and no
 element sits in a saturated region whose gradient would have to be masked.
 
-The TileLang quantizers are SM90-only and BF16-only, so every entry point here
-inherits both restrictions.
+Quantizing paths require BF16 operands on an NVIDIA SM90 or later GPU.
+``qat_linear(..., enabled=False)`` calls the original module directly and
+bypasses quantization and those restrictions.
 """
 
 import torch

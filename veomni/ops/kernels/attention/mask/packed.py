@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Shared packed-sequence predicates for SDPA and FlexAttention masks."""
+"""Shared packed-sequence predicates for eager and FlexAttention masks."""
 
 from collections.abc import Callable
 
@@ -40,26 +40,33 @@ def packed_mask_function(
     tensor cannot classify both sides. Map every query to its position in the
     corresponding key segment before evaluating the causal/sliding predicate;
     queries are the suffix of each key segment, matching cached-attention
-    ``q_offset=kv_length-q_length`` semantics.
+    ``q_offset=kv_length-q_length`` semantics. Self-attention that shares one
+    ``cu_seqlens`` object at equal Q/K lengths validates and expands it once.
     """
     if not isinstance(cu_seqlens, Tensor):
         raise TypeError(f"cu_seqlens must be a torch.Tensor, got {type(cu_seqlens).__name__}")
     if cu_seqlens_k is not None and not isinstance(cu_seqlens_k, Tensor):
         raise TypeError(f"cu_seqlens_k must be a torch.Tensor, got {type(cu_seqlens_k).__name__}")
     if cu_seqlens_k is None and q_length != kv_length:
-        raise ValueError("packed SDPA/FlexAttention with q_length != kv_length requires cu_seqlens_k")
+        raise ValueError("packed eager/FlexAttention with q_length != kv_length requires cu_seqlens_k")
     cu_seqlens_k = cu_seqlens if cu_seqlens_k is None else cu_seqlens_k
     if cu_seqlens.numel() != cu_seqlens_k.numel():
         raise ValueError(
-            "packed SDPA/FlexAttention requires the same number of query and key segments, got "
+            "packed eager/FlexAttention requires the same number of query and key segments, got "
             f"{cu_seqlens.numel() - 1} and {cu_seqlens_k.numel() - 1}"
         )
 
     device = torch.device(device)
+    share_qk = cu_seqlens is cu_seqlens_k and q_length == kv_length
     cu_seqlens_q = _validated_cu_seqlens(cu_seqlens, q_length, device)
-    cu_seqlens_k = _validated_cu_seqlens(cu_seqlens_k, kv_length, device)
-    q_segment_ids = _segment_ids(cu_seqlens_q, q_length, device)
-    k_segment_ids = _segment_ids(cu_seqlens_k, kv_length, device)
+    if share_qk:
+        cu_seqlens_k = cu_seqlens_q
+        q_segment_ids = _segment_ids(cu_seqlens_q, q_length, device)
+        k_segment_ids = q_segment_ids
+    else:
+        cu_seqlens_k = _validated_cu_seqlens(cu_seqlens_k, kv_length, device)
+        q_segment_ids = _segment_ids(cu_seqlens_q, q_length, device)
+        k_segment_ids = _segment_ids(cu_seqlens_k, kv_length, device)
 
     q_positions = torch.arange(q_length, device=device)
     q_starts = cu_seqlens_q[:-1]

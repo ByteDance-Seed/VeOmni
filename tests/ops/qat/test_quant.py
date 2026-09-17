@@ -17,7 +17,7 @@
 import pytest
 import torch
 
-from tests.ops.qat.reference import reference_act_quant, reference_fp8_weight_quant
+from tests.ops.qat.reference import reference_act_quant, reference_fp4_act_quant, reference_fp8_weight_quant
 from tests.ops.utils import require_nvidia_cuda
 from veomni.utils.device import get_device_type
 
@@ -25,70 +25,83 @@ from veomni.utils.device import get_device_type
 DEVICE = get_device_type()
 
 
-def test_tilelang_act_quant_shapes_scales_and_dequant():
+def test_fp8_scale_pairing_rejects_e8m0_without_format():
+    from veomni.ops.qat.scale import validate_fp8_scale_pairing
+
+    validate_fp8_scale_pairing(None, torch.float32)
+    validate_fp8_scale_pairing("ue8m0", torch.float8_e8m0fnu)
+    with pytest.raises(AssertionError, match="powers of two"):
+        validate_fp8_scale_pairing(None, torch.float8_e8m0fnu)
+    with pytest.raises(AssertionError, match="float32 and float8_e8m0fnu"):
+        validate_fp8_scale_pairing(None, torch.float16)
+
+
+def test_tilelang_fp4_quant_matches_reference_and_dequantizes():
+    require_nvidia_cuda("tilelang", min_cc=90)
+    from veomni.ops.qat.quant import fp4_act_quant
+
+    torch.manual_seed(1)
+    rounding_ties = torch.tensor((0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0)).repeat(8)
+    x = torch.stack(
+        (
+            torch.zeros(64),
+            torch.full((64,), 1e-8),
+            torch.linspace(-7.0, 7.0, 64),
+            rounding_ties,
+            torch.randn(64),
+        )
+    ).to(device=DEVICE, dtype=torch.bfloat16)
+    x[-1, 9] = 500.0
+    quantized, scales = fp4_act_quant(x)
+    reference_quantized, reference_scales = reference_fp4_act_quant(x)
+
+    assert quantized.shape == (5, 32)
+    assert quantized.dtype == torch.float4_e2m1fn_x2
+    assert scales.shape == (5, 2)
+    assert scales.dtype == torch.float8_e8m0fnu
+    assert torch.equal(quantized.view(torch.uint8), reference_quantized.view(torch.uint8))
+    assert torch.equal(scales.view(torch.uint8), reference_scales.view(torch.uint8))
+
+    dequantized = fp4_act_quant(x, dequant=True)
+    expected_dequantized = reference_fp4_act_quant(x, dequant=True)
+    assert dequantized.dtype == torch.bfloat16
+    assert torch.equal(dequantized, expected_dequantized)
+
+
+@pytest.mark.parametrize("block_size", (64, 128), ids=("block64", "block128"))
+@pytest.mark.parametrize(
+    ("scale_fmt", "scale_dtype"),
+    ((None, torch.float32), ("ue8m0", torch.float8_e8m0fnu)),
+    ids=("exact-scale", "ue8m0"),
+)
+def test_tilelang_act_quant_matches_reference_and_dequantizes(block_size, scale_fmt, scale_dtype):
     require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.qat.quant import act_quant
 
     torch.manual_seed(2)
-    x = torch.randn(3, 256, device=DEVICE, dtype=torch.bfloat16)
-    quantized, scales = act_quant(x, block_size=128)
+    x = torch.randn(256, 3, device=DEVICE, dtype=torch.bfloat16).t()
+    x[0].zero_()
+    assert not x.is_contiguous()
+    original = x.clone()
+    kwargs = {"block_size": block_size, "scale_fmt": scale_fmt, "scale_dtype": scale_dtype}
+    quantized, scales = act_quant(x, **kwargs)
 
     assert quantized.shape == x.shape
     assert quantized.dtype == torch.float8_e4m3fn
-    assert scales.shape == (3, 2)
-    expected_quantized, expected_scales = reference_act_quant(x, block_size=128)
-    assert torch.equal(scales, expected_scales)
+    assert scales.shape == (3, 256 // block_size)
+    assert scales.dtype == scale_dtype
+    expected_quantized, expected_scales = reference_act_quant(x, **kwargs)
+    if scale_dtype == torch.float8_e8m0fnu:
+        assert torch.equal(scales.view(torch.uint8), expected_scales.view(torch.uint8))
+    else:
+        assert torch.equal(scales, expected_scales)
     assert torch.equal(quantized.view(torch.uint8), expected_quantized.view(torch.uint8))
-    expected_dequantized = reference_act_quant(x, block_size=128, dequant=True)
-    actual_dequantized = (quantized.float() * scales.repeat_interleave(128, dim=-1)).to(torch.bfloat16)
-    torch.testing.assert_close(actual_dequantized, expected_dequantized, rtol=0, atol=0)
-
-    result = act_quant(x, block_size=128, dequant=True)
-    torch.testing.assert_close(result, expected_dequantized, rtol=0, atol=0)
-
-    x_mx = x.clone()
-    x_mx[0].zero_()
-    quantized_mx, scales_mx = act_quant(
-        x_mx,
-        block_size=128,
-        scale_fmt="ue8m0",
-        scale_dtype=torch.float8_e8m0fnu,
-    )
-    expected_quantized_mx, expected_scales_mx = reference_act_quant(
-        x_mx,
-        block_size=128,
-        scale_fmt="ue8m0",
-        scale_dtype=torch.float8_e8m0fnu,
-    )
-    assert torch.equal(scales_mx.view(torch.uint8), expected_scales_mx.view(torch.uint8))
-    assert torch.equal(quantized_mx.view(torch.uint8), expected_quantized_mx.view(torch.uint8))
-
-
-def test_tilelang_act_quant_dequant_fuses_the_round_trip():
-    require_nvidia_cuda("tilelang", min_cc=90)
-    from veomni.ops.qat.quant import act_quant
-
-    torch.manual_seed(2)
-    x = torch.randn(3, 256, device=DEVICE, dtype=torch.bfloat16)
-    x[0].zero_()
-
-    for scale_fmt in (None, "ue8m0"):
-        quantized, scales = act_quant(x, block_size=128, scale_fmt=scale_fmt)
-        expected = (quantized.float() * scales.repeat_interleave(128, dim=-1)).to(torch.bfloat16)
-        original = x.clone()
-        result = act_quant(x, block_size=128, scale_fmt=scale_fmt, dequant=True)
-
-        assert result.dtype == torch.bfloat16
-        assert torch.equal(result, expected)
-        assert result.data_ptr() != x.data_ptr()
-        assert torch.equal(x, original)
-
-    transposed = torch.randn(256, 3, device=DEVICE, dtype=torch.bfloat16).t()
-    assert not transposed.is_contiguous()
-    assert torch.equal(
-        act_quant(transposed, block_size=128, scale_fmt="ue8m0", dequant=True),
-        act_quant(transposed.contiguous(), block_size=128, scale_fmt="ue8m0", dequant=True),
-    )
+    dequantized = act_quant(x, dequant=True, **kwargs)
+    expected_dequantized = reference_act_quant(x, dequant=True, **kwargs)
+    assert dequantized.dtype == torch.bfloat16
+    assert torch.equal(dequantized, expected_dequantized)
+    assert dequantized.data_ptr() != x.data_ptr()
+    assert torch.equal(x, original)
 
 
 def _weight_quant_test_input():
@@ -144,24 +157,34 @@ def test_tilelang_fp8_weight_quant_matches_reference():
     assert scales[0, 2] == 1e-4 / 448.0
 
 
-def test_tilelang_fp8_weight_quant_round_trip_and_non_contiguous_input():
+@pytest.mark.parametrize(
+    ("scale_fmt", "scale_dtype", "tolerance_divisor"),
+    (
+        (None, None, 16.0),
+        ("ue8m0", torch.float8_e8m0fnu, 8.0),
+    ),
+    ids=("exact-scale", "ue8m0"),
+)
+def test_tilelang_fp8_weight_quant_round_trip_and_non_contiguous_input(scale_fmt, scale_dtype, tolerance_divisor):
     require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.qat.quant import fp8_weight_quant
 
     x = _weight_quant_test_input()
-    quantized, scales = fp8_weight_quant(x, block_size=128)
+    kwargs = {"scale_fmt": scale_fmt}
+    if scale_dtype is not None:
+        kwargs["scale_dtype"] = scale_dtype
+    quantized, scales = fp8_weight_quant(x, block_size=128, **kwargs)
 
-    dequantized = quantized.float().view(2, 128, 3, 128) * scales[:, None, :, None]
+    dequantized = quantized.float().view(2, 128, 3, 128) * scales.float()[:, None, :, None]
     dequantized = dequantized.view(x.shape)
-    # E4M3 keeps 3 mantissa bits, so a correctly scaled tile round-trips to
-    # within one ulp (~2^-4) relative to that tile's amax.
+    # E8M0 scale rounding spends one additional mantissa bit of the E4M3 value.
     tile_amax = x.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
-    tolerance = (tile_amax / 16.0)[:, None, :, None].expand(2, 128, 3, 128).reshape(x.shape)
+    tolerance = (tile_amax / tolerance_divisor)[:, None, :, None].expand(2, 128, 3, 128).reshape(x.shape)
     assert ((dequantized - x.float()).abs() <= tolerance).all()
 
     transposed = x.t().contiguous().t()
     assert not transposed.is_contiguous()
-    transposed_quantized, transposed_scales = fp8_weight_quant(transposed, block_size=128)
+    transposed_quantized, transposed_scales = fp8_weight_quant(transposed, block_size=128, **kwargs)
     assert torch.equal(transposed_quantized.view(torch.uint8), quantized.view(torch.uint8))
     assert torch.equal(transposed_scales, scales)
 
@@ -232,22 +255,6 @@ def test_tilelang_fp8_weight_quant_ue8m0_keeps_exact_power_of_two_scale():
     assert quantized.float()[3, 5] == 448.0
 
 
-def test_tilelang_fp8_weight_quant_ue8m0_round_trip():
-    require_nvidia_cuda("tilelang", min_cc=90)
-    from veomni.ops.qat.quant import fp8_weight_quant
-
-    x = _weight_quant_test_input()
-    quantized, scales = fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu)
-
-    dequantized = quantized.float().view(2, 128, 3, 128) * scales.float()[:, None, :, None]
-    dequantized = dequantized.view(x.shape)
-    # Rounding the scale up spends up to one of E4M3's 3 mantissa bits, so the
-    # round-trip budget is twice the ~2^-4 of the exact-scale mode.
-    tile_amax = x.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
-    tolerance = (tile_amax / 8.0)[:, None, :, None].expand(2, 128, 3, 128).reshape(x.shape)
-    assert ((dequantized - x.float()).abs() <= tolerance).all()
-
-
 def test_tilelang_fp8_weight_quant_dequant_fuses_the_round_trip():
     require_nvidia_cuda("tilelang", min_cc=90)
     from veomni.ops.qat.quant import fp8_weight_quant
@@ -291,3 +298,11 @@ def test_tilelang_fp8_weight_quant_rejects_unsupported_inputs():
     # divide by, so the pairing has to be rejected instead of drifting.
     with pytest.raises(AssertionError, match="powers of two"):
         fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float8_e8m0fnu)
+
+
+def test_tilelang_act_quant_rejects_e8m0_without_format():
+    require_nvidia_cuda("tilelang", min_cc=90)
+    from veomni.ops.qat.quant import act_quant
+
+    with pytest.raises(AssertionError, match="powers of two"):
+        act_quant(torch.empty(4, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float8_e8m0fnu)

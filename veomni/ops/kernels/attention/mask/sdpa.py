@@ -28,6 +28,7 @@ from transformers.masking_utils import (
     sliding_window_overlay,
 )
 
+from ..helper import reject_sdpa_packed_metadata
 from ..ulysses import effective_sequence_lengths, should_apply_ulysses
 from .packed import packed_mask_function
 
@@ -45,12 +46,47 @@ def sdpa_attention_mask_builder(
 ) -> Tensor | None:
     """HF-signature SDPA mask for ``sdpa`` / ``veomni_sdpa``.
 
+    Packed/varlen metadata is rejected, matching the SDPA attention API.
+    Dense masks and sliding-window/custom visibility remain supported.
+    Skip hints apply only to the matching canonical predicate. Causal skip
+    additionally requires equal Q/K lengths and offsets; composed predicates
+    always produce an explicit mask, even if skip hints are enabled.
+    """
+    reject_sdpa_packed_metadata(kwargs)
+    return _dense_attention_mask_builder(
+        batch_size,
+        q_length,
+        kv_length,
+        q_offset,
+        kv_offset,
+        mask_function,
+        attention_mask,
+        skip_ulysses,
+        **kwargs,
+    )
+
+
+def _dense_attention_mask_builder(
+    batch_size: int,
+    q_length: int,
+    kv_length: int,
+    q_offset: int = 0,
+    kv_offset: int = 0,
+    mask_function: Callable = causal_mask_function,
+    attention_mask: torch.Tensor | None = None,
+    skip_ulysses: bool = False,
+    **kwargs,
+) -> Tensor | None:
+    """Materialize visibility for SDPA and the eager shape-mask APIs.
+
     Expand Ulysses-local lengths only when the adapter would gather Q/K/V
-    itself: sync Ulysses and not ``skip_ulysses``. Then call Transformers'
+    itself: ``ulysses_size > 1`` and not ``skip_ulysses``. Then call Transformers'
     ``sdpa`` builder. Cached decode (``q_length != kv_length``) cannot use
-    SDPA ``is_causal`` skip. Optional ``sliding_window`` / ``cu_seqlens``
-    compose onto ``mask_function``. Canonical causal/bidirectional masks need
-    no explicit metadata under Ulysses; custom predicates do.
+    SDPA ``is_causal`` skip. Eager shape masks may additionally compose packed
+    boundaries; the public SDPA builder rejects that metadata before this call.
+    Optional ``sliding_window`` composes onto ``mask_function``. Canonical
+    causal/bidirectional masks need no explicit metadata under Ulysses;
+    custom predicates do.
     """
     sliding_window = kwargs.pop("sliding_window", None)
     cu_seqlens = kwargs.pop("cu_seqlens", None)
@@ -71,7 +107,7 @@ def sdpa_attention_mask_builder(
         ):
             raise ValueError(
                 "SDPA with Ulysses requires full-sequence metadata for a custom mask function; "
-                "pass a 2D attention mask or cu_seqlens."
+                "pass a full-sequence 2D attention mask."
             )
         if attention_mask is not None and attention_mask.ndim != 2:
             raise ValueError("SDPA with Ulysses requires a full-sequence 2D attention mask.")
@@ -103,8 +139,12 @@ def sdpa_attention_mask_builder(
             device=device,
         )
 
-    if q_length != kv_length:
+    # HF checks skip hints before evaluating mask_function. They are safe only
+    # for the final canonical pattern, after applying all visibility overlays.
+    if mask_function is not causal_mask_function or q_length != kv_length or q_offset != kv_offset:
         kwargs["allow_is_causal_skip"] = False
+    if mask_function is not bidirectional_mask_function:
+        kwargs["allow_is_bidirectional_skip"] = False
 
     return ALL_MASK_ATTENTION_FUNCTIONS["sdpa"](
         batch_size=batch_size,

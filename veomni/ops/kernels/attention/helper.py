@@ -17,6 +17,35 @@
 import torch
 
 
+def reject_sdpa_packed_metadata(kwargs: dict) -> None:
+    """Reject non-null packed/varlen arguments absent from the SDPA API.
+
+    Dense attention masks remain supported. Do not inspect their contents or
+    infer packing from position IDs used by ordinary attention calls.
+    """
+    unsupported = tuple(
+        name
+        for name in (
+            "cu_seqlens",
+            "cu_seqlens_q",
+            "cu_seqlens_k",
+            "cu_seq_lens_q",
+            "cu_seq_lens_k",
+            "max_length_q",
+            "max_length_k",
+            "max_seqlen_q",
+            "max_seqlen_k",
+        )
+        if kwargs.get(name) is not None
+    )
+    if unsupported:
+        raise ValueError(
+            "SDPA does not support packed/varlen attention metadata: "
+            + ", ".join(unsupported)
+            + ". Use a packed-capable attention implementation."
+        )
+
+
 def require_all(condition: torch.Tensor, message: str) -> None:
     """Require every element to be true without synchronizing CUDA to Python.
 

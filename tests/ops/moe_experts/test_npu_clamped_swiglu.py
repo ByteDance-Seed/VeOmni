@@ -53,7 +53,15 @@ def test_npu_swiglu_dispatches_by_limit(monkeypatch: pytest.MonkeyPatch) -> None
     fake_torch_npu = ModuleType("torch_npu")
     fake_torch_npu.npu_swiglu = fake_npu_swiglu
     monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
-    monkeypatch.setattr(npu_moe, "_clamped_swiglu", fake_clamped_swiglu)
+    fake_triton = ModuleType("triton")
+    fake_triton.__path__ = []
+    fake_triton_c = ModuleType("triton._C")
+    fake_triton_c.libtriton = SimpleNamespace(ascend=object())
+    monkeypatch.setitem(sys.modules, "triton", fake_triton)
+    monkeypatch.setitem(sys.modules, "triton._C", fake_triton_c)
+    fake_kernel = ModuleType(_CLAMPED_SWIGLU_MODULE)
+    fake_kernel.npu_triton_clamped_swiglu = fake_clamped_swiglu
+    monkeypatch.setitem(sys.modules, _CLAMPED_SWIGLU_MODULE, fake_kernel)
 
     assert npu_moe._swiglu(x, 7.0) is clamped_output
     assert npu_moe._swiglu(x, None) is unclamped_output
@@ -74,22 +82,6 @@ def test_npu_clamped_swiglu_missing_triton_uses_eager(monkeypatch: pytest.Monkey
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(source.grad, expected_input.grad, rtol=0, atol=0)
-
-
-def test_npu_clamped_swiglu_dispatches_to_ascend_triton(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_triton = ModuleType("triton")
-    fake_triton.__path__ = []
-    fake_triton_c = ModuleType("triton._C")
-    fake_triton_c.libtriton = SimpleNamespace(ascend=object())
-    monkeypatch.setitem(sys.modules, "triton", fake_triton)
-    monkeypatch.setitem(sys.modules, "triton._C", fake_triton_c)
-    x = torch.empty((1, 2))
-    output = object()
-    fake_kernel = ModuleType(_CLAMPED_SWIGLU_MODULE)
-    fake_kernel.npu_triton_clamped_swiglu = lambda actual_x, limit: output if actual_x is x and limit == 7.0 else None
-    monkeypatch.setitem(sys.modules, _CLAMPED_SWIGLU_MODULE, fake_kernel)
-
-    assert npu_moe._clamped_swiglu(x, 7.0) is output
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU kernels require torch_npu")

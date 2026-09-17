@@ -1,12 +1,12 @@
 ---
 name: veomni-new-op
-description: "Add or optimize a tensor-level kernel in veomni/ops, register its variants, integrate it with models_kernel, and add numerical and registry tests. Trigger: 'add op', 'new kernel', 'add attention variant', 'new fused op', 'add triton kernel', 'optimize operator'."
+description: "Add or optimize a tensor-level kernel in veomni/ops, register its variants, integrate it with models, and add numerical and registry tests. Trigger: 'add op', 'new kernel', 'add attention variant', 'new fused op', 'add triton kernel', 'optimize operator'."
 ---
 
 ## Before You Start
 
 1. Read `.agents/knowledge/constraints.md`, especially device guards and patchgen rules.
-2. Read `veomni/ops/README.md` and `docs/design/kernel_selection.md`.
+2. Read `veomni/ops/README.md` and `docs/design/op_selection.md`.
 3. Inspect the closest family under `veomni/ops/kernels/` and its tests under `tests/ops/`.
 
 ## Ops Architecture
@@ -30,7 +30,7 @@ non-tensor attributes by keyword.
 
 Model classes construct an instance-local `VeomniOp` handle and call it
 directly. Input normalization, HuggingFace-compatible signatures, and loss
-policy belong in `veomni/models_kernel/`; do not add consumer-specific adapters
+policy belong in `veomni/models/`; do not add consumer-specific adapters
 to the registry. The public CLI/YAML field remains
 `model.ops_implementation`, while model builders receive it through the
 `ops_implementation` keyword.
@@ -47,7 +47,7 @@ Use these separate mechanisms only when their semantics require them:
 ## Phase 1: Design
 
 1. Define the stable tensor contract and decide whether consumer-specific
-   preprocessing belongs in `models_kernel`.
+   preprocessing belongs in `models`.
 2. Choose the op name, semantic variant, implementation name, and device
    requirement. A variant changes the tensor contract; an implementation keeps
    that contract and changes how it is computed.
@@ -89,8 +89,10 @@ Use these separate mechanisms only when their semantics require them:
 7. Guard optional device packages and attach an explicit requirement. A
    registered implementation must fail clearly when its requirement is not
    satisfied; it must not silently fall back to eager.
-8. Add English module, class, and function docstrings. VeOmni-owned kernel code
-   is checked by `tests/ops/base/test_op_documentation.py`.
+8. Add English module, module-level class, and public function docstrings.
+   Nested closures and ordinary `_private` helpers are not gated; `forward` /
+   `backward` / `wrapper` / `__call__` still are. Checked by
+   `tests/ops/base/test_op_documentation.py`.
 
 ## Phase 3: Test
 
@@ -101,7 +103,7 @@ Use these separate mechanisms only when their semantics require them:
    - registration and device requirements;
    - explicit failure for unknown or unavailable implementations.
 2. Put consumer-specific normalization and model wiring tests under
-   `tests/models_kernel/` instead of duplicating them in the raw-kernel suite.
+   `tests/models/` instead of duplicating them in the raw-kernel suite.
 3. Run the family tests plus the registry and documentation guards:
 
    The GPU job runs `tests/ops/` wholesale. The NPU job enumerates ops files,
@@ -118,7 +120,7 @@ Use these separate mechanisms only when their semantics require them:
 
 1. Update `veomni/ops/README.md` with the family, variants, and supported
    implementations.
-2. Update `docs/design/kernel_selection.md` when selection behavior changes.
+2. Update `docs/design/op_selection.md` when selection behavior changes.
 3. Update `.agents/knowledge/architecture.md` when the layout or call chain
    changes.
 

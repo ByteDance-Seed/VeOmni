@@ -9,9 +9,11 @@ everything beneath them moved.
 `dsa_indexer_loss` trains it with DeepSeek-V3.2 eq. (4): the KL from the real CSA
 attention distribution, restricted to the candidates the indexer itself selected,
 to `softmax(index_score)`. The teacher is recomputed in the forward by
-`sparse_mqa_target_fwd` from the TileLang attention's own log-sum-exp, summed over
-CSA layers, normalised per query token, scaled by `dsa_indexer_loss_coef` and added
-to the total loss.
+`sparse_mqa_target_fwd` from the TileLang attention's own base-2 log-sum-exp,
+summed over CSA layers, normalised per query token, scaled by
+`dsa_indexer_loss_coef` and added to the total loss. The base is part of the
+operator contract because the target and backward kernels reconstruct
+probabilities with `exp2`.
 
 The objective requires sequence parallelism switched off. Ulysses and context
 parallelism are the only two modes that enable it and the gate refuses both, for
@@ -107,7 +109,7 @@ a config that does not declare it cannot be asked for the objective; and the che
 a *method* on that class, so `build_foundation_model` does not know the objective
 exists. All it does is `getattr(config, "validate_build_prerequisites", None)` and
 call whatever it finds, which `check_model_build_prerequisites` in
-`veomni/models_kernel/auto.py` is the whole of. A second model gaining the objective
+`veomni/models/auto.py` is the whole of. A second model gaining the objective
 declares the field and the method on its own config and needs no edit to the builder.
 
 Every constraint is keyed on the objective being *on*, and a coefficient of `0.0`
@@ -192,10 +194,10 @@ is not available: `PatchConfig` targets `modeling_*` modules and there is no
 precedent or mechanism for patching a `transformers` configuration class. VeOmni's
 mechanism is `MODEL_CONFIG_REGISTRY` with a hand-written subclass, as
 `qwen3_omni_moe` already does, and that is what
-`veomni/models_kernel/transformers/deepseek_v4/configuration_deepseek_v4.py` is.
+`veomni/models/transformers/deepseek_v4/configuration_deepseek_v4.py` is.
 
 **The check moved onto the config class, and the builder kept only a hook.** It
-was first written as `check_indexer_loss_prerequisites` in `veomni/models_kernel/auto.py`,
+was first written as `check_indexer_loss_prerequisites` in `veomni/models/auto.py`,
 called from `build_foundation_model` — which worked, and left a generic model
 builder holding a function about one model's training objective. Two of the three
 things that function reads are `DeepseekV4Config` fields, and the third is which
@@ -218,7 +220,7 @@ the same reason `_indexer_loss_enabled` reads the parallel state rather than
 receiving it.
 
 This is what a second model gaining the objective now costs: declare the two
-fields, implement the method. No edit to `veomni/models_kernel/auto.py`, which no longer
+fields, implement the method. No edit to `veomni/models/auto.py`, which no longer
 knows the objective exists.
 
 `check_context_parallel_supported` in that same file is the remaining gate of this
@@ -243,13 +245,13 @@ predicate, because neither keeps the model config: both take a config in
 `__init__` and retain only scalars off it. Giving them one means patching
 `__init__`, and the only route patchgen offers is `override_method` on it —
 restating the whole upstream body for one attribute, as the NPU config does for
-its `position_bias` sharding. (`modify_init` reads like the tool for this and is
-not: it is declared in `patch_spec.py` and unimplemented in the generator, so it
-silently produces nothing.) Threading the decision is both smaller and stronger:
+its `position_bias` sharding. `modify_init` now inlines extra `__init__`
+statements after the upstream body, so a one-attribute bind no longer needs a
+full `__init__` restatement. Threading the decision is both smaller and stronger:
 one evaluation per layer per forward cannot disagree with itself mid-call, and the
 HCA compressor takes the same parameter and ignores it only because its shared
 call site demands one signature —
-`tests/models_kernel/transformers/test_generated_call_site_signatures.py` is what enforces that, and
+`tests/models/transformers/test_generated_call_site_signatures.py` is what enforces that, and
 it is what caught the NPU compressors missing it.
 
 The layer gate keys on `layer_type` rather than on `module.compressor.indexer`

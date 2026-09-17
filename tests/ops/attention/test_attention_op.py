@@ -30,23 +30,10 @@ from veomni.ops import OP_REGISTRY, VeomniOp
 from veomni.ops.install import _VEOMNI_HF_PATCHES, apply_veomni_attention_patch
 from veomni.ops.kernels.attention import lookup
 from veomni.ops.kernels.attention import ulysses as ulysses_backend
-from veomni.ops.kernels.attention.standard.flash import flash_attention_forward
-from veomni.ops.kernels.attention.standard.flex import flex_attention_forward
-from veomni.ops.kernels.attention.standard.magi import magi_attention_forward
-from veomni.ops.kernels.attention.standard.sage import sage_attention_forward
-from veomni.ops.kernels.attention.standard.sdpa import sdpa_attention_forward
 from veomni.ops.kernels.attention.ulysses import should_apply_ulysses
 
 
-_VEOMNI_FORWARDS = {
-    "veomni_flash_attention_2": flash_attention_forward,
-    "veomni_flash_attention_3": flash_attention_forward,
-    "veomni_flash_attention_4": flash_attention_forward,
-    "veomni_flex_attention": flex_attention_forward,
-    "veomni_magi_attention": magi_attention_forward,
-    "veomni_sage_attention": sage_attention_forward,
-    "veomni_sdpa": sdpa_attention_forward,
-}
+_VEOMNI_FORWARDS = {name: forward for name, forward, _mask in _VEOMNI_HF_PATCHES}
 
 _STANDARD_IMPLS = (
     "eager",
@@ -144,28 +131,17 @@ def test_apply_veomni_attention_patch_is_idempotent():
         assert ALL_ATTENTION_FUNCTIONS[name] is forward
 
 
-def test_apply_ops_patch_delegates_attention_registration(monkeypatch):
+@pytest.mark.parametrize(("backend", "expected_calls"), (("veomni", (True,)), ("hf", ())))
+def test_apply_ops_patch_respects_modeling_backend(monkeypatch, backend, expected_calls):
     from veomni.ops import install
 
     calls = []
-    monkeypatch.setattr(install, "get_env", lambda _name: "veomni")
+    monkeypatch.setattr(install, "get_env", lambda _name: backend)
     monkeypatch.setattr(install, "apply_veomni_attention_patch", lambda: calls.append(True))
 
     install.apply_ops_patch()
 
-    assert calls == [True]
-
-
-def test_apply_ops_patch_skips_hf_backend(monkeypatch):
-    from veomni.ops import install
-
-    calls = []
-    monkeypatch.setattr(install, "get_env", lambda _name: "hf")
-    monkeypatch.setattr(install, "apply_veomni_attention_patch", lambda: calls.append(True))
-
-    install.apply_ops_patch()
-
-    assert calls == []
+    assert tuple(calls) == expected_calls
 
 
 def eager_attention_forward(module, query, key, value, attention_mask, **kwargs):
@@ -223,7 +199,8 @@ def test_should_apply_ulysses_follows_parallel_state(monkeypatch):
     assert should_apply_ulysses()
     assert not should_apply_ulysses(skip_ulysses=True)
     _set_state(ulysses_size=2, async_enabled=True)
-    assert not should_apply_ulysses()
+    assert should_apply_ulysses()
+    assert not should_apply_ulysses(skip_ulysses=True)
 
 
 def test_ulysses_helpers_preserve_layout(monkeypatch):

@@ -22,10 +22,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from tests.ops.attention.utils import UlyssesHelperRecorder
 from tests.ops.tol import ATTN_ATOL, ATTN_GRAD_ATOL, ATTN_GRAD_RTOL, ATTN_RTOL
-from veomni.ops import resolve_op
+from tests.ops.utils import is_nvidia_cuda_available
+from veomni.ops import OP_REGISTRY, resolve_op
 from veomni.ops.kernels.attention.standard import flash as flash_backend
 from veomni.utils.device import IS_CUDA_AVAILABLE
 
@@ -93,6 +95,174 @@ def test_registered_fa2_adapter_matches_sdpa_with_mla_value_dim_and_gradients():
             atol=ATTN_GRAD_ATOL,
             rtol=ATTN_GRAD_RTOL,
         )
+
+
+@pytest.mark.parametrize(
+    ("implementation", "package"),
+    (
+        ("veomni_flash_attention_3", "flash_attn_interface"),
+        ("veomni_flash_attention_4", "flash_attn.cute"),
+    ),
+)
+def test_registered_fa3_fa4_adapters_match_sdpa_with_gqa_and_gradients(implementation, package):
+    """Exercise each real SM90 backend through the registered VeOmni adapter."""
+    if not is_nvidia_cuda_available(min_cc=90):
+        pytest.skip("FlashAttention 3 and 4 numerical parity requires SM90 or later")
+    pytest.importorskip(package)
+
+    torch.manual_seed(23)
+    batch, query_heads, kv_heads, seq_len, head_dim = 2, 4, 2, 32, 64
+    tensors = (
+        torch.randn(batch, query_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+        torch.randn(batch, kv_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+        torch.randn(batch, kv_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+    )
+    q_fa, k_fa, v_fa = (tensor.detach().requires_grad_(True) for tensor in tensors)
+    q_ref, k_ref, v_ref = (tensor.detach().requires_grad_(True) for tensor in tensors)
+    scale = 0.17
+
+    adapter = resolve_op("attention", "standard", implementation).wrapper
+    actual, attention_weights = adapter(
+        _FakeAttentionModule(implementation),
+        q_fa,
+        k_fa,
+        v_fa,
+        None,
+        dropout=0.0,
+        scaling=scale,
+        is_causal=True,
+        skip_ulysses=True,
+    )
+    with sdpa_kernel(backends=[SDPBackend.MATH]):
+        expected = F.scaled_dot_product_attention(
+            q_ref,
+            k_ref,
+            v_ref,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=scale,
+            enable_gqa=True,
+        ).transpose(1, 2)
+
+    assert attention_weights is None
+    torch.testing.assert_close(actual.float(), expected.float(), atol=ATTN_ATOL, rtol=ATTN_RTOL)
+    grad_output = torch.randn_like(actual)
+    actual.backward(grad_output)
+    expected.backward(grad_output)
+    for name, actual_input, expected_input in zip(
+        ("query", "key", "value"), (q_fa, k_fa, v_fa), (q_ref, k_ref, v_ref), strict=True
+    ):
+        torch.testing.assert_close(
+            actual_input.grad.float(),
+            expected_input.grad.float(),
+            atol=ATTN_GRAD_ATOL,
+            rtol=ATTN_GRAD_RTOL,
+            msg=lambda message, tensor_name=name: f"{tensor_name}: {message}",
+        )
+
+
+def test_registered_fa4_adapter_matches_attention_sink_reference_and_gradients():
+    """Compare FA4's trainable attention sinks with a direct softmax reference."""
+    if not is_nvidia_cuda_available(min_cc=90):
+        pytest.skip("FlashAttention 4 sink parity requires SM90 or later")
+    pytest.importorskip("flash_attn.cute")
+
+    torch.manual_seed(29)
+    batch, heads, seq_len, head_dim = 2, 4, 32, 64
+    tensors = (
+        torch.randn(batch, heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+        torch.randn(batch, heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+        torch.randn(batch, heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16),
+        torch.randn(heads, device="cuda", dtype=torch.bfloat16),
+    )
+    q_fa, k_fa, v_fa, sinks_fa = (tensor.detach().requires_grad_(True) for tensor in tensors)
+    q_ref, k_ref, v_ref, sinks_ref = (tensor.detach().requires_grad_(True) for tensor in tensors)
+    scale = head_dim**-0.5
+
+    adapter = resolve_op("attention", "standard", "veomni_flash_attention_4").wrapper
+    actual, _ = adapter(
+        _FakeAttentionModule("veomni_flash_attention_4"),
+        q_fa,
+        k_fa,
+        v_fa,
+        None,
+        dropout=0.0,
+        scaling=scale,
+        is_causal=True,
+        s_aux=sinks_fa,
+        skip_ulysses=True,
+    )
+
+    logits = torch.einsum("bhqd,bhkd->bhqk", q_ref.float(), k_ref.float()) * scale
+    causal_mask = torch.ones(seq_len, seq_len, device="cuda", dtype=torch.bool).tril()
+    logits = logits.masked_fill(~causal_mask, -torch.inf)
+    sink_logits = sinks_ref.float().view(1, heads, 1, 1).expand(batch, heads, seq_len, 1)
+    probabilities = torch.softmax(torch.cat((logits, sink_logits), dim=-1), dim=-1)[..., :-1]
+    expected = torch.einsum("bhqk,bhkd->bhqd", probabilities, v_ref.float()).to(torch.bfloat16).transpose(1, 2)
+
+    torch.testing.assert_close(actual.float(), expected.float(), atol=ATTN_ATOL, rtol=ATTN_RTOL)
+    grad_output = torch.randn_like(actual)
+    actual.backward(grad_output)
+    expected.backward(grad_output)
+    for name, actual_input, expected_input in zip(
+        ("query", "key", "value", "sinks"),
+        (q_fa, k_fa, v_fa, sinks_fa),
+        (q_ref, k_ref, v_ref, sinks_ref),
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            actual_input.grad.float(),
+            expected_input.grad.float(),
+            atol=ATTN_GRAD_ATOL,
+            rtol=ATTN_GRAD_RTOL,
+            msg=lambda message, tensor_name=name: f"{tensor_name}: {message}",
+        )
+
+
+@pytest.mark.parametrize(
+    ("selected", "expected_backend"),
+    (
+        ("veomni_flash_attention_2", "flash_attention_2"),
+        ("veomni_flash_attention_3", "flash_attention_3"),
+        ("veomni_flash_attention_4", "veomni_flash_attention_4"),
+    ),
+)
+@pytest.mark.parametrize(
+    "config_impl",
+    (
+        "veomni_flash_attention_2",
+        "veomni_flash_attention_3",
+        "veomni_flash_attention_4",
+        "eager",
+    ),
+)
+def test_selected_flash_row_pins_backend_when_module_config_differs(
+    monkeypatch, selected, expected_backend, config_impl
+):
+    """Registry/HF selection, not module config, decides the flash vendor token."""
+    captured = {}
+
+    def replacement_backend(query, key, value, attention_mask, **kwargs):
+        captured["attn_implementation"] = kwargs["attn_implementation"]
+        return query
+
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", replacement_backend)
+    monkeypatch.setattr(flash_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
+    wrapper = next(
+        entry.wrapper for entry in OP_REGISTRY.list_entries("attention", "standard") if entry.impl == selected
+    )
+    query = torch.randn(1, 2, 3, 4, dtype=torch.float16)
+
+    wrapper(
+        _FakeAttentionModule(config_impl),
+        query,
+        query,
+        query,
+        None,
+        skip_ulysses=True,
+    )
+
+    assert captured["attn_implementation"] == expected_backend
 
 
 @pytest.mark.parametrize(
@@ -214,6 +384,46 @@ def test_flash_attention_skip_ulysses_skips_exchange_and_is_not_forwarded(monkey
         contract_marker=object(),
     )
     assert "skip_ulysses" not in captured["kwargs"]
+
+
+def test_flash_attention_exchanges_when_async_enabled_unless_skipped(monkeypatch):
+    """Global async must not disable vision-style sync Ulysses."""
+    from veomni.ops.kernels.attention import ulysses as ulysses_backend
+
+    group = object()
+    state = SimpleNamespace(ulysses_group=group, ulysses_size=2, async_enabled=True)
+    recorder = UlyssesHelperRecorder()
+
+    def fake_flash(query, key, value, attention_mask, **kwargs):
+        recorder.calls.append(("backend", query.shape))
+        return query
+
+    monkeypatch.setattr(ulysses_backend, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(flash_backend, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(flash_backend, "prepare_ulysses_qkv", recorder.prepare)
+    monkeypatch.setattr(flash_backend, "restore_ulysses_output", recorder.restore)
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", fake_flash)
+    query = torch.randn(1, 4, 4, 16, dtype=torch.float16)
+
+    flash_backend.flash_attention_forward(
+        _FakeAttentionModule("veomni_flash_attention_2"),
+        query,
+        query,
+        query,
+        attention_mask=None,
+    )
+    assert [call[0] for call in recorder.calls] == ["prepare", "backend", "restore"]
+
+    recorder.calls.clear()
+    flash_backend.flash_attention_forward(
+        _FakeAttentionModule("veomni_flash_attention_2"),
+        query,
+        query,
+        query,
+        attention_mask=None,
+        skip_ulysses=True,
+    )
+    assert [call[0] for call in recorder.calls] == ["backend"]
 
 
 def test_varlen_flash_attn_padded_input_matches_unpadded():

@@ -73,9 +73,25 @@ def _prepare_lens(cu_seqlens: Tensor) -> Tensor:
 
 
 def _prepare_chunk_indices(cu_seqlens: Tensor, chunk_size: int) -> Tensor:
-    """Build device-side sequence and chunk indices for variable lengths."""
-    indices = torch.cat([torch.arange(n) for n in _cdiv(_prepare_lens(cu_seqlens), chunk_size).tolist()])
-    return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
+    """Build device-side sequence and chunk indices for variable lengths.
+
+    Empty sequences emit no rows, but later sequences keep their original
+    ``cu_seqlens`` index. Do not renumber after a zero-length gap.
+    """
+    lengths = _prepare_lens(cu_seqlens)
+    n_chunks = _cdiv(lengths, chunk_size)
+    seq_ids = torch.repeat_interleave(
+        torch.arange(n_chunks.numel(), device=cu_seqlens.device, dtype=cu_seqlens.dtype),
+        n_chunks,
+    )
+    chunk_ids = (
+        torch.cat([torch.arange(int(n), device=cu_seqlens.device, dtype=cu_seqlens.dtype) for n in n_chunks.tolist()])
+        if int(n_chunks.sum().item()) > 0
+        else cu_seqlens.new_empty(0)
+    )
+    if seq_ids.numel() == 0:
+        return cu_seqlens.new_empty((0, 2))
+    return torch.stack([seq_ids, chunk_ids], 1)
 
 
 def _prepare_chunk_indices_list(cu_seqlens: list[int] | Tensor, chunk_size: int) -> list[int]:
@@ -490,8 +506,10 @@ def forward(
 
     Empty or omitted *initial_state* / *cu_seqlens* are unused. Unused final
     state is an empty tensor so the registry output stays tensors-only. The
-    fused backward does not produce ``dh0``. Extra NPU varlen tables are
-    accepted; missing keys are filled from ``cu_seqlens``.
+    fused backward does not produce ``dh0`` or consume ``dht``. Trainable
+    ``initial_state`` and ``output_final_state=True`` with trainable inputs
+    are rejected. Extra NPU varlen tables are accepted; missing keys are
+    filled from ``cu_seqlens``.
     """
     from ...vendor.triton.utils import input_guard
 
@@ -527,11 +545,18 @@ def forward(
         raise ValueError(f"chunk_size must be a power of 2, got {chunk_size}.")
 
     initial_opt = optional_tensor(initial_state)
-    if torch.is_grad_enabled() and initial_opt is not None and initial_opt.requires_grad:
+    if initial_opt is not None and initial_opt.requires_grad:
         raise NotImplementedError(
             "npu_ascendc chunk_gated_delta_rule cannot differentiate initial_state "
             "(the AscendC backward returns no dh0, same as MindSpeed-MM). Detach "
             "initial_state, or use the 'npu' (Triton) backend if you need that gradient."
+        )
+    inputs_need_grad = any(tensor.requires_grad for tensor in (query, key, value, g, beta))
+    if output_final_state and inputs_need_grad:
+        raise NotImplementedError(
+            "npu_ascendc chunk_gated_delta_rule cannot differentiate the final state "
+            "(the AscendC backward drops dht). Set output_final_state=False, or use "
+            "the 'npu' (Triton) backend if you need a final-state loss."
         )
 
     cu_opt = optional_tensor(cu_seqlens)

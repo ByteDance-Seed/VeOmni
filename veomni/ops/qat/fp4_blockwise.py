@@ -24,8 +24,7 @@ the same layout ``checkpoint_tensor_converter`` writes when it exports experts.
 Scales are always ``float8_e8m0fnu``, i.e. powers of two by construction, so
 unlike FP8 there is no ``scale_fmt`` to choose.
 
-The TileLang quantizer is SM90-only and BF16-only, so both entry points here
-inherit those restrictions.
+The quantization path requires a BF16 operand on an NVIDIA SM90 or later GPU.
 """
 
 import torch

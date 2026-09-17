@@ -101,8 +101,8 @@ def sage_attention_forward(
     ``flash_attention_2`` / ``3`` / ``4`` when gradients are needed.
     Packed, sparse, and auxiliary attention metadata is rejected because the
     SageAttention call below cannot represent those visibility semantics.
-    ``skip_ulysses`` opts a call out of sync Ulysses when its tokens are not
-    on the SP mesh. Async Ulysses stays outside attention.
+    ``skip_ulysses`` opts a call out when it already gathered or its tokens
+    are not on the SP mesh.
     """
     if _requires_attention_grad(query, key, value):
         raise RuntimeError(

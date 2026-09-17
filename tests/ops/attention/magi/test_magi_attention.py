@@ -27,6 +27,7 @@ from tests.ops.attention.attention_cases import clone_qkv, dense_mask, magi_mask
 from tests.ops.tol import ATTN_ATOL, ATTN_BF16_GRAD_ATOL, ATTN_GRAD_ATOL, ATTN_GRAD_RTOL, ATTN_LSE_RTOL, ATTN_RTOL
 from veomni.ops.kernels.attention.standard import magi as magi_backend
 from veomni.ops.kernels.attention.standard.magi import _kernel as magi_kernel
+from veomni.ops.kernels.attention.standard.magi import _metadata as magi_metadata
 from veomni.ops.mask import MagiAttentionMask
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
@@ -78,6 +79,11 @@ _MAGI_FFA_REASON = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_magi_metadata_cache(monkeypatch):
+    monkeypatch.setattr(magi_metadata, "_cache_entry", None)
+
+
 def test_magi_attention_preserves_ffa_layout_and_scale(monkeypatch):
     captured = {}
 
@@ -125,6 +131,28 @@ def test_magi_attention_preserves_ffa_layout_and_scale(monkeypatch):
     assert captured["kwargs"] == {"softmax_scale": 0.25, "softcap": 30.0}
     torch.testing.assert_close(output, query.transpose(1, 2) + 1)
     assert lse.shape == (1, 4, 8)
+
+
+def test_magi_attention_rejects_s_aux_before_ulysses(monkeypatch):
+    """Sink softmax is not implemented; fail closed before any collective."""
+
+    def unexpected_call(*args, **kwargs):
+        pytest.fail("s_aux reached Magi Ulysses or FA4 handling")
+
+    monkeypatch.setattr(magi_backend, "get_parallel_state", unexpected_call)
+    monkeypatch.setattr(magi_backend, "should_apply_ulysses", unexpected_call)
+    monkeypatch.setattr(magi_backend, "prepare_ulysses_qkv", unexpected_call)
+    monkeypatch.setattr(magi_backend, "_magi_attention_forward", unexpected_call)
+    query = torch.randn(1, 4, 8, 16)
+    with pytest.raises(ValueError, match="does not implement attention sinks"):
+        magi_backend.magi_attention_forward(
+            _FakeAttentionModule(),
+            query,
+            query,
+            query,
+            _causal_mask(8),
+            s_aux=torch.arange(4),
+        )
 
 
 def test_magi_attention_rejects_unsupported_features(monkeypatch):
@@ -256,10 +284,76 @@ def test_magi_attention_rejects_global_ranges_when_ulysses_is_off(monkeypatch):
         )
 
 
+def _count_range_bound_reductions(monkeypatch) -> dict[str, int]:
+    """Count ``require_all`` launches used by cached Magi range-endpoint checks."""
+    counts = {"require_all": 0}
+    real_require_all = magi_metadata.require_all
+
+    def counting_require_all(condition, message):
+        counts["require_all"] += 1
+        return real_require_all(condition, message)
+
+    monkeypatch.setattr(magi_metadata, "require_all", counting_require_all)
+    return counts
+
+
+def _run_mocked_magi_layer(monkeypatch, query: torch.Tensor, attention_mask: MagiAttentionMask) -> None:
+    monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state())
+    monkeypatch.setattr(
+        magi_backend,
+        "_magi_attention_forward",
+        lambda query, key, value, *args, **kwargs: (query, SimpleNamespace(lse=None)),
+    )
+    magi_backend.magi_attention_forward(
+        _FakeAttentionModule(),
+        query,
+        query[:, :2],
+        query[:, :2],
+        attention_mask,
+    )
+
+
+def test_magi_attention_range_bound_cache_hit_miss_and_mutation(monkeypatch):
+    """Same mask across layers checks once; in-place range or seq-len changes recheck.
+
+    CUDA saves later ``.all()`` launches, not host synchronizations.
+    """
+    counts = _count_range_bound_reductions(monkeypatch)
+    attention_mask = _causal_mask(8)
+    for _ in range(3):
+        _run_mocked_magi_layer(monkeypatch, torch.randn(1, 4, 8, 16), attention_mask)
+    assert counts["require_all"] == 2
+
+    attention_mask.q_ranges[0, 1] = 7
+    _run_mocked_magi_layer(monkeypatch, torch.randn(1, 4, 8, 16), attention_mask)
+    _run_mocked_magi_layer(monkeypatch, torch.randn(1, 4, 8, 16), attention_mask)
+    assert counts["require_all"] == 4
+
+    _run_mocked_magi_layer(monkeypatch, torch.randn(1, 4, 16, 16), attention_mask)
+    assert counts["require_all"] == 6
+
+
 @pytest.mark.skipif(not _MAGI_FFA_AVAILABLE, reason=_MAGI_FFA_REASON)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("mask_case", ("causal", "full", "2d_mask"))
-def test_magi_attention_matches_math_sdpa(monkeypatch, mask_case, dtype):
+@pytest.mark.parametrize(
+    ("mask_case", "dtype", "sequence_length", "query_heads", "kv_heads", "head_dim"),
+    (
+        *(
+            pytest.param(mask_case, dtype, 128, 4, 2, 64, id=f"{mask_case}-{dtype_name}")
+            for mask_case in ("causal", "full", "2d_mask")
+            for dtype, dtype_name in ((torch.bfloat16, "bf16"), (torch.float16, "fp16"))
+        ),
+        pytest.param("2d_mask", torch.bfloat16, 4096, 28, 4, 128, id="2d-mask-production-bf16"),
+    ),
+)
+def test_magi_attention_matches_math_sdpa(
+    monkeypatch,
+    mask_case,
+    dtype,
+    sequence_length,
+    query_heads,
+    kv_heads,
+    head_dim,
+):
     device = torch.device(get_device_type())
     monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state())
     kernel_mode, build_flags = magi_kernel.prepare_kernel(device)
@@ -271,8 +365,6 @@ def test_magi_attention_matches_math_sdpa(monkeypatch, mask_case, dtype):
     ):
         pytest.skip("The installed CUTLASS overlay does not include FP16 kernels.")
 
-    sequence_length = 128
-    query_heads, kv_heads, head_dim = 4, 2, 64
     generator = torch.Generator(device=device).manual_seed(9300)
     query, key, value = (
         torch.randn((1, heads, sequence_length, head_dim), device=device, dtype=dtype, generator=generator)

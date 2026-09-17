@@ -14,7 +14,7 @@
 
 
 from dataclasses import dataclass
-from typing import Dict, Union
+from typing import Dict, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -38,6 +38,10 @@ class SpecInfo:
     # Muon zero-comm layout). Used by the checkpointer to build the correct
     # DTensor placements when (re)storing the ExtraParallel dim.
     fsdp_shard_dim: int = 1
+    # A persistent complementary shard is owned directly by the model instead
+    # of FSDP2. Its runtime parameter remains a DTensor on the complete
+    # ``(para_fsdp, para)`` mesh for the entire forward/backward lifecycle.
+    persistent_fsdp_shard_dim: Optional[int] = None
 
     @property
     def para_mesh(self):
@@ -48,8 +52,17 @@ class SpecInfo:
 
 
 class ParallelPlan:
-    def __init__(self, extra_parallel_plan: Dict[str, Dict[str, Shard]]):
+    def __init__(
+        self,
+        extra_parallel_plan: Dict[str, Dict[str, Shard]],
+        extra_parallel_persistent_modules: Optional[Dict[str, Dict[str, int]]] = None,
+    ):
         self.extra_parallel_plan = extra_parallel_plan
+        # ``{para_name: {module_fqn_pattern: complementary_shard_dim}}``.
+        # This is deliberately an ExtraParallel policy rather than a general TP
+        # API: only parameters already selected by ``extra_parallel_plan`` may
+        # opt into the persistent complementary shard.
+        self.extra_parallel_persistent_modules = extra_parallel_persistent_modules or {}
         self.extra_parallel_fsdp_no_shard_module = {
             para_name: {".".join(list(plan.keys())[0].split(".")[:-1])}
             for para_name, plan in self.extra_parallel_plan.items()
@@ -65,6 +78,19 @@ class ParallelPlan:
         }
 
         fqn2spec_info = {}
+        for fqn, _param in model.named_parameters():
+            matched_para_names = [
+                para
+                for para, para_plan in self.extra_parallel_plan.items()
+                if extra_parallel_mesh.get(para) is not None
+                and any(check_fqn_match(fqn_pattern, fqn) for fqn_pattern in para_plan)
+            ]
+            if len(matched_para_names) > 1:
+                raise ValueError(
+                    f"ExtraParallel parameter {fqn!r} matches multiple enabled dimensions: "
+                    f"{matched_para_names}. Each parameter must belong to exactly one ExtraParallel dimension."
+                )
+
         for para, para_plan in self.extra_parallel_plan.items():
             para_mesh = extra_parallel_mesh[para]
             para_fsdp_mesh = extra_parallel_fsdp_device_mesh[para]
@@ -75,22 +101,53 @@ class ParallelPlan:
                     for fqn_pattern, shard in para_plan.items():
                         if check_fqn_match(fqn_pattern, fqn):
                             assert param.size(shard.dim) % para_size == 0
-                            para_placement = para_replicate[:-1] + [shard]
+                            persistent_fsdp_shard_dim = self._get_persistent_fsdp_shard_dim(para, fqn)
+                            if persistent_fsdp_shard_dim is not None:
+                                if para_fsdp_mesh.ndim != 2:
+                                    raise NotImplementedError(
+                                        f"Persistent {para} parameters require a 2D "
+                                        f"({para}_fsdp, {para}) mesh; HSDP is not supported."
+                                    )
+                                para_fsdp_size = para_fsdp_mesh.size(0)
+                                if persistent_fsdp_shard_dim == shard.dim:
+                                    raise ValueError(
+                                        f"Persistent {para} parameter {fqn!r} cannot shard tensor dim "
+                                        f"{shard.dim} over both mesh dimensions."
+                                    )
+                                if param.size(persistent_fsdp_shard_dim) % para_fsdp_size != 0:
+                                    raise ValueError(
+                                        f"Persistent {para} parameter {fqn!r} dimension "
+                                        f"{persistent_fsdp_shard_dim} ({param.size(persistent_fsdp_shard_dim)}) "
+                                        f"must be divisible by {para}_fsdp size {para_fsdp_size}."
+                                    )
+                                target_mesh = para_fsdp_mesh
+                                source_placement = [Replicate() for _ in range(target_mesh.ndim)]
+                                para_placement = [Shard(persistent_fsdp_shard_dim), shard]
+                            else:
+                                target_mesh = para_mesh
+                                source_placement = para_replicate
+                                para_placement = para_replicate[:-1] + [shard]
                             logger.info_rank0(
                                 f"{para} sharding: slicing param {fqn} along {para}_mesh with placement {para_placement}"
                             )
                             dtensor = DTensor.from_local(
-                                local_tensor=param.data, device_mesh=para_mesh, placements=para_replicate
+                                local_tensor=param.data, device_mesh=target_mesh, placements=source_placement
                             )
-                            dtensor = dtensor.redistribute(device_mesh=para_mesh, placements=para_placement)
-                            local_chunk = torch.nn.Parameter(dtensor.to_local(), requires_grad=param.requires_grad)
-                            local_chunk.spec_info = SpecInfo(
-                                para_name=para, para_fsdp_mesh=para_fsdp_mesh, placement=shard, fqn=fqn
+                            dtensor = dtensor.redistribute(device_mesh=target_mesh, placements=para_placement)
+                            spec_info = SpecInfo(
+                                para_name=para,
+                                para_fsdp_mesh=para_fsdp_mesh,
+                                placement=shard,
+                                fqn=fqn,
+                                persistent_fsdp_shard_dim=persistent_fsdp_shard_dim,
                             )
+                            if persistent_fsdp_shard_dim is not None:
+                                local_chunk = torch.nn.Parameter(dtensor, requires_grad=param.requires_grad)
+                            else:
+                                local_chunk = torch.nn.Parameter(dtensor.to_local(), requires_grad=param.requires_grad)
+                            local_chunk.spec_info = spec_info
                             set_module_from_path(model, fqn, local_chunk)
-                            fqn2spec_info[fqn] = SpecInfo(
-                                para_name=para, para_fsdp_mesh=para_fsdp_mesh, placement=shard, fqn=fqn
-                            )
+                            fqn2spec_info[fqn] = spec_info
                             break
                     if fqn not in fqn2spec_info:  # not sharded
                         param.spec_info = SpecInfo(
@@ -103,7 +160,19 @@ class ParallelPlan:
         for fqn, param in model.named_parameters():
             assert hasattr(param, "spec_info"), f"Internal Error: {fqn=} with {param=} is omitted"
 
+        model._fqn2spec_info = fqn2spec_info
         return fqn2spec_info
+
+    def _get_persistent_fsdp_shard_dim(self, para_name: str, parameter_fqn: str) -> Optional[int]:
+        """Return the persistent complementary shard dim for ``parameter_fqn``."""
+        for module_pattern, shard_dim in self.extra_parallel_persistent_modules.get(para_name, {}).items():
+            if check_fqn_match(f"{module_pattern}.*", parameter_fqn):
+                return shard_dim
+        return None
+
+    def is_persistent_parameter(self, parameter_fqn: str) -> bool:
+        shard_group = self._get_shard_parameter_groupname(parameter_fqn)
+        return shard_group is not None and self._get_persistent_fsdp_shard_dim(shard_group, parameter_fqn) is not None
 
     def get_fsdp_no_shard_info(self, model: nn.Module):
         if self.extra_parallel_fsdp_no_shard_module is None:
@@ -149,6 +218,10 @@ class ParallelPlan:
         self.extra_parallel_fsdp_no_shard_module = {
             para_name: {prefix + "." + no_shard_pattern for no_shard_pattern in para_fsdp_no_shard_module}
             for para_name, para_fsdp_no_shard_module in self.extra_parallel_fsdp_no_shard_module.items()
+        }
+        self.extra_parallel_persistent_modules = {
+            para_name: {prefix + "." + module_pattern: dim for module_pattern, dim in module_patterns.items()}
+            for para_name, module_patterns in self.extra_parallel_persistent_modules.items()
         }
 
     def shard_tensor(self, tensor: "torch.Tensor", full_param_name: str, target_shape: tuple) -> "torch.Tensor":

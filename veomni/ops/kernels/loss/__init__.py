@@ -19,8 +19,10 @@
 ``attention_mask`` means every token counts.
 
 ``cross_entropy_loss`` ``standard`` is token-level CE. Empty ``weight`` means
-the first tensor is already logits. Label shift and SP reduction stay in the
-caller. ``chunk_logprobs`` / top-k distill are not this kernel.
+the first tensor is already logits; that path is eager-only.
+``liger_kernel`` and ``chunk_loss`` require a projection weight. Label
+shift and SP reduction stay in the caller. ``chunk_logprobs`` / top-k
+distill are not this kernel.
 """
 
 from ...platform import GpuKernelRequirement
