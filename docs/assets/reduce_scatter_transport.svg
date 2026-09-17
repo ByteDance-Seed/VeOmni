@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1122" viewBox="0 0 1280 1122" role="img" aria-labelledby="title desc">
   <title id="title">Lower-precision transport with FP32 ReduceScatter input, accumulation and output</title>
-  <desc id="desc">Native FSDP2 uses FP32 ReduceScatter. The optional custom path casts the FP32 input to matching BF16 or FP16 transport buffers, exchanges destination shards through a verified node-local all-to-all, then sums and scales locally into the FP32 ReduceScatter output. It requires enabled mixed precision, FP32 reduction, and matching parameter and transport dtypes. Cross-node, unknown and singleton shard groups retain native communication. HSDP replica-linked shard groups must agree on eligibility and scaling; its subsequent AllReduce remains native FP32. On the custom path, replica AllReduce uses SUM because full-mesh scaling is applied in the ReduceScatter hook. Parameter AllGather and later gradient dtype casts are unchanged. FP32 addition order can differ from native ReduceScatter, so bitwise identity is not guaranteed. This diagram makes no performance claim.</desc>
+  <desc id="desc">With reduce_dtype set to FP32, native FSDP2 uses FP32 ReduceScatter. Enabling low_precision_reduce_scatter_comm infers BF16 or FP16 wire precision from mixed_precision.param_dtype. The custom path casts the FP32 input to that wire precision, exchanges destination shards through a verified node-local all-to-all, then sums and scales locally into the FP32 ReduceScatter output. It requires enabled mixed precision and FP32 reduction. Cross-node, unknown and singleton shard groups retain native communication. HSDP replica-linked shard groups must agree on eligibility and scaling; its subsequent AllReduce remains native FP32. On the custom path, replica AllReduce uses SUM because full-mesh scaling is applied in the ReduceScatter hook. Parameter AllGather and later gradient dtype casts are unchanged. FP32 addition order can differ from native ReduceScatter, so bitwise identity is not guaranteed. This diagram makes no performance claim.</desc>
   <defs>
     <style>
       text { font-family: 'DejaVu Sans', sans-serif; fill: #172c3f; }
@@ -26,8 +26,8 @@
   <text x="34" y="96" class="body muted">FSDP2: change the communication step, not the ReduceScatter dtype contract.</text>
 
   <rect x="32" y="124" width="1216" height="90" rx="12" fill="#fff7e9" stroke="#ecd5ae" stroke-width="1.5"/>
-  <text x="52" y="156" class="label amber">CUSTOM-PATH PREREQUISITES</text>
-  <text x="52" y="190" class="body">Mixed precision on  /  reduce_dtype = FP32  /  param_dtype = transport_dtype = BF16 or FP16</text>
+  <text x="52" y="156" class="label amber">OPT IN: low_precision_reduce_scatter_comm = true</text>
+  <text x="52" y="190" class="body">Mixed precision on / reduce_dtype = FP32 / wire dtype follows param_dtype (BF16 or FP16)</text>
 
   <rect x="32" y="238" width="1216" height="178" rx="14" fill="#eff5fa" stroke="#c9dce9" stroke-width="1.5"/>
   <text x="52" y="275" class="label blue">01  NATIVE FP32 REDUCESCATTER</text>
@@ -94,7 +94,7 @@
   <text x="52" y="954" class="label">WHEN THE CUSTOM PATH IS NOT USED</text>
   <text x="52" y="989" class="small muted">Cross-node / unknown placement / singleton:</text>
   <text x="52" y="1018" class="small muted">native communication and scaling remain.</text>
-  <text x="52" y="1047" class="small muted">Also native when off or transport = reduce dtype.</text>
+  <text x="52" y="1047" class="small muted">Also native: off or param_dtype = reduce_dtype.</text>
 
   <rect x="648" y="920" width="600" height="140" rx="12" fill="#ffffff" stroke="#d2dde5" stroke-width="1.5"/>
   <text x="668" y="954" class="label">UNCHANGED BOUNDARIES</text>
