@@ -14,8 +14,8 @@ from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.device_mesh import init_device_mesh
 
 from veomni.arguments import FSDPConfig, MixedPrecisionConfig
-from veomni.arguments.arguments_types import validate_reduce_scatter_transport
-from veomni.arguments.parser import _instantiate_recursive
+from veomni.arguments.arguments_types import validate_low_precision_reduce_scatter_comm
+from veomni.arguments.parser import _instantiate_recursive, parse_args
 from veomni.distributed import torch_parallelize
 from veomni.distributed.fsdp2 import reduce_scatter as reduce_scatter_module
 from veomni.distributed.fsdp2.reduce_scatter import (
@@ -333,13 +333,14 @@ def test_hsdp_decision_cache_includes_replica_group(monkeypatch):
     assert calls == [shard_group, replica_a, replica_b]
 
 
-@pytest.mark.parametrize("comm_dtype", [None, "bfloat16", "float16", "float32"])
-def test_reduce_scatter_comm_dtype_configuration_reaches_builder(monkeypatch, comm_dtype):
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("param_dtype", ["bfloat16", "float16", "float32"])
+def test_low_precision_rs_flag_configuration_reaches_builder(monkeypatch, enabled, param_dtype):
     config = _instantiate_recursive(
         FSDPConfig,
         {
-            "reduce_scatter_comm_dtype": comm_dtype,
-            "mixed_precision": {"param_dtype": comm_dtype or "bfloat16", "reduce_dtype": "float32"},
+            "low_precision_reduce_scatter_comm": enabled,
+            "mixed_precision": {"param_dtype": param_dtype, "reduce_dtype": "float32"},
         },
     )
     calls = []
@@ -359,87 +360,142 @@ def test_reduce_scatter_comm_dtype_configuration_reaches_builder(monkeypatch, co
         torch_parallelize.build_parallelize_model(
             model,
             mixed_precision=config.mixed_precision,
-            reduce_scatter_comm_dtype=config.reduce_scatter_comm_dtype,
+            low_precision_reduce_scatter_comm=config.low_precision_reduce_scatter_comm,
             enable_gradient_checkpointing=False,
         )
         is model
     )
     assert len(calls) == 1
-    assert calls[0]["reduce_scatter_comm_dtype"] == comm_dtype
+    assert calls[0]["low_precision_reduce_scatter_comm"] is enabled
+    assert calls[0]["mixed_precision"].param_dtype == param_dtype
 
 
-def test_reduce_scatter_transport_config_and_native_fallback():
-    with pytest.raises(ValueError, match="fsdp_mode='fsdp2'"):
-        FSDPConfig(
-            fsdp_mode="ddp",
-            reduce_scatter_comm_dtype="bfloat16",
-        )
-    for reduce_dtype, transport_dtype in (("bfloat16", "float16"), ("float16", "bfloat16")):
-        with pytest.raises(ValueError, match="supports only.*reduce_dtype='float32'"):
-            FSDPConfig(
-                mixed_precision=MixedPrecisionConfig(reduce_dtype=reduce_dtype),
-                reduce_scatter_comm_dtype=transport_dtype,
-            )
-    with pytest.raises(ValueError, match="supports only.*reduce_dtype='float32'"):
-        FSDPConfig(
-            mixed_precision=MixedPrecisionConfig(enable=False, reduce_dtype="float32"),
-            reduce_scatter_comm_dtype="bfloat16",
-        )
-    with pytest.raises(ValueError, match="must be one of"):
-        FSDPConfig(reduce_scatter_comm_dtype="float8")
-
-    for transport_dtype in ("bfloat16", "float16"):
-        config = FSDPConfig(
-            mixed_precision=MixedPrecisionConfig(param_dtype=transport_dtype),
-            reduce_scatter_comm_dtype=transport_dtype,
-        )
-        assert config.reduce_scatter_comm_dtype == transport_dtype
-
-    for reduce_dtype in ("bfloat16", "float16", "float32"):
-        config = FSDPConfig(
-            mixed_precision=MixedPrecisionConfig(reduce_dtype=reduce_dtype),
-            reduce_scatter_comm_dtype=reduce_dtype,
-        )
-        assert config.reduce_scatter_comm_dtype == reduce_dtype
-
-    native_config = FSDPConfig(
-        fsdp_mode="ddp",
-        mixed_precision=MixedPrecisionConfig(enable=False, reduce_dtype="float32"),
-        reduce_scatter_comm_dtype="float32",
+@pytest.mark.parametrize("enabled", [False, True])
+def test_low_precision_rs_flag_yaml_and_cli(monkeypatch, tmp_path, enabled):
+    path = tmp_path / "fsdp.yaml"
+    path.write_text(f"low_precision_reduce_scatter_comm: {str(enabled).lower()}\n")
+    monkeypatch.setattr("sys.argv", ["test", str(path)])
+    assert parse_args(FSDPConfig).low_precision_reduce_scatter_comm is enabled
+    monkeypatch.setattr(
+        "sys.argv", ["test", str(path), "--low_precision_reduce_scatter_comm", str(not enabled).lower()]
     )
-    assert native_config.reduce_scatter_comm_dtype == native_config.mixed_precision.reduce_dtype
+    assert parse_args(FSDPConfig).low_precision_reduce_scatter_comm is not enabled
+
+
+@pytest.mark.parametrize("value", [None, "false", "true", "bfloat16", 0, 1, []])
+def test_low_precision_rs_flag_requires_boolean(monkeypatch, value):
+    with pytest.raises(ValueError, match="must be a boolean"):
+        _instantiate_recursive(FSDPConfig, {"low_precision_reduce_scatter_comm": value})
+    monkeypatch.setattr(torch_parallelize, "get_parallel_state", object)
+    with pytest.raises(ValueError, match="must be a boolean"):
+        torch_parallelize.parallelize_model_fsdp2(nn.Linear(2, 2), low_precision_reduce_scatter_comm=value)
+
+
+def test_low_precision_rs_flag_defaults_off_and_skips_precision_inspection():
+    assert FSDPConfig().low_precision_reduce_scatter_comm is False
+    assert not validate_low_precision_reduce_scatter_comm(False, object())
+
+
+@pytest.mark.parametrize("dp_mode", ["ddp", "eager"])
+@pytest.mark.parametrize("flag", [True, "false", None, 0])
+def test_public_builder_rejects_unsupported_flags_before_side_effects(monkeypatch, dp_mode, flag):
+    monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: SimpleNamespace(dp_mode=dp_mode))
+    model = nn.Linear(2, 2)
+
+    def fail_conversion():
+        raise AssertionError("invalid configuration must fail before model conversion")
+
+    monkeypatch.setattr(model, "float", fail_conversion)
+    with pytest.raises(ValueError, match="fsdp_mode='fsdp2'" if flag is True else "must be a boolean"):
+        torch_parallelize.build_parallelize_model(model, low_precision_reduce_scatter_comm=flag)
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_public_ddp_builder_preserves_native_bypass(monkeypatch, flag):
+    monkeypatch.setattr(
+        torch_parallelize,
+        "get_parallel_state",
+        lambda: SimpleNamespace(fsdp_enabled=True, tp_enabled=False, dp_mode="ddp"),
+    )
+    monkeypatch.setattr(torch_parallelize, "parallelize_model_ddp", lambda model, **kwargs: model)
+    model = nn.Linear(2, 2)
+    assert (
+        torch_parallelize.build_parallelize_model(
+            model,
+            low_precision_reduce_scatter_comm=flag,
+            mixed_precision=MixedPrecisionConfig(param_dtype="bfloat16", reduce_dtype="bfloat16"),
+            enable_gradient_checkpointing=False,
+        )
+        is model
+    )
+
+
+def test_public_singleton_fsdp_builder_preserves_native_path(monkeypatch):
+    monkeypatch.setattr(device_utils, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(
+        torch_parallelize,
+        "get_parallel_state",
+        lambda: SimpleNamespace(fsdp_enabled=False, tp_enabled=False, dp_mode="fsdp2"),
+    )
+    model = nn.Linear(2, 2)
+    assert (
+        torch_parallelize.build_parallelize_model(
+            model,
+            low_precision_reduce_scatter_comm=True,
+            enable_gradient_checkpointing=False,
+            init_device=get_device_type(),
+        )
+        is model
+    )
 
 
 @pytest.mark.parametrize("param_dtype", [None, "bfloat16", "float16", "float32"])
 @pytest.mark.parametrize("reduce_dtype", [None, "bfloat16", "float16", "float32"])
 @pytest.mark.parametrize("enable", [False, True])
-def test_native_transport_does_not_constrain_parameter_precision(param_dtype, reduce_dtype, enable):
+def test_disabled_transport_does_not_constrain_precision(param_dtype, reduce_dtype, enable):
     mixed_precision = MixedPrecisionConfig(enable=enable, param_dtype=param_dtype, reduce_dtype=reduce_dtype)
-    for transport_dtype in (None, reduce_dtype):
-        config = FSDPConfig(
-            fsdp_mode="ddp",
-            mixed_precision=mixed_precision,
-            reduce_scatter_comm_dtype=transport_dtype,
-        )
-        assert config.reduce_scatter_comm_dtype == transport_dtype
-        assert not validate_reduce_scatter_transport(transport_dtype, mixed_precision)
+    config = FSDPConfig(fsdp_mode="ddp", mixed_precision=mixed_precision, low_precision_reduce_scatter_comm=False)
+    assert not config.low_precision_reduce_scatter_comm
+    assert not validate_low_precision_reduce_scatter_comm(False, mixed_precision, fsdp_mode="ddp")
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float32"])
+@pytest.mark.parametrize("enable", [False, True])
+def test_enabled_equal_dtypes_keep_native_path(dtype, enable):
+    mixed_precision = MixedPrecisionConfig(enable=enable, param_dtype=dtype, reduce_dtype=dtype)
+    config = FSDPConfig(fsdp_mode="ddp", mixed_precision=mixed_precision, low_precision_reduce_scatter_comm=True)
+    assert config.low_precision_reduce_scatter_comm
+    assert not validate_low_precision_reduce_scatter_comm(True, mixed_precision, fsdp_mode="ddp")
+
+
+@pytest.mark.parametrize("param_dtype", ["bfloat16", "float16"])
+def test_enabled_transport_inherits_parameter_precision(param_dtype):
+    mixed_precision = MixedPrecisionConfig(param_dtype=param_dtype, reduce_dtype="float32")
+    config = FSDPConfig(mixed_precision=mixed_precision, low_precision_reduce_scatter_comm=True)
+    assert validate_low_precision_reduce_scatter_comm(config.low_precision_reduce_scatter_comm, mixed_precision)
+    with pytest.raises(ValueError, match="fsdp_mode='fsdp2'"):
+        FSDPConfig(fsdp_mode="ddp", mixed_precision=mixed_precision, low_precision_reduce_scatter_comm=True)
 
 
 @pytest.mark.parametrize(
-    ("param_dtype", "transport_dtype"),
+    ("param_dtype", "reduce_dtype", "enable"),
     [
-        ("float16", "bfloat16"),
-        ("bfloat16", "float16"),
-        ("float32", "bfloat16"),
-        ("float32", "float16"),
-        (None, "bfloat16"),
-        (None, "float16"),
+        ("bfloat16", "float16", True),
+        ("float16", "bfloat16", True),
+        ("float32", "bfloat16", True),
+        ("float32", "float16", True),
+        (None, "float32", True),
+        (None, None, True),
+        ("bfloat16", None, True),
+        ("float16", None, True),
+        ("bfloat16", "float32", False),
+        ("float16", "float32", False),
     ],
 )
-def test_mismatched_parameter_and_transport_precision_is_rejected(monkeypatch, param_dtype, transport_dtype):
-    mixed_precision = MixedPrecisionConfig(param_dtype=param_dtype, reduce_dtype="float32")
-    with pytest.raises(ValueError, match="requires.*to match.*param_dtype") as config_error:
-        FSDPConfig(mixed_precision=mixed_precision, reduce_scatter_comm_dtype=transport_dtype)
+def test_unsupported_precision_is_rejected_before_backend_check(monkeypatch, param_dtype, reduce_dtype, enable):
+    mixed_precision = MixedPrecisionConfig(enable=enable, param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+    with pytest.raises(ValueError, match="requires enabled mixed-precision") as config_error:
+        FSDPConfig(mixed_precision=mixed_precision, low_precision_reduce_scatter_comm=True)
 
     monkeypatch.setattr(torch_parallelize, "get_parallel_state", object)
 
@@ -451,7 +507,7 @@ def test_mismatched_parameter_and_transport_precision_is_rejected(monkeypatch, p
         torch_parallelize.parallelize_model_fsdp2(
             nn.Linear(2, 2),
             mixed_precision=mixed_precision,
-            reduce_scatter_comm_dtype=transport_dtype,
+            low_precision_reduce_scatter_comm=True,
         )
     assert str(direct_error.value) == str(config_error.value)
 
@@ -463,29 +519,10 @@ def test_matching_transport_round_trip_preserves_all_finite_16bit_values(dtype):
     assert torch.equal(values.float().to(dtype).view(torch.int16), values.view(torch.int16))
 
 
-@pytest.mark.parametrize(
-    ("reduce_dtype", "transport_dtype"),
-    [("bfloat16", "float16"), ("float16", "bfloat16")],
-)
-def test_parallelize_rejects_cross_16bit_transport_before_backend_check(
-    monkeypatch,
-    reduce_dtype,
-    transport_dtype,
-):
-    monkeypatch.setattr(torch_parallelize, "get_parallel_state", object)
-    monkeypatch.setattr(torch_parallelize, "get_device_type", lambda: "cpu")
-
-    with pytest.raises(ValueError, match="supports only.*reduce_dtype='float32'"):
-        torch_parallelize.parallelize_model_fsdp2(
-            nn.Linear(2, 2),
-            mixed_precision=MixedPrecisionConfig(reduce_dtype=reduce_dtype),
-            reduce_scatter_comm_dtype=transport_dtype,
-        )
-
-
-@pytest.mark.parametrize("transport_dtype", [None, "bfloat16", "float16", "float32"])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float32"])
 @pytest.mark.parametrize("enable", [False, True])
-def test_native_transport_does_not_register_custom_collective(monkeypatch, transport_dtype, enable):
+@pytest.mark.parametrize("low_precision_comm", [False, True])
+def test_native_transport_does_not_register_custom_collective(monkeypatch, dtype, enable, low_precision_comm):
     class ParallelState:
         any_extra_parallel_enabled = False
         extra_parallel_names = []
@@ -497,7 +534,7 @@ def test_native_transport_does_not_register_custom_collective(monkeypatch, trans
     monkeypatch.setattr(torch_parallelize, "_materialize_and_load_weights", lambda *args, **kwargs: None)
 
     def fail_registration(*args, **kwargs):
-        raise AssertionError("matching dtypes must not register a custom ReduceScatter")
+        raise AssertionError("native paths must not register a custom ReduceScatter or inspect topology")
 
     monkeypatch.setattr(torch_parallelize, "ReduceScatterTransportPolicy", fail_registration)
     monkeypatch.setattr(
@@ -509,10 +546,8 @@ def test_native_transport_does_not_register_custom_collective(monkeypatch, trans
     model = nn.Linear(2, 2)
     result = torch_parallelize.parallelize_model_fsdp2(
         model,
-        mixed_precision=MixedPrecisionConfig(
-            enable=enable, param_dtype="float32", reduce_dtype=transport_dtype or "float32"
-        ),
-        reduce_scatter_comm_dtype=transport_dtype,
+        mixed_precision=MixedPrecisionConfig(enable=enable, param_dtype=dtype, reduce_dtype=dtype),
+        low_precision_reduce_scatter_comm=low_precision_comm,
         init_device="meta",
     )
 
@@ -577,7 +612,7 @@ def test_parallelize_registers_transport_only_for_eligible_fsdp_and_hsdp(
             param_dtype=transport_dtype,
             reduce_dtype="float32",
         ),
-        reduce_scatter_comm_dtype=transport_dtype,
+        low_precision_reduce_scatter_comm=True,
         init_device="meta",
     )
 
@@ -670,7 +705,7 @@ def test_parallelize_checks_dense_and_expert_meshes_independently(monkeypatch, d
         torch_parallelize.parallelize_model_fsdp2(
             model,
             mixed_precision=MixedPrecisionConfig(param_dtype="bfloat16", reduce_dtype="float32"),
-            reduce_scatter_comm_dtype="bfloat16",
+            low_precision_reduce_scatter_comm=True,
             init_device="meta",
         )
         is model

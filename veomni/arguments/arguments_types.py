@@ -503,30 +503,34 @@ class MixedPrecisionConfig:
         _check_dtype(self.output_dtype)
 
 
-def validate_reduce_scatter_transport(
-    transport_dtype: Optional[str],
+def validate_low_precision_reduce_scatter_comm(
+    enabled: bool,
     mixed_precision: MixedPrecisionConfig,
     *,
     fsdp_mode: str = "fsdp2",
 ) -> bool:
-    """Validate transport precision and return whether the custom path is active."""
-    if transport_dtype is not None and transport_dtype not in ("bfloat16", "float16", "float32"):
-        raise ValueError("reduce_scatter_comm_dtype must be one of 'bfloat16', 'float16', 'float32', or None.")
-    if transport_dtype is None or transport_dtype == mixed_precision.reduce_dtype:
+    """Validate the opt-in flag and precision settings; return whether a custom path is needed."""
+    if not isinstance(enabled, bool):
+        raise ValueError("low_precision_reduce_scatter_comm must be a boolean (true or false).")
+    if not enabled:
+        return False
+    if (
+        mixed_precision.param_dtype in ("bfloat16", "float16", "float32")
+        and mixed_precision.param_dtype == mixed_precision.reduce_dtype
+    ):
         return False
     if fsdp_mode != "fsdp2":
-        raise ValueError("reduce_scatter_comm_dtype requires fsdp_mode='fsdp2'.")
-    if not mixed_precision.enable or mixed_precision.reduce_dtype != "float32":
+        raise ValueError("low_precision_reduce_scatter_comm requires fsdp_mode='fsdp2'.")
+    if (
+        not mixed_precision.enable
+        or mixed_precision.reduce_dtype != "float32"
+        or mixed_precision.param_dtype not in ("bfloat16", "float16")
+    ):
         raise ValueError(
-            "The custom ReduceScatter transport path supports only mixed-precision FSDP2 with "
-            "mixed_precision.reduce_dtype='float32' and transport dtype 'bfloat16' or 'float16'. "
-            "Use None or match reduce_scatter_comm_dtype to reduce_dtype for the native path."
-        )
-    if transport_dtype != mixed_precision.param_dtype:
-        raise ValueError(
-            "The custom ReduceScatter transport path requires reduce_scatter_comm_dtype to match "
-            "mixed_precision.param_dtype ('bfloat16' or 'float16') to avoid lossy gradient conversion; "
-            f"got transport dtype {transport_dtype!r} and param_dtype {mixed_precision.param_dtype!r}."
+            "low_precision_reduce_scatter_comm requires enabled mixed-precision FSDP2 with "
+            "param_dtype='bfloat16' or 'float16' and reduce_dtype='float32'. "
+            "Communication precision is inferred from param_dtype. Disable the option or use equal "
+            "parameter and reduction dtypes for the native path."
         )
     return True
 
@@ -571,15 +575,15 @@ class FSDPConfig:
             )
         },
     )
-    reduce_scatter_comm_dtype: Optional[str] = field(
-        default=None,
+    low_precision_reduce_scatter_comm: bool = field(
+        default=False,
         metadata={
             "help": (
-                "Optional BF16 or FP16 wire dtype for node-local FSDP2 ReduceScatter while keeping FP32 reduction "
-                "buffers and accumulation. None or a value equal to mixed_precision.reduce_dtype uses "
-                "the native PyTorch path. The custom path supports only float32 reduction with bfloat16 "
-                "or float16 transport matching mixed_precision.param_dtype to avoid lossy gradient "
-                "conversion. Cross-node or unknown-placement shard groups fall back to native communication; "
+                "Use mixed_precision.param_dtype for node-local FSDP2 ReduceScatter communication, while "
+                "keeping FP32 reduction buffers and accumulation. Disabled by default. Equal parameter and "
+                "reduction dtypes retain native communication. The custom path requires enabled mixed precision, "
+                "bfloat16 or float16 parameters, and float32 reduction. "
+                "Cross-node or unknown-placement shard groups fall back to native communication; "
                 "HSDP replica-linked groups make a consistent choice. FP32 modules excluded from mixed "
                 "precision keep native communication."
             )
@@ -607,8 +611,8 @@ class FSDPConfig:
                 "model.accelerator.fsdp_config.fsdp_mode='eager' is reserved for the "
                 "single-process inference path and is not wired up yet."
             )
-        validate_reduce_scatter_transport(
-            self.reduce_scatter_comm_dtype, self.mixed_precision, fsdp_mode=self.fsdp_mode
+        validate_low_precision_reduce_scatter_comm(
+            self.low_precision_reduce_scatter_comm, self.mixed_precision, fsdp_mode=self.fsdp_mode
         )
 
 

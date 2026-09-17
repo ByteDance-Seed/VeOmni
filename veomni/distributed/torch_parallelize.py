@@ -27,7 +27,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
 from ..arguments import MixedPrecisionConfig
-from ..arguments.arguments_types import validate_reduce_scatter_transport
+from ..arguments.arguments_types import validate_low_precision_reduce_scatter_comm
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
@@ -336,7 +336,7 @@ def parallelize_model_fsdp2(
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
-    reduce_scatter_comm_dtype: Optional[str] = None,
+    low_precision_reduce_scatter_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
@@ -366,12 +366,14 @@ def parallelize_model_fsdp2(
     """
     parallel_state = get_parallel_state()
 
-    use_low_precision_transport = validate_reduce_scatter_transport(reduce_scatter_comm_dtype, mixed_precision)
+    use_low_precision_transport = validate_low_precision_reduce_scatter_comm(
+        low_precision_reduce_scatter_comm, mixed_precision
+    )
     if use_low_precision_transport:
         if get_device_type() != "cuda":
             raise RuntimeError("Low-precision ReduceScatter transport is only supported on CUDA/NCCL.")
-    elif reduce_scatter_comm_dtype is not None:
-        logger.info_rank0("ReduceScatter transport dtype matches reduce dtype; using the native PyTorch collective.")
+    elif low_precision_reduce_scatter_comm:
+        logger.info_rank0("Parameter dtype matches reduce dtype; using the native PyTorch collective.")
 
     model_no_split_modules = getattr(model, "_no_split_modules", None) or []
     target_classes = set(model_no_split_modules) | set(basic_modules or [])
@@ -757,11 +759,11 @@ def parallelize_model_fsdp2(
             transport_reduction_scales[model] = fsdp_reduction_scale
         registered = register_fp32_reduce_scatter_with_low_precision_transport(
             model,
-            transport_dtype=getattr(torch, reduce_scatter_comm_dtype),
+            transport_dtype=getattr(torch, mixed_precision.param_dtype),
             reduction_scales=transport_reduction_scales,
         )
         logger.info_rank0(
-            f"Registered {reduce_scatter_comm_dtype} ReduceScatter transport with FP32 output on "
+            f"Registered {mixed_precision.param_dtype} ReduceScatter transport with FP32 output on "
             f"{registered} FSDP module{'s' if registered != 1 else ''}."
         )
 
@@ -901,7 +903,7 @@ def build_parallelize_model(
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
-    reduce_scatter_comm_dtype: Optional[str] = None,
+    low_precision_reduce_scatter_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
@@ -913,6 +915,10 @@ def build_parallelize_model(
             EP-local dim is divisible by ``ep_fsdp_size``.
     """
     parallel_state = get_parallel_state()
+    if low_precision_reduce_scatter_comm is not False:
+        validate_low_precision_reduce_scatter_comm(
+            low_precision_reduce_scatter_comm, mixed_precision, fsdp_mode=parallel_state.dp_mode
+        )
     compile_config = compile_config or CompileConfig()
 
     if not parallel_state.fsdp_enabled:
@@ -957,7 +963,7 @@ def build_parallelize_model(
                 mixed_precision=mixed_precision,
                 basic_modules=basic_modules,
                 muon_expert_zero_comm=muon_expert_zero_comm,
-                reduce_scatter_comm_dtype=reduce_scatter_comm_dtype,
+                low_precision_reduce_scatter_comm=low_precision_reduce_scatter_comm,
                 compile_config=compile_config,
                 should_skip_hf_weight_load=should_skip_hf_weight_load,
                 **kwargs,
