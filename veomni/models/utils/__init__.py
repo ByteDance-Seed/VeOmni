@@ -14,11 +14,9 @@
 
 """Cross-model op construction and attention helpers."""
 
-from .op_utils import linear_bias, resolve_moe_impl, resolve_op_impl
+from .op_utils import resolve_op_impl
 
 
 __all__ = [
-    "linear_bias",
     "resolve_op_impl",
-    "resolve_moe_impl",
 ]

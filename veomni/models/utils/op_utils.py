@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Helpers for constructing ``VeomniOp`` handles and SwiGLU activation routing.
+"""Helpers for constructing ``VeomniOp`` handles.
 
 Read impl names from ``get_ops_config`` at construct time. ``npu`` on
 cross-entropy maps to ``chunk_loss``.
@@ -26,19 +26,6 @@ import torch
 from torch import Tensor, nn
 
 from veomni.ops.config import get_ops_config
-
-
-SWIGLU_HIDDEN_ACTS = frozenset({"silu", "swish"})
-
-
-def uses_swiglu_mlp(hidden_act: str) -> bool:
-    """Whether fused SwiGLU / silu MoE kernels match this ``hidden_act``.
-
-    Those kernels are silu-only. ``swish`` is the same function. Any other
-    activation stays on ``self.act_fn`` instead of teaching fused SwiGLU a
-    generic activation.
-    """
-    return hidden_act in SWIGLU_HIDDEN_ACTS
 
 
 class _MergedExpertsActFnEP:
@@ -330,22 +317,11 @@ def prepare_dense_attention_inputs(
     return drop_packed_attention_metadata(kwargs, impl=impl), attention_mask
 
 
-def resolve_moe_impl() -> str:
-    """Return the active ``moe_experts`` impl from the ops config."""
-    return resolve_op_impl("moe_implementation")
-
-
 def resolve_qat_impl() -> str:
-    """Return the active model-level quantization recipe, or ``none``."""
+    """Return the active model-level quantization recipe, or ``none``.
+
+    This is not an op-registry impl. Missing config is ``none`` (off), not
+    ``eager``.
+    """
     cfg = get_ops_config()
     return "none" if cfg is None else getattr(cfg, "qat_implementation", "none")
-
-
-def empty_bias(weight: Tensor) -> Tensor:
-    """Empty unused-layout bias for a Linear that has ``bias=None``."""
-    return weight.new_empty(0)
-
-
-def linear_bias(linear: nn.Linear) -> Tensor:
-    """Return the Linear bias, or the empty unused-layout sentinel."""
-    return linear.bias if linear.bias is not None else empty_bias(linear.weight)

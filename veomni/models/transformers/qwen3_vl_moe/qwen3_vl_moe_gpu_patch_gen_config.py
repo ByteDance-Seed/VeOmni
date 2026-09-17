@@ -64,7 +64,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_vision_forward_patched,
     qwen3_vl_vision_rot_pos_emb_patched,
 )
-from veomni.models.utils.op_utils import empty_bias, resolve_moe_impl, resolve_op_impl
+from veomni.models.utils.op_utils import merged_experts_act_fn_forward, resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import Qwen3VLMoeCausalLMOutputWithLogProbs
@@ -122,11 +122,8 @@ config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models.utils.op_utils",
     names=[
-        "empty_bias",
         "resolve_op_impl",
-        "resolve_moe_impl",
         "merged_experts_act_fn_forward",
-        "uses_swiglu_mlp",
     ],
 )
 config.add_import(
@@ -286,8 +283,8 @@ class PatchedQwen3VLMoeTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.use_swiglu_mlp = uses_swiglu_mlp(config.hidden_act)
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
+        self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
 
     def forward(
         self,
@@ -305,7 +302,7 @@ class PatchedQwen3VLMoeTextExperts(nn.Module):
                 self.act_fn,
                 self.num_experts,
             )
-        unused = empty_bias(self.gate_up_proj)
+        unused = self.gate_up_proj.new_empty(0)
         return self.veomni_moe(
             hidden_states,
             top_k_weights,

@@ -22,7 +22,7 @@ import pytest
 import torch
 
 from tests.models.compare import eager_ops_config, ops_config_scope
-from veomni.models.utils.op_utils import linear_bias, resolve_op_impl
+from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops.config import get_ops_config, set_ops_config
 
 
@@ -70,23 +70,6 @@ def test_resolve_op_impl_remaps_npu_ce_alias():
     set_ops_config(SimpleNamespace(cross_entropy_loss_implementation="npu"))
     assert resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss") == "chunk_loss"
     assert resolve_op_impl("cross_entropy_loss_implementation") == "npu"
-
-
-def test_linear_bias_empty_sentinel():
-    linear = torch.nn.Linear(4, 4, bias=False)
-    bias = linear_bias(linear)
-    assert bias.numel() == 0
-    assert bias.device == linear.weight.device
-    assert bias.dtype == linear.weight.dtype
-
-
-def test_resolve_moe_impl_reads_ops_config():
-    from veomni.models.utils.op_utils import resolve_moe_impl
-
-    set_ops_config(SimpleNamespace(moe_implementation="fused_triton"))
-    assert resolve_moe_impl() == "fused_triton"
-    set_ops_config(SimpleNamespace(moe_implementation="eager"))
-    assert resolve_moe_impl() == "eager"
 
 
 @pytest.mark.parametrize("impl", ["eager", "sdpa", "veomni_sdpa"])

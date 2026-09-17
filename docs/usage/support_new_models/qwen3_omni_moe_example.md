@@ -204,7 +204,7 @@ if sp_enabled and pixel_values is not None:
 The standard HuggingFace MoE uses `nn.ModuleList` of individual expert MLPs. VeOmni replaces this with a single module holding stacked 3D weight tensors and an instance-local `moe_experts` handle. `eager` is a registered row, not a separate `ModuleList` fork. EP sharding also requires the stacked layout.
 
 ```python
-from veomni.models.utils.op_utils import empty_bias, resolve_moe_impl
+from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
 
 
@@ -221,10 +221,10 @@ class YourModelExperts(nn.Module):
         self.down_proj = nn.Parameter(
             torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
         )
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
-        unused = empty_bias(self.gate_up_proj)
+        unused = self.gate_up_proj.new_empty(0)
         return self.veomni_moe(
             hidden_states,
             top_k_weights,

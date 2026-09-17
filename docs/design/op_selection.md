@@ -409,7 +409,7 @@ raise during config validation or op binding.
 | `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
 | `fused_mlu` | Apex grouped-GEMM | Cambricon MLU | Yes |
 
-Patched experts modules construct `VeomniOp("moe_experts", variant, resolve_moe_impl())`
+Patched experts modules construct `VeomniOp("moe_experts", variant, resolve_op_impl("moe_implementation"))`
 in `__init__` and always call that handle. `eager` is a registered row, not a
 separate `ModuleList` fork. LoRA experts reuse the same `moe_implementation`
 field and map it onto `moe_experts_lora` rows.
@@ -434,7 +434,7 @@ CANN and `torch_npu` stack to enable the fused activation.
 
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
 - Registration: `veomni/ops/kernels/moe_experts/__init__.py`
-- Model helper: `veomni/models/utils/op_utils.py` — `resolve_moe_impl()`
+- Model helper: `veomni/models/utils/op_utils.py` — `resolve_op_impl("moe_implementation")`
 - Model integration: `veomni/models/transformers/*/*_patch_gen_config.py`
 - Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
 

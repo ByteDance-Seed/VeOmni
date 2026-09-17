@@ -132,7 +132,7 @@ def fused_triton_moe_ops() -> OpsImplementationConfig:
 
     Selecting ``moe_implementation="fused_triton"`` installs the ops config that
     ``LoraSharedExperts`` / ``LoraIndependentExperts`` read via
-    ``resolve_moe_impl``-style lookup to construct
+    ``resolve_op_impl("moe_implementation")`` to construct
     ``VeomniOp("moe_experts_lora", variant, "fused_triton")``.
     """
     return OpsImplementationConfig(

@@ -75,7 +75,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 - Combine the per-expert MLPs into stacked `Qwen3MoeExperts` weights and always call a local `moe_experts` `VeomniOp`. `eager` is a registered row, not a separate `ModuleList` path.
 
 ```python
-from veomni.models.utils.op_utils import empty_bias, resolve_moe_impl
+from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
 
 
@@ -91,10 +91,10 @@ class Qwen3MoeExperts(nn.Module):
         self.down_proj = torch.nn.Parameter(
             torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
         )
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
-        unused = empty_bias(self.gate_up_proj)
+        unused = self.gate_up_proj.new_empty(0)
         return self.veomni_moe(
             hidden_states,
             top_k_weights,

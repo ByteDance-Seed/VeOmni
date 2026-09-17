@@ -92,7 +92,7 @@
 +from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 +
 +from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
-+from veomni.models.utils.op_utils import resolve_moe_impl, resolve_op_impl
++from veomni.models.utils.op_utils import resolve_op_impl
 +from veomni.ops import VeomniOp
 +from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
@@ -124,7 +124,7 @@
 -        glu = gate * torch.sigmoid(gate * self.alpha)
 -        gated_output = (up + 1) * glu
 -        return gated_output
-+        self.veomni_moe = VeomniOp("moe_experts", "gpt_oss", resolve_moe_impl())
++        self.veomni_moe = VeomniOp("moe_experts", "gpt_oss", resolve_op_impl("moe_implementation"))
 
      def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
 -        next_states = torch.zeros_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)

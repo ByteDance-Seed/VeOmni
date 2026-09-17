@@ -223,7 +223,7 @@ def get_parallel_plan():
 Qwen3-VL MoE already stores a fused `gate_up_proj` of shape `[E, 2*I, H]`. Replace the experts class so it always calls a local `moe_experts` handle. Pass the merged tensor as `fc1_1_2_weight` and leave the split `fc1_*` slots empty. `eager` is a registered row, not a `super().forward` fallback.
 
 ```python
-from veomni.models.utils.op_utils import empty_bias, resolve_moe_impl
+from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
 
 
@@ -239,10 +239,10 @@ class Qwen3VLMoeTextExperts(nn.Module):
         self.down_proj = nn.Parameter(
             torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
         )
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
-        unused = empty_bias(self.gate_up_proj)
+        unused = self.gate_up_proj.new_empty(0)
         return self.veomni_moe(
             hidden_states,
             top_k_weights,

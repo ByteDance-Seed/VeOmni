@@ -57,7 +57,7 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
-from veomni.models.utils.op_utils import resolve_moe_impl, resolve_op_impl
+from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
@@ -101,7 +101,7 @@ class GptOssExperts(nn.Module):
         self.down_proj_bias = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
         self.alpha = 1.702
         self.limit = 7.0
-        self.veomni_moe = VeomniOp("moe_experts", "gpt_oss", resolve_moe_impl())
+        self.veomni_moe = VeomniOp("moe_experts", "gpt_oss", resolve_op_impl("moe_implementation"))
 
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
         return self.veomni_moe(

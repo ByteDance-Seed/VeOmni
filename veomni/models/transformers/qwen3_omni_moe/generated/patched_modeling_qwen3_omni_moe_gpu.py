@@ -131,13 +131,7 @@ from veomni.distributed.sequence_parallel import gather_outputs, slice_input_ten
 from veomni.distributed.sequence_parallel.ulysses import _Gather
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
-from veomni.models.utils.op_utils import (
-    empty_bias,
-    merged_experts_act_fn_forward,
-    resolve_moe_impl,
-    resolve_op_impl,
-    uses_swiglu_mlp,
-)
+from veomni.models.utils.op_utils import merged_experts_act_fn_forward, resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs
@@ -1651,8 +1645,8 @@ class Qwen3OmniMoeThinkerTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.use_swiglu_mlp = uses_swiglu_mlp(config.hidden_act)
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
+        self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
 
     def forward(
         self,
@@ -1670,7 +1664,7 @@ class Qwen3OmniMoeThinkerTextExperts(nn.Module):
                 self.act_fn,
                 self.num_experts,
             )
-        unused = empty_bias(self.gate_up_proj)
+        unused = self.gate_up_proj.new_empty(0)
         return self.veomni_moe(
             hidden_states,
             top_k_weights,

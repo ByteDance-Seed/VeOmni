@@ -34,7 +34,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
-from veomni.models.utils.op_utils import linear_bias, resolve_op_impl, uses_swiglu_mlp
+from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
@@ -59,7 +59,7 @@ config.add_import(
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models.utils.op_utils",
-    names=["linear_bias", "resolve_op_impl", "uses_swiglu_mlp"],
+    names=["resolve_op_impl"],
 )
 config.add_import(
     "veomni.models.loss_utils",
@@ -109,15 +109,15 @@ def llama_mlp_init_patched(self, config):
     description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
 )
 def llama_mlp_forward_patched(self, x):
-    if uses_swiglu_mlp(self.config.hidden_act):
+    if self.config.hidden_act in {"silu", "swish"}:
         return self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,
-            linear_bias(self.gate_proj),
+            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
             self.up_proj.weight,
-            linear_bias(self.up_proj),
+            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
             self.down_proj.weight,
-            linear_bias(self.down_proj),
+            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
         )
     return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 

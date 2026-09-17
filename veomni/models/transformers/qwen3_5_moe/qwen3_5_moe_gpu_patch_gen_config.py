@@ -62,7 +62,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_vision_model_forward,
     qwen3_5_vision_model_rot_pos_emb,
 )
-from veomni.models.utils.op_utils import empty_bias, resolve_moe_impl, resolve_op_impl
+from veomni.models.utils.op_utils import merged_experts_act_fn_forward, resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -105,11 +105,8 @@ config.add_import(
     "veomni.models.utils.op_utils",
     names=[
         "prepare_dense_attention_inputs",
-        "empty_bias",
         "resolve_op_impl",
-        "resolve_moe_impl",
         "merged_experts_act_fn_forward",
-        "uses_swiglu_mlp",
     ],
 )
 config.add_import(
@@ -689,8 +686,8 @@ class PatchedQwen3_5MoeExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.use_swiglu_mlp = uses_swiglu_mlp(config.hidden_act)
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
+        self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
 
     def forward(
         self,
@@ -708,7 +705,7 @@ class PatchedQwen3_5MoeExperts(nn.Module):
                 self.act_fn,
                 self.num_experts,
             )
-        unused = empty_bias(self.gate_up_proj)
+        unused = self.gate_up_proj.new_empty(0)
         return self.veomni_moe(
             hidden_states,
             top_k_weights,

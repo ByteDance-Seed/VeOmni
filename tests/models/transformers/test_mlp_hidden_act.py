@@ -48,7 +48,6 @@ from tests.models.tiny_configs import (
     tiny_qwen3_vl_moe_config,
     tiny_seed_oss_config,
 )
-from veomni.models.utils.op_utils import uses_swiglu_mlp
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
@@ -81,7 +80,7 @@ def _pair(ours_cls, hf_cls, config):
         ours = ours_cls(config)
     ours.load_state_dict(hf.state_dict())
     counter = None
-    if uses_swiglu_mlp(config.hidden_act):
+    if config.hidden_act in {"silu", "swish"}:
         handle_name = "veomni_swiglu_mlp" if hasattr(ours, "veomni_swiglu_mlp") else "veomni_moe"
         counter = _CallCounter(getattr(ours, handle_name))
         setattr(ours, handle_name, counter)
@@ -97,11 +96,6 @@ def _assert_matches(hf, ours, counter, *args):
     assert_module_forward_and_grads_match(hf, ours, *args)
     if counter is not None:
         assert counter.calls == 1
-
-
-@pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)
-def test_uses_swiglu_mlp_matches_silu_family(hidden_act):
-    assert uses_swiglu_mlp(hidden_act) is (hidden_act in {"silu", "swish"})
 
 
 @pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)

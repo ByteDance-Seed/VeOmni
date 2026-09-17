@@ -40,7 +40,7 @@ from transformers.utils import TransformersKwargs, auto_docstring
 from transformers.utils.output_capturing import OutputRecorder
 
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
-from veomni.models.utils.op_utils import resolve_moe_impl, resolve_op_impl
+from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
@@ -60,7 +60,7 @@ config.add_import(
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models.utils.op_utils",
-    names=["resolve_op_impl", "resolve_moe_impl"],
+    names=["resolve_op_impl"],
 )
 config.add_import(
     "veomni.models.loss_utils",
@@ -132,7 +132,7 @@ class PatchedGptOssExperts(nn.Module):
         self.down_proj_bias = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
         self.alpha = 1.702
         self.limit = 7.0
-        self.veomni_moe = VeomniOp("moe_experts", "gpt_oss", resolve_moe_impl())
+        self.veomni_moe = VeomniOp("moe_experts", "gpt_oss", resolve_op_impl("moe_implementation"))
 
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
         return self.veomni_moe(

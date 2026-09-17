@@ -103,11 +103,8 @@ config.add_import(
     "veomni.models.utils.op_utils",
     names=[
         "prepare_dense_attention_inputs",
-        "empty_bias",
         "resolve_op_impl",
-        "resolve_moe_impl",
         "merged_experts_act_fn_forward",
-        "uses_swiglu_mlp",
     ],
 )
 config.add_import(

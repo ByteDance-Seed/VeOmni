@@ -35,12 +35,8 @@ from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.op_utils import (
-    empty_bias,
-    linear_bias,
     merged_experts_act_fn_forward,
-    resolve_moe_impl,
     resolve_op_impl,
-    uses_swiglu_mlp,
 )
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
@@ -59,12 +55,8 @@ config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models.utils.op_utils",
     names=[
-        "empty_bias",
-        "linear_bias",
         "merged_experts_act_fn_forward",
         "resolve_op_impl",
-        "resolve_moe_impl",
-        "uses_swiglu_mlp",
     ],
 )
 config.add_import(
@@ -221,15 +213,15 @@ def deepseek_v3_mlp_init_patched(self, config, intermediate_size=None):
     description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
 )
 def deepseek_v3_mlp_forward_patched(self, x):
-    if uses_swiglu_mlp(self.config.hidden_act):
+    if self.config.hidden_act in {"silu", "swish"}:
         return self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,
-            linear_bias(self.gate_proj),
+            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
             self.up_proj.weight,
-            linear_bias(self.up_proj),
+            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
             self.down_proj.weight,
-            linear_bias(self.down_proj),
+            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
         )
     return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
@@ -246,8 +238,8 @@ class PatchedDeepseekV3Experts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.use_swiglu_mlp = uses_swiglu_mlp(config.hidden_act)
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
+        self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
 
     def forward(
         self,
@@ -265,7 +257,7 @@ class PatchedDeepseekV3Experts(nn.Module):
                 self.act_fn,
                 self.num_experts,
             )
-        unused = empty_bias(self.gate_up_proj)
+        unused = self.gate_up_proj.new_empty(0)
         return self.veomni_moe(
             hidden_states,
             top_k_weights,
