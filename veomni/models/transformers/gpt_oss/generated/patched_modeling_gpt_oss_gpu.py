@@ -57,8 +57,8 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
-from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
 

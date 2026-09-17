@@ -24,8 +24,8 @@ from ltx_core.model.transformer.ops import (
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.transformer_args import TransformerArgs
 
-from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 
 
 @dataclass

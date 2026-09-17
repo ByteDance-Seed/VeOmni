@@ -64,8 +64,9 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_vision_forward_patched,
     qwen3_vl_vision_rot_pos_emb_patched,
 )
-from veomni.models.utils.op_utils import merged_experts_act_fn_forward, resolve_op_impl
+from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import Qwen3VLMoeCausalLMOutputWithLogProbs
 
@@ -120,11 +121,12 @@ config.add_import(
 )
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models.utils.op_utils",
-    names=[
-        "resolve_op_impl",
-        "merged_experts_act_fn_forward",
-    ],
+    "veomni.ops.config",
+    names=["resolve_op_impl"],
+)
+config.add_import(
+    "veomni.models.utils.moe_utils",
+    names=["merged_experts_act_fn_forward"],
 )
 config.add_import(
     "veomni.models.loss_utils",

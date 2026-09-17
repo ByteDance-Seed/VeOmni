@@ -63,7 +63,7 @@ from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config imp
 from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config import (
     config as gpu_config,
 )
-from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.patchgen.patch_spec import PatchConfig
 
 
@@ -100,12 +100,16 @@ config.add_import(
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models.utils.op_utils",
-    names=[
-        "prepare_dense_attention_inputs",
-        "resolve_op_impl",
-        "merged_experts_act_fn_forward",
-    ],
+    "veomni.ops.config",
+    names=["resolve_op_impl"],
+)
+config.add_import(
+    "veomni.models.utils.attention_utils",
+    names=["prepare_dense_attention_inputs"],
+)
+config.add_import(
+    "veomni.models.utils.moe_utils",
+    names=["merged_experts_act_fn_forward"],
 )
 config.add_import(
     "veomni.models.loss_utils",

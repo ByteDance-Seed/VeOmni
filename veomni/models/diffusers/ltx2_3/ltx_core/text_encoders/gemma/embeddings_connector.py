@@ -8,8 +8,8 @@ from ltx_core.model.transformer.rope import (
     precompute_freqs_cis,
 )
 
-from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 
 
 # Matches the standalone ``ltx_core.utils.rms_norm`` helper default. The raw

@@ -49,11 +49,9 @@ from transformers.utils import TransformersKwargs, torch_compilable_check
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
-from veomni.models.utils.op_utils import (
-    merged_experts_act_fn_forward,
-    resolve_op_impl,
-)
+from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
@@ -79,11 +77,12 @@ config.add_import("veomni.utils.model_outputs", names=["FusedLinearAuxOutput", "
 config.add_import("veomni.utils.seqlen_pos_transform_utils", names=["culen2pos", "pos2culen"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models.utils.op_utils",
-    names=[
-        "merged_experts_act_fn_forward",
-        "resolve_op_impl",
-    ],
+    "veomni.ops.config",
+    names=["resolve_op_impl"],
+)
+config.add_import(
+    "veomni.models.utils.moe_utils",
+    names=["merged_experts_act_fn_forward"],
 )
 config.add_import(
     "veomni.models.loss_utils",

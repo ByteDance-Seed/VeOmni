@@ -33,8 +33,8 @@ from veomni.distributed.sequence_parallel import (
     slice_input_tensor_scale_grad,
 )
 from veomni.distributed.sequence_parallel.utils import padding_tensor_for_seqeunce_parallel
-from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 
 from ....utils import logging
 from .config_wan import WanConfig

@@ -14,8 +14,8 @@ from veomni.distributed.sequence_parallel.ulysses import (
     _AsyncA2A,
     _Gather,
 )
-from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 from .core import attention_forward, gradient_checkpoint_forward

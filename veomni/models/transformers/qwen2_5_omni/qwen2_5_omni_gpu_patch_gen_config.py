@@ -78,8 +78,8 @@ from veomni.distributed.sequence_parallel import (
 )
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
-from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import (
     AUDIO_INPUT_INDEX,
@@ -119,7 +119,7 @@ config.add_import(
 config.add_import("veomni.models.utils.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models.utils.op_utils",
+    "veomni.ops.config",
     names=["resolve_op_impl"],
 )
 config.add_import(

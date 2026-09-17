@@ -152,7 +152,7 @@ Models construct a local handle once and call it directly:
 
 ```python
 from veomni.ops import VeomniOp
-from veomni.models.utils.op_utils import resolve_op_impl
+from veomni.ops.config import resolve_op_impl
 
 
 self.veomni_rms_norm = VeomniOp(

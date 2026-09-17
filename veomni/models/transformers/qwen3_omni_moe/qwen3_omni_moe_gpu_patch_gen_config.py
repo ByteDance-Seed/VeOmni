@@ -69,8 +69,9 @@ from veomni.distributed.sequence_parallel import (
 from veomni.distributed.sequence_parallel.ulysses import _Gather
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
-from veomni.models.utils.op_utils import merged_experts_act_fn_forward, resolve_op_impl
+from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import (
     AUDIO_INPUT_INDEX,
@@ -111,11 +112,12 @@ config.add_import("veomni.distributed.sequence_parallel.ulysses", names=["_Gathe
 config.add_import("veomni.models.utils.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models.utils.op_utils",
-    names=[
-        "resolve_op_impl",
-        "merged_experts_act_fn_forward",
-    ],
+    "veomni.ops.config",
+    names=["resolve_op_impl"],
+)
+config.add_import(
+    "veomni.models.utils.moe_utils",
+    names=["merged_experts_act_fn_forward"],
 )
 config.add_import(
     "veomni.models.loss_utils",

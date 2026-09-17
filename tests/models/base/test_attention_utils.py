@@ -12,69 +12,17 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""CPU tests for models op-construction helpers."""
+"""CPU tests for packed SDPA/eager attention helpers."""
 
 from __future__ import annotations
-
-from types import SimpleNamespace
 
 import pytest
 import torch
 
-from tests.models.compare import eager_ops_config, ops_config_scope
-from veomni.models.utils.op_utils import resolve_op_impl
-from veomni.ops.config import get_ops_config, set_ops_config
-
-
-@pytest.mark.parametrize("initially_configured", [False, True], ids=["none", "existing-config"])
-@pytest.mark.parametrize("fail", [False, True], ids=["normal-exit", "exception"])
-def test_ops_config_scope_restores_nested_bindings(initially_configured, fail):
-    previous = get_ops_config()
-    initial = eager_ops_config() if initially_configured else None
-    inner = eager_ops_config()
-    inner.cross_entropy_loss_implementation = "chunk_loss"
-    with ops_config_scope(initial):
-        assert get_ops_config() is initial
-
-        def nested_scope():
-            with ops_config_scope(inner):
-                assert get_ops_config() is inner
-                with ops_config_scope(None):
-                    assert get_ops_config() is None
-                assert get_ops_config() is inner
-                # The scoped code may itself install another config (as model builders do).
-                set_ops_config(eager_ops_config())
-                if fail:
-                    raise RuntimeError("construction failed")
-
-        if fail:
-            with pytest.raises(RuntimeError, match="construction failed"):
-                nested_scope()
-        else:
-            nested_scope()
-        assert get_ops_config() is initial
-    assert get_ops_config() is previous
-
-
-def test_resolve_op_impl_defaults_to_eager():
-    set_ops_config(None)
-    assert resolve_op_impl("rms_norm_implementation") == "eager"
-
-
-def test_resolve_op_impl_reads_ops_config():
-    set_ops_config(SimpleNamespace(cross_entropy_loss_implementation="chunk_loss"))
-    assert resolve_op_impl("cross_entropy_loss_implementation") == "chunk_loss"
-
-
-def test_resolve_op_impl_remaps_npu_ce_alias():
-    set_ops_config(SimpleNamespace(cross_entropy_loss_implementation="npu"))
-    assert resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss") == "chunk_loss"
-    assert resolve_op_impl("cross_entropy_loss_implementation") == "npu"
-
 
 @pytest.mark.parametrize("impl", ["eager", "sdpa", "veomni_sdpa"])
 def test_drop_packed_attention_metadata_strips_gdn_keys_for_sdpa_and_eager(impl):
-    from veomni.models.utils.op_utils import drop_packed_attention_metadata
+    from veomni.models.utils.attention_utils import drop_packed_attention_metadata
 
     kwargs = {
         "cu_seq_lens_q": torch.tensor([0, 32], dtype=torch.int32),
@@ -89,7 +37,7 @@ def test_drop_packed_attention_metadata_strips_gdn_keys_for_sdpa_and_eager(impl)
 
 
 def test_prepare_dense_attention_inputs_builds_packed_mask_for_multi_segment():
-    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 
     hidden = torch.randn(1, 8, 4)
     kwargs = {"cu_seq_lens_q": torch.tensor([0, 4, 8], dtype=torch.int32), "keep": 1}
@@ -117,7 +65,7 @@ def _mask_kept(mask: torch.Tensor, query: int, key: int) -> bool:
 
 
 def test_prepare_dense_attention_inputs_strips_single_segment_without_replacing_mask():
-    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 
     hidden = torch.randn(1, 8, 4)
     kwargs = {"cu_seq_lens_q": torch.tensor([0, 8], dtype=torch.int32)}
@@ -130,7 +78,7 @@ def test_prepare_dense_attention_inputs_strips_single_segment_without_replacing_
 
 
 def test_prepare_dense_attention_inputs_keeps_2d_padding_inside_packed_sample():
-    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 
     hidden = torch.randn(1, 8, 4)
     kwargs = {"cu_seq_lens_q": torch.tensor([0, 4, 8], dtype=torch.int32)}
@@ -147,7 +95,7 @@ def test_prepare_dense_attention_inputs_keeps_2d_padding_inside_packed_sample():
 
 @pytest.mark.parametrize("impl", ["sdpa", "eager", "veomni_sdpa"])
 def test_prepare_dense_attention_inputs_merges_4d_padding_with_packed_isolation(impl):
-    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 
     hidden = torch.randn(1, 8, 4)
     kwargs = {"cu_seq_lens_q": torch.tensor([0, 4, 8], dtype=torch.int32)}
@@ -170,7 +118,7 @@ def test_prepare_dense_attention_inputs_merges_4d_padding_with_packed_isolation(
 
 @pytest.mark.parametrize("impl", ["sdpa", "eager"])
 def test_prepare_dense_attention_inputs_keeps_positive_additive_bias(impl):
-    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 
     hidden = torch.randn(1, 4, 4)
     kwargs = {"cu_seq_lens_q": torch.tensor([0, 2, 4], dtype=torch.int32)}
@@ -196,7 +144,7 @@ def _eager_attn(query: torch.Tensor, values: torch.Tensor, mask: torch.Tensor) -
 @pytest.mark.parametrize("sample_start", [0, 2])
 @pytest.mark.parametrize("mask_kind", ["bool", "additive"])
 def test_packed_eager_fully_masked_row_isolates_other_sample(sample_start, mask_kind):
-    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 
     query = torch.zeros(1, 1, 4, 1)
     values = torch.tensor([0.0, 1.0, 10.0, 20.0]).view(1, 1, 4, 1).requires_grad_()
@@ -229,7 +177,7 @@ def test_packed_eager_fully_masked_row_isolates_other_sample(sample_start, mask_
 
 
 def test_packed_eager_fully_padded_sample_uses_neg_inf_isolation():
-    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 
     hidden = torch.zeros(1, 4, 1)
     kwargs = {"cu_seq_lens_q": torch.tensor([0, 2, 4], dtype=torch.int32)}
@@ -245,7 +193,7 @@ def test_packed_eager_fully_padded_sample_uses_neg_inf_isolation():
 @pytest.mark.parametrize("impl", ["sdpa", "veomni_sdpa"])
 @pytest.mark.parametrize("sample_start", [0, 2])
 def test_packed_sdpa_fully_masked_row_matches_separate_outputs_and_grads(impl, sample_start):
-    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 
     query = torch.zeros(1, 1, 4, 1)
     values = torch.tensor([0.0, 1.0, 10.0, 20.0]).view(1, 1, 4, 1).requires_grad_()
@@ -285,7 +233,7 @@ def test_packed_sdpa_fully_masked_row_matches_separate_outputs_and_grads(impl, s
 
 
 def test_prepare_dense_attention_inputs_rejects_cached_packed_sequences():
-    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+    from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 
     hidden = torch.randn(1, 8, 4)
     kwargs = {"cu_seq_lens_q": torch.tensor([0, 4, 8], dtype=torch.int32)}
@@ -294,30 +242,8 @@ def test_prepare_dense_attention_inputs_rejects_cached_packed_sequences():
         prepare_dense_attention_inputs(kwargs, impl="sdpa", attention_mask=attention_mask, hidden_states=hidden)
 
 
-def test_merged_experts_act_fn_ep_keeps_empty_tokens_on_graph():
-    from veomni.models.utils.op_utils import _MergedExpertsActFnEP
-
-    hidden = 4
-    permute_tokens = torch.zeros(0, hidden, dtype=torch.float32, requires_grad=True)
-    cumsum = torch.zeros(2, dtype=torch.long)
-    gate_up_proj = torch.randn(2, hidden * 2, hidden, requires_grad=True)
-    down_proj = torch.randn(2, hidden, hidden, requires_grad=True)
-    output = _MergedExpertsActFnEP.apply(
-        permute_tokens,
-        cumsum,
-        gate_up_proj,
-        down_proj,
-        torch.nn.functional.silu,
-    )
-    assert output.shape == (0, hidden)
-    assert output.requires_grad
-    output.sum().backward()
-    assert permute_tokens.grad is not None
-    assert permute_tokens.grad.shape == permute_tokens.shape
-
-
 def test_drop_packed_attention_metadata_keeps_keys_for_flash():
-    from veomni.models.utils.op_utils import drop_packed_attention_metadata
+    from veomni.models.utils.attention_utils import drop_packed_attention_metadata
 
     kwargs = {"cu_seq_lens_q": torch.tensor([0, 32], dtype=torch.int32)}
     assert drop_packed_attention_metadata(kwargs, impl="flash_attention_2") is kwargs

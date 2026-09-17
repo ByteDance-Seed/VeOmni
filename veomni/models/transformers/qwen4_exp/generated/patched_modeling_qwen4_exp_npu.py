@@ -119,8 +119,9 @@ from transformers.vision_utils import (
 from veomni.distributed.moe.comm import all_to_all
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
-from veomni.models.utils.op_utils import merged_experts_act_fn_forward, resolve_op_impl
+from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 from veomni.utils.seqlen_pos_transform_utils import culen2pos, pos2culen

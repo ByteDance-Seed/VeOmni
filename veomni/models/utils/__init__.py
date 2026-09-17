@@ -12,11 +12,4 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Cross-model op construction and attention helpers."""
-
-from .op_utils import resolve_op_impl
-
-
-__all__ = [
-    "resolve_op_impl",
-]
+"""Cross-model modeling helpers."""

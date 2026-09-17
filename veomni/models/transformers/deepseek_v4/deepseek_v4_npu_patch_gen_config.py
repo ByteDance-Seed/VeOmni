@@ -35,8 +35,11 @@ from veomni.models.transformers.deepseek_v4.packed_utils import (
     packed_compressed_block_bias,
     shard_packed_compression_metadata,
 )
-from veomni.models.utils.op_utils import resolve_op_impl, resolve_qat_impl
 from veomni.ops import VeomniOp
+from veomni.ops.config import (
+    resolve_op_impl,
+    resolve_qat_impl,
+)
 from veomni.patchgen.patch_spec import PatchConfig
 
 from .deepseek_v4_gpu_patch_gen_config import (

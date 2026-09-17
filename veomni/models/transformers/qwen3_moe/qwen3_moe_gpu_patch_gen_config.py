@@ -33,11 +33,9 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
-from veomni.models.utils.op_utils import (
-    merged_experts_act_fn_forward,
-    resolve_op_impl,
-)
+from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
@@ -67,11 +65,12 @@ config.add_import("functools", names=["partial"])
 config.add_import("transformers.modeling_outputs", names=["SequenceClassifierOutputWithPast"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models.utils.op_utils",
-    names=[
-        "merged_experts_act_fn_forward",
-        "resolve_op_impl",
-    ],
+    "veomni.ops.config",
+    names=["resolve_op_impl"],
+)
+config.add_import(
+    "veomni.models.utils.moe_utils",
+    names=["merged_experts_act_fn_forward"],
 )
 config.add_import(
     "veomni.models.loss_utils",

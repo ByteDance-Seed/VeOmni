@@ -4,8 +4,8 @@ import torch
 from ltx_core.model.transformer.rope import apply_rotary_emb
 from torch import nn
 
-from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 
 
 class PreAttentionCallable(Protocol):

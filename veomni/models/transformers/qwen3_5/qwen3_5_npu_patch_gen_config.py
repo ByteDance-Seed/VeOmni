@@ -61,7 +61,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     config as gpu_config,
 )
-from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  consumed by in-config dataclass + emitted forward
     FusedLinearAuxOutput,
@@ -102,8 +102,12 @@ config.add_import(
 )  # noqa: F401
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models.utils.op_utils",
-    names=["prepare_dense_attention_inputs", "resolve_op_impl"],
+    "veomni.ops.config",
+    names=["resolve_op_impl"],
+)
+config.add_import(
+    "veomni.models.utils.attention_utils",
+    names=["prepare_dense_attention_inputs"],
 )
 config.add_import(
     "veomni.models.loss_utils",

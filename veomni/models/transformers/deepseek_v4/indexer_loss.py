@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.models.utils.op_utils import resolve_op_impl
+from veomni.ops.config import resolve_op_impl
 
 
 def _indexer_loss_enabled(module) -> bool:

@@ -38,3 +38,26 @@ def set_ops_config(config: Any) -> None:
 def get_ops_config() -> Any:
     """Return the installed operation-implementation config, or ``None``."""
     return _ops_config
+
+
+def resolve_op_impl(field: str, *, npu_as: str | None = None) -> str:
+    """Return the impl name on the installed ops config, or ``eager``.
+
+    ``npu_as`` remaps the ``npu`` CE name to ``chunk_loss``. Missing config
+    is eager so unit tests can construct a module without ``set_ops_config``.
+    """
+    cfg = get_ops_config()
+    impl = "eager" if cfg is None else getattr(cfg, field, "eager")
+    if npu_as is not None and impl == "npu":
+        return npu_as
+    return impl
+
+
+def resolve_qat_impl() -> str:
+    """Return the active model-level quantization recipe, or ``none``.
+
+    This is not an op-registry impl. Missing config is ``none`` (off), not
+    ``eager``.
+    """
+    cfg = get_ops_config()
+    return "none" if cfg is None else getattr(cfg, "qat_implementation", "none")

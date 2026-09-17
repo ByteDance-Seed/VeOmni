@@ -18,8 +18,8 @@ from diffusers.models.transformers.transformer_wan import (
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
-from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (

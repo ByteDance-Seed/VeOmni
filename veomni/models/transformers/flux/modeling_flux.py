@@ -27,8 +27,8 @@ from veomni.distributed.sequence_parallel import (
     gather_seq_scatter_heads,
     slice_input_tensor,
 )
-from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 
 from .config_flux import FluxConfig
 from .utils_flux import (

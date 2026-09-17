@@ -62,12 +62,12 @@ from veomni.models.transformers.deepseek_v4.packed_utils import (
     scatter_topk_block_bias,
     shard_packed_compression_metadata,
 )
-from veomni.models.utils.op_utils import (
-    merged_experts_act_fn_forward,
+from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
+from veomni.ops import VeomniOp
+from veomni.ops.config import (
     resolve_op_impl,
     resolve_qat_impl,
 )
-from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 from veomni.ops.qat import (
     fp4_fake_quant_weight,
@@ -106,12 +106,15 @@ config.add_import("typing", names=["Optional"])
 config.add_import("functools", names=["partial"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models.utils.op_utils",
+    "veomni.ops.config",
     names=[
-        "merged_experts_act_fn_forward",
         "resolve_op_impl",
         "resolve_qat_impl",
     ],
+)
+config.add_import(
+    "veomni.models.utils.moe_utils",
+    names=["merged_experts_act_fn_forward"],
 )
 config.add_import(
     "veomni.ops.qat",

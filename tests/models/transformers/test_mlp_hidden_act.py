@@ -294,7 +294,7 @@ def test_qwen3_omni_moe_merged_experts_match_hf_for_hidden_act(hidden_act):
 def test_merged_experts_act_fn_forward_rejects_ep_sharded_weights_without_ep():
     from transformers.activations import ACT2FN
 
-    from veomni.models.utils.op_utils import merged_experts_act_fn_forward
+    from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 
     hidden = torch.randn(3, 4)
     top_k_index = torch.tensor([[3], [3], [3]], dtype=torch.long)

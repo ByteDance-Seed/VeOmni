@@ -90,8 +90,8 @@
 +from transformers.utils.output_capturing import capture_outputs
 +
 +from veomni.models.loss_utils import ForCausalLMLoss
-+from veomni.models.utils.op_utils import resolve_op_impl
 +from veomni.ops import VeomniOp
++from veomni.ops.config import resolve_op_impl
 +from veomni.ops.kernels.dsa.mask import copy_dsa_mask_provenance, create_standard_causal_mask, translate_fused_dsa_mask
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 +

@@ -434,7 +434,7 @@ CANN and `torch_npu` stack to enable the fused activation.
 
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
 - Registration: `veomni/ops/kernels/moe_experts/__init__.py`
-- Model helper: `veomni/models/utils/op_utils.py` — `resolve_op_impl("moe_implementation")`
+- Config helper: `veomni/ops/config.py` — `resolve_op_impl("moe_implementation")`
 - Model integration: `veomni/models/transformers/*/*_patch_gen_config.py`
 - Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
 
