@@ -20,7 +20,7 @@ import torch
 
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import MainCollator, build_data_transform
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.torch_compile import (
     CompileConfig,
     mark_compile_step_begin,
@@ -224,15 +224,13 @@ class VLMTrainer:
         self.base.device = self.base._setup(args)  # registers ParallelState("base") before seed
         self.base.model = self._build_model_runtime()
 
-        # rewrite build_data_transform to support multimodal transform
-        self._build_data_transform()
-
-        self.base._build_dataset()
-
-        # rewrite build_collate_fn to support multimodal collate_fn
-        self._build_collate_fn()
-
-        self.base._build_dataloader()
+        with use_parallel_state(self.base.model.parallel_state):
+            # rewrite build_data_transform to support multimodal transform
+            self._build_data_transform()
+            self.base._build_dataset()
+            # rewrite build_collate_fn to support multimodal collate_fn
+            self._build_collate_fn()
+            self.base._build_dataloader()
         self.base._build_lr_scheduler()
         self.base._build_training_context()
         self.base._init_callbacks()
@@ -253,12 +251,12 @@ class VLMTrainer:
             model_type,
             processor=self.base.model.processor,
             chat_template=self.base.model.chat_template,
-            position_id_func=self.base.model.get_position_id_func(),
+            position_id_func=self.base.model.unwrapped_module.get_position_id_func(),
             **args.data.mm_configs,
         )
 
     def _build_collate_fn(self):
-        model = self.base.model
+        model = self.base.model.unwrapped_module
         # The model owns its modality-specific collate topology — mirrors
         # get_position_id_func. Both hooks are optional capabilities: text
         # models / pipelines that don't wire them simply fall back (the ViT

@@ -20,7 +20,7 @@ import shutil
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Set, Union
 
 import torch
 import torch.distributed as dist
@@ -1331,6 +1331,7 @@ def _get_sharding_plan(
     checkpoint_path: Union[str, os.PathLike],
     shard_size: int = None,
     save_dtype: Optional[Union[str, torch.dtype]] = None,
+    drop_hf_keys: Optional[Set[str]] = None,
 ):
     """
     Create sharding plan from checkpoint metadata without loading weights.
@@ -1349,10 +1350,15 @@ def _get_sharding_plan(
     # Collect model tensors and calculate sizes
     tensor_infos = []
     all_dcp_keys = []
+    dropped = 0
 
     for key, tensor_meta in metadata.state_dict_metadata.items():
         hf_key = _normalize_key(key)
         if hf_key:
+            if drop_hf_keys and hf_key in drop_hf_keys:
+                dropped += 1
+                continue
+
             # Determine dtype for size calculation
             if not hasattr(tensor_meta.properties, "dtype"):
                 raise ValueError(
@@ -1373,6 +1379,9 @@ def _get_sharding_plan(
 
             tensor_infos.append({"dcp_key": key, "hf_key": hf_key, "size": byte_size, "metadata": tensor_meta})
             all_dcp_keys.append(key)
+
+    if dropped:
+        logger.info(f"Excluded {dropped} tensor(s) named by `drop_hf_keys` from the plan")
 
     # Sort by key name for deterministic output
     tensor_infos.sort(key=lambda x: x["hf_key"])

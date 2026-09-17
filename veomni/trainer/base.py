@@ -297,11 +297,14 @@ class BaseTrainer(Stateful, ABC):
         # Builds the model: meta-init, freeze, parallelize and optimizer all run
         # under the mesh the runtime registered, so nothing below needs a scope.
         self.model = self._build_model_runtime()
-        # build dataset and dataloader
-        self._build_data_transform()
-        self._build_dataset()
-        self._build_collate_fn()
-        self._build_dataloader()
+        # Collators capture SP from ambient ``get_parallel_state()``. The
+        # runtime's build scope has already exited, so re-enter this model's
+        # mesh rather than relying on it still being current.
+        with use_parallel_state(self.model.parallel_state):
+            self._build_data_transform()
+            self._build_dataset()
+            self._build_collate_fn()
+            self._build_dataloader()
         # The dataset fixes train_steps, which the schedule needs.
         self._build_lr_scheduler()
         self._build_training_context()

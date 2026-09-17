@@ -16,10 +16,12 @@
 
 The point of the class is that the model-bound half of a job stands on its
 own, so the integration tests here go build -> parallelize -> optimizer ->
-clip through the runtime alone. They wrap with DDP rather than FSDP2: a
-one-rank mesh reports ``fsdp_enabled=False`` and the parallelize path then
-rejects meta init, so FSDP2 needs the multi-rank suites. The seam tests below
-need no distribution at all.
+clip through the runtime alone. They wrap with DDP rather than FSDP2 because
+a one-rank mesh reports ``fsdp_enabled=False`` and the parallelize path then
+rejects meta init. That is a one-rank DDP *runtime* smoke test, not coverage
+of multi-rank DDP wrapping (capability hooks live on ``.module``). FSDP2
+still needs the multi-rank suites. The seam tests below need no distribution
+at all.
 """
 
 from types import SimpleNamespace
@@ -402,3 +404,55 @@ class TestWhatTheRuntimeAsksTheModel:
         runtime._setup_lora()
 
         assert isinstance(runtime.model, VeOmniLoraModel)
+
+
+def test_unwrapped_module_peels_ddp():
+    inner = nn.Linear(1, 1)
+
+    class DDPLike(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+    runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"))
+    runtime.model = DDPLike(inner)
+
+    assert runtime.unwrapped_module is inner
+
+
+def test_channel_loss_install_patches_the_module_not_the_handle():
+    from veomni.trainer.callbacks.channel_loss_callback import ChannelLossComputer
+
+    class Dummy(nn.Module):
+        def loss_function(self, *args, **kwargs):
+            return None
+
+    runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"))
+    dummy = Dummy()
+    runtime.model = dummy
+    original = dummy.loss_function
+    computer = ChannelLossComputer()
+    try:
+        computer.install(runtime)
+        assert dummy.loss_function is not original
+        assert dummy.loss_function.__func__ is ChannelLossComputer._wrapped_loss_fn
+        assert "loss_function" not in vars(runtime)
+    finally:
+        computer.uninstall()
+
+
+def test_a_local_dir_without_a_preprocessor_is_not_fatal(tmp_path):
+    runtime = unbuilt_runtime(ModelArguments(model_path="somewhere", tokenizer_path=str(tmp_path)))
+    runtime._build_model_assets()
+    assert runtime.tokenizer is None
+    assert runtime.processor is None
+    assert runtime.chat_template is None
+    assert runtime.model_assets == [runtime.model_config]
+
+
+def test_a_missing_preprocessor_path_is_not_swallowed(tmp_path):
+    runtime = unbuilt_runtime(
+        ModelArguments(model_path="somewhere", tokenizer_path=str(tmp_path / "no-such-dir")),
+    )
+    with pytest.raises(OSError):
+        runtime._build_model_assets()
