@@ -492,6 +492,22 @@ class MixedPrecisionConfig:
         default=True,
         metadata={"help": "Enable mixed precision cast forward inputs (FSDP2)."},
     )
+    extra_parallel_param_dtype: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Dtype for the unsharded parameters of ExtraParallel (e.g. expert) modules, "
+                "overriding param_dtype for those modules only. Unset keeps param_dtype. "
+                "With float32, expert weight gradients are accumulated in FP32 by the grouped "
+                "GEMM and returned in FP32, so the FSDP2 reduce-scatter (reduce_dtype=float32) "
+                "combines unrounded per-rank partial sums instead of BF16-rounded ones. Costs "
+                "an FP32 parameter all-gather and a larger unsharded buffer for every "
+                "ExtraParallel module. Forward activations keep their own dtype "
+                "(cast_forward_inputs is disabled for these modules); the fused kernels cast "
+                "the FP32 weights to the activation dtype internally."
+            )
+        },
+    )
 
     def __post_init__(self):
         def _check_dtype(dtype: str):
@@ -501,6 +517,12 @@ class MixedPrecisionConfig:
         _check_dtype(self.param_dtype)
         _check_dtype(self.reduce_dtype)
         _check_dtype(self.output_dtype)
+        _check_dtype(self.extra_parallel_param_dtype)
+        if self.extra_parallel_param_dtype is not None and not self.enable:
+            raise ValueError(
+                "extra_parallel_param_dtype requires mixed_precision.enable: without mixed "
+                "precision there is no param_dtype for it to override."
+            )
 
 
 @dataclass

@@ -45,6 +45,30 @@ def _apply_swiglu_clamp(fc1_1_output, fc1_2_output, swiglu_limit):
     return fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2
 
 
+def _expert_weight_grad_buffer(weight):
+    """FP32 accumulator for a grouped expert weight-gradient GEMM.
+
+    Mirrors ``ops/kernels/moe/group_gemm.py::expert_weight_grad_buffer`` to keep
+    this module free of circular imports. The grouped GEMM casts its FP32
+    accumulator to ``c.dtype`` on store, so a BF16 buffer would round every
+    rank's local partial sum before FSDP2 reduce-scatters it across the expert
+    module's ``<para>_fsdp`` mesh, making EP=1 and EP=2 disagree by that rounding
+    instead of by the mathematics.
+    """
+    return torch.empty_like(weight, dtype=torch.float32)
+
+
+def _compute_weight(weight, dtype):
+    """Cast a weight to the activation dtype the grouped GEMMs require.
+
+    Mirrors ``ops/kernels/moe/group_gemm.py::compute_weight``. Expert parameters
+    can be FP32 (``mixed_precision.extra_parallel_param_dtype``) while the GEMM
+    operands must still be BF16/FP16; the cast stays inside the Function so
+    autograd sees the FP32 input.
+    """
+    return weight.to(dtype) if weight.dtype != dtype else weight
+
+
 def preprocess(
     expert_mask: torch.Tensor,
     num_experts: int,
@@ -240,11 +264,15 @@ class EPGroupGemm(torch.autograd.Function):
     ):
         # permute_tokens: [tokens, hidden_dim]
         # cumsum: [local_experts]
+        compute_dtype = permute_tokens.dtype
+        fc1_1_weight_compute = _compute_weight(fc1_1_weight, compute_dtype)
+        fc1_2_weight_compute = _compute_weight(fc1_2_weight, compute_dtype)
+        fc2_weight_compute = _compute_weight(fc2_weight, compute_dtype)
 
         # compute linear layer fc1-1
         fc1_1_output = group_gemm_same_nk(
             a=permute_tokens,
-            b=fc1_1_weight,
+            b=fc1_1_weight_compute,
             cumsum_M=cumsum,
             max_M=permute_tokens.shape[0],
             transpose_a=False,
@@ -254,7 +282,7 @@ class EPGroupGemm(torch.autograd.Function):
         # compute linear layer fc1-2
         fc1_2_output = group_gemm_same_nk(
             a=permute_tokens,
-            b=fc1_2_weight,
+            b=fc1_2_weight_compute,
             cumsum_M=cumsum,
             max_M=permute_tokens.shape[0],
             transpose_a=False,
@@ -278,7 +306,7 @@ class EPGroupGemm(torch.autograd.Function):
         # compute linear layer fc2
         fc2_output = group_gemm_same_nk(
             a=fc1_output,
-            b=fc2_weight,
+            b=fc2_weight_compute,
             cumsum_M=cumsum,
             max_M=permute_tokens.shape[0],
             transpose_a=False,
@@ -289,9 +317,9 @@ class EPGroupGemm(torch.autograd.Function):
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
-            fc1_1_weight,
-            fc1_2_weight,
-            fc2_weight,
+            fc1_1_weight_compute,
+            fc1_2_weight_compute,
+            fc2_weight_compute,
             fc1_1_output,
             fc1_2_output,
             mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=permute_tokens.device),
@@ -333,8 +361,8 @@ class EPGroupGemm(torch.autograd.Function):
 
         # wgrad fc2
         grad_fc2_weight = None
-        if fc2_weight.requires_grad:
-            grad_fc2_weight = torch.empty_like(fc2_weight)
+        if ctx.needs_input_grad[4]:
+            grad_fc2_weight = _expert_weight_grad_buffer(fc2_weight)
             group_gemm_same_mn(
                 a=grad_output,
                 b=fc1_output,
@@ -362,8 +390,8 @@ class EPGroupGemm(torch.autograd.Function):
 
         # wgrad fc1-2
         grad_fc1_2_weight = None
-        if fc1_2_weight.requires_grad:
-            grad_fc1_2_weight = torch.empty_like(fc1_2_weight)
+        if ctx.needs_input_grad[3]:
+            grad_fc1_2_weight = _expert_weight_grad_buffer(fc1_2_weight)
             group_gemm_same_mn(
                 a=grad_fc1_2_output,
                 b=permute_tokens,
@@ -389,8 +417,8 @@ class EPGroupGemm(torch.autograd.Function):
 
         # wgrad fc1-1
         grad_fc1_1_weight = None
-        if fc1_1_weight.requires_grad:
-            grad_fc1_1_weight = torch.empty_like(fc1_1_weight)
+        if ctx.needs_input_grad[2]:
+            grad_fc1_1_weight = _expert_weight_grad_buffer(fc1_1_weight)
             group_gemm_same_mn(
                 a=grad_fc1_1_output,
                 b=permute_tokens,
@@ -434,11 +462,14 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         assert fc1_1_2_weight.shape[1] % 2 == 0, (
             f"Merged fc1_1_2_weight dim 1 must be even, got {fc1_1_2_weight.shape[1]}"
         )
+        compute_dtype = permute_tokens.dtype
+        fc1_1_2_weight_compute = _compute_weight(fc1_1_2_weight, compute_dtype)
+        fc2_weight_compute = _compute_weight(fc2_weight, compute_dtype)
 
         # Single fc1 gemm: output shape [T, 2I]
         fc1_output = group_gemm_same_nk(
             a=permute_tokens,
-            b=fc1_1_2_weight,
+            b=fc1_1_2_weight_compute,
             cumsum_M=cumsum,
             max_M=permute_tokens.shape[0],
             transpose_a=False,
@@ -464,7 +495,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         # compute linear layer fc2
         fc2_output = group_gemm_same_nk(
             a=fc1_result,
-            b=fc2_weight,
+            b=fc2_weight_compute,
             cumsum_M=cumsum,
             max_M=permute_tokens.shape[0],
             transpose_a=False,
@@ -475,8 +506,8 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
-            fc1_1_2_weight,
-            fc2_weight,
+            fc1_1_2_weight_compute,
+            fc2_weight_compute,
             fc1_1_output,
             fc1_2_output,
             mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=permute_tokens.device),
@@ -514,8 +545,8 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
 
         # wgrad fc2
         grad_fc2_weight = None
-        if fc2_weight.requires_grad:
-            grad_fc2_weight = torch.empty_like(fc2_weight)
+        if ctx.needs_input_grad[3]:
+            grad_fc2_weight = _expert_weight_grad_buffer(fc2_weight)
             group_gemm_same_mn(
                 a=grad_output,
                 b=fc1_result,
@@ -549,8 +580,8 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
 
         # single wgrad for merged fc1
         grad_fc1_1_2_weight = None
-        if fc1_1_2_weight.requires_grad:
-            grad_fc1_1_2_weight = torch.empty_like(fc1_1_2_weight)
+        if ctx.needs_input_grad[2]:
+            grad_fc1_1_2_weight = _expert_weight_grad_buffer(fc1_1_2_weight)
             group_gemm_same_mn(
                 a=grad_fc1_output,
                 b=permute_tokens,
