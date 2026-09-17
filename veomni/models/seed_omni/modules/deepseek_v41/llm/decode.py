@@ -48,9 +48,20 @@ to one and is wrong by whatever mass the sink held.
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 import torch
+
+from .attention import (
+    CompressionPlan,
+    DeepseekV41Attention,
+    DeepseekV41RotaryEmbedding,
+    SharedAttentionState,
+    apply_interleaved_rope,
+    select_candidate_blocks,
+)
+from .quantization import fake_quant_act, fake_quant_kv, fake_quant_linear
 
 
 def dense_sparse_attn(
@@ -118,4 +129,273 @@ def dense_sparse_attn(
     return out, ((shift + denominator.log()) / math.log(2.0)).float()
 
 
-__all__ = ["dense_sparse_attn"]
+@dataclass
+class DeepseekV41AttentionCache:
+    """One layer's carried state, and nothing a forward could recompute.
+
+    Three tensors with three different growth laws, which is why they are three
+    fields rather than one buffer:
+
+    ``window``
+        the last ``sliding_window`` KV rows this layer produced, already rotated
+        and rounded. Bounded, and the only field every layer has.
+    ``compress_kv`` / ``index_k``
+        the compressed history, append-only and unbounded, held solely by layers
+        in ``kv_source_layer_ids``. Group ``j`` is a function of the hidden states
+        at positions ``[j * ratio, (j + 1) * ratio)`` and of nothing later, so
+        once written it never changes -- the property the whole scheme rests on.
+    ``pending``
+        the hidden states of the group still being filled, at most ``ratio - 1``
+        of them. Prefill has no counterpart: it sees every token of every group at
+        once and a trailing partial group simply contributes no row.
+    """
+
+    sliding_window: int
+    compress_ratio: int
+    window: Optional[torch.Tensor] = None
+    compress_kv: Optional[torch.Tensor] = None
+    index_k: Optional[torch.Tensor] = None
+    pending: Optional[torch.Tensor] = None
+
+    @property
+    def window_len(self) -> int:
+        return 0 if self.window is None else int(self.window.shape[1])
+
+    @property
+    def compressed_len(self) -> int:
+        return 0 if self.compress_kv is None else int(self.compress_kv.shape[1])
+
+    def append_window(self, kv: torch.Tensor) -> None:
+        """Keep the newest ``sliding_window`` rows, oldest first."""
+        self.window = kv if self.window is None else torch.cat([self.window, kv], dim=1)
+        if self.window.shape[1] > self.sliding_window:
+            self.window = self.window[:, -self.sliding_window :]
+
+
+@dataclass
+class DeepseekV41DecodeCache:
+    """Every layer's state, plus the position the next token will occupy."""
+
+    layers: List[DeepseekV41AttentionCache]
+    position: int = 0
+
+    @classmethod
+    def empty(cls, config) -> "DeepseekV41DecodeCache":
+        return cls(
+            layers=[
+                DeepseekV41AttentionCache(
+                    sliding_window=config.sliding_window,
+                    compress_ratio=config.compress_ratios[idx],
+                )
+                for idx in range(config.num_hidden_layers)
+            ]
+        )
+
+
+def _group_plan(ratio: int, first_position: int, device: torch.device) -> CompressionPlan:
+    """A one-group plan, so the compressor runs its own arithmetic and not a copy.
+
+    ``DeepseekV41Compressor.forward`` reads ``ratio`` and ``window_indices`` and
+    nothing else, but reimplementing its gate-softmax pooling here would be a
+    second expression of the same thing, free to drift from the trained one.
+    """
+    return CompressionPlan(
+        ratio=ratio,
+        window_indices=torch.arange(ratio, device=device, dtype=torch.long).unsqueeze(0),
+        window_positions=torch.tensor([first_position], device=device, dtype=torch.long),
+        range_starts=torch.zeros(1, device=device, dtype=torch.int32),
+        range_ends=torch.ones(1, device=device, dtype=torch.int32),
+    )
+
+
+def _absorb(
+    attn: DeepseekV41Attention,
+    hidden_states: torch.Tensor,
+    position: int,
+    rotary_emb: DeepseekV41RotaryEmbedding,
+    cache: DeepseekV41AttentionCache,
+) -> None:
+    """Feed one token to this layer's compressor, emitting a group when it fills.
+
+    Groups are aligned to the sample's first token, so the token at position ``p``
+    completes group ``p // ratio`` exactly when ``(p + 1) % ratio == 0``. The
+    group's RoPE position is its *first* token's, matching prefill's
+    ``positions[window_starts]``.
+    """
+    ratio = cache.compress_ratio
+    cache.pending = hidden_states if cache.pending is None else torch.cat([cache.pending, hidden_states], dim=1)
+    if cache.pending.shape[1] < ratio:
+        return
+
+    group = cache.pending
+    cache.pending = None
+    first_position = position - ratio + 1
+    plan = _group_plan(ratio, first_position, hidden_states.device)
+
+    latent = attn.compressor(group, plan)
+    group_cos, group_sin = rotary_emb(plan.window_positions, compressed=True)
+    if attn.indexer is not None:
+        keys = attn.indexer.build_keys(latent, group_cos, group_sin)
+        cache.index_k = keys if cache.index_k is None else torch.cat([cache.index_k, keys], dim=1)
+    rotated = fake_quant_kv(apply_interleaved_rope(latent, group_cos, group_sin), attn.rope_head_dim)
+    cache.compress_kv = rotated if cache.compress_kv is None else torch.cat([cache.compress_kv, rotated], dim=1)
+
+
+def _decode_topk(
+    attn: DeepseekV41Attention,
+    hidden_states: torch.Tensor,
+    q_residual: torch.Tensor,
+    index_k: torch.Tensor,
+    shared: SharedAttentionState,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """This query's ``[B, 1, topk]`` selection into the compressed cache.
+
+    The prefill indexer masks its scores by a visibility mask before ranking.
+    Here there is nothing to mask: a query at position ``p`` may see
+    ``(p + 1) // ratio`` groups, and that is exactly how many the cache holds once
+    this step's ``_absorb`` has run. Every cached group is reachable, so no
+    selection can come back a miss and none is marked one.
+    """
+    indexer = attn.indexer
+    compressed_len = int(index_k.shape[1])
+
+    query = indexer.wq_b(q_residual).unflatten(-1, (indexer.n_heads, indexer.index_head_dim))
+    query = apply_interleaved_rope(query, cos.unsqueeze(-2), sin.unsqueeze(-2))
+    query = fake_quant_act(query)
+    weights = indexer.weights_proj(hidden_states) * (indexer.softmax_scale * indexer.n_heads**-0.5)
+
+    scores = torch.einsum("bshd,btd->bsht", query, index_k)
+    scores = (scores.float().relu() * weights.float().unsqueeze(-1)).sum(dim=2)
+
+    ranked = scores
+    if indexer.is_candidate_source:
+        range_ends = torch.full((1, 1), compressed_len, device=scores.device, dtype=torch.int32)
+        shared.candidates = select_candidate_blocks(
+            scores, range_ends, indexer.candidate_topk_blocks, indexer.candidate_block_size
+        )
+    elif indexer.uses_candidates:
+        if shared.candidates is None:
+            raise RuntimeError(
+                f"Layer {indexer.layer_idx} indexes inside the candidate blocks but none were published; "
+                "candidate_source_layer_id must name a layer in index_source_layer_ids"
+            )
+        ranked = scores.masked_fill(~shared.candidates, -torch.inf)
+
+    topk = min(indexer.index_topk, compressed_len)
+    return ranked.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values.to(torch.int32)
+
+
+def decode_attention_step(
+    attn: DeepseekV41Attention,
+    hidden_states: torch.Tensor,
+    position: int,
+    rotary_emb: DeepseekV41RotaryEmbedding,
+    shared: SharedAttentionState,
+    cache: DeepseekV41AttentionCache,
+) -> torch.Tensor:
+    """One layer's attention for one new token, against its cached KV.
+
+    A free function rather than a method on :class:`DeepseekV41Attention` so the
+    training forward keeps exactly one code path and cannot acquire a decode
+    branch it never takes. Every projection, rotation and rounding below is read
+    off ``attn``'s own submodules, so the two paths share weights *and* the
+    arithmetic applied to them.
+
+    Args:
+        hidden_states: ``[B, 1, hidden]``.
+        position: the token's absolute position in the sample.
+        shared: republished by source layers exactly as in prefill, and carried
+            across layers within this one step -- not across steps.
+        cache: this layer's state, mutated in place.
+
+    Returns:
+        ``[B, 1, hidden]``.
+    """
+    if hidden_states.shape[1] != 1:
+        raise ValueError(f"decode steps carry one token, got {hidden_states.shape[1]}")
+
+    batch = hidden_states.shape[0]
+    device = hidden_states.device
+    position_ids = torch.tensor([[position]], device=device, dtype=torch.long).expand(batch, 1)
+    cos, sin = rotary_emb(position_ids, compressed=attn.rope_is_compressed)
+
+    q_residual = attn.q_norm(fake_quant_linear(attn.wq_a, hidden_states))
+    query = fake_quant_linear(attn.wq_b, q_residual).unflatten(-1, (attn.n_heads, attn.head_dim))
+    query = apply_interleaved_rope(query, cos.unsqueeze(-2), sin.unsqueeze(-2))
+
+    kv = attn.kv_norm(fake_quant_linear(attn.wkv, hidden_states))
+    kv = apply_interleaved_rope(kv, cos, sin)
+    kv = fake_quant_kv(kv, attn.rope_head_dim)
+    cache.append_window(kv)
+
+    # The window rows are all causal and all inside the window by construction,
+    # so the selection is every row the cache holds. Prefill pads its width to
+    # ``min(window, S)`` with misses; padding to the same width here would add
+    # slots that contribute nothing.
+    window_len = cache.window_len
+    pool = cache.window
+    topk_idxs = torch.arange(window_len, device=device, dtype=torch.int32).view(1, 1, -1).expand(batch, 1, -1)
+
+    if attn.compress_ratio:
+        if attn.is_kv_source:
+            _absorb(attn, hidden_states, position, rotary_emb, cache)
+            # An empty tensor, not None, while the first group is still filling:
+            # the source layer *did* publish, it has nothing yet. Prefill says the
+            # same thing the same way -- ``DeepseekV41Compressor.forward`` returns
+            # ``[B, 0, head_dim]`` for an empty plan -- which leaves None meaning
+            # only "no source layer ran", the condition worth raising on.
+            if cache.compress_kv is None:
+                cache.compress_kv = hidden_states.new_zeros((batch, 0, attn.head_dim))
+                if attn.indexer is not None:
+                    cache.index_k = hidden_states.new_zeros((batch, 0, attn.indexer.index_head_dim))
+            shared.compress_kv = cache.compress_kv
+            if attn.indexer is not None:
+                shared.index_k = cache.index_k
+        if shared.compress_kv is None:
+            raise RuntimeError(
+                f"Layer {attn.layer_idx} attends over compressed KV but no source layer has published any; "
+                "kv_source_layer_ids must contain a layer at or before it"
+            )
+        # Before the first group completes there is nothing compressed to attend
+        # to, and the query runs on its window alone -- the decode counterpart of
+        # prefill's early positions, whose visibility row is empty.
+        if shared.compress_kv.shape[1]:
+            if attn.indexer is not None:
+                if shared.index_k is None:
+                    raise RuntimeError(
+                        f"Layer {attn.layer_idx} runs an indexer but no index keys have been published; "
+                        "every index source must be at or after a kv source"
+                    )
+                index_cos, index_sin = rotary_emb(position_ids, compressed=True)
+                shared.topk_idxs = _decode_topk(
+                    attn, hidden_states, q_residual, shared.index_k, shared, index_cos, index_sin
+                )
+            elif shared.topk_idxs is None:
+                raise RuntimeError(
+                    f"Layer {attn.layer_idx} reuses a top-k selection but none has been published; "
+                    "index_source_layer_ids must contain a layer at or before it"
+                )
+            pool = torch.cat([pool, shared.compress_kv], dim=1)
+            selection = torch.where(shared.topk_idxs >= 0, shared.topk_idxs + window_len, -1)
+            topk_idxs = torch.cat([topk_idxs, selection], dim=-1)
+
+    output = dense_sparse_attn(
+        query.contiguous(),
+        pool.contiguous(),
+        attn.attn_sink.float().contiguous(),
+        topk_idxs.contiguous(),
+        attn.softmax_scale,
+    )
+    output = apply_interleaved_rope(output, cos.unsqueeze(-2), -sin.unsqueeze(-2))
+    grouped = attn.wo_a(output.reshape(batch, 1, attn.n_groups, -1))
+    return attn.wo_b(grouped.flatten(2))
+
+
+__all__ = [
+    "DeepseekV41AttentionCache",
+    "DeepseekV41DecodeCache",
+    "decode_attention_step",
+    "dense_sparse_attn",
+]
