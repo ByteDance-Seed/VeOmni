@@ -213,7 +213,7 @@ class EnvironMeterCallback(Callback):
 
         args: "VeOmniArguments" = self.trainer.args
         # LoRA config lives on VeOmniLoraModel, which DDP does not forward.
-        module = trainer.model.unwrapped_module
+        module = getattr(trainer.model, "unwrapped_module", None)
         self.lora_config = module.get_lora_config() if hasattr(module, "get_lora_config") else None
         self.freeze_vit = getattr(args.train, "freeze_vit", None) if self.lora_config is None else None
         self.trainer.environ_meter = helper.EnvironMeter(

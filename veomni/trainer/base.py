@@ -193,13 +193,6 @@ class VeOmniIter:
         return {}
 
 
-def _resolve_offload_config(args) -> OffloadConfig:
-    """Return activation-offload config, or the disabled defaults if a stub omitted it."""
-    accelerator = getattr(getattr(args, "model", None), "accelerator", None)
-    config = getattr(accelerator, "offload_config", None)
-    return config if config is not None else OffloadConfig()
-
-
 def _resolve_model_offload_config(model) -> OffloadConfig:
     """Offload knobs live on this model's accelerator, not the job args.
 
@@ -300,7 +293,7 @@ class BaseTrainer(Stateful, ABC):
         try:
             return self._model
         except AttributeError:
-            raise RuntimeError(
+            raise AttributeError(
                 f"{type(self).__name__}.model is unset. Single-model trainers assign it "
                 "during build; a multi-model trainer must pass the runtime into "
                 "base methods explicitly."

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 import veomni.trainer.base as base_module
-from veomni.trainer.base import BaseTrainer, _resolve_offload_config
+from veomni.trainer.base import BaseTrainer
 from veomni.trainer.dit_trainer import DiTTrainer
 from veomni.trainer.text_dpo_trainer import TextDPOTrainer
 from veomni.trainer.text_trainer import TextTrainer
@@ -53,21 +53,19 @@ def test_reset_async_activation_offload_skips_missing_config(monkeypatch):
 
 def test_unset_base_trainer_model_raises():
     trainer = BaseTrainer.__new__(BaseTrainer)
-    with pytest.raises(RuntimeError, match="model is unset"):
+    with pytest.raises(AttributeError, match="model is unset"):
         _ = trainer.model
+
+
+def test_unset_base_trainer_model_is_getattr_defaultable():
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    assert getattr(trainer, "model", None) is None
 
 
 def test_build_training_context_requires_model_args():
     trainer = BaseTrainer.__new__(BaseTrainer)
     with pytest.raises(AttributeError):
         trainer._build_training_context(object())
-
-
-def test_resolve_offload_config_defaults_when_absent():
-    cfg = _resolve_offload_config(SimpleNamespace(model=SimpleNamespace(accelerator=SimpleNamespace())))
-
-    assert cfg.enable_async_activation is False
-    assert cfg.enable_activation is False
 
 
 def test_build_training_context_without_offload_config(monkeypatch):
