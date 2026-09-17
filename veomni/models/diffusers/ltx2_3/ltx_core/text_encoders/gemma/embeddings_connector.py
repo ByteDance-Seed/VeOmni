@@ -12,6 +12,11 @@ from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
 
 
+# Matches the standalone ``ltx_core.utils.rms_norm`` helper default. The raw
+# unweighted RMSNorm row requires keyword-only ``eps``.
+_UNWEIGHTED_RMS_NORM_EPS = 1e-6
+
+
 class _BasicTransformerBlock1D(torch.nn.Module):
     def __init__(
         self,
@@ -44,7 +49,7 @@ class _BasicTransformerBlock1D(torch.nn.Module):
         additive_attention_mask: torch.Tensor | None = None,
         pe: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        norm_hidden_states = self.veomni_rms_norm_unweighted(hidden_states)
+        norm_hidden_states = self.veomni_rms_norm_unweighted(hidden_states, eps=_UNWEIGHTED_RMS_NORM_EPS)
         norm_hidden_states = norm_hidden_states.squeeze(1)
 
         attn_output = self.attn1(norm_hidden_states, mask=additive_attention_mask, pe=pe)
@@ -53,7 +58,7 @@ class _BasicTransformerBlock1D(torch.nn.Module):
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
 
-        norm_hidden_states = self.veomni_rms_norm_unweighted(hidden_states)
+        norm_hidden_states = self.veomni_rms_norm_unweighted(hidden_states, eps=_UNWEIGHTED_RMS_NORM_EPS)
         ff_output = self.ff(norm_hidden_states)
 
         hidden_states = ff_output + hidden_states
@@ -167,7 +172,7 @@ class Embeddings1DConnector(torch.nn.Module):
         for block in self.transformer_1d_blocks:
             hidden_states = block(hidden_states, additive_attention_mask=additive_attention_mask, pe=freqs_cis)
 
-        hidden_states = self.veomni_rms_norm_unweighted(hidden_states)
+        hidden_states = self.veomni_rms_norm_unweighted(hidden_states, eps=_UNWEIGHTED_RMS_NORM_EPS)
 
         return hidden_states, additive_attention_mask
 

@@ -33,7 +33,7 @@ from ltx_core.model.transformer.attention import Attention
 from ltx_core.model.transformer.model import LTXModel
 # isort: on
 
-from tests.models.compare import assert_outputs_and_grads_match, eager_ops_config
+from tests.models.compare import assert_outputs_and_grads_match, eager_ops_config, ops_config_scope
 from tests.models.tiny_configs import tiny_ltx2_3_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_ltx2_3_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
@@ -161,6 +161,12 @@ def test_ltx2_3_rms_norm_matches_official():
     torch.testing.assert_close(weight.grad, official_weight.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+def _explicit_unweighted_rms(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """Unweighted RMS used by the LTX connector: ``x / sqrt(mean(x^2) + eps)``."""
+    x_f = x.float()
+    return x * torch.rsqrt(x_f.square().mean(dim=-1, keepdim=True) + eps)
+
+
 def test_ltx2_3_unweighted_rms_norm_matches_official():
     torch.manual_seed(1)
     x = torch.randn(2, 8, 16, requires_grad=True)
@@ -173,6 +179,62 @@ def test_ltx2_3_unweighted_rms_norm_matches_official():
     ours.sum().backward()
     official.sum().backward()
     torch.testing.assert_close(x.grad, official_x.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+def test_ltx2_3_connector_forwards_use_explicit_unweighted_rms_eps():
+    """Condition connector blocks must pass the required RMSNorm ``eps``.
+
+    Zero-layer ``Embeddings1DConnector`` is only the final unweighted RMS.
+    ``_BasicTransformerBlock1D`` also runs attention and FF after the same eps.
+    """
+    from veomni.models.diffusers.ltx2_3.ltx_core.text_encoders.gemma.embeddings_connector import (
+        _UNWEIGHTED_RMS_NORM_EPS,
+        Embeddings1DConnector,
+        _BasicTransformerBlock1D,
+    )
+
+    assert _UNWEIGHTED_RMS_NORM_EPS == 1e-6
+    # Small activations make 1e-6 and 1e-3 disagree, so the test pins eps.
+    hidden = torch.full((1, 4, 8), 1e-4, dtype=torch.float32, requires_grad=True)
+    expected = _explicit_unweighted_rms(hidden, _UNWEIGHTED_RMS_NORM_EPS)
+    wrong_eps = _explicit_unweighted_rms(hidden, 1e-3)
+    assert not torch.allclose(expected, wrong_eps, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    with ops_config_scope(eager_ops_config()):
+        connector = Embeddings1DConnector(
+            attention_head_dim=4,
+            num_attention_heads=2,
+            num_layers=0,
+            num_learnable_registers=None,
+        )
+        block = _BasicTransformerBlock1D(dim=8, heads=2, dim_head=4)
+
+        connector_hidden = hidden.detach().clone().requires_grad_(True)
+        connector_out, _ = connector(connector_hidden)
+        torch.testing.assert_close(connector_out, expected, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+        connector_out.sum().backward()
+        torch.testing.assert_close(
+            connector_hidden.grad,
+            torch.autograd.grad(expected.sum(), hidden)[0],
+            atol=EAGER_GRAD_ATOL,
+            rtol=EAGER_GRAD_RTOL,
+        )
+
+        block_hidden = hidden.detach().clone().requires_grad_(True)
+        recorded_eps: list[float] = []
+        bound = block.veomni_rms_norm_unweighted
+
+        def _record_eps(x, *args, **kwargs):
+            recorded_eps.append(kwargs["eps"])
+            return bound(x, *args, **kwargs)
+
+        block.veomni_rms_norm_unweighted = _record_eps
+        block_out = block(block_hidden)
+        assert recorded_eps == [_UNWEIGHTED_RMS_NORM_EPS, _UNWEIGHTED_RMS_NORM_EPS]
+        assert torch.isfinite(block_out).all()
+        block_out.sum().backward()
+        assert block_hidden.grad is not None
+        assert torch.isfinite(block_hidden.grad).all()
 
 
 def test_ltx_core_rebinds_away_from_another_copy(tmp_path):
