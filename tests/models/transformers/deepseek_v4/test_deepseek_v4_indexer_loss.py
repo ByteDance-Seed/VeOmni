@@ -374,3 +374,159 @@ def test_the_flag_is_refused_when_no_layer_can_build_a_kl(monkeypatch: pytest.Mo
     input_ids = torch.ones(1, 8, dtype=torch.long)
     with pytest.raises(RuntimeError, match="no layer of this model builds an indexer KL"):
         model(input_ids=input_ids, use_cache=False)
+
+
+def _tiny_mixed_layer_config() -> DeepseekV4Config:
+    return DeepseekV4Config(
+        vocab_size=32,
+        hidden_size=32,
+        moe_intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=8,
+        q_lora_rank=8,
+        num_experts_per_tok=1,
+        n_routed_experts=1,
+        max_position_embeddings=16,
+        o_groups=4,
+        o_lora_rank=8,
+        index_n_heads=4,
+        index_head_dim=8,
+        compress_rates={"compressed_sparse_attention": 4, "heavily_compressed_attention": 8},
+        sliding_window=8,
+        index_topk=2,
+        layer_types=["compressed_sparse_attention", "sliding_attention"],
+        dsa_indexer_loss=True,
+        dsa_indexer_loss_coef=0.5,
+        attn_implementation="eager",
+        experts_implementation="eager",
+    )
+
+
+def _enable_indexer_kl(monkeypatch: pytest.MonkeyPatch, gpu_module) -> None:
+    monkeypatch.setattr(
+        "veomni.models.transformers.deepseek_v4.indexer_loss._indexer_loss_enabled",
+        lambda module: True,
+    )
+    monkeypatch.setattr(gpu_module, "_indexer_loss_enabled", lambda module: True)
+    monkeypatch.setattr(gpu_module, "get_parallel_state", lambda: ParallelState(dp_size=1, ulysses_size=1))
+
+
+def _install_term_attention(attention, index_score: torch.Tensor, target: torch.Tensor):
+    """Keep the real model loop; only replace the TileLang score/teacher pair."""
+
+    def forward(hidden_states, *args, **kwargs):
+        kl, uniform = indexer_kl_terms(index_score, target)
+        return hidden_states, None, kl.sum(), uniform.sum()
+
+    attention.forward = forward
+
+
+def _build_indexed_model(monkeypatch: pytest.MonkeyPatch):
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as gpu
+
+    config = _tiny_mixed_layer_config()
+    previous = get_ops_config()
+    set_ops_config(eager_ops_config())
+    try:
+        model = gpu.DeepseekV4ForCausalLM(config)
+    finally:
+        set_ops_config(previous)
+    _enable_indexer_kl(monkeypatch, gpu)
+    return gpu, model
+
+
+def test_real_model_folds_window_denominator_and_compressed_only_teacher(monkeypatch: pytest.MonkeyPatch):
+    """Model loop + CausalLM fold-in use real ``indexer_kl_terms``, not constants."""
+    _gpu, model = _build_indexed_model(monkeypatch)
+    index_score = torch.tensor([[[1.0, 0.0, float("-inf")], [0.0, float("-inf"), float("-inf")]]], requires_grad=True)
+    target = torch.tensor([[[0.5, 0.5, 0.0], [0.0, 0.0, 0.0]]])
+    _install_term_attention(model.model.layers[0].self_attn, index_score, target)
+
+    expected_kl, expected_uniform = indexer_kl_terms(index_score, target)
+    labels = torch.ones(1, 2, dtype=torch.long)
+    out = model(input_ids=torch.ones(1, 2, dtype=torch.long), labels=labels, use_cache=False)
+    query_tokens = 2
+    expected_mean = expected_kl.sum() / query_tokens
+    expected_uniform_mean = expected_uniform.sum() / query_tokens
+    torch.testing.assert_close(out.aux_metrics["indexer_kl"], expected_mean.detach())
+    torch.testing.assert_close(out.aux_metrics["indexer_kl_uniform"], expected_uniform_mean.detach())
+    torch.testing.assert_close(
+        out.aux_metrics["indexer_kl_captured"],
+        1.0 - expected_mean.detach() / expected_uniform_mean.detach().clamp_min(torch.finfo(torch.float32).tiny),
+    )
+    assert expected_kl[0, 1].item() == 0.0
+    assert expected_uniform[0, 1].item() == 0.0
+    torch.testing.assert_close(out.loss, out.aux_metrics["lm_loss_before_indexer_kl"] + 0.5 * expected_mean)
+
+
+def test_indexer_kl_does_not_train_the_language_model_trunk(monkeypatch: pytest.MonkeyPatch):
+    _gpu, model = _build_indexed_model(monkeypatch)
+    index_score = torch.tensor([[[0.25, -0.5, float("-inf")]]], requires_grad=True)
+    target = torch.tensor([[[0.7, 0.3, 0.0]]])
+    _install_term_attention(model.model.layers[0].self_attn, index_score, target)
+    for param in model.parameters():
+        param.requires_grad_(False)
+    out = model(
+        input_ids=torch.ones(1, 1, dtype=torch.long), labels=torch.ones(1, 1, dtype=torch.long), use_cache=False
+    )
+    out.loss.backward()
+    assert index_score.grad is not None and torch.isfinite(index_score.grad).all()
+    assert all(param.grad is None for param in model.parameters())
+
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+def test_indexer_kl_survives_decoder_layer_checkpoint(monkeypatch: pytest.MonkeyPatch, use_reentrant: bool):
+    _gpu, model = _build_indexed_model(monkeypatch)
+    index_score = torch.tensor([[[0.5, 0.0, float("-inf")]]], requires_grad=True)
+    target = torch.tensor([[[1.0, 0.0, 0.0]]])
+    _install_term_attention(model.model.layers[0].self_attn, index_score, target)
+    layer = model.model.layers[0]
+    original = layer.forward
+
+    def checkpointed(hidden_states, *args, **kwargs):
+        return torch.utils.checkpoint.checkpoint(
+            lambda hs: original(hs, *args, **kwargs),
+            hidden_states,
+            use_reentrant=use_reentrant,
+        )
+
+    layer.forward = checkpointed
+    out = model(
+        input_ids=torch.ones(1, 1, dtype=torch.long), labels=torch.ones(1, 1, dtype=torch.long), use_cache=False
+    )
+    out.loss.backward()
+    assert index_score.grad is not None and torch.isfinite(index_score.grad).all()
+
+
+def test_two_csa_layers_sum_the_objective_and_mean_the_metric(monkeypatch: pytest.MonkeyPatch):
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as gpu
+
+    config = _tiny_mixed_layer_config()
+    config.num_hidden_layers = 2
+    config.layer_types = ["compressed_sparse_attention", "compressed_sparse_attention"]
+    previous = get_ops_config()
+    set_ops_config(eager_ops_config())
+    try:
+        model = gpu.DeepseekV4ForCausalLM(config)
+    finally:
+        set_ops_config(previous)
+    _enable_indexer_kl(monkeypatch, gpu)
+    score_a = torch.tensor([[[1.0, 0.0, float("-inf")]]], requires_grad=True)
+    score_b = torch.tensor([[[0.0, 1.0, float("-inf")]]], requires_grad=True)
+    target = torch.tensor([[[0.5, 0.5, 0.0]]])
+    _install_term_attention(model.model.layers[0].self_attn, score_a, target)
+    _install_term_attention(model.model.layers[1].self_attn, score_b, target)
+    kl_a, uni_a = indexer_kl_terms(score_a, target)
+    kl_b, uni_b = indexer_kl_terms(score_b, target)
+    out = model(
+        input_ids=torch.ones(1, 1, dtype=torch.long), labels=torch.ones(1, 1, dtype=torch.long), use_cache=False
+    )
+    expected_mean = (kl_a.sum() + kl_b.sum()) / 1 / 2
+    expected_uniform = (uni_a.sum() + uni_b.sum()) / 1 / 2
+    torch.testing.assert_close(out.aux_metrics["indexer_kl"], expected_mean.detach())
+    torch.testing.assert_close(out.aux_metrics["indexer_kl_uniform"], expected_uniform.detach())
+    torch.testing.assert_close(
+        out.loss, out.aux_metrics["lm_loss_before_indexer_kl"] + 0.5 * (kl_a.sum() + kl_b.sum())
+    )
