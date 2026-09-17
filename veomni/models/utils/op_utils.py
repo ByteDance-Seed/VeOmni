@@ -219,6 +219,9 @@ def dense_packed_attention_mask(
 
     A 2-D padding mask is composed with packed isolation. A 3-D/4-D mask is
     merged afterwards so padding and custom overlays are not replaced.
+    Eager converts bool False to ``finfo.min`` first, then reapplies packed
+    isolation as ``-inf`` so a fully-masked sample cannot softmax across
+    another sample.
     """
     from veomni.ops.kernels.attention.mask.sdpa import _dense_attention_mask_builder
     from veomni.ops.kernels.attention.mask.shape import _to_eager_additive
@@ -238,6 +241,17 @@ def dense_packed_attention_mask(
         mask = _merge_dense_attention_masks(attention_mask, mask)
     if _canonical_attn_impl(impl) == "eager":
         mask = _to_eager_additive(mask, dtype)
+        packed_only = _dense_attention_mask_builder(
+            batch_size,
+            q_len,
+            kv_len,
+            q_offset=kv_len - q_len,
+            attention_mask=None,
+            cu_seqlens=cu_seqlens,
+            device=device,
+            allow_is_causal_skip=False,
+        )
+        mask = _merge_dense_attention_masks(mask, packed_only)
     return mask
 
 

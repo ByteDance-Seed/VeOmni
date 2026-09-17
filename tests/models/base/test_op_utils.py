@@ -193,6 +193,7 @@ def test_prepare_dense_attention_inputs_merges_4d_padding_with_packed_isolation(
     assert packed_mask is not None
     if impl == "eager":
         assert packed_mask.dtype.is_floating_point
+        assert torch.isneginf(packed_mask[0, 0, 4, 0])
     else:
         assert packed_mask.dtype == torch.bool
     assert not _mask_kept(packed_mask, 4, 0)
@@ -219,6 +220,60 @@ def test_prepare_dense_attention_inputs_keeps_positive_additive_bias(impl):
     torch.testing.assert_close(packed_mask[0, 0, 1, 0], existing.new_tensor(2.0))
     assert not _mask_kept(packed_mask, 2, 0)
     assert _mask_kept(packed_mask, 3, 2)
+
+
+def _eager_attn(query: torch.Tensor, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    scores = torch.matmul(query, query.transpose(-2, -1)) + mask
+    return torch.matmul(torch.softmax(scores, dim=-1), values)
+
+
+@pytest.mark.parametrize("sample_start", [0, 2])
+@pytest.mark.parametrize("mask_kind", ["bool", "additive"])
+def test_packed_eager_fully_masked_row_isolates_other_sample(sample_start, mask_kind):
+    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+
+    query = torch.zeros(1, 1, 4, 1)
+    values = torch.tensor([0.0, 1.0, 10.0, 20.0]).view(1, 1, 4, 1).requires_grad_()
+    allowed = torch.ones(4, 4, dtype=torch.bool).tril()
+    if mask_kind == "bool":
+        existing = allowed.view(1, 1, 4, 4).clone()
+        existing[:, :, sample_start, sample_start : sample_start + 2] = False
+    else:
+        existing = torch.zeros(1, 1, 4, 4).masked_fill(~allowed, torch.finfo(torch.float32).min)
+        existing[:, :, sample_start, sample_start : sample_start + 2] = torch.finfo(torch.float32).min
+    _, mask = prepare_dense_attention_inputs(
+        {"cu_seq_lens_q": torch.tensor([0, 2, 4], dtype=torch.int32)},
+        impl="eager",
+        attention_mask=existing,
+        hidden_states=torch.zeros(1, 4, 1),
+    )
+    other_start = 2 - sample_start
+    assert torch.isneginf(mask[0, 0, sample_start, other_start : other_start + 2]).all()
+    actual = _eager_attn(query, values, mask)
+    actual[:, :, sample_start : sample_start + 2].sum().backward()
+    other_grad = values.grad[:, :, other_start : other_start + 2]
+    torch.testing.assert_close(other_grad, torch.zeros_like(other_grad))
+    perturbed = values.detach().clone()
+    perturbed[:, :, other_start : other_start + 2] += 100
+    actual_perturbed = _eager_attn(query, perturbed, mask)
+    torch.testing.assert_close(
+        actual.detach()[:, :, sample_start : sample_start + 2],
+        actual_perturbed[:, :, sample_start : sample_start + 2],
+    )
+
+
+def test_packed_eager_fully_padded_sample_uses_neg_inf_isolation():
+    from veomni.models.utils.op_utils import prepare_dense_attention_inputs
+
+    hidden = torch.zeros(1, 4, 1)
+    kwargs = {"cu_seq_lens_q": torch.tensor([0, 2, 4], dtype=torch.int32)}
+    attention_mask = torch.ones(1, 4, dtype=torch.long)
+    attention_mask[0, :2] = 0
+    _, mask = prepare_dense_attention_inputs(kwargs, impl="eager", attention_mask=attention_mask, hidden_states=hidden)
+    assert mask is not None
+    assert torch.isneginf(mask[0, 0, 0, 2:4]).all()
+    assert not _mask_kept(mask, 0, 0)
+    assert _mask_kept(mask, 3, 2)
 
 
 @pytest.mark.parametrize("impl", ["sdpa", "veomni_sdpa"])
