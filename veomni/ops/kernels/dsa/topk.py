@@ -19,6 +19,17 @@ from __future__ import annotations
 import torch
 
 
+def mask_unselectable_topk_indices(topk_values: torch.Tensor, topk_indices: torch.Tensor) -> torch.Tensor:
+    """Replace top-k slots whose scores are non-finite with invalid ``-1``.
+
+    Causal and padding fills use ``-inf``. ``Tensor.topk`` still returns those
+    positions when fewer than K keys remain visible. GLM fused attention sets
+    ``causal=False`` and relies on the indices themselves for visibility.
+    """
+    invalid = ~torch.isfinite(topk_values)
+    return torch.where(invalid, topk_indices.new_full((), -1), topk_indices)
+
+
 def local_topk_to_global(topk_indices: torch.Tensor, seqlen_k: int) -> torch.Tensor:
     """Shift per-batch top-k indices into a flattened KV sequence.
 

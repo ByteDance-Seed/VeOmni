@@ -27,6 +27,7 @@ from cudnn import DSA
 from flash_mla import flash_mla_sparse_fwd
 
 from ..topk import local_topk_to_global as _local_topk_to_global
+from ..topk import mask_unselectable_topk_indices
 
 
 def check_sparse_attention_backward_compatible(
@@ -357,7 +358,8 @@ def indexer_select_topk(
         sm_scale=sm_scale,
     )["scores"]
     top_k = min(int(top_k), int(scores.shape[-1]))
-    return scores.topk(top_k, dim=-1).indices.to(torch.long)
+    topk_out = scores.topk(top_k, dim=-1)
+    return mask_unselectable_topk_indices(topk_out.values, topk_out.indices).to(torch.long)
 
 
 __all__ = [

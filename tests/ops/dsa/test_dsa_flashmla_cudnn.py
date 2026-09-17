@@ -117,6 +117,24 @@ def test_indexer_select_topk_uses_cudnn_score_wrapper(monkeypatch, dsa):
     assert indices.tolist() == [[[1, 2], [0, 2]]]
 
 
+def test_indexer_select_topk_invalidates_non_finite_scores(monkeypatch, dsa):
+    scores = torch.tensor([[[0.0, float("-inf"), float("-inf")]]], dtype=torch.float32)
+
+    monkeypatch.setattr(
+        dsa,
+        "DSA",
+        SimpleNamespace(indexer_forward_wrapper=lambda *args, **kwargs: {"scores": scores}),
+    )
+
+    indices = dsa.indexer_select_topk(
+        torch.empty(1, 1, 1, 1),
+        torch.empty(1, 3, 1),
+        torch.empty(1, 1, 1),
+        3,
+    )
+    assert indices.tolist() == [[[0, -1, -1]]]
+
+
 def test_sparse_attention_backward_flattens_batched_inputs(monkeypatch, dsa):
     q = torch.empty(2, 3, 4, 5, dtype=torch.bfloat16)
     kv = torch.empty(2, 7, 5, dtype=torch.bfloat16)

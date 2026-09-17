@@ -61,6 +61,7 @@ from veomni.ops.kernels.dsa.mask import (
     mark_standard_causal_mask,
     translate_fused_dsa_mask,
 )
+from veomni.ops.kernels.dsa.topk import mask_unselectable_topk_indices
 from veomni.utils.device import IS_CUDA_AVAILABLE
 
 
@@ -146,7 +147,8 @@ def _hf_glm_indexer_indices(
     index_scores = torch.einsum("bsht,bsh->bst", scores, w.float())
     future = torch.arange(k.shape[1], device=k.device).view(1, 1, -1) > position_ids.unsqueeze(-1)
     index_scores = index_scores.masked_fill(future, float("-inf"))
-    return index_scores.topk(min(top_k, index_scores.shape[-1]), dim=-1).indices.to(torch.int32)
+    topk_out = index_scores.topk(min(top_k, index_scores.shape[-1]), dim=-1)
+    return mask_unselectable_topk_indices(topk_out.values, topk_out.indices).to(torch.int32)
 
 
 def _additive_causal(batch: int, seq_len: int) -> Tensor:
@@ -752,8 +754,14 @@ def test_dsa_indexer_deepseek_v4_eager_empty_compressed_kv(packed):
     assert weights.grad is not None
 
 
+def test_mask_unselectable_topk_indices_replaces_non_finite_scores():
+    values = torch.tensor([[0.0, float("-inf"), float("nan")]])
+    indices = torch.tensor([[0, 2, 1]])
+    assert torch.equal(mask_unselectable_topk_indices(values, indices), torch.tensor([[0, -1, -1]]))
+
+
 def test_dsa_indexer_glm_eager_matches_hf():
-    """Eager GLM indexer matches ``GlmMoeDsaIndexer.forward`` top-k."""
+    """Eager GLM indexer matches the causal ReLU / weighted-sum top-k contract."""
     torch.manual_seed(3)
     batch, seq_len, heads, dim, kv_len, topk = 2, 6, 4, 8, 6, 2
     q = torch.randn(batch, seq_len, heads, dim)
@@ -772,6 +780,68 @@ def test_dsa_indexer_glm_eager_matches_hf():
         position_ids=position_ids,
     )
     torch.testing.assert_close(ours, hf)
+
+
+def test_dsa_indexer_glm_eager_underfull_topk_does_not_select_future():
+    """When fewer than K keys are visible, leftover top-k slots are ``-1``."""
+    seq_len = 4
+    q = torch.zeros(1, seq_len, 1, 1)
+    k = torch.zeros(1, seq_len, 1)
+    w = torch.ones(1, seq_len, 1)
+    position_ids = torch.arange(seq_len).unsqueeze(0)
+    indices = resolve_op("dsa_indexer", "glm", "eager").wrapper(
+        q,
+        k,
+        w,
+        seq_len,
+        position_ids=position_ids,
+    )
+    first = indices[0, 0]
+    assert (first >= 0).sum() == 1
+    assert first[first >= 0].tolist() == [0]
+    assert (first < 0).sum() == seq_len - 1
+    assert not (first > 0).any()
+
+
+def test_dsa_glm_indexer_attention_early_query_has_zero_future_kv_grad():
+    """Indexer → attention: first query sees only KV 0, not the later values."""
+    seq_len = 4
+    values = torch.tensor([0.0, 1.0, 2.0, 3.0], dtype=torch.float32)
+    q = torch.zeros(1, seq_len, 1, 1)
+    k = torch.zeros(1, seq_len, 1)
+    w = torch.ones(1, seq_len, 1)
+    position_ids = torch.arange(seq_len).unsqueeze(0)
+    indices = resolve_op("dsa_indexer", "glm", "eager").wrapper(
+        q,
+        k,
+        w,
+        seq_len,
+        position_ids=position_ids,
+    )
+
+    q_pe = torch.zeros(1, seq_len, 1, 1)
+    k_pe = torch.zeros(1, seq_len, 1, 1)
+    q_nope = torch.zeros(1, seq_len, 1, 1)
+    kv_cache = values.view(1, seq_len, 1, 1).detach().clone().requires_grad_(True)
+    out = resolve_op("dsa_attention", "glm", "eager").wrapper(
+        q_pe,
+        k_pe,
+        kv_cache,
+        q_nope,
+        indices,
+        softmax_scale=0.0,
+    )
+    # Sparse softmax over the one visible key. A raw top-k of future slots
+    # would average V=[0,1,2,3] to 1.5.
+    torch.testing.assert_close(out[0, 0], torch.zeros(1, 1), atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    assert not torch.allclose(out[0, 0], out.new_tensor(1.5))
+
+    out[0, 0].sum().backward()
+    future_grad = kv_cache.grad[0, 1:, 0, 0]
+    torch.testing.assert_close(future_grad, torch.zeros_like(future_grad), atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    torch.testing.assert_close(
+        kv_cache.grad[0, 0, 0, 0], kv_cache.new_tensor(1.0), atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL
+    )
 
 
 def test_dsa_attention_glm_eager_matches_hf_mask_path():
