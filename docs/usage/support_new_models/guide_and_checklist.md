@@ -4,7 +4,7 @@
 - [qwen3_vl_example.md](./qwen3_vl_example.md) — VLM + MoE (image/video, deepstack, EP)
 - [qwen3_omni_moe_example.md](./qwen3_omni_moe_example.md) — Omni-modal MoE (image/video/audio, talker)
 
-> **Scope note:** VeOmni now pins `transformers==5.9.0` and ships
+> **Scope note:** VeOmni now pins `transformers==5.16.1` and ships
 > patchgen-generated modeling files under
 > `veomni/models/transformers/<model>/generated/`. The runtime monkey-patch
 > flow this document was originally written for has been retired. The high-level
@@ -14,7 +14,7 @@
 > happening in `<model>_gpu_patch_gen_config.py`. For step-by-step
 > instructions on the patchgen flow, see
 > [the patchgen design guide](../../design/patchgen.md) and
-> the `veomni-migrate-transformers-v5` agent skill.
+> the `veomni-patchgen-model` agent skill.
 
 ---
 

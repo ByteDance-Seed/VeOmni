@@ -187,15 +187,15 @@ def _accumulating_trainer(outputs, recorded):
     trainer.optimizer = SimpleNamespace(step=lambda: None, zero_grad=lambda: None)
     trainer.lr_scheduler = SimpleNamespace(step=lambda: None)
     trainer.args = SimpleNamespace(
-        train=SimpleNamespace(
+        train=SimpleNamespace(sync_each_train_step=False),
+        model=SimpleNamespace(
             optimizer=SimpleNamespace(max_grad_norm=1.0),
             accelerator=SimpleNamespace(
                 dp_replicate_size=1,
                 fsdp_config=SimpleNamespace(fsdp_mode="fsdp2", reshard_after_backward=True),
                 offload_config=OffloadConfig(),
             ),
-            sync_each_train_step=False,
-        )
+        ),
     )
     trainer._callbacks = []
 

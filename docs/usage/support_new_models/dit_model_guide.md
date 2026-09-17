@@ -663,13 +663,13 @@ model:
   condition_model_path: YourOrg/YourModel-Diffusers
   ops_implementation:
     attn_implementation: veomni_flash_attention_2_with_sp
-
-train:
   accelerator:
+    init_device: meta
     ulysses_size: 4
     fsdp_config:
       fsdp_mode: fsdp2
-  init_device: meta
+
+train:
   global_batch_size: 8
   micro_batch_size: 1
 ```

@@ -27,7 +27,7 @@ from transformers import PretrainedConfig
 from utils import (
     DummyDataset,
     FakeModel,
-    StepAwareResumeCheckpointerCallback,
+    StepAwareResumeGlobalStateCallback,
     compare_global_batch,
     compare_metrics,
     mock_empty_cache,
@@ -202,7 +202,7 @@ class TrainerTest(BaseTrainer):
         self.model.train()
 
     def _build_optimizer(self):
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.args.train.optimizer.lr)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.args.model.optimizer.lr)
 
     def _build_lr_scheduler(self):
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lambda _: 1.0)
@@ -213,40 +213,40 @@ class TrainerTest(BaseTrainer):
 
     def _init_callbacks(self):
         self.environ_meter_callback = EnvironMeterCallbackTest(self)
-        self.checkpointer_callback = StepAwareResumeCheckpointerCallback(self)
+        self.global_state_callback = StepAwareResumeGlobalStateCallback(self)
         self.check_callback = CheckCallback(self)
         self.state = TrainerState()
 
     def on_train_begin(self):
         self.environ_meter_callback.on_train_begin(self.state)
-        self.checkpointer_callback.on_train_begin(self.state)
+        self.global_state_callback.on_train_begin(self.state)
         self.check_callback.on_train_begin(self.state)
 
     def on_train_end(self):
         self.environ_meter_callback.on_train_end(self.state)
-        self.checkpointer_callback.on_train_end(self.state)
+        self.global_state_callback.on_train_end(self.state)
         self.check_callback.on_train_end(self.state)
 
     def on_epoch_begin(self):
         self.state.curr_step = self.start_step - 1
         self.environ_meter_callback.on_epoch_begin(self.state)
-        self.checkpointer_callback.on_epoch_begin(self.state)
+        self.global_state_callback.on_epoch_begin(self.state)
         self.check_callback.on_epoch_begin(self.state)
 
     def on_epoch_end(self):
         self.environ_meter_callback.on_epoch_end(self.state)
-        self.checkpointer_callback.on_epoch_end(self.state)
+        self.global_state_callback.on_epoch_end(self.state)
         self.check_callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         # we need to put the check callback before environ meter callback because the later one will remove 'ds_idx' and 'source_name' from it
         self.check_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.checkpointer_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.global_state_callback.on_step_begin(self.state, micro_batches=micro_batches)
 
     def on_step_end(self, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs) -> None:
         self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.checkpointer_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.global_state_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.check_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
@@ -845,7 +845,7 @@ def build_command():
         "--data.datasets_type=iterable",
         "--train.global_batch_size=8",
         "--train.micro_batch_size=2",
-        "--train.accelerator.fsdp_config.fsdp_mode=ddp",
+        "--model.accelerator.fsdp_config.fsdp_mode=ddp",
         "--train.checkpoint.manager=dcp",
         "--train.checkpoint.output_dir=.tests/cache",
         "--train.dyn_bsz=true",

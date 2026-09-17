@@ -12,7 +12,7 @@ To enable Ulysses, users can specify the `accelerator.ulysses_size` parameter in
 bash train.sh tasks/train_vlm.py configs/multimodal/qwen25_vl/qwen25_vl.yaml \
     --model.model_path YOUR_MODEL_PATH \
     --data.train_path YOUR_DATA_PATH \
-    --train.accelerator.ulysses_size 4
+    --model.accelerator.ulysses_size 4
 ```
 
 Currently, we have supported Ulysses on the following models:
@@ -331,8 +331,8 @@ Notice: Async Ulysses works when `accelerator.ulysses_size > 1`.
 
 ```shell
 bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
-    --train.accelerator.ulysses_size 4 \
-    --train.accelerator.enable_async true
+    --model.accelerator.ulysses_size 4 \
+    --model.accelerator.enable_async true
 ```
 
 

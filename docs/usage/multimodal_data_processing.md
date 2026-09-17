@@ -55,6 +55,43 @@ Frame sampling flow:
 4. Uniformly sample `nframes` indices from the video
 5. Pad with last frame if `nframes > total_frames`
 
+### Video Timing Metadata
+
+`fps` in `mm_configs` is a **target sampling rate**. Frame limits, alignment,
+rounding, and padding can change the actual intervals between selected frames.
+For example, limiting a 15-second video to 16 frames at a target of 2 FPS still
+selects frames across the whole video; it does not produce an 8-second clip.
+
+`smart_video_nframes`, `fetch_videos_metadata`, and the `load_video*` wrappers
+return metadata in the **source frame coordinate system**:
+
+| Field | Meaning |
+|-------|---------|
+| `fps` | Source frame rate, before sampling |
+| `total_num_frames` | Source frame count, before sampling |
+| `frames_indices` | Source index of each output frame; padding repeats the last selected index |
+
+Use `video.shape[0]` or `len(metadata["frames_indices"])` for the sampled frame
+count. Callers that previously treated metadata `fps` as the output sampling
+rate or `total_num_frames` as the sampled count must use these source semantics.
+`fetch_videos` retains its `(videos, audios)` return format.
+
+For paths/URLs and encoded video bytes, the decoder supplies the source FPS.
+Pre-decoded dicts use `video_fps`; for compatibility, a `video` array dict defaults
+to 30 FPS, while a `frames` bytes dict defaults to `mm_configs.fps` (2 FPS if
+omitted). Bare PIL/bytes frame lists also use `mm_configs.fps` as their input
+frame rate. To express a different source frame rate, wrap the frames in a dict
+with `video_fps`. A bare frame list cannot recover timing lost during earlier
+extraction, or represent irregular source timestamps.
+
+The Qwen-VL transform calls the video processor with `do_sample_frames=False`:
+VeOmni has already sampled the frames, and another sampling pass would overwrite
+their source indices. The processor still performs its spatial preprocessing
+and patch construction. Qwen3-VL/Qwen3.5 chat templates compute frame times as
+`frames_indices / fps` and average the first/last frame times within each temporal
+patch. This uses the source's average FPS; exact timing for variable-frame-rate
+containers would require retaining decoder presentation timestamps separately.
+
 ### Spatial Resize Parameters
 
 | Parameter | Description |
