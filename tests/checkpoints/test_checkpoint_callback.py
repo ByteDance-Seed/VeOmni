@@ -34,6 +34,7 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
         manager="dcp",
         dcp_save_to_lowest_rank=False,
         stage_dir=None,
+        save_timeout_seconds=None,
         save_hf_weights=True,
         hf_save_steps=5,
         hf_save_epochs=1,
@@ -277,10 +278,12 @@ class TestModelCheckpointManagerSaveContract:
     def test_the_step_reaches_save_instead_of_being_folded_into_the_path(
         self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps, tmp_path
     ):
+        """One staging directory per run needs the run path, with the step passed separately."""
         from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
 
         trainer = _make_mock_trainer(save_path=str(tmp_path / "run"))
         trainer.args.train.checkpoint.stage_dir = str(tmp_path / "stage")
+        trainer.args.train.checkpoint.save_timeout_seconds = 1234
         mock_build_ckpt.return_value = MagicMock()
         manager = ModelCheckpointManager(trainer)
         trainer.checkpoint = manager
@@ -292,6 +295,9 @@ class TestModelCheckpointManagerSaveContract:
                 call = manager.checkpointer.save.call_args
                 assert call.kwargs["global_steps"] == step
                 assert call.kwargs["stage_dir"] == str(tmp_path / "stage")
+                # Configuration the manager only forwards; unforwarded, a staged save
+                # would silently fall back to gloo's default timeout.
+                assert call.kwargs["save_timeout_seconds"] == 1234
                 staged.append(_prepare_stage_dir(call.kwargs["stage_dir"], call.args[0]))
 
         assert staged[0] == staged[1], "each step staged somewhere different"

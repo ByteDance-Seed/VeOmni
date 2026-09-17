@@ -161,17 +161,24 @@ avoid.
 With `stage_dir` (synchronous), the whole `model/` subtree — both DCP
 directories and `lr_scheduler.pt` — is written to node-local scratch and copied
 into the step directory afterwards, with every `.metadata` copied last. The
-staging directory is never part of the checkpoint itself.
+staging directory is never part of the checkpoint itself. The copy's collectives
+run on a dedicated Gloo group rather than the training backend, bounded by
+`train.checkpoint.save_timeout_seconds` (Gloo's 30-minute default when unset):
+the ranks not copying wait on it for the whole copy. A multi-node staged save
+therefore needs working Gloo networking (for example `GLOO_SOCKET_IFNAME`), and a
+misconfiguration only shows at the first checkpoint.
 
 With `save_async` (unstaged), `model/` is written in place and the call returns
 while the DCP write is still in flight. `lr_scheduler.pt` is written first, by
 rank 0, before either DCP save starts. Weights and optimizer are two independent
-saves, each holding its own future and its own Gloo process group so they
-overlap rather than serialise. Nothing downstream waits for them: the cursor
+saves, each holding its own future and its own Gloo process group (also bounded
+by `save_timeout_seconds`) so they overlap rather than serialise. Nothing downstream waits for them: the cursor
 files and the manifest claim only what they cover, and the shards answer for
 themselves through the `.metadata` DCP writes last. Pending saves are drained at
 the next save of the same kind and at train end; a drain that finds a failed
-save raises on every rank, not just the one that saw it.
+save raises on every rank, not just the one that saw it, agreeing on that
+save's own Gloo group so the ranks whose write finished first wait there
+rather than on the training backend.
 
 ## Resuming older checkpoints
 
