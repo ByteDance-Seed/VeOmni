@@ -3,6 +3,7 @@ import gc
 import os
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from veomni.arguments import FSDPConfig, MixedPrecisionConfig
 from veomni.arguments.arguments_types import validate_reduce_scatter_transport
+from veomni.arguments.parser import _instantiate_recursive
 from veomni.distributed import torch_parallelize
 from veomni.distributed.fsdp2 import reduce_scatter as reduce_scatter_module
 from veomni.distributed.fsdp2.reduce_scatter import (
@@ -276,7 +278,11 @@ def test_transport_policy_does_not_hide_collective_failures(monkeypatch):
 
 @pytest.mark.parametrize("local_ids", [["node-a", "node-a"], ["node-a", "node-b"], [None, None]])
 @pytest.mark.parametrize("peer_status", ["node_local", "cross_node", "unknown"])
-def test_hsdp_replica_consensus_runs_even_for_rejected_shard(monkeypatch, local_ids, peer_status):
+@pytest.mark.parametrize("shard_rank", [0, 1])
+def test_hsdp_replica_consensus_runs_even_for_rejected_shard(monkeypatch, caplog, local_ids, peer_status, shard_rank):
+    # VeOmni's logger does not propagate to pytest's root capture handler.
+    monkeypatch.setattr(reduce_scatter_module.logger, "handlers", [caplog.handler])
+    caplog.set_level("WARNING", logger=reduce_scatter_module.__name__)
     shard_group, replica_group = object(), object()
     calls = []
 
@@ -286,7 +292,8 @@ def test_hsdp_replica_consensus_runs_even_for_rejected_shard(monkeypatch, local_
 
     monkeypatch.setattr(reduce_scatter_module, "_get_node_id", lambda: local_ids[0])
     monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
-    monkeypatch.setattr(dist, "get_rank", lambda group: 1)
+    monkeypatch.setattr(dist, "get_rank", lambda group: shard_rank)
+    monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: [1, 7])
     monkeypatch.setattr(dist, "all_gather_object", gather)
     policy = ReduceScatterTransportPolicy()
     mesh = _FakeReductionMesh(shard_group, replica_group)
@@ -294,6 +301,16 @@ def test_hsdp_replica_consensus_runs_even_for_rejected_shard(monkeypatch, local_
     assert policy.can_use(mesh) is expected
     assert policy.can_use(mesh) is expected
     assert calls == [shard_group, replica_group]
+    warnings = [record for record in caplog.records if record.name == reduce_scatter_module.__name__]
+    if expected or shard_rank != 0:
+        assert not warnings
+    else:
+        assert len(warnings) == 1
+        assert warnings[0].levelname == "WARNING"
+        message = warnings[0].getMessage()
+        assert "Using native ReduceScatter for shard group [1, 7]" in message
+        reason = "node identity is unavailable" if None in local_ids or peer_status == "unknown" else "spans nodes"
+        assert reason in message
 
 
 def test_hsdp_decision_cache_includes_replica_group(monkeypatch):
@@ -316,46 +333,81 @@ def test_hsdp_decision_cache_includes_replica_group(monkeypatch):
     assert calls == [shard_group, replica_a, replica_b]
 
 
+@pytest.mark.parametrize("comm_dtype", [None, "bfloat16", "float16", "float32"])
+def test_reduce_scatter_comm_dtype_configuration_reaches_builder(monkeypatch, comm_dtype):
+    config = _instantiate_recursive(
+        FSDPConfig,
+        {
+            "reduce_scatter_comm_dtype": comm_dtype,
+            "mixed_precision": {"param_dtype": comm_dtype or "bfloat16", "reduce_dtype": "float32"},
+        },
+    )
+    calls = []
+
+    def parallelize(**kwargs):
+        calls.append(kwargs)
+        return kwargs["model"]
+
+    monkeypatch.setattr(
+        torch_parallelize,
+        "get_parallel_state",
+        lambda: SimpleNamespace(fsdp_enabled=True, tp_enabled=False, dp_mode="fsdp2"),
+    )
+    monkeypatch.setattr(torch_parallelize, "parallelize_model_fsdp2", parallelize)
+    model = nn.Linear(2, 2)
+    assert (
+        torch_parallelize.build_parallelize_model(
+            model,
+            mixed_precision=config.mixed_precision,
+            reduce_scatter_comm_dtype=config.reduce_scatter_comm_dtype,
+            enable_gradient_checkpointing=False,
+        )
+        is model
+    )
+    assert len(calls) == 1
+    assert calls[0]["reduce_scatter_comm_dtype"] == comm_dtype
+
+
 def test_reduce_scatter_transport_config_and_native_fallback():
     with pytest.raises(ValueError, match="fsdp_mode='fsdp2'"):
         FSDPConfig(
             fsdp_mode="ddp",
-            reduce_scatter_transport_dtype="bfloat16",
+            reduce_scatter_comm_dtype="bfloat16",
         )
     for reduce_dtype, transport_dtype in (("bfloat16", "float16"), ("float16", "bfloat16")):
         with pytest.raises(ValueError, match="supports only.*reduce_dtype='float32'"):
             FSDPConfig(
                 mixed_precision=MixedPrecisionConfig(reduce_dtype=reduce_dtype),
-                reduce_scatter_transport_dtype=transport_dtype,
+                reduce_scatter_comm_dtype=transport_dtype,
             )
     with pytest.raises(ValueError, match="supports only.*reduce_dtype='float32'"):
         FSDPConfig(
             mixed_precision=MixedPrecisionConfig(enable=False, reduce_dtype="float32"),
-            reduce_scatter_transport_dtype="bfloat16",
+            reduce_scatter_comm_dtype="bfloat16",
         )
     with pytest.raises(ValueError, match="must be one of"):
-        FSDPConfig(reduce_scatter_transport_dtype="float8")
+        FSDPConfig(reduce_scatter_comm_dtype="float8")
 
     for transport_dtype in ("bfloat16", "float16"):
         config = FSDPConfig(
             mixed_precision=MixedPrecisionConfig(param_dtype=transport_dtype),
-            reduce_scatter_transport_dtype=transport_dtype,
+            reduce_scatter_comm_dtype=transport_dtype,
         )
-        assert config.reduce_scatter_transport_dtype == transport_dtype
+        assert config.reduce_scatter_comm_dtype == transport_dtype
 
     for reduce_dtype in ("bfloat16", "float16", "float32"):
         config = FSDPConfig(
             mixed_precision=MixedPrecisionConfig(reduce_dtype=reduce_dtype),
-            reduce_scatter_transport_dtype=reduce_dtype,
+            reduce_scatter_comm_dtype=reduce_dtype,
         )
-        assert config.reduce_scatter_transport_dtype == reduce_dtype
+        assert config.reduce_scatter_comm_dtype == reduce_dtype
 
     native_config = FSDPConfig(
         fsdp_mode="ddp",
         mixed_precision=MixedPrecisionConfig(enable=False, reduce_dtype="float32"),
-        reduce_scatter_transport_dtype="float32",
+        reduce_scatter_comm_dtype="float32",
     )
-    assert native_config.reduce_scatter_transport_dtype == native_config.mixed_precision.reduce_dtype
+    assert native_config.reduce_scatter_comm_dtype == native_config.mixed_precision.reduce_dtype
 
 
 @pytest.mark.parametrize("param_dtype", [None, "bfloat16", "float16", "float32"])
@@ -367,9 +419,9 @@ def test_native_transport_does_not_constrain_parameter_precision(param_dtype, re
         config = FSDPConfig(
             fsdp_mode="ddp",
             mixed_precision=mixed_precision,
-            reduce_scatter_transport_dtype=transport_dtype,
+            reduce_scatter_comm_dtype=transport_dtype,
         )
-        assert config.reduce_scatter_transport_dtype == transport_dtype
+        assert config.reduce_scatter_comm_dtype == transport_dtype
         assert not validate_reduce_scatter_transport(transport_dtype, mixed_precision)
 
 
@@ -387,7 +439,7 @@ def test_native_transport_does_not_constrain_parameter_precision(param_dtype, re
 def test_mismatched_parameter_and_transport_precision_is_rejected(monkeypatch, param_dtype, transport_dtype):
     mixed_precision = MixedPrecisionConfig(param_dtype=param_dtype, reduce_dtype="float32")
     with pytest.raises(ValueError, match="requires.*to match.*param_dtype") as config_error:
-        FSDPConfig(mixed_precision=mixed_precision, reduce_scatter_transport_dtype=transport_dtype)
+        FSDPConfig(mixed_precision=mixed_precision, reduce_scatter_comm_dtype=transport_dtype)
 
     monkeypatch.setattr(torch_parallelize, "get_parallel_state", object)
 
@@ -399,7 +451,7 @@ def test_mismatched_parameter_and_transport_precision_is_rejected(monkeypatch, p
         torch_parallelize.parallelize_model_fsdp2(
             nn.Linear(2, 2),
             mixed_precision=mixed_precision,
-            reduce_scatter_transport_dtype=transport_dtype,
+            reduce_scatter_comm_dtype=transport_dtype,
         )
     assert str(direct_error.value) == str(config_error.value)
 
@@ -427,7 +479,7 @@ def test_parallelize_rejects_cross_16bit_transport_before_backend_check(
         torch_parallelize.parallelize_model_fsdp2(
             nn.Linear(2, 2),
             mixed_precision=MixedPrecisionConfig(reduce_dtype=reduce_dtype),
-            reduce_scatter_transport_dtype=transport_dtype,
+            reduce_scatter_comm_dtype=transport_dtype,
         )
 
 
@@ -460,7 +512,7 @@ def test_native_transport_does_not_register_custom_collective(monkeypatch, trans
         mixed_precision=MixedPrecisionConfig(
             enable=enable, param_dtype="float32", reduce_dtype=transport_dtype or "float32"
         ),
-        reduce_scatter_transport_dtype=transport_dtype,
+        reduce_scatter_comm_dtype=transport_dtype,
         init_device="meta",
     )
 
@@ -525,7 +577,7 @@ def test_parallelize_registers_transport_only_for_eligible_fsdp_and_hsdp(
             param_dtype=transport_dtype,
             reduce_dtype="float32",
         ),
-        reduce_scatter_transport_dtype=transport_dtype,
+        reduce_scatter_comm_dtype=transport_dtype,
         init_device="meta",
     )
 
@@ -618,7 +670,7 @@ def test_parallelize_checks_dense_and_expert_meshes_independently(monkeypatch, d
         torch_parallelize.parallelize_model_fsdp2(
             model,
             mixed_precision=MixedPrecisionConfig(param_dtype="bfloat16", reduce_dtype="float32"),
-            reduce_scatter_transport_dtype="bfloat16",
+            reduce_scatter_comm_dtype="bfloat16",
             init_device="meta",
         )
         is model

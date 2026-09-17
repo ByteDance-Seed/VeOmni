@@ -582,11 +582,35 @@ configured and never round-trip through a saved config.
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |
 | offload | `bool` | `False` | Enable CPU offload. |
 | offload_pin_memory | `bool` | `True` | Pin the CPU offload buffers, matching torch's `CPUOffloadPolicy` default. Set `False` to keep offloaded shards pageable, so a large-MoE job is not charged non-reclaimable Shmem. |
-| reduce_scatter_transport_dtype | `Optional[str]` | `None` | Optional `bfloat16` or `float16` wire dtype, matching `mixed_precision.param_dtype`, for node-local FSDP2 ReduceScatter while keeping `mixed_precision.reduce_dtype: float32`. `None`, a value equal to `reduce_dtype`, or cross-node/unknown shard placement uses native PyTorch communication. |
+| reduce_scatter_comm_dtype | `Optional[str]` | `None` | Optional `bfloat16` or `float16` wire dtype, matching `mixed_precision.param_dtype`, for node-local FSDP2 ReduceScatter while keeping `mixed_precision.reduce_dtype: float32`. `None`, a value equal to `reduce_dtype`, or cross-node/unknown shard placement uses native PyTorch communication. |
 | max_load_broadcast_size | `float` | `20.0` | Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting. |
 | mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |
 
-When `reduce_scatter_transport_dtype` differs from `mixed_precision.reduce_dtype` and the topology check below
+`reduce_scatter_comm_dtype` controls the precision of communicated gradient values, not the precision of
+their sum. Set it to `bfloat16` or `float16` while keeping `mixed_precision.reduce_dtype: float32` and
+matching `mixed_precision.param_dtype`. The default `None` leaves communication unchanged.
+
+#### Which training layouts use it?
+
+The following assumes a valid custom configuration on CUDA. A node means a physical machine, not a worker
+process. VeOmni checks the actual ReduceScatter (RS) group, not the FSDP/HSDP strategy name.
+
+| Training layout | RS behavior | Warning or error? |
+| --- | --- | --- |
+| Single-node FSDP with multiple GPUs | Use the configured communication dtype; sum in FP32 | No fallback warning |
+| Multi-node FSDP whose RS group spans machines | Keep native PyTorch RS | Warning; training continues |
+| HSDP with RS inside each node and AllReduce between nodes | Use the configured dtype for RS only; replica AllReduce stays FP32 | No fallback warning |
+| HSDP whose RS group spans machines | Keep native communication for all replica-linked shard groups | Warning; training continues |
+| Node identity cannot be determined | Keep native communication for all replica-linked shard groups | Warning; training continues |
+| RS group contains only one rank | Keep native communication and scaling | No fallback warning |
+
+Fallback warnings are emitted by each affected shard group's rank zero when its decision is first cached
+for a model initialization, not on every backward pass. Unsupported precision combinations still raise
+configuration errors; real communication failures are not hidden by fallback.
+
+#### How it works
+
+When `reduce_scatter_comm_dtype` differs from `mixed_precision.reduce_dtype` and the topology check below
 allows it, VeOmni converts the FP32 ReduceScatter input to the configured wire dtype, performs an all-to-all over
 the shard group, and accumulates directly into the FP32 output. This allocates low-precision send and receive
 buffers. Under HSDP, only eligible shard-group ReduceScatter uses the low-precision transport; the replicate-
@@ -618,7 +642,7 @@ does not reduce parameter AllGather traffic or HSDP replica AllReduce traffic.
 Modules excluded via `modules_to_ignore_in_mixed_precision` deliberately retain native FP32 communication:
 their gradients are genuine FP32 values, so low-precision transport would discard the precision they preserve.
 
-The custom path requires `reduce_scatter_transport_dtype == mixed_precision.param_dtype`: use `bfloat16`
+The custom path requires `reduce_scatter_comm_dtype == mixed_precision.param_dtype`: use `bfloat16`
 transport for BF16 parameters and `float16` transport for FP16 parameters. Mismatched parameter/transport
 dtypes, including FP32 parameters or an unset `param_dtype`, are rejected rather than silently compressing
 genuine FP32 gradients or converting between the two 16-bit formats. Finite gradients computed in the matching
@@ -635,7 +659,7 @@ require the parameter and transport dtypes to match.
 
 The supported combinations are intentionally narrow:
 
-| `mixed_precision.reduce_dtype` | `reduce_scatter_transport_dtype` | Behavior |
+| `mixed_precision.reduce_dtype` | `reduce_scatter_comm_dtype` | Behavior |
 | --- | --- | --- |
 | Any supported dtype | `None` | Native PyTorch path |
 | Any supported dtype | Same as `reduce_dtype` | Native PyTorch path |
