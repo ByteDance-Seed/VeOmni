@@ -58,12 +58,12 @@ config.additional_imports.extend(gpu_config.additional_imports)
 config.post_import_blocks.extend(gpu_config.post_import_blocks)
 config.helpers.extend(gpu_config.helpers)
 config.drop_imported_names.update(gpu_config.drop_imported_names)
+config.add_import("veomni.utils.constants", names=["IGNORE_INDEX"])
 
 # NPU-specific OpSlot declarations (RMSNorm + RoPE) on top of the GPU config's
 # cross-entropy-loss OpSlot.
 config.add_post_import_block(
     """
-    # ── NPU OpSlot declarations ────────────────────────────────────────────
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
     veomni_rms_norm = OpSlot("rms_norm", "standard")
@@ -84,7 +84,6 @@ class Gemma3CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Gemma3CausalLM
     """
 
 
-# ── RMSNorm (OpSlot guard, NPU fused kernel) ───────────────────────────────
 # Gemma 3 uses (1.0 + weight) scaling (weight zero-initialised), and the eps
 # attribute is ``self.eps`` (not ``self.variance_epsilon``).  Pass ``1.0 +
 # self.weight`` so the NPU ``npu_rms_norm`` kernel reproduces the Gemma
@@ -102,9 +101,6 @@ def gemma3_rmsnorm_forward_npu(self, x: torch.Tensor) -> torch.Tensor:
     output = self._norm(x.float())
     output = output * (1.0 + self.weight.float())
     return output.type_as(x)
-
-
-# ── Rotary Positional Embedding (OpSlot guard, NPU fused kernel) ───────────
 
 
 @config.replace_function(
@@ -143,8 +139,7 @@ def gemma3_model_init_npu(self, config):
     self.post_init()
 
 
-# ── Gemma3TextModel.forward (pass packed-sequence boundaries) ──────────────
-# Reuse the GPU patch verbatim — the masking-utils wrappers handle both
+# Reuse the GPU patch verbatim. The masking-utils wrappers handle both
 # FlexAttention (BlockMask) and SDPA/eager (tensor mask) backends.
 
 
@@ -155,8 +150,7 @@ config.override_method(
 )
 
 
-# ── Gemma3ForCausalLM.forward (fused cross-entropy via OpSlot) ──────────────
-# Reuse the GPU patch verbatim — the veomni_causal_lm_loss OpSlot dispatches to
+# Reuse the GPU patch verbatim. The veomni_causal_lm_loss OpSlot dispatches to
 # the NPU chunk-loss kernel when bound.
 
 
@@ -167,7 +161,6 @@ config.override_method(
 )
 
 
-# ── Gemma3ForConditionalGeneration.forward (VLM fused cross-entropy) ────────
 # Patch the multimodal (VLM) forward to use VeOmni's fused-CE OpSlot instead
 # of the upstream ``nn.CrossEntropyLoss``.  This is the VLM-specific addition
 # over the text-only GPU config (which only patches Gemma3ForCausalLM).
@@ -212,6 +205,17 @@ def gemma3_for_conditional_generation_forward_npu(
     logits = None
     fused_linear_aux = None
     if labels is not None:
+        loss_labels = labels
+        if attention_mask is not None and hidden_states.shape[1] > 1:
+            # Match the upstream VLM loss: padding positions in the shifted
+            # causal targets do not contribute, including longer PEFT masks.
+            shift_attention_mask = attention_mask[:, -(hidden_states.shape[1] - 1) :].to(labels.device)
+            loss_labels = labels.clone()
+            loss_labels[..., 1:] = loss_labels[..., 1:].masked_fill(
+                shift_attention_mask == 0,
+                IGNORE_INDEX,
+            )
+
         if veomni_causal_lm_loss.use_non_eager_impl:
             if self.config.text_config.final_logit_softcapping is not None:
                 raise ValueError(
@@ -220,7 +224,7 @@ def gemma3_for_conditional_generation_forward_npu(
                 )
             loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                 logits=None,
-                labels=labels,
+                labels=loss_labels,
                 vocab_size=self.config.text_config.vocab_size,
                 hidden_states=hidden_states,
                 weights=self.lm_head.weight,
@@ -230,7 +234,7 @@ def gemma3_for_conditional_generation_forward_npu(
             logits = self.lm_head(hidden_states).float()
             loss, _, fused_linear_aux = self.loss_function(
                 logits=logits,
-                labels=labels,
+                labels=loss_labels,
                 vocab_size=self.config.text_config.vocab_size,
                 hidden_states=hidden_states,
                 weights=self.lm_head.weight,

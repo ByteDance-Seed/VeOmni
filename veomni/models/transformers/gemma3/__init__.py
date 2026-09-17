@@ -32,12 +32,13 @@ def register_gemma3_text_modeling(architecture: str | None):
 
 
 @MODELING_REGISTRY.register("gemma3")
-def register_gemma3_modeling(architecture: str):
+def register_gemma3_modeling(architecture: str | None):
     if IS_NPU_AVAILABLE:
         from .generated.patched_modeling_gemma3_npu import Gemma3ForConditionalGeneration, Gemma3Model
     else:
         from .generated.patched_modeling_gemma3_gpu import Gemma3ForConditionalGeneration, Gemma3Model
 
+    architecture = architecture or "Gemma3ForConditionalGeneration"
     if "ForConditionalGeneration" in architecture:
         return Gemma3ForConditionalGeneration
     if "Model" in architecture:

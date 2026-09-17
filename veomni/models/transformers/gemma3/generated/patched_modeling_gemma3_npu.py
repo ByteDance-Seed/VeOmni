@@ -70,6 +70,7 @@ from veomni.models.transformers.masking_utils import create_causal_mask, create_
 # Additional import blocks for patches
 # Bound at model-build time by _bind_veomni_ops() in auto.py.
 from veomni.ops.dispatch import OpSlot
+from veomni.utils.constants import IGNORE_INDEX
 
 # Additional imports for patches
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutputMixin
@@ -77,7 +78,6 @@ from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAu
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 
-# ── NPU OpSlot declarations ────────────────────────────────────────────
 # Bound at model-build time by _bind_veomni_ops() in auto.py.
 from veomni.ops.dispatch import OpSlot
 
@@ -193,7 +193,6 @@ class Gemma3RMSNorm(nn.Module):
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    # ── RMSNorm (OpSlot guard, NPU fused kernel) ───────────────────────────────
     # Gemma 3 uses (1.0 + weight) scaling (weight zero-initialised), and the eps
     # attribute is ``self.eps`` (not ``self.variance_epsilon``).  Pass ``1.0 +
     # self.weight`` so the NPU ``npu_rms_norm`` kernel reproduces the Gemma
@@ -294,7 +293,6 @@ def rotate_half(x):
 # Reason: OpSlot guard for NPU fused RoPE
 # Source: veomni.models.transformers.gemma3.gemma3_npu_patch_gen_config
 # ======================================================================
-# ── Rotary Positional Embedding (OpSlot guard, NPU fused kernel) ───────────
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1031,7 +1029,6 @@ class Gemma3ForConditionalGeneration(Gemma3PreTrainedModel, GenerationMixin):
     def get_image_features(self, pixel_values: torch.FloatTensor, **kwargs: Unpack[TransformersKwargs]):
         return self.model.get_image_features(pixel_values, **kwargs)
 
-    # ── Gemma3ForConditionalGeneration.forward (VLM fused cross-entropy) ────────
     # Patch the multimodal (VLM) forward to use VeOmni's fused-CE OpSlot instead
     # of the upstream ``nn.CrossEntropyLoss``.  This is the VLM-specific addition
     # over the text-only GPU config (which only patches Gemma3ForCausalLM).
@@ -1072,6 +1069,17 @@ class Gemma3ForConditionalGeneration(Gemma3PreTrainedModel, GenerationMixin):
         logits = None
         fused_linear_aux = None
         if labels is not None:
+            loss_labels = labels
+            if attention_mask is not None and hidden_states.shape[1] > 1:
+                # Match the upstream VLM loss: padding positions in the shifted
+                # causal targets do not contribute, including longer PEFT masks.
+                shift_attention_mask = attention_mask[:, -(hidden_states.shape[1] - 1) :].to(labels.device)
+                loss_labels = labels.clone()
+                loss_labels[..., 1:] = loss_labels[..., 1:].masked_fill(
+                    shift_attention_mask == 0,
+                    IGNORE_INDEX,
+                )
+
             if veomni_causal_lm_loss.use_non_eager_impl:
                 if self.config.text_config.final_logit_softcapping is not None:
                     raise ValueError(
@@ -1080,7 +1088,7 @@ class Gemma3ForConditionalGeneration(Gemma3PreTrainedModel, GenerationMixin):
                     )
                 loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                     logits=None,
-                    labels=labels,
+                    labels=loss_labels,
                     vocab_size=self.config.text_config.vocab_size,
                     hidden_states=hidden_states,
                     weights=self.lm_head.weight,
@@ -1090,7 +1098,7 @@ class Gemma3ForConditionalGeneration(Gemma3PreTrainedModel, GenerationMixin):
                 logits = self.lm_head(hidden_states).float()
                 loss, _, fused_linear_aux = self.loss_function(
                     logits=logits,
-                    labels=labels,
+                    labels=loss_labels,
                     vocab_size=self.config.text_config.vocab_size,
                     hidden_states=hidden_states,
                     weights=self.lm_head.weight,

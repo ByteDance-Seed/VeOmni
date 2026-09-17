@@ -110,6 +110,7 @@
 +# Additional import blocks for patches
 +# Bound at model-build time by _bind_veomni_ops() in auto.py.
 +from veomni.ops.dispatch import OpSlot
++from veomni.utils.constants import IGNORE_INDEX
 +
 +# Additional imports for patches
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutputMixin
@@ -117,7 +118,6 @@
 +
 +veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 +
-+# ── NPU OpSlot declarations ────────────────────────────────────────────
 +# Bound at model-build time by _bind_veomni_ops() in auto.py.
 +from veomni.ops.dispatch import OpSlot
 +
@@ -163,12 +163,11 @@
  class Gemma3RMSNorm(nn.Module):
      def __init__(self, dim: int, eps: float = 1e-6):
          super().__init__()
-@@ -142,10 +193,16 @@
+@@ -142,10 +193,15 @@
      def _norm(self, x):
          return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
 -    def forward(self, x):
-+    # ── RMSNorm (OpSlot guard, NPU fused kernel) ───────────────────────────────
 +    # Gemma 3 uses (1.0 + weight) scaling (weight zero-initialised), and the eps
 +    # attribute is ``self.eps`` (not ``self.variance_epsilon``).  Pass ``1.0 +
 +    # self.weight`` so the NPU ``npu_rms_norm`` kernel reproduces the Gemma
@@ -183,7 +182,7 @@
          output = output * (1.0 + self.weight.float())
          return output.type_as(x)
 
-@@ -232,25 +289,22 @@
+@@ -232,25 +288,21 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
@@ -211,7 +210,6 @@
 +# Reason: OpSlot guard for NPU fused RoPE
 +# Source: veomni.models.transformers.gemma3.gemma3_npu_patch_gen_config
 +# ======================================================================
-+# ── Rotary Positional Embedding (OpSlot guard, NPU fused kernel) ───────────
 +def apply_rotary_pos_emb(
 +    q: torch.Tensor,
 +    k: torch.Tensor,
@@ -225,7 +223,7 @@
      cos = cos.unsqueeze(unsqueeze_dim)
      sin = sin.unsqueeze(unsqueeze_dim)
      q_embed = (q * cos) + (rotate_half(q) * sin)
-@@ -481,6 +535,12 @@
+@@ -481,6 +533,12 @@
      return inner_mask
 
 
@@ -238,7 +236,7 @@
  @auto_docstring
  class Gemma3TextModel(Gemma3PreTrainedModel):
      config: Gemma3TextConfig
-@@ -541,6 +601,7 @@
+@@ -541,6 +599,7 @@
                  "attention_mask": attention_mask,
                  "past_key_values": past_key_values,
                  "position_ids": position_ids,
@@ -246,7 +244,7 @@
              }
              sliding_mask_kwargs = mask_kwargs.copy()
 
-@@ -576,6 +637,12 @@
+@@ -576,6 +635,12 @@
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
          )
@@ -259,7 +257,7 @@
 
 
  @auto_docstring
-@@ -609,24 +676,6 @@
+@@ -609,24 +674,6 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> CausalLMOutputWithPast:
@@ -284,7 +282,7 @@
          outputs: BaseModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -638,21 +687,53 @@
+@@ -638,21 +685,53 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -347,7 +345,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -758,6 +839,12 @@
+@@ -758,6 +837,12 @@
      }
 
 
@@ -360,7 +358,7 @@
  @auto_docstring(
      custom_intro="""
      The Base Gemma3 model which consists of a vision backbone and a language model without language modeling head.,
-@@ -767,14 +854,14 @@
+@@ -767,14 +852,14 @@
      # we are filtering the logits/labels so we shouldn't divide the loss based on num_items_in_batch
      accepts_loss_kwargs = False
 
@@ -378,7 +376,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -917,6 +1004,12 @@
+@@ -917,6 +1002,12 @@
          )
 
 
@@ -391,18 +389,17 @@
  @auto_docstring(
      custom_intro="""
      The Base Gemma3 model which consists of a vision backbone and a language model without language modeling head.,
-@@ -938,6 +1031,10 @@
+@@ -938,6 +1029,9 @@
      def get_image_features(self, pixel_values: torch.FloatTensor, **kwargs: Unpack[TransformersKwargs]):
          return self.model.get_image_features(pixel_values, **kwargs)
 
-+    # ── Gemma3ForConditionalGeneration.forward (VLM fused cross-entropy) ────────
 +    # Patch the multimodal (VLM) forward to use VeOmni's fused-CE OpSlot instead
 +    # of the upstream ``nn.CrossEntropyLoss``.  This is the VLM-specific addition
 +    # over the text-only GPU config (which only patches Gemma3ForCausalLM).
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -953,52 +1050,7 @@
+@@ -953,52 +1047,7 @@
          use_cache: bool | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **lm_kwargs: Unpack[TransformersKwargs],
@@ -456,7 +453,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1014,35 +1066,45 @@
+@@ -1014,35 +1063,56 @@
          )
 
          hidden_states = outputs[0]
@@ -478,6 +475,17 @@
 -                shift_attention_mask = attention_mask[:, -shift_logits.shape[1] :].to(logits.device)
 -                shift_logits = shift_logits[shift_attention_mask.to(logits.device) != 0].contiguous()
 -                shift_labels = shift_labels[shift_attention_mask.to(shift_labels.device) != 0].contiguous()
++            loss_labels = labels
++            if attention_mask is not None and hidden_states.shape[1] > 1:
++                # Match the upstream VLM loss: padding positions in the shifted
++                # causal targets do not contribute, including longer PEFT masks.
++                shift_attention_mask = attention_mask[:, -(hidden_states.shape[1] - 1) :].to(labels.device)
++                loss_labels = labels.clone()
++                loss_labels[..., 1:] = loss_labels[..., 1:].masked_fill(
++                    shift_attention_mask == 0,
++                    IGNORE_INDEX,
++                )
++
 +            if veomni_causal_lm_loss.use_non_eager_impl:
 +                if self.config.text_config.final_logit_softcapping is not None:
 +                    raise ValueError(
@@ -486,7 +494,7 @@
 +                    )
 +                loss, logits, fused_linear_aux = veomni_causal_lm_loss(
 +                    logits=None,
-+                    labels=labels,
++                    labels=loss_labels,
 +                    vocab_size=self.config.text_config.vocab_size,
 +                    hidden_states=hidden_states,
 +                    weights=self.lm_head.weight,
@@ -506,7 +514,7 @@
 +                logits = self.lm_head(hidden_states).float()
 +                loss, _, fused_linear_aux = self.loss_function(
 +                    logits=logits,
-+                    labels=labels,
++                    labels=loss_labels,
 +                    vocab_size=self.config.text_config.vocab_size,
 +                    hidden_states=hidden_states,
 +                    weights=self.lm_head.weight,
