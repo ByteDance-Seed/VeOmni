@@ -390,9 +390,9 @@ class GlmMoeDsaAttention(nn.Module):
             bias=config.attention_bias,
         )
         self.scaling = yarn_apply_mscale(config.rope_parameters, self.qk_head_dim ** (-0.5))
-        # Refer: https://arxiv.org/abs/2603.12201 for more details.
         self.skip_topk = config.indexer_types[layer_idx] == "shared"
         self.indexer = None if self.skip_topk else GlmMoeDsaIndexer(config, layer_idx)
+        self.veomni_rope = VeomniOp("rope", "interleave", "eager")
         self.veomni_dsa_attention = VeomniOp(
             "dsa_attention",
             "glm",
@@ -445,7 +445,7 @@ class GlmMoeDsaAttention(nn.Module):
         k_compressed = self.kv_a_layernorm(k_compressed)
         k_pe = k_pe.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
 
-        q_pe, k_pe = apply_rotary_pos_emb_interleave(q_pe, k_pe, cos, sin)
+        q_pe, k_pe = self.veomni_rope(q_pe, k_pe, cos, sin)
 
         # DSA consumes MQA compressed latents. Keep them on the shared Cache object
         # (BHSD, concat on seq) instead of module buffers so chunked prefill,

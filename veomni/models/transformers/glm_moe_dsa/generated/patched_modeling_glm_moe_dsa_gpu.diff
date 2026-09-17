@@ -101,20 +101,55 @@
 
 
  @use_kernel_forward_from_hub("RMSNorm")
-@@ -161,6 +180,12 @@
-     return q_embed, k_embed
+@@ -122,43 +141,10 @@
+         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+-def apply_rotary_pos_emb_interleave(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+-    r"""
+-    Applies interleaved Rotary Position Embedding to the query and key tensors.
+-
+-    DeepSeek lays the rotary dimensions out in interleaved pairs `(x0, x1), (x2, x3), ...`, each rotated by a
+-    single frequency. We compute that rotation directly on the even/odd slices instead of de-interleaving with a
+-    `view`/`transpose`/`reshape`; the output is bit-identical to the de-interleaved `rotate_half` formulation while
+-    avoiding the extra contiguous copy.
+-
+-    Args:
+-        q (`torch.Tensor`): The query tensor.
+-        k (`torch.Tensor`): The key tensor.
+-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+-        sin (`torch.Tensor`): The sine part of the rotary embedding.
+-        position_ids (`torch.Tensor`):
+-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
+-            used to pass offsetted position ids when working with a KV-cache.
+-        unsqueeze_dim (`int`, *optional*, defaults to 1):
+-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+-    Returns:
+-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+-    """
+-    # `cos`/`sin` are `cat(freqs, freqs)`; the first half holds the per-pair angle.
+-    cos = cos[..., : cos.shape[-1] // 2].unsqueeze(unsqueeze_dim)
+-    sin = sin[..., : sin.shape[-1] // 2].unsqueeze(unsqueeze_dim)
+-
+-    q1, q2 = q[..., 0::2], q[..., 1::2]
+-    k1, k2 = k[..., 0::2], k[..., 1::2]
+-
+-    q_embed = torch.cat([q1 * cos - q2 * sin, q2 * cos + q1 * sin], dim=-1)
+-    k_embed = torch.cat([k1 * cos - k2 * sin, k2 * cos + k1 * sin], dim=-1)
+-    return q_embed, k_embed
 +# ======================================================================
 +# [MODIFIED CLASS] GlmMoeDsaIndexer
 +# Methods patched: __init__, forward
 +# ======================================================================
-+
-+
+
+
  class GlmMoeDsaIndexer(nn.Module):
-     """
-     DeepSeek Sparse Attention (DSA) indexer for selecting top-k tokens.
-@@ -175,7 +200,7 @@
+@@ -175,7 +161,7 @@
      """
 
      def __init__(self, config: "GlmMoeDsaConfig", layer_idx: int):
@@ -123,10 +158,11 @@
          self.config = config
          self.layer_idx = layer_idx
 
-@@ -191,6 +216,11 @@
+@@ -191,6 +177,12 @@
          self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
          self.weights_proj = nn.Linear(self.hidden_size, self.n_heads, bias=False)
          self.softmax_scale = self.head_dim**-0.5
++        self.veomni_rope = VeomniOp("rope", "interleave", "eager")
 +        self.veomni_dsa_indexer = VeomniOp(
 +            "dsa_indexer",
 +            "glm",
@@ -135,7 +171,7 @@
 
      @torch.no_grad()
      def forward(
-@@ -202,57 +232,44 @@
+@@ -202,57 +194,44 @@
          position_ids: torch.Tensor,
          past_key_values: Cache | None = None,
      ) -> torch.Tensor:
@@ -170,9 +206,10 @@
          k_rot, k_pass = torch.split(k, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
 
 -        # GLM-MoE-DSA uses interleaved RoPE in the indexer
-         q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin, unsqueeze_dim=2)
+-        q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin, unsqueeze_dim=2)
 -        q = torch.cat([q_rot, q_pass], dim=-1)  # [B, S, H, D]
 -        k = torch.cat([k_rot, k_pass], dim=-1).squeeze(2)  # [B, S, D]
++        q_rot, k_rot = self.veomni_rope(q_rot, k_rot, cos, sin, unsqueeze_dim=2)
 +        q = torch.cat([q_rot, q_pass], dim=-1)
 +        k = torch.cat([k_rot, k_pass], dim=-1).squeeze(2)
 
@@ -219,7 +256,7 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -308,6 +325,12 @@
+@@ -308,6 +287,12 @@
      return scaling
 
 
@@ -232,7 +269,7 @@
  class GlmMoeDsaAttention(nn.Module):
      """
      DeepSeek-V3 MLA + a DSA indexer, extended with **cross-layer top-k sharing**.
-@@ -319,11 +342,11 @@
+@@ -319,11 +304,11 @@
      """
 
      def __init__(self, config: GlmMoeDsaConfig, layer_idx: int):
@@ -246,7 +283,7 @@
          self.num_heads = config.num_attention_heads
 
          self.q_lora_rank = config.q_lora_rank
-@@ -331,18 +354,17 @@
+@@ -331,18 +316,17 @@
          self.kv_lora_rank = config.kv_lora_rank
          self.v_head_dim = config.v_head_dim
          self.qk_nope_head_dim = config.qk_nope_head_dim
@@ -268,7 +305,7 @@
              if self.q_lora_rank is not None
              else None
          )
-@@ -354,27 +376,29 @@
+@@ -354,27 +338,30 @@
          )
 
          self.kv_a_proj_with_mqa = nn.Linear(
@@ -298,6 +335,7 @@
 -        # Refer: https://arxiv.org/abs/2603.12201 for more details.
          self.skip_topk = config.indexer_types[layer_idx] == "shared"
          self.indexer = None if self.skip_topk else GlmMoeDsaIndexer(config, layer_idx)
++        self.veomni_rope = VeomniOp("rope", "interleave", "eager")
 +        self.veomni_dsa_attention = VeomniOp(
 +            "dsa_attention",
 +            "glm",
@@ -306,7 +344,7 @@
 
      def expand_kv(self, kv_nope: torch.Tensor, k_rot: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
          """Expands the compressed latents into key and value states. Args:
-@@ -406,32 +430,41 @@
+@@ -406,32 +393,41 @@
          **kwargs: Unpack[FlashAttentionKwargs],
      ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
          batch_size, seq_length = hidden_states.shape[:-1]
@@ -344,7 +382,7 @@
 +        k_compressed = self.kv_a_layernorm(k_compressed)
 +        k_pe = k_pe.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
 +
-+        q_pe, k_pe = apply_rotary_pos_emb_interleave(q_pe, k_pe, cos, sin)
++        q_pe, k_pe = self.veomni_rope(q_pe, k_pe, cos, sin)
 +
 +        # DSA consumes MQA compressed latents. Keep them on the shared Cache object
 +        # (BHSD, concat on seq) instead of module buffers so chunked prefill,
@@ -370,7 +408,7 @@
              topk_indices = self.indexer(
                  hidden_states,
                  q_resid,
-@@ -439,42 +472,58 @@
+@@ -439,42 +435,58 @@
                  indexer_mask,
                  position_ids,
                  past_key_values=past_key_values,
@@ -458,7 +496,7 @@
          attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
          attn_output = self.o_proj(attn_output)
          return attn_output, attn_weights, topk_indices
-@@ -756,6 +805,12 @@
+@@ -756,6 +768,12 @@
          )
 
 
@@ -471,7 +509,7 @@
  @auto_docstring
  class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -768,8 +823,9 @@
+@@ -768,8 +786,9 @@
          self.model = GlmMoeDsaModel(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -483,7 +521,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -783,52 +839,57 @@
+@@ -783,52 +802,61 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -556,10 +594,16 @@
              attentions=outputs.attentions,
          )
 
+-
+-__all__ = ["GlmMoeDsaPreTrainedModel", "GlmMoeDsaModel", "GlmMoeDsaForCausalLM"]
 +    def get_parallel_plan(self):
 +        from ..parallel_plan import get_parallel_plan as _get_parallel_plan
 +
 +        return _get_parallel_plan()
 +
-
- __all__ = ["GlmMoeDsaPreTrainedModel", "GlmMoeDsaModel", "GlmMoeDsaForCausalLM"]
++
++__all__ = [
++    "GlmMoeDsaPreTrainedModel",
++    "GlmMoeDsaModel",
++    "GlmMoeDsaForCausalLM",
++]

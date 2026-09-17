@@ -72,7 +72,7 @@ config.add_import(
 # wrapper so a no-padding HF causal mask can be dropped without a host scan.
 config.drop_import_names("create_causal_mask")
 config.add_post_import_block("create_causal_mask = create_standard_causal_mask")
-apply_rotary_pos_emb_interleave = None  # noqa: E305  resolved from the generated modeling file
+config.exclude_from_output("apply_rotary_pos_emb_interleave")
 yarn_apply_mscale = None
 GlmMoeDsaRMSNorm = None
 
@@ -98,6 +98,7 @@ def glm_moe_dsa_indexer_init_patched(self, config: "GlmMoeDsaConfig", layer_idx:
     self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
     self.weights_proj = nn.Linear(self.hidden_size, self.n_heads, bias=False)
     self.softmax_scale = self.head_dim**-0.5
+    self.veomni_rope = VeomniOp("rope", "interleave", "eager")
     self.veomni_dsa_indexer = VeomniOp(
         "dsa_indexer",
         "glm",
@@ -128,7 +129,7 @@ def glm_moe_dsa_indexer_forward_patched(
     k = self.k_norm(self.wk(hidden_states)).unsqueeze(2)
     k_rot, k_pass = torch.split(k, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
 
-    q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin, unsqueeze_dim=2)
+    q_rot, k_rot = self.veomni_rope(q_rot, k_rot, cos, sin, unsqueeze_dim=2)
     q = torch.cat([q_rot, q_pass], dim=-1)
     k = torch.cat([k_rot, k_pass], dim=-1).squeeze(2)
 
@@ -215,6 +216,7 @@ def glm_moe_dsa_attention_init_patched(self, config: GlmMoeDsaConfig, layer_idx:
     self.scaling = yarn_apply_mscale(config.rope_parameters, self.qk_head_dim ** (-0.5))
     self.skip_topk = config.indexer_types[layer_idx] == "shared"
     self.indexer = None if self.skip_topk else GlmMoeDsaIndexer(config, layer_idx)
+    self.veomni_rope = VeomniOp("rope", "interleave", "eager")
     self.veomni_dsa_attention = VeomniOp(
         "dsa_attention",
         "glm",
@@ -253,7 +255,7 @@ def glm_moe_dsa_attention_forward_patched(
     k_compressed = self.kv_a_layernorm(k_compressed)
     k_pe = k_pe.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
 
-    q_pe, k_pe = apply_rotary_pos_emb_interleave(q_pe, k_pe, cos, sin)
+    q_pe, k_pe = self.veomni_rope(q_pe, k_pe, cos, sin)
 
     # DSA consumes MQA compressed latents. Keep them on the shared Cache object
     # (BHSD, concat on seq) instead of module buffers so chunked prefill,

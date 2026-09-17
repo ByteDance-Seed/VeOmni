@@ -83,7 +83,7 @@ config.modify_init(
 config.override_method(
     "DeepseekV3Attention.forward",
     replacement=deepseek_v3_attention_forward_patched,
-    description="Always call the local rope and attention VeomniOps on the non-interleaved path",
+    description="Always call the local rope and attention VeomniOps",
 )
 config.override_method(
     "DeepseekV3MLP.__init__",

@@ -20,7 +20,7 @@
 #    - init_modification: DeepseekV3Attention
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: DeepseekV3Attention.forward
-#      Always call the local rope and attention VeomniOps on the non-interleaved path
+#      Always call the local rope and attention VeomniOps
 #    - method_override: DeepseekV3MLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: DeepseekV3MLP.forward
@@ -89,7 +89,9 @@ from veomni.utils.moe_monitor import record_router_indices
 # ======================================================================
 
 
-def _deepseek_v3_rope_op() -> VeomniOp:
+def _deepseek_v3_rope_op(rope_interleave: bool = False) -> VeomniOp:
+    if rope_interleave:
+        return VeomniOp("rope", "interleave", "eager")
     impl = resolve_op_impl("rotary_pos_emb_implementation")
     return VeomniOp("rope", "full", "eager" if impl == "triton" else impl)
 
@@ -400,45 +402,6 @@ def yarn_apply_mscale(rope_parameters, scaling):
     return scaling
 
 
-def apply_rotary_pos_emb_interleave(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    r"""
-    Applies interleaved Rotary Position Embedding to the query and key tensors.
-
-    DeepSeek lays the rotary dimensions out in interleaved pairs `(x0, x1), (x2, x3), ...`, each rotated by a
-    single frequency. We compute that rotation directly on the even/odd slices instead of de-interleaving with a
-    `view`/`transpose`/`reshape`; the output is bit-identical to the de-interleaved `rotate_half` formulation while
-    avoiding the extra contiguous copy.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    # `cos`/`sin` are `cat(freqs, freqs)`; the first half holds the per-pair angle.
-    cos = cos[..., : cos.shape[-1] // 2].unsqueeze(unsqueeze_dim)
-    sin = sin[..., : sin.shape[-1] // 2].unsqueeze(unsqueeze_dim)
-
-    q1, q2 = q[..., 0::2], q[..., 1::2]
-    k1, k2 = k[..., 0::2], k[..., 1::2]
-
-    q_embed = torch.cat([q1 * cos - q2 * sin, q2 * cos + q1 * sin], dim=-1)
-    k_embed = torch.cat([k1 * cos - k2 * sin, k2 * cos + k1 * sin], dim=-1)
-    return q_embed, k_embed
-
-
 # ======================================================================
 # [MODIFIED CLASS] DeepseekV3Attention
 # Methods patched: forward, __init__
@@ -504,7 +467,7 @@ class DeepseekV3Attention(nn.Module):
 
         self.scaling = yarn_apply_mscale(config.rope_parameters, self.qk_head_dim ** (-0.5))
         # Bind instance-local rope and attention VeomniOps
-        self.veomni_rope = _deepseek_v3_rope_op()
+        self.veomni_rope = _deepseek_v3_rope_op(self.config.rope_interleave)
         self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def expand_kv(self, kv_nope: torch.Tensor, k_rot: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -551,10 +514,7 @@ class DeepseekV3Attention(nn.Module):
         k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
 
         cos, sin = position_embeddings
-        if self.config.rope_interleave:
-            q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin)
-        else:
-            q_rot, k_rot = self.veomni_rope(q_rot, k_rot, cos, sin)
+        q_rot, k_rot = self.veomni_rope(q_rot, k_rot, cos, sin)
 
         if past_key_values is not None:
             kv_nope, k_rot = past_key_values.update(kv_nope, k_rot, self.layer_idx)

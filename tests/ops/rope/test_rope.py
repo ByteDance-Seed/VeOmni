@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 import torch
 from torch import Tensor
+from transformers.models.deepseek_v3.modeling_deepseek_v3 import apply_rotary_pos_emb_interleave as hf_interleave_rope
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import apply_rotary_pos_emb as hf_dsv4_rope
 from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb as hf_full_rope
 from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb as hf_partial_rope
@@ -112,7 +113,35 @@ def test_vision_eager_matches_hf(dtype: torch.dtype):
     assert torch.allclose(k_e.grad, k_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-@pytest.mark.parametrize("kind", ("full", "partial", "vision"))
+@pytest.mark.parametrize("unsqueeze_dim", (1, 2))
+def test_interleave_eager_matches_hf(unsqueeze_dim: int):
+    torch.manual_seed(0)
+    if unsqueeze_dim == 1:
+        q = torch.randn(2, 8, 16, 64, dtype=torch.float32, requires_grad=True)
+        k = torch.randn(2, 1, 16, 64, dtype=torch.float32, requires_grad=True)
+        cos = torch.randn(2, 16, 64, dtype=torch.float32)
+        sin = torch.randn(2, 16, 64, dtype=torch.float32)
+    else:
+        q = torch.randn(2, 16, 8, 64, dtype=torch.float32, requires_grad=True)
+        k = torch.randn(2, 16, 1, 64, dtype=torch.float32, requires_grad=True)
+        cos = torch.randn(2, 16, 64, dtype=torch.float32)
+        sin = torch.randn(2, 16, 64, dtype=torch.float32)
+
+    q_h, k_h = make_grad_leaves(q, k)
+    out_h = hf_interleave_rope(q_h, k_h, cos, sin, unsqueeze_dim=unsqueeze_dim)
+
+    q_e, k_e = make_grad_leaves(q, k)
+    out_e = resolve_op("rope", "interleave", "eager").wrapper(q_e, k_e, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    _assert_pair(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    go = (torch.randn_like(out_e[0]), torch.randn_like(out_e[1]))
+    torch.autograd.backward(out_h, go)
+    torch.autograd.backward(out_e, go)
+    assert torch.allclose(q_e.grad, q_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(k_e.grad, k_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+@pytest.mark.parametrize("kind", ("full", "partial", "vision", "interleave"))
 @pytest.mark.parametrize(
     ("cos_requires_grad", "sin_requires_grad"),
     ((True, False), (False, True), (True, True)),
@@ -134,6 +163,14 @@ def test_eager_rope_table_gradients_match_hf(kind: str, cos_requires_grad: bool,
         sin = torch.randn(2, 4, 8)
         reference = hf_partial_rope
         op = resolve_op("rope", "partial", "eager").wrapper
+        attrs = {"unsqueeze_dim": 1}
+    elif kind == "interleave":
+        q = torch.randn(2, 3, 4, 8)
+        k = torch.randn(2, 2, 4, 8)
+        cos = torch.randn(2, 4, 8)
+        sin = torch.randn(2, 4, 8)
+        reference = hf_interleave_rope
+        op = resolve_op("rope", "interleave", "eager").wrapper
         attrs = {"unsqueeze_dim": 1}
     else:
         q = torch.randn(4, 3, 8)
@@ -167,7 +204,7 @@ def test_eager_rope_table_gradients_match_hf(kind: str, cos_requires_grad: bool,
         torch.testing.assert_close(sin_e.grad, sin_h.grad)
 
 
-@pytest.mark.parametrize("kind", ("full", "partial", "vision"))
+@pytest.mark.parametrize("kind", ("full", "partial", "vision", "interleave"))
 def test_eager_rope_fixed_tables_do_not_save_inputs(kind: str):
     if kind == "vision":
         q = torch.randn(4, 3, 8, requires_grad=True)
@@ -176,7 +213,7 @@ def test_eager_rope_fixed_tables_do_not_save_inputs(kind: str):
         sin = torch.randn(4, 8)
         output = resolve_op("rope", "full", "eager").wrapper(q, k, cos, sin)
     else:
-        head_dim = 8 if kind == "full" else 12
+        head_dim = 12 if kind == "partial" else 8
         q = torch.randn(2, 3, 4, head_dim, requires_grad=True)
         k = torch.randn(2, 2, 4, head_dim, requires_grad=True)
         cos = torch.randn(2, 4, 8)

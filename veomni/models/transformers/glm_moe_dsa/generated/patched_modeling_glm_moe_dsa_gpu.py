@@ -141,45 +141,6 @@ class GlmMoeDsaRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-def apply_rotary_pos_emb_interleave(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    r"""
-    Applies interleaved Rotary Position Embedding to the query and key tensors.
-
-    DeepSeek lays the rotary dimensions out in interleaved pairs `(x0, x1), (x2, x3), ...`, each rotated by a
-    single frequency. We compute that rotation directly on the even/odd slices instead of de-interleaving with a
-    `view`/`transpose`/`reshape`; the output is bit-identical to the de-interleaved `rotate_half` formulation while
-    avoiding the extra contiguous copy.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    # `cos`/`sin` are `cat(freqs, freqs)`; the first half holds the per-pair angle.
-    cos = cos[..., : cos.shape[-1] // 2].unsqueeze(unsqueeze_dim)
-    sin = sin[..., : sin.shape[-1] // 2].unsqueeze(unsqueeze_dim)
-
-    q1, q2 = q[..., 0::2], q[..., 1::2]
-    k1, k2 = k[..., 0::2], k[..., 1::2]
-
-    q_embed = torch.cat([q1 * cos - q2 * sin, q2 * cos + q1 * sin], dim=-1)
-    k_embed = torch.cat([k1 * cos - k2 * sin, k2 * cos + k1 * sin], dim=-1)
-    return q_embed, k_embed
-
-
 # ======================================================================
 # [MODIFIED CLASS] GlmMoeDsaIndexer
 # Methods patched: __init__, forward
@@ -216,6 +177,7 @@ class GlmMoeDsaIndexer(nn.Module):
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
         self.weights_proj = nn.Linear(self.hidden_size, self.n_heads, bias=False)
         self.softmax_scale = self.head_dim**-0.5
+        self.veomni_rope = VeomniOp("rope", "interleave", "eager")
         self.veomni_dsa_indexer = VeomniOp(
             "dsa_indexer",
             "glm",
@@ -242,7 +204,7 @@ class GlmMoeDsaIndexer(nn.Module):
         k = self.k_norm(self.wk(hidden_states)).unsqueeze(2)
         k_rot, k_pass = torch.split(k, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
 
-        q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin, unsqueeze_dim=2)
+        q_rot, k_rot = self.veomni_rope(q_rot, k_rot, cos, sin, unsqueeze_dim=2)
         q = torch.cat([q_rot, q_pass], dim=-1)
         k = torch.cat([k_rot, k_pass], dim=-1).squeeze(2)
 
@@ -394,6 +356,7 @@ class GlmMoeDsaAttention(nn.Module):
         self.scaling = yarn_apply_mscale(config.rope_parameters, self.qk_head_dim ** (-0.5))
         self.skip_topk = config.indexer_types[layer_idx] == "shared"
         self.indexer = None if self.skip_topk else GlmMoeDsaIndexer(config, layer_idx)
+        self.veomni_rope = VeomniOp("rope", "interleave", "eager")
         self.veomni_dsa_attention = VeomniOp(
             "dsa_attention",
             "glm",
@@ -446,7 +409,7 @@ class GlmMoeDsaAttention(nn.Module):
         k_compressed = self.kv_a_layernorm(k_compressed)
         k_pe = k_pe.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
 
-        q_pe, k_pe = apply_rotary_pos_emb_interleave(q_pe, k_pe, cos, sin)
+        q_pe, k_pe = self.veomni_rope(q_pe, k_pe, cos, sin)
 
         # DSA consumes MQA compressed latents. Keep them on the shared Cache object
         # (BHSD, concat on seq) instead of module buffers so chunked prefill,
@@ -892,4 +855,8 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
         return _get_parallel_plan()
 
 
-__all__ = ["GlmMoeDsaPreTrainedModel", "GlmMoeDsaModel", "GlmMoeDsaForCausalLM"]
+__all__ = [
+    "GlmMoeDsaPreTrainedModel",
+    "GlmMoeDsaModel",
+    "GlmMoeDsaForCausalLM",
+]

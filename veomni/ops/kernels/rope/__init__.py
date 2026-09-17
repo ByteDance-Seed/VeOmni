@@ -15,9 +15,10 @@
 """RoPE kernel family.
 
 Variants: ``full`` (rotate every channel for text or rank-3 vision layouts),
-``partial`` (rotate a prefix), ``deepseek_v4`` (trailing interleaved slice),
-and ``wan`` (complex multiply by freqs). Each variant registers an eager row
-plus optional CUDA / NPU adapters.
+``partial`` (rotate a prefix), ``interleave`` (interleaved pairs in, rotate-half
+out), ``deepseek_v4`` (trailing interleaved slice), and ``wan`` (complex
+multiply by freqs). Each variant registers an eager row plus optional CUDA /
+NPU adapters.
 """
 
 from ...platform import GpuKernelRequirement, NpuKernelRequirement
@@ -27,6 +28,7 @@ from .deepseek_v4 import triton as dsv4_triton
 from .full import eager as full_eager
 from .full import liger_kernel as full_liger
 from .full import npu as full_npu
+from .interleave import eager as interleave_eager
 from .partial import eager as partial_eager
 from .partial import npu as partial_npu
 from .wan import eager as wan_eager
@@ -84,6 +86,15 @@ register_op(
     partial_npu.backward,
     description="torch_npu rotary embedding over a channel prefix",
     requirement=NpuKernelRequirement(),
+)
+
+register_op(
+    "rope",
+    "interleave",
+    "eager",
+    interleave_eager.forward,
+    interleave_eager.backward,
+    description="PyTorch rotary embedding for interleaved pairs with rotate-half output",
 )
 
 register_op(

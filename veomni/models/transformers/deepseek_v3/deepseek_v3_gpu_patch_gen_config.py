@@ -71,7 +71,7 @@ config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
 )
-config.exclude_from_output("apply_rotary_pos_emb", "rotate_half")
+config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_interleave", "rotate_half")
 config.add_import("veomni.utils.moe_monitor", names=["record_router_indices"])
 config.add_import(
     "veomni.utils.model_outputs",
@@ -79,12 +79,13 @@ config.add_import(
 )
 
 maybe_autocast = None  # noqa: E305  resolved from the generated modeling file
-apply_rotary_pos_emb_interleave = None  # noqa: E305
 FlashAttentionKwargs = None  # noqa: E305
 
 
 @config.add_helper
-def _deepseek_v3_rope_op() -> VeomniOp:
+def _deepseek_v3_rope_op(rope_interleave: bool = False) -> VeomniOp:
+    if rope_interleave:
+        return VeomniOp("rope", "interleave", "eager")
     impl = resolve_op_impl("rotary_pos_emb_implementation")
     return VeomniOp("rope", "full", "eager" if impl == "triton" else impl)
 
@@ -144,13 +145,13 @@ def deepseek_v3_rotary_embedding_forward_patched(self, x, position_ids):
 @config.modify_init("DeepseekV3Attention", description="Bind instance-local rope and attention VeomniOps")
 def deepseek_v3_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_rope = _deepseek_v3_rope_op()
+    self.veomni_rope = _deepseek_v3_rope_op(self.config.rope_interleave)
     self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
 @config.override_method(
     "DeepseekV3Attention.forward",
-    description="Always call the local rope and attention VeomniOps on the non-interleaved path",
+    description="Always call the local rope and attention VeomniOps",
 )
 def deepseek_v3_attention_forward_patched(
     self,
@@ -177,10 +178,7 @@ def deepseek_v3_attention_forward_patched(
     k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
 
     cos, sin = position_embeddings
-    if self.config.rope_interleave:
-        q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin)
-    else:
-        q_rot, k_rot = self.veomni_rope(q_rot, k_rot, cos, sin)
+    q_rot, k_rot = self.veomni_rope(q_rot, k_rot, cos, sin)
 
     if past_key_values is not None:
         kv_nope, k_rot = past_key_values.update(kv_nope, k_rot, self.layer_idx)

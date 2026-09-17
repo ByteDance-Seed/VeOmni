@@ -146,7 +146,7 @@
              if self.q_lora_rank is not None
              else None
          )
-@@ -354,27 +374,29 @@
+@@ -354,27 +374,30 @@
          )
 
          self.kv_a_proj_with_mqa = nn.Linear(
@@ -176,6 +176,7 @@
 -        # Refer: https://arxiv.org/abs/2603.12201 for more details.
          self.skip_topk = config.indexer_types[layer_idx] == "shared"
          self.indexer = None if self.skip_topk else GlmMoeDsaIndexer(config, layer_idx)
++        self.veomni_rope = VeomniOp("rope", "interleave", "eager")
 +        self.veomni_dsa_attention = VeomniOp(
 +            "dsa_attention",
 +            "glm",
@@ -184,7 +185,7 @@
 
      def expand_kv(self, kv_nope: torch.Tensor, k_rot: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
          """Expands the compressed latents into key and value states. Args:
-@@ -406,32 +428,41 @@
+@@ -406,32 +429,41 @@
          **kwargs: Unpack[FlashAttentionKwargs],
      ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
          batch_size, seq_length = hidden_states.shape[:-1]
@@ -222,7 +223,7 @@
 +        k_compressed = self.kv_a_layernorm(k_compressed)
 +        k_pe = k_pe.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
 +
-+        q_pe, k_pe = apply_rotary_pos_emb_interleave(q_pe, k_pe, cos, sin)
++        q_pe, k_pe = self.veomni_rope(q_pe, k_pe, cos, sin)
 +
 +        # DSA consumes MQA compressed latents. Keep them on the shared Cache object
 +        # (BHSD, concat on seq) instead of module buffers so chunked prefill,
@@ -248,7 +249,7 @@
              topk_indices = self.indexer(
                  hidden_states,
                  q_resid,
-@@ -439,42 +470,58 @@
+@@ -439,42 +471,58 @@
                  indexer_mask,
                  position_ids,
                  past_key_values=past_key_values,
@@ -336,7 +337,7 @@
          attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
          attn_output = self.o_proj(attn_output)
          return attn_output, attn_weights, topk_indices
-@@ -756,6 +803,12 @@
+@@ -756,6 +804,12 @@
          )
 
 
@@ -349,7 +350,7 @@
  @auto_docstring
  class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -768,8 +821,9 @@
+@@ -768,8 +822,9 @@
          self.model = GlmMoeDsaModel(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -361,7 +362,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -783,52 +837,57 @@
+@@ -783,52 +838,57 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
