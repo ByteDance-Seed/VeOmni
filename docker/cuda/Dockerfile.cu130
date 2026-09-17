@@ -1,15 +1,4 @@
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-11.html
-#
-# Builds for linux/amd64 and linux/arm64 from this one file; arm64 is what Grace
-# nodes (GB200 / GH200) require. The NGC tag is a multi-arch manifest and the
-# `gpu` extra already carries aarch64 markers (`[tool.uv].sources` in
-# pyproject.toml), so nothing below pins an architecture -- deliberately, since
-# a `--platform` on FROM would nail every build to one arch.
-#
-# One runtime difference is load-bearing: FA2 publishes no aarch64 wheel and
-# pyproject.toml scopes `flash-attn` to x86_64. An arm64 image therefore has
-# CUDA and no `flash_attn`, so model code must branch on the package being
-# importable rather than on CUDA being present.
 from nvcr.io/nvidia/pytorch:25.11-py3
 
 # Define environments
@@ -18,19 +7,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_ROOT_USER_ACTION=ignore
 
 # Define installation arguments
-# APT_SOURCE defaults to empty rather than to a URL: the base image already
-# ships the right sources.list for its architecture (amd64 archive.ubuntu.com,
-# arm64 ports.ubuntu.com), and comparing against one hardcoded default would
-# silently point an arm64 build at an x86-only mirror. A mirror passed here must
-# serve the target architecture.
-ARG APT_SOURCE=
+ARG APT_SOURCE=http://archive.ubuntu.com/ubuntu/
 ARG PIP_INDEX=https://pypi.org/simple
 
 # Set apt source
 # ubuntu 24.04
 # Only override the base image's sources.list when the user passed
-# --build-arg APT_SOURCE=...
-RUN if [ -n "${APT_SOURCE}" ]; then \
+# a non-default --build-arg APT_SOURCE=...
+RUN if [ "${APT_SOURCE}" != "http://archive.ubuntu.com/ubuntu/" ]; then \
     cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.bak && \
     { \
     echo "Types: deb"; \

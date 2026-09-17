@@ -7,7 +7,7 @@ accelerator and edit it directly.
 ```
 docker/
 ├── cuda/                  NVIDIA images (NGC PyTorch base)
-│   └── Dockerfile.cu130       multi-arch: amd64 + arm64
+│   └── Dockerfile.cu130
 ├── ascend/                Ascend NPU images (CANN base), per CANN version / SoC / arch
 │   ├── Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86
 │   ├── Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm
@@ -20,34 +20,6 @@ docker/
 Ascend file names encode the variant: CANN version, torch-npu version where it
 is pinned, then the SoC (`910b` / A2 vs `a3`) and the host arch (`.x86` /
 `.arm`; the `a3` files are arm-only).
-
-`cuda/Dockerfile.cu130` carries no arch suffix because it builds both.
-
-## Grace (GB200 / GH200)
-
-Those queues require an ARM image and reject an x86 one before it starts. The
-same `cuda/Dockerfile.cu130` covers them — add `linux/arm64` to the build's
-platform list, no separate file:
-
-```bash
-docker buildx build --platform linux/amd64,linux/arm64 \
-    -f docker/cuda/Dockerfile.cu130 -t veomni:cu130 .
-```
-
-Two things make that work, and both are easy to undo by accident:
-
-- **Nothing pins a platform.** `FROM` takes no `--platform`, so buildx resolves
-  the multi-arch NGC manifest per target. Adding `--platform=linux/arm64` there
-  would pin *every* arch of the build to arm64.
-- **`APT_SOURCE` defaults to empty**, leaving whichever sources.list the base
-  image ships (amd64 `archive.ubuntu.com`, arm64 `ports.ubuntu.com`). A mirror
-  passed through that arg must serve the target architecture.
-
-One runtime difference is load-bearing: **FA2 has no aarch64 wheel**, and
-`pyproject.toml` scopes `flash-attn` to `x86_64`. A Grace node therefore has
-CUDA but no `flash_attn`, so model code must branch on
-`is_flash_attn_2_available()` rather than on `IS_CUDA_AVAILABLE` — the latter
-turns a missing wheel into an import error that takes the whole package down.
 
 ## Building
 
