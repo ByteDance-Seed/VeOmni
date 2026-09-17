@@ -37,10 +37,11 @@ from veomni.models.seed_omni.modules.deepseek_v41.convert_model import (
     ShardWriter,
     TensorSource,
     _llm_layer_names,
+    convert_deepseek_v41_checkpoint,
     convert_llm,
     convert_vision,
 )
-from veomni.models.seed_omni.modules.deepseek_v41.dequant import dequant_fp8_blockwise
+from veomni.models.seed_omni.modules.deepseek_v41.dequant import dequant_fp4_blockwise, dequant_fp8_blockwise
 
 
 HIDDEN = 64
@@ -91,17 +92,32 @@ def llm_config():
     )
 
 
+def e8m0_scale(*shape):
+    """Block scales in the dtype the release stores them in.
+
+    e8m0 is an exponent and nothing else -- byte ``b`` means ``2**(b - 127)`` --
+    so the byte is drawn directly. Drawing a float and casting would collapse:
+    every value rounds to the nearest power of two, and the narrow band around
+    1.0 that reads naturally becomes all ones, which is a scale that cannot tell
+    a correct dequantization from one that ignored it.
+
+    It also matters that this is one byte rather than four. A float32 stand-in
+    makes a native-precision expert look 18% larger than it is, which is enough
+    to move a size ratio past a threshold and send someone looking for a bug in
+    the converter.
+    """
+    return torch.randint(123, 132, shape, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+
+
 def fp8_pair(out_dim, in_dim, block=32):
     """A weight and the block scale that dequantizes it."""
     weight = torch.randn(out_dim, in_dim).to(torch.float8_e4m3fn)
-    scale = torch.rand(out_dim // block, in_dim // block) * 0.1 + 0.95
-    return weight, scale
+    return weight, e8m0_scale(out_dim // block, in_dim // block)
 
 
 def fp4_pair(out_dim, in_dim, block=32):
     packed = torch.randint(0, 256, (out_dim, in_dim // 2), dtype=torch.uint8).view(torch.int8)
-    scale = torch.rand(out_dim, in_dim // block) * 0.1 + 0.95
-    return packed, scale
+    return packed, e8m0_scale(out_dim, in_dim // block)
 
 
 #: Released tensors that carry a block scale. Everything else is a norm gain, a
@@ -404,7 +420,7 @@ class TestLlmConversionLoads:
     def _convert(self, tmp_path, released):
         config, _, path = released
         source = TensorSource(path)
-        convert_llm(source, str(tmp_path / "out"), config, list(ENGRAM_LAYERS))
+        convert_llm(source, str(tmp_path / "out"), config, list(ENGRAM_LAYERS), "bf16")
         out_dir = tmp_path / "out" / "deepseek_v41_llm"
         files = [f for f in os.listdir(out_dir) if f.endswith(".safetensors")]
         state = {}
@@ -463,13 +479,154 @@ class TestLlmConversionLoads:
         assert {v.dtype for v in state.values()} == {torch.bfloat16}
 
 
+class TestNativePrecision:
+    """The inference output: released dtypes kept, scales carried alongside.
+
+    The load-into-the-module check that guards the bf16 path cannot guard this
+    one, because a module built in bf16 rejects an fp8 parameter on dtype rather
+    than on name. What replaces it is an equivalence: dequantizing the native
+    output has to reproduce the bf16 output exactly. That catches the failure
+    this mode is actually exposed to -- a scale that gets separated from its
+    weight by the fusing and stacking, which leaves every name correct, every
+    shape correct, and every number wrong.
+    """
+
+    def _convert(self, tmp_path, released, precision):
+        config, _, path = released
+        out = tmp_path / precision
+        convert_llm(TensorSource(path), str(out), config, list(ENGRAM_LAYERS), precision)
+        out_dir = out / "deepseek_v41_llm"
+        state = {}
+        for file_name in os.listdir(out_dir):
+            if file_name.endswith(".safetensors"):
+                state.update(load_file(str(out_dir / file_name)))
+        return config, state
+
+    def test_quantized_weights_keep_the_dtype_they_shipped_in(self, tmp_path, released):
+        _, state = self._convert(tmp_path, released, "native")
+
+        assert state["model.layers.0.self_attn.wq_a.weight"].dtype == torch.float8_e4m3fn
+        assert state["model.layers.0.mlp.experts.gate_up_proj"].dtype == torch.int8
+        # Norms were never quantized and are unaffected by the mode.
+        assert state["model.norm.weight"].dtype == torch.float32
+
+    def test_every_quantized_weight_has_its_scale_beside_it(self, tmp_path, released):
+        _, state = self._convert(tmp_path, released, "native")
+
+        quantized = [
+            name
+            for name, tensor in state.items()
+            if tensor.dtype in (torch.float8_e4m3fn, torch.int8) and not name.endswith("_scale")
+        ]
+        assert quantized
+        for name in quantized:
+            assert f"{name}_scale" in state, f"{name} was written without its scale"
+
+    def test_the_released_scale_names_do_not_leak_through(self, tmp_path, released):
+        """``wq_a.scale`` is the release's name for it; the module's is ``wq_a.weight_scale``.
+
+        Copying the released name across would put the scale on a sibling
+        attribute of the submodule rather than next to the weight it belongs to,
+        and it would land as an unexpected key.
+        """
+        _, state = self._convert(tmp_path, released, "native")
+
+        assert "model.layers.0.self_attn.wq_a.weight_scale" in state
+        assert "model.layers.0.self_attn.wq_a.scale" not in state
+
+    def test_the_expert_scales_are_stacked_to_match_their_slab(self, tmp_path, released):
+        _, state = self._convert(tmp_path, released, "native")
+
+        fused = state["model.layers.0.mlp.experts.gate_up_proj"]
+        scale = state["model.layers.0.mlp.experts.gate_up_proj_scale"]
+        # fp4 packs two values per byte along the input dimension, and one scale
+        # covers 32 of them -- so the stored width is H/2 and the scale's is H/32.
+        assert fused.shape == (N_EXPERTS, 2 * MOE_INTER, HIDDEN // 2)
+        assert scale.shape == (N_EXPERTS, 2 * MOE_INTER, HIDDEN // 32)
+
+    def test_dequantizing_the_native_output_reproduces_the_bf16_one(self, tmp_path, released):
+        """The equivalence that makes the two modes two spellings of one checkpoint."""
+        _, native = self._convert(tmp_path, released, "native")
+        _, reference = self._convert(tmp_path, released, "bf16")
+
+        for name in ("gate_up_proj", "down_proj"):
+            key = f"model.layers.0.mlp.experts.{name}"
+            rebuilt = torch.stack(
+                [
+                    dequant_fp4_blockwise(native[key][expert], native[f"{key}_scale"][expert], torch.bfloat16)
+                    for expert in range(N_EXPERTS)
+                ]
+            )
+            torch.testing.assert_close(rebuilt, reference[key], rtol=0, atol=0)
+
+        key = "model.layers.0.self_attn.wq_a.weight"
+        torch.testing.assert_close(
+            dequant_fp8_blockwise(native[key], native[f"{key}_scale"], torch.bfloat16),
+            reference[key],
+            rtol=0,
+            atol=0,
+        )
+
+    def test_the_experts_cost_a_quarter_of_their_dequantized_size(self, tmp_path, released):
+        """Not a performance assertion -- it is why this mode exists at all.
+
+        The experts are 269 GiB of the release's 475 GiB, and bf16 would be four
+        times that on its own. Keeping them packed is the difference between
+        fitting on eight H20s and not.
+        """
+        _, native = self._convert(tmp_path, released, "native")
+        _, reference = self._convert(tmp_path, released, "bf16")
+
+        def total_bytes(state, key):
+            return sum(
+                state[name].numel() * state[name].element_size() for name in (key, f"{key}_scale") if name in state
+            )
+
+        key = "model.layers.0.mlp.experts.gate_up_proj"
+        # Four bits against sixteen, plus one e8m0 byte per 32 values: the native
+        # side costs (1/2 + 1/32) bytes per value against bf16's 2, or 26.6%.
+        # Pinned rather than bounded -- the number is arithmetic, not a budget,
+        # and drifting off it means a tensor changed dtype without anyone saying so.
+        assert total_bytes(native, key) == pytest.approx(total_bytes(reference, key) * 0.2656, rel=0.01)
+
+    def test_unquantized_tensors_are_not_narrowed_to_save_space(self, tmp_path, released):
+        """Native mode is faithful, not merely smaller, and the two differ here.
+
+        A norm the release stores in float32 stays float32, where the bf16 mode
+        would halve it. That is a real cost -- it is the only place native loses
+        to bf16 -- and it is deliberate: the released precision is what this mode
+        promises, and 6.4 GiB of dense tensors is noise against 269 GiB of
+        experts. Narrowing them would make the mode's name a lie for the sake of
+        a rounding error.
+        """
+        _, native = self._convert(tmp_path, released, "native")
+        _, reference = self._convert(tmp_path, released, "bf16")
+
+        assert native["model.norm.weight"].dtype == torch.float32
+        assert reference["model.norm.weight"].dtype == torch.bfloat16
+
+
+class TestConversionOptions:
+    def test_an_unknown_precision_is_refused(self, tmp_path, released):
+        _, _, path = released
+
+        with pytest.raises(ValueError, match="precision must be one of"):
+            convert_deepseek_v41_checkpoint(path, str(tmp_path / "out"), precision="fp8")
+
+    def test_an_unknown_module_is_refused(self, tmp_path, released):
+        _, _, path = released
+
+        with pytest.raises(ValueError, match="unknown modules"):
+            convert_deepseek_v41_checkpoint(path, str(tmp_path / "out"), modules=["deepseek_v41_brain"])
+
+
 class TestVisionPassthrough:
     def _convert(self, tmp_path, path):
         from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
 
         VisionConfig = OMNI_CONFIG_REGISTRY["deepseek_v41_vision"]()
         config = VisionConfig(num_hidden_layers=1, hidden_size=HIDDEN, num_attention_heads=4, intermediate_size=128)
-        convert_vision(TensorSource(path), str(tmp_path / "out"), config)
+        convert_vision(TensorSource(path), str(tmp_path / "out"), config, "bf16")
         return load_file(str(tmp_path / "out" / "deepseek_v41_vision" / "model.safetensors"))
 
     def test_names_are_unchanged(self, tmp_path, released):

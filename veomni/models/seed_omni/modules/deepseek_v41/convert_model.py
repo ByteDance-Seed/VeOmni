@@ -35,25 +35,41 @@ it, so this converter walks them back rather than forward. The vision tower is
 the exception: its parameter names match :class:`DeepseekV41Vision` exactly and
 pass through untouched.
 
-Quantization
-------------
+Precision
+---------
 Dense projections are fp8 with a 32x32 block scale, routed experts are fp4
-packed two to a byte with a block scale of their own, and both are dequantized
-to bf16 here. The fp4 QAT in ``DeepseekV4Experts`` fake-quantizes *from* bf16,
-so leaving the experts in fp4 storage would quantize an already-quantized
-tensor and lose a second time. See ``dequant.py``.
+packed two to a byte with a block scale of their own, and the two Engram tables
+are fp8 with a scale every 32 columns. There are two ways to land that, and
+which one is right depends on what the output is *for*, so ``precision`` picks
+between them rather than one being a fixed policy:
 
-The two Engram tables are also fp8 in the release and are also dequantized,
-which doubles them to 393 GB. That is a deliberate interim: the tables are
-expected to stay frozen, so fp8 storage with dequant-on-gather would halve
-them, but ``DeepseekV41Ngram`` holds them in an ``nn.Embedding`` and has no
-per-row scale buffer to hold the other half.
+``"bf16"``
+    Every quantized tensor is dequantized and its scale dropped, giving 1.5 TB
+    from a 510 GB release. This is the training output. The fp4 QAT in
+    ``DeepseekV4Experts`` fake-quantizes *from* bf16, so handing it fp4 storage
+    would quantize an already-quantized tensor and lose a second time.
+
+``"native"``
+    Every tensor is passed through in the dtype it was released in, with its
+    ``.scale`` sibling carried alongside as ``<param>_scale``. The output is
+    475 GiB -- the release's own size, rather than triple it -- which is what
+    makes the model fit on eight H20s at all, and it is the only output that
+    runs at the released weights' actual precision. Inference consumes it
+    through ``fp8_gemm`` / ``fp4_gemm``; nothing is ever dequantized back.
+
+Scales ride with their weights under a single rule: the scale of a parameter
+``P`` is stored as ``P + "_scale"``. That holds for a submodule's weight
+(``...wq_a.weight`` -> ``...wq_a.weight_scale``) and for a bare stacked
+parameter alike (``...experts.gate_up_proj`` -> ``...gate_up_proj_scale``), so
+no consumer has to know which kind it is looking at. See ``dequant.py``.
 
 Not converted
 -------------
 The 2,401 ``mtp.*`` tensors are the DSpark draft stages, which this repo does
 not implement yet. They are counted and reported rather than silently dropped,
-so the number is there to check against when DSpark lands.
+so the number is there to check against when DSpark lands. Adding them later is
+cheap -- they are 7.4 GiB against the experts' 269 GiB -- and ``modules``
+exists so that run does not have to redo the expensive folders.
 
 Output
 ------
@@ -95,6 +111,17 @@ MASTER_DTYPE = torch.bfloat16
 #: enough to be noise next to a 197 GB output, large enough that a 384M-row
 #: table is a few hundred reads rather than a few hundred thousand.
 CHUNK_BYTES = 1 * 1000**3
+
+#: ``"bf16"`` for training, ``"native"`` for inference. See the module docstring.
+PRECISIONS = ("bf16", "native")
+
+#: The subfolders a full conversion writes, in the order it writes them.
+MODULES = (
+    "deepseek_v41_vision",
+    "deepseek_v41_text_encoder",
+    "deepseek_v41_ngram",
+    "deepseek_v41_llm",
+)
 
 
 class ShardWriter:
@@ -258,6 +285,20 @@ class TensorSource:
             self._handles[file_name] = handle
         return handle.get_tensor(name)
 
+    def get_released(self, name: str) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """A weight in the dtype it shipped in, and its scale, unmodified.
+
+        The counterpart to :meth:`get_dequantized`: that one spends the scale
+        and returns bf16, this one carries both forward. ``None`` means the
+        tensor was never quantized -- norms, biases, the sink -- not that its
+        scale is missing.
+        """
+        weight = self.get(name)
+        scale_name = _scale_name(name)
+        if scale_name not in self.weight_map:
+            return weight, None
+        return weight, self.get(scale_name)
+
     def get_dequantized(self, name: str) -> torch.Tensor:
         """A weight, with its ``.scale`` sibling applied if it has one."""
         weight = self.get(name)
@@ -321,6 +362,40 @@ def _scale_name(weight_name: str) -> str:
     return weight_name + ".scale"
 
 
+class Emitter:
+    """Reads a released tensor, renames it, and writes it at the chosen precision.
+
+    Exists so the four ``convert_*`` functions stay a list of renames. They
+    describe *what* maps to what, which is the part a reader has to check
+    against the module definitions; whether a scale rides along is a property of
+    the run, and belongs here instead of in forty branches.
+    """
+
+    def __init__(self, source: "TensorSource", writer: "ShardWriter", precision: str) -> None:
+        self.source = source
+        self.writer = writer
+        self.precision = precision
+
+    @property
+    def native(self) -> bool:
+        return self.precision == "native"
+
+    def emit(self, target: str, released: str) -> None:
+        if self.native:
+            weight, scale = self.source.get_released(released)
+            self.writer.add(target, weight)
+            if scale is not None:
+                self.writer.add(f"{target}_scale", scale)
+        else:
+            self.writer.add(target, self.source.get_dequantized(released))
+
+    def emit_tensor(self, target: str, tensor: torch.Tensor, scale: Optional[torch.Tensor] = None) -> None:
+        """For tensors the converter builds rather than reads -- fused, stacked, baked."""
+        self.writer.add(target, tensor)
+        if scale is not None:
+            self.writer.add(f"{target}_scale", scale)
+
+
 def build_compressed_token_map(tokenizer) -> Tuple[List[int], int]:
     """Collapse token ids that normalize alike, as the released engram does.
 
@@ -369,7 +444,7 @@ def build_compressed_token_map(tokenizer) -> Tuple[List[int], int]:
     return lookup, len(key_to_new)
 
 
-def convert_vision(source: TensorSource, output_dir: str, config) -> int:
+def convert_vision(source: TensorSource, output_dir: str, config, precision: str) -> int:
     """The ViT, the aligner and the three image markers -- names unchanged.
 
     Nothing is renamed here because :class:`DeepseekV41Vision` was written
@@ -378,20 +453,22 @@ def convert_vision(source: TensorSource, output_dir: str, config) -> int:
     that happened upstream without this converter noticing.
     """
     writer = ShardWriter(os.path.join(output_dir, "deepseek_v41_vision"))
+    emitter = Emitter(source, writer, precision)
     for name in sorted(source.names()):
         if name.startswith(("vision.", "aligner.", "image_")):
             if name.endswith(".scale"):
                 continue
-            writer.add(name, source.get_dequantized(name))
+            emitter.emit(name, name)
     return writer.finalize(config)
 
 
-def convert_text_encoder(source: TensorSource, output_dir: str, config, model_path: str) -> int:
+def convert_text_encoder(source: TensorSource, output_dir: str, config, model_path: str, precision: str) -> int:
     """``embed`` and ``head``, plus the tokenizer the chat template binds."""
     target_dir = os.path.join(output_dir, "deepseek_v41_text_encoder")
     writer = ShardWriter(target_dir)
-    writer.add("embed_tokens.weight", source.get_dequantized("embed.weight"))
-    writer.add("lm_head.weight", source.get_dequantized("head.weight"))
+    emitter = Emitter(source, writer, precision)
+    emitter.emit("embed_tokens.weight", "embed.weight")
+    emitter.emit("lm_head.weight", "head.weight")
     count = writer.finalize(config)
 
     from transformers import AutoTokenizer
@@ -401,12 +478,14 @@ def convert_text_encoder(source: TensorSource, output_dir: str, config, model_pa
     return count
 
 
-def convert_ngram(source: TensorSource, output_dir: str, config, model_path: str) -> int:
+def convert_ngram(source: TensorSource, output_dir: str, config, model_path: str, precision: str) -> int:
     """The two tables, plus the ``token_map`` baked from the tokenizer.
 
-    The tables are dequantized to bf16, which doubles them. See the module
-    docstring: the release stores them fp8 and they are expected to stay frozen,
-    but the module has nowhere to keep the scales.
+    Each table is a single ``[384M, 256]`` fp8 tensor -- 91.6 GiB that no shard
+    boundary can split, since safetensors stores a tensor whole. Under
+    ``"bf16"`` it doubles to 183 GiB and has to be dequantized a row chunk at a
+    time to keep the float32 intermediate off the heap; under ``"native"`` it is
+    copied as it lies, with the ``[384M, 8]`` scale beside it.
     """
     from transformers import AutoTokenizer
 
@@ -429,12 +508,17 @@ def convert_ngram(source: TensorSource, output_dir: str, config, model_path: str
         )
 
     writer = ShardWriter(os.path.join(output_dir, "deepseek_v41_ngram"))
+    emitter = Emitter(source, writer, precision)
     writer.add("token_map", torch.tensor(lookup, dtype=torch.int64))
     for table_index, layer_id in enumerate(config.layer_ids):
-        writer.add(
-            f"tables.{table_index}.weight",
-            source.get_dequantized_in_row_chunks(f"layers.{layer_id}.engram.embed.weight"),
-        )
+        released = f"layers.{layer_id}.engram.embed.weight"
+        if emitter.native:
+            emitter.emit(f"tables.{table_index}.weight", released)
+        else:
+            emitter.emit_tensor(
+                f"tables.{table_index}.weight",
+                source.get_dequantized_in_row_chunks(released),
+            )
         gc.collect()
     return writer.finalize(config)
 
@@ -497,48 +581,85 @@ def _llm_layer_names(layer: int) -> Dict[str, str]:
     return names
 
 
-def convert_llm(source: TensorSource, output_dir: str, config, engram_layer_ids: List[int]) -> int:
+def convert_llm(source: TensorSource, output_dir: str, config, engram_layer_ids: List[int], precision: str) -> int:
     """The 40 decoder layers, the Engram connections and the final norm."""
     writer = ShardWriter(os.path.join(output_dir, "deepseek_v41_llm"))
+    emitter = Emitter(source, writer, precision)
 
     for layer in range(config.num_hidden_layers):
         for released, target in _llm_layer_names(layer).items():
             if released not in source:
                 continue
-            writer.add(target, source.get_dequantized(released))
+            emitter.emit(target, released)
 
-        # The routed experts, stacked into the fused layout one layer at a time.
-        # This is the memory high-water mark: 384 experts of [4608, 5120] plus
-        # [5120, 2304], ~27 GB in bf16, which is why the loop is per layer and
-        # the intermediates are dropped before the next one.
-        gate_up, down = [], []
-        for expert in range(config.n_routed_experts):
-            prefix = f"layers.{layer}.ffn.experts.{expert}"
-            gate_up.append(
-                fuse_gate_up(
-                    source.get_dequantized(f"{prefix}.w1.weight"),
-                    source.get_dequantized(f"{prefix}.w3.weight"),
-                )
-            )
-            down.append(source.get_dequantized(f"{prefix}.w2.weight"))
-        writer.add(f"model.layers.{layer}.mlp.experts.gate_up_proj", torch.stack(gate_up))
-        writer.add(f"model.layers.{layer}.mlp.experts.down_proj", torch.stack(down))
-        del gate_up, down
-        gc.collect()
+        _convert_layer_experts(emitter, layer, config.n_routed_experts)
 
         # The Engram connection's half: the tables went to the ngram module, the
         # gate and wkv stay here because they read the mHC residual stream.
         if layer in engram_layer_ids:
             connection = f"model.engram.{layer}"
             for part in ("q_weight", "k_weight"):
-                writer.add(f"{connection}.{part}", source.get_dequantized(f"layers.{layer}.engram.{part}"))
-            writer.add(
-                f"{connection}.wkv.weight",
-                source.get_dequantized(f"layers.{layer}.engram.wkv.weight"),
-            )
+                emitter.emit(f"{connection}.{part}", f"layers.{layer}.engram.{part}")
+            emitter.emit(f"{connection}.wkv.weight", f"layers.{layer}.engram.wkv.weight")
 
-    writer.add("model.norm.weight", source.get_dequantized("norm.weight"))
+    emitter.emit("model.norm.weight", "norm.weight")
     return writer.finalize(config)
+
+
+def _convert_layer_experts(emitter: Emitter, layer: int, n_routed_experts: int) -> None:
+    """One layer's routed experts, fused and stacked into the module's layout.
+
+    This is the memory high-water mark, which is why the caller loops per layer
+    and these intermediates are dropped before the next one: 384 experts of
+    [4608, 5120] plus [5120, 2304] is ~27 GB dequantized, and a quarter of that
+    left in fp4.
+
+    The fusion is the same ``cat`` on dim 0 for a weight and for its scale. fp4
+    packs two values per byte along the *last* dimension, and a block scale
+    covers 32 columns of one row, so both tensors are indexed by output row and
+    both concatenate along it -- the gate rows keep their scales and the up rows
+    keep theirs.
+    """
+    prefix = f"layers.{layer}.ffn.experts"
+    target = f"model.layers.{layer}.mlp.experts"
+
+    if not emitter.native:
+        gate_up, down = [], []
+        for expert in range(n_routed_experts):
+            expert_prefix = f"{prefix}.{expert}"
+            gate_up.append(
+                fuse_gate_up(
+                    emitter.source.get_dequantized(f"{expert_prefix}.w1.weight"),
+                    emitter.source.get_dequantized(f"{expert_prefix}.w3.weight"),
+                )
+            )
+            down.append(emitter.source.get_dequantized(f"{expert_prefix}.w2.weight"))
+        emitter.emit_tensor(f"{target}.gate_up_proj", torch.stack(gate_up))
+        emitter.emit_tensor(f"{target}.down_proj", torch.stack(down))
+        del gate_up, down
+        gc.collect()
+        return
+
+    gate_up, gate_up_scale, down, down_scale = [], [], [], []
+    for expert in range(n_routed_experts):
+        expert_prefix = f"{prefix}.{expert}"
+        w1, w1_scale = emitter.source.get_released(f"{expert_prefix}.w1.weight")
+        w3, w3_scale = emitter.source.get_released(f"{expert_prefix}.w3.weight")
+        w2, w2_scale = emitter.source.get_released(f"{expert_prefix}.w2.weight")
+        if w1_scale is None or w3_scale is None or w2_scale is None:
+            raise ValueError(
+                f"layer {layer} expert {expert} has no scale. Routed experts are quantized in every "
+                "released DeepSeek-V4.1 checkpoint, so a missing scale means the source is not the "
+                "release this converter targets, and a native-precision copy of it would be unusable."
+            )
+        gate_up.append(fuse_gate_up(w1, w3))
+        gate_up_scale.append(fuse_gate_up(w1_scale, w3_scale))
+        down.append(w2)
+        down_scale.append(w2_scale)
+    emitter.emit_tensor(f"{target}.gate_up_proj", torch.stack(gate_up), torch.stack(gate_up_scale))
+    emitter.emit_tensor(f"{target}.down_proj", torch.stack(down), torch.stack(down_scale))
+    del gate_up, gate_up_scale, down, down_scale
+    gc.collect()
 
 
 def _build_configs(hf_config: Dict[str, Any]):
@@ -582,9 +703,32 @@ def _build_configs(hf_config: Dict[str, Any]):
     return vision_config, text_encoder_config, ngram_config, llm_config
 
 
-def convert_deepseek_v41_checkpoint(model_path: str, output_dir: str, **kwargs) -> None:
-    """Split the released DeepSeek-V4.1 checkpoint into four module subfolders."""
+def convert_deepseek_v41_checkpoint(
+    model_path: str,
+    output_dir: str,
+    precision: str = "bf16",
+    modules: Optional[Iterable[str]] = None,
+    **kwargs,
+) -> None:
+    """Split the released DeepSeek-V4.1 checkpoint into four module subfolders.
+
+    Args:
+        precision: ``"bf16"`` to dequantize for training, ``"native"`` to keep
+            the released dtypes for inference. See the module docstring.
+        modules: Which subfolders to write, defaulting to all four. A folder is
+            self-contained, so converting one does not invalidate the others --
+            which is the point, since the experts are 269 GiB and a rerun to
+            pick up a fix in, say, the n-gram ``token_map`` should not repay
+            that.
+    """
     del kwargs
+    if precision not in PRECISIONS:
+        raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
+    selected = set(modules) if modules is not None else set(MODULES)
+    unknown = selected - set(MODULES)
+    if unknown:
+        raise ValueError(f"unknown modules {sorted(unknown)}; expected a subset of {list(MODULES)}")
+
     with open(os.path.join(model_path, "config.json")) as handle:
         hf_config = json.load(handle)
 
@@ -593,23 +737,29 @@ def convert_deepseek_v41_checkpoint(model_path: str, output_dir: str, **kwargs) 
 
     skipped = sum(1 for name in source.names() if name.startswith("mtp."))
     print(f"Converting {model_path} -> {output_dir}")
+    print(f"  precision={precision}, modules={sorted(selected)}")
     print(f"  {len(source.weight_map)} tensors, of which {skipped} are mtp.* (DSpark, not implemented)")
 
-    print("Extracting deepseek_v41_vision ...")
-    count = convert_vision(source, output_dir, vision_config)
-    print(f"  {count} tensors")
+    if "deepseek_v41_vision" in selected:
+        print("Extracting deepseek_v41_vision ...")
+        count = convert_vision(source, output_dir, vision_config, precision)
+        print(f"  {count} tensors")
 
-    print("Extracting deepseek_v41_text_encoder ...")
-    count = convert_text_encoder(source, output_dir, text_encoder_config, model_path)
-    print(f"  {count} tensors + tokenizer")
+    if "deepseek_v41_text_encoder" in selected:
+        print("Extracting deepseek_v41_text_encoder ...")
+        count = convert_text_encoder(source, output_dir, text_encoder_config, model_path, precision)
+        print(f"  {count} tensors + tokenizer")
 
-    print("Extracting deepseek_v41_ngram ...")
-    count = convert_ngram(source, output_dir, ngram_config, model_path)
-    print(f"  {count} tensors (tables dequantized to bf16)")
+    if "deepseek_v41_ngram" in selected:
+        print("Extracting deepseek_v41_ngram ...")
+        count = convert_ngram(source, output_dir, ngram_config, model_path, precision)
+        table_note = "tables kept fp8" if precision == "native" else "tables dequantized to bf16"
+        print(f"  {count} tensors ({table_note})")
 
-    print("Extracting deepseek_v41_llm ...")
-    count = convert_llm(source, output_dir, llm_config, list(ngram_config.layer_ids))
-    print(f"  {count} tensors")
+    if "deepseek_v41_llm" in selected:
+        print("Extracting deepseek_v41_llm ...")
+        count = convert_llm(source, output_dir, llm_config, list(ngram_config.layer_ids), precision)
+        print(f"  {count} tensors")
 
     source.close()
     print(f"\nDone. Split checkpoint saved to: {output_dir}")
