@@ -150,7 +150,7 @@ class VLMModelRuntime(VeOmniModelRuntime):
         )
 
     def _freeze_model_module(self):
-        train_args: VLMTrainingArguments = self.train
+        train_args: VLMTrainingArguments = self.train_args
         model_config = self.model_config
         lora_enabled = bool(self.args.lora_config)
         is_omni = model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe")
