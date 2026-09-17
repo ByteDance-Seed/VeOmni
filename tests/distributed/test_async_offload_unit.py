@@ -543,7 +543,7 @@ def _run_async_offload_base_trainer_fsdp2_gc():
             torch_compile=TorchCompileConfig(enable=False),
         ),
     )
-    runtime.train = SimpleNamespace(
+    runtime.train_args = SimpleNamespace(
         checkpoint=SimpleNamespace(load_path=None),
     )
 

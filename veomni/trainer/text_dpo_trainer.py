@@ -166,7 +166,8 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
         args.accelerator.offload_config.enable_async_activation = False
         self.args = args
         self.model_name = model_name
-        self.train = train
+        self.train_args = train
+        self.model_assets = []
         self._torch_dtype = torch_dtype
         self.setup()
         with use_parallel_state(self.model_name):

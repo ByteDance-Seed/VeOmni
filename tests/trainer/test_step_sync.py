@@ -2,6 +2,8 @@ import inspect
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import pytest
+
 import veomni.trainer.base as base_module
 from veomni.trainer.base import BaseTrainer, _resolve_offload_config
 from veomni.trainer.dit_trainer import DiTTrainer
@@ -39,15 +41,26 @@ def test_reset_async_activation_offload_skips_missing_config(monkeypatch):
     monkeypatch.setattr(base_module, "reset_async_activation_offload", lambda model: calls.append(model))
 
     trainer = BaseTrainer.__new__(BaseTrainer)
-    trainer.model = object()
-    trainer.args = SimpleNamespace(model=SimpleNamespace(accelerator=SimpleNamespace()))
+    model = SimpleNamespace(args=SimpleNamespace(accelerator=SimpleNamespace()))
 
-    trainer._reset_async_activation_offload_if_enabled(trainer.model)
+    trainer._reset_async_activation_offload_if_enabled(model)
     assert calls == []
 
-    trainer.args.model.accelerator.offload_config = SimpleNamespace(enable_async_activation=True)
-    trainer._reset_async_activation_offload_if_enabled(trainer.model)
-    assert calls == [trainer.model]
+    model.args.accelerator.offload_config = SimpleNamespace(enable_async_activation=True)
+    trainer._reset_async_activation_offload_if_enabled(model)
+    assert calls == [model]
+
+
+def test_unset_base_trainer_model_raises():
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    with pytest.raises(RuntimeError, match="model is unset"):
+        _ = trainer.model
+
+
+def test_build_training_context_requires_model_args():
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    with pytest.raises(AttributeError):
+        trainer._build_training_context(object())
 
 
 def test_resolve_offload_config_defaults_when_absent():

@@ -200,6 +200,17 @@ def _resolve_offload_config(args) -> OffloadConfig:
     return config if config is not None else OffloadConfig()
 
 
+def _resolve_model_offload_config(model) -> OffloadConfig:
+    """Offload knobs live on this model's accelerator, not the job args.
+
+    ``model.args.accelerator`` must exist — a missing handle is a build bug,
+    not a reason to silently disable activation offload.
+    """
+    accelerator = model.args.accelerator
+    config = getattr(accelerator, "offload_config", None)
+    return config if config is not None else OffloadConfig()
+
+
 def mean_aux_metrics(total_aux_metrics: Dict[str, float], num_micro_steps: int) -> Dict[str, float]:
     """Reduce accumulated ``aux_metrics`` to the mean over a step's micro batches.
 
@@ -258,9 +269,6 @@ class BaseTrainer(Stateful, ABC):
     collate_fn: DataCollator
     train_dataloader: DistributedDataloader
 
-    # Model
-    model: VeOmniModelRuntime = None
-
     # Training context
     model_fwd_context: Any
     model_bwd_context: Any
@@ -279,6 +287,28 @@ class BaseTrainer(Stateful, ABC):
     train_steps: int = 0  # total training steps
     start_epoch: int = 0  # start epoch
     start_step: int = 0  # start step
+
+    @property
+    def model(self) -> VeOmniModelRuntime:
+        """The runtime this job trains.
+
+        Raises if unset so a composed trainer (DPO) cannot silently read the
+        class default ``None`` from a base method that still takes no explicit
+        runtime. Single-model trainers assign this during build; multi-model
+        trainers pass the runtime into those methods instead of binding it here.
+        """
+        try:
+            return self._model
+        except AttributeError:
+            raise RuntimeError(
+                f"{type(self).__name__}.model is unset. Single-model trainers assign it "
+                "during build; a multi-model trainer must pass the runtime into "
+                "base methods explicitly."
+            ) from None
+
+    @model.setter
+    def model(self, value: VeOmniModelRuntime) -> None:
+        self._model = value
 
     def __init__(self, args: VeOmniArguments):
         """
@@ -464,15 +494,15 @@ class BaseTrainer(Stateful, ABC):
         Sync offload still wraps the step in ``saved_tensors_hooks``; its knobs
         live on the runtime, not the job args.
         """
-        accelerator = getattr(getattr(model, "args", None), "accelerator", None)
-        offload_config = getattr(accelerator, "offload_config", None) or OffloadConfig()
+        accelerator = model.args.accelerator
+        offload_config = _resolve_model_offload_config(model)
 
         if offload_config.enable_async_activation:
             from contextlib import nullcontext
 
             self.model_fwd_context, self.model_bwd_context = nullcontext(), nullcontext()
             return
-        enable_gc = bool(getattr(getattr(accelerator, "gradient_checkpointing", None), "enable", False))
+        enable_gc = bool(accelerator.gradient_checkpointing.enable)
         self.model_fwd_context, self.model_bwd_context = build_activation_offloading_context(
             offload_config.enable_activation,
             enable_gc,
@@ -708,7 +738,7 @@ class BaseTrainer(Stateful, ABC):
                 model.set_requires_all_reduce(True)
 
     def _reset_async_activation_offload_if_enabled(self, model) -> None:
-        if _resolve_offload_config(self.args).enable_async_activation:
+        if _resolve_model_offload_config(model).enable_async_activation:
             reset_async_activation_offload(model)
 
     def sync_before_train_step(self):

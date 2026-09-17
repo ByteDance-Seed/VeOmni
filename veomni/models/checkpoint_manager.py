@@ -87,7 +87,7 @@ class ModelCheckpointManager:
 
     def __init__(self, runtime: "VeOmniModelRuntime"):
         self.runtime = runtime
-        self.config: "CheckpointConfig" = runtime.train.checkpoint
+        self.config: "CheckpointConfig" = runtime.train_args.checkpoint
         self._last_saved_step: int = -1
         self.checkpointer: CheckpointerBase = build_checkpointer(
             ckpt_manager=self.config.manager,

@@ -207,7 +207,7 @@ class VLMModelRuntime(VeOmniModelRuntime):
         # KeyError: 'betas' on the first step after resume.
         param_groups = []
         if vit_params:
-            param_groups.append({"params": vit_params, "lr": self.train.vit_lr})
+            param_groups.append({"params": vit_params, "lr": self.train_args.vit_lr})
         if other_params:
             param_groups.append({"params": other_params, "lr": self.args.optimizer.lr})
 

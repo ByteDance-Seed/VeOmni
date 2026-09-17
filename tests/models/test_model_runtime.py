@@ -189,7 +189,7 @@ class TestHowATrainerHoldsItsModel:
         def record_only(runtime, args, model_name="base", *, train=None):
             runtime.args = args
             runtime.model_name = model_name
-            runtime.train = train
+            runtime.train_args = train
 
         monkeypatch.setattr(VeOmniModelRuntime, "__init__", record_only)
 
@@ -199,7 +199,7 @@ class TestHowATrainerHoldsItsModel:
         assert runtime.args is args.model, "the runtime is handed its own slice, not the job"
         assert runtime.model_name == "base"
         assert trainer._build_model_runtime("policy").model_name == "policy"
-        assert runtime.train is args.train, "and the job-wide half it still needs"
+        assert runtime.train_args is args.train, "and the job-wide half it still needs"
         assert runtime.args.chat_template == "chatml", (
             "which chat template to build lives on the model slice, since only the runtime holds the preprocessor"
         )
@@ -418,6 +418,25 @@ def test_unwrapped_module_peels_ddp():
     runtime.model = DDPLike(inner)
 
     assert runtime.unwrapped_module is inner
+
+
+def test_runtime_train_forwards_to_the_wrapped_module():
+    runtime = unbuilt_runtime(ModelArguments(model_path="somewhere"), train=train_args())
+    runtime.model = nn.Linear(1, 1)
+    runtime.model.eval()
+
+    returned = runtime.train()
+
+    assert runtime.model.training is True
+    assert returned is runtime.model
+
+
+def test_model_assets_are_per_instance():
+    left = unbuilt_runtime(ModelArguments(model_path="somewhere"))
+    right = unbuilt_runtime(ModelArguments(model_path="somewhere"))
+    left.model_assets.append("only-left")
+
+    assert right.model_assets == []
 
 
 def test_channel_loss_install_patches_the_module_not_the_handle():
