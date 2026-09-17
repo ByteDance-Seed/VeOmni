@@ -62,15 +62,15 @@ def test_build_training_context_without_offload_config(monkeypatch):
     monkeypatch.setattr(base_module, "build_activation_offloading_context", lambda *args, **kwargs: contexts)
 
     trainer = BaseTrainer.__new__(BaseTrainer)
-    trainer.args = SimpleNamespace(
-        model=SimpleNamespace(
+    model = SimpleNamespace(
+        args=SimpleNamespace(
             accelerator=SimpleNamespace(
                 gradient_checkpointing=SimpleNamespace(enable=False),
             ),
         )
     )
 
-    trainer._build_training_context()
+    trainer._build_training_context(model)
 
     assert trainer.model_fwd_context is contexts[0]
     assert trainer.model_bwd_context is contexts[1]

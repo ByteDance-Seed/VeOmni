@@ -22,7 +22,7 @@ class TextRLTrainer(TextTrainer):
         self.base._build_collate_fn()
         self.base._build_dataloader()
         self.base._build_lr_scheduler()
-        self.base._build_training_context()
+        self.base._build_training_context(self.base.model)
         self.base._init_callbacks()
 
         self.base._build_preforward_postforward()

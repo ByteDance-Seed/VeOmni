@@ -217,7 +217,7 @@ class TextDPOTrainer:
             self.base._build_dataloader()
         self._build_postforward()
         self.policy_model._build_lr_scheduler(args.train_steps * args.train.num_train_epochs)
-        self.base._build_training_context()
+        self.base._build_training_context(self.policy_model)
         self.base._init_callbacks(self)
 
         self.reference_model = self._build_reference_model_runtime()

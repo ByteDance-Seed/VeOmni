@@ -307,7 +307,7 @@ class BaseTrainer(Stateful, ABC):
             self._build_dataloader()
         # The dataset fixes train_steps, which the schedule needs.
         self._build_lr_scheduler()
-        self._build_training_context()
+        self._build_training_context(self.model)
         self._init_callbacks()
 
     @staticmethod
@@ -456,20 +456,26 @@ class BaseTrainer(Stateful, ABC):
             **dataloader_kwargs,
         )
 
-    def _build_training_context(self):
-        """Build training context for distributed training."""
-        offload_config = _resolve_offload_config(self.args)
+    def _build_training_context(self, model) -> None:
+        """Build fwd/bwd contexts from this model's offload config.
 
-        # Async activation offload uses per-module saved_tensors_hooks (applied
-        # before FSDP sharding), so the global fwd/bwd contexts are nullcontext.
+        Async activation offload uses per-module ``saved_tensors_hooks`` (applied
+        before FSDP sharding), so the trainer-level contexts are ``nullcontext``.
+        Sync offload still wraps the step in ``saved_tensors_hooks``; its knobs
+        live on the runtime, not the job args.
+        """
+        accelerator = getattr(getattr(model, "args", None), "accelerator", None)
+        offload_config = getattr(accelerator, "offload_config", None) or OffloadConfig()
+
         if offload_config.enable_async_activation:
             from contextlib import nullcontext
 
             self.model_fwd_context, self.model_bwd_context = nullcontext(), nullcontext()
             return
+        enable_gc = bool(getattr(getattr(accelerator, "gradient_checkpointing", None), "enable", False))
         self.model_fwd_context, self.model_bwd_context = build_activation_offloading_context(
             offload_config.enable_activation,
-            self.args.model.accelerator.gradient_checkpointing.enable,
+            enable_gc,
             offload_config.activation_gpu_limit,
         )
 
