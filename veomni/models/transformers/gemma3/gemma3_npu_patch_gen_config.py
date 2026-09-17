@@ -1,0 +1,221 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Patch configuration for Gemma 3 VeOmni NPU modeling path (text + VLM).
+
+Regen command:
+patchgen veomni.models.transformers.gemma3.gemma3_npu_patch_gen_config -o veomni/models/transformers/gemma3/generated --diff
+
+This mirrors the GPU patch in
+veomni/models/transformers/gemma3/gemma3_gpu_patch_gen_config.py and adds
+OpSlot guards for NPU fused RMSNorm and RoPE kernels, plus a VLM-aware
+patch for Gemma3ForConditionalGeneration.forward that uses fused CE.
+
+This file itself is not runnable. It's used to generate the runnable explicitly patched modeling file
+"generated/patched_modeling_gemma3_npu.py".
+"""
+
+import torch
+from transformers.cache_utils import Cache
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs
+
+from veomni.models.transformers.gemma3.gemma3_gpu_patch_gen_config import (
+    config as gpu_config,
+)
+from veomni.models.transformers.gemma3.gemma3_gpu_patch_gen_config import (
+    gemma3_forcausallm_forward_patched,
+    gemma3_textmodel_forward_patched,
+)
+from veomni.patchgen.patch_spec import PatchConfig
+
+
+config = PatchConfig(
+    source_module="transformers.models.gemma3.modeling_gemma3",
+    target_file="patched_modeling_gemma3_npu.py",
+    description="Gemma 3 (text + VLM) with VeOmni NPU fused-operator replacements",
+)
+
+# Mirror additional imports + post-import helpers + dropped names from the GPU
+# config so the generated file is self-contained (same masking-utils imports,
+# same CausalLMOutputWithLogProbs import, same veomni_causal_lm_loss OpSlot).
+config.additional_imports.extend(gpu_config.additional_imports)
+config.post_import_blocks.extend(gpu_config.post_import_blocks)
+config.helpers.extend(gpu_config.helpers)
+config.drop_imported_names.update(gpu_config.drop_imported_names)
+
+# NPU-specific OpSlot declarations (RMSNorm + RoPE) on top of the GPU config's
+# cross-entropy-loss OpSlot.
+config.add_post_import_block(
+    """
+    # ── NPU OpSlot declarations ────────────────────────────────────────────
+    # Bound at model-build time by _bind_veomni_ops() in auto.py.
+    from veomni.ops.dispatch import OpSlot
+    veomni_rms_norm = OpSlot("rms_norm", "standard")
+    veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
+    """
+)
+
+
+# ── RMSNorm (OpSlot guard, NPU fused kernel) ───────────────────────────────
+# Gemma 3 uses (1.0 + weight) scaling (weight zero-initialised), and the eps
+# attribute is ``self.eps`` (not ``self.variance_epsilon``).  Pass ``1.0 +
+# self.weight`` so the NPU ``npu_rms_norm`` kernel reproduces the Gemma
+# contract exactly.
+
+
+@config.override_method(
+    "Gemma3RMSNorm.forward",
+    description="OpSlot guard for NPU fused RMSNorm (Gemma 1.0+weight formulation)",
+)
+def gemma3_rmsnorm_forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+    if veomni_rms_norm.use_non_eager_impl:
+        return veomni_rms_norm(x, 1.0 + self.weight, self.eps)
+    # Original HF code below, unchanged.
+    output = self._norm(x.float())
+    output = output * (1.0 + self.weight.float())
+    return output.type_as(x)
+
+
+# ── Rotary Positional Embedding (OpSlot guard, NPU fused kernel) ───────────
+
+
+@config.replace_function(
+    "apply_rotary_pos_emb",
+    description="OpSlot guard for NPU fused RoPE",
+)
+def apply_rotary_pos_emb_npu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    # Original HF code below, unchanged.
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+# ── Gemma3TextModel.forward (pass packed-sequence boundaries) ──────────────
+# Reuse the GPU patch verbatim — the masking-utils wrappers handle both
+# FlexAttention (BlockMask) and SDPA/eager (tensor mask) backends.
+
+
+config.override_method(
+    "Gemma3TextModel.forward",
+    replacement=gemma3_textmodel_forward_patched,
+    description="Pass packed-sequence boundaries into VeOmni FlexAttention mask preparation",
+)
+
+
+# ── Gemma3ForCausalLM.forward (fused cross-entropy via OpSlot) ──────────────
+# Reuse the GPU patch verbatim — the veomni_causal_lm_loss OpSlot dispatches to
+# the NPU chunk-loss kernel when bound.
+
+
+config.override_method(
+    "Gemma3ForCausalLM.forward",
+    replacement=gemma3_forcausallm_forward_patched,
+    description="Adapt Gemma 3 causal-LM loss to VeOmni's fused-loss output contract",
+)
+
+
+# ── Gemma3ForConditionalGeneration.forward (VLM fused cross-entropy) ────────
+# Patch the multimodal (VLM) forward to use VeOmni's fused-CE OpSlot instead
+# of the upstream ``nn.CrossEntropyLoss``.  This is the VLM-specific addition
+# over the text-only GPU config (which only patches Gemma3ForCausalLM).
+
+
+@config.override_method(
+    "Gemma3ForConditionalGeneration.forward",
+    description="Use VeOmni fused cross-entropy in the VLM forward path",
+)
+def gemma3_for_conditional_generation_forward_npu(
+    self,
+    input_ids: torch.LongTensor | None = None,
+    pixel_values: torch.FloatTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    token_type_ids: torch.LongTensor | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    labels: torch.LongTensor | None = None,
+    use_cache: bool | None = None,
+    logits_to_keep: int | torch.Tensor = 0,
+    **lm_kwargs: Unpack[TransformersKwargs],
+) -> CausalLMOutputWithPast:
+    outputs = self.model(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        token_type_ids=token_type_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        labels=labels,
+        return_dict=True,
+        **lm_kwargs,
+    )
+
+    hidden_states = outputs[0]
+    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+
+    loss = None
+    logits = None
+    fused_linear_aux = None
+    if labels is not None:
+        if veomni_causal_lm_loss.use_non_eager_impl:
+            if self.config.text_config.final_logit_softcapping is not None:
+                raise ValueError(
+                    "Gemma 3 fused-linear loss does not support final_logit_softcapping; "
+                    "use cross_entropy_loss_implementation='eager'."
+                )
+            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
+                logits=None,
+                labels=labels,
+                vocab_size=self.config.text_config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **lm_kwargs,
+            )
+        else:
+            logits = self.lm_head(hidden_states).float()
+            loss, _, fused_linear_aux = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.text_config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **lm_kwargs,
+            )
+            if fused_linear_aux is not None:
+                logits = None
+    else:
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+    return CausalLMOutputWithLogProbs(
+        loss=loss,
+        logits=logits,
+        fused_linear_aux=fused_linear_aux,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+    )

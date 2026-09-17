@@ -1,7 +1,11 @@
 model:
   model_path: google/gemma-3-270m
   ops_implementation:
-    attn_implementation: flex_attention
+    attn_implementation: sdpa
+    rms_norm_implementation: liger_kernel
+    rotary_pos_emb_implementation: liger_kernel
+    swiglu_mlp_implementation: liger_kernel
+    cross_entropy_loss_implementation: liger_kernel
 
 data:
   train_path: tulu-3-sft-mixture
@@ -15,7 +19,7 @@ data:
 train:
   dyn_bsz: false
   accelerator:
-    ulysses_size: 2
+    ulysses_size: 1
     fsdp_config:
       fsdp_mode: fsdp2
       mixed_precision:
@@ -37,11 +41,11 @@ train:
   enable_full_determinism: false
   empty_cache_steps: 500
   checkpoint:
-    output_dir: gemma-3-270m-sft-tulu
+    output_dir: gemma-3-270m-sft-tulu-gpu-sdpa
     manager: dcp
-    save_steps: 10000
+    save_steps: 100
     save_epochs: 1
     save_hf_weights: true
   wandb:
     project: VeOmni
-    name: gemma-3-270m-sft-tulu
+    name: gemma-3-270m-sft-tulu-gpu-sdpa

@@ -98,6 +98,7 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 | Migrate existing model to transformers v5 | `/veomni-migrate-transformers-v5` |
 | Add new op/kernel | `/veomni-new-op` |
 | Update dependencies (uv) | `/veomni-uv-update` |
+| Migrate GPU model to Ascend NPU | `/veomni-gpu-to-npu` |
 | Performance profiling | `/veomni-profile` |
 | Create or update a pull request | `/create-pr` |
 
@@ -109,5 +110,6 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 - **"Fix this error" / "training hangs" / "wrong results"** → `/veomni-debug`
 - **"Add a new capability" / "refactor" / "clean up"** → `/veomni-develop`
 - **"Update package X" / "bump uv" / "upgrade torch"** → `/veomni-uv-update`
+- **"Port X to NPU" / "Ascend support" / "add NPU patch"** → `/veomni-gpu-to-npu`
 - **"Analyze this trace" / "why is training slow" / "profile" / "MFU"** → `/veomni-profile`
 - **"Create a PR" / "submit PR"** → `/create-pr`

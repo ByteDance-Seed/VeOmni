@@ -171,3 +171,9 @@ nsysoutput/
 
 # Agents worksspace should not be tracked by the primary repo.
 .agents_workspace/
+
+# NPU migration: training checkpoints, data, and debug artifacts
+gemma-3-*-sft-tulu*/
+nohup.out
+torch_compile_debug/
+tulu-first2000.parquet

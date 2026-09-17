@@ -42,7 +42,14 @@ from veomni.models.transformers.gemma3.generated.patched_modeling_gemma3_gpu imp
 )
 from veomni.ops.kernels import attention as veomni_attention
 from veomni.ops.kernels.attention import flex as flex_attention
-from veomni.utils.device import IS_CUDA_AVAILABLE, empty_cache, get_device_type, get_torch_device, synchronize
+from veomni.utils.device import (
+    IS_CUDA_AVAILABLE,
+    IS_NPU_AVAILABLE,
+    empty_cache,
+    get_device_type,
+    get_torch_device,
+    synchronize,
+)
 
 
 _TOY_CONFIG = Path(__file__).parents[1] / "toy_config" / "gemma3_toy"
@@ -120,6 +127,7 @@ def _efficient_attention_profile_forward(
     return output.transpose(1, 2).contiguous(), None
 
 
+@pytest.mark.skipif(IS_NPU_AVAILABLE, reason="flex_attention is GPU-only; NPU uses sdpa")
 def test_gemma3_text_registry_builds_generated_flex_model(monkeypatch):
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
 
