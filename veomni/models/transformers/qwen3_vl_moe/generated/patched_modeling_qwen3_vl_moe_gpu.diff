@@ -30,7 +30,7 @@
 -
 +#  Patches applied:
 +#    - method_override: Qwen3VLMoeModel.__init__
-+#      Construct generated towers and propagate the MoE implementation to text_config
++#      Construct generated vision and text towers instead of upstream AutoModel classes
 +#    - method_override: Qwen3VLMoeTextRMSNorm.__init__
 +#      Construct a local rms_norm VeomniOp
 +#    - method_override: Qwen3VLMoeTextRMSNorm.forward
@@ -1215,11 +1215,9 @@
  @auto_docstring
  class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
      base_model_prefix = "model"
-@@ -977,12 +1583,11 @@
-     accepts_loss_kwargs = False
+@@ -978,11 +1584,9 @@
 
      def __init__(self, config):
-+        config.text_config._moe_implementation = getattr(config, "_moe_implementation", "eager")
          super().__init__(config)
 -        self.visual = AutoModel.from_config(config.vision_config)
 -        self.language_model = AutoModel.from_config(config.text_config)
@@ -1232,7 +1230,7 @@
          self.post_init()
 
      def get_vision_position_ids(
-@@ -1142,6 +1747,13 @@
+@@ -1142,6 +1746,13 @@
          # Same implementation as for images
          return self.get_image_features(pixel_values_videos, video_grid_thw, **kwargs)
 
@@ -1246,7 +1244,7 @@
      @accepts_precomputed_kwargs(modality="image")
      @can_return_tuple
      @auto_docstring
-@@ -1150,57 +1762,40 @@
+@@ -1150,57 +1761,40 @@
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -1326,7 +1324,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1252,6 +1847,16 @@
+@@ -1252,6 +1846,16 @@
              position_ids = None
          return position_ids
 
@@ -1343,7 +1341,7 @@
      @auto_docstring
      @can_return_tuple
      def forward(
-@@ -1265,48 +1870,184 @@
+@@ -1265,48 +1869,184 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1545,7 +1543,7 @@
              visual_pos_masks = image_mask | video_mask
              deepstack_visual_embeds = []
              image_mask_joint = image_mask[visual_pos_masks]
-@@ -1316,25 +2057,63 @@
+@@ -1316,25 +2056,63 @@
                  embed_joint[image_mask_joint, :] = img_embed
                  embed_joint[video_mask_joint, :] = vid_embed
                  deepstack_visual_embeds.append(embed_joint)
@@ -1614,7 +1612,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1342,13 +2121,18 @@
+@@ -1342,13 +2120,18 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1634,7 +1632,7 @@
              rope_deltas=self.rope_deltas,
          )
 
-@@ -1422,16 +2206,34 @@
+@@ -1422,16 +2205,34 @@
      return overall_loss * num_experts
 
 
@@ -1670,7 +1668,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -1460,6 +2262,11 @@
+@@ -1460,6 +2261,11 @@
          """
          return self.model.get_image_features(pixel_values, image_grid_thw, **kwargs)
 
@@ -1682,7 +1680,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1474,92 +2281,59 @@
+@@ -1474,92 +2280,59 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1802,7 +1800,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1567,7 +2341,8 @@
+@@ -1567,7 +2340,8 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
@@ -1812,7 +1810,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -1755,6 +2530,59 @@
+@@ -1755,6 +2529,59 @@
 
          return input_ids, model_kwargs
 

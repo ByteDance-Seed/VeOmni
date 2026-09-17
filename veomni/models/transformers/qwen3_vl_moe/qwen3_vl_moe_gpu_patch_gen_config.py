@@ -81,10 +81,9 @@ config.drop_import_names("use_kernelized_func")
 
 @config.override_method(
     "Qwen3VLMoeModel.__init__",
-    description="Construct generated towers and propagate the MoE implementation to text_config",
+    description="Construct generated vision and text towers instead of upstream AutoModel classes",
 )
 def qwen3_vl_moe_model_init_patched(self, config):
-    config.text_config._moe_implementation = getattr(config, "_moe_implementation", "eager")
     super().__init__(config)
     self.visual = Qwen3VLMoeVisionModel._from_config(config.vision_config)
     self.language_model = Qwen3VLMoeTextModel._from_config(config.text_config)

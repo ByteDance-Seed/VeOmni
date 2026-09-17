@@ -151,13 +151,13 @@ config.override_method(
     description="Always call the local rms_norm qwen3_5 VeomniOp",
 )
 
-# ── Propagate _moe_implementation from top-level config to text_config ────────
+# ── Construct generated vision / text towers ──────────────────────────────────
 
 
 config.override_method(
     "Qwen3_5MoeModel.__init__",
     replacement=qwen3_5_moe_model_init_patched,
-    description="Propagate _moe_implementation from top-level config to text_config",
+    description="Construct generated vision and text towers instead of upstream AutoModel classes",
 )
 
 

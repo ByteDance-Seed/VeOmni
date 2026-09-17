@@ -71,7 +71,7 @@ config.exclude.extend(gpu_config.exclude)
 config.override_method(
     "Qwen3VLMoeModel.__init__",
     replacement=qwen3_vl_moe_model_init_patched,
-    description="Construct generated towers and propagate the MoE implementation to text_config",
+    description="Construct generated vision and text towers instead of upstream AutoModel classes",
 )
 
 

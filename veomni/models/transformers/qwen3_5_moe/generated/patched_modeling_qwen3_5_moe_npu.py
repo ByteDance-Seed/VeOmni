@@ -14,7 +14,7 @@
 #    - method_override: Qwen3_5MoeRMSNorm.forward
 #      Always call the local rms_norm qwen3_5 VeomniOp
 #    - method_override: Qwen3_5MoeModel.__init__
-#      Propagate _moe_implementation from top-level config to text_config
+#      Construct generated vision and text towers instead of upstream AutoModel classes
 #    - method_override: Qwen3_5MoeSparseMoeBlock.forward
 #      Avoid in-place += on custom autograd Function output
 #    - method_override: Qwen3_5MoeModel.get_image_features
@@ -1981,12 +1981,8 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
     # liger_rotary_pos_emb applies RoPE to the full head_dim, producing incorrect
     # results and NaN in attention output.
 
-    # ── Propagate _moe_implementation from top-level config to text_config ────────
+    # ── Construct generated vision / text towers ──────────────────────────────────
     def __init__(self, config):
-        # Propagate _moe_implementation so SparseMoeBlock picks up the correct mode.
-        moe_implementation = getattr(config, "_moe_implementation", "eager")
-        config.text_config._moe_implementation = moe_implementation
-
         super().__init__(config)
         self.visual = Qwen3_5MoeVisionModel._from_config(config.vision_config)
         self.language_model = Qwen3_5MoeTextModel._from_config(config.text_config)

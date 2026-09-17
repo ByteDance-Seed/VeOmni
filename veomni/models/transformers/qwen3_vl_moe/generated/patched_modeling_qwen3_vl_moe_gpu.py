@@ -10,7 +10,7 @@
 #
 #  Patches applied:
 #    - method_override: Qwen3VLMoeModel.__init__
-#      Construct generated towers and propagate the MoE implementation to text_config
+#      Construct generated vision and text towers instead of upstream AutoModel classes
 #    - method_override: Qwen3VLMoeTextRMSNorm.__init__
 #      Construct a local rms_norm VeomniOp
 #    - method_override: Qwen3VLMoeTextRMSNorm.forward
@@ -1583,7 +1583,6 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
     accepts_loss_kwargs = False
 
     def __init__(self, config):
-        config.text_config._moe_implementation = getattr(config, "_moe_implementation", "eager")
         super().__init__(config)
         self.visual = Qwen3VLMoeVisionModel._from_config(config.vision_config)
         self.language_model = Qwen3VLMoeTextModel._from_config(config.text_config)

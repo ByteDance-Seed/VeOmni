@@ -159,18 +159,14 @@ def qwen3_5_moe_rmsnorm_forward_patched(self, x):
 # results and NaN in attention output.
 
 
-# ── Propagate _moe_implementation from top-level config to text_config ────────
+# ── Construct generated vision / text towers ──────────────────────────────────
 
 
 @config.override_method(
     "Qwen3_5MoeModel.__init__",
-    description="Propagate _moe_implementation from top-level config to text_config",
+    description="Construct generated vision and text towers instead of upstream AutoModel classes",
 )
 def qwen3_5_moe_model_init_patched(self, config):
-    # Propagate _moe_implementation so SparseMoeBlock picks up the correct mode.
-    moe_implementation = getattr(config, "_moe_implementation", "eager")
-    config.text_config._moe_implementation = moe_implementation
-
     super().__init__(config)
     self.visual = Qwen3_5MoeVisionModel._from_config(config.vision_config)
     self.language_model = Qwen3_5MoeTextModel._from_config(config.text_config)
