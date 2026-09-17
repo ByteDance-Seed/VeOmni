@@ -376,6 +376,11 @@ class FakeModelRuntime(VeOmniModelRuntime):
         self.model = FakeModel().to(get_device_type())
         self.model_config = PretrainedConfig()
 
+    def _build_model_assets(self) -> None:
+        # ``config_path=test`` is a stub, not a Hub repo. Skip the preprocessor
+        # load the parent would otherwise attempt.
+        self.model_assets = [self.model_config]
+
 
 def compare_items(item, rank, group_size, group):
     item = item.to(get_device_type())
