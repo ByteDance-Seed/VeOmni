@@ -701,9 +701,9 @@ class BaseTrainer(Stateful, ABC):
             elif micro_step == num_micro_steps - 1:
                 model.set_requires_all_reduce(True)
 
-    def _reset_async_activation_offload_if_enabled(self):
+    def _reset_async_activation_offload_if_enabled(self, model) -> None:
         if _resolve_offload_config(self.args).enable_async_activation:
-            reset_async_activation_offload(self.model)
+            reset_async_activation_offload(model)
 
     def sync_before_train_step(self):
         if self.args.train.sync_each_train_step:
@@ -717,7 +717,7 @@ class BaseTrainer(Stateful, ABC):
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
-        self._reset_async_activation_offload_if_enabled()
+        self._reset_async_activation_offload_if_enabled(self.model)
         self.on_step_begin(micro_batches=micro_batches)
 
         # Forward and backward for each micro batch

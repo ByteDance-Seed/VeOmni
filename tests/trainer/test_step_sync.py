@@ -42,11 +42,11 @@ def test_reset_async_activation_offload_skips_missing_config(monkeypatch):
     trainer.model = object()
     trainer.args = SimpleNamespace(model=SimpleNamespace(accelerator=SimpleNamespace()))
 
-    trainer._reset_async_activation_offload_if_enabled()
+    trainer._reset_async_activation_offload_if_enabled(trainer.model)
     assert calls == []
 
     trainer.args.model.accelerator.offload_config = SimpleNamespace(enable_async_activation=True)
-    trainer._reset_async_activation_offload_if_enabled()
+    trainer._reset_async_activation_offload_if_enabled(trainer.model)
     assert calls == [trainer.model]
 
 
@@ -99,7 +99,7 @@ def test_train_step_uses_async_offload_reset_helper():
     for wrapper_cls in (BaseTrainer, TextTrainer, VLMTrainer, TextDPOTrainer, DiTTrainer):
         source = inspect.getsource(wrapper_cls.train_step)
 
-        assert "_reset_async_activation_offload_if_enabled()" in source
+        assert "_reset_async_activation_offload_if_enabled(" in source
 
 
 def test_train_step_uses_hsdp_allreduce_helper():
