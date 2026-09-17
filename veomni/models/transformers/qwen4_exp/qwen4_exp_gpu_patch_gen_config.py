@@ -1170,21 +1170,21 @@ def qwen4_exp_for_conditional_generation_forward_patched(
 
 
 # Names resolved at codegen time from generated imports.
-apply_rotary_pos_emb = None
 apply_rotary_pos_emb_vision = None
 is_flash_attention_requested = None
 get_max_seqlen = None
 
 
-@config.modify_init("Qwen4ExpTextAttention", description="Bind instance-local attention VeomniOp")
+@config.modify_init("Qwen4ExpTextAttention", description="Bind instance-local rope and attention VeomniOps")
 def qwen4_exp_text_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
     self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
 @config.override_method(
     "Qwen4ExpTextAttention.forward",
-    description="Always call the local attention VeomniOp",
+    description="Always call the local rope and attention VeomniOps",
 )
 def qwen4_exp_text_attention_forward_patched(
     self,
@@ -1212,7 +1212,7 @@ def qwen4_exp_text_attention_forward_patched(
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)

@@ -17,8 +17,6 @@
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: SeedOssMLP.forward
 #      Call swiglu_mlp for silu/swish, otherwise self.act_fn, then residual dropout
-#    - function_replacement: apply_rotary_pos_emb
-#      Always call rope full VeomniOp
 #    - method_override: SeedOssForCausalLM.__init__
 #      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: SeedOssForCausalLM.forward
@@ -34,8 +32,6 @@ from collections.abc import Callable
 from functools import partial
 
 # Additional imports for patches
-from typing import Optional
-
 import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
@@ -119,31 +115,6 @@ class SeedOssMLP(nn.Module):
         else:
             down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return nn.functional.dropout(down_proj, p=self.residual_dropout, training=self.training)
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-# ======================================================================
-# [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: Always call rope full VeomniOp
-# Source: veomni.models.transformers.seed_oss.seed_oss_gpu_patch_gen_config
-# ======================================================================
-def apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    position_ids: Optional[torch.Tensor] = None,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    del position_ids
-    rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    return rope(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:

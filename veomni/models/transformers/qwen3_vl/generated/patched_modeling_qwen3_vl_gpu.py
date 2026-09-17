@@ -15,8 +15,6 @@
 #      Construct a local rms_norm VeomniOp
 #    - method_override: Qwen3VLTextRMSNorm.forward
 #      Always call the local rms_norm VeomniOp
-#    - function_replacement: apply_rotary_pos_emb
-#      Always call rope full VeomniOp
 #    - function_replacement: apply_rotary_pos_emb_vision
 #      Call rope full VeomniOp with rank-3 vision layout
 #    - init_modification: Qwen3VLVisionAttention
@@ -73,7 +71,7 @@ from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_kernel_forward_from_hub, use_kernelized_func
+from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
@@ -722,29 +720,11 @@ class Qwen3VLTextRMSNorm(nn.Module):
 
 
 # ======================================================================
-# [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: Always call rope full VeomniOp
-# Source: veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config
-# ======================================================================
-# ── Rotary Positional Embedding (always call rope full VeomniOp) ─────────
-def apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    return rope(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
-
-
-# ======================================================================
 # [MODIFIED CLASS] Qwen3VLTextAttention
 # Methods patched: forward, __init__
 # ======================================================================
 
 
-@use_kernelized_func(apply_rotary_pos_emb)
 class Qwen3VLTextAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 

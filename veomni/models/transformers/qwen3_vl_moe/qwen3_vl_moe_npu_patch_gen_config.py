@@ -21,7 +21,6 @@ patchgen veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_npu_patch_gen_conf
 """
 
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
-    apply_rotary_pos_emb_patched,
     apply_rotary_pos_emb_vision_patched,
     qwen3_vl_get_metadata_collate_func_patched,
     qwen3_vl_get_position_id_func_patched,
@@ -68,6 +67,7 @@ config.helpers.extend(gpu_config.helpers)
 # now superseded by ``Qwen3VLMoeCausalLMOutputWithLogProbs`` for the FSDP2-safe
 # pre-backward unshard hook on ``lm_head``).
 config.drop_imported_names.update(gpu_config.drop_imported_names)
+config.exclude.extend(gpu_config.exclude)
 
 config.override_method(
     "Qwen3VLMoeModel.__init__",
@@ -191,11 +191,6 @@ config.override_method(
     "Qwen3VLMoeForConditionalGeneration.get_parallel_plan",
     replacement=qwen3_vl_moe_get_parallel_plan_patched,
     description="Register Qwen3VLMoe expert parallel plan for v5 generated modeling",
-)
-config.replace_function(
-    "apply_rotary_pos_emb",
-    replacement=apply_rotary_pos_emb_patched,
-    description="Always call rope full VeomniOp",
 )
 config.replace_function(
     "apply_rotary_pos_emb_vision",

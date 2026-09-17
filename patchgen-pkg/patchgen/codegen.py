@@ -255,17 +255,15 @@ def get_object_source_with_leading_comments(obj: Any) -> str:
     return "".join(leading) + "".join(src_lines)
 
 
-def extract_source_segment(source_lines: list[str], start_line: int, end_line: int) -> str:
+def extract_source_span(source_lines: list[str], start_line: int, end_line: int) -> tuple[int, str]:
     """
-    Extract a segment of source code from source lines, preserving comments and blank lines.
+    Extract a source span, including leading comments and decorators.
 
-    Also includes any leading comments and decorators that precede the definition.
-    Line numbers are 1-indexed (as in AST).
+    Line numbers are 1-indexed (as in AST). Returns ``(first_line, segment)``
+    where ``first_line`` is the 1-indexed start of the extracted text.
     """
-    # Look backwards for leading comments and blank lines
     actual_start = start_line - 1  # Convert to 0-indexed
 
-    # Include leading comments/decorators (lines starting with # or @)
     while actual_start > 0:
         prev_line = source_lines[actual_start - 1].strip()
         if prev_line.startswith("#") or prev_line.startswith("@") or prev_line == "":
@@ -273,9 +271,45 @@ def extract_source_segment(source_lines: list[str], start_line: int, end_line: i
         else:
             break
 
-    # Extract the segment
     segment = source_lines[actual_start:end_line]
-    return "\n".join(segment)
+    return actual_start + 1, "\n".join(segment)
+
+
+def extract_source_segment(source_lines: list[str], start_line: int, end_line: int) -> str:
+    """
+    Extract a segment of source code from source lines, preserving comments and blank lines.
+
+    Also includes any leading comments and decorators that precede the definition.
+    Line numbers are 1-indexed (as in AST).
+    """
+    _, segment = extract_source_span(source_lines, start_line, end_line)
+    return segment
+
+
+def _decorator_mentions_names(decorator: ast.expr, names: set[str]) -> bool:
+    return any(isinstance(node, ast.Name) and node.id in names for node in ast.walk(decorator))
+
+
+def strip_decorators_referencing_names(node: ast.AST, source: str, extract_start: int, names: set[str]) -> str:
+    """Drop decorator lines from ``source`` when they reference ``names``."""
+    decorator_list = getattr(node, "decorator_list", None)
+    if not names or not decorator_list:
+        return source
+
+    drop_ranges = []
+    for decorator in decorator_list:
+        if not _decorator_mentions_names(decorator, names):
+            continue
+        start_idx = decorator.lineno - extract_start
+        end_idx = (decorator.end_lineno or decorator.lineno) - extract_start
+        drop_ranges.append((start_idx, end_idx))
+    if not drop_ranges:
+        return source
+
+    lines = source.split("\n")
+    for start_idx, end_idx in sorted(drop_ranges, reverse=True):
+        del lines[start_idx : end_idx + 1]
+    return "\n".join(lines)
 
 
 def get_node_end_line(node: ast.AST, source_lines: list[str]) -> int:
@@ -1185,6 +1219,12 @@ class ModelingCodeGenerator:
 
         # Generate output
         lines = []
+        end_line = get_node_end_line(class_node, self.source_lines)
+        start_line = get_node_start_line(class_node)
+        extract_start, class_source = extract_source_span(self.source_lines, start_line, end_line)
+        class_source = strip_decorators_referencing_names(
+            class_node, class_source, extract_start, set(self.config.exclude)
+        )
         if methods_patched:
             lines.append("")
             lines.append(f"# {'=' * 70}")
@@ -1193,20 +1233,12 @@ class ModelingCodeGenerator:
             lines.append(f"# {'=' * 70}")
             # Preserve original class formatting/comments for untouched methods,
             # and replace only the patched methods in-place.
-            end_line = get_node_end_line(class_node, self.source_lines)
-            start_line = get_node_start_line(class_node)
-            class_source = extract_source_segment(self.source_lines, start_line, end_line)
-
-            # Replace the unparsed method bodies with comment-preserved versions
             for method_name, preserved_source in method_replacement_sources.items():
                 class_source = self._replace_method_body_with_preserved(class_source, method_name, preserved_source)
 
             lines.append(class_source)
         else:
-            # No patches - use original source with comments preserved
-            end_line = get_node_end_line(class_node, self.source_lines)
-            start_line = get_node_start_line(class_node)
-            lines.append(extract_source_segment(self.source_lines, start_line, end_line))
+            lines.append(class_source)
 
         return "\n".join(lines)
 

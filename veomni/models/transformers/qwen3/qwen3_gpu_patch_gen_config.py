@@ -62,6 +62,8 @@ config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "ForSequenceClassificationLoss"],
 )
+config.exclude_from_output("apply_rotary_pos_emb", "rotate_half")
+config.drop_import_names("use_kernelized_func")
 
 
 @config.override_method(
@@ -115,18 +117,6 @@ def qwen3_mlp_forward_patched(self, x):
             linear_bias(self.down_proj),
         )
     return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
-
-@config.replace_function("apply_rotary_pos_emb", description="Always call rope full VeomniOp")
-def apply_rotary_pos_emb_patched(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    return rope(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
 @config.override_method(

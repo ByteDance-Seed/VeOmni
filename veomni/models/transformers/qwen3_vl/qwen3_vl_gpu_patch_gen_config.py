@@ -70,6 +70,8 @@ config = PatchConfig(
 # hook on ``lm_head`` and triggering ``setStorage … storage of size 0`` in
 # ``chunk_logprobs.backward`` (parallels VeOmni #731's qwen3_5_moe fix).
 config.drop_import_names("Qwen3VLCausalLMOutputWithPast")
+config.exclude_from_output("apply_rotary_pos_emb")
+config.drop_import_names("use_kernelized_func")
 
 
 @config.override_method(
@@ -147,21 +149,6 @@ def qwen3_vl_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
 )
 def qwen3_vl_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
     return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
-
-
-# ── Rotary Positional Embedding (always call rope full VeomniOp) ─────────
-
-
-@config.replace_function("apply_rotary_pos_emb", description="Always call rope full VeomniOp")
-def apply_rotary_pos_emb_patched(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    return rope(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
 # ── Vision Rotary Positional Embedding (call rope full with rank-3 layout) ───

@@ -21,7 +21,6 @@ patchgen veomni.models.transformers.qwen3_vl.qwen3_vl_npu_patch_gen_config -o ve
 """
 
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
-    apply_rotary_pos_emb_patched,
     apply_rotary_pos_emb_vision_patched,
     qwen3_vl_for_conditional_generation_forward_patched,
     qwen3_vl_for_conditional_generation_init_patched,
@@ -64,6 +63,7 @@ config.helpers.extend(gpu_config.helpers)
 # now superseded by ``Qwen3VLCausalLMOutputWithLogProbs`` for the FSDP2-safe
 # pre-backward unshard hook on ``lm_head``).
 config.drop_imported_names.update(gpu_config.drop_imported_names)
+config.exclude.extend(gpu_config.exclude)
 
 config.override_method(
     "Qwen3VLModel.__init__",
@@ -159,11 +159,6 @@ config.override_method(
     "Qwen3VLForConditionalGeneration.forward",
     replacement=qwen3_vl_for_conditional_generation_forward_patched,
     description="Always call self.loss_function (ForCausalLMLoss + VeomniOp)",
-)
-config.replace_function(
-    "apply_rotary_pos_emb",
-    replacement=apply_rotary_pos_emb_patched,
-    description="Always call rope full VeomniOp",
 )
 config.replace_function(
     "apply_rotary_pos_emb_vision",

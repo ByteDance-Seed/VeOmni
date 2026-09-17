@@ -197,6 +197,7 @@ config.exclude_from_output(
     "TimeDelayNetBlock",
     "TorchActivation1d",
     "SnakeBeta",
+    "apply_rotary_pos_emb",
 )
 
 

@@ -41,7 +41,6 @@ from veomni.patchgen.patch_spec import PatchConfig
 
 from .deepseek_v4_gpu_patch_gen_config import (
     PatchedDeepseekV4Experts,
-    apply_rotary_pos_emb_patched,
     deepseek_v4_attention_forward_patched,
     deepseek_v4_attention_init_patched,
     deepseek_v4_decoder_layer_forward_patched,
@@ -90,6 +89,7 @@ config.additional_imports.extend(gpu_config.additional_imports)
 config.post_import_blocks.extend(gpu_config.post_import_blocks)
 config.helpers.extend(gpu_config.helpers)
 config.drop_imported_names.update(gpu_config.drop_imported_names)
+config.exclude.extend(gpu_config.exclude)
 
 config.override_method(
     "DeepseekV4RMSNorm.__init__",
@@ -115,11 +115,6 @@ config.override_method(
     "DeepseekV4RotaryEmbedding.forward",
     replacement=deepseek_v4_rotary_embedding_forward_patched,
     description="Retain FP32 cos/sin for inference and use activation dtype for checkpoint-stable training",
-)
-config.replace_function(
-    "apply_rotary_pos_emb",
-    replacement=apply_rotary_pos_emb_patched,
-    description="Always call rope deepseek_v4 VeomniOp",
 )
 config.override_method(
     "DeepseekV4MLP.__init__",

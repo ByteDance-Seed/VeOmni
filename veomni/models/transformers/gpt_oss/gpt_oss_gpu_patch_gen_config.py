@@ -66,9 +66,8 @@ config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "load_balancing_loss"],
 )
-apply_rotary_pos_emb = None  # noqa: E305  resolved from the generated modeling file
-
-
+config.exclude_from_output("apply_rotary_pos_emb", "rotate_half")
+config.drop_import_names("use_kernelized_func")
 config.drop_import_names("MoeCausalLMOutputWithPast")
 
 
@@ -277,15 +276,16 @@ def gpt_oss_forcausallm_forward_patched(
     )
 
 
-@config.modify_init("GptOssAttention", description="Bind instance-local attention VeomniOp")
+@config.modify_init("GptOssAttention", description="Bind instance-local rope and attention VeomniOps")
 def gpt_oss_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
     self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
 @config.override_method(
     "GptOssAttention.forward",
-    description="Always call the local attention VeomniOp",
+    description="Always call the local rope and attention VeomniOps",
 )
 def gpt_oss_attention_forward_patched(
     self,
@@ -303,8 +303,10 @@ def gpt_oss_attention_forward_patched(
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     cos, sin = position_embeddings
-    # HF GPT-OSS RoPE uses half-dim cos/sin, not rope/full.
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    # HF GPT-OSS tables are half-width. Duplicate them so rope/full sees last-dim == head_dim.
+    cos = torch.cat((cos, cos), dim=-1)
+    sin = torch.cat((sin, sin), dim=-1)
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)

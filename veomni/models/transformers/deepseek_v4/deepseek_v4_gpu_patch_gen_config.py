@@ -135,6 +135,7 @@ config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "load_balancing_loss"],
 )
+config.exclude_from_output("apply_rotary_pos_emb", "rotate_half")
 config.add_import(
     "veomni.distributed.parallel_state",
     names=["get_parallel_state"],
@@ -271,16 +272,6 @@ def deepseek_v4_rotary_embedding_forward_patched(self, x, position_ids, layer_ty
     if self.training:
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
     return cos, sin
-
-
-@config.replace_function(
-    "apply_rotary_pos_emb",
-    description="Always call rope deepseek_v4 VeomniOp",
-)
-def apply_rotary_pos_emb_patched(
-    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
-) -> torch.Tensor:
-    return _deepseek_v4_rope_op()(x, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
 # ================================================================

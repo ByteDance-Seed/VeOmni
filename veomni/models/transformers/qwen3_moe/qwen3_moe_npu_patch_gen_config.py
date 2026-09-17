@@ -20,7 +20,6 @@ patchgen veomni.models.transformers.qwen3_moe.qwen3_moe_npu_patch_gen_config -o 
 
 from veomni.models.transformers.qwen3_moe.qwen3_moe_gpu_patch_gen_config import (
     PatchedQwen3MoeExperts,
-    apply_rotary_pos_emb_patched,
     qwen3_moe_attention_forward_patched,
     qwen3_moe_for_question_answering_init_patched,
     qwen3_moe_for_sequence_classification_forward_patched,
@@ -58,6 +57,7 @@ config.helpers.extend(gpu_config.helpers)
 # now superseded by ``Qwen3MoeCausalLMOutputWithLogProbs`` for the FSDP2-safe
 # pre-backward unshard hook on ``lm_head``).
 config.drop_imported_names.update(gpu_config.drop_imported_names)
+config.exclude.extend(gpu_config.exclude)
 
 
 config.override_method(
@@ -98,16 +98,6 @@ config.override_method(
         "stays consistent with the HF aux-loss baseline."
     ),
 )
-
-
-config.replace_function(
-    "apply_rotary_pos_emb",
-    replacement=apply_rotary_pos_emb_patched,
-    description="Always call rope full VeomniOp",
-)
-
-# Dummy reference resolved at codegen time from the generated module.
-rotate_half = None  # noqa: E305
 
 
 config.override_method(

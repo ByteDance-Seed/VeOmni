@@ -75,6 +75,7 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_5_npu.py",
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
 )
+config.exclude_from_output("apply_rotary_pos_emb")
 
 config.add_import("copy", names=["copy"])
 config.add_import("functools", names=["partial"])
@@ -160,15 +161,6 @@ config.override_method(
     replacement=qwen3_5_rmsnorm_forward_patched,
     description="Always call the local rms_norm qwen3_5 VeomniOp",
 )
-
-
-@config.replace_function(
-    "apply_rotary_pos_emb",
-    description="Always call rope partial VeomniOp",
-)
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
-    return rope(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
 @config.replace_function(

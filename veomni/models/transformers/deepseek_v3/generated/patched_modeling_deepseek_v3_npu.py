@@ -17,8 +17,6 @@
 #      Use construct-time triton_bmm choice for deterministic freqs
 #    - init_modification: DeepseekV3RotaryEmbedding
 #      Capture rotary freq impl at construct time
-#    - function_replacement: apply_rotary_pos_emb
-#      Always call rope full VeomniOp
 #    - init_modification: DeepseekV3Attention
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: DeepseekV3Attention.forward
@@ -400,28 +398,6 @@ def yarn_apply_mscale(rope_parameters, scaling):
             mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
             scaling = scaling * mscale * mscale
     return scaling
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-# ======================================================================
-# [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: Always call rope full VeomniOp
-# Source: veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config
-# ======================================================================
-def apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _deepseek_v3_rope_op()(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
 def apply_rotary_pos_emb_interleave(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):

@@ -21,7 +21,9 @@ Mirrors the GPU package. RoPE and RMSNorm call local VeomniOp.
 """
 
 from veomni.models.transformers.seed_oss.seed_oss_gpu_patch_gen_config import (
-    apply_rotary_pos_emb_patched,
+    config as gpu_config,
+)
+from veomni.models.transformers.seed_oss.seed_oss_gpu_patch_gen_config import (
     seed_oss_attention_forward_patched,
     seed_oss_forcausallm_forward_patched,
     seed_oss_forcausallm_init_patched,
@@ -29,9 +31,6 @@ from veomni.models.transformers.seed_oss.seed_oss_gpu_patch_gen_config import (
     seed_oss_mlp_init_patched,
     seed_oss_rmsnorm_forward_patched,
     seed_oss_rmsnorm_init_patched,
-)
-from veomni.models.transformers.seed_oss.seed_oss_gpu_patch_gen_config import (
-    config as gpu_config,
 )
 from veomni.patchgen.patch_spec import PatchConfig
 
@@ -46,6 +45,7 @@ config.additional_imports.extend(gpu_config.additional_imports)
 config.post_import_blocks.extend(gpu_config.post_import_blocks)
 config.helpers.extend(gpu_config.helpers)
 config.drop_imported_names.update(gpu_config.drop_imported_names)
+config.exclude.extend(gpu_config.exclude)
 
 config.override_method(
     "SeedOssRMSNorm.__init__",
@@ -66,11 +66,6 @@ config.override_method(
     "SeedOssMLP.forward",
     replacement=seed_oss_mlp_forward_patched,
     description="Always call the local swiglu_mlp VeomniOp, then residual dropout",
-)
-config.replace_function(
-    "apply_rotary_pos_emb",
-    replacement=apply_rotary_pos_emb_patched,
-    description="Always call rope full VeomniOp",
 )
 config.override_method(
     "SeedOssForCausalLM.__init__",

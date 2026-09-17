@@ -42,9 +42,9 @@
 #    - method_override: Qwen4ExpForConditionalGeneration.forward
 #      Always call ForCausalLMLoss and load_balancing_loss VeomniOps
 #    - init_modification: Qwen4ExpTextAttention
-#      Bind instance-local attention VeomniOp
+#      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen4ExpTextAttention.forward
-#      Always call the local attention VeomniOp
+#      Always call the local rope and attention VeomniOps
 #    - init_modification: Qwen4ExpVisionAttention
 #      Bind instance-local attention VeomniOp
 #    - method_override: Qwen4ExpVisionAttention.forward
@@ -907,7 +907,7 @@ def eager_attention_forward(
 class Qwen4ExpTextAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    # [modified __init__] Bind instance-local attention VeomniOp
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: Qwen4ExpTextConfig, layer_idx: int):
         super().__init__()
         self.config = config
@@ -932,7 +932,8 @@ class Qwen4ExpTextAttention(nn.Module):
         self.q_norm = Qwen4ExpTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen4ExpTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.indexer = Qwen4ExpTextQSAIndexer(config, layer_idx)
-        # Bind instance-local attention VeomniOp
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
         self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
@@ -963,7 +964,7 @@ class Qwen4ExpTextAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)

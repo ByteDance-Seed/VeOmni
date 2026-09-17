@@ -69,7 +69,8 @@ config.add_import(
     "veomni.ops.mask",
     names=["packed_causal_mask", "sliding_window_mask"],
 )
-apply_rotary_pos_emb = None  # noqa: E305  resolved from the generated modeling file
+config.exclude_from_output("apply_rotary_pos_emb", "rotate_half")
+config.drop_import_names("use_kernelized_func")
 _bidirectional_window_overlay = None  # noqa: E305  resolved from the generated modeling file
 
 

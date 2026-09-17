@@ -21,7 +21,6 @@ Router replay, fused loss, and the parallel plan call local VeomniOp.
 """
 
 from functools import partial
-from typing import Optional
 
 import torch
 from torch import nn
@@ -86,6 +85,8 @@ config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "ForSequenceClassificationLoss", "load_balancing_loss"],
 )
+config.exclude_from_output("apply_rotary_pos_emb", "rotate_half")
+config.drop_import_names("use_kernelized_func")
 
 
 # ── RMSNorm (always call local VeomniOp) ─────────────────────────────────
@@ -218,24 +219,6 @@ def qwen3_moe_topk_router_forward_patched(self, hidden_states: torch.Tensor):
     # keeps the generated modeling bitwise-equal to vanilla HF.
     router_top_value = router_top_value.to(router_logits.dtype)
     return router_logits, router_top_value, router_indices
-
-
-@config.replace_function("apply_rotary_pos_emb", description="Always call rope full VeomniOp")
-def apply_rotary_pos_emb_patched(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    position_ids: Optional[torch.Tensor] = None,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    del position_ids
-    rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    return rope(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
-
-
-# Dummy reference resolved at codegen time from the generated module.
-rotate_half = None  # noqa: E305
 
 
 @config.override_method("Qwen3MoeModel.forward", description="Support SP in Qwen3MoeModel.forward")

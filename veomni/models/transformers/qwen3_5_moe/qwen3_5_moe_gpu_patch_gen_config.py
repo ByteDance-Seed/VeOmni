@@ -75,6 +75,7 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_5_moe_gpu.py",
     description="Qwen3_5Moe with LigerKernel GPU replacements, fused MoE, and VeOmni SP/fused loss patches",
 )
+config.exclude_from_output("apply_rotary_pos_emb")
 
 config.add_import("copy", names=["copy"])
 config.add_import("functools", names=["partial"])

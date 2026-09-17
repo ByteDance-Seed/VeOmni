@@ -17,8 +17,6 @@
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: Qwen2MLP.forward
 #      Call swiglu_mlp for silu/swish, otherwise self.act_fn
-#    - function_replacement: apply_rotary_pos_emb
-#      Leftover helper; Attention uses the instance-local rope handle
 #    - method_override: Qwen2Model.forward
 #      Support SP in Qwen2Model.forward
 #    - method_override: Qwen2ForCausalLM.__init__
@@ -44,14 +42,12 @@ from collections.abc import Callable
 from functools import partial
 
 # Additional imports for patches
-from typing import Optional
-
 import torch
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_kernel_forward_from_hub, use_kernelized_func
+from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import (
@@ -166,31 +162,6 @@ class Qwen2RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-# ======================================================================
-# [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: Leftover helper; Attention uses the instance-local rope handle
-# Source: veomni.models.transformers.qwen2.qwen2_gpu_patch_gen_config
-# ======================================================================
-def apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    position_ids: Optional[torch.Tensor] = None,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    del position_ids
-    rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    return rope(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
-
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -234,7 +205,6 @@ def eager_attention_forward(
 # ======================================================================
 
 
-@use_kernelized_func(apply_rotary_pos_emb)
 class Qwen2Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 

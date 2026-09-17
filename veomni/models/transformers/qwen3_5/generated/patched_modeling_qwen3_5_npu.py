@@ -15,8 +15,6 @@
 #      Construct a local rms_norm qwen3_5 VeomniOp
 #    - method_override: Qwen3_5RMSNorm.forward
 #      Always call the local rms_norm qwen3_5 VeomniOp
-#    - function_replacement: apply_rotary_pos_emb
-#      Always call rope partial VeomniOp
 #    - function_replacement: apply_rotary_pos_emb_vision
 #      Call rope full VeomniOp with rank-3 vision layout
 #    - method_override: Qwen3_5GatedDeltaNet.__init__
@@ -834,16 +832,6 @@ def rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
-
-
-# ======================================================================
-# [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: Always call rope partial VeomniOp
-# Source: veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config
-# ======================================================================
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
-    return rope(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:

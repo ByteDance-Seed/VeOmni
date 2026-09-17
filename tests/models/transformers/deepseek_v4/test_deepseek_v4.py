@@ -26,6 +26,7 @@ import torch
 import torch.nn.functional as F
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM as HFDeepseekV4ForCausalLM
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import apply_rotary_pos_emb as hf_apply_rotary_pos_emb
 
 from tests.models.compare import (
     assert_eager_matches_hf,
@@ -107,7 +108,6 @@ def test_deepseek_v4_routers_use_fp32_projection_under_autocast():
 
 
 def test_deepseek_v4_attention_preserves_q_norm_and_rope_dtype_modes():
-    modeling = _dsv4_module()
     config = _tiny_config()
     model = _build_ours(config)
     attention = model.model.layers[0].self_attn.to(torch.bfloat16).eval()
@@ -144,9 +144,9 @@ def test_deepseek_v4_attention_preserves_q_norm_and_rope_dtype_modes():
     )
     rstd = torch.rsqrt(q_raw.float().square().mean(-1, keepdim=True) + config.rms_norm_eps)
     expected = q_raw * rstd.to(q_raw.dtype)
-    expected = modeling.apply_rotary_pos_emb(expected.transpose(1, 2), cos, sin)
+    expected = hf_apply_rotary_pos_emb(expected.transpose(1, 2), cos, sin)
     wrong_fp32_multiply = (q_raw.float() * rstd).to(q_raw.dtype)
-    wrong_fp32_multiply = modeling.apply_rotary_pos_emb(wrong_fp32_multiply.transpose(1, 2), cos, sin)
+    wrong_fp32_multiply = hf_apply_rotary_pos_emb(wrong_fp32_multiply.transpose(1, 2), cos, sin)
 
     torch.testing.assert_close(captured["query"], expected, rtol=0, atol=0)
     assert not torch.equal(captured["query"], wrong_fp32_multiply)

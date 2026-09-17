@@ -79,22 +79,18 @@ def test_qwen2_rope_reads_selected_impl(monkeypatch):
         def __init__(self, op: str, variant: str, impl: str):
             selected.append((op, variant, impl))
 
-        def __call__(self, q, k, *_args, **_kwargs):
-            return q, k
+        def __call__(self, *args, **_kwargs):
+            return args[0], args[1] if len(args) > 1 else args[0]
 
     monkeypatch.setattr(modeling, "VeomniOp", StubOp)
     ops = eager_ops_config()
     ops.rotary_pos_emb_implementation = "test_impl"
+    config = _tiny_config()
     with ops_config_scope(ops):
-        q = torch.randn(1, 2, 4, 8)
-        k = torch.randn_like(q)
-        cos = torch.randn(1, 4, 8)
-        sin = torch.randn_like(cos)
-        q_out, k_out = modeling.apply_rotary_pos_emb(q, k, cos, sin)
+        attn = modeling.Qwen2Attention(config, layer_idx=0)
 
-    assert selected == [("rope", "full", "test_impl")]
-    assert q_out is q
-    assert k_out is k
+    assert ("rope", "full", "test_impl") in selected
+    assert attn.veomni_rope is not None
 
 
 def test_qwen2_eager_matches_hf():

@@ -65,6 +65,7 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_5_gpu.py",
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
 )
+config.exclude_from_output("apply_rotary_pos_emb")
 
 
 @config.override_method(

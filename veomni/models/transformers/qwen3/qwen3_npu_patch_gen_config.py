@@ -25,7 +25,9 @@ This file itself is not runnable. It's used to generate the runnable explicitly 
 """
 
 from veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config import (
-    apply_rotary_pos_emb_patched,
+    config as gpu_config,
+)
+from veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config import (
     qwen3_attention_forward_patched,
     qwen3_attention_init_patched,
     qwen3_forcausallm_forward_patched,
@@ -36,9 +38,6 @@ from veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config import (
     qwen3_rmsnorm_init_patched,
     qwen3_seq_cls_init_patched,
     qwen3forsequenceclassification_forward_patched,
-)
-from veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config import (
-    config as gpu_config,
 )
 from veomni.patchgen.patch_spec import PatchConfig
 
@@ -53,6 +52,7 @@ config.additional_imports.extend(gpu_config.additional_imports)
 config.post_import_blocks.extend(gpu_config.post_import_blocks)
 config.helpers.extend(gpu_config.helpers)
 config.drop_imported_names.update(gpu_config.drop_imported_names)
+config.exclude.extend(gpu_config.exclude)
 
 
 config.override_method(
@@ -74,11 +74,6 @@ config.override_method(
     "Qwen3MLP.forward",
     replacement=qwen3_mlp_forward_patched,
     description="Always call the local swiglu_mlp VeomniOp",
-)
-config.replace_function(
-    "apply_rotary_pos_emb",
-    replacement=apply_rotary_pos_emb_patched,
-    description="Always call rope full VeomniOp",
 )
 config.override_method(
     "Qwen3Attention.__init__",

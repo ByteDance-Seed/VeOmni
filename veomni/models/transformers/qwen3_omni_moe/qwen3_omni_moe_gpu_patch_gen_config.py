@@ -139,8 +139,6 @@ config.add_import(
 )
 config.drop_import_names("Qwen3OmniMoeThinkerCausalLMOutputWithPast")
 
-apply_rotary_pos_emb = None  # noqa: E305  resolved from the generated modeling file
-
 config.add_import(
     "veomni.utils.constants",
     names=["AUDIO_INPUT_INDEX", "IGNORE_INDEX", "IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"],
@@ -208,7 +206,9 @@ config.exclude_from_output(
     # SnakeBeta activation is only referenced inside the excluded Code2Wav
     # residual blocks, so exclude it too to avoid generating dead code.
     "SnakeBeta",
+    "apply_rotary_pos_emb",
 )
+config.drop_import_names("use_kernelized_func")
 
 
 # ================================================================

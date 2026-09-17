@@ -397,6 +397,10 @@ class PatchConfig:
         """
         Exclude specific classes/functions from the generated output.
 
+        Decorators that reference an excluded name are stripped as well, so a
+        leftover ``@use_kernelized_func(apply_rotary_pos_emb)`` does not
+        NameError after the helper is dropped.
+
         Usage:
             config.exclude_from_output("Qwen3ForTokenClassification")
         """

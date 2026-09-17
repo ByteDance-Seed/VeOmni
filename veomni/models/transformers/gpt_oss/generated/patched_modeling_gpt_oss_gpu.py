@@ -22,9 +22,9 @@
 #    - method_override: GptOssForCausalLM.forward
 #      Always call ForCausalLMLoss and load_balancing_loss VeomniOps
 #    - init_modification: GptOssAttention
-#      Bind instance-local attention VeomniOp
+#      Bind instance-local rope and attention VeomniOps
 #    - method_override: GptOssAttention.forward
-#      Always call the local attention VeomniOp
+#      Always call the local rope and attention VeomniOps
 #
 # ==============================================================================
 
@@ -39,7 +39,7 @@ from torch.nn import functional as F
 from transformers import initialization as init
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_kernel_forward_from_hub, use_kernelized_func
+from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_layers import (
     GenericForSequenceClassification,
@@ -232,15 +232,6 @@ def _apply_rotary_emb(
     return torch.cat((first_, second_), dim=-1)
 
 
-@use_kernel_forward_from_hub("rotary_pos_emb")
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = _apply_rotary_emb(q, cos, sin)
-    k_embed = _apply_rotary_emb(k, cos, sin)
-    return q_embed, k_embed
-
-
 def eager_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -278,11 +269,10 @@ def eager_attention_forward(
 # ======================================================================
 
 
-@use_kernelized_func(apply_rotary_pos_emb)
 class GptOssAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    # [modified __init__] Bind instance-local attention VeomniOp
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: GptOssConfig, layer_idx: int):
         super().__init__()
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
@@ -307,7 +297,8 @@ class GptOssAttention(nn.Module):
         )
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
         self.sinks = nn.Parameter(torch.empty(config.num_attention_heads))
-        # Bind instance-local attention VeomniOp
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
         self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
@@ -326,8 +317,10 @@ class GptOssAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        # HF GPT-OSS RoPE uses half-dim cos/sin, not rope/full.
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # HF GPT-OSS tables are half-width. Duplicate them so rope/full sees last-dim == head_dim.
+        cos = torch.cat((cos, cos), dim=-1)
+        sin = torch.cat((sin, sin), dim=-1)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)

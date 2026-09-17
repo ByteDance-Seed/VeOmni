@@ -1941,7 +1941,7 @@
 
      def _expand_inputs_for_generation(
          self,
-@@ -2117,799 +2744,54 @@
+@@ -2117,825 +2744,54 @@
 
          return position_ids
 
@@ -2738,6 +2738,32 @@
 -        for layer in self.ff:
 -            hidden_states = layer(hidden_states)
 -        return hidden_states
+-
+-
+-@use_kernel_forward_from_hub("rotary_pos_emb")
+-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+-    """Applies Rotary Position Embedding to the query and key tensors.
+-
+-    Args:
+-        q (`torch.Tensor`): The query tensor.
+-        k (`torch.Tensor`): The key tensor.
+-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+-        sin (`torch.Tensor`): The sine part of the rotary embedding.
+-        unsqueeze_dim (`int`, *optional*, defaults to 1):
+-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+-    Returns:
+-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+-    """
+-    cos = cos.unsqueeze(unsqueeze_dim)
+-    sin = sin.unsqueeze(unsqueeze_dim)
+-    q_embed = (q * cos) + (rotate_half(q) * sin)
+-    k_embed = (k * cos) + (rotate_half(k) * sin)
+-    return q_embed, k_embed
 +    # ================================================================
 +    # Patch: Qwen2_5OmniThinkerForConditionalGeneration.get_position_id_func (NEW)
 +    # Returns a per-sample closure that converts VeOmni's multimodal tokens
@@ -2788,8 +2814,8 @@
 +        )
 
 
- @use_kernel_forward_from_hub("rotary_pos_emb")
-@@ -2943,137 +2825,6 @@
+ def deinterleave_head_dim(x: torch.Tensor) -> torch.Tensor:
+@@ -2943,137 +2799,6 @@
      `(x0, x2, ..., x1, x3, ...)` so the kernelized `apply_rotary_pos_emb` can be used.
      """
      return torch.cat((x[..., 0::2], x[..., 1::2]), dim=-1)
@@ -2927,7 +2953,7 @@
 
 
  class Qwen2_5OmniSnakeBeta(nn.Module):
-@@ -3295,405 +3046,10 @@
+@@ -3295,405 +3020,10 @@
          super().__init__(*args, **kwargs)
 
 
@@ -3337,7 +3363,7 @@
 
 
  ############################
-@@ -3720,22 +3076,74 @@
+@@ -3720,22 +3050,74 @@
          "Qwen2_5OmniToken2WavModel",
      ]
 
@@ -3422,7 +3448,7 @@
 
      def load_speakers(self, path):
          check_torch_load_is_safe()
-@@ -3797,285 +3205,71 @@
+@@ -3797,285 +3179,71 @@
 
          return model
 

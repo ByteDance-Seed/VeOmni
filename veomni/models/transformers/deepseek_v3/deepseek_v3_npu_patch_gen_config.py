@@ -23,7 +23,6 @@ the installed ops config. No local ``triton_bmm`` on NPU.
 
 from veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config import (
     PatchedDeepseekV3Experts,
-    apply_rotary_pos_emb_patched,
     deepseek_v3_attention_bind_ops,
     deepseek_v3_attention_forward_patched,
     deepseek_v3_forcausallm_forward_patched,
@@ -54,6 +53,7 @@ config.additional_imports.extend(gpu_config.additional_imports)
 config.post_import_blocks.extend(gpu_config.post_import_blocks)
 config.helpers.extend(gpu_config.helpers)
 config.drop_imported_names.update(gpu_config.drop_imported_names)
+config.exclude.extend(gpu_config.exclude)
 
 config.override_method(
     "DeepseekV3RMSNorm.__init__",
@@ -74,11 +74,6 @@ config.modify_init(
     "DeepseekV3RotaryEmbedding",
     replacement=deepseek_v3_rotary_embedding_bind_ops,
     description="Capture rotary freq impl at construct time",
-)
-config.replace_function(
-    "apply_rotary_pos_emb",
-    replacement=apply_rotary_pos_emb_patched,
-    description="Always call rope full VeomniOp",
 )
 config.modify_init(
     "DeepseekV3Attention",
@@ -130,5 +125,3 @@ config.override_method(
     replacement=deepseek_v3_get_parallel_plan_patched,
     description="Register DeepseekV3 expert parallel plan for v5 generated modeling",
 )
-
-rotate_half = None  # noqa: E305

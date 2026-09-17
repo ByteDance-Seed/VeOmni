@@ -17,8 +17,6 @@
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: LlamaMLP.forward
 #      Call swiglu_mlp for silu/swish, otherwise self.act_fn
-#    - function_replacement: apply_rotary_pos_emb
-#      Always call rope full VeomniOp
 #    - method_override: LlamaForCausalLM.__init__
 #      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: LlamaForCausalLM.forward
@@ -44,7 +42,7 @@ from torch import nn
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_kernel_forward_from_hub, use_kernelized_func
+from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_layers import (
     GenericForQuestionAnswering,
@@ -153,29 +151,6 @@ class LlamaRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-# ======================================================================
-# [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: Always call rope full VeomniOp
-# Source: veomni.models.transformers.llama.llama_gpu_patch_gen_config
-# ======================================================================
-def apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    return rope(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
-
-
 # ======================================================================
 # [MODIFIED CLASS] LlamaMLP
 # Methods patched: __init__, forward
@@ -251,7 +226,6 @@ def eager_attention_forward(
 # ======================================================================
 
 
-@use_kernelized_func(apply_rotary_pos_emb)
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 

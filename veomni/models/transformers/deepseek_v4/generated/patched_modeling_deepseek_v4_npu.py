@@ -19,8 +19,6 @@
 #      Always call the local unweighted rms_norm VeomniOp
 #    - method_override: DeepseekV4RotaryEmbedding.forward
 #      Retain FP32 cos/sin for inference and use activation dtype for checkpoint-stable training
-#    - function_replacement: apply_rotary_pos_emb
-#      Always call rope deepseek_v4 VeomniOp
 #    - method_override: DeepseekV4MLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: DeepseekV4MLP.forward
@@ -498,24 +496,6 @@ class DeepseekV4GroupedLinear(nn.Linear):
         x = x.reshape(-1, self.n_groups, hidden_dim).transpose(0, 1)
         y = torch.bmm(x, w).transpose(0, 1)
         return y.reshape(*input_shape, self.n_groups, -1)
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., 0::2]
-    x2 = x[..., 1::2]
-    return torch.stack((-x2, x1), dim=-1).flatten(-2)
-
-
-# ======================================================================
-# [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: Always call rope deepseek_v4 VeomniOp
-# Source: veomni.models.transformers.deepseek_v4.deepseek_v4_gpu_patch_gen_config
-# ======================================================================
-def apply_rotary_pos_emb(
-    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
-) -> torch.Tensor:
-    return _deepseek_v4_rope_op()(x, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
 # ======================================================================
@@ -2657,4 +2637,8 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
         return _get_parallel_plan()
 
 
-__all__ = ["DeepseekV4PreTrainedModel", "DeepseekV4Model", "DeepseekV4ForCausalLM"]
+__all__ = [
+    "DeepseekV4PreTrainedModel",
+    "DeepseekV4Model",
+    "DeepseekV4ForCausalLM",
+]

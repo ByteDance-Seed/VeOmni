@@ -71,6 +71,7 @@ config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
 )
+config.exclude_from_output("apply_rotary_pos_emb", "rotate_half")
 config.add_import("veomni.utils.moe_monitor", names=["record_router_indices"])
 config.add_import(
     "veomni.utils.model_outputs",
@@ -140,17 +141,6 @@ def deepseek_v3_rotary_embedding_forward_patched(self, x, position_ids):
     return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-@config.replace_function("apply_rotary_pos_emb", description="Always call rope full VeomniOp")
-def apply_rotary_pos_emb_patched(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _deepseek_v3_rope_op()(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
-
-
 @config.modify_init("DeepseekV3Attention", description="Bind instance-local rope and attention VeomniOps")
 def deepseek_v3_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
@@ -210,9 +200,6 @@ def deepseek_v3_attention_forward_patched(
     attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
     attn_output = self.o_proj(attn_output)
     return attn_output, attn_weights
-
-
-rotate_half = None  # noqa: E305  resolved from the generated modeling file
 
 
 @config.override_method(

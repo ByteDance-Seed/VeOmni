@@ -53,3 +53,28 @@ def test_modify_init_appends_at_function_body_indent_not_trailing_if():
     assert handle_lines
     assert handle_lines[0].startswith("    self.veomni_attn")
     assert not handle_lines[0].startswith("        self.veomni_attn")
+
+
+def test_exclude_from_output_strips_decorators_that_name_the_dropped_helper():
+    source = textwrap.dedent(
+        """
+        def apply_rotary_pos_emb(q, k, cos, sin):
+            return q, k
+
+        @use_kernelized_func(apply_rotary_pos_emb)
+        class Attention:
+            def forward(self):
+                return None
+        """
+    ).lstrip()
+    config = PatchConfig(source_module="mod", target_file="out.py")
+    config.exclude_from_output("apply_rotary_pos_emb")
+    generator = ModelingCodeGenerator(config)
+    generator.source_code = source
+    generator.source_lines = source.splitlines()
+    generator.source_ast = ast.parse(source)
+    class_node = generator.source_ast.body[1]
+    generated = generator._generate_class_source(class_node, {})
+    assert "def apply_rotary_pos_emb" not in generated
+    assert "@use_kernelized_func" not in generated
+    assert "class Attention:" in generated
