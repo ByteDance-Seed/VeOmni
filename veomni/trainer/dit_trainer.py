@@ -304,17 +304,15 @@ class DiTTrainer:
         self.base.model = self._build_model_runtime()
         self.base.LOG_SAMPLE = args.data.log_sample
 
-        # rewrite _build_data_transform, build data transform for offline or online dit data
-        self._build_data_transform()
-
-        # rewrite _build_dataset, init offline_embedding_saver after build_dataset
-        self._build_dataset()
-
-        # Do not use maincollator in dit training
-        # self.base._build_collate_fn()
-
-        # rewrite _build_dataloader, build dataloader only on sp_rank_0 to save memory
-        self._build_dataloader()
+        with use_parallel_state(self.base.model.parallel_state):
+            # rewrite _build_data_transform, build data transform for offline or online dit data
+            self._build_data_transform()
+            # rewrite _build_dataset, init offline_embedding_saver after build_dataset
+            self._build_dataset()
+            # Do not use maincollator in dit training
+            # self.base._build_collate_fn()
+            # rewrite _build_dataloader, build dataloader only on sp_rank_0 to save memory
+            self._build_dataloader()
 
         if self.training_task != "offline_embedding":
             self.base._build_lr_scheduler()

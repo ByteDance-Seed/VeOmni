@@ -24,6 +24,7 @@ This split is what lets a single-model trainer and a multi-module omni model
 share one build sequence instead of maintaining divergent copies of it.
 """
 
+import os
 from dataclasses import fields
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -179,6 +180,24 @@ class VeOmniModelRuntime:
         return get_parallel_state_by_name(self.model_name)
 
     @property
+    def unwrapped_module(self) -> torch.nn.Module:
+        """The :class:`~torch.nn.Module`, peeling ``DistributedDataParallel`` if present.
+
+        FSDP2 shards in place, so this is :attr:`model` itself. DDP wraps, and
+        capability hooks (``get_position_id_func``, collate metadata, fused
+        ``loss_function``) live on the inner module — :meth:`__getattr__` does
+        not find them on the wrapper, and a write through the handle would land
+        on the handle, not the module.
+        """
+        model = self.model
+        if model is None:
+            raise AttributeError(f"{type(self).__name__}.model is not built yet.")
+        inner = getattr(model, "module", None)
+        if isinstance(inner, torch.nn.Module):
+            return inner
+        return model
+
+    @property
     def skip_hf_weight_load(self) -> bool:
         """Whether the initial HF weight materialization can be skipped.
 
@@ -259,8 +278,13 @@ class VeOmniModelRuntime:
         path = self.args.tokenizer_path
         try:
             loaded = build_processor(path, **(self.args.processor_config or {}))
-        except Exception as e:  # noqa: BLE001 — surfaced later by whoever reads text
-            logger.warning_once(f"{type(self).__name__}: no preprocessor loaded from {path}: {e}.")
+        except OSError as e:
+            # A local snapshot that simply has no preprocessor is fine (toy
+            # configs, diffusion). A typo'd path or a hub/network failure is
+            # not — those must not leave tokenizer/processor silently None.
+            if not (isinstance(path, str) and os.path.exists(path)):
+                raise
+            logger.warning(f"{type(self).__name__}: no preprocessor loaded from {path}: {e}.")
             loaded = None
 
         if loaded is not None:

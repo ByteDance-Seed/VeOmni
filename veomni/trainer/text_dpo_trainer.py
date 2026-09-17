@@ -138,7 +138,8 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
 
     Always copies the policy's ``model`` args. A custom reference-model
     config is not supported. Frozen-eval knobs (no LoRA / AMP / recompute /
-    compile) are applied here, not by rewriting the caller's config.
+    compile / activation offload) are applied here, not by rewriting the
+    caller's config.
 
     Init only builds the module. Optimizer, assets, and checkpoint stay
     uncalled — callbacks only ever fan out to the policy.
@@ -157,6 +158,12 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
         args.accelerator.fsdp_config.mixed_precision.enable = False
         args.accelerator.gradient_checkpointing.enable = False
         args.accelerator.torch_compile.enable = False
+        # A second PinnedBufferPool on the frozen copy is wasted host RAM.
+        # Load knobs (ep_sharded_stream_load / muon_expert_zero_comm /
+        # fqn_to_index_mapping) stay: the reference materializes the same HF
+        # checkpoint as the policy.
+        args.accelerator.offload_config.enable_activation = False
+        args.accelerator.offload_config.enable_async_activation = False
         self.args = args
         self.model_name = model_name
         self.train = train
@@ -202,14 +209,18 @@ class TextDPOTrainer:
 
         self.base.device = self.base._setup(args)  # registers ParallelState("base") before seed
         self.policy_model = self._build_policy_model_runtime()
+        # BaseTrainer helpers (async-offload reset, lr schedule, HSDP) read
+        # ``self.base.model``. Bind the policy handle so they are not walking
+        # the class default ``None``.
+        self.base.model = self.policy_model
 
-        self._build_data_transform()
-
-        self.base._build_dataset()
-        self.base._build_collate_fn()
-        self.base._build_dataloader()
+        with use_parallel_state(self.policy_model.parallel_state):
+            self._build_data_transform()
+            self.base._build_dataset()
+            self.base._build_collate_fn()
+            self.base._build_dataloader()
         self._build_postforward()
-        self.policy_model._build_lr_scheduler(args.train_steps * args.train.num_train_epochs)
+        self.base._build_lr_scheduler()
         self.base._build_training_context()
         self.base._init_callbacks(self)
 

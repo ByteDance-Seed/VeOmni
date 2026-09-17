@@ -21,6 +21,7 @@ from ..arguments import VeOmniArguments
 from ..data import (
     build_data_transform,
 )
+from ..distributed.parallel_state import use_parallel_state
 from ..distributed.torch_compile import mark_compile_step_begin
 from ..utils import helper
 from ..utils.device import synchronize
@@ -43,12 +44,12 @@ class TextTrainer:
         self.base.device = self.base._setup(args)  # registers ParallelState("base") before seed
         self.base.model = self.base._build_model_runtime()
 
-        # rewrite build_data_transform to support conversation dataset
-        self._build_data_transform()
-
-        self.base._build_dataset()
-        self.base._build_collate_fn()
-        self.base._build_dataloader()
+        with use_parallel_state(self.base.model.parallel_state):
+            # rewrite build_data_transform to support conversation dataset
+            self._build_data_transform()
+            self.base._build_dataset()
+            self.base._build_collate_fn()
+            self.base._build_dataloader()
         self.base._build_lr_scheduler()
         self.base._build_training_context()
         self.base._init_callbacks()
