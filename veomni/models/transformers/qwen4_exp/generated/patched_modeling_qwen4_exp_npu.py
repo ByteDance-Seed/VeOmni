@@ -41,6 +41,10 @@
 #      Bind ForCausalLMLoss and load_balancing_loss VeomniOps
 #    - method_override: Qwen4ExpForConditionalGeneration.forward
 #      Always call ForCausalLMLoss and load_balancing_loss VeomniOps
+#    - init_modification: Qwen4ExpTextQSAIndexer
+#      Bind instance-local partial rope VeomniOp
+#    - method_override: Qwen4ExpTextQSAIndexer.forward
+#      Always call the local partial rope VeomniOp for single-tensor indexer RoPE
 #    - init_modification: Qwen4ExpTextAttention
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen4ExpTextAttention.forward
@@ -707,54 +711,16 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
         return self.out_proj(core_attn_out)
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q, k=None, cos=None, sin=None, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors, or only the queries if the keys are not provided.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor if provided.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    rotary_dim = cos.shape[-1]
-
-    # Keep half or full tensor for later concatenation
-    q_rope, q_nope = q[..., :rotary_dim], q[..., rotary_dim:]
-    # Apply rotary embeddings on the first half or full tensor
-    q_rope = (q_rope * cos) + (rotate_half(q_rope) * sin)
-    # Concatenate back to full shape
-    q_rotated = torch.cat([q_rope, q_nope], dim=-1)
-
-    if k is not None:
-        k_rope, k_nope = k[..., :rotary_dim], k[..., rotary_dim:]
-        k_rope = (k_rope * cos) + (rotate_half(k_rope) * sin)
-        k_rotated = torch.cat([k_rope, k_nope], dim=-1)
-        return q_rotated, k_rotated
-    else:
-        return q_rotated
+# ======================================================================
+# [MODIFIED CLASS] Qwen4ExpTextQSAIndexer
+# Methods patched: forward, __init__
+# ======================================================================
 
 
 class Qwen4ExpTextQSAIndexer(nn.Module):
     """Select QSA token indices from compressed key blocks."""
 
+    # [modified __init__] Bind instance-local partial rope VeomniOp
     def __init__(self, config: Qwen4ExpTextConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
@@ -771,6 +737,8 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         )
         self.q_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
         self.k_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
+        # Bind instance-local partial rope VeomniOp
+        self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
 
     def forward(
         self,
@@ -781,7 +749,6 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
     ) -> torch.Tensor:
         batch_size, seq_length, _ = hidden_states.shape
         hidden_shape = (batch_size, seq_length, -1, self.index_head_dim)
-        # The cos/sin here are the full positions for the keys, so we need to slice to get only the current positions for the queries
         full_cos, full_sin = position_embeddings
         current_cos, current_sin = full_cos[:, -seq_length:, :], full_sin[:, -seq_length:, :]
 
@@ -793,13 +760,11 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         )
         q, raw_keys = q.reshape(*hidden_shape), token_k.reshape(*hidden_shape).squeeze(2)
         q = self.q_layernorm(q)
-        q = apply_rotary_pos_emb(q, cos=current_cos, sin=current_sin, unsqueeze_dim=2)
+        q, _ = self.veomni_rope(q, q, current_cos, current_sin, unsqueeze_dim=2)
 
         if past_key_values is not None:
             raw_keys = past_key_values.update_indexer(raw_keys, self.layer_idx)
 
-        # Note that the mask is never None here as we only allow eager and sdpa, and we do not allow sdpa's mask skip
-        # It's always 4D with either bool (sdpa) or float (eager) and already gives us the valid indices
         visible_token_indices = attention_mask if attention_mask.dtype == torch.bool else attention_mask == 0
 
         selected_token_indices = torch.full(
@@ -814,7 +779,6 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
                     visible_token_indices[batch_idx, 0, query_idx], as_tuple=False
                 ).flatten()
                 num_complete_blocks = local_visible_indices.shape[-1] // self.compress_ratio
-                # Compute selected tokens
                 if num_complete_blocks > 0:
                     block_token_indices = local_visible_indices[: num_complete_blocks * self.compress_ratio].view(
                         num_complete_blocks, self.compress_ratio
@@ -825,11 +789,14 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
                     pooled_keys = key_groups.float().mean(dim=1).to(raw_keys.dtype)
                     pooled_keys = self.k_layernorm(pooled_keys)
                     group_starts = block_token_indices[:, 0]
-                    block_key_states = apply_rotary_pos_emb(
-                        pooled_keys.unsqueeze(1),
-                        cos=full_cos[batch_idx].index_select(0, group_starts),
-                        sin=full_sin[batch_idx].index_select(0, group_starts),
-                    ).squeeze(1)
+                    pooled_keys = pooled_keys.unsqueeze(1)
+                    block_key_states, _ = self.veomni_rope(
+                        pooled_keys,
+                        pooled_keys,
+                        full_cos[batch_idx].index_select(0, group_starts),
+                        full_sin[batch_idx].index_select(0, group_starts),
+                    )
+                    block_key_states = block_key_states.squeeze(1)
 
                     scores = torch.matmul(
                         q[batch_idx, query_idx].float(), block_key_states.float().transpose(-1, -2)
@@ -837,7 +804,6 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
                     scores = torch.relu(scores).sum(dim=-1) / math.sqrt(self.index_head_dim)
 
                     selected_block_indices = scores.topk(min(self.block_topk, num_complete_blocks), dim=0).indices
-                    # Remap the indices of the blocks to the indices of individual tokens
                     selected_tokens = block_token_indices.index_select(0, selected_block_indices).flatten()
                 else:
                     selected_tokens = torch.tensor([], device=hidden_states.device)
@@ -845,15 +811,12 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
                 selected_tokens = torch.cat([selected_tokens, tail]).to(torch.int32)
                 selected_token_indices[batch_idx, query_idx, : selected_tokens.numel()] = selected_tokens
 
-        # Create the additive mask to be added to the main causal mask
         kv_length = attention_mask.shape[-1]
         selected_token_mask = torch.zeros(
             (*selected_token_indices.shape[:-1], kv_length + 1), device=attention_mask.device, dtype=torch.bool
         )
-        # We absorb all the -1 by scaterring them to the last index that we will drop
         scatter_indices = torch.where(selected_token_indices >= 0, selected_token_indices, kv_length)
         selected_token_mask = selected_token_mask.scatter(-1, scatter_indices, True)[..., :kv_length].unsqueeze(1)
-        # if using eager, convert to float mask
         if attention_mask.is_floating_point():
             min_dtype = torch.finfo(attention_mask.dtype).min
             selected_token_mask = torch.where(selected_token_mask, attention_mask.new_zeros(()), min_dtype)

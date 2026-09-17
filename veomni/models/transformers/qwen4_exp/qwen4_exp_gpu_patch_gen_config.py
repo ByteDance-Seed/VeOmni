@@ -22,6 +22,7 @@ unsupported Ulysses path fail explicitly. MTP is intentionally outside the
 training model and is filtered by ``checkpoint_tensor_converter.py``.
 """
 
+import math
 from copy import copy
 from dataclasses import dataclass
 from functools import partial
@@ -67,7 +68,7 @@ config = PatchConfig(
     target_file="patched_modeling_qwen4_exp_gpu.py",
     description="Qwen4-Exp initial GPU VLM-SFT integration with explicit PLE/QSA limits",
 )
-config.exclude_from_output("apply_rotary_pos_emb_vision")
+config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
 
 config.add_import("copy", names=["copy"])
 config.add_import("dataclasses", names=["dataclass"])
@@ -1173,6 +1174,100 @@ def qwen4_exp_for_conditional_generation_forward_patched(
 # Names resolved at codegen time from generated imports.
 is_flash_attention_requested = None
 get_max_seqlen = None
+
+
+@config.modify_init("Qwen4ExpTextQSAIndexer", description="Bind instance-local partial rope VeomniOp")
+def qwen4_exp_text_qsa_indexer_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
+
+
+@config.override_method(
+    "Qwen4ExpTextQSAIndexer.forward",
+    description="Always call the local partial rope VeomniOp for single-tensor indexer RoPE",
+)
+def qwen4_exp_text_qsa_indexer_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor,
+    past_key_values: Cache | None,
+) -> torch.Tensor:
+    batch_size, seq_length, _ = hidden_states.shape
+    hidden_shape = (batch_size, seq_length, -1, self.index_head_dim)
+    full_cos, full_sin = position_embeddings
+    current_cos, current_sin = full_cos[:, -seq_length:, :], full_sin[:, -seq_length:, :]
+
+    qk = self.index_qk_proj(hidden_states)
+    q, token_k = torch.split(
+        qk,
+        [self.index_n_heads * self.index_head_dim, self.index_kv_heads * self.index_head_dim],
+        dim=-1,
+    )
+    q, raw_keys = q.reshape(*hidden_shape), token_k.reshape(*hidden_shape).squeeze(2)
+    q = self.q_layernorm(q)
+    q, _ = self.veomni_rope(q, q, current_cos, current_sin, unsqueeze_dim=2)
+
+    if past_key_values is not None:
+        raw_keys = past_key_values.update_indexer(raw_keys, self.layer_idx)
+
+    visible_token_indices = attention_mask if attention_mask.dtype == torch.bool else attention_mask == 0
+
+    selected_token_indices = torch.full(
+        (batch_size, seq_length, self.token_budget + self.compress_ratio - 1),
+        -1,
+        dtype=torch.int32,
+        device=hidden_states.device,
+    )
+    for batch_idx in range(batch_size):
+        for query_idx in range(seq_length):
+            local_visible_indices = torch.nonzero(
+                visible_token_indices[batch_idx, 0, query_idx], as_tuple=False
+            ).flatten()
+            num_complete_blocks = local_visible_indices.shape[-1] // self.compress_ratio
+            if num_complete_blocks > 0:
+                block_token_indices = local_visible_indices[: num_complete_blocks * self.compress_ratio].view(
+                    num_complete_blocks, self.compress_ratio
+                )
+
+                key_groups = raw_keys[batch_idx].index_select(0, block_token_indices.flatten())
+                key_groups = key_groups.view(*block_token_indices.shape, self.index_head_dim)
+                pooled_keys = key_groups.float().mean(dim=1).to(raw_keys.dtype)
+                pooled_keys = self.k_layernorm(pooled_keys)
+                group_starts = block_token_indices[:, 0]
+                pooled_keys = pooled_keys.unsqueeze(1)
+                block_key_states, _ = self.veomni_rope(
+                    pooled_keys,
+                    pooled_keys,
+                    full_cos[batch_idx].index_select(0, group_starts),
+                    full_sin[batch_idx].index_select(0, group_starts),
+                )
+                block_key_states = block_key_states.squeeze(1)
+
+                scores = torch.matmul(
+                    q[batch_idx, query_idx].float(), block_key_states.float().transpose(-1, -2)
+                ).transpose(-1, -2)
+                scores = torch.relu(scores).sum(dim=-1) / math.sqrt(self.index_head_dim)
+
+                selected_block_indices = scores.topk(min(self.block_topk, num_complete_blocks), dim=0).indices
+                selected_tokens = block_token_indices.index_select(0, selected_block_indices).flatten()
+            else:
+                selected_tokens = torch.tensor([], device=hidden_states.device)
+            tail = local_visible_indices[num_complete_blocks * self.compress_ratio :]
+            selected_tokens = torch.cat([selected_tokens, tail]).to(torch.int32)
+            selected_token_indices[batch_idx, query_idx, : selected_tokens.numel()] = selected_tokens
+
+    kv_length = attention_mask.shape[-1]
+    selected_token_mask = torch.zeros(
+        (*selected_token_indices.shape[:-1], kv_length + 1), device=attention_mask.device, dtype=torch.bool
+    )
+    scatter_indices = torch.where(selected_token_indices >= 0, selected_token_indices, kv_length)
+    selected_token_mask = selected_token_mask.scatter(-1, scatter_indices, True)[..., :kv_length].unsqueeze(1)
+    if attention_mask.is_floating_point():
+        min_dtype = torch.finfo(attention_mask.dtype).min
+        selected_token_mask = torch.where(selected_token_mask, attention_mask.new_zeros(()), min_dtype)
+
+    return selected_token_mask
 
 
 @config.modify_init("Qwen4ExpTextAttention", description="Bind instance-local rope and attention VeomniOps")
