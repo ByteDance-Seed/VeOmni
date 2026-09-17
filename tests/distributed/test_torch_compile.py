@@ -827,3 +827,90 @@ def test_enable_compile_accepts_text_data_argument_subclass():
     )
 
     assert args.train.pad_to_length == 16
+
+
+def _decoder_gradient_relative_l2(actual, reference):
+    """Whole-decoder relative L2 over the union of the trained parameters."""
+    assert actual.keys() == reference.keys(), actual.keys() ^ reference.keys()
+    error_squared = reference_squared = 0.0
+    for name, expected in reference.items():
+        value = actual[name]
+        assert value.shape == expected.shape, name
+        error_squared += (value.double() - expected.double()).square().sum().item()
+        reference_squared += expected.double().square().sum().item()
+    return (error_squared / reference_squared) ** 0.5
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="V4 fused MoE requires CUDA")
+@pytest.mark.parametrize("seed", [1, 2])
+def test_deepseek_v4_compiled_decoder_gradients_track_the_fp32_oracle(seed):
+    """Compiled BF16 must not be numerically further from FP32 than eager BF16.
+
+    Both modes start from one set of BF16-rounded weights, so a pairwise
+    eager/Inductor comparison cannot tell "different rounding" from "less
+    accurate". An eager FP32 forward/backward over the same BF16 values can: it
+    is the shared reference both modes are measured against.
+
+    The FP32 reference runs the eager MoE implementation, while both BF16 modes
+    run the Triton grouped GEMM, so a distance to it also contains that
+    implementation difference; the eager-versus-Inductor comparison, which shares
+    the fused path, is the one that isolates compilation. Budget: each mode
+    within 5% relative L2 of the reference (measured 1.70% eager, 1.48%
+    Inductor; mutual difference 2.08%). That both stay inside the budget is the
+    claim under test; the ordering between them is not asserted, because it is a
+    rounding coincidence rather than a contract. Costs about 65s of GPU wall time
+    for two seeds on an L20.
+    """
+    from veomni.distributed.parallel_state import ParallelState
+    from veomni.models import build_foundation_model
+    from veomni.utils.device import empty_cache
+
+    from ..tools.training_utils import make_eager_ops_config
+
+    def trainable_gradients(model):
+        model.zero_grad(set_to_none=True)
+        with use_parallel_state(ParallelState()):
+            model(input_ids=inputs, labels=inputs, use_cache=False).loss.backward()
+        return {
+            name: parameter.grad.detach().float()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+
+    fused = _build_deepseek_v4_fused_toy(seed)
+    # ``tid2eid`` is a persistent buffer, so its filled-in tables travel with the
+    # state dict; no separate re-fill is needed.
+    state = {name: tensor.detach().clone() for name, tensor in fused.state_dict().items()}
+    del fused
+    empty_cache()
+    inputs = torch.arange(64, device=get_device_type()).view(1, 64)
+
+    precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        oracle = build_foundation_model(
+            config_path="tests/toy_config/deepseek_v4_toy",
+            weights_path=None,
+            torch_dtype="float32",
+            init_device=get_device_type(),
+            ops_implementation=make_eager_ops_config(),
+        ).train()
+        oracle.load_state_dict(state)
+        oracle_gradients = trainable_gradients(oracle)
+    finally:
+        torch.set_float32_matmul_precision(precision)
+    del oracle
+    empty_cache()
+
+    distances = {}
+    for backend in ("eager", "inductor"):
+        model = _build_deepseek_v4_fused_toy(seed)
+        model.load_state_dict(state)
+        if backend == "inductor":
+            assert compile_decoder_blocks(model, CompileConfig(enable=True, backend=backend, fullgraph=True)) == 4
+        distances[backend] = _decoder_gradient_relative_l2(trainable_gradients(model), oracle_gradients)
+        del model
+        empty_cache()
+
+    assert distances["eager"] < 0.05, distances
+    assert distances["inductor"] < 0.05, distances

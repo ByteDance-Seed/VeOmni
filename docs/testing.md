@@ -195,6 +195,22 @@ about 5.81% for Inductor versus eager. First-step AdamW replay and clipping
 passed their scoped oracles; whole-model update parity and convergence remain
 unqualified. See the separate EP validation PR for expert transport validation.
 
+The eager/Inductor BF16 gap is rounding divergence, not an accuracy regression.
+`test_deepseek_v4_compiled_decoder_gradients_track_the_fp32_oracle` keeps the
+decoder-level bound under test: from one fixed set of BF16-rounded weights and the
+same input, both the eager and the fullgraph Inductor decoder stay within 5%
+relative L2 of an eager FP32 forward/backward over those same values. The
+reference runs the eager MoE implementation rather than the Triton grouped GEMM
+both BF16 modes use, so its distance also contains that implementation
+difference.
+
+Measurements taken for this document, none of which a test asserts: the harness
+reads 1.70% (eager) and 1.48% (Inductor), so Inductor is if anything closer to
+the reference, and the two BF16 modes are 2.08% apart. Their pre-clipping
+gradient norms agree to 1.5e-4 relative and the cosine between them is 0.9985.
+In the four-rank run `TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1` does not close the
+gap: 5.84% and 6.02% at steps 1 and 2, against 5.48% and 5.79% by default.
+
 ---
 
 ### 2. VLM Trainer Test (`tests/models/test_vlm_trainer.py`)
