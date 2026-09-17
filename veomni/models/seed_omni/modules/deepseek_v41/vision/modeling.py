@@ -46,6 +46,7 @@ import torch.nn.functional as F
 from torch.nn.functional import scaled_dot_product_attention
 
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+from veomni.utils.import_utils import is_flash_attn_2_available
 
 from ....omni_pretrained_model import OmniPreTrainedModel
 from ....utils.conversation import ConversationItem
@@ -63,7 +64,11 @@ from .processing import (
 )
 
 
-if IS_CUDA_AVAILABLE:
+# FA2 ships no aarch64 wheel, so a CUDA box is not proof the kernel is there:
+# Grace-Blackwell has CUDA and no ``flash_attn``. Dispatch on the package.
+USE_FLASH_ATTN_VARLEN = IS_CUDA_AVAILABLE and is_flash_attn_2_available()
+
+if USE_FLASH_ATTN_VARLEN:
     from flash_attn import flash_attn_varlen_func
 elif IS_NPU_AVAILABLE:
     import torch_npu
@@ -160,7 +165,7 @@ class DeepseekV41VisionAttention(nn.Module):
         q = _apply_rotary(q, cos, sin)
         k = _apply_rotary(k, cos, sin)
 
-        if IS_CUDA_AVAILABLE:
+        if USE_FLASH_ATTN_VARLEN:
             out = flash_attn_varlen_func(
                 q.to(torch.bfloat16),
                 k.to(torch.bfloat16),
