@@ -903,6 +903,8 @@ class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Causal
         ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
         ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """
+
+
 config.add_import("transformers.utils", names=["logging"])
 config.add_post_import_block("""
 from transformers.utils import logging

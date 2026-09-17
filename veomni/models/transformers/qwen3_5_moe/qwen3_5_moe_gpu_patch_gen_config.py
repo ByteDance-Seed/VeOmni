@@ -1318,6 +1318,8 @@ def qwen3_5_moe_causal_lm_get_parallel_plan_patched(self):
     from ..parallel_plan import get_causal_lm_parallel_plan as _get_causal_lm_parallel_plan
 
     return _get_causal_lm_parallel_plan()
+
+
 config.add_import("transformers.utils", names=["logging"])
 config.add_post_import_block("""
 from transformers.utils import logging
