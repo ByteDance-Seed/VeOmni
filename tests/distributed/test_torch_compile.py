@@ -433,15 +433,15 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
     monkeypatch.setattr("veomni.trainer.vlm_trainer.reduce_global_loss_token", lambda token_count: token_count)
 
     trainer = VLMTrainer.__new__(VLMTrainer)
+    model_args = SimpleNamespace(
+        optimizer=SimpleNamespace(max_grad_norm=1.0),
+        accelerator=SimpleNamespace(offload_config=OffloadConfig()),
+    )
     trainer.base = SimpleNamespace(
-        args=SimpleNamespace(
-            model=SimpleNamespace(
-                optimizer=SimpleNamespace(max_grad_norm=1.0),
-                accelerator=SimpleNamespace(offload_config=OffloadConfig()),
-            )
-        ),
+        args=SimpleNamespace(model=model_args),
         state=SimpleNamespace(global_step=0),
         model=SimpleNamespace(
+            args=model_args,
             _veomni_compile_uses_cuda_graphs=True,
             clip_grad_norm=lambda: torch.tensor(0.0),
             optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda: None),
