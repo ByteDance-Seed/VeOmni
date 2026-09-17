@@ -80,7 +80,7 @@ def _dense_attention_mask_builder(
     """Materialize visibility for SDPA and the eager shape-mask APIs.
 
     Expand Ulysses-local lengths only when the adapter would gather Q/K/V
-    itself: sync Ulysses and not ``skip_ulysses``. Then call Transformers'
+    itself: ``ulysses_size > 1`` and not ``skip_ulysses``. Then call Transformers'
     ``sdpa`` builder. Cached decode (``q_length != kv_length``) cannot use
     SDPA ``is_causal`` skip. Eager shape masks may additionally compose packed
     boundaries; the public SDPA builder rejects that metadata before this call.

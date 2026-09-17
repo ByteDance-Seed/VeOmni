@@ -386,6 +386,46 @@ def test_flash_attention_skip_ulysses_skips_exchange_and_is_not_forwarded(monkey
     assert "skip_ulysses" not in captured["kwargs"]
 
 
+def test_flash_attention_exchanges_when_async_enabled_unless_skipped(monkeypatch):
+    """Global async must not disable vision-style sync Ulysses."""
+    from veomni.ops.kernels.attention import ulysses as ulysses_backend
+
+    group = object()
+    state = SimpleNamespace(ulysses_group=group, ulysses_size=2, async_enabled=True)
+    recorder = UlyssesHelperRecorder()
+
+    def fake_flash(query, key, value, attention_mask, **kwargs):
+        recorder.calls.append(("backend", query.shape))
+        return query
+
+    monkeypatch.setattr(ulysses_backend, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(flash_backend, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(flash_backend, "prepare_ulysses_qkv", recorder.prepare)
+    monkeypatch.setattr(flash_backend, "restore_ulysses_output", recorder.restore)
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", fake_flash)
+    query = torch.randn(1, 4, 4, 16, dtype=torch.float16)
+
+    flash_backend.flash_attention_forward(
+        _FakeAttentionModule("veomni_flash_attention_2"),
+        query,
+        query,
+        query,
+        attention_mask=None,
+    )
+    assert [call[0] for call in recorder.calls] == ["prepare", "backend", "restore"]
+
+    recorder.calls.clear()
+    flash_backend.flash_attention_forward(
+        _FakeAttentionModule("veomni_flash_attention_2"),
+        query,
+        query,
+        query,
+        attention_mask=None,
+        skip_ulysses=True,
+    )
+    assert [call[0] for call in recorder.calls] == ["backend"]
+
+
 def test_varlen_flash_attn_padded_input_matches_unpadded():
     """Pin the vendor contract used when packed inputs retain padded tails."""
     if not IS_CUDA_AVAILABLE or torch.version.hip is not None:

@@ -112,12 +112,12 @@ def flash_attention_forward(
        via ``cu_seqlens`` (varlen path) and do not need the top-left causal mask
        workaround required by some older Transformers models.
 
-    2. **Ulysses sequence-parallelism** — when Ulysses SP is on and async is
-       off, the full Q/K/V sequence is gathered across SP ranks before the
-       kernel call and the output is scattered back afterwards. Async SP and
-       ``ulysses_size == 1`` leave the layout unchanged. ``skip_ulysses`` is
-       an opt-out for a call whose tokens are not on the SP mesh, such as
-       Wan cross-attn. Async Ulysses stays outside attention.
+    2. **Ulysses sequence-parallelism** — when Ulysses SP is on, the full
+       Q/K/V sequence is gathered across SP ranks before the kernel call
+       and the output is scattered back afterwards. ``ulysses_size == 1``
+       leaves the layout unchanged. ``skip_ulysses`` opts out a call that
+       already gathered, or whose tokens are not on the SP mesh, such as
+       Wan cross-attn or Qwen3-VL text async.
 
     3. **FA backend selection** — the selected registry / HF name is mapped to
        the token that Transformers' ``lazy_import_flash_attention`` expects.

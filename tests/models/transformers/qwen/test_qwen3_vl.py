@@ -93,3 +93,81 @@ def test_qwen3_vl_eager_matches_hf_vision_and_text(modality):
     labels = vision_inputs.pop("labels")
     # Vision embed / RoPE ULP (~2e-7); the text-only path above is bitwise.
     assert_eager_matches_hf(hf, ours, input_ids=ids, labels=labels, fwd_kwargs=vision_inputs)
+
+
+def test_qwen3_vl_async_text_skips_ulysses_but_vision_stays_sync():
+    """Text async gathers outside attention; vision must keep sync Ulysses."""
+    import inspect
+
+    from veomni.models.transformers.qwen3_vl.generated import (
+        patched_modeling_qwen3_vl_gpu,
+        patched_modeling_qwen3_vl_npu,
+    )
+    from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
+        _qwen3_vl_async_ulysses_attention_forward,
+        qwen3_vl_vision_attention_forward_patched,
+    )
+    from veomni.models.transformers.qwen3_vl_moe.generated import (
+        patched_modeling_qwen3_vl_moe_gpu,
+        patched_modeling_qwen3_vl_moe_npu,
+    )
+
+    assert "skip_ulysses=True" in inspect.getsource(_qwen3_vl_async_ulysses_attention_forward)
+    assert "skip_ulysses=True" not in inspect.getsource(qwen3_vl_vision_attention_forward_patched)
+    for module in (
+        patched_modeling_qwen3_vl_gpu,
+        patched_modeling_qwen3_vl_npu,
+        patched_modeling_qwen3_vl_moe_gpu,
+        patched_modeling_qwen3_vl_moe_npu,
+    ):
+        assert "skip_ulysses=True" in inspect.getsource(module._qwen3_vl_async_ulysses_attention_forward)
+
+
+def test_qwen3_vl_async_helper_forwards_skip_ulysses(monkeypatch):
+    from veomni.models.transformers.qwen3_vl import qwen3_vl_gpu_patch_gen_config as cfg
+
+    captured = {}
+
+    class _FakeOp:
+        def __init__(self, op, variant, impl=None):
+            self.op = op
+
+        def __call__(self, *args, **kwargs):
+            if self.op == "async_ulysses_qkv":
+                hidden = kwargs["hidden_states"]
+                batch, seq, _ = hidden.shape
+                qkv = hidden.new_zeros(batch, seq * 2, 2, 4)
+                return qkv, qkv.clone(), qkv.clone()
+            return kwargs["hidden_states"]
+
+    def fake_attn(module, query, key, value, attention_mask, **kwargs):
+        captured["skip_ulysses"] = kwargs.get("skip_ulysses")
+        captured["query_seq"] = query.shape[2]
+        return query.transpose(1, 2), None
+
+    monkeypatch.setattr(cfg, "VeomniOp", _FakeOp)
+    monkeypatch.setattr(cfg, "gather_outputs", lambda tensor, **kwargs: tensor)
+    monkeypatch.setattr(cfg, "get_ulysses_sequence_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(cfg, "get_parallel_state", lambda: SimpleNamespace(sp_group=object()))
+    monkeypatch.setattr(cfg, "is_flash_attention_requested", lambda _config: True)
+
+    module = SimpleNamespace(
+        config=SimpleNamespace(_attn_implementation="flash_attention_2", rms_norm_eps=1e-6),
+        q_proj=SimpleNamespace(weight=None, bias=None),
+        k_proj=SimpleNamespace(weight=None, bias=None),
+        v_proj=SimpleNamespace(weight=None, bias=None),
+        o_proj=SimpleNamespace(weight=None, bias=None),
+        q_norm=SimpleNamespace(weight=None),
+        k_norm=SimpleNamespace(weight=None),
+        veomni_rope=lambda q, k, cos, sin: (q, k),
+        veomni_attn=fake_attn,
+        training=False,
+        attention_dropout=0.0,
+        scaling=1.0,
+        head_dim=4,
+    )
+    hidden = torch.zeros(1, 4, 8)
+    cos = torch.zeros(1, 4, 4)
+    cfg._qwen3_vl_async_ulysses_attention_forward(module, hidden, None, (cos, cos))
+    assert captured["skip_ulysses"] is True
+    assert captured["query_seq"] == 8

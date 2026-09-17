@@ -101,8 +101,8 @@ def sdpa_attention_forward(
     Flash is not tried. Use ``veomni_flash_attention_*`` when the pattern can
     stay in attention kwargs.
 
-    ``skip_ulysses`` opts a call out of sync Ulysses when its tokens are not
-    on the SP mesh. Async Ulysses stays outside attention.
+    ``skip_ulysses`` opts a call out when it already gathered or its tokens
+    are not on the SP mesh.
     """
     reject_sdpa_packed_metadata(kwargs)
     del sliding_window

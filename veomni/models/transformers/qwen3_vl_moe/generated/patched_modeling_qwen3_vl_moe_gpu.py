@@ -184,8 +184,9 @@ def _qwen3_vl_async_ulysses_attention_forward(
     """Async Ulysses attention forward path for Qwen3VLTextAttention.
 
     Fuses QKV projection + q_norm/k_norm + RoPE + ulysses all-to-all, and
-    the output projection + reverse all-to-all. Requires a flash-attention
-    implementation because of the packed-varlen contract.
+    the output projection + reverse all-to-all. Attention must not gather
+    again, so this path passes ``skip_ulysses=True``. Requires a
+    flash-attention implementation because of the packed-varlen contract.
     """
     if not is_flash_attention_requested(self.config):
         raise ValueError(
@@ -240,6 +241,7 @@ def _qwen3_vl_async_ulysses_attention_forward(
         attention_mask,
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling,
+        skip_ulysses=True,
         **kwargs,
     )
 
@@ -805,6 +807,9 @@ class Qwen3VLMoeVisionAttention(nn.Module):
             # --- Patch.1 ---
             # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
             # --- Patch.1 ---
+            # Vision tokens stay on the attention-internal sync Ulysses path
+            # even when text async is on. Do not pass skip_ulysses; cu_seqlens
+            # still describes the global packed sequence.
             attn_output, _ = attention_interface(
                 self,
                 query_states,

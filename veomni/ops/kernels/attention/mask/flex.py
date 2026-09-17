@@ -46,11 +46,12 @@ def flex_attention_mask_builder(
     """Build a Transformers FlexAttention mask.
 
     Expand local lengths to the Ulysses-global sequence only when the
-    adapter would gather Q/K/V itself: sync Ulysses and not
-    ``skip_ulysses``. Async Ulysses gathers before attention, so the
-    lengths already passed in are the effective/global ones and the mask
-    is built at that scale. Explicit cumulative lengths are sufficient
-    packed-sequence metadata and do not require an additional 2D mask.
+    adapter would gather Q/K/V itself: ``ulysses_size > 1`` and not
+    ``skip_ulysses``. Callers that already gathered pass
+    ``skip_ulysses=True``, so the lengths already passed in are the
+    effective/global ones and the mask is built at that scale. Explicit
+    cumulative lengths are sufficient packed-sequence metadata and do not
+    require an additional 2D mask.
     Canonical masks can be rebuilt from global lengths; custom predicates
     require global metadata.
     """

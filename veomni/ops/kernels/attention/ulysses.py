@@ -28,18 +28,15 @@ from ....distributed.sequence_parallel.ulysses import (
 def should_apply_ulysses(*, skip_ulysses: bool = False) -> bool:
     """Return whether this call should gather/scatter Ulysses itself.
 
-    Sync Ulysses belongs inside attention only when the Ulysses axis is
-    greater than 1 and async Ulysses is off. Async SP gathers outside
-    attention. ``ulysses_size == 1`` is a no-op. ``skip_ulysses`` opts a
-    call out when its tokens are not on the SP mesh.
+    Attention gathers when the Ulysses axis is greater than 1. Callers
+    that already gathered, or whose tokens are not on the SP mesh, pass
+    ``skip_ulysses=True``. The global async flag is not consulted: mixed
+    models keep vision on the sync path while text async gathers outside
+    attention.
     """
     if skip_ulysses:
         return False
-
-    parallel_state = get_parallel_state()
-    if parallel_state.ulysses_size <= 1:
-        return False
-    return not bool(parallel_state.async_enabled)
+    return get_parallel_state().ulysses_size > 1
 
 
 def effective_sequence_lengths(
@@ -50,10 +47,9 @@ def effective_sequence_lengths(
 ) -> tuple[int, int]:
     """Return the Q/K lengths seen by the attention kernel.
 
-    Synchronous Ulysses gathers the sequence inside attention, so mask
-    metadata must describe the global sequence. Async Ulysses gathers before
-    attention, and skipped calls stay local, so their input lengths are already
-    the effective lengths.
+    When attention gathers, mask metadata must describe the global
+    sequence. ``skip_ulysses`` keeps the caller's lengths: either they
+    are already global after an outside gather, or the tokens stay local.
     """
     if not should_apply_ulysses(skip_ulysses=skip_ulysses):
         return q_length, kv_length

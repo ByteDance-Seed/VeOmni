@@ -199,7 +199,8 @@ def test_should_apply_ulysses_follows_parallel_state(monkeypatch):
     assert should_apply_ulysses()
     assert not should_apply_ulysses(skip_ulysses=True)
     _set_state(ulysses_size=2, async_enabled=True)
-    assert not should_apply_ulysses()
+    assert should_apply_ulysses()
+    assert not should_apply_ulysses(skip_ulysses=True)
 
 
 def test_ulysses_helpers_preserve_layout(monkeypatch):

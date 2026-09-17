@@ -110,8 +110,8 @@ def magi_attention_forward(
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run MagiAttention FFA for CP1 with optional VeOmni Ulysses exchange.
 
-    ``skip_ulysses`` opts a call out of sync Ulysses when its tokens are not
-    on the SP mesh. Async Ulysses stays outside attention. FA4 is called with
+    ``skip_ulysses`` opts a call out when it already gathered or its tokens
+    are not on the SP mesh. FA4 is called with
     ``sink=None``; a provided ``s_aux`` is rejected instead of dropped.
     """
     if kwargs.get("s_aux") is not None:
