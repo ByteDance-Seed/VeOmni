@@ -1919,7 +1919,7 @@ def deepseek_v4_forcausallm_forward_patched(
             self.num_experts_per_tok,
             attention_mask,
         )
-        if labels is not None and isinstance(aux_loss, torch.Tensor):
+        if isinstance(loss, torch.Tensor) and isinstance(aux_loss, torch.Tensor):
             loss = loss + self.router_aux_loss_coef * aux_loss.to(loss.device)
 
     aux_metrics = None

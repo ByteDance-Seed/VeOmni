@@ -2704,7 +2704,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
                 self.config.num_experts_per_tok,
                 attention_mask,
             )
-            if labels is not None and isinstance(aux_loss, torch.Tensor):
+            if isinstance(loss, torch.Tensor) and isinstance(aux_loss, torch.Tensor):
                 loss += self.config.router_aux_loss_coef * aux_loss.to(loss.device)
 
         return MoeCausalLMOutputWithLogProbs(
@@ -2840,7 +2840,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
                 self.config.text_config.num_experts_per_tok,
                 attention_mask,
             )
-            if labels is not None and isinstance(aux_loss, torch.Tensor):
+            if isinstance(loss, torch.Tensor) and isinstance(aux_loss, torch.Tensor):
                 loss += self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
 
         return Qwen3_5MoeCausalLMOutputWithLogProbs(

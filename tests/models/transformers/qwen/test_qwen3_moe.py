@@ -213,7 +213,8 @@ def test_qwen3_moe_registry_installs_checkpoint_and_lora_hooks(architecture: str
     ]
 
 
-def test_qwen3_moe_eager_matches_hf_aux_loss():
+@pytest.mark.parametrize("output_router_logits", [False, True])
+def test_qwen3_moe_eager_matches_hf_aux_loss(output_router_logits):
     torch.manual_seed(0)
     config = _tiny_config()
     hf = HFQwen3MoeForCausalLM(config)
@@ -222,9 +223,42 @@ def test_qwen3_moe_eager_matches_hf_aux_loss():
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
     labels = input_ids.clone()
-    hf_out = hf(input_ids=input_ids, labels=labels, use_cache=False, output_router_logits=True)
-    ours_out = ours(input_ids=input_ids, labels=labels, use_cache=False, output_router_logits=True)
-    assert ours_out.aux_loss is not None
-    assert hf_out.aux_loss is not None
-    torch.testing.assert_close(ours_out.aux_loss, hf_out.aux_loss, atol=1e-6, rtol=1e-6)
+    hf_out = hf(input_ids=input_ids, labels=labels, use_cache=False, output_router_logits=output_router_logits)
+    ours_out = ours(input_ids=input_ids, labels=labels, use_cache=False, output_router_logits=output_router_logits)
+    if output_router_logits:
+        assert ours_out.aux_loss is not None
+        assert hf_out.aux_loss is not None
+        torch.testing.assert_close(ours_out.aux_loss, hf_out.aux_loss, atol=1e-6, rtol=1e-6)
+    else:
+        assert ours_out.aux_loss is None
     torch.testing.assert_close(ours_out.loss, hf_out.loss, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("output_router_logits", [False, True])
+def test_qwen3_moe_router_aux_survives_none_loss(output_router_logits):
+    from veomni.utils.model_outputs import FusedLinearAuxOutput
+
+    torch.manual_seed(0)
+    config = _tiny_config()
+    ours = _build_ours(config)
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    labels = input_ids.clone()
+
+    def fake_loss(*_args, **_kwargs):
+        return None, None, FusedLinearAuxOutput(log_probs=torch.zeros_like(labels, dtype=torch.float32))
+
+    ours.loss_function = fake_loss
+    ours_out = ours(
+        input_ids=input_ids,
+        labels=labels,
+        use_cache=False,
+        output_router_logits=output_router_logits,
+    )
+    assert ours_out.loss is None
+    assert ours_out.logits is None
+    assert ours_out.fused_linear_aux is not None
+    assert ours_out.fused_linear_aux.log_probs is not None
+    if output_router_logits:
+        assert isinstance(ours_out.aux_loss, torch.Tensor)
+    else:
+        assert ours_out.aux_loss is None

@@ -715,7 +715,7 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
             self.config.text_config.num_experts_per_tok,
             attention_mask,
         )
-        if labels is not None and isinstance(aux_loss, torch.Tensor):
+        if isinstance(loss, torch.Tensor) and isinstance(aux_loss, torch.Tensor):
             loss = loss + self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
     # --- Patch.2 ---
 
