@@ -154,7 +154,13 @@ YAML Config -> VeOmniArguments -> Trainer
 ## DiT Remove-Padding Interface
 
 `model.use_remove_padding` is DiT-only and defaults to false. The shared contract
-lives in `veomni/models/diffusers/packing.py`; no built-in model opts in yet.
+lives in `veomni/models/diffusers/packing.py`. MiniMax H3 is the first consumer:
+`minimax_h3_core/batch_packing.py` concatenates valid prepared rows with separate
+DiT/refiner boundaries, remapped timestep indices, and sample-local positions.
+Its model restores per-sample target predictions and weighted losses; its
+condition model prepares FL2VA or visual Ref2VA independently before packing.
+The enabled path uses per-instance segmented SDPA or local FA2/FA3 varlen dispatch,
+without changing parameter names or the legacy global attention path.
 `DiTTrainer` checks config constraints before distributed setup, resolves model
 and condition capabilities through the existing registry before loading weights,
 and configures a supporting model before wrapping. Its enabled forward path calls

@@ -33,6 +33,7 @@ _MINIMAX_H3_TIME_DIVISION_REMAINDER = 5
 
 class MiniMaxH3ConditionModel(PreTrainedModel):
     config_class = MiniMaxH3ConditionModelConfig
+    supports_sample_inputs = True
 
     def __init__(self, config: MiniMaxH3ConditionModelConfig, **kwargs):
         super().__init__(config)
@@ -471,6 +472,43 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
     # ── process_condition (add noise + pack) ──────────────────────────
 
     @torch.no_grad()
+    def prepare_samples(self, **collated_inputs) -> list[dict]:
+        """Prepare independently before packing, preserving the single-sample RNG path."""
+        count = len(collated_inputs["input_latents"])
+        if count == 0:
+            raise ValueError("H3 requires a nonempty sample list.")
+        for name, values in collated_inputs.items():
+            if isinstance(values, list) and len(values) != count:
+                raise ValueError(f"H3 input column {name} has length {len(values)}, expected {count}.")
+        samples = []
+        for i in range(count):
+            single = {key: [value[i]] if isinstance(value, list) else value for key, value in collated_inputs.items()}
+            pk = single["packed"][0]
+            anchors = [
+                single[key][0]
+                for key in ("keyframe_cond_anchor", "ref_visual_anchor")
+                if single.get(key) is not None and single[key][0] is not None
+            ]
+            if pk["cond_rows"] and (len(anchors) != 1 or anchors[0].shape != (pk["cond_rows"], 96)):
+                raise ValueError("H3 condition anchor rows must match the packed layout.")
+            inputs = self.process_condition(**single)
+            targets = {key: inputs.pop(key) for key in ("training_target", "training_target_audio")}
+            metadata = {
+                key: inputs.pop(key)
+                for key in (
+                    "cond_rows",
+                    "video_latent_shape",
+                    "audio_latent_shape",
+                    "scheduler_video",
+                    "scheduler_audio",
+                    "t_video",
+                    "t_audio",
+                )
+            }
+            samples.append({"model_inputs": inputs, "targets": targets, "metadata": metadata})
+        return samples
+
+    @torch.no_grad()
     def process_condition(
         self,
         input_latents: list[torch.Tensor],
@@ -481,6 +519,8 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         imgvid_cond_noise_aug: float = 0.999,
         audio_cond_noise_aug: float = 1.0,
         use_gradient_checkpointing: bool = True,
+        ref_visual_anchor: list[torch.Tensor | None] | None = None,
+        ref_audio_anchor: list[torch.Tensor | None] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         """Add noise + pack latents into model.forward() inputs.
@@ -517,6 +557,12 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         }
         if keyframe_cond_anchor is not None:
             supplied["keyframe_cond_anchor"] = keyframe_cond_anchor
+        if ref_visual_anchor is not None:
+            supplied["ref_visual_anchor"] = ref_visual_anchor
+        if ref_audio_anchor is not None:
+            if any(anchor is not None for anchor in ref_audio_anchor):
+                raise NotImplementedError("Ref2VA audio references are not supported.")
+            supplied["ref_audio_anchor"] = ref_audio_anchor
         for name, coll in supplied.items():
             if len(coll) != 1:
                 raise ValueError(
@@ -528,6 +574,15 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         prompt = prompt_embeds[0]
         pk = packed[0]
         cond_anchor = keyframe_cond_anchor[0] if keyframe_cond_anchor else None
+        if ref_visual_anchor and ref_visual_anchor[0] is not None:
+            if cond_anchor is not None:
+                raise ValueError("Specify either keyframe or reference visual anchors, not both.")
+            cond_anchor = ref_visual_anchor[0]
+        if pk.get("task") == "ref2va":
+            if cond_anchor is None or cond_anchor.shape != (pk["cond_rows"], clean_video.shape[1] * 4):
+                raise ValueError("Ref2VA visual anchor rows must match the packed reference layout.")
+            if len(pk["audio_pos"]) != clean_audio.shape[0] * clean_audio.shape[-1]:
+                raise NotImplementedError("Ref2VA audio reference rows are not supported.")
 
         device = clean_video.device
         dtype = clean_video.dtype

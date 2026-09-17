@@ -238,17 +238,13 @@ def test_capability_flag_without_hook_is_rejected():
     _api().configure_diffusion_remove_padding(object(), enabled=False, attn_implementation="eager")
 
 
-def test_builtin_models_do_not_opt_in():
-    from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
-        MiniMaxH3DiTModel,
-    )
+def test_unadapted_qwen_image_does_not_opt_in():
     from veomni.models.diffusers.qwen_image.qwen_image_transformer.modeling_qwen_image_transformer import (
         QwenImageTransformer2DModel,
     )
 
-    for cls in (MiniMaxH3DiTModel, QwenImageTransformer2DModel):
-        with pytest.raises(ValueError, match="remove_padding"):
-            _api().validate_diffusion_remove_padding_support(cls, _Condition)
+    with pytest.raises(ValueError, match="remove_padding"):
+        _api().validate_diffusion_remove_padding_support(QwenImageTransformer2DModel, _Condition)
 
 
 def _forward_trainer(monkeypatch):

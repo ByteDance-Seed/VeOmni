@@ -1,4 +1,4 @@
-"""FL2VA Packed Sequence Builder.
+"""FL2VA and visual Ref2VA packed sequence builders.
 
 Layout: [text | cond | audio | video | pad]
 
@@ -56,6 +56,74 @@ def _temporal_position_span(temporal_length: int) -> float:
     for token_index in range(_T_GROUP):
         spans[token_index::_T_GROUP] *= _FRAME_PER_TOKEN[token_index]
     return float(spans.sum())
+
+
+def build_packed_ref2va(
+    text_len: int,
+    latent_t: int,
+    latent_h: int,
+    latent_w: int,
+    audio_t: int,
+    ref_blocks: list[dict],
+    audio_channel: int = 2,
+    text_token_tags: torch.Tensor | None = None,
+) -> dict:
+    """Build visual-reference training metadata using the native inference grids.
+
+    References describe pre-encoded image/video geometry; anchor rows are supplied
+    separately, in block order. Audio references require a different replay/loss
+    contract and are not supported here. No encoder or inference pipeline is loaded.
+    """
+    if not ref_blocks:
+        raise ValueError("Ref2VA requires at least one visual reference.")
+    pk = build_packed_fl2va(text_len, latent_t, latent_h, latent_w, audio_t, [], audio_channel, text_token_tags)
+    grids = []
+    t_cursor = float(text_len)
+    for block in ref_blocks:
+        kind = block["kind"]
+        if kind in ("audio", "video_audio") or block.get("ref_audio_t", 0):
+            raise NotImplementedError("Ref2VA audio references are not supported.")
+        if kind not in ("image", "video"):
+            raise ValueError(f"Unknown visual reference kind: {kind}")
+        t, h, w = (int(block[key]) for key in ("latent_t", "latent_h", "latent_w"))
+        if t < 1 or h < 2 or w < 2 or h % 2 or w % 2 or (kind == "image" and t != 1):
+            raise ValueError("Reference geometry requires positive T, even H/W, and T=1 for images.")
+        sqrt_area = np.sqrt(h * w)
+        hh, ww = torch.meshgrid(
+            _axis_from_sqrt_area(h, 2, sqrt_area), _axis_from_sqrt_area(w, 2, sqrt_area), indexing="ij"
+        )
+        grid = torch.empty(t, (h // 2) * (w // 2), 3, dtype=torch.float64)
+        grid[:, :, 0] = _video_t_grid(t, t_cursor)[:, None]
+        grid[:, :, 1:] = torch.stack([hh.flatten(), ww.flatten()], dim=-1)[None]
+        grids.append(grid.flatten(0, 1))
+        t_cursor += 1.0 if kind == "image" else _temporal_position_span(t)
+    ref_grid = torch.cat(grids)
+    cond_rows = ref_grid.shape[0]
+    old_used = int(pk["cu_seqlens"][1])
+    target_grid = pk["img_position_ids"][0, text_len:old_used].clone()
+    target_grid[:, 0] += t_cursor - text_len
+    used = old_used + cond_rows
+    seq_len = ((used + _SEQ_ALIGN - 1) // _SEQ_ALIGN) * _SEQ_ALIGN
+    positions = torch.zeros(1, seq_len, 3, dtype=torch.float64)
+    positions[0, :text_len] = pk["img_position_ids"][0, :text_len]
+    positions[0, text_len : text_len + cond_rows] = ref_grid
+    positions[0, text_len + cond_rows : used] = target_grid
+    tags = torch.full((seq_len,), -1, dtype=torch.long)
+    tags[:text_len] = pk["token_tags"][:text_len]
+    tags[text_len : text_len + cond_rows] = 0
+    tags[text_len + cond_rows : used] = pk["token_tags"][text_len:old_used]
+    pk.update(
+        seq_len=seq_len,
+        img_position_ids=positions,
+        token_tags=tags,
+        img_pos=torch.cat([torch.arange(text_len, text_len + cond_rows), pk["img_pos"] + cond_rows]),
+        audio_pos=pk["audio_pos"] + cond_rows,
+        cond_rows=cond_rows,
+        update_mask=torch.cat([torch.zeros(cond_rows, dtype=torch.bool), pk["update_mask"]]),
+        cu_seqlens=torch.tensor([0, used, seq_len], dtype=torch.int32),
+        task="ref2va",
+    )
+    return pk
 
 
 def build_packed_fl2va(

@@ -15,6 +15,8 @@
 # Model
 # -----------------------------------------------------------------------------
 model:
+  # Opt in with micro_batch_size > 1; retain cast_forward_inputs=false below.
+  use_remove_padding: false
   model_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer
   condition_model_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA
   config_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer/config.json

@@ -4,10 +4,11 @@
 model-specific packing inside a fixed microbatch. It is independent of
 `train.dyn_bsz` and does not change LLM/VLM collators or configuration.
 
-This change supplies the common interface, not a packing implementation.
-**No built-in DiT/condition-model pair opts in yet.** Enabling the option on an
-unadapted model raises before condition/model weight loading. Model consumers
-will be introduced separately; there is no GPU performance claim in this API.
+The common interface is implemented by **MiniMax H3** for fixed-target-geometry
+FL2VA and visual Ref2VA offline training. See the
+[H3 usage and validation notes](../examples/minimax_h3.md#packed-offline-training).
+Enabling the option on an unadapted model still raises before condition/model
+weight loading. There is no GPU performance claim implied by this interface.
 
 See [RFC #1198](https://github.com/ByteDance-Seed/VeOmni/issues/1198) for design
 context. The interface and model consumers are delivered separately. Generic
@@ -15,7 +16,7 @@ attention kernels and model-specific layouts are not implemented by this API.
 
 ## Configuration and initial boundaries
 
-For a future supporting pair, the relevant settings are:
+For a supporting pair, the relevant settings are:
 
 ```yaml
 model:
@@ -32,7 +33,7 @@ data:
     drop_last: true
 ```
 
-This is an overlay on a DiT recipe, not a runnable built-in model example.
+This is an overlay on a supporting DiT recipe, not a complete model/data configuration.
 The initial trainer envelope requires:
 
 - FSDP2, with Ulysses, CP, TP, PP and extra-parallel sizes equal to one.
@@ -164,9 +165,11 @@ Every future consumer must verify:
    correctness. No speedup is implied by declaring the capability.
 
 CPU protocol regressions live in `tests/trainer/test_diffusion_remove_padding.py`
-and are listed explicitly in both GPU and NPU unit-test workflows. The test-only
-consumer exercises real trainer dispatch, root hooks and sample-mean gradient
-accumulation without opting any production model in. It uses an ordinary CPU
-module, not FSDP2. A real FSDP2 mixed-precision optimizer-step regression for the
-shared input/output protocol remains required before claiming distributed support,
-independently of the later model-specific packing tests.
+and are listed explicitly in both GPU and NPU unit-test workflows. That suite's
+test-only consumer uses an ordinary CPU module. H3 additionally has
+`tests/models/test_minimax_h3_remove_padding.py` for native CPU parity and
+`tests/trainer/test_minimax_h3_remove_padding_fsdp.py` for two-rank FSDP2
+mixed-precision root input/output, gradient-reduction and optimizer-step parity.
+The FSDP2 suite is registered in GPU CI; it skips without the required hardware
+or local FlashAttention package. Its execution is separate evidence, not something
+the generic CPU suite establishes.

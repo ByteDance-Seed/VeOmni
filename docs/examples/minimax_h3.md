@@ -187,6 +187,96 @@ train:
 
 ---
 
+## Packed Offline Training
+
+`model.use_remove_padding=true` opts H3 into cross-sample packing inside a fixed
+microbatch. Both **FL2VA** and **visual Ref2VA** (image/video references, without
+reference audio) use the shared DiT interface. It does not change rollout/inference
+batching, add dynamic batching, load new encoders, or implement an RL objective.
+The default remains false.
+
+For existing FL2VA embeddings, reuse the offline recipe:
+
+```shell
+bash train.sh tasks/train_dit.py configs/dit/minimax_h3_fl2va_offline.yaml \
+  --model.use_remove_padding true \
+  --train.micro_batch_size 2 \
+  --train.global_batch_size 16
+```
+
+Keep `train.dyn_bsz=false`, `data.dataloader.drop_last=true`, and FSDP2
+`mixed_precision.cast_forward_inputs=false`. Timesteps stay FP32 and positions
+stay FP32/FP64; blanket BF16 input casting is rejected rather than silently
+changing their precision. Targets must have the same video/audio geometry within
+a microbatch, while prompt lengths, reference counts and reference geometry may
+vary. Initial support excludes SP/CP/TP/PP, extra parallelism, LoRA, offload and
+compilation. The shared gate enforces these boundaries.
+
+### Visual Ref2VA prepared data
+
+Use matching Ref2VA model weights and **precomputed** Ref2VA prompt/condition
+embeddings. The existing FL2VA embedding recipe does not become a Ref2VA encoder.
+A decoded offline sample has the usual `input_latents`, `audio_input_latents`,
+`prompt_embeds` and `use_gradient_checkpointing`, plus:
+
+```python
+from veomni.models.diffusers.minimax_h3.minimax_h3_core.packed_sequence import build_packed_ref2va
+
+# Illustrative geometry; match it to the actual encoded tensors.
+ref_blocks = [
+    {"kind": "image", "latent_t": 1, "latent_h": 16, "latent_w": 24},
+    {"kind": "video", "latent_t": 6, "latent_h": 16, "latent_w": 24},
+]
+packed = build_packed_ref2va(
+    text_len=prompt_embeds.shape[0],
+    latent_t=video_latents.shape[2],
+    latent_h=video_latents.shape[3],
+    latent_w=video_latents.shape[4],
+    audio_t=audio_latents.shape[-1],
+    audio_channel=audio_latents.shape[0],
+    ref_blocks=ref_blocks,
+    text_token_tags=text_token_tags,
+)
+```
+
+Store this `packed` dictionary and `ref_visual_anchor` of shape
+`[packed["cond_rows"], 96]` in the existing offline-record format. Anchor rows must
+be concatenated in reference-block order and already use the same conditioning
+noise augmentation as `model.condition_model_cfg.imgvid_cond_noise_aug`, matching
+the native inference reference encoder. Preserve the Ref2VA presentation's text
+versus vision token tags. Do not substitute target-video keyframes or FL2VA prompt
+embeddings for Ref2VA references. Reference audio is rejected explicitly.
+
+Each sample samples its own timestep/noise through the existing condition path
+before packing. The transformer then executes once over compact rows with
+independent main-DiT and text-refiner cumulative boundaries. Its RoPE coordinates
+stay sample-local; timestep tables are remapped, not assumed shared. Reference
+rows are cropped separately for each output. Video/audio signs, unpatchification,
+scheduler weights and sample-mean losses retain their single-sample meanings.
+
+### Attention and validation
+
+- `eager` / `sdpa`: explicit per-segment PyTorch SDPA reference path; projections
+  and MLPs still operate on compact cross-sample rows.
+- `flash_attention_2` / `flash_attention_3` in `model.ops_implementation` resolve
+  to VeOmni's local FA2/FA3 backends. Each layer uses one non-causal varlen call,
+  not a loop of dense calls. The matching local kernel package and BF16/FP16 are
+  required; unavailable kernels are not silently replaced with SDPA.
+
+Native tiny-model CPU tests cover output/loss/gradient equivalence, checkpoint
+recomputation, sample isolation, valid zero rows versus nonzero padding, independent
+attention boundaries, and Ref2VA geometry against the existing inference builder.
+Two-rank tests additionally exercise real FSDP2, mixed precision, DP gradient
+reduction, and a real accumulated optimizer update through the trainer. They do
+not load official H3 weights or validate training convergence.
+
+FA2/FA3 protocol tests on CPU use a kernel stub and are **not** hardware kernel
+validation. The GPU suite has real-kernel cases that skip when the package or
+hardware is unavailable (FA3 requires SM90). Local SDPA verification uses torch
+2.13/Diffusers 0.40, not the project's locked torch 2.11/Diffusers 0.37 stack.
+No throughput improvement or production convergence is claimed; benchmark against
+an equivalent, tuned non-packed baseline before making either claim.
+
 ## 5. Inference
 
 ```shell
