@@ -66,7 +66,7 @@ from ...data import SeedOmniCollator, build_dataloader, build_dataset
 from ...data.data_transform import build_data_transform
 from ...distributed.clip_grad_norm import omni_clip_grad_norm
 from ...distributed.offloading import build_activation_offloading_context
-from ...distributed.parallel_state import init_parallel_state_from_config
+from ...distributed.parallel_state import init_parallel_state_from_config, use_parallel_state
 from ...models.seed_omni.accelerator import OmniModelRuntime
 from ...models.seed_omni.accelerator.module_runtime import ModuleRuntime
 from ...models.seed_omni.processing_omni import OmniProcessor
@@ -341,9 +341,10 @@ class OmniTrainer:
 
     def _build_data(self) -> None:
         """Build transform → dataset (fixes ``train_steps``) → dataloader."""
-        self._build_data_transform()
-        self._build_train_dataset()
-        self._build_train_dataloader()
+        with use_parallel_state("base"):
+            self._build_data_transform()
+            self._build_train_dataset()
+            self._build_train_dataloader()
 
     def _build_data_transform(self) -> None:
         self.data_transform = build_data_transform(self.args.data.data_type, **self.args.data.mm_configs)
