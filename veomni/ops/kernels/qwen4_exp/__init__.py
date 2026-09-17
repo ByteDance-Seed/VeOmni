@@ -23,11 +23,6 @@ import torch
 from ....utils.device import IS_CUDA_AVAILABLE
 
 
-def _require_tilelang_sm90() -> None:
-    if torch.version.hip is not None or not IS_CUDA_AVAILABLE:
-        raise RuntimeError("Qwen4-Exp TileLang kernels require an NVIDIA CUDA GPU")
-
-
 def qsa_attn_tilelang(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -35,7 +30,9 @@ def qsa_attn_tilelang(
     selected_indices: torch.Tensor,
     sm_scale: float | None = None,
 ) -> torch.Tensor:
-    _require_tilelang_sm90()
+    if torch.version.hip is not None or not IS_CUDA_AVAILABLE:
+        raise RuntimeError("Qwen4-Exp TileLang kernels require an NVIDIA CUDA GPU")
+
     from .tilelang_qsa import qsa_attn_tilelang as impl
 
     return impl(query, key, value, selected_indices, sm_scale)

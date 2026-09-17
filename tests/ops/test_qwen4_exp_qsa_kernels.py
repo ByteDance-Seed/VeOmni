@@ -76,7 +76,7 @@ def _qsa_reference(q, k, v, indices, scale):
 
     _bind_qsa_implementation(modeling, "eager")
     output, _ = modeling.eager_attention_forward(
-        SimpleNamespace(),
+        SimpleNamespace(training=False),
         q.float(),
         k.float(),
         v.float(),

@@ -35,6 +35,8 @@ import tilelang
 import torch
 from tilelang import language as T
 
+from ....utils.device import get_torch_device
+
 
 def cta_threads(block_H, block_size):
     """Pick the backward CTA width for a ``(block_H, block_size)`` tile.
@@ -70,7 +72,7 @@ def _dkv_split_store(block_H, block_size, D):
         + block_size  # mask
     )
     try:
-        limit = torch.cuda.get_device_properties(torch.cuda.current_device()).shared_memory_per_block_optin
+        limit = get_torch_device().get_device_properties(None).shared_memory_per_block_optin
     except (RuntimeError, AttributeError):
         limit = 101376  # conservative floor: cut-down Ada (L20/L4)
     budget = limit - base - 1024  # headroom for allocator alignment
