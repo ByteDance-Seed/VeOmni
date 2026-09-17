@@ -200,6 +200,17 @@ def test_translate_fused_dsa_mask_rejects_custom_head_and_additive_bias():
     assert is_standard_causal_mask(bool_blocked, q_len=seq_len, kv_len=seq_len)
     assert translate_fused_dsa_mask(bool_allowed, q_len=seq_len, kv_len=seq_len, fused=True, what="x") is None
 
+    finite_neg = torch.tensor([[[[0.0, -0.1], [0.0, 0.0]]]])
+    assert not is_standard_causal_mask(finite_neg, q_len=2, kv_len=2)
+    with pytest.raises(ValueError, match="eager implementation"):
+        translate_fused_dsa_mask(finite_neg, q_len=2, kv_len=2, fused=True, what="x")
+    assert translate_fused_dsa_mask(finite_neg, q_len=2, kv_len=2, fused=False, what="x") is finite_neg
+
+    finfo_causal = torch.zeros(1, 1, 2, 2)
+    finfo_causal[..., 0, 1] = torch.finfo(finfo_causal.dtype).min
+    assert is_standard_causal_mask(finfo_causal, q_len=2, kv_len=2)
+    assert translate_fused_dsa_mask(finfo_causal, q_len=2, kv_len=2, fused=True, what="x") is None
+
 
 def test_create_standard_causal_mask_marks_only_when_attention_mask_is_none():
     from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig

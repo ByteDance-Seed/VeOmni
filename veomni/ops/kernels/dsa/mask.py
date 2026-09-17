@@ -146,8 +146,9 @@ def is_standard_causal_mask(attention_mask: Tensor | None, *, q_len: int, kv_len
     ``None`` is the ``is_causal`` skip used when there is no padding. Additive
     or boolean ``[B, 1, Q, K]`` / ``[B, Q, K]`` masks must match the
     decode-aware triangle ``k > q + kv_len - q_len`` on every entry.
-    ``H != 1``, padding, a custom overlay, or a nonzero additive bias on an
-    allowed position is not standard.
+    ``H != 1``, padding, a custom overlay, a nonzero additive bias on an
+    allowed position, or a finite negative other than ``finfo.min`` is not
+    standard. Hard blocks are only ``-inf`` and the dtype minimum.
     """
     if attention_mask is None:
         return True
@@ -165,7 +166,7 @@ def is_standard_causal_mask(attention_mask: Tensor | None, *, q_len: int, kv_len
         # Accept either convention only when the full triangle matches.
         return bool(torch.equal(mask, ~expected_blocked) or torch.equal(mask, expected_blocked))
     allowed = mask == 0
-    blocked = mask < 0
+    blocked = torch.isneginf(mask) | (mask == torch.finfo(mask.dtype).min)
     return bool(torch.equal(blocked, expected_blocked) and torch.equal(allowed, ~expected_blocked))
 
 
