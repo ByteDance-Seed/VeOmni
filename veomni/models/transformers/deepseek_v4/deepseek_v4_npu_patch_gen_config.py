@@ -35,7 +35,7 @@ from veomni.models.transformers.deepseek_v4.packed_utils import (
     packed_compressed_block_bias,
     shard_packed_compression_metadata,
 )
-from veomni.models.utils.op_utils import resolve_op_impl
+from veomni.models.utils.op_utils import resolve_op_impl, resolve_qat_impl
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 
@@ -254,6 +254,7 @@ def deepseek_v4_hca_compressor_init_patched(self, config: "DeepseekV4Config") ->
     self.rotary_emb = DeepseekV4RotaryEmbedding(config)
     self.position_bias._veomni_fsdp_shard_dim = 1
     self.veomni_rope = _deepseek_v4_rope_op()
+    self.qat_implementation = resolve_qat_impl()
 
 
 @config.override_method("DeepseekV4Indexer.__init__", description=_POSITION_BIAS_SHARD_DIM_DESCRIPTION)
@@ -277,6 +278,7 @@ def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config") -> None:
         resolve_op_impl("dsa_indexer_implementation"),
     )
     self.veomni_rope = _deepseek_v4_rope_op()
+    self.qat_implementation = resolve_qat_impl()
 
 
 @config.override_method("DeepseekV4CSACompressor.__init__", description=_POSITION_BIAS_SHARD_DIM_DESCRIPTION)
@@ -292,6 +294,7 @@ def deepseek_v4_csa_compressor_init_patched(self, config: "DeepseekV4Config") ->
     self.indexer = DeepseekV4Indexer(config)
     self.position_bias._veomni_fsdp_shard_dim = 1
     self.veomni_rope = _deepseek_v4_rope_op()
+    self.qat_implementation = resolve_qat_impl()
 
 
 # ================================================================
@@ -387,7 +390,9 @@ def deepseek_v4_hca_compressor_forward_patched(
             compressed = compressed + anchor.to(compressed.dtype)
         if cp_enabled:
             compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-        compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
+        compressed = veomni_qat_fake_quant_kv(
+            compressed, self.rotary_emb.config.qk_rope_head_dim, qat_implementation=self.qat_implementation
+        )
         block_bias = packed_compressed_block_bias(rate_metadata) if build_block_bias else None
         result = (compressed.unsqueeze(1), block_bias)
         return (*result, None) if return_topk_indices else result
@@ -428,7 +433,9 @@ def deepseek_v4_hca_compressor_forward_patched(
         compressed = cache_layer.update_compressor_states("compressor", compressed)
     if cp_enabled:
         compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-    compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
+    compressed = veomni_qat_fake_quant_kv(
+        compressed, self.rotary_emb.config.qk_rope_head_dim, qat_implementation=self.qat_implementation
+    )
     compressed_kv = compressed.unsqueeze(1)
 
     compressed_len = compressed_kv.shape[2]
@@ -537,7 +544,9 @@ def deepseek_v4_csa_compressor_forward_patched(
             compressed = compressed + anchor.to(compressed.dtype)
         if cp_enabled:
             compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-        compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
+        compressed = veomni_qat_fake_quant_kv(
+            compressed, self.rotary_emb.config.qk_rope_head_dim, qat_implementation=self.qat_implementation
+        )
         compressed_kv = compressed.unsqueeze(1)
         top_k_indices = self.indexer(
             hidden_states,
@@ -613,7 +622,9 @@ def deepseek_v4_csa_compressor_forward_patched(
         compressed = cache_layer.update_compressor_states("compressor", compressed)
     if cp_enabled:
         compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-    compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
+    compressed = veomni_qat_fake_quant_kv(
+        compressed, self.rotary_emb.config.qk_rope_head_dim, qat_implementation=self.qat_implementation
+    )
     compressed_kv = compressed.unsqueeze(1)
     top_k_indices = self.indexer(hidden_states, q_residual, position_ids, past_key_values, layer_idx)
     if build_block_bias:

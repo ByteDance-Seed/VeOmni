@@ -31,10 +31,13 @@ If a field is not in this table, it is not an op-selection knob.
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (GPU; NPU config normalizes this default to `eager`) | `"triton"` | Model `__init__` via an instance-local `VeomniOp` |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU) | Model `__init__` via an instance-local `VeomniOp` |
-| QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Read by the patched modeling helpers (`veomni/ops/qat/`) |
+| QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Model `__init__` stores `self.qat_implementation`; patched helpers consume that bound recipe |
 
 `qat_implementation` has no per-model registry variants. `fp8_blockwise` is
 rejected at config-parse time on anything but an SM90+ NVIDIA CUDA GPU.
+Constructed DeepSeek-V4 modules freeze the recipe on `self.qat_implementation`;
+changing the process-global ops config later does not retarget an existing
+instance.
 
 **Most optimized-op defaults are GPU-oriented.** On Ascend NPU, values still
 equal to the dataclass defaults automatically resolve to `npu` for RMSNorm,

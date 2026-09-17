@@ -66,7 +66,9 @@ _EXPECTED_PLAIN = {
     "DeepseekV4Indexer.forward": {"scorer.weights_proj", "kv_proj", "gate_proj"},
     "DeepseekV4HCACompressor.forward": {"kv_proj", "gate_proj"},
     "DeepseekV4CSACompressor.forward": {"kv_proj", "gate_proj"},
-    "DeepseekV4MLP.forward": set(),
+    # Non-QAT fallback when hidden_act is not silu/swish. The QAT branch still
+    # routes the same three projections through veomni_qat_linear.
+    "DeepseekV4MLP.forward": {"gate_proj", "up_proj", "down_proj"},
 }
 
 # The activation-only recipe: tensors quantized because inference *stores* them
@@ -199,6 +201,34 @@ def test_qat_resolves_from_the_installed_ops_config():
         assert modeling_gpu.resolve_qat_impl() == "fp8_blockwise"
     finally:
         set_ops_config(previous)
+
+
+def test_qat_recipe_stays_on_the_constructed_instance():
+    """A later global switch must not retarget an already-built FP32 module."""
+    from tests.models.compare import eager_ops_config, ops_config_scope
+    from tests.models.tiny_configs import tiny_deepseek_v4_config
+
+    config = tiny_deepseek_v4_config()
+    none_ops = eager_ops_config()
+    none_ops.qat_implementation = "none"
+    qat_ops = eager_ops_config()
+    qat_ops.qat_implementation = "fp8_blockwise"
+
+    with ops_config_scope(none_ops):
+        none_mlp = modeling_gpu.DeepseekV4MLP(config)
+    with ops_config_scope(qat_ops):
+        qat_mlp = modeling_gpu.DeepseekV4MLP(config)
+    assert none_mlp.qat_implementation == "none"
+    assert qat_mlp.qat_implementation == "fp8_blockwise"
+
+    x = torch.randn(2, 5, config.hidden_size)
+    with ops_config_scope(qat_ops):
+        none_out = none_mlp(x)
+    assert none_out.shape == x.shape
+    assert torch.isfinite(none_out).all()
+    with ops_config_scope(none_ops):
+        assert qat_mlp.qat_implementation == "fp8_blockwise"
+        assert none_mlp.qat_implementation == "none"
 
 
 def test_qat_linear_helper_is_a_passthrough_while_disabled(monkeypatch):
@@ -407,9 +437,8 @@ def test_expert_weight_gradients_survive_the_straight_through_estimator():
     def run(qat):
         for param in experts.parameters():
             param.grad = None
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(modeling_gpu, "resolve_qat_impl", _qat_impl(qat))
-            out = experts(hidden_states, top_k_index, top_k_weights)
+        experts.qat_implementation = qat
+        out = experts(hidden_states, top_k_index, top_k_weights)
         out.float().square().mean().backward()
         return out.detach().clone(), {n: p.grad.detach().clone() for n, p in experts.named_parameters()}
 

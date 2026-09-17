@@ -412,31 +412,42 @@ def deepseek_v4_decoder_layer_forward_patched(
 
 
 @config.add_helper
-def veomni_qat_linear(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """Run a deployment FP8 GEMM recipe when DeepSeek-V4 QAT is enabled."""
-    return qat_linear(linear, x, enabled=resolve_qat_impl() == "fp8_blockwise")
+def _qat_is_fp8_blockwise(qat_implementation: str | None) -> bool:
+    """Use the instance recipe when the caller bound one at construct time."""
+    impl = resolve_qat_impl() if qat_implementation is None else qat_implementation
+    return impl == "fp8_blockwise"
 
 
 @config.add_helper
-def veomni_qat_fake_quant_kv(kv: torch.Tensor, rope_features: int) -> torch.Tensor:
+def veomni_qat_linear(linear: nn.Module, x: torch.Tensor, *, qat_implementation: str | None = None) -> torch.Tensor:
+    """Run a deployment FP8 GEMM recipe when DeepSeek-V4 QAT is enabled."""
+    return qat_linear(linear, x, enabled=_qat_is_fp8_blockwise(qat_implementation))
+
+
+@config.add_helper
+def veomni_qat_fake_quant_kv(
+    kv: torch.Tensor, rope_features: int, *, qat_implementation: str | None = None
+) -> torch.Tensor:
     """Fake-quantize cached NoPE channels while preserving the RoPE tail."""
-    if resolve_qat_impl() != "fp8_blockwise" or kv.numel() == 0:
+    if not _qat_is_fp8_blockwise(qat_implementation) or kv.numel() == 0:
         return kv
     return fp8_fake_quant_act_prefix(kv, kv.shape[-1] - rope_features, block_size=64)
 
 
 @config.add_helper
-def veomni_qat_fake_quant_act(x: torch.Tensor) -> torch.Tensor:
+def veomni_qat_fake_quant_act(x: torch.Tensor, *, qat_implementation: str | None = None) -> torch.Tensor:
     """Fake-quantize a complete activation in 1x128 blocks."""
-    if resolve_qat_impl() != "fp8_blockwise" or x.numel() == 0:
+    if not _qat_is_fp8_blockwise(qat_implementation) or x.numel() == 0:
         return x
     return fp8_fake_quant_act(x, block_size=128)
 
 
 @config.add_helper
-def veomni_qat_fake_quant_expert_weight(weight: torch.Tensor, expert_dtype: str) -> torch.Tensor:
+def veomni_qat_fake_quant_expert_weight(
+    weight: torch.Tensor, expert_dtype: str, *, qat_implementation: str | None = None
+) -> torch.Tensor:
     """Fake-quantize routed expert weights using the checkpoint's dtype."""
-    if resolve_qat_impl() != "fp8_blockwise":
+    if not _qat_is_fp8_blockwise(qat_implementation):
         return weight
     if expert_dtype == "fp4":
         return fp4_fake_quant_weight(weight)
@@ -452,12 +463,14 @@ def veomni_qat_fake_quant_expert_weight(weight: torch.Tensor, expert_dtype: str)
 def deepseek_v4_hca_compressor_bind_rope(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
     self.veomni_rope = _deepseek_v4_rope_op()
+    self.qat_implementation = resolve_qat_impl()
 
 
 @config.modify_init("DeepseekV4CSACompressor", description="Bind instance-local rope VeomniOp")
 def deepseek_v4_csa_compressor_bind_rope(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
     self.veomni_rope = _deepseek_v4_rope_op()
+    self.qat_implementation = resolve_qat_impl()
 
 
 @config.override_method(
@@ -547,7 +560,9 @@ def deepseek_v4_hca_compressor_forward_patched(
         )
         if cp_enabled:
             compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-        compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
+        compressed = veomni_qat_fake_quant_kv(
+            compressed, self.rotary_emb.config.qk_rope_head_dim, qat_implementation=self.qat_implementation
+        )
         compressed_kv = compressed.unsqueeze(1)
         candidates = CompressedCandidates(
             range_starts=rate_metadata["range_starts"],
@@ -598,7 +613,9 @@ def deepseek_v4_hca_compressor_forward_patched(
         compressed = cache_layer.update_compressor_states("compressor", compressed)
     if cp_enabled:
         compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-    compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
+    compressed = veomni_qat_fake_quant_kv(
+        compressed, self.rotary_emb.config.qk_rope_head_dim, qat_implementation=self.qat_implementation
+    )
     compressed_kv = compressed.unsqueeze(1)
 
     compressed_len = compressed_kv.shape[2]
@@ -699,7 +716,9 @@ def deepseek_v4_csa_compressor_forward_patched(
         )
         if cp_enabled:
             compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-        compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
+        compressed = veomni_qat_fake_quant_kv(
+            compressed, self.rotary_emb.config.qk_rope_head_dim, qat_implementation=self.qat_implementation
+        )
         compressed_kv = compressed.unsqueeze(1)
         # The indexer gets the global metadata next to a local shard on purpose: it
         # summarises the same windows through its own projections, so it does its
@@ -783,7 +802,9 @@ def deepseek_v4_csa_compressor_forward_patched(
         compressed = cache_layer.update_compressor_states("compressor", compressed)
     if cp_enabled:
         compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-    compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
+    compressed = veomni_qat_fake_quant_kv(
+        compressed, self.rotary_emb.config.qk_rope_head_dim, qat_implementation=self.qat_implementation
+    )
     compressed_kv = compressed.unsqueeze(1)
     indexer_output = self.indexer(
         hidden_states,
@@ -828,6 +849,7 @@ def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config") -> None:
         resolve_op_impl("dsa_indexer_implementation"),
     )
     self.veomni_rope = _deepseek_v4_rope_op()
+    self.qat_implementation = resolve_qat_impl()
 
 
 @config.override_method(
@@ -1000,13 +1022,17 @@ def deepseek_v4_indexer_forward_patched(
 
     if cp_enabled:
         compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
-    compressed = veomni_qat_fake_quant_act(compressed)
+    compressed = veomni_qat_fake_quant_act(compressed, qat_implementation=self.qat_implementation)
     compressed_kv = compressed if cache_layer is None else cache_layer.update_compressor_states("indexer", compressed)
 
     cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
-    q = veomni_qat_linear(self.q_b_proj, q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
+    q = (
+        veomni_qat_linear(self.q_b_proj, q_residual, qat_implementation=self.qat_implementation)
+        .view(batch, seq_len, -1, self.head_dim)
+        .transpose(1, 2)
+    )
     q = self.veomni_rope(q, cos_q, sin_q).transpose(1, 2)
-    q = veomni_qat_fake_quant_act(q)
+    q = veomni_qat_fake_quant_act(q, qat_implementation=self.qat_implementation)
     weights = self.scorer.weights_proj(hidden_states).float() * (
         self.scorer.weights_scaling * self.scorer.softmax_scale
     )
@@ -1125,6 +1151,7 @@ def deepseek_v4_attention_init_patched(self, config: "DeepseekV4Config", layer_i
         resolve_op_impl("dsa_attention_implementation"),
     )
     self.veomni_rope = _deepseek_v4_rope_op()
+    self.qat_implementation = resolve_qat_impl()
 
 
 @config.override_method(
@@ -1144,14 +1171,22 @@ def deepseek_v4_attention_forward_patched(
     hidden_shape = (*input_shape, -1, self.head_dim)
     cos, sin = position_embeddings[self.rope_layer_type]
 
-    q_residual = self.q_a_norm(veomni_qat_linear(self.q_a_proj, hidden_states))
-    q = self.q_b_norm(veomni_qat_linear(self.q_b_proj, q_residual).view(*hidden_shape))
+    q_residual = self.q_a_norm(
+        veomni_qat_linear(self.q_a_proj, hidden_states, qat_implementation=self.qat_implementation)
+    )
+    q = self.q_b_norm(
+        veomni_qat_linear(self.q_b_proj, q_residual, qat_implementation=self.qat_implementation).view(*hidden_shape)
+    )
     q = q.transpose(1, 2)
     q = self.veomni_rope(q, cos, sin)
 
-    kv = self.kv_norm(veomni_qat_linear(self.kv_proj, hidden_states)).view(*hidden_shape).transpose(1, 2)
+    kv = (
+        self.kv_norm(veomni_qat_linear(self.kv_proj, hidden_states, qat_implementation=self.qat_implementation))
+        .view(*hidden_shape)
+        .transpose(1, 2)
+    )
     kv = self.veomni_rope(kv, cos, sin)
-    kv = veomni_qat_fake_quant_kv(kv, self.config.qk_rope_head_dim)
+    kv = veomni_qat_fake_quant_kv(kv, self.config.qk_rope_head_dim, qat_implementation=self.qat_implementation)
 
     if past_key_values is not None:
         kv = past_key_values.update(kv, kv, self.layer_idx)[0]
@@ -1341,8 +1376,8 @@ def deepseek_v4_attention_forward_patched(
 
     attn_output = self.veomni_rope(attn_output.transpose(1, 2), cos, -sin).transpose(1, 2)
     grouped = attn_output.reshape(*input_shape, self.config.o_groups, -1)
-    grouped = veomni_qat_linear(self.o_a_proj, grouped).flatten(2)
-    output = veomni_qat_linear(self.o_b_proj, grouped)
+    grouped = veomni_qat_linear(self.o_a_proj, grouped, qat_implementation=self.qat_implementation).flatten(2)
+    output = veomni_qat_linear(self.o_b_proj, grouped, qat_implementation=self.qat_implementation)
     if build_indexer_loss:
         return output, attn_weights, indexer_kl, indexer_uniform
     return output, attn_weights
@@ -1708,6 +1743,7 @@ class PatchedDeepseekV4Experts(nn.Module):
         self.limit = config.swiglu_limit
         self.expert_dtype = getattr(config, "expert_dtype", "fp8")
         self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
+        self.qat_implementation = resolve_qat_impl()
 
     def forward(
         self,
@@ -1715,9 +1751,13 @@ class PatchedDeepseekV4Experts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_states = veomni_qat_fake_quant_act(hidden_states)
-        down_proj = veomni_qat_fake_quant_expert_weight(self.down_proj, self.expert_dtype)
-        gate_up_proj = veomni_qat_fake_quant_expert_weight(self.gate_up_proj, self.expert_dtype)
+        hidden_states = veomni_qat_fake_quant_act(hidden_states, qat_implementation=self.qat_implementation)
+        down_proj = veomni_qat_fake_quant_expert_weight(
+            self.down_proj, self.expert_dtype, qat_implementation=self.qat_implementation
+        )
+        gate_up_proj = veomni_qat_fake_quant_expert_weight(
+            self.gate_up_proj, self.expert_dtype, qat_implementation=self.qat_implementation
+        )
         if not self.use_swiglu_mlp:
             return merged_experts_act_fn_forward(
                 hidden_states,
@@ -1762,6 +1802,7 @@ def deepseek_v4_mlp_init_patched(self, config):
     self.act_fn = ACT2FN[config.hidden_act]
     self.limit = config.swiglu_limit
     self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+    self.qat_implementation = resolve_qat_impl()
 
 
 @config.override_method(
@@ -1769,10 +1810,12 @@ def deepseek_v4_mlp_init_patched(self, config):
     description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
 )
 def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
-    if resolve_qat_impl() == "fp8_blockwise":
-        gate = veomni_qat_linear(self.gate_proj, x).clamp(max=self.limit)
-        up = veomni_qat_linear(self.up_proj, x).clamp(min=-self.limit, max=self.limit)
-        return veomni_qat_linear(self.down_proj, self.act_fn(gate) * up)
+    if self.qat_implementation == "fp8_blockwise":
+        gate = veomni_qat_linear(self.gate_proj, x, qat_implementation=self.qat_implementation).clamp(max=self.limit)
+        up = veomni_qat_linear(self.up_proj, x, qat_implementation=self.qat_implementation).clamp(
+            min=-self.limit, max=self.limit
+        )
+        return veomni_qat_linear(self.down_proj, self.act_fn(gate) * up, qat_implementation=self.qat_implementation)
     if uses_swiglu_mlp(self.config.hidden_act):
         return self.veomni_swiglu_mlp(
             x,
