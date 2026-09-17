@@ -47,10 +47,7 @@ def _stub_runtime(name, *, processor=None, tokenizer=None):
 def _build(runtime, monkeypatch):
     """Drive the merged assets step; skip the HF load so the stub's preprocessor stands."""
 
-    def _fail(path, **kwargs):
-        raise FileNotFoundError(path)
-
-    monkeypatch.setattr("veomni.models.auto.build_processor", _fail)
+    monkeypatch.setattr("veomni.models.auto.build_processor", lambda *a, **k: None)
     VeOmniModelRuntime._build_model_assets(runtime)
 
 
