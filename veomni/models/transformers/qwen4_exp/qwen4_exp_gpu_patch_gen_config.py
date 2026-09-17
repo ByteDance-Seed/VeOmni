@@ -148,6 +148,7 @@ def qwen4_exp_text_model_reverse_embedding_patched(self, inputs_embeds: torch.Te
             # --- Patch.1 ---
     return input_ids
 
+
 @config.override_method(
     "Qwen4ExpModel.__init__",
     description="Build local patched submodels and propagate the VeOmni MoE implementation",
@@ -1685,7 +1686,6 @@ class _Qwen4ExpFakeForPositionIds(SimpleNamespace):
         return Qwen4ExpModel.get_vision_position_ids(self, *args, **kwargs)
 
 
-
 @config.override_method(
     "Qwen4ExpForConditionalGeneration.get_position_id_func",
     description="Expose a picklable Qwen4-Exp multimodal position-id preprocessor",
@@ -2044,8 +2044,8 @@ def qwen4_exp_for_conditional_generation_forward_patched(
     # --- Patch.1 ---
 
     # --- Patch.2: Add the sequence-local router auxiliary loss. ---
-    # 2. Preserve Qwen4 MoE router auxiliary loss without enabling MTP loss, using 
-    # the sequence-local padding mask that matches local router logits under 
+    # Preserve Qwen4 MoE router auxiliary loss without enabling MTP loss, using
+    # the sequence-local padding mask that matches local router logits under
     # Ulysses, consistent with Qwen3.5-MoE.
     aux_loss = None
     if kwargs.get("output_router_logits", False):

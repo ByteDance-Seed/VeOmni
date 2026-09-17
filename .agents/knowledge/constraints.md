@@ -99,9 +99,10 @@ Core entry points:
    - Device mesh: `init_parallel_state_from_config()` builds `[ep × ep_fsdp]` submesh; accessed via `ParallelState.extra_parallel_mesh("ep")`, `ep_group`, `ep_rank`.
    - In FSDP2: expert modules get `fully_shard()` on the `ep_fsdp` submesh with `Shard(1)` placement so hidden-dim sharding composes with EP's dim-0 sharding.
 
-8a. **Persistent 2D ExtraParallel parameters require explicit SP opt-in**
-   - Persistent ExtraParallel parameters are rejected with SP unless their model plan lists the dimension in `sequence_parallel_persistent_names`; HSDP replicas remain unsupported.
-   - Qwen4-Exp opts its `ple` dimension in only because its lookup, gradient scaling, optimizer, and checkpoint paths operate over the complete flattened PLE mesh while inputs remain sequence-sharded.
+8a. **Persistent 2D ExtraParallel parameters require a complete 2D mesh**
+   - Persistent ExtraParallel parameters currently require a 2D `(<para>_fsdp, <para>)` mesh covering the complete world. HSDP replicas and FSDP CPU offload remain unsupported.
+   - There is currently no `sequence_parallel_persistent_names` plan field and no explicit SP allowlist or SP-specific rejection in `torch_parallelize.py`. Therefore this constraint must not be read as validation that persistent ExtraParallel parameters are safe for every SP model; adding another such model requires reviewing its optimizer, gradient, and checkpoint semantics under SP.
+   - Qwen4-Exp's `ple` dimension is currently the only persistent ExtraParallel use. Its lookup, gradient scaling, optimizer, and checkpoint paths operate over the complete flattened PLE mesh while inputs remain sequence-sharded.
 
 8b. **Qwen4-Exp QSA indices are global full-resolution token indices**
    - `qsa_attention_implementation` selects blocks with local queries and globally gathered pooled keys, then gathers `[B,L,K]` selections to `[B,S,K]` before the Ulysses attention call.
