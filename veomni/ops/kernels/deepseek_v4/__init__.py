@@ -129,9 +129,41 @@ def fp8_weight_quant(
     return impl(x, block_size, scale_fmt, scale_dtype, dequant)
 
 
+def fp8_gemm(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    scale_dtype: torch.dtype = torch.float32,
+    block_size: int = 128,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    _require_tilelang_sm90()
+    from .gemm import fp8_gemm as impl
+
+    return impl(a, a_s, b, b_s, scale_dtype, block_size, out_dtype)
+
+
+def fp4_gemm(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    scale_dtype: torch.dtype = torch.float32,
+    act_block_size: int = 128,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    _require_tilelang_sm90()
+    from .gemm import fp4_gemm as impl
+
+    return impl(a, a_s, b, b_s, scale_dtype, act_block_size, out_dtype)
+
+
 __all__ = [
     "act_quant",
     "fp4_act_quant",
+    "fp4_gemm",
+    "fp8_gemm",
     "fp8_weight_quant",
     "linear_bf16_fp32",
     "sparse_attn_tilelang",
