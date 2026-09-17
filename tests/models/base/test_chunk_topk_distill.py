@@ -261,15 +261,24 @@ def test_log_prob_min_clamp_affects_only_clamped_entries():
     torch.testing.assert_close(outs_clamped[2], ref[2], rtol=0, atol=0)
 
 
-def test_mass_outputs_are_detached():
-    """``student_mass`` / ``teacher_mass`` carry ``requires_grad=False``."""
+@pytest.mark.parametrize("path", ["default", "explicit_shift", "sequence_parallel"])
+def test_mass_outputs_are_detached(path, monkeypatch):
+    """``student_mass`` / ``teacher_mass`` stay metrics-only on every shift path."""
     h, w, labels, ids, tlp = _make_inputs(B=1, L=8, H=4, V=16, K=3, seed=4)
     h = h.detach().clone().requires_grad_(True)
     w = w.detach().clone().requires_grad_(True)
+    kwargs = {"chunk_size": 4}
+    if path == "explicit_shift":
+        kwargs["shift_labels"] = labels
+    elif path == "sequence_parallel":
+        monkeypatch.setattr(ctkd, "get_parallel_state", lambda: type("State", (), {"sp_enabled": True})())
 
-    _, _, _, smass, tmass = ctkd.chunk_topk_distill_function(h, w, labels, ids, tlp, chunk_size=4)
-    assert not smass.requires_grad, "student_mass must be detached"
-    assert not tmass.requires_grad, "teacher_mass must be detached"
+    _, _, distill, smass, tmass = ctkd.chunk_topk_distill_function(h, w, labels, ids, tlp, **kwargs)
+    assert distill.requires_grad, "distill must stay on the graph"
+    assert not smass.requires_grad, f"student_mass must be detached on the {path} path"
+    assert not tmass.requires_grad, f"teacher_mass must be detached on the {path} path"
+    assert smass.grad_fn is None
+    assert tmass.grad_fn is None
 
 
 def test_backward_matches_dense_reference():
