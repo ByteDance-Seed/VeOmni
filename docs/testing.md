@@ -412,6 +412,19 @@ pytest → test_text_fsdp_equivalence(config, ...)
 
 ---
 
+## Batch-invariant FP32 GEMM precision
+
+`tests/ops/test_batch_invariant_matmul_precision.py` checks FP32, BF16 and FP16
+matrix products against FP64 arithmetic over the same operands, including bias,
+strided inputs, padded tiles and batch partitions. The GPU unit workflow runs
+the entire `tests/ops/` directory.
+
+The invariant Triton GEMM explicitly uses IEEE input precision. Triton's default
+TF32 dot precision truncates FP32 projection inputs even when PyTorch's matmul
+precision is `highest`; setting the PyTorch policy alone does not configure a
+Triton kernel. This fixes that operator's FP32 accuracy, but does not establish
+whole-model BF16 gradient, parameter-update or convergence parity.
+
 ## Architecture Notes
 
 ### Resolved consolidations
