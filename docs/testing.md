@@ -251,11 +251,23 @@ and that is why the two rows there agree. These are measurements taken for this
 document; the ops regressions enforce the operator contract those measurements
 rest on, not the four-rank numbers themselves.
 
-The override reaches modules on an enabled ExtraParallel mesh (`ep_size > 1`) and
-costs an FP32 parameter all-gather plus a larger unsharded buffer for those
-modules. At `ep_size == 1` the expert modules are sharded with their decoder
-layer and follow the global `param_dtype`, so an EP=1-versus-EP=2 comparison
-still needs the override extended to that case.
+EP=2 against EP=1 shows the same collapse when the override also covers the
+collapsed ExtraParallel dimension (`ep_size == 1`), where the expert modules are
+otherwise sharded with their decoder layer under the global `param_dtype` and are
+wrapped separately so that only their parameter dtype changes:
+
+| expert parameter dtype | EP=4 vs EP=2, step 1 | EP=2 vs EP=1, step 1 |
+|---|---|---|
+| bfloat16 (default) | 7.51e-4 | 7.51e-4 |
+| float32 | 5.77e-7 | 4.39e-7 |
+
+At `ep_size == 1` the override changes the expert-weight gradient and nothing
+else: knob-off against knob-on at the same EP size gives 5.31e-4 whole-model
+relative L2 with `expert_error_share` 1.0 and no parameter above 1% relative,
+while the first-step loss is identical across every run above.
+
+The override costs an FP32 parameter all-gather plus a larger unsharded buffer
+for the modules it covers.
 
 ---
 
