@@ -125,11 +125,6 @@ veomni_chunk_gated_delta_rule = None
 veomni_qsa_attention_implementation = None
 
 
-# ================================================================
-# Patch: Qwen4ExpTextModel.reverse_embedding
-# 1. Preserve the upstream recovery path while making exception chaining
-#    explicit so generated code passes the repository's B904 lint gate.
-# ================================================================
 @config.override_method(
     "Qwen4ExpTextModel.reverse_embedding",
     description="Make the upstream reverse-embedding error path ruff-compliant",
@@ -143,6 +138,8 @@ def qwen4_exp_text_model_reverse_embedding_patched(self, inputs_embeds: torch.Te
             input_ids = input_ids.view(inputs_embeds.shape[:2])
         except RuntimeError:
             # --- Patch.1 ---
+            # Preserve the upstream recovery path while making exception chaining
+            # explicit so generated code passes the repository's B904 lint gate.
             raise RuntimeError(
                 "It seems like you tried to call `forward` from `inputs_embeds` without providing `input_ids`, and "
                 "the `inputs_embeds` you provided do not exactly match the embedding weights. Since Qwen4-Exp needs "
@@ -151,34 +148,25 @@ def qwen4_exp_text_model_reverse_embedding_patched(self, inputs_embeds: torch.Te
             # --- Patch.1 ---
     return input_ids
 
-
-# ================================================================
-# Patch: Qwen4ExpModel.__init__
-# 1. Build the generated local text/vision classes instead of AutoModel, so
-#    VeOmni patches are retained inside the VLM wrapper.
-# 2. Propagate the selected MoE backend into the nested text config.
-# ================================================================
 @config.override_method(
     "Qwen4ExpModel.__init__",
     description="Build local patched submodels and propagate the VeOmni MoE implementation",
 )
 def qwen4_exp_model_init_patched(self, config):
-    # --- Patch.2 ---
+    # --- Patch.1: Propagate the selected MoE backend into the nested text config. ---
     config.text_config._moe_implementation = getattr(config, "_moe_implementation", "eager")
-    # --- Patch.2 ---
+    # --- Patch.1 ---
 
     super().__init__(config)
-    # --- Patch.1 ---
+    # --- Patch.2: Build local patched submodels instead of AutoModel ---
+    # VeOmni patches are retained inside the VLM wrapper. ---
     self.visual = Qwen4ExpVisionModel._from_config(config.vision_config)
     self.language_model = Qwen4ExpTextModel._from_config(config.text_config)
-    # --- Patch.1 ---
+    # --- Patch.2 ---
     self.rope_deltas = None
     self.post_init()
 
 
-# ================================================================
-# Helpers: packed-sequence boundaries
-# ================================================================
 @config.add_helper
 def _qwen4_exp_validate_packed_seq_lens(
     packed_seq_lens: tuple[int, ...] | list[int] | None,
@@ -200,13 +188,6 @@ def _qwen4_exp_validate_packed_seq_lens(
     return lengths
 
 
-# ================================================================
-# Patch: Qwen4ExpTextGatedDeltaNet
-# 1. Freeze the configured GDN kernels on each model instance.
-# 2. Exchange local sequence ownership for local head ownership under Ulysses.
-# 3. Slice depthwise-convolution and recurrent parameters by local head range.
-# 4. Restore local-sequence/full-head layout before the output gate.
-# ================================================================
 @config.override_method(
     "Qwen4ExpTextGatedDeltaNet.__init__",
     description="Bind instance-local GDN kernels for Qwen4-Exp Ulysses",
@@ -247,7 +228,7 @@ def qwen4_exp_gated_deltanet_init_patched(self, config, layer_idx):
     self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
     self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
     self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
-
+    # --- Patch.1 ---
     self.veomni_causal_conv1d_fn = veomni_causal_conv1d.bound_kernel()
     self.veomni_chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel()
     if veomni_rms_norm_gated.use_non_eager_impl:
@@ -260,6 +241,7 @@ def qwen4_exp_gated_deltanet_init_patched(self, config, layer_idx):
             device=get_device_id(),
             dtype=config.dtype if config.dtype is not None else torch.get_default_dtype(),
         )
+    # --- Patch.1 ---
 
 
 @config.override_method(
@@ -274,6 +256,11 @@ def qwen4_exp_gated_deltanet_forward_patched(
     cu_seq_lens_q: torch.Tensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ):
+    # --- Patch.1 ---
+    # Freeze the configured GDN kernels on each model instance.
+    # Exchange local sequence ownership for local head ownership under Ulysses.
+    # Slice depthwise-convolution and recurrent parameters by local head range.
+    # Restore local-sequence/full-head layout before the output gate.
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
     batch_size, seq_len, _ = hidden_states.shape
     parallel_state = get_parallel_state()
@@ -529,14 +516,9 @@ def qwen4_exp_gated_deltanet_forward_patched(
     core_attn_out = self.norm(core_attn_out.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim))
     core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
     return self.out_proj(core_attn_out)
+    # --- Patch.1 ---
 
 
-# ================================================================
-# Patch: Qwen4ExpTextQSAIndexer.forward
-# 1. Select compact global QSA token indices directly in the patched method,
-#    using sequence-local RoPE inputs and gathering only the compressed keys
-#    and final selections required by the attention backend.
-# ================================================================
 @config.override_method(
     "Qwen4ExpTextQSAIndexer.forward",
     description="Select compact global QSA token indices under Ulysses",
@@ -549,7 +531,9 @@ def qwen4_exp_qsa_indexer_forward_patched(
     past_key_values: Cache | None,
     cu_seq_lens_q: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    # --- Patch.1 ---
+    # --- Patch.1: Select compact global QSA token indices under Ulysses. ---
+    # Using sequence-local RoPE inputs and gathering only the compressed keys
+    # and final selections required by the attention backend.
     del attention_mask
     parallel_state = get_parallel_state()
     if past_key_values is not None:
@@ -732,15 +716,6 @@ def qwen4_exp_qsa_indexer_forward_patched(
     # --- Patch.1 ---
 
 
-# ================================================================
-# Patch: Qwen4ExpTextAttention.forward
-# 1. Keep compact selections in global token coordinates.
-# 2. Apply sequence-local RoPE before exchanging main Q/K/V into
-#    full-sequence/local-head layout.
-# 3. Hand the compact indices to eager_attention_forward, which expands them to
-#    a dense mask (eager reference) or runs the TileLang sparse kernel,
-#    depending on ``qsa_attention_implementation``.
-# ================================================================
 @config.override_method(
     "Qwen4ExpTextAttention.forward",
     description="Run dense-mask eager QSA with global selection and Ulysses QKV exchange",
@@ -753,6 +728,7 @@ def qwen4_exp_text_attention_forward_patched(
     past_key_values: Cache | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    # --- Patch.1 ---
     parallel_state = get_parallel_state()
     if parallel_state.ulysses_enabled:
         if past_key_values is not None:
@@ -769,6 +745,7 @@ def qwen4_exp_text_attention_forward_patched(
                 f"Qwen4-Exp QSA KV heads ({key_value_head_count}) and ulysses_size ({ulysses_size}) "
                 "must divide one another."
             )
+    # --- Patch.1 ---
 
     selection = self.indexer(
         hidden_states,
@@ -789,7 +766,7 @@ def qwen4_exp_text_attention_forward_patched(
     key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
     value_states = self.v_proj(hidden_states).view(hidden_shape)
 
-    # --- Patch.2 ---
+    # --- Patch.2: Apply local RoPE before the Ulysses QKV exchange. ---
     # Under Ulysses these embeddings already belong to this rank's sequence
     # shard. The trailing slice preserves the non-SP cache continuation path.
     cos, sin = (tensor[:, -hidden_states.shape[1] :, :] for tensor in position_embeddings)
@@ -824,6 +801,7 @@ def qwen4_exp_text_attention_forward_patched(
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
+    # --- Patch.3 ---
     # Compact QSA indices are understood only by this module's patched eager
     # function, so bypass the global registry for this QSA-specific call.
     attn_output, attn_weights = eager_attention_forward(
@@ -839,6 +817,7 @@ def qwen4_exp_text_attention_forward_patched(
 
     if parallel_state.ulysses_enabled:
         attn_output = restore_ulysses_output(attn_output, group=parallel_state.ulysses_group)
+    # --- Patch.3 ---
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output * torch.sigmoid(gate))
     return attn_output, attn_weights
@@ -852,14 +831,6 @@ def repeat_kv(hidden_states: torch.Tensor, repeats: int) -> torch.Tensor:
     return hidden_states.reshape(batch_size, kv_heads * repeats, seq_len, head_dim)
 
 
-# ================================================================
-# Patch: eager_attention_forward
-# 1. Expand compact QSA selections into a dense mask for the reference path.
-# 2. Preserve the Transformers eager contract for every non-QSA caller.
-# 3. Dispatch QSA calls to the TileLang sparse-attention kernel when
-#    ``qsa_attention_implementation='tilelang'``, failing closed on layouts
-#    the kernel does not cover.
-# ================================================================
 @config.replace_function("eager_attention_forward", description="Optional dense QSA dispatch with TileLang backend")
 def qwen4_exp_eager_attention_forward_patched(
     module: nn.Module,
@@ -892,14 +863,16 @@ def qwen4_exp_eager_attention_forward_patched(
         attention_weights = F.dropout(attention_weights, p=dropout, training=module.training)
         return torch.matmul(attention_weights, value_states).transpose(1, 2).contiguous(), attention_weights
 
-    # --- Patch.3 ---
+    # --- Patch.1: Dispatch QSA to eager or TileLang attention. ---
+    # Dispatch QSA calls to the TileLang sparse-attention kernel when
+    # `qsa_attention_implementation='tilelang'`.
+    # If dropout != 0, fall back to the eager path;
     qsa_implementation = veomni_qsa_attention_implementation.value
     if qsa_implementation not in {"eager", "tilelang"}:
         raise ValueError(
             f"Unknown qsa_attention_implementation={qsa_implementation!r}; expected 'eager' or 'tilelang'."
         )
     if qsa_implementation == "tilelang":
-        # If dropout != 0, fall back to the eager path;
         if attention_mask is not None:
             raise ValueError(
                 "qsa_attention_implementation='tilelang' requires no attention_mask; "
@@ -907,7 +880,8 @@ def qwen4_exp_eager_attention_forward_patched(
             )
         if dropout == 0:
             return qsa_attn_tilelang(query, key, value, selected_indices, scaling), None
-    # --- Patch.3 ---
+    # --- Patch.1 ---
+    # --- Patch.2 Preserve the Transformers eager contract for every non-QSA caller. ---
     kv_heads, kv_len, kv_head_dim = key.shape[1:]
     batch_size, query_heads, query_len, head_dim = query.shape
     selected_token_mask = torch.zeros(
@@ -933,13 +907,9 @@ def qwen4_exp_eager_attention_forward_patched(
     probabilities = probabilities / torch.where(denominator > 0, denominator, torch.ones_like(denominator))
     probabilities = F.dropout(probabilities, p=dropout, training=module.training)
     return torch.matmul(probabilities, value_states).transpose(1, 2).contiguous(), attention_weights
+    # --- Patch.2 ---
 
 
-# ================================================================
-# Patch: Qwen4ExpTextExperts
-# 1. Drop HF's use_experts_implementation decorator so VeOmni owns dispatch.
-# 2. Retain the upstream fused checkpoint layout and eager implementation.
-# ================================================================
 @config.replace_class(
     "Qwen4ExpTextExperts",
     description="Use the VeOmni MoE OpSlot while preserving Qwen4-Exp fused expert weights",
@@ -963,12 +933,12 @@ class PatchedQwen4ExpTextExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        # --- Patch.1 ---
+        # --- Patch.1: Route expert computation through the VeOmni MoE backend. ---
         if veomni_moe_experts_forward.use_non_eager_impl:
             return veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
         # --- Patch.1 ---
 
-        # --- Patch.2 ---
+        # --- Patch.2: Preserve the upstream fused expert weight layout. ---
         final_hidden_states = torch.zeros_like(hidden_states)
         with torch.no_grad():
             expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
@@ -1053,7 +1023,7 @@ class PatchedQwen4ExpTextNGramEmbedding(nn.Module):
         self.ngram_heads_vocab_sizes = nn.Buffer(torch.tensor(self.head_vocab_sizes, dtype=torch.long))
         self.ngram_heads_offsets = nn.Buffer(torch.tensor(self.head_offsets, dtype=torch.long))
 
-        # --- Patch.1 / Patch.2 ---
+        # --- Patch.1 / Patch.2: Add VeOmni n-gram embedding and metadata handling. ---
         vocab_divisor = config.make_ngram_vocab_size_divisible_by
         padded_vocab_size = math.ceil(self.total_vocab_size / vocab_divisor) * vocab_divisor
         if padded_vocab_size % config.split_ngram_parts != 0:
@@ -1126,7 +1096,7 @@ class PatchedQwen4ExpTextNGramEmbedding(nn.Module):
         if ple_size == 1:
             return self._lookup_local_rows(shard_ids, row_ids, output_dtype=output_dtype)
 
-        # --- Patch.3 ---
+        # --- Patch.3: Apply VeOmni PLE input preprocessing. ---
         first_embedding = self.ngram_embedding["shard_0"]
         first_weight = first_embedding.weight
         persistent_2d = hasattr(first_weight, "placements") and len(first_weight.placements) == 2
@@ -1186,7 +1156,7 @@ class PatchedQwen4ExpTextNGramEmbedding(nn.Module):
             input_split_sizes=send_counts,
             group=group,
         )
-        # --- Patch.5 ---
+        # --- Patch.5: Use the VeOmni PLE lookup path. ---
         local_output = self._lookup_local_rows(
             received_requests[:, 0],
             received_requests[:, 1],
@@ -1300,17 +1270,12 @@ class PatchedQwen4ExpTextNGramEmbedding(nn.Module):
         flat_ids = ngram_ids.reshape(-1)
         shard_ids = torch.div(flat_ids, self.rows_per_checkpoint_shard, rounding_mode="floor")
         row_ids = torch.remainder(flat_ids, self.rows_per_checkpoint_shard)
-        # --- Patch.5 ---
+        # --- Patch.5: Load distributed PLE rows through the VeOmni lookup path. ---
         embeddings = self._distributed_lookup(shard_ids, row_ids, output_dtype=output_dtype)
         # --- Patch.5 ---
         return embeddings.view(*original_shape, -1).flatten(-2)
 
 
-# ================================================================
-# Patch: Qwen4ExpTextPLELayer._short_conv
-# 1. Add a differentiable left halo for the dilated depthwise convolution.
-# 2. Keep the original cache/padding path unchanged when Ulysses is disabled.
-# ================================================================
 @config.override_method(
     "Qwen4ExpTextPLELayer._short_conv",
     description="Exchange differentiable PLE dilated-convolution halos under Ulysses",
@@ -1346,6 +1311,7 @@ def qwen4_exp_text_ple_layer_short_conv_patched(
 
     if past_key_values is not None:
         raise NotImplementedError("Qwen4-Exp PLE dilated convolution does not support cache state under Ulysses.")
+    # --- Patch.1: Add a differentiable left halo for the dilated depthwise convolution ---
     halo_length = self.short_conv_state_len
     if halo_length == 0:
         return F.silu(self.conv1d(hidden_states.transpose(1, 2))).transpose(1, 2)
@@ -1361,6 +1327,7 @@ def qwen4_exp_text_ple_layer_short_conv_patched(
         gather_dim=1,
         group=parallel_state.ulysses_group,
     )
+    # --- Patch.1 ---
     if cu_seq_lens_q is not None:
         local_seq_len = hidden_states.shape[1]
         global_seq_len = local_seq_len * parallel_state.ulysses_size
@@ -1397,20 +1364,17 @@ def qwen4_exp_text_ple_layer_short_conv_patched(
         # graph, even when all of its local segments start without a halo.
         # Otherwise ranks enter different collectives during backward.
         return torch.cat(outputs, dim=1) + gathered_tails.sum() * 0
+    # --- Patch.2: Keep the original cache/padding path unchanged when Ulysses is disabled. ---
     if parallel_state.ulysses_rank == 0:
         left_halo = gathered_tails[:, :halo_length, :] * 0
     else:
         start = (parallel_state.ulysses_rank - 1) * halo_length
         left_halo = gathered_tails[:, start : start + halo_length, :]
+    # --- Patch.2 ---
     conv_input = torch.cat((left_halo, hidden_states), dim=1).transpose(1, 2)
     return F.silu(self.conv1d(conv_input)).transpose(1, 2)
 
 
-# ================================================================
-# Patch: Qwen4ExpTextPLELayer.forward
-# 1. Keep FP32 PLE master weights while casting sparse lookup results to the
-#    activation dtype before the result all-to-all and downstream projections.
-# ================================================================
 @config.override_method(
     "Qwen4ExpTextPLELayer.forward",
     description="Match PLE lookup results to the mixed-precision activation dtype before communication",
@@ -1423,7 +1387,9 @@ def qwen4_exp_text_ple_layer_forward_patched(
     conv_mask: torch.Tensor | None = None,
     cu_seq_lens_q: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    # --- Patch.1 ---
+    # --- Patch.1: Run the PLE layer with VeOmni sequence-parallel handling. ---
+    # Keep FP32 PLE master weights while casting sparse lookup results to the
+    # activation dtype before the result all-to-all and downstream projections.
     embeddings = self.ple_embedding(
         input_ids,
         past_key_values,
@@ -1450,70 +1416,6 @@ def qwen4_exp_text_ple_layer_forward_patched(
     return output
 
 
-# ================================================================
-# Patch: Qwen4ExpTextDecoderLayer.forward
-# 1. Thread the collator's packed boundaries into the PLE token mixers.
-# ================================================================
-@config.override_method(
-    "Qwen4ExpTextDecoderLayer.forward",
-    description="Pass packed sequence boundaries to Qwen4-Exp PLE",
-)
-def qwen4_exp_text_decoder_layer_forward_patched(
-    self,
-    hidden_states: torch.Tensor,
-    position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    attention_mask: torch.Tensor | None = None,
-    conv_mask: torch.Tensor | None = None,
-    past_key_values: Cache | None = None,
-    ple_input_ids: torch.LongTensor | None = None,
-    **kwargs: Unpack[TransformersKwargs],
-) -> torch.FloatTensor:
-    cu_seq_lens_q = kwargs.pop("cu_seq_lens_q", None)
-    if self.ple is not None:
-        hidden_states = hidden_states + self.ple(
-            hidden_states,
-            ple_input_ids,
-            past_key_values,
-            conv_mask=conv_mask,
-            cu_seq_lens_q=cu_seq_lens_q,
-        )
-
-    hidden_states, hyper_input, injection_weights = self.attn_hyper_connection(hidden_states)
-    if self.layer_type == "linear_attention":
-        hidden_states = self.linear_attn(
-            hidden_states,
-            cache_params=past_key_values,
-            attention_mask=conv_mask,
-            cu_seq_lens_q=cu_seq_lens_q,
-            **kwargs,
-        )
-    else:
-        hidden_states, _ = self.self_attn(
-            hidden_states,
-            position_embeddings,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            cu_seq_lens_q=cu_seq_lens_q,
-            **kwargs,
-        )
-
-    injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
-    hidden_states = hyper_input + injection.flatten(-2)
-
-    hidden_states, hyper_input, injection_weights = self.mlp_hyper_connection(hidden_states)
-    hidden_states = self.mlp(hidden_states)
-    injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
-    return hyper_input + injection.flatten(-2)
-
-
-# ================================================================
-# Patch: Qwen4ExpTextModel.forward
-# 1. Defer the quadratic QSA mask to the attention backend while retaining
-#    sequence-local M-RoPE embeddings under Ulysses.
-# 2. Keep hidden states, PLE ids, and recurrent padding masks sequence-local.
-# 3. Reject cache and context-parallel combinations before collectives.
-# 4. Drop the unused decoder-layer index so the generated method passes lint.
-# ================================================================
 @config.override_method(
     "Qwen4ExpTextModel.forward",
     description="Coordinate global QSA metadata with local RoPE/GDN/PLE tensors under Ulysses",
@@ -1539,17 +1441,17 @@ def qwen4_exp_text_model_forward_patched(
     if inputs_embeds is None:
         inputs_embeds = self.embed_tokens(input_ids)
 
-    # --- Patch.1 ---
+    # --- Patch.1: Prepare VeOmni inputs and sequence-parallel metadata. ---
+    # Defer the quadratic QSA mask to the attention backend while retaining
+    # sequence-local M-RoPE embeddings under Ulysses.
     parallel_state = get_parallel_state()
-    # --- Patch.1 ---
-    # --- Patch.3 ---
     if parallel_state.cp_enabled:
         raise NotImplementedError(
             "Qwen4-Exp supports Ulysses sequence parallelism only; context parallelism is disabled."
         )
     if parallel_state.ulysses_enabled and (use_cache or past_key_values is not None):
         raise NotImplementedError("Qwen4-Exp does not support cache prefill or decode under Ulysses.")
-    # --- Patch.3 ---
+    # --- Patch.1 ---
     # CODEPATH: @ArthurZucker fix flagging for no reason here
     if self.config.ple_layer_ids and ple_input_ids is None:
         # If we do not have input_ids but have ple, we need to revert the embeddings to find back the ids
@@ -1559,10 +1461,10 @@ def qwen4_exp_text_model_forward_patched(
         past_key_values = DynamicCache(config=self.config)
 
     if position_ids is None:
-        # --- Patch.3 ---
+        # --- Patch.2: Pass the VeOmni attention mask contract to decoder layers. ---
         if parallel_state.ulysses_enabled:
             raise ValueError("Qwen4-Exp Ulysses requires collator-provided sequence-local position_ids.")
-        # --- Patch.3 ---
+        # --- Patch.2 ---
         past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
         position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
         position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
@@ -1584,7 +1486,7 @@ def qwen4_exp_text_model_forward_patched(
             position_ids = torch.cat([previous_positions, position_ids], dim=-1)
         past_key_values.position_ids = position_ids
 
-    # --- Patch.1 ---
+    # --- Patch.3: Preserve the VeOmni sequence-parallel decoder layout. ---
     if not isinstance(causal_mask_mapping := attention_mask, dict):
         if parallel_state.ulysses_enabled:
             mask_seq_len = inputs_embeds.shape[1] * parallel_state.ulysses_size
@@ -1603,10 +1505,10 @@ def qwen4_exp_text_model_forward_patched(
             "full_attention": None,
             "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
         }
-    # --- Patch.1 ---
+    # --- Patch.3 ---
 
     conv_mask = causal_mask_mapping.get("linear_attention")
-    # --- Patch.2 ---
+    # --- Patch.4: Run the patched decoder layers and restore the output layout. ---
     if parallel_state.ulysses_enabled:
         if conv_mask is not None:
             conv_mask = slice_input_tensor(
@@ -1615,7 +1517,7 @@ def qwen4_exp_text_model_forward_patched(
                 padding=False,
                 group=parallel_state.ulysses_group,
             )
-    # --- Patch.2 ---
+    # --- Patch.4 ---
 
     # CODEPATH: @ArthurZucker fix flagging for no reason here
     if self.config.ple_layer_ids and conv_mask is not None:
@@ -1627,12 +1529,12 @@ def qwen4_exp_text_model_forward_patched(
     position_embeddings = self.rotary_emb(hidden_states, position_ids)
     hidden_states = hidden_states.repeat(1, 1, self.config.hc_count)
 
-    # --- Patch.4 ---
+    # --- Patch.4: Run the patched decoder layers and restore the output layout. ---
     for decoder_layer in self.layers[: self.config.num_hidden_layers]:
         hidden_states = decoder_layer(
             hidden_states,
             position_embeddings=position_embeddings,
-            # --- Patch.1 ---
+            # --- Patch.1: Disable the upstream attention mask for local decoder input. ---
             attention_mask=None,
             # --- Patch.1 ---
             conv_mask=conv_mask,
@@ -1650,14 +1552,6 @@ def qwen4_exp_text_model_forward_patched(
     )
 
 
-# ================================================================
-# Patches: Qwen4ExpVisionModel / Qwen4ExpVisionAttention
-# 1. Reuse Qwen3.5's structurally identical SP-aware vision position helpers.
-# 2. Run the ViT on local patch shards; the registered VeOmni FlashAttention
-#    adapter performs Ulysses sequence/head exchange inside every attention.
-# 3. Consume collator-precomputed ViT metadata and keep a runtime fallback.
-# 4. Avoid a per-block max-seqlen device-to-host synchronization.
-# ================================================================
 _QWEN3_5_TO_QWEN4_EXP = {"Qwen3_5": "Qwen4Exp"}
 
 config.override_method(
@@ -1686,21 +1580,18 @@ config.override_method(
 )
 
 
-# ================================================================
-# Patch: Qwen4ExpVisionModel.dummy_forward
-# 1. Touch the vision tower on text-only FSDP ranks.
-# 2. Derive shapes and dtype from the live model instead of hardcoding them.
-# 3. Under SP, describe the global grid while supplying only this rank's
-#    local patch rows, and avoid runtime metadata synchronization.
-# 4. Use local varlen boundaries when the selected vision attention does not
-#    perform the Ulysses sequence exchange.
-# ================================================================
 @config.override_method(
     "Qwen4ExpVisionModel.dummy_forward",
     description="Add a config-derived dummy vision forward for rank-asymmetric FSDP batches",
 )
 def qwen4_exp_vision_model_dummy_forward(self):
-    # --- Patch.1 / Patch.2 / Patch.3 / Patch.4 ---
+    # --- Patch.1: Reuse VeOmni's SP-aware vision helpers. ---
+    # 1. Touch the vision tower on text-only FSDP ranks.
+    # 2. Derive shapes and dtype from the live model instead of hardcoding them.
+    # 3. Under SP, describe the global grid while supplying only this rank's
+    #    local patch rows, and avoid runtime metadata synchronization.
+    # 4. Use local varlen boundaries when the selected vision attention does not
+    #    perform the Ulysses sequence exchange.
     merge_size = self.spatial_merge_size
     parallel_state = get_parallel_state()
     t = 1
@@ -1724,7 +1615,7 @@ def qwen4_exp_vision_model_dummy_forward(self):
         "max_seqlen": attention_seq_len,
     }
     return self(hidden_states=pixel_values, grid_thw=grid_thw, vit_metadata=vit_metadata)
-    # --- Patch.1 / Patch.2 / Patch.3 / Patch.4 ---
+    # --- Patch.1 ---
 
 
 @config.add_helper
@@ -1794,16 +1685,13 @@ class _Qwen4ExpFakeForPositionIds(SimpleNamespace):
         return Qwen4ExpModel.get_vision_position_ids(self, *args, **kwargs)
 
 
-# ================================================================
-# Patch: Qwen4ExpForConditionalGeneration.get_position_id_func
-# 1. Expose M-RoPE preprocessing using VeOmni's negative placeholder ids.
-# ================================================================
+
 @config.override_method(
     "Qwen4ExpForConditionalGeneration.get_position_id_func",
     description="Expose a picklable Qwen4-Exp multimodal position-id preprocessor",
 )
 def qwen4_exp_get_position_id_func_patched(self):
-    # --- Patch.1 ---
+    # --- Patch.1: Expose VeOmni multimodal position-id preprocessing. ---
     fake_config = copy(self.config)
     fake_config.image_token_id = IMAGE_INPUT_INDEX
     fake_config.video_token_id = VIDEO_INPUT_INDEX
@@ -1812,49 +1700,33 @@ def qwen4_exp_get_position_id_func_patched(self):
     # --- Patch.1 ---
 
 
-# ================================================================
-# Patch: Qwen4ExpForConditionalGeneration.get_metadata_collate_func
-# 1. Mark VeOmni-packed position ids as batch-first so Model.forward can
-#    distinguish them from HF's canonical axis-first layout.
-# 2. Precompute image/video ViT varlen metadata after SP padding so the local
-#    VisionModel path does not synchronize GPU tensors back to the host.
-# ================================================================
 @config.override_method(
     "Qwen4ExpForConditionalGeneration.get_metadata_collate_func",
     description="Expose Qwen4-Exp position-layout and ViT metadata collation",
 )
 def qwen4_exp_get_metadata_collate_func_patched(self):
-    # --- Patch.1 / Patch.2 ---
+    # --- Patch.1 : Expose packed position and ViT metadata collation. ---
+    # Qwen4ExpForConditionalGeneration.get_metadata_collate_func
+    # Mark VeOmni-packed position ids as batch-first so Model.forward can
+    # distinguish them from HF's canonical axis-first layout.
+    # Precompute image/video ViT varlen metadata after SP padding so the local
+    # VisionModel path does not synchronize GPU tensors back to the host.
     return qwen4_exp_collate_metadata
-    # --- Patch.1 / Patch.2 ---
+    # --- Patch.1 ---
 
 
-# ================================================================
-# Patch: Qwen4ExpForConditionalGeneration.get_parallel_plan
-# 1. Register checkpoint-native PLE shards under the dedicated ``ple``
-#    ExtraParallel mesh for row-sharded streaming load and training.
-# ================================================================
 @config.override_method(
     "Qwen4ExpForConditionalGeneration.get_parallel_plan",
     description="Register the Qwen4-Exp PLE ExtraParallel plan",
 )
 def qwen4_exp_get_parallel_plan_patched(self):
-    # --- Patch.1 ---
+    # --- Patch.1: Register the VeOmni PLE ExtraParallel plan. ---
     from ..parallel_plan import get_parallel_plan as _get_parallel_plan
 
     return _get_parallel_plan()
     # --- Patch.1 ---
 
 
-# ================================================================
-# Patch: Qwen4ExpModel.forward
-# 1. Consume VeOmni's precomputed masks after placeholder ids are zeroed.
-# 2. Reconstruct real modality ids specifically for PLE n-gram hashing.
-# 3. Touch missing vision modalities on FSDP ranks.
-# 4. Perform multimodal scatter in global-sequence layout under Ulysses.
-# 5. Accept VeOmni's batch-first precomputed M-RoPE layout.
-# 6. Run VisionModel on local SP patch shards and gather only merged features.
-# ================================================================
 @config.override_method(
     "Qwen4ExpModel.forward",
     description="Support VeOmni VLM SFT masks, PLE ids, and global placeholder scatter under Ulysses",
@@ -1905,7 +1777,7 @@ def qwen4_exp_model_forward_patched(
         if key in kwargs:
             lm_kwargs[key] = kwargs.pop(key)
     multimodal_metadata = kwargs.pop("multimodal_metadata", None) or {}
-    # --- Patch.6 ---
+    # --- Patch.6: Pass precomputed ViT metadata into the vision model. ---
     image_vit_kwargs = {
         "vit_metadata": {
             "grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
@@ -1931,7 +1803,7 @@ def qwen4_exp_model_forward_patched(
             gather_dim=1,
             group=parallel_state.ulysses_group,
         )
-
+    # if None, calculate mask
     if image_mask is None or video_mask is None:
         mask_input_ids = input_ids
         if parallel_state.ulysses_enabled and input_ids is not None:
@@ -1947,12 +1819,7 @@ def qwen4_exp_model_forward_patched(
     video_mask = video_mask.bool()
 
     if pixel_values is not None:
-        # --- Patch.6 ---
-        # The collator already SP-sliced patch rows. Run the ViT locally; its
-        # FlashAttention path performs Ulysses all-to-all per block. Calling
-        # ``self.visual`` directly preserves the public get_image_features
-        # tuple-of-images contract while giving this internal path the flat
-        # local tensor needed before the feature gather.
+        # --- Patch.6: Run the patched vision model and scatter image features. ---
         image_outputs: BaseModelOutputWithPooling = self.visual(
             pixel_values.type(self.visual.dtype),
             grid_thw=image_grid_thw,
@@ -1970,13 +1837,13 @@ def qwen4_exp_model_forward_patched(
         inputs_embeds = inputs_embeds.masked_scatter(image_mask.unsqueeze(-1), image_embeds)
         # --- Patch.6 ---
     elif get_parallel_state().fsdp_enabled:
-        # --- Patch.3 ---
+        # --- Patch.3: Touch the vision path for FSDP when images are absent. ---
         fake_embeds = self.visual.dummy_forward().pooler_output.mean() * 0.0
         inputs_embeds = inputs_embeds + fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         # --- Patch.3 ---
 
     if pixel_values_videos is not None:
-        # --- Patch.6 ---
+        # --- Patch.6: Run the patched vision model and scatter video features. ---
         video_outputs: BaseModelOutputWithPooling = self.visual(
             pixel_values_videos.type(self.visual.dtype),
             grid_thw=video_grid_thw,
@@ -1994,7 +1861,7 @@ def qwen4_exp_model_forward_patched(
         inputs_embeds = inputs_embeds.masked_scatter(video_mask.unsqueeze(-1), video_embeds)
         # --- Patch.6 ---
     elif get_parallel_state().fsdp_enabled:
-        # --- Patch.3 ---
+        # --- Patch.3: Touch the vision path for FSDP when videos are absent. ---
         fake_embeds = self.visual.dummy_forward().pooler_output.mean() * 0.0
         inputs_embeds = inputs_embeds + fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         # --- Patch.3 ---
@@ -2020,6 +1887,8 @@ def qwen4_exp_model_forward_patched(
         )
 
     ple_input_ids = None
+    # Multimodal preprocessing previously zeroed out the image/video placeholders;
+    # PLE needs to restore the real model tokens.
     if local_ple_input_ids is not None:
         ple_input_ids = local_ple_input_ids
         ple_input_ids.masked_fill_(image_mask, self.config.image_token_id)
@@ -2040,7 +1909,7 @@ def qwen4_exp_model_forward_patched(
             past_key_values=past_key_values,
             mm_token_type_ids=mm_token_type_ids,
         )
-    # --- Patch.5 ---
+    # --- Patch.5: Accept VeOmni batch-first precomputed position ids. ---
     elif position_ids_layout == "batch_first":
         if (
             position_ids.ndim != 3
@@ -2061,6 +1930,7 @@ def qwen4_exp_model_forward_patched(
         lm_kwargs["cu_seq_lens_q"] = cu_seq_lens_q
     global_sequence_length = inputs_embeds.shape[1] * parallel_state.ulysses_size
     _qwen4_exp_validate_packed_seq_lens(cu_seq_lens_q.diff().tolist(), inputs_embeds.shape[0], global_sequence_length)
+    # the final shape passed to language_model is [4, B, S_local]
     if position_ids.shape[0] == 3:
         text_position_ids = culen2pos(cu_seq_lens_q).to(device=position_ids.device, dtype=position_ids.dtype)
         if parallel_state.ulysses_enabled:
@@ -2101,14 +1971,6 @@ class Qwen4ExpCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen4ExpCaus
     """
 
 
-# ================================================================
-# Patch: Qwen4ExpForConditionalGeneration.forward
-# 1. Use VeOmni's fused-linear-compatible loss contract for VLM SFT and keep
-#    model-only metadata out of loss kwargs.
-# 2. Preserve Qwen4 MoE router auxiliary loss without enabling MTP loss, using
-#    the sequence-local padding mask that matches local router logits under
-#    Ulysses, consistent with Qwen3.5-MoE.
-# ================================================================
 @config.override_method(
     "Qwen4ExpForConditionalGeneration.forward",
     description="Use VeOmni fused loss for Qwen4-Exp VLM SFT without MTP loss",
@@ -2129,7 +1991,7 @@ def qwen4_exp_for_conditional_generation_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen4ExpCausalLMOutputWithLogProbs:
-    # --- Patch.1 ---
+    # --- Patch.1: Forward the packed position-id layout to the VLM model. ---
     position_ids_layout = kwargs.pop("qwen4_exp_position_ids_layout", None)
     # --- Patch.1 ---
     outputs = self.model(
@@ -2151,7 +2013,7 @@ def qwen4_exp_for_conditional_generation_forward_patched(
     slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
     hidden_states = hidden_states[:, slice_indices, :]
 
-    # --- Patch.1 ---
+    # --- Patch.1: Use the VeOmni fused-linear-compatible loss path. ---
     loss = None
     logits = None
     fused_linear_aux = None
@@ -2181,7 +2043,10 @@ def qwen4_exp_for_conditional_generation_forward_patched(
         logits = self.lm_head(hidden_states)
     # --- Patch.1 ---
 
-    # --- Patch.2 ---
+    # --- Patch.2: Add the sequence-local router auxiliary loss. ---
+    # 2. Preserve Qwen4 MoE router auxiliary loss without enabling MTP loss, using 
+    # the sequence-local padding mask that matches local router logits under 
+    # Ulysses, consistent with Qwen3.5-MoE.
     aux_loss = None
     if kwargs.get("output_router_logits", False):
         router_attention_mask = attention_mask
