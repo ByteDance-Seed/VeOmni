@@ -36,6 +36,7 @@ from tests.models.compare import (
     ops_config_scope,
     pin_eager_attn_implementation,
     qwen_image_inputs,
+    stamp_attn_implementation,
 )
 from tests.models.tiny_configs import tiny_qwen3_vl_moe_config as _tiny_config
 
@@ -59,7 +60,9 @@ def _qwen3_vl_moe_cls():
 
 
 def _build_ours(config: Qwen3VLMoeConfig, ops: SimpleNamespace | None = None):
-    with ops_config_scope(ops if ops is not None else eager_ops_config()):
+    ops = ops if ops is not None else eager_ops_config()
+    stamp_attn_implementation(config, ops.attn_implementation)
+    with ops_config_scope(ops):
         return _qwen3_vl_moe_cls()(config)
 
 

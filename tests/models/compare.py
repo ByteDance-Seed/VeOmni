@@ -76,16 +76,22 @@ def stamp_attn_implementation(config: object | None, impl: str) -> None:
 
 
 def pin_eager_attn_implementation(model: torch.nn.Module) -> None:
-    """Force every config on ``model`` onto HF eager attention.
+    """Force every config and already-bound standard attention onto HF eager.
 
     Composite VL/omni configs drop ``attn_implementation`` when nested
     configs go through ``to_dict()``, so Hugging Face defaults to ``sdpa``.
-    Modeling binds attention from ``config._attn_implementation``. Pin HF to
-    eager before comparing against an eager ops config.
+    Modeling binds ``veomni_attn`` from ``config._attn_implementation`` at
+    construct time. Stamping the config after that is not enough; rebind
+    the handle so later forwards actually use eager.
     """
+    from veomni.ops import VeomniOp
+
     stamp_attn_implementation(getattr(model, "config", None), "eager")
     for module in model.modules():
         stamp_attn_implementation(getattr(module, "config", None), "eager")
+        handle = getattr(module, "veomni_attn", None)
+        if getattr(handle, "op", None) == "attention":
+            module.veomni_attn = VeomniOp("attention", "standard", "eager")
 
 
 def named_trainable(model: torch.nn.Module) -> dict[str, torch.Tensor]:
