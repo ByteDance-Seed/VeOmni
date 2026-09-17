@@ -128,6 +128,9 @@ _ORACLE_CASES = [
         "causal_lm",
         tiny_qwen3_moe_config,
         _hf_qwen3_moe,
+        # Expert loops accumulate BF16 ULP; not the dense FA2 bitwise path.
+        atol=5e-2,
+        rtol=5e-2,
         config_overrides={"_experts_implementation": "eager"},
     ),
     Case(
@@ -148,6 +151,9 @@ _ORACLE_CASES = [
         "vlm_full",
         tiny_qwen3_vl_config,
         _hf_qwen3_vl,
+        # Vision scatter mixes BF16 reductions; keep the measured family budget.
+        atol=5e-2,
+        rtol=5e-2,
     ),
     Case(
         "qwen2_5_omni-fa2",
@@ -155,6 +161,9 @@ _ORACLE_CASES = [
         "omni_thinker",
         tiny_qwen2_5_omni_thinker_config,
         _hf_qwen2_5_omni_thinker,
+        # Thinker + expert/vision mix; same measured family budget as Qwen3-VL.
+        atol=5e-2,
+        rtol=5e-2,
     ),
 ]
 
@@ -166,6 +175,8 @@ _LOADER_CASES = [
         "causal_lm",
         tiny_qwen3_moe_config,
         _hf_qwen3_moe,
+        atol=5e-2,
+        rtol=5e-2,
         config_overrides={"_experts_implementation": "eager"},
     ),
     Case(
@@ -174,6 +185,8 @@ _LOADER_CASES = [
         "vlm_full",
         tiny_qwen3_vl_config,
         _hf_qwen3_vl,
+        atol=5e-2,
+        rtol=5e-2,
     ),
     Case(
         "qwen2_5_omni-fa2-loader",
@@ -181,15 +194,32 @@ _LOADER_CASES = [
         "omni_thinker",
         tiny_qwen2_5_omni_thinker_config,
         _hf_qwen2_5_omni_thinker,
+        atol=5e-2,
+        rtol=5e-2,
     ),
 ]
 
 
-def _apply_determinism() -> None:
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+@pytest.fixture(autouse=True)
+def _deterministic_backend_flags():
+    """Scope cuDNN flags so a frozen collection cannot be assigned into."""
+    if not IS_CUDA_AVAILABLE:
+        yield
+        return
+
+    prev_deterministic = torch.are_deterministic_algorithms_enabled()
     torch.use_deterministic_algorithms(True, warn_only=True)
+    with torch.backends.cudnn.flags(
+        enabled=torch.backends.cudnn.enabled,
+        benchmark=False,
+        benchmark_limit=torch.backends.cudnn.benchmark_limit,
+        deterministic=True,
+        allow_tf32=False,
+    ):
+        try:
+            yield
+        finally:
+            torch.use_deterministic_algorithms(prev_deterministic, warn_only=True)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -348,7 +378,6 @@ def _hf_logits(case: Case, config, input_ids, fwd_kwargs, dtype):
 @pytest.mark.parametrize("case", _ORACLE_CASES, ids=[case.case_id for case in _ORACLE_CASES])
 def test_bf16_fa2_sdpa_logits_match_independent_hf(case: Case):
     _skip_if_unavailable(case)
-    _apply_determinism()
     device = get_device_type()
     dtype = torch.bfloat16
     config = _make_config(case)
@@ -365,7 +394,6 @@ def test_bf16_fa2_sdpa_logits_match_independent_hf(case: Case):
 @pytest.mark.parametrize("case", _LOADER_CASES, ids=[case.case_id for case in _LOADER_CASES])
 def test_weights_path_loader_logits_match_independent_hf(case: Case):
     _skip_if_unavailable(case)
-    _apply_determinism()
     device = get_device_type()
     dtype = torch.bfloat16
     config = _make_config(case)
@@ -383,3 +411,66 @@ def test_weights_path_loader_logits_match_independent_hf(case: Case):
         del state_dict
         _release()
     _assert_logits(case, logits_hf, logits_ve)
+
+
+_BACKWARD_CASES = [case for case in _ORACLE_CASES if case.kind == "causal_lm"]
+
+
+def test_low_precision_oracle_scoped_flags_survive_a_frozen_cudnn_context():
+    """Direct cuDNN assignment fails after a freeze; scoped flags must not."""
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("CUDA required.")
+    with torch.backends.cudnn.flags(
+        enabled=torch.backends.cudnn.enabled,
+        benchmark=False,
+        deterministic=True,
+        allow_tf32=False,
+    ):
+        try:
+            torch.backends.cudnn.deterministic = True
+        except RuntimeError:
+            assigned = False
+        else:
+            assigned = True
+        if assigned:
+            pytest.skip("this PyTorch build does not freeze cuDNN flags")
+        with torch.backends.cudnn.flags(
+            enabled=torch.backends.cudnn.enabled,
+            benchmark=False,
+            deterministic=True,
+            allow_tf32=False,
+        ):
+            assert torch.backends.cudnn.deterministic is True
+
+
+@pytest.mark.parametrize("case", _BACKWARD_CASES, ids=[case.case_id for case in _BACKWARD_CASES])
+def test_bf16_causal_lm_backward_matches_independent_hf(case: Case):
+    _skip_if_unavailable(case)
+    device = get_device_type()
+    dtype = torch.bfloat16
+    config = _make_config(case)
+    input_ids, fwd_kwargs = _make_inputs(case, config, device, dtype)
+    labels = input_ids.clone()
+    model_hf = _build_hf_model(case, config, dtype).train()
+    state_dict = copy.deepcopy(model_hf.state_dict())
+    loss_hf = model_hf(input_ids=input_ids.clone(), labels=labels.clone(), use_cache=False, **fwd_kwargs).loss
+    loss_hf.backward()
+    hf_grads = {
+        name: param.grad.detach().clone() for name, param in model_hf.named_parameters() if param.grad is not None
+    }
+    del model_hf
+    _release()
+    model_ve = _build_veomni_model(case, config, state_dict).train()
+    loss_ve = model_ve(input_ids=input_ids.clone(), labels=labels.clone(), use_cache=False, **fwd_kwargs).loss
+    loss_ve.backward()
+    torch.testing.assert_close(loss_ve.float(), loss_hf.float(), atol=case.atol, rtol=case.rtol)
+    shared = [
+        (name, grad, model_ve.get_parameter(name).grad)
+        for name, grad in hf_grads.items()
+        if name in dict(model_ve.named_parameters())
+    ]
+    assert shared, f"[{case.case_id}] no shared parameter gradients"
+    name, hf_grad, ve_grad = next(item for item in shared if item[2] is not None)
+    torch.testing.assert_close(ve_grad.float(), hf_grad.float(), atol=case.atol, rtol=case.rtol, msg=name)
+    del model_ve, state_dict
+    _release()
