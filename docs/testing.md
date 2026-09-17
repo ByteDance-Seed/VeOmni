@@ -209,6 +209,31 @@ output, input/routing and base-weight gradients, while retaining trainable
 B-gradients. Both files run in GPU CI. Duplicate routes still have distinct
 EP/non-EP reduction layouts; no bitwise guarantee is made for arbitrary routes.
 
+`tests/ops/test_group_gemm_weight_grad_precision.py` pins the dtype contract the
+expert weight-gradient path depends on. `group_gemm_same_mn` accumulates in FP32
+but casts to `c.dtype` when it stores and asserts no dtype for `c`, so the BF16
+buffer the expert Functions allocate is the dtype a local partial sum is rounded
+to before FSDP2 reduce-scatters it across the `<para>_fsdp` mesh of the
+`fully_shard`-ed expert module (`veomni/distributed/torch_parallelize.py`). The
+regressions enforce FP32 accuracy of the accumulation and a one-BF16-epsilon band
+for the BF16 store, covering an empty expert, skewed payloads and per-rank
+partial sums. Measurements on L20/SM89 against an FP64 reference built from the
+same BF16 operands -- recorded here, not enforced by CI -- are about 1.7e-3
+relative L2 for a BF16 write-back and about 6e-8 for an FP32 one, rising to about
+2.4e-3 and about 1e-7 when two per-rank partials are combined.
+
+That write-back dominates the remaining first-step expert-weight difference, but
+an FP32 buffer alone is not sufficient: autograd casts a returned gradient back
+to the BF16 dtype of the leaf parameter it accumulates into, which for FSDP2
+mixed precision is the unsharded parameter. A four-rank A/B run with FP32
+gradient buffers and the current mixed-precision policy is bit-identical to this
+head. Keeping the expert *parameters* in FP32 through the FSDP2 all-gather does
+move the numbers on the same fixture -- first-step expert gradient relative L2
+0.219% to 0.155%, whole-model 0.0751% to 0.0531% -- at the cost of an FP32 expert
+all-gather and a larger unsharded buffer. Those four-rank numbers are
+measurements taken for this document, not assertions any test makes. That is a
+mixed-precision-policy decision rather than a kernel fix and is not applied here.
+
 ---
 
 ### 2. VLM Trainer Test (`tests/models/test_vlm_trainer.py`)
