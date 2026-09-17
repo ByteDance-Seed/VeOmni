@@ -36,7 +36,7 @@
 #    - method_override: Qwen3_5VisionModel.dummy_forward
 #      Add dummy_forward to prevent FSDP reduce-scatter hang on uneven multimodal batches.
 #    - init_modification: Qwen3_5VisionAttention
-#      Bind instance-local attention VeomniOp
+#      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3_5VisionAttention.forward
 #      Read pre-computed `vision_max_seqlen` (Python int) from kwargs to avoid the per-block GPU->CPU sync that flash_attn_varlen_func incurs when `max_length_q/k` are 0-D GPU tensors (FA's C++ binding `.item()`s them).
 #    - method_override: Qwen3_5Model.forward
@@ -832,13 +832,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return torch.cat([w_q, w_k, w_v], dim=0)
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -1160,20 +1153,6 @@ class Qwen3_5VisionPatchMerger(nn.Module):
         return x
 
 
-def apply_rotary_pos_emb_vision(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.float(), k.float()
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    q_embed = q_embed.to(orig_q_dtype)
-    k_embed = k_embed.to(orig_k_dtype)
-    return q_embed, k_embed
-
-
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5VisionAttention
 # Methods patched: forward, __init__
@@ -1181,7 +1160,7 @@ def apply_rotary_pos_emb_vision(
 
 
 class Qwen3_5VisionAttention(nn.Module):
-    # [modified __init__] Bind instance-local attention VeomniOp
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: Qwen3_5VisionConfig) -> None:
         super().__init__()
         self.dim = config.hidden_size
@@ -1194,7 +1173,8 @@ class Qwen3_5VisionAttention(nn.Module):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
-        # Bind instance-local attention VeomniOp
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
         self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
@@ -1210,7 +1190,7 @@ class Qwen3_5VisionAttention(nn.Module):
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)

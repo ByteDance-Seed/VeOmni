@@ -10,7 +10,7 @@
 #
 #  Patches applied:
 #    - init_modification: Qwen2_5_VLVisionAttention
-#      Bind instance-local attention VeomniOp
+#      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen2_5_VLVisionAttention.forward
 #      Use precomputed max_seqlen passed from outer forward to avoid per-layer CPU-GPU sync
 #    - method_override: Qwen2_5_VLVisionBlock.forward
@@ -388,20 +388,6 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb_vision(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.float(), k.float()
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    q_embed = q_embed.to(orig_q_dtype)
-    k_embed = k_embed.to(orig_k_dtype)
-    return q_embed, k_embed
-
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -446,7 +432,7 @@ def eager_attention_forward(
 
 
 class Qwen2_5_VLVisionAttention(nn.Module):
-    # [modified __init__] Bind instance-local attention VeomniOp
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: Qwen2_5_VLVisionConfig) -> None:
         super().__init__()
         self.dim = config.hidden_size
@@ -459,7 +445,8 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
-        # Bind instance-local attention VeomniOp
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
         self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
@@ -478,7 +465,7 @@ class Qwen2_5_VLVisionAttention(nn.Module):
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)
@@ -2235,4 +2222,9 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         )
 
 
-__all__ = ["Qwen2_5_VLForConditionalGeneration", "Qwen2_5_VLModel", "Qwen2_5_VLPreTrainedModel", "Qwen2_5_VLTextModel"]
+__all__ = [
+    "Qwen2_5_VLForConditionalGeneration",
+    "Qwen2_5_VLModel",
+    "Qwen2_5_VLPreTrainedModel",
+    "Qwen2_5_VLTextModel",
+]

@@ -65,7 +65,6 @@ from transformers.modeling_utils import is_flash_attention_requested
 from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
     Qwen2_5OmniThinkerForConditionalGeneration,
     apply_multimodal_rotary_pos_emb,
-    apply_rotary_pos_emb_vision,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
@@ -198,6 +197,7 @@ config.exclude_from_output(
     "TorchActivation1d",
     "SnakeBeta",
     "apply_rotary_pos_emb",
+    "apply_rotary_pos_emb_vision",
 )
 
 
@@ -703,9 +703,10 @@ def qwen2_5_omni_audio_dummy_forward_patched(self):
 #    the SP-appended cu_seqlens padding entry would run through the
 #    non-varlen split branch and size-mismatch.
 # ================================================================
-@config.modify_init("Qwen2_5OmniVisionAttention", description="Bind instance-local attention VeomniOp")
+@config.modify_init("Qwen2_5OmniVisionAttention", description="Bind instance-local rope and attention VeomniOps")
 def qwen2_5_omni_vision_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
     self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
@@ -725,8 +726,9 @@ def qwen2_5_omni_vision_attention_forward_patched(
     query_states = self.q(hidden_states).reshape(seq_length, self.num_heads, -1)
     key_states = self.k(hidden_states).reshape(seq_length, self.num_heads, -1)
     value_states = self.v(hidden_states).reshape(seq_length, self.num_heads, -1)
-    query_states = apply_rotary_pos_emb_vision(query_states.unsqueeze(0), position_embeddings).squeeze(0)
-    key_states = apply_rotary_pos_emb_vision(key_states.unsqueeze(0), position_embeddings).squeeze(0)
+    cos = torch.cat((position_embeddings.cos(), position_embeddings.cos()), dim=-1)
+    sin = torch.cat((position_embeddings.sin(), position_embeddings.sin()), dim=-1)
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
     query_states = query_states.transpose(0, 1).unsqueeze(0)
     key_states = key_states.transpose(0, 1).unsqueeze(0)

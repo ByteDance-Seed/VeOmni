@@ -14,7 +14,7 @@
 #    - method_override: Qwen3OmniMoePreTrainedModelForConditionalGeneration.get_rope_index
 #      Per-video use_audio_in_video via audio_seqlens + None attention_mask tolerance
 #    - init_modification: Qwen3OmniMoeVisionAttention
-#      Bind instance-local attention VeomniOp
+#      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3OmniMoeVisionAttention.forward
 #      Route through VARLEN_ATTENTION_TYPES so veomni_flash_attention_* with cu_seqlens works
 #    - method_override: Qwen3OmniMoeVisionEncoder.forward
@@ -69,8 +69,6 @@
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3OmniMoeThinkerTextAttention.forward
 #      Always call the local rope and attention VeomniOps
-#    - function_replacement: apply_rotary_pos_emb_vision
-#      Replace with the fusion operator on Ascend.
 #    - method_override: Qwen3OmniMoeThinkerTextRMSNorm.forward
 #      NPU fused RMSNorm -- reduces pow+mean+rsqrt to single npu_rms_norm call
 #
@@ -92,7 +90,7 @@ import torch
 from torch import nn
 from torch.nn import Parameter
 from torch.nn import functional as F
-from torch_npu import npu_rms_norm, npu_rotary_mul
+from torch_npu import npu_rms_norm
 from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
@@ -1084,30 +1082,6 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
         return self(input_features=input_features, feature_lens=feature_lens)
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-# ======================================================================
-# [PATCHED FUNCTION] apply_rotary_pos_emb_vision
-# Reason: Replace with the fusion operator on Ascend.
-# Source: veomni.models.transformers.qwen3_omni_moe.qwen3_omni_moe_npu_patch_gen_config
-# ======================================================================
-def apply_rotary_pos_emb_vision(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.unsqueeze(-2).float()
-    sin = sin.unsqueeze(-2).float()
-
-    q_embed = npu_rotary_mul(q.float(), cos, sin, rotary_mode="half").to(q.dtype)
-    k_embed = npu_rotary_mul(k.float(), cos, sin, rotary_mode="half").to(k.dtype)
-
-    return q_embed, k_embed
-
-
 # ======================================================================
 # [MODIFIED CLASS] Qwen3OmniMoeVisionAttention
 # Methods patched: forward, __init__
@@ -1115,7 +1089,7 @@ def apply_rotary_pos_emb_vision(
 
 
 class Qwen3OmniMoeVisionAttention(nn.Module):
-    # [modified __init__] Bind instance-local attention VeomniOp
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: Qwen3OmniMoeVisionEncoderConfig) -> None:
         super().__init__()
         self.dim = config.hidden_size
@@ -1128,7 +1102,8 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
-        # Bind instance-local attention VeomniOp
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
         self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
@@ -1144,7 +1119,7 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)

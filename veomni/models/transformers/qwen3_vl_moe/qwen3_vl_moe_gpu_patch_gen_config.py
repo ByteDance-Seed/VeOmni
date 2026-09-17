@@ -44,7 +44,9 @@ from veomni.distributed.sequence_parallel import (
 )
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
-    apply_rotary_pos_emb_vision_patched,
+    config as qwen3_vl_config,
+)
+from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_get_metadata_collate_func_patched,
     qwen3_vl_get_position_id_func_patched,
     qwen3_vl_model_get_image_features_patched,
@@ -62,9 +64,6 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_vision_forward_patched,
     qwen3_vl_vision_rot_pos_emb_patched,
 )
-from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
-    config as qwen3_vl_config,
-)
 from veomni.models.utils.op_utils import empty_bias, resolve_moe_impl, resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
@@ -76,7 +75,7 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_vl_moe_gpu.py",
     description="Qwen3-VL-MoE with VeOmni v5 patches and VeomniOp replacements",
 )
-config.exclude_from_output("apply_rotary_pos_emb")
+config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
 config.drop_import_names("use_kernelized_func")
 
 
@@ -260,11 +259,6 @@ config.override_method(
     replacement=qwen3_vl_get_metadata_collate_func_patched,
     name_map=_NAME_MAP,
     description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
-)
-config.replace_function(
-    "apply_rotary_pos_emb_vision",
-    replacement=apply_rotary_pos_emb_vision_patched,
-    description="Call rope full VeomniOp with rank-3 vision layout",
 )
 
 

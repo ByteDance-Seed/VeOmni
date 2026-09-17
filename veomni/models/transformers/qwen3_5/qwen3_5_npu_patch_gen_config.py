@@ -61,8 +61,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     config as gpu_config,
 )
-from veomni.models.utils.op_utils import prepare_dense_attention_inputs, resolve_op_impl
-from veomni.ops import VeomniOp
+from veomni.models.utils.op_utils import prepare_dense_attention_inputs
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  consumed by in-config dataclass + emitted forward
     FusedLinearAuxOutput,
@@ -75,7 +74,7 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_5_npu.py",
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
 )
-config.exclude_from_output("apply_rotary_pos_emb")
+config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
 
 config.add_import("copy", names=["copy"])
 config.add_import("functools", names=["partial"])
@@ -161,17 +160,6 @@ config.override_method(
     replacement=qwen3_5_rmsnorm_forward_patched,
     description="Always call the local rms_norm qwen3_5 VeomniOp",
 )
-
-
-@config.replace_function(
-    "apply_rotary_pos_emb_vision",
-    description="Call rope full VeomniOp with rank-3 vision layout",
-)
-def apply_rotary_pos_emb_vision(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-    return rope(q, k, cos, sin)
 
 
 config.override_method(

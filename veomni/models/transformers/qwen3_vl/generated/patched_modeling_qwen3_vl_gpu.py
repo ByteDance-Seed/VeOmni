@@ -15,8 +15,6 @@
 #      Construct a local rms_norm VeomniOp
 #    - method_override: Qwen3VLTextRMSNorm.forward
 #      Always call the local rms_norm VeomniOp
-#    - function_replacement: apply_rotary_pos_emb_vision
-#      Call rope full VeomniOp with rank-3 vision layout
 #    - init_modification: Qwen3VLVisionAttention
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3VLVisionAttention.forward
@@ -406,24 +404,6 @@ class Qwen3VLVisionPatchMerger(nn.Module):
         x = self.norm(x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x).view(-1, self.hidden_size)
         x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
         return x
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-# ======================================================================
-# [PATCHED FUNCTION] apply_rotary_pos_emb_vision
-# Reason: Call rope full VeomniOp with rank-3 vision layout
-# Source: veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config
-# ======================================================================
-# ── Vision Rotary Positional Embedding (call rope full with rank-3 layout) ───
-def apply_rotary_pos_emb_vision(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-    return rope(q, k, cos, sin, position_ids, unsqueeze_dim)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:

@@ -13,8 +13,6 @@
 #      Construct a local rms_norm qwen3_5 VeomniOp
 #    - method_override: Qwen3_5MoeRMSNorm.forward
 #      Always call the local rms_norm qwen3_5 VeomniOp
-#    - function_replacement: apply_rotary_pos_emb_vision
-#      Call rope full VeomniOp with rank-3 vision layout
 #    - method_override: Qwen3_5MoeModel.__init__
 #      Propagate _moe_implementation from top-level config to text_config
 #    - method_override: Qwen3_5MoeSparseMoeBlock.forward
@@ -839,13 +837,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         return torch.cat([w_q, w_k, w_v], dim=0)
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -1307,18 +1298,6 @@ class Qwen3_5MoeVisionPatchMerger(nn.Module):
 
 
 # ======================================================================
-# [PATCHED FUNCTION] apply_rotary_pos_emb_vision
-# Reason: Call rope full VeomniOp with rank-3 vision layout
-# Source: veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config
-# ======================================================================
-def apply_rotary_pos_emb_vision(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-    return rope(q, k, cos, sin)
-
-
-# ======================================================================
 # [MODIFIED CLASS] Qwen3_5MoeVisionAttention
 # Methods patched: forward, __init__
 # ======================================================================
@@ -1339,6 +1318,7 @@ class Qwen3_5MoeVisionAttention(nn.Module):
         self.attention_dropout = 0.0
         self.is_causal = False
         # Bind instance-local attention VeomniOp
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
         self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
@@ -1354,7 +1334,7 @@ class Qwen3_5MoeVisionAttention(nn.Module):
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)

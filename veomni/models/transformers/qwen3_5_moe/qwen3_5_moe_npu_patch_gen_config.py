@@ -34,7 +34,6 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_vision_model_rot_pos_emb,
 )
 from veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config import (
-    apply_rotary_pos_emb_vision,
     qwen3_5_gated_deltanet_forward_patched,
     qwen3_5_rmsnorm_forward_patched,
     qwen3_5_text_model_forward_patched,
@@ -73,7 +72,7 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_5_moe_npu.py",
     description="Qwen3_5Moe with mojo_opset NPU replacements, fused MoE, and VeOmni SP/fused loss patches",
 )
-config.exclude_from_output("apply_rotary_pos_emb")
+config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
 
 config.add_import("copy", names=["copy"])
 config.add_import("functools", names=["partial"])
@@ -150,12 +149,6 @@ config.override_method(
     "Qwen3_5MoeRMSNorm.forward",
     replacement=qwen3_5_rmsnorm_forward_patched,
     description="Always call the local rms_norm qwen3_5 VeomniOp",
-)
-
-config.replace_function(
-    "apply_rotary_pos_emb_vision",
-    replacement=apply_rotary_pos_emb_vision,
-    description="Call rope full VeomniOp with rank-3 vision layout",
 )
 
 # ── Propagate _moe_implementation from top-level config to text_config ────────

@@ -55,7 +55,7 @@
 +#    - method_override: Qwen3_5VisionModel.dummy_forward
 +#      Add dummy_forward to prevent FSDP reduce-scatter hang on uneven multimodal batches.
 +#    - init_modification: Qwen3_5VisionAttention
-+#      Bind instance-local attention VeomniOp
++#      Bind instance-local rope and attention VeomniOps
 +#    - method_override: Qwen3_5VisionAttention.forward
 +#      Read pre-computed `vision_max_seqlen` (Python int) from kwargs to avoid the per-block GPU->CPU sync that flash_attn_varlen_func incurs when `max_length_q/k` are 0-D GPU tensors (FA's C++ binding `.item()`s them).
 +#    - method_override: Qwen3_5Model.forward
@@ -537,7 +537,7 @@
                  query,
                  key,
                  value,
-@@ -515,35 +790,46 @@
+@@ -515,81 +790,46 @@
                  initial_state=recurrent_state,
                  output_final_state=cache_params is not None,
                  use_qk_l2norm_in_kernel=True,
@@ -584,27 +584,13 @@
 
          output = self.out_proj(core_attn_out)
          return output
-+
-+    def _get_local_conv1d_weight(self, ulysses_rank: int, local_key_dim: int, local_value_dim: int) -> torch.Tensor:
-+        # Modification: shard depthwise conv1d weights to match head-sharded mixed_qkv channels.
-+        w_full = self.conv1d.weight.squeeze(1)
-+        assert w_full.shape[0] == self.key_dim * 2 + self.value_dim, (
-+            f"conv1d weight dim ({w_full.shape[0]}) must match "
-+            f"(2 * key_dim + value_dim) ({self.key_dim * 2 + self.value_dim})"
-+        )
-+        k_off = ulysses_rank * local_key_dim
-+        v_off = ulysses_rank * local_value_dim
-+        w_q = w_full[k_off : k_off + local_key_dim]
-+        w_k = w_full[self.key_dim + k_off : self.key_dim + k_off + local_key_dim]
-+        w_v = w_full[2 * self.key_dim + v_off : 2 * self.key_dim + v_off + local_value_dim]
-+        return torch.cat([w_q, w_k, w_v], dim=0)
 
-
- def rotate_half(x):
-@@ -551,45 +837,6 @@
-     x1 = x[..., : x.shape[-1] // 2]
-     x2 = x[..., x.shape[-1] // 2 :]
-     return torch.cat((-x2, x1), dim=-1)
+-
+-def rotate_half(x):
+-    """Rotates half the hidden dims of the input."""
+-    x1 = x[..., : x.shape[-1] // 2]
+-    x2 = x[..., x.shape[-1] // 2 :]
+-    return torch.cat((-x2, x1), dim=-1)
 -
 -
 -# Adapted from transformers.models.glm.modular_glm.apply_rotary_pos_emb
@@ -644,10 +630,23 @@
 -    q_embed = torch.cat([q_embed, q_pass], dim=-1)
 -    k_embed = torch.cat([k_embed, k_pass], dim=-1)
 -    return q_embed, k_embed
++    def _get_local_conv1d_weight(self, ulysses_rank: int, local_key_dim: int, local_value_dim: int) -> torch.Tensor:
++        # Modification: shard depthwise conv1d weights to match head-sharded mixed_qkv channels.
++        w_full = self.conv1d.weight.squeeze(1)
++        assert w_full.shape[0] == self.key_dim * 2 + self.value_dim, (
++            f"conv1d weight dim ({w_full.shape[0]}) must match "
++            f"(2 * key_dim + value_dim) ({self.key_dim * 2 + self.value_dim})"
++        )
++        k_off = ulysses_rank * local_key_dim
++        v_off = ulysses_rank * local_value_dim
++        w_q = w_full[k_off : k_off + local_key_dim]
++        w_k = w_full[self.key_dim + k_off : self.key_dim + k_off + local_key_dim]
++        w_v = w_full[2 * self.key_dim + v_off : 2 * self.key_dim + v_off + local_value_dim]
++        return torch.cat([w_q, w_k, w_v], dim=0)
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -629,9 +876,16 @@
+@@ -629,9 +869,16 @@
      return attn_output, attn_weights
 
 
@@ -664,7 +663,7 @@
      def __init__(self, config: Qwen3_5Config, layer_idx: int):
          super().__init__()
          self.config = config
-@@ -655,6 +909,9 @@
+@@ -655,6 +902,9 @@
          )
          self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
          self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
@@ -674,7 +673,7 @@
 
      def forward(
          self,
-@@ -677,16 +934,12 @@
+@@ -677,16 +927,12 @@
          value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
          cos, sin = position_embeddings
@@ -693,7 +692,7 @@
              self,
              query_states,
              key_states,
-@@ -720,24 +973,34 @@
+@@ -720,24 +966,34 @@
          return down_proj
 
 
@@ -735,7 +734,7 @@
 
 
  class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
-@@ -760,29 +1023,48 @@
+@@ -760,29 +1016,48 @@
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
          past_key_values: Cache | None = None,
@@ -787,7 +786,7 @@
              )
 
          hidden_states = residual + hidden_states
-@@ -792,7 +1074,6 @@
+@@ -792,7 +1067,6 @@
          hidden_states = self.post_attention_layernorm(hidden_states)
          hidden_states = self.mlp(hidden_states)
          hidden_states = residual + hidden_states
@@ -795,26 +794,39 @@
          return hidden_states
 
 
-@@ -893,7 +1174,14 @@
-     return q_embed, k_embed
+@@ -879,21 +1153,14 @@
+         return x
 
 
+-def apply_rotary_pos_emb_vision(
+-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+-) -> tuple[torch.Tensor, torch.Tensor]:
+-    orig_q_dtype = q.dtype
+-    orig_k_dtype = k.dtype
+-    q, k = q.float(), k.float()
+-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+-    q_embed = (q * cos) + (rotate_half(q) * sin)
+-    k_embed = (k * cos) + (rotate_half(k) * sin)
+-    q_embed = q_embed.to(orig_q_dtype)
+-    k_embed = k_embed.to(orig_k_dtype)
+-    return q_embed, k_embed
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen3_5VisionAttention
 +# Methods patched: forward, __init__
 +# ======================================================================
-+
-+
+
+
  class Qwen3_5VisionAttention(nn.Module):
-+    # [modified __init__] Bind instance-local attention VeomniOp
++    # [modified __init__] Bind instance-local rope and attention VeomniOps
      def __init__(self, config: Qwen3_5VisionConfig) -> None:
          super().__init__()
          self.dim = config.hidden_size
-@@ -906,13 +1194,15 @@
+@@ -906,13 +1173,16 @@
          self.config = config
          self.attention_dropout = 0.0
          self.is_causal = False
-+        # Bind instance-local attention VeomniOp
++        # Bind instance-local rope and attention VeomniOps
++        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
 +        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
      def forward(
@@ -827,7 +839,14 @@
          **kwargs,
      ) -> torch.Tensor:
          seq_length = hidden_states.shape[0]
-@@ -926,14 +1216,15 @@
+@@ -920,20 +1190,21 @@
+             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+         )
+         cos, sin = position_embeddings
+-        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
++        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
+
+         query_states = query_states.transpose(0, 1).unsqueeze(0)
          key_states = key_states.transpose(0, 1).unsqueeze(0)
          value_states = value_states.transpose(0, 1).unsqueeze(0)
 
@@ -850,7 +869,7 @@
                  self,
                  query_states,
                  key_states,
-@@ -949,6 +1240,9 @@
+@@ -949,6 +1220,9 @@
                  **kwargs,
              )
          else:
@@ -860,7 +879,7 @@
              # Other implementations: Process each chunk separately
              lengths = cu_seqlens[1:] - cu_seqlens[:-1]
              splits = [
-@@ -956,7 +1250,7 @@
+@@ -956,7 +1230,7 @@
              ]
 
              attn_outputs = [
@@ -869,7 +888,7 @@
                      self,
                      q,
                      k,
-@@ -1006,6 +1300,12 @@
+@@ -1006,6 +1280,12 @@
          return hidden_states
 
 
@@ -882,7 +901,7 @@
  class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
      config: Qwen3_5VisionConfig
      input_modalities = ("image", "video")
-@@ -1044,30 +1344,127 @@
+@@ -1044,30 +1324,127 @@
 
          self.post_init()
 
@@ -1032,7 +1051,7 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1082,33 +1479,150 @@
+@@ -1082,33 +1459,150 @@
          Returns:
              `torch.Tensor`: hidden_states.
          """
@@ -1198,7 +1217,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -1119,6 +1633,36 @@
+@@ -1119,6 +1613,36 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -1235,7 +1254,7 @@
 
 
  @auto_docstring
-@@ -1221,6 +1765,12 @@
+@@ -1221,6 +1745,12 @@
          )
 
 
@@ -1248,7 +1267,7 @@
  @auto_docstring
  class Qwen3_5Model(Qwen3_5PreTrainedModel):
      base_model_prefix = "model"
-@@ -1230,11 +1780,9 @@
+@@ -1230,11 +1760,9 @@
 
      def __init__(self, config):
          super().__init__(config)
@@ -1263,7 +1282,7 @@
          self.post_init()
 
      def get_vision_position_ids(
-@@ -1401,58 +1949,43 @@
+@@ -1401,58 +1929,43 @@
          self,
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
@@ -1351,7 +1370,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1518,37 +2051,188 @@
+@@ -1518,37 +2031,188 @@
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
          mm_token_type_ids: torch.IntTensor | None = None,
@@ -1550,7 +1569,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1558,6 +2242,18 @@
+@@ -1558,6 +2222,18 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -1569,7 +1588,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1565,6 +2261,7 @@
+@@ -1565,6 +2241,7 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1577,7 +1596,7 @@
              **kwargs,
          )
 
-@@ -1572,6 +2269,12 @@
+@@ -1572,6 +2249,12 @@
              **outputs,
              rope_deltas=self.rope_deltas,
          )
@@ -1590,7 +1609,7 @@
 
 
  @auto_docstring
-@@ -1588,8 +2291,9 @@
+@@ -1588,8 +2271,9 @@
          self.model = Qwen3_5TextModel(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -1602,7 +1621,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -1603,10 +2307,13 @@
+@@ -1603,10 +2287,13 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -1616,7 +1635,7 @@
          labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
              Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
              config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-@@ -1635,21 +2342,34 @@
+@@ -1635,21 +2322,34 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1655,7 +1674,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1672,6 +2392,43 @@
+@@ -1672,6 +2372,43 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -1699,7 +1718,7 @@
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
      # Reference: fix gemma3 grad acc #37208
-@@ -1681,7 +2438,9 @@
+@@ -1681,7 +2418,9 @@
          super().__init__(config)
          self.model = Qwen3_5Model(config)
          self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
@@ -1710,7 +1729,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -1724,48 +2483,15 @@
+@@ -1724,48 +2463,15 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1764,7 +1783,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1776,27 +2502,38 @@
+@@ -1776,27 +2482,38 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1809,7 +1828,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -1984,6 +2721,24 @@
+@@ -1984,6 +2701,24 @@
 
          return input_ids, model_kwargs
 

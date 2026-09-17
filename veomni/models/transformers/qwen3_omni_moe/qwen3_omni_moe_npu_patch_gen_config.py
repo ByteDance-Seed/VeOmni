@@ -17,7 +17,7 @@ Patch configuration for Qwen3-Omni-Moe.
 Regen command:
 patchgen veomni.models.transformers.qwen3_omni_moe.qwen3_omni_moe_npu_patch_gen_config -o veomni/models/transformers/qwen3_omni_moe/generated --diff
 
-NPU keeps torch_npu fused rope/rmsnorm. MoE, CE, and load-balancing loss call local VeomniOp.
+NPU keeps torch_npu fused rmsnorm. Vision rope, MoE, CE, and load-balancing loss call local VeomniOp.
 """
 
 import torch
@@ -28,21 +28,7 @@ from veomni.models.transformers.qwen3_omni_moe.qwen3_omni_moe_gpu_patch_gen_conf
 config.target_file = "patched_modeling_qwen3_omni_moe_npu.py"
 config.description = "Qwen3OmniMoe with NPU"
 
-config.add_import("torch_npu", names=["npu_rotary_mul"])
 config.add_import("torch_npu", names=["npu_rms_norm"])
-
-
-@config.replace_function("apply_rotary_pos_emb_vision", description="Replace with the fusion operator on Ascend.")
-def apply_rotary_pos_emb_vision(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.unsqueeze(-2).float()
-    sin = sin.unsqueeze(-2).float()
-
-    q_embed = npu_rotary_mul(q.float(), cos, sin, rotary_mode="half").to(q.dtype)
-    k_embed = npu_rotary_mul(k.float(), cos, sin, rotary_mode="half").to(k.dtype)
-
-    return q_embed, k_embed
 
 
 @config.override_method(

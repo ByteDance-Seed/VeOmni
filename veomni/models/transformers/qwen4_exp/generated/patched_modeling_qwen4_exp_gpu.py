@@ -46,7 +46,7 @@
 #    - method_override: Qwen4ExpTextAttention.forward
 #      Always call the local rope and attention VeomniOps
 #    - init_modification: Qwen4ExpVisionAttention
-#      Bind instance-local attention VeomniOp
+#      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen4ExpVisionAttention.forward
 #      Always call the local attention VeomniOp
 #
@@ -2080,20 +2080,6 @@ class Qwen4ExpVisionPatchMerger(nn.Module):
         return x
 
 
-def apply_rotary_pos_emb_vision(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.float(), k.float()
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    q_embed = q_embed.to(orig_q_dtype)
-    k_embed = k_embed.to(orig_k_dtype)
-    return q_embed, k_embed
-
-
 # ======================================================================
 # [MODIFIED CLASS] Qwen4ExpVisionAttention
 # Methods patched: forward, __init__
@@ -2101,7 +2087,7 @@ def apply_rotary_pos_emb_vision(
 
 
 class Qwen4ExpVisionAttention(nn.Module):
-    # [modified __init__] Bind instance-local attention VeomniOp
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: Qwen4ExpVisionConfig) -> None:
         super().__init__()
         self.dim = config.hidden_size
@@ -2114,7 +2100,8 @@ class Qwen4ExpVisionAttention(nn.Module):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
-        # Bind instance-local attention VeomniOp
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
         self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
@@ -2130,7 +2117,7 @@ class Qwen4ExpVisionAttention(nn.Module):
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)

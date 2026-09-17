@@ -34,7 +34,7 @@
 +#    - method_override: Qwen2_5OmniAudioEncoder.dummy_forward
 +#      FSDP dummy forward with conv-weight dtype lookup (no caching) to stay bf16-safe
 +#    - init_modification: Qwen2_5OmniVisionAttention
-+#      Bind instance-local attention VeomniOp
++#      Bind instance-local rope and attention VeomniOps
 +#    - method_override: Qwen2_5OmniVisionAttention.forward
 +#      Route through VARLEN_ATTENTION_TYPES so veomni_flash_attention_* with cu_seqlens works
 +#    - method_override: Qwen2_5OmniVisionEncoder.forward
@@ -998,11 +998,10 @@
 
      # Ignore copy
      def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
-@@ -972,6 +1256,50 @@
-             batch_mask.unsqueeze(1),
+@@ -973,6 +1257,50 @@
              batch_mask_after_cnn.bool(),
          )
-+
+
 +    # ================================================================
 +    # Patch: Qwen2_5OmniAudioEncoder._prepare_attention_mask
 +    # 1. Return None for any VARLEN_ATTENTION_TYPES backend (including
@@ -1046,42 +1045,57 @@
 +        feature_lens = torch.tensor([min_len], dtype=torch.long, device=self.device)
 +        aftercnn_lens, _ = self._get_feat_extract_output_lengths(feature_lens)
 +        return self(input_features=input_features, feature_lens=feature_lens, aftercnn_lens=aftercnn_lens)
-
++
 
  def rotate_half(x):
-@@ -993,7 +1321,14 @@
-     return output
+     """Rotates half the hidden dims of the input."""
+@@ -981,19 +1309,14 @@
+     return torch.cat((-x2, x1), dim=-1)
 
 
+-def apply_rotary_pos_emb_vision(tensor: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+-    orig_dtype = tensor.dtype
+-    tensor = tensor.float()
+-    cos = freqs.cos()
+-    sin = freqs.sin()
+-    cos = cos.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+-    sin = sin.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+-    output = (tensor * cos) + (rotate_half(tensor) * sin)
+-    output = output.to(orig_dtype)
+-    return output
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen2_5OmniVisionAttention
 +# Methods patched: forward, __init__
 +# ======================================================================
-+
-+
+
+
  class Qwen2_5OmniVisionAttention(nn.Module):
-+    # [modified __init__] Bind instance-local attention VeomniOp
++    # [modified __init__] Bind instance-local rope and attention VeomniOps
      def __init__(self, config: Qwen2_5OmniVisionEncoderConfig = None) -> None:
          super().__init__()
          self.dim = config.hidden_size
-@@ -1008,6 +1343,8 @@
+@@ -1008,6 +1331,9 @@
          self.config = config
          self.attention_dropout = 0.0
          self.is_causal = False
-+        # Bind instance-local attention VeomniOp
++        # Bind instance-local rope and attention VeomniOps
++        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
 +        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
      @deprecate_kwarg("rotary_pos_emb", version="v5.20", new_name="position_embeddings")
      def forward(
-@@ -1022,7 +1359,6 @@
+@@ -1022,21 +1348,20 @@
          query_states = self.q(hidden_states).reshape(seq_length, self.num_heads, -1)
          key_states = self.k(hidden_states).reshape(seq_length, self.num_heads, -1)
          value_states = self.v(hidden_states).reshape(seq_length, self.num_heads, -1)
 -
-         query_states = apply_rotary_pos_emb_vision(query_states.unsqueeze(0), position_embeddings).squeeze(0)
-         key_states = apply_rotary_pos_emb_vision(key_states.unsqueeze(0), position_embeddings).squeeze(0)
+-        query_states = apply_rotary_pos_emb_vision(query_states.unsqueeze(0), position_embeddings).squeeze(0)
+-        key_states = apply_rotary_pos_emb_vision(key_states.unsqueeze(0), position_embeddings).squeeze(0)
++        cos = torch.cat((position_embeddings.cos(), position_embeddings.cos()), dim=-1)
++        sin = torch.cat((position_embeddings.sin(), position_embeddings.sin()), dim=-1)
++        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
-@@ -1030,13 +1366,12 @@
+         query_states = query_states.transpose(0, 1).unsqueeze(0)
          key_states = key_states.transpose(0, 1).unsqueeze(0)
          value_states = value_states.transpose(0, 1).unsqueeze(0)
 
@@ -1101,7 +1115,7 @@
              attn_output, _ = attention_interface(
                  self,
                  query_states,
-@@ -1053,7 +1388,7 @@
+@@ -1053,7 +1378,7 @@
                  **kwargs,
              )
          else:
@@ -1110,7 +1124,7 @@
              lengths = cu_seqlens[1:] - cu_seqlens[:-1]
              splits = [
                  torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-@@ -1074,6 +1409,7 @@
+@@ -1074,6 +1399,7 @@
                  for q, k, v in zip(*splits)
              ]
              attn_output = torch.cat(attn_outputs, dim=1)
@@ -1118,7 +1132,7 @@
 
          attn_output = attn_output.reshape(seq_length, -1).contiguous()
          attn_output = self.proj(attn_output)
-@@ -1199,6 +1535,12 @@
+@@ -1199,6 +1525,12 @@
          return x
 
 
@@ -1131,7 +1145,7 @@
  class Qwen2_5OmniVisionEncoder(Qwen2_5OmniPreTrainedModel):
      config: Qwen2_5OmniVisionEncoderConfig
      _no_split_modules = ["Qwen2_5OmniVisionBlock"]
-@@ -1260,12 +1602,27 @@
+@@ -1260,12 +1592,27 @@
          )
          return window_index, cu_window_seqlens.tolist()
 
@@ -1161,7 +1175,7 @@
          Args:
              hidden_states (`torch.Tensor` of shape `(seq_len, hidden_size)`):
                  The final hidden states of the model.
-@@ -1273,58 +1630,199 @@
+@@ -1273,58 +1620,199 @@
                  The temporal, height and width of feature shape of each image in LLM.
 
          Returns:
@@ -1381,7 +1395,7 @@
 
 
  class Qwen2_5OmniRotaryEmbedding(nn.Module):
-@@ -1429,12 +1927,19 @@
+@@ -1429,12 +1917,19 @@
      return q_embed, k_embed
 
 
@@ -1401,7 +1415,7 @@
      def __init__(self, config: Qwen2_5OmniConfig, layer_idx: int | None = None):
          super().__init__()
          self.config = config
-@@ -1462,6 +1967,8 @@
+@@ -1462,6 +1957,8 @@
          self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
          self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
          self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
@@ -1410,7 +1424,7 @@
 
      def forward(
          self,
-@@ -1474,6 +1981,7 @@
+@@ -1474,6 +1971,7 @@
          position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
          **kwargs: Unpack[FlashAttentionKwargs],
      ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
@@ -1418,7 +1432,7 @@
          bsz, q_len, _ = hidden_states.size()
 
          query_states = self.q_proj(hidden_states)
-@@ -1492,11 +2000,7 @@
+@@ -1492,11 +1990,7 @@
          if past_key_values is not None:
              key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
@@ -1431,7 +1445,7 @@
              self,
              query_states,
              key_states,
-@@ -1505,7 +2009,7 @@
+@@ -1505,7 +1999,7 @@
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
              sliding_window=self.sliding_window,
@@ -1440,7 +1454,7 @@
              **kwargs,
          )
 
-@@ -1712,6 +2216,12 @@
+@@ -1712,6 +2206,12 @@
          )
 
 
@@ -1453,7 +1467,7 @@
  @auto_docstring(
      custom_intro="""
      The Qwen2.5OmniThinker model which consists of an audio backbone and a language model.
-@@ -1724,7 +2234,27 @@
+@@ -1724,7 +2224,27 @@
      _no_split_modules = ["Qwen2_5OmniAudioEncoder", "Qwen2_5OmniVisionEncoder"]
      _can_compile_fullgraph = True
 
@@ -1482,7 +1496,7 @@
          super().__init__(config)
          self.audio_tower = Qwen2_5OmniAudioEncoder._from_config(config.audio_config)
          self.visual = Qwen2_5OmniVisionEncoder._from_config(config.vision_config)
-@@ -1733,6 +2263,9 @@
+@@ -1733,6 +2253,9 @@
          self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
          self.spatial_merge_size = config.vision_config.spatial_merge_size
          self.rope_deltas = None
@@ -1492,7 +1506,7 @@
          self.post_init()
 
      def get_input_embeddings(self):
-@@ -1746,6 +2279,10 @@
+@@ -1746,6 +2269,10 @@
          # the default `get_decoder` can't find the LLM. The text model lives on `self.model`.
          return self.model
 
@@ -1503,7 +1517,7 @@
      @accepts_precomputed_kwargs(modality="video")
      @can_return_tuple
      @auto_docstring
-@@ -1755,13 +2292,20 @@
+@@ -1755,13 +2282,20 @@
          video_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -1530,7 +1544,7 @@
      @accepts_precomputed_kwargs(modality="image")
      @can_return_tuple
      @auto_docstring
-@@ -1771,47 +2315,42 @@
+@@ -1771,47 +2305,42 @@
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -1604,7 +1618,7 @@
 
      def get_placeholder_mask(
          self,
-@@ -1911,120 +2450,195 @@
+@@ -1911,120 +2440,195 @@
      @auto_docstring
      def forward(
          self,
@@ -1891,7 +1905,7 @@
 
          outputs = self.model(
              attention_mask=attention_mask,
-@@ -2032,27 +2646,40 @@
+@@ -2032,27 +2636,40 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1941,7 +1955,7 @@
 
      def _expand_inputs_for_generation(
          self,
-@@ -2117,825 +2744,54 @@
+@@ -2117,825 +2734,54 @@
 
          return position_ids
 
@@ -2815,7 +2829,7 @@
 
 
  def deinterleave_head_dim(x: torch.Tensor) -> torch.Tensor:
-@@ -2943,137 +2799,6 @@
+@@ -2943,137 +2789,6 @@
      `(x0, x2, ..., x1, x3, ...)` so the kernelized `apply_rotary_pos_emb` can be used.
      """
      return torch.cat((x[..., 0::2], x[..., 1::2]), dim=-1)
@@ -2953,7 +2967,7 @@
 
 
  class Qwen2_5OmniSnakeBeta(nn.Module):
-@@ -3295,405 +3020,10 @@
+@@ -3295,405 +3010,10 @@
          super().__init__(*args, **kwargs)
 
 
@@ -3363,7 +3377,7 @@
 
 
  ############################
-@@ -3720,22 +3050,74 @@
+@@ -3720,22 +3040,74 @@
          "Qwen2_5OmniToken2WavModel",
      ]
 
@@ -3448,7 +3462,7 @@
 
      def load_speakers(self, path):
          check_torch_load_is_safe()
-@@ -3797,285 +3179,71 @@
+@@ -3797,285 +3169,71 @@
 
          return model
 

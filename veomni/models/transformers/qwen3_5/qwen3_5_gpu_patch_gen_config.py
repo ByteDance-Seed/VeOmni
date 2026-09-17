@@ -65,7 +65,7 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_5_gpu.py",
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
 )
-config.exclude_from_output("apply_rotary_pos_emb")
+config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
 
 
 @config.override_method(
@@ -135,7 +135,6 @@ slice_input_tensor = None
 # codegen time from the imports already present in the generated modeling file.
 ALL_ATTENTION_FUNCTIONS = None
 eager_attention_forward = None
-apply_rotary_pos_emb_vision = None
 is_flash_attention_requested = None
 # Sentinel injected via add_post_import_block. True when
 # Qwen3_5VisionAttention.forward is patched to consume ``vision_max_seqlen``.
@@ -910,9 +909,10 @@ def qwen3_5_vision_model_dummy_forward(self):
     return self(hidden_states=pixel_values, grid_thw=grid_thw, vit_metadata=vit_metadata)
 
 
-@config.modify_init("Qwen3_5VisionAttention", description="Bind instance-local attention VeomniOp")
+@config.modify_init("Qwen3_5VisionAttention", description="Bind instance-local rope and attention VeomniOps")
 def qwen3_5_vision_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
     self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
@@ -937,7 +937,7 @@ def qwen3_5_vision_attention_forward_patched(
         self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
     )
     cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
     query_states = query_states.transpose(0, 1).unsqueeze(0)
     key_states = key_states.transpose(0, 1).unsqueeze(0)

@@ -67,6 +67,7 @@ config = PatchConfig(
     target_file="patched_modeling_qwen4_exp_gpu.py",
     description="Qwen4-Exp initial GPU VLM-SFT integration with explicit PLE/QSA limits",
 )
+config.exclude_from_output("apply_rotary_pos_emb_vision")
 
 config.add_import("copy", names=["copy"])
 config.add_import("dataclasses", names=["dataclass"])
@@ -1170,7 +1171,6 @@ def qwen4_exp_for_conditional_generation_forward_patched(
 
 
 # Names resolved at codegen time from generated imports.
-apply_rotary_pos_emb_vision = None
 is_flash_attention_requested = None
 get_max_seqlen = None
 
@@ -1235,9 +1235,10 @@ def qwen4_exp_text_attention_forward_patched(
     return attn_output, attn_weights
 
 
-@config.modify_init("Qwen4ExpVisionAttention", description="Bind instance-local attention VeomniOp")
+@config.modify_init("Qwen4ExpVisionAttention", description="Bind instance-local rope and attention VeomniOps")
 def qwen4_exp_vision_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
     self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
@@ -1258,7 +1259,7 @@ def qwen4_exp_vision_attention_forward_patched(
         self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
     )
     cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
     query_states = query_states.transpose(0, 1).unsqueeze(0)
     key_states = key_states.transpose(0, 1).unsqueeze(0)

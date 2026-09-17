@@ -21,7 +21,9 @@ patchgen veomni.models.transformers.qwen3_vl.qwen3_vl_npu_patch_gen_config -o ve
 """
 
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
-    apply_rotary_pos_emb_vision_patched,
+    config as gpu_config,
+)
+from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_for_conditional_generation_forward_patched,
     qwen3_vl_for_conditional_generation_init_patched,
     qwen3_vl_get_metadata_collate_func_patched,
@@ -40,9 +42,6 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_vision_fast_pos_embed_interpolate_patched,
     qwen3_vl_vision_forward_patched,
     qwen3_vl_vision_rot_pos_emb_patched,
-)
-from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
-    config as gpu_config,
 )
 from veomni.patchgen.patch_spec import PatchConfig
 
@@ -159,9 +158,4 @@ config.override_method(
     "Qwen3VLForConditionalGeneration.forward",
     replacement=qwen3_vl_for_conditional_generation_forward_patched,
     description="Always call self.loss_function (ForCausalLMLoss + VeomniOp)",
-)
-config.replace_function(
-    "apply_rotary_pos_emb_vision",
-    replacement=apply_rotary_pos_emb_vision_patched,
-    description="Call rope full VeomniOp with rank-3 vision layout",
 )

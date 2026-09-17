@@ -20,7 +20,7 @@
 #    - method_override: Qwen2_5OmniAudioEncoder.dummy_forward
 #      FSDP dummy forward with conv-weight dtype lookup (no caching) to stay bf16-safe
 #    - init_modification: Qwen2_5OmniVisionAttention
-#      Bind instance-local attention VeomniOp
+#      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen2_5OmniVisionAttention.forward
 #      Route through VARLEN_ATTENTION_TYPES so veomni_flash_attention_* with cu_seqlens works
 #    - method_override: Qwen2_5OmniVisionEncoder.forward
@@ -1309,18 +1309,6 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb_vision(tensor: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    orig_dtype = tensor.dtype
-    tensor = tensor.float()
-    cos = freqs.cos()
-    sin = freqs.sin()
-    cos = cos.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
-    sin = sin.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
-    output = (tensor * cos) + (rotate_half(tensor) * sin)
-    output = output.to(orig_dtype)
-    return output
-
-
 # ======================================================================
 # [MODIFIED CLASS] Qwen2_5OmniVisionAttention
 # Methods patched: forward, __init__
@@ -1328,7 +1316,7 @@ def apply_rotary_pos_emb_vision(tensor: torch.Tensor, freqs: torch.Tensor) -> to
 
 
 class Qwen2_5OmniVisionAttention(nn.Module):
-    # [modified __init__] Bind instance-local attention VeomniOp
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: Qwen2_5OmniVisionEncoderConfig = None) -> None:
         super().__init__()
         self.dim = config.hidden_size
@@ -1343,7 +1331,8 @@ class Qwen2_5OmniVisionAttention(nn.Module):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
-        # Bind instance-local attention VeomniOp
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
         self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     @deprecate_kwarg("rotary_pos_emb", version="v5.20", new_name="position_embeddings")
@@ -1359,8 +1348,9 @@ class Qwen2_5OmniVisionAttention(nn.Module):
         query_states = self.q(hidden_states).reshape(seq_length, self.num_heads, -1)
         key_states = self.k(hidden_states).reshape(seq_length, self.num_heads, -1)
         value_states = self.v(hidden_states).reshape(seq_length, self.num_heads, -1)
-        query_states = apply_rotary_pos_emb_vision(query_states.unsqueeze(0), position_embeddings).squeeze(0)
-        key_states = apply_rotary_pos_emb_vision(key_states.unsqueeze(0), position_embeddings).squeeze(0)
+        cos = torch.cat((position_embeddings.cos(), position_embeddings.cos()), dim=-1)
+        sin = torch.cat((position_embeddings.sin(), position_embeddings.sin()), dim=-1)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)

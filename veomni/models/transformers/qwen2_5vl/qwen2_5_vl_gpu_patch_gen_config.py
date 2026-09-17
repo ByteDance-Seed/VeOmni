@@ -38,7 +38,6 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLModel,
     Qwen2_5_VLModelOutputWithPast,
     apply_multimodal_rotary_pos_emb,
-    apply_rotary_pos_emb_vision,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
@@ -100,6 +99,7 @@ config.add_import(
     names=["ForCausalLMLoss"],
 )
 config.drop_import_names("Qwen2_5_VLCausalLMOutputWithPast")
+config.exclude_from_output("apply_rotary_pos_emb_vision")
 
 
 # ================================================================
@@ -107,9 +107,10 @@ config.drop_import_names("Qwen2_5_VLCausalLMOutputWithPast")
 # 1. accept precomputed max_seqlen from outer forward to avoid
 #    per-layer `(cu_seqlens[1:] - cu_seqlens[:-1]).max()` CPU-GPU sync
 # ================================================================
-@config.modify_init("Qwen2_5_VLVisionAttention", description="Bind instance-local attention VeomniOp")
+@config.modify_init("Qwen2_5_VLVisionAttention", description="Bind instance-local rope and attention VeomniOps")
 def qwen2_5_vl_vision_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
     self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
@@ -133,7 +134,7 @@ def qwen2_5_vl_vision_attention_forward_patched(
         self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
     )
     cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
     query_states = query_states.transpose(0, 1).unsqueeze(0)
     key_states = key_states.transpose(0, 1).unsqueeze(0)

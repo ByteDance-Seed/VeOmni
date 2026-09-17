@@ -65,7 +65,7 @@
 +#    - method_override: Qwen4ExpTextAttention.forward
 +#      Always call the local rope and attention VeomniOps
 +#    - init_modification: Qwen4ExpVisionAttention
-+#      Bind instance-local attention VeomniOp
++#      Bind instance-local rope and attention VeomniOps
 +#    - method_override: Qwen4ExpVisionAttention.forward
 +#      Always call the local attention VeomniOp
 +#
@@ -1127,31 +1127,51 @@
          return input_ids
 
 
-@@ -1732,7 +2094,14 @@
-     return q_embed, k_embed
+@@ -1718,21 +2080,14 @@
+         return x
 
 
+-def apply_rotary_pos_emb_vision(
+-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+-) -> tuple[torch.Tensor, torch.Tensor]:
+-    orig_q_dtype = q.dtype
+-    orig_k_dtype = k.dtype
+-    q, k = q.float(), k.float()
+-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+-    q_embed = (q * cos) + (rotate_half(q) * sin)
+-    k_embed = (k * cos) + (rotate_half(k) * sin)
+-    q_embed = q_embed.to(orig_q_dtype)
+-    k_embed = k_embed.to(orig_k_dtype)
+-    return q_embed, k_embed
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen4ExpVisionAttention
 +# Methods patched: forward, __init__
 +# ======================================================================
-+
-+
+
+
  class Qwen4ExpVisionAttention(nn.Module):
-+    # [modified __init__] Bind instance-local attention VeomniOp
++    # [modified __init__] Bind instance-local rope and attention VeomniOps
      def __init__(self, config: Qwen4ExpVisionConfig) -> None:
          super().__init__()
          self.dim = config.hidden_size
-@@ -1745,6 +2114,8 @@
+@@ -1745,6 +2100,9 @@
          self.config = config
          self.attention_dropout = 0.0
          self.is_causal = False
-+        # Bind instance-local attention VeomniOp
++        # Bind instance-local rope and attention VeomniOps
++        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
 +        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
      def forward(
          self,
-@@ -1765,12 +2136,9 @@
+@@ -1759,18 +2117,15 @@
+             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+         )
+         cos, sin = position_embeddings
+-        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
++        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
+
+         query_states = query_states.transpose(0, 1).unsqueeze(0)
          key_states = key_states.transpose(0, 1).unsqueeze(0)
          value_states = value_states.transpose(0, 1).unsqueeze(0)
 
@@ -1165,7 +1185,7 @@
              max_seqlen = get_max_seqlen(cu_seqlens, self.config, kwargs={"max_seqlen": max_seqlen})
              attn_output, _ = attention_interface(
                  self,
-@@ -1788,7 +2156,6 @@
+@@ -1788,7 +2143,6 @@
                  **kwargs,
              )
          else:
@@ -1173,7 +1193,7 @@
              lengths = cu_seqlens[1:] - cu_seqlens[:-1]
              splits = [
                  torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-@@ -1845,6 +2212,12 @@
+@@ -1845,6 +2199,12 @@
          return hidden_states
 
 
@@ -1186,7 +1206,7 @@
  @auto_docstring
  class Qwen4ExpVisionModel(Qwen4ExpPreTrainedModel):
      config: Qwen4ExpVisionConfig
-@@ -1960,6 +2333,30 @@
+@@ -1960,6 +2320,30 @@
              pooler_output=merged_hidden_states,
          )
 
@@ -1217,7 +1237,7 @@
 
  @auto_docstring
  class Qwen4ExpModel(Qwen4ExpPreTrainedModel):
-@@ -1968,13 +2365,18 @@
+@@ -1968,13 +2352,18 @@
      accepts_loss_kwargs = False
      _no_split_modules = ["Qwen4ExpDecoderLayer", "Qwen4ExpVisionBlock"]
 
@@ -1241,7 +1261,7 @@
          self.post_init()
 
      def get_vision_position_ids(
-@@ -2244,6 +2646,17 @@
+@@ -2244,6 +2633,17 @@
              position_ids = None
          return position_ids
 
@@ -1259,7 +1279,7 @@
      @auto_docstring
      @can_return_tuple
      def forward(
-@@ -2260,67 +2673,125 @@
+@@ -2260,67 +2660,125 @@
          mm_token_type_ids: torch.IntTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen4ExpModelOutputWithPast:
@@ -1421,7 +1441,7 @@
 
 
  @auto_docstring
-@@ -2337,6 +2808,27 @@
+@@ -2337,6 +2795,27 @@
      aux_loss: torch.FloatTensor | None = None
 
 
@@ -1449,7 +1469,7 @@
  @auto_docstring
  class Qwen4ExpForConditionalGeneration(Qwen4ExpPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
-@@ -2346,11 +2838,23 @@
+@@ -2346,11 +2825,23 @@
 
      _fsdp_plan = {"lm_head": "keep_full_weight"}
 
@@ -1474,7 +1494,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -2379,6 +2883,12 @@
+@@ -2379,6 +2870,12 @@
          """
          return self.model.get_image_features(pixel_values, image_grid_thw, **kwargs)
 
@@ -1487,7 +1507,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -2396,47 +2906,10 @@
+@@ -2396,47 +2893,10 @@
          mm_token_type_ids: torch.IntTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1539,7 +1559,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -2448,33 +2921,47 @@
+@@ -2448,33 +2908,47 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1600,7 +1620,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -2483,6 +2970,7 @@
+@@ -2483,6 +2957,7 @@
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
              router_logits=outputs.router_logits,
@@ -1608,7 +1628,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -2696,6 +3184,41 @@
+@@ -2696,6 +3171,41 @@
          }
          return causal_mask_mapping
 

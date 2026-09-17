@@ -21,7 +21,6 @@ patchgen veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_npu_patch_gen_conf
 """
 
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
-    apply_rotary_pos_emb_vision_patched,
     qwen3_vl_get_metadata_collate_func_patched,
     qwen3_vl_get_position_id_func_patched,
     qwen3_vl_model_get_image_features_patched,
@@ -191,9 +190,4 @@ config.override_method(
     "Qwen3VLMoeForConditionalGeneration.get_parallel_plan",
     replacement=qwen3_vl_moe_get_parallel_plan_patched,
     description="Register Qwen3VLMoe expert parallel plan for v5 generated modeling",
-)
-config.replace_function(
-    "apply_rotary_pos_emb_vision",
-    replacement=apply_rotary_pos_emb_vision_patched,
-    description="Call rope full VeomniOp with rank-3 vision layout",
 )
