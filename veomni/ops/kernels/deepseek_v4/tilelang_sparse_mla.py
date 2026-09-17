@@ -65,6 +65,11 @@ def sparse_attn_tilelang(q, kv, attn_sink, topk_idxs, sm_scale=None, return_lse=
 
     Returns:
         [B, S, H, D] bf16, or that and the [B, S, H] fp32 LSE when ``return_lse``
+
+    The LSE is **base two** -- the kernel exponentiates with ``exp2`` and does
+    not convert on the way out -- and includes the sink. A natural-log consumer
+    is wrong by ``log2(e) = 1.4427`` uniformly, which ``sparse_mqa_target_fwd``
+    would absorb into a still-normalized teacher distribution rather than reject.
     """
     # The kernels are compiled for bf16 operands. Callers run under autocast,
     # whose fp32 op policy (sum, rsqrt, ...) can silently promote an upstream
