@@ -14,10 +14,14 @@
 
 """SP-aware FlexAttention mask builder."""
 
-from typing import Callable
+from __future__ import annotations
+
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 import torch
-from torch.nn.attention.flex_attention import BlockMask
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+from transformers import masking_utils
 from transformers.masking_utils import (
     ALL_MASK_ATTENTION_FUNCTIONS,
     and_masks,
@@ -28,6 +32,44 @@ from transformers.masking_utils import (
 
 from ..ulysses import effective_sequence_lengths, should_apply_ulysses
 from .packed import packed_mask_function
+
+
+_COMPILED_CREATE_BLOCK_MASK = None
+
+
+def _compiled_create_block_mask():
+    """Return a cached ``torch.compile(create_block_mask)``."""
+    global _COMPILED_CREATE_BLOCK_MASK
+    if _COMPILED_CREATE_BLOCK_MASK is None:
+        _COMPILED_CREATE_BLOCK_MASK = torch.compile(create_block_mask)
+    return _COMPILED_CREATE_BLOCK_MASK
+
+
+def _create_block_mask(*args, **kwargs):
+    """Compiled ``create_block_mask`` with HF's deprecated ``_compile`` forced off."""
+    kwargs["_compile"] = False
+    return _compiled_create_block_mask()(*args, **kwargs)
+
+
+def _eager_create_block_mask(*args, **kwargs):
+    """Eager ``create_block_mask`` with HF's deprecated ``_compile`` forced off."""
+    kwargs["_compile"] = False
+    return create_block_mask(*args, **kwargs)
+
+
+@contextmanager
+def _patched_hf_create_block_mask(compile_block_mask: bool) -> Iterator[None]:
+    """Swap HF's ``create_block_mask`` for the compiled or eager path.
+
+    Transformers still passes ``_compile=True`` on torch>=2.6, so the eager
+    path cannot use the raw function or the flag would compile anyway.
+    """
+    original = masking_utils.create_block_mask
+    masking_utils.create_block_mask = _create_block_mask if compile_block_mask else _eager_create_block_mask
+    try:
+        yield
+    finally:
+        masking_utils.create_block_mask = original
 
 
 def flex_attention_mask_builder(
@@ -41,6 +83,7 @@ def flex_attention_mask_builder(
     skip_ulysses: bool = False,
     cu_seqlens: torch.Tensor | None = None,
     cu_seqlens_k: torch.Tensor | None = None,
+    compile_block_mask: bool = True,
     **kwargs,
 ) -> BlockMask:
     """Build a Transformers FlexAttention mask.
@@ -51,6 +94,10 @@ def flex_attention_mask_builder(
     local too. Explicit cumulative lengths are sufficient packed-sequence
     metadata and do not require an additional 2D mask. Canonical masks can be
     rebuilt from global lengths; custom predicates require global metadata.
+
+    ``create_block_mask`` is compiled by default so the eager dense
+    ``[B, H, Q, KV]`` materialization can be fused. Pass
+    ``compile_block_mask=False`` to keep the uncompiled path.
     """
     sliding_window = kwargs.pop("sliding_window", None)
     if cu_seqlens_k is None:
@@ -99,13 +146,14 @@ def flex_attention_mask_builder(
             device=device,
         )
 
-    return ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"](
-        batch_size=batch_size,
-        q_length=q_length,
-        kv_length=kv_length,
-        q_offset=q_offset,
-        kv_offset=kv_offset,
-        mask_function=mask_function,
-        attention_mask=attention_mask,
-        **kwargs,
-    )
+    with _patched_hf_create_block_mask(compile_block_mask):
+        return ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"](
+            batch_size=batch_size,
+            q_length=q_length,
+            kv_length=kv_length,
+            q_offset=q_offset,
+            kv_offset=kv_offset,
+            mask_function=mask_function,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
