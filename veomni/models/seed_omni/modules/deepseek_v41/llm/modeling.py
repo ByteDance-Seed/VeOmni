@@ -60,6 +60,7 @@ from .attention import (
 from .configuration import DeepseekV41LlmConfig
 from .decoder_layer import DeepseekV41DecoderLayer
 from .engram_connection import build_engram_connections
+from .inference import DeepseekV41LlmInferenceMixin
 from .mhc import expand_to_streams, identity_pre_mix, mhc_collapse
 from .reuse import DeepseekV4RMSNorm
 
@@ -183,7 +184,7 @@ class DeepseekV41Backbone(nn.Module):
         return outputs
 
 
-class DeepseekV41Llm(OmniPreTrainedModel):
+class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
     """``deepseek_v41_llm`` -- the CED backbone as an OmniModule.
 
     Takes ``inputs_embeds`` because the embedding belongs to the sibling text
@@ -205,6 +206,8 @@ class DeepseekV41Llm(OmniPreTrainedModel):
         super().__init__(config)
         self.config = config
         self.model = DeepseekV41Backbone(config)
+        self._decode_cache = None
+        self._next_position = 0
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Module:

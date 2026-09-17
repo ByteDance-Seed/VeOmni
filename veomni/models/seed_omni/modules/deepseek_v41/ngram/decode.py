@@ -39,11 +39,13 @@ rather than callers passing the two arguments themselves.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
-from .modeling import DeepseekV41Ngram
+
+if TYPE_CHECKING:
+    from .modeling import DeepseekV41Ngram
 
 
 @dataclass
@@ -78,7 +80,7 @@ class DeepseekV41NgramCache:
 
 
 def ngram_lookup_step(
-    module: DeepseekV41Ngram,
+    module: "DeepseekV41Ngram",
     input_ids: torch.Tensor,
     cache: DeepseekV41NgramCache,
     token_mask: Optional[torch.Tensor] = None,

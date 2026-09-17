@@ -45,9 +45,10 @@ from .hashing import (
     gather_lookback,
     rolling_hash,
 )
+from .inference import DeepseekV41NgramInferenceMixin
 
 
-class DeepseekV41Ngram(OmniPreTrainedModel):
+class DeepseekV41Ngram(DeepseekV41NgramInferenceMixin, OmniPreTrainedModel):
     """Two n-gram hash tables plus the hashing that addresses them.
 
     ``token_map`` is a **persistent** buffer: it collapses token ids that
@@ -87,6 +88,7 @@ class DeepseekV41Ngram(OmniPreTrainedModel):
         # Persistent: produced by the convert step from the tokenizer (see class docstring).
         # Sized by the *tokenizer's* vocab, not the hash base -- it is indexed by raw token id.
         self.register_buffer("token_map", torch.zeros(config.vocab_size, dtype=torch.int64), persistent=True)
+        self._ngram_cache = None
         self.post_init()
 
     def freeze_model(self) -> None:

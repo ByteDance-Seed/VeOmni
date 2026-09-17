@@ -82,6 +82,15 @@ class DeepseekV41TextEncoder(TextEncoder):
 
         tail.value = inputs_embeds
         maybe_merge_outputs(conversation_list)
+        # The id, not just its embedding: deepseek_v41_ngram hashes token ids and
+        # this is the only place the sampled one reaches the carrier. The key
+        # matches what the chat template stashes on prompt text items, so the
+        # n-gram node reads one field whether it is prefilling or stepping.
+        #
+        # After the merge, not before: merging rebuilds the tail, and a meta set
+        # on the pre-merge item would be dropped on the step that merges -- the
+        # n-gram node would then hash a stale id with nothing raising.
+        conversation_list[-1].meta["input_ids"] = input_ids
 
         # V4.1 has one stop token: the turn ends on the end-of-sentence marker that
         # `_render_assistant` appends. There is no second ChatML-style `im_end`.

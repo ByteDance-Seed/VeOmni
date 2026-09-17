@@ -35,7 +35,7 @@ backbone refuses, and would hash n-grams straight across the images an image
 span is supposed to interrupt.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch.distributed._tensor import Shard
@@ -43,57 +43,10 @@ from torch.distributed._tensor import Shard
 from .......distributed.parallel_plan import ParallelPlan
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
-from .....utils.conversation import ConversationItem, is_dummy
+from .....utils.conversation import ConversationItem
 from ..configuration import DeepseekV41NgramConfig
 from ..modeling import DeepseekV41Ngram
-
-
-def pack_ngram_inputs(
-    conversations: List[List[ConversationItem]],
-    device: torch.device,
-    pad_token_id: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``(input_ids, token_mask)`` over the packed row the backbone will see.
-
-    Both are ``[1, total]``, and *total* is the full packed length **including
-    image spans** -- not the text-only length the text encoder embeds. That
-    distinction is the whole reason this packer exists rather than reusing
-    ``pack_input_ids``: the rows this module emits are indexed positionally by
-    the backbone, so they have to cover every position the backbone has.
-
-    Image spans contribute ``pad_token_id`` and a ``False`` mask. The id is
-    never hashed: the mask turns those positions into ``DEAD``, which stops the
-    lookback. Pad rather than the image placeholder token because that is
-    already what a blocked lookback slot compresses to, so the two ways a
-    position can be unhashable agree instead of merely both working.
-
-    Text ids come from ``meta['input_ids']`` rather than ``value``, because by
-    the time this runs the text encoder may already have replaced ``value``
-    with embeddings. The template stashes the copy for exactly this.
-    """
-    ids: List[torch.Tensor] = []
-    mask: List[torch.Tensor] = []
-    for sample in conversations:
-        for item in sample:
-            if is_dummy(item):
-                continue
-            if item.type == "text":
-                token_ids = item.meta.get("input_ids")
-                if token_ids is None:
-                    raise ValueError(
-                        "deepseek_v41_ngram needs meta['input_ids'] on every text item: it hashes token ids, "
-                        "and the text encoder overwrites `value` with embeddings. DeepseekV41ChatTemplate."
-                        "tokenize stashes the copy -- a conversation built by another template will not have it."
-                    )
-                ids.append(token_ids.reshape(-1).to(device))
-                mask.append(torch.ones(token_ids.numel(), dtype=torch.bool, device=device))
-            else:
-                # The span's length is the number of tokens vision produced for
-                # it, which is why this node must run after the vision one.
-                length = item.value.size(0)
-                ids.append(torch.full((length,), pad_token_id, dtype=torch.long, device=device))
-                mask.append(torch.zeros(length, dtype=torch.bool, device=device))
-    return torch.cat(ids).unsqueeze(0), torch.cat(mask).unsqueeze(0)
+from ..packing import pack_ngram_inputs
 
 
 class TrainingMixin(TrainingModuleMixin):
