@@ -221,17 +221,6 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-def _apply_rotary_emb(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> torch.Tensor:
-    first_half, second_half = torch.chunk(x, 2, dim=-1)
-    first_ = first_half * cos - second_half * sin
-    second_ = second_half * cos + first_half * sin
-    return torch.cat((first_, second_), dim=-1)
-
-
 def eager_attention_forward(
     module: nn.Module,
     query: torch.Tensor,

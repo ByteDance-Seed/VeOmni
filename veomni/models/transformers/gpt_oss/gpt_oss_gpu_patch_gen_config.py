@@ -66,7 +66,7 @@ config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "load_balancing_loss"],
 )
-config.exclude_from_output("apply_rotary_pos_emb", "rotate_half")
+config.exclude_from_output("apply_rotary_pos_emb", "rotate_half", "_apply_rotary_emb")
 config.drop_import_names("use_kernelized_func")
 config.drop_import_names("MoeCausalLMOutputWithPast")
 
