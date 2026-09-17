@@ -22,37 +22,36 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 
 from veomni.utils.constants import IGNORE_INDEX
 
 from ...utils.conversation import ConversationItem, is_dummy
+from ..base.packing import (
+    PACKED_ATTENTION_MASK,
+    PACKED_CU_SEQLENS,
+    PACKED_FEATURES,
+    PACKED_HIDDEN,
+    PACKED_INPUT_IDS,
+    PACKED_LABELS,
+    PACKED_MAX_LENGTH,
+    PACKED_POSITION_IDS,
+    as_1d_long,
+    ensure_packed_batch_dim,
+    fold_dummy_anchor,
+    masked_scatter_embeds,
+    shift_packed_labels,
+)
 from .llm.modeling import qwen3vl_vision_position_ids
 from .vision.processing import _OMNI_GRID
 
 
 VISION_SOURCE = "qwen3vl_vision"
 
-PACKED_INPUT_IDS = "packed_input_ids"
-PACKED_LABELS = "packed_labels"
-PACKED_ATTENTION_MASK = "packed_attention_mask"
-PACKED_POSITION_IDS = "packed_position_ids"
-PACKED_FEATURES = "packed_features"
-PACKED_HIDDEN = "packed_hidden"
-PACKED_CU_SEQLENS = "packed_cu_seqlens"
-PACKED_MAX_LENGTH = "packed_max_length"
 VISUAL_POS_MASK = "visual_pos_mask"
 PIXEL_VALUES = "pixel_values"
 IMAGE_GRID_THW = "image_grid_thw"
 VISUAL_NUM_REAL = "visual_num_real"
 DEEPSTACK_VISUAL_EMBEDS = "deepstack_visual_embeds"
-
-
-def _as_1d_long(value: Any) -> torch.Tensor:
-    tensor = value if isinstance(value, torch.Tensor) else torch.tensor(value, dtype=torch.long)
-    if tensor.dim() == 0:
-        tensor = tensor.unsqueeze(0)
-    return tensor.reshape(-1).to(dtype=torch.long)
 
 
 def _grid_from_item(item: ConversationItem) -> list[int]:
@@ -123,8 +122,8 @@ def pack_qwen3vl_conversations(
                     dummy_grids.append(_grid_from_item(part))
                 continue
             if part.type == "text":
-                token_ids = _as_1d_long(part.value)
-                labels = _as_1d_long(part.meta.get("labels", torch.full_like(token_ids, IGNORE_INDEX)))
+                token_ids = as_1d_long(part.value)
+                labels = as_1d_long(part.meta.get("labels", torch.full_like(token_ids, IGNORE_INDEX)))
                 length = int(token_ids.numel())
                 sample_ids.append(token_ids)
                 sample_labels.append(labels)
@@ -212,49 +211,6 @@ def _concat_patches(
             "visual so FSDP ranks stay symmetric."
         )
     return torch.cat(pixels, dim=0), torch.tensor(grids, dtype=torch.long)
-
-
-def ensure_packed_batch_dim(tensor: torch.Tensor) -> torch.Tensor:
-    """``[T, D]`` → ``[1, T, D]``; leave ``[1, T, ...]`` unchanged."""
-    if tensor.dim() == 2:
-        return tensor.unsqueeze(0)
-    return tensor
-
-
-def masked_scatter_embeds(
-    packed_features: torch.Tensor,
-    mask: torch.Tensor,
-    embeds: torch.Tensor,
-) -> torch.Tensor:
-    """Write ``embeds`` onto ``packed_features`` where ``mask`` is True.
-
-    ``embeds`` is ``[N, S, D]`` or ``[N * S, D]``. ``mask`` is ``[1, T]`` / ``[T]``.
-    """
-    packed = ensure_packed_batch_dim(packed_features)
-    if mask.dim() == 1:
-        mask = mask.unsqueeze(0)
-    hidden = embeds
-    if hidden.dim() == 3:
-        hidden = hidden.reshape(-1, hidden.size(-1))
-    mask_3d = mask.unsqueeze(-1).expand_as(packed)
-    n_true = int(mask.sum().item()) if mask.device.type == "cpu" else hidden.size(0)
-    if hidden.size(0) != n_true and mask.device.type == "cpu":
-        raise ValueError(f"masked_scatter_embeds: mask selects {n_true} tokens but embeds has {hidden.size(0)} rows.")
-    return packed.masked_scatter(mask_3d, hidden.to(device=packed.device, dtype=packed.dtype))
-
-
-def fold_dummy_anchor(target: torch.Tensor, dummy: torch.Tensor | None) -> torch.Tensor:
-    """Keep dummy activations on the autograd graph without changing values."""
-    if dummy is None:
-        return target
-    anchor = dummy.mean().to(device=target.device, dtype=target.dtype) * 0
-    return target + anchor
-
-
-def shift_packed_labels(packed_labels: torch.Tensor) -> torch.Tensor:
-    """Causal LM shift: drop token 0, pad IGNORE_INDEX at the end."""
-    labels = packed_labels[..., 1:].contiguous()
-    return F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
 
 
 def visual_token_count(grid_thw: torch.Tensor, spatial_merge_size: int, num_real: int) -> int:
