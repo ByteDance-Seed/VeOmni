@@ -272,10 +272,12 @@ not load official H3 weights or validate training convergence.
 
 FA2/FA3 protocol tests on CPU use a kernel stub and are **not** hardware kernel
 validation. The GPU suite has real-kernel cases that skip when the package or
-hardware is unavailable (FA3 requires SM90). Local SDPA verification uses torch
-2.13/Diffusers 0.40, not the project's locked torch 2.11/Diffusers 0.37 stack.
-No throughput improvement or production convergence is claimed; benchmark against
-an equivalent, tuned non-packed baseline before making either claim.
+hardware is unavailable (FA3 requires SM90). Local two-rank verification on H20
+passed all eight SDPA/FA2/FA3 cases with torch 2.11.0+cu130, Transformers 5.16.1,
+and Diffusers 0.37.0. These match the core GPU dependency versions, but the
+isolated environment is not a complete frozen-lockfile installation.
+No end-to-end throughput improvement or production convergence is established;
+benchmark against an equivalent, tuned non-packed baseline before making either claim.
 
 ## 5. Inference
 
