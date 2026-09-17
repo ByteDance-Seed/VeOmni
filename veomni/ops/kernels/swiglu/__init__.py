@@ -16,9 +16,14 @@
 
 Default per-model backend:
     - ``liger_kernel``: ``liger_kernel.transformers.swiglu.LigerSwiGLUMLP``
+
+Opt-in GPU backend:
+    - ``nabla``: Triton fwd+bwd SiLU-mul activation core (projections stay on
+      cuBLAS), validated on H100 against liger v0.7.0.
 """
 
 from ...config.registry import BackendSpec, OpScope, OpSpec, register_op
+from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
 
 
 register_op(
@@ -33,6 +38,30 @@ register_op(
                 entry="liger_kernel.transformers.swiglu:LigerSwiGLUMLP",
                 requires=("liger_kernel",),
             ),
+            "nabla": BackendSpec(
+                entry="veomni.ops.kernels.swiglu.nabla:NablaSwiGLUMLP",
+                requires=("triton",),
+            ),
         },
+    )
+)
+
+
+def _nabla_swiglu_factory():
+    """Return the OpSlot-shaped Nabla SwiGLU forward (fused SiLU-mul core)."""
+
+    from .nabla import nabla_swiglu_forward
+
+    return nabla_swiglu_forward
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="nabla",
+        op_name="swiglu_mlp",
+        variant="standard",
+        factory=_nabla_swiglu_factory,
+        hardware=HardwareRequirement(device_type="gpu"),
+        description="Nabla fused SwiGLU MLP (Triton SiLU-mul activation core)",
     )
 )
