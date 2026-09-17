@@ -160,11 +160,22 @@ Core files:
 16. **DCP checkpoint keys must match model state dict**
     - `veomni/checkpoint/dcp_checkpointer.py` uses PyTorch's DCP (`torch.distributed.checkpoint`).
     - Renaming model parameters or changing the model structure between save and load breaks checkpoint loading.
-    - Extra state is saved per-rank via `_EXTRA_STATE_FORMAT` — changing rank count requires checkpoint resharding.
 
 17. **Checkpoint save/load requires all ranks to participate**
     - DCP operations are collective — all ranks must call save/load simultaneously.
     - Calling checkpoint operations from only rank 0 causes deadlocks.
+    - ``lr_scheduler.pt`` is replicated: rank 0 writes the file, but every rank
+      still joins the save reduction and the promotion collectives. The sidecar
+      is written before ``dcp.save`` / ``dcp.async_save``, so DCP's ``.metadata``
+      (the resume completeness marker) lands last. Each step writes a new
+      ``global_step_{N}/``; a failed save has no ``.metadata`` and is skipped.
+      A resume that expects a scheduler and finds no ``lr_scheduler.pt`` falls
+      back to ``extra_state/`` via ``veomni/checkpoint/legacy_v0_1_12.py``
+      (VeOmni 0.1.12). Delete that module and its two imports to drop the
+      fallback; the load then raises.
+    - ``trainer_state_rank_{R}.pt`` stays per-rank: the dataloader cursor and RNG
+      are rank-local. Changing world size still requires a matching cursor file
+      per rank. On-disk layout: ``docs/usage/checkpoint.md``.
 
 18. **Distributed HF safetensors consolidation must support non-floating tensors**
     - PyTorch 2.9–2.11 computes consolidated tensor byte sizes with `torch.finfo`, which crashes for valid integer and boolean buffers such as DeepSeek V4 `tid2eid`.

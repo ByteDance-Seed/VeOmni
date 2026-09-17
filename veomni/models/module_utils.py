@@ -36,6 +36,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import distributed as dist
 from torch import nn
+from torch.distributed._tensor import DTensor, Shard
 from tqdm import tqdm
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
@@ -47,6 +48,8 @@ from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
 from ..utils.import_utils import is_diffusers_available
 from .checkpoint_tensor_loading import (
     checkpoint_converter_is_dim0_zero_pad,
+    checkpoint_converter_record_skip_without_loading,
+    checkpoint_converter_should_skip_without_loading,
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
 )
@@ -222,6 +225,7 @@ def _dispatch_parameter(
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
     parallel_plan: Optional["ParallelPlan"] = None,
     dtensor_to_cpu: bool = False,
+    tensor_is_local_dtensor_shard: bool = False,
 ) -> None:
     """
     Assigns parameter to an empty model.
@@ -236,12 +240,29 @@ def _dispatch_parameter(
     if parallel_plan is not None:
         tensor = parallel_plan.shard_tensor(tensor, full_param_name, orig_tensor.shape)
 
-    if hasattr(orig_tensor, "device_mesh"):  # dtensor
-        if dtensor_factory is None:
+    if isinstance(orig_tensor, DTensor):
+        if tensor_is_local_dtensor_shard:
+            local_target = orig_tensor.to_local()
+            tensor = tensor.to(device=local_target.device, dtype=local_target.dtype)
+            if tuple(tensor.shape) != tuple(local_target.shape):
+                raise RuntimeError(
+                    f"Local DTensor shard shape mismatch for {full_param_name}: "
+                    f"loaded {tuple(tensor.shape)}, expected {tuple(local_target.shape)}."
+                )
+            sharded_tensor = DTensor.from_local(
+                tensor,
+                device_mesh=orig_tensor.device_mesh,
+                placements=orig_tensor.placements,
+                run_check=False,
+                shape=orig_tensor.shape,
+                stride=orig_tensor.stride(),
+            )
+        elif dtensor_factory is None:
             raise ValueError("dtensor parameter requires a dtensor_factory.")
-        device_mesh = orig_tensor.device_mesh
-        placements = orig_tensor.placements
-        sharded_tensor = dtensor_factory(tensor.to(dtype=orig_tensor.dtype), device_mesh, placements)
+        else:
+            device_mesh = orig_tensor.device_mesh
+            placements = orig_tensor.placements
+            sharded_tensor = dtensor_factory(tensor.to(dtype=orig_tensor.dtype), device_mesh, placements)
         if dtensor_to_cpu:
             sharded_tensor = sharded_tensor.to("cpu")
         module._parameters[local_name].data.copy_(sharded_tensor)
@@ -526,6 +547,74 @@ def _read_ep_dim0_slice(
     return tensor
 
 
+def _read_persistent_extra_parallel_slice(
+    sl: Any,
+    *,
+    name: str,
+    parameter: DTensor,
+    zero_pad_dim0: bool,
+) -> "torch.Tensor":
+    """Read one persistent ExtraParallel DTensor rectangle from safetensors.
+
+    Unlike ordinary ExtraParallel+FSDP parameters, the model parameter already
+    carries every shard placement. The loader must therefore slice once for
+    each ``Shard`` placement and wrap the result as an already-local DTensor
+    shard instead of feeding it through ``distribute_tensor`` again.
+    """
+    if parameter.device_mesh.ndim != 2 or parameter.ndim != 2:
+        raise NotImplementedError(
+            f"Persistent ExtraParallel streaming currently supports 2D tensors on 2D meshes; "
+            f"got tensor ndim={parameter.ndim}, mesh ndim={parameter.device_mesh.ndim} for {name}."
+        )
+
+    placements = parameter.placements
+    shard_dims = [placement.dim for placement in placements if isinstance(placement, Shard)]
+    if len(shard_dims) != 2 or len(set(shard_dims)) != 2:
+        raise NotImplementedError(
+            f"Persistent ExtraParallel streaming requires two distinct Shard placements for {name}; got {placements}."
+        )
+
+    real_shape = tuple(sl.get_shape())
+    global_shape = tuple(parameter.shape)
+    local_shape = tuple(parameter.to_local().shape)
+    if len(real_shape) != len(global_shape):
+        raise RuntimeError(f"{name}: checkpoint shape {real_shape} does not match model rank {len(global_shape)}.")
+
+    for dim, (real_dim, global_dim) in enumerate(zip(real_shape, global_shape)):
+        if dim == 0 and zero_pad_dim0:
+            if real_dim > global_dim:
+                raise RuntimeError(f"{name}: checkpoint dim0={real_dim} exceeds model dim0={global_dim}.")
+        elif real_dim != global_dim:
+            raise RuntimeError(
+                f"{name}: checkpoint dimension {dim}={real_dim} does not match model dimension {global_dim}."
+            )
+
+    read_slices = [slice(0, dim) for dim in real_shape]
+    output_slices = [slice(0, dim) for dim in local_shape]
+    for mesh_dim, placement in enumerate(placements):
+        if not isinstance(placement, Shard):
+            continue
+        tensor_dim = placement.dim
+        mesh_dim_name = parameter.device_mesh.mesh_dim_names[mesh_dim]
+        mesh_rank = parameter.device_mesh.get_local_rank(mesh_dim_name)
+        start = mesh_rank * local_shape[tensor_dim]
+        end = start + local_shape[tensor_dim]
+        read_start = min(start, real_shape[tensor_dim])
+        read_end = min(end, real_shape[tensor_dim])
+        read_slices[tensor_dim] = slice(read_start, read_end)
+        output_slices[tensor_dim] = slice(0, max(read_end - read_start, 0))
+
+    tensor = sl[tuple(read_slices)]
+    if tuple(tensor.shape) == local_shape:
+        return tensor
+
+    if not zero_pad_dim0:
+        raise RuntimeError(f"{name}: loaded local shape {tuple(tensor.shape)} does not match expected {local_shape}.")
+    output = torch.zeros(local_shape, dtype=tensor.dtype)
+    output[tuple(output_slices)] = tensor
+    return output
+
+
 @torch.no_grad()
 def load_model_weights_ep_sharded(
     model: Union["nn.Module", "PreTrainedModel"],
@@ -626,7 +715,8 @@ def load_model_weights_ep_sharded(
                 )
 
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
-    param_shapes = {name: tuple(p.shape) for name, p in model.named_parameters()}
+    params_by_name = dict(model.named_parameters())
+    param_shapes = {name: tuple(p.shape) for name, p in params_by_name.items()}
     parameter_names_to_load = set(param_shapes.keys())
 
     parallel_state = get_parallel_state()
@@ -652,6 +742,8 @@ def load_model_weights_ep_sharded(
     if converter is not None:
         for raw_name in key_to_file:
             bare_name = _convert_weight_key(raw_name, model)
+            if checkpoint_converter_should_skip_without_loading(converter, bare_name):
+                continue
             if converter.can_handle(bare_name) and not checkpoint_converter_is_dim0_zero_pad(converter, bare_name):
                 raise NotImplementedError(
                     f"ep_sharded_stream_load: checkpoint-tensor converter "
@@ -670,7 +762,7 @@ def load_model_weights_ep_sharded(
     for key, fname in key_to_file.items():
         keys_by_file.setdefault(fname, []).append(key)
 
-    n_ep = n_dense = n_buf = 0
+    n_ep = n_dense = n_buf = n_skipped = 0
     for fname in tqdm(
         sorted(keys_by_file),
         desc="Streaming EP-sharded checkpoint",
@@ -683,6 +775,10 @@ def load_model_weights_ep_sharded(
                 # under PEFT, else identical to ``bare_name``).
                 bare_name = _convert_weight_key(raw_name, model)
                 name = _apply_peft_override(bare_name)
+                if checkpoint_converter_should_skip_without_loading(converter, bare_name):
+                    checkpoint_converter_record_skip_without_loading(converter, bare_name)
+                    n_skipped += 1
+                    continue
                 if name in buffer_dict:  # persistent buffers: read whole
                     buffer_dict[name] = f.get_tensor(raw_name).clone()
                     n_buf += 1
@@ -707,6 +803,31 @@ def load_model_weights_ep_sharded(
                             f"ep_sharded_stream_load: converter applies a non-dim0-zero-pad "
                             f"transform to ExtraParallel key '{name}'."
                         )
+                    spec_info = getattr(model, "_fqn2spec_info", {}).get(name)
+                    if spec_info is not None and spec_info.persistent_fsdp_shard_dim is not None:
+                        parameter = params_by_name[name]
+                        if not isinstance(parameter, DTensor):
+                            raise RuntimeError(
+                                f"Persistent ExtraParallel parameter {name!r} must remain a DTensor during loading."
+                            )
+                        tensor = _read_persistent_extra_parallel_slice(
+                            f.get_slice(raw_name),
+                            name=name,
+                            parameter=parameter,
+                            zero_pad_dim0=zero_pad,
+                        )
+                        _dispatch_parameter(
+                            model,
+                            name,
+                            tensor,
+                            dtensor_factory,
+                            None,
+                            dtensor_to_cpu,
+                            tensor_is_local_dtensor_shard=True,
+                        )
+                        n_ep += 1
+                        parameter_names_to_load.discard(name)
+                        continue
                     target0 = param_shapes[name][0]
                     _, para_rank, expected_full0 = _ep_dim0_slice_meta(parallel_state, shard_group, target0)
                     tensor = _read_ep_dim0_slice(
@@ -737,8 +858,16 @@ def load_model_weights_ep_sharded(
         empty_cache()
 
     logger.info_rank0(
-        f"ep_sharded_stream_load: read {n_ep} ExtraParallel-sliced, {n_dense} dense, {n_buf} buffer tensors/rank."
+        f"ep_sharded_stream_load: read {n_ep} ExtraParallel-sliced, {n_dense} dense, {n_buf} buffer tensors/rank; "
+        f"skipped {n_skipped} converter-declared tensors without reading."
     )
+
+    if converter is not None:
+        finalized = converter.finalize()
+        if finalized:
+            raise NotImplementedError(
+                "ep_sharded_stream_load cannot dispatch converter outputs produced only at finalize time."
+            )
 
     if is_peft_model and adapter_path:
         # Stream the LoRA adapter the same per-rank way as the base: independent MoE

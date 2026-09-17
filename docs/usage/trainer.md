@@ -152,8 +152,10 @@ VeOmni includes several built-in callbacks:
 - **[ProfileTraceCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/trace_callback.py)**: Handles profiling.
 - **[ChannelLossCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/channel_loss_callback.py)**: Logs detached per-channel causal-LM loss metrics when `train.channel_loss.enable=true`.
 - **[CheckpointCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/checkpoint_callback.py)**: Saves resumable DCP checkpoints, exports HuggingFace / LoRA weights, and writes the config / tokenizer sidecars.
-- **[GlobalStateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/global_state_callback.py)**: Saves job-level state (dataloader cursor, rng, meters).
+- **[GlobalStateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/global_state_callback.py)**: Saves the job cursor per rank — the dataloader position as `loader/rank_{N}.pt`, the step counter, rng and meters as `extra_state/rank_{N}.pt` — separate from the model's `model/lr_scheduler.pt`. Runs last, and writes the step's `checkpoint_manifest.json`.
 - **[EvaluateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/evaluate_callback.py)**: Runs evaluation on the validation set.
+
+On-disk layout for weights, optimizer, scheduler and job cursor, and how a checkpoint from an earlier layout is still resumed: [Checkpoint layout](checkpoint.md).
 
 ### Custom Callbacks
 
