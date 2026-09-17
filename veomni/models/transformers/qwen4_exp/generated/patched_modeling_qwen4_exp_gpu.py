@@ -1263,17 +1263,14 @@ def eager_attention_forward(
             f"Unknown qsa_attention_implementation={qsa_implementation!r}; expected 'eager' or 'tilelang'."
         )
     if qsa_implementation == "tilelang":
-        # Fail closed rather than silently running the quadratic reference: the
-        # kernel expects the compact indices to express the complete mask and
-        # has no cache/dropout path.
-        if attention_mask is not None or dropout != 0:
+        # If dropout != 0, fall back to the eager path;
+        if attention_mask is not None:
             raise ValueError(
-                "qsa_attention_implementation='tilelang' requires no attention_mask and dropout=0; "
-                f"got attention_mask={type(attention_mask).__name__}, dropout={dropout}."
+                "qsa_attention_implementation='tilelang' requires no attention_mask; "
+                f"got attention_mask={type(attention_mask).__name__}."
             )
-        # Operand dtype/layout conditions are the kernel's contract and are
-        # enforced by ``qsa_attn_tilelang`` itself, which names the offender.
-        return qsa_attn_tilelang(query, key, value, selected_indices, scaling), None
+        if dropout == 0:
+            return qsa_attn_tilelang(query, key, value, selected_indices, scaling), None
     # --- Patch.3 ---
     kv_heads, kv_len, kv_head_dim = key.shape[1:]
     batch_size, query_heads, query_len, head_dim = query.shape
@@ -1298,6 +1295,7 @@ def eager_attention_forward(
     probabilities = probabilities.masked_fill(~allowed, 0)
     denominator = probabilities.sum(dim=-1, keepdim=True)
     probabilities = probabilities / torch.where(denominator > 0, denominator, torch.ones_like(denominator))
+    probabilities = F.dropout(probabilities, p=dropout, training=module.training)
     return torch.matmul(probabilities, value_states).transpose(1, 2).contiguous(), attention_weights
 
 
@@ -1353,8 +1351,6 @@ class Qwen4ExpTextAttention(nn.Module):
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         parallel_state = get_parallel_state()
-        if self.training and self.attention_dropout != 0:
-            raise ValueError("Qwen4-Exp compact QSA currently requires attention_dropout=0 during training.")
         if parallel_state.ulysses_enabled:
             if past_key_values is not None:
                 raise NotImplementedError("Qwen4-Exp QSA does not support a KV cache under Ulysses.")
@@ -2306,8 +2302,6 @@ class Qwen4ExpTextModel(Qwen4ExpPreTrainedModel):
 
         # --- Patch.1 ---
         parallel_state = get_parallel_state()
-        if self.training and self.config.attention_dropout != 0:
-            raise ValueError("Qwen4-Exp compact QSA currently requires attention_dropout=0 during training.")
         # --- Patch.1 ---
         # --- Patch.3 ---
         if parallel_state.cp_enabled:

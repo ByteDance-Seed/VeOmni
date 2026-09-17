@@ -57,7 +57,8 @@ Known limitations:
   Transformers reference shape. Use `qsa_attention_implementation=tilelang`
   (GPU, SM90+, bf16) for the 16K performance gate; the TileLang backend covers
   training forward/backward only and raises on KV-cache or additive-mask
-  layouts.
+  layouts. Nonzero attention dropout falls back to eager QSA and therefore
+  loses the sparse kernel's memory advantage.
 - Ulysses GatedDeltaNet requires non-eager, varlen-capable causal-conv and
   chunk gated-delta-rule kernels. Head counts must be divisible by the
   Ulysses size; QSA KV heads may instead divide the Ulysses size (MQA/GQA

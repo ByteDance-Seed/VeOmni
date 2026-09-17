@@ -337,9 +337,10 @@ from distributed local-query/global-block selection:
 - `tilelang` runs the gather-based TileLang sparse-attention kernel in
   `veomni/ops/kernels/qwen4_exp/` (training forward/backward, bf16, NVIDIA
   SM90+). It never materializes the dense score tensor, which is what makes
-  16K-token training feasible. The dispatch fails closed: a non-QSA caller, an
-  additive `attention_mask`, nonzero dropout, or a KV cache raises instead of
-  falling back to the quadratic reference.
+  16K-token training feasible. A nonzero attention dropout falls back to the
+  eager reference because the kernel has no dropout path; this materializes the
+  quadratic score tensor. The dispatch still fails closed for an additive
+  `attention_mask` or a KV cache.
 
 The QSA selection lives in the model patch because it owns packed-block and
 Ulysses semantics. Its model-specific dense eager implementation lives in
