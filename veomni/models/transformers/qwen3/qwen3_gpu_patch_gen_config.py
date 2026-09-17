@@ -36,7 +36,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
-from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl, uses_swiglu_mlp
+from veomni.models.utils.op_utils import linear_bias, resolve_op_impl, uses_swiglu_mlp
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 
@@ -56,7 +56,7 @@ config.add_import(
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models.utils.op_utils",
-    names=["attention_op", "linear_bias", "resolve_op_impl", "uses_swiglu_mlp"],
+    names=["linear_bias", "resolve_op_impl", "uses_swiglu_mlp"],
 )
 config.add_import(
     "veomni.models.loss_utils",
@@ -152,7 +152,7 @@ def qwen3_attention_init_patched(self, config, layer_idx: int):
     self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
     self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
     self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    self.veomni_attn = attention_op()
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
 @config.override_method(

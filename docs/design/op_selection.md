@@ -17,7 +17,7 @@ If a field is not in this table, it is not an op-selection knob.
 
 | Op | Config field | Available values | Default | Selection time |
 |--------|-------------|------------------|---------|----------------|
-| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `magi_attention`, `sage_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` rewrite + model `__init__` via `attention_op()` stored on the attention module |
+| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `magi_attention`, `sage_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` rewrite + model `__init__` via `VeomniOp("attention", "standard", config._attn_implementation)` stored on the attention module |
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
@@ -75,7 +75,7 @@ BaseTrainer._build_model()                    # (3) model build time
        └─ model init + weight loading
             ├─ patched modules construct local VeomniOp handles
             ├─ registry validates row hardware + optional packages
-            ├─ attention_op() / VeomniOp("attention", "standard", impl)
+            ├─ VeomniOp("attention", "standard", config._attn_implementation)
             ├─ self.veomni_ce = VeomniOp("cross_entropy_loss", ...)
             ├─ self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
             └─ RMSNorm / RoPE / SwiGLU / MoE / DSA / mHC bind local handles
@@ -142,10 +142,10 @@ public values to VeOmni adapters:
 
 `apply_veomni_attention_patch()` registers those names and matching mask
 builders on Transformers' `ALL_ATTENTION_FUNCTIONS` /
-`ALL_MASK_ATTENTION_FUNCTIONS`. Patched modeling constructs `attention_op()`
-in `__init__` (or `modify_init`) and stores `self.veomni_attn`. `forward`
-calls that handle, which is `VeomniOp("attention", "standard", impl)` for the
-rewritten name. The registered row looks up the same Transformers interface.
+`ALL_MASK_ATTENTION_FUNCTIONS`. Patched modeling constructs
+`VeomniOp("attention", "standard", config._attn_implementation)` in
+`__init__` (or `modify_init`) and stores `self.veomni_attn`. `forward` calls
+that handle. The registered row looks up the same Transformers interface.
 
 FlexAttention requires a model-provided native `BlockMask`; VeOmni does not
 construct model-specific visibility. With Ulysses enabled, the mask must be
@@ -157,7 +157,6 @@ not rebased for head-specific masks. See
 
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
 - Installation: `veomni/ops/install.py` — `apply_ops_patch()` / `apply_veomni_attention_patch()`
-- Model helper: `veomni/models/utils/op_utils.py` — `attention_op()`
 - Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
 
 ### DeepSeek V4 DSA and mHC
@@ -502,7 +501,7 @@ All four are defined in `transformers.integrations`:
 
 | | VeOmni | Transformers v5 |
 |---|--------|----------------|
-| **Mechanism** | `apply_veomni_attention_patch()` registers SP-aware `veomni_*` names into `ALL_ATTENTION_FUNCTIONS`; patched models bind `attention_op()` in `__init__` and call `self.veomni_attn` | Same `ALL_ATTENTION_FUNCTIONS` registry. Additionally supports hub-based attention kernels via `attn_implementation="kernels-community/flash-mla"` syntax (loaded by `load_and_register_attn_kernel()`). |
+| **Mechanism** | `apply_veomni_attention_patch()` registers SP-aware `veomni_*` names into `ALL_ATTENTION_FUNCTIONS`; patched models bind `VeomniOp("attention", "standard", config._attn_implementation)` in `__init__` and call `self.veomni_attn` | Same `ALL_ATTENTION_FUNCTIONS` registry. Additionally supports hub-based attention kernels via `attn_implementation="kernels-community/flash-mla"` syntax (loaded by `load_and_register_attn_kernel()`). |
 | **Config** | `OpsImplementationConfig.attn_implementation` | `config._attn_implementation` (set via `AutoModel.from_pretrained(attn_implementation=...)`) |
 | **SP rewrite** | `__post_init__` rewrites `flash_attention_2/3/4`, `flex_attention`, `magi_attention`, `sage_attention`, and `sdpa` to `veomni_*` | No SP support — upstream Transformers does not handle Ulysses SP |
 | **Compatibility** | VeOmni registers into the **same** `ALL_ATTENTION_FUNCTIONS` registry that Transformers uses, so the two are compatible by design |
@@ -628,7 +627,7 @@ currently exist in the `kernels-community` hub.
 | RMSNorm | Instance-local `VeomniOp` with variants | `@use_kernel_forward_from_hub` | Parallel — both can apply | VeOmni covers Qwen3.5's `+1` variant explicitly |
 | RoPE | Instance-local `VeomniOp` with variants | `@use_kernel_forward_from_hub` + `@use_kernelized_func` | Parallel | VeOmni adds an NPU partial-RoPE variant |
 | SwiGLU MLP | Instance-local `VeomniOp` | Not annotated in MoE models (MLP is per-expert, not standalone) | VeOmni only | — |
-| Attention | Instance-local `attention_op()` plus shared `ALL_ATTENTION_FUNCTIONS` | `ALL_ATTENTION_FUNCTIONS` (same registry) | Yes | VeOmni adds SP wrapping |
+| Attention | Instance-local `VeomniOp("attention", "standard", config._attn_implementation)` plus shared `ALL_ATTENTION_FUNCTIONS` | `ALL_ATTENTION_FUNCTIONS` (same registry) | Yes | VeOmni adds SP wrapping |
 | MoE experts | Instance-local `VeomniOp("moe_experts", ...)` | `@use_experts_implementation` (batched_mm/grouped_mm) | No — different dispatch paths | VeOmni uses registered fused rows; HF uses PyTorch native `grouped_mm` |
 | Cross-entropy | Instance-local `VeomniOp` + model helper | `LOSS_MAPPING` (standard `F.cross_entropy`) | VeOmni only | HF has no fused loss selection |
 | MoE aux loss | Instance-local eager/Triton `VeomniOp` + model helper | Eager `load_balancing_loss_func` | VeOmni only | HF has no fused selection surface |

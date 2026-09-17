@@ -69,7 +69,7 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import capture_outputs
 
 from veomni.models.loss_utils import ForCausalLMLoss
-from veomni.models.utils.op_utils import attention_op, resolve_op_impl
+from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.ops.mask import packed_causal_mask, sliding_window_mask
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
@@ -364,7 +364,7 @@ class Gemma3Attention(nn.Module):
         self.k_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
         # Bind instance-local rope and attention VeomniOps
         self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-        self.veomni_attn = attention_op()
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,

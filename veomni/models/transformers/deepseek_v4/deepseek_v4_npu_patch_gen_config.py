@@ -179,7 +179,7 @@ config.override_method(
 config.override_method(
     "DeepseekV4Attention.__init__",
     replacement=deepseek_v4_attention_init_patched,
-    description="Construct a local dsa_attention deepseek_v4 VeomniOp",
+    description="Construct local dsa_attention and standard attention VeomniOps",
 )
 config.override_method(
     "DeepseekV4Attention.forward",

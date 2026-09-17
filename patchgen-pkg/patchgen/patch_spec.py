@@ -278,7 +278,7 @@ class PatchConfig:
             @config.modify_init("Qwen2Attention")
             def bind_ops(original_init, self, config, layer_idx):
                 original_init(self, config, layer_idx)
-                self.veomni_attn = attention_op()
+                self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
         Direct usage (NPU configs reusing a GPU function):
             config.modify_init("Qwen2Attention", replacement=bind_ops)

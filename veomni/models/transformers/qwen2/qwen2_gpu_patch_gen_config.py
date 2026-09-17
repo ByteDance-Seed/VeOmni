@@ -38,7 +38,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
-from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl, uses_swiglu_mlp
+from veomni.models.utils.op_utils import linear_bias, resolve_op_impl, uses_swiglu_mlp
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
@@ -65,7 +65,7 @@ config.add_import(
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models.utils.op_utils",
-    names=["attention_op", "linear_bias", "resolve_op_impl", "uses_swiglu_mlp"],
+    names=["linear_bias", "resolve_op_impl", "uses_swiglu_mlp"],
 )
 config.add_import(
     "veomni.models.loss_utils",
@@ -384,7 +384,7 @@ def qwen2_for_question_answering_init_patched(self, config):
 def qwen2_attention_bind_ops(original_init, self, config, layer_idx):
     original_init(self, config, layer_idx)
     self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    self.veomni_attn = attention_op()
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
 @config.override_method(

@@ -22,8 +22,7 @@ import pytest
 import torch
 
 from tests.models.compare import eager_ops_config, ops_config_scope
-from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl
-from veomni.ops import VeomniOp
+from veomni.models.utils.op_utils import linear_bias, resolve_op_impl
 from veomni.ops.config import get_ops_config, set_ops_config
 
 
@@ -79,22 +78,6 @@ def test_linear_bias_empty_sentinel():
     assert bias.numel() == 0
     assert bias.device == linear.weight.device
     assert bias.dtype == linear.weight.dtype
-
-
-def test_attention_op_defaults_to_eager():
-    set_ops_config(None)
-    op = attention_op()
-    assert isinstance(op, VeomniOp)
-    assert op.op == "attention"
-    assert op.variant == "standard"
-    assert op.impl == "eager"
-
-
-def test_attention_op_reads_ops_config(available_nvidia_ops):
-    set_ops_config(SimpleNamespace(attn_implementation="veomni_flash_attention_2"))
-    op = attention_op()
-    assert op.impl == "veomni_flash_attention_2"
-    assert attention_op() is op
 
 
 def test_resolve_moe_impl_reads_ops_config():

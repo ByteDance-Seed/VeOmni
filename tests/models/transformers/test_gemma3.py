@@ -35,6 +35,7 @@ from tests.models.compare import (
     eager_ops_config,
     named_trainable,
     ops_config_scope,
+    stamp_attn_implementation,
 )
 from tests.models.tiny_configs import tiny_gemma3_text_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
@@ -46,7 +47,9 @@ def _build_ours(config: Gemma3TextConfig, ops: SimpleNamespace | None = None):
         Gemma3ForCausalLM,
     )
 
-    with ops_config_scope(ops if ops is not None else eager_ops_config()):
+    ops = ops if ops is not None else eager_ops_config()
+    stamp_attn_implementation(config, ops.attn_implementation)
+    with ops_config_scope(ops):
         return Gemma3ForCausalLM(config)
 
 
@@ -175,35 +178,37 @@ def test_gemma3_routes_full_and_sliding_flex_masks(monkeypatch):
     assert full_mask.mask_mod(zero, zero, query_idx, torch.tensor(0))
 
 
-def test_gemma3_packed_flex_matches_independent_samples_on_cpu():
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Gemma 3 packed FlexAttention requires CUDA")
+def test_gemma3_packed_flex_matches_independent_samples_from_input_ids():
+    device = torch.device(get_device_type())
     torch.compiler.reset()
     torch.manual_seed(123)
     ops = _flex_ops_config()
-    model = _build_ours(_tiny_config(), ops).eval()
-    first_input_ids = torch.tensor([[5, 6, 7]])
-    second_input_ids = torch.tensor([[8, 9, 10, 11, 12]])
+    model = _build_ours(_tiny_config(), ops).to(device=device).eval()
+    first_input_ids = torch.tensor([[5, 6, 7]], device=device)
+    second_input_ids = torch.tensor([[8, 9, 10, 11, 12]], device=device)
     packed_input_ids = torch.cat((first_input_ids, second_input_ids), dim=1)
 
     with ops_config_scope(ops), torch.no_grad():
         packed_logits = model(
             input_ids=packed_input_ids,
             attention_mask=torch.ones_like(packed_input_ids),
-            position_ids=torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]]),
-            cu_seq_lens_q=torch.tensor([0, 3, 8], dtype=torch.int32),
+            position_ids=torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]], device=device),
+            cu_seq_lens_q=torch.tensor([0, 3, 8], device=device, dtype=torch.int32),
             use_cache=False,
         ).logits
         first_logits = model(
             input_ids=first_input_ids,
             attention_mask=torch.ones_like(first_input_ids),
-            position_ids=torch.arange(3).unsqueeze(0),
-            cu_seq_lens_q=torch.tensor([0, 3], dtype=torch.int32),
+            position_ids=torch.arange(3, device=device).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 3], device=device, dtype=torch.int32),
             use_cache=False,
         ).logits
         second_logits = model(
             input_ids=second_input_ids,
             attention_mask=torch.ones_like(second_input_ids),
-            position_ids=torch.arange(5).unsqueeze(0),
-            cu_seq_lens_q=torch.tensor([0, 5], dtype=torch.int32),
+            position_ids=torch.arange(5, device=device).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 5], device=device, dtype=torch.int32),
             use_cache=False,
         ).logits
 

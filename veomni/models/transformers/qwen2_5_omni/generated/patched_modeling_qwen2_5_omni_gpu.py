@@ -128,7 +128,7 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, pad_tensor, slice_input_tensor, unpad_tensor
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
-from veomni.models.utils.op_utils import attention_op, resolve_op_impl
+from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
@@ -797,7 +797,7 @@ class Qwen2_5OmniAudioAttention(nn.Module):
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
         # Bind instance-local attention VeomniOp
-        self.veomni_attn = attention_op()
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,
@@ -1344,7 +1344,7 @@ class Qwen2_5OmniVisionAttention(nn.Module):
         self.attention_dropout = 0.0
         self.is_causal = False
         # Bind instance-local attention VeomniOp
-        self.veomni_attn = attention_op()
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     @deprecate_kwarg("rotary_pos_emb", version="v5.20", new_name="position_embeddings")
     def forward(
@@ -1968,7 +1968,7 @@ class Qwen2_5OmniAttention(nn.Module):
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
         # Bind instance-local attention VeomniOp
-        self.veomni_attn = attention_op()
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,

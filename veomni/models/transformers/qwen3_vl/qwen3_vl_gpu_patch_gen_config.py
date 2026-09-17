@@ -49,7 +49,7 @@ from veomni.distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from veomni.models.loss_utils import ForCausalLMLoss
-from veomni.models.utils.op_utils import attention_op, resolve_op_impl
+from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -112,14 +112,14 @@ from veomni.utils.model_outputs import (  # noqa: F401  surfaced for forward log
     Qwen3VLCausalLMOutputWithLogProbs,
 )
 from veomni.ops import VeomniOp
-from veomni.models.utils.op_utils import attention_op, resolve_op_impl
+from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.models.loss_utils import ForCausalLMLoss
 """)
 
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models.utils.op_utils",
-    names=["attention_op", "resolve_op_impl"],
+    names=["resolve_op_impl"],
 )
 config.add_import(
     "veomni.models.loss_utils",
@@ -390,7 +390,7 @@ def collate_multimodal_metadata(batch, sp_pad):
 def qwen3_vl_vision_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
     self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-    self.veomni_attn = attention_op()
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
 @config.override_method(
@@ -876,7 +876,7 @@ def qwen3_vl_vision_dummy_forward_patched(self):
 def qwen3_vl_text_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
     self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    self.veomni_attn = attention_op()
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
 @config.override_method(

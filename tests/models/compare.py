@@ -60,33 +60,32 @@ def eager_ops_config() -> SimpleNamespace:
     )
 
 
-def pin_eager_attn_implementation(model: torch.nn.Module) -> None:
-    """Force every config on ``model`` onto HF eager attention.
-
-    Composite VL/omni configs drop ``attn_implementation`` when nested
-    configs go through ``to_dict()``, so Hugging Face defaults to ``sdpa``.
-    VeOmni model implementations read the ops config's ``attn_implementation`` (eager in
-    these tests). Pin HF to the same impl before comparing.
-    """
-    configs: list[object] = []
-    top = getattr(model, "config", None)
-    if top is not None:
-        configs.append(top)
-    for module in model.modules():
-        cfg = getattr(module, "config", None)
-        if cfg is not None:
-            configs.append(cfg)
+def stamp_attn_implementation(config: object | None, impl: str) -> None:
+    """Write ``_attn_implementation`` onto ``config`` and nested HF configs."""
     seen: set[int] = set()
-    stack = list(configs)
+    stack = [config]
     while stack:
         cfg = stack.pop()
         if cfg is None or id(cfg) in seen:
             continue
         seen.add(id(cfg))
         if hasattr(cfg, "_attn_implementation"):
-            cfg._attn_implementation = "eager"
+            cfg._attn_implementation = impl
         for name in ("text_config", "vision_config", "audio_config", "thinker_config"):
             stack.append(getattr(cfg, name, None))
+
+
+def pin_eager_attn_implementation(model: torch.nn.Module) -> None:
+    """Force every config on ``model`` onto HF eager attention.
+
+    Composite VL/omni configs drop ``attn_implementation`` when nested
+    configs go through ``to_dict()``, so Hugging Face defaults to ``sdpa``.
+    Modeling binds attention from ``config._attn_implementation``. Pin HF to
+    eager before comparing against an eager ops config.
+    """
+    stamp_attn_implementation(getattr(model, "config", None), "eager")
+    for module in model.modules():
+        stamp_attn_implementation(getattr(module, "config", None), "eager")
 
 
 def named_trainable(model: torch.nn.Module) -> dict[str, torch.Tensor]:

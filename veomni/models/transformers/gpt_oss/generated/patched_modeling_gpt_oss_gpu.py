@@ -57,7 +57,7 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
-from veomni.models.utils.op_utils import attention_op, resolve_moe_impl, resolve_op_impl
+from veomni.models.utils.op_utils import resolve_moe_impl, resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
@@ -308,7 +308,7 @@ class GptOssAttention(nn.Module):
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
         self.sinks = nn.Parameter(torch.empty(config.num_attention_heads))
         # Bind instance-local attention VeomniOp
-        self.veomni_attn = attention_op()
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,

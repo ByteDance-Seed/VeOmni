@@ -79,7 +79,6 @@ from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss, load_balancing_loss
 from veomni.models.utils.op_utils import (
-    attention_op,
     empty_bias,
     linear_bias,
     merged_experts_act_fn_forward,
@@ -191,7 +190,7 @@ class Qwen3MoeAttention(nn.Module):
         self.sliding_window = getattr(config, "sliding_window", None)
         # Bind instance-local rope and attention VeomniOps
         self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-        self.veomni_attn = attention_op()
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,

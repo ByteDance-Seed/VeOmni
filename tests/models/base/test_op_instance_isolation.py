@@ -26,7 +26,7 @@ from types import SimpleNamespace
 
 import torch
 
-from tests.models.compare import eager_ops_config, ops_config_scope, qwen_image_inputs
+from tests.models.compare import eager_ops_config, ops_config_scope, qwen_image_inputs, stamp_attn_implementation
 from tests.models.tiny_configs import (
     tiny_deepseek_v3_config,
     tiny_deepseek_v4_config,
@@ -87,12 +87,15 @@ def _assert_isolated(
     eager_cfg: SimpleNamespace,
     alt_cfg: SimpleNamespace,
     poison_cfg: SimpleNamespace,
+    hf_config: object | None = None,
 ) -> None:
+    stamp_attn_implementation(hf_config, eager_cfg.attn_implementation)
     with ops_config_scope(eager_cfg):
         seed = build()
         state = {key: value.detach().clone() for key, value in seed.state_dict().items()}
 
     def construct(cfg: SimpleNamespace) -> torch.nn.Module:
+        stamp_attn_implementation(hf_config, cfg.attn_implementation)
         with ops_config_scope(cfg):
             model = build()
         model.load_state_dict(state)
@@ -138,6 +141,7 @@ def test_qwen2_text_forward_keeps_construction_impls():
         eager_cfg=_attn_cfg("eager"),
         alt_cfg=_attn_cfg("sdpa"),
         poison_cfg=_poison_cfg(),
+        hf_config=config,
     )
 
 
@@ -161,6 +165,7 @@ def test_qwen2_vl_vision_forward_keeps_construction_impls():
         eager_cfg=_attn_cfg("eager"),
         alt_cfg=_attn_cfg("sdpa"),
         poison_cfg=_poison_cfg(),
+        hf_config=config,
     )
 
 
@@ -200,6 +205,7 @@ def test_qwen3_moe_text_forward_keeps_construction_impls():
         eager_cfg=_attn_cfg("eager"),
         alt_cfg=_attn_cfg("sdpa"),
         poison_cfg=_poison_cfg(),
+        hf_config=config,
     )
 
 
@@ -219,6 +225,7 @@ def test_glm_moe_dsa_forward_keeps_construction_impls():
         eager_cfg=_attn_cfg("eager"),
         alt_cfg=_attn_cfg("sdpa"),
         poison_cfg=_poison_cfg(),
+        hf_config=config,
     )
 
 
@@ -235,6 +242,7 @@ def test_gemma3_text_forward_keeps_construction_impls():
         eager_cfg=_attn_cfg("eager"),
         alt_cfg=_attn_cfg("sdpa"),
         poison_cfg=_poison_cfg(),
+        hf_config=config,
     )
 
 

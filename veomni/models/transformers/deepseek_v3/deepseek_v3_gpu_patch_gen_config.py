@@ -23,7 +23,6 @@ call local VeomniOp handles. Deterministic freqs use the local
 """
 
 from functools import partial
-from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -79,8 +78,6 @@ config.add_import(
 )
 
 maybe_autocast = None  # noqa: E305  resolved from the generated modeling file
-ALL_ATTENTION_FUNCTIONS = None  # noqa: E305
-eager_attention_forward = None  # noqa: E305
 apply_rotary_pos_emb_interleave = None  # noqa: E305
 FlashAttentionKwargs = None  # noqa: E305
 
@@ -154,15 +151,16 @@ def apply_rotary_pos_emb_patched(
     return _deepseek_v3_rope_op()(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
-@config.modify_init("DeepseekV3Attention", description="Bind instance-local rope VeomniOp")
+@config.modify_init("DeepseekV3Attention", description="Bind instance-local rope and attention VeomniOps")
 def deepseek_v3_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
     self.veomni_rope = _deepseek_v3_rope_op()
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
 @config.override_method(
     "DeepseekV3Attention.forward",
-    description="Always call the local rope VeomniOp on the non-interleaved path",
+    description="Always call the local rope and attention VeomniOps on the non-interleaved path",
 )
 def deepseek_v3_attention_forward_patched(
     self,
@@ -199,10 +197,7 @@ def deepseek_v3_attention_forward_patched(
 
     query_states = torch.cat((q_pass, q_rot), dim=-1)
     key_states, value_states = self.expand_kv(kv_nope, k_rot)
-    attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-        self.config._attn_implementation, eager_attention_forward
-    )
-    attn_output, attn_weights = attention_interface(
+    attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
         key_states,
@@ -427,6 +422,3 @@ def deepseek_v3_get_parallel_plan_patched(self):
     from ..parallel_plan import get_parallel_plan as _get_parallel_plan
 
     return _get_parallel_plan()
-
-
-_ = (Callable, Optional)

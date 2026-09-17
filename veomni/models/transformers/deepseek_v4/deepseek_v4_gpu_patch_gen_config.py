@@ -32,7 +32,6 @@ from torch import nn
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_sliding_window_causal_mask
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4CSACache,
     DeepseekV4HCACache,
@@ -1117,7 +1116,7 @@ def deepseek_v4_indexer_forward_patched(
 # ================================================================
 @config.override_method(
     "DeepseekV4Attention.__init__",
-    description="Construct a local dsa_attention deepseek_v4 VeomniOp",
+    description="Construct local dsa_attention and standard attention VeomniOps",
 )
 def deepseek_v4_attention_init_patched(self, config: "DeepseekV4Config", layer_idx: int):
     nn.Module.__init__(self)
@@ -1150,6 +1149,7 @@ def deepseek_v4_attention_init_patched(self, config: "DeepseekV4Config", layer_i
         "deepseek_v4",
         resolve_op_impl("dsa_attention_implementation"),
     )
+    self.veomni_attn = VeomniOp("attention", "standard", config._attn_implementation)
     self.veomni_rope = _deepseek_v4_rope_op()
     self.qat_implementation = resolve_qat_impl()
 
@@ -1299,9 +1299,7 @@ def deepseek_v4_attention_forward_patched(
         else:
             attention_mask = F.pad(attention_mask, (0, kv.shape[2] - attention_mask.shape[-1]), value=0.0)
 
-    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-        self.config._attn_implementation, eager_attention_forward
-    )
+    attention_interface = self.veomni_attn
     kwargs = {key: value for key, value in kwargs.items() if key != "s_aux"}
     # Not ``kv.shape[-2] - q.shape[-2]``: that assumed the query and
     # full-resolution KV lengths are equal, which is what CP breaks.

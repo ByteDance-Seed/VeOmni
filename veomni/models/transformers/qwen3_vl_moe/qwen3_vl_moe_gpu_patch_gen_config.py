@@ -123,7 +123,6 @@ config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models.utils.op_utils",
     names=[
-        "attention_op",
         "empty_bias",
         "resolve_op_impl",
         "resolve_moe_impl",

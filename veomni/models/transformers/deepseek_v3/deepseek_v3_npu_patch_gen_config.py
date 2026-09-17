@@ -83,12 +83,12 @@ config.replace_function(
 config.modify_init(
     "DeepseekV3Attention",
     replacement=deepseek_v3_attention_bind_ops,
-    description="Bind instance-local rope VeomniOp",
+    description="Bind instance-local rope and attention VeomniOps",
 )
 config.override_method(
     "DeepseekV3Attention.forward",
     replacement=deepseek_v3_attention_forward_patched,
-    description="Always call the local rope VeomniOp on the non-interleaved path",
+    description="Always call the local rope and attention VeomniOps on the non-interleaved path",
 )
 config.override_method(
     "DeepseekV3MLP.__init__",

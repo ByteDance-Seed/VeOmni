@@ -20,9 +20,9 @@
 #    - function_replacement: apply_rotary_pos_emb
 #      Always call rope full VeomniOp
 #    - init_modification: DeepseekV3Attention
-#      Bind instance-local rope VeomniOp
+#      Bind instance-local rope and attention VeomniOps
 #    - method_override: DeepseekV3Attention.forward
-#      Always call the local rope VeomniOp on the non-interleaved path
+#      Always call the local rope and attention VeomniOps on the non-interleaved path
 #    - method_override: DeepseekV3MLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: DeepseekV3MLP.forward
@@ -64,7 +64,7 @@ from transformers.modeling_layers import (
 )
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
@@ -472,7 +472,7 @@ def apply_rotary_pos_emb_interleave(q, k, cos, sin, position_ids=None, unsqueeze
 class DeepseekV3Attention(nn.Module):
     """Multi-headed Latent Attention (MLA) from Deepseek V2"""
 
-    # [modified __init__] Bind instance-local rope VeomniOp
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: DeepseekV3Config, layer_idx: int):
         super().__init__()
         self.config = config
@@ -527,8 +527,9 @@ class DeepseekV3Attention(nn.Module):
         )
 
         self.scaling = yarn_apply_mscale(config.rope_parameters, self.qk_head_dim ** (-0.5))
-        # Bind instance-local rope VeomniOp
+        # Bind instance-local rope and attention VeomniOps
         self.veomni_rope = _deepseek_v3_rope_op()
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def expand_kv(self, kv_nope: torch.Tensor, k_rot: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Expands the compressed latents into key and value states. Args:
@@ -584,10 +585,7 @@ class DeepseekV3Attention(nn.Module):
 
         query_states = torch.cat((q_pass, q_rot), dim=-1)
         key_states, value_states = self.expand_kv(kv_nope, k_rot)
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
             key_states,

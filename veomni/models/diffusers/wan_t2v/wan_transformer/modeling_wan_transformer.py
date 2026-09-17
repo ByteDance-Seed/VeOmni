@@ -18,7 +18,8 @@ from diffusers.models.transformers.transformer_wan import (
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
-from veomni.models.utils.op_utils import attention_op
+from veomni.models.utils.op_utils import resolve_op_impl
+from veomni.ops import VeomniOp
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
@@ -37,7 +38,7 @@ logger = logging.get_logger(__name__)
 # Inputs/output follow the ALL_ATTENTION_FUNCTIONS convention:
 #   input : (B, heads, seq, head_dim)
 #   output: (B, seq,   heads, head_dim), None
-# ``attention_op()`` looks this name up on the defining module.
+# ``VeomniOp("attention", ...)`` looks this name up on the defining module.
 # ================================================================
 def eager_attention_forward(
     module,
@@ -148,8 +149,8 @@ class WanSPAttnProcessor(WanAttnProcessor):
     """Video self-attn / text cross-attn through the interned ``attention`` kernel."""
 
     def __init__(self):
-        self.veomni_attn = attention_op()
-        impl = self.veomni_attn.impl
+        impl = resolve_op_impl("attn_implementation")
+        self.veomni_attn = VeomniOp("attention", "standard", impl)
         self._use_flash2 = impl in _WAN_FLASH2_IMPLS
         self.config = SimpleNamespace(_attn_implementation=impl)
         super().__init__()

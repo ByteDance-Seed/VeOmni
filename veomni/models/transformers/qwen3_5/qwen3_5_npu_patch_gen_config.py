@@ -102,7 +102,7 @@ config.add_import(
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models.utils.op_utils",
-    names=["attention_op", "prepare_dense_attention_inputs", "resolve_op_impl"],
+    names=["prepare_dense_attention_inputs", "resolve_op_impl"],
 )
 config.add_import(
     "veomni.models.loss_utils",

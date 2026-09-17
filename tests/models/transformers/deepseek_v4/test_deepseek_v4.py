@@ -106,7 +106,7 @@ def test_deepseek_v4_routers_use_fp32_projection_under_autocast():
     torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
 
 
-def test_deepseek_v4_attention_preserves_q_norm_and_rope_dtype_modes(monkeypatch):
+def test_deepseek_v4_attention_preserves_q_norm_and_rope_dtype_modes():
     modeling = _dsv4_module()
     config = _tiny_config()
     model = _build_ours(config)
@@ -130,9 +130,7 @@ def test_deepseek_v4_attention_preserves_q_norm_and_rope_dtype_modes(monkeypatch
         captured["query"] = query
         return torch.zeros_like(query.transpose(1, 2)), None
 
-    monkeypatch.setattr(
-        modeling, "ALL_ATTENTION_FUNCTIONS", SimpleNamespace(get_interface=lambda *_args: fake_attention)
-    )
+    attention.veomni_attn = fake_attention
     attention(
         hidden_states,
         position_embeddings={"main": (cos, sin), "compress": (cos, sin)},

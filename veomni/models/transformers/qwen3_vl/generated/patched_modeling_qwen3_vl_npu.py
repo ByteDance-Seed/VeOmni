@@ -100,7 +100,7 @@ from veomni.distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from veomni.models.loss_utils import ForCausalLMLoss
-from veomni.models.utils.op_utils import attention_op, resolve_op_impl
+from veomni.models.utils.op_utils import resolve_op_impl
 
 # Additional imports for patches
 from veomni.ops import VeomniOp
@@ -487,7 +487,7 @@ class Qwen3VLVisionAttention(nn.Module):
         self.is_causal = False
         # Bind instance-local rope and attention VeomniOps
         self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-        self.veomni_attn = attention_op()
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,
@@ -778,7 +778,7 @@ class Qwen3VLTextAttention(nn.Module):
         )  # thus post q_norm does not need reshape
         # Bind instance-local rope and attention VeomniOps
         self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-        self.veomni_attn = attention_op()
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,

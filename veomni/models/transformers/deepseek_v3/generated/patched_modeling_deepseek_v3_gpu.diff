@@ -29,9 +29,9 @@
 +#    - function_replacement: apply_rotary_pos_emb
 +#      Always call rope full VeomniOp
 +#    - init_modification: DeepseekV3Attention
-+#      Bind instance-local rope VeomniOp
++#      Bind instance-local rope and attention VeomniOps
 +#    - method_override: DeepseekV3Attention.forward
-+#      Always call the local rope VeomniOp on the non-interleaved path
++#      Always call the local rope and attention VeomniOps on the non-interleaved path
 +#    - method_override: DeepseekV3MLP.__init__
 +#      Construct a local swiglu_mlp VeomniOp
 +#    - method_override: DeepseekV3MLP.forward
@@ -91,7 +91,7 @@
 -from .configuration_deepseek_v3 import DeepseekV3Config
 +from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 +from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
++from transformers.modeling_utils import PreTrainedModel
 +from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 +from transformers.processing_utils import Unpack
 +from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
@@ -411,20 +411,21 @@
  class DeepseekV3Attention(nn.Module):
      """Multi-headed Latent Attention (MLA) from Deepseek V2"""
 
-+    # [modified __init__] Bind instance-local rope VeomniOp
++    # [modified __init__] Bind instance-local rope and attention VeomniOps
      def __init__(self, config: DeepseekV3Config, layer_idx: int):
          super().__init__()
          self.config = config
-@@ -415,6 +527,8 @@
+@@ -415,6 +527,9 @@
          )
 
          self.scaling = yarn_apply_mscale(config.rope_parameters, self.qk_head_dim ** (-0.5))
-+        # Bind instance-local rope VeomniOp
++        # Bind instance-local rope and attention VeomniOps
 +        self.veomni_rope = _deepseek_v3_rope_op()
++        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
      def expand_kv(self, kv_nope: torch.Tensor, k_rot: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
          """Expands the compressed latents into key and value states. Args:
-@@ -441,7 +555,7 @@
+@@ -441,7 +556,7 @@
          position_embeddings: tuple[torch.Tensor, torch.Tensor],
          attention_mask: torch.Tensor | None,
          past_key_values: Cache | None = None,
@@ -433,7 +434,7 @@
      ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
          batch_size, seq_length = hidden_states.shape[:-1]
          query_shape = (batch_size, seq_length, -1, self.qk_head_dim)
-@@ -456,28 +570,23 @@
+@@ -456,29 +571,21 @@
          compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
          kv_nope, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
          kv_nope = self.kv_a_layernorm(kv_nope)
@@ -458,14 +459,16 @@
 -
          key_states, value_states = self.expand_kv(kv_nope, k_rot)
 -
-         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-             self.config._attn_implementation, eager_attention_forward
-         )
+-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+-            self.config._attn_implementation, eager_attention_forward
+-        )
 -
-         attn_output, attn_weights = attention_interface(
+-        attn_output, attn_weights = attention_interface(
++        attn_output, attn_weights = self.veomni_attn(
              self,
              query_states,
-@@ -488,7 +597,6 @@
+             key_states,
+@@ -488,7 +595,6 @@
              scaling=self.scaling,
              **kwargs,
          )
@@ -473,7 +476,7 @@
          attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
          attn_output = self.o_proj(attn_output)
          return attn_output, attn_weights
-@@ -646,6 +754,12 @@
+@@ -646,6 +752,12 @@
          )
 
 
@@ -486,7 +489,7 @@
  @auto_docstring
  class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -658,8 +772,9 @@
+@@ -658,8 +770,9 @@
          self.model = DeepseekV3Model(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -498,7 +501,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -673,26 +788,15 @@
+@@ -673,26 +786,15 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -530,7 +533,7 @@
          outputs: BaseModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -700,25 +804,41 @@
+@@ -700,25 +802,41 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,

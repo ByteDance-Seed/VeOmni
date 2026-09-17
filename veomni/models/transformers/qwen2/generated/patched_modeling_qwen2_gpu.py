@@ -75,7 +75,7 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import capture_outputs
 
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
-from veomni.models.utils.op_utils import attention_op, linear_bias, resolve_op_impl, uses_swiglu_mlp
+from veomni.models.utils.op_utils import linear_bias, resolve_op_impl, uses_swiglu_mlp
 from veomni.ops import VeomniOp
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
@@ -256,7 +256,7 @@ class Qwen2Attention(nn.Module):
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
         # Bind instance-local rope and attention VeomniOps
         self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-        self.veomni_attn = attention_op()
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,

@@ -33,7 +33,7 @@ from veomni.distributed.sequence_parallel import (
     slice_input_tensor_scale_grad,
 )
 from veomni.distributed.sequence_parallel.utils import padding_tensor_for_seqeunce_parallel
-from veomni.models.utils.op_utils import attention_op, resolve_op_impl
+from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
 
 from ....utils import logging
@@ -160,10 +160,12 @@ class RMSNorm(nn.Module):
 
 
 class AttentionModule(nn.Module):
-    """``attention`` / ``standard``. Impl from ``attn_implementation``, else eager.
+    """``attention`` / ``standard``. Impl from the installed ops config.
 
-    ``sageattention`` maps to ``veomni_sage_attention``. FA3 self-attn with a
-    finite ``last_loss`` uses the local fp8 helper.
+    ``WanModel`` is not on the HuggingFace attention-interface path, so
+    ``config._attn_implementation`` must stay ``eager``. ``sageattention``
+    maps to ``veomni_sage_attention``. FA3 self-attn with a finite
+    ``last_loss`` uses the local fp8 helper.
     """
 
     def __init__(self, config, num_heads, head_dim):
@@ -172,9 +174,8 @@ class AttentionModule(nn.Module):
         self.head_dim = head_dim
         impl = resolve_op_impl("attn_implementation")
         if impl in {"sageattention", "veomni_sage_attention"}:
-            self.veomni_attn = VeomniOp("attention", "standard", "veomni_sage_attention")
-        else:
-            self.veomni_attn = attention_op()
+            impl = "veomni_sage_attention"
+        self.veomni_attn = VeomniOp("attention", "standard", impl)
         self.is_causal = False
         self.config = config
 

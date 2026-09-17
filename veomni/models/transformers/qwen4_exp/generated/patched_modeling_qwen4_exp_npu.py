@@ -41,6 +41,14 @@
 #      Bind ForCausalLMLoss and load_balancing_loss VeomniOps
 #    - method_override: Qwen4ExpForConditionalGeneration.forward
 #      Always call ForCausalLMLoss and load_balancing_loss VeomniOps
+#    - init_modification: Qwen4ExpTextAttention
+#      Bind instance-local attention VeomniOp
+#    - method_override: Qwen4ExpTextAttention.forward
+#      Always call the local attention VeomniOp
+#    - init_modification: Qwen4ExpVisionAttention
+#      Bind instance-local attention VeomniOp
+#    - method_override: Qwen4ExpVisionAttention.forward
+#      Always call the local attention VeomniOp
 #
 # ==============================================================================
 
@@ -81,7 +89,7 @@ from transformers.modeling_outputs import (
     MoeModelOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen4_exp.configuration_qwen4_exp import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
@@ -890,9 +898,16 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen4ExpTextAttention
+# Methods patched: forward, __init__
+# ======================================================================
+
+
 class Qwen4ExpTextAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
+    # [modified __init__] Bind instance-local attention VeomniOp
     def __init__(self, config: Qwen4ExpTextConfig, layer_idx: int):
         super().__init__()
         self.config = config
@@ -917,6 +932,8 @@ class Qwen4ExpTextAttention(nn.Module):
         self.q_norm = Qwen4ExpTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen4ExpTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.indexer = Qwen4ExpTextQSAIndexer(config, layer_idx)
+        # Bind instance-local attention VeomniOp
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,
@@ -927,13 +944,11 @@ class Qwen4ExpTextAttention(nn.Module):
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         selected_token_mask = self.indexer(hidden_states, position_embeddings, attention_mask, past_key_values)
-        # Combine both masks (they are never None, and are always 4D with either bool for sdpa, or float for eager)
         if attention_mask.is_floating_point():
             attention_mask = attention_mask + selected_token_mask
         else:
             attention_mask = attention_mask & selected_token_mask
 
-        # The cos/sin are the full positions here due to the indexer, so we need to slice to get current positions
         position_embeddings = (x[:, -hidden_states.shape[1] :, :] for x in position_embeddings)
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -953,11 +968,7 @@ class Qwen4ExpTextAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
             key_states,
@@ -2082,7 +2093,14 @@ def apply_rotary_pos_emb_vision(
     return q_embed, k_embed
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen4ExpVisionAttention
+# Methods patched: forward, __init__
+# ======================================================================
+
+
 class Qwen4ExpVisionAttention(nn.Module):
+    # [modified __init__] Bind instance-local attention VeomniOp
     def __init__(self, config: Qwen4ExpVisionConfig) -> None:
         super().__init__()
         self.dim = config.hidden_size
@@ -2095,6 +2113,8 @@ class Qwen4ExpVisionAttention(nn.Module):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
+        # Bind instance-local attention VeomniOp
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,
@@ -2115,12 +2135,9 @@ class Qwen4ExpVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
+        attention_interface = self.veomni_attn
 
         if is_flash_attention_requested(self.config):
-            # Flash Attention: Use cu_seqlens for variable length attention
             max_seqlen = get_max_seqlen(cu_seqlens, self.config, kwargs={"max_seqlen": max_seqlen})
             attn_output, _ = attention_interface(
                 self,
@@ -2138,7 +2155,6 @@ class Qwen4ExpVisionAttention(nn.Module):
                 **kwargs,
             )
         else:
-            # Other implementations: Process each chunk separately
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
             splits = [
                 torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)

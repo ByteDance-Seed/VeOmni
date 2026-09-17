@@ -48,7 +48,6 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import sp_pad_and_slice
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.op_utils import (
-    attention_op,
     prepare_dense_attention_inputs,
     resolve_op_impl,
 )
@@ -111,7 +110,7 @@ config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_I
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models.utils.op_utils",
-    names=["attention_op", "prepare_dense_attention_inputs", "resolve_op_impl"],
+    names=["prepare_dense_attention_inputs", "resolve_op_impl"],
 )
 config.add_import(
     "veomni.models.loss_utils",
@@ -920,7 +919,7 @@ def qwen3_5_vision_model_dummy_forward(self):
 @config.modify_init("Qwen3_5VisionAttention", description="Bind instance-local attention VeomniOp")
 def qwen3_5_vision_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_attn = attention_op()
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
 @config.override_method(
@@ -1587,7 +1586,7 @@ def qwen3_5_forconditional_generation_forward_patched(
 def qwen3_5_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
     self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
-    self.veomni_attn = attention_op()
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
 @config.override_method(

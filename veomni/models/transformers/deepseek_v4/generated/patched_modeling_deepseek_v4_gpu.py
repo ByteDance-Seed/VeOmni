@@ -46,7 +46,7 @@
 #    - method_override: DeepseekV4Indexer.forward
 #      Always call the local dsa_indexer deepseek_v4 VeomniOp
 #    - method_override: DeepseekV4Attention.__init__
-#      Construct a local dsa_attention deepseek_v4 VeomniOp
+#      Construct local dsa_attention and standard attention VeomniOps
 #    - method_override: DeepseekV4Attention.forward
 #      Packed compressor path + Ulysses SP for DeepSeek-V4 sparse attention
 #    - function_replacement: eager_attention_forward
@@ -88,7 +88,7 @@ from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_sliding_window_causal_mask
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
@@ -1481,6 +1481,7 @@ class DeepseekV4Attention(nn.Module):
             "deepseek_v4",
             resolve_op_impl("dsa_attention_implementation"),
         )
+        self.veomni_attn = VeomniOp("attention", "standard", config._attn_implementation)
         self.veomni_rope = _deepseek_v4_rope_op()
         self.qat_implementation = resolve_qat_impl()
 
@@ -1629,9 +1630,7 @@ class DeepseekV4Attention(nn.Module):
             else:
                 attention_mask = F.pad(attention_mask, (0, kv.shape[2] - attention_mask.shape[-1]), value=0.0)
 
-        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
+        attention_interface = self.veomni_attn
         kwargs = {key: value for key, value in kwargs.items() if key != "s_aux"}
         # Not ``kv.shape[-2] - q.shape[-2]``: that assumed the query and
         # full-resolution KV lengths are equal, which is what CP breaks.

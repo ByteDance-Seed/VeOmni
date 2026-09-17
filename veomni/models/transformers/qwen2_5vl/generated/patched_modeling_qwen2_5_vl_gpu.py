@@ -93,7 +93,7 @@ from veomni.distributed.sequence_parallel import (
     unpad_tensor,
 )
 from veomni.models.loss_utils import ForCausalLMLoss
-from veomni.models.utils.op_utils import attention_op, resolve_op_impl
+from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import (
@@ -460,7 +460,7 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         self.attention_dropout = 0.0
         self.is_causal = False
         # Bind instance-local attention VeomniOp
-        self.veomni_attn = attention_op()
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,
@@ -1090,7 +1090,7 @@ class Qwen2_5_VLAttention(nn.Module):
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
         # Bind instance-local attention VeomniOp
-        self.veomni_attn = attention_op()
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,

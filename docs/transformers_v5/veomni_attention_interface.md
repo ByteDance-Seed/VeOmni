@@ -4,7 +4,7 @@ VeOmni registers sequence-parallel FlashAttention, FlexAttention, SDPA,
 SageAttention, and MagiAttention FFA adapters in Transformers'
 `ALL_ATTENTION_FUNCTIONS`. There is no `fused_attention_forward` facade and
 no replaceable module-level `_flash_attention_forward` slots. Patched models
-bind `attention_op()` once in `__init__` / `modify_init` and call
+bind `VeomniOp("attention", "standard", config._attn_implementation)` once in `__init__` / `modify_init` and call
 `self.veomni_attn` from `forward`.
 
 Public names such as `flash_attention_2` rewrite to `veomni_flash_attention_2`

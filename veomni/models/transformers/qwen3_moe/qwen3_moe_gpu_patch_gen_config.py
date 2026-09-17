@@ -35,7 +35,6 @@ from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models.utils.op_utils import (
-    attention_op,
     empty_bias,
     linear_bias,
     merged_experts_act_fn_forward,
@@ -75,7 +74,6 @@ config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models.utils.op_utils",
     names=[
-        "attention_op",
         "empty_bias",
         "linear_bias",
         "merged_experts_act_fn_forward",
@@ -560,7 +558,7 @@ def qwen3_moe_sparse_moe_block_forward_patched(self, hidden_states: torch.Tensor
 def qwen3_moe_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
     self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    self.veomni_attn = attention_op()
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
 @config.override_method(

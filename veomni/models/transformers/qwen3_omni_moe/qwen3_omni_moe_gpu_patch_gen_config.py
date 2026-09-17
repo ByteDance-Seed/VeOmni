@@ -70,7 +70,7 @@ from veomni.distributed.sequence_parallel import (
 from veomni.distributed.sequence_parallel.ulysses import _Gather
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
-from veomni.models.utils.op_utils import attention_op, empty_bias, resolve_moe_impl, resolve_op_impl
+from veomni.models.utils.op_utils import empty_bias, resolve_moe_impl, resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import (
@@ -114,7 +114,6 @@ config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models.utils.op_utils",
     names=[
-        "attention_op",
         "empty_bias",
         "resolve_op_impl",
         "resolve_moe_impl",
@@ -555,7 +554,7 @@ def qwen3_omni_moe_get_rope_index_patched(
 @config.modify_init("Qwen3OmniMoeVisionAttention", description="Bind instance-local attention VeomniOp")
 def qwen3_omni_moe_vision_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_attn = attention_op()
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
 @config.override_method(
@@ -1811,7 +1810,7 @@ def qwen3_omni_moe_text_get_parallel_plan_patched(self):
 @config.modify_init("Qwen3OmniMoeAudioAttention", description="Bind instance-local attention VeomniOp")
 def qwen3_omni_moe_audio_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_attn = attention_op()
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
 @config.override_method(
@@ -1881,7 +1880,7 @@ def qwen3_omni_moe_audio_attention_forward_patched(
 def qwen3_omni_moe_thinker_text_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
     self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    self.veomni_attn = attention_op()
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
 @config.override_method(

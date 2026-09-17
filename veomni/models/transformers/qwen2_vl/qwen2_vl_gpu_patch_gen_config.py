@@ -50,7 +50,7 @@ from veomni.distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from veomni.models.loss_utils import ForCausalLMLoss
-from veomni.models.utils.op_utils import attention_op, resolve_op_impl
+from veomni.models.utils.op_utils import resolve_op_impl
 from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -90,7 +90,7 @@ config.add_import(
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models.utils.op_utils",
-    names=["attention_op", "resolve_op_impl"],
+    names=["resolve_op_impl"],
 )
 config.add_import(
     "veomni.models.loss_utils",
@@ -102,7 +102,7 @@ config.drop_import_names("Qwen2VLCausalLMOutputWithPast")
 @config.modify_init("VisionAttention", description="Bind instance-local attention VeomniOp")
 def qwen2_vl_vision_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_attn = attention_op()
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
 @config.override_method(
@@ -774,7 +774,7 @@ def qwen2vl_for_conditional_generation_forward_patched(
 @config.modify_init("Qwen2VLAttention", description="Bind instance-local attention VeomniOp")
 def qwen2_vl_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_attn = attention_op()
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
 @config.override_method(

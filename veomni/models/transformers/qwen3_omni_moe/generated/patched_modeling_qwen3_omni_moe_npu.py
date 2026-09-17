@@ -137,7 +137,6 @@ from veomni.distributed.sequence_parallel.ulysses import _Gather
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
 from veomni.models.utils.op_utils import (
-    attention_op,
     empty_bias,
     merged_experts_act_fn_forward,
     resolve_moe_impl,
@@ -681,7 +680,7 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
         # Bind instance-local attention VeomniOp
-        self.veomni_attn = attention_op()
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,
@@ -1130,7 +1129,7 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
         self.attention_dropout = 0.0
         self.is_causal = False
         # Bind instance-local attention VeomniOp
-        self.veomni_attn = attention_op()
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,
@@ -1841,7 +1840,7 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         self.sliding_window = None
         # Bind instance-local rope and attention VeomniOps
         self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-        self.veomni_attn = attention_op()
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,

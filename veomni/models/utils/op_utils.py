@@ -25,7 +25,6 @@ from collections.abc import Callable
 import torch
 from torch import Tensor, nn
 
-from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config
 
 
@@ -162,16 +161,6 @@ def resolve_op_impl(field: str, *, npu_as: str | None = None) -> str:
     if npu_as is not None and impl == "npu":
         return npu_as
     return impl
-
-
-def attention_op() -> VeomniOp:
-    """Return the interned standard-attention op for the active impl.
-
-    Missing ops config resolves to ``eager``. Construct this only in
-    ``__init__`` / ``modify_init`` and store the handle on ``self``.
-    Do not call it from ``forward``.
-    """
-    return VeomniOp("attention", "standard", resolve_op_impl("attn_implementation"))
 
 
 PACKED_ATTENTION_METADATA_KEYS = frozenset(
