@@ -181,3 +181,67 @@ def test_grouped_wgrad_bf16_partial_sums_reproduce_the_ep_gap():
 
     # The rounding of the partials, not a different sum, is the whole difference.
     assert rounded_error > 10 * exact_error
+
+
+def test_fused_moe_keeps_fp32_weight_gradients_for_fp32_weights():
+    """An FP32 expert parameter receives an FP32 weight gradient.
+
+    ``mixed_precision.extra_parallel_param_dtype=float32`` leaves expert
+    parameters uncast through the FSDP2 all-gather, so the fused Function sees
+    FP32 weights. It must cast them to the activation dtype for the GEMMs and
+    still return the weight gradient for the FP32 input, otherwise autograd
+    rounds that gradient back to BF16 and the extra precision is discarded.
+    A BF16 parameter keeps the BF16 gradient it has always had.
+    """
+    _skip_if_unsupported()
+    import veomni.ops.kernels.moe as fused_moe
+    from veomni.ops.kernels.moe import fused_moe_forward
+    from veomni.ops.kernels.moe.group_gemm import group_gemm_fused_moe_forward
+
+    # Same binding the ops tests use: point the dispatch at the Triton grouped-GEMM path.
+    fused_moe._fused_moe_forward = group_gemm_fused_moe_forward
+
+    device = torch.device(get_device_type())
+    torch.manual_seed(0)
+    num_tokens, num_experts, hidden_dim, ffn_dim, topk = 64, 4, 32, 48, 2
+    hidden_states = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.bfloat16)
+    router_logits = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
+    routing_weights, selected_experts = torch.topk(torch.softmax(router_logits, dim=-1), topk, dim=-1)
+    routing_weights = routing_weights.to(torch.bfloat16)
+    gate_up_bf16 = 0.1 * torch.randn(num_experts, 2 * ffn_dim, hidden_dim, device=device, dtype=torch.bfloat16)
+    down_bf16 = 0.1 * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=torch.bfloat16)
+
+    def run(gate_up_weight, down_weight):
+        hidden = hidden_states.clone().requires_grad_(True)
+        out = fused_moe_forward(
+            num_experts=num_experts,
+            routing_weights=routing_weights,
+            selected_experts=selected_experts,
+            hidden_states=hidden,
+            fc1_1_weight=None,
+            fc1_2_weight=None,
+            fc2_weight=down_weight,
+            fc1_1_2_weight=gate_up_weight,
+        )
+        out.float().pow(2).sum().backward()
+        return out, gate_up_weight.grad, down_weight.grad
+
+    out_fp32, gate_up_grad_fp32, down_grad_fp32 = run(
+        gate_up_bf16.float().clone().requires_grad_(True), down_bf16.float().clone().requires_grad_(True)
+    )
+    assert gate_up_grad_fp32 is not None and gate_up_grad_fp32.dtype == torch.float32
+    assert down_grad_fp32 is not None and down_grad_fp32.dtype == torch.float32
+
+    out_bf16, gate_up_grad_bf16, down_grad_bf16 = run(
+        gate_up_bf16.clone().requires_grad_(True), down_bf16.clone().requires_grad_(True)
+    )
+    assert gate_up_grad_bf16.dtype == torch.bfloat16
+    assert down_grad_bf16.dtype == torch.bfloat16
+
+    # The FP32 parameters do not change the forward: the Function casts the
+    # weights to the activation dtype internally.
+    torch.testing.assert_close(out_fp32, out_bf16, rtol=0, atol=0)
+    # The two gradients differ only by the BF16 write-back the FP32 path avoids.
+    eps = torch.finfo(torch.bfloat16).eps
+    for fp32_grad, bf16_grad in ((gate_up_grad_fp32, gate_up_grad_bf16), (down_grad_fp32, down_grad_bf16)):
+        torch.testing.assert_close(fp32_grad, bf16_grad.float(), rtol=4 * eps, atol=4 * eps)

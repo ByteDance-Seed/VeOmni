@@ -222,17 +222,40 @@ same BF16 operands -- recorded here, not enforced by CI -- are about 1.7e-3
 relative L2 for a BF16 write-back and about 6e-8 for an FP32 one, rising to about
 2.4e-3 and about 1e-7 when two per-rank partials are combined.
 
-That write-back dominates the remaining first-step expert-weight difference, but
-an FP32 buffer alone is not sufficient: autograd casts a returned gradient back
-to the BF16 dtype of the leaf parameter it accumulates into, which for FSDP2
-mixed precision is the unsharded parameter. A four-rank A/B run with FP32
-gradient buffers and the current mixed-precision policy is bit-identical to this
-head. Keeping the expert *parameters* in FP32 through the FSDP2 all-gather does
-move the numbers on the same fixture -- first-step expert gradient relative L2
-0.219% to 0.155%, whole-model 0.0751% to 0.0531% -- at the cost of an FP32 expert
-all-gather and a larger unsharded buffer. Those four-rank numbers are
-measurements taken for this document, not assertions any test makes. That is a
-mixed-precision-policy decision rather than a kernel fix and is not applied here.
+An FP32 gradient buffer alone is not sufficient: autograd casts a returned
+gradient back to the dtype of the leaf parameter it accumulates into, which for
+FSDP2 mixed precision is the unsharded parameter. A four-rank A/B run with FP32
+gradient buffers and BF16 expert parameters is bit-identical to this head.
+
+`mixed_precision.extra_parallel_param_dtype` is the boundary that does work. It
+keeps an ExtraParallel (expert) module's unsharded parameters in the configured
+dtype instead of `param_dtype`; the fused Functions cast the weights to the
+activation dtype inside the `autograd.Function`, so the forward is bit-identical
+(measured: the same first-step loss to the last digit) while the weight gradient
+is accumulated, returned and reduce-scattered in FP32.
+
+Four-rank A/B on the toy fixture, EP=4 against EP=2, two optimizer steps, every
+other setting identical -- whole-model pre-clipping gradient relative L2:
+
+| expert parameter dtype | step 1 | step 2 |
+|---|---|---|
+| bfloat16 (default) | 7.51e-4 | 4.47e-2 |
+| float32 | 5.77e-7 | 4.29e-2 |
+
+At step 1 the entire difference sits in the expert weights
+(`expert_error_share` 1.0, no parameter above 1% relative), so FP32 expert
+parameters remove the EP partial-sum rounding from the configuration difference
+and leave FP32 accumulation-order noise. Step 2 is dominated by trajectory
+separation instead: after one step the two configurations have already diverged,
+and that is why the two rows there agree. These are measurements taken for this
+document; the ops regressions enforce the operator contract those measurements
+rest on, not the four-rank numbers themselves.
+
+The override reaches modules on an enabled ExtraParallel mesh (`ep_size > 1`) and
+costs an FP32 parameter all-gather plus a larger unsharded buffer for those
+modules. At `ep_size == 1` the expert modules are sharded with their decoder
+layer and follow the global `param_dtype`, so an EP=1-versus-EP=2 comparison
+still needs the override extended to that case.
 
 ---
 
