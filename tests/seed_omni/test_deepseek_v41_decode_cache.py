@@ -48,8 +48,10 @@ from veomni.models.seed_omni.modules.deepseek_v41.llm.decode import (
     DeepseekV41AttentionCache,
     DeepseekV41DecodeCache,
     decode_attention_step,
+    decode_backbone_step,
     dense_sparse_attn,
 )
+from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import DeepseekV41Backbone
 
 
 HIDDEN = 64
@@ -228,6 +230,88 @@ class TestDecodeMatchesPrefill:
 
         torch.testing.assert_close(actual[0], expected[0], **EXACT)
         assert caches[0].compress_kv is None
+
+
+def make_backbone_config(**overrides) -> DeepseekV41LlmConfig:
+    """The attention config, shrunk where the defaults are sized for the real model.
+
+    384 routed experts and an engram head dim of 256 are the shipped numbers and
+    are not what a per-position comparison needs; everything that decides
+    *behaviour* -- the source-layer roles, the window, the ratio -- is inherited
+    from :func:`make_config` unchanged.
+    """
+    fields = dict(
+        n_routed_experts=8,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        engram_n_heads=2,
+        engram_head_dim=8,
+        hc_mult=2,
+    )
+    fields.update(overrides)
+    return make_config(**fields)
+
+
+class TestBackboneDecodeMatchesPrefill:
+    """The whole stack, not just its attention -- mHC, Engram and MoE included.
+
+    ``decode_layer_step`` is a hand copy of ``DeepseekV41DecoderLayer.forward``
+    with one call swapped, and a copy is exactly the thing that rots quietly. This
+    is what notices: anything ``forward`` grows that the copy misses moves the
+    hidden states, and every position is compared.
+    """
+
+    def _backbone(self, config, seed=0):
+        torch.manual_seed(seed)
+        backbone = DeepseekV41Backbone(config).double()
+        for param in backbone.parameters():
+            param.data.normal_(0, 0.05)
+        for layer in backbone.layers:
+            layer.self_attn.attn_sink.data.normal_(0, 0.5)
+        return backbone
+
+    def _ngram_embeds(self, config, seq_len):
+        cols = (config.engram_max_ngram_size - 1) * config.engram_n_heads
+        return [
+            torch.randn(1, seq_len, cols, config.engram_head_dim, dtype=torch.float64) for _ in config.engram_layer_ids
+        ]
+
+    def test_every_position_agrees(self):
+        config = make_backbone_config()
+        backbone = self._backbone(config)
+        torch.manual_seed(1)
+        embeds = torch.randn(1, SEQ_LEN, HIDDEN, dtype=torch.float64)
+        ngram_embeds = self._ngram_embeds(config, SEQ_LEN)
+        position_ids = torch.arange(SEQ_LEN).unsqueeze(0)
+
+        expected = backbone(embeds, position_ids, ngram_embeds=ngram_embeds)["hidden_states"]
+
+        cache = DeepseekV41DecodeCache.empty(config)
+        rows = [
+            decode_backbone_step(
+                backbone,
+                embeds[:, position : position + 1],
+                position,
+                cache,
+                ngram_embeds=[e[:, position : position + 1] for e in ngram_embeds],
+            )
+            for position in range(SEQ_LEN)
+        ]
+        torch.testing.assert_close(torch.cat(rows, dim=1), expected, **FP32_POOLED)
+
+    def test_a_missing_ngram_lookup_is_refused(self):
+        """Silently skipping Engram would leave the stack running, and wrong."""
+        config = make_backbone_config()
+        backbone = self._backbone(config)
+        assert backbone.engram, "this config is supposed to have an Engram layer"
+        with pytest.raises(RuntimeError, match="ngram_embeds"):
+            decode_backbone_step(
+                backbone,
+                torch.randn(1, 1, HIDDEN, dtype=torch.float64),
+                0,
+                DeepseekV41DecodeCache.empty(config),
+            )
 
 
 class TestStarvedCandidates:

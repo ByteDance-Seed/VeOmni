@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -61,7 +61,13 @@ from .attention import (
     apply_interleaved_rope,
     select_candidate_blocks,
 )
+from .mhc import expand_to_streams, identity_pre_mix, mhc_collapse, mhc_expand
 from .quantization import fake_quant_act, fake_quant_kv, fake_quant_linear
+
+
+if TYPE_CHECKING:
+    from .decoder_layer import DeepseekV41DecoderLayer
+    from .modeling import DeepseekV41Backbone
 
 
 def dense_sparse_attn(
@@ -393,9 +399,102 @@ def decode_attention_step(
     return attn.wo_b(grouped.flatten(2))
 
 
+def decode_layer_step(
+    layer: "DeepseekV41DecoderLayer",
+    hidden_streams: torch.Tensor,
+    pre_mix: torch.Tensor,
+    position: int,
+    rotary_emb: DeepseekV41RotaryEmbedding,
+    shared: SharedAttentionState,
+    cache: DeepseekV41AttentionCache,
+    image_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """One decoder layer for one token: ``[B, 1, hc, D]`` in, that and the next ``pre``.
+
+    A line-for-line copy of :meth:`DeepseekV41DecoderLayer.forward` with the
+    attention call swapped, because everything else in that method -- both Hyper-
+    Connections, both collapses, the expansions and the MoE -- is a function of
+    one position and carries nothing between tokens. Only the attention had
+    history to keep.
+
+    The copy is deliberate but it is still a copy, and the test that holds it to
+    the original is the one that matters: if ``forward`` grows a step this misses,
+    the per-position comparison stops agreeing.
+    """
+    residual = hidden_streams
+    attn_pre, attn_post, attn_comb = layer.attn_hc(hidden_streams)
+    collapsed = mhc_collapse(hidden_streams, pre_mix)
+    attn_out = decode_attention_step(
+        layer.self_attn, layer.input_layernorm(collapsed), position, rotary_emb, shared, cache
+    )
+    hidden_streams = mhc_expand(attn_out, residual, attn_post, attn_comb)
+
+    residual = hidden_streams
+    ffn_pre, ffn_post, ffn_comb = layer.ffn_hc(hidden_streams)
+    collapsed = mhc_collapse(hidden_streams, attn_pre)
+    mlp_out, _ = layer.mlp(layer.post_attention_layernorm(collapsed), image_mask)
+    hidden_streams = mhc_expand(mlp_out, residual, ffn_post, ffn_comb)
+
+    # ``attn_pre`` fed the FFN's collapse; ``ffn_pre`` feeds the next site's, which
+    # is the V4.1 data flow the mHC rewrite exists for -- a `pre` belongs to the
+    # site after the one that produced it.
+    return hidden_streams, ffn_pre
+
+
+def decode_backbone_step(
+    backbone: "DeepseekV41Backbone",
+    inputs_embeds: torch.Tensor,
+    position: int,
+    cache: DeepseekV41DecodeCache,
+    ngram_embeds: Optional[List[torch.Tensor]] = None,
+    image_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """The backbone for one token: ``[B, 1, hidden]`` in, normed hidden states out.
+
+    ``expand_to_streams`` and ``identity_pre_mix`` are rebuilt every step rather
+    than carried, which is not an oversight: the streams start from this token's
+    embedding and the identity ``pre`` is a constant of the shape. Neither is
+    history, so neither belongs in a cache.
+
+    ``SharedAttentionState`` likewise is per step. It carries a source layer's
+    compressed KV and selection *down* the stack within one token; what carries
+    across tokens is the per-layer cache the source layer republishes from.
+    """
+    if ngram_embeds is None and backbone.engram:
+        raise RuntimeError(
+            "This backbone has Engram connections at layers "
+            f"{sorted(int(idx) for idx in backbone.engram)} but no ngram_embeds were passed. "
+            "The deepseek_v41_ngram step must run before this one."
+        )
+
+    token_mask = None if image_mask is None else ~image_mask
+    shared = SharedAttentionState()
+    hidden_streams = expand_to_streams(inputs_embeds, backbone.config.hc_mult)
+    pre_mix = identity_pre_mix(hidden_streams, backbone.config.hc_mult)
+
+    for layer_idx, layer in enumerate(backbone.layers):
+        if str(layer_idx) in backbone.engram:
+            connection = backbone.engram[str(layer_idx)]
+            hidden_streams = connection(hidden_streams, ngram_embeds[connection.layer_hash_index], token_mask)
+        hidden_streams, pre_mix = decode_layer_step(
+            layer,
+            hidden_streams,
+            pre_mix,
+            position,
+            backbone.rotary_emb,
+            shared,
+            cache.layers[layer_idx],
+            image_mask,
+        )
+
+    return backbone.norm(mhc_collapse(hidden_streams, pre_mix))
+
+
 __all__ = [
     "DeepseekV41AttentionCache",
     "DeepseekV41DecodeCache",
     "decode_attention_step",
+    "decode_backbone_step",
+    "decode_layer_step",
     "dense_sparse_attn",
 ]
