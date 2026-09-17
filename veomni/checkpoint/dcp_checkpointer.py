@@ -58,14 +58,13 @@ from .layout import (
     step_dir,
     weights_dir,
 )
-from .layout import (
-    LR_SCHEDULER_FILENAME as _LR_SCHEDULER_FILENAME,
-)
 
 
 logger = logging.get_logger(__name__)
 
-_LR_SCHEDULER_KEY = "lr_scheduler"
+_EXTRA_STATE_KEY = "extra_state"
+_EXTRA_STATE_DIRNAME = "extra_state"
+_EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 
 
 class _ModelStrictLoadPlanner(DefaultLoadPlanner):
@@ -887,7 +886,7 @@ class DistributedCheckpointer(CheckpointerBase):
         # and it is written only after every module's save has returned — but
         # writing the small replicated file first still means a save that dies
         # part-way leaves less behind.
-        cls._save_lr_scheduler(checkpoint_dir=write_root, state=state)
+        cls._save_extra_state(checkpoint_dir=write_root, state=state)
 
         try:
             cls.execute_save(
@@ -1027,7 +1026,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 process_group=process_group,
                 planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
             )
-            cls._load_lr_scheduler(checkpoint_dir=fused_dir, state=state)
+            cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
             logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
             return state
 
@@ -1048,7 +1047,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 planner=_ModelStrictLoadPlanner(strict_model=False),
             )
 
-        cls._load_lr_scheduler(checkpoint_dir=model_root, state=state)
+        cls._load_extra_state(checkpoint_dir=model_root, state=state)
 
         logger.info_rank0(f"Loaded checkpoint from {model_root}")
 
@@ -1234,54 +1233,30 @@ class DistributedCheckpointer(CheckpointerBase):
         )
 
     @classmethod
-    def _save_lr_scheduler(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
-        """Pickle ``lr_scheduler.state_dict`` into a single ``lr_scheduler.pt``.
+    def _save_extra_state(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
+        """Pickle this rank's ``extra_state`` dict into ``extra_state/``.
 
-        The scheduler is replicated across ranks, so only rank 0 writes. Every
-        rank still joins the reduction afterwards: a failed write must not let
-        peers enter the DCP collective alone.
+        The condition-model RNG is rank-local, so every rank writes its own file.
         """
-        error: Optional[Exception] = None
-        is_writer = (not dist.is_initialized()) or dist.get_rank() == 0
-        if is_writer:
-            try:
-                if _LR_SCHEDULER_KEY not in state:
-                    logger.warning_rank0("lr_scheduler not found in state, skipping lr_scheduler save")
-                else:
-                    lr_scheduler = state[_LR_SCHEDULER_KEY]
-                    if lr_scheduler is not None:
-                        torch.save(lr_scheduler.state_dict(), os.path.join(checkpoint_dir, _LR_SCHEDULER_FILENAME))
-            except Exception as e:  # noqa: BLE001 - raised once every rank has agreed
-                error = e
-        if any_rank_failed(error is not None):
-            raise error or RuntimeError("another rank could not save lr_scheduler")
+        if _EXTRA_STATE_KEY not in state:
+            logger.warning_rank0("extra_state not found in state, skipping extra_state save")
+            return
+        extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIRNAME)
+        os.makedirs(extra_state_dir, exist_ok=True)
+        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
+        torch.save(state[_EXTRA_STATE_KEY], extra_state_path)
 
     @classmethod
-    def _load_lr_scheduler(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
-        """Load ``lr_scheduler.pt`` into ``lr_scheduler``. Every rank reads the same file."""
-        if _LR_SCHEDULER_KEY not in state:
-            logger.warning_rank0("lr_scheduler not found in state, skipping lr_scheduler load")
+    def _load_extra_state(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
+        """Load this rank's ``extra_state`` dict from ``extra_state/``."""
+        if _EXTRA_STATE_KEY not in state:
+            logger.warning_rank0("extra_state not found in state, skipping extra_state load")
             return
-        lr_scheduler = state[_LR_SCHEDULER_KEY]
-        if lr_scheduler is None:
-            return
-
-        lr_scheduler_path = os.path.join(checkpoint_dir, _LR_SCHEDULER_FILENAME)
-        if os.path.exists(lr_scheduler_path):
-            lr_scheduler.load_state_dict(torch.load(lr_scheduler_path, weights_only=False))
-            return
-
-        # Delete this import (and veomni/checkpoint/legacy_v0_1_12.py) to drop 0.1.12 extra_state resume.
-        from .legacy_v0_1_12 import apply_legacy_lr_scheduler
-
-        if apply_legacy_lr_scheduler(checkpoint_dir, lr_scheduler):
-            return
-
-        raise FileNotFoundError(
-            f"lr_scheduler sidecar not found at {lr_scheduler_path}. "
-            "This layout writes lr_scheduler.pt next to the DCP shards "
-            "(see docs/usage/checkpoint.md)."
+        extra_state_path = os.path.join(
+            checkpoint_dir, _EXTRA_STATE_DIRNAME, _EXTRA_STATE_FORMAT.format(dist.get_rank())
         )
+        if os.path.exists(extra_state_path):
+            state[_EXTRA_STATE_KEY] = torch.load(extra_state_path, weights_only=False)
 
 
 def get_dtype_size(dtype: torch.dtype) -> int:

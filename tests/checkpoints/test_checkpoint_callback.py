@@ -341,7 +341,7 @@ class TestModelCheckpointManagerSaveContract:
         assert rebuilt == "/remote/run/global_step_10/model"
         assert rebuilt == manager.save_dir(state)
 
-    def test_save_forwards_lr_scheduler_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
+    def test_save_forwards_extra_state_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
         trainer = _make_mock_trainer()
         mock_build_ckpt.return_value = MagicMock()
         manager = ModelCheckpointManager(trainer)
@@ -349,11 +349,10 @@ class TestModelCheckpointManagerSaveContract:
         manager.save_dcp(TrainerState(global_step=10))
 
         saved = manager.checkpointer.save.call_args.args[1]
-        assert saved["lr_scheduler"] is trainer.lr_scheduler
+        assert set(saved["extra_state"]) == {"lr_scheduler", "condition_model_rng_state"}
         assert saved["optimizer"] is trainer.optimizer
-        assert "extra_state" not in saved
 
-    def test_load_forwards_lr_scheduler_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
+    def test_load_forwards_extra_state_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
         trainer = _make_mock_trainer()
         trainer.args.train.checkpoint.load_path = "/tmp/ckpt"
         mock_checkpointer = MagicMock()
@@ -363,10 +362,39 @@ class TestModelCheckpointManagerSaveContract:
         manager.load()
 
         loaded = mock_checkpointer.load.call_args.args[1]
-        assert loaded["lr_scheduler"] is trainer.lr_scheduler
+        assert loaded["extra_state"] == {}
         assert loaded["optimizer"] is trainer.optimizer
         assert trainer.state.global_step == 0
         assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is mock_get_ps.return_value
+
+    def test_extra_state_persists_condition_model_rng(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
+        trainer = _make_mock_trainer()
+        trainer.condition_model = _StubConditionModel()
+        mock_build_ckpt.return_value = MagicMock()
+        manager = ModelCheckpointManager(trainer)
+
+        extra_state = manager._extra_state(TrainerState(global_step=10))
+
+        assert set(extra_state["condition_model_rng_state"]) == {"generator"}
+
+    def test_load_extra_state_restores_condition_model_rng(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
+        trainer = _make_mock_trainer()
+        condition_model = _StubConditionModel()
+        trainer.condition_model = condition_model
+        mock_build_ckpt.return_value = MagicMock()
+        manager = ModelCheckpointManager(trainer)
+
+        for _ in range(3):
+            condition_model.draw_noise()
+        rng_state = condition_model.rng_state_dict()
+        reference = torch.Generator(device="cpu")
+        reference.set_state(condition_model.generator.get_state())
+        expected_next_noise = torch.randn(4, generator=reference)
+
+        condition_model.draw_noise()
+        manager._load_extra_state({"lr_scheduler": {"lr": 1e-4}, "condition_model_rng_state": rng_state})
+
+        assert torch.equal(condition_model.draw_noise(), expected_next_noise)
 
     def test_save_lora_writes_the_adapter_to_its_own_export_dir(
         self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps, tmp_path
@@ -466,22 +494,13 @@ class TestGlobalStateCallbackJobState:
         assert "torch_rng_state" in global_state
         assert "device_rng_state" in global_state
 
-    def test_state_dict_omits_condition_model_rng_without_condition_model(self, mock_dist):
+    def test_state_dict_has_no_condition_model_rng(self, mock_dist):
         trainer = _make_mock_trainer()
         cb = GlobalStateCallback(trainer)
 
         global_state = cb.state_dict(TrainerState(global_step=10))
 
-        assert global_state["condition_model_rng_state"] is None
-
-    def test_state_dict_persists_condition_model_rng(self, mock_dist):
-        trainer = _make_mock_trainer()
-        trainer.condition_model = _StubConditionModel()
-        cb = GlobalStateCallback(trainer)
-
-        global_state = cb.state_dict(TrainerState(global_step=10))
-
-        assert set(global_state["condition_model_rng_state"]) == {"generator"}
+        assert "condition_model_rng_state" not in global_state
 
     def test_load_resumes_device_and_cpu_rng_streams(self, mock_dist, tmp_path):
         """A resumed run must continue the device and CPU rng streams, not replay."""

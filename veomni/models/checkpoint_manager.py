@@ -26,7 +26,7 @@ Two blobs, two owners:
 On-disk layout: ``docs/usage/checkpoint.md``.
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch.distributed as dist
 
@@ -136,44 +136,87 @@ class ModelCheckpointManager:
         """
         return self.config.load_path
 
+    def _extra_state(self, state: "TrainerState") -> Dict[str, Any]:
+        """Model-bound state to store beside the weights.
+
+        The condition model's noise/timestep generator and the lr scheduler are
+        model-bound state, persisted here for the checkpointer to write per rank.
+        """
+        lr_scheduler = self.trainer.lr_scheduler
+        condition_model = getattr(self.trainer, "condition_model", None)
+        rng_state_dict = getattr(condition_model, "rng_state_dict", None)
+        if (
+            condition_model is not None
+            and rng_state_dict is None
+            and getattr(condition_model, "generator", None) is not None
+        ):
+            logger.warning_rank0(
+                "Condition model owns a ``generator`` but exposes no ``rng_state_dict``; "
+                "its noise/timestep stream will not be restored across a resume."
+            )
+        return {
+            "lr_scheduler": None if lr_scheduler is None else lr_scheduler.state_dict(),
+            "condition_model_rng_state": None if rng_state_dict is None else rng_state_dict(),
+        }
+
+    def _load_extra_state(self, extra_state: Dict[str, Any]) -> None:
+        lr_state = extra_state.get("lr_scheduler")
+        lr_scheduler = self.trainer.lr_scheduler
+        if lr_state is not None and lr_scheduler is not None:
+            lr_scheduler.load_state_dict(lr_state)
+
+        condition_model_rng_state = extra_state.get("condition_model_rng_state")
+        if condition_model_rng_state is not None:
+            loader = getattr(getattr(self.trainer, "condition_model", None), "load_rng_state_dict", None)
+            if loader is None:
+                logger.warning_rank0(
+                    "Checkpoint carries condition-model RNG state but the model cannot restore it; "
+                    "the resumed run may replay its initial noise stream."
+                )
+            else:
+                loader(condition_model_rng_state)
+
     def wait_for_pending_save(self) -> None:
         """Block until the in-flight async save is on disk, if there is one."""
         self.checkpointer.wait_for_pending_save()
 
     def load(self) -> None:
-        """Restore model, optimizer and lr_scheduler from ``load_path``."""
+        """Restore model, optimizer and model-bound extra state from ``load_path``."""
         load_dir = self.load_dir()
         if load_dir is None:
             return
 
         self.wait_for_pending_save()
+        state: Dict[str, Any] = {
+            "model": self.trainer.model,
+            "optimizer": self.trainer.optimizer,
+            "extra_state": {},
+        }
         self.checkpointer.load(
             load_dir,
-            {
-                "model": self.trainer.model,
-                "optimizer": self.trainer.optimizer,
-                "lr_scheduler": self.trainer.lr_scheduler,
-            },
+            state,
             module=self.module_name,
             trainable_only=self.trainable_only,
             parallel_state=self.parallel_state,
         )
+        self._load_extra_state(state["extra_state"])
         dist.barrier()
         logger.info_rank0(f"Load distributed checkpoint from {load_dir} successfully!")
 
     def save_dcp(self, state: "TrainerState") -> None:
-        """Write model, optimizer and lr_scheduler for ``state.global_step``.
+        """Write model, optimizer and model-bound extra state for ``state.global_step``.
 
         Only model-bound state goes in here. Job-level state — where the
         dataloader is, the rng — has its own writer.
         """
+        extra_state = self._extra_state(state)
         helper.empty_cache()
         self.checkpointer.save(
             self.config.save_path,
             {
                 "model": self.trainer.model,
                 "optimizer": self.trainer.optimizer,
-                "lr_scheduler": self.trainer.lr_scheduler,
+                "extra_state": extra_state,
             },
             global_steps=state.global_step,
             module=self.module_name,
