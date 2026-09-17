@@ -26,9 +26,11 @@ This file itself is not runnable. It's used to generate the runnable explicitly 
 "generated/patched_modeling_gemma3_npu.py".
 """
 
+from dataclasses import dataclass
+
 import torch
 from transformers.cache_utils import Cache
-from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.models.gemma3.modeling_gemma3 import Gemma3CausalLMOutputWithPast
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
@@ -40,6 +42,7 @@ from veomni.models.transformers.gemma3.gemma3_gpu_patch_gen_config import (
     gemma3_textmodel_forward_patched,
 )
 from veomni.patchgen.patch_spec import PatchConfig
+from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 
 
 config = PatchConfig(
@@ -67,6 +70,18 @@ config.add_post_import_block(
     veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
     """
 )
+
+
+@config.add_helper_after("Gemma3CausalLMOutputWithPast")
+@dataclass
+class Gemma3CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Gemma3CausalLMOutputWithPast):
+    r"""
+    image_hidden_states (`torch.FloatTensor`, *optional*):
+        Image features returned by the vision encoder after projection.
+    fused_linear_aux (`FusedLinearAuxOutput`, *optional*):
+        Per-token tensors produced by the fused-linear loss path. This is
+        ``None`` on the plain loss path.
+    """
 
 
 # ── RMSNorm (OpSlot guard, NPU fused kernel) ───────────────────────────────
@@ -111,6 +126,21 @@ def apply_rotary_pos_emb_npu(
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+@config.override_method(
+    "Gemma3Model.__init__",
+    description="Construct the generated text tower instead of the upstream AutoModel class",
+)
+def gemma3_model_init_npu(self, config):
+    super().__init__(config)
+    self.vision_tower = AutoModel.from_config(config=config.vision_config)
+    self.multi_modal_projector = Gemma3MultiModalProjector(config)
+    self.vocab_size = config.text_config.vocab_size
+
+    # AutoModel resolves to the upstream class, bypassing the NPU patches.
+    self.language_model = Gemma3TextModel._from_config(config.text_config)
+    self.post_init()
 
 
 # ── Gemma3TextModel.forward (pass packed-sequence boundaries) ──────────────
@@ -160,7 +190,7 @@ def gemma3_for_conditional_generation_forward_npu(
     use_cache: bool | None = None,
     logits_to_keep: int | torch.Tensor = 0,
     **lm_kwargs: Unpack[TransformersKwargs],
-) -> CausalLMOutputWithPast:
+) -> Gemma3CausalLMOutputWithLogProbs:
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,
@@ -211,11 +241,12 @@ def gemma3_for_conditional_generation_forward_npu(
     else:
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-    return CausalLMOutputWithLogProbs(
+    return Gemma3CausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
         fused_linear_aux=fused_linear_aux,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
+        image_hidden_states=outputs.image_hidden_states,
     )

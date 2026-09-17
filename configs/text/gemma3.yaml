@@ -39,7 +39,7 @@ train:
   checkpoint:
     output_dir: gemma-3-270m-sft-tulu
     manager: dcp
-    save_steps: 10000
+    save_steps: 100
     save_epochs: 1
     save_hf_weights: true
   wandb:

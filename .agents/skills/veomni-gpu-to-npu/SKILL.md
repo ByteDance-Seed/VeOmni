@@ -1,441 +1,306 @@
 ---
 name: veomni-gpu-to-npu
-description: "Use this skill when migrating a VeOmni GPU model to Ascend NPU. The model must already train on VeOmni GPU (patchgen-generated GPU path exists). Covers: CUDA/GPU-specific dependency scanning, NPU backend selection (rms_norm / rotary / cross_entropy / attention / moe / swiglu), device-agnostic API verification, NPU patchgen config creation (mirroring the GPU config and adding OpSlot guards), training config adaptation, test creation, E2E smoke training, and accuracy/performance report generation. Use Gemma 3 as the reference implementation. Trigger: 'NPU migration', 'port model to NPU', 'Ascend support', 'add NPU patch'."
+description: "Migrate an existing VeOmni GPU model to Ascend NPU. Use when the GPU patchgen path already works and the task needs dependency scanning, NPU operator selection, patchgen, runtime configuration, tests, E2E accuracy comparison, or MFU evidence. Gemma 3 is the worked example."
 ---
 
-# VeOmni GPU→NPU Model Migration Skill
+# VeOmni GPU-to-NPU Migration
 
-Migrate a model that already has a working VeOmni GPU path
-(`veomni/models/transformers/<model>/<model>_gpu_patch_gen_config.py`) to
-Ascend NPU. The output is a fully functional NPU patchgen path: NPU
-patch config, generated modeling file, training config, E2E script,
-tests, and a practice report.
+Produce the smallest maintainable NPU implementation for a model that already
+trains through VeOmni's GPU path. Keep reusable procedure and evidence templates
+in this skill. Commit only artifacts required by the repository or issue; runtime
+configs, launch scripts, raw logs, plots, and reports may instead be attached to
+the PR when maintainers request a minimal model diff.
 
-**References (read first, load on demand):**
+Read these before changing code:
 
-- `docs/design/patchgen.md` — patchgen DSL, CLI, CI drift check
-- `docs/design/kernel_selection.md` — unified kernel registry, OpSlot dispatch
-- `docs/design/unified_kernel_registry.md` — per-op backend availability matrix
-- `.agents/knowledge/constraints.md` — hard constraints (never edit `generated/`, transformers v5.9.0, FSDP2)
-- `.agents/skills/veomni-new-model/SKILL.md` — new-model lifecycle (GPU path only)
-- `.agents/skills/veomni-migrate-transformers-v5/SKILL.md` — patchgen DSL reference
+- `.agents/knowledge/constraints.md`
+- `.agents/skills/veomni-patchgen-model/SKILL.md`
+- `docs/design/patchgen.md`
+- `docs/design/kernel_selection.md`
+- `.agents/knowledge/testing.md`
 
-**Reference implementations (study before starting):**
+Use `veomni/models/transformers/qwen3/`, `seed_oss/`, `qwen3_vl/`, and
+`qwen3_5/` as reference implementations. Gemma 3 under
+`veomni/models/transformers/gemma3/` is the dense text/VLM worked example.
 
-- `veomni/models/transformers/qwen3/` — OpSlot-guard pattern (GPU config has
-  OpSlot guards; NPU config mirrors GPU functions and re-registers them)
-- `veomni/models/transformers/seed_oss/` — direct-NPU-kernel pattern (NPU
-  config calls NPU kernels directly instead of going through OpSlot)
-- `veomni/models/transformers/gemma3/` — **the migration worked-example**
-  produced by this Skill
+## 1. Define The Deliverables
 
----
+Start by printing a file manifest split into two groups:
 
-## Phase 1: Pre-Migration Analysis
+1. Repository artifacts: NPU patch spec, generated `.py` and `.diff`, registry
+   dispatch, and any existing CI test that must be extended.
+2. Validation artifacts: exact commands, temporary config overrides, raw logs,
+   loss comparison, MFU calculation, plots, and environment metadata.
 
-### 1.1 Confirm GPU path exists
+Do not assume every validation artifact belongs in git. Follow the issue and
+maintainer direction. Never commit checkpoints, datasets, raw logs, local paths,
+one-off launch scripts, or generated plots unless explicitly requested.
 
-```bash
-ls veomni/models/transformers/<model>/
-# Must contain:
-#   __init__.py
-#   <model>_gpu_patch_gen_config.py
-#   generated/patched_modeling_<model>_gpu.py
-```
-
-If the GPU path does not exist, use the `veomni-new-model` skill first.
-
-### 1.2 Scan for CUDA/GPU-specific dependencies
-
-Search the GPU patch config, the generated GPU modeling file, and the
-upstream HF modeling source for device-specific code:
+Confirm the GPU path and pinned environment:
 
 ```bash
-# In the GPU patch config:
-rg "flash_attention\|flex_attention\|triton\|liger\|cuda\|\.cuda()\|is_cuda" \
-   veomni/models/transformers/<model>/<model>_gpu_patch_gen_config.py
-
-# In the generated GPU modeling:
-rg "flash_attention\|flex_attention\|triton\|liger\|cuda\|\.cuda()\|is_cuda" \
-   veomni/models/transformers/<model>/generated/patched_modeling_<model>_gpu.py
+python -c "import transformers; print(transformers.__version__)"
+rg -n "transformers==" pyproject.toml
+ls veomni/models/transformers/<model>/{__init__.py,*_gpu_patch_gen_config.py}
+ls veomni/models/transformers/<model>/generated/patched_modeling_*_gpu.py
 ```
 
-Document every finding in the migration report's "Dependency Scan" section.
+The installed Transformers version must equal the repository pin before
+running patchgen.
 
-### 1.3 Classify each op into an NPU backend category
+## 2. Audit GPU Assumptions
 
-For each fused op the GPU path uses, determine the NPU strategy:
-
-| Op (OpSlot name) | GPU backend | NPU backend | NPU kernel file |
-|---|---|---|---|
-| `rms_norm` | `liger_kernel` | `npu` | `veomni/ops/kernels/rms_norm/npu.py` |
-| `rotary_pos_emb` | `liger_kernel` | `npu` | `veomni/ops/kernels/rotary/npu.py` |
-| `cross_entropy_loss` | `liger_kernel` | `npu` / `chunk_loss` | `veomni/ops/kernels/cross_entropy/` |
-| `swiglu_mlp` | `liger_kernel` | **`eager`** (no NPU backend) | — |
-| `moe` | `fused_triton` | `fused_npu` | `veomni/ops/kernels/moe/npu_group_gemm.py` |
-| `load_balancing_loss` | `triton` | **`eager`** (no NPU backend) | — |
-| `attn_implementation` | `flex_attention` / `flash_attention_2` | `sdpa` / `eager` | — (PyTorch built-in via torch_npu) |
-
-> **Rule**: if no NPU backend exists, the field **must** be set to `"eager"`
-> in the NPU training config. The NPU validation tables in
-> `veomni/arguments/arguments_types.py` (`_NPU_ALLOWED`,
-> `_NPU_REQUIRED`, `_NPU_DEFAULT_FALLBACK`) enforce this at config-parse
-> time.
-
-### 1.4 Identify model-specific RMSNorm variants
-
-Some models use non-standard RMSNorm formulations:
-
-| Model family | Weight init | Formula | NPU handling |
-|---|---|---|---|
-| Qwen3, Llama, most | `ones` | `x * rsqrt(var+eps) * weight` | `standard_rms_norm_forward_npu(x, weight, eps)` |
-| Gemma 3 | **zeros** | `x * rsqrt(var+eps) * (1.0 + weight)` | Pass `1.0 + self.weight` to OpSlot |
-| Qwen3.5 | `zeros` | `x * rsqrt(var+eps) * (1.0 + weight)` | `qwen3_5_rms_norm_forward_npu(x, 1.0+weight, eps)` |
-
-Check the model's RMSNorm class:
-```bash
-rg "class.*RMSNorm" -A 15 generated/patched_modeling_<model>_gpu.py
-```
-
-Look for:
-- `self.weight = nn.Parameter(torch.zeros(dim))` → needs `1.0 + weight`
-- `self.weight = nn.Parameter(torch.ones(dim))` → standard
-- `self.variance_epsilon` vs `self.eps` → attribute name for epsilon
-
-### 1.5 Check attention implementation compatibility
+Scan the patch spec, generated model, upstream Transformers model, registry,
+and training config. Record each match and its NPU decision.
 
 ```bash
-rg "attn_implementation\|_attn_implementation\|ALL_ATTENTION_FUNCTIONS\|flex_attention\|BlockMask" \
-   generated/patched_modeling_<model>_gpu.py
+rg -n "cuda|triton|flash_attention|flex_attention|liger|is_cuda|\.cuda\(" \
+  veomni/models/transformers/<model> \
+  configs
+
+rg -n "OpSlot|ops_implementation|attn_implementation|RMSNorm|apply_rotary" \
+  veomni/models/transformers/<model> \
+  veomni/ops/kernels
 ```
 
-- **flex_attention** (BlockMask): CUDA-only. On NPU, use `sdpa` or `eager`.
-  The VeOmni masking-utils wrappers (`create_causal_mask`,
-  `create_sliding_window_causal_mask`) return tensor masks for `sdpa`/`eager`
-  and `BlockMask` for `flex_attention`, so the same forward code works on both
-  backends.
-- **flash_attention_2**: CUDA-only. Use `sdpa` on NPU.
-- **eager**: hardware-agnostic, works everywhere.
-- **model-specific attention** (e.g., DeepSeek sparse): check if an NPU path
-  exists; if not, use `eager`.
+For every operator, verify the live registry rather than relying on this table:
 
----
+| Operation | Typical GPU backend | Typical NPU choice |
+|---|---|---|
+| attention | `flex_attention` / flash attention | `sdpa` or `eager` |
+| RMSNorm | `liger_kernel` | `npu` when the formula matches |
+| rotary embedding | `liger_kernel` | `npu` |
+| causal cross entropy | `liger_kernel` | `npu`, `chunk_loss`, or `eager` |
+| SwiGLU | fused GPU backend | registered NPU backend or `eager` |
+| MoE | `fused_triton` | `fused_npu` |
+| load-balancing loss | `triton` | registered NPU backend or `eager` |
 
-## Phase 2: Create NPU Patchgen Config
+Also check device-neutral behavior: allocations must derive their device from
+inputs/parameters, no `.cuda()` calls may remain, dtype casts must preserve the
+model contract, and distributed collectives must use VeOmni's current parallel
+state APIs.
 
-### 2.1 Create the config file
+Model-specific normalization semantics are correctness-critical. Standard
+RMSNorm initializes weights to ones and passes `weight`; Gemma 3 initializes
+weights to zeros and computes with `1 + weight`, so its NPU kernel call must
+also receive `1 + self.weight`.
 
-Create `veomni/models/transformers/<model>/<model>_npu_patch_gen_config.py`.
+## 3. Implement The NPU Patch
 
-**Option A — OpSlot-guard pattern (preferred, like Qwen3):**
-
-The GPU config already has OpSlot guards with `use_non_eager_impl` checks.
-The NPU config imports the GPU config's patch functions and re-registers
-them with the NPU target file, adding NPU-specific OpSlot declarations:
+Prefer an NPU sibling patch spec that reuses the GPU patch bodies and changes
+only device-specific operators:
 
 ```python
 from veomni.models.transformers.<model>.<model>_gpu_patch_gen_config import (
-    # ... import all patch functions from GPU config ...
+    config as gpu_config,
+    <shared_patch_function>,
 )
-from veomni.models.transformers.<model>.<model>_gpu_patch_gen_config import config as gpu_config
 from veomni.patchgen.patch_spec import PatchConfig
 
 config = PatchConfig(
     source_module="transformers.models.<model>.modeling_<model>",
     target_file="patched_modeling_<model>_npu.py",
-    description="<Model> with VeOmni NPU fused-operator replacements",
+    description="<Model> with VeOmni NPU operator replacements",
 )
-
-# Mirror GPU config's imports, helpers, post-import blocks, dropped names
 config.additional_imports.extend(gpu_config.additional_imports)
 config.post_import_blocks.extend(gpu_config.post_import_blocks)
 config.helpers.extend(gpu_config.helpers)
 config.drop_imported_names.update(gpu_config.drop_imported_names)
-
-# Add NPU-specific OpSlot declarations (if GPU config doesn't already have them)
-config.add_post_import_block("""
-    from veomni.ops.dispatch import OpSlot
-    veomni_rms_norm = OpSlot("rms_norm", "standard")
-    veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
-    """)
-
-# Re-register each patched method/function with the same replacement
-config.override_method("<Model>RMSNorm.forward", replacement=<rmsnorm_patched>, description="...")
-config.replace_function("apply_rotary_pos_emb", replacement=<rotary_patched>, description="...")
-config.override_method("<Model>ForCausalLM.forward", replacement=<forcausallm_patched>, description="...")
 ```
 
-**Option B — Direct NPU kernel pattern (like SeedOss):**
-
-When the GPU config does NOT use OpSlot guards, the NPU config defines its
-own patch functions that call NPU kernels directly:
+Use an `OpSlot` guard when eager fallback is meaningful on CPU/GPU tests:
 
 ```python
-@config.override_method("<Model>RMSNorm.forward", description="Use NPU fused RMSNorm")
-def rmsnorm_forward_npu(self, x):
-    from veomni.ops.kernels.rms_norm.npu import rms_norm_forward_npu
-    return rms_norm_forward_npu(self, x)
-```
-
-> **Choose Option A** when the GPU config already has OpSlot guards (the
-> guards fall through to eager code when no NPU kernel is bound, giving
-> correct CPU-test behavior). **Choose Option B** when the GPU config has
-> no OpSlot guards and you need explicit NPU kernel dispatch.
-
-### 2.2 Handle model-specific RMSNorm
-
-If the model uses the Gemma `(1.0 + weight)` formulation, the OpSlot guard
-must pass `1.0 + self.weight` and use `self.eps` (not `self.variance_epsilon`):
-
-```python
-@config.override_method("Gemma3RMSNorm.forward", description="...")
+@config.override_method("<Model>RMSNorm.forward", description="Use NPU RMSNorm through OpSlot")
 def rmsnorm_forward_npu(self, x):
     if veomni_rms_norm.use_non_eager_impl:
-        return veomni_rms_norm(x, 1.0 + self.weight, self.eps)  # Gemma offset
-    # Original HF code below, unchanged.
-    ...
+        return veomni_rms_norm(x, self.weight, self.variance_epsilon)
+    return <upstream eager implementation>
 ```
 
-### 2.3 Wire `__init__.py` for NPU dispatch
+Use a direct NPU kernel only when the surrounding model family already uses
+that pattern and CPU fallback is not required. Do not duplicate a GPU patch
+body merely to change its target file.
 
-Update `veomni/models/transformers/<model>/__init__.py` to select NPU vs GPU
-generated file at import time:
+Update `__init__.py` at import time:
 
 ```python
 from ....utils.device import IS_NPU_AVAILABLE
-from ...loader import MODELING_REGISTRY
 
-@MODELING_REGISTRY.register("<model_type>")
-def register_<model>_modeling(architecture: str | None):
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_<model>_npu import <Model>ForCausalLM, <Model>Model
-    else:
-        from .generated.patched_modeling_<model>_gpu import <Model>ForCausalLM, <Model>Model
-    ...
+if IS_NPU_AVAILABLE:
+    from .generated.patched_modeling_<model>_npu import <classes>
+else:
+    from .generated.patched_modeling_<model>_gpu import <classes>
 ```
 
-For **VLM** models (e.g. `gemma3`, `qwen3_vl`) the model class is
-`<Model>ForConditionalGeneration` paired with `<Model>Model`. Register a
-**second** `model_type` and dispatch both classes:
+Register every supported `model_type`. A VLM commonly needs a second registry
+entry for the multimodal wrapper in addition to its text backbone. Preserve the
+existing architecture fallback behavior.
 
-```python
-@MODELING_REGISTRY.register("<model>")          # VLM model_type
-def register_<model>_modeling(architecture: str):
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_<model>_npu import (
-            <Model>ForConditionalGeneration, <Model>Model,
-        )
-    else:
-        from .generated.patched_modeling_<model>_gpu import (
-            <Model>ForConditionalGeneration, <Model>Model,
-        )
-    if "ForConditionalGeneration" in architecture:
-        return <Model>ForConditionalGeneration
-    if "Model" in architecture:
-        return <Model>Model
-    return <Model>ForConditionalGeneration
-```
+For multimodal models, separately audit the vision/audio tower, placeholder
+masks, packed metadata, sequence-parallel boundaries, and the outer
+`ForConditionalGeneration.forward`. Read
+`.agents/skills/veomni-patchgen-model/references/multimodal.md` before changing
+those paths.
 
-### 2.4 Generate the NPU modeling file
+Generate files; never edit `generated/` by hand:
 
 ```bash
 patchgen veomni.models.transformers.<model>.<model>_npu_patch_gen_config \
   -o veomni/models/transformers/<model>/generated --diff -v
+git diff --check
 ```
 
-### 2.5 Verify drift gate
+Then rerun the same command and assert it leaves the generated files unchanged.
+
+## 4. Configure Without Committing A Config
+
+Start from the existing GPU YAML and override only hardware-specific values at
+launch. Adapt field paths to the current argument schema:
 
 ```bash
-patchgen --check
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash train.sh tasks/train_text.py configs/text/<model>.yaml \
+  --model.model_path /path/to/model \
+  --data.train_path /path/to/data \
+  --model.ops_implementation.attn_implementation sdpa \
+  --model.ops_implementation.rms_norm_implementation npu \
+  --model.ops_implementation.rotary_pos_emb_implementation npu \
+  --model.ops_implementation.cross_entropy_loss_implementation npu \
+  --model.accelerator.ulysses_size 1 \
+  --train.max_steps 20 \
+  --train.checkpoint.save_steps 0 \
+  --train.checkpoint.save_hf_weights false \
+  --train.checkpoint.output_dir /tmp/<model>-npu-smoke
 ```
 
-Must exit 0 (no drift between checked-in and freshly generated files).
+Validate backend availability with the current operator registry. Use `eager`
+for an unsupported fused operator. If the model enables logit soft-capping,
+confirm whether the selected fused loss implements it; otherwise select
+`chunk_loss` or `eager`.
 
-If the model is a VLM (`ForConditionalGeneration`), add a
-`<Model>ForConditionalGeneration.forward` patch that mirrors the GPU override
-and threads VeOmni's fused-CE OpSlot through the multimodal forward. Reuse the
-GPU patch function when possible.
+## 5. Validate In Layers
 
-```python
-register_override(
-    "<Model>ForConditionalGeneration.forward",
-    replacement=<model>_for_conditional_generation_forward_patched,
-    description="VLM forward with fused cross-entropy via OpSlot",
-)
-```
-
-**Vision tower** — most vision encoders (e.g. SiglipVisionModel) work with
-`eager`/`sdpa` attention and need **no** NPU-specific patches. If the vision
-tower has custom CUDA kernels (e.g. Qwen3-VL's window-attention / RoPE), add
-OpSlot guards or direct-NPU-kernel replacements for those methods, mirroring
-the text-side patterns. See `qwen3_vl_npu_patch_gen_config.py` for a full
-vision-tower example (vision attention, block, RoPE, dummy_forward).
-
-**FLOPS for MFU** — VLM FLOPS must include the vision tower. Add a model-specific
-estimator in `veomni/utils/count_flops.py` that sums the text-config FLOPS and
-the vision-encoder FLOPS, and register it under the VLM `model_type`.
-
----
-
-## Phase 3: Create NPU Training Config
-
-Create `configs/text/<model>_npu.yaml` (or `configs/multimodal/...` for VLMs).
-
-Base it on the GPU config, then override `ops_implementation`:
-
-```yaml
-model:
-  model_path: <same as GPU>
-  ops_implementation:
-    attn_implementation: sdpa          # or eager; never flex_attention/flash on NPU
-    rms_norm_implementation: npu       # if NPU backend exists, else eager
-    rotary_pos_emb_implementation: npu # if NPU backend exists, else eager
-    swiglu_mlp_implementation: eager   # no NPU backend
-    cross_entropy_loss_implementation: npu  # or chunk_loss
-```
-
-Other config changes:
-- `init_device: meta` — required for FSDP2 (same as GPU)
-- `ulysses_size` — set to 1 unless SP has been validated on NPU for this model
-- `checkpoint.output_dir` — suffix with `_npu` to distinguish from GPU runs
-- `wandb.name` — suffix with `_npu`
-
-If the model has `final_logit_softcapping` (e.g., Gemma 3 4B/12B/27B), the
-fused-linear cross-entropy path raises — use
-`cross_entropy_loss_implementation: chunk_loss` or `eager` instead.
-
----
-
-## Phase 4: Create Tests
-
-Create `tests/models/test_<model>_npu.py` with:
-
-1. **Import/structure tests** — verify NPU modeling module exposes expected
-   classes and OpSlot declarations
-2. **OpSlot guard verification** — inspect patched method source to confirm
-   guards use the correct NPU dispatch pattern (e.g., `1.0 + self.weight` for
-   Gemma-style RMSNorm)
-3. **Forward/backward tests** — build model with NPU ops config (using eager
-   fallback on non-NPU hardware), verify loss > 0, gradients flow, loss
-   decreases over a few steps
-4. **RMSNorm parity test** — verify the OpSlot-guarded RMSNorm (eager
-   fallback) matches HF upstream output
-
-Tests run on any backend because OpSlot guards fall through to eager HF code
-when no fused kernel is bound (e.g., on CPU in CI).
-
----
-
-## Phase 5: Create E2E Script
-
-Create `scripts/e2e/<model>_npu_e2e.sh`:
+Run the narrowest useful checks first:
 
 ```bash
-#!/bin/bash
-set -euo pipefail
-# ... NPU device detection (ASCEND_RT_VISIBLE_DEVICES / /dev/davinci*) ...
-# ... PYTORCH_NPU_ALLOC_CONF, MULTI_STREAM_MEMORY_REUSE env vars ...
+python -m py_compile \
+  veomni/models/transformers/<model>/<model>_npu_patch_gen_config.py \
+  veomni/models/transformers/<model>/generated/patched_modeling_<model>_npu.py
 
-torchrun \
-  --nnodes=$NNODES \
-  --nproc-per-node=$NPROC_PER_NODE \
-  tasks/train_text.py \
-  --config configs/text/<model>_npu.yaml \
-  --train.max_steps $MAX_STEPS
+python -c "import veomni.models.transformers.<model>.generated.patched_modeling_<model>_npu"
+make quality
 ```
 
-The E2E script should:
-- Auto-detect NPU count
-- Set NPU-specific environment variables
-- Run a short smoke training (default 20 steps)
-- Log output to `<model>_npu_e2e.log`
+Extend an existing CI-enumerated test when practical. Test at least:
 
----
+- generated module import and expected classes;
+- NPU/GPU registry dispatch;
+- fused-op guard and eager fallback parity;
+- forward/backward with finite loss and gradients;
+- patchgen reproducibility.
 
-## Phase 6: Write Practice Report
+If no repository test is added because the requested diff is model-and-skill
+only, say so explicitly in the PR and provide the exact commands and observed
+results. Hardware E2E evidence does not replace import and quality checks.
 
-Create `docs/npu_migration/<model>_npu_practice_report.md` using the template
-in `docs/npu_migration/report_template.md`. The report must include:
+## 6. E2E Accuracy Protocol
 
-1. **Model overview** — architecture, size, attention type
-2. **Dependency scan results** — every CUDA/GPU-specific dependency found
-3. **NPU backend selection table** — per-op backend mapping
-4. **Files created/modified** — complete file list with descriptions
-5. **Test results** — test pass/fail, coverage
-6. **E2E results** — loss curve, training stability
-7. **Accuracy comparison** — NPU vs GPU loss curves (same model, data, config)
-8. **Performance** — MFU calculation, seq length, batch size, hardware spec
-9. **Issues encountered** — and how they were resolved
+Run GPU and NPU with the same model checkpoint, ordered dataset, seed, batch
+sizes, sequence length, optimizer, learning-rate schedule, precision, and step
+count. Only hardware operator choices should differ. Disable checkpoint saves
+for measurement runs.
 
----
+Record per step:
 
-## NPU-Specific Pitfalls
+- loss and gradient norm;
+- effective tokens and step time;
+- allocated/reserved memory;
+- any NaN, Inf, OOM, hang, or retry.
 
-1. **`flex_attention` is CUDA-only** — the `BlockMask` type is not available
-   on NPU. Use `sdpa` or `eager`. The VeOmni masking-utils wrappers handle
-   the mask-type difference automatically.
+Report the first loss, final loss, mean loss, and a clearly defined alignment
+metric. Symmetric relative error is robust near zero:
 
-2. **Gemma-style RMSNorm** — Gemma models initialise `weight` to zeros and
-   use `(1.0 + weight)`. The NPU `npu_rms_norm` kernel takes the weight
-   directly, so pass `1.0 + self.weight`. The attribute name is `self.eps`
-   (not `self.variance_epsilon`).
+```text
+relative_error(a, b) = 2 * abs(a - b) / (abs(a) + abs(b) + 1e-12)
+```
 
-3. **`final_logit_softcapping`** — Gemma 3 (4B+) uses logit softcapping
-   (tanh). The fused-linear cross-entropy path does not support this; use
-   `chunk_loss` or `eager` for the loss implementation.
+State the acceptance threshold before interpreting the result. Plot both loss
+series against optimizer step using Python/matplotlib, upload the image to the
+PR, and keep the raw logs outside git.
 
-4. **No NPU backend for SwiGLU MLP** — must use `swiglu_mlp_implementation:
-   eager`. There is no OpSlot guard needed in the NPU patch for MLP; the HF
-   default code runs as-is.
+## 7. MFU Protocol
 
-5. **No NPU backend for load-balancing loss** — must use
-   `load_balancing_loss_implementation: eager` (Triton kernel is CUDA-only).
+Measure after compilation/warmup and exclude initialization, checkpointing,
+evaluation, and cache-cleanup outliers. Report median step time and effective
+tokens/s over the stated window.
 
-6. **Ulysses sequence parallel** — set `ulysses_size: 1` unless SP has been
-   validated on NPU for this specific model. The transport helpers
-   (all-to-all head/sequence exchange) are backend-agnostic but may not have
-   been tested with this model's attention structure on NPU.
+Use a model-appropriate training FLOP formula. For a dense decoder, document
+linear-layer forward/backward FLOPs plus attention-score FLOPs; for sliding
+window attention, use the actual window for those layers. For VLMs include the
+vision tower only when it is trained. Then calculate:
 
-7. **Generated files** — never edit files under `generated/` manually. Edit
-   the `*_npu_patch_gen_config.py` and re-run `patchgen`.
+```text
+achieved_FLOP/s = training_FLOPs_per_step / median_step_time
+MFU = achieved_FLOP/s / (device_count * peak_BF16_FLOP/s_per_device)
+```
 
-8. **NPU validation tables** — `veomni/arguments/arguments_types.py` has
-   `_NPU_ALLOWED`, `_NPU_REQUIRED`, and `_NPU_DEFAULT_FALLBACK` dicts that
-   validate ops at config-parse time. If a new op needs NPU support, it must
-   be added to these tables.
+The PR must name the accelerator, device count, peak value source, model,
+precision, sequence length, global/micro batch size, warmup/exclusion window,
+formula, achieved throughput, and MFU. Do not add a shared FLOPs estimator only
+to display one acceptance result; change shared infrastructure only when the
+runtime feature itself requires it and add focused tests.
 
-9. **VLM `ForConditionalGeneration.forward`** — the multimodal forward is
-   **not** patched by the GPU text-only config. The NPU config must add its
-   own `ForConditionalGeneration.forward` override that threads the fused-CE
-   OpSlot, otherwise the VLM path runs the upstream HF loss (no fused CE).
+## 8. PR Evidence Template
 
-10. **Vision tower kernels** — SiglipVisionModel works without NPU patches,
-    but models with custom CUDA vision kernels (Qwen3-VL) need per-method
-    OpSlot guards. Always scan the vision encoder for `flash_attention`,
-    `triton`, or `cuda` references.
+Put this material in the PR body (or a requested report), aligned one-to-one
+with the issue acceptance criteria:
 
-11. **Logit softcapping** — some VLMs use `final_logit_softcapping` (tanh).
-    The fused-linear-CE path does not support it; use `chunk_loss`/`eager`.
+```markdown
+### Migration scope
+- Dependency scan: <findings and decisions>
+- Repository files: <minimal file list>
+- Reproduction commands: <GPU and NPU commands>
 
----
+### Accuracy
+| Metric | GPU | NPU | Difference |
+|---|---:|---:|---:|
+| First loss | | | |
+| Final loss | | | |
+| Mean loss | | | |
 
-## Quick Checklist
+<uploaded loss curve>
 
-- [ ] GPU path exists and trains successfully
-- [ ] CUDA/GPU-specific dependencies scanned and documented
-- [ ] NPU backend selected for each op (or `eager` fallback)
-- [ ] Model-specific RMSNorm variant identified (standard vs Gemma offset)
-- [ ] Attention backend chosen (`sdpa` or `eager`, never `flex_attention`)
-- [ ] `<model>_npu_patch_gen_config.py` created
-- [ ] `__init__.py` updated with `IS_NPU_AVAILABLE` dispatch
-- [ ] NPU modeling file generated via `patchgen`
-- [ ] `patchgen --check` passes (no drift)
-- [ ] `configs/text/<model>_npu.yaml` created
-- [ ] `tests/models/test_<model>_npu.py` created and passing
-- [ ] `scripts/e2e/<model>_npu_e2e.sh` created
-- [ ] **VLM only**: second `model_type` + `ForConditionalGeneration` dispatch in `__init__.py`
-- [ ] **VLM only**: `ForConditionalGeneration.forward` patch in NPU config
-- [ ] **VLM only**: vision tower scanned / patched if needed
-- [ ] **VLM only**: FLOPS estimator includes vision tower (MFU correct)
-- [ ] Practice report written from template
-- [ ] `make quality` passes (ruff check + format)
+### Performance
+| Item | Value |
+|---|---:|
+| Hardware / devices | |
+| Model / precision | |
+| Sequence / global / micro batch | |
+| Measurement window | |
+| Median step time / tokens per second | |
+| FLOPs formula / peak per device | |
+| MFU | |
+
+### Verification
+- `patchgen ...`: PASS
+- `python -m py_compile ...`: PASS
+- `make quality`: PASS
+- NPU E2E: PASS, <steps>, no runtime errors
+```
+
+## Completion Checklist
+
+- [ ] GPU baseline and pinned Transformers version confirmed
+- [ ] CUDA/GPU-only dependencies classified
+- [ ] Device-neutral APIs and distributed assumptions checked
+- [ ] NPU backends verified in the live registry
+- [ ] Model-specific normalization/loss semantics preserved
+- [ ] Patch spec, generated files, and import-time dispatch implemented
+- [ ] Text and multimodal model types covered as applicable
+- [ ] Patchgen rerun is reproducible
+- [ ] Import, quality, and focused correctness checks pass
+- [ ] GPU/NPU E2E uses matched inputs and hyperparameters
+- [ ] Loss curve and numerical comparison reported
+- [ ] MFU setup, formula, peak hardware value, and result reported
+- [ ] PR diff contains no configs, scripts, logs, datasets, plots, or checkpoints unless requested

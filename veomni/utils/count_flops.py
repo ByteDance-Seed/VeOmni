@@ -107,8 +107,6 @@ class VeomniFlopsCounter:
             "qwen3_5_moe_text": self._estimate_qwen3_5_family_flops,
             "qwen4_exp": self._estimate_qwen4_exp_flops,
             "gpt_oss": self._estimate_gpt_oss_flops,
-            "gemma3_text": self._estimate_gemma3_text_flops,
-            "gemma3": self._estimate_gemma3_flops,
         }
 
         self.config = config
@@ -594,86 +592,6 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
-    def _estimate_gemma3_text_flops(
-        self,
-        tokens_sum,
-        batch_seqlens,
-        delta_time,
-        lora_config=None,
-    ):
-        """Estimate Gemma 3 text-only training FLOPs.
-
-        Gemma 3 uses SwiGLU MLP (gate + up + down), GQA attention, and an alternating
-        schedule of sliding-window and full attention layers, structurally similar to
-        GPT-OSS attention but dense (no MoE). The RMSNorm q/k projections are negligible.
-        """
-        config = self.config
-        hidden_size = config.hidden_size
-        vocab_size = config.vocab_size
-        intermediate_size = config.intermediate_size
-        num_hidden_layers = config.num_hidden_layers
-        num_key_value_heads = config.num_key_value_heads
-        num_attention_heads = config.num_attention_heads
-        head_dim = getattr(config, "head_dim", hidden_size // num_attention_heads)
-
-        q_size = num_attention_heads * head_dim
-        k_size = num_key_value_heads * head_dim
-        v_size = num_key_value_heads * head_dim
-
-        mlp_N = hidden_size * intermediate_size * 3
-        attn_linear_N = hidden_size * (q_size + k_size + v_size + q_size)
-        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
-        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
-        dense_N_flops = 6 * dense_N * tokens_sum
-
-        layer_types = getattr(config, "layer_types", None)
-        if layer_types is None:
-            num_full_attn_layers = num_hidden_layers
-            num_sliding_attn_layers = 0
-        else:
-            num_full_attn_layers = sum(t == "full_attention" for t in layer_types)
-            num_sliding_attn_layers = sum(t == "sliding_attention" for t in layer_types)
-
-        full_attn_score_sum = sum(seqlen * seqlen for seqlen in batch_seqlens)
-        sliding_window = getattr(config, "sliding_window", None)
-        sliding_attn_score_sum = (
-            self._compute_sliding_attention_score_sum(batch_seqlens, sliding_window)
-            if num_sliding_attn_layers > 0 and sliding_window
-            else 0
-        )
-        attn_score_sum = full_attn_score_sum * num_full_attn_layers + sliding_attn_score_sum * num_sliding_attn_layers
-        attn_qkv_flops = 12 * attn_score_sum * head_dim * num_attention_heads
-
-        flops_all_token = dense_N_flops + attn_qkv_flops
-        flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
-        return flops_achieved
-
-    def _estimate_gemma3_flops(
-        self,
-        tokens_sum,
-        batch_seqlens,
-        delta_time,
-        lora_config=None,
-        **kargs,
-    ):
-        """Estimate Gemma 3 VLM training FLOPs (text + vision tower)."""
-        text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
-        text_flops_counter = VeomniFlopsCounter(text_config)
-        text_flops = text_flops_counter._estimate_gemma3_text_flops(
-            tokens_sum, batch_seqlens, delta_time, lora_config=lora_config
-        )
-        images_seqlens = kargs.get("images_seqlens", None)
-        if images_seqlens:
-            vit_flops = self._estimate_siglip_vit_flops(
-                images_seqlens,
-                self.config.vision_config,
-                lora_config=lora_config,
-                freeze_vit=kargs.get("freeze_vit", False),
-            )
-        else:
-           vit_flops = 0
-        return text_flops + vit_flops / 1e12
-
     def _estimate_qwen2_flops(
         self,
         tokens_sum,
@@ -1024,49 +942,6 @@ class VeomniFlopsCounter:
         vit_flops = dense_N_flops + attn_qkv_flops
 
         return vit_flops
-
-    def _estimate_siglip_vit_flops(
-        self,
-        images_seqlens,
-        config,
-        lora_config=None,
-        freeze_vit=False,
-    ):
-        """Estimate FLOPs of the SiglipVisionModel vision tower used by Gemma 3.
-
-        SiglipViT uses full self-attention (no window attention), GELU MLP
-        (fc1 + fc2, factor 2 not 3), LayerNorm (not RMSNorm), and a
-        multi-head attention pooling head at the end.
-        """
-        if config is None:
-            return 0
-        tokens_sum = sum(images_seqlens)
-
-        hidden_size = config.hidden_size
-        intermediate_size = config.intermediate_size
-        num_heads = config.num_attention_heads
-        depth = config.num_hidden_layers
-        head_dim = hidden_size // num_heads
-
-        # SiglipMLP: fc1 (hidden->intermediate) + fc2 (intermediate->hidden), GELU -> factor 2
-        mlp_N = hidden_size * intermediate_size * 2
-        # q/k/v/o projections, all hidden->hidden
-        attn_linear_N = hidden_size * (4 * hidden_size)
-        # patch embedding conv + multi_modal_projector are negligible vs ViT body
-        dense_N = (mlp_N + attn_linear_N) * depth
-
-        if lora_config is None and freeze_vit:
-            dense_N_flops = 2 * dense_N * tokens_sum
-        elif lora_config is not None:
-            dense_N_flops = 4 * dense_N * tokens_sum
-        else:
-            dense_N_flops = 6 * dense_N * tokens_sum
-
-        attention_factor = 4 if freeze_vit else 12
-        seqlen_square_sum = sum(seqlen * seqlen for seqlen in images_seqlens)
-        attn_qkv_flops = attention_factor * seqlen_square_sum * head_dim * num_heads * depth
-
-        return dense_N_flops + attn_qkv_flops
 
     @staticmethod
     def _compute_hybrid_attn_params(config, full_attention_types=("full_attention",)):
