@@ -59,6 +59,8 @@
 #      Bind instance-local attention VeomniOp
 #    - init_modification: Qwen3_5Attention
 #      Bind instance-local rope and attention VeomniOps
+#    - method_override: Qwen3_5VisionAttention.forward
+#      Read pre-computed `vision_max_seqlen` (Python int) from kwargs to avoid the per-block host sync that flash_attn_varlen_func incurs when `max_length_q/k` are 0-D device tensors.
 #    - method_override: Qwen3_5Attention.forward
 #      Always call the local rope and attention VeomniOps
 #
@@ -102,14 +104,13 @@ from transformers.modeling_outputs import (
     SequenceClassifierOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import (
     accepts_precomputed_kwargs,
-    get_max_seqlen,
     is_flash_attention_requested,
     maybe_autocast,
     merge_with_config_defaults,
@@ -127,7 +128,7 @@ from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAu
 
 
 # Additional import blocks for patches
-_VEOMNI_VISION_ATTENTION_PATCHED = False
+_VEOMNI_VISION_ATTENTION_PATCHED = True
 
 
 # ======================================================================
@@ -1187,7 +1188,7 @@ def apply_rotary_pos_emb_vision(
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5VisionAttention
-# Methods patched: __init__
+# Methods patched: forward, __init__
 # ======================================================================
 
 
@@ -1212,8 +1213,8 @@ class Qwen3_5VisionAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        rotary_pos_emb: torch.Tensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        max_seqlen: int | None = None,
         **kwargs,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
@@ -1227,14 +1228,15 @@ class Qwen3_5VisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
         if is_flash_attention_requested(self.config):
-            # Flash Attention: Use cu_seqlens for variable length attention
-            max_seqlen = get_max_seqlen(cu_seqlens, self.config, kwargs={"max_seqlen": max_seqlen})
-            attn_output, _ = attention_interface(
+            # Modification: prefer the int max_seqlen pre-computed once in
+            # Qwen3_5VisionModel.forward (Patch.5). Fall back to the original
+            # GPU-side reduction so this method still works when the model forward
+            # has not been patched (e.g. external callers, unit tests).
+            max_seqlen = kwargs.pop("vision_max_seqlen", None)
+            if max_seqlen is None:
+                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            attn_output, _ = self.veomni_attn(
                 self,
                 query_states,
                 key_states,
@@ -1250,6 +1252,9 @@ class Qwen3_5VisionAttention(nn.Module):
                 **kwargs,
             )
         else:
+            # Modification: drop `vision_max_seqlen` from kwargs before falling through
+            # to the non-FA path so it doesn't reach kernels that don't expect it.
+            kwargs.pop("vision_max_seqlen", None)
             # Other implementations: Process each chunk separately
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
             splits = [
@@ -1257,7 +1262,7 @@ class Qwen3_5VisionAttention(nn.Module):
             ]
 
             attn_outputs = [
-                attention_interface(
+                self.veomni_attn(
                     self,
                     q,
                     k,
@@ -1611,10 +1616,8 @@ class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
         # recompute when the key is absent (so non-VeOmni callers keep working).
         # Gate is two-pronged:
         #   (a) `_VEOMNI_VISION_ATTENTION_PATCHED` — set per generated file. True
-        #       only in GPU generated files where the consumer override is
-        #       registered. NPU configs inject False because they reuse upstream
-        #       HF Qwen3_5VisionAttention.forward, which recomputes max_seqlen and
-        #       would leak the unused kwarg into `attention_interface(**kwargs)`.
+        #       when Qwen3_5VisionAttention.forward is patched to consume
+        #       ``vision_max_seqlen``. GPU and NPU both register that consumer.
         #   (b) `is_flash_attention_requested(self.config)` — only FA's
         #       `flash_attn_varlen_func` benefits from the int hand-off; eager
         #       and sdpa paths in the consumer pop+discard the kwarg, so the

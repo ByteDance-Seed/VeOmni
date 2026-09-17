@@ -116,12 +116,8 @@ config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
 )
-# True in GPU generated files, False in NPU. Read by qwen3_5_vision_model_forward
-# (Patch.5) to gate the host sync: the int hand-off to flash_attn_varlen_func
-# only pays off when Qwen3_5VisionAttention.forward has been patched to consume
-# the kwarg. Only the GPU patch configs register that override; the NPU
-# configs reuse the upstream HF body which recomputes max_seqlen itself and
-# would otherwise leak `vision_max_seqlen` into `attention_interface(**kwargs)`.
+# True when Qwen3_5VisionAttention.forward is patched to consume
+# ``vision_max_seqlen``. GPU and NPU both register that consumer.
 config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = True")
 
 
@@ -140,9 +136,8 @@ ALL_ATTENTION_FUNCTIONS = None
 eager_attention_forward = None
 apply_rotary_pos_emb_vision = None
 is_flash_attention_requested = None
-# Sentinel injected via add_post_import_block. True only in the GPU generated
-# files where Qwen3_5VisionAttention.forward is patched to consume
-# `vision_max_seqlen`. NPU configs inject False — see Patch.5 below.
+# Sentinel injected via add_post_import_block. True when
+# Qwen3_5VisionAttention.forward is patched to consume ``vision_max_seqlen``.
 _VEOMNI_VISION_ATTENTION_PATCHED = True
 
 
@@ -848,10 +843,8 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
     # recompute when the key is absent (so non-VeOmni callers keep working).
     # Gate is two-pronged:
     #   (a) `_VEOMNI_VISION_ATTENTION_PATCHED` — set per generated file. True
-    #       only in GPU generated files where the consumer override is
-    #       registered. NPU configs inject False because they reuse upstream
-    #       HF Qwen3_5VisionAttention.forward, which recomputes max_seqlen and
-    #       would leak the unused kwarg into `attention_interface(**kwargs)`.
+    #       when Qwen3_5VisionAttention.forward is patched to consume
+    #       ``vision_max_seqlen``. GPU and NPU both register that consumer.
     #   (b) `is_flash_attention_requested(self.config)` — only FA's
     #       `flash_attn_varlen_func` benefits from the int hand-off; eager
     #       and sdpa paths in the consumer pop+discard the kwarg, so the
@@ -949,8 +942,6 @@ def qwen3_5_vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = self.veomni_attn
-
     if is_flash_attention_requested(self.config):
         # Modification: prefer the int max_seqlen pre-computed once in
         # Qwen3_5VisionModel.forward (Patch.5). Fall back to the original
@@ -959,7 +950,7 @@ def qwen3_5_vision_attention_forward_patched(
         max_seqlen = kwargs.pop("vision_max_seqlen", None)
         if max_seqlen is None:
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-        attn_output, _ = attention_interface(
+        attn_output, _ = self.veomni_attn(
             self,
             query_states,
             key_states,
@@ -983,7 +974,7 @@ def qwen3_5_vision_attention_forward_patched(
         splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
 
         attn_outputs = [
-            attention_interface(
+            self.veomni_attn(
                 self,
                 q,
                 k,

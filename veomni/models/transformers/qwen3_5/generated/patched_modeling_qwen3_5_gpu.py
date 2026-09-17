@@ -1255,8 +1255,6 @@ class Qwen3_5VisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = self.veomni_attn
-
         if is_flash_attention_requested(self.config):
             # Modification: prefer the int max_seqlen pre-computed once in
             # Qwen3_5VisionModel.forward (Patch.5). Fall back to the original
@@ -1265,7 +1263,7 @@ class Qwen3_5VisionAttention(nn.Module):
             max_seqlen = kwargs.pop("vision_max_seqlen", None)
             if max_seqlen is None:
                 max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-            attn_output, _ = attention_interface(
+            attn_output, _ = self.veomni_attn(
                 self,
                 query_states,
                 key_states,
@@ -1291,7 +1289,7 @@ class Qwen3_5VisionAttention(nn.Module):
             ]
 
             attn_outputs = [
-                attention_interface(
+                self.veomni_attn(
                     self,
                     q,
                     k,
@@ -1645,10 +1643,8 @@ class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
         # recompute when the key is absent (so non-VeOmni callers keep working).
         # Gate is two-pronged:
         #   (a) `_VEOMNI_VISION_ATTENTION_PATCHED` — set per generated file. True
-        #       only in GPU generated files where the consumer override is
-        #       registered. NPU configs inject False because they reuse upstream
-        #       HF Qwen3_5VisionAttention.forward, which recomputes max_seqlen and
-        #       would leak the unused kwarg into `attention_interface(**kwargs)`.
+        #       when Qwen3_5VisionAttention.forward is patched to consume
+        #       ``vision_max_seqlen``. GPU and NPU both register that consumer.
         #   (b) `is_flash_attention_requested(self.config)` — only FA's
         #       `flash_attn_varlen_func` benefits from the int hand-off; eager
         #       and sdpa paths in the consumer pop+discard the kwarg, so the

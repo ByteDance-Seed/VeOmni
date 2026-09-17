@@ -28,6 +28,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_vision_attention_forward_patched,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_rot_pos_emb,
@@ -120,11 +121,9 @@ gather_seq_scatter_heads = None
 gather_heads_scatter_seq = None
 gather_outputs = None
 slice_input_tensor = None
-# Mirror the qwen3_5 NPU sentinel: this NPU config reuses
-# qwen3_5_vision_model_forward (Patch.5) but does NOT register the
-# Qwen3_5MoeVisionAttention.forward consumer. False suppresses the host sync
-# and kwarg leak — see qwen3_5_gpu_patch_gen_config.py Patch.5 for rationale.
-config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = False")
+# Same GPU VisionAttention.forward consumer: bind ``self.veomni_attn`` via
+# ``adopt_init_modifications`` and call it from the patched forward.
+config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = True")
 
 
 # Register the multimodal helpers used by the reused get_position_id_func /
@@ -415,6 +414,15 @@ config.override_method(
 )
 
 config.adopt_init_modifications(gpu_config)
+config.override_method(
+    "Qwen3_5MoeVisionAttention.forward",
+    replacement=qwen3_5_vision_attention_forward_patched,
+    description=(
+        "Read pre-computed `vision_max_seqlen` (Python int) from kwargs to avoid "
+        "the per-block host sync that flash_attn_varlen_func incurs when "
+        "`max_length_q/k` are 0-D device tensors."
+    ),
+)
 config.override_method(
     "Qwen3_5MoeAttention.forward",
     replacement=qwen3_5_moe_attention_forward_patched,

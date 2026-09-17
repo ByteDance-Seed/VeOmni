@@ -17,14 +17,16 @@ Patch configuration for GLM-MoE-DSA NPU VeomniOp replacements.
 Regen command:
 patchgen veomni.models.transformers.glm_moe_dsa.glm_moe_dsa_npu_patch_gen_config -o veomni/models/transformers/glm_moe_dsa/generated --diff
 
-CausalLM uses ``ForCausalLMLoss``. Indexer and attention stay on the
-HuggingFace official modules.
+CausalLM uses ``ForCausalLMLoss``. Attention reuses the GPU
+``dsa_attention`` / ``glm`` VeomniOp patches.
 """
 
 from veomni.models.transformers.glm_moe_dsa.glm_moe_dsa_gpu_patch_gen_config import (
     config as gpu_config,
 )
 from veomni.models.transformers.glm_moe_dsa.glm_moe_dsa_gpu_patch_gen_config import (
+    glm_moe_dsa_attention_forward_patched,
+    glm_moe_dsa_attention_init_patched,
     glm_moe_dsa_forcausallm_forward_patched,
     glm_moe_dsa_forcausallm_init_patched,
     glm_moe_dsa_get_parallel_plan_patched,
@@ -43,6 +45,16 @@ config.post_import_blocks.extend(gpu_config.post_import_blocks)
 config.helpers.extend(gpu_config.helpers)
 config.drop_imported_names.update(gpu_config.drop_imported_names)
 
+config.override_method(
+    "GlmMoeDsaAttention.__init__",
+    replacement=glm_moe_dsa_attention_init_patched,
+    description="Construct a local dsa_attention glm VeomniOp",
+)
+config.override_method(
+    "GlmMoeDsaAttention.forward",
+    replacement=glm_moe_dsa_attention_forward_patched,
+    description="DSA consumes compressed K/V from past_key_values.update(), not module buffers",
+)
 config.override_method(
     "GlmMoeDsaForCausalLM.__init__",
     replacement=glm_moe_dsa_forcausallm_init_patched,
