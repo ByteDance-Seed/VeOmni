@@ -52,6 +52,7 @@ class _MergedExpertsActFnEP:
         gate_up_proj: Tensor,
         down_proj: Tensor,
         act_fn: Callable[[Tensor], Tensor],
+        swiglu_limit: float | None = None,
     ) -> Tensor:
         """Run ``down(act_fn(gate) * up)`` on each local expert slice.
 
@@ -68,13 +69,26 @@ class _MergedExpertsActFnEP:
             end = int(ends[expert_idx])
             current_state = permute_tokens[start:end]
             gate, up = nn.functional.linear(current_state, gate_up_proj[expert_idx]).chunk(2, dim=-1)
-            current_hidden_states = act_fn(gate) * up
+            current_hidden_states = _gated_expert_activation(gate, up, act_fn, swiglu_limit)
             current_hidden_states = nn.functional.linear(current_hidden_states, down_proj[expert_idx])
             pieces.append(current_hidden_states.to(permute_tokens.dtype))
         output = torch.cat(pieces, dim=0)
         # Empty ranks still have to keep ``permute_tokens`` on the graph so the
         # EP all-to-all backward runs on every rank.
         return output + permute_tokens * 0
+
+
+def _gated_expert_activation(
+    gate: Tensor,
+    up: Tensor,
+    act_fn: Callable[[Tensor], Tensor],
+    swiglu_limit: float | None,
+) -> Tensor:
+    """Apply optional DSV4-style clamp, then ``act_fn(gate) * up``."""
+    if swiglu_limit is not None:
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+    return act_fn(gate) * up
 
 
 def merged_experts_act_fn_forward(
@@ -85,12 +99,14 @@ def merged_experts_act_fn_forward(
     down_proj: Tensor,
     act_fn: Callable[[Tensor], Tensor],
     num_experts: int,
+    swiglu_limit: float | None = None,
 ) -> Tensor:
     """HF merged-expert loop: ``down(act_fn(gate) * up)`` then routing weights.
 
     Expert-parallel shards store only local rows on ``gate_up_proj``. Those
     tokens must go through the same EP dispatch as ``veomni_moe``; indexing
     with global expert ids would read past the local shard.
+    Optional ``swiglu_limit`` applies DeepSeek-V4's gate/up clamp first.
     """
     local_experts = gate_up_proj.shape[0]
     if local_experts != num_experts:
@@ -113,6 +129,7 @@ def merged_experts_act_fn_forward(
             gate_up_proj,
             down_proj,
             act_fn,
+            swiglu_limit,
         )
 
     final_hidden_states = hidden_states.new_zeros(hidden_states.shape)
@@ -127,7 +144,7 @@ def merged_experts_act_fn_forward(
         top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
         current_state = hidden_states[token_idx]
         gate, up = nn.functional.linear(current_state, gate_up_proj[expert_idx]).chunk(2, dim=-1)
-        current_hidden_states = act_fn(gate) * up
+        current_hidden_states = _gated_expert_activation(gate, up, act_fn, swiglu_limit)
         current_hidden_states = nn.functional.linear(current_hidden_states, down_proj[expert_idx])
         current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
         final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))

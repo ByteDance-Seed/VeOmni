@@ -21,6 +21,8 @@ import torch
 from torch import nn
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3Experts as HFDeepseekV3Experts
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MLP as HFDeepseekV3MLP
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts as HFDeepseekV4Experts
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MLP as HFDeepseekV4MLP
 from transformers.models.llama.modeling_llama import LlamaMLP as HFLlamaMLP
 from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP as HFQwen2MLP
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP as HFQwen3MLP
@@ -36,6 +38,7 @@ from transformers.models.seed_oss.modeling_seed_oss import SeedOssMLP as HFSeedO
 from tests.models.compare import assert_module_forward_and_grads_match, eager_ops_config, ops_config_scope
 from tests.models.tiny_configs import (
     tiny_deepseek_v3_config,
+    tiny_deepseek_v4_config,
     tiny_llama_config,
     tiny_qwen2_config,
     tiny_qwen3_5_moe_text_config,
@@ -190,6 +193,33 @@ def test_deepseek_v3_dense_mlp_matches_hf_for_hidden_act(hidden_act):
     hf, ours, counter = _pair(DeepseekV3MLP, HFDeepseekV3MLP, config)
     x = torch.randn(2, 5, config.hidden_size)
     _assert_matches(hf, ours, counter, x)
+
+
+@pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)
+def test_deepseek_v4_dense_mlp_matches_hf_for_hidden_act(hidden_act):
+    if IS_NPU_AVAILABLE:
+        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_npu import DeepseekV4MLP
+    else:
+        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import DeepseekV4MLP
+
+    config = tiny_deepseek_v4_config()
+    config.hidden_act = hidden_act
+    hf, ours, counter = _pair(DeepseekV4MLP, HFDeepseekV4MLP, config)
+    x = torch.randn(2, 5, config.hidden_size)
+    _assert_matches(hf, ours, counter, x)
+
+
+@pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)
+def test_deepseek_v4_merged_experts_match_hf_for_hidden_act(hidden_act):
+    if IS_NPU_AVAILABLE:
+        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_npu import DeepseekV4Experts
+    else:
+        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import DeepseekV4Experts
+
+    config = tiny_deepseek_v4_config()
+    config.hidden_act = hidden_act
+    hf, ours, counter = _pair(DeepseekV4Experts, HFDeepseekV4Experts, config)
+    _assert_matches(hf, ours, counter, *_moe_expert_inputs(config))
 
 
 @pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)

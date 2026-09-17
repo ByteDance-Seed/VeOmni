@@ -129,7 +129,7 @@ config.override_method(
 config.override_method(
     "DeepseekV4MLP.forward",
     replacement=deepseek_v4_mlp_forward_patched,
-    description="Always call the local swiglu_mlp VeomniOp",
+    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
 )
 config.override_method(
     "DeepseekV4TopKRouter.forward",

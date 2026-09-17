@@ -66,9 +66,11 @@ from veomni.models.transformers.deepseek_v4.packed_utils import (
 from veomni.models.utils.op_utils import (
     empty_bias,
     linear_bias,
+    merged_experts_act_fn_forward,
     resolve_moe_impl,
     resolve_op_impl,
     resolve_qat_impl,
+    uses_swiglu_mlp,
 )
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
@@ -110,7 +112,15 @@ config.add_import("functools", names=["partial"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
     "veomni.models.utils.op_utils",
-    names=["empty_bias", "linear_bias", "resolve_op_impl", "resolve_moe_impl", "resolve_qat_impl"],
+    names=[
+        "empty_bias",
+        "linear_bias",
+        "merged_experts_act_fn_forward",
+        "resolve_op_impl",
+        "resolve_moe_impl",
+        "resolve_qat_impl",
+        "uses_swiglu_mlp",
+    ],
 )
 config.add_import(
     "veomni.ops.qat",
@@ -1694,6 +1704,7 @@ class PatchedDeepseekV4Experts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
+        self.use_swiglu_mlp = uses_swiglu_mlp(config.hidden_act)
         self.limit = config.swiglu_limit
         self.expert_dtype = getattr(config, "expert_dtype", "fp8")
         self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
@@ -1707,6 +1718,17 @@ class PatchedDeepseekV4Experts(nn.Module):
         hidden_states = veomni_qat_fake_quant_act(hidden_states)
         down_proj = veomni_qat_fake_quant_expert_weight(self.down_proj, self.expert_dtype)
         gate_up_proj = veomni_qat_fake_quant_expert_weight(self.gate_up_proj, self.expert_dtype)
+        if not self.use_swiglu_mlp:
+            return merged_experts_act_fn_forward(
+                hidden_states,
+                top_k_index,
+                top_k_weights.to(hidden_states.dtype),
+                gate_up_proj,
+                down_proj,
+                self.act_fn,
+                self.num_experts,
+                swiglu_limit=self.limit,
+            )
         unused = empty_bias(gate_up_proj)
         return self.veomni_moe(
             hidden_states,
@@ -1744,23 +1766,27 @@ def deepseek_v4_mlp_init_patched(self, config):
 
 @config.override_method(
     "DeepseekV4MLP.forward",
-    description="Always call the local swiglu_mlp VeomniOp",
+    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
 )
 def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
     if resolve_qat_impl() == "fp8_blockwise":
         gate = veomni_qat_linear(self.gate_proj, x).clamp(max=self.limit)
         up = veomni_qat_linear(self.up_proj, x).clamp(min=-self.limit, max=self.limit)
         return veomni_qat_linear(self.down_proj, self.act_fn(gate) * up)
-    return self.veomni_swiglu_mlp(
-        x,
-        self.gate_proj.weight,
-        linear_bias(self.gate_proj),
-        self.up_proj.weight,
-        linear_bias(self.up_proj),
-        self.down_proj.weight,
-        linear_bias(self.down_proj),
-        swiglu_limit=self.limit,
-    )
+    if uses_swiglu_mlp(self.config.hidden_act):
+        return self.veomni_swiglu_mlp(
+            x,
+            self.gate_proj.weight,
+            linear_bias(self.gate_proj),
+            self.up_proj.weight,
+            linear_bias(self.up_proj),
+            self.down_proj.weight,
+            linear_bias(self.down_proj),
+            swiglu_limit=self.limit,
+        )
+    gate = self.gate_proj(x).clamp(max=self.limit)
+    up = self.up_proj(x).clamp(min=-self.limit, max=self.limit)
+    return self.down_proj(self.act_fn(gate) * up)
 
 
 @config.override_method(

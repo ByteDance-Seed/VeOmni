@@ -24,7 +24,7 @@
 #    - method_override: DeepseekV4MLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: DeepseekV4MLP.forward
-#      Always call the local swiglu_mlp VeomniOp
+#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
 #    - method_override: DeepseekV4TopKRouter.forward
 #      Match the official DeepSeek-V4 FP32 router projection
 #    - method_override: DeepseekV4HashRouter.forward
@@ -130,7 +130,15 @@ from veomni.models.transformers.deepseek_v4.packed_utils import (
     resolve_packed_sequence_slices,
     shard_packed_compression_metadata,
 )
-from veomni.models.utils.op_utils import empty_bias, linear_bias, resolve_moe_impl, resolve_op_impl, resolve_qat_impl
+from veomni.models.utils.op_utils import (
+    empty_bias,
+    linear_bias,
+    merged_experts_act_fn_forward,
+    resolve_moe_impl,
+    resolve_op_impl,
+    resolve_qat_impl,
+    uses_swiglu_mlp,
+)
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 from veomni.ops.qat import (
@@ -1784,16 +1792,20 @@ class DeepseekV4MLP(nn.Module):
             gate = veomni_qat_linear(self.gate_proj, x).clamp(max=self.limit)
             up = veomni_qat_linear(self.up_proj, x).clamp(min=-self.limit, max=self.limit)
             return veomni_qat_linear(self.down_proj, self.act_fn(gate) * up)
-        return self.veomni_swiglu_mlp(
-            x,
-            self.gate_proj.weight,
-            linear_bias(self.gate_proj),
-            self.up_proj.weight,
-            linear_bias(self.up_proj),
-            self.down_proj.weight,
-            linear_bias(self.down_proj),
-            swiglu_limit=self.limit,
-        )
+        if uses_swiglu_mlp(self.config.hidden_act):
+            return self.veomni_swiglu_mlp(
+                x,
+                self.gate_proj.weight,
+                linear_bias(self.gate_proj),
+                self.up_proj.weight,
+                linear_bias(self.up_proj),
+                self.down_proj.weight,
+                linear_bias(self.down_proj),
+                swiglu_limit=self.limit,
+            )
+        gate = self.gate_proj(x).clamp(max=self.limit)
+        up = self.up_proj(x).clamp(min=-self.limit, max=self.limit)
+        return self.down_proj(self.act_fn(gate) * up)
 
 
 # ======================================================================
@@ -1823,6 +1835,7 @@ class DeepseekV4Experts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
+        self.use_swiglu_mlp = uses_swiglu_mlp(config.hidden_act)
         self.limit = config.swiglu_limit
         self.expert_dtype = getattr(config, "expert_dtype", "fp8")
         self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
@@ -1836,6 +1849,17 @@ class DeepseekV4Experts(nn.Module):
         hidden_states = veomni_qat_fake_quant_act(hidden_states)
         down_proj = veomni_qat_fake_quant_expert_weight(self.down_proj, self.expert_dtype)
         gate_up_proj = veomni_qat_fake_quant_expert_weight(self.gate_up_proj, self.expert_dtype)
+        if not self.use_swiglu_mlp:
+            return merged_experts_act_fn_forward(
+                hidden_states,
+                top_k_index,
+                top_k_weights.to(hidden_states.dtype),
+                gate_up_proj,
+                down_proj,
+                self.act_fn,
+                self.num_experts,
+                swiglu_limit=self.limit,
+            )
         unused = empty_bias(gate_up_proj)
         return self.veomni_moe(
             hidden_states,
