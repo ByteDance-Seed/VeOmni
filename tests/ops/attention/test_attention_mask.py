@@ -391,3 +391,54 @@ def test_2d_masks_match_dense_visibility():
     flex = flex_2d_mask(sequence_length, device)
     torch.testing.assert_close(materialize_magi_mask(magi, sequence_length), dense)
     torch.testing.assert_close(flex_visible(flex, sequence_length, sequence_length), dense[0, 0])
+
+
+def _reset_flex_compile_cache(monkeypatch):
+    monkeypatch.setattr(flex_mask, "_COMPILED_CREATE_BLOCK_MASK", None)
+
+
+def _spy_torch_compile(monkeypatch):
+    compiled = []
+
+    def fake_compile(fn, *args, **kwargs):
+        compiled.append(fn)
+        return fn
+
+    monkeypatch.setattr(flex_mask.torch, "compile", fake_compile)
+    return compiled
+
+
+def test_flex_mask_builder_compiles_create_block_mask_by_default(monkeypatch):
+    _reset_flex_compile_cache(monkeypatch)
+    compiled = _spy_torch_compile(monkeypatch)
+    mask = flex_attention_mask_builder(1, 4, 4, device="cpu")
+    assert isinstance(mask, BlockMask)
+    assert compiled == [flex_mask.create_block_mask]
+    flex_attention_mask_builder(1, 4, 4, device="cpu")
+    assert compiled == [flex_mask.create_block_mask]
+
+
+def test_flex_mask_builder_compile_block_mask_false_skips_compile(monkeypatch):
+    _reset_flex_compile_cache(monkeypatch)
+    compiled = _spy_torch_compile(monkeypatch)
+    captured = []
+    real = flex_mask.create_block_mask
+
+    def spy(*args, **kwargs):
+        captured.append(kwargs.get("_compile"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(flex_mask, "create_block_mask", spy)
+    mask = flex_attention_mask_builder(1, 4, 4, device="cpu", compile_block_mask=False)
+    assert isinstance(mask, BlockMask)
+    assert compiled == []
+    assert captured == [False]
+
+
+def test_flex_mask_builder_compile_flag_preserves_causal_visibility(monkeypatch):
+    _reset_flex_compile_cache(monkeypatch)
+    compiled = flex_attention_mask_builder(1, 4, 4, device="cpu", compile_block_mask=True)
+    eager = flex_attention_mask_builder(1, 4, 4, device="cpu", compile_block_mask=False)
+    torch.testing.assert_close(flex_visible(compiled, 4, 4), flex_visible(eager, 4, 4))
+    expected = torch.ones(4, 4, dtype=torch.bool).tril()
+    torch.testing.assert_close(flex_visible(compiled, 4, 4), expected)
