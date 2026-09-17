@@ -78,7 +78,7 @@ def _build(source: str, conversations, example: dict):
     ``_build_conversation_list`` is exercised and duplicate copy-image refs
     resolve to identical content.
     """
-    constructed, image_refs, video_refs = conv_preprocess(source, conversations, example)
+    constructed, image_refs, video_refs, _ = conv_preprocess(source, conversations, example)
     images = _fake_tensors_for_refs(image_refs)
     videos = [object() for _ in range(len(video_refs))]  # opaque VideoInputs stand-ins
     items = _build_conversation_list(constructed, images, videos)
@@ -331,18 +331,18 @@ def test_preprocessors_return_matching_refs():
     img_ref = object()
     vid_ref = object()
 
-    _, image_refs, video_refs = conv_preprocess("imagenet1k", "cat", {"images": [img_ref]})
+    _, image_refs, video_refs, _ = conv_preprocess("imagenet1k", "cat", {"images": [img_ref]})
     assert image_refs == [img_ref] and video_refs == []
 
     conv = [{"from": "human", "value": "<image>describe"}, {"from": "gpt", "value": "a cat"}]
-    _, image_refs, video_refs = conv_preprocess("sharegpt4v_sft", conv, {"images": [img_ref]})
+    _, image_refs, video_refs, _ = conv_preprocess("sharegpt4v_sft", conv, {"images": [img_ref]})
     assert image_refs == [img_ref] and video_refs == []
 
-    _, image_refs, video_refs = conv_preprocess("llava_video", conv, {"videos": [vid_ref]})
+    _, image_refs, video_refs, _ = conv_preprocess("llava_video", conv, {"videos": [vid_ref]})
     assert image_refs == [] and video_refs == [vid_ref]
 
     tulu = {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]}
-    _, image_refs, video_refs = conv_preprocess("tulu-3-sft-mixture", tulu, {})
+    _, image_refs, video_refs, _ = conv_preprocess("tulu-3-sft-mixture", tulu, {})
     assert image_refs == [] and video_refs == []
 
 
@@ -365,7 +365,7 @@ def test_seed_edit_multi_turn_chain_structure_three_targets():
     conv = _edit_conv(n_targets)
     refs = [f"img{i}" for i in range(1 + n_targets)]  # 4 distinct string refs
     example = {"images": refs}
-    constructed, image_refs, video_refs = conv_preprocess("seed_edit_p23_multi_turn", conv, example)
+    constructed, image_refs, video_refs, _ = conv_preprocess("seed_edit_p23_multi_turn", conv, example)
 
     # Expected flattened chain: S0, instr1, T1, S1(copy), instr2, T2, S2(copy),
     # instr3, T3 (final, no copy).
@@ -401,7 +401,7 @@ def test_seed_edit_multi_turn_image_refs_expansion_matches_primaries_and_copies(
     conv = _edit_conv(n_targets)
     refs = [object() for _ in range(1 + n_targets)]  # 4 distinct opaque refs
     example = {"images": refs}
-    _, image_refs, _ = conv_preprocess("seed_edit_p23_multi_turn", conv, example)
+    _, image_refs, _, _ = conv_preprocess("seed_edit_p23_multi_turn", conv, example)
 
     assert image_refs == [refs[0], refs[1], refs[1], refs[2], refs[2], refs[3]]
     # Copies are the very same object as the preceding target's ref.
@@ -446,7 +446,7 @@ def test_seed_edit_multi_turn_last_target_has_no_copy_single_target():
         {"from": "gpt", "value": "<image>"},
     ]
     example = {"images": [object(), object()]}
-    constructed, image_refs, video_refs = conv_preprocess("seed_edit_p23_multi_turn", conv, example)
+    constructed, image_refs, video_refs, _ = conv_preprocess("seed_edit_p23_multi_turn", conv, example)
     flat = [(e[0], turn[0], e[2].get(_IMG_TAG_KEY) if len(e) == 3 else None) for turn in constructed for e in turn[1:]]
     assert flat == [
         ("image", "user", "edit"),
@@ -472,7 +472,7 @@ def test_fetch_images_dedupes_repeated_bytes_ref_and_clones():
 
     from PIL import Image
 
-    from veomni.data.seed_omni.image_utils import fetch_images
+    from veomni.data.seed_omni.utils.image import fetch_images
 
     buf = io.BytesIO()
     Image.new("RGB", (4, 4), (7, 7, 7)).save(buf, format="PNG")
@@ -490,7 +490,7 @@ def test_fetch_images_dedupes_repeated_bytes_ref_and_clones():
 def test_fetch_images_decodes_repeated_ref_once_and_returns_independent_clones(monkeypatch):
     from PIL import Image
 
-    from veomni.data.seed_omni import image_utils
+    from veomni.data.seed_omni.utils import image as image_utils
 
     calls = 0
 
@@ -516,7 +516,7 @@ def test_fetch_images_unique_refs_each_decoded():
 
     from PIL import Image
 
-    from veomni.data.seed_omni.image_utils import fetch_images
+    from veomni.data.seed_omni.utils.image import fetch_images
 
     buf1 = io.BytesIO()
     Image.new("RGB", (4, 4), (7, 7, 7)).save(buf1, format="PNG")
@@ -532,7 +532,7 @@ def test_fetch_images_unique_refs_each_decoded():
 def test_fetch_images_dedupes_repeated_pil_ref_by_identity():
     from PIL import Image
 
-    from veomni.data.seed_omni.image_utils import fetch_images
+    from veomni.data.seed_omni.utils.image import fetch_images
 
     pil = Image.new("RGB", (4, 4), (5, 5, 5))
     out = fetch_images([pil, pil])  # same PIL object twice → identity-dedupe
@@ -544,7 +544,7 @@ def test_fetch_images_dedupes_repeated_pil_ref_by_identity():
 def test_fetch_videos_decodes_repeated_ref_once_and_returns_independent_copies(monkeypatch):
     import numpy as np
 
-    from veomni.data.seed_omni import video_utils
+    from veomni.data.seed_omni.utils import video as video_utils
 
     calls = 0
 

@@ -177,7 +177,7 @@ class OmniInferencer:
         *,
         output_dir: str,
     ) -> None:
-        """Persist reply / images / trace from one ``generate`` call.
+        """Persist the reply, the FSM trace and any generated media from one ``generate`` call.
 
         Under a distributed launch every rank runs the FSM (the collectives need
         all ranks) and — with replicated/greedy decoding — produces the same
@@ -195,16 +195,8 @@ class OmniInferencer:
         if reply:
             logger.info_rank0(f"--- reply ---\n{reply}\n-------------")
 
-        images_out = [
-            item["value"]
-            for item in ctx["generated"]
-            if isinstance(item, dict) and item.get("type") == "image" and item.get("value") is not None
-        ]
-        for idx, image in enumerate(images_out):
-            out_path = os.path.join(output_dir, f"generated_image_{idx}.png")
-            image.save(out_path)
-            logger.info_rank0(f"finalize: image #{idx} → {out_path}")
-
+        # Before the media: decoding a waveform or an image can fail, and the
+        # trace is what you would reach for to find out why the FSM got there.
         profiler = ctx.get("profiler")
         trace = profiler.save_records() if isinstance(profiler, GraphProfiler) else []
         trace_path = os.path.join(output_dir, "trace.txt")
@@ -212,8 +204,10 @@ class OmniInferencer:
             f.write("\n".join(trace) + "\n")
         logger.info_rank0(f"finalize: FSM trace ({len(trace)} lines) → {trace_path}")
 
-        if not reply and not images_out:
-            logger.warning_rank0("finalize: FSM produced no reply and no images.")
+        written = _save_generated_media(ctx["generated"], output_dir)
+
+        if not reply and not written:
+            logger.warning_rank0("finalize: FSM produced no reply, no images and no audio.")
 
     def _begin_graph_trace(self) -> GraphProfiler | None:
         """Open a per-request FSM trace on the VeOmni runtime handle.
@@ -237,6 +231,65 @@ class OmniInferencer:
         with torch.no_grad():
             generated = self.model.generate(request_dict, generation_kwargs=req.generation_kwargs)
         return {"generated": generated, "profiler": profiler}
+
+
+def _generated_items(generated: list[dict[str, Any]], item_type: str) -> list[dict[str, Any]]:
+    """The emitted items of one modality that actually carry a value.
+
+    A graph can append a typed row and leave it unfilled — a talker round that
+    produced no speech, for instance — and such a row must not become a file.
+    """
+    return [
+        item
+        for item in generated
+        if isinstance(item, dict) and item.get("type") == item_type and item.get("value") is not None
+    ]
+
+
+def _save_generated_media(generated: list[dict[str, Any]], output_dir: str) -> dict[str, int]:
+    """Write the non-text modalities one ``generate`` call produced, a file per item.
+
+    Split out of :meth:`OmniInferencer.finalize` because this is the only part
+    of inference that has to know how each modality is encoded on disk; keeping
+    it here leaves ``finalize`` a readable list of what gets persisted.
+
+    The data-layer import sits in the body rather than at module scope — not to
+    defer load cost, since importing this module already pulls the data layer
+    transitively through :class:`OmniTrainer`, but to keep the boundary legible.
+    This function is the only place the trainer reaches into ``data/`` for IO,
+    and naming that dependency where it is used states the fact better than one
+    more line in the module header.
+
+    Returns the number of files written per modality, omitting modalities that
+    produced none, so the caller can distinguish "generated nothing" from
+    "generated something".
+    """
+    from ...data.seed_omni.utils.audio import SAMPLING_RATE_KEY, save_audio
+
+    written: dict[str, int] = {}
+
+    # Images arrive as PIL objects from the vision decoder, which serialises
+    # itself; there is nothing for the data layer to add.
+    images = _generated_items(generated, "image")
+    for idx, item in enumerate(images):
+        out_path = os.path.join(output_dir, f"generated_image_{idx}.png")
+        item["value"].save(out_path)
+        logger.info_rank0(f"finalize: image #{idx} → {out_path}")
+    if images:
+        written["image"] = len(images)
+
+    # Audio carries its rate on the item rather than taking a default here: the
+    # audio tower, the codec and the talker do not run at one rate, so only the
+    # module that emitted these samples knows which one they are in.
+    audios = _generated_items(generated, "audio")
+    for idx, item in enumerate(audios):
+        out_path = os.path.join(output_dir, f"generated_audio_{idx}.wav")
+        save_audio(out_path, item["value"], (item.get("meta") or {}).get(SAMPLING_RATE_KEY))
+        logger.info_rank0(f"finalize: audio #{idx} → {out_path}")
+    if audios:
+        written["audio"] = len(audios)
+
+    return written
 
 
 def _extract_generated_text(generated: list[dict[str, Any]]) -> str:

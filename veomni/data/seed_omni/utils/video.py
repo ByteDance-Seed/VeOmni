@@ -39,9 +39,9 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from ...utils import logging
-from ...utils.import_utils import is_ffmpeg_available
-from ..multimodal.audio_utils import extract_audio_from_video
+from ....utils import logging
+from ....utils.import_utils import is_ffmpeg_available
+from ...multimodal.audio_utils import extract_audio_from_video
 
 
 logger = logging.get_logger(__name__)

@@ -4,7 +4,7 @@
 > unsupported; silent video understanding *is* implemented (see
 > [`example_models/qwen3vl.md`](example_models/qwen3vl.md)). The data layer
 > already decodes and carries the audio stream (`VideoInputs.audio` in
-> `veomni/data/seed_omni/video_utils.py`), but nothing downstream consumes it.
+> `veomni/data/seed_omni/utils/video.py`), but nothing downstream consumes it.
 > This note records the intended design so a future implementation has a decided
 > starting point.
 >
