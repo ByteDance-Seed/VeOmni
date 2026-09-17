@@ -336,7 +336,7 @@ def parallelize_model_fsdp2(
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
-    reduce_scatter_transport_dtype: Optional[str] = None,
+    reduce_scatter_comm_dtype: Optional[str] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
@@ -366,11 +366,11 @@ def parallelize_model_fsdp2(
     """
     parallel_state = get_parallel_state()
 
-    use_low_precision_transport = validate_reduce_scatter_transport(reduce_scatter_transport_dtype, mixed_precision)
+    use_low_precision_transport = validate_reduce_scatter_transport(reduce_scatter_comm_dtype, mixed_precision)
     if use_low_precision_transport:
         if get_device_type() != "cuda":
             raise RuntimeError("Low-precision ReduceScatter transport is only supported on CUDA/NCCL.")
-    elif reduce_scatter_transport_dtype is not None:
+    elif reduce_scatter_comm_dtype is not None:
         logger.info_rank0("ReduceScatter transport dtype matches reduce dtype; using the native PyTorch collective.")
 
     model_no_split_modules = getattr(model, "_no_split_modules", None) or []
@@ -757,11 +757,11 @@ def parallelize_model_fsdp2(
             transport_reduction_scales[model] = fsdp_reduction_scale
         registered = register_fp32_reduce_scatter_with_low_precision_transport(
             model,
-            transport_dtype=getattr(torch, reduce_scatter_transport_dtype),
+            transport_dtype=getattr(torch, reduce_scatter_comm_dtype),
             reduction_scales=transport_reduction_scales,
         )
         logger.info_rank0(
-            f"Registered {reduce_scatter_transport_dtype} ReduceScatter transport with FP32 output on "
+            f"Registered {reduce_scatter_comm_dtype} ReduceScatter transport with FP32 output on "
             f"{registered} FSDP module{'s' if registered != 1 else ''}."
         )
 
@@ -901,7 +901,7 @@ def build_parallelize_model(
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
-    reduce_scatter_transport_dtype: Optional[str] = None,
+    reduce_scatter_comm_dtype: Optional[str] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
@@ -957,7 +957,7 @@ def build_parallelize_model(
                 mixed_precision=mixed_precision,
                 basic_modules=basic_modules,
                 muon_expert_zero_comm=muon_expert_zero_comm,
-                reduce_scatter_transport_dtype=reduce_scatter_transport_dtype,
+                reduce_scatter_comm_dtype=reduce_scatter_comm_dtype,
                 compile_config=compile_config,
                 should_skip_hf_weight_load=should_skip_hf_weight_load,
                 **kwargs,

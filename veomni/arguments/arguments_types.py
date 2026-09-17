@@ -511,20 +511,20 @@ def validate_reduce_scatter_transport(
 ) -> bool:
     """Validate transport precision and return whether the custom path is active."""
     if transport_dtype is not None and transport_dtype not in ("bfloat16", "float16", "float32"):
-        raise ValueError("reduce_scatter_transport_dtype must be one of 'bfloat16', 'float16', 'float32', or None.")
+        raise ValueError("reduce_scatter_comm_dtype must be one of 'bfloat16', 'float16', 'float32', or None.")
     if transport_dtype is None or transport_dtype == mixed_precision.reduce_dtype:
         return False
     if fsdp_mode != "fsdp2":
-        raise ValueError("reduce_scatter_transport_dtype requires fsdp_mode='fsdp2'.")
+        raise ValueError("reduce_scatter_comm_dtype requires fsdp_mode='fsdp2'.")
     if not mixed_precision.enable or mixed_precision.reduce_dtype != "float32":
         raise ValueError(
             "The custom ReduceScatter transport path supports only mixed-precision FSDP2 with "
             "mixed_precision.reduce_dtype='float32' and transport dtype 'bfloat16' or 'float16'. "
-            "Use None or match reduce_scatter_transport_dtype to reduce_dtype for the native path."
+            "Use None or match reduce_scatter_comm_dtype to reduce_dtype for the native path."
         )
     if transport_dtype != mixed_precision.param_dtype:
         raise ValueError(
-            "The custom ReduceScatter transport path requires reduce_scatter_transport_dtype to match "
+            "The custom ReduceScatter transport path requires reduce_scatter_comm_dtype to match "
             "mixed_precision.param_dtype ('bfloat16' or 'float16') to avoid lossy gradient conversion; "
             f"got transport dtype {transport_dtype!r} and param_dtype {mixed_precision.param_dtype!r}."
         )
@@ -571,7 +571,7 @@ class FSDPConfig:
             )
         },
     )
-    reduce_scatter_transport_dtype: Optional[str] = field(
+    reduce_scatter_comm_dtype: Optional[str] = field(
         default=None,
         metadata={
             "help": (
@@ -608,7 +608,7 @@ class FSDPConfig:
                 "single-process inference path and is not wired up yet."
             )
         validate_reduce_scatter_transport(
-            self.reduce_scatter_transport_dtype, self.mixed_precision, fsdp_mode=self.fsdp_mode
+            self.reduce_scatter_comm_dtype, self.mixed_precision, fsdp_mode=self.fsdp_mode
         )
 
 
