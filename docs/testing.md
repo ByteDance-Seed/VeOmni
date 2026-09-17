@@ -188,10 +188,26 @@ gradient averaging or whole-model optimizer trajectories.
 Controlled two-step BF16 FSDP2 runs matched initial FP32 master weights,
 buffers, optimizer settings and every rank's micro-batches. Aggregate execution
 gates passed, but whole-model pre-clipping gradient relative L2 differed by
-about 4.61% for EP2 versus EP1. First-step AdamW replay and clipping passed their
-scoped oracles; whole-model update parity and convergence remain unqualified.
-Replaying EP1's expert selections reduced global gradient difference to 3.03%,
-so discrete routing contributes without explaining the entire discrepancy.
+about 4.61% for EP2 versus EP1 before aligning routing-weight placement. Non-EP
+Triton experts now weight the down-projection output, matching EP and the eager
+reference, instead of weighting the BF16 activation before that projection.
+Both split/merged weights and shared/independent LoRA use this order; for LoRA,
+the routing weight scales the complete base-plus-adapter output.
+
+On the same four-rank fixture, this reduced first-step whole-model gradient
+relative L2 to 0.0751%, with bit-identical non-expert gradients. Expert weight
+gradients still differ across EP reduction layouts. First-step update relative
+L2 was 2.62%; after that update, second-step gradient relative L2 was 4.24% and
+update relative L2 was 5.21%. These measurements do not establish whole-model
+update parity or convergence. First-step AdamW replay and clipping passed their
+separate oracles in the earlier diagnostic runs.
+
+`tests/ops/test_fused_moe_split_vs_merged.py` checks output and all VJPs against
+the single-expert EP projection order without relaxing split/merged parity.
+`tests/lora/test_moe_lora_fused.py` checks that zero-B adapters preserve base
+output, input/routing and base-weight gradients, while retaining trainable
+B-gradients. Both files run in GPU CI. Duplicate routes still have distinct
+EP/non-EP reduction layouts; no bitwise guarantee is made for arbitrary routes.
 
 ---
 

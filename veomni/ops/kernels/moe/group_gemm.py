@@ -110,20 +110,15 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         # MOE Step 7: compute final result of linear layer 1
         fc1_activation = fc1_1_activation * fc1_2_output
 
-        # MOE Step 8: compute the weighted linear layer 1 result
         # MOE Step 8-1: compute scattered_gate_weight, shape is (batch_size * sequence_len * topk)
         reshaped_gate_weight = gate_weights.reshape(-1, 1)
         scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
         scattered_gate_weight[scatter_index.flatten()] = reshaped_gate_weight
 
-        # MOE Step 8-2: multiply activate with scattered_gate_weight
-        # fc1_weighted_output shape is (batch_size * sequence_len * topk, ffn_dim)
-        fc1_weighted_output = fc1_activation * scattered_gate_weight
-
         # MOE Step 9: compute linear layer 2
         # result shape is (batch_size * sequence_len * topk, hidden_size)
         fc2_output = group_gemm_same_nk(
-            a=fc1_weighted_output,
+            a=fc1_activation,
             b=fc2_weight,
             cumsum_M=cumsum_t,
             max_M=scatter_output.shape[0],
@@ -132,7 +127,9 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         )
 
         # MOE Step 10: gather the final token result by averaging the top-k token results
-        expert_output = moe_gather(fc2_output, scatter_index)
+        # Apply routing after the down projection, matching EP and the eager reference.
+        # Moving it before this BF16 GEMM changes both forward and backward rounding.
+        expert_output = moe_gather(fc2_output * scattered_gate_weight, scatter_index)
 
         # reshape the output with input shape
         output = expert_output.reshape(hidden_states.shape)
@@ -152,7 +149,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc1_2_output,
             fc1_activation,
             scattered_gate_weight,
-            fc1_weighted_output,
+            fc2_output,
             mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=hidden_states.device),
             mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=hidden_states.device),
         )
@@ -174,7 +171,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc1_2_output,
             fc1_activation,
             scattered_gate_weight,
-            fc1_weighted_output,
+            fc2_output,
             mask_fc1_1,
             mask_fc1_2,
         ) = ctx.saved_tensors
@@ -183,17 +180,15 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         grad_output = grad_output.view(-1, hidden_dim)
 
         # MOE Step 10
-        grad_fc2_output = moe_scatter(grad_output, scatter_index)
+        grad_unweighted_output = moe_scatter(grad_output, scatter_index)
+        grad_fc2_output = grad_unweighted_output * scattered_gate_weight
         # ``max_M`` for grouped GEMM is a per-expert launch bound. Duplicate
         # top-k routes can make one expert receive more rows than the original
         # token count, so the total scattered row count is a safe bound.
         num_scattered_tokens = grad_fc2_output.shape[0]
 
-        # MOE Step 9
-        # grad_fc1_weighted_output = torch.empty_like(fc1_weighted_output)
-
-        # dgrad
-        grad_fc1_weighted_output = group_gemm_same_nk(
+        # MOE Step 9 - dgrad
+        grad_fc1_activation = group_gemm_same_nk(
             a=grad_fc2_output,
             b=fc2_weight,
             cumsum_M=cumsum_t,
@@ -207,7 +202,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             grad_fc2_weight = torch.empty_like(fc2_weight)
             group_gemm_same_mn(
                 a=grad_fc2_output,
-                b=fc1_weighted_output,
+                b=fc1_activation,
                 c=grad_fc2_weight,
                 cumsum_K=cumsum_t,
                 max_K=num_scattered_tokens,
@@ -215,12 +210,8 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
                 transpose_b=False,
             )
 
-        # MOE Step 8
-        # MOE Step 8-2
-        grad_fc1_activation = grad_fc1_weighted_output * scattered_gate_weight
-
         # MOE Step 8-1
-        grad_scattered_gate_weight = torch.sum(fc1_activation * grad_fc1_weighted_output, dim=-1)
+        grad_scattered_gate_weight = torch.sum(fc2_output * grad_unweighted_output, dim=-1)
         grad_gate_weight = grad_scattered_gate_weight[scatter_index.flatten()]
         grad_gate_weight = grad_gate_weight.reshape(gate_weights.shape)
 
@@ -369,10 +360,8 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
         scattered_gate_weight[scatter_index.flatten()] = reshaped_gate_weight
 
-        fc1_weighted_output = fc1_activation * scattered_gate_weight
-
         fc2_output = group_gemm_same_nk(
-            a=fc1_weighted_output,
+            a=fc1_activation,
             b=fc2_weight,
             cumsum_M=cumsum_t,
             max_M=scatter_output.shape[0],
@@ -380,7 +369,9 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             transpose_b=True,
         )
 
-        expert_output = moe_gather(fc2_output, scatter_index)
+        # Apply routing after the down projection, matching EP and the eager reference.
+        # Moving it before this BF16 GEMM changes both forward and backward rounding.
+        expert_output = moe_gather(fc2_output * scattered_gate_weight, scatter_index)
         output = expert_output.reshape(hidden_states.shape)
 
         ctx.num_experts = num_experts
@@ -397,7 +388,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc1_2_output,
             fc1_activation,
             scattered_gate_weight,
-            fc1_weighted_output,
+            fc2_output,
             mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=hidden_states.device),
             mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=hidden_states.device),
         )
@@ -418,7 +409,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc1_2_output,
             fc1_activation,
             scattered_gate_weight,
-            fc1_weighted_output,
+            fc2_output,
             mask_fc1_1,
             mask_fc1_2,
         ) = ctx.saved_tensors
@@ -427,14 +418,15 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         grad_output = grad_output.view(-1, hidden_dim)
 
         # MOE Step 10
-        grad_fc2_output = moe_scatter(grad_output, scatter_index)
+        grad_unweighted_output = moe_scatter(grad_output, scatter_index)
+        grad_fc2_output = grad_unweighted_output * scattered_gate_weight
         # ``max_M`` for grouped GEMM is a per-expert launch bound. Duplicate
         # top-k routes can make one expert receive more rows than the original
         # token count, so the total scattered row count is a safe bound.
         num_scattered_tokens = grad_fc2_output.shape[0]
 
         # MOE Step 9 - dgrad
-        grad_fc1_weighted_output = group_gemm_same_nk(
+        grad_fc1_activation = group_gemm_same_nk(
             a=grad_fc2_output,
             b=fc2_weight,
             cumsum_M=cumsum_t,
@@ -448,7 +440,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             grad_fc2_weight = torch.empty_like(fc2_weight)
             group_gemm_same_mn(
                 a=grad_fc2_output,
-                b=fc1_weighted_output,
+                b=fc1_activation,
                 c=grad_fc2_weight,
                 cumsum_K=cumsum_t,
                 max_K=num_scattered_tokens,
@@ -456,11 +448,8 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
                 transpose_b=False,
             )
 
-        # MOE Step 8-2
-        grad_fc1_activation = grad_fc1_weighted_output * scattered_gate_weight
-
         # MOE Step 8-1
-        grad_scattered_gate_weight = torch.sum(fc1_activation * grad_fc1_weighted_output, dim=-1)
+        grad_scattered_gate_weight = torch.sum(fc2_output * grad_unweighted_output, dim=-1)
         grad_gate_weight = grad_scattered_gate_weight[scatter_index.flatten()]
         grad_gate_weight = grad_gate_weight.reshape(gate_weights.shape)
 
