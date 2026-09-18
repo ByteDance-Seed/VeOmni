@@ -1,5 +1,13 @@
 # Qwen3-Omni training with offline-extracted audio-enabled video
 
+## Scope and prerequisites
+
+Qwen3 Omni training from offline audio/video parquet data.
+
+Configuration: [training YAML](../../configs/multimodal/qwen3_omni/qwen3_omni_offline_av.yaml). Read the
+[catalog prerequisites and validation scope](index.md#choose-hardware-and-check-a-run)
+before following the model-specific steps below.
+
 The default Qwen3-Omni recipe (`docs/examples/qwen3_omni_moe.md`) feeds raw
 video files to the framework; VeOmni then decodes frames and pulls the audio
 track out of the container at training time.
@@ -219,3 +227,8 @@ QWEN3_OMNI_MODEL_PATH=/path/to/Qwen3-Omni-30B-A3B-Instruct \
 
 The end-to-end test does **not** need the 30B model weights — only the
 processor / tokenizer / config files from the HF checkpoint.
+
+## Check outputs and continue
+
+Use the [run checks](index.md#choose-hardware-and-check-a-run) and
+[checkpoint completion contract](../usage/checkpoint.md#completion) for training.

@@ -1,5 +1,13 @@
 # Qwen3 Omni MoE training guide
 
+## Scope and prerequisites
+
+Multisource Qwen3 Omni training with text, image, video, and audio inputs.
+
+Configuration: [training YAML](../../configs/multimodal/qwen3_omni/qwen3_omni.yaml). Read the
+[catalog prerequisites and validation scope](index.md#choose-hardware-and-check-a-run)
+before following the model-specific steps below.
+
 ## Download multisource dataset
 
 ### sharegpt4v_cap_100k + COCO2017
@@ -138,3 +146,8 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_omni/qwen3_omni.yaml \
 > be useful as a one-time optimization for very large checkpoints (e.g.
 > Qwen3-235B) where you want to amortize the per-load stacking cost across
 > many runs, but it is no longer a prerequisite.
+
+## Check outputs and continue
+
+Use the [run checks](index.md#choose-hardware-and-check-a-run) and
+[checkpoint completion contract](../usage/checkpoint.md#completion) for training.

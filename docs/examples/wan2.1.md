@@ -1,5 +1,13 @@
 # Wan2.1-I2V training guide
 
+## Scope and prerequisites
+
+Wan diffusion training with prepared video data.
+
+Configuration: [training YAML](../../configs/dit/wan_sft.yaml). Read the
+[catalog prerequisites and validation scope](index.md#choose-hardware-and-check-a-run)
+before following the model-specific steps below.
+
 ## Download model
 
 ```shell
@@ -34,3 +42,8 @@ bash train.sh tasks/train_dit.py configs/dit/wan_sft.yaml \
     --model.model_path Wan2.1-I2V-14B-480P-Diffusers/transformer \
     --model.accelerator.init_device npu
 ```
+
+## Check outputs and continue
+
+Use the [run checks](index.md#choose-hardware-and-check-a-run) and
+[checkpoint completion contract](../usage/checkpoint.md#completion) for training.

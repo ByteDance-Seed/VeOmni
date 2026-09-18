@@ -1,5 +1,13 @@
 # Qwen3 DPO training guide
 
+## Scope and prerequisites
+
+Preference training with Qwen3 and chosen/rejected conversation pairs.
+
+Configuration: [training YAML](../../configs/text/qwen3_dpo.yaml). Read the
+[catalog prerequisites and validation scope](index.md#choose-hardware-and-check-a-run)
+before following the model-specific steps below.
+
 DPO training with **Qwen3-0.6B** on the
 [trl-lib/ultrafeedback_binarized](https://huggingface.co/datasets/trl-lib/ultrafeedback_binarized) dataset.
 
@@ -84,3 +92,8 @@ Qwen3-0.6B-dpo-ultrafeedback/
 ```
 
 File-by-file contract: [Checkpoint layout](../usage/checkpoint.md).
+
+## Check outputs and continue
+
+Use the [run checks](index.md#choose-hardware-and-check-a-run) and
+[checkpoint completion contract](../usage/checkpoint.md#completion) for training.

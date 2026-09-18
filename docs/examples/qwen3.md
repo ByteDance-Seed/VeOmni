@@ -1,5 +1,13 @@
 # Qwen3 training guide
 
+## Scope and prerequisites
+
+Text SFT for dense Qwen3 and the shown MoE variant.
+
+Configuration: [training YAML](../../configs/text/qwen3.yaml). Read the
+[catalog prerequisites and validation scope](index.md#choose-hardware-and-check-a-run)
+before following the model-specific steps below.
+
 ## Download dataset
 Download the [tulu-3-sft-mixture](https://huggingface.co/datasets/allenai/tulu-3-sft-mixture) dataset.
 
@@ -62,3 +70,8 @@ bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
     --model.accelerator.init_device meta \
     --train.global_batch_size 16
 ```
+
+## Check outputs and continue
+
+Use the [run checks](index.md#choose-hardware-and-check-a-run) and
+[checkpoint completion contract](../usage/checkpoint.md#completion) for training.

@@ -1,5 +1,13 @@
 # LTX-2.3 training guide
 
+## Scope and prerequisites
+
+LTX-2.3 audio/video LoRA and IC-LoRA using offline embeddings and a condition encoder.
+
+Configuration: [training YAML](../../configs/dit/ltx2_av_lora.yaml). Read the
+[catalog prerequisites and validation scope](index.md#choose-hardware-and-check-a-run)
+before following the model-specific steps below.
+
 ## Download model
 
 Download the LTX-2.3 transformer weights and the Gemma3 text encoder:
@@ -152,3 +160,8 @@ For video-to-video transformations (e.g., depth-to-video, style transfer), use t
 ```shell
 bash train.sh tasks/train_dit.py configs/dit/ltx2_v2v_ic_lora.yaml
 ```
+
+## Check outputs and continue
+
+Use the [run checks](index.md#choose-hardware-and-check-a-run) and
+[checkpoint completion contract](../usage/checkpoint.md#completion) for training.
