@@ -62,7 +62,39 @@ parallel_plan = ParallelPlan(
 )
 ```
 
+### Inference without the FSDP wrap
 
+ExtraParallel normally composes with FSDP2: the plan slices along its own
+dimension and FSDP shards what is left along `<para>_fsdp`. At inference the
+second half often has nothing to do, and for a quantized checkpoint it cannot
+run at all — an FSDP parameter group requires a single original dtype, while
+one quantized decoder layer holds several (packed int8 weights, fp8 values,
+fp8 or fp32 scales, fp32 numerics buffers).
+
+```yaml
+accelerator:
+  ep_size: 8
+  fsdp_config:
+    fsdp_mode: fsdp2
+    extra_parallel_only: true
+```
+
+This applies the plan and skips the wrap. The two shard for different reasons:
+FSDP shards for *storage* and all-gathers the parameter back before the
+operator runs, whereas ExtraParallel shards for *compute* and never reassembles
+— tokens are routed to the rank holding their expert or their table rows. Only
+the second is load-bearing when there are no gradients and no optimizer state.
+
+It is required rather than merely helpful when `<para>` already spans the whole
+shard axis: FSDP then shards nothing but still allocates an all-gather buffer
+the size of the local shard. The mode refuses a topology where `<para>_fsdp` is
+wider than one rank, since the plan leaves that axis to FSDP and without the
+wrap it would not be sharded at all.
+
+Note that inference defaults `mixed_precision.enable` to `false`. Mixed
+precision keeps fp32 master weights for an optimizer; left on it builds the
+model at float32 and calls `model.float()`, which upcasts quantized fp8 weights
+and scales along with everything else.
 
 ## Acknowledgements
 
