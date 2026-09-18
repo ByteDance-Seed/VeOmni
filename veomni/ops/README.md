@@ -150,6 +150,21 @@ DeepSeek V4 selects the mHC adapters with `mhc_implementation: tilelang`; once
 selected, unsupported dtype, layout, or hardware raises instead of falling
 back to eager.
 
+### Qwen4-Exp library kernels
+
+`kernels/qwen4_exp/` contains the TileLang sparse-attention forward/backward
+kernels for Qwen4-Exp QSA, adapted from the DeepSeek-V4 sparse MLA kernels
+above. The kernels gather the compact `[B,S,K]` selected K/V rows directly and
+never materialize the quadratic score tensor, which is what makes 16K-token
+training feasible; GQA is handled by assigning each CTA the query-head group of
+one KV head. The package does not import TileLang eagerly, so CPU and NPU
+installations can still import VeOmni.
+
+Qwen4-Exp selects this path with `qsa_attention_implementation: tilelang`. It
+defaults to `eager`; once `tilelang` is selected, unsupported layouts (a
+missing compact selection, an additive attention mask, nonzero dropout, KV
+cache) raise instead of falling back to the dense reference.
+
 ---
 
 ## Recipe 1: Add a new backend to an existing op
