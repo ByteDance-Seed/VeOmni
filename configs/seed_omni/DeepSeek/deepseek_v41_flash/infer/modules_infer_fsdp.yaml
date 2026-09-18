@@ -43,6 +43,10 @@ deepseek_v41_text_encoder:
     # is applied as part of the FSDP2 plan and is not reachable from the others.
     fsdp_config:
       fsdp_mode: fsdp2
+      # `emb` already spans the whole shard axis, so the wrap would shard
+      # nothing further -- it would only allocate an all-gather buffer the size
+      # of the local shard to hand back what the plan just distributed.
+      extra_parallel_only: true
     gradient_checkpointing:
       enable: false
 
@@ -61,6 +65,10 @@ deepseek_v41_ngram:
     extra_parallel_placement_innermost: [false]
     fsdp_config:
       fsdp_mode: fsdp2
+      # Same as the text encoder, and here it is the difference between running
+      # and not: FSDP's all-gather buffer for one 12.3 GiB table shard was the
+      # 11.45 GiB allocation that went over the card.
+      extra_parallel_only: true
       # The tables are frozen and read once per step; re-sharding them after the
       # lookup would buy back memory that was never gathered in the first place.
       reshard_after_forward: false
@@ -75,12 +83,15 @@ deepseek_v41_llm:
     # owning their expert and the fp4 GEMMs run there.
     ep_size: 8
     ep_outside: false
-    # The remaining ~6.7 GiB is dense fp8. It is small enough that sharding it
-    # would buy little, but it is not left on `eager`: expert parallelism is a
-    # distributed build, and pairing it with an eager mode asks for one thing
-    # per rank and its opposite in the same breath.
+    # The remaining ~6.7 GiB is dense fp8, replicated. FSDP2 cannot shard it
+    # here whatever we ask: one decoder layer holds four storage dtypes (int8
+    # packed fp4, fp8_e4m3, fp8_e8m0 scales, fp32 hyper-connections) and an FSDP
+    # parameter group requires a single original dtype. So the wrap is dropped
+    # and the plan does the sharding -- which at inference is all FSDP was
+    # contributing anyway, there being no gradients or optimizer state.
     fsdp_config:
       fsdp_mode: fsdp2
+      extra_parallel_only: true
       reshard_after_forward: false
     gradient_checkpointing:
       enable: false

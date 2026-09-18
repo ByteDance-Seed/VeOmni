@@ -558,8 +558,25 @@ class FSDPConfig:
         },
     )
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
+    extra_parallel_only: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Apply the model's ExtraParallel plan (ep / emb) but skip the FSDP2 wrap. "
+                "Inference only. For a quantized checkpoint whose bulk is already sharded "
+                "by the plan, FSDP2 has nothing left to do -- and cannot run anyway, since "
+                "one decoder layer mixes several storage dtypes and an FSDP parameter group "
+                "requires a single original dtype."
+            )
+        },
+    )
 
     def __post_init__(self):
+        if self.extra_parallel_only and self.fsdp_mode != "fsdp2":
+            raise ValueError(
+                f"fsdp_config.extra_parallel_only requires fsdp_mode='fsdp2', got {self.fsdp_mode!r}. "
+                "It removes the wrap from the fsdp2 path; it is not a mode of its own."
+            )
         if self.fsdp_mode not in ("ddp", "fsdp2", "eager"):
             raise ValueError(
                 f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "

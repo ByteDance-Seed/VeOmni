@@ -16,7 +16,7 @@
 import types
 from collections.abc import Collection, Mapping
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -383,9 +383,98 @@ def _is_fsdp_wrap_target(fqn: str, class_name: str, targets: Collection[str]) ->
     return False
 
 
+def _finish_without_fsdp_wrap(
+    model: "nn.Module",
+    weights_path: Optional[str | Mapping[str, str]],
+    parallel_state,
+    fqn2spec_info,
+    should_skip_hf_weight_load: bool,
+    kwargs: Dict[str, Any],
+) -> "nn.Module":
+    """Materialize and load a model whose only parallelism is its ExtraParallel plan.
+
+    FSDP and the plan shard for different reasons. FSDP shards for *storage* and
+    all-gathers the parameter back before the operator runs, so it communicates
+    parameters and computes exactly what one device would. ep / emb shard for
+    *compute*: the parameter is never reassembled, tokens are routed to the rank
+    holding their expert or their table rows, and what crosses the wire is
+    activations. Only the second kind is load-bearing at inference, where there
+    are no gradients and no optimizer state for the first kind to shard.
+
+    Dropping the wrap is what makes a quantized checkpoint loadable at all: an
+    FSDP parameter group requires one original dtype, and one DeepSeek-V4.1
+    decoder layer holds four (int8 packed fp4, fp8_e4m3, fp8_e8m0 scales, and
+    fp32 hyper-connection weights). That is a property of quantized storage, not
+    a configuration to get right.
+
+    What it costs is the parameters the plan does not name: they stay whole on
+    every rank instead of being sharded for storage. That is logged rather than
+    assumed, since it is the number that decides whether the model fits.
+    """
+    # The plan builds its DTensors over a 2D ``(para_fsdp, para)`` mesh and
+    # leaves the first axis to FSDP. With no wrap nothing shards it, so a
+    # topology that expects one would silently hold every expert `para_fsdp`
+    # times over -- exactly the kind of quiet growth this path exists to avoid.
+    for para in parallel_state.extra_parallel_names:
+        if not parallel_state.extra_parallel_enabled(para):
+            continue
+        para_fsdp_size = parallel_state.extra_parallel_fsdp_size(para)
+        if para_fsdp_size != 1:
+            raise ValueError(
+                f"fsdp_config.extra_parallel_only needs {para} to span the whole shard axis, but "
+                f"{para}_fsdp_size={para_fsdp_size}: the plan leaves that axis to FSDP, and without "
+                f"the wrap it would not be sharded at all. Set {para}_size to the dp_shard size."
+            )
+
+    # Keyed on the plan, not on `isinstance(param, DTensor)`: ExtraParallel
+    # leaves a plain local tensor behind with its SpecInfo alongside, so a
+    # DTensor test calls every parameter replicated and reports the whole model.
+    sharded_bytes = replicated_bytes = 0
+    for fqn, param in model.named_parameters():
+        spec_info = (fqn2spec_info or {}).get(fqn)
+        size = param.numel() * param.element_size()
+        if spec_info is not None and isinstance(spec_info.placement, Shard):
+            sharded_bytes += size
+        else:
+            replicated_bytes += size
+    logger.info_rank0(
+        "ExtraParallel only: skipping the FSDP2 wrap. "
+        f"{sharded_bytes / 1024**3:.2f} GiB a rank is sharded by the plan; "
+        f"{replicated_bytes / 1024**3:.2f} GiB it does not name is replicated on every rank."
+    )
+
+    enable_fsdp_cpu_offload = kwargs.pop("enable_fsdp_offload", False)
+    model._fsdp_cpu_offload_enabled = enable_fsdp_cpu_offload
+    assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
+    materialize_device = "cpu" if enable_fsdp_cpu_offload else get_device_type()
+
+    _materialize_and_load_weights(
+        model,
+        weights_path,
+        materialize_device,
+        should_skip_hf_weight_load=should_skip_hf_weight_load,
+        is_peft_model=kwargs.pop("is_peft_model", False),
+        adapter_path=kwargs.pop("adapter_path", None),
+        broadcast_from_rank0=bool(kwargs.get("broadcast_model_weights_from_rank0")),
+        cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
+        max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
+        fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
+        ep_sharded_stream_load=bool(kwargs.get("ep_sharded_stream_load")),
+        module_skip_hf_weight_load=kwargs.pop("module_skip_hf_weight_load", None),
+        module_is_peft_model=kwargs.pop("module_is_peft_model", None),
+        module_adapter_path=kwargs.pop("module_adapter_path", None),
+    )
+
+    if materialize_device == "cpu":
+        _move_buffers_to_device(model, get_device_type())
+
+    return model
+
+
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str | Mapping[str, str]] = None,
+    extra_parallel_only: bool = False,
     enable_reshard_after_forward: bool = True,
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     basic_modules: Optional[List[str]] = None,
@@ -518,6 +607,16 @@ def parallelize_model_fsdp2(
         persistent_para_names = set()
         _extra_parallel_mesh = None
         _extra_parallel_map = None
+
+    if extra_parallel_only:
+        return _finish_without_fsdp_wrap(
+            model,
+            weights_path,
+            parallel_state,
+            fqn2spec_info,
+            should_skip_hf_weight_load=should_skip_hf_weight_load,
+            kwargs=kwargs,
+        )
 
     # Extract ExtraParallel modules from the target classes if any, then pair them.
     # Regard each target module as a layer.
@@ -958,6 +1057,7 @@ def parallelize_model_ddp(
 def build_parallelize_model(
     model: "nn.Module",
     weights_path: Optional[str | Mapping[str, str]] = None,
+    extra_parallel_only: bool = False,
     enable_reshard_after_forward: bool = True,
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     enable_gradient_checkpointing: bool = True,
@@ -1019,6 +1119,7 @@ def build_parallelize_model(
             model = parallelize_model_fsdp2(
                 model=model,
                 weights_path=weights_path,
+                extra_parallel_only=extra_parallel_only,
                 enable_reshard_after_forward=enable_reshard_after_forward,
                 mixed_precision=mixed_precision,
                 basic_modules=basic_modules,

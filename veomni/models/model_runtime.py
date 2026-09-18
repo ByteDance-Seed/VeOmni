@@ -369,6 +369,7 @@ class VeOmniModelRuntime:
             weights_path=args.model_path,
             should_skip_hf_weight_load=skip_hf_weight_load,
             enable_reshard_after_forward=args.accelerator.fsdp_config.reshard_after_forward,
+            extra_parallel_only=args.accelerator.fsdp_config.extra_parallel_only,
             mixed_precision=args.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=args.accelerator.gradient_checkpointing.enable,
             basic_modules=list(set(getattr(self.model, "_no_split_modules", None) or []) | set(args.basic_modules)),

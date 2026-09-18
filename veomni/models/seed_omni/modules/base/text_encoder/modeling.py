@@ -132,7 +132,10 @@ class InferenceMixin:
             logits = self._top_p_filter(logits, top_p)
         probs = F.softmax(logits, dim=-1)
         token = torch.multinomial(probs, num_samples=1)
-        return token
+        # An id, like the greedy branch above returns. Leaking the [1, 1] tensor
+        # instead reaches the tokenizer as a nested list and fails there, one
+        # whole decode step away from the line that produced it.
+        return int(token.item())
 
     def _token_id_tensor(self, token_id: int) -> torch.Tensor:
         device = self.device

@@ -548,11 +548,23 @@ def _resolve_default_accelerator(
     # `broadcast_model_weights_from_rank0` is only meaningful for `fsdp2`; forcing it off here
     # alongside `fsdp_mode: eager` keeps the common single-process eager-inference default
     # from inheriting a rank0-broadcast load policy that cannot run without a wrap.
+    #
+    # Mixed precision is off for the same reason it is on when training: it
+    # exists to keep fp32 master weights for an optimizer, and inference has no
+    # optimizer. Left on, it builds every module at float32 and calls
+    # `model.float()`, which upcasts whatever the checkpoint stored -- including
+    # a quantized model's fp8 weights and scales, since those are floating point
+    # too. DeepSeek-V4.1's backbone grew to 40 GiB of replicated fp32 that way,
+    # and its fp8 GEMMs would have been handed fp32 operands. These are defaults,
+    # so a config that wants fp32 inference can still ask for it.
     eager_by_module = {
         name: {
             "broadcast_model_weights_from_rank0": False,
             "accelerator": {
-                "fsdp_config": {"fsdp_mode": "eager"},
+                "fsdp_config": {
+                    "fsdp_mode": "eager",
+                    "mixed_precision": {"enable": False},
+                },
             },
         }
         for name in train_modules_config
