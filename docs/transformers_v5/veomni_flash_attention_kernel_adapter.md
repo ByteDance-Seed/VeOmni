@@ -5,7 +5,9 @@
 VeOmni uses custom attention implementation names:
 
 - `veomni_flash_attention_2_with_sp`
+- `veomni_flash_attention_2_hub_with_sp`
 - `veomni_flash_attention_3_with_sp`
+- `veomni_flash_attention_3_hub_with_sp`
 - `veomni_flash_attention_4_with_sp`
 
 These names are registered into `ALL_ATTENTION_FUNCTIONS` and routed to VeOmni's SP-aware attention wrapper.
@@ -37,15 +39,17 @@ Instead of patching `_lazy_imports` directly, VeOmni patches:
 and intercepts VeOmni custom names only.
 This compatibility adapter is applied only when `transformers>=5.0.0`.
 
-For VeOmni names, the adapter returns a local kernel-like object exposing:
+For VeOmni names, the adapter returns a kernel-like object exposing:
 
 - `flash_attn_func`
 - `flash_attn_varlen_func`
 
-mapped to local FA2/FA3/FA4 backends:
+mapped to local or explicitly selected Hub FA2/FA3/FA4 backends:
 
 - `veomni_flash_attention_2_with_sp` -> `flash_attn.flash_attn_func` / `flash_attn.flash_attn_varlen_func`
+- `veomni_flash_attention_2_hub_with_sp` -> pinned `kernels-community/flash-attn2` version 1 functions
 - `veomni_flash_attention_3_with_sp` -> `flash_attn_interface.flash_attn_func` / `flash_attn_interface.flash_attn_varlen_func`
+- `veomni_flash_attention_3_hub_with_sp` -> pinned `kernels-community/flash-attn3` version 1 functions
 - `veomni_flash_attention_4_with_sp` -> `flash_attn.cute.flash_attn_func` / `flash_attn.cute.flash_attn_varlen_func`
 
 For simplicity, paged VeOmni aliases (for example `paged|veomni_flash_attention_2_with_sp`) are not handled by this adapter.
@@ -56,7 +60,7 @@ All non-VeOmni implementations are delegated to the original Transformers loader
 
 - Keep VeOmni custom implementation names unchanged.
 - Keep existing VeOmni `ALL_ATTENTION_FUNCTIONS.register(...)` behavior unchanged.
-- Avoid hub-kernel lookup for VeOmni private names.
+- Avoid accidental hub-kernel lookup for VeOmni private names; the explicit FA2/FA3 hub backends are the only opt-in exceptions.
 - Minimize patch surface by touching a single integration point.
 - Fail fast with clear ImportError when required FA backend is missing.
 
@@ -73,8 +77,8 @@ After `import veomni`:
 
 - This adapter is a compatibility bridge for Transformers 5.x behavior around flash preload.
 - It does not change VeOmni SP attention semantics.
-- It does not require the `kernels` Python package for VeOmni custom names.
-- FA2 and FA3 have dedicated branches in `_lazy_imports` and are resolved
+- Local FA2/FA3/FA4 names do not require the `kernels` Python package. The explicit `flash_attention_2_hub` and `flash_attention_3_hub` backends require `kernels`, which is included in the GPU extra, and download or reuse version 1 of `kernels-community/flash-attn2` or `kernels-community/flash-attn3`, respectively.
+- FA2 and local FA3 have dedicated branches in `_lazy_imports` and are resolved
   directly without reaching the hub-kernel path. The adapter is therefore a
   no-op for those two in practice, but is kept for safety.
 - FA4 (`veomni_flash_attention_4_with_sp`) has no such branch in
