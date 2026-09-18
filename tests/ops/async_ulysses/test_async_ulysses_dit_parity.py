@@ -172,6 +172,9 @@ class AttentionDiT(nn.Module):
 
 
 DIT_SP_WORLD_SIZE = 4
+# k_proj grads are ~1e3× larger than q_proj. fp32 A2A+SDPA leaves ~1.6e-4 abs
+# on a few entries; 2e-4 covers that jitter without matching v_proj's 3e-3.
+DIT_K_PROJ_GRAD_ATOL = 2e-4
 
 
 class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
@@ -293,7 +296,9 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
         _assert_close_with_diagnostics("forward_output", dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
         _assert_close_with_diagnostics("proj_o.weight.grad", attn_dp_o_grad, attn_sp_o_grad, atol=1e-3, rtol=1e-4)
         _assert_close_with_diagnostics("q_proj.weight.grad", attn_dp_q_grad, attn_sp_q_grad, atol=1e-4, rtol=1e-4)
-        _assert_close_with_diagnostics("k_proj.weight.grad", attn_dp_k_grad, attn_sp_k_grad, atol=1e-4, rtol=1e-4)
+        _assert_close_with_diagnostics(
+            "k_proj.weight.grad", attn_dp_k_grad, attn_sp_k_grad, atol=DIT_K_PROJ_GRAD_ATOL, rtol=1e-4
+        )
         _assert_close_with_diagnostics("v_proj.weight.grad", attn_dp_v_grad, attn_sp_v_grad, atol=3e-3, rtol=1e-4)
         _assert_close_with_diagnostics(
             "k_norm.weight.grad", attn_dp_k_norm_grad, attn_sp_k_norm_grad, atol=2e-3, rtol=1e-4
@@ -383,7 +388,7 @@ class AsyncUlyssesDiTSequenceParallelTest(SequenceParallelTest):
             "[padding] q_proj.weight.grad", attn_dp_q_grad, attn_sp_q_grad, atol=1e-4, rtol=1e-4
         )
         _assert_close_with_diagnostics(
-            "[padding] k_proj.weight.grad", attn_dp_k_grad, attn_sp_k_grad, atol=1e-4, rtol=1e-4
+            "[padding] k_proj.weight.grad", attn_dp_k_grad, attn_sp_k_grad, atol=DIT_K_PROJ_GRAD_ATOL, rtol=1e-4
         )
         _assert_close_with_diagnostics(
             "[padding] v_proj.weight.grad", attn_dp_v_grad, attn_sp_v_grad, atol=3e-3, rtol=1e-4
