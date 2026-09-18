@@ -24,23 +24,6 @@ from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 from veomni.utils.device import get_device_rng_state
 
 
-class _StubConditionModel:
-    """Stand-in for a DiT condition model that owns a noise/timestep generator."""
-
-    def __init__(self, seed: int = 2024):
-        self.generator = torch.Generator(device="cpu")
-        self.generator.manual_seed(seed)
-
-    def rng_state_dict(self):
-        return {"generator": self.generator.get_state()}
-
-    def load_rng_state_dict(self, state):
-        self.generator.set_state(state["generator"])
-
-    def draw_noise(self):
-        return torch.randn(4, generator=self.generator)
-
-
 def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
     """Build a minimal mock trainer for CheckpointCallback / manager tests."""
     checkpoint_cfg = SimpleNamespace(
@@ -91,6 +74,9 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
     # auto-created MagicMock attribute is not picklable and would slip a mock
     # into the checkpoint payload instead of the ``None`` the loader skips.
     trainer.condition_model = None
+    # The manager merges ``trainer.extra_state()`` into the model blob; the mock
+    # contributes nothing by default.
+    trainer.extra_state.return_value = {}
 
     return trainer
 
@@ -349,7 +335,7 @@ class TestModelCheckpointManagerSaveContract:
         manager.save_dcp(TrainerState(global_step=10))
 
         saved = manager.checkpointer.save.call_args.args[1]
-        assert set(saved["extra_state"]) == {"lr_scheduler", "condition_model_rng_state"}
+        assert set(saved["extra_state"]) == {"lr_scheduler"}
         assert saved["optimizer"] is trainer.optimizer
 
     def test_load_forwards_extra_state_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
@@ -367,34 +353,27 @@ class TestModelCheckpointManagerSaveContract:
         assert trainer.state.global_step == 0
         assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is mock_get_ps.return_value
 
-    def test_extra_state_persists_condition_model_rng(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
+    def test_extra_state_merges_trainer_contribution(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
         trainer = _make_mock_trainer()
-        trainer.condition_model = _StubConditionModel()
+        trainer.extra_state.return_value = {"condition_model_rng_state": {"generator": "state"}}
         mock_build_ckpt.return_value = MagicMock()
         manager = ModelCheckpointManager(trainer)
 
         extra_state = manager._extra_state(TrainerState(global_step=10))
 
-        assert set(extra_state["condition_model_rng_state"]) == {"generator"}
+        assert extra_state["condition_model_rng_state"] == {"generator": "state"}
+        assert extra_state["lr_scheduler"] == {"lr": 1e-4}
 
-    def test_load_extra_state_restores_condition_model_rng(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
+    def test_load_extra_state_delegates_to_trainer(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
         trainer = _make_mock_trainer()
-        condition_model = _StubConditionModel()
-        trainer.condition_model = condition_model
         mock_build_ckpt.return_value = MagicMock()
         manager = ModelCheckpointManager(trainer)
 
-        for _ in range(3):
-            condition_model.draw_noise()
-        rng_state = condition_model.rng_state_dict()
-        reference = torch.Generator(device="cpu")
-        reference.set_state(condition_model.generator.get_state())
-        expected_next_noise = torch.randn(4, generator=reference)
+        extra = {"lr_scheduler": {"lr": 1e-4}, "condition_model_rng_state": {"generator": "state"}}
+        manager._load_extra_state(extra)
 
-        condition_model.draw_noise()
-        manager._load_extra_state({"lr_scheduler": {"lr": 1e-4}, "condition_model_rng_state": rng_state})
-
-        assert torch.equal(condition_model.draw_noise(), expected_next_noise)
+        trainer.load_extra_state.assert_called_once_with(extra)
+        trainer.lr_scheduler.load_state_dict.assert_called_once_with({"lr": 1e-4})
 
     def test_save_lora_writes_the_adapter_to_its_own_export_dir(
         self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps, tmp_path

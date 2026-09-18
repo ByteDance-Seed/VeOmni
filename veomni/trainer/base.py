@@ -684,6 +684,19 @@ class BaseTrainer(Stateful, ABC):
         """Write this job's resumable checkpoint for ``state.global_step``."""
         self.checkpoint.save_dcp(state)
 
+    def extra_state(self) -> Dict[str, Any]:
+        """Model-bound state to persist beside the weights.
+
+        Trainers with model-specific state (e.g. the DiT condition model's
+        noise/timestep generator) contribute it here. The checkpoint manager
+        merges the result into the model's extra_state blob. Default: nothing.
+        """
+        return {}
+
+    def load_extra_state(self, extra_state: Dict[str, Any]) -> None:
+        """Restore what :meth:`extra_state` produced. Default: nothing."""
+        return
+
     def save_hf_or_lora(self, state: TrainerState, stage: str = "step_end") -> None:
         """Export this job's weights in whichever format the model was trained in."""
         self.checkpoint.save_hf_or_lora(state, stage=stage)

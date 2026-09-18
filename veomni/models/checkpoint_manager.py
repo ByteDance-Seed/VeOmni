@@ -139,25 +139,15 @@ class ModelCheckpointManager:
     def _extra_state(self, state: "TrainerState") -> Dict[str, Any]:
         """Model-bound state to store beside the weights.
 
-        The condition model's noise/timestep generator and the lr scheduler are
-        model-bound state, persisted here for the checkpointer to write per rank.
+        The lr scheduler plus whatever the trainer contributes via
+        ``extra_state()``.
         """
         lr_scheduler = self.trainer.lr_scheduler
-        condition_model = getattr(self.trainer, "condition_model", None)
-        rng_state_dict = getattr(condition_model, "rng_state_dict", None)
-        if (
-            condition_model is not None
-            and rng_state_dict is None
-            and getattr(condition_model, "generator", None) is not None
-        ):
-            logger.warning_rank0(
-                "Condition model owns a ``generator`` but exposes no ``rng_state_dict``; "
-                "its noise/timestep stream will not be restored across a resume."
-            )
-        return {
+        extra_state = {
             "lr_scheduler": None if lr_scheduler is None else lr_scheduler.state_dict(),
-            "condition_model_rng_state": None if rng_state_dict is None else rng_state_dict(),
         }
+        extra_state.update(self.trainer.extra_state())
+        return extra_state
 
     def _load_extra_state(self, extra_state: Dict[str, Any]) -> None:
         lr_state = extra_state.get("lr_scheduler")
@@ -165,16 +155,7 @@ class ModelCheckpointManager:
         if lr_state is not None and lr_scheduler is not None:
             lr_scheduler.load_state_dict(lr_state)
 
-        condition_model_rng_state = extra_state.get("condition_model_rng_state")
-        if condition_model_rng_state is not None:
-            loader = getattr(getattr(self.trainer, "condition_model", None), "load_rng_state_dict", None)
-            if loader is None:
-                logger.warning_rank0(
-                    "Checkpoint carries condition-model RNG state but the model cannot restore it; "
-                    "the resumed run may replay its initial noise stream."
-                )
-            else:
-                loader(condition_model_rng_state)
+        self.trainer.load_extra_state(extra_state)
 
     def wait_for_pending_save(self) -> None:
         """Block until the in-flight async save is on disk, if there is one."""

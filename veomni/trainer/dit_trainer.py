@@ -322,9 +322,39 @@ class DiTTrainer:
             self.condition_model.to(get_device_type())
             logger.info_rank0("Condition model loaded.")
         # The condition model owns the noise/timestep generator, persisted in the
-        # DCP extra_state. ``ModelCheckpointManager`` reaches it through the
-        # reused ``BaseTrainer`` instance, so expose it there as well.
+        # DCP extra_state. ``ModelCheckpointManager`` holds the reused
+        # ``BaseTrainer`` instance, so expose the model and its extra-state hooks
+        # through it.
         self.base.condition_model = self.condition_model
+        self.base.extra_state = self.extra_state
+        self.base.load_extra_state = self.load_extra_state
+
+    def extra_state(self) -> dict[str, Any]:
+        """Model-bound state: the condition model's noise/timestep generator."""
+        rng_state_dict = getattr(self.condition_model, "rng_state_dict", None)
+        if (
+            self.condition_model is not None
+            and rng_state_dict is None
+            and getattr(self.condition_model, "generator", None) is not None
+        ):
+            logger.warning_rank0(
+                "Condition model owns a ``generator`` but exposes no ``rng_state_dict``; "
+                "its noise/timestep stream will not be restored across a resume."
+            )
+        return {} if rng_state_dict is None else {"condition_model_rng_state": rng_state_dict()}
+
+    def load_extra_state(self, extra_state: dict[str, Any]) -> None:
+        condition_model_rng_state = extra_state.get("condition_model_rng_state")
+        if condition_model_rng_state is None:
+            return
+        loader = getattr(self.condition_model, "load_rng_state_dict", None)
+        if loader is None:
+            logger.warning_rank0(
+                "Checkpoint carries condition-model RNG state but the model cannot restore it; "
+                "the resumed run may replay its initial noise stream."
+            )
+        else:
+            loader(condition_model_rng_state)
 
     def _freeze_model_module(self):
         self.condition_model.requires_grad_(False)
