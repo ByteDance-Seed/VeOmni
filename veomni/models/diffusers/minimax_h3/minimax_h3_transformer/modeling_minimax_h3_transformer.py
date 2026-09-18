@@ -19,7 +19,9 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
-from ..minimax_h3_core.minimax_h3_dit import MiniMaxH3DiT, unpack_audio, unpatchify_video
+from ...packing import DiffusionBatchOutput
+from ..minimax_h3_core.batch_packing import pack_samples
+from ..minimax_h3_core.minimax_h3_dit import MiniMaxH3Attention, MiniMaxH3DiT, unpack_audio, unpatchify_video
 from .configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
 
 
@@ -32,6 +34,8 @@ class MiniMaxH3DiTOutput(ModelOutput):
 class MiniMaxH3DiTModel(PreTrainedModel):
     config_class = MiniMaxH3DiTModelConfig
     supports_gradient_checkpointing = True
+    supports_remove_padding = True
+    _supports_sdpa = True  # HF checks this before the load-time packing hook runs.
     _no_split_modules = ["MiniMaxH3DiTBlock"]
 
     _checkpoint_conversion_mapping = {"^": "dit."}
@@ -39,6 +43,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
     def __init__(self, config: MiniMaxH3DiTModelConfig, **kwargs):
         super().__init__(config)
         self.gradient_checkpointing = False  # enable HF-compatible GC attr
+        self.use_remove_padding = False
         self.dit = MiniMaxH3DiT(
             num_layers=config.num_layers,
             token_refiner_num_layers=config.token_refiner_num_layers,
@@ -59,6 +64,51 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             norm_eps=config.norm_eps,
             qk_norm_eps=config.qk_norm_eps,
             final_norm_eps=config.final_norm_eps,
+        )
+
+    def configure_remove_padding(self, *, attn_implementation: str):
+        """Configure only this instance; the existing parameter/wrap hierarchy is unchanged."""
+        from .....ops.kernels.attention.flash import _load_veomni_local_flash_kernel
+
+        if (
+            self.config.latents_dim != 24
+            or self.config.audio_latents_dim != 32
+            or tuple(self.config.patch_size) != (1, 2, 2)
+        ):
+            raise ValueError("H3 remove-padding requires the native 24-video/32-audio patch geometry.")
+        if attn_implementation in ("eager", "sdpa"):
+            kernel = None
+        elif attn_implementation in ("veomni_flash_attention_2_with_sp", "veomni_flash_attention_3_with_sp"):
+            kernel = _load_veomni_local_flash_kernel(attn_implementation).flash_attn_varlen_func
+        else:
+            raise ValueError(f"Unsupported H3 remove-padding backend: {attn_implementation}")
+        for module in self.dit.modules():
+            if isinstance(module, MiniMaxH3Attention):
+                module.packed_sdpa = kernel is None
+                module.varlen_kernel = kernel
+        self.dit.use_varlen_attention = kernel is not None
+        self.dit.use_remove_padding = True
+        self.use_remove_padding = True
+
+    def _forward_samples(self, samples):
+        packed_inputs, row_counts = pack_samples(samples)
+        video, audio = self.dit(**packed_inputs)
+        video_parts = video.split([v for v, _ in row_counts])
+        audio_parts = audio.split([a for _, a in row_counts])
+        outputs = [
+            self._finish_outputs(v, a, **sample["targets"], **sample["metadata"])
+            for sample, v, a in zip(samples, video_parts, audio_parts)
+        ]
+        if any((out.loss is None) != (outputs[0].loss is None) for out in outputs):
+            raise ValueError("All H3 samples must consistently supply or omit training targets.")
+        losses = (
+            None
+            if outputs[0].loss is None
+            else {key: torch.stack([out.loss[key] for out in outputs]) for key in outputs[0].loss}
+        )
+        return DiffusionBatchOutput(
+            sample_predictions=[{"video": out.predictions[0], "audio": out.predictions[1]} for out in outputs],
+            sample_losses=losses,
         )
 
     def forward(
@@ -82,8 +132,9 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         training_target_audio=None,
         video_latent_shape=None,
         audio_latent_shape=None,
+        sample_inputs=None,
         **kwargs,
-    ) -> MiniMaxH3DiTOutput:
+    ) -> MiniMaxH3DiTOutput | DiffusionBatchOutput:
         """Forward pass with unpatchify + negation + internal loss computation.
 
         Accepts all keys from condition_model.process_condition().
@@ -92,6 +143,11 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         video_latent_shape: (T_v, latent_h//2, latent_w//2) for unpatchify_video
         audio_latent_shape: (audio_channel, T_a) for unpack_audio
         """
+        if sample_inputs is not None:
+            if not self.use_remove_padding:
+                raise ValueError("sample_inputs requires use_remove_padding to be configured at model load.")
+            return self._forward_samples(sample_inputs)
+
         # Pop metadata keys (trainer may also pop them)
         skip_mask_out_condition = kwargs.pop("skip_mask_out_condition", False)
         cond_rows = kwargs.pop("cond_rows", 0)
@@ -118,6 +174,33 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             skip_mask_out_condition=skip_mask_out_condition,
         )
 
+        return self._finish_outputs(
+            video_tokens,
+            audio_tokens,
+            cond_rows=cond_rows,
+            video_latent_shape=video_latent_shape,
+            audio_latent_shape=audio_latent_shape,
+            training_target=training_target,
+            training_target_audio=training_target_audio,
+            scheduler_video=scheduler_video,
+            scheduler_audio=scheduler_audio,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _finish_outputs(
+        video_tokens,
+        audio_tokens,
+        *,
+        cond_rows=0,
+        video_latent_shape=None,
+        audio_latent_shape=None,
+        training_target=None,
+        training_target_audio=None,
+        scheduler_video=None,
+        scheduler_audio=None,
+        **kwargs,
+    ):
         # Slice off condition rows (v_video_rows[cond_rows_count:])
         if cond_rows > 0:
             video_tokens = video_tokens[cond_rows:]

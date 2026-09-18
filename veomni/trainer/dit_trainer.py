@@ -35,7 +35,14 @@ from ..data.data_collator import DataCollator
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..models import build_foundation_model
 from ..models.auto import build_config
-from ..models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from ..models.diffusers.packing import (
+    DiffusionBatchOutput,
+    configure_diffusion_remove_padding,
+    validate_diffusion_remove_padding_config,
+    validate_diffusion_remove_padding_support,
+    validate_diffusion_samples,
+)
+from ..models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY, get_model_class
 from ..models.model_runtime import VeOmniModelRuntime
 from ..ops import apply_ops_config
 from ..utils import helper
@@ -124,6 +131,12 @@ class DiTDataCollator(DataCollator):
 
 @dataclass
 class DiTModelArguments(ModelArguments):
+    use_remove_padding: bool = field(
+        default=False,
+        metadata={
+            "help": "Opt into model-specific fixed-microbatch packing. Requires a supporting DiT/condition pair."
+        },
+    )
     condition_model_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path to condition model."},
@@ -132,6 +145,11 @@ class DiTModelArguments(ModelArguments):
         default_factory=dict,
         metadata={"help": "Config for condition model."},
     )
+
+    def __post_init__(self):
+        if not isinstance(self.use_remove_padding, bool):
+            raise ValueError("model.use_remove_padding must be a bool.")
+        super().__post_init__()
 
 
 @dataclass
@@ -179,6 +197,10 @@ class VeOmniDiTArguments(VeOmniArguments):
     data: DiTDataArguments = field(default_factory=DiTDataArguments)
     train: DiTTrainingArguments = field(default_factory=DiTTrainingArguments)
 
+    def __post_init__(self):
+        validate_diffusion_remove_padding_config(self)
+        super().__post_init__()
+
 
 class DiTModelRuntime(VeOmniModelRuntime):
     """A DiT and the frozen condition model that feeds it.
@@ -201,6 +223,10 @@ class DiTModelRuntime(VeOmniModelRuntime):
         dit_config = build_config(args.config_path, **args.model_config)
         self.model_config = dit_config
         logger.info_rank0(f"Detected DiT model type: {dit_config.model_type}.")
+        if args.use_remove_padding:
+            validate_diffusion_remove_padding_support(
+                get_model_class(dit_config), MODELING_REGISTRY[dit_config.condition_model_type]()
+            )
         self._build_condition_model(dit_config.condition_model_type)
         if self.train_args.training_task != "offline_embedding":
             logger.info_rank0(f"Task: {self.train_args.training_task}, prepare dit model.")
@@ -211,6 +237,11 @@ class DiTModelRuntime(VeOmniModelRuntime):
                 init_device=args.accelerator.init_device,
                 ops_implementation=args.ops_implementation,
                 config_kwargs=args.model_config,
+            )
+            configure_diffusion_remove_padding(
+                self.model,
+                enabled=args.use_remove_padding,
+                attn_implementation=args.ops_implementation.attn_implementation,
             )
             self.model_config = getattr(self.model, "config", None)
         else:
@@ -330,13 +361,15 @@ class DiTTrainer:
 
     def _setup(self):
         args: VeOmniDiTArguments = self.base.args
-        # registers ParallelState("base") before seed
+        validate_diffusion_remove_padding_config(args)
         self.base.device = self.base._setup(args)
-        args.train.dyn_bsz = False
-        args.train.micro_batch_size = 1
-        # dataloader_batch_size was computed in __post_init__ when dyn_bsz was still True
-        # (default), so it was set to 1. Recompute now that dyn_bsz=False.
-        args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
+        if args.model.use_remove_padding:
+            args.train._derive_batch_config(args.model.accelerator)
+        else:
+            args.train.dyn_bsz = False
+            args.train.micro_batch_size = 1
+            # Preserve the legacy single-sample path, including embedding extraction.
+            args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
         if args.train.training_task == "offline_embedding":
             assert args.data.datasets_type == "mapping", "Datasets type must be mapping for offline embedding."
             if args.data.offline_embedding_save_dir is None:
@@ -486,7 +519,12 @@ class DiTTrainer:
         self, outputs: ModelOutput, micro_batch: Dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
-        loss_dict: Dict[str, torch.Tensor] = outputs.loss
+        if self.base.args.model.use_remove_padding:
+            if not isinstance(outputs, DiffusionBatchOutput):
+                raise TypeError("Remove-padding forward must return DiffusionBatchOutput.")
+            loss_dict = outputs.mean_losses(batch_size=len(micro_batch["sample_inputs"]))
+        else:
+            loss_dict: Dict[str, torch.Tensor] = outputs.loss
         loss_dict = {k: v / self.base.num_micro_batches for k, v in loss_dict.items()}
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
@@ -513,7 +551,12 @@ class DiTTrainer:
             return 0.0, {}
 
         with torch.no_grad():
-            micro_batch = self.condition_model.process_condition(**micro_batch)
+            if self.base.args.model.use_remove_padding:
+                samples = self.condition_model.prepare_samples(**micro_batch)
+                validate_diffusion_samples(samples, batch_size=self.base.args.train.micro_batch_size)
+                micro_batch = {"sample_inputs": samples}
+            else:
+                micro_batch = self.condition_model.process_condition(**micro_batch)
 
         with use_parallel_state(self.base.model.parallel_state), self.base.model_fwd_context:
             outputs = self.base.model(**micro_batch)

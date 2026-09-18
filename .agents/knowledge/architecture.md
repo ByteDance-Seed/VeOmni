@@ -201,6 +201,27 @@ YAML Config -> VeOmniArguments -> Trainer
 6. Load weights (`load_model_weights()` or `rank0_load_and_broadcast_weights()`)
 7. Apply parallelization (`build_parallelize_model()`)
 
+## DiT Remove-Padding Interface
+
+`model.use_remove_padding` is DiT-only and defaults to false. The shared contract
+lives in `veomni/models/diffusers/packing.py`. MiniMax H3 is the first consumer:
+`minimax_h3_core/batch_packing.py` concatenates valid prepared rows with separate
+DiT/refiner boundaries, remapped timestep indices, and sample-local positions.
+Its model restores per-sample target predictions and weighted losses; its
+condition model prepares FL2VA or visual Ref2VA independently before packing.
+The enabled path uses per-instance segmented SDPA or local FA2/FA3 varlen dispatch,
+without changing parameter names or the legacy global attention path.
+`DiTTrainer` checks config constraints before distributed setup.
+`DiTModelRuntime._build_model` resolves model and condition capabilities through
+the existing registry before constructing either component, then configures the
+DiT before freeze, wrapping and optimizer construction. The trainer's enabled forward path calls
+`condition_model.prepare_samples` and passes native dict/list `DiffusionSample`
+pytrees through the root model. `DiffusionBatchOutput` preserves sample order and
+per-sample losses, reduced by sample count and then accumulation count. Packing,
+validity masks, attention boundaries and output reconstruction remain model-owned;
+this interface neither uses MainCollator nor enables dynamic batching. See
+`docs/usage/diffusion_remove_padding.md` for the initial support envelope.
+
 ## Parallelization Flow
 
 VeOmni uses FSDP2 exclusively.
