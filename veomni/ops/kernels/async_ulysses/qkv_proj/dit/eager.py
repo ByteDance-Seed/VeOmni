@@ -29,8 +29,8 @@ from ......distributed.sequence_parallel.utils import (
 )
 from .....compound import InnerHandle, append_inner, resolve_inner_op, take_inner
 from .....registry import SavedState
-from ...shared.backward import layer_norm_backward, linear_backward
-from ...shared.norm import layernorm_forward, normalize_shape
+from ...shared.backward import linear_backward
+from ...shared.norm import normalize_shape
 from ...shared.qkv_state import QKVMeta, qkv_grads, unpack_qkv
 
 
@@ -56,6 +56,7 @@ def forward(
     normalized_shape: int | tuple[int, ...] | None = None,
     eps: float | None = None,
     rms_norm: InnerHandle = None,
+    layer_norm: InnerHandle = None,
 ) -> tuple[tuple[Tensor, Tensor, Tensor], SavedState]:
     """Project QKV, optional QK norm, then all-to-all.
 
@@ -65,16 +66,19 @@ def forward(
     sp_group = get_ulysses_sequence_parallel_group() if group is None else group
     shape = normalize_shape(normalized_shape)
     rms = None
+    ln = None
     saved_rms_q = None
     saved_rms_k = None
-    mean_q = mean_k = invvar_q = invvar_k = None
+    saved_ln_q = None
+    saved_ln_k = None
 
     q = F.linear(hidden_states, q_weight, q_bias)
     if norm_type == "rmsnorm":
         rms = resolve_inner_op(rms_norm, op="rms_norm", variant="standard")
         output_q, saved_rms_q = rms.forward(q, norm_q_weight, eps=eps)
     elif norm_type == "layernorm":
-        output_q, mean_q, invvar_q = layernorm_forward(q, norm_q_weight, norm_q_bias, shape, eps)
+        ln = resolve_inner_op(layer_norm, op="layer_norm", variant="standard")
+        output_q, saved_ln_q = ln.forward(q, norm_q_weight, norm_q_bias, normalized_shape=shape, eps=eps)
     elif norm_type is None:
         output_q = q
     else:
@@ -87,7 +91,7 @@ def forward(
     if norm_type == "rmsnorm":
         output_k, saved_rms_k = rms.forward(k, norm_k_weight, eps=eps)
     elif norm_type == "layernorm":
-        output_k, mean_k, invvar_k = layernorm_forward(k, norm_k_weight, norm_k_bias, shape, eps)
+        output_k, saved_ln_k = ln.forward(k, norm_k_weight, norm_k_bias, normalized_shape=shape, eps=eps)
     elif norm_type is None:
         output_k = k
     else:
@@ -123,11 +127,11 @@ def forward(
         normalized_shape=shape,
         eps=eps,
         rms=rms,
+        layer_norm=ln,
     )
     if norm_type == "layernorm":
-        saved.extend(
-            [q, norm_q_weight, norm_q_bias, mean_q, invvar_q, k, norm_k_weight, norm_k_bias, mean_k, invvar_k]
-        )
+        meta.ln_q = append_inner(saved, saved_ln_q)
+        meta.ln_k = append_inner(saved, saved_ln_k)
     elif norm_type == "rmsnorm":
         # Flatten nested RMS SavedState into the outer tensor list.
         meta.rms_q = append_inner(saved, saved_rms_q)
@@ -143,18 +147,8 @@ def backward(grad_output: tuple[Tensor, Tensor, Tensor], saved: SavedState) -> t
     sp_group = meta.group
 
     if meta.norm_type == "layernorm":
-        (
-            q,
-            norm_q_weight,
-            norm_q_bias,
-            mean_q,
-            invvar_q,
-            k,
-            norm_k_weight,
-            norm_k_bias,
-            mean_k,
-            invvar_k,
-        ) = rest
+        saved_ln_q, rest = take_inner(rest, meta.ln_q)
+        saved_ln_k, rest = take_inner(rest, meta.ln_k)
     elif meta.norm_type == "rmsnorm":
         saved_rms_q, rest = take_inner(rest, meta.rms_q)
         saved_rms_k, rest = take_inner(rest, meta.rms_k)
@@ -191,9 +185,7 @@ def backward(grad_output: tuple[Tensor, Tensor, Tensor], saved: SavedState) -> t
     if meta.norm_type == "rmsnorm":
         grad_k, grad_norm_k_weight = meta.rms.backward(grad_k, saved_rms_k)
     elif meta.norm_type == "layernorm":
-        grad_k, grad_norm_k_weight, grad_norm_k_bias = layer_norm_backward(
-            grad_k, k, mean_k, invvar_k, norm_k_weight, norm_k_bias, meta.normalized_shape, meta.eps
-        )
+        grad_k, grad_norm_k_weight, grad_norm_k_bias = meta.layer_norm.backward(grad_k, saved_ln_k)
     elif meta.norm_type is not None:
         raise NotImplementedError(f"{meta.norm_type} is not supported in async-ulysses now!")
 
@@ -216,9 +208,7 @@ def backward(grad_output: tuple[Tensor, Tensor, Tensor], saved: SavedState) -> t
     if meta.norm_type == "rmsnorm":
         grad_q, grad_norm_q_weight = meta.rms.backward(grad_q, saved_rms_q)
     elif meta.norm_type == "layernorm":
-        grad_q, grad_norm_q_weight, grad_norm_q_bias = layer_norm_backward(
-            grad_q, q, mean_q, invvar_q, norm_q_weight, norm_q_bias, meta.normalized_shape, meta.eps
-        )
+        grad_q, grad_norm_q_weight, grad_norm_q_bias = meta.layer_norm.backward(grad_q, saved_ln_q)
 
     grad_q_input, grad_q_weight, grad_q_bias = linear_backward(
         grad_q,

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Linear and LayerNorm backward units for async Ulysses schedules.
+"""Linear backward units for async Ulysses schedules.
 
 These helpers do not launch collectives or keep autograd context. The QKV / O
 eager pairs arrange them around all-to-all launch and wait points.
@@ -20,13 +20,7 @@ eager pairs arrange them around all-to-all launch and wait points.
 
 from __future__ import annotations
 
-import importlib
-
-import torch
 from torch import Tensor
-
-
-_fused_layer_norm_cuda = None
 
 
 def _align_linear_backward_dtype(
@@ -98,41 +92,6 @@ def linear_backward(
     return grad_input, grad_weight, grad_bias
 
 
-def _get_fused_layer_norm_cuda():
-    """Lazy-import the Apex fused LayerNorm CUDA extension."""
-    global _fused_layer_norm_cuda
-    if _fused_layer_norm_cuda is None:
-        _fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
-    return _fused_layer_norm_cuda
-
-
-def layer_norm_backward(
-    grad_output: Tensor,
-    input_tensor: Tensor,
-    mean: Tensor,
-    invvar: Tensor,
-    weight: Tensor,
-    bias: Tensor,
-    normalized_shape: torch.Size,
-    eps: float,
-) -> tuple[Tensor, Tensor, Tensor]:
-    """Compute affine LayerNorm grads via ``fused_layer_norm_cuda.backward_affine``.
-
-    Pair with ``norm.layernorm_forward``, which saved ``mean`` and ``invvar``.
-    """
-    return _get_fused_layer_norm_cuda().backward_affine(
-        grad_output.contiguous(),
-        mean,
-        invvar,
-        input_tensor,
-        normalized_shape,
-        weight,
-        bias,
-        eps,
-        False,
-    )
-
-
 def reduce_repeated_kv_gradient(
     grad_output: Tensor,
     original_num_heads: int,
@@ -159,7 +118,6 @@ def reduce_repeated_kv_gradient(
 
 
 __all__ = [
-    "layer_norm_backward",
     "linear_backward",
     "linear_input_backward",
     "linear_parameter_backward",

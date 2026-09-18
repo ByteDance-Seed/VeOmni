@@ -22,6 +22,7 @@ from . import async_ulysses as _async_ulysses  # noqa: F401
 from . import attention as _attention  # noqa: F401
 from . import dsa as _dsa  # noqa: F401
 from . import gated_delta_rule as _gated_delta_rule  # noqa: F401
+from . import layer_norm as _layer_norm  # noqa: F401
 from . import loss as _loss  # noqa: F401
 from . import mhc as _mhc  # noqa: F401
 from . import moe_experts as _moe_experts  # noqa: F401

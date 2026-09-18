@@ -12,27 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fused LayerNorm forward used by async Ulysses QKV.
-
-LayerNorm is not a registry row yet. Compound QKV calls this CUDA extension
-directly so it can save ``mean`` / ``invvar`` and pair them with
-``backward.layer_norm_backward``. RMSNorm goes through a nested kernel instead.
-"""
+"""Normalized-shape coercion used by async Ulysses QKV metadata."""
 
 from __future__ import annotations
 
-import importlib
 import numbers
 from typing import Any
 
-from torch import Tensor
-
-
-_fused_layer_norm_cuda = None
-
 
 def normalize_shape(normalized_shape: int | tuple[int, ...] | None) -> Any:
-    """Coerce ``normalized_shape`` to ``torch.Size`` for the fused LayerNorm kernel."""
+    """Coerce ``normalized_shape`` to ``torch.Size`` for QKV metadata."""
     if normalized_shape is None:
         return None
     if isinstance(normalized_shape, numbers.Integral):
@@ -40,17 +29,3 @@ def normalize_shape(normalized_shape: int | tuple[int, ...] | None) -> Any:
     import torch
 
     return torch.Size(normalized_shape)
-
-
-def layernorm_forward(
-    hidden: Tensor,
-    weight: Tensor,
-    bias: Tensor,
-    normalized_shape: Any,
-    eps: float,
-) -> tuple[Tensor, Tensor, Tensor]:
-    """Return ``(output, mean, invvar)`` from ``fused_layer_norm_cuda.forward_affine``."""
-    global _fused_layer_norm_cuda
-    if _fused_layer_norm_cuda is None:
-        _fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
-    return _fused_layer_norm_cuda.forward_affine(hidden, normalized_shape, weight, bias, eps)

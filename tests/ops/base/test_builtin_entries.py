@@ -135,6 +135,8 @@ _BUILTIN_ENTRIES = (
     ("moe_experts_lora", "independent", "eager", "any", _ANY, ()),
     ("moe_experts_lora", "independent", "fused_triton", "cuda", _GPU_SM70, ("triton",)),
     ("moe_experts_lora", "independent", "fused_npu", "npu", _NPU, ()),
+    ("layer_norm", "standard", "eager", "any", _ANY, ()),
+    ("layer_norm", "standard", "apex", "cuda", _GPU, ("fused_layer_norm_cuda",)),
     ("rms_norm", "standard", "eager", "any", _ANY, ()),
     ("rms_norm", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
     ("rms_norm", "standard", "npu", "npu", _NPU, ()),

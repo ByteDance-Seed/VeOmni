@@ -48,6 +48,7 @@ optional_roots = {
     "flash_attn_interface",
     "flash_mla",
     "flash_qla",
+    "fused_layer_norm_cuda",
     "liger_kernel",
     "magi_attention",
     "quack",

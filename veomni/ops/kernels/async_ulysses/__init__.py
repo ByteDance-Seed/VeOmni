@@ -15,8 +15,7 @@
 """Async Ulysses compound kernels.
 
 ``async_ulysses_qkv`` / ``async_ulysses_o`` each have ``standard`` and ``dit``
-eager rows. Nested RMSNorm uses a raw kernel pair. LayerNorm still calls the
-fused CUDA extension in ``shared/norm`` / ``shared/backward``.
+eager rows. Nested RMSNorm and LayerNorm use raw kernel pairs.
 """
 
 from ...registry import register_op

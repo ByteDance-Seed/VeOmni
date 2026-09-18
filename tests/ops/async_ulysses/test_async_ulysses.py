@@ -34,7 +34,6 @@ from veomni.ops.kernels.async_ulysses.shared.backward import (
     linear_parameter_backward,
 )
 from veomni.ops.registry import OpEntry, SavedState
-from veomni.utils.device import IS_CUDA_AVAILABLE
 
 
 _EAGER_ROWS = (
@@ -409,22 +408,20 @@ def test_qkv_empty_sequence_matches_sequential(monkeypatch: pytest.MonkeyPatch, 
         torch.testing.assert_close(actual_input.grad, expected_input.grad)
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="async Ulysses LayerNorm backward requires CUDA")
 @pytest.mark.parametrize("variant", ("standard", "dit"))
 def test_qkv_layer_norm_matches_sequential(monkeypatch: pytest.MonkeyPatch, variant: str) -> None:
-    pytest.importorskip("fused_layer_norm_cuda")
     _mock_identity_comm(monkeypatch)
     torch.manual_seed(6106)
     batch, seq, hidden, head_dim = 2, 3, 16, 4
     norm_size = head_dim if variant == "standard" else hidden
-    weights = tuple(tensor.to("cuda") for tensor in _qkv_weights(hidden, hidden, hidden, dtype=torch.float32))
+    weights = _qkv_weights(hidden, hidden, hidden, dtype=torch.float32)
     inputs = (
-        torch.randn(batch, seq, hidden, device="cuda", dtype=torch.float32),
+        torch.randn(batch, seq, hidden, dtype=torch.float32),
         *weights,
-        torch.randn(norm_size, device="cuda"),
-        torch.randn(norm_size, device="cuda"),
-        torch.randn(norm_size, device="cuda"),
-        torch.randn(norm_size, device="cuda"),
+        torch.randn(norm_size),
+        torch.randn(norm_size),
+        torch.randn(norm_size),
+        torch.randn(norm_size),
     )
     actual_inputs = [tensor.detach().clone().requires_grad_(True) for tensor in inputs]
     expected_inputs = [tensor.detach().clone().requires_grad_(True) for tensor in inputs]
@@ -640,6 +637,69 @@ def test_nested_rms_handle_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
     expected = (
         F.linear(hidden_e, q_weight, q_bias) * 2,
         F.linear(hidden_e, k_weight, k_bias) * 2,
+        F.linear(hidden_e, v_weight, v_bias),
+    )
+    for actual_output, expected_output in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_output, expected_output)
+
+    grad_outputs = tuple(torch.randn_like(output) for output in actual)
+    torch.autograd.backward(actual, grad_outputs)
+    torch.autograd.backward(expected, grad_outputs)
+    for actual_input, expected_input in zip(actual_inputs, expected_inputs, strict=True):
+        torch.testing.assert_close(actual_input.grad, expected_input.grad)
+
+
+def test_nested_layer_norm_handle_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_identity_comm(monkeypatch)
+
+    def dummy_forward(
+        hidden: Tensor,
+        weight: Tensor,
+        bias: Tensor,
+        *,
+        normalized_shape: int | tuple[int, ...] | None = None,
+        eps: float,
+    ) -> tuple[Tensor, SavedState]:
+        return hidden * 2 + bias, SavedState((hidden, weight, bias), eps)
+
+    def dummy_backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...]:
+        return grad_output * 2, None, grad_output
+
+    dummy = OpEntry(
+        op="dummy_layer_norm",
+        variant="standard",
+        impl="eager",
+        description="Test LayerNorm",
+        forward=dummy_forward,
+        backward=dummy_backward,
+    )
+    hidden = torch.randn(2, 3, 16)
+    weights = _qkv_weights(16, 16, 16, dtype=torch.float32)
+    actual_inputs = [tensor.detach().clone().requires_grad_(True) for tensor in (hidden, *weights)]
+    expected_inputs = [tensor.detach().clone().requires_grad_(True) for tensor in (hidden, *weights)]
+    norm_q_weight = torch.ones(16)
+    norm_q_bias = torch.randn(16)
+    norm_k_weight = torch.ones(16)
+    norm_k_bias = torch.randn(16)
+    actual = VeomniOp("async_ulysses_qkv", "dit")(
+        *actual_inputs,
+        norm_q_weight,
+        norm_q_bias,
+        norm_k_weight,
+        norm_k_bias,
+        seq_dimension=1,
+        head_dimension=2,
+        unpadded_dim_size=3,
+        group=object(),
+        norm_type="layernorm",
+        normalized_shape=16,
+        eps=1e-5,
+        layer_norm=dummy,
+    )
+    hidden_e, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias = expected_inputs
+    expected = (
+        F.linear(hidden_e, q_weight, q_bias) * 2 + norm_q_bias,
+        F.linear(hidden_e, k_weight, k_bias) * 2 + norm_k_bias,
         F.linear(hidden_e, v_weight, v_bias),
     )
     for actual_output, expected_output in zip(actual, expected, strict=True):

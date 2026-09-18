@@ -31,7 +31,7 @@ class QKVMeta:
     """Non-tensor QKV save payload.
 
     ``rms_q`` / ``rms_k`` are ``append_inner`` specs for the rmsnorm path.
-    LayerNorm tensors stay in the trailing save list instead.
+    ``ln_q`` / ``ln_k`` are ``append_inner`` specs for the layernorm path.
     """
 
     seq_dimension: int
@@ -48,6 +48,9 @@ class QKVMeta:
     rms: OpEntry | None = None
     rms_q: tuple[Any, int] | None = None
     rms_k: tuple[Any, int] | None = None
+    layer_norm: OpEntry | None = None
+    ln_q: tuple[Any, int] | None = None
+    ln_k: tuple[Any, int] | None = None
 
 
 def qkv_grads(
