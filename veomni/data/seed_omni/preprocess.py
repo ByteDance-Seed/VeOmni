@@ -18,15 +18,28 @@ SEED_OMNI_PREPROCESSOR_REGISTRY = Registry("SeedOmniPreprocessor")
 def conv_preprocess(source: str, conversations, example, **kwargs):
     """Dispatch ``source`` to its registered preprocessor.
 
-    Returns a 3-tuple ``(constructed, image_refs, video_refs)``: the
+    Returns a 4-tuple ``(constructed, image_refs, video_refs, audio_refs)``: the
     ``[[role, (type, value) | (type, value, meta), ...], ...]`` layout plus the
     per-sample media ref lists the transform decodes via ``fetch_images`` /
-    ``fetch_videos``. The ref lists' lengths must match the flattened
-    image / video entry counts so ``_build_conversation_list`` can pair them by
-    pure sequential order — the preprocessor owns that alignment (the
+    ``fetch_videos`` / ``fetch_audios``. The ref lists' lengths must match the
+    flattened entry counts per modality so ``_build_conversation_list`` can pair
+    them by pure sequential order — the preprocessor owns that alignment (the
     multi-turn edit preprocessor duplicates copy-image refs to express reuse).
+
+    A preprocessor may return the older 3-tuple, which is read as "no audio".
+    This registry is an extension point — a preprocessor for a private corpus
+    lives outside this repo — so adding a modality widens the contract instead
+    of breaking every implementation of it.
     """
-    return SEED_OMNI_PREPROCESSOR_REGISTRY[source](conversations, example, **kwargs)
+    result = SEED_OMNI_PREPROCESSOR_REGISTRY[source](conversations, example, **kwargs)
+    if len(result) == 3:
+        return (*result, [])
+    if len(result) != 4:
+        raise ValueError(
+            f"conv_preprocess: preprocessor for source {source!r} returned {len(result)} values; expected "
+            f"(constructed, image_refs, video_refs) or (constructed, image_refs, video_refs, audio_refs)."
+        )
+    return result
 
 
 @SEED_OMNI_PREPROCESSOR_REGISTRY.register("imagenet1k")
@@ -70,6 +83,50 @@ def tulu_3_sft_mixture_preprocess(conversations, example, **kwargs):
     for conversation in text_example:
         constructed_conversation.append([conversation["role"], ("text", conversation["content"])])
     return constructed_conversation, [], []
+
+
+@SEED_OMNI_PREPROCESSOR_REGISTRY.register("voice_assistant")
+def voice_assistant_preprocess(conversations, example, **kwargs):
+    """Spoken question -> text answer: one ``user`` audio turn per sample.
+
+    Exercises the thinker's audio tower, which no other shipped source does.
+    The clip is the *user* side, so it is an encoder input rather than a talker
+    target — that distinction is carried by ``role`` alone, since both uses are
+    ``type="audio"``.
+
+    The ``human`` turn's text is the clip's transcript. It is dropped rather
+    than emitted beside the audio: fed as text the model would answer from the
+    transcript and the tower would carry no signal, which is the opposite of
+    what this source is here to test.
+
+    Clips are 22.05 kHz, matching neither the tower (16 kHz) nor the codec
+    (24 kHz), so this is also the source that keeps the declared-rate path
+    honest — the transform reads the rate off the file and each module
+    resamples for itself.
+    """
+    del kwargs
+    audio_refs = list(example.get("audios", []) or [])
+
+    constructed = []
+    spoken = 0
+    for message in conversations:
+        if message["from"] == "human":
+            constructed.append(["user", ("audio", None)])
+            spoken += 1
+        elif message["from"] == "gpt":
+            constructed.append(["assistant", ("text", message["value"])])
+        else:
+            raise ValueError(f"voice_assistant: unexpected speaker {message['from']!r}")
+
+    # Counted up front and in both directions. Pairing downstream is positional,
+    # so a count that does not match does not fail — it attaches the wrong clip
+    # to the wrong turn, and every later turn shifts with it.
+    if spoken != len(audio_refs):
+        raise ValueError(
+            f"voice_assistant: sample has {spoken} spoken turn(s) but {len(audio_refs)} clip(s); "
+            f"they are paired by position, so an unequal count would misattach them."
+        )
+    return constructed, [], [], audio_refs
 
 
 def _sharegpt4v_sft_layout(conversations):

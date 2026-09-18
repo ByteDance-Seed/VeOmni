@@ -50,7 +50,7 @@ _SOURCE = "qwen3vl_vision"
 def _video_metadata(items: list, frames: list) -> list[dict]:
     """HF ``video_metadata`` for the handed-over (already decoded) frames.
 
-    The data layer (``seed_omni/video_utils.load_video``) pre-trims each clip to
+    The data layer (``seed_omni/utils/video.load_video``) pre-trims each clip to
     ``mm_configs.fps`` purely as a memory bound, so the frames passed here are a
     self-contained clip whose *source* fps **is** ``VideoInputs.video_fps``. We
     forward that as the metadata fps; the HF ``Qwen3VLVideoProcessor`` then

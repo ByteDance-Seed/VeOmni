@@ -28,11 +28,13 @@ This transform is intentionally minimal — it does **only**:
    ``veomni.data.seed_omni.preprocess``) so that downstream code sees a uniform
    ``[[role, (type, value), ...], ...]`` structure regardless of the upstream
    dataset.
-2. Image IO + ``smart_resize`` (delegated to ``image_utils.fetch_images``),
-   followed by PIL → uint8 ``torch.Tensor`` of shape ``(C, H, W)``.  Images are
-   **not** normalized, **not** patchified, and **not** wrapped in any
-   processor-specific feature dict — those steps are owned by the vision
-   encoder module (e.g. ``JanusSiglip`` / ``JanusVqvae``) at forward time.
+2. Image IO + an aspect-preserving downscale to ``image_max_pixels`` (delegated
+   to ``utils/image.fetch_images``), followed by PIL → uint8 ``torch.Tensor`` of
+   shape ``(C, H, W)``.  That downscale is an OOM guard, not a resize to the
+   model's grid: images are **not** ``smart_resize``-d, **not** normalized,
+   **not** patchified, and **not** wrapped in any processor-specific feature
+   dict — those steps are owned by the vision encoder module (e.g.
+   ``JanusSiglip`` / ``JanusVqvae``) at forward time.
 3. Conversation list assembly — pair each ``("image", None)`` tuple with the
    next image tensor in source order and attach ``role`` per item.
 
@@ -41,6 +43,16 @@ emission, ``input_ids`` / ``labels`` / ``attention_mask`` construction,
 position id calculation, image normalization, image patchification) is
 deliberately **not** done here — it belongs in model modules per the V2
 design contract (see ``docs/seed_omni/seed_omni_v2.md`` § 3).
+
+Audio turns (``("audio", _)``) are paired with the per-sample ``audios`` list and
+loaded by ``utils/audio.fetch_audios`` **at the source's own rate**, which each
+item then declares in ``meta["sampling_rate"]``. The data layer does not pick a
+rate because there is no single right one: a Qwen3-Omni thinker's tower wants
+16 kHz while the codec that turns assistant speech into talker targets wants
+24 kHz, and the rate is also what places a clip on TMRoPE's shared clock.
+``role`` separates the two uses of the same ``type="audio"`` row — ``user`` is an
+input to an audio encoder, ``assistant`` is the speech a talker is trained to
+say, i.e. a label.
 
 Video turns (``("video", _)``) are paired with the per-sample ``videos`` list
 and decoded via ``fetch_videos`` into a :class:`VideoInputs` bundle — the
@@ -67,12 +79,13 @@ import torch
 from ...models.seed_omni.utils.conversation import ConversationItem
 from ...utils.import_utils import is_video_audio_available
 from ..data_transform import DATA_TRANSFORM_REGISTRY
-from .image_utils import fetch_images
 from .preprocess import conv_preprocess
+from .utils.audio import SAMPLING_RATE_KEY, fetch_audios
+from .utils.image import fetch_images
 
 
 if is_video_audio_available():
-    from .video_utils import VideoInputs, fetch_videos
+    from .utils.video import VideoInputs, fetch_videos
 else:
     VideoInputs = None
 
@@ -88,10 +101,23 @@ else:
 _TupleTurn = List  # ``[role: str, (type, value) | (type, value, meta), ...]``
 
 
+def _is_rate(declared: Any, rate: int) -> bool:
+    """Whether a preprocessor's declared rate agrees with the decoded one.
+
+    Non-numeric counts as disagreement so the caller's message names the field,
+    rather than a bare ``int()`` failure naming nothing.
+    """
+    try:
+        return int(declared) == rate
+    except (TypeError, ValueError):
+        return False
+
+
 def _build_conversation_list(
     constructed: list[_TupleTurn],
     image_tensors: list[torch.Tensor],
     video_inputs: list[VideoInputs],
+    audio_clips: list[tuple[Any, int]] | None = None,
 ) -> list[ConversationItem]:
     """Flatten ``[[role, (type, value) | (type, value, meta), ...], ...]`` into
     :class:`ConversationItem` rows and pair image / video turns with
@@ -116,8 +142,10 @@ def _build_conversation_list(
     """
     image_iter = iter(image_tensors)
     video_iter = iter(video_inputs)
+    audio_iter = iter(audio_clips or [])
     image_consumed = 0
     video_consumed = 0
+    audio_consumed = 0
     out: list[ConversationItem] = []
     for turn in constructed:
         if not turn:
@@ -139,6 +167,25 @@ def _build_conversation_list(
             elif type_ == "video":
                 value: VideoInputs = next(video_iter)
                 video_consumed += 1
+            elif type_ == "audio":
+                # The rate rides along rather than being normalised away: the
+                # modules that read this item disagree on what they want (16 kHz
+                # tower, 24 kHz codec) and each resamples for itself, so the
+                # data layer's job is to say what it loaded, not to choose.
+                value, rate = next(audio_iter)
+                declared = meta.get(SAMPLING_RATE_KEY)
+                if declared is not None and not _is_rate(declared, rate):
+                    # The decoded header wins any argument, so a preprocessor
+                    # asserting a different rate is stating something false
+                    # rather than expressing a preference — and the effect is a
+                    # silent misplacement on TMRoPE's clock, not a bad-sounding
+                    # clip, so it is worth stopping for.
+                    raise ValueError(
+                        f"audio item declares meta[{SAMPLING_RATE_KEY!r}]={declared} but the clip decodes at "
+                        f"{rate} Hz. Drop the key and let the decoded rate stand."
+                    )
+                meta[SAMPLING_RATE_KEY] = rate
+                audio_consumed += 1
             elif type_ == "text":
                 assert value is not None, "text value must not be None"
             else:
@@ -151,6 +198,10 @@ def _build_conversation_list(
     leftover_videos = list(video_iter)
     assert len(leftover_videos) == 0, (
         f"sample has {len(leftover_videos)} unused video(s) after consuming {video_consumed}"
+    )
+    leftover_audios = list(audio_iter)
+    assert len(leftover_audios) == 0, (
+        f"sample has {len(leftover_audios)} unused audio clip(s) after consuming {audio_consumed}"
     )
     return out
 
@@ -178,10 +229,17 @@ def process_seedomni_example(
             - ``"videos"`` (optional): list of video refs.  The preprocessor
               returns the ref list paired in order with the flattened
               ``("video", _)`` turns.
+            - ``"audios"`` (optional): list of audio refs (paths / wav-or-flac
+              bytes).  Paired in order with the flattened ``("audio", _)``
+              turns and decoded at each clip's own rate, which the resulting
+              item declares in ``meta["sampling_rate"]``.
         **kwargs: forwarded to both ``conv_preprocess`` (e.g.
             ``generation_ratio``) and ``fetch_images`` / ``fetch_videos``
-            (e.g. ``image_min_pixels`` / ``image_max_pixels`` /
-            ``scale_factor`` / ``max_ratio`` — see ``image_utils.smart_resize``).
+            (``image_max_pixels`` / ``video_max_pixels`` / ``fps`` /
+            ``max_frames`` — the OOM caps; see
+            ``utils/image.resize_to_max_pixels``).  Both fetchers drop every
+            other keyword, so a knob named here that they do not read is
+            ignored rather than rejected.
             ``OmniTrainer`` injects ``tokenizer`` / ``max_seq_len`` /
             ``text_keys`` here (legacy contract); they are silently
             ignored — V2 modules own their own tokenizer.
@@ -206,12 +264,13 @@ def process_seedomni_example(
     if isinstance(conversations, (bytes, bytearray)):
         conversations = json.loads(conversations.decode("utf-8"))
 
-    constructed, image_refs, video_refs = conv_preprocess(source, conversations, example, **kwargs)
+    constructed, image_refs, video_refs, audio_refs = conv_preprocess(source, conversations, example, **kwargs)
 
     image_tensors = fetch_images(image_refs, **kwargs)
     video_inputs = fetch_videos(video_refs, **kwargs)
+    audio_clips = fetch_audios(audio_refs, **kwargs)
 
-    conversation_list = _build_conversation_list(constructed, image_tensors, video_inputs)
+    conversation_list = _build_conversation_list(constructed, image_tensors, video_inputs, audio_clips)
     return [{"conversation_list": conversation_list}]
 
 
