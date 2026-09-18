@@ -54,6 +54,9 @@ model:
     ulysses_size: 1
     gradient_checkpointing:
       enable: true
+      # recompute_last_n_layers: 15   # 重算层数, 从最后一层往前数: -1 = 全部 (默认), 0 = 不重算, N = 后 N 层
+      # selective_n_layers: 10   # 重算范围里从前往后数 10 层走 SAC: 0 = 不开 (默认), >= 重算层数 = 全部走 SAC
+      # selective_ops: []  # 默认空 = auto attention 集合 (SDPA 类 op MUST_SAVE, 其余重算)
     fsdp_config:
       fsdp_mode: fsdp2
       mixed_precision:
