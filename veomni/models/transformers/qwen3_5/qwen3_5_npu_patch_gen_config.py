@@ -52,8 +52,8 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_model_forward,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_model_init_patched,
     qwen3_5_rmsnorm_forward_patched,
-    qwen3_5_text_model_update_linear_attn_mask,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_rot_pos_emb,
@@ -69,6 +69,12 @@ config = PatchConfig(
     source_module="transformers.models.qwen3_5.modeling_qwen3_5",
     target_file="patched_modeling_qwen3_5_npu.py",
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
+)
+
+config.override_method(
+    "Qwen3_5Model.__init__",
+    replacement=qwen3_5_model_init_patched,
+    description="Construct generated vision and text towers instead of upstream AutoModel classes",
 )
 
 config.add_import("copy", names=["copy"])
@@ -95,29 +101,15 @@ config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )  # noqa: F401
-config.drop_import_names(
-    "FusedRMSNormGated",
-    "causal_conv1d_fn",
-    "causal_conv1d_update",
-    "chunk_gated_delta_rule",
-    "fused_recurrent_gated_delta_rule",
-)
-config.add_post_import_block(
-    """
-    # NPU has no fla/flash_qla backend registered today; selecting a non-eager
-    # linear-attention impl raises at OpSlot.bind() time, which is desirable —
-    # a silent fallback would mask the misconfiguration. These None
-    # placeholders preserve the upstream HF top-level
-    # `is_fast_path_available = all((causal_conv1d_fn, ...))` (resolves to
-    # False — legacy warning) and let the `<fla_name> or <torch_fallback>`
-    # assignments in __init__ resolve to torch.
-    FusedRMSNormGated = None
-    causal_conv1d_fn = None
-    causal_conv1d_update = None
-    chunk_gated_delta_rule = None
-    fused_recurrent_gated_delta_rule = None
-    """
-)
+# NPU has no fla/flash_qla backend registered today; selecting a non-eager
+# linear-attention impl raises at OpSlot.bind() time, which is desirable — a
+# silent fallback would mask the misconfiguration.
+#
+# transformers 5.16 removed the conditional FLA / causal-conv1d imports,
+# `FusedRMSNormGated` and `is_fast_path_available`, so the previous
+# `drop_import_names` call and the `<name> = None` post-import placeholders have
+# nothing left to neutralise (and would collide with the new upstream
+# module-level definitions). See the GPU config for the same change.
 
 config.add_post_import_block(
     """
@@ -151,6 +143,7 @@ veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block ab
 # codegen time from the imports already present in the generated modeling file.
 DynamicCache = None
 create_causal_mask = None
+create_recurrent_attention_mask = None
 Qwen3_5ModelOutputWithPast = None
 
 # This NPU config reuses qwen3_5_vision_model_forward (Patch.5) from the GPU
@@ -471,7 +464,7 @@ def qwen3_5_decoder_layer_forward_patched(
     linear_attn_chunk_indices_list = kwargs.pop("chunk_indices_list_q", None)
 
     # Token Mixer
-    if self.layer_type == "linear_attention":
+    if self.block_type == "linear_attention":
         # Modification: pass linear-attention cu_seqlens + precomputed metadata through to GatedDeltaNet.forward.
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
@@ -483,7 +476,7 @@ def qwen3_5_decoder_layer_forward_patched(
             chunk_indices=linear_attn_chunk_indices,
             chunk_indices_list=linear_attn_chunk_indices_list,
         )
-    elif self.layer_type == "full_attention":
+    elif self.block_type == "full_attention":
         # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
@@ -545,14 +538,20 @@ def qwen3_5_text_model_forward_patched(
     else:
         text_position_ids = None
 
-    causal_mask = create_causal_mask(
-        config=self.config,
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        past_key_values=past_key_values,
-        position_ids=text_position_ids,
-    )
-    linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_key_values)
+    if not isinstance(causal_mask_mapping := attention_mask, dict):
+        # Prepare mask arguments
+        mask_kwargs = {
+            "config": self.config,
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "position_ids": text_position_ids,
+        }
+        # Create the masks
+        causal_mask_mapping = {
+            "full_attention": create_causal_mask(**mask_kwargs),
+            "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
+        }
 
     # Modification: precompute varlen metadata once for all GDN layers to avoid per-layer tolist overhead.
     cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
@@ -579,12 +578,10 @@ def qwen3_5_text_model_forward_patched(
     position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
     for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
-        layer_mask = linear_attn_mask if self.config.layer_types[i] == "linear_attention" else causal_mask
-
         hidden_states = decoder_layer(
             hidden_states,
             position_embeddings=position_embeddings,
-            attention_mask=layer_mask,
+            attention_mask=causal_mask_mapping[self.config.layer_types[i]],
             position_ids=text_position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
@@ -597,13 +594,6 @@ def qwen3_5_text_model_forward_patched(
         last_hidden_state=hidden_states,
         past_key_values=past_key_values,
     )
-
-
-config.override_method(
-    "Qwen3_5TextModel._update_linear_attn_mask",
-    replacement=qwen3_5_text_model_update_linear_attn_mask,
-    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
-)
 
 
 config.override_method(
@@ -862,8 +852,13 @@ config.override_method(
 @config.add_helper_after("Qwen3_5CausalLMOutputWithPast")
 @dataclass
 class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5CausalLMOutputWithPast):
-    """``Qwen3_5CausalLMOutputWithPast`` + ``fused_linear_aux`` payload.
-
+    r"""
+    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+        Language modeling loss (for next-token prediction).
+    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
     fused_linear_aux (`FusedLinearAuxOutput`, *optional*):
         Per-token tensors produced by the fused-linear loss path
         (``log_probs`` / ``entropy``; plus ``distillation_losses`` /

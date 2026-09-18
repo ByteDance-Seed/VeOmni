@@ -38,10 +38,10 @@ WORKDIR /app
 
 COPY . .
 
-# pyproject.toml pins transformers==5.9.0 in the transformers-stable uv default
+# pyproject.toml pins transformers==5.16.1 in the transformers-stable uv default
 # group. pip install -e does not install uv dependency groups, so pin and verify it here.
-RUN pip install -e ".[npu_aarch64]" "transformers==5.9.0" && \
-    python -c "import transformers; assert transformers.__version__ == '5.9.0'"
+RUN pip install -e ".[npu_aarch64]" "transformers==5.16.1" && \
+    python -c "import transformers; assert transformers.__version__ == '5.16.1'"
 
 # Align the parquet/data stack with the uv lockfile. pip install -e (unlike x86's
 # uv sync --locked) ignores the lockfile and floats pyarrow/pandas to latest; pyarrow

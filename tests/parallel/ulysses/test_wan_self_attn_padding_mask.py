@@ -9,7 +9,7 @@ CPU with no distributed setup.
 
 import torch
 
-from veomni.models.transformers.wan.modeling_wan import eager_attention_forward
+from veomni.models.transformers.wan.modeling_wan import _trim_kv_tail_padding, eager_attention_forward
 
 
 class _Module:
@@ -69,7 +69,47 @@ def test_unmasked_padding_would_have_diverged():
     )
 
 
+def test_trim_kv_tail_padding_matches_unpadded_reference():
+    """`_trim_kv_tail_padding` backs `wrapped_flash_attention_3`/`wrapped_sageattention`,
+    neither of which take a mask argument. It must drop exactly the padded tail the
+    global mask marks, and re-report that count as `pad_size` so the caller can re-pad
+    the kernel's output back to the original (padded) length."""
+    torch.manual_seed(0)
+    batch, heads, real_len, head_dim = 2, 4, 37, 16
+    pad_size = 3
+    local_len = real_len + pad_size
+
+    query = torch.randn(batch, heads, local_len, head_dim)
+    key = torch.randn(batch, heads, local_len, head_dim)
+    value = torch.randn(batch, heads, local_len, head_dim)
+
+    mask = torch.zeros(1, 1, 1, local_len)
+    mask[..., local_len - pad_size :] = torch.finfo(torch.float32).min
+
+    trimmed_q, trimmed_k, trimmed_v, reported_pad = _trim_kv_tail_padding(query, key, value, mask)
+
+    assert reported_pad == pad_size
+    torch.testing.assert_close(trimmed_q, query[..., :real_len, :])
+    torch.testing.assert_close(trimmed_k, key[..., :real_len, :])
+    torch.testing.assert_close(trimmed_v, value[..., :real_len, :])
+
+
+def test_trim_kv_tail_padding_is_noop_without_mask():
+    query = torch.randn(2, 4, 37, 16)
+    key = torch.randn(2, 4, 37, 16)
+    value = torch.randn(2, 4, 37, 16)
+
+    trimmed_q, trimmed_k, trimmed_v, pad_size = _trim_kv_tail_padding(query, key, value, None)
+
+    assert pad_size == 0
+    assert trimmed_q is query
+    assert trimmed_k is key
+    assert trimmed_v is value
+
+
 if __name__ == "__main__":
     test_padding_mask_matches_unpadded_reference()
     test_unmasked_padding_would_have_diverged()
+    test_trim_kv_tail_padding_matches_unpadded_reference()
+    test_trim_kv_tail_padding_is_noop_without_mask()
     print("OK")

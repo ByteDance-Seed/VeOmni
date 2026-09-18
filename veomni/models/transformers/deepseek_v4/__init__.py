@@ -15,7 +15,14 @@
 from functools import partial
 
 from ....utils.device import IS_NPU_AVAILABLE
-from ...loader import MODELING_REGISTRY
+from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+
+
+@MODEL_CONFIG_REGISTRY.register("deepseek_v4")
+def register_deepseek_v4_config():
+    from .configuration_deepseek_v4 import DeepseekV4Config
+
+    return DeepseekV4Config
 
 
 @MODELING_REGISTRY.register("deepseek_v4")

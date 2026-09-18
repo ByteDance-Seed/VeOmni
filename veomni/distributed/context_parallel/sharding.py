@@ -30,7 +30,7 @@ them in a collective.
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 import torch
 
@@ -96,7 +96,7 @@ def plan_compressor_shard(
     local_seq_len: int,
     cp_rank: int,
     cp_size: int,
-    packed_compression_metadata: Optional[dict],
+    packed_compression_metadata: dict | None,
     device: torch.device,
 ) -> CompressorShardPlan:
     """Everything a window-compressing module needs before it touches a collective.

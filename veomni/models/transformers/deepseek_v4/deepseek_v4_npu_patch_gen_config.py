@@ -98,6 +98,9 @@ from veomni.patchgen.patch_spec import PatchConfig
 
 from .deepseek_v4_gpu_patch_gen_config import (
     PatchedDeepseekV4Experts,
+    _builds_indexer_kl,
+    _indexer_loss_enabled,
+    _split_indexer_output,
     deepseek_v4_attention_forward_patched,
     deepseek_v4_decoder_layer_forward_patched,
     deepseek_v4_eager_attention_forward_patched,
@@ -114,6 +117,11 @@ from .deepseek_v4_gpu_patch_gen_config import (
     deepseek_v4_sparse_moe_block_init_patched,
     deepseek_v4_topk_router_forward_patched,
     deepseek_v4_unweighted_rmsnorm_forward_patched,
+    indexer_kl_terms,
+    veomni_qat_fake_quant_act,
+    veomni_qat_fake_quant_expert_weight,
+    veomni_qat_fake_quant_kv,
+    veomni_qat_linear,
 )
 
 
@@ -124,9 +132,15 @@ config = PatchConfig(
 )
 
 config.add_import("veomni.ops", names=["fused_moe_forward"])
+# ``sparse_mqa_target_fwd`` is the indexer loss's teacher kernel. The objective
+# needs both the TileLang indexer and the TileLang attention (see
+# ``_indexer_loss_enabled``), and the TileLang sparse attention declines any
+# non-CUDA tensor, so the branches reusing it are dead on NPU and refuse on the
+# first attention call. The import exists only so patchgen can emit a module that
+# type-checks.
 config.add_import(
     "veomni.ops.kernels.deepseek_v4",
-    names=["sparse_attn_tilelang", "v4_lighting_indexer"],
+    names=["sparse_attn_tilelang", "sparse_mqa_target_fwd", "v4_lighting_indexer"],
 )
 config.add_import(
     "veomni.distributed.parallel_state",
@@ -134,7 +148,12 @@ config.add_import(
 )
 config.add_import(
     "veomni.distributed.sequence_parallel",
-    names=["gather_heads_scatter_seq", "gather_outputs", "gather_seq_scatter_heads"],
+    names=[
+        "gather_heads_scatter_seq",
+        "gather_outputs",
+        "gather_seq_scatter_heads",
+        "reduce_sequence_parallel_loss",
+    ],
 )
 # The GPU attention/indexer forwards reused below include context-parallel
 # branches. CP is rejected at model build on NPU (see
@@ -173,7 +192,12 @@ config.add_import(
 # constructor fields (FSDP2 unshard-hook safe — see GPU config comment).
 config.add_import(
     "veomni.utils.model_outputs",
-    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "MoeCausalLMOutputWithLogProbs"],
+    names=[
+        "FusedLinearAuxOutput",
+        "FusedLinearAuxOutputMixin",
+        "MoeCausalLMOutputWithLogProbs",
+        "MoeModelOutputWithIndexerKL",
+    ],
 )
 config.drop_import_names("MoeCausalLMOutputWithPast")
 
@@ -183,6 +207,28 @@ config.add_import(
     "veomni.utils.moe_router_replay",
     names=["get_active_replay", "maybe_replay_indices"],
 )
+
+# The reused attention / indexer / compressor forwards route their projections
+# and stored KV through the GPU config's QAT helpers, so the generated NPU module
+# needs them too. Emitting them here costs nothing on Ascend: `qat_implementation`
+# has no NPU backend, so the slot stays at "none" and every helper is a
+# passthrough that never reaches the SM90-only kernels. Importing
+# `veomni.ops.qat` is likewise safe -- TileLang loads inside the kernel
+# wrappers, not at import.
+config.add_import(
+    "veomni.ops.qat",
+    names=[
+        "fp4_fake_quant_weight",
+        "fp8_fake_quant_act",
+        "fp8_fake_quant_act_prefix",
+        "fp8_fake_quant_stacked_weight",
+        "qat_linear",
+    ],
+)
+config.add_helper(veomni_qat_linear)
+config.add_helper(veomni_qat_fake_quant_kv)
+config.add_helper(veomni_qat_fake_quant_act)
+config.add_helper(veomni_qat_fake_quant_expert_weight)
 
 config.add_post_import_block(
     """
@@ -198,8 +244,19 @@ config.add_post_import_block(
     veomni_mhc_head = OpSlot("mhc", "head")
     veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
     veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
+    veomni_qat_implementation = OpsConfigSlot("qat_implementation")
     """
 )
+
+# The reused indexer/attention/model/ForCausalLM forwards read the indexer-loss
+# gate, so the generated NPU module needs the same helpers the GPU one defines.
+# Registered by reference rather than restated, so the two backends cannot drift
+# apart on a predicate whose whole purpose is to be read identically from the
+# three call sites that decide the forward's arity.
+config.add_helper(_indexer_loss_enabled)
+config.add_helper(_builds_indexer_kl)
+config.add_helper(_split_indexer_output)
+config.add_helper(indexer_kl_terms)
 
 # ================================================================
 # Structural + numerics patches reused verbatim from the GPU config. Keeping
@@ -358,15 +415,13 @@ def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config") -> None:
     self.num_heads = config.index_n_heads
     self.head_dim = config.index_head_dim
     self.index_topk = config.index_topk
-    self.softmax_scale = self.head_dim**-0.5
-    self.weights_scaling = self.num_heads**-0.5
     self.kv_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
     self.gate_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
     self.position_bias = nn.Parameter(torch.empty(self.compress_rate, 2 * self.head_dim))
     self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
     self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
-    self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
     self.rotary_emb = DeepseekV4RotaryEmbedding(config)
+    self.scorer = DeepseekV4IndexerScorer(config)
     self.position_bias._veomni_fsdp_shard_dim = 1
 
 
@@ -415,6 +470,13 @@ def deepseek_v4_hca_compressor_forward_patched(
     packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
     return_topk_indices: bool = False,
     build_block_bias: bool = True,
+    # Accepted and ignored, matching the GPU config's HCA compressor: the shared
+    # ``DeepseekV4Attention.forward`` holds one compressor whose class is chosen by
+    # layer type and calls it through a single call site, so both compressors have to
+    # take the same arguments. Only the CSA one owns a Lightning Indexer. Dead on NPU
+    # either way -- ``_indexer_loss_enabled`` refuses anything but the TileLang
+    # indexer, which is CUDA-only -- but the signature has to line up with the call.
+    build_indexer_loss: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, None]:
     if (packed_sequence_slices is None) != (packed_compression_metadata is None):
         raise ValueError("Packed sequence slices and compression metadata must be provided together")
@@ -439,6 +501,7 @@ def deepseek_v4_hca_compressor_forward_patched(
             overlap=False,
             apply_rope=apply_rotary_pos_emb,
         )
+        compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
         if compressed.shape[1] == 0:
             anchor = (self.kv_norm(kv[..., : self.head_dim]).sum() + gate.sum() + self.position_bias.sum()) * 0.0
             compressed = compressed + anchor.to(compressed.dtype)
@@ -468,6 +531,7 @@ def deepseek_v4_hca_compressor_forward_patched(
     else:
         compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
 
+    compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
     if cache_layer is not None:
         compressed = cache_layer.update_compressor_states("compressor", compressed)
     compressed_kv = compressed.unsqueeze(1)
@@ -507,9 +571,29 @@ def deepseek_v4_csa_compressor_forward_patched(
     packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
     return_topk_indices: bool = False,
     build_block_bias: bool = True,
+    # Accepted, refused, and never forwarded on this backend. The shared attention
+    # forward passes ``_builds_indexer_kl``'s answer down here, so the parameter
+    # exists because the call site is shared -- ``tests/models/
+    # test_generated_call_site_signatures.py`` is what enforces that. The two indexer
+    # call sites below stay on their bare-tensor return and this file needs no
+    # ``_split_indexer_output``.
+    build_indexer_loss: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     if (packed_sequence_slices is None) != (packed_compression_metadata is None):
         raise ValueError("Packed sequence slices and compression metadata must be provided together")
+    if build_indexer_loss:
+        # Reachable: ``dsa_indexer_implementation`` is a plain ``Literal`` with no
+        # hardware gate, so ``tilelang`` parses on NPU and ``_indexer_loss_enabled``
+        # then admits the objective. Everything after this point would quietly
+        # disagree with it -- the indexer is called without the flag and returns bare
+        # top-k indices, and the attention forward eventually fails its own wiring
+        # check with a message about an internal invariant rather than about the two
+        # lines of YAML that caused it. Say the true thing here instead.
+        raise NotImplementedError(
+            "dsa_indexer_loss is not implemented on NPU: the objective's student "
+            "distribution is the TileLang Lightning Indexer's per-slot scores, and that "
+            "kernel is CUDA-only. Set dsa_indexer_loss: false under model.model_config."
+        )
     batch, seq_len, _ = hidden_states.shape
     cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
     kv = self.kv_proj(hidden_states)
@@ -531,6 +615,7 @@ def deepseek_v4_csa_compressor_forward_patched(
             overlap=True,
             apply_rope=apply_rotary_pos_emb,
         )
+        compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
         # The indexer submodule is intentionally NOT anchored here: its outputs
         # are non-differentiable top-k indices, so its params already receive no
         # gradient on every rank uniformly, and anchoring them would create the
@@ -592,6 +677,7 @@ def deepseek_v4_csa_compressor_forward_patched(
     else:
         compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
 
+    compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
     if cache_layer is not None:
         compressed = cache_layer.update_compressor_states("compressor", compressed)
     compressed_kv = compressed.unsqueeze(1)
