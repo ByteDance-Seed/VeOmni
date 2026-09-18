@@ -91,7 +91,7 @@ def test_dpo_rejects_zigzag_before_setup():
 
 @pytest.mark.parametrize("extra_outputs", [(), (None, None)])
 def test_fa4_forward_accepts_auxiliary_outputs(monkeypatch, extra_outputs):
-    from veomni.distributed.sequence_parallel import ring_attention as ring
+    from veomni.distributed.sequence_parallel.ring_attention import gpu as ring
 
     q = torch.zeros(1, 8, 2, 4)
     lse = torch.zeros(1, 2, 8)
@@ -113,3 +113,24 @@ def test_rl_rejects_zigzag_for_composed_trainers(monkeypatch):
     trainer = base_rl_trainer.BaseRLTrainer.__new__(base_rl_trainer.BaseRLTrainer)
     with pytest.raises(NotImplementedError, match="RL postprocessing"):
         trainer._build_preforward_postforward()
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_cuda_backend_rejects_dropout(packed):
+    from veomni.distributed.sequence_parallel.ring_attention import gpu
+
+    q = torch.zeros(1, 8, 2, 4)
+    with pytest.raises(NotImplementedError, match="dropout"):
+        if packed:
+            gpu.packed_forward(q, q, q, torch.tensor([0, 8], dtype=torch.int32), 8, dropout_p=0.1)
+        else:
+            gpu.forward(q, q, q, dropout_p=0.1)
+
+
+def test_npu_usp_model_gate(monkeypatch):
+    monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(auto, "is_torch_npu_available", lambda: True)
+    monkeypatch.setattr(auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_layout="zigzag"))
+    auto.check_context_parallel_supported(SimpleNamespace(model_type="qwen3"), "veomni_flash_attention_2_with_sp")
+    with pytest.raises(NotImplementedError, match="Ascend USP"):
+        auto.check_context_parallel_supported(SimpleNamespace(model_type="qwen3"), "veomni_flash_attention_4_with_sp")
