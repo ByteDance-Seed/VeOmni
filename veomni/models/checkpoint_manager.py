@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Checkpoint/resume for one trainer-owned model.
+"""Checkpoint/resume for one :class:`~veomni.models.model_runtime.VeOmniModelRuntime`.
+
+On-disk layout is owned by :mod:`veomni.checkpoint.layout` (see
+``docs/usage/checkpoint.md``). This class only binds that layout to one model's
+runtime — the module, optimizer, scheduler, assets, and the ParallelState they
+were built under.
 
 Two blobs, two owners:
 
@@ -22,8 +27,6 @@ Two blobs, two owners:
 * **global_state** — the job cursor (dataloader in ``loader/``; step, rng and
   meters in ``extra_state/``), written per rank by
   :class:`~veomni.trainer.callbacks.global_state_callback.GlobalStateCallback`.
-
-On-disk layout: ``docs/usage/checkpoint.md``.
 """
 
 from typing import TYPE_CHECKING, Optional
@@ -31,26 +34,25 @@ from typing import TYPE_CHECKING, Optional
 import torch.distributed as dist
 
 from ..checkpoint import CheckpointerBase, build_checkpointer, layout
-from ..distributed.parallel_state import get_parallel_state
 from ..utils import helper
 
 
 if TYPE_CHECKING:
     from ..arguments import CheckpointConfig
-    from ..trainer.base import BaseTrainer
     from ..trainer.callbacks import TrainerState
+    from .model_runtime import VeOmniModelRuntime
 
 
 logger = helper.create_logger(__name__)
 
 
 class ModelCheckpointManager:
-    """Own DCP / HF / LoRA save-load for the trainer's model.
+    """Own DCP / HF / LoRA save-load for one model runtime.
 
-    The trainer supplies the module, optimizer, scheduler and assets; this class
-    owns the *ordering* around them — when to drain an in-flight async save,
-    where the ``empty_cache`` and ``barrier`` calls go, and which directory each
-    artifact lands in.
+    The runtime supplies the module, optimizer, scheduler, assets and mesh; this
+    class owns the *ordering* around them — when to drain an in-flight async
+    save, where the ``empty_cache`` and ``barrier`` calls go, and which
+    directory each artifact lands in.
 
     That ordering is load-bearing rather than incidental. The two ``empty_cache``
     calls bracketing a DCP save keep the save from competing with the training
@@ -83,17 +85,26 @@ class ModelCheckpointManager:
 
     module_name: str = ""
 
-    def __init__(self, trainer: "BaseTrainer"):
-        self.trainer = trainer
-        self.config: "CheckpointConfig" = trainer.args.train.checkpoint
+    def __init__(self, runtime: "VeOmniModelRuntime"):
+        self.runtime = runtime
+        self.config: "CheckpointConfig" = runtime.train_args.checkpoint
         self._last_saved_step: int = -1
-        # Cached at construction, same as Callback.parallel_state: later save/load
-        # must not depend on whichever mesh is ambient.
-        self.parallel_state = get_parallel_state()
         self.checkpointer: CheckpointerBase = build_checkpointer(
             ckpt_manager=self.config.manager,
-            dist_backend=trainer.args.model.accelerator.fsdp_config.fsdp_mode,
+            dist_backend=runtime.args.accelerator.fsdp_config.fsdp_mode,
         )
+
+    @property
+    def parallel_state(self):
+        """This model's mesh, via the runtime's by-name registry lookup.
+
+        Not the ambient ``get_parallel_state()``: ``build_checkpoint()`` runs
+        outside the runtime's ``use_parallel_state`` scope, so ambient is still
+        ``"base"`` while a DPO policy or an Omni module is registered under its
+        own name. A property rather than a cached object, so a re-registered
+        mesh is picked up the same way ``VeOmniModelRuntime.parallel_state`` is.
+        """
+        return self.runtime.parallel_state
 
     @property
     def last_saved_step(self) -> int:
@@ -110,7 +121,7 @@ class ModelCheckpointManager:
 
     @property
     def trainable_only(self) -> bool:
-        return bool(self.trainer.args.model.lora_config)
+        return bool(self.runtime.args.lora_config)
 
     def step_dir(self, state: "TrainerState") -> str:
         """Root of this step's checkpoint, shared by every module of the job."""
@@ -127,6 +138,15 @@ class ModelCheckpointManager:
     def lora_export_dir(self, state: "TrainerState") -> str:
         """Where this step's PEFT adapter export lives."""
         return layout.lora_export_dir(self.step_dir(state), self.module_name)
+
+    def assets_dir(self) -> str:
+        """Where this model's config/tokenizer/processor sidecars live.
+
+        Once per run, at the output root — not inside a step. Nested under
+        :attr:`module_name` so two modules cannot overwrite each other's
+        ``config.json``.
+        """
+        return layout.assets_dir(self.config.model_assets_dir, self.module_name)
 
     def load_dir(self) -> Optional[str]:
         """Step directory to resume from.
@@ -150,9 +170,9 @@ class ModelCheckpointManager:
         self.checkpointer.load(
             load_dir,
             {
-                "model": self.trainer.model,
-                "optimizer": self.trainer.optimizer,
-                "lr_scheduler": self.trainer.lr_scheduler,
+                "model": self.runtime.model,
+                "optimizer": self.runtime.optimizer,
+                "lr_scheduler": self.runtime.lr_scheduler,
             },
             module=self.module_name,
             trainable_only=self.trainable_only,
@@ -171,9 +191,9 @@ class ModelCheckpointManager:
         self.checkpointer.save(
             self.config.save_path,
             {
-                "model": self.trainer.model,
-                "optimizer": self.trainer.optimizer,
-                "lr_scheduler": self.trainer.lr_scheduler,
+                "model": self.runtime.model,
+                "optimizer": self.runtime.optimizer,
+                "lr_scheduler": self.runtime.lr_scheduler,
             },
             global_steps=state.global_step,
             module=self.module_name,
@@ -207,8 +227,8 @@ class ModelCheckpointManager:
         self.wait_for_pending_save()
 
         if stage == "train_end":
-            self.trainer.optimizer = None
-            self.trainer.lr_scheduler = None
+            self.runtime.optimizer = None
+            self.runtime.lr_scheduler = None
 
         return layout.weights_dir(self.step_dir(state), self.module_name)
 
@@ -219,13 +239,13 @@ class ModelCheckpointManager:
 
         save_hf_safetensor(
             save_hf_safetensor_path=self.hf_export_dir(state),
-            model_assets=self.trainer.model_assets,
+            model_assets=self.runtime.model_assets,
             ckpt_manager=self.config.manager,
             output_dir=self.config.output_dir,
             save_checkpoint_path=weights_path,
-            model=self.trainer.model,
-            fqn_to_index_mapping=self.trainer.args.model.fqn_to_index_mapping,
-            is_rank_0=self.trainer.args.train.global_rank == 0,
+            model=self.runtime.model,
+            fqn_to_index_mapping=self.runtime.args.fqn_to_index_mapping,
+            is_rank_0=self.parallel_state.global_rank == 0,
             parallel_state=self.parallel_state,
         )
         helper.empty_cache()
@@ -236,7 +256,7 @@ class ModelCheckpointManager:
 
         self._prepare_export(state, stage)
         save_lora_adapter_with_dcp(
-            model=self.trainer.model,
+            model=self.runtime.model,
             save_path=self.lora_export_dir(state),
             adapter_name=adapter_name,
         )

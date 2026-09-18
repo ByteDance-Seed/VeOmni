@@ -2572,14 +2572,14 @@ class TestResumeDiscovery:
         assert self._validate(step) is None
 
     def test_a_step_missing_one_modules_shards_is_skipped(self, tmp_path):
-        """The manifest names the modules, so discovery checks each without
-        walking the tree — and a job is not resumable on half its models."""
+        """Discovery walks ``model/`` for ``ckpt/`` directories — a job is not
+        resumable on half its models."""
         from veomni.checkpoint import layout
 
         step = tmp_path / "global_step_10"
         self._write_dcp(step, module="vision")
         os.makedirs(layout.weights_dir(str(step), "audio"))
-        layout.write_manifest(str(step), global_step=10, world_size=1, modules=["vision", "audio"])
+        layout.write_manifest(str(step), global_step=10, world_size=1)
 
         assert self._validate(step) is None
 
