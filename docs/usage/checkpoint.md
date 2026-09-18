@@ -2,7 +2,8 @@
 
 `train.checkpoint.output_dir` is the run root. Every per-step artifact lives
 under `output_dir/checkpoints/global_step_{N}/` (`train.checkpoint.save_path`);
-the model assets are written once to `output_dir/model_assets/`.
+the model assets are written once to `output_dir/model_assets/`
+(`output_dir/model_assets/<module>/` in a [multi-module job](#multi-module-jobs-seedomni-v2)).
 
 ```
 checkpoints/global_step_{N}/
@@ -33,15 +34,16 @@ nothing else. The two exports are inference artifacts that resume never reads.
 | `extra_state/rank_{R}.pt` | `global_step`, `environ_meter`, `channel_loss_callback`, `torch_rng_state`. | Rank R |
 | `hf_ckpt/` | `model*.safetensors`, its index, and the model assets. Written when `train.checkpoint.save_hf_weights` is set and the run is not LoRA. | Rank 0, after a collective gather |
 | `lora_ckpt/` | `adapter_config.json`, `adapter_model.safetensors`. Written instead of `hf_ckpt/` when `model.lora_config` is set. | Rank 0, after a collective gather |
-| `checkpoint_manifest.json` | Format version, `global_step`, world size, module names. | Rank 0, last |
-| `model_assets/` | The model assets again, once per run at train start. | Rank 0 |
+| `checkpoint_manifest.json` | Format version, `global_step`, world size. Trainer-level completion only. | Rank 0, last |
+| `model_assets/[<module>/]` | Each model's config / tokenizer / processor, once per run at train start. Nested like `hf_ckpt/`. | Rank 0 |
 
-**Model assets** is whatever `trainer.model_assets` carries, in type terms
+**Model assets** is whatever that model's runtime `model_assets` list carries, in type terms
 `Union[PretrainedConfig, GenerationConfig, PreTrainedTokenizer, ProcessorMixin]`
 (`veomni/models/module_utils.py`). Each is written by calling its own
 `save_pretrained`, so the files that appear are whatever those objects emit —
 `config.json`, `generation_config.json`, then tokenizer files, processor files,
-or both. Do not read a fixed file list into these directories.
+or both. Do not read a fixed file list into these directories. Two modules
+cannot share one directory: both would write `config.json`.
 
 Three splits in the tree above are deliberate:
 
@@ -70,22 +72,27 @@ Three splits in the tree above are deliberate:
 A V2 job trains several modules side by side, each with its own weights,
 optimizer, scheduler and accelerator config. Module names are the keys of
 `model.model_config.modules`, declared in a `modules_train.yaml`, and they become
-directory names verbatim. `model/` and the exports nest one level deeper under
-that name; `loader/`, `extra_state/` and the manifest do **not** — one dataloader
-feeds the job, so there is one cursor and one marker per step.
+directory names verbatim. `model/`, the exports and `model_assets/` nest one
+level deeper under that name; `loader/`, `extra_state/` and the manifest do
+**not** — one dataloader feeds the job, so there is one cursor and one marker
+per step.
 
 ```
-checkpoints/global_step_{N}/
-├── checkpoint_manifest.json      # lists every module below
-├── model/
-│   ├── janus_siglip/             # each module directory holds the same three
-│   │   ├── ckpt/                 # things as a single-module model/
-│   │   ├── optimizer/
-│   │   └── lr_scheduler.pt
-│   └── janus_llama/
-├── loader/rank_{R}.pt            # one cursor for the whole job
-├── extra_state/rank_{R}.pt
-└── hf_ckpt/                      # or lora_ckpt/, same nesting
+output_dir/
+├── checkpoints/global_step_{N}/
+│   ├── checkpoint_manifest.json      # trainer cursor is down; does not list modules
+│   ├── model/
+│   │   ├── janus_siglip/             # each module directory holds the same three
+│   │   │   ├── ckpt/                 # things as a single-module model/
+│   │   │   ├── optimizer/
+│   │   │   └── lr_scheduler.pt
+│   │   └── janus_llama/
+│   ├── loader/rank_{R}.pt            # one cursor for the whole job
+│   ├── extra_state/rank_{R}.pt
+│   └── hf_ckpt/                      # or lora_ckpt/, same nesting
+│       ├── janus_siglip/
+│       └── janus_llama/
+└── model_assets/                     # run root, beside checkpoints/
     ├── janus_siglip/
     └── janus_llama/
 ```
@@ -104,11 +111,12 @@ whoever owns it:
 
 - **`checkpoint_manifest.json`** — written by rank 0 once every rank's `loader/`
   and `extra_state/` files are down. It covers the trainer-level state and
-  nothing else; it also names the modules the job saved, so a reader knows which
-  markers to look for without walking the tree.
+  nothing else.
 - **`.metadata` in every DCP directory** — written by DCP itself, one per
   `model/<name>/ckpt/` and `model/<name>/optimizer/`, at the end of that
-  directory's save.
+  directory's save. Resume discovery finds those directories under `model/`
+  (`model/ckpt/` for a single model, `model/<name>/ckpt/` otherwise); the
+  manifest does not list them.
 
 Neither marker can stand in for the other. The manifest is written while the
 async DCP saves may still be in flight, so it says nothing about the model; a

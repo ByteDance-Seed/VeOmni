@@ -2572,14 +2572,14 @@ class TestResumeDiscovery:
         assert self._validate(step) is None
 
     def test_a_step_missing_one_modules_shards_is_skipped(self, tmp_path):
-        """The manifest names the modules, so discovery checks each without
-        walking the tree — and a job is not resumable on half its models."""
+        """Discovery walks ``model/`` for ``ckpt/`` directories — a job is not
+        resumable on half its models."""
         from veomni.checkpoint import layout
 
         step = tmp_path / "global_step_10"
         self._write_dcp(step, module="vision")
         os.makedirs(layout.weights_dir(str(step), "audio"))
-        layout.write_manifest(str(step), global_step=10, world_size=1, modules=["vision", "audio"])
+        layout.write_manifest(str(step), global_step=10, world_size=1)
 
         assert self._validate(step) is None
 
@@ -2784,3 +2784,57 @@ class TestSaveTimeoutConfig:
             CheckpointConfig(save_timeout_seconds=1800, **enabled)
 
         logger.warning_rank0.assert_not_called()
+
+
+class TestShardingPlanDropHfKeys:
+    """``_get_sharding_plan`` plans one shard entry per DCP key.
+
+    A caller that knows two of those keys name the same tensor -- a state dict reports a
+    shared tensor under every name it is reachable by -- has no way to say so from the
+    checkpoint alone, since the metadata records the two names independently.
+    ``drop_hf_keys`` is how it names them.
+    """
+
+    @pytest.fixture
+    def checkpoint(self, tmp_path):
+        """Two equally sized tensors, keyed as a tied checkpoint holds them.
+
+        ``_normalize_key`` maps ``model.model.*`` to ``model.*`` and
+        ``model.lm_head.weight`` to ``lm_head.weight``.
+        """
+        path = tmp_path / "checkpoint"
+        dcp.save(
+            {
+                "model.model.embed_tokens.weight": torch.arange(4, dtype=torch.float32),
+                "model.lm_head.weight": torch.arange(4, dtype=torch.float32),
+            },
+            checkpoint_id=str(path),
+        )
+        return str(path)
+
+    def test_named_keys_are_left_out_of_the_plan(self, checkpoint):
+        from veomni.checkpoint.dcp_checkpointer import _get_sharding_plan
+
+        # ``shard_size=None`` plans a single shard, so the result is one {hf_key: dcp_key}.
+        plan, _, _ = _get_sharding_plan(checkpoint, None, "float32", drop_hf_keys={"lm_head.weight"})
+
+        assert set(plan) == {"model.embed_tokens.weight"}
+
+    def test_the_reported_total_follows_the_plan(self, checkpoint):
+        """Otherwise the exported index advertises bytes nobody wrote."""
+        from veomni.checkpoint.dcp_checkpointer import _get_sharding_plan
+
+        _, unfiltered_size, _ = _get_sharding_plan(checkpoint, None, "float32")
+        _, filtered_size, _ = _get_sharding_plan(checkpoint, None, "float32", drop_hf_keys={"lm_head.weight"})
+
+        assert filtered_size == unfiltered_size // 2
+
+    def test_a_key_the_checkpoint_does_not_have_removes_nothing(self, checkpoint):
+        """The two key spaces are only conventionally aligned, so a name may not match."""
+        from veomni.checkpoint.dcp_checkpointer import _get_sharding_plan
+
+        expected, expected_size, _ = _get_sharding_plan(checkpoint, None, "float32")
+        plan, size, _ = _get_sharding_plan(checkpoint, None, "float32", drop_hf_keys={"model.absent.weight"})
+
+        assert set(plan) == set(expected)
+        assert size == expected_size
