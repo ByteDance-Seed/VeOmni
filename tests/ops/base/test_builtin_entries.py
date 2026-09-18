@@ -150,6 +150,7 @@ _BUILTIN_ENTRIES = (
     ("rope", "full", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
     ("rope", "full", "npu", "npu", _NPU, ()),
     ("rope", "partial", "eager", "any", _ANY, ()),
+    ("rope", "partial", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
     ("rope", "partial", "npu", "npu", _NPU, ()),
     ("rope", "interleave", "eager", "any", _ANY, ()),
     ("rope", "mrope", "eager", "any", _ANY, ()),

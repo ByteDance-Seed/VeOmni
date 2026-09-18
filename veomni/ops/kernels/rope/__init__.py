@@ -19,7 +19,7 @@ Variants: ``full`` (rotate every channel for text or rank-3 vision layouts),
 out), ``mrope`` (remix 3-axis multimodal tables, then rotate-half),
 ``deepseek_v4`` (trailing interleaved slice), and ``wan`` (complex
 multiply by freqs). Each variant registers an eager row plus optional CUDA /
-NPU adapters.
+NPU adapters. ``full`` and ``partial`` also expose ``liger_kernel``.
 """
 
 from ...platform import GpuKernelRequirement, NpuKernelRequirement
@@ -32,6 +32,7 @@ from .full import npu as full_npu
 from .interleave import eager as interleave_eager
 from .mrope import eager as mrope_eager
 from .partial import eager as partial_eager
+from .partial import liger_kernel as partial_liger
 from .partial import npu as partial_npu
 from .wan import eager as wan_eager
 from .wan import npu as wan_npu
@@ -78,6 +79,17 @@ register_op(
     partial_eager.forward,
     partial_eager.backward,
     description="PyTorch rotary embedding over a channel prefix",
+)
+
+register_op(
+    "rope",
+    "partial",
+    "liger_kernel",
+    partial_liger.forward,
+    partial_liger.backward,
+    description="Liger Kernel rotary embedding over a channel prefix with eager fallback",
+    requirement=_GPU,
+    requires=("liger_kernel",),
 )
 
 register_op(

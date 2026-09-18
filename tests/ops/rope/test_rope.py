@@ -295,6 +295,7 @@ def test_partial_rope_accepts_positional_unsqueeze_dim():
     (
         ("full_liger", "full"),
         ("full_npu", "full"),
+        ("partial_liger", "partial"),
         ("partial_npu", "partial"),
         ("full_liger", "vision"),
         ("full_npu", "vision"),
@@ -305,9 +306,15 @@ def test_fused_rope_rows_fall_back_for_trainable_tables_before_vendor_import(imp
     from veomni.ops.kernels.rope.full import liger_kernel as full_liger
     from veomni.ops.kernels.rope.full import npu as full_npu
     from veomni.ops.kernels.rope.partial import eager as partial_eager
+    from veomni.ops.kernels.rope.partial import liger_kernel as partial_liger
     from veomni.ops.kernels.rope.partial import npu as partial_npu
 
-    modules = {"full_liger": full_liger, "full_npu": full_npu, "partial_npu": partial_npu}
+    modules = {
+        "full_liger": full_liger,
+        "full_npu": full_npu,
+        "partial_liger": partial_liger,
+        "partial_npu": partial_npu,
+    }
     eager_modules = {"full": full_eager, "partial": partial_eager, "vision": full_eager}
     module = modules[implementation]
     eager_module = eager_modules[layout]
@@ -416,6 +423,44 @@ def test_full_liger_matches_eager(
     torch.autograd.backward(out_o, go)
     assert torch.allclose(q_e.grad, q_o.grad, atol=ROPE_FUSED_GRAD_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
     assert torch.allclose(k_e.grad, k_o.grad, atol=ROPE_FUSED_GRAD_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RoPE needs a GPU")
+@pytest.mark.parametrize(
+    ("seed", "unsqueeze_dim", "query_shape", "key_shape"),
+    (
+        pytest.param(0, 1, (2, 8, 16, 128), (2, 4, 16, 128), id="bhsd"),
+        pytest.param(4, 2, (2, 16, 8, 128), (2, 16, 4, 128), id="bshd"),
+    ),
+)
+def test_partial_liger_matches_eager(
+    seed: int, unsqueeze_dim: int, query_shape: tuple[int, ...], key_shape: tuple[int, ...]
+):
+    pytest.importorskip("liger_kernel")
+    eager = resolve_op("rope", "partial", "eager").wrapper
+    other = resolve_op("rope", "partial", "liger_kernel").wrapper
+    torch.manual_seed(seed)
+    q = torch.randn(query_shape, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(key_shape, device="cuda", dtype=torch.bfloat16)
+    # Llama-style tables duplicate the first half of the rotary prefix.
+    cos_half = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
+    sin_half = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
+    cos = torch.cat((cos_half, cos_half), dim=-1)
+    sin = torch.cat((sin_half, sin_half), dim=-1)
+
+    q_e, k_e = make_grad_leaves(q, k)
+    q_o, k_o = make_grad_leaves(q, k)
+    out_e = eager(q_e, k_e, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    out_o = other(q_o, k_o, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    _assert_pair(out_e, out_o, atol=ROPE_NPU_PROD_BF16_ATOL, rtol=ROPE_FUSED_RTOL)
+    assert torch.equal(out_o[0][..., 64:], q_o[..., 64:])
+    assert torch.equal(out_o[1][..., 64:], k_o[..., 64:])
+
+    go = (torch.randn_like(out_e[0]), torch.randn_like(out_e[1]))
+    torch.autograd.backward(out_e, go)
+    torch.autograd.backward(out_o, go)
+    assert torch.allclose(q_e.grad, q_o.grad, atol=ROPE_NPU_PROD_BF16_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
+    assert torch.allclose(k_e.grad, k_o.grad, atol=ROPE_NPU_PROD_BF16_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU RoPE needs NPU")
