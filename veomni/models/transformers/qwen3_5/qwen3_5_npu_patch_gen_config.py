@@ -159,12 +159,12 @@ config.add_helper(_Qwen3_5FakeForPosID)
 config.override_method(
     "Qwen3_5RMSNorm.__init__",
     replacement=qwen3_5_rmsnorm_init_patched,
-    description="Construct a local rms_norm qwen3_5 VeomniOp",
+    description="Construct a local rms_norm offset VeomniOp",
 )
 config.override_method(
     "Qwen3_5RMSNorm.forward",
     replacement=qwen3_5_rmsnorm_forward_patched,
-    description="Always call the local rms_norm qwen3_5 VeomniOp",
+    description="Always call the local rms_norm offset VeomniOp",
 )
 config.override_method(
     "Qwen3_5MLP.__init__",

@@ -486,7 +486,7 @@ All four are defined in `transformers.integrations`:
 | **Config** | `OpsImplementationConfig.rms_norm_implementation` field (default `"liger_kernel"` on GPU) | `USE_HUB_KERNELS` env var + `model.kernelize()` call |
 | **When** | Model `__init__` via an instance-local `VeomniOp` | Deferred — `kernelize()` after model init |
 | **SP support** | N/A (norm is local) | N/A |
-| **Qwen3.5 MoE gap** | Covered by the `rms_norm/qwen3_5` registry variant, including offset-aware Liger and NPU rows | **Not annotated.** `Qwen3_5MoeRMSNorm` uses `weight * (1.0 + self.weight)` (offset-by-1 convention, weight init to zeros) instead of the standard `self.weight * x` (weight init to ones). No `@use_kernel_forward_from_hub("RMSNorm")` decorator. Standard `LigerRMSNorm` cannot replace it without accounting for the `+1.0` offset. |
+| **Qwen3.5 MoE gap** | Covered by the `rms_norm/offset` registry variant, including offset-aware Liger and NPU rows | **Not annotated.** `Qwen3_5MoeRMSNorm` uses `weight * (1.0 + self.weight)` (offset-by-1 convention, weight init to zeros) instead of the standard `self.weight * x` (weight init to ones). No `@use_kernel_forward_from_hub("RMSNorm")` decorator. Standard `LigerRMSNorm` cannot replace it without accounting for the `+1.0` offset. |
 
 #### Rotary Position Embedding (RoPE)
 

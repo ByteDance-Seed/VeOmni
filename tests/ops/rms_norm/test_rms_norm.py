@@ -61,7 +61,7 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 def _hf_rms_norm(variant: str, hidden: int, eps: float) -> nn.Module:
     if variant == "standard":
         return Qwen3RMSNorm(hidden, eps=eps)
-    if variant == "qwen3_5":
+    if variant == "offset":
         return Qwen3_5RMSNorm(hidden, eps=eps)
     raise KeyError(variant)
 
@@ -73,13 +73,13 @@ def _deepseek_v4_reference(x: Tensor, weight: Tensor, eps: float) -> Tensor:
 
 
 def _fused_weight(variant: str, hidden: int, device: str, dtype: torch.dtype) -> Tensor:
-    if variant == "qwen3_5":
+    if variant == "offset":
         weight = torch.zeros(hidden, device=device, dtype=dtype)
         return weight + 0.01 * torch.randn_like(weight)
     return torch.randn(hidden, device=device, dtype=dtype)
 
 
-@pytest.mark.parametrize("variant", ["standard", "qwen3_5", "deepseek_v4"])
+@pytest.mark.parametrize("variant", ["standard", "offset", "deepseek_v4"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
     ("shape", "seed"),
@@ -196,10 +196,10 @@ def _fused_matches_eager(
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RMSNorm needs a GPU")
-@pytest.mark.parametrize("variant", ["standard", "deepseek_v4", "qwen3_5"])
+@pytest.mark.parametrize("variant", ["standard", "deepseek_v4", "offset"])
 def test_liger_matches_eager(variant: str):
     pytest.importorskip("liger_kernel")
-    fp32_affine = variant in {"deepseek_v4", "qwen3_5"}
+    fp32_affine = variant in {"deepseek_v4", "offset"}
     _fused_matches_eager(
         variant,
         "liger_kernel",
@@ -250,7 +250,7 @@ def test_triton_matches_eager():
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU RMSNorm needs NPU")
-@pytest.mark.parametrize("variant", ["standard", "qwen3_5"])
+@pytest.mark.parametrize("variant", ["standard", "offset"])
 def test_npu_matches_eager(variant: str):
     _fused_matches_eager(
         variant,
@@ -259,7 +259,7 @@ def test_npu_matches_eager(variant: str):
         torch.bfloat16,
         atol=RMS_NPU_ATOL,
         rtol=RMS_NPU_RTOL,
-        cast_fp32=variant == "qwen3_5",
+        cast_fp32=variant == "offset",
     )
 
 
@@ -309,12 +309,12 @@ def test_npu_standard_production_shape(hidden: int, dtype: torch.dtype, atol: fl
         (1024, RMS_NPU_BF16_DIM1024_ATOL),
     ],
 )
-def test_npu_qwen3_5_production_shape(hidden: int, atol: float):
+def test_npu_offset_production_shape(hidden: int, atol: float):
     torch.manual_seed(1)
     x = torch.randn(2, 32, hidden, device="npu", dtype=torch.bfloat16)
     w = torch.zeros(hidden, device="npu", dtype=torch.bfloat16)
     w = w + 0.01 * torch.randn_like(w)
-    out_e, out_o = _npu_forward_only("qwen3_5", x, w, 1e-6)
+    out_e, out_o = _npu_forward_only("offset", x, w, 1e-6)
     assert torch.allclose(out_e.float(), out_o.float(), atol=atol, rtol=atol)
 
 

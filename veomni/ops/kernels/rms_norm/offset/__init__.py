@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""qwen3_5 RMSNorm implementations (offset 1, gemma-style fp32 scale)."""
+"""offset RMSNorm implementations (offset 1, gemma-style fp32 scale)."""

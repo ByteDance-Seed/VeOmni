@@ -12,9 +12,9 @@
 #    - method_override: Qwen3_5Model.__init__
 #      Construct generated vision and text towers instead of upstream AutoModel classes
 #    - method_override: Qwen3_5RMSNorm.__init__
-#      Construct a local rms_norm qwen3_5 VeomniOp
+#      Construct a local rms_norm offset VeomniOp
 #    - method_override: Qwen3_5RMSNorm.forward
-#      Always call the local rms_norm qwen3_5 VeomniOp
+#      Always call the local rms_norm offset VeomniOp
 #    - method_override: Qwen3_5MLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: Qwen3_5MLP.forward
@@ -992,7 +992,7 @@ class Qwen3_5RMSNorm(nn.Module):
         nn.Module.__init__(self)
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
-        self.veomni_rms_norm = VeomniOp("rms_norm", "qwen3_5", resolve_op_impl("rms_norm_implementation"))
+        self.veomni_rms_norm = VeomniOp("rms_norm", "offset", resolve_op_impl("rms_norm_implementation"))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)

@@ -64,6 +64,7 @@ def test_gemma3_eager_matches_hf():
     config = _tiny_config()
     hf = HFGemma3ForCausalLM(config)
     ours = _build_ours(config)
+    assert ours.model.layers[0].input_layernorm.veomni_rms_norm.variant == "offset"
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8))

@@ -67,6 +67,33 @@ config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision"
 
 
 @config.override_method(
+    "Qwen4ExpTextRMSNorm.__init__",
+    description="Construct a local rms_norm offset VeomniOp",
+)
+def qwen4_exp_rmsnorm_init_patched(self, dim: int, group_size: int | None = None, eps: float = 1e-6) -> None:
+    nn.Module.__init__(self)
+    self.eps = eps
+    self.weight = nn.Parameter(torch.zeros(dim))
+    self.group_size = group_size
+    if group_size is not None and dim % group_size != 0:
+        raise ValueError(f"hidden_size ({dim}) must be divisible by group_size ({group_size}).")
+    self.veomni_rms_norm = VeomniOp("rms_norm", "offset", resolve_op_impl("rms_norm_implementation"))
+
+
+@config.override_method(
+    "Qwen4ExpTextRMSNorm.forward",
+    description="Call rms_norm offset when ungrouped; keep grouped last-dim math local",
+)
+def qwen4_exp_rmsnorm_forward_patched(self, x):
+    if self.group_size is not None:
+        grouped = x.float().reshape(*x.shape[:-1], -1, self.group_size)
+        output = grouped * torch.rsqrt(grouped.pow(2).mean(-1, keepdim=True) + self.eps)
+        output = output.flatten(-2) * (1.0 + self.weight.float())
+        return output.type_as(x)
+    return self.veomni_rms_norm(x, self.weight, eps=self.eps)
+
+
+@config.override_method(
     "Qwen4ExpTextMLP.__init__",
     description="Construct a local swiglu_mlp VeomniOp",
 )

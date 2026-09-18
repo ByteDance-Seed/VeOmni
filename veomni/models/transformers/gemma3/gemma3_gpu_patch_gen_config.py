@@ -274,6 +274,25 @@ def gemma3_forcausallm_forward_patched(
     )
 
 
+@config.override_method(
+    "Gemma3RMSNorm.__init__",
+    description="Construct a local rms_norm offset VeomniOp",
+)
+def gemma3_rmsnorm_init_patched(self, dim: int, eps: float = 1e-6) -> None:
+    nn.Module.__init__(self)
+    self.eps = eps
+    self.weight = nn.Parameter(torch.zeros(dim))
+    self.veomni_rms_norm = VeomniOp("rms_norm", "offset", resolve_op_impl("rms_norm_implementation"))
+
+
+@config.override_method(
+    "Gemma3RMSNorm.forward",
+    description="Always call the local rms_norm offset VeomniOp",
+)
+def gemma3_rmsnorm_forward_patched(self, x):
+    return self.veomni_rms_norm(x, self.weight, eps=self.eps)
+
+
 @config.modify_init("Gemma3MLP", description="Bind instance-local geglu swiglu_mlp VeomniOp")
 def gemma3_mlp_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)

@@ -9,6 +9,10 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Qwen4ExpTextRMSNorm.__init__
+#      Construct a local rms_norm offset VeomniOp
+#    - method_override: Qwen4ExpTextRMSNorm.forward
+#      Call rms_norm offset when ungrouped; keep grouped last-dim math local
 #    - method_override: Qwen4ExpTextMLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: Qwen4ExpTextMLP.forward
@@ -299,14 +303,21 @@ class Qwen4ExpTextRotaryEmbedding(nn.Module):
         return freqs_t
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen4ExpTextRMSNorm
+# Methods patched: __init__, forward
+# ======================================================================
+
+
 class Qwen4ExpTextRMSNorm(nn.Module):
-    def __init__(self, dim: int, group_size: int | None = None, eps: float = 1e-6):
-        super().__init__()
+    def __init__(self, dim: int, group_size: int | None = None, eps: float = 1e-6) -> None:
+        nn.Module.__init__(self)
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
         self.group_size = group_size
         if group_size is not None and dim % group_size != 0:
             raise ValueError(f"hidden_size ({dim}) must be divisible by group_size ({group_size}).")
+        self.veomni_rms_norm = VeomniOp("rms_norm", "offset", resolve_op_impl("rms_norm_implementation"))
 
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         if self.group_size is not None:
@@ -315,11 +326,12 @@ class Qwen4ExpTextRMSNorm(nn.Module):
         return out.flatten(-2) if self.group_size is not None else out
 
     def forward(self, x):
-        output = self._norm(x.float())
-        # Llama does x.to(float16) * w whilst Qwen4ExpText is (x * w).to(float16)
-        # See https://github.com/huggingface/transformers/pull/29402
-        output = output * (1.0 + self.weight.float())
-        return output.type_as(x)
+        if self.group_size is not None:
+            grouped = x.float().reshape(*x.shape[:-1], -1, self.group_size)
+            output = grouped * torch.rsqrt(grouped.pow(2).mean(-1, keepdim=True) + self.eps)
+            output = output.flatten(-2) * (1.0 + self.weight.float())
+            return output.type_as(x)
+        return self.veomni_rms_norm(x, self.weight, eps=self.eps)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"

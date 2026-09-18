@@ -148,18 +148,18 @@ _VEOMNI_VISION_ATTENTION_PATCHED = True
 
 @config.override_method(
     "Qwen3_5RMSNorm.__init__",
-    description="Construct a local rms_norm qwen3_5 VeomniOp",
+    description="Construct a local rms_norm offset VeomniOp",
 )
 def qwen3_5_rmsnorm_init_patched(self, dim: int, eps: float = 1e-6) -> None:
     nn.Module.__init__(self)
     self.eps = eps
     self.weight = nn.Parameter(torch.zeros(dim))
-    self.veomni_rms_norm = VeomniOp("rms_norm", "qwen3_5", resolve_op_impl("rms_norm_implementation"))
+    self.veomni_rms_norm = VeomniOp("rms_norm", "offset", resolve_op_impl("rms_norm_implementation"))
 
 
 @config.override_method(
     "Qwen3_5RMSNorm.forward",
-    description="Always call the local rms_norm qwen3_5 VeomniOp",
+    description="Always call the local rms_norm offset VeomniOp",
 )
 def qwen3_5_rmsnorm_forward_patched(self, x):
     return self.veomni_rms_norm(x, self.weight, eps=self.eps)

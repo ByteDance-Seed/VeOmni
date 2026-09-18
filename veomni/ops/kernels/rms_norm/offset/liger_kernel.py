@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""qwen3_5 RMSNorm Liger adapter (offset 1, gemma casting)."""
+"""offset RMSNorm Liger adapter (offset 1, gemma casting)."""
 
 from __future__ import annotations
 

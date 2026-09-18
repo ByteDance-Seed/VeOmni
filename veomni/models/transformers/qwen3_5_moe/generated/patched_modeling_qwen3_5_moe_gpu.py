@@ -10,9 +10,9 @@
 #
 #  Patches applied:
 #    - method_override: Qwen3_5MoeRMSNorm.__init__
-#      Construct a local rms_norm qwen3_5 VeomniOp
+#      Construct a local rms_norm offset VeomniOp
 #    - method_override: Qwen3_5MoeRMSNorm.forward
-#      Always call the local rms_norm qwen3_5 VeomniOp
+#      Always call the local rms_norm offset VeomniOp
 #    - method_override: Qwen3_5MoeMLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: Qwen3_5MoeMLP.forward
@@ -1128,7 +1128,7 @@ class Qwen3_5MoeRMSNorm(nn.Module):
         nn.Module.__init__(self)
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
-        self.veomni_rms_norm = VeomniOp("rms_norm", "qwen3_5", resolve_op_impl("rms_norm_implementation"))
+        self.veomni_rms_norm = VeomniOp("rms_norm", "offset", resolve_op_impl("rms_norm_implementation"))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)

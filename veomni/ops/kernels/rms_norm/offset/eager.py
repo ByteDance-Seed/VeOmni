@@ -12,16 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""qwen3_5 RMSNorm npu adapter (scale is 1 + weight)."""
+"""offset RMSNorm eager math (offset 1, gemma-style fp32 scale)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
 from torch import Tensor
 
 from ....registry import SavedState
-from . import eager as _eager
 
 
 @dataclass(frozen=True)
@@ -33,32 +33,36 @@ class _Meta:
 
 
 def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
-    """NPU fused affine RMSNorm. The fused scale is ``1 + weight``.
+    """Affine RMSNorm with offset 1. Scale is ``1 + weight`` in fp32.
 
-    Empty ``x`` falls back to the eager pair. Backward also passes
-    ``1 + weight`` into ``npu_rms_norm_backward``.
+    Matches HuggingFace offset-1 RMSNorm (Qwen3.5 / Gemma): reduce in fp32, then
+    ``norm * (1 + weight.float())``, then cast back to ``x.dtype``.
+    Adding in the input dtype first rounds ``1 + weight`` too early.
+    Empty ``x`` returns ``x * (1 + weight)`` with the same fp32 scale.
     """
-    scale = 1.0 + weight
+    scale = 1.0 + weight.float()
     if x.numel() == 0:
-        output, saved = _eager.forward(x, weight, eps=eps)
-        return output, SavedState(saved.tensors, _Meta(True, eps))
+        return (x.float() * scale).to(x.dtype), SavedState((x, weight), _Meta(True, eps))
 
-    import torch_npu
-
-    output, rstd = torch_npu.npu_rms_norm(x, scale, eps)
+    x_f = x.float()
+    rstd = torch.rsqrt(x_f.square().mean(dim=-1, keepdim=True) + eps)
+    output = (scale * (x_f * rstd)).to(x.dtype)
     return output, SavedState((x, weight, rstd), _Meta(False, eps))
 
 
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor]:
-    """Return ``(grad_x, grad_weight)``. Empty inputs reuse the eager backward."""
+    """Return ``(grad_x, grad_weight)``. ``grad_weight`` is the offset-1 scale grad."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     x, weight, *optional_rstd = saved.tensors
     if meta.empty:
-        return _eager.backward(grad_output, SavedState((x, weight), _eager._Meta(True, meta.eps)))
-
-    import torch_npu
+        return torch.zeros_like(x), torch.zeros_like(weight)
 
     (rstd,) = optional_rstd
-    scale = 1.0 + weight
-    return torch_npu.npu_rms_norm_backward(grad_output.contiguous(), x, scale, rstd)
+    x_f = x.float()
+    n = x.shape[-1]
+    scale = 1.0 + weight.float()
+    scaled_grad = grad_output.float() * scale
+    grad_weight = (grad_output.float() * (x_f * rstd)).sum_to_size(weight.shape).to(weight.dtype)
+    grad_x = rstd * scaled_grad - (rstd.pow(3) / n) * x_f * (scaled_grad * x_f).sum(dim=-1, keepdim=True)
+    return grad_x.to(x.dtype), grad_weight.to(weight.dtype)

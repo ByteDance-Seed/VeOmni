@@ -201,6 +201,7 @@ _MODEL_CASES = (
         model_type="gemma3_text",
         eager_ops=(
             ("veomni_ce", "cross_entropy_loss"),
+            ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
             ("model.layers.0.self_attn.veomni_rope", "rope"),
             ("model.layers.0.self_attn.veomni_attn", "attention"),
         ),

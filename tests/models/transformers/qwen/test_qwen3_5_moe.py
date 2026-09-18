@@ -169,7 +169,7 @@ def test_qwen3_5_moe_eager_matches_hf_mixed_attention():
     config = _tiny_text_config(layer_types=["linear_attention", "linear_attention", "full_attention"])
     hf = HFQwen3_5MoeForCausalLM(config)
     ours = _build_causal(config)
-    assert ours.model.layers[0].input_layernorm.veomni_rms_norm.variant == "qwen3_5"
+    assert ours.model.layers[0].input_layernorm.veomni_rms_norm.variant == "offset"
     ours.load_state_dict(hf.state_dict())
 
     _pin_hf_gdn_to_torch(hf)

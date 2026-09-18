@@ -44,7 +44,7 @@ when the selected implementation runs.
 |---|---|---|
 | `attention` | `standard` | `eager`, `sdpa`, and FlashAttention/FlexAttention/MagiAttention/SageAttention names |
 | `async_ulysses_qkv`, `async_ulysses_o` | `standard`, `dit` | `eager` orchestration |
-| `rms_norm` | `standard`, `deepseek_v4`, `unweighted`, `qwen3_5` | `eager`, `liger_kernel`, `npu`, and `triton` where supported |
+| `rms_norm` | `standard`, `deepseek_v4`, `unweighted`, `offset` | `eager`, `liger_kernel`, `npu`, and `triton` where supported |
 | `rope` | `full`, `partial`, `interleave`, `mrope`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
 | `swiglu_mlp` | `standard`, `geglu` | `eager`, `liger_kernel` |
 | `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `fused_npu`, `fused_mlu` as supported by the variant |

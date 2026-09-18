@@ -15,6 +15,10 @@
 #      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: Gemma3ForCausalLM.forward
 #      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
+#    - method_override: Gemma3RMSNorm.__init__
+#      Construct a local rms_norm offset VeomniOp
+#    - method_override: Gemma3RMSNorm.forward
+#      Always call the local rms_norm offset VeomniOp
 #    - init_modification: Gemma3MLP
 #      Bind instance-local geglu swiglu_mlp VeomniOp
 #    - method_override: Gemma3MLP.forward
@@ -172,21 +176,24 @@ class Gemma3MLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
+# ======================================================================
+# [MODIFIED CLASS] Gemma3RMSNorm
+# Methods patched: __init__, forward
+# ======================================================================
+
+
 class Gemma3RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        nn.Module.__init__(self)
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
+        self.veomni_rms_norm = VeomniOp("rms_norm", "offset", resolve_op_impl("rms_norm_implementation"))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        output = self._norm(x.float())
-        # Llama does x.to(float16) * w whilst Gemma3 is (x * w).to(float16)
-        # See https://github.com/huggingface/transformers/pull/29402
-        output = output * (1.0 + self.weight.float())
-        return output.type_as(x)
+        return self.veomni_rms_norm(x, self.weight, eps=self.eps)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"

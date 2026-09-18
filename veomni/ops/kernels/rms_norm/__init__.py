@@ -15,7 +15,7 @@
 """RMSNorm kernel family.
 
 Variants: ``standard`` (offset 0, llama-style cast), ``deepseek_v4`` (offset 0,
-fp32 affine scale), ``qwen3_5`` (offset 1, gemma-style fp32 scale), and
+fp32 affine scale), ``offset`` (offset 1, gemma-style fp32 scale), and
 ``unweighted`` (no affine weight). Each variant registers an eager row plus
 optional CUDA / NPU adapters.
 """
@@ -24,9 +24,9 @@ from ...platform import GpuKernelRequirement, NpuKernelRequirement
 from ...registry import register_op
 from .deepseek_v4 import eager as deepseek_v4_eager
 from .deepseek_v4 import liger_kernel as deepseek_v4_liger
-from .qwen3_5 import eager as qwen3_5_eager
-from .qwen3_5 import liger_kernel as qwen3_5_liger
-from .qwen3_5 import npu as qwen3_5_npu
+from .offset import eager as offset_eager
+from .offset import liger_kernel as offset_liger
+from .offset import npu as offset_npu
 from .standard import eager as standard_eager
 from .standard import liger_kernel as standard_liger
 from .standard import npu as standard_npu
@@ -101,31 +101,31 @@ register_op(
 
 register_op(
     "rms_norm",
-    "qwen3_5",
+    "offset",
     "eager",
-    qwen3_5_eager.forward,
-    qwen3_5_eager.backward,
-    description="PyTorch Qwen3.5 RMSNorm with offset weights and Gemma-style scaling",
+    offset_eager.forward,
+    offset_eager.backward,
+    description="PyTorch RMSNorm with offset-1 weights and Gemma-style scaling",
 )
 
 register_op(
     "rms_norm",
-    "qwen3_5",
+    "offset",
     "liger_kernel",
-    qwen3_5_liger.forward,
-    qwen3_5_liger.backward,
-    description="Liger Kernel Qwen3.5 RMSNorm with offset weights and Gemma-style scaling",
+    offset_liger.forward,
+    offset_liger.backward,
+    description="Liger Kernel RMSNorm with offset-1 weights and Gemma-style scaling",
     requirement=_GPU,
     requires=("liger_kernel",),
 )
 
 register_op(
     "rms_norm",
-    "qwen3_5",
+    "offset",
     "npu",
-    qwen3_5_npu.forward,
-    qwen3_5_npu.backward,
-    description="torch_npu Qwen3.5 RMSNorm with offset weights and Gemma-style scaling",
+    offset_npu.forward,
+    offset_npu.backward,
+    description="torch_npu RMSNorm with offset-1 weights and Gemma-style scaling",
     requirement=NpuKernelRequirement(),
 )
 
