@@ -36,6 +36,7 @@ import torch.nn as nn
 
 from ....omni_pretrained_model import OmniPreTrainedModel
 from ..quant_scheme import quantized_storage_dtype
+from .checkpoint import create_ngram_table_padding
 from .configuration import DeepseekV41NgramConfig
 from .hashing import (
     DEAD,
@@ -69,14 +70,27 @@ class DeepseekV41Ngram(DeepseekV41NgramInferenceMixin, OmniPreTrainedModel):
     _no_split_modules = ["Embedding"]
     supports_gradient_checkpointing = False
 
+    @staticmethod
+    def _create_checkpoint_tensor_converter(model: "DeepseekV41Ngram"):
+        """Zero-pad the checkpoint's table rows up to the allocated counts."""
+        return create_ngram_table_padding(model)
+
     def __init__(self, config: DeepseekV41NgramConfig):
         super().__init__(config)
         config.validate_bucket_layout()
         self.config = config
 
         quant_dtype = quantized_storage_dtype(config)
+        # Allocated on the padded counts, not the prime sums: a table has to be
+        # divisible by the `emb` group size to be row-sharded, and a sum of
+        # primes is not. The extra rows are unreachable by construction -- see
+        # `padded_num_embeddings` -- and the checkpoint's real rows are
+        # zero-padded into them by `_NgramTablePadding` at load.
         self.tables = nn.ModuleList(
-            [DeepseekV41NgramTable(rows, config.head_dim, quant_dtype=quant_dtype) for rows in config.num_embeddings]
+            [
+                DeepseekV41NgramTable(rows, config.head_dim, quant_dtype=quant_dtype)
+                for rows in config.padded_num_embeddings
+            ]
         )
 
         primes = build_bucket_primes(

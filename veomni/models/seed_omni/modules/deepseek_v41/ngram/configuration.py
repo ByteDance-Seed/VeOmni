@@ -14,6 +14,7 @@
 
 """Config for :class:`DeepseekV41Ngram` -- the n-gram hash lookup tables."""
 
+import math
 from typing import Any, Dict, List, Optional
 
 from transformers import PretrainedConfig
@@ -60,6 +61,7 @@ class DeepseekV41NgramConfig(PretrainedConfig):
         hash_vocab_size: int = 16000000,
         compressed_vocab_size: int = 99092,
         pad_token_id: int = 2,
+        make_table_rows_divisible_by: int = 256,
         freeze: bool = False,
         weight_quantization: Optional[Dict[str, Any]] = None,
         **kwargs,
@@ -72,6 +74,7 @@ class DeepseekV41NgramConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.hash_vocab_size = hash_vocab_size
         self.compressed_vocab_size = compressed_vocab_size
+        self.make_table_rows_divisible_by = make_table_rows_divisible_by
         self.freeze = freeze
         # The released ``quantization_config``, or None when the tables have
         # been dequantized to bf16. Same field and same reason as on the llm
@@ -82,6 +85,27 @@ class DeepseekV41NgramConfig(PretrainedConfig):
         # between 196 GB and 393 GB before anything else is loaded.
         self.weight_quantization = weight_quantization
         super().__init__(pad_token_id=pad_token_id, **kwargs)
+
+    @property
+    def padded_num_embeddings(self) -> List[int]:
+        """``num_embeddings`` rounded up to what a row-sharded table can be split into.
+
+        A table's row count is a sum of the drawn primes, so it is divisible by
+        essentially nothing -- the released pair is 384006168 and 384016682, and
+        the second is not even divisible by 8. Row-sharding over ``emb`` needs a
+        count the group size divides, so the tables are allocated a little
+        larger and the checkpoint's rows are zero-padded into them at load.
+
+        The padding is inert rather than merely harmless. A hash id is
+        ``rolling % prime + offset`` and the offsets sum to ``num_embeddings``,
+        so no id can address a padded row; they exist to be divided, not read.
+        ``num_embeddings`` stays the prime sum, which is what
+        :meth:`validate_bucket_layout` checks and what the hashing uses.
+
+        At the default 256 the two tables together grow by under 100 KB.
+        """
+        divisor = self.make_table_rows_divisible_by
+        return [math.ceil(rows / divisor) * divisor for rows in self.num_embeddings]
 
     @property
     def n_hash_cols(self) -> int:

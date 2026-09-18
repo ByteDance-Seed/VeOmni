@@ -38,6 +38,11 @@ deepseek_v41_text_encoder:
     extra_parallel_sizes: [8]
     extra_parallel_names: ["emb"]
     extra_parallel_placement_innermost: [false]
+    # Spelled out because inference defaults every module to `eager`, where
+    # training inherits fsdp2 from the top-level accelerator. Extra parallelism
+    # is applied as part of the FSDP2 plan and is not reachable from the others.
+    fsdp_config:
+      fsdp_mode: fsdp2
     gradient_checkpointing:
       enable: false
 
@@ -54,6 +59,11 @@ deepseek_v41_ngram:
     extra_parallel_sizes: [8]
     extra_parallel_names: ["emb"]
     extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      # The tables are frozen and read once per step; re-sharding them after the
+      # lookup would buy back memory that was never gathered in the first place.
+      reshard_after_forward: false
     gradient_checkpointing:
       enable: false
 

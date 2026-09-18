@@ -20,10 +20,16 @@ only the gathered rows may ever become bf16. A lookup that dequantized in bulk
 would be numerically perfect and would also need 393 GB.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from veomni.models.seed_omni.modules.deepseek_v41.dequant import dequant_fp8_blockwise
+from veomni.models.seed_omni.modules.deepseek_v41.ngram.checkpoint import (
+    NgramTablePadding,
+    create_ngram_table_padding,
+)
 from veomni.models.seed_omni.modules.deepseek_v41.ngram.configuration import DeepseekV41NgramConfig
 from veomni.models.seed_omni.modules.deepseek_v41.ngram.quantized import DeepseekV41NgramTable
 from veomni.models.seed_omni.modules.deepseek_v41.quant_scheme import (
@@ -135,3 +141,73 @@ class TestTheConfigSwitch:
     def test_the_native_ngram_config_asks_for_fp8(self):
         config = DeepseekV41NgramConfig(weight_quantization=RELEASED_QUANTIZATION)
         assert quantized_storage_dtype(config) is torch.float8_e4m3fn
+
+
+class TestRowPadding:
+    """The tables are allocated a little larger than the checkpoint holds.
+
+    A row count that is a sum of primes divides by essentially nothing, and a
+    row-sharded table needs one its group size divides. The padding is applied
+    as the tensors stream in, so the artifact is untouched and the 91.6 GiB
+    tables are never held whole.
+    """
+
+    def test_the_released_counts_do_not_divide_by_eight(self):
+        """The premise. Without this the padding would be dead code."""
+        config = DeepseekV41NgramConfig()
+        assert config.num_embeddings == [384006168, 384016682]
+        assert config.num_embeddings[1] % 8 != 0
+
+    def test_padding_reaches_every_plausible_group_size(self):
+        config = DeepseekV41NgramConfig()
+        for rows in config.padded_num_embeddings:
+            for group_size in (2, 4, 8, 16, 32, 64, 128, 256):
+                assert rows % group_size == 0
+
+    def test_padding_is_cheap(self):
+        """446 rows between the two tables; the point is that it is not a tradeoff."""
+        config = DeepseekV41NgramConfig()
+        added = sum(p - r for r, p in zip(config.num_embeddings, config.padded_num_embeddings))
+        assert added * config.head_dim < 200 * 1024
+
+    def test_the_semantic_size_is_left_alone(self):
+        """`num_embeddings` is the prime sum, which the hashing and the layout check use."""
+        config = DeepseekV41NgramConfig()
+        assert config.num_embeddings == [384006168, 384016682]
+        config.validate_bucket_layout()
+
+    def test_a_table_is_padded_up_and_its_rows_kept(self):
+        config = DeepseekV41NgramConfig(num_embeddings=[384006168, 384016682])
+        converter = NgramTablePadding(config.padded_num_embeddings)
+        # Stands in for the real tensor; padding is a dim-0 operation and does
+        # not care how many rows precede it.
+        converted = converter.convert("tables.0.weight", torch.ones(64, 4))
+
+        assert converted.tensor.shape[0] == config.padded_num_embeddings[0]
+        assert (converted.tensor[:64] == 1).all()
+        assert (converted.tensor[64:] == 0).all()
+
+    def test_only_the_tables_are_claimed(self):
+        """`token_map` and the hash constants are replicated, not row-sharded."""
+        converter = NgramTablePadding([100, 100])
+        assert converter.can_handle("tables.0.weight")
+        assert converter.can_handle("tables.1.weight_scale")
+        assert not converter.can_handle("token_map")
+        assert not converter.can_handle("primes")
+
+    def test_the_padding_is_declared_streamable(self):
+        """Lets the loader read only a rank's slice instead of the whole table."""
+        converter = NgramTablePadding([100, 100])
+        assert converter.is_dim0_zero_pad("tables.0.weight")
+        assert converter.finalize() == []
+
+    def test_a_table_larger_than_allocated_is_refused(self):
+        """A config describing a different table would otherwise read wrong buckets."""
+        converter = NgramTablePadding([64, 64])
+        with pytest.raises(ValueError, match="more than"):
+            converter.convert("tables.0.weight", torch.ones(128, 4))
+
+    def test_no_converter_when_nothing_needs_padding(self):
+        config = DeepseekV41NgramConfig(num_embeddings=[384006400, 384016896])
+        model = SimpleNamespace(config=config)
+        assert create_ngram_table_padding(model) is None
