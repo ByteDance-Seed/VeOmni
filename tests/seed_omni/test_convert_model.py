@@ -132,3 +132,51 @@ def test_require_converted_graphs_rejects_empty_training_graph(tmp_path):
 
     with pytest.raises(ValueError, match="empty"):
         _require_converted_graphs(str(tmp_path))
+
+
+def _one_node_generation_graphs(endpoint: str) -> dict:
+    return {
+        "infer_und": {
+            "initial": "run",
+            "states": {
+                "run": {
+                    "body": [{"from": endpoint, "to": "end"}],
+                    "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
+                }
+            },
+        }
+    }
+
+
+def test_save_converted_omni_rejects_missing_endpoint_method(tmp_path):
+    """A named module with a missing method must fail before the checkpoint is written."""
+    output = tmp_path / "omni"
+    with pytest.raises(ValueError, match=r"FakeModuleA\.encode"):
+        save_converted_omni(
+            str(output),
+            modules={
+                FAKE_A: FakeModuleA(FakeModuleAConfig()),
+                FAKE_B: FakeModuleB(FakeModuleBConfig()),
+            },
+            training_graph=[{"from": f"{FAKE_A}.encode", "to": "end"}],
+            generation_graphs=_one_node_generation_graphs(FAKE_A),
+        )
+    assert not (output / DEFAULT_TRAINING_GRAPH_FILE).exists()
+    assert not (output / DEFAULT_GENERATION_GRAPH_FILE).exists()
+
+
+def test_save_converted_omni_rejects_missing_default_generate(tmp_path):
+    """Bare generation endpoints resolve to ``generate``; that method must exist."""
+
+    class NoGenerate(FakeModuleA):
+        generate = None
+
+    output = tmp_path / "omni"
+    with pytest.raises(ValueError, match=r"NoGenerate\.generate"):
+        save_converted_omni(
+            str(output),
+            modules={FAKE_A: NoGenerate(FakeModuleAConfig())},
+            training_graph=[{"from": FAKE_A, "to": "end"}],
+            generation_graphs=_one_node_generation_graphs(FAKE_A),
+        )
+    assert not (output / DEFAULT_TRAINING_GRAPH_FILE).exists()

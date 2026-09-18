@@ -55,7 +55,7 @@ def save_converted_omni(
         infer_type=infer_type,
         generation_kwargs=generation_kwargs,
     )
-    _assert_graph_modules(config)
+    _assert_graph_modules(config, modules)
     OmniModel(config, modules).save_pretrained(output_dir)
 
 
@@ -147,32 +147,63 @@ def _require_converted_graphs(output_dir: str) -> None:
     _assert_graph_modules(config)
 
 
-def _assert_graph_modules(config: Any) -> None:
-    """Every graph endpoint must name a module declared on the omni config."""
-    from ..graphs.base import EdgeDef, is_end
+def _assert_graph_modules(config: Any, modules: Mapping[str, nn.Module] | None = None) -> None:
+    """Every non-end graph endpoint must name a declared module and an existing method.
 
+    Module-name checks run against ``config.modules``. Method checks need the
+    live converted modules and therefore run only when ``modules`` is passed
+    (convert write path). Bare training endpoints resolve to ``forward``; bare
+    generation endpoints resolve to ``generate`` — the same defaults
+    :class:`~veomni.models.seed_omni.modeling_omni.OmniModel` uses at
+    train/generate time.
+    """
+    nodes = list(_iter_graph_nodes(config))
     declared = set(config.module_names)
-    referenced: set[str] = set()
-    for spec in config.training_graph:
-        referenced.update(_edge_modules(spec, default_method="forward", edge_cls=EdgeDef, is_end=is_end))
-    for fsm in config.generation_graphs.values():
-        for state in (fsm.get("states") or {}).values():
-            for spec in state.get("body") or []:
-                referenced.update(_edge_modules(spec, default_method="generate", edge_cls=EdgeDef, is_end=is_end))
-    unknown = sorted(referenced - declared)
+    unknown = sorted({node.module for node in nodes} - declared)
     if unknown:
         raise ValueError(
             "Omni convert graphs reference modules that are not in `config.modules`: "
             f"{unknown}. Declared: {sorted(declared)}."
         )
+    if modules is None:
+        return
+
+    missing: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for node in nodes:
+        key = (node.module, node.method)
+        if key in seen:
+            continue
+        seen.add(key)
+        module = modules.get(node.module)
+        if module is None:
+            continue
+        if getattr(module, node.method, None) is None:
+            missing.append(f"{type(module).__name__}.{node.method}")
+    if missing:
+        raise ValueError(
+            "Omni convert graphs reference methods that are not implemented on the "
+            f"converted modules: {missing}. OmniModel would raise AttributeError at "
+            "train or generate time."
+        )
 
 
-def _edge_modules(spec: dict[str, Any], *, default_method: str, edge_cls: Any, is_end: Any) -> set[str]:
-    edge = edge_cls.parse(spec, default_method=default_method)
-    names = {edge.from_node.module}
-    if edge.to_node is not None and not is_end(edge.to):
-        names.add(edge.to_node.module)
-    return names
+def _iter_graph_nodes(config: Any):
+    for spec in config.training_graph:
+        yield from _edge_nodes(spec, default_method="forward")
+    for fsm in config.generation_graphs.values():
+        for state in (fsm.get("states") or {}).values():
+            for spec in state.get("body") or []:
+                yield from _edge_nodes(spec, default_method="generate")
+
+
+def _edge_nodes(spec: dict[str, Any], *, default_method: str):
+    from ..graphs.base import EdgeDef
+
+    edge = EdgeDef.parse(spec, default_method=default_method)
+    yield edge.from_node
+    if edge.to_node is not None:
+        yield edge.to_node
 
 
 __all__ = [
