@@ -89,6 +89,40 @@ def is_quantized(weight: torch.Tensor) -> bool:
     return weight.dtype in (torch.float8_e4m3fn, torch.float4_e2m1fn_x2, torch.int8)
 
 
+def linear_quant_dtype(config) -> Optional[torch.dtype]:
+    """The storage dtype for a dense projection, or ``None`` for an ordinary layer.
+
+    ``config.weight_quantization`` is the released ``quantization_config`` and is
+    present only on the native artifact; the bf16 one has been dequantized and
+    gets plain ``nn.Linear``. Every dense projection the release quantizes is
+    fp8 -- fp4 is only ever the stacked routed experts, which are not a Linear.
+
+    The scheme is checked rather than assumed. The kernels index a weight's
+    scale by the same block counter as the activation's, so a checkpoint
+    quantized on a different block width would not fail to run, it would read
+    the wrong scale for every block and return plausible nonsense.
+    """
+    declared = getattr(config, "weight_quantization", None)
+    if not declared:
+        return None
+
+    block_size = declared.get("weight_block_size", [QUANT_BLOCK_SIZE, QUANT_BLOCK_SIZE])
+    if tuple(block_size) != (QUANT_BLOCK_SIZE, QUANT_BLOCK_SIZE):
+        raise ValueError(
+            f"This checkpoint is quantized in {tuple(block_size)} blocks, but the kernels here are "
+            f"built for {(QUANT_BLOCK_SIZE, QUANT_BLOCK_SIZE)}. Running it anyway would pair every "
+            "block with the wrong scale."
+        )
+    scale_fmt = declared.get("scale_fmt", SCALE_FMT)
+    if scale_fmt != SCALE_FMT:
+        raise ValueError(
+            f"This checkpoint's scales are {scale_fmt!r}, not {SCALE_FMT!r}. Only the latter rounds "
+            f"every scale to a power of two, which is what lets it be stored as the bare exponent "
+            f"{SCALE_DTYPE} the kernels read."
+        )
+    return torch.float8_e4m3fn
+
+
 def quantized_matmul(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """``x @ weight.T`` with ``weight`` left in the precision it was released in.
 
@@ -191,5 +225,6 @@ __all__ = [
     "DeepseekV41Linear",
     "QuantizedWeightMixin",
     "is_quantized",
+    "linear_quant_dtype",
     "quantized_matmul",
 ]

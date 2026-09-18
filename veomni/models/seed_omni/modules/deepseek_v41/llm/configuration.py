@@ -44,7 +44,7 @@ unconditionally; V4.1 does it only when ``norm_topk_prob and num_experts_per_tok
 > 1``. And V4 has no ``gate_temp`` at all, which is the same as a hardcoded 1.0.
 """
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from transformers import PretrainedConfig
 
@@ -94,6 +94,7 @@ class DeepseekV41LlmConfig(PretrainedConfig):
         routed_scaling_factor: float = 1.5,
         gate_temp: float = 1.0,
         expert_dtype: str = "fp4",
+        weight_quantization: Optional[Dict[str, Any]] = None,
         # Attention schedule
         sliding_window: int = 128,
         compress_ratios: Optional[List[int]] = None,
@@ -169,6 +170,21 @@ class DeepseekV41LlmConfig(PretrainedConfig):
         # would otherwise be dropped on load and change routing silently.
         self.gate_temp = gate_temp
         self.expert_dtype = expert_dtype
+        # The released `quantization_config`, verbatim, or None when the weights
+        # have been dequantized to bf16. Two things make this a separate field
+        # rather than that name:
+        #
+        # `expert_dtype` above is about QAT -- which format training should
+        # fake-quantize the routed experts to, in bf16 arithmetic. This one is
+        # about storage: whether the weights on disk are the quantized ones and
+        # so need the quantized GEMMs. A bf16 checkpoint still declares an
+        # `expert_dtype`, and must, or QAT would silently change.
+        #
+        # And `quantization_config` is a reserved name. transformers reads it
+        # off the config in `get_hf_quantizer`, and `quant_method: "fp8"` is a
+        # method it supports, so it would install its own fp8 quantizer,
+        # substitute its own Linear and take over weight loading.
+        self.weight_quantization = weight_quantization
 
         self.sliding_window = sliding_window
         self.compress_ratios = list(compress_ratios) if compress_ratios is not None else self._default_ratios()

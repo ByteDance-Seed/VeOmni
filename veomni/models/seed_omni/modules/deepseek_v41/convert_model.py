@@ -662,7 +662,7 @@ def _convert_layer_experts(emitter: Emitter, layer: int, n_routed_experts: int) 
     gc.collect()
 
 
-def _build_configs(hf_config: Dict[str, Any]):
+def _build_configs(hf_config: Dict[str, Any], precision: str = "bf16"):
     """The four module configs, from the released ``config.json``."""
     import veomni.models.seed_omni.modules  # noqa: F401
     from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
@@ -699,6 +699,10 @@ def _build_configs(hf_config: Dict[str, Any]):
     # The experts' storage format is a quantization_config key upstream, and a
     # field on the module config here because the QAT path reads it per forward.
     llm_fields["expert_dtype"] = quant.get("expert_dtype", "fp8")
+    # Only the native artifact keeps the weights quantized, so only it declares
+    # the scheme; carrying it on a bf16 artifact would send the modules looking
+    # for scales that were folded away during conversion.
+    llm_fields["weight_quantization"] = dict(quant) if precision == "native" and quant else None
     llm_config = LlmConfig(**llm_fields)
     return vision_config, text_encoder_config, ngram_config, llm_config
 
@@ -732,7 +736,7 @@ def convert_deepseek_v41_checkpoint(
     with open(os.path.join(model_path, "config.json")) as handle:
         hf_config = json.load(handle)
 
-    vision_config, text_encoder_config, ngram_config, llm_config = _build_configs(hf_config)
+    vision_config, text_encoder_config, ngram_config, llm_config = _build_configs(hf_config, precision)
     source = TensorSource(model_path)
 
     skipped = sum(1 for name in source.names() if name.startswith("mtp."))

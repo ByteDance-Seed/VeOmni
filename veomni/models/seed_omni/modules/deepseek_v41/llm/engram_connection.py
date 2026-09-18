@@ -36,6 +36,7 @@ import torch
 import torch.nn as nn
 
 from .configuration import DeepseekV41LlmConfig
+from .quantized import DeepseekV41Linear, linear_quant_dtype
 
 
 class DeepseekV41EngramConnection(nn.Module):
@@ -72,10 +73,11 @@ class DeepseekV41EngramConnection(nn.Module):
         self.eps = config.rms_norm_eps
 
         n_hash_cols = (config.engram_max_ngram_size - 1) * config.engram_n_heads
-        self.wkv = nn.Linear(
+        self.wkv = DeepseekV41Linear(
             n_hash_cols * config.engram_head_dim,
             config.hidden_size * (config.hc_mult + 1),
             bias=False,
+            quant_dtype=linear_quant_dtype(config),
         )
         self.q_weight = nn.Parameter(torch.ones(config.hc_mult, config.hidden_size))
         self.k_weight = nn.Parameter(torch.ones(config.hc_mult, config.hidden_size))

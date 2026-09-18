@@ -69,6 +69,7 @@ import torch.nn as nn
 from ......ops.kernels.deepseek_v4 import sparse_attn_tilelang, sparse_mqa_target_fwd
 from .configuration import DeepseekV41LlmConfig
 from .quantization import fake_quant_act, fake_quant_kv, fake_quant_linear
+from .quantized import DeepseekV41Linear, linear_quant_dtype
 from .reuse import DeepseekV4GroupedLinear, DeepseekV4RMSNorm
 
 
@@ -519,7 +520,16 @@ class DeepseekV41Indexer(nn.Module):
         self.rope_head_dim = config.qk_rope_head_dim
         self.softmax_scale = config.index_head_dim**-0.5
 
-        self.wq_b = nn.Linear(config.q_lora_rank, config.index_n_heads * config.index_head_dim, bias=False)
+        # `wq_b` is the only quantized projection in here. `weights_proj` and
+        # `wk` are left in the precision the release left them: they do not
+        # scale an output slightly, they decide which blocks the sparse
+        # attention reads at all.
+        self.wq_b = DeepseekV41Linear(
+            config.q_lora_rank,
+            config.index_n_heads * config.index_head_dim,
+            bias=False,
+            quant_dtype=linear_quant_dtype(config),
+        )
         self.weights_proj = nn.Linear(config.hidden_size, config.index_n_heads, bias=False)
         if self.owns_keys:
             self.wk = nn.Linear(config.head_dim, config.index_head_dim, bias=False)
@@ -637,17 +647,22 @@ class DeepseekV41Attention(nn.Module):
         self.is_index_source = layer_idx in config.index_source_layer_ids
 
         self.attn_sink = nn.Parameter(torch.zeros(self.n_heads, dtype=torch.float32))
-        self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
+        quant_dtype = linear_quant_dtype(config)
+        self.wq_a = DeepseekV41Linear(config.hidden_size, config.q_lora_rank, bias=False, quant_dtype=quant_dtype)
         self.q_norm = DeepseekV4RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
-        self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * config.head_dim, bias=False)
-        self.wkv = nn.Linear(config.hidden_size, config.head_dim, bias=False)
+        self.wq_b = DeepseekV41Linear(
+            config.q_lora_rank, self.n_heads * config.head_dim, bias=False, quant_dtype=quant_dtype
+        )
+        self.wkv = DeepseekV41Linear(config.hidden_size, config.head_dim, bias=False, quant_dtype=quant_dtype)
         self.kv_norm = DeepseekV4RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.wo_a = DeepseekV4GroupedLinear(
             self.n_heads * config.head_dim // self.n_groups,
             self.n_groups * config.o_lora_rank,
             n_groups=self.n_groups,
         )
-        self.wo_b = nn.Linear(self.n_groups * config.o_lora_rank, config.hidden_size, bias=False)
+        self.wo_b = DeepseekV41Linear(
+            self.n_groups * config.o_lora_rank, config.hidden_size, bias=False, quant_dtype=quant_dtype
+        )
 
         self.compressor = DeepseekV41Compressor(config, layer_idx) if self.is_kv_source else None
         self.indexer = DeepseekV41Indexer(config, layer_idx) if self.is_index_source else None
