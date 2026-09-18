@@ -16,8 +16,9 @@
 
 Only :meth:`InferenceModuleMixin.reset_global_inference_state` and
 :meth:`InferenceModuleMixin.finalize` are wired in, on both inference paths —
-eager (``OmniModel.reset`` / ``OmniModel._invoke_module_finalize``) and
-distributed (``OmniModelRuntime``, ``accelerator/omni_model_runtime.py``).
+eager (``OmniModel.reset`` / abort-only ``OmniModel._invoke_module_finalize``)
+and distributed (``OmniModelRuntime``). ``finalize`` runs when the driver
+hits ``max_new_tokens`` *before* ``done``, not after a normal FSM completion.
 
 The ``pre_generate`` / ``post_generate`` / ``generate_step`` surface has NO
 call-site: both FSM drivers invoke each graph endpoint directly with no hooks
@@ -97,7 +98,13 @@ class InferenceModuleMixin:
         self.reset_local_inference_state()
 
     def finalize(self, *, ctx: dict[str, Any]) -> dict[str, Any]:
-        """Flush module-private generation buffers into a one-shot ``generated`` payload."""
+        """Abort-only flush of leftover buffers into a one-shot ``generated`` payload.
+
+        Called when the FSM is cut short (``max_new_tokens``), not when it
+        reaches ``done`` — that path already collected a complete span from
+        ``generate``. Incomplete image tokens usually cannot be finalized;
+        text might still emit.
+        """
         del ctx
         return {}
 

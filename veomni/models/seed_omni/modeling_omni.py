@@ -481,7 +481,13 @@ class OmniModel(PreTrainedModel):
         ctx.update(out)
 
     def _invoke_module_finalize(self, ctx: dict[str, Any]) -> None:
-        """Call ``finalize`` on every graph participant when the safety cap trips."""
+        """Abort-only flush: call ``finalize`` when the FSM did not reach ``done``.
+
+        Normal completion already collected artefacts from the last state's
+        ``generate`` via :meth:`_collect_generated`. Hitting ``max_new_tokens``
+        cuts a span short (often mid-image tokens, which cannot be finalized);
+        this is a best-effort salvage, typically text-only.
+        """
         for _, module in self.named_omni_modules():
             finalize_fn = getattr(module, "finalize", None)
             if finalize_fn is None:
@@ -540,6 +546,8 @@ class OmniModel(PreTrainedModel):
 
         self._emit_progress(total_steps)
 
+        # ``done``: the last state already finished; do not finalize again.
+        # Still running: safety-cap abort — best-effort ``finalize``.
         if not self.generation_graph.is_done():
             self._invoke_module_finalize(ctx)
 

@@ -60,7 +60,11 @@ class OmniPreTrainedModel(PreTrainedModel):
         self.reset_local_inference_state()
 
     def finalize(self, *, ctx: dict[str, Any]) -> dict[str, Any]:
-        """Flush module-private generation buffers into a one-shot ``generated`` payload."""
+        """Abort-only flush of leftover buffers into a one-shot ``generated`` payload.
+
+        Invoked when generation hits ``max_new_tokens`` before ``done``, not
+        after a normal FSM completion.
+        """
         del ctx
         return {}
 
