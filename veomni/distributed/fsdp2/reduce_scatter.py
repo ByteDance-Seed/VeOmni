@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-import logging
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Mapping
@@ -23,9 +22,11 @@ import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FSDPModule
 
+from ...utils import logging
+
 
 _SUPPORTED_TRANSPORT_DTYPES = frozenset((torch.bfloat16, torch.float16))
-logger = logging.getLogger(__name__)
+logger = logging.get_logger(__name__)
 
 
 def _get_node_id() -> str | None:
@@ -46,6 +47,9 @@ class ReduceScatterTransportPolicy:
         self._decisions: dict[tuple[dist.ProcessGroup, dist.ProcessGroup | None], bool] = {}
 
     def can_use(self, mesh) -> bool:
+        """Select transport for a named 1D shard mesh or 2D replica/shard mesh."""
+        if len(mesh.mesh_dim_names) not in (1, 2):
+            raise ValueError("Low-precision ReduceScatter requires a 1D or 2D FSDP mesh.")
         shard_group = mesh.get_group(mesh.mesh_dim_names[-1])
         replica_group = mesh.get_group(mesh.mesh_dim_names[0]) if len(mesh.mesh_dim_names) == 2 else None
         key = (shard_group, replica_group)

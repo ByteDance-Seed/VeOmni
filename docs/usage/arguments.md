@@ -648,10 +648,17 @@ the entire associated FSDP mesh retains native reduction and scaling. This preve
 the custom force-SUM scaling contract with native reduction scaling. Unrelated module meshes may still
 choose different paths. Decisions are cached by actual process groups within one model initialization;
 no placement detection is performed during backward. Singleton shard groups always retain native behavior.
+Only named 1D shard meshes and 2D replica/shard meshes are supported; other dimensionalities are rejected
+before process-group lookup rather than skipping replica consensus.
 
 This is a conservative performance guard, not a guarantee of acceleration on every node-local interconnect
 or bucket size. All-to-all can increase cross-node NIC traffic despite using a smaller dtype. The option
 does not reduce parameter AllGather traffic or HSDP replica AllReduce traffic.
+
+Budget two additional full-size low-precision buffers per in-flight reduction: one for the converted
+input and one for the all-to-all receive data. For a 1 GiB BF16/FP16 gradient bucket, these add 2 GiB
+of live tensor storage alongside the native-sized FP32 input and output buffers. Allocator/workspace
+overhead and overlapping reductions can further affect peak device memory.
 
 Modules excluded via `modules_to_ignore_in_mixed_precision` deliberately retain native FP32 communication:
 their gradients are genuine FP32 values, so low-precision transport would discard the precision they preserve.

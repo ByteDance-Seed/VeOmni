@@ -916,6 +916,7 @@ def build_parallelize_model(
     """
     parallel_state = get_parallel_state()
     if low_precision_reduce_scatter_comm is not False:
+        # Only literal False bypasses validation; false-like non-booleans must still raise.
         validate_low_precision_reduce_scatter_comm(
             low_precision_reduce_scatter_comm, mixed_precision, fsdp_mode=parallel_state.dp_mode
         )
