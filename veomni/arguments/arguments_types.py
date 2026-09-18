@@ -480,8 +480,21 @@ class GradientCheckpointingConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int):
                 raise ValueError(
-                    f"train.gradient_checkpointing.{name} must be an integer, got {value!r} ({type(value).__name__})"
+                    f"model.accelerator.gradient_checkpointing.{name} must be an integer, "
+                    f"got {value!r} ({type(value).__name__})"
                 )
+        # Same reason: a bare operator string would be iterated character by
+        # character by the op resolver (one warning per letter), so normalise it
+        # and reject anything that is not a sequence of names.
+        if self.selective_ops is None:
+            self.selective_ops = []
+        elif isinstance(self.selective_ops, str):
+            self.selective_ops = [self.selective_ops]
+        elif not isinstance(self.selective_ops, list):
+            raise ValueError(
+                "model.accelerator.gradient_checkpointing.selective_ops must be a list of operator names, "
+                f"got {self.selective_ops!r} ({type(self.selective_ops).__name__})"
+            )
 
 
 @dataclass
