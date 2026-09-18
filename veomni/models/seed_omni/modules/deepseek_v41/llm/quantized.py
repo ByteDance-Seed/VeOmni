@@ -63,6 +63,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ......distributed.moe import dispatch_to_ep_class
+from ......distributed.parallel_state import get_parallel_state
 from ......ops.kernels.deepseek_v4 import act_quant, fp4_gemm, fp8_gemm
 from ..quant_scheme import QUANT_BLOCK_SIZE, SCALE_DTYPE, SCALE_FMT, quantized_storage_dtype
 from .reuse import DeepseekV4Experts, DeepseekV4GroupedLinear, DeepseekV4MLP
@@ -285,6 +287,57 @@ class DeepseekV41SharedExpert(DeepseekV4MLP):
             )
 
 
+class QuantizedEPExperts:
+    """The local half of an expert-parallel step, over fp4 slabs.
+
+    ``dispatch_to_ep_class`` owns the all-to-all that sends each token to the
+    rank holding its expert and brings the result back; what it calls in between
+    is this. It stands where ``EPMergedFc1GroupGemm`` stands on the bf16 path,
+    and cannot be that class: a grouped GEMM multiplies in bf16 and there is no
+    bf16 weight here.
+
+    Not an ``autograd.Function``, unlike every other ``ep_class``. The released
+    quantized weights are an inference artifact -- training goes through QAT
+    from bf16 masters -- and a ``backward`` that cannot be reached is worse than
+    no ``backward`` at all.
+    """
+
+    @staticmethod
+    def apply(
+        permute_tokens: torch.Tensor,
+        cumsum: torch.Tensor,
+        gate_up: torch.Tensor,
+        gate_up_scale: torch.Tensor,
+        down: torch.Tensor,
+        down_scale: torch.Tensor,
+        apply_gate,
+    ) -> torch.Tensor:
+        """``[T_local, H]`` in, ``[T_local, H]`` out, grouped by local expert.
+
+        ``permute_tokens`` arrives sorted by the local expert that owns each
+        token, so ``cumsum`` is all that is needed to find each expert's slice.
+        """
+        outputs = torch.empty(
+            permute_tokens.shape[0],
+            down.shape[1],
+            dtype=permute_tokens.dtype,
+            device=permute_tokens.device,
+        )
+        # One sync rather than one per expert: with 48 local experts a layer,
+        # reading the boundaries back individually would cost more than the
+        # GEMMs between them.
+        boundaries = cumsum.tolist()
+        start = 0
+        for local_expert, end in enumerate(boundaries):
+            if end == start:
+                continue
+            tokens = permute_tokens[start:end]
+            gated = apply_gate(quantized_matmul(tokens, gate_up[local_expert], gate_up_scale[local_expert]))
+            outputs[start:end] = quantized_matmul(gated, down[local_expert], down_scale[local_expert])
+            start = end
+        return outputs
+
+
 class DeepseekV41QuantizedExperts(DeepseekV4Experts):
     """The routed experts, holding the released fp4 slabs instead of bf16 ones.
 
@@ -357,6 +410,23 @@ class DeepseekV41QuantizedExperts(DeepseekV4Experts):
         if not self.experts_are_quantized:
             return super().forward(hidden_states, top_k_index, top_k_weights)
 
+        if get_parallel_state().ep_enabled:
+            # The slabs are 269 GiB, so on any real checkpoint this is the live
+            # branch and the loop below is what runs inside it, on one rank's
+            # share of the experts.
+            return dispatch_to_ep_class(
+                QuantizedEPExperts,
+                self.num_experts,
+                top_k_weights.to(hidden_states.dtype),
+                top_k_index,
+                hidden_states,
+                self.gate_up_proj,
+                self.gate_up_proj_scale,
+                self.down_proj,
+                self.down_proj_scale,
+                self._apply_gate,
+            )
+
         final_hidden_states = torch.zeros_like(hidden_states)
         with torch.no_grad():
             expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
@@ -394,6 +464,7 @@ __all__ = [
     "DeepseekV41GroupedLinear",
     "DeepseekV41Linear",
     "DeepseekV41QuantizedExperts",
+    "QuantizedEPExperts",
     "DeepseekV41SharedExpert",
     "QuantizedWeightMixin",
     "expert_quant_dtype",

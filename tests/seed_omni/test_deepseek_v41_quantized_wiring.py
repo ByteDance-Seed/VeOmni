@@ -44,6 +44,7 @@ from veomni.models.seed_omni.modules.deepseek_v41.llm.quantized import (
     DeepseekV41GroupedLinear,
     DeepseekV41QuantizedExperts,
     DeepseekV41SharedExpert,
+    QuantizedEPExperts,
     expert_quant_dtype,
     linear_quant_dtype,
 )
@@ -345,6 +346,57 @@ class TestRoutedExperts:
         assert actual.shape == expected.shape
         assert (actual - expected).abs().max() < 0.10 * expected.abs().max()
         assert (actual - expected).norm() / expected.norm() < 0.08
+
+
+class TestExpertParallelLocalHalf:
+    """What ``dispatch_to_ep_class`` calls between its two all-to-alls.
+
+    Exercised directly rather than through a process group: the all-to-all is
+    VeOmni's and already tested, while the part that is new here is reading each
+    local expert's slice out of one permuted buffer.
+    """
+
+    @requires_sm90
+    def test_each_expert_gets_exactly_its_own_tokens(self):
+        from veomni.ops.kernels.deepseek_v4 import fp4_act_quant
+
+        torch.manual_seed(0)
+        n_local_experts, hidden, intermediate = 3, 64, 96
+        counts = [2, 0, 5]  # an expert with no tokens is the case worth covering
+        cumsum = torch.tensor(counts, device=DEVICE).cumsum(0)
+
+        def slab(out_features, in_features):
+            plain = torch.randn(n_local_experts, out_features, in_features, dtype=torch.bfloat16, device=DEVICE) * 0.1
+            packed, scale = fp4_act_quant(plain, QUANT_BLOCK_SIZE)
+            return packed.view(torch.int8), scale, fp4_act_quant(plain, QUANT_BLOCK_SIZE, dequant=True)
+
+        gate_up, gate_up_scale, gate_up_ref = slab(2 * intermediate, hidden)
+        down, down_scale, down_ref = slab(hidden, intermediate)
+
+        tokens = torch.randn(sum(counts), hidden, dtype=torch.bfloat16, device=DEVICE)
+        limit = 7.0
+
+        def apply_gate(gate_up_output):
+            gate, up = gate_up_output.chunk(2, dim=-1)
+            return torch.nn.functional.silu(gate.clamp(max=limit)) * up.clamp(min=-limit, max=limit)
+
+        actual = QuantizedEPExperts.apply(tokens, cumsum, gate_up, gate_up_scale, down, down_scale, apply_gate)
+
+        # The reference walks the same boundaries with plain matmuls, so a slice
+        # taken from the wrong expert shows up as a whole row being wrong rather
+        # than as rounding.
+        expected = torch.empty_like(actual)
+        start = 0
+        for expert, count in enumerate(counts):
+            if count == 0:
+                continue
+            chunk = tokens[start : start + count]
+            gated = apply_gate(chunk.float() @ gate_up_ref[expert].float().T)
+            expected[start : start + count] = (gated @ down_ref[expert].float().T).to(actual.dtype)
+            start += count
+
+        assert actual.shape == (sum(counts), hidden)
+        assert (actual.float() - expected.float()).norm() / expected.float().norm() < 0.08
 
 
 class TestEngram:

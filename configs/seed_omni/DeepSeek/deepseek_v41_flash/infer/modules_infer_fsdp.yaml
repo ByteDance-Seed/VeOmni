@@ -1,0 +1,74 @@
+# Per-module overrides for sharded inference -- DeepSeek-V4.1-Flash, 8 ranks.
+#
+# Sized for the native artifact, which keeps the released fp8 and fp4 weights
+# rather than dequantizing them. Measured on disk:
+#
+#   vision          0.9 GiB   bf16 throughout
+#   text_encoder    2.5 GiB   bf16
+#   ngram         188.8 GiB   fp8 rows + per-row block scales
+#   llm           275.7 GiB   fp4 routed experts (269 GiB of it), fp8 dense
+#   ------------------------------------
+#   total         468   GiB   -> 58.5 GiB a rank if everything shards
+#
+# Against 8 x H20 that is 468 of 776 GiB, leaving room per rank for the KV
+# cache and activations. The bf16 artifact is 1.5 TB and does not fit here at
+# all; it is the training input, not this.
+#
+# Gradient checkpointing is off everywhere, as in the eager file: it trades
+# compute for activation memory across a backward, and there is no backward.
+
+deepseek_v41_vision:
+  model_path: deepseek_v41_vision
+  ops_implementation:
+    # Falls back to an SDPA varlen path where FA2 has no wheels (aarch64/GB200).
+    attn_implementation: flash_attention_2
+  accelerator:
+    # 0.9 GiB, so sharding it saves nothing worth an all-gather per image.
+    fsdp_config:
+      fsdp_mode: eager
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_text_encoder:
+  model_path: deepseek_v41_text_encoder
+  accelerator:
+    # Vocab-parallel, the same as in training. Small enough not to need it, but
+    # the head produces full-vocab logits by all-gather either way, and matching
+    # the training layout keeps one loading path for both.
+    extra_parallel_sizes: [8]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_ngram:
+  model_path: deepseek_v41_ngram
+  model_config:
+    # Also drives `freeze_model`; without it the tables would be built with
+    # grads for 196.6 B rows that are never stepped.
+    freeze: true
+  accelerator:
+    # Row-sharded over 8 ranks -> 23.6 GiB each. A lookup dispatches the ids to
+    # the rank owning each row and ships the fp8 row and its scales back, so the
+    # result is bit-identical to a full-table gather.
+    extra_parallel_sizes: [8]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_llm:
+  model_path: deepseek_v41_llm
+  accelerator:
+    # The routed experts are 269 of the module's 275.7 GiB, so this is the
+    # sharding that matters: 33.6 GiB a rank. Tokens are dispatched to the rank
+    # owning their expert and the fp4 GEMMs run there.
+    ep_size: 8
+    ep_outside: false
+    # The remaining ~6.7 GiB is dense fp8 and small enough to hold whole, which
+    # also keeps the decode step free of an all-gather on the path every token
+    # takes.
+    fsdp_config:
+      fsdp_mode: eager
+    gradient_checkpointing:
+      enable: false
