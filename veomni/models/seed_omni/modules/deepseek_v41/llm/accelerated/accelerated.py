@@ -53,6 +53,7 @@ from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem, is_dummy
 from ....base.llm_packing import pack_llm_conversations_for_forward, scatter_llm_hidden_states
+from ...quant_scheme import quantized_storage_dtype
 from ..configuration import DeepseekV41LlmConfig
 from ..modeling import DeepseekV41Llm
 
@@ -274,6 +275,18 @@ class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
             "model.layers.*.mlp.experts.gate_up_proj": Shard(0),
             "model.layers.*.mlp.experts.down_proj": Shard(0),
         }
+        # A quantized expert weight is two tensors, and both are indexed by the
+        # expert on dim 0. Sharding the slab without its scales would leave
+        # ~15.6 GiB of scales replicated on every rank -- enough, together with
+        # the n-gram tables, to put eight H20s over their 97 GiB.
+        #
+        # Added only when they exist. The bf16 artifact has no scales, and a
+        # plan entry that resolves to nothing is exactly what a stale prefix
+        # looks like -- the thing `test_plan_fqns_resolve_against_the_real_
+        # module_tree` exists to catch.
+        if quantized_storage_dtype(self.config) is not None:
+            ep_plan["model.layers.*.mlp.experts.gate_up_proj_scale"] = Shard(0)
+            ep_plan["model.layers.*.mlp.experts.down_proj_scale"] = Shard(0)
         return ParallelPlan(extra_parallel_plan={"ep": ep_plan})
 
 

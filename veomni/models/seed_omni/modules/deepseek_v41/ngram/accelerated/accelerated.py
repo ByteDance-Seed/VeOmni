@@ -44,6 +44,7 @@ from .......distributed.parallel_plan import ParallelPlan
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem
+from ...quant_scheme import quantized_storage_dtype
 from ..configuration import DeepseekV41NgramConfig
 from ..modeling import DeepseekV41Ngram
 from ..packing import pack_ngram_inputs
@@ -98,7 +99,18 @@ class VeOmniMixin(BaseMixin, TrainingMixin):
 
     def get_parallel_plan(self) -> ParallelPlan:
         # fqn is module-local: the tables sit directly under ``self.tables``.
-        emb_plan = {f"tables.{index}.weight": Shard(0) for index in range(len(self.config.layer_ids))}
+        #
+        #
+        # A quantized table is two tensors, both indexed by row, so both shard
+        # the same way -- the lookup ships a row and its scales together and
+        # dequantizes after the gather. The scale entry is added only when the
+        # tables are quantized; on the bf16 artifact it would resolve to nothing.
+        quantized = quantized_storage_dtype(self.config) is not None
+        emb_plan = {}
+        for index in range(len(self.config.layer_ids)):
+            emb_plan[f"tables.{index}.weight"] = Shard(0)
+            if quantized:
+                emb_plan[f"tables.{index}.weight_scale"] = Shard(0)
         return ParallelPlan(extra_parallel_plan={"emb": emb_plan})
 
 

@@ -587,11 +587,23 @@ def parallelize_model_fsdp2(
         "reshard_after_forward": enable_reshard_after_forward,
         "shard_placement_fn": _veomni_shard_placement_fn,
     }
-    if persistent_extra_parallel_params:
-        # These params already carry their complete 2D DTensor placement. Every
-        # ancestor FSDP group must ignore them or the parent layer/root would
-        # absorb them and reintroduce a parameter all-gather.
-        fsdp_kwargs["ignored_params"] = persistent_extra_parallel_params
+    ignored_params = set(persistent_extra_parallel_params or ())
+    # A parameter that is not floating point cannot be an FSDP2 parameter at
+    # all: sharding one ends in `nn.Parameter(...)`, which torch refuses for an
+    # integer tensor. This is not a policy that could be configured differently.
+    #
+    # What lands here is packed quantized storage -- DeepSeek-V4.1's fp4 experts
+    # are two values to an int8 byte, because safetensors has no 4-bit float.
+    # Such a tensor is storage rather than a trainable weight: it is frozen,
+    # dequantized inside the kernel that reads it, and already placed by
+    # whatever sharded it (expert parallelism, for the experts). Ignoring it
+    # leaves it exactly where it was put.
+    ignored_params.update(param for param in model.parameters() if not param.is_floating_point())
+    if ignored_params:
+        # These params already carry their complete placement. Every ancestor
+        # FSDP group must ignore them or the parent layer/root would absorb them
+        # and reintroduce a parameter all-gather.
+        fsdp_kwargs["ignored_params"] = ignored_params
     # prepare mp_policy kwargs
     if mixed_precision.enable:
         mp_policy = MixedPrecisionPolicy(

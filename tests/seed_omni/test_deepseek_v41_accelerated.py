@@ -42,6 +42,15 @@ HIDDEN = 64
 N_LAYERS = 8
 
 
+RELEASED_QUANTIZATION = {
+    "quant_method": "fp8",
+    "activation_scheme": "dynamic",
+    "weight_block_size": [32, 32],
+    "scale_fmt": "ue8m0",
+    "expert_dtype": "fp4",
+}
+
+
 def make_config(**overrides) -> DeepseekV41LlmConfig:
     kwargs = dict(
         hidden_size=HIDDEN,
@@ -161,6 +170,32 @@ class TestParallelPlan:
         for pattern in model.get_parallel_plan().extra_parallel_plan["ep"]:
             concrete = pattern.replace("*", "0")
             assert concrete in names, f"{pattern} matches nothing in the module tree"
+
+    def test_quantized_experts_shard_their_scales_too(self):
+        """A quantized expert weight is two tensors and both are indexed by expert.
+
+        Sharding the slab alone leaves every rank holding the full scales --
+        ~15.6 GiB at the released dimensions, which is what takes eight H20s
+        past their 97 GiB.
+        """
+        # o_lora_rank is raised off the toy default so that a group's rows are
+        # whole 32-row scale tiles, as they are at the released 1024.
+        config = make_config(weight_quantization=RELEASED_QUANTIZATION, o_lora_rank=64)
+        # On meta because the real path is `from_pretrained`, which never
+        # initializes: there is no normal_ for fp8 on CPU to fall back on.
+        with torch.device("meta"):
+            model = DeepseekV41LlmAccelerated(config)
+        ep = model.get_parallel_plan().extra_parallel_plan["ep"]
+
+        assert set(ep) == {
+            "model.layers.*.mlp.experts.gate_up_proj",
+            "model.layers.*.mlp.experts.down_proj",
+            "model.layers.*.mlp.experts.gate_up_proj_scale",
+            "model.layers.*.mlp.experts.down_proj_scale",
+        }
+        names = {name for name, _ in model.named_parameters()}
+        for pattern in ep:
+            assert pattern.replace("*", "0") in names
 
 
 class TestMeter:
