@@ -1,6 +1,6 @@
 --- a/transformers/models/qwen2_vl/modeling_qwen2_vl.py
 +++ b/patched_modeling_qwen2_vl_gpu.py
-@@ -1,3 +1,172 @@
+@@ -1,3 +1,175 @@
 +# ==============================================================================
 +#  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
 +# ==============================================================================
@@ -12,6 +12,10 @@
 +#  It contains a patched version of the original HuggingFace modeling code.
 +#
 +#  Patches applied:
++#    - method_override: Qwen2VLRMSNorm.__init__
++#      Construct a local rms_norm VeomniOp
++#    - method_override: Qwen2VLRMSNorm.forward
++#      Always call the local rms_norm VeomniOp
 +#    - init_modification: VisionAttention
 +#      Bind instance-local rope and attention VeomniOps
 +#    - method_override: VisionAttention.forward
@@ -59,7 +63,6 @@
 +from transformers.activations import ACT2FN
 +from transformers.cache_utils import Cache, DynamicCache
 +from transformers.generation import GenerationMixin
-+from transformers.integrations import use_kernel_forward_from_hub
 +from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 +from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 +from transformers.modeling_layers import GradientCheckpointingLayer
@@ -173,11 +176,10 @@
  # Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
  #
  # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-@@ -17,51 +186,6 @@
- # See the License for the specific language governing permissions and
+@@ -18,51 +190,6 @@
  # limitations under the License.
  """PyTorch Qwen2-VL model."""
--
+
 -import itertools
 -import warnings
 -from collections.abc import Callable
@@ -222,10 +224,44 @@
 -from ...utils.output_capturing import capture_outputs
 -from ...vision_utils import get_vision_attention_seqlens, get_vision_position_ids
 -from .configuration_qwen2_vl import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
-
+-
 
  logger = logging.get_logger(__name__)
-@@ -222,20 +346,6 @@
+
+@@ -91,23 +218,22 @@
+     rope_deltas: torch.LongTensor | None = None
+
+
+-@use_kernel_forward_from_hub("RMSNorm")
++# ======================================================================
++# [MODIFIED CLASS] Qwen2VLRMSNorm
++# Methods patched: __init__, forward
++# ======================================================================
++
++
+ # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Qwen2VL
+ class Qwen2VLRMSNorm(nn.Module):
+     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+-        """
+-        Qwen2VLRMSNorm is equivalent to T5LayerNorm
+-        """
+-        super().__init__()
++        nn.Module.__init__(self)
+         self.weight = nn.Parameter(torch.ones(hidden_size))
+         self.variance_epsilon = eps
++        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+-        input_dtype = hidden_states.dtype
+-        hidden_states = hidden_states.to(torch.float32)
+-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+-        return self.weight * hidden_states.to(input_dtype)
++        return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
+
+     def extra_repr(self):
+         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+@@ -222,20 +348,6 @@
      return q_embed, k_embed
 
 
@@ -246,7 +282,7 @@
  class VisionRotaryEmbedding(nn.Module):
      def __init__(self, dim: int, theta: float = 10000.0) -> None:
          super().__init__()
-@@ -339,7 +449,14 @@
+@@ -339,7 +451,14 @@
      return attn_output, attn_weights
 
 
@@ -261,7 +297,7 @@
      def __init__(self, config: Qwen2VLVisionConfig) -> None:
          super().__init__()
          self.dim = config.embed_dim
-@@ -352,13 +469,17 @@
+@@ -352,13 +471,17 @@
          self.config = config
          self.attention_dropout = 0.0
          self.is_causal = False
@@ -280,7 +316,7 @@
          **kwargs,
      ) -> torch.Tensor:
          seq_length = hidden_states.shape[0]
-@@ -366,19 +487,16 @@
+@@ -366,19 +489,16 @@
              self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
          )
          cos, sin = position_embeddings
@@ -303,7 +339,7 @@
              attn_output, _ = attention_interface(
                  self,
                  query_states,
-@@ -395,12 +513,10 @@
+@@ -395,12 +515,10 @@
                  **kwargs,
              )
          else:
@@ -316,7 +352,7 @@
              attn_outputs = [
                  attention_interface(
                      self,
-@@ -466,12 +582,19 @@
+@@ -466,12 +584,19 @@
          return down_proj
 
 
@@ -336,7 +372,7 @@
      def __init__(self, config: Qwen2VLTextConfig, layer_idx: int | None = None):
          super().__init__()
          self.config = config
-@@ -504,6 +627,8 @@
+@@ -504,6 +629,8 @@
          self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
          self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
          self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
@@ -345,7 +381,7 @@
 
      def forward(
          self,
-@@ -516,6 +641,7 @@
+@@ -516,6 +643,7 @@
          position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
          **kwargs: Unpack[FlashAttentionKwargs],
      ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
@@ -353,7 +389,7 @@
          bsz, q_len, _ = hidden_states.size()
 
          query_states = self.q_proj(hidden_states)
-@@ -534,11 +660,7 @@
+@@ -534,11 +662,7 @@
          if past_key_values is not None:
              key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
@@ -366,7 +402,7 @@
              self,
              query_states,
              key_states,
-@@ -547,7 +669,7 @@
+@@ -547,7 +671,7 @@
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
              sliding_window=self.sliding_window,
@@ -375,7 +411,7 @@
              **kwargs,
          )
 
-@@ -645,6 +767,12 @@
+@@ -645,6 +769,12 @@
              init.copy_(module.inv_freq, inv_freq)
 
 
@@ -388,7 +424,7 @@
  @auto_docstring
  class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
      config: Qwen2VLVisionConfig
-@@ -698,19 +826,86 @@
+@@ -698,19 +828,86 @@
      @capture_outputs
      @auto_docstring
      def forward(
@@ -480,7 +516,7 @@
 
          for blk in self.blocks:
              hidden_states = blk(
-@@ -727,6 +922,47 @@
+@@ -727,6 +924,47 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -528,7 +564,7 @@
 
 
  @auto_docstring
-@@ -842,6 +1078,12 @@
+@@ -842,6 +1080,12 @@
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
          )
@@ -541,7 +577,7 @@
 
 
  @auto_docstring
-@@ -1024,11 +1266,14 @@
+@@ -1024,11 +1268,14 @@
          video_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -560,7 +596,7 @@
 
          return vision_outputs
 
-@@ -1041,11 +1286,14 @@
+@@ -1041,11 +1288,14 @@
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -579,7 +615,7 @@
 
          return vision_outputs
 
-@@ -1149,33 +1397,128 @@
+@@ -1149,33 +1399,128 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
@@ -719,7 +755,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1185,6 +1528,10 @@
+@@ -1185,6 +1530,10 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -730,7 +766,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1193,15 +1540,27 @@
+@@ -1193,15 +1542,27 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -759,7 +795,7 @@
 
 
  class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
-@@ -1211,7 +1570,9 @@
+@@ -1211,7 +1572,9 @@
          super().__init__(config)
          self.model = Qwen2VLModel(config)
          self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
@@ -770,7 +806,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -1251,90 +1612,82 @@
+@@ -1251,90 +1614,82 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -828,7 +864,6 @@
 -        >>> output_text = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
 -        >>> print(output_text)
 -        ```
--        """
 +        cache_position (`torch.LongTensor`, *optional*):
 +            Indices describing the positions of the input sequence tokens in the cache.
 +        image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
@@ -837,7 +872,7 @@
 +            The temporal, height and width of feature shape of each video in LLM.
 +        rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
 +            The rope index difference between sequence length and multimodal rope.
-+        """
+         """
 +        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
 +        output_hidden_states = (
 +            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -905,7 +940,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -1514,5 +1867,51 @@
+@@ -1514,5 +1869,51 @@
 
          return input_ids, model_kwargs
 

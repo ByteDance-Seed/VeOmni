@@ -99,7 +99,27 @@ config.add_import(
     names=["ForCausalLMLoss"],
 )
 config.drop_import_names("Qwen2_5_VLCausalLMOutputWithPast")
-config.exclude_from_output("apply_rotary_pos_emb_vision")
+config.exclude_from_output("apply_rotary_pos_emb_vision", "use_kernel_forward_from_hub")
+config.drop_import_names("use_kernel_forward_from_hub")
+
+
+@config.override_method(
+    "Qwen2_5_VLRMSNorm.__init__",
+    description="Construct a local rms_norm VeomniOp",
+)
+def qwen2_5_vl_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+    nn.Module.__init__(self)
+    self.weight = nn.Parameter(torch.ones(hidden_size))
+    self.variance_epsilon = eps
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+
+
+@config.override_method(
+    "Qwen2_5_VLRMSNorm.forward",
+    description="Always call the local rms_norm VeomniOp",
+)
+def qwen2_5_vl_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 
 
 # ================================================================

@@ -9,34 +9,20 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# See the License for the specific language governing limitations
+# under the License.
 """
 Patch configuration for Qwen3-Omni-Moe.
 
 Regen command:
 patchgen veomni.models.transformers.qwen3_omni_moe.qwen3_omni_moe_npu_patch_gen_config -o veomni/models/transformers/qwen3_omni_moe/generated --diff
 
-NPU keeps torch_npu fused rmsnorm. Vision rope, MoE, CE, and load-balancing loss call local VeomniOp.
+NPU reuses the GPU VeomniOp RMSNorm, vision rope, MoE, CE, and
+load-balancing loss patches.
 """
-
-import torch
 
 from veomni.models.transformers.qwen3_omni_moe.qwen3_omni_moe_gpu_patch_gen_config import config
 
 
 config.target_file = "patched_modeling_qwen3_omni_moe_npu.py"
 config.description = "Qwen3OmniMoe with NPU"
-
-config.add_import("torch_npu", names=["npu_rms_norm"])
-
-
-@config.override_method(
-    "Qwen3OmniMoeThinkerTextRMSNorm.forward",
-    description="NPU fused RMSNorm -- reduces pow+mean+rsqrt to single npu_rms_norm call",
-)
-def qwen3_omni_moe_thinker_text_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    """NPU optimized implementation for RMSNorm"""
-    input_dtype = hidden_states.dtype
-    out_fp32 = npu_rms_norm(hidden_states.float(), self.weight.float(), epsilon=self.variance_epsilon)[0]
-    return out_fp32.to(input_dtype)

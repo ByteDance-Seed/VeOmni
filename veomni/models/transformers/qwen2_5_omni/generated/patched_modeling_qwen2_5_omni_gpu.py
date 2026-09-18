@@ -9,6 +9,10 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Qwen2_5OmniRMSNorm.__init__
+#      Construct a local rms_norm VeomniOp
+#    - method_override: Qwen2_5OmniRMSNorm.forward
+#      Always call the local rms_norm VeomniOp
 #    - method_override: Qwen2_5OmniPreTrainedModelForConditionalGeneration.get_rope_index
 #      Per-video use_audio_in_video via audio_seqlens + None attention_mask tolerance
 #    - method_override: Qwen2_5OmniPreTrainedModel._init_weights
@@ -86,7 +90,6 @@ from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
@@ -1406,22 +1409,21 @@ class Qwen2_5OmniVisionAttention(nn.Module):
         return attn_output
 
 
-@use_kernel_forward_from_hub("RMSNorm")
+# ======================================================================
+# [MODIFIED CLASS] Qwen2_5OmniRMSNorm
+# Methods patched: __init__, forward
+# ======================================================================
+
+
 class Qwen2_5OmniRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
-        """
-        Qwen2_5OmniRMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
+        nn.Module.__init__(self)
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"

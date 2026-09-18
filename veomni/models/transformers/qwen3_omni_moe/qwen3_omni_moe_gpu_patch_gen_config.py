@@ -207,8 +207,48 @@ config.exclude_from_output(
     "apply_rotary_pos_emb",
     "apply_rotary_pos_emb_vision",
     "rotate_half",
+    "use_kernel_forward_from_hub",
 )
 config.drop_import_names("use_kernelized_func")
+config.drop_import_names("use_kernel_forward_from_hub")
+
+
+@config.override_method(
+    "Qwen3OmniMoeThinkerTextRMSNorm.__init__",
+    description="Construct a local rms_norm VeomniOp",
+)
+def qwen3_omni_moe_thinker_text_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+    nn.Module.__init__(self)
+    self.weight = nn.Parameter(torch.ones(hidden_size))
+    self.variance_epsilon = eps
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+
+
+@config.override_method(
+    "Qwen3OmniMoeThinkerTextRMSNorm.forward",
+    description="Always call the local rms_norm VeomniOp",
+)
+def qwen3_omni_moe_thinker_text_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
+
+
+@config.override_method(
+    "Qwen3OmniMoeTextRMSNorm.__init__",
+    description="Construct a local rms_norm VeomniOp",
+)
+def qwen3_omni_moe_text_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+    nn.Module.__init__(self)
+    self.weight = nn.Parameter(torch.ones(hidden_size))
+    self.variance_epsilon = eps
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+
+
+@config.override_method(
+    "Qwen3OmniMoeTextRMSNorm.forward",
+    description="Always call the local rms_norm VeomniOp",
+)
+def qwen3_omni_moe_text_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 
 
 # ================================================================

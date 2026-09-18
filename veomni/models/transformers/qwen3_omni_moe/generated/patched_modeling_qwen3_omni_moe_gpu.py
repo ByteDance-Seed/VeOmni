@@ -9,6 +9,14 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Qwen3OmniMoeThinkerTextRMSNorm.__init__
+#      Construct a local rms_norm VeomniOp
+#    - method_override: Qwen3OmniMoeThinkerTextRMSNorm.forward
+#      Always call the local rms_norm VeomniOp
+#    - method_override: Qwen3OmniMoeTextRMSNorm.__init__
+#      Construct a local rms_norm VeomniOp
+#    - method_override: Qwen3OmniMoeTextRMSNorm.forward
+#      Always call the local rms_norm VeomniOp
 #    - method_override: Qwen3OmniMoePreTrainedModel._init_weights
 #      Drop Qwen3OmniMoeCode2Wav branch since the class is excluded from the generated file
 #    - method_override: Qwen3OmniMoePreTrainedModelForConditionalGeneration.get_rope_index
@@ -92,7 +100,6 @@ from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
@@ -1713,22 +1720,21 @@ class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
 
-@use_kernel_forward_from_hub("RMSNorm")
+# ======================================================================
+# [MODIFIED CLASS] Qwen3OmniMoeThinkerTextRMSNorm
+# Methods patched: __init__, forward
+# ======================================================================
+
+
 class Qwen3OmniMoeThinkerTextRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
-        """
-        Qwen3OmniMoeThinkerTextRMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
+        nn.Module.__init__(self)
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -1908,22 +1914,21 @@ class Qwen3OmniMoeThinkerTextPreTrainedModel(PreTrainedModel):
             init.normal_(module.weight, mean=0.0, std=std)
 
 
-@use_kernel_forward_from_hub("RMSNorm")
+# ======================================================================
+# [MODIFIED CLASS] Qwen3OmniMoeTextRMSNorm
+# Methods patched: __init__, forward
+# ======================================================================
+
+
 class Qwen3OmniMoeTextRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
-        """
-        Qwen3OmniMoeTextRMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
+        nn.Module.__init__(self)
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"

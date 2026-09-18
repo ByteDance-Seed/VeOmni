@@ -89,10 +89,15 @@ def test_glm_moe_dsa_base_model_eager_matches_hf():
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
     gradient_weights = torch.randn(2, 8, config.hidden_size)
+    # Isolated ``rms_norm`` / ``standard`` matches HF (fwd exact, dx ~5e-7).
+    # This probe backprops a random cotangent through last_hidden_state, so
+    # DSA ULP plus that RMS backward ULP shows up on embed_tokens (~4.6e-5).
     assert_outputs_and_grads_match(
         hf,
         ours,
         lambda model: model(input_ids=input_ids, use_cache=False).last_hidden_state * gradient_weights,
+        grad_atol=1e-4,
+        grad_rtol=1e-4,
     )
 
 

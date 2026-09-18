@@ -9,6 +9,10 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: GlmMoeDsaRMSNorm.__init__
+#      Construct a local rms_norm VeomniOp
+#    - method_override: GlmMoeDsaRMSNorm.forward
+#      Always call the local rms_norm VeomniOp
 #    - method_override: GlmMoeDsaAttention.__init__
 #      Construct a local dsa_attention glm VeomniOp
 #    - method_override: GlmMoeDsaAttention.forward
@@ -35,7 +39,7 @@ from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_experts_implementation, use_kernel_forward_from_hub
+from transformers.integrations import use_experts_implementation
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
@@ -59,22 +63,21 @@ from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 create_causal_mask = create_standard_causal_mask
 
 
-@use_kernel_forward_from_hub("RMSNorm")
+# ======================================================================
+# [MODIFIED CLASS] GlmMoeDsaRMSNorm
+# Methods patched: __init__, forward
+# ======================================================================
+
+
 class GlmMoeDsaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
-        """
-        GlmMoeDsaRMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
+        nn.Module.__init__(self)
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -891,4 +894,8 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
         return _get_parallel_plan()
 
 
-__all__ = ["GlmMoeDsaPreTrainedModel", "GlmMoeDsaModel", "GlmMoeDsaForCausalLM"]
+__all__ = [
+    "GlmMoeDsaPreTrainedModel",
+    "GlmMoeDsaModel",
+    "GlmMoeDsaForCausalLM",
+]

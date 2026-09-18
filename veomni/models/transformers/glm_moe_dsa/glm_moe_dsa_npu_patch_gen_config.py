@@ -30,6 +30,8 @@ from veomni.models.transformers.glm_moe_dsa.glm_moe_dsa_gpu_patch_gen_config imp
     glm_moe_dsa_forcausallm_forward_patched,
     glm_moe_dsa_forcausallm_init_patched,
     glm_moe_dsa_get_parallel_plan_patched,
+    glm_moe_dsa_rmsnorm_forward_patched,
+    glm_moe_dsa_rmsnorm_init_patched,
 )
 from veomni.patchgen.patch_spec import PatchConfig
 
@@ -44,7 +46,18 @@ config.additional_imports.extend(gpu_config.additional_imports)
 config.post_import_blocks.extend(gpu_config.post_import_blocks)
 config.helpers.extend(gpu_config.helpers)
 config.drop_imported_names.update(gpu_config.drop_imported_names)
+config.exclude_from_output("use_kernel_forward_from_hub")
 
+config.override_method(
+    "GlmMoeDsaRMSNorm.__init__",
+    replacement=glm_moe_dsa_rmsnorm_init_patched,
+    description="Construct a local rms_norm VeomniOp",
+)
+config.override_method(
+    "GlmMoeDsaRMSNorm.forward",
+    replacement=glm_moe_dsa_rmsnorm_forward_patched,
+    description="Always call the local rms_norm VeomniOp",
+)
 config.override_method(
     "GlmMoeDsaAttention.__init__",
     replacement=glm_moe_dsa_attention_init_patched,

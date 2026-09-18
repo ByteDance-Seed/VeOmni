@@ -72,9 +72,29 @@ config.add_import(
 # wrapper so a no-padding HF causal mask can be dropped without a host scan.
 config.drop_import_names("create_causal_mask")
 config.add_post_import_block("create_causal_mask = create_standard_causal_mask")
-config.exclude_from_output("apply_rotary_pos_emb_interleave")
+config.exclude_from_output("apply_rotary_pos_emb_interleave", "use_kernel_forward_from_hub")
+config.drop_import_names("use_kernel_forward_from_hub")
 yarn_apply_mscale = None
 GlmMoeDsaRMSNorm = None
+
+
+@config.override_method(
+    "GlmMoeDsaRMSNorm.__init__",
+    description="Construct a local rms_norm VeomniOp",
+)
+def glm_moe_dsa_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+    nn.Module.__init__(self)
+    self.weight = nn.Parameter(torch.ones(hidden_size))
+    self.variance_epsilon = eps
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+
+
+@config.override_method(
+    "GlmMoeDsaRMSNorm.forward",
+    description="Always call the local rms_norm VeomniOp",
+)
+def glm_moe_dsa_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 
 
 @config.override_method(
