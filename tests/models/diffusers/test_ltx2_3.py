@@ -34,6 +34,7 @@ from ltx_core.model.transformer.attention import (
     AttentionFunction,
     MaskedAttentionFunction,
     VeomniLTXAttention,
+    _hf_attention_mask,
 )
 from ltx_core.model.transformer.model import LTXModel
 # isort: on
@@ -55,6 +56,35 @@ def _sdpa_ops_config() -> SimpleNamespace:
 
 _OFFICIAL_ATTENTION_FORWARD = Attention.forward
 _OFFICIAL_LTX_MODEL_FORWARD = LTXModel.forward
+
+
+class _MathSDPAAttention:
+    """Independent SDPA reference. Does not go through ``VeomniLTXAttention``."""
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        heads: int,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch, seq_q, inner = q.shape
+        dim_head = inner // heads
+        query = q.view(batch, seq_q, heads, dim_head).transpose(1, 2)
+        key = k.view(batch, -1, heads, dim_head).transpose(1, 2)
+        value = v.view(batch, -1, heads, dim_head).transpose(1, 2)
+        attn_mask = None if mask is None else _hf_attention_mask(mask)
+        out = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask)
+        return out.transpose(1, 2).reshape(batch, seq_q, heads * dim_head)
+
+
+def _bind_math_sdpa(model: torch.nn.Module) -> None:
+    math_attn = _MathSDPAAttention()
+    for module in model.modules():
+        if isinstance(module, Attention):
+            module.attention_function = math_attn
+            module.masked_attention_function = math_attn
 
 
 def _call_rms(x: torch.Tensor, weight: torch.Tensor | None, ops: SimpleNamespace | None = None):
@@ -96,6 +126,7 @@ def test_ltx2_3_eager_forward_and_backward_match_vendored_reference():
     with ops_config_scope(_sdpa_ops_config()):
         official = ltx_modeling.LTXVideoTransformerModel(config)
         official.apply(official._init_weights)
+        _bind_math_sdpa(official)
         ours = ltx_modeling.LTXVideoTransformerModel(config)
         ours.load_state_dict(official.state_dict())
     official_inputs = _ltx_inputs()
@@ -287,18 +318,29 @@ def test_ltx_adapter_expands_mask_and_skips_ulysses():
 def test_ltx_adapter_matches_sdpa():
     adapter = VeomniLTXAttention("sdpa")
     torch.manual_seed(0)
-    query = torch.randn(2, 6, 16)
-    key = torch.randn(2, 6, 16)
-    value = torch.randn(2, 6, 16)
+    query = torch.randn(2, 6, 16, requires_grad=True)
+    key = torch.randn(2, 6, 16, requires_grad=True)
+    value = torch.randn(2, 6, 16, requires_grad=True)
     heads = 2
     dim_head = 8
+    q_ref = query.detach().clone().requires_grad_(True)
+    k_ref = key.detach().clone().requires_grad_(True)
+    v_ref = value.detach().clone().requires_grad_(True)
+
     out = adapter(query, key, value, heads)
-    query_h = query.view(2, 6, heads, dim_head).transpose(1, 2)
-    key_h = key.view(2, 6, heads, dim_head).transpose(1, 2)
-    value_h = value.view(2, 6, heads, dim_head).transpose(1, 2)
+    query_h = q_ref.view(2, 6, heads, dim_head).transpose(1, 2)
+    key_h = k_ref.view(2, 6, heads, dim_head).transpose(1, 2)
+    value_h = v_ref.view(2, 6, heads, dim_head).transpose(1, 2)
     ref = F.scaled_dot_product_attention(query_h, key_h, value_h)
     ref = ref.transpose(1, 2).reshape(2, 6, 16)
     torch.testing.assert_close(out, ref, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    ref.backward(grad.clone())
+    torch.testing.assert_close(query.grad, q_ref.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    torch.testing.assert_close(key.grad, k_ref.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    torch.testing.assert_close(value.grad, v_ref.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
 def test_ltx_core_rebinds_away_from_another_copy(tmp_path):
