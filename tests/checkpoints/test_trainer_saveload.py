@@ -23,7 +23,6 @@ except Exception as _:
 from veomni.arguments import parse_args
 from veomni.checkpoint.layout import weights_dir
 from veomni.data import build_dummy_dataset
-from veomni.models.checkpoint_manager import ModelCheckpointManager
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
@@ -105,9 +104,6 @@ class TrainerTest(BaseTrainer):
     dcp_weights_path: str
     hf_weights_path: str
 
-    def _build_model_assets(self):
-        self.model_assets = [self.model_config]
-
     def _build_data_transform(self):
         pass
 
@@ -118,7 +114,6 @@ class TrainerTest(BaseTrainer):
         self.train_steps = args.train_steps
 
     def _init_callbacks(self):
-        self.checkpoint = ModelCheckpointManager(self)
         self.environ_meter_callback = EnvironMeterCallbackTest(self)
         self.checkpoint_callback = CheckpointCallbackTest(self)
         self.check_callback = CheckCallback(self)
@@ -178,7 +173,7 @@ class CheckpointCallbackTest(CheckpointCallback):
     def on_epoch_end(self, state: TrainerState, **kwargs):
         if state.epoch == 0:
             self.trainer.golden_model_sd = copy.deepcopy(self.trainer.model.state_dict())
-            self.trainer.golden_optim_sd = copy.deepcopy(self.trainer.optimizer.state_dict())
+            self.trainer.golden_optim_sd = copy.deepcopy(self.trainer.model.optimizer.state_dict())
             self._save_dcp(state)
             # Two different paths: resume takes the step directory, while a
             # reader of raw shards wants the DCP directory inside it.
@@ -222,7 +217,7 @@ class CheckCallback(Callback):
             tied_weights_keys = self.trainer.model._tied_weights_keys
 
         check_state_dict(self.trainer.golden_model_sd, self.trainer.model.state_dict(), tied_weights_keys)
-        check_state_dict(self.trainer.golden_optim_sd, self.trainer.optimizer.state_dict(), need_flatten=True)
+        check_state_dict(self.trainer.golden_optim_sd, self.trainer.model.optimizer.state_dict(), need_flatten=True)
 
 
 def main():
