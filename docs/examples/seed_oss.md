@@ -2,7 +2,7 @@
 
 ## Scope and prerequisites
 
-Text SFT for Seed-OSS with conversation data.
+Seed-OSS language-model training on FineWeb plain text (`data_type: plaintext`).
 
 Configuration: [training YAML](../../configs/text/seed_oss.yaml). Read the
 [catalog prerequisites and validation scope](index.md#choose-hardware-and-check-a-run)
@@ -32,4 +32,3 @@ bash train.sh tasks/train_text.py configs/text/seed_oss.yaml \
 
 Use the [run checks](index.md#choose-hardware-and-check-a-run) and
 [checkpoint completion contract](../usage/checkpoint.md#completion) for training.
-For preprocessing or inference, inspect the stage-specific outputs described above.
