@@ -38,6 +38,7 @@ _ATTENTION_FORWARD_DISPATCH: dict[str, Callable] = {
     "veomni_magi_attention_with_sp": magi_attention_forward,
     "veomni_flash_attention_2_with_sp": flash_attention_forward,
     "veomni_flash_attention_3_with_sp": flash_attention_forward,
+    "veomni_flash_attention_3_hub_with_sp": flash_attention_forward,
     "veomni_flash_attention_4_with_sp": flash_attention_forward,
 }
 
@@ -89,4 +90,5 @@ def apply_veomni_attention_patch():
     ALL_ATTENTION_FUNCTIONS.register("veomni_magi_attention_with_sp", fused_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_2_with_sp", fused_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_3_with_sp", fused_attention_forward)
+    ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_3_hub_with_sp", fused_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_4_with_sp", fused_attention_forward)

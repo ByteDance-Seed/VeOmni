@@ -29,6 +29,7 @@ from transformers.masking_utils import (
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
+from veomni.models.transformers.attention_utils import VARLEN_ATTENTION_TYPES
 from veomni.ops.kernels import attention as veomni_attention
 from veomni.ops.kernels.attention import flex as flex_backend
 from veomni.ops.kernels.attention import magi as magi_backend
@@ -38,6 +39,7 @@ from veomni.ops.kernels.attention.magi import mask as magi_mask_backend
 _FLASH_IMPLEMENTATIONS = (
     "veomni_flash_attention_2_with_sp",
     "veomni_flash_attention_3_with_sp",
+    "veomni_flash_attention_3_hub_with_sp",
     "veomni_flash_attention_4_with_sp",
 )
 _FLEX_IMPLEMENTATION = "veomni_flex_attention_with_sp"
@@ -48,6 +50,26 @@ class _FakeAttentionModule(nn.Module):
     def __init__(self, implementation: str):
         super().__init__()
         self.config = SimpleNamespace(_attn_implementation=implementation)
+
+
+def test_hub_fa3_is_classified_as_varlen_attention():
+    assert "flash_attention_3_hub" in VARLEN_ATTENTION_TYPES
+    assert "veomni_flash_attention_3_hub_with_sp" in VARLEN_ATTENTION_TYPES
+
+
+def test_hub_fa3_config_maps_to_veomni_sp_backend(monkeypatch):
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+
+    config = OpsImplementationConfig(attn_implementation="flash_attention_3_hub")
+
+    assert config.attn_implementation == "veomni_flash_attention_3_hub_with_sp"
+
+
+def test_hub_fa3_config_rejects_huggingface_modeling_backend(monkeypatch):
+    monkeypatch.setenv("MODELING_BACKEND", "hf")
+
+    with pytest.raises(ValueError, match="requires MODELING_BACKEND=veomni"):
+        OpsImplementationConfig(attn_implementation="flash_attention_3_hub")
 
 
 @pytest.mark.parametrize(
