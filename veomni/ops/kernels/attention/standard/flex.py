@@ -14,19 +14,146 @@
 
 """FlexAttention backend and SP-aware adapter implementation."""
 
+from collections.abc import Callable
+from functools import cache
 from typing import Optional
 
 import torch
 from torch.nn.attention.flex_attention import BlockMask
-from transformers.integrations.flex_attention import flex_attention_forward as hf_flex_attention_forward
+from torch.nn.attention.flex_attention import flex_attention as raw_flex_attention
+from transformers.integrations.flex_attention import (
+    flex_attention_forward as _flex_attention_triton,
+)
+from transformers.integrations.flex_attention import get_flex_attention_lse_kwargs, repeat_kv
+from transformers.utils.import_utils import is_torchdynamo_compiling
 
 from .....distributed.parallel_state import get_parallel_state
+from .....utils.device import get_gpu_compute_capability
 from ..ulysses import (
     prepare_ulysses_qkv,
     restore_ulysses_output,
     should_apply_ulysses,
     slice_ulysses_head_auxiliary,
 )
+
+
+FLEX_BACKEND_FLASH = "FLASH"
+FLEX_BACKEND_TRITON = "TRITON"
+_HOPPER_MIN_CC = 90
+
+
+@cache
+def _flash_attn_cute_available() -> bool:
+    """Return whether PyTorch's FLASH Flex backend can import FA4."""
+    try:
+        import flash_attn.cute  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@cache
+def _compiled_flex_attention_fa4():
+    """Compile FlexAttention once with static shapes for the FA4 path.
+
+    Hugging Face's shared ``WrappedFlexAttention`` uses the default dynamic
+    compile. FLASH cannot inline symbolic BlockMask scalars into CuteDSL.
+    """
+    return torch.compile(raw_flex_attention, dynamic=False)
+
+
+def _flex_attention_fa4(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: BlockMask,
+    *,
+    dropout: float,
+    scaling: Optional[float],
+    softcap: Optional[float],
+    kernel_options: dict,
+    position_bias: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    """Run compiled FlexAttention without requesting LSE.
+
+    FLASH backward does not support dLSE. Keep this path free of
+    ``return_lse`` / ``AuxRequest(lse=True)`` so SM90 training can use FA4.
+    """
+    del module, kwargs
+    if dropout > 0:
+        raise ValueError(
+            "`flex_attention` does not support `dropout`. Please use it with inference"
+            " only (`model.eval()`) or turn off the attention dropout in the respective config."
+        )
+
+    score_mod = None
+    if softcap is not None or position_bias is not None:
+
+        def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
+            if softcap is not None:
+                score = softcap * torch.tanh(score / softcap)
+            if position_bias is not None:
+                score = score + position_bias[batch_idx, head_idx, q_idx, kv_idx]
+            return score
+
+    enable_gqa = True
+    num_local_query_heads = query.shape[1]
+    if (num_local_query_heads & (num_local_query_heads - 1)) != 0:
+        key = repeat_kv(key, query.shape[1] // key.shape[1])
+        value = repeat_kv(value, query.shape[1] // value.shape[1])
+        enable_gqa = False
+
+    flex_fn = raw_flex_attention if is_torchdynamo_compiling() else _compiled_flex_attention_fa4()
+    attention_output = flex_fn(
+        query,
+        key,
+        value,
+        score_mod=score_mod,
+        block_mask=attention_mask,
+        enable_gqa=enable_gqa,
+        scale=scaling,
+        kernel_options=kernel_options,
+        **get_flex_attention_lse_kwargs(False),
+    )
+    return attention_output.transpose(1, 2).contiguous(), None
+
+
+def resolve_flex_attention(
+    device: torch.device,
+    kernel_options: dict,
+    *,
+    attention_sinks: bool = False,
+) -> Callable:
+    """Select the FlexAttention implementation for this call.
+
+    The registry row stays GPU-agnostic. NVIDIA SM90 and newer use the FLASH
+    adapter (CuteDSL wrapping FA4). SM80, CPU, and other devices stay on the
+    Transformers Triton adapter. An explicit ``kernel_options`` backend wins.
+    Attention sinks need LSE renormalization, and FLASH backward rejects dLSE,
+    so sinks fall back to Triton unless FLASH was forced.
+    """
+    backend = kernel_options.get("BACKEND")
+    if backend is not None:
+        backend = str(backend).upper()
+        if backend == FLEX_BACKEND_FLASH and attention_sinks:
+            raise ValueError(
+                "FlexAttention FLASH backend does not support attention sinks "
+                "(s_aux). FLASH backward rejects dLSE, and sinks need LSE "
+                "renormalization. Omit BACKEND to fall back to Triton, or drop s_aux."
+            )
+    elif attention_sinks or device.type != "cuda":
+        backend = FLEX_BACKEND_TRITON
+    elif get_gpu_compute_capability(device) >= _HOPPER_MIN_CC and _flash_attn_cute_available():
+        backend = FLEX_BACKEND_FLASH
+    else:
+        backend = FLEX_BACKEND_TRITON
+
+    kernel_options["BACKEND"] = backend
+    if backend == FLEX_BACKEND_FLASH:
+        return _flex_attention_fa4
+    return _flex_attention_triton
 
 
 def flex_attention_forward(
@@ -65,10 +192,6 @@ def flex_attention_forward(
     del sliding_window
 
     kernel_options = dict(kwargs.pop("kernel_options", {}) or {})
-    # PyTorch's AUTO backend may select Flex Decoding for short queries and then
-    # fail during Inductor kernel selection. Use the standard Triton FlexAttention
-    # kernel by default while preserving an explicit caller override.
-    kernel_options.setdefault("BACKEND", "TRITON")
 
     parallel_state = get_parallel_state()
     ulysses_enabled = should_apply_ulysses(skip_ulysses=skip_ulysses)
@@ -96,7 +219,12 @@ def flex_attention_forward(
                 group=parallel_state.ulysses_group,
             )
 
-    output, lse = hf_flex_attention_forward(
+    flex_attention = resolve_flex_attention(
+        query.device,
+        kernel_options,
+        attention_sinks=kwargs.get("s_aux") is not None,
+    )
+    output, lse = flex_attention(
         module,
         query,
         key,

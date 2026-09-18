@@ -173,7 +173,10 @@ _register_attention(
     "VeOmni FlashAttention 4 adapter through Transformers",
     rows=_FA4_ROWS,
 )
-_register_attention("veomni_flex_attention", "VeOmni FlexAttention adapter through Transformers")
+_register_attention(
+    "veomni_flex_attention",
+    "VeOmni FlexAttention adapter; SM90+ FLASH / otherwise Triton",
+)
 _register_attention(
     "veomni_magi_attention",
     "VeOmni MagiAttention adapter through Transformers",
