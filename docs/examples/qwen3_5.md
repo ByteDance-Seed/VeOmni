@@ -4,7 +4,9 @@
 
 Text and vision-language SFT for Qwen3.5 dense and MoE models; use the separate GPU/NPU kernel instructions below.
 
-Configuration: [training YAML](../../configs/multimodal/qwen3_5/qwen3_5_vl.yaml). Read the
+Configurations: [text SFT](../../configs/text/qwen3_5_sft.yaml),
+[dense VLM](../../configs/multimodal/qwen3_5/qwen3_5_vl.yaml), and
+[MoE VLM](../../configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl.yaml). Read the
 [catalog prerequisites and validation scope](index.md#choose-hardware-and-check-a-run)
 before following the model-specific steps below.
 
@@ -324,4 +326,3 @@ For detailed implementation notes, see the
 
 Use the [run checks](index.md#choose-hardware-and-check-a-run) and
 [checkpoint completion contract](../usage/checkpoint.md#completion) for training.
-For preprocessing or inference, inspect the stage-specific outputs described above.

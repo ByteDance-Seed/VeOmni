@@ -4,7 +4,8 @@
 
 Vision-language SFT for Qwen3 VL dense and MoE models, with image/video data preparation.
 
-Configuration: [training YAML](../../configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml). Read the
+Configurations: [dense](../../configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml) and
+[MoE](../../configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml). Read the
 [catalog prerequisites and validation scope](index.md#choose-hardware-and-check-a-run)
 before following the model-specific steps below.
 
@@ -94,4 +95,3 @@ This path currently requires CUDA, FSDP2, the default `model.accelerator.torch_c
 
 Use the [run checks](index.md#choose-hardware-and-check-a-run) and
 [checkpoint completion contract](../usage/checkpoint.md#completion) for training.
-For preprocessing or inference, inspect the stage-specific outputs described above.

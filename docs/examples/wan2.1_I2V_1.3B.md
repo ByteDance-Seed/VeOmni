@@ -2,7 +2,9 @@
 
 ## Scope and prerequisites
 
-Wan image-to-video LoRA with online or offline preprocessing.
+Wan text-to-video LoRA with online or offline preprocessing.
+The page and configuration retain their historical I2V filenames; the commands
+below explicitly select the T2V checkpoint through both model-path overrides.
 
 Configuration: [training YAML](../../configs/dit/wan2.1_I2V_1.3B_lora.yaml). Read the
 [catalog prerequisites and validation scope](index.md#choose-hardware-and-check-a-run)
@@ -271,4 +273,3 @@ export_to_video(output, "output_lora.mp4", fps=15)
 
 Use the [run checks](index.md#choose-hardware-and-check-a-run) and
 [checkpoint completion contract](../usage/checkpoint.md#completion) for training.
-For preprocessing or inference, inspect the stage-specific outputs described above.
