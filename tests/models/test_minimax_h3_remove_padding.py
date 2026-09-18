@@ -260,7 +260,7 @@ def test_visual_ref_layout_matches_native_inference(audio_channel):
 
 
 @pytest.mark.parametrize("backend", ["veomni_flash_attention_2_with_sp", "veomni_flash_attention_3_with_sp"])
-def test_fused_backend_receives_one_varlen_call_per_layer(monkeypatch, backend):
+def test_fused_backend_packs_main_dit_but_keeps_refiner_sample_local(monkeypatch, backend):
     from veomni.ops.kernels.attention import flash
 
     calls = []
@@ -288,10 +288,93 @@ def test_fused_backend_receives_one_varlen_call_per_layer(monkeypatch, backend):
     samples = prepare(condition_model(), raws)
     out = model(sample_inputs=samples)
     sum(out.mean_losses(batch_size=2).values()).backward()
-    assert len(calls) == 3  # one refiner and two main-DiT blocks, not one call per sample
-    assert calls[0] == [0, 3, 10]
-    assert calls[1] == calls[2]
-    assert calls[1] != calls[0]
+    assert len(calls) == 4  # two sample-local refiners, then two packed main-DiT blocks
+    assert calls[:2] == [[0, 3], [0, 7]]
+    assert calls[2] == calls[3]
+    assert len(calls[2]) == 3
+
+
+@pytest.mark.parametrize("task", ["fl2va", "ref2va"])
+def test_refiner_preserves_linear_row_counts_with_main_dit_packed(task):
+    model = tiny_model()
+    model.configure_remove_padding(attn_implementation="eager")
+    samples = prepare(condition_model(), [raw_sample(3, task), raw_sample(9, task)])
+    rows = {"out_proj": [], "fc2": [], "main": []}
+    refiner = model.dit.token_refiner.blocks[0]
+    modules = {"out_proj": refiner.attn.out_proj, "fc2": refiner.mlp.fc2, "main": model.dit.blocks[0]}
+    handles = [
+        module.register_forward_pre_hook(lambda mod, args, name=name: rows[name].append(args[0].shape[0]))
+        for name, module in modules.items()
+    ]
+    try:
+        out = model(sample_inputs=samples)
+        sum(out.mean_losses(batch_size=2).values()).backward()
+    finally:
+        for handle in handles:
+            handle.remove()
+    # Small BF16 refiner GEMMs must keep their serial M dimension. Attention
+    # masking alone cannot prevent batch-shape-dependent projection rounding.
+    assert rows["out_proj"] == rows["fc2"] == [3, 9]
+    used = sum(int(s["model_inputs"]["packed_seq_params"]["cu_seqlens_q"][1]) for s in samples)
+    assert rows["main"] == [used]
+    assert refiner.attn.out_proj.weight.grad is not None
+    assert refiner.mlp.fc2.weight.grad is not None
+
+
+def test_disabled_refiner_preserves_legacy_multisegment_execution():
+    model = tiny_model()
+    assert not model.use_remove_padding
+    refiner = model.dit.token_refiner
+    legacy = copy.deepcopy(refiner)
+    x = torch.randn(12, 32, requires_grad=True)
+    expected_x = x.detach().clone().requires_grad_()
+    cu = (0, 3, 12)
+    rows = []
+    handle = refiner.blocks[0].mlp.fc2.register_forward_pre_hook(lambda module, args: rows.append(args[0].shape[0]))
+    try:
+        actual = refiner(x, cu_seqlens=cu, max_seqlen=9)
+    finally:
+        handle.remove()
+    expected = expected_x
+    for block in legacy.blocks:
+        expected = block(expected, cu_seqlens=cu, max_seqlen=9)
+    expected = legacy.final_norm(expected)
+    assert rows == [12]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actual.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(x.grad, expected_x.grad, rtol=0, atol=0)
+    for actual_param, expected_param in zip(refiner.parameters(), legacy.parameters()):
+        torch.testing.assert_close(actual_param.grad, expected_param.grad, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+def test_modulation_preserves_upstream_gather_dtype_and_gradients(monkeypatch, dtype):
+    original = torch.Tensor.index_select
+    gather_dtypes = []
+
+    def select(tensor, dim, index):
+        gather_dtypes.append(tensor.dtype)
+        return original(tensor, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", select)
+    index = torch.arange(512) % 2
+    x = torch.ones(512, 4, dtype=dtype)
+    shift = torch.randn(2, 4, dtype=dtype, requires_grad=True)
+    scale = torch.randn(2, 4, dtype=dtype, requires_grad=True)
+    gate = torch.randn(2, 4, dtype=dtype, requires_grad=True)
+    expected = x * (1 + original(scale, 0, index)) + original(shift, 0, index)
+    out = minimax_h3_dit._modulate_scale_shift(x, shift, scale, index)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    gated = minimax_h3_dit._modulate_gate(x, gate, x, index)
+    torch.testing.assert_close(gated, x + original(gate, 0, index), rtol=0, atol=0)
+    (out.sum() + gated.sum()).backward()
+    assert gather_dtypes == [dtype] * 3
+    expected_grads = torch.autograd.grad(
+        expected.sum() + (x + original(gate, 0, index) * x).sum(), (shift, scale, gate)
+    )
+    for param, expected_grad in zip((shift, scale, gate), expected_grads):
+        torch.testing.assert_close(param.grad, expected_grad, rtol=0, atol=0)
 
 
 def test_packing_rejects_heterogeneous_target_shapes():

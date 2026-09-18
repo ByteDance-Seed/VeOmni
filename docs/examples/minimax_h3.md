@@ -253,15 +253,29 @@ independent main-DiT and text-refiner cumulative boundaries. Its RoPE coordinate
 stay sample-local; timestep tables are remapped, not assumed shared. Reference
 rows are cropped separately for each output. Video/audio signs, unpatchification,
 scheduler weights and sample-mean losses retain their single-sample meanings.
+On the enabled path, the small text token refiner runs separately for each sample. Its BF16 output
+projections can round differently when their GEMM row count changes; the deep
+pretrained DiT amplifies those differences. Keeping the refiner sample-local
+preserves its serial arithmetic without disabling packing in the main DiT.
+This is not a promise of bitwise equality for every packed operator or shape.
+
+AdaLN timestep gathers retain the upstream dtype and backward reduction on both
+paths. This feature does not introduce an FP32 gather correction into the shared
+H3 implementation. Low-precision repeated-index reductions can vary even between
+serial repeats, so packed-gradient comparisons must also measure that baseline
+variability; a separate accumulation-precision fix must not silently change the
+disabled path. The refiner's sample-local execution is also restricted to the
+remove-padding opt-in; disabled multi-segment execution retains the legacy path.
 
 ### Attention and validation
 
-- `eager` / `sdpa`: explicit per-segment PyTorch SDPA reference path; projections
-  and MLPs still operate on compact cross-sample rows.
+- `eager` / `sdpa`: explicit per-segment PyTorch SDPA reference path; main-DiT
+  projections and MLPs still operate on compact cross-sample rows.
 - `flash_attention_2` / `flash_attention_3` in `model.ops_implementation` resolve
-  to VeOmni's local FA2/FA3 backends. Each layer uses one non-causal varlen call,
-  not a loop of dense calls. The matching local kernel package and BF16/FP16 are
-  required; unavailable kernels are not silently replaced with SDPA.
+  to VeOmni's local FA2/FA3 backends. Each main-DiT layer uses one non-causal
+  varlen call; refiner layers retain one call per sample. The matching local
+  kernel package and BF16/FP16 are required; unavailable kernels are not silently
+  replaced with SDPA.
 
 Native tiny-model CPU tests cover output/loss/gradient equivalence, checkpoint
 recomputation, sample isolation, valid zero rows versus nonzero padding, independent

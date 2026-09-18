@@ -304,7 +304,22 @@ class MiniMaxH3TokenRefiner(nn.Module):
         )
         self.final_norm = _norm(hidden_size, eps=final_norm_eps)
 
-    def forward(self, x, *, cu_seqlens, max_seqlen):
+    def forward(self, x, *, cu_seqlens, max_seqlen, sample_local=False):
+        if sample_local and len(cu_seqlens) > 2:
+            bounds = cu_seqlens.tolist() if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
+            segments = [(start, stop) for start, stop in zip(bounds, bounds[1:]) if stop > start]
+            if len(segments) > 1:
+                # Small BF16 refiner GEMMs can change rounding with the row count.
+                # Keep them sample-local: pretrained main-DiT blocks amplify those
+                # differences. The much larger main-DiT sequence stays packed.
+                outputs = []
+                for start, stop in segments:
+                    length = stop - start
+                    local_cu = (
+                        cu_seqlens.new_tensor([0, length]) if isinstance(cu_seqlens, torch.Tensor) else (0, length)
+                    )
+                    outputs.append(self.forward(x[start:stop], cu_seqlens=local_cu, max_seqlen=length))
+                return torch.cat(outputs, dim=0)
         for block in self.blocks:
             x = block(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         return self.final_norm(x)
@@ -502,7 +517,12 @@ class MiniMaxH3DiT(nn.Module):
         audio_embed = self.audio_patch_proj(audio_rows)
         text_rows = text_embeddings_selected.to(device=device)
         text_embed = self.condition_proj(text_rows)
-        text_embed = self.token_refiner(text_embed, cu_seqlens=refiner_cu_seqlens, max_seqlen=refiner_max_seqlen)
+        text_embed = self.token_refiner(
+            text_embed,
+            cu_seqlens=refiner_cu_seqlens,
+            max_seqlen=refiner_max_seqlen,
+            sample_local=self.use_remove_padding,
+        )
 
         embeddings = torch.zeros((seq_len, self.hidden_size), device=device, dtype=dtype)
         embeddings[text_pos] = text_embed.to(dtype)[: text_pos.shape[0]]
