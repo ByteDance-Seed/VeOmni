@@ -19,28 +19,31 @@
 ## 🍪 Overview
 VeOmni is a versatile framework for both single- and multi-modal pre-training and post-training. It empowers users to seamlessly scale models of any modality across various accelerators, offering both flexibility and user-friendliness.
 
-Our guiding principles when building VeOmni are:
-- **Flexibility and Modularity**: VeOmni is built with a modular design, allowing users to decouple most components and replace them with their own implementations as needed.
-- **Trainer-free**: VeOmni supports linear training scripts that avoid rigid, structured trainer classes (e.g., [PyTorch-Lightning](https://github.com/Lightning-AI/pytorch-lightning) or [HuggingFace](https://huggingface.co/docs/transformers/v4.50.0/en/main_classes/trainer#transformers.Trainer) Trainer). These training scripts expose the entire training logic to users for maximum transparency and control. Besides, VeOmni supports a basic trainer for text-only or vlm/omni models training and a rl trainer as a trainer backend in reinforcement learning.
+VeOmni combines reusable model, data, optimizer, and distributed components with
+training entry points for text, vision-language, audio, and diffusion workloads.
+The trainers compose a shared training loop with model-specific runtimes; advanced
+users can reuse the components in their own tasks. See the
+[Trainer guide](docs/usage/trainer.md) for the extension points.
 
-- **Omni model native**: VeOmni enables users to effortlessly scale any omni-model across devices and accelerators.
-- **Torch native**: VeOmni is designed to leverage PyTorch’s native functions to the fullest extent, ensuring maximum compatibility and performance.
+- **Modular**: configure or extend model loading, data processing, kernels, and training tasks.
+- **Multimodal**: train text, vision-language, audio/video, and diffusion models.
+- **PyTorch native**: use FSDP2, DeviceMesh, and distributed checkpointing.
 
 <div align="center">
 <img src="./docs/assets/system.png" width="90%">
 </div>
 
-## 🔥 Latest News
+## 🔥 Project Milestones
 - [2025/11] Our Paper [OmniScale: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo](https://arxiv.org/abs/2508.02317) was accepted by AAAI 2026
-- [2025/09] We release first offical release [v0.1.0](https://github.com/ByteDance-Seed/VeOmni/pull/75) of VeOmni.
+- [2025/09] We release first official release [v0.1.0](https://github.com/ByteDance-Seed/VeOmni/pull/75) of VeOmni.
 - [2025/08] We release [VeOmni Tech report](https://arxiv.org/abs/2508.02317) and open the [WeChat group](./docs/assets/wechat.png). Feel free to join us!
 - [2025/04] We release VeOmni!
 
 
 ## 📚 Key Features
 - **FSDP2** backend for training.
-- **Sequence Parallelism** with [Deepspeed Ulysess](https://arxiv.org/abs/2309.14509), support with non-async and async mode.
-- **Experts Parallelism** support large MOE model training, like [Qwen3-Moe](https://veomni.readthedocs.io/en/latest/key_features/ep_fsdp2.html).
+- **Sequence Parallelism** with [DeepSpeed Ulysses](https://arxiv.org/abs/2309.14509), support with non-async and async mode.
+- **Expert Parallelism** for large MoE model training, like [Qwen3-Moe](https://veomni.readthedocs.io/en/latest/key_features/ep_fsdp2.html).
 - Efficient **GroupGemm** kernel for Moe model, [Liger-Kernel](https://github.com/linkedin/Liger-Kernel).
 - Compatible with HuggingFace Transformers models. [Qwen3](https://veomni.readthedocs.io/en/latest/examples/qwen3.html), [Qwen3-VL](https://veomni.readthedocs.io/en/latest/examples/qwen3_vl.html), Qwen3-Moe, etc
 - Dynamic batching strategy, Omnidata processing
@@ -48,22 +51,24 @@ Our guiding principles when building VeOmni are:
 - Support for NVIDIA GPU, AMD ROCm, and Ascend NPU training.
 - Experiment tracking with wandb
 
-## 📝 Upcoming Features and Changes
+## 📝 Roadmap
 
-- VeOmni v0.2 Roadmap https://github.com/ByteDance-Seed/VeOmni/issues/268, https://github.com/ByteDance-Seed/VeOmni/issues/271
-- Vit balance tool https://github.com/ByteDance-Seed/VeOmni/issues/280
-- Validation dataset during training https://github.com/ByteDance-Seed/VeOmni/issues/247
-- RL post training for omni-modality models with VeRL https://github.com/ByteDance-Seed/VeOmni/issues/262
-
+Track planned work and its current status in the
+[2026 Q3 roadmap](https://github.com/ByteDance-Seed/VeOmni/issues/988) and
+[NPU roadmap](https://github.com/ByteDance-Seed/VeOmni/issues/796).
 
 ## 🚀 Getting Started
 
-<a href="https://veomni.readthedocs.io/en/latest/index.html"><b>Documentation</b></a>
+| Goal | Start here |
+| --- | --- |
+| Install VeOmni | [NVIDIA GPU](docs/get_started/installation/install.md), [Ascend x86](docs/get_started/installation/install_ascend_x86.md), [Ascend ARM](docs/get_started/installation/install_ascend_arm.md), [AMD ROCm](docs/hardware_support/rocm/README.md), [Cambricon MLU](docs/hardware_support/mlu/README.md) |
+| Run text training | [Qwen3 training guide](docs/examples/qwen3.md) |
+| Configure a run | [Arguments reference](docs/usage/arguments.md) |
+| Contribute code or documentation | [Contribution guide](CONTRIBUTING.md) |
 
-### Quick Start
-  - [Installation](https://veomni.readthedocs.io/en/latest/get_started/installation/install.html)
-  - [Quick Start with Qwen3](https://veomni.readthedocs.io/en/latest/examples/qwen3.html)
-
+Browse the [documentation](https://veomni.readthedocs.io/en/latest/) for feature
+and model guides. Installation instructions and examples on the `latest` site
+track `main`; use the documentation from your checkout when working on an older revision.
 
 ## ✏️ Supported Models
 
@@ -103,7 +108,8 @@ Agentic Models in Minecraft](https://arxiv.org/pdf/2509.13347)
 
 ## 🎨 Contributing
 
-Contributions from the community are welcome! Please check out [CONTRIBUTING.md](CONTRIBUTING.md) our project roadmap(To be updated),
+Contributions are welcome. Start with the [contribution guide](CONTRIBUTING.md).
+For documentation changes, follow the [authoring guide](docs/README.md).
 
 
 ## 📝 Citation and Acknowledgement
