@@ -526,6 +526,39 @@ def parallelize_model_fsdp2(
             cast_forward_inputs=mixed_precision.cast_forward_inputs,
         )
         fsdp_kwargs["mp_policy"] = mp_policy
+
+    # ExtraParallel (e.g. expert) modules may keep their unsharded parameters in
+    # a higher dtype than ``param_dtype``. A grouped weight-gradient GEMM writes
+    # its FP32 accumulator in the dtype of its output buffer, so a BF16 parameter
+    # rounds every rank's local partial sum before the FSDP2 reduce-scatter
+    # combines them; an FP32 parameter lets the whole gradient stay FP32 into the
+    # optimizer. Activations keep their own dtype (``cast_forward_inputs`` is off
+    # for these modules) and the fused kernels cast the weights internally, so
+    # only the parameter all-gather grows.
+    extra_parallel_mp_policy = None
+    if mixed_precision.enable and mixed_precision.extra_parallel_param_dtype:
+        extra_parallel_mp_policy = MixedPrecisionPolicy(
+            param_dtype=getattr(torch, mixed_precision.extra_parallel_param_dtype),
+            reduce_dtype=mp_policy.reduce_dtype,
+            output_dtype=mp_policy.output_dtype,
+            cast_forward_inputs=False,
+        )
+
+    # The override also has to cover a *collapsed* ExtraParallel dimension
+    # (``ep_size == 1``). Those modules are otherwise sharded with their decoder
+    # layer under the global policy, so an EP=1 run would keep BF16 expert
+    # parameters while an EP=2 run moved to FP32 -- and the two configurations
+    # would then disagree by exactly the rounding the override removes. They are
+    # wrapped separately below, with the same FSDP kwargs their layer would have
+    # used, so only the parameter dtype changes.
+    collapsed_extra_parallel_mod = {}
+    if extra_parallel_mp_policy is not None and not parallel_state.any_extra_parallel_enabled:
+        collapsed_plan = get_runtime_parallel_plan(model)
+        if collapsed_plan is not None:
+            for para in parallel_state.extra_parallel_names:
+                if para not in (collapsed_plan.extra_parallel_plan or {}):
+                    continue
+                collapsed_extra_parallel_mod[para] = collapsed_plan.get_extra_parallel_fsdp_no_shard_info(model, para)
     # prepare offload_policy kwargs
     enable_fsdp_cpu_offload = kwargs.pop("enable_fsdp_offload", False)
     offload_pin_memory = kwargs.pop("fsdp_offload_pin_memory", True)
@@ -598,6 +631,8 @@ def parallelize_model_fsdp2(
                         "Shard(1) layout (Muon will use the all-to-all-gather path)."
                     )
             para_fsdp_kwargs["shard_placement_fn"] = lambda param, _d=shard_dim_for_para: Shard(_d)
+            if extra_parallel_mp_policy is not None:
+                para_fsdp_kwargs["mp_policy"] = extra_parallel_mp_policy
             extra_parallel_fsdp_kwargs[para] = para_fsdp_kwargs
             # Record the FSDP shard dim on the spec_info so the checkpointer can
             # build correct DTensor placements (EP dim vs FSDP dim) on save/load.
@@ -642,6 +677,12 @@ def parallelize_model_fsdp2(
             # (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens). A layer
             # may hold more than one (e.g. multiple experts modules) -- wrap each.
             if not parallel_state.extra_parallel_enabled(para):
+                # Collapsed dimension: only the parameter-dtype override applies.
+                for para_fqn, _para_mod in (collapsed_extra_parallel_mod.get(para) or {}).items():
+                    if para_fqn != layer_fqn and not para_fqn.startswith(layer_fqn + "."):
+                        continue
+                    fully_shard(_para_mod, **{**fsdp_kwargs, "mp_policy": extra_parallel_mp_policy})
+                    layer_mod._fsdp_modules.append(_para_mod)
                 continue
             for _para_mod in extra_parallel_mod[para]:
                 if isinstance(_para_mod, FSDPModule):

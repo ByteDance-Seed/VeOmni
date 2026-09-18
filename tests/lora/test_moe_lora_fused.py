@@ -390,12 +390,11 @@ def _build_lora_leaves(mode: str, *, E: int, H: int, I: int, r: int, dtype: torc
 def test_ep_class_matches_nonep_class_single_rank(mode):
     """EP autograd class output AND LoRA grads match the non-EP class on the same permuted token block.
 
-    Math equivalence: routing-weight scaling commutes with the linear ``down``
-    + LoRA-down chain, so applying ``scattered_gate_weights`` *after* fc2 (the
-    EP convention, via ``tokens_post_all2all`` → ``unpermute``) and applying
-    it *before* fc2 (the non-EP convention, baked into the class) produce the
-    same forward output and same LoRA gradients up to bf16 reduction-order
-    noise. The forward leg is the easy half; the backward leg also closes
+    Both paths apply routing weights after the complete ``down`` + LoRA-down
+    chain. EP applies them through ``tokens_post_all2all`` → ``unpermute``;
+    non-EP applies them inside its autograd class. Compare forward output and
+    LoRA gradients up to BF16 reduction-order noise from token permutation.
+    The forward leg is the easy half; the backward leg also closes
     over ``grad_lora_a_*`` / ``grad_lora_b_*`` per-expert chains, which is
     where any bug in the EP autograd backward would surface.
     """
@@ -539,3 +538,57 @@ def test_ep_class_matches_nonep_class_single_rank(mode):
             f"[{mode}] {name}: EP-vs-non-EP backward parity broken — L2 rel {l2:.4%} > {_GRAD_L2REL_TOL:.2%} "
             f"(nonep_norm={g_nonep.float().norm().item():.3e}, max|Δ|={(g_nonep - g_ep).abs().max().item():.3e})"
         )
+
+
+@pytest.mark.parametrize("mode", ["shared", "independent"])
+@pytest.mark.parametrize("seed", [17, 29])
+def test_zero_b_preserves_fused_base_output_and_vjp(mode, seed):
+    """Zero adapters must not change the base expert's BF16 routing order."""
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("Triton fused MoE requires CUDA.")
+    from veomni.lora.ops.moe_group_gemm import (
+        MergedFc1IndependentTritonFusedLoRAMoeExpertFunction,
+        MergedFc1TritonFusedLoRAMoeExpertFunction,
+    )
+    from veomni.ops.kernels.moe.group_gemm import MergedFc1TritonFusedMoeExpertFunction
+
+    device = get_device_type()
+    generator = torch.Generator(device=device).manual_seed(seed)
+
+    def randn(*shape):
+        return torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator) * 0.1
+
+    tokens, experts, hidden, intermediate, rank = 32, 2, 64, 96, 16
+    inputs = [randn(tokens, hidden), torch.rand((tokens, 2), device=device, generator=generator).bfloat16()]
+    weights = [randn(experts, 2 * intermediate, hidden), randn(experts, hidden, intermediate)]
+    selected = torch.arange(2, device=device).expand(tokens, -1).contiguous()
+    cotangent = randn(tokens, hidden)
+    prefix = (experts,) if mode == "independent" else ()
+    adapters = []
+    for in_dim, out_dim in ((hidden, intermediate), (hidden, intermediate), (intermediate, hidden)):
+        adapters.extend(
+            (randn(*prefix, rank, in_dim), torch.zeros((*prefix, out_dim, rank), device=device, dtype=torch.bfloat16))
+        )
+    results = []
+    for with_lora in (False, True):
+        x, route, gate_up, down = [v.detach().clone().requires_grad_() for v in (*inputs, *weights)]
+        leaves = (x, route, gate_up, down)
+        if with_lora:
+            adapter_leaves = tuple(v.detach().clone().requires_grad_() for v in adapters)
+            fn = (
+                MergedFc1IndependentTritonFusedLoRAMoeExpertFunction
+                if mode == "independent"
+                else MergedFc1TritonFusedLoRAMoeExpertFunction
+            )
+            output = fn.apply(experts, route, selected, x, gate_up, down, *adapter_leaves, 0.5, 0.5, 0.5)
+            grads = torch.autograd.grad(output, (*leaves, *adapter_leaves), cotangent)
+            for grad in grads[4::2]:
+                assert torch.count_nonzero(grad) == 0
+            for grad in grads[5::2]:
+                assert torch.isfinite(grad).all() and torch.count_nonzero(grad) > 0
+        else:
+            output = MergedFc1TritonFusedMoeExpertFunction.apply(experts, route, selected, x, gate_up, down, None)
+            grads = torch.autograd.grad(output, leaves, cotangent)
+        results.append((output, *grads[:4]))
+    for actual, expected in zip(*results):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

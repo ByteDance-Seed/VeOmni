@@ -170,6 +170,105 @@ Registry binding plus mHC pre/post/head forward and backward parity are covered
 by `tests/ops/test_mhc_tile_kernels.py`, which requires TileKernels on an SM90+
 NVIDIA GPU for kernel execution.
 
+DeepSeek-V4 expert-parallel training is exercised separately by
+`tests/e2e/test_e2e_parallel.py::test_deepseek_v4_expert_parallel_alignment`:
+four-rank FSDP2, SP=1, EP=1 versus EP=2, and two optimizer steps. This uses
+eager DSA/mHC with fused routed experts, so it does not qualify the SM90+
+kernel paths. The CPU duplicate-hash-route regression verifies that EP split
+counts match unique token/expert dispatch pairs; repeated routing weights are
+summed when combining outputs.
+The GPU CI also enumerates `test_deepseek_v4_expert_parallel_fixed_route_vjp_matches_fp32_reference`
+in `tests/models/test_deepseek_v4_fused_moe.py`: four-rank EP=4, unequal token
+payloads, ordinary and duplicate expert slots, and three held-out seeds. Output,
+input/routing gradients and expert-weight gradients are compared with a global
+FP32 mathematical VJP using the same BF16 bit patterns and the rounding budget
+described below. This isolates expert transport/kernel numerics, not FSDP2
+gradient averaging or whole-model optimizer trajectories.
+
+Controlled two-step BF16 FSDP2 runs matched initial FP32 master weights,
+buffers, optimizer settings and every rank's micro-batches. Aggregate execution
+gates passed, but whole-model pre-clipping gradient relative L2 differed by
+about 4.61% for EP2 versus EP1 before aligning routing-weight placement. Non-EP
+Triton experts now weight the down-projection output, matching EP and the eager
+reference, instead of weighting the BF16 activation before that projection.
+Both split/merged weights and shared/independent LoRA use this order; for LoRA,
+the routing weight scales the complete base-plus-adapter output.
+
+On the same four-rank fixture, this reduced first-step whole-model gradient
+relative L2 to 0.0751%, with bit-identical non-expert gradients. Expert weight
+gradients still differ across EP reduction layouts. First-step update relative
+L2 was 2.62%; after that update, second-step gradient relative L2 was 4.24% and
+update relative L2 was 5.21%. These measurements do not establish whole-model
+update parity or convergence. First-step AdamW replay and clipping passed their
+separate oracles in the earlier diagnostic runs.
+
+`tests/ops/test_fused_moe_split_vs_merged.py` checks output and all VJPs against
+the single-expert EP projection order without relaxing split/merged parity.
+`tests/lora/test_moe_lora_fused.py` checks that zero-B adapters preserve base
+output, input/routing and base-weight gradients, while retaining trainable
+B-gradients. Both files run in GPU CI. Duplicate routes still have distinct
+EP/non-EP reduction layouts; no bitwise guarantee is made for arbitrary routes.
+
+`tests/ops/test_group_gemm_weight_grad_precision.py` pins the dtype contract the
+expert weight-gradient path depends on. `group_gemm_same_mn` accumulates in FP32
+but casts to `c.dtype` when it stores and asserts no dtype for `c`, so the BF16
+buffer the expert Functions allocate is the dtype a local partial sum is rounded
+to before FSDP2 reduce-scatters it across the `<para>_fsdp` mesh of the
+`fully_shard`-ed expert module (`veomni/distributed/torch_parallelize.py`). The
+regressions enforce FP32 accuracy of the accumulation and a one-BF16-epsilon band
+for the BF16 store, covering an empty expert, skewed payloads and per-rank
+partial sums. Measurements on L20/SM89 against an FP64 reference built from the
+same BF16 operands -- recorded here, not enforced by CI -- are about 1.7e-3
+relative L2 for a BF16 write-back and about 6e-8 for an FP32 one, rising to about
+2.4e-3 and about 1e-7 when two per-rank partials are combined.
+
+An FP32 gradient buffer alone is not sufficient: autograd casts a returned
+gradient back to the dtype of the leaf parameter it accumulates into, which for
+FSDP2 mixed precision is the unsharded parameter. A four-rank A/B run with FP32
+gradient buffers and BF16 expert parameters is bit-identical to this head.
+
+`mixed_precision.extra_parallel_param_dtype` is the boundary that does work. It
+keeps an ExtraParallel (expert) module's unsharded parameters in the configured
+dtype instead of `param_dtype`; the fused Functions cast the weights to the
+activation dtype inside the `autograd.Function`, so the forward is bit-identical
+(measured: the same first-step loss to the last digit) while the weight gradient
+is accumulated, returned and reduce-scattered in FP32.
+
+Four-rank A/B on the toy fixture, EP=4 against EP=2, two optimizer steps, every
+other setting identical -- whole-model pre-clipping gradient relative L2:
+
+| expert parameter dtype | step 1 | step 2 |
+|---|---|---|
+| bfloat16 (default) | 7.51e-4 | 4.47e-2 |
+| float32 | 5.77e-7 | 4.29e-2 |
+
+At step 1 the entire difference sits in the expert weights
+(`expert_error_share` 1.0, no parameter above 1% relative), so FP32 expert
+parameters remove the EP partial-sum rounding from the configuration difference
+and leave FP32 accumulation-order noise. Step 2 is dominated by trajectory
+separation instead: after one step the two configurations have already diverged,
+and that is why the two rows there agree. These are measurements taken for this
+document; the ops regressions enforce the operator contract those measurements
+rest on, not the four-rank numbers themselves.
+
+EP=2 against EP=1 shows the same collapse when the override also covers the
+collapsed ExtraParallel dimension (`ep_size == 1`), where the expert modules are
+otherwise sharded with their decoder layer under the global `param_dtype` and are
+wrapped separately so that only their parameter dtype changes:
+
+| expert parameter dtype | EP=4 vs EP=2, step 1 | EP=2 vs EP=1, step 1 |
+|---|---|---|
+| bfloat16 (default) | 7.51e-4 | 7.51e-4 |
+| float32 | 5.77e-7 | 4.39e-7 |
+
+At `ep_size == 1` the override changes the expert-weight gradient and nothing
+else: knob-off against knob-on at the same EP size gives 5.31e-4 whole-model
+relative L2 with `expert_error_share` 1.0 and no parameter above 1% relative,
+while the first-step loss is identical across every run above.
+
+The override costs an FP32 parameter all-gather plus a larger unsharded buffer
+for the modules it covers.
+
 ---
 
 ### 2. VLM Trainer Test (`tests/models/test_vlm_trainer.py`)
