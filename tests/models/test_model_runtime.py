@@ -31,6 +31,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from tests.tools.training_utils import make_eager_ops_config, unbuilt_runtime
 from veomni.arguments import (
     AcceleratorConfig,
     FSDPConfig,
@@ -45,8 +46,6 @@ from veomni.distributed.parallel_state import (
 from veomni.models.model_runtime import VeOmniModelRuntime
 from veomni.trainer.base import BaseTrainer
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
-
-from ..tools.training_utils import make_eager_ops_config, unbuilt_runtime
 
 
 TOY_CONFIG = "./tests/toy_config/qwen3_toy"

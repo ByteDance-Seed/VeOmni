@@ -23,7 +23,7 @@ from operator import attrgetter
 import pytest
 from transformers import PretrainedConfig
 
-from tests.models.compare import eager_ops_config, ops_config_scope
+from tests.models.compare import eager_ops_config, ops_config_scope, stamp_attn_implementation
 from tests.models.tiny_configs import (
     tiny_deepseek_v3_config as _tiny_deepseek_v3_config,
 )
@@ -151,6 +151,10 @@ class _ModelCase:
     # Representative integration points, not an exhaustive snapshot of model internals.
     eager_ops: tuple[tuple[str, str], ...] = (("veomni_ce", "cross_entropy_loss"),)
     isolation_op_path: str | None = None
+    # Attention that binds from ``config._attn_implementation`` needs the
+    # ops selection stamped before HF construction. resolve_op_impl families
+    # leave HF attn as eager; stamping sdpa makes PreTrainedModel reject them.
+    stamps_hf_attn: bool = True
 
 
 _MODEL_CASES = (
@@ -217,7 +221,8 @@ _MODEL_CASES = (
             ("model.layers.0.mlp.experts.veomni_moe", "moe_experts"),
             ("model.layers.0.self_attn.veomni_attn", "attention"),
         ),
-        isolation_op_path="model.layers.0.self_attn.veomni_attn",
+        # HF rejects sdpa for GptOss, and gpt_oss moe has no fused_triton row.
+        isolation_op_path="veomni_ce",
         config_factory=_tiny_gpt_oss_config,
         architectures=(
             "GptOssForCausalLM",
@@ -514,6 +519,7 @@ _MODEL_CASES = (
         registered_model_aliases=("MiniMaxH3ConditionModel",),
         eager_ops=(("dit.blocks.0.attn.veomni_attn", "attention"),),
         isolation_op_path="dit.blocks.0.attn.veomni_attn",
+        stamps_hf_attn=False,
     ),
     _ModelCase(
         model_type="QwenImageTransformer2DModel",
@@ -533,6 +539,7 @@ _MODEL_CASES = (
         ),
         # wan rope has no liger row; isolate via attention (sdpa) and keep rope in eager_ops
         isolation_op_path="blocks.0.self_attn.attn.veomni_attn",
+        stamps_hf_attn=False,
         config_factory=_tiny_wan_config,
         architectures=("WanModel",),
         has_registered_config=True,
@@ -630,14 +637,20 @@ def test_model_instances_keep_distinct_impls(model_case: _ModelCase, available_n
     """
     previous = get_ops_config()
     eager_config = eager_ops_config()
+    selected_path = model_case.isolation_op_path or model_case.eager_ops[0][0]
+    selected_op_name = next(op for path, op in model_case.eager_ops if path == selected_path)
 
     def construct(config):
+        model_config = model_case.config_factory(model_case.architectures[0])
+        # HF-interface attention binds from ``config._attn_implementation``.
+        # VL nested ``to_dict()`` also drops the field and HF then defaults
+        # to sdpa, so eager construction must stamp as well.
+        if selected_op_name == "attention" and model_case.stamps_hf_attn:
+            stamp_attn_implementation(model_config, config.attn_implementation)
         with ops_config_scope(config):
-            model_config = model_case.config_factory(model_case.architectures[0])
             return get_model_class(model_config)(model_config)
 
     eager = construct(eager_config)
-    selected_path = model_case.isolation_op_path or model_case.eager_ops[0][0]
     selected_op = attrgetter(selected_path)
     assert selected_op(eager).impl == "eager"
     eager_bindings = _op_bindings(eager, selected_path)
