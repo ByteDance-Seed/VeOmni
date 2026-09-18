@@ -13,8 +13,9 @@ from veomni.distributed.sequence_parallel.ulysses import (
     _Gather,
 )
 from veomni.utils.device import IS_NPU_AVAILABLE
+from veomni.utils.recompute_utils import checkpoint_forward as gradient_checkpoint_forward
 
-from .core import attention_forward, gradient_checkpoint_forward
+from .core import attention_forward
 
 
 if IS_NPU_AVAILABLE:
