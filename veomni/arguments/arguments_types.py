@@ -1082,6 +1082,8 @@ class TrainingArguments:
             self.dataloader_batch_size = self.global_batch_size // acc.dp_size  # = micro bsz * grad accu
 
     def _resolve_checkpoint_paths(self):
+        from ..checkpoint.layout import ASSETS_DIRNAME
+
         ckpt = self.checkpoint
 
         if ckpt.load_path == "auto":
@@ -1107,10 +1109,10 @@ class TrainingArguments:
         # │   ├── global_step_100/
         # │   └── global_step_200/
         # │       └── hf_ckpt/      # HF safetensors saved under the last checkpoint folder
-        # └── model_assets/
+        # └── model_assets/         # or model_assets/<module>/ in a multi-module job
         # See docs/usage/checkpoint.md.
         ckpt.save_path = os.path.join(ckpt.output_dir, "checkpoints")
-        ckpt.model_assets_dir = os.path.join(ckpt.output_dir, "model_assets")
+        ckpt.model_assets_dir = os.path.join(ckpt.output_dir, ASSETS_DIRNAME)
 
     def _resolve_profile(self):
         if self.profile.enable:
@@ -1570,6 +1572,25 @@ class BaseModelArguments:
         default_factory=dict,
         metadata={"help": "Config to overwrite foundation model config."},
     )
+    processor_config: Optional[Dict] = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "Kwargs to overwrite the processor/tokenizer config, e.g. "
+                "`size: {shortest_edge: 3136, longest_edge: 602112}` for a Qwen-VL image processor."
+            )
+        },
+    )
+    chat_template: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Registered chat-template name used to lay conversations out into training samples. "
+                "Leave unset for data with no conversation structure (plaintext, diffusion) or for a "
+                "model that formats prompts through its own processor (Qwen-Omni)."
+            )
+        },
+    )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
@@ -1796,10 +1817,6 @@ class DataArguments:
     text_keys: str = field(
         default=None,
         metadata={"help": "Key to get text from the training data."},
-    )
-    chat_template: str = field(
-        default="default",
-        metadata={"help": "Chat template to use."},
     )
     max_seq_len: int = field(
         default=2048,

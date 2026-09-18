@@ -65,12 +65,23 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
     trainer.state = TrainerState()
     trainer.start_epoch = 0
     trainer.start_step = 0
-    trainer.checkpoint = MagicMock()
-    # Single-model job: the real manager's class default, which keeps the
-    # manifest's module list empty.
-    trainer.checkpoint.module_name = ""
+    trainer.model.checkpoint = MagicMock()
 
     return trainer
+
+
+def _make_mock_runtime(save_path="/tmp/test_ckpt", save_async=False):
+    """Runtime-shaped stand-in for :class:`ModelCheckpointManager` tests."""
+    trainer = _make_mock_trainer(save_path=save_path, save_async=save_async)
+    return SimpleNamespace(
+        model=trainer.model,
+        optimizer=trainer.optimizer,
+        lr_scheduler=trainer.lr_scheduler,
+        model_assets=trainer.model_assets,
+        parallel_state=SimpleNamespace(global_rank=trainer.args.train.global_rank),
+        args=trainer.args.model,
+        train_args=trainer.args.train,
+    )
 
 
 @patch("veomni.trainer.callbacks.checkpoint_callback.helper")
@@ -238,12 +249,12 @@ class TestCheckpointCallbackTrainEndWait:
 
         cb.on_train_end(TrainerState(global_step=60))
 
-        trainer.checkpoint.wait_for_pending_save.assert_called_once_with()
+        trainer.wait_for_pending_save.assert_called_once_with()
 
     def test_train_end_propagates_async_save_failure(self, mock_helper):
         trainer = _make_mock_trainer(save_async=True)
         trainer.args.train.checkpoint.save_hf_weights = False
-        trainer.checkpoint.wait_for_pending_save.side_effect = RuntimeError("HDFS write failed")
+        trainer.wait_for_pending_save.side_effect = RuntimeError("HDFS write failed")
         cb = CheckpointCallback(trainer)
 
         with pytest.raises(RuntimeError, match="HDFS write failed"):
@@ -257,10 +268,9 @@ class TestCheckpointCallbackTrainEndWait:
 
         cb.on_train_end(TrainerState(global_step=60))
 
-        trainer.checkpoint.wait_for_pending_save.assert_called_once_with()
+        trainer.wait_for_pending_save.assert_called_once_with()
 
 
-@patch("veomni.models.checkpoint_manager.get_parallel_state")
 @patch("veomni.models.checkpoint_manager.build_checkpointer")
 @patch("veomni.models.checkpoint_manager.dist")
 @patch("veomni.models.checkpoint_manager.helper")
@@ -276,17 +286,16 @@ class TestModelCheckpointManagerSaveContract:
     """
 
     def test_the_step_reaches_save_instead_of_being_folded_into_the_path(
-        self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps, tmp_path
+        self, mock_helper, mock_dist, mock_build_ckpt, tmp_path
     ):
         """One staging directory per run needs the run path, with the step passed separately."""
         from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
 
-        trainer = _make_mock_trainer(save_path=str(tmp_path / "run"))
-        trainer.args.train.checkpoint.stage_dir = str(tmp_path / "stage")
-        trainer.args.train.checkpoint.save_timeout_seconds = 1234
+        runtime = _make_mock_runtime(save_path=str(tmp_path / "run"))
+        runtime.train_args.checkpoint.stage_dir = str(tmp_path / "stage")
+        runtime.train_args.checkpoint.save_timeout_seconds = 1234
         mock_build_ckpt.return_value = MagicMock()
-        manager = ModelCheckpointManager(trainer)
-        trainer.checkpoint = manager
+        manager = ModelCheckpointManager(runtime)
 
         staged = []
         with patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", return_value=False):
@@ -302,14 +311,14 @@ class TestModelCheckpointManagerSaveContract:
 
         assert staged[0] == staged[1], "each step staged somewhere different"
 
-    def test_the_logged_destination_is_the_one_save_writes(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
+    def test_the_logged_destination_is_the_one_save_writes(self, mock_helper, mock_dist, mock_build_ckpt):
         """The manager names the model directory for its log, and ``save`` rebuilds
         the same one from ``path``, ``global_steps`` and ``module``."""
         from veomni.checkpoint.layout import model_dir, step_dir
 
-        trainer = _make_mock_trainer(save_path="/remote/run")
+        runtime = _make_mock_runtime(save_path="/remote/run")
         mock_build_ckpt.return_value = MagicMock()
-        manager = ModelCheckpointManager(trainer)
+        manager = ModelCheckpointManager(runtime)
         state = TrainerState(global_step=10)
 
         manager.save_dcp(state)
@@ -319,44 +328,55 @@ class TestModelCheckpointManagerSaveContract:
         assert rebuilt == "/remote/run/global_step_10/model"
         assert rebuilt == manager.save_dir(state)
 
-    def test_save_forwards_lr_scheduler_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
-        trainer = _make_mock_trainer()
+    def test_model_assets_nest_under_the_module_name(self, mock_helper, mock_dist, mock_build_ckpt):
+        runtime = _make_mock_runtime()
         mock_build_ckpt.return_value = MagicMock()
-        manager = ModelCheckpointManager(trainer)
+        manager = ModelCheckpointManager(runtime)
+        assert manager.assets_dir() == runtime.train_args.checkpoint.model_assets_dir
+
+        class Named(ModelCheckpointManager):
+            module_name = "vision_encoder"
+
+        named = Named(runtime)
+        assert named.assets_dir() == f"{runtime.train_args.checkpoint.model_assets_dir}/vision_encoder"
+
+    def test_save_forwards_lr_scheduler_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
+        runtime = _make_mock_runtime()
+        mock_build_ckpt.return_value = MagicMock()
+        manager = ModelCheckpointManager(runtime)
 
         manager.save_dcp(TrainerState(global_step=10))
 
         saved = manager.checkpointer.save.call_args.args[1]
-        assert saved["lr_scheduler"] is trainer.lr_scheduler
-        assert saved["optimizer"] is trainer.optimizer
+        assert saved["lr_scheduler"] is runtime.lr_scheduler
+        assert saved["optimizer"] is runtime.optimizer
         assert "extra_state" not in saved
 
-    def test_load_forwards_lr_scheduler_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
-        trainer = _make_mock_trainer()
-        trainer.args.train.checkpoint.load_path = "/tmp/ckpt"
+    def test_load_forwards_lr_scheduler_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
+        runtime = _make_mock_runtime()
+        runtime.train_args.checkpoint.load_path = "/tmp/ckpt"
         mock_checkpointer = MagicMock()
         mock_build_ckpt.return_value = mock_checkpointer
 
-        manager = ModelCheckpointManager(trainer)
+        manager = ModelCheckpointManager(runtime)
         manager.load()
 
         loaded = mock_checkpointer.load.call_args.args[1]
-        assert loaded["lr_scheduler"] is trainer.lr_scheduler
-        assert loaded["optimizer"] is trainer.optimizer
-        assert trainer.state.global_step == 0
-        assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is mock_get_ps.return_value
+        assert loaded["lr_scheduler"] is runtime.lr_scheduler
+        assert loaded["optimizer"] is runtime.optimizer
+        assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is runtime.parallel_state
 
     def test_save_lora_writes_the_adapter_to_its_own_export_dir(
-        self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps, tmp_path
+        self, mock_helper, mock_dist, mock_build_ckpt, tmp_path
     ):
         """The adapter is an export: it goes to lora_ckpt/, not in with the shards.
 
         Separate from hf_ckpt/ as well, so a future LoRA merge can write both for
         one step without either landing on the other.
         """
-        trainer = _make_mock_trainer(save_path=str(tmp_path / "checkpoints"))
+        runtime = _make_mock_runtime(save_path=str(tmp_path / "checkpoints"))
         mock_build_ckpt.return_value = MagicMock()
-        manager = ModelCheckpointManager(trainer)
+        manager = ModelCheckpointManager(runtime)
         state = TrainerState(global_step=10)
 
         with patch("veomni.utils.save_safetensor_utils.save_lora_adapter_with_dcp") as save_adapter:
@@ -368,17 +388,15 @@ class TestModelCheckpointManagerSaveContract:
         assert save_path != manager.hf_export_dir(state)
         assert save_path != manager.save_dir(state)
 
-    def test_export_rewrites_a_step_this_run_did_not_save(
-        self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps, tmp_path
-    ):
+    def test_export_rewrites_a_step_this_run_did_not_save(self, mock_helper, mock_dist, mock_build_ckpt, tmp_path):
         """A ``model/`` an interrupted save left behind is indistinguishable from
         a finished one, and its weights belong to a trajectory this run
         abandoned. Skipping the save on the strength of that directory would
         export stale weights and leave the step's record set without anything
         having finished writing it. This run's own record is what decides."""
-        trainer = _make_mock_trainer(save_path=str(tmp_path / "checkpoints"))
+        runtime = _make_mock_runtime(save_path=str(tmp_path / "checkpoints"))
         mock_build_ckpt.return_value = MagicMock()
-        manager = ModelCheckpointManager(trainer)
+        manager = ModelCheckpointManager(runtime)
         state = TrainerState(global_step=10)
         # What an interrupted save leaves: the tree, and no completion marker.
         (tmp_path / "checkpoints" / "global_step_10" / "model" / "ckpt").mkdir(parents=True)
@@ -390,13 +408,13 @@ class TestModelCheckpointManagerSaveContract:
         assert manager.last_saved_step == 10
 
     def test_export_does_not_repeat_the_save_this_run_just_made(
-        self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps, tmp_path
+        self, mock_helper, mock_dist, mock_build_ckpt, tmp_path
     ):
         """The other half of the same rule: the cadence already wrote this step
         in this process, so the export must not write it a second time."""
-        trainer = _make_mock_trainer(save_path=str(tmp_path / "checkpoints"))
+        runtime = _make_mock_runtime(save_path=str(tmp_path / "checkpoints"))
         mock_build_ckpt.return_value = MagicMock()
-        manager = ModelCheckpointManager(trainer)
+        manager = ModelCheckpointManager(runtime)
         state = TrainerState(global_step=10)
 
         manager.save_dcp(state)
@@ -405,16 +423,14 @@ class TestModelCheckpointManagerSaveContract:
 
         assert manager.checkpointer.save.call_count == 1
 
-    def test_an_export_alone_does_not_advance_the_record(
-        self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps, tmp_path
-    ):
+    def test_an_export_alone_does_not_advance_the_record(self, mock_helper, mock_dist, mock_build_ckpt, tmp_path):
         """``last_saved_step`` is read as 'this step's DCP is on disk', so only a
         DCP save may move it. Here the save is stubbed out, standing in for any
         path that exports without writing one: the export must not leave the
         record claiming a step it did not write."""
-        trainer = _make_mock_trainer(save_path=str(tmp_path / "checkpoints"))
+        runtime = _make_mock_runtime(save_path=str(tmp_path / "checkpoints"))
         mock_build_ckpt.return_value = MagicMock()
-        manager = ModelCheckpointManager(trainer)
+        manager = ModelCheckpointManager(runtime)
 
         with patch.object(manager, "save_dcp") as save_dcp:
             with patch("veomni.utils.save_safetensor_utils.save_lora_adapter_with_dcp"):
@@ -458,7 +474,7 @@ class TestGlobalStateCallbackJobState:
 
         cb.save_global_state(TrainerState(global_step=10))
 
-        trainer.checkpoint.wait_for_pending_save.assert_not_called()
+        trainer.model.checkpoint.wait_for_pending_save.assert_not_called()
         step = tmp_path / "global_step_10"
         assert (step / "extra_state" / "rank_0.pt").is_file()
         assert (step / "loader" / "rank_0.pt").is_file()

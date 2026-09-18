@@ -12,6 +12,7 @@ import torch
 import yaml
 from torch import nn
 
+import veomni.models.model_runtime as runtime_module
 import veomni.trainer.dit_trainer as dit_module
 from veomni.arguments import ModelArguments, parse_args
 from veomni.data.data_collator import MakeMicroBatchCollator
@@ -143,13 +144,15 @@ def test_unspecified_global_batch_size_is_derived():
 
 
 def test_setup_preserves_enabled_microbatch_and_disabled_behavior(monkeypatch):
-    monkeypatch.setattr(dit_module.BaseTrainer, "_setup", lambda self: None)
     monkeypatch.setattr(dit_module, "get_parallel_state", lambda: SimpleNamespace(dp_size=1))
     for enabled, expected in [(True, 2), (False, 1)]:
         args = _args(enabled)
         trainer = DiTTrainer.__new__(DiTTrainer)
-        trainer.base = SimpleNamespace(args=args, _setup=lambda: None)
+        setup = Mock(return_value=torch.device("cpu"))
+        trainer.base = SimpleNamespace(args=args, _setup=setup)
         trainer._setup()
+        setup.assert_called_once_with(args)
+        assert trainer.base.device == torch.device("cpu")
         assert args.train.micro_batch_size == expected
         assert args.train.dataloader_batch_size == 4
         assert args.train.dyn_bsz is False
@@ -157,7 +160,7 @@ def test_setup_preserves_enabled_microbatch_and_disabled_behavior(monkeypatch):
             assert args.train.gradient_accumulation_steps == 2
 
 
-class _Condition:
+class _Condition(nn.Module):
     supports_sample_inputs = True
 
     def prepare_samples(self, *, values):
@@ -189,15 +192,26 @@ class _Model(nn.Module):
 def _loader_trainer(monkeypatch, model_cls=_Model, condition_cls=_Condition, enabled=True):
     trainer = DiTTrainer.__new__(DiTTrainer)
     trainer.base = SimpleNamespace(args=_args(enabled))
-    trainer.training_task = "offline_training"
     config = SimpleNamespace(model_type="test_dit", condition_model_type="test_condition", architectures=["TestDiT"])
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
     monkeypatch.setattr(dit_module, "build_config", lambda *a, **kw: config)
     monkeypatch.setitem(dit_module.MODELING_REGISTRY._local_mapping, "test_dit", lambda arch: model_cls)
     monkeypatch.setitem(dit_module.MODELING_REGISTRY._local_mapping, "test_condition", lambda: condition_cls)
     monkeypatch.setattr(dit_module, "apply_ops_config", lambda cfg: None)
-    condition_build = Mock(side_effect=lambda **kw: setattr(trainer, "condition_model", condition_cls()))
-    trainer._build_condition_model = condition_build
+    condition_build = Mock(side_effect=lambda runtime: setattr(runtime, "condition_model", condition_cls()))
+    monkeypatch.setattr(
+        dit_module.DiTModelRuntime, "_build_condition_model", lambda self, model_type: condition_build(self)
+    )
+    monkeypatch.setattr(runtime_module, "use_parallel_state", lambda name: nullcontext())
+    monkeypatch.setattr(dit_module.DiTModelRuntime, "setup", lambda self: None)
+
+    def check_configured_before_sharding(runtime):
+        backend = trainer.base.args.model.ops_implementation.attn_implementation
+        assert runtime.model.configured == ([backend] if enabled else [])
+
+    monkeypatch.setattr(dit_module.DiTModelRuntime, "_build_parallelized_model", check_configured_before_sharding)
+    monkeypatch.setattr(dit_module.DiTModelRuntime, "_build_optimizer", lambda self: None)
+    monkeypatch.setattr(dit_module.DiTModelRuntime, "build_checkpoint", lambda self: None)
     model_build = Mock(side_effect=model_cls)
     monkeypatch.setattr(dit_module, "build_foundation_model", lambda **kw: model_build())
     return trainer, model_build, condition_build
@@ -211,7 +225,7 @@ def test_unsupported_pair_rejected_before_weights(monkeypatch, which):
         condition_cls=object if which == "condition" else _Condition,
     )
     with pytest.raises(ValueError, match="remove_padding|sample_inputs"):
-        trainer._build_model()
+        trainer._build_model_runtime()
     model_build.assert_not_called()
     condition_build.assert_not_called()
 
@@ -219,16 +233,42 @@ def test_unsupported_pair_rejected_before_weights(monkeypatch, which):
 def test_startup_configures_model_once_and_disabled_is_unchanged(monkeypatch):
     for enabled in (False, True):
         trainer, _, _ = _loader_trainer(monkeypatch, enabled=enabled)
-        trainer._build_model()
+        runtime = trainer._build_model_runtime()
         backend = trainer.base.args.model.ops_implementation.attn_implementation
-        assert trainer.base.model.configured == ([backend] if enabled else [])
+        assert runtime.model.configured == ([backend] if enabled else [])
+        assert isinstance(runtime.condition_model, _Condition)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_trainer_constructor_uses_configured_runtime(monkeypatch, enabled):
+    fixture, model_build, condition_build = _loader_trainer(monkeypatch, enabled=enabled)
+    args = fixture.base.args
+    setup = Mock(return_value=torch.device("cpu"))
+    monkeypatch.setattr(dit_module.BaseTrainer, "_setup", setup)
+    monkeypatch.setattr(dit_module, "get_parallel_state", lambda: SimpleNamespace(dp_size=1))
+    monkeypatch.setattr(dit_module, "use_parallel_state", lambda state: nullcontext())
+    monkeypatch.setattr(dit_module.DiTModelRuntime, "parallel_state", property(lambda self: self.model_name))
+    for name in ("_build_data_transform", "_build_dataset", "_build_dataloader"):
+        monkeypatch.setattr(DiTTrainer, name, lambda self: None)
+    for name in ("_build_lr_scheduler", "_build_training_context", "_init_callbacks"):
+        monkeypatch.setattr(dit_module.BaseTrainer, name, lambda *args: None)
+
+    trainer = DiTTrainer(args)
+
+    setup.assert_called_once_with(args)
+    model_build.assert_called_once()
+    condition_build.assert_called_once()
+    assert isinstance(trainer.base.model, dit_module.DiTModelRuntime)
+    assert trainer.condition_model is trainer.base.model.condition_model
+    assert trainer.base.device == torch.device("cpu")
+    assert args.train.micro_batch_size == (2 if enabled else 1)
 
 
 def test_backend_error_from_model_hook_is_not_swallowed(monkeypatch):
     trainer, _, _ = _loader_trainer(monkeypatch)
     monkeypatch.setattr(_Model, "configure_remove_padding", Mock(side_effect=ValueError("unsupported backend")))
     with pytest.raises(ValueError, match="unsupported backend"):
-        trainer._build_model()
+        trainer._build_model_runtime()
 
 
 def test_capability_flag_without_hook_is_rejected():
@@ -251,10 +291,14 @@ def _forward_trainer(monkeypatch):
     monkeypatch.setattr(dit_module, "use_parallel_state", lambda name: nullcontext())
     trainer = DiTTrainer.__new__(DiTTrainer)
     trainer.training_task = "offline_training"
-    trainer.condition_model = _Condition()
+    runtime = dit_module.DiTModelRuntime.__new__(dit_module.DiTModelRuntime)
+    runtime.model = _Model()
+    runtime.model_name = "test"
+    runtime.condition_model = _Condition()
+    monkeypatch.setattr(dit_module.DiTModelRuntime, "parallel_state", property(lambda self: self.model_name))
     trainer.base = SimpleNamespace(
         args=_args(),
-        model=_Model(),
+        model=runtime,
         device="cpu",
         LOG_SAMPLE=False,
         num_micro_batches=2,
@@ -289,14 +333,14 @@ def test_disabled_forward_uses_legacy_condition_and_loss(monkeypatch):
     trainer.base.args.model.use_remove_padding = False
     model = nn.Linear(1, 1, bias=False)
     calls = []
-    trainer.condition_model = SimpleNamespace(process_condition=lambda **kw: {"input": kw["values"][0]})
+    trainer.base.model.condition_model = SimpleNamespace(process_condition=lambda **kw: {"input": kw["values"][0]})
 
     class Legacy(nn.Module):
         def forward(self, **kwargs):
             calls.append(kwargs)
             return SimpleNamespace(loss={"mse": model(**kwargs).square().mean()})
 
-    trainer.base.model = Legacy()
+    trainer.base.model.model = Legacy()
     loss, _ = trainer.forward_backward_step({"values": [torch.tensor([[3.0]])]})
     assert set(calls[0]) == {"input"}
     assert loss.ndim == 0

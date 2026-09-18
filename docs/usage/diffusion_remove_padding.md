@@ -84,9 +84,12 @@ def prepare_samples(self, **collated_inputs):
 ```
 
 Classes are resolved through the existing loader/registry; there is no second
-packing registry. A flag without the required callable is rejected. The model's
-configuration hook runs after construction but before the trainer's freeze/LoRA
-and distributed-wrap steps. The backend string is the **resolved**
+packing registry. A flag without the required callable is rejected.
+`DiTModelRuntime._build_model` checks both classes before constructing the
+condition model or loading DiT weights. It configures the newly built DiT before
+the runtime's freeze/LoRA, distributed-wrap and optimizer steps. `DiTTrainer`
+retains job setup and sample/loss dispatch; it does not own a second model-build
+path. The backend string is the **resolved**
 `OpsImplementationConfig.attn_implementation`, which can have a VeOmni-specific
 name such as `veomni_flash_attention_2_with_sp`; consumers must validate it, not
 assume they receive the original YAML spelling.

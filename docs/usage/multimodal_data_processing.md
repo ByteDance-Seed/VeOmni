@@ -26,6 +26,8 @@ Images are resized by `smart_resize` to satisfy three constraints simultaneously
 
 The resize preserves aspect ratio: it scales H and W by the same factor, then rounds to `scale_factor` multiples.
 
+`mm_configs` sets the pixel budget and resizes before the processor. Set `scale_factor` to the model's patch alignment (28 for Qwen-VL) so the processor has nothing left to round.
+
 **Example config:**
 ```yaml
 data:
