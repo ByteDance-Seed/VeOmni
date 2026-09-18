@@ -84,7 +84,9 @@ After `import veomni`:
   (`veomni_flash_attention_aiter_with_sp`) have no such branch in
   `_lazy_imports` and always fall through to the hub-kernel path. The
   adapter is the **critical** component that makes those two usable.
-- FA4 requires the `flash-attn-cute` package (`flash_attn.cute`), shipped
-  in the `gpu` extra; `uv sync --extra gpu` source-builds it.
+- FA4 requires the `flash-attn-4` package (`flash_attn.cute`), shipped
+  in the `gpu` extra; `uv sync --extra gpu` installs it from PyPI.
+  MagiAttention's companion `flash-attn-cute` package (`flash_attn_cute`)
+  is separate and lives in the optional `magi` extra.
 - aiter requires AMD ROCm and the `aiter` package, which is not in any extra —
   it ships in the ROCm image. See `docs/hardware_support/rocm/README.md`.

@@ -14,9 +14,13 @@
 
 
 import gc
+import hashlib
 import os
+import shutil
 from collections import OrderedDict
-from typing import Any, Dict, Optional, Union
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+from typing import Any, Dict, Optional, Set, Union
 
 import torch
 import torch.distributed as dist
@@ -41,15 +45,27 @@ from torch.distributed.checkpoint.stateful import Stateful
 from ..distributed.parallel_state import get_parallel_state
 from ..optim.optimizer import restore_optimizer_param_group_defaults
 from ..utils import logging
-from ..utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
 from ..utils.device import empty_cache, synchronize
+from ..utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
 from .checkpointer import CheckpointerBase
+from .layout import (
+    DCP_MARKER_FILENAME,
+    OPTIMIZER_DIRNAME,
+    WEIGHTS_DIRNAME,
+    dcp_markers,
+    model_dir,
+    optimizer_dir,
+    step_dir,
+    weights_dir,
+)
+from .layout import (
+    LR_SCHEDULER_FILENAME as _LR_SCHEDULER_FILENAME,
+)
 
 
 logger = logging.get_logger(__name__)
 
-_EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
-_EXTRA_STATE_DIR = "extra_state"
+_LR_SCHEDULER_KEY = "lr_scheduler"
 
 
 class _ModelStrictLoadPlanner(DefaultLoadPlanner):
@@ -154,6 +170,13 @@ def _apply_extra_parallel_dim(
             spec_info = extra_parallel_fqn2spec_info[matches[0]]
 
         if not isinstance(spec_info.placement, Shard):
+            continue
+
+        # Persistent ExtraParallel parameters already use their complete
+        # runtime placement (for example PLE ``[Shard(1), Shard(0)]`` on
+        # ``(ple_fsdp, ple)``). They are not managed by FSDP2, so there is no
+        # temporary ExtraParallel dimension to drop or restore around DCP.
+        if getattr(spec_info, "persistent_fsdp_shard_dim", None) is not None:
             continue
 
         tensor = state_dict[name]
@@ -268,9 +291,20 @@ class OptimizerState(Stateful):
     cannot be scoped to optimizer-only). ``_ModelStrictLoadPlanner`` therefore
     validates model-key completeness from checkpoint metadata before loading a
     non-LoRA full-model DCP.
+
+    Args:
+        model: the model whose parameters the optimizer owns.
+        optimizer: the optimizer to save or load.
+        parallel_state: optional parallel state; otherwise ``get_parallel_state()`` is used.
+        load: when ``True`` (the normal resume path), ``state_dict()`` returns a
+            dense state dict so DCP knows where to place restored optimizer
+            entries.  When ``False`` (the save path), the returned dict is
+            sparse and skips sub-optimizers that have never been stepped,
+            avoiding synthetic zero state for unused parameters (e.g. unused
+            MoE experts) in the checkpoint.
     """
 
-    def __init__(self, model, optimizer, parallel_state=None):
+    def __init__(self, model, optimizer, parallel_state=None, *, load: bool = False):
         self.model = model
         self.optimizer = optimizer
         self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
@@ -278,6 +312,7 @@ class OptimizerState(Stateful):
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
         )
+        self._load = load
 
     def state_dict(self):
         if self.should_extra_parallel_aware:
@@ -293,6 +328,11 @@ class OptimizerState(Stateful):
             )
             return optim_sd_with_extra_parallel_dim
 
+        if getattr(self.optimizer, "_is_multi_optimizer", False):
+            if self._load:
+                return self.optimizer.state_dict()
+            return self.optimizer._sparse_state_dict()
+
         return get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
 
     def load_state_dict(self, state_dict):
@@ -306,6 +346,11 @@ class OptimizerState(Stateful):
             self.optimizer.load_state_dict(optim_state_without_extra_parallel_dim)
             # MultiOptimizer sub-optimizers can also lose param-group hyperparams
             # (betas/...) for empty groups after load; restore recurses into them.
+            restore_optimizer_param_group_defaults(self.optimizer)
+            return
+
+        if getattr(self.optimizer, "_is_multi_optimizer", False):
+            self.optimizer.load_state_dict(optim_state_from_dcp_load)
             restore_optimizer_param_group_defaults(self.optimizer)
             return
 
@@ -428,14 +473,307 @@ def restore_extra_parallel_dim(
     return dtensor
 
 
+def _local_rank() -> int:
+    """This process's rank within its node, as set by the elastic launcher.
+
+    Elects one rank per node for the node-local staging work; defaults to 0 so
+    single-process runs still take the leader path.
+    """
+    value = os.environ.get("LOCAL_RANK", "0")
+    return int(value) if value.isdigit() else 0
+
+
+def _stage_key(path: str) -> str:
+    """Directory name that isolates one run's staged files from another's.
+
+    Substituting separators would collide -- it maps ``/tmp/a_b/c`` and
+    ``/tmp/a/b_c`` onto one name -- so the name is a digest of the absolute path,
+    prefixed with the basename to stay identifiable on disk.
+    """
+    absolute = os.path.abspath(path)
+    digest = hashlib.sha256(absolute.encode("utf-8")).hexdigest()[:16]
+    return f"{os.path.basename(absolute) or 'ckpt'}-{digest}"
+
+
+class _Promotion:
+    """Failure state shared by the phases of one promotion.
+
+    ``error`` is what this rank saw, ``failed`` what the whole group saw: the work
+    is split across ranks -- one leader per node copies that node's files -- so a
+    failure starts out visible to a single rank.
+    """
+
+    def __init__(self) -> None:
+        self.error: Optional[BaseException] = None
+        self.failed = False
+
+
+def _promotion_phase(state: _Promotion, work, *, participates: bool, group: Optional[Any] = None) -> None:
+    """Run one phase on the ranks that take part, then let every rank agree on the result.
+
+    The closing reduction is the phase's only collective and every rank reaches it
+    on every path, including the failing one. Collectives are untagged, so a rank
+    that returned early would leave the others pairing up with the wrong one from
+    then on and the save would hang instead of failing; one collective per phase
+    keeps the counts equal by construction rather than by inspection.
+
+    ``BaseException`` because ``work`` is arbitrary and the guarantee above is
+    structural: anything that escapes this catch skips the reduction, and the
+    ranks that did reach it wait for a peer that has already left.
+    """
+    if participates and not state.failed:
+        try:
+            work()
+        except BaseException as e:  # noqa: BLE001 - raised once every phase is done
+            if state.error is None:
+                state.error = e
+    try:
+        state.failed = any_rank_failed(state.error is not None, group=group) or state.failed
+    except BaseException as group_error:
+        # The group itself failed, e.g. peers timed out first. Keep this rank's own
+        # error as the cause, or the log only shows the connection closing.
+        if state.error is not None:
+            raise group_error from state.error
+        raise
+
+
+_STAGE_ROOT = "veomni_ckpt_stage"
+
+
+def _gloo_timeout(timeout_seconds: Optional[int]) -> Optional[timedelta]:
+    """``save_timeout_seconds`` as a process-group timeout; None keeps gloo's default."""
+    return timedelta(seconds=timeout_seconds) if timeout_seconds is not None else None
+
+
+def _prepare_stage_dir(stage_dir: str, path: str, group: Optional[Any] = None) -> str:
+    """Create the empty staging directory for the run writing to ``path``.
+
+    One directory per run, shared by every checkpoint it writes and emptied
+    first. That is also how a save killed part-way is cleaned up: its copy -- the
+    size of the model plus its optimizer state -- is left exactly where the next
+    save clears it, instead of stranded under a key naming its own step.
+
+    Keyed on ``path`` because ``stage_dir`` is often something generic like /tmp
+    and this directory gets swept: two runs sharing a node must not land in the
+    same place, or one would delete the other's staged data.
+
+    Only the node leader touches the filesystem; peers would race the sweep and
+    have no need to, since the reduction below is a collective. That reduction
+    also keeps a per-node failure -- a full or read-only scratch disk -- from
+    being seen by one rank alone, which would leave the rest waiting in
+    ``dcp.save`` on a collective that never arrives.
+    """
+    stage_path = os.path.join(stage_dir, _STAGE_ROOT, _stage_key(path))
+    error: Optional[BaseException] = None
+    if _local_rank() == 0:
+        try:
+            shutil.rmtree(stage_path, ignore_errors=True)
+            os.makedirs(stage_path, exist_ok=True)
+        except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
+            # ``BaseException`` for the reason ``_promotion_phase`` documents:
+            # anything that escapes here skips the reduction below, and the ranks
+            # that did reach it wait for a peer that has already left.
+            error = e
+    if any_rank_failed(error is not None, group=group):
+        raise error or RuntimeError(f"another rank could not prepare a staging directory under {stage_dir}")
+    return stage_path
+
+
+def _promote_staged_checkpoint(
+    stage_path: str, final_path: str, step_root: Optional[str] = None, group: Optional[Any] = None
+) -> None:
+    """Copy a staged checkpoint to its destination, then drop the staged copy.
+
+    The staging directory is node-local, so one rank per node copies all of it
+    rather than each rank working out which files it wrote; that keeps this
+    independent of DCP's file naming.
+
+    Three phases, each ending in a single collective on ``group`` (see
+    ``_promotion_phase``). A phase's error is re-raised on every rank once all
+    three have run; a failure of the group itself -- a timeout, a dead peer --
+    raises out of the phase it hit, where NCCL would have aborted the process.
+    Either way a node leader frees its staged copy in a ``finally``; one killed
+    mid-copy leaves it for the next save's ``_prepare_stage_dir`` to sweep.
+
+    ``.metadata`` is what DCP reads as "this DCP directory is complete", and the
+    staged tree holds one per directory -- ``ckpt/`` and ``optimizer/``. The
+    destination is emptied first, before anything is overwritten, and the new
+    markers go last and only if every rank's data landed -- so a reader sees
+    either the previous complete checkpoint or none, never a completion marker
+    over data that is only partly there, and never this save's files mixed with
+    a previous one's.
+
+    This is the *only* place a staged save invalidates its destination. Doing it
+    when the save starts, as the unstaged path does, would throw away the
+    previous checkpoint before the new one exists anywhere -- and keeping that
+    checkpoint readable until the last possible moment is what staging is for.
+
+    ``step_root`` is the step directory, given when the destination may hold a
+    pre-split checkpoint whose marker sits there rather than inside
+    ``final_path``. Nested files are copied in the data phase, before any
+    ``.metadata`` is. ``lr_scheduler.pt`` is one of those files.
+    """
+    metadata_name = DCP_MARKER_FILENAME
+    is_node_leader = _local_rank() == 0
+    is_coordinator = (not dist.is_initialized()) or dist.get_rank() == 0
+    state = _Promotion()
+
+    def staged_markers() -> list[str]:
+        """Relative path of every ``.metadata`` in the staged tree.
+
+        DCP writes the marker from its coordinator rank, so only that rank has
+        them staged -- which is also the only rank that deletes and copies them.
+        """
+        rels: list[str] = []
+        for dirpath, _dirnames, filenames in os.walk(stage_path):
+            for filename in filenames:
+                if filename == metadata_name:
+                    rels.append(os.path.relpath(os.path.join(dirpath, filename), stage_path))
+        return sorted(rels)
+
+    # Listed once, up front. Retracting a marker must not depend on the staged
+    # tree still being there: the cleanup below removes it, and a promotion that
+    # failed is exactly when both run.
+    markers = staged_markers()
+
+    def clear_destination() -> None:
+        """Empty the destination, so the staged tree replaces it rather than merges.
+
+        Deleting only the files about to be overwritten would leave whatever the
+        previous save wrote and this one does not: a weights-only save over a
+        step that has an optimizer keeps that optimizer's shards *and* its
+        ``.metadata``, and the step then reads as a complete checkpoint pairing
+        this run's weights with an earlier run's optimizer.
+
+        Nothing is lost that the destination could still have used. A marker has
+        to go before its shards are overwritten either way, and without one DCP
+        will not read the directory at all.
+
+        One module's directory. A sibling module of the same job lives beside it,
+        is not being written, and keeps everything it has.
+        """
+        # The step may predate this layout, in which case DCP left its marker at
+        # the step root rather than in here. Delete this import (and
+        # veomni/checkpoint/legacy_v0_1_12.py) to drop that layout.
+        from .legacy_v0_1_12 import drop_marker
+
+        shutil.rmtree(final_path, ignore_errors=True)
+        os.makedirs(final_path, exist_ok=True)
+        if step_root is not None:
+            drop_marker(step_root)
+
+    def copy_this_nodes_files() -> None:
+        """Copy every staged file on this node, except the completion markers.
+
+        Walks the tree so nested directories are copied, not skipped.
+        """
+        os.makedirs(final_path, exist_ok=True)
+
+        names: list[str] = []
+        for dirpath, _dirnames, filenames in os.walk(stage_path):
+            for filename in filenames:
+                if filename == metadata_name:
+                    continue
+                names.append(os.path.relpath(os.path.join(dirpath, filename), stage_path))
+        names.sort()
+
+        def _copy(rel: str) -> None:
+            """Copy one staged file to the destination, preserving its relative path."""
+            src = os.path.join(stage_path, rel)
+            dst = os.path.join(final_path, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(src, dst)
+
+        if names:
+            with ThreadPoolExecutor(max_workers=min(16, len(names))) as pool:
+                list(pool.map(_copy, names))
+
+    def drop_destination_markers() -> None:
+        """Remove every marker this promotion could have copied.
+
+        Earlier markers go with the one that failed: half a model is not
+        resumable, and leaving one valid directory behind would misreport which
+        part survived.
+        """
+        for rel in markers:
+            dst = os.path.join(final_path, rel)
+            try:
+                if os.path.exists(dst):
+                    os.remove(dst)
+            except OSError:
+                logger.error(f"could not remove the completion marker {dst}", exc_info=True)
+
+    def copy_markers() -> None:
+        """Copy the completion markers last, or leave none behind if that fails."""
+        try:
+            for rel in markers:
+                dst = os.path.join(final_path, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copyfile(os.path.join(stage_path, rel), dst)
+        except BaseException:
+            # copyfile creates the destination before writing it, so a failure
+            # can leave a truncated marker -- worse than none, since DCP would
+            # read it as a complete directory.
+            drop_destination_markers()
+            raise
+
+    promoted = False
+    try:
+        _promotion_phase(state, clear_destination, participates=is_coordinator, group=group)
+        _promotion_phase(state, copy_this_nodes_files, participates=is_node_leader, group=group)
+        _promotion_phase(state, copy_markers, participates=is_coordinator, group=group)
+        promoted = not state.failed
+    finally:
+        # The markers are copied before the phase that agrees on them, so a
+        # failure of the agreement itself -- a peer gone, the group timed out --
+        # would leave them standing over a save that did not finish. The step
+        # keeps the previous run's manifest until the cursor files are rewritten,
+        # and the two together read as a complete checkpoint pairing this run's
+        # model state with that run's cursor.
+        #
+        # This covers the failures the coordinator itself observes, which is
+        # every agreed one. A reduction that fails on a peer alone, or a
+        # coordinator that dies between copying the markers and agreeing on
+        # them, still leaves them behind; the next save of that step clears the
+        # destination before writing, so they are stale for one step at most.
+        if is_coordinator and not promoted:
+            drop_destination_markers()
+        # The staged copy is as large as the model plus its optimizer state, and
+        # nothing is lost by dropping it: without a marker the destination reads
+        # as incomplete, which it is.
+        if is_node_leader:
+            shutil.rmtree(stage_path, ignore_errors=True)
+
+    if state.error is not None:
+        raise state.error
+    if state.failed:
+        raise RuntimeError("checkpoint promotion failed on another rank; no completion marker was written")
+
+
 class DistributedCheckpointer(CheckpointerBase):
     """
     Distributed checkpointer for torch.distributed.checkpoint
     """
 
-    save_future: Optional[Any] = None
-    # Dedicated process group for async saves (created on first use)
-    _async_process_group: Optional[Any] = None
+    # One in-flight async save per slot. A step writes the weights and the
+    # optimizer into two directories, so there are two saves to track rather than
+    # one.
+    #
+    # Each slot gets its own Gloo group. ``dcp.async_save`` hands the group it is
+    # given to a background thread that runs the *whole* save, collectives
+    # included -- it asserts a CPU backend for exactly that reason. Two saves
+    # sharing one group would have two threads issuing collectives on it at once,
+    # and ranks that interleave them differently deadlock. Separate groups let
+    # the two writes overlap; sharing one would force the second to wait out the
+    # first, which is what draining before each save used to do.
+    _save_futures: Dict[str, Any] = {}
+    _async_process_groups: Dict[str, Any] = {}
+    # The gloo group a staged save's own collectives run on, created on first use.
+    _stage_process_group: Optional[Any] = None
+    # Both group caches live as long as the process: a run initialises distributed
+    # once and tears it down on the way out, so there is no point at which a stale
+    # group could be read back. Reusing a process across runs would have to clear
+    # them here, together with ``_save_futures``.
 
     @classmethod
     def save(
@@ -444,20 +782,34 @@ class DistributedCheckpointer(CheckpointerBase):
         state: Dict[str, Any],
         save_async: bool = False,
         global_steps: int = None,
-        storage_writer: Optional[FileSystemWriter] = None,
+        module: str = "",
         trainable_only: bool = False,
         save_to_lowest_rank: bool = False,
         parallel_state=None,
+        stage_dir: Optional[str] = None,
+        save_timeout_seconds: Optional[int] = None,
     ) -> None:
         """
         save training state to distributed checkpoint
+
+        Writes three things under ``model/`` (see ``veomni.checkpoint.layout``):
+        ``ckpt/`` for the weights, ``optimizer/`` for the optimizer state, and a
+        replicated ``lr_scheduler.pt``. Weights and optimizer are separate DCP
+        directories so the weights can be shipped or converted on their own; a
+        single directory interleaves both into the same ``.distcp`` files.
 
         args:
             path: path to save checkpoint
             state: state to save
             save_async: whether to save asynchronously
-            global_steps: global steps
-            storage_writer: storage writer backend for dcp.save and dcp.async_save. If None, will use FileSystemWriter
+            global_steps: step this checkpoint belongs to. Given, the checkpoint goes
+                into a per-step subdirectory of ``path`` and ``path`` identifies the run,
+                which is what ``stage_dir`` keys its staging directory on. Callers that
+                fold the step into ``path`` themselves get a staging directory per step.
+            module: name of the model this checkpoint belongs to, for a job that trains
+                several (SeedOmni V2). Nests every artifact under ``model/<module>/``.
+                Empty for a single-model job, which is the only difference between the
+                two cases.
             trainable_only: when True, only persist parameters with ``requires_grad=True``
                 (LoRA / PEFT path). Frozen base weights are skipped on save and must be
                 re-materialised from ``model.model_path`` at resume time. The optimizer
@@ -473,37 +825,144 @@ class DistributedCheckpointer(CheckpointerBase):
                 checkpoint. Note this only consolidates *replicated* data: unique shards from
                 expert/tensor/pipeline parallelism are never deduplicated and remain distributed.
                 See ``CheckpointConfig.dcp_save_to_lowest_rank``.
+            stage_dir: write the checkpoint here and copy it to ``path`` afterwards,
+                instead of writing straight to ``path``. Intended for a destination far
+                slower than local disk. The whole ``model/`` subtree — both DCP
+                directories and the scheduler sidecar — lands under the staging
+                directory and is copied together, with every ``.metadata`` copied
+                last. Staging is keyed per module as well as per run, so two modules
+                of one job do not sweep each other's staged files. The caller
+                owns the choice: this does not probe
+                for a usable directory or check free space, and an unusable ``stage_dir``
+                fails the save rather than silently writing elsewhere. See
+                ``CheckpointConfig.stage_dir``.
+            save_timeout_seconds: collective timeout for the gloo groups this save runs
+                its own collectives on -- staging's, and each ``save_async`` slot's. It
+                has to outlast the work, since the ranks not writing wait on it for the
+                whole duration. Unset keeps gloo's default.
         return:
             None
         """
         if "model" not in state:
             raise ValueError("Model must be provided to save a distributed checkpoint.")
 
-        checkpoint_dir = f"{path}/{_GLOBAL_STEP_PREFIX}{global_steps}" if global_steps else path
-        cls._create_checkpoint_dir(checkpoint_dir)
+        # Rejected up front, before anything reaches disk: an async write is still
+        # running when save() returns and drops the staged copy, so it would write
+        # straight to the slow destination staging was meant to avoid.
+        if stage_dir and save_async:
+            raise ValueError("stage_dir cannot be combined with save_async")
 
-        # saving extra_state first to gurantee that every saved model/optimizer ckpts have their extra_state saved before them
-        cls._save_extra_state(checkpoint_dir=checkpoint_dir, state=state)
+        # ``is not None`` rather than truthiness: step 0 is a step like any other, and
+        # folding it onto ``path`` would write it over the run's own directory.
+        checkpoint_dir = step_dir(path, global_steps) if global_steps is not None else path
+        model_root = model_dir(checkpoint_dir, module)
 
-        save_state = {
-            "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
-        }
-        if "optimizer" in state:
-            save_state["optimizer"] = OptimizerState(
-                model=state["model"], optimizer=state["optimizer"], parallel_state=parallel_state
+        # Keyed on the module's own run-level path, not just ``path``: a
+        # multi-module job calls this once per module, and a single key would have
+        # each module clear the previous one's staged files.
+        stage_key_path = os.path.join(path, module) if module else path
+        # Staging's collectives run on a gloo group rather than the training backend:
+        # the copy to a slow destination outlasts NCCL's watchdog, which aborts the
+        # process where gloo raises. Created up front, before any rank can fail.
+        stage_group = cls._get_stage_process_group(save_timeout_seconds) if stage_dir else None
+        stage_path = _prepare_stage_dir(stage_dir, stage_key_path, group=stage_group) if stage_dir else None
+        write_root = stage_path or model_root
+
+        if stage_path is None:
+            # Nothing stands between this save and the previous checkpoint's
+            # shards, so its markers have to go before the first byte lands --
+            # otherwise a save that dies part-way leaves one describing shards
+            # that are half this step and half the last. A staged save invalidates
+            # its destination in ``_promote_staged_checkpoint`` instead, at the
+            # point where it is about to overwrite it for real.
+            #
+            # The manifest is not ours either way; ``GlobalStateCallback`` clears
+            # the one it writes.
+            cls._remove_dcp_markers(checkpoint_dir, module)
+
+        cls._create_checkpoint_dir(write_root)
+
+        # Sidecar first, then the DCP directories. Ordering no longer carries the
+        # completeness guarantee it used to — ``checkpoint_manifest.json`` does,
+        # and it is written only after every module's save has returned — but
+        # writing the small replicated file first still means a save that dies
+        # part-way leaves less behind.
+        cls._save_lr_scheduler(checkpoint_dir=write_root, state=state)
+
+        try:
+            cls.execute_save(
+                save_state={
+                    "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
+                },
+                storage_writer=cls._create_storage_writer(os.path.join(write_root, WEIGHTS_DIRNAME)),
+                save_async=save_async,
+                save_to_lowest_rank=save_to_lowest_rank,
+                slot=WEIGHTS_DIRNAME,
+                timeout_seconds=save_timeout_seconds,
             )
 
-        if storage_writer is None:
-            storage_writer = cls._create_storage_writer(checkpoint_dir)
+            if "optimizer" in state and state["optimizer"] is not None:
+                cls.execute_save(
+                    save_state={
+                        "optimizer": OptimizerState(
+                            model=state["model"],
+                            optimizer=state["optimizer"],
+                            parallel_state=parallel_state,
+                            load=False,
+                        )
+                    },
+                    storage_writer=cls._create_storage_writer(os.path.join(write_root, OPTIMIZER_DIRNAME)),
+                    save_async=save_async,
+                    save_to_lowest_rank=save_to_lowest_rank,
+                    slot=OPTIMIZER_DIRNAME,
+                    timeout_seconds=save_timeout_seconds,
+                )
+        except BaseException:
+            if stage_path is not None and _local_rank() == 0:
+                shutil.rmtree(stage_path, ignore_errors=True)
+            raise
 
-        cls.execute_save(
-            save_state=save_state,
-            storage_writer=storage_writer,
-            save_async=save_async,
-            save_to_lowest_rank=save_to_lowest_rank,
-        )
+        if stage_path is not None:
+            _promote_staged_checkpoint(stage_path, model_root, step_root=checkpoint_dir, group=stage_group)
 
-        logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
+        logger.info_rank0(f"Saved checkpoint to {model_root}")
+
+    @classmethod
+    def _remove_dcp_markers(cls, checkpoint_dir: str, module: str) -> None:
+        """Delete the ``.metadata`` files vouching for what this save overwrites.
+
+        The unstaged path's invalidation, run before the first byte lands. A
+        staged save has ``_promote_staged_checkpoint`` do the same job at
+        promotion time, because until then it has overwritten nothing.
+
+        Two places to look. This module's ``ckpt/`` and ``optimizer/``, and the
+        step root, where an older VeOmni's fused save left the same file. Both
+        are DCP's own marker, which is why both are dropped here rather than by
+        the callback: this class is the one that puts them back.
+
+        Only this module's. A sibling module is not being rewritten and its
+        markers still hold. The step's ``checkpoint_manifest.json`` is not ours
+        either -- ``GlobalStateCallback`` writes it and clears it.
+
+        One rank owns these files, so only that rank deletes them, and the
+        reduction turns a failure there into one every rank sees.
+        """
+        # The step being overwritten may predate this layout, in which case DCP
+        # left its marker at the step root. Delete this import (and
+        # veomni/checkpoint/legacy_v0_1_12.py) to drop that layout.
+        from .legacy_v0_1_12 import drop_marker
+
+        is_coordinator = (not dist.is_initialized()) or dist.get_rank() == 0
+        error: Optional[Exception] = None
+        if is_coordinator:
+            try:
+                drop_marker(checkpoint_dir)
+                for marker in dcp_markers(checkpoint_dir, [module]):
+                    if os.path.exists(marker):
+                        os.remove(marker)
+            except Exception as e:  # noqa: BLE001 - raised once every rank has agreed
+                error = e
+        raise_if_any_rank_failed(error, f"removing the old DCP markers under {checkpoint_dir}")
 
     @classmethod
     def load(
@@ -511,17 +970,24 @@ class DistributedCheckpointer(CheckpointerBase):
         path: str,
         state: Dict[str, Any],
         process_group=None,
-        storage_reader: Optional[FileSystemReader] = None,
+        module: str = "",
         trainable_only: bool = False,
         parallel_state=None,
     ) -> Dict[str, Any]:
         """
         load training state from distributed checkpoint
+
+        Mirrors :meth:`save`: weights from ``model/<module>/ckpt``, optimizer from
+        ``model/<module>/optimizer``, scheduler from the sidecar beside them. A
+        checkpoint written before the split has no ``model/`` at all and keeps
+        both in one directory; that shape is detected and read as-is.
+
         args:
-            path: path to load checkpoint
-            state: state to load, "model" are required,  "optimizer" and "extra_state" are optional
+            path: step directory to load from
+            state: state to load, "model" is required; "optimizer" and "lr_scheduler" are optional
             process_group: process group for loading checkpoint
-            storage_reader: storage reader backend for dcp.load. If None, will use FileSystemReader
+            module: name of the model to load, for a job that trains several.
+                Empty for a single-model job. See :meth:`save`.
             trainable_only: when True, ``set_model_state_dict`` runs in non-strict
                 mode (``StateDictOptions(strict=False)``). Use this for LoRA / PEFT
                 resumes where the DCP only contains trainable adapter weights and the
@@ -531,63 +997,169 @@ class DistributedCheckpointer(CheckpointerBase):
         return:
             state: state loaded
         """
-        checkpoint_dir = path
-
         if state is None:
             raise ValueError("State dict must be provided to load a distributed checkpoint.")
 
         if "model" not in state:
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
-        load_state = {
-            "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
-        }
-        if "optimizer" in state:
-            load_state["optimizer"] = OptimizerState(
-                model=state["model"], optimizer=state["optimizer"], parallel_state=parallel_state
-            )  # type: ignore[index]
+        def _model_state() -> "ModelState":
+            return ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
 
-        if storage_reader is None:
-            storage_reader = cls._create_storage_reader(checkpoint_dir)
+        def _optimizer_state() -> "OptimizerState":
+            return OptimizerState(
+                model=state["model"],
+                optimizer=state["optimizer"],
+                parallel_state=parallel_state,
+                load=True,
+            )
 
+        wants_optimizer = state.get("optimizer") is not None
+
+        fused_dir = cls._legacy_fused_dir(path, module)
+        if fused_dir is not None:
+            load_state: Dict[str, Any] = {"model": _model_state()}
+            if wants_optimizer:
+                load_state["optimizer"] = _optimizer_state()
+            dcp.load(
+                state_dict=load_state,
+                storage_reader=cls._create_storage_reader(fused_dir),
+                process_group=process_group,
+                planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
+            )
+            cls._load_lr_scheduler(checkpoint_dir=fused_dir, state=state)
+            logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
+            return state
+
+        model_root = model_dir(path, module)
         dcp.load(
-            state_dict=load_state,
-            storage_reader=storage_reader,
+            state_dict={"model": _model_state()},
+            storage_reader=cls._create_storage_reader(weights_dir(path, module)),
             process_group=process_group,
             planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
         )
+        if wants_optimizer:
+            dcp.load(
+                state_dict={"optimizer": _optimizer_state()},
+                storage_reader=cls._create_storage_reader(optimizer_dir(path, module)),
+                process_group=process_group,
+                # The strict check looks for missing ``model`` keys; there are none
+                # in an optimizer-only load, so strictness has nothing to say here.
+                planner=_ModelStrictLoadPlanner(strict_model=False),
+            )
 
-        cls._load_extra_state(checkpoint_dir=checkpoint_dir, state=state)
+        cls._load_lr_scheduler(checkpoint_dir=model_root, state=state)
 
-        logger.info_rank0(f"Loaded checkpoint from {checkpoint_dir}")
+        logger.info_rank0(f"Loaded checkpoint from {model_root}")
 
         return state
 
     @classmethod
-    def wait_for_pending_save(cls) -> None:
-        """Block until any pending async DCP save completes.
+    def _legacy_fused_dir(cls, path: str, module: str) -> Optional[str]:
+        """Directory holding a pre-split checkpoint, or ``None`` for a current one.
 
-        Safe to call when no save is pending (no-op).  Re-raises any
-        exception from the pending save after logging which rank saw it.
-        After completion, all ranks synchronize via a barrier so callers
-        can safely begin a new collective operation.
+        Before weights and optimizer were separated there was one DCP directory
+        per model, marked by its own ``.metadata``: at the step root for a
+        single-model job, and at ``<step>/<module>/`` for SeedOmni V2. Neither has
+        a ``model/`` subtree, which is what tells the two apart.
+        """
+        if os.path.exists(os.path.join(weights_dir(path, module), DCP_MARKER_FILENAME)):
+            return None
+        legacy_dir = os.path.join(path, module) if module else path
+        if os.path.exists(os.path.join(legacy_dir, DCP_MARKER_FILENAME)):
+            return legacy_dir
+        return None
+
+    @classmethod
+    def wait_for_pending_save(cls) -> None:
+        """Block until every pending async DCP save completes.
+
+        Safe to call when no save is pending (no-op).  Every rank ends up
+        raising if any rank's save failed, and the reductions that decide
+        that are also the synchronization callers rely on before starting a
+        new collective. There is one per drained slot, on that slot's own
+        gloo group: the write it covers ran there too, so the ranks that
+        finished first wait out the others off the training backend.
 
         This is the single entrypoint for all async-save coordination —
-        prefer calling this over poking ``save_future`` directly.
+        prefer calling this over poking ``_save_futures`` directly.
+
+        Every slot is drained even when one raises, so a failed weights write
+        cannot leave the optimizer write running into the next step's
+        collectives. That is also why the catch below is ``BaseException``:
+        DCP reports a failed save as ``CheckpointException``, which derives
+        from ``BaseException`` rather than ``Exception``, so catching the
+        latter would let the very failures this drains for escape the loop --
+        leaving the remaining slots running and their futures unreachable.
         """
-        if cls.save_future is None:
+        if not cls._save_futures:
             return
         rank = dist.get_rank() if dist.is_initialized() else 0
+        futures = cls._save_futures
+        cls._save_futures = {}
+        errors: Dict[str, BaseException] = {}
+        for slot, future in futures.items():
+            try:
+                logger.info(f"[RANK {rank}] waiting for pending DCP save ({slot}) to end...")
+                future.result()
+            except BaseException as e:  # noqa: BLE001 - re-raised once every rank has agreed
+                logger.error(f"[RANK {rank}] pending async DCP save ({slot}) raised; propagating", exc_info=True)
+                errors[slot] = e
+        # Agreeing after the loop rather than inside it is what drains every slot
+        # even when one raised. The slots are the same on every rank, and so is
+        # their order, so the reductions below line up. Reducing on the slot's
+        # group is safe here because every rank's future has resolved: the save
+        # that owned that group has stopped issuing collectives on it. The lookup
+        # misses only when the save ran without a process group at all, in a
+        # single process, where the reduction is a no-op anyway.
+        for slot in futures:
+            raise_if_any_rank_failed(
+                errors.get(slot), f"a pending async DCP save ({slot})", group=cls._async_process_groups.get(slot)
+            )
+
+    @classmethod
+    def _drain_slot(cls, slot: str) -> None:
+        """Finish this slot's previous save before its process group is reused.
+
+        DCP surfaces an async failure through the future of the rank that hit
+        it, and the save's own process group does not reduce that across the
+        group. Raising here on the failing rank alone would leave its peers in
+        the reduction below with nobody to meet -- which is also why the catch
+        is ``BaseException``: DCP's ``CheckpointException`` does not derive
+        from ``Exception``, and letting it past the reduction is exactly the
+        hang this method exists to prevent.
+
+        The agreement runs on the slot's own gloo group, like the write it
+        follows: ranks whose write finished first wait out the rest there rather
+        than in the training backend, whose watchdog aborts the process.
+        """
+        future = cls._save_futures.pop(slot, None)
+        if future is None:
+            return
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        error: Optional[BaseException] = None
         try:
-            logger.info(f"[RANK {rank}] waiting for previous DCP saving session to end...")
-            cls.save_future.result()
-        except Exception:
-            logger.error(f"[RANK {rank}] previous async DCP save raised; propagating", exc_info=True)
-            raise
-        finally:
-            cls.save_future = None
-        if dist.is_initialized():
-            dist.barrier()
+            logger.info(f"[RANK {rank}] waiting for previous DCP save ({slot}) to end...")
+            future.result()
+        except BaseException as e:  # noqa: BLE001 - re-raised once every rank has agreed
+            logger.error(f"[RANK {rank}] previous async DCP save ({slot}) raised; propagating", exc_info=True)
+            error = e
+        raise_if_any_rank_failed(
+            error, f"the previous async DCP save ({slot})", group=cls._async_process_groups.get(slot)
+        )
+
+    @classmethod
+    def _get_stage_process_group(cls, timeout_seconds: Optional[int]) -> Optional[Any]:
+        """The gloo group a staged save runs its collectives on, created on first use.
+
+        Creating a group is itself a collective, so every rank must reach this in the
+        same order. Cached for the life of the process, like the async slot groups:
+        ``timeout_seconds`` takes effect on the first staged save, and a group broken
+        by a timeout is not rebuilt -- the save that broke it has already failed the run.
+        """
+        if cls._stage_process_group is None and dist.is_initialized():
+            cls._stage_process_group = dist.new_group(backend="gloo", timeout=_gloo_timeout(timeout_seconds))
+        return cls._stage_process_group
 
     @classmethod
     def execute_save(
@@ -596,24 +1168,36 @@ class DistributedCheckpointer(CheckpointerBase):
         storage_writer: FileSystemWriter,
         save_async: bool,
         save_to_lowest_rank: bool = False,
+        slot: str = WEIGHTS_DIRNAME,
+        timeout_seconds: Optional[int] = None,
     ) -> None:
         """Execute DCP save with optional async support.
 
         ``save_to_lowest_rank`` is forwarded to ``DefaultSavePlanner``; the default
         (False) preserves DCP's load-balanced write assignment across replica holders.
+
+        ``slot`` names the concurrent async save this call belongs to — one per
+        directory a step writes. Only the *same* slot's previous save is drained,
+        so the weights and the optimizer overlap within a step while neither can
+        outlive its own next write. ``timeout_seconds`` is that slot's group
+        timeout, applied when the group is created.
         """
         planner = DefaultSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
         if save_async:
-            # Lazily create a dedicated Gloo process group for async DCP saves
-            if cls._async_process_group is None:
-                cls._async_process_group = dist.new_group(backend="gloo")
+            # Lazily create this slot's dedicated Gloo process group. Creating a
+            # group is itself collective, and every rank runs the same save
+            # sequence, so every rank creates the same groups in the same order.
+            if slot not in cls._async_process_groups:
+                cls._async_process_groups[slot] = dist.new_group(
+                    backend="gloo", timeout=_gloo_timeout(timeout_seconds)
+                )
 
-            cls.wait_for_pending_save()
+            cls._drain_slot(slot)
 
-            cls.save_future = dcp.async_save(
+            cls._save_futures[slot] = dcp.async_save(
                 state_dict=save_state,
                 storage_writer=storage_writer,
-                process_group=cls._async_process_group,
+                process_group=cls._async_process_groups[slot],
                 planner=planner,
             )
         else:
@@ -650,31 +1234,54 @@ class DistributedCheckpointer(CheckpointerBase):
         )
 
     @classmethod
-    def _save_extra_state(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
-        """Save extra_state to checkpoint directory."""
-        if "extra_state" not in state:
-            logger.warning_rank0("extra_state not found in state, skipping extra_state save")
-            return
+    def _save_lr_scheduler(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
+        """Pickle ``lr_scheduler.state_dict`` into a single ``lr_scheduler.pt``.
 
-        extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
-        os.makedirs(extra_state_dir, exist_ok=True)
-        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
-        torch.save(
-            state["extra_state"],
-            extra_state_path,
-        )
+        The scheduler is replicated across ranks, so only rank 0 writes. Every
+        rank still joins the reduction afterwards: a failed write must not let
+        peers enter the DCP collective alone.
+        """
+        error: Optional[Exception] = None
+        is_writer = (not dist.is_initialized()) or dist.get_rank() == 0
+        if is_writer:
+            try:
+                if _LR_SCHEDULER_KEY not in state:
+                    logger.warning_rank0("lr_scheduler not found in state, skipping lr_scheduler save")
+                else:
+                    lr_scheduler = state[_LR_SCHEDULER_KEY]
+                    if lr_scheduler is not None:
+                        torch.save(lr_scheduler.state_dict(), os.path.join(checkpoint_dir, _LR_SCHEDULER_FILENAME))
+            except Exception as e:  # noqa: BLE001 - raised once every rank has agreed
+                error = e
+        if any_rank_failed(error is not None):
+            raise error or RuntimeError("another rank could not save lr_scheduler")
 
     @classmethod
-    def _load_extra_state(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
-        """Load extra_state from checkpoint directory."""
-        if "extra_state" not in state:
-            logger.warning_rank0("extra_state not found in state, skipping extra_state load")
+    def _load_lr_scheduler(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
+        """Load ``lr_scheduler.pt`` into ``lr_scheduler``. Every rank reads the same file."""
+        if _LR_SCHEDULER_KEY not in state:
+            logger.warning_rank0("lr_scheduler not found in state, skipping lr_scheduler load")
+            return
+        lr_scheduler = state[_LR_SCHEDULER_KEY]
+        if lr_scheduler is None:
             return
 
-        extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
-        os.makedirs(extra_state_dir, exist_ok=True)
-        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
-        state["extra_state"] = torch.load(extra_state_path, weights_only=False)
+        lr_scheduler_path = os.path.join(checkpoint_dir, _LR_SCHEDULER_FILENAME)
+        if os.path.exists(lr_scheduler_path):
+            lr_scheduler.load_state_dict(torch.load(lr_scheduler_path, weights_only=False))
+            return
+
+        # Delete this import (and veomni/checkpoint/legacy_v0_1_12.py) to drop 0.1.12 extra_state resume.
+        from .legacy_v0_1_12 import apply_legacy_lr_scheduler
+
+        if apply_legacy_lr_scheduler(checkpoint_dir, lr_scheduler):
+            return
+
+        raise FileNotFoundError(
+            f"lr_scheduler sidecar not found at {lr_scheduler_path}. "
+            "This layout writes lr_scheduler.pt next to the DCP shards "
+            "(see docs/usage/checkpoint.md)."
+        )
 
 
 def get_dtype_size(dtype: torch.dtype) -> int:
@@ -724,6 +1331,7 @@ def _get_sharding_plan(
     checkpoint_path: Union[str, os.PathLike],
     shard_size: int = None,
     save_dtype: Optional[Union[str, torch.dtype]] = None,
+    drop_hf_keys: Optional[Set[str]] = None,
 ):
     """
     Create sharding plan from checkpoint metadata without loading weights.
@@ -742,10 +1350,15 @@ def _get_sharding_plan(
     # Collect model tensors and calculate sizes
     tensor_infos = []
     all_dcp_keys = []
+    dropped = 0
 
     for key, tensor_meta in metadata.state_dict_metadata.items():
         hf_key = _normalize_key(key)
         if hf_key:
+            if drop_hf_keys and hf_key in drop_hf_keys:
+                dropped += 1
+                continue
+
             # Determine dtype for size calculation
             if not hasattr(tensor_meta.properties, "dtype"):
                 raise ValueError(
@@ -766,6 +1379,9 @@ def _get_sharding_plan(
 
             tensor_infos.append({"dcp_key": key, "hf_key": hf_key, "size": byte_size, "metadata": tensor_meta})
             all_dcp_keys.append(key)
+
+    if dropped:
+        logger.info(f"Excluded {dropped} tensor(s) named by `drop_hf_keys` from the plan")
 
     # Sort by key name for deterministic output
     tensor_infos.sort(key=lambda x: x["hf_key"])
