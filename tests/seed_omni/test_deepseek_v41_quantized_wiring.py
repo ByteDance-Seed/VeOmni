@@ -42,10 +42,12 @@ from veomni.models.seed_omni.modules.deepseek_v41.llm.quantized import (
     SCALE_DTYPE,
     SCALE_FMT,
     DeepseekV41GroupedLinear,
+    DeepseekV41QuantizedExperts,
     DeepseekV41SharedExpert,
+    expert_quant_dtype,
     linear_quant_dtype,
 )
-from veomni.models.seed_omni.modules.deepseek_v41.llm.reuse import DeepseekV4GroupedLinear
+from veomni.models.seed_omni.modules.deepseek_v41.llm.reuse import DeepseekV4Experts, DeepseekV4GroupedLinear
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
 
 
@@ -257,6 +259,92 @@ class TestSharedExpert:
         quantized = DeepseekV41SharedExpert(config, quant_dtype=linear_quant_dtype(config))
         for name in ("gate_proj", "up_proj", "down_proj"):
             assert getattr(plain, name).weight.shape == getattr(quantized, name).weight.shape
+
+
+class TestRoutedExperts:
+    """The fp4 slabs -- the bulk of the parameters, and the only 4-bit weights."""
+
+    def test_bf16_leaves_the_slabs_alone(self):
+        experts = DeepseekV41QuantizedExperts(make_config())
+        assert not experts.experts_are_quantized
+        assert experts.gate_up_proj.dtype is torch.float32
+        assert not hasattr(experts, "gate_up_proj_scale")
+
+    def test_the_slabs_are_packed_two_values_to_a_byte(self):
+        config = make_config(weight_quantization=RELEASED_QUANTIZATION)
+        experts = DeepseekV41QuantizedExperts(config, quant_dtype=expert_quant_dtype(config))
+        n_experts = config.n_routed_experts
+        hidden, intermediate = config.hidden_size, config.moe_intermediate_size
+
+        # int8 and half the columns: safetensors has no code for a 4-bit float.
+        assert experts.gate_up_proj.dtype is torch.int8
+        assert tuple(experts.gate_up_proj.shape) == (n_experts, 2 * intermediate, hidden // 2)
+        assert tuple(experts.down_proj.shape) == (n_experts, hidden, intermediate // 2)
+
+    def test_a_scale_is_per_row_not_per_tile(self):
+        """Experts do not share a range with each other, so neither do their scales."""
+        config = make_config(weight_quantization=RELEASED_QUANTIZATION)
+        experts = DeepseekV41QuantizedExperts(config, quant_dtype=expert_quant_dtype(config))
+        n_experts = config.n_routed_experts
+        hidden, intermediate = config.hidden_size, config.moe_intermediate_size
+
+        assert tuple(experts.gate_up_proj_scale.shape) == (
+            n_experts,
+            2 * intermediate,
+            hidden // QUANT_BLOCK_SIZE,
+        )
+        assert tuple(experts.down_proj_scale.shape) == (n_experts, hidden, intermediate // QUANT_BLOCK_SIZE)
+        assert experts.gate_up_proj_scale.dtype is SCALE_DTYPE
+
+    def test_an_fp8_expert_release_is_refused_rather_than_misread(self):
+        config = make_config(weight_quantization=RELEASED_QUANTIZATION, expert_dtype="fp8")
+        with pytest.raises(ValueError, match="different scale layout"):
+            expert_quant_dtype(config)
+
+    @requires_sm90
+    def test_the_routed_forward_matches_its_dequantized_slabs(self):
+        """Routing, gating and weighting must survive the slabs going to 4 bits.
+
+        The reference is the generated eager loop over bf16 weights dequantized
+        from the very slabs under test, so the weight rounding cancels and what
+        is left is the activation's, which only the quantized side pays.
+
+        The bounds come from measuring one quantized GEMM in isolation: about
+        2.7% relative L2, all of it the activation. This chains two of them with
+        a SwiGLU between, and lands near 5%, which is that error accumulating
+        rather than anything going wrong.
+
+        The relative L2 is the bound that matters, not the max. It is what
+        catches the mistake worth catching -- an expert or a scale block read
+        from the wrong offset puts it at order 1, nowhere near 8%, however
+        ordinary the largest single deviation might look.
+        """
+        from veomni.ops.kernels.deepseek_v4 import fp4_act_quant
+
+        torch.manual_seed(0)
+        config = make_config(weight_quantization=RELEASED_QUANTIZATION, n_routed_experts=4, num_experts_per_tok=2)
+        quantized = DeepseekV41QuantizedExperts(config, quant_dtype=expert_quant_dtype(config)).to(DEVICE)
+        reference = DeepseekV4Experts(config).to(device=DEVICE, dtype=torch.bfloat16)
+
+        with torch.no_grad():
+            for name in ("gate_up_proj", "down_proj"):
+                plain = torch.randn(getattr(reference, name).shape, dtype=torch.bfloat16, device=DEVICE) * 0.1
+                packed, scale = fp4_act_quant(plain, QUANT_BLOCK_SIZE)
+                getattr(quantized, name).copy_(packed.view(torch.int8))
+                getattr(quantized, f"{name}_scale").copy_(scale)
+                getattr(reference, name).copy_(fp4_act_quant(plain, QUANT_BLOCK_SIZE, dequant=True))
+
+        n_tokens = 8
+        hidden_states = torch.randn(n_tokens, config.hidden_size, dtype=torch.bfloat16, device=DEVICE)
+        top_k_index = torch.randint(0, config.n_routed_experts, (n_tokens, 2), device=DEVICE)
+        top_k_weights = torch.rand(n_tokens, 2, dtype=torch.bfloat16, device=DEVICE)
+
+        expected = reference(hidden_states, top_k_index, top_k_weights).float()
+        actual = quantized(hidden_states, top_k_index, top_k_weights).float()
+
+        assert actual.shape == expected.shape
+        assert (actual - expected).abs().max() < 0.10 * expected.abs().max()
+        assert (actual - expected).norm() / expected.norm() < 0.08
 
 
 class TestEngram:

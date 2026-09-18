@@ -72,8 +72,12 @@ from transformers.utils.generic import maybe_autocast
 
 from ......utils.moe_router_replay import get_active_replay, maybe_replay_indices
 from .configuration import DeepseekV41LlmConfig
-from .quantized import DeepseekV41SharedExpert, linear_quant_dtype
-from .reuse import DeepseekV4Experts
+from .quantized import (
+    DeepseekV41QuantizedExperts,
+    DeepseekV41SharedExpert,
+    expert_quant_dtype,
+    linear_quant_dtype,
+)
 
 
 #: The renormalisation floor, from training. Not ``rms_norm_eps``: that it holds
@@ -145,7 +149,7 @@ class DeepseekV41SparseMoeBlock(nn.Module):
     def __init__(self, config: DeepseekV41LlmConfig) -> None:
         super().__init__()
         self.gate = DeepseekV41TopKRouter(config)
-        self.experts = DeepseekV4Experts(config)
+        self.experts = DeepseekV41QuantizedExperts(config, quant_dtype=expert_quant_dtype(config))
         self.shared_experts = DeepseekV41SharedExpert(config, quant_dtype=linear_quant_dtype(config))
 
     def forward(

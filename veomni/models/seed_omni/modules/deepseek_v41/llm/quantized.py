@@ -64,7 +64,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ......ops.kernels.deepseek_v4 import act_quant, fp4_gemm, fp8_gemm
-from .reuse import DeepseekV4GroupedLinear, DeepseekV4MLP
+from .reuse import DeepseekV4Experts, DeepseekV4GroupedLinear, DeepseekV4MLP
 
 
 #: ``quantization_config.weight_block_size`` in the released config, and the
@@ -122,6 +122,25 @@ def linear_quant_dtype(config) -> Optional[torch.dtype]:
             f"{SCALE_DTYPE} the kernels read."
         )
     return torch.float8_e4m3fn
+
+
+def expert_quant_dtype(config) -> Optional[torch.dtype]:
+    """The storage dtype for the stacked routed experts, or ``None``.
+
+    Separate from :func:`linear_quant_dtype` because the experts are the one
+    place the release goes to 4 bits, and which format that is comes from
+    ``expert_dtype`` rather than the checkpoint-wide ``quant_method``.
+    """
+    if linear_quant_dtype(config) is None:
+        return None
+    expert_dtype = getattr(config, "expert_dtype", "fp8")
+    if expert_dtype != "fp4":
+        raise ValueError(
+            f"This checkpoint stores its routed experts as {expert_dtype!r}. Only fp4 is handled "
+            "here: V4.1-Flash is an fp4-expert release, and an fp8 stack would carry a different "
+            "scale layout that the fp4 path would misread rather than reject."
+        )
+    return torch.float4_e2m1fn_x2
 
 
 def quantized_matmul(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -302,14 +321,118 @@ class DeepseekV41SharedExpert(DeepseekV4MLP):
             )
 
 
+class DeepseekV41QuantizedExperts(DeepseekV4Experts):
+    """The routed experts, holding the released fp4 slabs instead of bf16 ones.
+
+    This is where fp4 earns its place: the routed experts are the overwhelming
+    majority of the parameters, and at 4 bits they are what brings the
+    checkpoint under what eight H20s hold.
+
+    Two things differ from the fp8 sites. The weights are not an ``nn.Linear``
+    but one stacked ``[E, out, in]`` parameter per projection, so the scale is
+    named ``<param>_scale`` and is per row and per 32-wide block of the reduce
+    dimension rather than per square tile -- experts do not share a range with
+    each other. And safetensors has no code for a 4-bit float, so the release
+    stores the packed pairs as ``int8``, two values to a byte along the reduce
+    dimension; the kernel reinterprets them.
+
+    The fused path is not available here. It fake-quantizes in bf16 and then
+    multiplies in bf16, which needs a bf16 weight to start from; there is no
+    bf16 weight any more. The eager loop is what the quantized forward extends,
+    and at decode it is the right shape anyway -- a token touches only
+    ``num_experts_per_tok`` of the experts, so the loop runs a handful of
+    narrow GEMMs rather than the whole slab.
+    """
+
+    def __init__(self, config, quant_dtype: Optional[torch.dtype] = None) -> None:
+        super().__init__(config)
+        self.experts_are_quantized = quant_dtype is not None
+        if not self.experts_are_quantized:
+            return
+        if self.hidden_dim % QUANT_BLOCK_SIZE or self.intermediate_dim % QUANT_BLOCK_SIZE:
+            raise ValueError(
+                f"Expert dimensions {self.hidden_dim} and {self.intermediate_dim} must be whole "
+                f"numbers of {QUANT_BLOCK_SIZE}-wide scale blocks."
+            )
+
+        device = self.gate_up_proj.device
+        self.gate_up_proj = self._packed(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim, device=device)
+        self.gate_up_proj_scale = self._scale(
+            self.num_experts, 2 * self.intermediate_dim, self.hidden_dim, device=device
+        )
+        self.down_proj = self._packed(self.num_experts, self.hidden_dim, self.intermediate_dim, device=device)
+        self.down_proj_scale = self._scale(self.num_experts, self.hidden_dim, self.intermediate_dim, device=device)
+
+    @staticmethod
+    def _packed(experts: int, out_features: int, in_features: int, device) -> nn.Parameter:
+        """``int8`` and half the columns: two fp4 values share a byte along ``in_features``."""
+        return nn.Parameter(
+            torch.empty(experts, out_features, in_features // 2, dtype=torch.int8, device=device),
+            requires_grad=False,
+        )
+
+    @staticmethod
+    def _scale(experts: int, out_features: int, in_features: int, device) -> nn.Parameter:
+        return nn.Parameter(
+            torch.empty(
+                experts,
+                out_features,
+                in_features // QUANT_BLOCK_SIZE,
+                dtype=SCALE_DTYPE,
+                device=device,
+            ),
+            requires_grad=False,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.experts_are_quantized:
+            return super().forward(hidden_states, top_k_index, top_k_weights)
+
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            gate_up = quantized_matmul(
+                current_state,
+                self.gate_up_proj[expert_idx],
+                self.gate_up_proj_scale[expert_idx],
+            )
+            # The clamp and SwiGLU are the parent's, unchanged: they run on the
+            # GEMM's output and are not an operand of the quantized product.
+            current_hidden_states = self._apply_gate(gate_up)
+            current_hidden_states = quantized_matmul(
+                current_hidden_states,
+                self.down_proj[expert_idx],
+                self.down_proj_scale[expert_idx],
+            )
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+        return final_hidden_states
+
+
 __all__ = [
     "QUANT_BLOCK_SIZE",
     "SCALE_DTYPE",
     "SCALE_FMT",
     "DeepseekV41GroupedLinear",
     "DeepseekV41Linear",
+    "DeepseekV41QuantizedExperts",
     "DeepseekV41SharedExpert",
     "QuantizedWeightMixin",
+    "expert_quant_dtype",
     "is_quantized",
     "linear_quant_dtype",
     "quantized_matmul",
