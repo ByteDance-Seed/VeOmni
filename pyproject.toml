@@ -54,7 +54,9 @@ gpu = [
   "nvidia-cutlass-dsl>=4.4.2",
   # cuDNN Frontend DSA kernels for DeepSeek sparse attention training. Avoid the
   # `cutedsl` extra because it pins nvidia-cutlass-dsl==4.5.0, which conflicts with FA4.
-  "nvidia-cudnn-frontend>=1.24.0",
+  # 1.27.0+ is required for SM90 backward: 1.25.0 calls atomicrmw() without res
+  # against nvidia-cutlass-dsl 4.5.x.
+  "nvidia-cudnn-frontend>=1.27.0",
   "cuda-python==13.0.3",
   # See `[tool.uv.sources]` — FA2 is x86_64-only; FA3 and FlashMLA support
   # x86_64/aarch64.
