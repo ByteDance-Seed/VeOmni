@@ -42,6 +42,16 @@ class ExportCheckpointArguments:
         default=False,
         metadata={"help": "Reload the exported root with OmniModel.from_pretrained."},
     )
+    config_only: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Write the root config and graph sidecars without loading any weights. For refreshing "
+                "the metadata on a checkpoint whose module folders are already in place; module assets "
+                "(tokenizer / processor) are left as they are rather than re-copied from the source"
+            )
+        },
+    )
 
 
 @dataclass
@@ -102,9 +112,17 @@ def main() -> None:
         raise SystemExit("`model.model_path` is required (set it in the launcher YAML or via CLI).")
 
     config = build_config(args)
-    model = build_model(args.model.model_path, config)
 
-    model.save_pretrained(args.export.output_dir, save_module_weights=args.export.save_module_weights)
+    if args.export.config_only:
+        # Loading the modules would be the expensive half and buys nothing here:
+        # what the root needs is the graphs and the module map, and those come
+        # from the launcher YAML. It is also the only way to re-export a
+        # checkpoint the current module definitions cannot yet hold -- a
+        # quantized one, say, before the quantized layers land.
+        config.save_pretrained(args.export.output_dir)
+    else:
+        model = build_model(args.model.model_path, config)
+        model.save_pretrained(args.export.output_dir, save_module_weights=args.export.save_module_weights)
     print(f"Exported omni checkpoint → {args.export.output_dir}")
     for entry in sorted(os.listdir(args.export.output_dir)):
         path = os.path.join(args.export.output_dir, entry)
