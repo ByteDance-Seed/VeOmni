@@ -12,6 +12,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Replicate, Shard
 
 from veomni.arguments import FSDPConfig, MixedPrecisionConfig
 from veomni.arguments.arguments_types import validate_low_precision_reduce_scatter_comm
@@ -23,6 +24,7 @@ from veomni.distributed.fsdp2.reduce_scatter import (
     ReduceScatterTransportPolicy,
     register_fp32_reduce_scatter_with_low_precision_transport,
 )
+from veomni.distributed.parallel_plan import SpecInfo
 from veomni.distributed.torch_parallelize import _configure_fsdp_gradient_reduction
 from veomni.utils import device as device_utils
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
@@ -668,7 +670,15 @@ def test_parallelize_checks_dense_and_expert_meshes_independently(monkeypatch, d
         extra_parallel_plan = {"ep": {}}
 
         def apply(self, model, meshes):
-            return {}
+            return {
+                fqn: SpecInfo(
+                    para_name="ep" if fqn.startswith("decoder.experts.") else None,
+                    placement=Shard(0) if fqn.startswith("decoder.experts.") else Replicate(),
+                    fqn=fqn,
+                    para_fsdp_mesh=meshes["ep"] if fqn.startswith("decoder.experts.") else None,
+                )
+                for fqn, _ in model.named_parameters()
+            }
 
         def get_extra_parallel_fsdp_no_shard_info(self, model, name):
             return {"decoder.experts": model.decoder.experts}
