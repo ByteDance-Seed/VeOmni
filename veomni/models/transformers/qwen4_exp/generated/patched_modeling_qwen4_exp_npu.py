@@ -22,7 +22,7 @@
 #    - method_override: Qwen4ExpModel.__init__
 #      Build local patched submodels instead of upstream AutoModel classes
 #    - method_override: Qwen4ExpTextGatedDeltaNet.__init__
-#      Bind instance-local GDN VeomniOps used by packed varlen training
+#      Bind instance-local GDN VeomniOps; keep Qwen4ExpTextRMSNormGated for the weight
 #    - method_override: Qwen4ExpTextGatedDeltaNet.forward
 #      Reset Qwen4-Exp GDN convolution and recurrent state at packed boundaries
 #    - class_replacement: Qwen4ExpTextExperts
@@ -601,6 +601,11 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
 
+        self.veomni_rms_norm_gated = VeomniOp(
+            "rms_norm_gated",
+            "standard",
+            resolve_op_impl("rms_norm_gated_implementation"),
+        )
         self.veomni_causal_conv1d = VeomniOp(
             "causal_conv1d",
             "standard",
@@ -712,7 +717,13 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
                 use_qk_l2norm_in_kernel=True,
             )
 
-        core_attn_out = self.norm(core_attn_out.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim))
+        core_attn_out = self.veomni_rms_norm_gated(
+            core_attn_out.reshape(-1, self.head_v_dim),
+            z.reshape(-1, self.head_v_dim),
+            self.norm.weight,
+            eps=self.layer_norm_epsilon,
+            activation=self.norm.activation,
+        )
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
         return self.out_proj(core_attn_out)
 

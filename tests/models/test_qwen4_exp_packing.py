@@ -43,6 +43,7 @@ def test_qwen4_exp_packed_matches_separate_outputs_and_gradients():
         config.use_cache = False
         text_model_cls = _load_text_model_class()
         packed_model = text_model_cls(config).float().eval()
+        assert packed_model.layers[0].linear_attn.veomni_rms_norm_gated.op == "rms_norm_gated"
         assert packed_model.layers[1].self_attn.q_norm.veomni_rms_norm.variant == "offset"
         assert packed_model.layers[1].self_attn.q_norm.group_size is None
         grouped_norm = next(

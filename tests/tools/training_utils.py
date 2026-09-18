@@ -57,8 +57,7 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
 
 # GPU per-model overrides for models whose patched ops disable a default
 # backend. Wan uses FA2 in real DiT configs, while RoPE stays eager because
-# its ``rope_apply(x, **kwargs)`` signature is incompatible with the
-# registry-default Liger RoPE.
+# the ``rope/wan`` row has no Liger backend.
 _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "wan_t2v": {
         "attn_implementation": "flash_attention_2",

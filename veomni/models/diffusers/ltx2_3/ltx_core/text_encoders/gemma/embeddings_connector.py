@@ -12,8 +12,7 @@ from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
 
 
-# Matches the standalone ``ltx_core.utils.rms_norm`` helper default. The raw
-# unweighted RMSNorm row requires keyword-only ``eps``.
+# The raw unweighted RMSNorm row requires keyword-only ``eps``.
 _UNWEIGHTED_RMS_NORM_EPS = 1e-6
 
 

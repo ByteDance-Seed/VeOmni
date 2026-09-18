@@ -230,7 +230,7 @@ def _qwen4_exp_validate_packed_seq_lens(
 # ================================================================
 @config.override_method(
     "Qwen4ExpTextGatedDeltaNet.__init__",
-    description="Bind instance-local GDN VeomniOps used by packed varlen training",
+    description="Bind instance-local GDN VeomniOps; keep Qwen4ExpTextRMSNormGated for the weight",
 )
 def qwen4_exp_gated_deltanet_init_patched(self, config, layer_idx):
     super().__init__()
@@ -269,6 +269,11 @@ def qwen4_exp_gated_deltanet_init_patched(self, config, layer_idx):
     self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
     self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
 
+    self.veomni_rms_norm_gated = VeomniOp(
+        "rms_norm_gated",
+        "standard",
+        resolve_op_impl("rms_norm_gated_implementation"),
+    )
     self.veomni_causal_conv1d = VeomniOp(
         "causal_conv1d",
         "standard",
@@ -384,7 +389,13 @@ def qwen4_exp_gated_deltanet_forward_patched(
             use_qk_l2norm_in_kernel=True,
         )
 
-    core_attn_out = self.norm(core_attn_out.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim))
+    core_attn_out = self.veomni_rms_norm_gated(
+        core_attn_out.reshape(-1, self.head_v_dim),
+        z.reshape(-1, self.head_v_dim),
+        self.norm.weight,
+        eps=self.layer_norm_epsilon,
+        activation=self.norm.activation,
+    )
     core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
     return self.out_proj(core_attn_out)
 

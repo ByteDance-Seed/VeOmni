@@ -124,19 +124,6 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
     return freqs_cis
 
 
-def rope_apply(x, **kwargs):
-    """``rope`` / ``wan`` helper for tests.
-
-    Modeling must call the instance handle bound in ``SelfAttention.__init__``.
-    This helper still constructs a ``VeomniOp`` so standalone tests can apply
-    Wan RoPE without an attention module.
-    """
-    freqs = kwargs.pop("freqs")
-    head_dim = kwargs.pop("head_dim")
-    rope = VeomniOp("rope", "wan", resolve_op_impl("rotary_pos_emb_implementation"))
-    return rope(x, freqs, head_dim=head_dim)
-
-
 def pad_freqs(original_tensor, target_len):
     seq_len, s1, s2 = original_tensor.shape
     pad_size = target_len - seq_len

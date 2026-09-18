@@ -37,7 +37,8 @@ from tests.models.compare import assert_outputs_and_grads_match, eager_ops_confi
 from tests.models.tiny_configs import tiny_ltx2_3_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_ltx2_3_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
-from veomni.ops.config import get_ops_config, set_ops_config
+from veomni.ops import resolve_op
+from veomni.ops.config import get_ops_config, resolve_op_impl, set_ops_config
 
 
 _OFFICIAL_ATTENTION_FORWARD = Attention.forward
@@ -45,12 +46,13 @@ _OFFICIAL_LTX_MODEL_FORWARD = LTXModel.forward
 
 
 def _call_rms(x: torch.Tensor, weight: torch.Tensor | None, ops: SimpleNamespace | None = None):
-    from veomni.models.diffusers.ltx2_3.ltx_core.utils import rms_norm
-
     previous = get_ops_config()
     set_ops_config(ops if ops is not None else eager_ops_config())
     try:
-        return rms_norm(x, weight=weight, eps=1e-6)
+        impl = resolve_op_impl("rms_norm_implementation")
+        if weight is None:
+            return resolve_op("rms_norm", "unweighted", impl).wrapper(x, eps=1e-6)
+        return resolve_op("rms_norm", "standard", impl).wrapper(x, weight, eps=1e-6)
     finally:
         set_ops_config(previous)
 

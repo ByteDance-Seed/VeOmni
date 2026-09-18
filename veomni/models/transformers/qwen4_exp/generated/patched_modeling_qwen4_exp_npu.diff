@@ -41,7 +41,7 @@
 +#    - method_override: Qwen4ExpModel.__init__
 +#      Build local patched submodels instead of upstream AutoModel classes
 +#    - method_override: Qwen4ExpTextGatedDeltaNet.__init__
-+#      Bind instance-local GDN VeomniOps used by packed varlen training
++#      Bind instance-local GDN VeomniOps; keep Qwen4ExpTextRMSNormGated for the weight
 +#    - method_override: Qwen4ExpTextGatedDeltaNet.forward
 +#      Reset Qwen4-Exp GDN convolution and recurrent state at packed boundaries
 +#    - class_replacement: Qwen4ExpTextExperts
@@ -332,7 +332,7 @@
          self.conv_dim = self.key_dim * 2 + self.value_dim
          self.conv1d = nn.Conv1d(
              in_channels=self.conv_dim,
-@@ -426,25 +588,29 @@
+@@ -426,25 +588,34 @@
              groups=self.conv_dim,
              padding=self.conv_kernel_size - 1,
          )
@@ -356,6 +356,11 @@
          self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
          self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
 +
++        self.veomni_rms_norm_gated = VeomniOp(
++            "rms_norm_gated",
++            "standard",
++            resolve_op_impl("rms_norm_gated_implementation"),
++        )
 +        self.veomni_causal_conv1d = VeomniOp(
 +            "causal_conv1d",
 +            "standard",
@@ -369,7 +374,7 @@
 
      @force_accelerate_hooks("conv1d")
      def forward(
-@@ -452,165 +618,115 @@
+@@ -452,165 +623,121 @@
          hidden_states: torch.Tensor,
          cache_params: Cache | None = None,
          attention_mask: torch.Tensor | None = None,
@@ -550,7 +555,13 @@
 -        core_attn_out = self.norm(core_attn_out, z)
 +            )
 +
-+        core_attn_out = self.norm(core_attn_out.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim))
++        core_attn_out = self.veomni_rms_norm_gated(
++            core_attn_out.reshape(-1, self.head_v_dim),
++            z.reshape(-1, self.head_v_dim),
++            self.norm.weight,
++            eps=self.layer_norm_epsilon,
++            activation=self.norm.activation,
++        )
          core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 -
 -        output = self.out_proj(core_attn_out)
@@ -616,7 +627,7 @@
      def __init__(self, config: Qwen4ExpTextConfig, layer_idx: int):
          super().__init__()
          self.layer_idx = layer_idx
-@@ -627,6 +743,8 @@
+@@ -627,6 +754,8 @@
          )
          self.q_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
          self.k_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
@@ -625,7 +636,7 @@
 
      def forward(
          self,
-@@ -637,7 +755,6 @@
+@@ -637,7 +766,6 @@
      ) -> torch.Tensor:
          batch_size, seq_length, _ = hidden_states.shape
          hidden_shape = (batch_size, seq_length, -1, self.index_head_dim)
@@ -633,7 +644,7 @@
          full_cos, full_sin = position_embeddings
          current_cos, current_sin = full_cos[:, -seq_length:, :], full_sin[:, -seq_length:, :]
 
-@@ -649,13 +766,11 @@
+@@ -649,13 +777,11 @@
          )
          q, raw_keys = q.reshape(*hidden_shape), token_k.reshape(*hidden_shape).squeeze(2)
          q = self.q_layernorm(q)
@@ -648,7 +659,7 @@
          visible_token_indices = attention_mask if attention_mask.dtype == torch.bool else attention_mask == 0
 
          selected_token_indices = torch.full(
-@@ -670,7 +785,6 @@
+@@ -670,7 +796,6 @@
                      visible_token_indices[batch_idx, 0, query_idx], as_tuple=False
                  ).flatten()
                  num_complete_blocks = local_visible_indices.shape[-1] // self.compress_ratio
@@ -656,7 +667,7 @@
                  if num_complete_blocks > 0:
                      block_token_indices = local_visible_indices[: num_complete_blocks * self.compress_ratio].view(
                          num_complete_blocks, self.compress_ratio
-@@ -681,11 +795,14 @@
+@@ -681,11 +806,14 @@
                      pooled_keys = key_groups.float().mean(dim=1).to(raw_keys.dtype)
                      pooled_keys = self.k_layernorm(pooled_keys)
                      group_starts = block_token_indices[:, 0]
@@ -676,7 +687,7 @@
 
                      scores = torch.matmul(
                          q[batch_idx, query_idx].float(), block_key_states.float().transpose(-1, -2)
-@@ -693,7 +810,6 @@
+@@ -693,7 +821,6 @@
                      scores = torch.relu(scores).sum(dim=-1) / math.sqrt(self.index_head_dim)
 
                      selected_block_indices = scores.topk(min(self.block_topk, num_complete_blocks), dim=0).indices
@@ -684,7 +695,7 @@
                      selected_tokens = block_token_indices.index_select(0, selected_block_indices).flatten()
                  else:
                      selected_tokens = torch.tensor([], device=hidden_states.device)
-@@ -701,15 +817,12 @@
+@@ -701,15 +828,12 @@
                  selected_tokens = torch.cat([selected_tokens, tail]).to(torch.int32)
                  selected_token_indices[batch_idx, query_idx, : selected_tokens.numel()] = selected_tokens
 
@@ -700,7 +711,7 @@
          if attention_mask.is_floating_point():
              min_dtype = torch.finfo(attention_mask.dtype).min
              selected_token_mask = torch.where(selected_token_mask, attention_mask.new_zeros(()), min_dtype)
-@@ -754,9 +867,16 @@
+@@ -754,9 +878,16 @@
      return attn_output, attn_weights
 
 
@@ -717,7 +728,7 @@
      def __init__(self, config: Qwen4ExpTextConfig, layer_idx: int):
          super().__init__()
          self.config = config
-@@ -781,6 +901,9 @@
+@@ -781,6 +912,9 @@
          self.q_norm = Qwen4ExpTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
          self.k_norm = Qwen4ExpTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
          self.indexer = Qwen4ExpTextQSAIndexer(config, layer_idx)
@@ -727,7 +738,7 @@
 
      def forward(
          self,
-@@ -791,13 +914,11 @@
+@@ -791,13 +925,11 @@
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple[torch.Tensor, torch.Tensor | None]:
          selected_token_mask = self.indexer(hidden_states, position_embeddings, attention_mask, past_key_values)
@@ -741,7 +752,7 @@
          position_embeddings = (x[:, -hidden_states.shape[1] :, :] for x in position_embeddings)
          input_shape = hidden_states.shape[:-1]
          hidden_shape = (*input_shape, -1, self.head_dim)
-@@ -812,16 +933,12 @@
+@@ -812,16 +944,12 @@
          value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
          cos, sin = position_embeddings
@@ -760,7 +771,7 @@
              self,
              query_states,
              key_states,
-@@ -839,9 +956,15 @@
+@@ -839,9 +967,15 @@
          return attn_output, attn_weights
 
 
@@ -777,7 +788,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
-@@ -849,24 +972,47 @@
+@@ -849,24 +983,47 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -831,7 +842,7 @@
 
      def forward(
          self,
-@@ -874,25 +1020,29 @@
+@@ -874,25 +1031,29 @@
          top_k_index: torch.Tensor,
          top_k_weights: torch.Tensor,
      ) -> torch.Tensor:
@@ -880,7 +891,7 @@
 
 
  class Qwen4ExpTextTopKRouter(nn.Module):
-@@ -970,9 +1120,13 @@
+@@ -970,9 +1131,13 @@
 
 
  _MASK64 = (1 << 64) - 1
@@ -894,7 +905,7 @@
  _PRIME_1 = 10007
 
 
-@@ -1015,8 +1169,14 @@
+@@ -1015,8 +1180,14 @@
      return prime
 
 
@@ -910,7 +921,7 @@
          super().__init__()
          self.layer_idx = layer_idx
          self.ngram_size = config.ngram_size
-@@ -1028,7 +1188,6 @@
+@@ -1028,7 +1199,6 @@
          self.ngram_vocab_size_base = config.ngram_vocab_size_base
          head_dim_per_ngram = embedding_dim // self.ngram_heads
          self.seed = config.seed
@@ -918,7 +929,7 @@
          self.eos_token_id = config.eos_token_id[0] if isinstance(config.eos_token_id, list) else config.eos_token_id
 
          self.head_vocab_sizes = []
-@@ -1046,9 +1205,29 @@
+@@ -1046,9 +1216,29 @@
          )
          self.ngram_heads_vocab_sizes = nn.Buffer(torch.tensor(self.head_vocab_sizes, dtype=torch.long))
          self.ngram_heads_offsets = nn.Buffer(torch.tensor(self.head_offsets, dtype=torch.long))
@@ -951,7 +962,7 @@
 
      def _shift_right_ignore_eos(self, token_ids: torch.Tensor, shift: int) -> torch.Tensor:
          if shift == 0:
-@@ -1066,52 +1245,173 @@
+@@ -1066,52 +1256,173 @@
          valid = (position_in_segment >= shift) & (source_positions.unsqueeze(0) >= 0)
          return torch.where(valid, shifted, token_ids.new_full((), self.eos_token_id))
 
@@ -1158,7 +1169,7 @@
 
 
  class Qwen4ExpTextPLELayer(nn.Module):
-@@ -1147,24 +1447,34 @@
+@@ -1147,24 +1458,34 @@
              bias=False,
          )
 
@@ -1210,7 +1221,7 @@
 
      def forward(
          self,
-@@ -1172,8 +1482,16 @@
+@@ -1172,8 +1493,16 @@
          input_ids: torch.Tensor,
          past_key_values: Cache | None,
          conv_mask: torch.Tensor | None = None,
@@ -1228,7 +1239,7 @@
          key_normed = self.norm_key(self.key_proj(embeddings)).unflatten(-1, (self.hc_count, self.hidden_size))
          value = self.value_proj(embeddings)
          query_normed = self.norm_query(hidden_states).unflatten(-1, (self.hc_count, self.hidden_size))
-@@ -1185,8 +1503,18 @@
+@@ -1185,8 +1514,18 @@
          if conv_mask is not None:
              gated_value = apply_mask_to_padding_states(gated_value, conv_mask)
              gated_value_normed = apply_mask_to_padding_states(gated_value_normed, conv_mask)
@@ -1248,7 +1259,7 @@
 
 
  class Qwen4ExpTextDecoderLayer(GradientCheckpointingLayer):
-@@ -1204,6 +1532,10 @@
+@@ -1204,6 +1543,10 @@
          self.attn_hyper_connection = Qwen4ExpTextGatedResidual(config)
          self.mlp_hyper_connection = Qwen4ExpTextGatedResidual(config)
 
@@ -1259,7 +1270,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -1214,15 +1546,25 @@
+@@ -1214,15 +1557,25 @@
          ple_input_ids: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> torch.FloatTensor:
@@ -1287,7 +1298,7 @@
              )
          else:
              hidden_states, _ = self.self_attn(
-@@ -1238,10 +1580,8 @@
+@@ -1238,10 +1591,8 @@
 
          hidden_states, hyper_input, injection_weights = self.mlp_hyper_connection(hidden_states)
          hidden_states = self.mlp(hidden_states)
@@ -1299,7 +1310,7 @@
 
 
  @auto_docstring
-@@ -1308,6 +1648,12 @@
+@@ -1308,6 +1659,12 @@
 
      rope_deltas: torch.LongTensor | None = None
      router_logits: tuple[torch.FloatTensor] | None = None
@@ -1312,7 +1323,7 @@
 
 
  @auto_docstring
-@@ -1434,13 +1780,12 @@
+@@ -1434,13 +1791,12 @@
              past_key_values=past_key_values,
          )
 
@@ -1331,7 +1342,7 @@
          with torch.no_grad():
              input_ids = (
                  (inputs_embeds[:, :, None, :] == self.embed_tokens.weight[None, None, :, :]).all(dim=3).nonzero()[:, 2]
-@@ -1448,11 +1793,13 @@
+@@ -1448,11 +1804,13 @@
              try:
                  input_ids = input_ids.view(inputs_embeds.shape[:2])
              except RuntimeError:
@@ -1349,7 +1360,7 @@
          return input_ids
 
 
-@@ -1718,21 +2065,14 @@
+@@ -1718,21 +2076,14 @@
          return x
 
 
@@ -1376,7 +1387,7 @@
      def __init__(self, config: Qwen4ExpVisionConfig) -> None:
          super().__init__()
          self.dim = config.hidden_size
-@@ -1745,6 +2085,9 @@
+@@ -1745,6 +2096,9 @@
          self.config = config
          self.attention_dropout = 0.0
          self.is_causal = False
@@ -1386,7 +1397,7 @@
 
      def forward(
          self,
-@@ -1759,18 +2102,15 @@
+@@ -1759,18 +2113,15 @@
              self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
          )
          cos, sin = position_embeddings
@@ -1407,7 +1418,7 @@
              max_seqlen = get_max_seqlen(cu_seqlens, self.config, kwargs={"max_seqlen": max_seqlen})
              attn_output, _ = attention_interface(
                  self,
-@@ -1788,7 +2128,6 @@
+@@ -1788,7 +2139,6 @@
                  **kwargs,
              )
          else:
@@ -1415,7 +1426,7 @@
              lengths = cu_seqlens[1:] - cu_seqlens[:-1]
              splits = [
                  torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-@@ -1845,6 +2184,12 @@
+@@ -1845,6 +2195,12 @@
          return hidden_states
 
 
@@ -1428,7 +1439,7 @@
  @auto_docstring
  class Qwen4ExpVisionModel(Qwen4ExpPreTrainedModel):
      config: Qwen4ExpVisionConfig
-@@ -1960,6 +2305,30 @@
+@@ -1960,6 +2316,30 @@
              pooler_output=merged_hidden_states,
          )
 
@@ -1459,7 +1470,7 @@
 
  @auto_docstring
  class Qwen4ExpModel(Qwen4ExpPreTrainedModel):
-@@ -1968,13 +2337,18 @@
+@@ -1968,13 +2348,18 @@
      accepts_loss_kwargs = False
      _no_split_modules = ["Qwen4ExpDecoderLayer", "Qwen4ExpVisionBlock"]
 
@@ -1483,7 +1494,7 @@
          self.post_init()
 
      def get_vision_position_ids(
-@@ -2244,6 +2618,17 @@
+@@ -2244,6 +2629,17 @@
              position_ids = None
          return position_ids
 
@@ -1501,7 +1512,7 @@
      @auto_docstring
      @can_return_tuple
      def forward(
-@@ -2260,67 +2645,125 @@
+@@ -2260,67 +2656,125 @@
          mm_token_type_ids: torch.IntTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen4ExpModelOutputWithPast:
@@ -1663,7 +1674,7 @@
 
 
  @auto_docstring
-@@ -2337,6 +2780,27 @@
+@@ -2337,6 +2791,27 @@
      aux_loss: torch.FloatTensor | None = None
 
 
@@ -1691,7 +1702,7 @@
  @auto_docstring
  class Qwen4ExpForConditionalGeneration(Qwen4ExpPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
-@@ -2346,11 +2810,23 @@
+@@ -2346,11 +2821,23 @@
 
      _fsdp_plan = {"lm_head": "keep_full_weight"}
 
@@ -1716,7 +1727,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -2379,6 +2855,12 @@
+@@ -2379,6 +2866,12 @@
          """
          return self.model.get_image_features(pixel_values, image_grid_thw, **kwargs)
 
@@ -1729,7 +1740,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -2396,47 +2878,10 @@
+@@ -2396,47 +2889,10 @@
          mm_token_type_ids: torch.IntTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -1781,7 +1792,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -2448,33 +2893,47 @@
+@@ -2448,33 +2904,47 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1842,7 +1853,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -2483,6 +2942,7 @@
+@@ -2483,6 +2953,7 @@
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
              router_logits=outputs.router_logits,
@@ -1850,7 +1861,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -2696,6 +3156,41 @@
+@@ -2696,6 +3167,41 @@
          }
          return causal_mask_mapping
 

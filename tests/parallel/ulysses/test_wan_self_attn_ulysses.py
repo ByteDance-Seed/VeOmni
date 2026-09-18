@@ -31,14 +31,16 @@ if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backen
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, get_parallel_state
 from veomni.distributed.sequence_parallel.utils import padding_tensor_for_seqeunce_parallel
 from veomni.models.transformers.wan.modeling_wan import SelfAttention, precompute_freqs_cis
+from veomni.ops import resolve_op
+from veomni.ops.config import resolve_op_impl
 
 from .utils import SequenceParallelTest
 
 
 def rope_apply_ref(x, freqs, head_dim):
-    from veomni.models.transformers.wan.modeling_wan import rope_apply
-
-    return rope_apply(x, freqs=freqs, cos=None, sin=None, head_dim=head_dim)
+    return resolve_op("rope", "wan", resolve_op_impl("rotary_pos_emb_implementation")).wrapper(
+        x, freqs, head_dim=head_dim
+    )
 
 
 def _reference_out(self_attn, x_full, freqs_full, head_dim, attention_mask=None):

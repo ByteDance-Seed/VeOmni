@@ -111,7 +111,7 @@ def precompute_freqs_cis_3d(dim: int, end: int = 1024, theta: float = 10000.0):
 
 
 def rope_apply(x, **kwargs):
-    """VeOmni packed ``rope_apply`` from ``modeling_wan.py``.
+    """Wan2.1 packed RoPE reference for tests.
 
     Math is the Wan2.1 complex multiply. Layout is VeOmni ``[B, S, N*D]``,
     not upstream ``rope_apply(x, grid_sizes, freqs)``.
