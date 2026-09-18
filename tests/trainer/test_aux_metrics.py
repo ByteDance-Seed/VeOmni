@@ -183,21 +183,23 @@ def _accumulating_trainer(outputs, recorded):
     """
     trainer = _bare_trainer()
     trainer.state = TrainerState(global_step=0)
+    model_args = SimpleNamespace(
+        optimizer=SimpleNamespace(max_grad_norm=1.0),
+        accelerator=SimpleNamespace(
+            dp_replicate_size=1,
+            fsdp_config=SimpleNamespace(fsdp_mode="fsdp2", reshard_after_backward=True),
+            offload_config=OffloadConfig(),
+        ),
+    )
     trainer.model = SimpleNamespace(
         clip_grad_norm=lambda: 0.0,
         optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda: None),
         lr_scheduler=SimpleNamespace(step=lambda: None),
+        args=model_args,
     )
     trainer.args = SimpleNamespace(
         train=SimpleNamespace(sync_each_train_step=False),
-        model=SimpleNamespace(
-            optimizer=SimpleNamespace(max_grad_norm=1.0),
-            accelerator=SimpleNamespace(
-                dp_replicate_size=1,
-                fsdp_config=SimpleNamespace(fsdp_mode="fsdp2", reshard_after_backward=True),
-                offload_config=OffloadConfig(),
-            ),
-        ),
+        model=model_args,
     )
     trainer._callbacks = []
 

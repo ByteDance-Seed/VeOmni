@@ -205,7 +205,8 @@ def unbuilt_runtime(args, *, cls=None, name: str = "base", train=None):
     runtime = cls.__new__(cls)
     runtime.args = args
     runtime.model_name = name
-    runtime.train = train
+    runtime.train_args = train
+    runtime.model_assets = []
     return runtime
 
 

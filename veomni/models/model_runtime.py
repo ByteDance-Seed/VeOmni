@@ -91,9 +91,12 @@ class VeOmniModelRuntime:
     :attr:`model_name` its :class:`ParallelState` registers under, so a job
     composing several models hands each one its own slice and its own mesh
     without any of them having to know how to find itself inside a larger
-    config. ``train`` comes alongside because a handful of decisions are
+    config. ``train_args`` comes alongside because a handful of decisions are
     genuinely job-wide: where checkpoints are written, and whether a resume path
     makes the initial HF weight load redundant (see :attr:`skip_hf_weight_load`).
+    The constructor still takes ``train=``; storing it as ``train_args`` leaves
+    :meth:`train` free to forward ``nn.Module.train()``.
+
     Which chat template to build is on this model's arguments
     (``model.chat_template``); only the runtime holds the preprocessor to
     build it from.
@@ -111,7 +114,7 @@ class VeOmniModelRuntime:
     model_name: str
     model: Optional[torch.nn.Module] = None
     model_config: PretrainedConfig = PretrainedConfig()
-    train: "TrainingArguments"
+    train_args: "TrainingArguments"
     optimizer: Optional["Optimizer"] = None
     lr_scheduler: Optional["LRScheduler"] = None
     # Class-level so __getattr__ never fires for them before the build runs.
@@ -121,7 +124,7 @@ class VeOmniModelRuntime:
     tokenizer: Optional[Any] = None
     processor: Optional[Any] = None
     chat_template: Optional["ChatTemplate"] = None
-    model_assets: List[Any] = []
+    model_assets: Optional[List[Any]] = None
 
     def __init__(
         self,
@@ -132,7 +135,8 @@ class VeOmniModelRuntime:
     ):
         self.args = args
         self.model_name = model_name
-        self.train = train
+        self.train_args = train
+        self.model_assets = []
         self.setup()
         with use_parallel_state(self.model_name):
             self._build_model()
@@ -156,6 +160,13 @@ class VeOmniModelRuntime:
         ``trainer.model(**batch)`` — it has to be spelled out.
         """
         return self.model(*args, **kwargs)
+
+    def train(self, mode: bool = True):
+        """Forward ``nn.Module.train()``. Job-wide knobs live on :attr:`train_args`."""
+        model = self.model
+        if model is None:
+            raise AttributeError(f"{type(self).__name__}.model is not built yet.")
+        return model.train(mode)
 
     def setup(self) -> None:
         """Build this model's device mesh and register it under :attr:`model_name`.
@@ -207,7 +218,7 @@ class VeOmniModelRuntime:
         """
         from ..utils.checkpoint_utils import should_skip_hf_weight_load
 
-        return should_skip_hf_weight_load(self.train.checkpoint.load_path, self.args.lora_config)
+        return should_skip_hf_weight_load(self.train_args.checkpoint.load_path, self.args.lora_config)
 
     def _build_model(self) -> None:
         """Meta-init the model from its config via the registry-aware loader."""
@@ -365,7 +376,7 @@ class VeOmniModelRuntime:
         skip_hf_weight_load = self.skip_hf_weight_load
         if skip_hf_weight_load:
             logger.info_rank0(
-                f"Checkpoint resume enabled (load_path={self.train.checkpoint.load_path}); "
+                f"Checkpoint resume enabled (load_path={self.train_args.checkpoint.load_path}); "
                 "skipping HF weight materialization before checkpoint restore."
             )
 
@@ -577,6 +588,6 @@ class VeOmniModelRuntime:
 
         from .module_utils import save_model_assets as write_model_assets
 
-        if self.train.global_rank == 0:
+        if self.train_args.global_rank == 0:
             write_model_assets(self.checkpoint.assets_dir(), self.model_assets)
         dist.barrier()

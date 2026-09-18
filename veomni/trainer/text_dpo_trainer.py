@@ -166,7 +166,8 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
         args.accelerator.offload_config.enable_async_activation = False
         self.args = args
         self.model_name = model_name
-        self.train = train
+        self.train_args = train
+        self.model_assets = []
         self._torch_dtype = torch_dtype
         self.setup()
         with use_parallel_state(self.model_name):
@@ -209,10 +210,6 @@ class TextDPOTrainer:
 
         self.base.device = self.base._setup(args)  # registers ParallelState("base") before seed
         self.policy_model = self._build_policy_model_runtime()
-        # BaseTrainer helpers (async-offload reset, lr schedule, HSDP) read
-        # ``self.base.model``. Bind the policy handle so they are not walking
-        # the class default ``None``.
-        self.base.model = self.policy_model
 
         with use_parallel_state(self.policy_model.parallel_state):
             self._build_data_transform()
@@ -220,8 +217,8 @@ class TextDPOTrainer:
             self.base._build_collate_fn()
             self.base._build_dataloader()
         self._build_postforward()
-        self.base._build_lr_scheduler()
-        self.base._build_training_context()
+        self.policy_model._build_lr_scheduler(args.train_steps * args.train.num_train_epochs)
+        self.base._build_training_context(self.policy_model)
         self.base._init_callbacks(self)
 
         self.reference_model = self._build_reference_model_runtime()
@@ -453,7 +450,7 @@ class TextDPOTrainer:
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
-        self.base._reset_async_activation_offload_if_enabled()
+        self.base._reset_async_activation_offload_if_enabled(self.policy_model)
         self.on_step_begin(micro_batches=micro_batches)
 
         self.base.sync_before_train_step()
