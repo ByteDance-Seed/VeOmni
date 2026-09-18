@@ -64,20 +64,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ......ops.kernels.deepseek_v4 import act_quant, fp4_gemm, fp8_gemm
+from ..quant_scheme import QUANT_BLOCK_SIZE, SCALE_DTYPE, SCALE_FMT, quantized_storage_dtype
 from .reuse import DeepseekV4Experts, DeepseekV4GroupedLinear, DeepseekV4MLP
-
-
-#: ``quantization_config.weight_block_size`` in the released config, and the
-#: width of one activation quantization block. Both sides must agree: the
-#: kernels index a weight's scale by the same block counter as the activation's.
-QUANT_BLOCK_SIZE = 32
-
-#: ``quantization_config.scale_fmt``. Rounds every scale up to a power of two,
-#: which is what lets it be stored as a bare exponent.
-SCALE_FMT = "ue8m0"
-
-#: The bare exponent that ``SCALE_FMT`` makes possible: no mantissa, one byte.
-SCALE_DTYPE = torch.float8_e8m0fnu
 
 
 def is_quantized(weight: torch.Tensor) -> bool:
@@ -93,35 +81,11 @@ def is_quantized(weight: torch.Tensor) -> bool:
 def linear_quant_dtype(config) -> Optional[torch.dtype]:
     """The storage dtype for a dense projection, or ``None`` for an ordinary layer.
 
-    ``config.weight_quantization`` is the released ``quantization_config`` and is
-    present only on the native artifact; the bf16 one has been dequantized and
-    gets plain ``nn.Linear``. Every dense projection the release quantizes is
-    fp8 -- fp4 is only ever the stacked routed experts, which are not a Linear.
-
-    The scheme is checked rather than assumed. The kernels index a weight's
-    scale by the same block counter as the activation's, so a checkpoint
-    quantized on a different block width would not fail to run, it would read
-    the wrong scale for every block and return plausible nonsense.
+    Every dense projection the release quantizes is fp8 -- fp4 is only ever the
+    stacked routed experts, which are not a Linear, so this is the shared scheme
+    resolver under the name the Linear sites read it by.
     """
-    declared = getattr(config, "weight_quantization", None)
-    if not declared:
-        return None
-
-    block_size = declared.get("weight_block_size", [QUANT_BLOCK_SIZE, QUANT_BLOCK_SIZE])
-    if tuple(block_size) != (QUANT_BLOCK_SIZE, QUANT_BLOCK_SIZE):
-        raise ValueError(
-            f"This checkpoint is quantized in {tuple(block_size)} blocks, but the kernels here are "
-            f"built for {(QUANT_BLOCK_SIZE, QUANT_BLOCK_SIZE)}. Running it anyway would pair every "
-            "block with the wrong scale."
-        )
-    scale_fmt = declared.get("scale_fmt", SCALE_FMT)
-    if scale_fmt != SCALE_FMT:
-        raise ValueError(
-            f"This checkpoint's scales are {scale_fmt!r}, not {SCALE_FMT!r}. Only the latter rounds "
-            f"every scale to a power of two, which is what lets it be stored as the bare exponent "
-            f"{SCALE_DTYPE} the kernels read."
-        )
-    return torch.float8_e4m3fn
+    return quantized_storage_dtype(config)
 
 
 def expert_quant_dtype(config) -> Optional[torch.dtype]:

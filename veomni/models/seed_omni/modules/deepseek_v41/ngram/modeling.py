@@ -34,8 +34,8 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 
-from ....mixins.emb_parallel_mixin import EmbParallelMixin
 from ....omni_pretrained_model import OmniPreTrainedModel
+from ..quant_scheme import quantized_storage_dtype
 from .configuration import DeepseekV41NgramConfig
 from .hashing import (
     DEAD,
@@ -46,6 +46,7 @@ from .hashing import (
     rolling_hash,
 )
 from .inference import DeepseekV41NgramInferenceMixin
+from .quantized import DeepseekV41NgramTable, ngram_table_lookup
 
 
 class DeepseekV41Ngram(DeepseekV41NgramInferenceMixin, OmniPreTrainedModel):
@@ -73,7 +74,10 @@ class DeepseekV41Ngram(DeepseekV41NgramInferenceMixin, OmniPreTrainedModel):
         config.validate_bucket_layout()
         self.config = config
 
-        self.tables = nn.ModuleList([nn.Embedding(rows, config.head_dim) for rows in config.num_embeddings])
+        quant_dtype = quantized_storage_dtype(config)
+        self.tables = nn.ModuleList(
+            [DeepseekV41NgramTable(rows, config.head_dim, quant_dtype=quant_dtype) for rows in config.num_embeddings]
+        )
 
         primes = build_bucket_primes(
             len(config.layer_ids), config.max_ngram_size, config.n_heads, config.hash_vocab_size
@@ -146,8 +150,7 @@ class DeepseekV41Ngram(DeepseekV41NgramInferenceMixin, OmniPreTrainedModel):
         lookup.
         """
         return [
-            EmbParallelMixin.emb_parallel_lookup(table, hash_ids[:, :, layer_index])
-            for layer_index, table in enumerate(self.tables)
+            ngram_table_lookup(table, hash_ids[:, :, layer_index]) for layer_index, table in enumerate(self.tables)
         ]
 
     def forward(  # type: ignore[override]

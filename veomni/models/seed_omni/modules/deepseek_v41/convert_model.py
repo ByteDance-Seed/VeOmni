@@ -694,6 +694,9 @@ def _build_configs(hf_config: Dict[str, Any], precision: str = "bf16"):
         hash_vocab_size=text["engram_vocab_size"],
         compressed_vocab_size=text["engram_compressed_vocab_size"],
         pad_token_id=text["engram_pad_token_id"],
+        # Same marker as the llm config, for the same reason: only the native
+        # artifact keeps its two tables in fp8, and only it ships their scales.
+        weight_quantization=dict(quant) if precision == "native" and quant else None,
     )
     llm_fields = {k: v for k, v in text.items() if not k.startswith("engram_") and k != "model_type"}
     # The experts' storage format is a quantization_config key upstream, and a

@@ -14,7 +14,7 @@
 
 """Config for :class:`DeepseekV41Ngram` -- the n-gram hash lookup tables."""
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from transformers import PretrainedConfig
 
@@ -61,6 +61,7 @@ class DeepseekV41NgramConfig(PretrainedConfig):
         compressed_vocab_size: int = 99092,
         pad_token_id: int = 2,
         freeze: bool = False,
+        weight_quantization: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         self.layer_ids = list(layer_ids) if layer_ids is not None else [1, 14]
@@ -72,6 +73,14 @@ class DeepseekV41NgramConfig(PretrainedConfig):
         self.hash_vocab_size = hash_vocab_size
         self.compressed_vocab_size = compressed_vocab_size
         self.freeze = freeze
+        # The released ``quantization_config``, or None when the tables have
+        # been dequantized to bf16. Same field and same reason as on the llm
+        # config -- the name ``quantization_config`` is one transformers claims.
+        #
+        # It matters more here than anywhere else: these two tables are 196.6B
+        # of the parameters, so whether they are fp8 or bf16 is the difference
+        # between 196 GB and 393 GB before anything else is loaded.
+        self.weight_quantization = weight_quantization
         super().__init__(pad_token_id=pad_token_id, **kwargs)
 
     @property
