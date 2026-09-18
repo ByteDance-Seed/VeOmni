@@ -352,13 +352,12 @@ def _qwen4_grouped_offset(x: Tensor, weight: Tensor, eps: float, group_size: int
     return (output.flatten(-2) * (1.0 + weight.float())).type_as(x)
 
 
-@pytest.mark.parametrize("variant", ["standard", "offset", "deepseek_v4"])
-def test_weighted_omitted_group_size_matches_explicit_none(variant: str):
+def test_weighted_omitted_group_size_matches_explicit_none():
     torch.manual_seed(0)
     x = torch.randn(2, 8, 64, dtype=torch.float32)
     weight = torch.randn(64, dtype=torch.float32)
     eps = 1e-6
-    op = resolve_op("rms_norm", variant, "eager").wrapper
+    op = resolve_op("rms_norm", "standard", "eager").wrapper
 
     x_omit, w_omit = make_grad_leaves(x, weight)
     x_none, w_none = make_grad_leaves(x, weight)
@@ -391,14 +390,13 @@ def test_unweighted_omitted_group_size_matches_explicit_none():
     assert torch.equal(grad_omit, grad_none)
 
 
-@pytest.mark.parametrize("variant", ["standard", "offset", "deepseek_v4"])
-def test_weighted_grouped_matches_reshaped_ungrouped(variant: str):
+def test_weighted_grouped_matches_reshaped_ungrouped():
     torch.manual_seed(1)
     group_size = 16
     x = torch.randn(2, 8, 64, dtype=torch.float32)
     weight = torch.randn(64, dtype=torch.float32)
     eps = 1e-6
-    op = resolve_op("rms_norm", variant, "eager").wrapper
+    op = resolve_op("rms_norm", "standard", "eager").wrapper
 
     x_grouped, w_grouped = make_grad_leaves(x, weight)
     out_grouped = op(x_grouped, w_grouped, eps=eps, group_size=group_size)

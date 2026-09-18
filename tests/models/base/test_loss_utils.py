@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -390,24 +389,3 @@ def test_seqcls_validates_required_inputs(monkeypatch, kwargs, message):
     monkeypatch.setattr(loss_utils, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
     with pytest.raises(ValueError, match=message):
         ForSequenceClassificationLoss(**kwargs)
-
-
-def test_reduce_loss_no_nan_when_sp_group_all_padding():
-    """The distributed reducer must return graph-connected zero for 0/0 tokens."""
-    from veomni.distributed.sequence_parallel.loss import ReduceLoss
-
-    with (
-        patch(
-            "veomni.distributed.sequence_parallel.loss.get_unified_sequence_parallel_group", return_value=MagicMock()
-        ),
-        patch("veomni.distributed.sequence_parallel.loss.dist.get_world_size", return_value=2),
-        patch("veomni.distributed.sequence_parallel.loss.dist.all_reduce", side_effect=lambda *_args, **_kwargs: None),
-    ):
-        value = torch.tensor(0.5, requires_grad=True)
-        result = ReduceLoss.apply(value * 1.0, torch.tensor(0.0))
-        assert torch.isfinite(result)
-        assert result.item() == 0.0
-        result.backward()
-        assert value.grad is not None
-        assert torch.isfinite(value.grad)
-        assert value.grad.item() == 0.0

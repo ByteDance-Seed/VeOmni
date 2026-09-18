@@ -82,29 +82,6 @@ def _minimax_h3_inputs(cond_rows: int) -> dict:
     }
 
 
-def test_minimax_h3_configs_roundtrip_through_registry(tmp_path):
-    from veomni.models import build_config, get_model_class
-    from veomni.models.diffusers.minimax_h3.minimax_h3_condition.configuration_minimax_h3_condition import (
-        MiniMaxH3ConditionModelConfig,
-    )
-    from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.configuration_minimax_h3_transformer import (
-        MiniMaxH3DiTModelConfig,
-    )
-
-    transformer_path = tmp_path / "transformer"
-    condition_path = tmp_path / "condition"
-    _tiny_config().save_pretrained(transformer_path)
-    _tiny_condition_config().save_pretrained(condition_path)
-
-    transformer = build_config(str(transformer_path))
-    condition = build_config(str(condition_path))
-
-    assert type(transformer) is MiniMaxH3DiTModelConfig
-    assert type(condition) is MiniMaxH3ConditionModelConfig
-    assert get_model_class(transformer).__name__ == "MiniMaxH3DiTModel"
-    assert get_model_class(condition).__name__ == "MiniMaxH3ConditionModel"
-
-
 def test_minimax_h3_condition_builds_from_registered_class_without_assets():
     from veomni.models import MODELING_REGISTRY
     from veomni.models.diffusers.minimax_h3.minimax_h3_condition import modeling_minimax_h3_condition

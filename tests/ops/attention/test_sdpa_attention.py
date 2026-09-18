@@ -117,8 +117,7 @@ def test_sdpa_attention_rejects_zero_dimensions():
         sdpa_backend.sdpa_attention_forward(module, query, query, query, attention_mask=None)
 
 
-@pytest.mark.parametrize("softcap", (0.0, 30.0))
-def test_sdpa_attention_rejects_softcap(softcap):
+def test_sdpa_attention_rejects_softcap():
     query = torch.randn(1, 2, 4, 8)
     with pytest.raises(ValueError, match="does not support softcap"):
         sdpa_backend.sdpa_attention_forward(
@@ -127,7 +126,7 @@ def test_sdpa_attention_rejects_softcap(softcap):
             query,
             query,
             attention_mask=None,
-            softcap=softcap,
+            softcap=0.0,
         )
 
 

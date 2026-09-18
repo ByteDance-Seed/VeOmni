@@ -22,7 +22,7 @@ import pytest
 import torch
 from torch.nn.attention.flex_attention import BlockMask
 from transformers import PreTrainedConfig
-from transformers.masking_utils import create_causal_mask
+from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, create_causal_mask
 
 from tests.ops.attention.attention_cases import (
     dense_2d_mask,
@@ -96,18 +96,9 @@ def test_hf_create_causal_mask_uses_registered_builders():
     assert magi.k_ranges.tolist() == [[0, 8]]
 
 
-@pytest.mark.parametrize(
-    "implementation",
-    (
-        "veomni_flash_attention_2",
-        "veomni_flash_attention_3",
-        "veomni_flash_attention_4",
-        "veomni_sage_attention",
-    ),
-)
-def test_hf_create_causal_mask_preserves_flash_like_padding(implementation):
+def test_hf_create_causal_mask_preserves_flash_like_padding():
     config = PreTrainedConfig()
-    config._attn_implementation = implementation
+    config._attn_implementation = "veomni_flash_attention_2"
     embeds = torch.randn(1, 4, 16)
     position_ids = torch.arange(4).unsqueeze(0)
     attention_2d = torch.tensor([[1, 1, 1, 0]], dtype=torch.bool)
@@ -115,6 +106,18 @@ def test_hf_create_causal_mask_preserves_flash_like_padding(implementation):
     mask = create_causal_mask(config, embeds, attention_2d, None, position_ids)
 
     torch.testing.assert_close(mask, attention_2d)
+
+
+def test_flash_like_hf_names_share_the_flash_mask_builder():
+    from veomni.ops.kernels.attention.mask.flash import flash_attention_mask_builder
+
+    for name in (
+        "veomni_flash_attention_2",
+        "veomni_flash_attention_3",
+        "veomni_flash_attention_4",
+        "veomni_sage_attention",
+    ):
+        assert ALL_MASK_ATTENTION_FUNCTIONS[name] is flash_attention_mask_builder
 
 
 def test_flex_and_sdpa_2d_padding_masks_align():

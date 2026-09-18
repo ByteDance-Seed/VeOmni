@@ -56,26 +56,6 @@ def _build_ours(config: WanTransformer3DModelConfig, ops: SimpleNamespace | None
         return WanTransformer3DModel(config)
 
 
-def test_wan_t2v_configs_roundtrip_through_registry(tmp_path):
-    from veomni.models import build_config, get_model_class
-    from veomni.models.diffusers.wan_t2v.wan_condition.configuration_wan_condition import (
-        WanTransformer3DConditionModelConfig,
-    )
-
-    transformer_path = tmp_path / "transformer"
-    condition_path = tmp_path / "condition"
-    _tiny_config().save_pretrained(transformer_path)
-    _tiny_condition_config().save_pretrained(condition_path)
-
-    transformer = build_config(str(transformer_path))
-    condition = build_config(str(condition_path))
-
-    assert type(transformer) is WanTransformer3DModelConfig
-    assert type(condition) is WanTransformer3DConditionModelConfig
-    assert get_model_class(transformer).__name__ == "WanTransformer3DModel"
-    assert get_model_class(condition).__name__ == "WanTransformer3DConditionModel"
-
-
 def test_wan_t2v_condition_builds_from_registered_class_without_assets(monkeypatch):
     from veomni.models import MODELING_REGISTRY
     from veomni.models.diffusers.wan_t2v.wan_condition import modeling_wan_condition

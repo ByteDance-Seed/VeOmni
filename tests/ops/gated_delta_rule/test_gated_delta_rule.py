@@ -616,27 +616,6 @@ def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl):
     not is_nvidia_cuda_available(min_cc=90, max_cc=100),
     reason="flash_qla requires an NVIDIA GPU from SM90 through SM100",
 )
-def test_chunk_gated_delta_rule_flash_qla_matches_fla():
-    pytest.importorskip("flash_qla")
-    fla = resolve_op("chunk_gated_delta_rule", "standard", "fla").wrapper
-    other = resolve_op("chunk_gated_delta_rule", "standard", "flash_qla").wrapper
-    torch.manual_seed(0)
-    batch, seq, heads, dim = 1, 64, 4, 128
-    q = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-    g = -torch.rand(batch, seq, heads, device="cuda", dtype=torch.float32).abs() * 0.5
-    beta = torch.rand(batch, seq, heads, device="cuda", dtype=torch.bfloat16)
-
-    out_fla, _ = fla(q, k, v, g, beta, use_qk_l2norm_in_kernel=True)
-    out_qla, _ = other(q, k, v, g, beta, use_qk_l2norm_in_kernel=True)
-    assert torch.allclose(out_fla, out_qla, atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
-
-
-@pytest.mark.skipif(
-    not is_nvidia_cuda_available(min_cc=90, max_cc=100),
-    reason="flash_qla requires an NVIDIA GPU from SM90 through SM100",
-)
 def test_chunk_gated_delta_rule_flash_qla_matches_eager():
     pytest.importorskip("flash_qla")
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper

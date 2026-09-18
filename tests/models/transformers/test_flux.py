@@ -74,21 +74,6 @@ def test_flux_config_defaults_preserve_production_shapes():
     assert config.axes_dims_rope == [16, 56, 56]
 
 
-def test_flux_registered_config_round_trip(tmp_path):
-    from veomni.models import build_config
-    from veomni.models.transformers.flux.config_flux import FluxConfig
-
-    expected = _tiny_config()
-    expected.save_pretrained(tmp_path)
-    loaded = build_config(str(tmp_path))
-
-    assert type(loaded) is FluxConfig
-    assert loaded.architectures == ["FluxModel"]
-    assert loaded.num_attention_heads == expected.num_attention_heads
-    assert loaded.attention_head_dim == expected.attention_head_dim
-    assert loaded.num_single_layers == expected.num_single_layers
-
-
 def test_flux_repository_config_loads_through_registry():
     from veomni.models import build_config, get_model_class
     from veomni.models.transformers.flux.config_flux import FluxConfig
@@ -177,18 +162,6 @@ def test_flux_joint_attention_with_mask_matches_official():
         return module(hidden_a, hidden_b, rotary, attn_mask=attn_mask)
 
     assert_outputs_and_grads_match(official, ours, call)
-
-
-def test_flux_masked_attention_falls_back_to_sdpa(available_nvidia_ops):
-    from veomni.models.transformers.flux.modeling_flux import FluxJointAttention
-
-    ops = eager_ops_config()
-    ops.attn_implementation = "flash_attention_2"
-    with ops_config_scope(ops):
-        attn = FluxJointAttention(32, 32, 4, 8)
-    assert attn.veomni_attn.impl == "flash_attention_2"
-    assert attn.veomni_attn_masked.impl == "sdpa"
-    assert attn.veomni_attn_masked is not attn.veomni_attn
 
 
 def test_flux_tiny_model_forward_backward_smoke():

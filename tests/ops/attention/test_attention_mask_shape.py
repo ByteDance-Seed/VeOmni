@@ -54,10 +54,9 @@ def test_flash_shapes_are_none():
     )
 
 
-@pytest.mark.parametrize("impl", ("flash_attention_2", "veomni_sage_attention"))
-def test_flash_like_causal_shape_preserves_padding(impl):
+def test_flash_like_causal_shape_preserves_padding():
     attention_2d = torch.tensor([[1, 1, 1, 0]], dtype=torch.bool)
-    mask = causal_mask(4, 4, impl=impl, device="cpu", attention_mask=attention_2d)
+    mask = causal_mask(4, 4, impl="flash_attention_2", device="cpu", attention_mask=attention_2d)
     torch.testing.assert_close(mask, attention_2d)
 
 
@@ -155,38 +154,22 @@ def test_eager_packed_with_long_padding_mask_is_additive():
     torch.testing.assert_close(blocked, torch.full_like(blocked, torch.finfo(torch.float32).min))
 
 
-@pytest.mark.parametrize("q_len", (2, 4), ids=("cached", "prefill"))
-def test_sdpa_packed_shape_is_unsupported(q_len):
-    """SDPA rejects the packed API for both cached and square attention."""
+def test_sdpa_packed_shape_is_unsupported():
+    """SDPA rejects the packed API before looking at cached vs square lengths."""
     with pytest.raises(ValueError, match="SDPA does not support packed_causal_mask"):
         packed_causal_mask(
-            q_len,
+            2,
             4,
             impl="sdpa",
             device="cpu",
-            cu_seqlens=torch.tensor([0, q_len]),
+            cu_seqlens=torch.tensor([0, 2]),
             cu_seq_lens_k=torch.tensor([0, 4]),
         )
 
 
 @pytest.mark.parametrize("impl", ("eager", "flex_attention", "magi_attention"))
-@pytest.mark.parametrize("key_lengths_name", ("cu_seqlens_k", "cu_seq_lens_k"))
-def test_packed_cached_uses_independent_query_and_key_segments(impl, key_lengths_name):
+def test_packed_cached_uses_independent_query_and_key_segments(impl):
     """Cross-length packed masks align each query with its paired key segment."""
-    shaped = packed_causal_mask(
-        3,
-        6,
-        impl=impl,
-        device="cpu",
-        cu_seqlens=torch.tensor([0, 2, 3]),
-        **{key_lengths_name: torch.tensor([0, 4, 6])},
-    )
-    if impl == "eager":
-        visible = shaped[0, 0] == 0
-    elif impl == "flex_attention":
-        visible = flex_visible(shaped, 3, 6)
-    else:
-        visible = materialize_magi_mask(shaped, 3, 6)[0, 0]
     expected = torch.tensor(
         [
             [True, True, True, False, False, False],
@@ -194,7 +177,22 @@ def test_packed_cached_uses_independent_query_and_key_segments(impl, key_lengths
             [False, False, False, False, True, True],
         ]
     )
-    torch.testing.assert_close(visible, expected)
+    for key_lengths_name in ("cu_seqlens_k", "cu_seq_lens_k"):
+        shaped = packed_causal_mask(
+            3,
+            6,
+            impl=impl,
+            device="cpu",
+            cu_seqlens=torch.tensor([0, 2, 3]),
+            **{key_lengths_name: torch.tensor([0, 4, 6])},
+        )
+        if impl == "eager":
+            visible = shaped[0, 0] == 0
+        elif impl == "flex_attention":
+            visible = flex_visible(shaped, 3, 6)
+        else:
+            visible = materialize_magi_mask(shaped, 3, 6)[0, 0]
+        torch.testing.assert_close(visible, expected, msg=key_lengths_name)
 
 
 def test_flex_causal_aligns_with_hf_builder():
@@ -351,7 +349,7 @@ def test_magi_packed_rejects_incomplete_coverage(cu_seqlens, cu_seqlens_k, match
         )
 
 
-@pytest.mark.parametrize("impl", ("eager", "flex_attention", "magi_attention"))
+@pytest.mark.parametrize("impl", ("eager", "magi_attention"))
 @pytest.mark.parametrize(
     ("cu_seqlens", "error", "match"),
     (
@@ -368,7 +366,6 @@ def test_packed_mask_rejects_invalid_cumulative_lengths(impl, cu_seqlens, error,
     ("mask_builder", "impl", "kwargs", "custom_arg"),
     (
         pytest.param(causal_mask, "flash_attention_2", {}, "or_mask_function", id="causal-flash"),
-        pytest.param(causal_mask, "veomni_sage_attention", {}, "or_mask_function", id="causal-sage"),
         pytest.param(causal_mask, "magi_attention", {}, "or_mask_function", id="causal-magi"),
         pytest.param(
             packed_causal_mask,

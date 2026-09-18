@@ -227,18 +227,7 @@ def test_registered_fa4_adapter_matches_attention_sink_reference_and_gradients()
         ("veomni_flash_attention_4", "veomni_flash_attention_4"),
     ),
 )
-@pytest.mark.parametrize(
-    "config_impl",
-    (
-        "veomni_flash_attention_2",
-        "veomni_flash_attention_3",
-        "veomni_flash_attention_4",
-        "eager",
-    ),
-)
-def test_selected_flash_row_pins_backend_when_module_config_differs(
-    monkeypatch, selected, expected_backend, config_impl
-):
+def test_selected_flash_row_pins_backend_when_module_config_differs(monkeypatch, selected, expected_backend):
     """Registry/HF selection, not module config, decides the flash vendor token."""
     captured = {}
 
@@ -254,7 +243,7 @@ def test_selected_flash_row_pins_backend_when_module_config_differs(
     query = torch.randn(1, 2, 3, 4, dtype=torch.float16)
 
     wrapper(
-        _FakeAttentionModule(config_impl),
+        _FakeAttentionModule("eager"),
         query,
         query,
         query,
@@ -265,15 +254,7 @@ def test_selected_flash_row_pins_backend_when_module_config_differs(
     assert captured["attn_implementation"] == expected_backend
 
 
-@pytest.mark.parametrize(
-    ("implementation", "expected_backend"),
-    [
-        ("veomni_flash_attention_2", "flash_attention_2"),
-        ("veomni_flash_attention_3", "flash_attention_3"),
-        ("veomni_flash_attention_4", "veomni_flash_attention_4"),
-    ],
-)
-def test_flash_attention_preserves_layout_and_backend_contract(monkeypatch, implementation, expected_backend):
+def test_flash_attention_preserves_layout_and_backend_contract(monkeypatch):
     captured = {}
 
     def replacement_backend(query, key, value, attention_mask, **kwargs):
@@ -283,7 +264,7 @@ def test_flash_attention_preserves_layout_and_backend_contract(monkeypatch, impl
     monkeypatch.setattr(flash_backend, "_flash_attention_forward", replacement_backend)
     monkeypatch.setattr(flash_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
 
-    module = _FakeAttentionModule(implementation)
+    module = _FakeAttentionModule("veomni_flash_attention_2")
     query = torch.randn(2, 4, 3, 4, dtype=torch.float16)
     key = torch.randn(2, 2, 3, 4, dtype=torch.float16)
     value = torch.randn(2, 2, 3, 4, dtype=torch.float16)
@@ -316,7 +297,7 @@ def test_flash_attention_preserves_layout_and_backend_contract(monkeypatch, impl
     assert backend_kwargs["sliding_window"] == 16
     assert backend_kwargs["softcap"] == 30.0
     assert backend_kwargs["use_top_left_mask"] is False
-    assert backend_kwargs["attn_implementation"] == expected_backend
+    assert backend_kwargs["attn_implementation"] == "flash_attention_2"
     assert backend_kwargs["layer_idx"] == module.layer_idx
     assert backend_kwargs["contract_marker"] is marker
     assert output.shape == (2, 3, 4, 4)

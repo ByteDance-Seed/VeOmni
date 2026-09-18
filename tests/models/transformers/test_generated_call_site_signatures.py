@@ -37,6 +37,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TRANSFORMERS_ROOT = REPO_ROOT / "veomni" / "models" / "transformers"
 GENERATED_MODULES = sorted(TRANSFORMERS_ROOT.glob("*/generated/patched_modeling_*.py"))
+if not GENERATED_MODULES:
+    raise RuntimeError(f"No generated modeling modules found under {TRANSFORMERS_ROOT}")
 
 _UNKNOWN = object()
 
@@ -223,11 +225,6 @@ def _violations(path: Path) -> list[str]:
                 detail = "; ".join(f"{cls}.forward: {reason}" for cls, reason in reasons.items())
                 problems.append(f"{path.name}:{call.lineno} calls self.{func.attr}(...) — {detail}")
     return problems
-
-
-def test_generated_modules_exist():
-    """A silent zero-module glob would make every check below vacuously pass."""
-    assert GENERATED_MODULES, f"No generated modeling modules found under {TRANSFORMERS_ROOT}"
 
 
 @pytest.mark.parametrize("path", GENERATED_MODULES, ids=lambda p: p.stem)

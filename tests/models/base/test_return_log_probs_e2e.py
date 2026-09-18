@@ -180,22 +180,16 @@ _MODELS = [
 
 
 @pytest.mark.parametrize("toy_path,family", _MODELS)
-@pytest.mark.parametrize(
-    "ce_impl",
-    [
-        pytest.param("chunk_loss", id="chunk_loss"),
-        pytest.param("eager", id="eager"),
-    ],
-)
-def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, family):
+def test_return_log_probs_bitwise_matches_logits_reference(toy_path, family):
     """Compare fused auxiliary outputs against a full-logits forward bitwise.
 
-    Exercise eager and chunk-loss selections on text-only Qwen3 and Qwen3-VL
-    inputs. The reference shares the token-level log-probability and entropy
-    helpers with the model's loss path. Deterministic backend settings and
-    optional batch-invariant mode control rounding; a chunk covering the whole
-    packed batch avoids a different projection boundary. Also check next-token
-    label alignment, ignore-label masking, and trailing zero padding.
+    ``return_log_probs=True`` bypasses the CE op, so the selected CE
+    implementation is not part of this contract. Exercise text-only Qwen3 and
+    Qwen3-VL inputs. The reference shares the token-level log-probability and
+    entropy helpers with the model's loss path. Deterministic backend settings
+    and optional batch-invariant mode control rounding; a chunk covering the
+    whole packed batch avoids a different projection boundary. Also check
+    next-token label alignment, ignore-label masking, and trailing zero padding.
     """
     _skip_unless_cuda(toy_path)
     _apply_determinism()
@@ -216,7 +210,7 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
 
     try:
         torch.manual_seed(0)
-        model = _build_model(toy_path, ce_impl=ce_impl).eval()
+        model = _build_model(toy_path).eval()
 
         B, L = 2, 16
         # Keeping token IDs below 32000 avoids the multimodal placeholder ids
@@ -267,7 +261,7 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
         ne = out.fused_linear_aux.log_probs != ref_log_probs
         first_idx = torch.nonzero(ne, as_tuple=False)[:5].tolist()
         raise AssertionError(
-            f"[{family}/{ce_impl}] per-token log_probs not bitwise equal: "
+            f"[{family}] per-token log_probs not bitwise equal: "
             f"{int(ne.sum().item())}/{out.fused_linear_aux.log_probs.numel()} mismatched, "
             f"max_abs_diff={diff.max().item():.3e}, first_idx={first_idx}"
         )
@@ -275,18 +269,16 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
     # Entropy contract: same shape as log_probs, populated, bitwise equal
     # to the reference (same ``_per_token_entropy_from_logits`` helper on
     # the same fp32 logits).
-    assert out.fused_linear_aux.entropy is not None, (
-        f"[{family}/{ce_impl}] entropy must be populated when return_log_probs=True"
-    )
+    assert out.fused_linear_aux.entropy is not None, f"[{family}] entropy must be populated when return_log_probs=True"
     assert out.fused_linear_aux.entropy.shape == labels.shape, (
-        f"[{family}/{ce_impl}] entropy shape {tuple(out.fused_linear_aux.entropy.shape)} != labels shape {tuple(labels.shape)}"
+        f"[{family}] entropy shape {tuple(out.fused_linear_aux.entropy.shape)} != labels shape {tuple(labels.shape)}"
     )
     if not torch.equal(out.fused_linear_aux.entropy, ref_entropy):
         diff = (out.fused_linear_aux.entropy - ref_entropy).abs()
         ne = out.fused_linear_aux.entropy != ref_entropy
         first_idx = torch.nonzero(ne, as_tuple=False)[:5].tolist()
         raise AssertionError(
-            f"[{family}/{ce_impl}] per-token entropy not bitwise equal: "
+            f"[{family}] per-token entropy not bitwise equal: "
             f"{int(ne.sum().item())}/{out.fused_linear_aux.entropy.numel()} mismatched, "
             f"max_abs_diff={diff.max().item():.3e}, first_idx={first_idx}"
         )
@@ -302,19 +294,19 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
     masked_ent = out.fused_linear_aux.entropy[shifted_target_is_ign]
     valid_ent = out.fused_linear_aux.entropy[~shifted_target_is_ign]
     assert torch.all(masked_lp == 0.0), (
-        f"[{family}/{ce_impl}] IGN-target positions must emit 0.0 log_probs, got max_abs={masked_lp.abs().max().item():.3e}"
+        f"[{family}] IGN-target positions must emit 0.0 log_probs, got max_abs={masked_lp.abs().max().item():.3e}"
     )
     assert torch.all(masked_ent == 0.0), (
-        f"[{family}/{ce_impl}] IGN-target positions must emit 0.0 entropy, got max_abs={masked_ent.abs().max().item():.3e}"
+        f"[{family}] IGN-target positions must emit 0.0 entropy, got max_abs={masked_ent.abs().max().item():.3e}"
     )
     # log p(.) < 0 strictly for any non-degenerate distribution at random
     # init (probability < 1).
     assert torch.all(valid_lp < 0), (
-        f"[{family}/{ce_impl}] valid-target positions must emit negative log_probs, got max={valid_lp.max().item():.3e}"
+        f"[{family}] valid-target positions must emit negative log_probs, got max={valid_lp.max().item():.3e}"
     )
     # H[p] > 0 strictly for any non-degenerate distribution.
     assert torch.all(valid_ent > 0), (
-        f"[{family}/{ce_impl}] valid-target positions must emit positive entropy, got min={valid_ent.min().item():.3e}"
+        f"[{family}] valid-target positions must emit positive entropy, got min={valid_ent.min().item():.3e}"
     )
 
     del model, ref_logits, ref_log_probs, ref_entropy, out

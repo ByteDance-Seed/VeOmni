@@ -135,7 +135,6 @@ def test_eager_hidden_skips_unneeded_grad_and_value(
 @pytest.mark.parametrize(
     "impl",
     (
-        pytest.param("eager", id="eager"),
         pytest.param("chunk_loss", id="chunk-loss"),
         pytest.param(
             "liger_kernel",

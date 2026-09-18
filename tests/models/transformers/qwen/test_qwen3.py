@@ -28,23 +28,13 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM as HFQwen3
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForTokenClassification as HFQwen3ForTokenClassification
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Model as HFQwen3Model
 
-from tests.models.compare import assert_sequence_classification_matches_hf, ops_config_scope
+from tests.models.compare import assert_sequence_classification_matches_hf, eager_ops_config, ops_config_scope
 from tests.models.tiny_configs import tiny_qwen3_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.data.data_collator import MainCollator
 from veomni.models import build_foundation_model
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
-
-
-def _eager_kernels_config() -> SimpleNamespace:
-    return SimpleNamespace(
-        attn_implementation="eager",
-        cross_entropy_loss_implementation="eager",
-        rms_norm_implementation="eager",
-        rotary_pos_emb_implementation="eager",
-        swiglu_mlp_implementation="eager",
-    )
 
 
 def _qwen3_classes():
@@ -68,7 +58,7 @@ def _qwen3_classes():
 
 
 def _build_qwen3(config: Qwen3Config, ops: SimpleNamespace | None = None):
-    with ops_config_scope(ops if ops is not None else _eager_kernels_config()):
+    with ops_config_scope(ops if ops is not None else eager_ops_config()):
         causal_cls, _, _, _ = _qwen3_classes()
         return causal_cls(config)
 
@@ -112,7 +102,7 @@ def test_qwen3_base_model_eager_matches_hf():
     torch.manual_seed(0)
     config = _tiny_config()
     hf = HFQwen3Model(config)
-    with ops_config_scope(_eager_kernels_config()):
+    with ops_config_scope(eager_ops_config()):
         *_, model_cls = _qwen3_classes()
         ours = model_cls(config)
     ours.load_state_dict(hf.state_dict())
@@ -127,7 +117,7 @@ def test_qwen3_base_model_eager_matches_hf():
 def test_qwen3_seq_cls_matches_hf(supervision):
     torch.manual_seed(0)
     _, seq_cls, _, _ = _qwen3_classes()
-    with ops_config_scope(_eager_kernels_config()):
+    with ops_config_scope(eager_ops_config()):
         model = seq_cls(_tiny_config(num_labels=4))
     assert_sequence_classification_matches_hf(model, supervision=supervision)
 
@@ -136,7 +126,7 @@ def test_qwen3_token_cls_eager_matches_hf():
     torch.manual_seed(0)
     config = _tiny_config(num_labels=4)
     hf = HFQwen3ForTokenClassification(config)
-    with ops_config_scope(_eager_kernels_config()):
+    with ops_config_scope(eager_ops_config()):
         _, _, token_cls, _ = _qwen3_classes()
         ours = token_cls(config)
     ours.load_state_dict(hf.state_dict())

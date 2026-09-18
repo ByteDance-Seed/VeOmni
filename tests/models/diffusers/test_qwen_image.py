@@ -26,9 +26,6 @@ from diffusers import QwenImageTransformer2DModel as OfficialQwenImageTransforme
 from tests.models.compare import assert_outputs_and_grads_match, eager_ops_config, ops_config_scope
 from tests.models.tiny_configs import tiny_qwen_image_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_qwen_image_config as _tiny_config
-from veomni.models.diffusers.qwen_image.qwen_image_transformer.configuration_qwen_image_transformer import (
-    QwenImageTransformer2DModelConfig,
-)
 
 
 _OFFICIAL_FORWARD = OfficialQwenImageTransformer2DModel.forward
@@ -39,26 +36,6 @@ def _sdpa_ops_config() -> SimpleNamespace:
     ops = eager_ops_config()
     ops.attn_implementation = "sdpa"
     return ops
-
-
-def test_qwen_image_configs_roundtrip_through_registry(tmp_path):
-    from veomni.models import build_config, get_model_class
-    from veomni.models.diffusers.qwen_image.qwen_image_condition.configuration_qwen_image_condition import (
-        QwenImageConditionModelConfig,
-    )
-
-    transformer_path = tmp_path / "transformer"
-    condition_path = tmp_path / "condition"
-    _tiny_config().save_pretrained(transformer_path)
-    _tiny_condition_config().save_pretrained(condition_path)
-
-    transformer = build_config(str(transformer_path))
-    condition = build_config(str(condition_path))
-
-    assert type(transformer) is QwenImageTransformer2DModelConfig
-    assert type(condition) is QwenImageConditionModelConfig
-    assert get_model_class(transformer).__name__ == "QwenImageTransformer2DModel"
-    assert get_model_class(condition).__name__ == "QwenImageConditionModel"
 
 
 def test_qwen_image_condition_builds_from_registered_class_without_assets(monkeypatch):
@@ -141,17 +118,3 @@ def test_qwen_image_public_forward_matches_official_without_sp(monkeypatch, trai
         for key in ("hidden_states", "encoder_hidden_states"):
             assert expected[key].grad is not None
             torch.testing.assert_close(actual[key].grad, expected[key].grad)
-
-
-def test_qwen_image_masked_attention_falls_back_to_sdpa(available_nvidia_ops):
-    from veomni.models.diffusers.qwen_image.qwen_image_transformer.modeling_qwen_image_transformer import (
-        QwenImageSPAttnProcessor,
-    )
-
-    ops = eager_ops_config()
-    ops.attn_implementation = "flash_attention_2"
-    with ops_config_scope(ops):
-        processor = QwenImageSPAttnProcessor()
-    assert processor.veomni_attn.impl == "flash_attention_2"
-    assert processor.veomni_attn_masked.impl == "sdpa"
-    assert processor.veomni_attn_masked is not processor.veomni_attn

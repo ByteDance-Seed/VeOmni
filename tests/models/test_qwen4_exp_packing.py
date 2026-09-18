@@ -1,3 +1,11 @@
+"""Packed-boundary contracts for Qwen4-Exp's internal text submodule.
+
+The modeling registry rejects standalone ``Qwen4ExpTextModel``
+(``qwen4_exp_text``). These tests construct that class directly because QSA,
+GDN, and PLE packing live on the text stack inside the registered
+``Qwen4ExpForConditionalGeneration``.
+"""
+
 import importlib
 
 import torch

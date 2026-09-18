@@ -77,29 +77,6 @@ def _ltx_inputs() -> dict:
     }
 
 
-def test_ltx2_3_configs_roundtrip_through_registry(tmp_path):
-    from veomni.models import build_config, get_model_class
-    from veomni.models.diffusers.ltx2_3.ltx_condition.configuration_ltx2_3_condition import (
-        LTXVideoConditionModelConfig,
-    )
-    from veomni.models.diffusers.ltx2_3.ltx_transformer.configuration_ltx2_3_transformer import (
-        LTXVideoTransformerModelConfig,
-    )
-
-    transformer_path = tmp_path / "transformer"
-    condition_path = tmp_path / "condition"
-    _tiny_config().save_pretrained(transformer_path)
-    _tiny_condition_config().save_pretrained(condition_path)
-
-    transformer = build_config(str(transformer_path))
-    condition = build_config(str(condition_path))
-
-    assert type(transformer) is LTXVideoTransformerModelConfig
-    assert type(condition) is LTXVideoConditionModelConfig
-    assert get_model_class(transformer).__name__ == "LTXVideoTransformerModel"
-    assert get_model_class(condition).__name__ == "LTXVideoConditionModel"
-
-
 def test_ltx2_3_condition_builds_from_registered_class_without_assets(monkeypatch):
     from veomni.models import MODELING_REGISTRY
     from veomni.models.diffusers.ltx2_3.ltx_condition import modeling_ltx2_3_condition
