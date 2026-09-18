@@ -210,6 +210,7 @@ def _qwen3_vl_async_ulysses_attention_forward(
         eps=self.config.rms_norm_eps,
         unpadded_dim_size=unpadded_seq_len * get_ulysses_sequence_parallel_world_size(),
         head_dim=self.head_dim,
+        rms_norm=self.q_norm.veomni_rms_norm,
     )
 
     q = q.transpose(1, 2)

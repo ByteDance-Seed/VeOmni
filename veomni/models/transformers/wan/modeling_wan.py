@@ -267,6 +267,7 @@ class SelfAttention(nn.Module):
                 normalized_shape=self.dim,
                 eps=1e-6,
                 unpadded_dim_size=x.shape[1] * get_ulysses_sequence_parallel_world_size(),
+                rms_norm=self.norm_q.veomni_rms_norm,
             )
 
         q = self.veomni_rope(q, freqs, head_dim=self.head_dim)

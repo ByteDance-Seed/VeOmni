@@ -223,6 +223,7 @@ def test_wan_async_self_attn_passes_dit_qkv_biases(monkeypatch):
     assert arguments["v_bias"] is attn.v.bias
     assert arguments["norm_q_bias"] is None
     assert arguments["norm_k_bias"] is None
+    assert arguments["rms_norm"] is attn.norm_q.veomni_rms_norm
 
 
 def test_wan_async_self_attn_uses_full_sequence_freqs(monkeypatch):

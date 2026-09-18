@@ -116,6 +116,7 @@ def test_qwen3_vl_async_text_skips_ulysses_but_vision_stays_sync():
     )
 
     assert "skip_ulysses=True" in inspect.getsource(_qwen3_vl_async_ulysses_attention_forward)
+    assert "rms_norm=self.q_norm.veomni_rms_norm" in inspect.getsource(_qwen3_vl_async_ulysses_attention_forward)
     assert "skip_ulysses=True" not in inspect.getsource(qwen3_vl_vision_attention_forward_patched)
     for module in (
         patched_modeling_qwen3_vl_gpu,
@@ -123,7 +124,9 @@ def test_qwen3_vl_async_text_skips_ulysses_but_vision_stays_sync():
         patched_modeling_qwen3_vl_moe_gpu,
         patched_modeling_qwen3_vl_moe_npu,
     ):
-        assert "skip_ulysses=True" in inspect.getsource(module._qwen3_vl_async_ulysses_attention_forward)
+        source = inspect.getsource(module._qwen3_vl_async_ulysses_attention_forward)
+        assert "skip_ulysses=True" in source
+        assert "rms_norm=self.q_norm.veomni_rms_norm" in source
 
 
 def test_qwen3_vl_async_helper_forwards_skip_ulysses(monkeypatch):
@@ -137,6 +140,7 @@ def test_qwen3_vl_async_helper_forwards_skip_ulysses(monkeypatch):
 
         def __call__(self, *args, **kwargs):
             if self.op == "async_ulysses_qkv":
+                captured["rms_norm"] = kwargs.get("rms_norm")
                 hidden = kwargs["hidden_states"]
                 batch, seq, _ = hidden.shape
                 qkv = hidden.new_zeros(batch, seq * 2, 2, 4)
@@ -154,13 +158,14 @@ def test_qwen3_vl_async_helper_forwards_skip_ulysses(monkeypatch):
     monkeypatch.setattr(cfg, "get_parallel_state", lambda: SimpleNamespace(sp_group=object()))
     monkeypatch.setattr(cfg, "is_flash_attention_requested", lambda _config: True)
 
+    rms_handle = object()
     module = SimpleNamespace(
         config=SimpleNamespace(_attn_implementation="flash_attention_2", rms_norm_eps=1e-6),
         q_proj=SimpleNamespace(weight=None, bias=None),
         k_proj=SimpleNamespace(weight=None, bias=None),
         v_proj=SimpleNamespace(weight=None, bias=None),
         o_proj=SimpleNamespace(weight=None, bias=None),
-        q_norm=SimpleNamespace(weight=None),
+        q_norm=SimpleNamespace(weight=None, veomni_rms_norm=rms_handle),
         k_norm=SimpleNamespace(weight=None),
         veomni_rope=lambda q, k, cos, sin: (q, k),
         veomni_attn=fake_attn,
@@ -174,3 +179,4 @@ def test_qwen3_vl_async_helper_forwards_skip_ulysses(monkeypatch):
     cfg._qwen3_vl_async_ulysses_attention_forward(module, hidden, None, (cos, cos))
     assert captured["skip_ulysses"] is True
     assert captured["query_seq"] == 8
+    assert captured["rms_norm"] is rms_handle
