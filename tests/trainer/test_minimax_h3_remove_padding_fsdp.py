@@ -149,6 +149,7 @@ def _run_fsdp_regression(*, step_driver, checkpointing, attention, task):
     from veomni.trainer.dit_trainer import (
         DiTDataArguments,
         DiTModelArguments,
+        DiTModelRuntime,
         DiTTrainer,
         DiTTrainingArguments,
         VeOmniDiTArguments,
@@ -221,22 +222,28 @@ def _run_fsdp_regression(*, step_driver, checkpointing, attention, task):
             for name, param in model.named_parameters():
                 torch.testing.assert_close(_full_cpu(param), initial[name], rtol=0, atol=0)
 
+            runtime = DiTModelRuntime.__new__(DiTModelRuntime)
+            runtime.args = args.model
+            runtime.model_name = "base"
+            runtime.train_args = args.train
+            runtime.model = model
+            runtime.condition_model = condition_model()
+            runtime.condition_model.requires_grad_(False)
+            runtime.optimizer = torch.optim.SGD(model.parameters(), lr=_LR, foreach=False)
+            runtime.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(runtime.optimizer, lambda _: 1.0)
+            scheduler_epoch = runtime.lr_scheduler.last_epoch
+
             base = BaseTrainer.__new__(BaseTrainer)
-            base.args, base.model, base.device = args, model, device
+            base.args, base.model, base.device = args, runtime, device
             base.state = TrainerState()
             base.LOG_SAMPLE = False
             base.num_micro_batches = _MICROBATCHES
-            base._build_training_context()
+            base._build_training_context(runtime)
             recorder = _StepRecorder()
             base._callbacks = [recorder]
-            base.optimizer = torch.optim.SGD(model.parameters(), lr=_LR, foreach=False)
-            base.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(base.optimizer, lambda _: 1.0)
-            scheduler_epoch = base.lr_scheduler.last_epoch
             trainer = DiTTrainer.__new__(DiTTrainer)
             trainer.base = base
             trainer.training_task = "offline_training"
-            trainer.condition_model = condition_model()
-            trainer.condition_model.requires_grad_(False)
 
             batches = _raw_microbatches(rank, checkpointing=checkpointing, task=task)
             # Replay the production condition RNG, not hand-authored/noiseless
@@ -313,7 +320,7 @@ def _run_fsdp_regression(*, step_driver, checkpointing, attention, task):
                     {name: _full_cpu(param.grad) for name, param in model.named_parameters() if param.grad is not None}
                 )
 
-            handles.append(base.optimizer.register_step_pre_hook(capture_gradients))
+            handles.append(base.model.optimizer.register_step_pre_hook(capture_gradients))
             torch.manual_seed(noise_seed)
             if step_driver == "base":
                 # BaseTrainer owns generic optimizer/accumulation mechanics but
@@ -339,7 +346,7 @@ def _run_fsdp_regression(*, step_driver, checkpointing, attention, task):
             assert len(gradients_seen) == 1
             assert recorder.begin_count == len(recorder.end_metrics) == 1
             assert base.state.global_step == 1
-            assert base.lr_scheduler.last_epoch == scheduler_epoch + 1
+            assert base.model.lr_scheduler.last_epoch == scheduler_epoch + 1
             assert all(param.grad is None for param in model.parameters())
 
             # FP32 master parameters with differentiable BF16 forward copies
