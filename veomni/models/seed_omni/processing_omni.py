@@ -35,7 +35,7 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
-from ...utils import logging
+from ...utils import logging  # VeOmni shared logger (rank-0 helpers); not seed_omni-local.
 from .configuration_omni import OmniConfig
 from .modules import OMNI_MODEL_REGISTRY, ModulePreprocessorBase, read_model_type
 

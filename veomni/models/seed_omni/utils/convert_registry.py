@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from torch import nn
 
-from ....utils.registry import Registry
+from ....utils.registry import Registry  # VeOmni shared name→factory registry; not seed_omni-local.
 from ..configuration_omni import DEFAULT_GENERATION_GRAPH_FILE, DEFAULT_TRAINING_GRAPH_FILE
 
 

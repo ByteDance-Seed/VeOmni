@@ -39,7 +39,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from transformers import PreTrainedModel
 
-from ...utils import helper
+from ...utils import helper  # VeOmni shared logger (rank-0 helpers); not seed_omni-local.
 from .configuration_omni import OmniConfig
 from .graphs.base import NodeDef
 from .graphs.generation_graph import GenerationGraph
@@ -154,7 +154,7 @@ class OmniModel(PreTrainedModel):
         modules = cls._load_modules(
             config,
             checkpoint_root=checkpoint_root,
-            pretrained=False,
+            load_weights=False,
             **kwargs,
         )
         return cls(config, modules)
@@ -173,10 +173,8 @@ class OmniModel(PreTrainedModel):
 
         Remaining kwargs are forwarded to **every** sub-module's
         ``from_pretrained`` as global load options (e.g. ``torch_dtype``,
-        ``device_map``).  Per-module ``model_config`` and ``ops_implementation``
-        persisted in the checkpoint are merged on top via
-        :meth:`_build_module_load_kwargs` — module-level ``attn_implementation``
-        wins over any global kwarg when both are set.
+        ``device_map``).  Per-module ``model_config`` overrides persisted in the
+        checkpoint are merged on top via :meth:`_build_module_load_kwargs`.
 
         Pass ``config=`` to load the weights under an already-resolved
         :class:`OmniConfig` instead of the root ``config.json`` — how
@@ -211,7 +209,7 @@ class OmniModel(PreTrainedModel):
         modules = cls._load_modules(
             config,
             checkpoint_root=checkpoint_root,
-            pretrained=True,
+            load_weights=True,
             **kwargs,
         )
         return cls(config, modules)
@@ -222,20 +220,8 @@ class OmniModel(PreTrainedModel):
         name: str,
         base_kwargs: dict[str, Any],
     ) -> dict[str, Any]:
-        """Merge checkpoint overrides and apply persisted ``ops_implementation``."""
-        from ...arguments import OpsImplementationConfig
-        from ...ops import apply_ops_config
-
-        load_kwargs = {**base_kwargs, **config.module_model_config(name)}
-        ops_dict = config.module_ops_implementation(name)
-        if not ops_dict:
-            return load_kwargs
-
-        ops = OpsImplementationConfig(**ops_dict)
-        apply_ops_config(ops)
-        if ops.attn_implementation is not None:
-            load_kwargs["attn_implementation"] = ops.attn_implementation
-        return load_kwargs
+        """Merge per-module ``model_config`` overrides onto the caller's load kwargs."""
+        return {**base_kwargs, **config.module_model_config(name)}
 
     @staticmethod
     def _init_only_load_kwargs(load_kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -256,15 +242,15 @@ class OmniModel(PreTrainedModel):
         config: OmniConfig,
         *,
         checkpoint_root: str | os.PathLike | None,
-        pretrained: bool,
+        load_weights: bool,
         **kwargs: Any,
     ) -> dict[str, nn.Module]:
-        import sys
+        """Load each declared module.
 
+        ``load_weights=True`` calls ``from_pretrained`` (checkpoint weights).
+        ``load_weights=False`` calls ``_from_config`` (architecture only).
+        """
         from transformers import PretrainedConfig
-
-        from ...ops.config.singleton import get_ops_config
-        from ..auto import _bind_veomni_ops
 
         modules: dict[str, nn.Module] = {}
         for name in config.module_names:
@@ -272,31 +258,19 @@ class OmniModel(PreTrainedModel):
             entry = config.modules.get(name)
             load_kwargs = cls._build_module_load_kwargs(config, name, kwargs)
             if isinstance(entry, PretrainedConfig):
-                model_type = entry.model_type
-                mod_cls = OMNI_MODEL_REGISTRY[model_type]()
-                modeling_module = sys.modules.get(mod_cls.__module__)
-                if modeling_module is not None and config.module_ops_implementation(name):
-                    _bind_veomni_ops(modeling_module, get_ops_config())
-                if pretrained:
-                    modules[name] = mod_cls.from_pretrained(module_path, config=entry, **load_kwargs)
-                else:
-                    # ``entry`` is hydrated, so it already carries this module's
-                    # ``model_config`` overrides.
-                    modules[name] = mod_cls._from_config(entry, **cls._init_only_load_kwargs(load_kwargs))
-                continue
-            model_type = read_model_type(module_path)
-            mod_cls = OMNI_MODEL_REGISTRY[model_type]()
-            modeling_module = sys.modules.get(mod_cls.__module__)
-            if modeling_module is not None and config.module_ops_implementation(name):
-                _bind_veomni_ops(modeling_module, get_ops_config())
-            if pretrained:
-                modules[name] = mod_cls.from_pretrained(module_path, **load_kwargs)
+                # ``OmniConfig.from_pretrained`` already hydrated this entry.
+                mod_cls = OMNI_MODEL_REGISTRY[entry.model_type]()
+                module_config = entry
             else:
-                cfg_cls = mod_cls.config_class
-                sub_config = cfg_cls.from_pretrained(module_path)
+                # In-memory / launcher descriptor: typed config still lives on disk.
+                mod_cls = OMNI_MODEL_REGISTRY[read_model_type(module_path)]()
+                module_config = mod_cls.config_class.from_pretrained(module_path)
                 for key, value in config.module_model_config(name).items():
-                    setattr(sub_config, key, value)
-                modules[name] = mod_cls._from_config(sub_config, **cls._init_only_load_kwargs(load_kwargs))
+                    setattr(module_config, key, value)
+            if load_weights:
+                modules[name] = mod_cls.from_pretrained(module_path, config=module_config, **load_kwargs)
+            else:
+                modules[name] = mod_cls._from_config(module_config, **cls._init_only_load_kwargs(load_kwargs))
         return modules
 
     @staticmethod

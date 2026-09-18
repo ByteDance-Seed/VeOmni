@@ -264,18 +264,8 @@ class GenerationGraph:
         if DONE_STATE_NAME in generation_graph["states"]:
             raise ValueError(
                 f"State name '{DONE_STATE_NAME}' is reserved and auto-injected by the framework. "
-                f"Remove the explicit `{DONE_STATE_NAME}:` block from your generation_graph YAML — "
-                f"transitions targeting `next_state: {DONE_STATE_NAME}` will land on the built-in "
-                f"terminal state, which then triggers each active module's `finalize` hook."
-            )
-        # The pre-existing `done_state` config knob is gone — the framework
-        # always uses `DONE_STATE_NAME`.  If the user still has it lying
-        # around, reject loudly so they migrate cleanly.
-        if "done_state" in generation_graph:
-            raise ValueError(
-                "`generation_graph.done_state` is no longer configurable — the terminal state "
-                f"is hardcoded to '{DONE_STATE_NAME}'. Remove the `done_state:` line from your "
-                "generation_graph YAML."
+                f"Do not declare a `{DONE_STATE_NAME}:` block; transitions with "
+                f"`next_state: {DONE_STATE_NAME}` land on the built-in terminal state."
             )
 
         self._initial: str = generation_graph["initial"]

@@ -35,7 +35,7 @@ than re-spelling ``<family>_<sub_module>`` per file.
 
 from transformers import PretrainedConfig
 
-from ....utils.registry import Registry
+from ....utils.registry import Registry  # VeOmni shared name→factory registry; not seed_omni-local.
 from .module_modeling_base import OmniPreTrainedModel
 from .module_processing_base import MODULE_ASSET_ATTRS, ModulePreprocessorBase, bind_module_assets
 

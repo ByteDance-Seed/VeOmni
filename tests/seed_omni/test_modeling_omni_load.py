@@ -142,6 +142,15 @@ def test_omni_config_from_pretrained_hydrates_graph_sidecars(tmp_path):
     assert config.modules[FAKE_A].hidden_size == HIDDEN_SIZE
 
 
+def test_omni_config_from_pretrained_rejects_unregistered_module_type(tmp_path):
+    """Only registered omni modules can be composed; a plain HF type is not a fallback."""
+    _write_omni_checkpoint(tmp_path)
+    _write_module_stub(tmp_path / FAKE_A, model_type="llama")
+
+    with pytest.raises(ValueError, match="Unknown OmniModel name: llama"):
+        OmniConfig.from_pretrained(tmp_path)
+
+
 def test_omni_config_infer_type_selects_generation_graph(tmp_path):
     _write_omni_checkpoint(tmp_path)
 
@@ -181,29 +190,6 @@ def test_omni_config_without_scenarios_reports_clearly():
     )
     with pytest.raises(ValueError, match="No graph scenarios"):
         _ = config.generation_graph
-
-
-def test_omni_config_from_dict_rejects_legacy_generation_graph_key():
-    with pytest.raises(ValueError, match="no longer a config field"):
-        OmniConfig.from_dict(
-            {
-                "modules": _chain_modules(),
-                "training_graph": _chain_edges(),
-                "generation_graph": _minimal_generation_graph(),
-            }
-        )
-
-
-def test_omni_config_rejects_legacy_single_graph_sidecar(tmp_path):
-    _write_omni_checkpoint(tmp_path)
-    yaml.safe_dump(
-        {"generation_graph": {"initial": "step", "states": {}}},
-        (tmp_path / DEFAULT_GENERATION_GRAPH_FILE).open("w", encoding="utf-8"),
-        sort_keys=False,
-    )
-
-    with pytest.raises(ValueError, match="no longer supported"):
-        OmniConfig.from_pretrained(tmp_path)
 
 
 def test_omni_model_from_pretrained_loads_the_fake_chain(tmp_path):
