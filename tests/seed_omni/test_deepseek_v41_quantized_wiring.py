@@ -30,6 +30,7 @@ import math
 import pytest
 import torch
 
+from veomni.models.seed_omni.modules.deepseek_v41.dequant import dequant_fp8_blockwise
 from veomni.models.seed_omni.modules.deepseek_v41.llm.attention import (
     DeepseekV41Attention,
     DeepseekV41Indexer,
@@ -39,7 +40,19 @@ from veomni.models.seed_omni.modules.deepseek_v41.llm.engram_connection import D
 from veomni.models.seed_omni.modules.deepseek_v41.llm.quantized import (
     QUANT_BLOCK_SIZE,
     SCALE_DTYPE,
+    SCALE_FMT,
+    DeepseekV41GroupedLinear,
+    DeepseekV41SharedExpert,
     linear_quant_dtype,
+)
+from veomni.models.seed_omni.modules.deepseek_v41.llm.reuse import DeepseekV4GroupedLinear
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
+
+
+DEVICE = get_device_type()
+requires_sm90 = pytest.mark.skipif(
+    not IS_CUDA_AVAILABLE or torch.version.hip is not None or get_gpu_compute_capability() < 90,
+    reason="the quantized path runs on TileLang kernels needing an SM90 or later NVIDIA GPU",
 )
 
 
@@ -63,8 +76,11 @@ def make_config(**overrides) -> DeepseekV41LlmConfig:
         num_attention_heads=4,
         head_dim=32,
         qk_rope_head_dim=8,
-        q_lora_rank=48,
-        o_lora_rank=16,
+        q_lora_rank=64,
+        # Both must be whole numbers of 32-row scale tiles, as they are in the
+        # release (q_lora_rank 1280, o_lora_rank 1024). The other V4.1 test
+        # fixtures predate quantization and use sizes that are not.
+        o_lora_rank=32,
         o_groups=2,
         sliding_window=6,
         index_n_heads=8,
@@ -125,6 +141,7 @@ class TestAttentionInventory:
             "wq_a.weight_scale",
             "wq_b.weight_scale",
             "wkv.weight_scale",
+            "wo_a.weight_scale",
             "wo_b.weight_scale",
             "indexer.wq_b.weight_scale",
         }
@@ -161,6 +178,85 @@ class TestScaleShapes:
         config = make_config(weight_quantization=RELEASED_QUANTIZATION)
         indexer = DeepseekV41Indexer(config, layer_idx=0)
         assert indexer.wq_b.weight_scale.dtype is SCALE_DTYPE
+
+
+class TestGroupedOutputProjection:
+    """``wo_a`` holds one flat weight that its forward views as ``n_groups`` blocks."""
+
+    def test_a_group_that_does_not_divide_into_scale_tiles_is_refused(self):
+        with pytest.raises(ValueError, match="cannot be sliced per group"):
+            DeepseekV41GroupedLinear(64, 2 * 48, n_groups=2, quant_dtype=torch.float8_e4m3fn)
+
+    def test_the_scale_covers_the_flat_weight_not_a_block(self):
+        config = make_config(weight_quantization=RELEASED_QUANTIZATION)
+        wo_a = DeepseekV41Attention(config, layer_idx=0).wo_a
+        out_features, in_per_group = wo_a.weight.shape
+        assert tuple(wo_a.weight_scale.shape) == (
+            math.ceil(out_features / QUANT_BLOCK_SIZE),
+            math.ceil(in_per_group / QUANT_BLOCK_SIZE),
+        )
+
+    @requires_sm90
+    def test_the_block_diagonal_forward_reproduces_the_bmm(self):
+        """The looped per-group fp8 GEMMs must land where the bf16 ``bmm`` does.
+
+        Both sides are given the same weight -- one as fp8 plus scale, the other
+        dequantized from exactly that pair -- so the weight rounding cancels and
+        what is left is the kernel's own error plus the activation's, which the
+        quantized side takes and the reference does not.
+
+        Slicing is the thing being tested. Handing a group the neighbouring
+        group's scale rows would still produce a finite, right-shaped answer.
+        """
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.quantized import act_quant
+
+        torch.manual_seed(0)
+        n_groups, in_per_group, out_per_group = 4, 128, 64
+        shape = dict(in_features_per_group=in_per_group, out_features=n_groups * out_per_group, n_groups=n_groups)
+
+        quantized = DeepseekV41GroupedLinear(**shape, quant_dtype=torch.float8_e4m3fn).to(DEVICE)
+        reference_weight = torch.randn(n_groups * out_per_group, in_per_group, dtype=torch.bfloat16, device=DEVICE)
+        fp8_weight, row_scale = act_quant(reference_weight * 0.1, QUANT_BLOCK_SIZE, SCALE_FMT, SCALE_DTYPE)
+        tile_scale = row_scale[::QUANT_BLOCK_SIZE, :]
+        with torch.no_grad():
+            quantized.weight.copy_(fp8_weight)
+            quantized.weight_scale.copy_(tile_scale)
+
+        reference = DeepseekV4GroupedLinear(in_per_group, n_groups * out_per_group, n_groups=n_groups)
+        reference = reference.to(device=DEVICE, dtype=torch.bfloat16)
+        with torch.no_grad():
+            reference.weight.copy_(dequant_fp8_blockwise(fp8_weight, tile_scale, torch.bfloat16))
+
+        x = torch.randn(6, n_groups, in_per_group, dtype=torch.bfloat16, device=DEVICE)
+        expected = reference(x)
+        actual = quantized(x)
+
+        assert actual.shape == expected.shape
+        # Scaled to the outputs at hand rather than absolute: the products here
+        # are order 1, and an atol alone would pass a group reading the wrong
+        # scale if that scale happened to be small.
+        assert (actual - expected).abs().max() < 0.05 * expected.abs().max()
+
+
+class TestSharedExpert:
+    def test_all_three_projections_are_quantized(self):
+        plain = DeepseekV41SharedExpert(make_config())
+        assert scale_names(plain) == set()
+
+        config = make_config(weight_quantization=RELEASED_QUANTIZATION)
+        quantized = DeepseekV41SharedExpert(config, quant_dtype=linear_quant_dtype(config))
+        assert scale_names(quantized) == {
+            "gate_proj.weight_scale",
+            "up_proj.weight_scale",
+            "down_proj.weight_scale",
+        }
+
+    def test_quantizing_does_not_move_a_projection(self):
+        config = make_config(weight_quantization=RELEASED_QUANTIZATION)
+        plain = DeepseekV41SharedExpert(make_config())
+        quantized = DeepseekV41SharedExpert(config, quant_dtype=linear_quant_dtype(config))
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            assert getattr(plain, name).weight.shape == getattr(quantized, name).weight.shape
 
 
 class TestEngram:

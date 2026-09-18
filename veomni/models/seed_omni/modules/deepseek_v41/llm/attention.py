@@ -69,8 +69,8 @@ import torch.nn as nn
 from ......ops.kernels.deepseek_v4 import sparse_attn_tilelang, sparse_mqa_target_fwd
 from .configuration import DeepseekV41LlmConfig
 from .quantization import fake_quant_act, fake_quant_kv, fake_quant_linear
-from .quantized import DeepseekV41Linear, linear_quant_dtype
-from .reuse import DeepseekV4GroupedLinear, DeepseekV4RMSNorm
+from .quantized import DeepseekV41GroupedLinear, DeepseekV41Linear, linear_quant_dtype
+from .reuse import DeepseekV4RMSNorm
 
 
 #: Query rows scored per chunk by the eager indexer. Its ``[B, S, H, C]``
@@ -655,10 +655,11 @@ class DeepseekV41Attention(nn.Module):
         )
         self.wkv = DeepseekV41Linear(config.hidden_size, config.head_dim, bias=False, quant_dtype=quant_dtype)
         self.kv_norm = DeepseekV4RMSNorm(config.head_dim, eps=config.rms_norm_eps)
-        self.wo_a = DeepseekV4GroupedLinear(
+        self.wo_a = DeepseekV41GroupedLinear(
             self.n_heads * config.head_dim // self.n_groups,
             self.n_groups * config.o_lora_rank,
             n_groups=self.n_groups,
+            quant_dtype=quant_dtype,
         )
         self.wo_b = DeepseekV41Linear(
             self.n_groups * config.o_lora_rank, config.hidden_size, bias=False, quant_dtype=quant_dtype

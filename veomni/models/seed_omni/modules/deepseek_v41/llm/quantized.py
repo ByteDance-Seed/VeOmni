@@ -64,6 +64,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ......ops.kernels.deepseek_v4 import act_quant, fp4_gemm, fp8_gemm
+from .reuse import DeepseekV4GroupedLinear, DeepseekV4MLP
 
 
 #: ``quantization_config.weight_block_size`` in the released config, and the
@@ -218,11 +219,96 @@ class DeepseekV41Linear(nn.Linear, QuantizedWeightMixin):
         return out if self.bias is None else out + self.bias
 
 
+class DeepseekV41GroupedLinear(DeepseekV4GroupedLinear, QuantizedWeightMixin):
+    """The block-diagonal output projection, optionally over the released fp8 weight.
+
+    ``wo_a`` is one ``[out_features, in_per_group]`` weight that the generated
+    forward *views* as ``n_groups`` blocks and runs through a ``bmm``. The
+    checkpoint quantizes it as that one flat weight, on the same 32x32 tiles as
+    every other projection, so nothing about the scale layout is special here --
+    a group's rows are simply a contiguous slice of it.
+
+    There is no batched fp8 GEMM to call, so the groups are looped. At decode
+    the loop is over eight tiny GEMMs and the cost is launch overhead on a step
+    that is memory-bound anyway.
+    """
+
+    def __init__(
+        self,
+        in_features_per_group: int,
+        out_features: int,
+        n_groups: int,
+        bias: bool = False,
+        quant_dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        super().__init__(in_features_per_group, out_features, n_groups=n_groups, bias=bias)
+        if quant_dtype is None:
+            return
+        out_per_group = out_features // n_groups
+        if out_per_group % QUANT_BLOCK_SIZE:
+            # Slicing the scale by group would otherwise cut a tile in half and
+            # hand the neighbouring group's exponent to the last rows.
+            raise ValueError(
+                f"A group's {out_per_group} output rows do not divide into {QUANT_BLOCK_SIZE}-row "
+                "scale tiles, so this weight cannot be sliced per group."
+            )
+        self._replace_weight_with_quantized(quant_dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.is_quantized:
+            return super().forward(x)
+
+        input_shape = x.shape[:-2]
+        hidden_dim = x.shape[-1]
+        out_per_group = self.weight.shape[0] // self.n_groups
+        scale_rows = out_per_group // QUANT_BLOCK_SIZE
+
+        grouped = x.reshape(-1, self.n_groups, hidden_dim)
+        outputs = [
+            quantized_matmul(
+                grouped[:, group].contiguous(),
+                self.weight[group * out_per_group : (group + 1) * out_per_group],
+                self.weight_scale[group * scale_rows : (group + 1) * scale_rows],
+            )
+            for group in range(self.n_groups)
+        ]
+        return torch.stack(outputs, dim=1).reshape(*input_shape, self.n_groups, out_per_group)
+
+
+class DeepseekV41SharedExpert(DeepseekV4MLP):
+    """The shared expert, optionally over the released fp8 weights.
+
+    Only ``__init__`` differs. The generated forward reaches its projections
+    through ``veomni_qat_linear``, which with QAT off is the identity wrapper
+    over ``linear(x)`` and dispatches to whatever layer is installed -- so the
+    clamp and the SwiGLU fusion above it keep working untouched.
+    """
+
+    def __init__(self, config, quant_dtype: Optional[torch.dtype] = None) -> None:
+        super().__init__(config)
+        if quant_dtype is None:
+            return
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            plain = getattr(self, name)
+            setattr(
+                self,
+                name,
+                DeepseekV41Linear(
+                    plain.in_features,
+                    plain.out_features,
+                    bias=plain.bias is not None,
+                    quant_dtype=quant_dtype,
+                ),
+            )
+
+
 __all__ = [
     "QUANT_BLOCK_SIZE",
     "SCALE_DTYPE",
     "SCALE_FMT",
+    "DeepseekV41GroupedLinear",
     "DeepseekV41Linear",
+    "DeepseekV41SharedExpert",
     "QuantizedWeightMixin",
     "is_quantized",
     "linear_quant_dtype",

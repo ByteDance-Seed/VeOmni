@@ -22,6 +22,11 @@ down to the same clamp. Both read the config by attribute name, which is what
 ``intermediate_size`` / ``num_local_experts`` / ``mlp_bias`` on
 :class:`DeepseekV41LlmConfig` are for.
 
+The shared expert is taken through :class:`DeepseekV41SharedExpert`, which is
+that same class with its three projections able to hold the released fp8
+weights. It subclasses rather than replaces because the arithmetic around them
+-- the fp32 clamp, the fused SwiGLU -- is what V4.1 wants and is generated code.
+
 The router is rewritten. Subclassing ``DeepseekV4TopKRouter`` would mean
 overriding ``forward`` in full anyway -- three of its five lines differ -- while
 inheriting a ``__init__`` that declares the wrong buffers. What it would still
@@ -67,7 +72,8 @@ from transformers.utils.generic import maybe_autocast
 
 from ......utils.moe_router_replay import get_active_replay, maybe_replay_indices
 from .configuration import DeepseekV41LlmConfig
-from .reuse import DeepseekV4Experts, DeepseekV4MLP
+from .quantized import DeepseekV41SharedExpert, linear_quant_dtype
+from .reuse import DeepseekV4Experts
 
 
 #: The renormalisation floor, from training. Not ``rms_norm_eps``: that it holds
@@ -140,7 +146,7 @@ class DeepseekV41SparseMoeBlock(nn.Module):
         super().__init__()
         self.gate = DeepseekV41TopKRouter(config)
         self.experts = DeepseekV4Experts(config)
-        self.shared_experts = DeepseekV4MLP(config)
+        self.shared_experts = DeepseekV41SharedExpert(config, quant_dtype=linear_quant_dtype(config))
 
     def forward(
         self,
