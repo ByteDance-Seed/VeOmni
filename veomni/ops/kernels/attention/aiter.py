@@ -66,8 +66,38 @@ def _reject_attention_sinks(s_aux, learnable_sink) -> None:
         raise ValueError(
             "attn_implementation='aiter' does not support attention sinks yet (the model passed "
             "s_aux/learnable_sink). Sink logits would be silently ignored, changing the attention "
-            "maths. Use attn_implementation='flash_attention_2' or 'eager' for sink models such as "
-            "DeepSeek-V4 and gpt_oss."
+            "maths. Use attn_implementation='eager' for sink models such as DeepSeek-V4 and gpt_oss; "
+            "'flash_attention_2' is not a substitute because flash-attn 2.8.3 has no sink argument "
+            "either and drops them without raising."
+        )
+
+
+def _reject_softcap_under_autograd(softcap) -> None:
+    """Reject a logits softcap on the varlen path whenever gradients are needed.
+
+    aiter's varlen forward applies ``logits_soft_cap`` through a dedicated CK kernel, but
+    the backward has no softcap at all: ``_flash_attn_varlen_backward`` takes no such
+    argument, ``ctx`` never stores one, and the backward kernels have no ``_logits``
+    variant while the forward ones do. Gradients are therefore computed as if the cap
+    were absent, silently dropping the ``1 - tanh**2(s / cap)`` factor.
+
+    Measured on gfx942 against an eager reference, max |delta| vs a softcap=0 control at
+    0.0195 (the bf16 noise floor for that harness):
+
+        softcap   forward err   gradient err
+          2.0        0.0156          4.60
+          0.5        0.0156         14.44
+          0.125      0.0156         18.77
+
+    The forward tracks the reference at every cap, so inference is unaffected and is
+    deliberately still allowed; only the autograd path is refused.
+    """
+    if softcap and torch.is_grad_enabled():
+        raise ValueError(
+            "attn_implementation='aiter' does not support a logits softcap under autograd: "
+            "aiter applies the cap in the forward but its backward ignores it, so gradients "
+            "would be silently wrong. Use attn_implementation='eager' to train a model with "
+            "attention logit softcapping. Inference (torch.no_grad) is unaffected."
         )
 
 
@@ -89,7 +119,10 @@ def build_aiter_flash_kernels() -> SimpleNamespace:
     * ``window_size`` is a 3-tuple ``(left, right, sink_size)`` rather than a 2-tuple.
     * the varlen entry point names the softcap ``logits_soft_cap``; the dense entry
       point exposes no softcap argument at all, which this shim rejects explicitly
-      rather than silently ignoring. Attention sinks are rejected for the same reason.
+      rather than silently ignoring. On the varlen path the cap is honoured by the
+      forward but not the backward, so it is refused under autograd and allowed for
+      inference — see ``_reject_softcap_under_autograd``. Attention sinks are rejected
+      outright for the same class of reason.
 
     Every kwarg Transformers can forward is declared explicitly and either passed on or
     rejected: there is no catch-all, so a kwarg a future Transformers version starts
@@ -167,6 +200,7 @@ def build_aiter_flash_kernels() -> SimpleNamespace:
         learnable_sink=None,
     ):
         _reject_attention_sinks(s_aux, learnable_sink)
+        _reject_softcap_under_autograd(softcap)
         return aiter.flash_attn_varlen_func(
             q,
             k,

@@ -188,29 +188,64 @@ def test_transformers_kwarg_selection_matches_the_shim_signature(monkeypatch):
 
 
 def test_varlen_path_maps_softcap_to_logits_soft_cap(monkeypatch):
+    """Inference only: under autograd the cap is refused, see the test below."""
     calls = _install_fake_aiter(monkeypatch)
     kernels = veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
 
     q = torch.randn(6, 2, 4)
     cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
-    kernels.flash_attn_varlen_func(
-        q,
-        q,
-        q,
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_k=cu_seqlens,
-        max_seqlen_q=3,
-        max_seqlen_k=3,
-        softcap=30.0,
-        window_size=(8, 0),
-    )
+    with torch.no_grad():
+        kernels.flash_attn_varlen_func(
+            q,
+            q,
+            q,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=3,
+            max_seqlen_k=3,
+            softcap=30.0,
+            window_size=(8, 0),
+        )
 
     varlen = calls["varlen"]
     assert varlen["logits_soft_cap"] == 30.0
     assert "softcap" not in varlen
-    assert varlen["return_lse"] is True
+    assert varlen["return_lse"] is False
     assert varlen["window_size"] == (8, 0, 0)
     assert varlen["max_seqlen_q"] == 3
+
+
+def test_varlen_softcap_is_refused_under_autograd(monkeypatch):
+    """aiter's varlen forward applies `logits_soft_cap` but its backward ignores it, so
+    training with a cap would produce silently wrong gradients. Measured on gfx942: the
+    forward matches an eager reference at every cap, while the gradient error reaches
+    4.6 / 14.4 / 18.8 for caps of 2.0 / 0.5 / 0.125 against a 0.0195 softcap=0 control."""
+    _install_fake_aiter(monkeypatch)
+    kernels = veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
+
+    q = torch.randn(6, 2, 4)
+    cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+    varlen_kwargs = dict(cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=3, max_seqlen_k=3)
+
+    with pytest.raises(ValueError, match="softcap under autograd"):
+        kernels.flash_attn_varlen_func(q, q, q, softcap=30.0, **varlen_kwargs)
+
+    # A zero cap is not a cap, so it must not trip the guard.
+    kernels.flash_attn_varlen_func(q, q, q, softcap=0.0, **varlen_kwargs)
+
+
+def test_sink_rejection_does_not_recommend_flash_attention_2(monkeypatch):
+    """FA2 drops sinks silently (flash-attn 2.8.3 has no sink argument), so pointing a
+    sink model at it would trade a loud failure for wrong maths."""
+    _install_fake_aiter(monkeypatch)
+    kernels = veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
+
+    q = torch.randn(1, 3, 2, 4)
+    with pytest.raises(ValueError) as excinfo:
+        kernels.flash_attn_func(q, q, q, s_aux=torch.zeros(2))
+
+    assert "eager" in str(excinfo.value)
+    assert "not a substitute" in str(excinfo.value)
 
 
 @pytest.mark.parametrize("grad_enabled", [True, False])

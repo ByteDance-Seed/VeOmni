@@ -68,7 +68,7 @@ All non-VeOmni implementations are delegated to the original Transformers loader
 After `import veomni`:
 
 - VeOmni custom names remain registered in `ALL_ATTENTION_FUNCTIONS`.
-- `_lazy_imports("veomni_flash_attention_2_with_sp")` and `_lazy_imports("veomni_flash_attention_4_with_sp")` can resolve through the adapter.
+- `_lazy_imports("veomni_flash_attention_2_with_sp")`, `_lazy_imports("veomni_flash_attention_4_with_sp")` and `_lazy_imports("veomni_flash_attention_aiter_with_sp")` can resolve through the adapter.
 - No spurious "kernel hub name not found" error for VeOmni custom names.
 - Paged VeOmni aliases are outside the adapter scope.
 

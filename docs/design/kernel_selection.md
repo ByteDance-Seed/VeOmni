@@ -131,8 +131,10 @@ SP-aware variants (`veomni_flash_attention_*_with_sp` and
 
 `aiter` reuses the FlashAttention adapter and only swaps the underlying
 kernels, so it behaves like `flash_attention_2` for packed/varlen inputs and
-Ulysses SP. It has no softcap argument on the dense path and rejects one
-rather than silently dropping it. See
+Ulysses SP. It raises rather than silently ignoring what it cannot honour: a
+logits softcap on the dense path (no such argument) or under autograd (the
+forward applies it, the backward does not, so gradients would be wrong),
+attention sinks, and a `window_size` that is neither a 2- nor a 3-tuple. See
 [VeOmni on AMD ROCm](../hardware_support/rocm/README.md) for measured parity
 and speedup.
 
