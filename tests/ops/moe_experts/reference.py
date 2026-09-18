@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-def standard_fused_reference(
+def _standard_expert_loop(
     hidden: Tensor,
     routing: Tensor,
     selected: Tensor,
@@ -28,14 +28,9 @@ def standard_fused_reference(
     fc2: Tensor,
     *,
     num_experts: int,
-    swiglu_limit: float | None = None,
+    swiglu_limit: float | None,
+    route_before_fc2: bool,
 ) -> Tensor:
-    """Evaluate standard MoE with the routing-before-fc2 fused-kernel order.
-
-    Triton and Quack use this order. Expert-parallel grouped GEMMs apply routing
-    after fc2; the two orders are algebraically equivalent for a bias-free fc2,
-    although BF16 rounding can differ.
-    """
     output = torch.zeros_like(hidden)
     expert_mask = F.one_hot(selected, num_classes=num_experts).permute(2, 1, 0)
     expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
@@ -49,7 +44,68 @@ def standard_fused_reference(
             gate = gate.clamp(max=swiglu_limit)
             up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
         intermediate = F.silu(gate) * up
-        intermediate = intermediate * routing[token_idx, top_k_pos, None]
-        expert_output = F.linear(intermediate, fc2[idx])
+        routing_scale = routing[token_idx, top_k_pos, None]
+        if route_before_fc2:
+            expert_output = F.linear(intermediate * routing_scale, fc2[idx])
+        else:
+            expert_output = F.linear(intermediate, fc2[idx]) * routing_scale
         output.index_add_(0, token_idx, expert_output.to(output.dtype))
     return output
+
+
+def standard_fused_reference(
+    hidden: Tensor,
+    routing: Tensor,
+    selected: Tensor,
+    fc1_1: Tensor,
+    fc1_2: Tensor,
+    fc2: Tensor,
+    *,
+    num_experts: int,
+    swiglu_limit: float | None = None,
+) -> Tensor:
+    """Evaluate standard MoE with github/main fused-kernel order.
+
+    Non-EP Triton and Quack multiply routing onto the SwiGLU intermediate,
+    then apply ``fc2``. Use this only for fused-kernel tests.
+    """
+    return _standard_expert_loop(
+        hidden,
+        routing,
+        selected,
+        fc1_1,
+        fc1_2,
+        fc2,
+        num_experts=num_experts,
+        swiglu_limit=swiglu_limit,
+        route_before_fc2=True,
+    )
+
+
+def standard_ep_reference(
+    hidden: Tensor,
+    routing: Tensor,
+    selected: Tensor,
+    fc1_1: Tensor,
+    fc1_2: Tensor,
+    fc2: Tensor,
+    *,
+    num_experts: int,
+    swiglu_limit: float | None = None,
+) -> Tensor:
+    """Evaluate standard MoE with github/main EP combine order.
+
+    ``EPGroupGemm`` finishes ``fc2`` without a routing scale. Combine then
+    applies routing, matching ``tokens_post_all2all`` / ``unpermute``.
+    """
+    return _standard_expert_loop(
+        hidden,
+        routing,
+        selected,
+        fc1_1,
+        fc1_2,
+        fc2,
+        num_experts=num_experts,
+        swiglu_limit=swiglu_limit,
+        route_before_fc2=False,
+    )

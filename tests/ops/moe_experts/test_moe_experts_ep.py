@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tests.ops.moe_experts.reference import standard_fused_reference
+from tests.ops.moe_experts.reference import standard_ep_reference
 from tests.ops.tol import (
     MOE_EP_PRE_SM90_ATOL,
     MOE_EP_PRE_SM90_GRAD_FC1_ATOL,
@@ -327,7 +327,7 @@ def test_ep_vs_non_ep(
 
     scatter_output, cumsum, scatter_index = _scatter_tokens(hidden_states, selected_experts, num_experts)
     scattered_gw = _scatter_routing_weights(routing_weights, scatter_index)
-    out_eager = standard_fused_reference(
+    out_eager = standard_ep_reference(
         hidden_states,
         routing_weights,
         selected_experts,
@@ -354,7 +354,7 @@ def test_ep_vs_non_ep(
     fc1_1_eager = fc1_1_weight.clone().detach().requires_grad_(True)
     fc1_2_eager = fc1_2_weight.clone().detach().requires_grad_(True)
     fc2_eager = fc2_weight.clone().detach().requires_grad_(True)
-    out_e = standard_fused_reference(
+    out_e = standard_ep_reference(
         hs_eager,
         routing_eager,
         selected_experts,
@@ -423,7 +423,7 @@ def test_ep_merged_vs_non_ep(
 
     scatter_output, cumsum, scatter_index = _scatter_tokens(hidden_states, selected_experts, num_experts)
     scattered_gw = _scatter_routing_weights(routing_weights, scatter_index)
-    out_eager = standard_fused_reference(
+    out_eager = standard_ep_reference(
         hidden_states,
         routing_weights,
         selected_experts,
@@ -449,7 +449,7 @@ def test_ep_merged_vs_non_ep(
     fc1_1_eager = fc1_1_weight.clone().detach().requires_grad_(True)
     fc1_2_eager = fc1_2_weight.clone().detach().requires_grad_(True)
     fc2_eager = fc2_weight.clone().detach().requires_grad_(True)
-    out_e = standard_fused_reference(
+    out_e = standard_ep_reference(
         hs_eager,
         routing_eager,
         selected_experts,
