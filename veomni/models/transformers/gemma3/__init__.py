@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ....utils.device import IS_NPU_AVAILABLE
 from ...loader import MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("gemma3_text")
 def register_gemma3_text_modeling(architecture: str | None):
-    from .generated.patched_modeling_gemma3_gpu import Gemma3ForCausalLM, Gemma3TextModel
+    if IS_NPU_AVAILABLE:
+        from .generated.patched_modeling_gemma3_npu import Gemma3ForCausalLM, Gemma3TextModel
+    else:
+        from .generated.patched_modeling_gemma3_gpu import Gemma3ForCausalLM, Gemma3TextModel
 
     architecture = architecture or "Gemma3ForCausalLM"
     if "ForCausalLM" in architecture:
@@ -25,3 +29,18 @@ def register_gemma3_text_modeling(architecture: str | None):
     if "Model" in architecture:
         return Gemma3TextModel
     return Gemma3ForCausalLM
+
+
+@MODELING_REGISTRY.register("gemma3")
+def register_gemma3_modeling(architecture: str | None):
+    if IS_NPU_AVAILABLE:
+        from .generated.patched_modeling_gemma3_npu import Gemma3ForConditionalGeneration, Gemma3Model
+    else:
+        from .generated.patched_modeling_gemma3_gpu import Gemma3ForConditionalGeneration, Gemma3Model
+
+    architecture = architecture or "Gemma3ForConditionalGeneration"
+    if "ForConditionalGeneration" in architecture:
+        return Gemma3ForConditionalGeneration
+    if "Model" in architecture:
+        return Gemma3Model
+    return Gemma3ForConditionalGeneration
