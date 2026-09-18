@@ -17,6 +17,10 @@
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: GlmMoeDsaMLP.forward
 #      Call swiglu_mlp for silu/swish, otherwise self.act_fn
+#    - init_modification: GlmMoeDsaIndexer
+#      Bind instance-local interleave rope VeomniOp
+#    - method_override: GlmMoeDsaIndexer.forward
+#      Call interleave rope; keep Hugging Face indexer scoring
 #    - method_override: GlmMoeDsaAttention.__init__
 #      Construct a local dsa_attention glm VeomniOp
 #    - method_override: GlmMoeDsaAttention.forward
@@ -144,43 +148,10 @@ class GlmMoeDsaRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-def apply_rotary_pos_emb_interleave(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    r"""
-    Applies interleaved Rotary Position Embedding to the query and key tensors.
-
-    DeepSeek lays the rotary dimensions out in interleaved pairs `(x0, x1), (x2, x3), ...`, each rotated by a
-    single frequency. We compute that rotation directly on the even/odd slices instead of de-interleaving with a
-    `view`/`transpose`/`reshape`; the output is bit-identical to the de-interleaved `rotate_half` formulation while
-    avoiding the extra contiguous copy.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    # `cos`/`sin` are `cat(freqs, freqs)`; the first half holds the per-pair angle.
-    cos = cos[..., : cos.shape[-1] // 2].unsqueeze(unsqueeze_dim)
-    sin = sin[..., : sin.shape[-1] // 2].unsqueeze(unsqueeze_dim)
-
-    q1, q2 = q[..., 0::2], q[..., 1::2]
-    k1, k2 = k[..., 0::2], k[..., 1::2]
-
-    q_embed = torch.cat([q1 * cos - q2 * sin, q2 * cos + q1 * sin], dim=-1)
-    k_embed = torch.cat([k1 * cos - k2 * sin, k2 * cos + k1 * sin], dim=-1)
-    return q_embed, k_embed
+# ======================================================================
+# [MODIFIED CLASS] GlmMoeDsaIndexer
+# Methods patched: forward, __init__
+# ======================================================================
 
 
 class GlmMoeDsaIndexer(nn.Module):
@@ -196,6 +167,7 @@ class GlmMoeDsaIndexer(nn.Module):
     `past_key_values.update_indexer()`.
     """
 
+    # [modified __init__] Bind instance-local interleave rope VeomniOp
     def __init__(self, config: "GlmMoeDsaConfig", layer_idx: int):
         super().__init__()
         self.config = config
@@ -213,6 +185,8 @@ class GlmMoeDsaIndexer(nn.Module):
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
         self.weights_proj = nn.Linear(self.hidden_size, self.n_heads, bias=False)
         self.softmax_scale = self.head_dim**-0.5
+        # Bind instance-local interleave rope VeomniOp
+        self.veomni_rope = VeomniOp("rope", "interleave", "eager")
 
     @torch.no_grad()
     def forward(
@@ -224,36 +198,18 @@ class GlmMoeDsaIndexer(nn.Module):
         position_ids: torch.Tensor,
         past_key_values: Cache | None = None,
     ) -> torch.Tensor:
-        """
-        Selects the top-k tokens per query for DeepSeek Sparse Attention (DSA).
-
-        Same as [`DeepseekV32Indexer.forward`], but the indexer applies **interleaved** RoPE
-        rather than the non-interleaved half-split RoPE used by DeepSeek-V3.2.
-
-        Args:
-            hidden_states: Input hidden states `[B, S, hidden_size]`.
-            q_resid: Query residual from `q_a_layernorm(q_a_proj(x))`, shape `[B, S, q_lora_rank]`.
-            position_embeddings: `(cos, sin)` from RotaryEmbedding.
-            attention_mask: Causal mask, broadcastable to `[B, S, T]`.
-            past_key_values: Cache object containing the indexer key cache for this layer.
-
-        Returns:
-            `torch.Tensor`: the `int32` top-k token indices of shape `[B, S, topk]`. The eager / SDPA paths
-                turn these into an additive sparse mask; the `flash-mla` kernel consumes them directly.
-        """
         batch_size, seq_len, _ = hidden_states.shape
         cos, sin = position_embeddings
-        q = self.wq_b(q_resid)  # [B, S, H*D]
-        q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)  # [B, S, H, D]
+        q = self.wq_b(q_resid)
+        q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)
         q_rot, q_pass = torch.split(q, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
 
-        k = self.k_norm(self.wk(hidden_states)).unsqueeze(2)  # [B, S, 1, D]
+        k = self.k_norm(self.wk(hidden_states)).unsqueeze(2)
         k_rot, k_pass = torch.split(k, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
 
-        # GLM-MoE-DSA uses interleaved RoPE in the indexer
-        q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin, unsqueeze_dim=2)
-        q = torch.cat([q_rot, q_pass], dim=-1)  # [B, S, H, D]
-        k = torch.cat([k_rot, k_pass], dim=-1).squeeze(2)  # [B, S, D]
+        q_rot, k_rot = self.veomni_rope(q_rot, k_rot, cos, sin, unsqueeze_dim=2)
+        q = torch.cat([q_rot, q_pass], dim=-1)
+        k = torch.cat([k_rot, k_pass], dim=-1).squeeze(2)
 
         if past_key_values is not None:
             k = past_key_values.update_indexer(k, self.layer_idx)
@@ -261,20 +217,18 @@ class GlmMoeDsaIndexer(nn.Module):
         scores = torch.matmul(q.float(), k.transpose(-1, -2).float().unsqueeze(1)) * self.softmax_scale
         scores = F.relu(scores)
 
-        # Weight per head and sum across heads: [B, S, 1, H] @ [B, S, H, T] → [B, S, T]
         weights = self.weights_proj(hidden_states.to(self.weights_proj.weight.dtype)).float() * (self.n_heads**-0.5)
         index_scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)
 
-        # Causality needs to be taken into account when computing scores so padding tokens don't affect computation
         if attention_mask is not None:
             index_scores = index_scores + attention_mask
         else:
             key_positions = torch.arange(index_scores.shape[-1], device=index_scores.device)
-            causal = key_positions[None, None, :] > position_ids[:, :, None]  # [B, S, T]
+            causal = key_positions[None, None, :] > position_ids[:, :, None]
             index_scores = index_scores.masked_fill(causal, float("-inf"))
 
         topk = min(self.index_topk, index_scores.shape[-1])
-        return index_scores.topk(topk, dim=-1).indices.to(torch.int32)  # [B, S, topk]
+        return index_scores.topk(topk, dim=-1).indices.to(torch.int32)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:

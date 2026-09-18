@@ -55,11 +55,12 @@ def _build_ours(
 
 
 def _assert_dsa_wiring(attn) -> None:
-    """GPU and NPU bind DSA attention; NPU indexer stays on the HF path."""
+    """GPU binds DSA attention and indexer; NPU indexer keeps HF scoring."""
     from veomni.utils.device import IS_NPU_AVAILABLE
 
     assert attn.veomni_dsa_attention.variant == "glm"
     assert attn.indexer is not None
+    assert attn.indexer.veomni_rope.variant == "interleave"
     if IS_NPU_AVAILABLE:
         assert not hasattr(attn.indexer, "veomni_dsa_indexer")
         return
