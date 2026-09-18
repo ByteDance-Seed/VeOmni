@@ -92,6 +92,15 @@ supplied BlockMask remains the sole mask authority. Calls without a native
 BlockMask are rejected. Dropout and remaining kernel validation are delegated
 to the pinned Transformers/PyTorch FlexAttention adapter.
 
+`veomni_flex_attention` stays one public op. The registry row does not pin
+compute capability. The adapter selects PyTorch's FLASH backend (CuteDSL
+wrapping FA4) on NVIDIA SM90 and newer when FA4 is installed. SM80, CPU, and
+other devices stay on Triton.
+An explicit `kernel_options["BACKEND"]` wins. FLASH does not request LSE
+because that backend's backward rejects dLSE. Attention sinks (`s_aux`) need
+LSE renormalization, so they stay on Triton unless FLASH was forced, which
+is rejected.
+
 ## MagiAttention mask and execution contract
 
 `magi_attention_forward` requires a caller-owned `MagiAttentionMask`:
