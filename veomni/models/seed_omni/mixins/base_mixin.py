@@ -1,30 +1,27 @@
 """
 BaseMixin — minimal SeedOmni lifecycle + shared graph-hook registry.
 
-Every module composes capability mixins (training / inference) into a local
-``VeOmniMixin``; ``modeling.py`` inherits only ``VeOmniMixin`` +
-``PreTrainedModel``.
+Every module's ``modeling.py`` inherits :class:`OmniPreTrainedModel`.
+Training / inference graph hooks live on :class:`TrainingModuleMixin` /
+:class:`InferenceModuleMixin` and are composed onto a module when a later
+PR needs them.
 
 Layout
 ------
-* ``omni_pretrained_model.py`` — :class:`OmniPreTrainedModel` (native HF sub-models)
+* ``modules/module_modeling_base.py`` — :class:`OmniPreTrainedModel` (native HF sub-models)
 * ``base_mixin.py`` — :class:`BaseMixin` (runtime hook registry)
 * ``training_module_mixin.py`` — :class:`TrainingModuleMixin` (``pre_forward`` / ``post_forward``)
 * ``inference_module_mixin.py`` — :class:`InferenceModuleMixin` (runtime ``pre_generate`` / ``post_generate``)
 * ``modules/<family>/<sub>/modeling.py``::
 
     class Xxx(OmniPreTrainedModel): ...
-
-* ``modules/<family>/<sub>/accelerated.py``::
-
-    class XxxAccelerated(VeOmniMixin, Xxx): ...
 """
 
 from __future__ import annotations
 
 
 class BaseMixin:
-    """Accelerated SeedOmni base — shared graph-hook registry for runtime mixins."""
+    """Shared graph-hook registry for training / inference mixins."""
 
     @classmethod
     def _omni_hook_name(cls, marker: str, context: str) -> str | None:

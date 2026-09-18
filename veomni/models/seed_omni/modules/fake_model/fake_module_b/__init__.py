@@ -12,8 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Cross-family OmniModules.
+from ... import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
 
-Family-specific modules land under ``modules/<family>/`` in their own PRs.
-This package is the placeholder for later shared, family-agnostic modules.
-"""
+
+@OMNI_CONFIG_REGISTRY.register("fake_module_b")
+def register_fake_module_b_config():
+    from .configuration import FakeModuleBConfig
+
+    return FakeModuleBConfig
+
+
+@OMNI_MODEL_REGISTRY.register("fake_module_b")
+def register_fake_module_b_modeling():
+    from .modeling import FakeModuleB
+
+    return FakeModuleB

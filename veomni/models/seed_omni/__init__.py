@@ -28,14 +28,13 @@ from .mixins.inference_module_mixin import InferenceModuleMixin
 from .mixins.training_module_mixin import TrainingModuleMixin
 from .modeling_omni import OmniModel
 from .modules import (
-    OMNI_ACCELERATED_MODEL_REGISTRY,
     OMNI_CONFIG_REGISTRY,
     OMNI_MODEL_REGISTRY,
     OMNI_PROCESSOR_REGISTRY,
+    OmniPreTrainedModel,
     read_hf_model_type,
     read_model_type,
 )
-from .omni_pretrained_model import OmniPreTrainedModel
 from .processing_omni import OmniProcessor
 
 
@@ -54,7 +53,6 @@ __all__ = [
     "EdgeDef",
     "END",
     # Module registry
-    "OMNI_ACCELERATED_MODEL_REGISTRY",
     "OMNI_CONFIG_REGISTRY",
     "OMNI_MODEL_REGISTRY",
     "OMNI_PROCESSOR_REGISTRY",

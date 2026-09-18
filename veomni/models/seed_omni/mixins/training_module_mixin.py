@@ -73,10 +73,10 @@ class TrainingModuleMixin:
     def forward(self, **kwargs: Any) -> dict[str, Any]:
         """Training-graph ``forward`` endpoint.
 
-        Override on the module ``Accelerated`` class (or native ``modeling.py``)
-        when this module appears in the training graph. The default skips mixin
-        layers and delegates to the first concrete ``forward`` below this mixin
-        in MRO so a stub here does not shadow HF-native implementations.
+        Override on the native ``modeling.py`` class when this module appears in
+        the training graph. The default skips mixin layers and delegates to the
+        first concrete ``forward`` below this mixin in MRO so a stub here does
+        not shadow HF-native implementations.
         """
         for base in type(self).__mro__[1:]:
             if base is TrainingModuleMixin or base is Module:
@@ -87,7 +87,7 @@ class TrainingModuleMixin:
             return impl(self, **kwargs)
         raise NotImplementedError(
             f"{type(self).__name__}.forward(**kwargs) is not implemented. "
-            "Override it on the module Accelerated class if this module appears in the training graph."
+            "Override it on the native modeling class if this module appears in the training graph."
         )
 
     def dummy_inputs(self, *, batch_size: int, device: Any, dtype: Any) -> dict[str, Any]:

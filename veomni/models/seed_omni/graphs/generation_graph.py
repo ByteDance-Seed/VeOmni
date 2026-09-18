@@ -15,9 +15,10 @@ Each state specifies:
 
          a. Ensure ``e.from_`` is executed.  If it has any unprocessed
             in-body fan-in, that's a body-ordering bug — error.
-         b. Decrement ``e.to``'s pending fan-in.  When it hits zero
-            (i.e. all body edges into ``e.to`` have been processed),
-            execute ``e.to``.
+         b. Decrement ``e.to``'s pending fan-in.  ``pending`` is a gate on
+            a later ``from_`` appearance of that node, not a trigger to
+            run ``e.to``.  A node that only appears as ``to:`` is never
+            executed; pin a leaf with ``{from: leaf, to: end}``.
 
       Each executed node merges its return dict into ``ctx`` directly
       (``ctx.update(out)``).  Edges declare execution order only — they

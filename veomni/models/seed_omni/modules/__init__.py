@@ -22,21 +22,26 @@ package only wires up the registry table, it does not load modeling code.
 
 File layout
 -----------
-``modules/<family>/<sub_module>/(configuration.py, modeling.py[,
-processing.py])``.  Each sub-module gets its own folder; the folder name
-carries the namespace so the inner files use short names rather than
-re-spelling ``<family>_<sub_module>`` per file.  Cross-family
-lightweight modules live under ``modules/base/<sub_module>/``.
+Shared bases live next to the families, not at the ``seed_omni/`` package root:
+
+* ``module_modeling_base.py`` — :class:`OmniPreTrainedModel`
+* ``module_processing_base.py`` — :class:`ModulePreprocessorBase` + :func:`bind_module_assets`
+
+Concrete modules: ``modules/<family>/<sub_module>/(configuration.py,
+modeling.py[, processing.py])``.  Each sub-module gets its own folder; the
+folder name carries the namespace so the inner files use short names rather
+than re-spelling ``<family>_<sub_module>`` per file.
 """
 
 from transformers import PretrainedConfig
 
 from ....utils.registry import Registry
+from .module_modeling_base import OmniPreTrainedModel
+from .module_processing_base import MODULE_ASSET_ATTRS, ModulePreprocessorBase, bind_module_assets
 
 
 OMNI_CONFIG_REGISTRY = Registry("OmniConfig")
 OMNI_MODEL_REGISTRY = Registry("OmniModel")
-OMNI_ACCELERATED_MODEL_REGISTRY = Registry("OmniAcceleratedModel")
 OMNI_PROCESSOR_REGISTRY = Registry("OmniProcessor")
 
 
@@ -63,15 +68,6 @@ def read_hf_model_type(model_path: str) -> str:
     if not model_type:
         raise ValueError(f"Checkpoint at {model_path} has no `model_type` in config.json.")
     return model_type
-
-
-# Side-effect only: attach the @register factories each family declares. Only
-# the shared base/ is here; a model family adds itself to this line in its own
-# PR.
-# Imported after ``read_hf_model_type`` so the convert_registry ↔ modules cycle
-# resolves: each family's ``convert_model`` imports ``convert_registry``, whose
-# ``convert_checkpoint`` reads ``read_hf_model_type`` back from this module.
-from . import base  # noqa: F401  E402
 
 
 def read_model_type(model_path: str) -> str:
@@ -107,11 +103,17 @@ def read_model_type(model_path: str) -> str:
     return model_type
 
 
+from . import fake_model  # noqa: F401  E402
+
+
 __all__ = [
-    "OMNI_ACCELERATED_MODEL_REGISTRY",
+    "MODULE_ASSET_ATTRS",
     "OMNI_CONFIG_REGISTRY",
     "OMNI_MODEL_REGISTRY",
     "OMNI_PROCESSOR_REGISTRY",
+    "ModulePreprocessorBase",
+    "OmniPreTrainedModel",
+    "bind_module_assets",
     "read_hf_model_type",
     "read_model_type",
 ]

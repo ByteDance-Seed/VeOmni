@@ -410,14 +410,17 @@ class OmniModel(PreTrainedModel):
         node: NodeDef,
         batch: dict[str, Any],
     ) -> None:
-        """Run one training node — ``pre_forward`` → endpoint → ``post_forward``."""
+        """Run one training node — optional ``pre_forward`` → endpoint → optional ``post_forward``."""
         method = node.method
         fn = getattr(module, method, None)
         if fn is None:
             raise AttributeError(f"Node method {type(module).__name__}.{method}() is not implemented.")
-        inputs = module.pre_forward(method=method, **batch)
+        pre_forward = getattr(module, "pre_forward", None)
+        inputs = pre_forward(method=method, **batch) if pre_forward is not None else batch
         outputs = fn(**inputs)
-        outputs = module.post_forward(method=method, **outputs)
+        post_forward = getattr(module, "post_forward", None)
+        if post_forward is not None:
+            outputs = post_forward(method=method, **outputs)
         batch.update(outputs)
 
     def forward(
@@ -429,7 +432,8 @@ class OmniModel(PreTrainedModel):
     ) -> dict[str, Any]:
         """Run the training DAG; this is the FSDP2 root ``forward``.
 
-        Each node is ``pre_forward`` → endpoint → ``post_forward``. Nested wrap
+        Each node is optional ``pre_forward`` → endpoint → optional ``post_forward``.
+        Mixins are not required on a native ``OmniPreTrainedModel``. Nested wrap
         units (decoder layers, ``Embedding``, …) unshard on their own
         ``__call__``; leftover params on this module unshard because training
         enters here.

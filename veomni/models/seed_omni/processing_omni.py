@@ -4,10 +4,10 @@ Mirrors HuggingFace ``AutoProcessor``: collect each module's CPU preprocessor in
 ``config.module_names`` order, run the preprocessor chain over a batch dict, and
 return a generate-ready request.
 
-Every module's :class:`~veomni.models.seed_omni.processing.base.ModulePreprocessorBase`
+Every module's :class:`~veomni.models.seed_omni.modules.module_processing_base.ModulePreprocessorBase`
 (defined in its own ``processing.py`` and pointed at by ``preprocessor_class`` on
 its native model class) builds straight off its checkpoint subfolder via
-:meth:`~veomni.models.seed_omni.processing.base.ModulePreprocessorBase.from_pretrained` —
+:meth:`~veomni.models.seed_omni.modules.module_processing_base.ModulePreprocessorBase.from_pretrained` —
 no model instance (weight-free, meta-device, or otherwise) is built or required.
 :meth:`OmniProcessor.from_config` reads each module's ``preprocessor_class`` off
 the class registered for its ``model_type`` and is the single code path backing
@@ -37,8 +37,7 @@ from typing import Any
 
 from ...utils import logging
 from .configuration_omni import OmniConfig
-from .modules import OMNI_MODEL_REGISTRY, read_model_type
-from .processing import ModulePreprocessorBase
+from .modules import OMNI_MODEL_REGISTRY, ModulePreprocessorBase, read_model_type
 
 
 logger = logging.get_logger(__name__)

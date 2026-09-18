@@ -12,13 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SeedOmni utilities: HF → split-checkpoint conversion."""
+"""In-tree two-module stand-in family: ``fake_module_a`` → ``fake_module_b``."""
 
-from .convert_registry import OMNI_CONVERT_REGISTRY, convert_checkpoint, save_converted_omni
-
-
-__all__ = [
-    "OMNI_CONVERT_REGISTRY",
-    "convert_checkpoint",
-    "save_converted_omni",
-]
+from . import convert_model, fake_module_a, fake_module_b  # noqa: F401

@@ -2,8 +2,10 @@
 """Unified entry point for SeedOmni checkpoint conversion.
 
 Reads ``model_type`` from the upstream HuggingFace ``config.json`` at
-``--model_path`` and dispatches to the matching family converter registered
-under ``veomni/models/seed_omni/modules/<family>/convert_model.py``.
+``--model_path``, runs the matching family converter, and writes the split
+checkpoint through
+:func:`~veomni.models.seed_omni.utils.convert_registry.save_converted_omni`
+(module subfolders plus ``training_graph.yaml`` / ``generation_graph.yaml``).
 
 Usage::
 
@@ -17,7 +19,7 @@ from __future__ import annotations
 import argparse
 
 from veomni.models.seed_omni import read_hf_model_type
-from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
+from veomni.models.seed_omni.utils.convert_registry import OMNI_CONVERT_REGISTRY, save_converted_omni
 
 
 def main() -> None:
@@ -36,7 +38,8 @@ def main() -> None:
 
     model_type = read_hf_model_type(args.model_path)
     print(f"Detected model_type={model_type!r} from {args.model_path}")
-    convert_checkpoint(args.model_path, args.output_dir)
+    converted = OMNI_CONVERT_REGISTRY[model_type]()(args.model_path)
+    save_converted_omni(args.output_dir, **converted)
     print(f"Conversion complete → {args.output_dir}")
 
 

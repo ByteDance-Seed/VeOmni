@@ -357,9 +357,6 @@ exclude = [
 ]
 
 [tool.setuptools.package-data]
-# LTX-2.3 reads its default Gemma system prompts from disk at import-adjacent
-# runtime (`veomni/models/diffusers/ltx2_3/.../encoders/prompts/*.txt`), so they
-# have to travel with the package instead of only living in the git checkout.
 veomni = ["**/*.txt"]
 
 [tool.patchgen]

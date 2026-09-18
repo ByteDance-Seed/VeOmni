@@ -1,7 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 from veomni.models.seed_omni.configuration_omni import OmniConfig
-from veomni.models.seed_omni.processing.binding import bind_module_assets
+from veomni.models.seed_omni.modules.module_processing_base import bind_module_assets
 from veomni.models.seed_omni.processing_omni import OmniProcessor
 
 
@@ -168,3 +168,12 @@ def test_bind_module_assets_is_a_noop_the_second_time():
     bind_module_assets(model, preprocessor=_TwoAssetPreprocessor())
 
     assert model._image_processor == "swapped-later"
+
+
+def test_omni_processor_from_pretrained_on_fake_chain_has_no_preprocessors(tmp_path):
+    """fake_module_a / fake_module_b declare no ``preprocessor_class`` yet."""
+    from tests.seed_omni.test_modeling_omni_load import _write_omni_checkpoint
+
+    _write_omni_checkpoint(tmp_path)
+    processor = OmniProcessor.from_pretrained(tmp_path)
+    assert len(processor) == 0

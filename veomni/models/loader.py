@@ -80,18 +80,6 @@ def _omni_registries():
     return OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY, OMNI_PROCESSOR_REGISTRY
 
 
-def raise_unsupported_veomni_modeling(model_name: str) -> None:
-    # Gate for models whose VeOmni modeling path has NOT been ported to the
-    # patchgen/generated flow. ``get_model_class`` in this module short-circuits
-    # when MODELING_BACKEND=hf, so this function is only reached when the caller
-    # wants VeOmni's patched classes — fail loudly instead of returning a stub
-    # that would silently produce broken graphs.
-    raise RuntimeError(
-        f"{model_name} does not have a VeOmni modeling path. Set MODELING_BACKEND=hf "
-        f"to bypass VeOmni patches and load upstream HuggingFace classes directly."
-    )
-
-
 def get_model_config(config_path: str, **kwargs):
     modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend == "hf":
@@ -200,9 +188,7 @@ def get_model_class(model_config: PretrainedConfig):
         # OMNI registry (keyed by model_type; the factory takes no arch_name).
         _, omni_model_registry, _ = _omni_registries()
         if model_type in set(omni_model_registry.valid_keys()):
-            from .seed_omni.modules import OMNI_ACCELERATED_MODEL_REGISTRY
-
-            return OMNI_ACCELERATED_MODEL_REGISTRY[model_type]()
+            return omni_model_registry[model_type]()
         return MODELING_REGISTRY[model_type](arch_name)
     if type(model_config) in AutoModelForImageTextToText._model_mapping.keys():  # assume built-in models
         load_class = AutoModelForImageTextToText

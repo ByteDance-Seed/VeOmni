@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""HF-native SeedOmni sub-model base — extends :class:`PreTrainedModel` for eager inference."""
+"""HF-native base for every SeedOmni sub-module ``modeling.py``."""
 
 from __future__ import annotations
 
@@ -22,17 +22,15 @@ from transformers import PreTrainedModel
 
 
 class OmniPreTrainedModel(PreTrainedModel):
-    """VeOmni HF-native base for every ``modules/*/modeling.py`` class.
+    """Base for every ``modules/<family>/<sub>/modeling.py`` class.
 
     Subclasses hold weights, ``forward``, and FSM ``generate`` endpoints only.
-    VeOmni training / distributed hooks live on ``accelerated.py`` mixins composed
-    at runtime (``OMNI_ACCELERATED_MODEL_REGISTRY``).
     """
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
         """Load weights, then bind module-owned processor / tokenizer sidecars."""
-        from .processing.binding import bind_module_assets
+        from .module_processing_base import bind_module_assets
 
         model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
         # ``kwargs`` may carry an HF ``config=<PretrainedConfig>`` (the loaded

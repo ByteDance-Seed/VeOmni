@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 import pytest
+import torch
 import torch.nn as nn
 
 from veomni.models.seed_omni import EdgeDef, NodeDef
@@ -241,22 +242,30 @@ def _minimal_generation_graphs(module: str = "module_C") -> dict:
     return {"infer_gen": _minimal_generation_graph(module)}
 
 
-def test_omni_model_forward_runs_graph_without_a_runner():
-    """Without an injected runner the graph runs on the modeling's own eager path."""
-    edges = _fan_in_edges()
-    g = TrainingGraph(edges)
-    modules = _fake_modules(g)
-    config = OmniConfig(
-        modules={name: {"subfolder": name} for name in {g.module_of(n) for n in g.execution_order}},
-        training_graph=edges,
-        generation_graphs=_minimal_generation_graphs(),
-    )
-    model = OmniModel(config, modules)
+def test_omni_model_forward_runs_fake_module_chain():
+    """Eager training graph walks ``fake_module_a → fake_module_b`` (no conversation)."""
+    from veomni.models.seed_omni.modules.fake_model.fake_module_a.configuration import FakeModuleAConfig
+    from veomni.models.seed_omni.modules.fake_model.fake_module_a.modeling import FakeModuleA
+    from veomni.models.seed_omni.modules.fake_model.fake_module_b.configuration import FakeModuleBConfig
+    from veomni.models.seed_omni.modules.fake_model.fake_module_b.modeling import FakeModuleB
 
-    batch: dict = {"trace": []}
+    hidden_size = 8
+    edges = [{"from": "fake_module_a", "to": "fake_module_b"}, {"from": "fake_module_b", "to": "end"}]
+    a = FakeModuleA(FakeModuleAConfig(hidden_size=hidden_size))
+    b = FakeModuleB(FakeModuleBConfig(hidden_size=hidden_size))
+    config = OmniConfig(
+        modules={"fake_module_a": {"subfolder": "fake_module_a"}, "fake_module_b": {"subfolder": "fake_module_b"}},
+        training_graph=edges,
+        generation_graphs=_minimal_generation_graphs(module="fake_module_a"),
+    )
+    model = OmniModel(config, {"fake_module_a": a, "fake_module_b": b})
+
+    hidden = torch.ones(2, hidden_size)
+    batch: dict = {"hidden": hidden}
     out = model(batch)
 
-    assert batch["trace"] == [f"{g.module_of(n)}.forward" for n in g.execution_order]
+    # Each Linear is ones-initialized, so a row of ones becomes 8, then 64.
+    assert torch.allclose(batch["hidden"], torch.full((2, hidden_size), 64.0))
     assert out == {"loss": None, "losses": {}}
 
 

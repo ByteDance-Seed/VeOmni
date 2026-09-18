@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SeedOmni utilities: HF → split-checkpoint conversion."""
-
-from .convert_registry import OMNI_CONVERT_REGISTRY, convert_checkpoint, save_converted_omni
+from transformers import PretrainedConfig
 
 
-__all__ = [
-    "OMNI_CONVERT_REGISTRY",
-    "convert_checkpoint",
-    "save_converted_omni",
-]
+class FakeModuleBConfig(PretrainedConfig):
+    """Minimal OmniModule config used to exercise the composite save/load path."""
+
+    model_type = "fake_module_b"
+
+    def __init__(self, hidden_size: int = 8, **kwargs):
+        super().__init__(**kwargs)
+        self.hidden_size = hidden_size

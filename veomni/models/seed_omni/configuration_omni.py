@@ -97,6 +97,25 @@ DEFAULT_TRAINING_GRAPH_FILE = "training_graph.yaml"
 DEFAULT_GENERATION_GRAPH_FILE = "generation_graph.yaml"
 
 
+def _safe_checkpoint_subfolder(name: str) -> str:
+    """Return ``name`` if it is a single relative path component, else raise.
+
+    :meth:`OmniConfig.module_checkpoint_subfolder` joins this onto
+    ``save_directory``. Absolute paths, ``.`` / ``..``, and any separator would
+    let a module key write outside the checkpoint root.
+    """
+    if not name or name in {".", ".."}:
+        raise ValueError(f"Module name {name!r} is not a safe checkpoint subfolder.")
+    if os.path.isabs(name):
+        raise ValueError(
+            f"Module name {name!r} is an absolute path; checkpoint subfolders must be "
+            "a single relative path component."
+        )
+    if os.path.sep in name or (os.path.altsep is not None and os.path.altsep in name):
+        raise ValueError(f"Module name {name!r} is not a safe checkpoint subfolder; use a single path component.")
+    return name
+
+
 def select_graph(
     graphs: Dict[str, Any],
     scenario: Optional[str],
@@ -221,10 +240,15 @@ class OmniConfig(PretrainedConfig):
         return name
 
     def module_checkpoint_subfolder(self, name: str) -> str:
-        """Relative subfolder under an omni checkpoint root for ``name``."""
+        """Relative subfolder under an omni checkpoint root for ``name``.
+
+        The name is used as a single path component under ``save_directory``.
+        Absolute paths, ``.`` / ``..``, and any separator are rejected so a
+        hostile module key cannot write outside the checkpoint root.
+        """
         if name not in self.modules:
             raise KeyError(f"Module '{name}' not found in OmniConfig.modules")
-        return name
+        return _safe_checkpoint_subfolder(name)
 
     def normalize_modules_for_hf_export(self) -> Dict[str, Dict[str, Any]]:
         """Slim ``modules`` block for HF ``config.json`` (subfolder + load options)."""

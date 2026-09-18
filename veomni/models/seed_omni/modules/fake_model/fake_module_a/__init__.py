@@ -12,14 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-module CPU preprocessing contracts and model asset binding."""
-
-from .base import ModulePreprocessorBase
-from .binding import MODULE_ASSET_ATTRS, bind_module_assets
+from ... import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
 
 
-__all__ = [
-    "MODULE_ASSET_ATTRS",
-    "ModulePreprocessorBase",
-    "bind_module_assets",
-]
+@OMNI_CONFIG_REGISTRY.register("fake_module_a")
+def register_fake_module_a_config():
+    from .configuration import FakeModuleAConfig
+
+    return FakeModuleAConfig
+
+
+@OMNI_MODEL_REGISTRY.register("fake_module_a")
+def register_fake_module_a_modeling():
+    from .modeling import FakeModuleA
+
+    return FakeModuleA
