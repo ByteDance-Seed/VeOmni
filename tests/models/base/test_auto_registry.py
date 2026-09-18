@@ -512,7 +512,8 @@ _MODEL_CASES = (
         has_registered_config=True,
         registered_config_aliases=("MiniMaxH3ConditionModel",),
         registered_model_aliases=("MiniMaxH3ConditionModel",),
-        eager_ops=(),
+        eager_ops=(("dit.blocks.0.attn.veomni_attn", "attention"),),
+        isolation_op_path="dit.blocks.0.attn.veomni_attn",
     ),
     _ModelCase(
         model_type="QwenImageTransformer2DModel",

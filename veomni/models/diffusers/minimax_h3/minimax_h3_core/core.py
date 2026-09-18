@@ -1,317 +1,74 @@
 """Core utilities for MiniMax H3.
 
-Provides attention dispatch and gradient checkpointing compatible with
-the original minimax_h3_dit module.
+Attention binds an instance-local ``attention/standard`` handle through
+``resolve_op_impl``. Gradient checkpointing stays here for the DiT blocks.
 """
 
 from __future__ import annotations
 
-import inspect
-import os
+from types import SimpleNamespace
 
 import torch
-import torch.nn.functional as F
-from einops import rearrange
+import torch.nn as nn
+
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 
 
-# ── Attention backend detection ──────────────────────────────────────
-
-try:
-    import flash_attn_interface
-
-    FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
-    FLASH_ATTN_3_AVAILABLE = False
-
-try:
-    import flash_attn
-
-    FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
-    FLASH_ATTN_2_AVAILABLE = False
-
-try:
-    from sageattention import sageattn
-
-    SAGE_ATTN_AVAILABLE = True
-except ModuleNotFoundError:
-    SAGE_ATTN_AVAILABLE = False
-
-try:
-    import xformers.ops as xops
-
-    XFORMERS_AVAILABLE = True
-except ModuleNotFoundError:
-    XFORMERS_AVAILABLE = False
-
-try:
-    if "enable_gqa" in inspect.signature(torch.nn.functional.scaled_dot_product_attention).parameters:
-        TORCH_SUPPORT_GQA = True
-    else:
-        TORCH_SUPPORT_GQA = False
-except Exception:
-    TORCH_SUPPORT_GQA = False
+def bind_minimax_attention(module: nn.Module, *, is_causal: bool) -> None:
+    """Attach the configured ``attention/standard`` handle and HF interface attrs."""
+    impl = resolve_op_impl("attn_implementation")
+    num_heads = module.num_heads
+    module.veomni_attn = VeomniOp("attention", "standard", impl)
+    module.is_causal = is_causal
+    module.layer_idx = getattr(module, "layer_idx", None)
+    module.num_key_value_heads = num_heads
+    module.num_key_value_groups = 1
+    module.config = SimpleNamespace(_attn_implementation=impl)
 
 
-def _initialize_attention_priority() -> str:
-    env_val = os.environ.get("MINIMAX_H3_ATTENTION_IMPLEMENTATION")
-    if env_val is not None:
-        return env_val.lower()
-    if FLASH_ATTN_3_AVAILABLE:
-        return "flash_attention_3"
-    if FLASH_ATTN_2_AVAILABLE:
-        return "flash_attention_2"
-    if SAGE_ATTN_AVAILABLE:
-        return "sage_attention"
-    if XFORMERS_AVAILABLE:
-        return "xformers"
-    return "torch"
-
-
-ATTENTION_IMPLEMENTATION = _initialize_attention_priority()
-
-
-# ── Rearrange helpers (einops) ───────────────────────────────────────
-
-
-def _rearrange_qkv(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q_pattern: str = "b n s d",
-    k_pattern: str = "b n s d",
-    v_pattern: str = "b n s d",
-    target: str = "b n s d",
-    dims: dict | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Rearrange q/k/v to target pattern.
-
-    Einops-based rearrangement, supports any pattern including merged head
-    dims like "b s (n d)".
-    """
-    dims = {} if dims is None else dims
-
-    def _to_pattern(t: torch.Tensor, pat: str) -> torch.Tensor:
-        if pat != target:
-            t = rearrange(t, f"{pat} -> {target}", **dims)
-        return t
-
-    return _to_pattern(q, q_pattern), _to_pattern(k, k_pattern), _to_pattern(v, v_pattern)
-
-
-def _rearrange_out(
-    out: torch.Tensor,
-    out_pattern: str = "b n s d",
-    target: str = "b n s d",
-    dims: dict | None = None,
+def minimax_attention(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    attention_mask: torch.Tensor | None = None,
+    scaling: float | None = None,
+    sliding_window: int | None = None,
+    **kwargs,
 ) -> torch.Tensor:
-    """Reverse of _rearrange_qkv for output."""
-    dims = {} if dims is None else dims
-    if out_pattern != target:
-        out = rearrange(out, f"{target} -> {out_pattern}", **dims)
-    return out
+    """Run interned attention on ``(B, H, S, D)`` and return the same layout."""
+    output, _ = module.veomni_attn(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        dropout=0.0,
+        scaling=scaling,
+        sliding_window=sliding_window,
+        is_causal=module.is_causal,
+        skip_ulysses=True,
+        **kwargs,
+    )
+    return output.transpose(1, 2)
 
 
-# ── Backend implementations ──────────────────────────────────────────
+def packed_block_diag_mask(cu_seqlens: torch.Tensor, seq_len: int, device: torch.device) -> torch.Tensor:
+    """Boolean ``(1, 1, S, S)`` mask that keeps attention inside packed segments."""
+    if not isinstance(cu_seqlens, torch.Tensor):
+        raise TypeError(f"cu_seqlens must be a torch.Tensor, got {type(cu_seqlens).__name__}")
+    cu_seqlens = cu_seqlens.to(device=device)
+    positions = torch.arange(seq_len, device=device)
+    segment_ids = torch.bucketize(positions, cu_seqlens[1:], right=True)
+    mask = segment_ids[:, None] == segment_ids[None, :]
+    return mask.view(1, 1, seq_len, seq_len)
 
 
-def _torch_sdpa(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q_pattern: str = "b n s d",
-    k_pattern: str = "b n s d",
-    v_pattern: str = "b n s d",
-    out_pattern: str = "b n s d",
-    dims: dict | None = None,
-    attn_mask: torch.Tensor | None = None,
-    scale: float | None = None,
-    is_causal: bool = False,
-) -> torch.Tensor:
-    q, k, v = _rearrange_qkv(q, k, v, q_pattern, k_pattern, v_pattern, "b n s d", dims)
-
-    if q.shape[1] != k.shape[1] or q.shape[1] != v.shape[1]:
-        if TORCH_SUPPORT_GQA:
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask, scale=scale, is_causal=is_causal, enable_gqa=True)
-        else:
-            reps = q.shape[1] // k.shape[1]
-            k = k.repeat_interleave(reps, dim=1)
-            v = v.repeat_interleave(reps, dim=1)
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask, scale=scale, is_causal=is_causal)
-    else:
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask, scale=scale, is_causal=is_causal)
-
-    return _rearrange_out(out, out_pattern, "b n s d", dims)
-
-
-def _flash_attn_3_forward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q_pattern: str = "b n s d",
-    k_pattern: str = "b n s d",
-    v_pattern: str = "b n s d",
-    out_pattern: str = "b n s d",
-    dims: dict | None = None,
-    scale: float | None = None,
-    is_causal: bool = False,
-    window_size: int | None = None,
-) -> torch.Tensor:
-    q, k, v = _rearrange_qkv(q, k, v, q_pattern, k_pattern, v_pattern, "b s n d", dims)
-    ws = (window_size, window_size) if window_size is not None else (-1, -1)
-    out = flash_attn_interface.flash_attn_func(q, k, v, softmax_scale=scale, causal=is_causal, window_size=ws)
-    if isinstance(out, tuple):
-        out = out[0]
-    return _rearrange_out(out, out_pattern, "b s n d", dims)
-
-
-def _flash_attn_2_forward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q_pattern: str = "b n s d",
-    k_pattern: str = "b n s d",
-    v_pattern: str = "b n s d",
-    out_pattern: str = "b n s d",
-    dims: dict | None = None,
-    scale: float | None = None,
-    is_causal: bool = False,
-    window_size: int | None = None,
-) -> torch.Tensor:
-    q, k, v = _rearrange_qkv(q, k, v, q_pattern, k_pattern, v_pattern, "b s n d", dims)
-    ws = (window_size, window_size) if window_size is not None else (-1, -1)
-    out = flash_attn.flash_attn_func(q, k, v, softmax_scale=scale, causal=is_causal, window_size=ws)
-    return _rearrange_out(out, out_pattern, "b s n d", dims)
-
-
-def _sage_attn_forward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q_pattern: str = "b n s d",
-    k_pattern: str = "b n s d",
-    v_pattern: str = "b n s d",
-    out_pattern: str = "b n s d",
-    dims: dict | None = None,
-    scale: float | None = None,
-) -> torch.Tensor:
-    q, k, v = _rearrange_qkv(q, k, v, q_pattern, k_pattern, v_pattern, "b n s d", dims)
-    out = sageattn(q, k, v, sm_scale=scale)
-    return _rearrange_out(out, out_pattern, "b n s d", dims)
-
-
-def _xformers_forward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q_pattern: str = "b n s d",
-    k_pattern: str = "b n s d",
-    v_pattern: str = "b n s d",
-    out_pattern: str = "b n s d",
-    dims: dict | None = None,
-    scale: float | None = None,
-) -> torch.Tensor:
-    q, k, v = _rearrange_qkv(q, k, v, q_pattern, k_pattern, v_pattern, "b s n d", dims)
-    out = xops.memory_efficient_attention(q, k, v, scale=scale)
-    return _rearrange_out(out, out_pattern, "b s n d", dims)
-
-
-# ── Main dispatch ────────────────────────────────────────────────────
-
-
-def attention_forward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q_pattern: str = "b n s d",
-    k_pattern: str = "b n s d",
-    v_pattern: str = "b n s d",
-    out_pattern: str = "b n s d",
-    dims: dict | None = None,
-    attn_mask: torch.Tensor | None = None,
-    scale: float | None = None,
-    is_causal: bool = False,
-    compatibility_mode: bool = False,
-    window_size: int | None = None,
-) -> torch.Tensor:
-    """Dispatch attention to available backend."""
-    if compatibility_mode or (attn_mask is not None) or ATTENTION_IMPLEMENTATION == "torch":
-        return _torch_sdpa(
-            q,
-            k,
-            v,
-            q_pattern,
-            k_pattern,
-            v_pattern,
-            out_pattern,
-            dims,
-            attn_mask=attn_mask,
-            scale=scale,
-            is_causal=is_causal,
-        )
-    if ATTENTION_IMPLEMENTATION == "flash_attention_3":
-        return _flash_attn_3_forward(
-            q,
-            k,
-            v,
-            q_pattern,
-            k_pattern,
-            v_pattern,
-            out_pattern,
-            dims,
-            scale=scale,
-            is_causal=is_causal,
-            window_size=window_size,
-        )
-    if ATTENTION_IMPLEMENTATION == "flash_attention_2":
-        return _flash_attn_2_forward(
-            q,
-            k,
-            v,
-            q_pattern,
-            k_pattern,
-            v_pattern,
-            out_pattern,
-            dims,
-            scale=scale,
-            is_causal=is_causal,
-            window_size=window_size,
-        )
-    if ATTENTION_IMPLEMENTATION == "sage_attention":
-        if window_size is not None or is_causal:
-            return attention_forward(
-                q,
-                k,
-                v,
-                q_pattern,
-                k_pattern,
-                v_pattern,
-                out_pattern,
-                dims,
-                attn_mask,
-                scale,
-                is_causal,
-                compatibility_mode=True,
-            )
-        return _sage_attn_forward(q, k, v, q_pattern, k_pattern, v_pattern, out_pattern, dims, scale=scale)
-    if ATTENTION_IMPLEMENTATION == "xformers":
-        if window_size is not None or is_causal:
-            return attention_forward(
-                q,
-                k,
-                v,
-                q_pattern,
-                k_pattern,
-                v_pattern,
-                out_pattern,
-                dims,
-                attn_mask,
-                scale,
-                is_causal,
-                compatibility_mode=True,
-            )
-        return _xformers_forward(q, k, v, q_pattern, k_pattern, v_pattern, out_pattern, dims, scale=scale)
-    raise NotImplementedError(f"No available attention implementation (current: {ATTENTION_IMPLEMENTATION}).")
+def is_flash_attn_impl(impl: str) -> bool:
+    """True when the selected attention impl can take FA varlen kwargs."""
+    return "flash_attention" in impl
 
 
 # ── Gradient checkpointing ────────────────────────────────────────────

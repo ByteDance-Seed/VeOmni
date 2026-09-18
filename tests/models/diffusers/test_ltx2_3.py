@@ -29,7 +29,12 @@ import torch.nn.functional as F
 # Import the package binder before the vendored top-level ``ltx_core`` modules.
 from veomni.models.diffusers.ltx2_3.ltx_transformer import modeling_ltx2_3_transformer as ltx_modeling
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig
-from ltx_core.model.transformer.attention import Attention
+from ltx_core.model.transformer.attention import (
+    Attention,
+    AttentionFunction,
+    MaskedAttentionFunction,
+    VeomniLTXAttention,
+)
 from ltx_core.model.transformer.model import LTXModel
 # isort: on
 
@@ -39,6 +44,13 @@ from tests.models.tiny_configs import tiny_ltx2_3_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 from veomni.ops import resolve_op
 from veomni.ops.config import get_ops_config, resolve_op_impl, set_ops_config
+
+
+def _sdpa_ops_config() -> SimpleNamespace:
+    """Portable LTX attention path. This family has no local eager forward."""
+    ops = eager_ops_config()
+    ops.attn_implementation = "sdpa"
+    return ops
 
 
 _OFFICIAL_ATTENTION_FORWARD = Attention.forward
@@ -104,17 +116,16 @@ def test_ltx2_3_condition_builds_from_registered_class_without_assets(monkeypatc
 def test_ltx2_3_eager_forward_and_backward_match_vendored_reference():
     torch.manual_seed(2)
     config = _tiny_config()
-    official = ltx_modeling.LTXVideoTransformerModel(config)
-    official.apply(official._init_weights)
-    ours = ltx_modeling.LTXVideoTransformerModel(config)
-    ours.load_state_dict(official.state_dict())
+    with ops_config_scope(_sdpa_ops_config()):
+        official = ltx_modeling.LTXVideoTransformerModel(config)
+        official.apply(official._init_weights)
+        ours = ltx_modeling.LTXVideoTransformerModel(config)
+        ours.load_state_dict(official.state_dict())
     official_inputs = _ltx_inputs()
     ours_inputs = {key: [value.detach().clone() for value in values] for key, values in official_inputs.items()}
 
-    previous_ops = get_ops_config()
     previous_attention_forward = Attention.forward
     previous_ltx_model_forward = LTXModel.forward
-    set_ops_config(eager_ops_config())
     try:
 
         def call(model):
@@ -132,11 +143,11 @@ def test_ltx2_3_eager_forward_and_backward_match_vendored_reference():
     finally:
         Attention.forward = previous_attention_forward
         LTXModel.forward = previous_ltx_model_forward
-        set_ops_config(previous_ops)
 
 
 def test_ltx2_3_video_only_model_rejects_audio_input():
-    model = ltx_modeling.LTXVideoTransformerModel(_tiny_config())
+    with ops_config_scope(_sdpa_ops_config()):
+        model = ltx_modeling.LTXVideoTransformerModel(_tiny_config())
     with pytest.raises(ValueError, match="Audio is not enabled"):
         ltx_modeling.LTXVideoModel_forward(
             model,
@@ -202,7 +213,7 @@ def test_ltx2_3_connector_forwards_use_explicit_unweighted_rms_eps():
     wrong_eps = _explicit_unweighted_rms(hidden, 1e-3)
     assert not torch.allclose(expected, wrong_eps, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
-    with ops_config_scope(eager_ops_config()):
+    with ops_config_scope(_sdpa_ops_config()):
         connector = Embeddings1DConnector(
             attention_head_dim=4,
             num_attention_heads=2,
@@ -237,6 +248,80 @@ def test_ltx2_3_connector_forwards_use_explicit_unweighted_rms_eps():
         block_out.sum().backward()
         assert block_hidden.grad is not None
         assert torch.isfinite(block_hidden.grad).all()
+
+
+def test_ltx_automatic_to_callable_reads_ops_config():
+    with ops_config_scope(_sdpa_ops_config()):
+        adapter = AttentionFunction.AUTOMATIC.to_callable()
+        masked = MaskedAttentionFunction.AUTOMATIC.to_callable()
+    assert isinstance(adapter, VeomniLTXAttention)
+    assert adapter.veomni_attn.impl == "sdpa"
+    assert adapter.veomni_attn_masked is adapter.veomni_attn
+    assert masked.veomni_attn.impl == "sdpa"
+    assert masked.veomni_attn_masked is masked.veomni_attn
+
+
+def test_ltx_sdpa_flash_to_callable_collapses_to_sdpa():
+    adapter = AttentionFunction.SDPA_FLASH.to_callable()
+    assert isinstance(adapter, VeomniLTXAttention)
+    assert adapter.veomni_attn.impl == "sdpa"
+    assert adapter.veomni_attn_masked is adapter.veomni_attn
+
+
+def test_ltx_non_sdpa_masked_falls_back_to_sdpa():
+    assert AttentionFunction.FLASH_ATTENTION_3.value == "flash_attention_3"
+    adapter = VeomniLTXAttention("eager")
+    assert adapter.veomni_attn.impl == "eager"
+    assert adapter.veomni_attn_masked.impl == "sdpa"
+    assert adapter.veomni_attn_masked is not adapter.veomni_attn
+
+
+def test_ltx_adapter_expands_mask_and_skips_ulysses():
+    adapter = VeomniLTXAttention("sdpa")
+    captured: dict = {}
+
+    def record(_module, query, _key, _value, attention_mask=None, **kwargs):
+        captured["query_shape"] = tuple(query.shape)
+        captured["attention_mask"] = attention_mask
+        captured["skip_ulysses"] = kwargs.get("skip_ulysses")
+        return query.transpose(1, 2), None
+
+    adapter.veomni_attn = record
+    adapter.veomni_attn_masked = record
+    query = torch.randn(1, 4, 16)
+    key = torch.randn(1, 4, 16)
+    value = torch.randn(1, 4, 16)
+
+    out = adapter(query, key, value, heads=2)
+    assert out.shape == (1, 4, 16)
+    assert captured["query_shape"] == (1, 2, 4, 8)
+    assert captured["attention_mask"] is None
+    assert captured["skip_ulysses"] is True
+
+    mask = torch.ones(4, 4)
+    out = adapter(query, key, value, heads=2, mask=mask)
+    assert out.shape == (1, 4, 16)
+    assert captured["attention_mask"] is not None
+    assert tuple(captured["attention_mask"].shape) == (1, 1, 4, 4)
+    assert captured["attention_mask"].dtype == mask.dtype
+    assert captured["skip_ulysses"] is True
+
+
+def test_ltx_adapter_matches_sdpa():
+    adapter = VeomniLTXAttention("sdpa")
+    torch.manual_seed(0)
+    query = torch.randn(2, 6, 16)
+    key = torch.randn(2, 6, 16)
+    value = torch.randn(2, 6, 16)
+    heads = 2
+    dim_head = 8
+    out = adapter(query, key, value, heads)
+    query_h = query.view(2, 6, heads, dim_head).transpose(1, 2)
+    key_h = key.view(2, 6, heads, dim_head).transpose(1, 2)
+    value_h = value.view(2, 6, heads, dim_head).transpose(1, 2)
+    ref = F.scaled_dot_product_attention(query_h, key_h, value_h)
+    ref = ref.transpose(1, 2).reshape(2, 6, 16)
+    torch.testing.assert_close(out, ref, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
 
 def test_ltx_core_rebinds_away_from_another_copy(tmp_path):

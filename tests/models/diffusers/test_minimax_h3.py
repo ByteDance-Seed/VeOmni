@@ -23,11 +23,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tests.models.compare import assert_outputs_and_grads_match, eager_ops_config
+from tests.models.compare import assert_outputs_and_grads_match, eager_ops_config, ops_config_scope
 from tests.models.tiny_configs import tiny_minimax_h3_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_minimax_h3_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
-from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import VeomniRMSNorm
+from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3Attention, VeomniRMSNorm
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
     MiniMaxH3DiTModel,
 )
@@ -41,24 +41,23 @@ def _torch_rms_norm_forward(self, x: torch.Tensor) -> torch.Tensor:
     return F.rms_norm(x, (x.shape[-1],), self.weight, self.eps)
 
 
+def _sdpa_ops_config() -> SimpleNamespace:
+    """Portable MiniMax H3 attention path. This family has no local eager forward."""
+    ops = eager_ops_config()
+    ops.attn_implementation = "sdpa"
+    return ops
+
+
 def _build_norm(size: int = 16):
-    previous = get_ops_config()
-    set_ops_config(eager_ops_config())
-    try:
+    with ops_config_scope(eager_ops_config()):
         return VeomniRMSNorm(size, eps=1e-6)
-    finally:
-        set_ops_config(previous)
 
 
 def _build_model():
-    previous = get_ops_config()
-    set_ops_config(eager_ops_config())
-    try:
+    with ops_config_scope(_sdpa_ops_config()):
         # Keep the production latent channels/patch size: the public wrapper
         # unpacks 24-channel video and 32-dimensional audio tokens.
         return MiniMaxH3DiTModel(_tiny_config(latents_dim=24, audio_latents_dim=32, patch_size=(1, 2, 2)))
-    finally:
-        set_ops_config(previous)
 
 
 def _minimax_h3_inputs(cond_rows: int) -> dict:
@@ -128,11 +127,10 @@ def test_minimax_h3_public_forward_matches_token_reference(monkeypatch, cond_row
     The raw DiT is shared; this is a wrapper and norm integration reference,
     not an independent implementation of the entire MiniMax backbone.
     """
-    from veomni.models.diffusers.minimax_h3.minimax_h3_core import core
-
     torch.manual_seed(1)
     reference = _build_model()
     ours = _build_model()
+    assert ours.dit.blocks[0].attn.veomni_attn.impl == "sdpa"
     ours.load_state_dict(reference.state_dict())
     inputs = _minimax_h3_inputs(cond_rows)
     ours_inputs = {
@@ -159,8 +157,7 @@ def test_minimax_h3_public_forward_matches_token_reference(monkeypatch, cond_row
     expected_predictions = []
 
     previous = get_ops_config()
-    set_ops_config(eager_ops_config())
-    monkeypatch.setattr(core, "ATTENTION_IMPLEMENTATION", "torch")
+    set_ops_config(_sdpa_ops_config())
     monkeypatch.setattr(VeomniRMSNorm, "forward", VeomniRMSNorm.forward)
     try:
 
@@ -201,6 +198,91 @@ def test_minimax_h3_public_forward_matches_token_reference(monkeypatch, cond_row
             )
     finally:
         set_ops_config(previous)
+
+
+def _tiny_attention():
+    with ops_config_scope(_sdpa_ops_config()):
+        return MiniMaxH3Attention(hidden_size=16, num_attention_heads=2, attention_head_dim=8, qk_norm_eps=1e-5)
+
+
+def test_minimax_h3_packed_sdpa_matches_independent_segments():
+    torch.manual_seed(0)
+    attn = _tiny_attention()
+    packed = torch.randn(6, 16)
+    cu_seqlens = torch.tensor([0, 2, 6], dtype=torch.int32)
+    out_packed = attn(packed, rope_cos=None, rope_sin=None, cu_seqlens=cu_seqlens, max_seqlen=4, valid_seqlen=6)
+    out_a = attn(
+        packed[:2],
+        rope_cos=None,
+        rope_sin=None,
+        cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+        max_seqlen=2,
+        valid_seqlen=2,
+    )
+    out_b = attn(
+        packed[2:],
+        rope_cos=None,
+        rope_sin=None,
+        cu_seqlens=torch.tensor([0, 4], dtype=torch.int32),
+        max_seqlen=4,
+        valid_seqlen=4,
+    )
+    torch.testing.assert_close(out_packed, torch.cat((out_a, out_b), dim=0), atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+
+def test_minimax_h3_sdpa_packed_uses_block_diag_mask_not_varlen_kwargs():
+    attn = _tiny_attention()
+    captured: dict = {}
+
+    def record(_module, query, _key, _value, attention_mask=None, **kwargs):
+        captured["attention_mask"] = attention_mask
+        captured.update(kwargs)
+        return query.transpose(1, 2), None
+
+    attn.veomni_attn = record
+    hidden = torch.randn(6, 16)
+    attn(
+        hidden,
+        rope_cos=None,
+        rope_sin=None,
+        cu_seqlens=torch.tensor([0, 2, 6], dtype=torch.int32),
+        max_seqlen=4,
+        valid_seqlen=6,
+    )
+    assert captured["attention_mask"] is not None
+    assert captured["attention_mask"].shape == (1, 1, 6, 6)
+    assert "cu_seq_lens_q" not in captured
+    assert "cu_seq_lens_k" not in captured
+
+
+def test_minimax_h3_flash2_bind_passes_varlen_kwargs():
+    ops = eager_ops_config()
+    ops.attn_implementation = "flash_attention_2"
+    with ops_config_scope(ops):
+        attn = MiniMaxH3Attention(hidden_size=16, num_attention_heads=2, attention_head_dim=8, qk_norm_eps=1e-5)
+    assert attn.veomni_attn.impl == "flash_attention_2"
+    captured: dict = {}
+
+    def record(_module, query, _key, _value, attention_mask=None, **kwargs):
+        captured["attention_mask"] = attention_mask
+        captured.update(kwargs)
+        return query.transpose(1, 2), None
+
+    attn.veomni_attn = record
+    hidden = torch.randn(6, 16)
+    attn(
+        hidden,
+        rope_cos=None,
+        rope_sin=None,
+        cu_seqlens=torch.tensor([0, 2, 6], dtype=torch.int32),
+        max_seqlen=4,
+        valid_seqlen=6,
+    )
+    assert captured["attention_mask"] is None
+    assert captured["max_length_q"] == 4
+    assert captured["max_length_k"] == 4
+    assert captured["cu_seq_lens_q"].tolist() == [0, 2, 6]
+    assert captured["cu_seq_lens_k"].tolist() == [0, 2, 6]
 
 
 def test_minimax_h3_pipeline_constructs_without_weights():

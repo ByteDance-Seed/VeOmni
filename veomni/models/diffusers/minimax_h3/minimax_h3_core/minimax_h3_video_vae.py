@@ -9,7 +9,7 @@ from torchvision.transforms import Normalize
 
 from veomni.utils.device import get_device_type
 
-from .core import attention_forward
+from .core import bind_minimax_attention, minimax_attention
 
 
 class WarpedTensor(torch.nn.Module):
@@ -121,10 +121,11 @@ def _group_norm(ch, t_isolated=False):
 
 
 class Attention(nn.Module):
-    """Multi-head attention with backend dispatch via attention_forward."""
+    """Multi-head attention through the interned ``attention/standard`` handle."""
 
     def __init__(self, heads, dim_head, embed_dim=None, qk_norm_type=None, qk_norm_affine=False, bias=True, eps=1e-5):
         super().__init__()
+        self.num_heads = heads
         self.dim_head = dim_head
         inner_dim = dim_head * heads
         dim = embed_dim or inner_dim
@@ -133,6 +134,7 @@ class Attention(nn.Module):
         self.norm_k = norm_cls(dim_head, eps=eps, elementwise_affine=qk_norm_affine) if norm_cls else None
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=bias)
         self.to_out = nn.Linear(inner_dim, dim, bias=bias)
+        bind_minimax_attention(self, is_causal=False)
 
     def forward(self, x, rotary_pos_emb=None):
         B, S, _ = x.shape
@@ -143,11 +145,8 @@ class Attention(nn.Module):
             k = self.norm_k(k)
         if rotary_pos_emb is not None:
             q, k = apply_rotary_pos_emb(q, rotary_pos_emb), apply_rotary_pos_emb(k, rotary_pos_emb)
-        return self.to_out(
-            attention_forward(
-                q, k, v, q_pattern="b s n d", k_pattern="b s n d", v_pattern="b s n d", out_pattern="b s n d"
-            ).reshape(B, S, -1)
-        )
+        out = minimax_attention(self, q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+        return self.to_out(out.transpose(1, 2).reshape(B, S, -1))
 
 
 class FeedForward(nn.Module):

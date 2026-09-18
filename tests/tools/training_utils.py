@@ -67,6 +67,12 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # official path builds a ``(B, S)`` padding mask, so keep SDPA rather than
     # FA. RoPE stays eager because this family has no fused rope row.
     "qwen_image": {"attn_implementation": "sdpa", "rotary_pos_emb_implementation": "eager"},
+    # MiniMax H3 has no module-local eager attention. Packed DiT uses SDPA with
+    # a block-diagonal mask; production FA takes cu_seqlens once.
+    "minimax_h3": {"attn_implementation": "sdpa"},
+    # LTX has no module-local eager attention. The callable adapter binds
+    # ``attention/standard``; a mask falls back to SDPA.
+    "ltx2_3": {"attn_implementation": "sdpa"},
     # qwen3_5 / qwen3_5_moe peak GPU memory on the toy config is dominated
     # by the fused Liger cross-entropy kernel materializing the full
     # ``[B, S, V]`` logits buffer. Use ``chunk_loss`` instead: it
