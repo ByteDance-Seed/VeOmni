@@ -21,6 +21,11 @@ the part a job may want to replace or drop on its own: an Energon or
 multisource-sampler state is large, and resuming weights onto a different
 dataset means keeping ``extra_state/`` while discarding ``loader/``.
 
+"the rng" spans three streams: the CPU default generator, the accelerator
+default generator (diffusion condition models sample noise and timesteps from
+it), and any per-run ``torch.Generator`` a condition model owns. Restoring only
+the first resumes a different noise stream than an uninterrupted run.
+
 This callback also writes ``checkpoint_manifest.json``, which records that the
 files above are down. It says nothing about the model state: that is covered by
 DCP's own ``.metadata``, one per directory under ``model/``, and a step counts
@@ -39,7 +44,7 @@ import torch.distributed as dist
 
 from ...checkpoint import layout
 from ...utils import helper
-from ...utils.device import get_device_type
+from ...utils.device import get_device_rng_state, get_device_type, set_device_rng_state
 from ...utils.dist_utils import raise_if_any_rank_failed
 from .base import Callback, TrainerState
 
@@ -133,6 +138,7 @@ class GlobalStateCallback(Callback):
             "environ_meter": self.trainer.environ_meter.state_dict(),
             "channel_loss_callback": channel_loss_state,
             "torch_rng_state": torch.get_rng_state(),
+            "device_rng_state": get_device_rng_state(),
         }
 
     def save_global_state(self, state: TrainerState) -> None:
@@ -282,6 +288,9 @@ class GlobalStateCallback(Callback):
         rng_state = global_state.get("torch_rng_state")
         if rng_state is not None:
             torch.set_rng_state(rng_state)
+        # ``.get`` keeps checkpoints written before these fields existed loadable;
+        # the device namespace may also not support RNG state at all.
+        set_device_rng_state(global_state.get("device_rng_state"))
         if self.trainer.start_step == 0 and self.trainer.train_dataloader is not None:
             iter(self.trainer.train_dataloader)
 
