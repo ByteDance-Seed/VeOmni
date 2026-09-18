@@ -59,10 +59,48 @@ def save_converted_omni(
     OmniModel(config, modules).save_pretrained(output_dir)
 
 
-def convert_checkpoint(model_path: str, output_dir: str, **kwargs) -> None:
-    """Run the registered family converter and write the split omni checkpoint."""
-    save_converted_omni(output_dir, **_run_converter(model_path, **kwargs))
+def convert_checkpoint(
+    model_path: str,
+    output_dir: str,
+    *,
+    training_graph: str | None = None,
+    generation_graph: str | None = None,
+    **kwargs,
+) -> None:
+    """Run the registered family converter and write the split omni checkpoint.
+
+    ``training_graph`` / ``generation_graph`` are YAML paths. When set they
+    override whatever the family converter returned, so the CLI can bake a
+    complete omni checkpoint (module subfolders + both graph sidecars) without
+    the family hard-coding one DAG/FSM.
+    """
+    if training_graph is not None:
+        kwargs.setdefault("train_graph", training_graph)
+    if generation_graph is not None:
+        kwargs.setdefault("generation_graph", generation_graph)
+    converted = _run_converter(model_path, **kwargs)
+    _apply_graph_files(converted, training_graph=training_graph, generation_graph=generation_graph)
+    save_converted_omni(output_dir, **converted)
     _require_converted_graphs(output_dir)
+
+
+def _apply_graph_files(
+    converted: dict[str, Any],
+    *,
+    training_graph: str | None,
+    generation_graph: str | None,
+) -> None:
+    """Replace converter graphs with YAML from disk when the caller supplied paths."""
+    from ..configuration_omni import OmniConfig
+
+    if training_graph is not None:
+        converted["training_graph"] = OmniConfig._read_graph_file(str(training_graph), "training_graph")
+    if generation_graph is not None:
+        converted["generation_graphs"] = OmniConfig._read_generation_graphs(str(generation_graph))
+        infer_type = converted.get("infer_type")
+        graphs = converted["generation_graphs"]
+        if infer_type is None or infer_type not in graphs:
+            converted["infer_type"] = next(iter(graphs)) if graphs else None
 
 
 def _run_converter(model_path: str, **kwargs) -> dict[str, Any]:
