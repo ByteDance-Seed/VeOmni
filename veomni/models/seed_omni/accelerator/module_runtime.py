@@ -123,7 +123,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         self._global_accelerator = global_accelerator
 
         if for_inference:
-            if args.accelerator.fsdp_config.fsdp_mode == "eager":
+            if not args.needs_distributed_build:
                 self._init_eager_inference()
             else:
                 args.accelerator.fsdp_config.mixed_precision.enable = False

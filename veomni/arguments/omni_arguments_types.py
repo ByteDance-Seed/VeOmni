@@ -95,6 +95,28 @@ class OmniModuleRuntimeArguments(ModelArguments):
     is the projection onto an :class:`OmniConfig` entry.
     """
 
+    @property
+    def needs_distributed_build(self) -> bool:
+        """True when this module must be built under a process group, not loaded whole.
+
+        ``eager`` is the inference default and means one rank holds the module
+        entire, loaded through ``device_map`` with no collectives. Anything else
+        -- FSDP2, DDP, expert parallelism, vocab parallelism -- needs a
+        :class:`ParallelState` and a sharded build.
+
+        The two parallelisms that are *not* ``fsdp_mode`` are the reason this is
+        a property rather than a comparison written out at each call site. A
+        module can ask for ``ep`` or ``emb`` while leaving ``fsdp_mode`` alone,
+        and reading only ``fsdp_mode`` then sends it down the single-process
+        path -- where the sharding quietly does not happen and the whole module
+        is loaded on every rank. DeepSeek-V4.1 is both cases: its n-gram tables
+        shard over ``emb`` and nothing else, and one of them is 91.6 GiB.
+        """
+        fsdp_mode = self.accelerator.fsdp_config.fsdp_mode
+        if fsdp_mode and str(fsdp_mode).lower() not in ("eager",):
+            return True
+        return self.accelerator.ep_size > 1 or any(size > 1 for size in self.accelerator.extra_parallel_sizes or ())
+
     def to_hf_config(self, module_name: str) -> dict:
         """Project onto this module's slim :class:`OmniConfig` entry.
 

@@ -65,10 +65,12 @@ deepseek_v41_llm:
     # owning their expert and the fp4 GEMMs run there.
     ep_size: 8
     ep_outside: false
-    # The remaining ~6.7 GiB is dense fp8 and small enough to hold whole, which
-    # also keeps the decode step free of an all-gather on the path every token
-    # takes.
+    # The remaining ~6.7 GiB is dense fp8. It is small enough that sharding it
+    # would buy little, but it is not left on `eager`: expert parallelism is a
+    # distributed build, and pairing it with an eager mode asks for one thing
+    # per rank and its opposite in the same breath.
     fsdp_config:
-      fsdp_mode: eager
+      fsdp_mode: fsdp2
+      reshard_after_forward: false
     gradient_checkpointing:
       enable: false

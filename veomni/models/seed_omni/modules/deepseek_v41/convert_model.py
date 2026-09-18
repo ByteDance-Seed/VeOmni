@@ -451,15 +451,35 @@ def convert_vision(source: TensorSource, output_dir: str, config, precision: str
     against these names. The passthrough is asserted rather than assumed: a
     tensor that does not land on a parameter of the built module is a rename
     that happened upstream without this converter noticing.
+
+    The image processor is written out alongside them. The release does not
+    ship a ``preprocessor_config.json`` -- its reference runner reads the
+    resize policy off the model config instead -- but a split module is loaded
+    through ``from_pretrained``, which looks for that file and fails without
+    it. The five values are copied from ``vision_config``, so the artifact
+    states the policy the weights were trained under rather than relying on
+    this class's defaults still agreeing with it.
     """
-    writer = ShardWriter(os.path.join(output_dir, "deepseek_v41_vision"))
+    target_dir = os.path.join(output_dir, "deepseek_v41_vision")
+    writer = ShardWriter(target_dir)
     emitter = Emitter(source, writer, precision)
     for name in sorted(source.names()):
         if name.startswith(("vision.", "aligner.", "image_")):
             if name.endswith(".scale"):
                 continue
             emitter.emit(name, name)
-    return writer.finalize(config)
+    count = writer.finalize(config)
+
+    from .vision.processing import DeepseekV41VisionImageProcessor
+
+    DeepseekV41VisionImageProcessor(
+        patch_size=config.patch_size,
+        downsample_ratio=config.downsample_ratio,
+        max_image_tokens=config.max_image_tokens,
+        min_pixels=config.min_pixels,
+        max_wh_ratio=config.max_wh_ratio,
+    ).save_pretrained(target_dir)
+    return count
 
 
 def convert_text_encoder(source: TensorSource, output_dir: str, config, model_path: str, precision: str) -> int:
