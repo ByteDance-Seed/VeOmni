@@ -490,6 +490,11 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
   Blackwell/GB200. FA3 is Hopper-only (no Blackwell kernel image) and is not
   used by the ring path. Ascend dispatches to `torch_npu.npu_fusion_attention`
   and its backward operator through the VeOmni FlashAttention 2 adapter.
+- **CUDA backward determinism**: dense and packed FA2/FA4 Ring paths honor
+  `FLASH_ATTENTION_DETERMINISTIC=1`, set by `train.enable_full_determinism=true`.
+  Unset or `0` keeps the non-deterministic backward. This can use more memory
+  and be slower; it does not imply bitwise equality across USP topologies.
+  NPU backend behavior is unchanged.
 - **Divisibility**: `max_seq_len` must be divisible by `2 · ulysses_size · cp_size`
   (the collator pads up to this multiple automatically).
 - **Loss/data layout**: the `SequenceParallelCollator` lays sequences out
