@@ -28,8 +28,9 @@ from torch.utils.checkpoint import noop_context_fn
 
 from ..arguments import MixedPrecisionConfig
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
-from ..utils import logging
+from ..utils import logging, recompute_utils
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
+from ..utils.recompute_utils import RecomputePolicy
 from .checkpoint import CheckpointFunction
 from .parallel_plan import ParallelPlan, get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
@@ -837,6 +838,7 @@ def build_parallelize_model(
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
+    recompute_policy: Optional[RecomputePolicy] = None,
     muon_expert_zero_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
@@ -875,6 +877,13 @@ def build_parallelize_model(
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
         )
+
+    # Layer selection and SAC are bound per block, after HF has set its own
+    # function on every checkpointing layer and before FSDP shards them. Runs
+    # outside the branch above: models whose block loops drive checkpointing
+    # themselves (MiniMax-H3) still need their blocks bound.
+    if recompute_policy is not None:
+        recompute_utils.apply_recompute_policy(model, recompute_policy, basic_modules=basic_modules)
 
     if parallel_state.tp_enabled:
         logger.info_rank0("Apply tensor parallel to the model.")

@@ -434,6 +434,54 @@ class GradientCheckpointingConfig:
             )
         },
     )
+    recompute_last_n_layers: int = field(
+        default=-1,
+        metadata={
+            "help": (
+                "How many layers recompute, counted from the last block: -1 = "
+                "all layers (default), 0 = none, N = the last N layers. Values "
+                "above the model depth mean all layers. Applies to every model: "
+                "the framework finds the block stack itself (_no_split_modules / "
+                "basic_modules) and folds sibling stacks into one sequence."
+            )
+        },
+    )
+    selective_n_layers: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Selective activation checkpointing (SAC): how many of the "
+                "recomputed layers run SAC instead of full recompute, counted "
+                "from the front of the recompute range. 0 = off (default), N = "
+                "the first N recomputed layers, a value at or above the model "
+                "depth = every recomputed layer. Requires enable=True and "
+                "enable_reentrant=False; on a 20-layer model with "
+                "recompute_last_n_layers=-1, 10 = layers 0-9 SAC, 10-19 full "
+                "recompute. Applies to every model that checkpoints through HF "
+                "layers or through self._gradient_checkpointing_func; a model "
+                "calling torch.utils.checkpoint directly is reported and skipped."
+            )
+        },
+    )
+    selective_ops: list = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Extra operator strings to keep (MUST_SAVE) under selective mode, "
+                "e.g. ['aten._scaled_dot_product_attention.default']. Empty = auto default set."
+            )
+        },
+    )
+
+    def __post_init__(self) -> None:
+        # YAML values reach the dataclass untyped (parser only casts CLI args),
+        # so a quoted "10" would blow up later inside the forward pass.
+        for name in ("recompute_last_n_layers", "selective_n_layers"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    f"train.gradient_checkpointing.{name} must be an integer, got {value!r} ({type(value).__name__})"
+                )
 
 
 @dataclass

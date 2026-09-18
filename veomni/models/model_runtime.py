@@ -36,7 +36,7 @@ from ..distributed.parallel_state import (
     get_parallel_state_by_name,
     use_parallel_state,
 )
-from ..utils import helper, logging
+from ..utils import helper, logging, recompute_utils
 
 
 if TYPE_CHECKING:
@@ -380,6 +380,21 @@ class VeOmniModelRuntime:
                 "skipping HF weight materialization before checkpoint restore."
             )
 
+        # Recomputation strategy for this run: how many trailing blocks recompute
+        # at all, and how many of those — from the front of that range — run SAC
+        # instead of full recomputation.
+        gc_cfg = args.accelerator.gradient_checkpointing
+        recompute_policy = recompute_utils.build_policy(
+            enabled=gc_cfg.enable,
+            enable_reentrant=gc_cfg.enable_reentrant,
+            early_stop=gc_cfg.early_stop,
+            extra_op_names=gc_cfg.selective_ops,
+            recompute_last_n_layers=gc_cfg.recompute_last_n_layers,
+            selective_n_layers=gc_cfg.selective_n_layers,
+            offload_active=offload_config.enable_activation,
+            compile_enabled=args.accelerator.torch_compile.enable,
+        )
+
         from ..distributed import torch_parallelize
         from ..distributed.torch_compile import CompileConfig
 
@@ -393,10 +408,11 @@ class VeOmniModelRuntime:
             should_skip_hf_weight_load=skip_hf_weight_load,
             enable_reshard_after_forward=args.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=args.accelerator.fsdp_config.mixed_precision,
-            enable_gradient_checkpointing=args.accelerator.gradient_checkpointing.enable,
+            enable_gradient_checkpointing=gc_cfg.enable,
             basic_modules=list(set(getattr(self.model, "_no_split_modules", None) or []) | set(args.basic_modules)),
-            enable_reentrant=args.accelerator.gradient_checkpointing.enable_reentrant,
-            early_stop=args.accelerator.gradient_checkpointing.early_stop,
+            recompute_policy=recompute_policy,
+            enable_reentrant=gc_cfg.enable_reentrant,
+            early_stop=gc_cfg.early_stop,
             enable_forward_prefetch=args.accelerator.fsdp_config.forward_prefetch,
             enable_fsdp_offload=args.accelerator.fsdp_config.offload,
             fsdp_offload_pin_memory=args.accelerator.fsdp_config.offload_pin_memory,

@@ -1,7 +1,7 @@
 """Core utilities for MiniMax H3.
 
-Provides attention dispatch and gradient checkpointing compatible with
-the original minimax_h3_dit module.
+Provides attention dispatch compatible with the original minimax_h3_dit
+module. Gradient checkpointing lives in ``veomni.utils.recompute_utils``.
 """
 
 from __future__ import annotations
@@ -312,72 +312,3 @@ def attention_forward(
             )
         return _xformers_forward(q, k, v, q_pattern, k_pattern, v_pattern, out_pattern, dims, scale=scale)
     raise NotImplementedError(f"No available attention implementation (current: {ATTENTION_IMPLEMENTATION}).")
-
-
-# ── Gradient checkpointing ────────────────────────────────────────────
-
-try:
-    import deepspeed
-
-    _HAS_DEEPSPEED = True
-except ModuleNotFoundError:
-    _HAS_DEEPSPEED = False
-
-
-def _create_custom_forward(module):
-    def custom_forward(*inputs, **kwargs):
-        return module(*inputs, **kwargs)
-
-    return custom_forward
-
-
-def _create_custom_forward_use_reentrant(module):
-    def custom_forward(*inputs):
-        return module(*inputs)
-
-    return custom_forward
-
-
-def _judge_args_requires_grad(*args) -> bool:
-    for arg in args:
-        if isinstance(arg, torch.Tensor) and arg.requires_grad:
-            return True
-    return False
-
-
-def gradient_checkpoint_forward(
-    model,
-    use_gradient_checkpointing: bool,
-    use_gradient_checkpointing_offload: bool,
-    *args,
-    **kwargs,
-):
-    """Gradient checkpoint wrapper.
-
-    Delegates to deepspeed checkpointing when configured, torch checkpointing
-    otherwise. Falls back to direct call when checkpointing is disabled.
-    """
-    if use_gradient_checkpointing and _HAS_DEEPSPEED and deepspeed.checkpointing.is_configured():
-        all_args = args + tuple(kwargs.values())
-        if not _judge_args_requires_grad(*all_args):
-            return model(*args, **kwargs)
-        return deepspeed.checkpointing.checkpoint(
-            _create_custom_forward_use_reentrant(model),
-            *all_args,
-        )
-    if use_gradient_checkpointing_offload:
-        with torch.autograd.graph.save_on_cpu():
-            return torch.utils.checkpoint.checkpoint(
-                _create_custom_forward(model),
-                *args,
-                **kwargs,
-                use_reentrant=False,
-            )
-    if use_gradient_checkpointing:
-        return torch.utils.checkpoint.checkpoint(
-            _create_custom_forward(model),
-            *args,
-            **kwargs,
-            use_reentrant=False,
-        )
-    return model(*args, **kwargs)
