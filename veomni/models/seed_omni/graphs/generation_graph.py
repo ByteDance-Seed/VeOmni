@@ -121,10 +121,12 @@ def _mermaid_id(name: str) -> str:
 
 # Reserved name for the framework-injected terminal state.  Every FSM
 # automatically gains a ``done`` state with empty body and no transitions —
-# users must NOT declare it in their YAML.  All
-# transitions whose ``next_state`` is ``"done"`` therefore land on this
-# built-in state, and ``OmniModel.generate`` calls each active module's
-# :meth:`OmniModule.finalize` hook once the FSM enters it.
+# users must NOT declare it in their YAML.  Transitions whose ``next_state``
+# is ``"done"`` land here. Entering ``done`` means the previous state's body
+# already ran to completion (EOS / a finished image span); artefacts were
+# collected from ``ctx["generated"]`` on that step. ``finalize`` is **not**
+# invoked on this path — only when the driver aborts before ``done``
+# (``max_new_tokens``).
 DONE_STATE_NAME: str = "done"
 
 # Single ctx slot for module-driven FSM transitions.  Modules set
@@ -273,9 +275,10 @@ class GenerationGraph:
             name: _State(name, spec) for name, spec in generation_graph["states"].items()
         }
 
-        # Inject the built-in terminal state.  Empty body, no outgoing
-        # transitions: the FSM "rests" here and the orchestrator picks up the
-        # post-processing baton via finalize hooks.
+        # Inject the built-in terminal state. Empty body, no outgoing
+        # transitions: the FSM rests here. The previous state's endpoints
+        # already flushed complete artefacts into ``ctx``; there is no
+        # extra finalize pass on entry.
         self._states[DONE_STATE_NAME] = _State(DONE_STATE_NAME, {"body": [], "transitions": []})
 
         # Derive the node pool from every state's body edges (canonical names).

@@ -35,6 +35,43 @@ def _write_fake_omni_source(root: Path, *, hidden_size: int = 8) -> Path:
     return root
 
 
+def test_convert_checkpoint_uses_caller_graph_yaml(tmp_path):
+    """CLI-style graph paths must land in the split checkpoint, not the family default."""
+    source = _write_fake_omni_source(tmp_path / "src")
+    output = tmp_path / "omni"
+    train_yaml = tmp_path / "train.yaml"
+    infer_yaml = tmp_path / "infer.yaml"
+    train_yaml.write_text(
+        "- {from: fake_module_a, to: end}\n",
+        encoding="utf-8",
+    )
+    infer_yaml.write_text(
+        "generation_graphs:\n"
+        "  infer_und:\n"
+        "    initial: run\n"
+        "    states:\n"
+        "      run:\n"
+        "        body:\n"
+        "          - {from: fake_module_a, to: end}\n"
+        "        transitions:\n"
+        "          - {condition: {type: default}, next_state: done}\n",
+        encoding="utf-8",
+    )
+
+    convert_checkpoint(
+        str(source),
+        str(output),
+        training_graph=str(train_yaml),
+        generation_graph=str(infer_yaml),
+    )
+
+    config = OmniConfig.from_pretrained(output)
+    assert config.training_graph == [{"from": "fake_module_a", "to": "end"}]
+    assert list(config.generation_graphs) == ["infer_und"]
+    assert config.infer_type == "infer_und"
+    assert config.generation_graph["initial"] == "run"
+
+
 def test_convert_fake_omni_writes_both_graphs_and_loads(tmp_path):
     source = _write_fake_omni_source(tmp_path / "src", hidden_size=8)
     output = tmp_path / "omni"
@@ -95,3 +132,51 @@ def test_require_converted_graphs_rejects_empty_training_graph(tmp_path):
 
     with pytest.raises(ValueError, match="empty"):
         _require_converted_graphs(str(tmp_path))
+
+
+def _one_node_generation_graphs(endpoint: str) -> dict:
+    return {
+        "infer_und": {
+            "initial": "run",
+            "states": {
+                "run": {
+                    "body": [{"from": endpoint, "to": "end"}],
+                    "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
+                }
+            },
+        }
+    }
+
+
+def test_save_converted_omni_rejects_missing_endpoint_method(tmp_path):
+    """A named module with a missing method must fail before the checkpoint is written."""
+    output = tmp_path / "omni"
+    with pytest.raises(ValueError, match=r"FakeModuleA\.encode"):
+        save_converted_omni(
+            str(output),
+            modules={
+                FAKE_A: FakeModuleA(FakeModuleAConfig()),
+                FAKE_B: FakeModuleB(FakeModuleBConfig()),
+            },
+            training_graph=[{"from": f"{FAKE_A}.encode", "to": "end"}],
+            generation_graphs=_one_node_generation_graphs(FAKE_A),
+        )
+    assert not (output / DEFAULT_TRAINING_GRAPH_FILE).exists()
+    assert not (output / DEFAULT_GENERATION_GRAPH_FILE).exists()
+
+
+def test_save_converted_omni_rejects_missing_default_generate(tmp_path):
+    """Bare generation endpoints resolve to ``generate``; that method must exist."""
+
+    class NoGenerate(FakeModuleA):
+        generate = None
+
+    output = tmp_path / "omni"
+    with pytest.raises(ValueError, match=r"NoGenerate\.generate"):
+        save_converted_omni(
+            str(output),
+            modules={FAKE_A: NoGenerate(FakeModuleAConfig())},
+            training_graph=[{"from": FAKE_A, "to": "end"}],
+            generation_graphs=_one_node_generation_graphs(FAKE_A),
+        )
+    assert not (output / DEFAULT_TRAINING_GRAPH_FILE).exists()

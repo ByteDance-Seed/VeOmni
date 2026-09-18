@@ -51,6 +51,16 @@ class OmniPreTrainedModel(PreTrainedModel):
         """Module-owned auxiliary artefacts to save alongside the weights."""
         return []
 
+    def generate(self, generation_kwargs: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        """Default FSM endpoint: same as training ``forward``. Override when inference differs.
+
+        :class:`~veomni.models.seed_omni.modeling_omni.OmniModel` calls
+        ``generate(**ctx, generation_kwargs=...)`` for every generation-graph
+        node. Bare endpoints resolve to this method.
+        """
+        del generation_kwargs
+        return self.forward(**kwargs)
+
     def reset_local_inference_state(self) -> None:
         """Reset per-turn state inside an ongoing generation request."""
         return None
@@ -60,7 +70,11 @@ class OmniPreTrainedModel(PreTrainedModel):
         self.reset_local_inference_state()
 
     def finalize(self, *, ctx: dict[str, Any]) -> dict[str, Any]:
-        """Flush module-private generation buffers into a one-shot ``generated`` payload."""
+        """Abort-only flush of leftover buffers into a one-shot ``generated`` payload.
+
+        Invoked when generation hits ``max_new_tokens`` before ``done``, not
+        after a normal FSM completion.
+        """
         del ctx
         return {}
 
