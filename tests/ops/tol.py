@@ -122,3 +122,8 @@ ATTN_LSE_RTOL = 5e-3
 ATTN_GRAD_ATOL = 5e-2
 ATTN_GRAD_RTOL = 8e-2
 ATTN_BF16_GRAD_ATOL = 8e-2
+# Production-shape Flex toy (hidden=3584, seq=4096, GQA 28/4, hd=128) vs
+# MATH. bf16 v_proj.weight has 2 / 1,835,008 outliers at max_abs=0.25 on
+# both FLASH and Triton, so this is low-precision accumulation, not a
+# backend bug. fp16 stays on ATTN_GRAD_ATOL.
+ATTN_BF16_TOY_GRAD_ATOL = 0.25

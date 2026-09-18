@@ -40,6 +40,16 @@ from ..ulysses import (
 FLEX_BACKEND_FLASH = "FLASH"
 FLEX_BACKEND_TRITON = "TRITON"
 _HOPPER_MIN_CC = 90
+_FA4_DTYPES = frozenset(
+    dtype
+    for dtype in (
+        torch.float16,
+        torch.bfloat16,
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e5m2", None),
+    )
+    if dtype is not None
+)
 
 
 @cache
@@ -120,11 +130,58 @@ def _flex_attention_fa4(
     return attention_output.transpose(1, 2).contiguous(), None
 
 
+def _flex_fa4_compute_dtype(module: torch.nn.Module, query: torch.Tensor) -> torch.dtype:
+    """Recover the compute dtype when LayerNorm left QKV in fp32.
+
+    Matches the flash adapter: autocast, then a quantized config hint, then the
+    first Linear weight. A fully fp32 module stays fp32.
+    """
+    if query.dtype != torch.float32:
+        return query.dtype
+    if torch.is_autocast_enabled():
+        return torch.get_autocast_gpu_dtype()
+    config = getattr(module, "config", None)
+    pre_quant = getattr(config, "_pre_quantization_dtype", None)
+    if pre_quant is not None:
+        return pre_quant
+    linear = next((layer for layer in module.modules() if isinstance(layer, torch.nn.Linear)), None)
+    if linear is not None:
+        return linear.weight.dtype
+    return query.dtype
+
+
+def _maybe_recast_qkv_for_fa4(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Cast fp32 QKV back to a FA4-legal dtype when the module is low precision."""
+    target_dtype = _flex_fa4_compute_dtype(module, query)
+    if target_dtype == query.dtype:
+        return query, key, value
+    return query.to(target_dtype), key.to(target_dtype), value.to(target_dtype)
+
+
+def _dtype_supports_flex_fa4(dtype: torch.dtype) -> bool:
+    return dtype in _FA4_DTYPES
+
+
+def _head_dim_supports_flex_fa4(head_dim: int) -> bool:
+    # FA4 cute backward preprocess ICE when hd % 32 != 0
+    # (Dao-AILab/flash-attention#2492). hd % 32 == 0 skips the OOB
+    # predicate and can train. TODO: drop this gate after upgrading
+    # past flash-attn 4.0.0b16 once #2518 / #2698 land in the wheel.
+    return head_dim % 32 == 0
+
+
 def resolve_flex_attention(
     device: torch.device,
     kernel_options: dict,
     *,
     attention_sinks: bool = False,
+    query_dtype: torch.dtype | None = None,
+    head_dim: int | None = None,
 ) -> Callable:
     """Select the FlexAttention implementation for this call.
 
@@ -132,7 +189,10 @@ def resolve_flex_attention(
     adapter (CuteDSL wrapping FA4). SM80, CPU, and other devices stay on the
     Transformers Triton adapter. An explicit ``kernel_options`` backend wins.
     Attention sinks need LSE renormalization, and FLASH backward rejects dLSE,
-    so sinks fall back to Triton unless FLASH was forced.
+    so sinks fall back to Triton unless FLASH was forced. FA4 also rejects
+    fp32, so a remaining fp32 query stays on Triton unless FLASH was forced.
+    Head dims that are not a multiple of 32 stay on Triton for the same
+    reason: see ``_head_dim_supports_flex_fa4``.
     """
     backend = kernel_options.get("BACKEND")
     if backend is not None:
@@ -144,6 +204,10 @@ def resolve_flex_attention(
                 "renormalization. Omit BACKEND to fall back to Triton, or drop s_aux."
             )
     elif attention_sinks or device.type != "cuda":
+        backend = FLEX_BACKEND_TRITON
+    elif query_dtype is not None and not _dtype_supports_flex_fa4(query_dtype):
+        backend = FLEX_BACKEND_TRITON
+    elif head_dim is not None and not _head_dim_supports_flex_fa4(head_dim):
         backend = FLEX_BACKEND_TRITON
     elif get_gpu_compute_capability(device) >= _HOPPER_MIN_CC and _flash_attn_cute_available():
         backend = FLEX_BACKEND_FLASH
@@ -192,6 +256,7 @@ def flex_attention_forward(
     del sliding_window
 
     kernel_options = dict(kwargs.pop("kernel_options", {}) or {})
+    query, key, value = _maybe_recast_qkv_for_fa4(module, query, key, value)
 
     parallel_state = get_parallel_state()
     ulysses_enabled = should_apply_ulysses(skip_ulysses=skip_ulysses)
@@ -223,6 +288,8 @@ def flex_attention_forward(
         query.device,
         kernel_options,
         attention_sinks=kwargs.get("s_aux") is not None,
+        query_dtype=query.dtype,
+        head_dim=query.shape[-1],
     )
     output, lse = flex_attention(
         module,

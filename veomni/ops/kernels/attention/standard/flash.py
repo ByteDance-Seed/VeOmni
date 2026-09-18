@@ -204,6 +204,17 @@ def flash_attention_forward(
     if selected is None:
         selected = module.config._attn_implementation
     fa_kernel_implementation = flash_kernel_implementation(selected)
+    s_aux = kwargs.get("s_aux")
+    if (
+        s_aux is not None
+        and torch.is_tensor(s_aux)
+        and s_aux.requires_grad
+        and "flash_attention_4" in fa_kernel_implementation
+    ):
+        logger.warning_once(
+            "FlashAttention 4 applies learnable sinks in the forward pass but its CuteDSL "
+            "backward only returns dQ/dK/dV. Sink parameters will not receive gradients."
+        )
 
     # MLA models can use a smaller value head than their Q/K head. Transformers
     # handles this in its stock wrapper; this replacement must preserve it.
