@@ -391,7 +391,7 @@ class VeOmniModelRuntime:
             extra_op_names=gc_cfg.selective_ops,
             recompute_last_n_layers=gc_cfg.recompute_last_n_layers,
             selective_n_layers=gc_cfg.selective_n_layers,
-            offload_active=offload_config.enable_activation,
+            offload_active=offload_config.enable_activation or offload_config.enable_async_activation,
             compile_enabled=args.accelerator.torch_compile.enable,
         )
 
