@@ -1,6 +1,8 @@
 
 # Markdown support
 myst-parser==5.1.0
+# Local Markdown link checks (also pinned in the dependency closure).
+markdown-it-py==4.2.0
 # Sphinx build
 sphinx==9.1.0
 

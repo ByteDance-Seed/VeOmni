@@ -69,6 +69,12 @@ make -C docs html SPHINXOPTS=-W
 # Check repository references used by documentation and agent instructions.
 python3 scripts/ci/check_doc_task_paths.py
 python3 scripts/ci/check_agent_doc_paths.py
+
+# Check root entry-point links, built HTML links/anchors, and navigation reachability.
+python3 scripts/ci/check_docs_integrity.py
+
+# CPU-only checker regressions (also run by the documentation CI job).
+python -m unittest discover -s tests/special_sanity -p test_docs_integrity.py
 ```
 
 ## Open the docs with your browser
@@ -81,3 +87,22 @@ Launch your browser and open localhost:8000.
 Check the homepage, sidebar, edited pages, and their links. In the PR, report
 the build/path checks separately from any training validation. No new training
 test is needed for a documentation-only change.
+
+## What CI checks
+
+`check_docs.yml` builds with warnings as errors and runs the integrity checker
+on the same checkout's Sphinx artifacts. It triggers for root entry points,
+documentation, scripts, configs, tests, and framework changes.
+
+- Root `README.md`, `CONTRIBUTING.md`, and this authoring guide: local link and
+  image targets exist, including reference-style Markdown links and raw HTML.
+- Rendered site: local page, download, asset, and fragment targets exist.
+- Sphinx navigation: every discovered page is reachable from the root toctree,
+  except pages explicitly marked `orphan` (for intentional compatibility pages).
+- The existing task/agent checks validate their specialized path contracts.
+
+The checker makes no network requests and does not execute training examples.
+External URL availability, source-only heading fragments in root Markdown,
+configuration semantics, and hardware validation still require review. Model
+catalog links are checked like other local configuration references; listing a
+configuration does not certify a hardware combination.

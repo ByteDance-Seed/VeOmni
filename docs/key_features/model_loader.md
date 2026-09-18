@@ -12,9 +12,11 @@ VeOmni uses a model registry system that allows you to:
 
 To enable users to quickly train models from HuggingFace and flexibly train custom models, VeOmni adopts a model registration system to support model loading and initialization. This design is inspired by [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang). An overall architecture diagram is shown below.
 
-<div style="text-align: center;">
-    <img src="../assets/model_loader.png" alt="model loader" width="75%"/>
-</div>
+```{image} ../assets/model_loader.png
+:alt: Model loading and registration flow
+:width: 75%
+:align: center
+```
 
 Users can directly load models from HuggingFace and start the training process by specifying the model name or model path. Additionally, they can implement their own custom models or enhance existing HuggingFace models with advanced features such as sequence parallelism or expert parallelism. Custom modeling can be implemented in one of the supported modeling paths:
 

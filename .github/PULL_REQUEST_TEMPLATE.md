@@ -27,6 +27,7 @@
 
 - Read the [Contribute Guide](https://github.com/ByteDance-Seed/VeOmni/blob/main/CONTRIBUTING.md)
 - Applied pre-commit checks
-- Added/updated documentation
+- Added/updated the canonical documentation for changed APIs, configuration fields, or workflows; link the affected pages above (or explain why no update is needed)
+- For documentation changes: registered new pages in navigation, updated local links/configuration references, preserved moved page URLs, and ran the checks in `docs/README.md`; report training validation separately from documentation checks
 - If `tasks/` training scripts were moved or renamed: updated `docs/` examples and verified `python3 scripts/ci/check_doc_task_paths.py` passes (also enforced by the **Check doc task paths** CI workflow)
 - Tests: extended an existing CI-enumerated test, **or** added a new test and wired it into `gpu_unit_tests.yml` (and `npu_unit_tests.yml` where applicable), **or** explained in **Test** why none is needed. Note that CI enumerates test files individually — a new file outside `tests/data/` and `tests/ops/` does not run until it is listed. See [.agents/knowledge/testing.md](.agents/knowledge/testing.md).
