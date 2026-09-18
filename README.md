@@ -62,7 +62,7 @@ Track planned work and its current status in the
 | Goal | Start here |
 | --- | --- |
 | Install VeOmni | [NVIDIA GPU](docs/get_started/installation/install.md), [Ascend x86](docs/get_started/installation/install_ascend_x86.md), [Ascend ARM](docs/get_started/installation/install_ascend_arm.md), [AMD ROCm](docs/hardware_support/rocm/README.md), [Cambricon MLU](docs/hardware_support/mlu/README.md) |
-| Run text training | [Qwen3 training guide](docs/examples/qwen3.md) |
+| Run your first training job | [Quick Start](docs/get_started/quick_start.md) |
 | Configure a run | [Arguments reference](docs/usage/arguments.md) |
 | Contribute code or documentation | [Contribution guide](CONTRIBUTING.md) |
 
