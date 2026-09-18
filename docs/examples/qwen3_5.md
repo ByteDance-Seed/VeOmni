@@ -1,5 +1,13 @@
 # Qwen3.5 training guide
 
+## Scope and prerequisites
+
+Text and vision-language SFT for Qwen3.5 dense and MoE models; use the separate GPU/NPU kernel instructions below.
+
+Configuration: [training YAML](../../configs/multimodal/qwen3_5/qwen3_5_vl.yaml). Read the
+[catalog prerequisites and validation scope](index.md#choose-hardware-and-check-a-run)
+before following the model-specific steps below.
+
 > **Note:** Qwen3.5 requires transformers v5 (now the project default).
 
 ## Install dependencies
@@ -311,3 +319,9 @@ Qwen3.5 is a hybrid model alternating between softmax and linear attention layer
 
 For detailed implementation notes, see the
 [Ulysses documentation](../key_features/ulysses.md#-linear-attention-ulysses-gateddeltanet).
+
+## Check outputs and continue
+
+Use the [run checks](index.md#choose-hardware-and-check-a-run) and
+[checkpoint completion contract](../usage/checkpoint.md#completion) for training.
+For preprocessing or inference, inspect the stage-specific outputs described above.

@@ -1,5 +1,13 @@
 # MiniMax H3 FL2VA Quick Start
 
+## Scope and prerequisites
+
+MiniMax H3 first/last-frame video-and-audio generation, using separate embedding and offline training stages on Ascend.
+
+Configuration: [training YAML](../../configs/dit/minimax_h3_fl2va_offline.yaml). Read the
+[catalog prerequisites and validation scope](index.md#choose-hardware-and-check-a-run)
+before following the model-specific steps below.
+
 This guide walks through **training** and **inference** for MiniMax H3 FL2VA (first/last frame + text -> video + audio) on an Ascend NPU machine. Every command can be copied and run directly.
 
 - Verified environment: 4 Ascend NPUs, torch_npu + torchrun
@@ -256,3 +264,9 @@ video, audio = pipe(
 **Important**:
 
 - `num_frames` must satisfy `(N-5) % 17 == 0`, otherwise the Video VAE raises an error
+
+## Check outputs and continue
+
+Use the [run checks](index.md#choose-hardware-and-check-a-run) and
+[checkpoint completion contract](../usage/checkpoint.md#completion) for training.
+For preprocessing or inference, inspect the stage-specific outputs described above.

@@ -1,5 +1,13 @@
 # Qwen3 VL training guide
 
+## Scope and prerequisites
+
+Vision-language SFT for Qwen3 VL dense and MoE models, with image/video data preparation.
+
+Configuration: [training YAML](../../configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml). Read the
+[catalog prerequisites and validation scope](index.md#choose-hardware-and-check-a-run)
+before following the model-specific steps below.
+
 ## Download dataset
 
 Download the [COCO2017](https://images.cocodataset.org/zips/train2017.zip) dataset and download the data annotation JSON file [sharegpt4v_instruct_gpt4-vision_cap100k.json](https://huggingface.co/datasets/Lin-Chen/ShareGPT4V/tree/main).
@@ -81,3 +89,9 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml
 ```
 
 This path currently requires CUDA, FSDP2, the default `model.accelerator.torch_compile.backend=inductor` and `model.accelerator.torch_compile.mode=None`, `model.accelerator.torch_compile.dynamic=false`, `model.accelerator.ulysses_size=1`, `model.accelerator.cp_size=1`, and `model.accelerator.enable_async=false`. Padding fixes the token-tensor shapes, while different packed sequence boundaries can still produce separate Inductor specializations. CUDA Graph replay, Qwen3-VL-MoE, ExtraParallel, and NPU execution are not yet supported.
+
+## Check outputs and continue
+
+Use the [run checks](index.md#choose-hardware-and-check-a-run) and
+[checkpoint completion contract](../usage/checkpoint.md#completion) for training.
+For preprocessing or inference, inspect the stage-specific outputs described above.

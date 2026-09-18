@@ -1,5 +1,13 @@
 # Wan2.1-T2V Training Guide
 
+## Scope and prerequisites
+
+Wan image-to-video LoRA with online or offline preprocessing.
+
+Configuration: [training YAML](../../configs/dit/wan2.1_I2V_1.3B_lora.yaml). Read the
+[catalog prerequisites and validation scope](index.md#choose-hardware-and-check-a-run)
+before following the model-specific steps below.
+
 This guide covers LoRA fine-tuning of [Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) using VeOmni, including dataset preparation, multi-GPU training with Ulysses Sequence Parallelism (SP), and inference with trained adapters.
 
 ---
@@ -258,3 +266,9 @@ output = pipe(
 
 export_to_video(output, "output_lora.mp4", fps=15)
 ```
+
+## Check outputs and continue
+
+Use the [run checks](index.md#choose-hardware-and-check-a-run) and
+[checkpoint completion contract](../usage/checkpoint.md#completion) for training.
+For preprocessing or inference, inspect the stage-specific outputs described above.

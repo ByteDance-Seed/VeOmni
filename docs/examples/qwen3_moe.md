@@ -1,6 +1,18 @@
 # Qwen3 MoE training guide
 
-1. Download qwen3 moe model
+## Scope and prerequisites
+
+Train a Qwen3 MoE language model with the existing
+[SFT configuration](../../configs/text/qwen3-moe.yaml). Install the
+[environment for your hardware](../hardware_support/index.md) first and prepare
+conversation data using the [Qwen3 data instructions](qwen3.md#download-dataset).
+For a small first run, use the [Quick Start](../get_started/quick_start.md).
+
+Choose enough accelerator memory for the actual model size, optimizer state,
+sequence length, and parallel topology. This recipe does not establish a minimum
+GPU count for the 30B or 235B checkpoints.
+
+## Download the model
 
 ```shell
 python3 scripts/download_hf_model.py \
@@ -8,127 +20,36 @@ python3 scripts/download_hf_model.py \
   --local_dir .
 ```
 
-2. Train directly on the downloaded checkpoint
+The helper creates `./Qwen3-30B-A3B`. VeOmni's runtime checkpoint converter
+loads the stock HF expert weights into the fused expert layout. An offline
+merge is not required. See [MoE weight loading](../transformers_v5/transformers_v5_moe_weight_loading.md)
+for supported layouts and export conversion.
 
-VeOmni's runtime `CheckpointTensorConverter` folds the per-expert HF
-safetensor keys (`experts.{j}.gate_proj.weight`, …) into VeOmni's fused
-`gate_up_proj` / `down_proj` layout at load time. The stock HF checkpoint
-can be passed straight to training — no offline merge step is required.
-See `docs/transformers_v5/transformers_v5_moe_weight_loading.md` for the
-full format matrix and how to convert a VeOmni-format training checkpoint
-back to per-expert HF keys for inference engines.
+## Launch training
 
-`scripts/moe_ckpt_merge/moe_merge.py` is deprecated. It still works and
-may be useful as a one-time optimization for very large checkpoints
-(e.g. Qwen3-235B) where you want to amortize the per-load stacking cost
-across many runs, but it is no longer a prerequisite.
+After creating `tulu-first2000.parquet` as described in the data instructions:
 
-Most of the MoE models in Transformers referenced the open-source implementation of Mixtral MoE. In this implementation, MoE experts are divided into multiple blocks instead of being combined into a single `nn.Parameters`. Additionally, there are cpu-block operators like `torch.where()` and for loop, which are not very friendly for integrating MoE fusion operators.
-
-Origin [Qwen3MoeMLP](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py#L200C1-L213C25) code
-```python
-class Qwen3MoeMLP(nn.Module):
-    def __init__(self, config, intermediate_size=None):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = intermediate_size if intermediate_size is not None else config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
-
-class Qwen3MoeSparseMoeBlock(nn.Module):
-    def __init__(self, config):
-
-            ...
-
-        self.experts = nn.ModuleList(
-            [Qwen3MoeMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-
-            ...
-
-        final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
-        )
-
-        for expert_idx in expert_hitted:
-            expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
-
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
-
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-        return final_hidden_states, router_logits
-
+```shell
+bash train.sh tasks/train_text.py configs/text/qwen3-moe.yaml \
+  --model.model_path ./Qwen3-30B-A3B \
+  --data.train_path ./tulu-first2000.parquet \
+  --train.checkpoint.output_dir outputs/qwen3-moe
 ```
 
-- Combine Qwen3MoeMLP to Qwen3MoeExperts, then use fused moe operator
+The explicit model path overrides the historical `-merge` directory name in
+this configuration. Inspect the YAML before launch and adjust batch size and
+parallelism for your topology. To enable or tune EP, follow
+[EP with FSDP2](../key_features/ep_fsdp2.md) and the
+[ExtraParallel guide](../key_features/extra_parallel.md).
 
-```python
-class Qwen3MoeExperts(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.num_experts = config.num_experts
-        self.hidden_dim = config.hidden_size
-        self.intermediate_size = config.moe_intermediate_size
-        self.gate_proj = torch.nn.Parameter(
-            torch.empty(self.num_experts, self.intermediate_size, self.hidden_dim),
-            requires_grad=True,
-        )
-        self.up_proj = torch.nn.Parameter(
-            torch.empty(self.num_experts, self.intermediate_size, self.hidden_dim),
-            requires_grad=True,
-        )
-        self.down_proj = torch.nn.Parameter(
-            torch.empty(self.num_experts, self.hidden_dim, self.intermediate_size),
-            requires_grad=True,
-        )
-        self.act_fn = ACT2FN[config.hidden_act]
+## Check outputs and continue
 
-    def forward(self, hidden_states, expert_idx=None, cumsum=None):
-        gate_proj_out = torch.matmul(hidden_states, self.gate_proj[expert_idx].transpose(0, 1))
-        up_proj_out = torch.matmul(hidden_states, self.up_proj[expert_idx].transpose(0, 1))
+Inspect `log.txt` for finite loss and gradient norms, then verify the configured
+saves under `outputs/qwen3-moe/checkpoints/`. The
+[checkpoint guide](../usage/checkpoint.md) explains completion metadata, resume
+state, and HF exports. A successful short run checks the training path; validate
+convergence on your own dataset before scaling up.
 
-        out = self.act_fn(gate_proj_out) * up_proj_out
-        out = torch.matmul(out, self.down_proj[expert_idx].transpose(0, 1))
-        return out
-
-
-class Qwen3MoeSparseFusedMoeBlock(nn.Module):
-    def __init__(self, config):
-
-            ...
-
-      self.experts = Qwen3MoeExperts(config)
-
-    def forward(self, hidden_states, expert_idx=None, routing_weights=None, selected_experts=None) -> torch.Tensor:
-
-          ...
-
-        out = fused_moe_forward(
-            num_experts=self.num_experts,
-            routing_weights=routing_weights,
-            selected_experts=selected_experts,
-            hidden_states=hidden_states,
-            fc1_1_weight=self.gate_proj,
-            fc1_2_weight=self.up_proj,
-            fc2_weight=self.down_proj,
-        )
-      return out
-
-```
-
-3. Train qwen3 moe model
-```
-bash train.sh tasks/train_text.py configs/text/qwen3-moe.yaml
-```
+- [MoE LoRA](../key_features/lora.md#5-moe-lora) covers adapter training.
+- [Fused MoE implementation](../design/fused_moe_kernels.md) explains the kernels.
+- [Model catalog](index.md) lists related Qwen3 recipes.
