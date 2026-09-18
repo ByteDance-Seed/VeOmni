@@ -64,7 +64,7 @@ def test_runtime_config_keeps_the_full_launcher_view():
 
 
 def test_to_hf_config_projects_onto_the_checkpoint_view():
-    """The HF config stores subfolder, ops_implementation, and optional model_config."""
+    """The HF config stores subfolder and optional model_config; ops stay on runtime args."""
     runtime_cfg = _janus_model_runtime()
     cfg = runtime_cfg.to_hf_config()
 
@@ -81,12 +81,15 @@ def test_to_hf_config_projects_onto_the_checkpoint_view():
     # visual-instruction-tuning's ViT sourced from a different HF model — instead
     # of silently re-deriving the wrong `checkpoint_root/module_name` path). It
     # still never reaches an actually persisted checkpoint: `copy_for_hf_export` /
-    # `normalize_modules_for_hf_export` rebuild each module's `model` block from
-    # only `ops_implementation` + `model_config`, dropping `model_path`.
+    # `normalize_modules_for_hf_export` rebuild each module from subfolder +
+    # optional `model_config`, dropping `model_path`. Ops live on the runtime
+    # args and are never written onto OmniConfig.
     assert cfg.modules["janus_siglip"]["model"]["model_path"] == runtime_cfg.modules["janus_siglip"].model_path
     for name in ("janus_vqvae", "janus_llama"):
         runtime_ops = runtime_cfg.modules[name].ops_implementation
-        assert cfg.module_ops_implementation(name)["attn_implementation"] == runtime_ops.attn_implementation
+        assert runtime_ops.attn_implementation is not None
+        model_block = cfg.modules[name].get("model") or {}
+        assert "ops_implementation" not in model_block
 
 
 def test_hf_export_strips_model_path_from_the_persisted_checkpoint():
@@ -157,7 +160,7 @@ def test_packed_modules_yaml_sets_text_encoder_processor_config():
     )
     assert cfg.module_processor_config("janus_text_encoder") == {"packed_preprocess": True}
     exported = cfg.copy_for_hf_export()
-    assert "processor_config" not in exported.modules["janus_text_encoder"]
+    assert exported.modules["janus_text_encoder"]["processor_config"] == {"packed_preprocess": True}
 
 
 def test_build_module_runtime_args_merges_module_optimizer():
@@ -298,7 +301,7 @@ def test_training_keeps_module_fsdp_modes():
 
 
 def test_runtime_to_hf_config_roundtrips_through_checkpoint(tmp_path):
-    """Graphs / ops survive an export round-trip; module identity re-anchors under the new root.
+    """Graphs survive an export round-trip; module identity re-anchors under the new root.
 
     ``hf_cfg`` (pre-export, in-memory) carries each module's resolved absolute
     ``model_path`` (see ``test_to_hf_config_projects_onto_the_checkpoint_view``),
@@ -320,7 +323,8 @@ def test_runtime_to_hf_config_roundtrips_through_checkpoint(tmp_path):
     for name in hf_cfg.module_names:
         assert reloaded.module_subfolder(name) == name
         assert os.path.basename(hf_cfg.module_subfolder(name)) == name
-        assert reloaded.module_ops_implementation(name) == hf_cfg.module_ops_implementation(name)
+        exported_model = reloaded.normalize_modules_for_hf_export()[name].get("model") or {}
+        assert "ops_implementation" not in exported_model
 
 
 def test_resolve_model_reads_graphs_from_omni_checkpoint(tmp_path):
@@ -343,13 +347,45 @@ def test_from_model_runtime_projects_onto_hf_config():
     """from_model_runtime must build OmniModel from model_runtime.to_hf_config()."""
     from unittest.mock import MagicMock, patch
 
-    from veomni.models.seed_omni.accelerator.omni_model_runtime import OmniModelRuntime
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
 
     runtime_cfg = _janus_model_runtime()
-    with patch("veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime") as mock_rt_cls:
+    with patch("veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime") as mock_rt_cls:
         mock_rt_cls.return_value = MagicMock(model=MagicMock())
-        with patch("veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModel") as mock_omni_model:
+        with patch("veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.OmniModel") as mock_omni_model:
             OmniModelRuntime.from_model_runtime(runtime_cfg)
             omni_config = mock_omni_model.call_args[0][0]
             assert isinstance(omni_config, OmniConfig)
             assert set(omni_config.module_names) == set(runtime_cfg.module_names)
+
+
+def test_omni_module_config_owns_descriptor_conversion():
+    """Per-module path / export logic lives on OmniModuleConfig, not OmniConfig."""
+    from veomni.models.seed_omni.modules.module_configuration_base import OmniModuleConfig
+
+    entry = OmniModuleConfig.from_runtime(
+        "janus_siglip",
+        model_path="/tmp/janus/janus_siglip",
+        model_config={"freeze": True},
+        processor_config={"packed_preprocess": True},
+    )
+    cfg = OmniModuleConfig("janus_siglip", entry)
+    assert cfg.subfolder == "/tmp/janus/janus_siglip"
+    assert cfg.checkpoint_subfolder == "janus_siglip"
+    assert cfg.model_config_overrides() == {"freeze": True}
+    assert cfg.processor_config() == {"packed_preprocess": True}
+    exported = cfg.to_export_dict()
+    assert exported == {
+        "subfolder": "janus_siglip",
+        "model": {"model_config": {"freeze": True}},
+        "processor_config": {"packed_preprocess": True},
+    }
+    assert "model_path" not in exported.get("model", {})
+
+
+def test_omni_module_runtime_config_is_the_arguments_alias():
+    from veomni.arguments import OmniModelRuntimeArguments, OmniModuleRuntimeArguments
+    from veomni.models.seed_omni.accelerated import OmniModelRuntimeConfig, OmniModuleRuntimeConfig
+
+    assert OmniModuleRuntimeArguments is OmniModuleRuntimeConfig
+    assert OmniModelRuntimeArguments is OmniModelRuntimeConfig

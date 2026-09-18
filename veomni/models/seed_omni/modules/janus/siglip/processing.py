@@ -12,7 +12,7 @@ contains a ``preprocessor_config.json`` saved by HF's standard
 ``JanusSiglipProcessor.from_pretrained(<weights_path>)``.
 
 :class:`JanusSiglipPreprocessor` is the picklable, weight-free CPU worker
-counterpart (see :class:`~veomni.models.seed_omni.processing.base.ModulePreprocessorBase`) —
+counterpart (see :class:`~veomni.models.seed_omni.modules.module_processing_base.ModulePreprocessorBase`) —
 built straight off the checkpoint dir via :meth:`JanusSiglipPreprocessor.from_pretrained`,
 with no model instance involved.
 """
@@ -22,8 +22,8 @@ from typing import Any, Optional
 import torch
 from transformers.models.janus.image_processing_janus import JanusImageProcessor
 
-from ....processing import ModulePreprocessorBase
 from ....utils.conversation import ConversationItem, iter_desired_items
+from ...module_processing_base import ModulePreprocessorBase
 from .configuration import JanusSiglipConfig
 
 

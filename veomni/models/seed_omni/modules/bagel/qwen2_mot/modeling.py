@@ -11,8 +11,8 @@ from torch.nn.functional import scaled_dot_product_attention
 from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
 from transformers.utils import ModelOutput
 
-from ....omni_pretrained_model import OmniPreTrainedModel
 from ....utils.conversation import ConversationItem, get_tail_output_item
+from ...module_modeling_base import OmniPreTrainedModel
 from ..sources import BAGEL_FLOW_HIDDEN, BAGEL_FLOW_QUERY, BAGEL_FLOW_VELOCITY, BAGEL_START_TOKEN
 from .configuration import BagelQwen2MoTConfig
 from .generation_state import MotGenerationState
@@ -44,7 +44,7 @@ class InferenceMixin:
     """FSM ``generate`` / serial denoise / velocity-collection — HF ``GenerationMixin`` analog.
 
     Listed *before* :class:`BagelQwen2MoTCore` (and therefore before
-    :class:`~....omni_pretrained_model.OmniPreTrainedModel`): the pretrained
+    :class:`~...module_modeling_base.OmniPreTrainedModel`): the pretrained
     base ships a no-op ``reset_local_inference_state``, and MRO resolves
     left-to-right — put second, that no-op would shadow the real one below.
     """

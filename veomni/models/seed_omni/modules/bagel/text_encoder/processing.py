@@ -1,7 +1,7 @@
 """Stateless text carrier helpers + worker-side preprocessor for BAGEL text encoder.
 
 :class:`BagelTextEncoderPreprocessor` is the picklable, weight-free CPU worker
-counterpart (see :class:`~veomni.models.seed_omni.processing.base.ModulePreprocessorBase`).
+counterpart (see :class:`~veomni.models.seed_omni.modules.module_processing_base.ModulePreprocessorBase`).
 Its :meth:`from_pretrained` loads the tokenizer and builds the
 :class:`~veomni.models.seed_omni.modules.bagel.text_encoder.chat_template.BagelChatTemplate`
 straight off the checkpoint dir — no model instance involved.

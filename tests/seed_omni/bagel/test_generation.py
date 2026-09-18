@@ -15,7 +15,7 @@ from tests.seed_omni.bagel.helpers import (
     native_model_cls,
     tiny_bagel_qwen2_cfg,
 )
-from veomni.models.seed_omni.accelerator import OmniModelRuntime
+from veomni.models.seed_omni.accelerated import OmniModelRuntime
 from veomni.models.seed_omni.graphs.generation_graph import FSM_SIGNAL_KEY
 from veomni.models.seed_omni.mixins.base_mixin import BaseMixin
 from veomni.models.seed_omni.mixins.inference_module_mixin import InferenceModuleMixin

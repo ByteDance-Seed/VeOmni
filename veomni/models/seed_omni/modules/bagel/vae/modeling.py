@@ -24,8 +24,8 @@ from einops import rearrange
 from torch import Tensor
 
 from ....mixins.offline_encoding_mixin import OfflineEncodingMixin
-from ....omni_pretrained_model import OmniPreTrainedModel
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
+from ...module_modeling_base import OmniPreTrainedModel
 from ..sources import BAGEL_GENERATED_LATENT, BAGEL_VAE_CONTEXT
 from .configuration import BagelVAEConfig
 from .processing import BAGEL_VAE_PIXEL_SHAPE, BagelVAEPreprocessor, BagelVAEProcessor, crop_latent_to_image_shape
@@ -49,7 +49,7 @@ def select_bagel_vae_context_items(
 class InferenceMixin:
     """FSM ``encode_context`` / ``decode_generated`` — HF ``GenerationMixin`` analog.
 
-    Listed *before* :class:`~....omni_pretrained_model.OmniPreTrainedModel` in
+    Listed *before* :class:`~...module_modeling_base.OmniPreTrainedModel` in
     :class:`BagelVAE`'s bases for consistency with every other module's
     native / accelerated split (see ``janus/llama/modeling.py`` for the full
     MRO rationale where a competing no-op default exists — this module

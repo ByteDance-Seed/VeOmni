@@ -1,10 +1,10 @@
 """
-OmniModel V2 — composable multi-modal model driven by config-specified graphs.
+OmniModel — composable multi-modal model driven by config-specified graphs.
 
 This file holds the **clean modeling definition** — training graph via
 :meth:`OmniModel.forward`, FSM inference via :meth:`OmniModel.generate`, and
 checkpoint compose/load/save.  It must import nothing from VeOmni's runtime
-(``accelerator`` / ``distributed`` / trainer), at module scope or inside a
+(``accelerated`` / ``distributed`` / trainer), at module scope or inside a
 function, so this modeling can be lifted into another framework as-is and so
 HF ``from_pretrained`` / ``from_config`` keeps working for eager
 single-process inference. ``tests/seed_omni/test_graph.py`` asserts this.
@@ -12,7 +12,7 @@ single-process inference. ``tests/seed_omni/test_graph.py`` asserts this.
 ``forward`` is the FSDP2 root entry: leftover params unshard on ``__call__``,
 then the training graph runs each child. Everything runtime-specific about
 running a node arrives through the optional ``node_runner`` argument, which
-:class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`
+:class:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.OmniModelRuntime`
 supplies.
 
 Architecture
@@ -39,7 +39,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from transformers import PreTrainedModel
 
-from ...utils import helper
+from ...utils import helper  # VeOmni shared logger (rank-0 helpers); not seed_omni-local.
 from .configuration_omni import OmniConfig
 from .graphs.base import NodeDef
 from .graphs.generation_graph import GenerationGraph
@@ -107,7 +107,6 @@ class OmniModel(PreTrainedModel):
 
     config_class = OmniConfig
     base_model_prefix = "omni"
-    main_input_name = "conversation_list"
     supports_gradient_checkpointing = False
     _no_split_modules = []
 
@@ -155,7 +154,7 @@ class OmniModel(PreTrainedModel):
         modules = cls._load_modules(
             config,
             checkpoint_root=checkpoint_root,
-            pretrained=False,
+            load_weights=False,
             **kwargs,
         )
         return cls(config, modules)
@@ -174,10 +173,8 @@ class OmniModel(PreTrainedModel):
 
         Remaining kwargs are forwarded to **every** sub-module's
         ``from_pretrained`` as global load options (e.g. ``torch_dtype``,
-        ``device_map``).  Per-module ``model_config`` and ``ops_implementation``
-        persisted in the checkpoint are merged on top via
-        :meth:`_build_module_load_kwargs` — module-level ``attn_implementation``
-        wins over any global kwarg when both are set.
+        ``device_map``).  Per-module ``model_config`` overrides persisted in the
+        checkpoint are merged on top via :meth:`_build_module_load_kwargs`.
 
         Pass ``config=`` to load the weights under an already-resolved
         :class:`OmniConfig` instead of the root ``config.json`` — how
@@ -212,7 +209,7 @@ class OmniModel(PreTrainedModel):
         modules = cls._load_modules(
             config,
             checkpoint_root=checkpoint_root,
-            pretrained=True,
+            load_weights=True,
             **kwargs,
         )
         return cls(config, modules)
@@ -223,20 +220,8 @@ class OmniModel(PreTrainedModel):
         name: str,
         base_kwargs: dict[str, Any],
     ) -> dict[str, Any]:
-        """Merge checkpoint overrides and apply persisted ``ops_implementation``."""
-        from ...arguments import OpsImplementationConfig
-        from ...ops import apply_ops_config
-
-        load_kwargs = {**base_kwargs, **config.module_model_config(name)}
-        ops_dict = config.module_ops_implementation(name)
-        if not ops_dict:
-            return load_kwargs
-
-        ops = OpsImplementationConfig(**ops_dict)
-        apply_ops_config(ops)
-        if ops.attn_implementation is not None:
-            load_kwargs["attn_implementation"] = ops.attn_implementation
-        return load_kwargs
+        """Merge per-module ``model_config`` overrides onto the caller's load kwargs."""
+        return {**base_kwargs, **config.module_model_config(name)}
 
     @staticmethod
     def _init_only_load_kwargs(load_kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -257,15 +242,15 @@ class OmniModel(PreTrainedModel):
         config: OmniConfig,
         *,
         checkpoint_root: str | os.PathLike | None,
-        pretrained: bool,
+        load_weights: bool,
         **kwargs: Any,
     ) -> dict[str, nn.Module]:
-        import sys
+        """Load each declared module.
 
+        ``load_weights=True`` calls ``from_pretrained`` (checkpoint weights).
+        ``load_weights=False`` calls ``_from_config`` (architecture only).
+        """
         from transformers import PretrainedConfig
-
-        from ...ops.config.singleton import get_ops_config
-        from ..auto import _bind_veomni_ops
 
         modules: dict[str, nn.Module] = {}
         for name in config.module_names:
@@ -273,31 +258,19 @@ class OmniModel(PreTrainedModel):
             entry = config.modules.get(name)
             load_kwargs = cls._build_module_load_kwargs(config, name, kwargs)
             if isinstance(entry, PretrainedConfig):
-                model_type = entry.model_type
-                mod_cls = OMNI_MODEL_REGISTRY[model_type]()
-                modeling_module = sys.modules.get(mod_cls.__module__)
-                if modeling_module is not None and config.module_ops_implementation(name):
-                    _bind_veomni_ops(modeling_module, get_ops_config())
-                if pretrained:
-                    modules[name] = mod_cls.from_pretrained(module_path, config=entry, **load_kwargs)
-                else:
-                    # ``entry`` is hydrated, so it already carries this module's
-                    # ``model_config`` overrides.
-                    modules[name] = mod_cls._from_config(entry, **cls._init_only_load_kwargs(load_kwargs))
-                continue
-            model_type = read_model_type(module_path)
-            mod_cls = OMNI_MODEL_REGISTRY[model_type]()
-            modeling_module = sys.modules.get(mod_cls.__module__)
-            if modeling_module is not None and config.module_ops_implementation(name):
-                _bind_veomni_ops(modeling_module, get_ops_config())
-            if pretrained:
-                modules[name] = mod_cls.from_pretrained(module_path, **load_kwargs)
+                # ``OmniConfig.from_pretrained`` already hydrated this entry.
+                mod_cls = OMNI_MODEL_REGISTRY[entry.model_type]()
+                module_config = entry
             else:
-                cfg_cls = mod_cls.config_class
-                sub_config = cfg_cls.from_pretrained(module_path)
+                # In-memory / launcher descriptor: typed config still lives on disk.
+                mod_cls = OMNI_MODEL_REGISTRY[read_model_type(module_path)]()
+                module_config = mod_cls.config_class.from_pretrained(module_path)
                 for key, value in config.module_model_config(name).items():
-                    setattr(sub_config, key, value)
-                modules[name] = mod_cls._from_config(sub_config, **cls._init_only_load_kwargs(load_kwargs))
+                    setattr(module_config, key, value)
+            if load_weights:
+                modules[name] = mod_cls.from_pretrained(module_path, config=module_config, **load_kwargs)
+            else:
+                modules[name] = mod_cls._from_config(module_config, **cls._init_only_load_kwargs(load_kwargs))
         return modules
 
     @staticmethod
@@ -411,14 +384,17 @@ class OmniModel(PreTrainedModel):
         node: NodeDef,
         batch: dict[str, Any],
     ) -> None:
-        """Run one training node — ``pre_forward`` → endpoint → ``post_forward``."""
+        """Run one training node — optional ``pre_forward`` → endpoint → optional ``post_forward``."""
         method = node.method
         fn = getattr(module, method, None)
         if fn is None:
             raise AttributeError(f"Node method {type(module).__name__}.{method}() is not implemented.")
-        inputs = module.pre_forward(method=method, **batch)
+        pre_forward = getattr(module, "pre_forward", None)
+        inputs = pre_forward(method=method, **batch) if pre_forward is not None else batch
         outputs = fn(**inputs)
-        outputs = module.post_forward(method=method, **outputs)
+        post_forward = getattr(module, "post_forward", None)
+        if post_forward is not None:
+            outputs = post_forward(method=method, **outputs)
         batch.update(outputs)
 
     def forward(
@@ -430,7 +406,8 @@ class OmniModel(PreTrainedModel):
     ) -> dict[str, Any]:
         """Run the training DAG; this is the FSDP2 root ``forward``.
 
-        Each node is ``pre_forward`` → endpoint → ``post_forward``. Nested wrap
+        Each node is optional ``pre_forward`` → endpoint → optional ``post_forward``.
+        Mixins are not required on a native ``OmniPreTrainedModel``. Nested wrap
         units (decoder layers, ``Embedding``, …) unshard on their own
         ``__call__``; leftover params on this module unshard because training
         enters here.
@@ -439,9 +416,8 @@ class OmniModel(PreTrainedModel):
         the seam that keeps this modeling free of any training-framework import:
         the default runs each endpoint eagerly (correct for an unwrapped,
         single-process model), while VeOmni injects
-        :class:`~veomni.models.seed_omni.accelerator.executor.TrainNodeRunner`
-        to add wrapper unwrap, ``ParallelState`` scoping, metering and graph
-        profiling. The graph walk, loss collection and return contract stay here
+        :class:`~veomni.models.seed_omni.accelerated.utils.executor.TrainNodeRunner`
+        to add wrapper unwrap and ``ParallelState`` scoping. The graph walk, loss collection and return contract stay here
         so a port to another framework only has to supply a runner.
         """
         del args, kwargs
@@ -459,7 +435,7 @@ class OmniModel(PreTrainedModel):
         return {"loss": _sum_losses(self._losses), "losses": dict(self._losses)}
 
     def reset(self) -> None:
-        """Clear per-conversation inference runtime state."""
+        """Clear per-request inference runtime state."""
         self.generation_graph.reset()
         self._generated.clear()
         for _, module in self.named_omni_modules():
@@ -528,7 +504,7 @@ class OmniModel(PreTrainedModel):
         request: dict[str, Any],
         generation_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Run inference using the FSM (profiler-free eager path).
+        """Run inference using the FSM (eager path).
 
         Parameters
         ----------

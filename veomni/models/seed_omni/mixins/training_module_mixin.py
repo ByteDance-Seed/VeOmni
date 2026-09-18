@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Training-graph hooks shared by every SeedOmni V2 sub-model."""
+"""Training-graph hooks shared by every SeedOmni sub-model."""
 
 from __future__ import annotations
 

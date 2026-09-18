@@ -36,7 +36,7 @@ vision tower.
 
 ## Preprocessor Contract
 
-`ModulePreprocessorBase` lives in `veomni/models/seed_omni/processing/base.py`.
+`ModulePreprocessorBase` lives in `veomni/models/seed_omni/modules/module_processing_base.py`.
 
 Rules:
 

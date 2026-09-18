@@ -35,8 +35,8 @@ from transformers.models.janus.modeling_janus import (
 from veomni.utils import helper
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
-from ....omni_pretrained_model import OmniPreTrainedModel
 from ....utils.conversation import ConversationItem, maybe_merge_outputs, seal_outputs
+from ...module_modeling_base import OmniPreTrainedModel
 from .configuration import JanusVqvaeConfig
 from .processing import JanusVqvaePreprocessor, JanusVqvaeProcessor
 
@@ -47,7 +47,7 @@ logger = helper.create_logger(__name__)
 class InferenceMixin:
     """FSM ``generate`` (VQ AR sampling + CFG) — HF ``GenerationMixin`` analog.
 
-    Listed *before* :class:`~....omni_pretrained_model.OmniPreTrainedModel` in
+    Listed *before* :class:`~...module_modeling_base.OmniPreTrainedModel` in
     :class:`JanusVqvae`'s bases: ``OmniPreTrainedModel`` ships a no-op
     ``finalize`` default (kept as a safety net for modules that don't need
     real inference state), and MRO resolves left-to-right — put second, that

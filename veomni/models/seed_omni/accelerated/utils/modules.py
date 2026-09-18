@@ -22,8 +22,8 @@ from typing import Any
 
 import torch.nn as nn
 
-from ..configuration_omni import OmniConfig
-from ..mixins.base_mixin import BaseMixin
+from ...configuration_omni import OmniConfig
+from ...mixins.base_mixin import BaseMixin
 from .dispatch import unwrap_module_chain
 
 

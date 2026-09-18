@@ -196,6 +196,10 @@ done
 
 ### 5.2 Native eager (`infer_omni_native.py`)
 
+This is launch path 1 in [`seed_omni_v2.md` §4.1](../seed_omni_v2.md#two-launch-paths)
+(`OmniModel.from_pretrained`, no VeOmni runtime). Path 2 is
+`tasks/omni/infer_omni.py` plus `base.yaml`.
+
 Single-process load — preprocess the request, then ``model.generate``:
 
 ```python

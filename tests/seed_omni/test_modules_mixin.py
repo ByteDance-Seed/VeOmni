@@ -240,7 +240,7 @@ def _accelerated_model_cls(model_type: str):
 
 
 def test_all_registered_classes_are_module_mixins():
-    from veomni.models.seed_omni.omni_pretrained_model import OmniPreTrainedModel
+    from veomni.models.seed_omni.modules.module_modeling_base import OmniPreTrainedModel
 
     accelerated_keys = set(OMNI_ACCELERATED_MODEL_REGISTRY.valid_keys())
     for name in OMNI_MODEL_REGISTRY.valid_keys():

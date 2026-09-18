@@ -27,7 +27,7 @@ import torch.nn as nn
 from veomni.distributed import parallel_state
 from veomni.distributed.parallel_state import ParallelState
 from veomni.models.model_runtime import VeOmniModelRuntime
-from veomni.models.seed_omni.accelerator.module_runtime import ModuleRuntime
+from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 
 
 def _unbuilt(model: nn.Module | None = None, **args_fields) -> ModuleRuntime:
@@ -46,7 +46,10 @@ def test_module_runtime_is_a_model_runtime():
 
 def test_omni_runtime_arguments_are_model_arguments():
     from veomni.arguments import ModelArguments, OmniModelRuntimeArguments, OmniModuleRuntimeArguments
+    from veomni.models.seed_omni.accelerated import OmniModelRuntimeConfig, OmniModuleRuntimeConfig
 
+    assert OmniModuleRuntimeArguments is OmniModuleRuntimeConfig
+    assert OmniModelRuntimeArguments is OmniModelRuntimeConfig
     assert issubclass(OmniModuleRuntimeArguments, ModelArguments)
     assert issubclass(OmniModelRuntimeArguments, ModelArguments)
 
@@ -168,7 +171,7 @@ def test_a_trainable_module_does_get_a_checkpoint_manager(monkeypatch):
     """The frozen carve-out must be a carve-out, not the only path."""
     built = []
     monkeypatch.setattr(
-        "veomni.models.seed_omni.accelerator.module_runtime.OmniModuleCheckpointManager",
+        "veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.OmniModuleCheckpointManager",
         lambda runtime: built.append(runtime) or "manager",
     )
 

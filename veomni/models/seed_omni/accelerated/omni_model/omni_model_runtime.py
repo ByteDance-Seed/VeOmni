@@ -21,26 +21,27 @@ from contextlib import nullcontext
 from dataclasses import fields
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping
 
-from ....distributed.parallel_state import is_parallel_state_registered, use_parallel_state
-from ....utils.logging import get_logger
-from ..mixins.metric_meter_mixin import MetricMeterResult
-from ..modeling_omni import OmniModel
-from ..utils.graph_profiler import GraphProfiler
-from .executor import TrainNodeRunner, execute_generation_node
-from .utils import iter_named_omni_modules, save_module_subdirectory
+from .....distributed.parallel_state import is_parallel_state_registered, use_parallel_state
+from .....utils.logging import get_logger
+from ...mixins.metric_meter_mixin import MetricMeterResult
+from ...modeling_omni import OmniModel
+from ...utils.graph_profiler import GraphProfiler
+from ..utils.executor import TrainNodeRunner, execute_generation_node
+from ..utils.modules import iter_named_omni_modules, save_module_subdirectory
 
 
 if TYPE_CHECKING:
-    from ....arguments import OmniGraphProfileArguments
-    from ....arguments.omni_arguments_types import OmniModelRuntimeArguments, OmniTrainingArguments
-    from ....trainer.callbacks import TrainerState
-    from .module_runtime import ModuleRuntime
+    from .....arguments import OmniGraphProfileArguments
+    from .....arguments.omni_arguments_types import OmniTrainingArguments
+    from .....trainer.callbacks import TrainerState
+    from ..omni_module.omni_module_runtime import ModuleRuntime
+    from .omni_model_config import OmniModelRuntimeConfig
 
 
 logger = get_logger(__name__)
 
 
-def _scoped_no_split_modules(module_runtimes: Mapping[str, "ModuleRuntime"]) -> list[str]:
+def _scoped_no_split_modules(module_runtimes: Mapping[str, ModuleRuntime]) -> list[str]:
     """Prefix each child's ``_no_split_modules`` with that child's name.
 
     A bare class name is ambiguous once the children share one FSDP tree:
@@ -64,7 +65,7 @@ def _scoped_no_split_modules(module_runtimes: Mapping[str, "ModuleRuntime"]) -> 
     return list(dict.fromkeys(scoped))
 
 
-def _reject_lora_that_matched_nothing(module_runtimes: Mapping[str, "ModuleRuntime"], train: Any = None) -> None:
+def _reject_lora_that_matched_nothing(module_runtimes: Mapping[str, ModuleRuntime], train: Any = None) -> None:
     """Fail a LoRA run that left the composed model with nothing to train.
 
     A single module whose targets missed is normal — ``ModuleRuntime`` already
@@ -100,7 +101,7 @@ class OmniModelRuntime:
       ``PreTrainedModel`` and the composed model is a plain ``PreTrainedModel``;
       no VeOmni infrastructure is involved (eager single-process inference).
     * **VeOmni** — :meth:`from_model_runtime`. Every sub-module is owned by a
-      :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime`
+      :class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime`
       (FSDP2/DDP wrap, weight load, optimizer, checkpoint manager) and the
       composed model is *this* class. ``OmniTrainer.model`` /
       ``OmniInferencer.model`` hold it. Training enters the wrapped
@@ -122,7 +123,7 @@ class OmniModelRuntime:
         *,
         module_runtimes: Mapping[str, ModuleRuntime] | None = None,
         module_parallel_state_names: Iterable[str] | None = None,
-        omni_model_runtime_args: OmniModelRuntimeArguments | None = None,
+        omni_model_runtime_args: OmniModelRuntimeConfig | None = None,
     ) -> None:
         self.model = model
         self.module_runtimes = dict(module_runtimes or {})
@@ -133,18 +134,18 @@ class OmniModelRuntime:
     @classmethod
     def from_model_runtime(
         cls,
-        omni_model_runtime_args: OmniModelRuntimeArguments,
+        omni_model_runtime_args: OmniModelRuntimeConfig,
         *,
         train: OmniTrainingArguments = None,
         for_inference: bool = False,
     ) -> OmniModelRuntime:
-        """Compose a VeOmni-managed model from a resolved :class:`OmniModelRuntimeArguments`.
+        """Compose a VeOmni-managed model from a resolved :class:`OmniModelRuntimeConfig`.
 
         ``train`` is the global :class:`~....arguments.omni_arguments_types.OmniTrainingArguments`
         (unset for inference) — forwarded to every :class:`ModuleRuntime` so its
         checkpoint manager can resolve the shared ``save_path``/``output_dir``/``load_path``.
         """
-        from .module_runtime import ModuleRuntime
+        from ..omni_module.omni_module_runtime import ModuleRuntime
 
         omni_config = omni_model_runtime_args.to_hf_config()
         module_runtime_args = omni_model_runtime_args.modules
@@ -211,8 +212,8 @@ class OmniModelRuntime:
         if any(kwargs["module_is_peft_model"].values()):
             kwargs["is_peft_model"] = True
 
-        from ....distributed.torch_compile import CompileConfig
-        from ....distributed.torch_parallelize import build_parallelize_model
+        from .....distributed.torch_compile import CompileConfig
+        from .....distributed.torch_parallelize import build_parallelize_model
 
         compile_config = CompileConfig(
             **{field.name: getattr(acc.torch_compile, field.name) for field in fields(CompileConfig)}

@@ -60,7 +60,7 @@ def build_config(args: Arguments) -> OmniConfig:
     for name in config.module_names:
         print(f"  {name:24s} subfolder={config.module_checkpoint_subfolder(name)!r}")
         print(f"  {'':24s} path={config.resolve_module_path(model_path, name)}")
-    print(f"  training_graph edges: {len(config.training_edges)}")
+    print(f"  training_graph edges: {len(config.training_graph)}")
     print(f"  generation scenarios: {', '.join(config.infer_types)}")
     for infer_type in config.infer_types:
         print(f"    {infer_type:20s} initial={config.generation_graphs[infer_type].get('initial')!r}")

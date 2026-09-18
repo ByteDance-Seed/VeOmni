@@ -1,0 +1,3 @@
+# Launcher-style training DAG: a top-level edge list (bare module → .forward).
+- {from: fake_module_a, to: fake_module_b}
+- {from: fake_module_b, to: end}

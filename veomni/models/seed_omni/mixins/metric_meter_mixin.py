@@ -29,7 +29,7 @@ A module only ever produces **time-independent** quantities:
 
 * :meth:`metric_meter_add` accumulates this module's token lengths — the per-module
   analogue of ``EnvironMeter.add``.  The
-  :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime` calls it right after
+  :class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime` calls it right after
   ``pre_forward`` (when the real input tensors are in hand), passing the node's
   ``method`` + the forward ``data``.  A module reports its tokens by calling
   :meth:`MetricMeterMixin.metric_meter_set_seqlens` inside its ``pre_forward``

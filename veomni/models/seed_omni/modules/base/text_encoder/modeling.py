@@ -21,8 +21,8 @@ from transformers import PreTrainedTokenizerBase
 
 from veomni.utils.tensor_utils import naflatten, unflatten
 
-from ....omni_pretrained_model import OmniPreTrainedModel
 from ....utils.conversation import ConversationItem, seal_outputs
+from ...module_modeling_base import OmniPreTrainedModel
 from .chat_template import TextEncoderChatTemplate
 from .configuration import TextEncoderConfig
 
@@ -55,7 +55,7 @@ class InferenceMixin:
     helpers below, plus the FSM inference state initialized in
     :meth:`TextEncoder.__init__`.
 
-    Listed *before* :class:`~....omni_pretrained_model.OmniPreTrainedModel` in
+    Listed *before* :class:`~...module_modeling_base.OmniPreTrainedModel` in
     :class:`TextEncoder`'s bases: ``OmniPreTrainedModel`` ships no-op
     ``reset_local_inference_state`` / ``finalize`` defaults (kept so
     inference-only modules that don't mix this in still satisfy the FSM

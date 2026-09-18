@@ -7,8 +7,8 @@ from typing import Any
 
 import torch.nn as nn
 
-from ..mixins.base_mixin import BaseMixin
-from ..omni_pretrained_model import OmniPreTrainedModel
+from ...mixins.base_mixin import BaseMixin
+from ...modules.module_modeling_base import OmniPreTrainedModel
 
 
 def unwrap_module_chain(wrapped: nn.Module) -> nn.Module:
@@ -63,7 +63,7 @@ def unwrap_graph_module(wrapped: nn.Module, *, module_name: str) -> nn.Module:
 
     Parallel/acceleration hooks (``customized_build_parallelize_model``,
     ``get_parallel_plan``, …) are **not** part of :class:`BaseMixin`; they
-    live on :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime`
+    live on :class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime`
     or optional family mixins on the wrapped model.
 
     A LoRA-wrapped module (:class:`veomni.lora.VeOmniLoraModel`, possibly
@@ -75,7 +75,7 @@ def unwrap_graph_module(wrapped: nn.Module, *, module_name: str) -> nn.Module:
     need to return the inner :class:`BaseMixin` here.
 
     A ``fsdp_mode: eager`` module (``ModuleRuntime._init_eager_inference`` in
-    ``module_runtime.py``) is a bare native :class:`OmniPreTrainedModel` from
+    ``omni_module_runtime.py``) is a bare native :class:`OmniPreTrainedModel` from
     plain ``from_pretrained`` — no FSDP/DDP wrap, no ``BaseMixin``. It is only
     reachable from generation nodes (training always builds the wrapped
     ``BaseMixin`` path — eager is gated behind ``for_inference``), which need

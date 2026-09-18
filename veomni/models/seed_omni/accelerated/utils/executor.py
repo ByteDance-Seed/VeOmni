@@ -18,9 +18,9 @@ portable to other frameworks.
 from contextlib import nullcontext
 from typing import Any, Callable, ContextManager, Dict, Optional
 
-from ..graphs.base import NodeDef
-from ..modeling_omni import LOSS_KEY
-from ..utils.graph_profiler import GraphProfiler
+from ...graphs.base import NodeDef
+from ...modeling_omni import LOSS_KEY
+from ...utils.graph_profiler import GraphProfiler
 from .dispatch import call_graph_endpoint, unwrap_graph_module
 
 

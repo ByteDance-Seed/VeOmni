@@ -12,20 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""VeOmni accelerator layer over :class:`~veomni.models.seed_omni.modeling_omni.OmniModel`.
+"""Per-module accelerated config + runtime.
 
-Lightweight exports only — ``module_runtime`` / ``dispatch`` are submodules; import
-them explicitly (``from veomni.models.seed_omni.accelerator.module_runtime import …``)
-to avoid pulling trainer/distributed setup into every ``seed_omni`` import.
-Per-module checkpoint I/O lives in ``veomni.models.seed_omni.utils.checkpoint``.
+``OmniModuleRuntimeConfig`` is the lightweight launcher dataclass.
+:class:`ModuleRuntime` is heavier — import it from
+:mod:`.omni_module_runtime` when needed so config-only imports stay cheap.
 """
 
-from .executor import TrainNodeRunner, execute_generation_node
-from .omni_model_runtime import OmniModelRuntime
+from .omni_module_config import OmniModuleRuntimeConfig, hf_module_model_config
 
 
 __all__ = [
-    "OmniModelRuntime",
-    "TrainNodeRunner",
-    "execute_generation_node",
+    "OmniModuleRuntimeConfig",
+    "hf_module_model_config",
 ]

@@ -1,4 +1,4 @@
-"""SeedOmni V2 module mixin registry.
+"""SeedOmni module mixin registry.
 
 Each entry maps a HuggingFace ``model_type`` string (the ``model_type``
 field of each module's :class:`PretrainedConfig` subclass) to the
@@ -22,16 +22,25 @@ package only wires up the registry table, it does not load modeling code.
 
 File layout
 -----------
-``modules/<family>/<sub_module>/(configuration.py, modeling.py[,
-processing.py])``.  Each sub-module gets its own folder; the folder name
-carries the namespace so the inner files use short names rather than
-re-spelling ``<family>_<sub_module>`` per file.  Cross-family
+Shared bases live next to the families, not at the ``seed_omni/`` package root:
+
+* ``module_modeling_base.py`` — :class:`OmniPreTrainedModel`
+* ``module_processing_base.py`` — :class:`ModulePreprocessorBase` + :func:`bind_module_assets`
+* ``module_configuration_base.py`` — :class:`OmniModuleConfig` (HF descriptor for one ``OmniConfig.modules`` slot)
+
+Concrete modules: ``modules/<family>/<sub_module>/(configuration.py,
+modeling.py[, processing.py])``.  Each sub-module gets its own folder; the
+folder name carries the namespace so the inner files use short names rather
+than re-spelling ``<family>_<sub_module>`` per file.  Cross-family
 lightweight modules live under ``modules/base/<sub_module>/``.
 """
 
 from transformers import PretrainedConfig
 
-from ....utils.registry import Registry
+from ....utils.registry import Registry  # VeOmni shared name→factory registry; not seed_omni-local.
+from .module_configuration_base import OmniModuleConfig
+from .module_modeling_base import OmniPreTrainedModel
+from .module_processing_base import MODULE_ASSET_ATTRS, ModulePreprocessorBase, bind_module_assets
 
 
 OMNI_CONFIG_REGISTRY = Registry("OmniConfig")
@@ -51,14 +60,12 @@ def read_hf_model_type(model_path: str) -> str:
     :func:`read_model_type`.
 
     Uses :meth:`PretrainedConfig.get_config_dict` rather than
-    :class:`AutoConfig.from_pretrained` because Janus / future split
-    checkpoints declare custom ``model_type`` values
-    (``janus_siglip`` / ``janus_text_encoder`` / ``janus_llama`` /
-    ``janus_vqvae``) that are NOT in HF's :data:`CONFIG_MAPPING`.
-    ``AutoConfig`` would raise on those families before we even get a chance
-    to consult the registries; reading the raw dict sidesteps that.  See
-    :mod:`veomni.models.loader` for the same pattern in the foundation-model
-    loader.
+    :class:`AutoConfig.from_pretrained` because split-checkpoint modules
+    declare custom ``model_type`` values (``module_A`` / ``module_B`` / …)
+    that are NOT in HF's :data:`CONFIG_MAPPING`.  ``AutoConfig`` would raise
+    on those families before we even get a chance to consult the registries;
+    reading the raw dict sidesteps that.  See :mod:`veomni.models.loader`
+    for the same pattern in the foundation-model loader.
     """
     config_dict, _ = PretrainedConfig.get_config_dict(model_path)
     model_type = config_dict.get("model_type")
@@ -67,11 +74,12 @@ def read_hf_model_type(model_path: str) -> str:
     return model_type
 
 
-# Side-effect only: attach @register factories under bagel/, base/, janus/, qwen3/, qwen3_moe/, qwen3vl/.
-# Imported after ``read_hf_model_type`` so the convert_registry ↔ modules cycle
-# resolves: each family's ``convert_model`` imports ``convert_registry``, whose
-# ``convert_checkpoint`` reads ``read_hf_model_type`` back from this module.
-from . import bagel, base, janus, qwen3, qwen3_moe, qwen3vl  # noqa: F401  E402
+# Side-effect only: attach @register factories under bagel/, base/, janus/, qwen3/,
+# qwen3_moe/, qwen3vl/, fake_model/. Imported after ``read_hf_model_type`` so the
+# convert_registry ↔ modules cycle resolves: each family's ``convert_model``
+# imports ``convert_registry``, whose ``convert_checkpoint`` reads
+# ``read_hf_model_type`` back from this module.
+from . import bagel, base, fake_model, janus, qwen3, qwen3_moe, qwen3vl  # noqa: F401  E402
 
 
 def read_model_type(model_path: str) -> str:
@@ -108,10 +116,15 @@ def read_model_type(model_path: str) -> str:
 
 
 __all__ = [
+    "MODULE_ASSET_ATTRS",
     "OMNI_ACCELERATED_MODEL_REGISTRY",
     "OMNI_CONFIG_REGISTRY",
     "OMNI_MODEL_REGISTRY",
     "OMNI_PROCESSOR_REGISTRY",
+    "ModulePreprocessorBase",
+    "OmniModuleConfig",
+    "OmniPreTrainedModel",
+    "bind_module_assets",
     "read_hf_model_type",
     "read_model_type",
 ]

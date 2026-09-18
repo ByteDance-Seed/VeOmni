@@ -8,8 +8,8 @@ import torch.nn as nn
 from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.tensor_utils import naflatten
 
-from ....omni_pretrained_model import OmniPreTrainedModel
 from ....utils.conversation import ConversationItem, is_dummy
+from ...module_modeling_base import OmniPreTrainedModel
 from .configuration import Qwen3VLLlmConfig
 
 
@@ -117,7 +117,7 @@ def pack_qwen3vl_conversations_for_forward(
 class InferenceMixin:
     """FSM ``generate`` (with M-RoPE + DeepStack) — HF ``GenerationMixin`` analog.
 
-    Listed *before* :class:`~....omni_pretrained_model.OmniPreTrainedModel` in
+    Listed *before* :class:`~...module_modeling_base.OmniPreTrainedModel` in
     :class:`Qwen3VLLlm`'s bases: ``OmniPreTrainedModel`` ships no-op
     ``reset_local_inference_state`` / ``reset_global_inference_state`` defaults
     (kept as a safety net for modules that don't need real inference state),

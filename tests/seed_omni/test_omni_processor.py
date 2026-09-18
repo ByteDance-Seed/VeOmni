@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from veomni.models.seed_omni.configuration_omni import OmniConfig
-from veomni.models.seed_omni.processing.binding import bind_module_assets
+from veomni.models.seed_omni.modules.module_processing_base import bind_module_assets
 from veomni.models.seed_omni.processing_omni import OmniProcessor
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 

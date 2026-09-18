@@ -16,7 +16,7 @@ ships a ``preprocessor_config.json`` saved by HF's standard
 :meth:`JanusVqvaePreprocessor.from_pretrained`.
 
 :class:`JanusVqvaePreprocessor` is the picklable, weight-free CPU worker
-counterpart (see :class:`~veomni.models.seed_omni.processing.base.ModulePreprocessorBase`) —
+counterpart (see :class:`~veomni.models.seed_omni.modules.module_processing_base.ModulePreprocessorBase`) —
 built straight off the checkpoint dir, with no model instance involved.
 """
 
@@ -26,8 +26,8 @@ import torch
 from PIL import Image
 from transformers.models.janus.image_processing_janus import JanusImageProcessor
 
-from ....processing import ModulePreprocessorBase
 from ....utils.conversation import ConversationItem, iter_desired_items
+from ...module_processing_base import ModulePreprocessorBase
 from .configuration import JanusVqvaeConfig
 
 

@@ -6,12 +6,13 @@ import re
 from types import SimpleNamespace
 
 import pytest
+import torch
 import torch.nn as nn
 
 from veomni.arguments import OmniGraphProfileArguments
 from veomni.models.seed_omni import EdgeDef, NodeDef
-from veomni.models.seed_omni.accelerator import OmniModelRuntime
-from veomni.models.seed_omni.accelerator.executor import (
+from veomni.models.seed_omni.accelerated import OmniModelRuntime
+from veomni.models.seed_omni.accelerated.utils.executor import (
     TrainNodeRunner,
     execute_generation_node,
     execute_train_node,
@@ -348,13 +349,40 @@ def test_omni_model_forward_runs_graph_without_a_runner():
     assert out == {"loss": None, "losses": {}}
 
 
+def test_omni_model_forward_runs_fake_module_chain():
+    """Eager training graph walks ``fake_module_a → fake_module_b`` (no conversation)."""
+    from veomni.models.seed_omni.modules.fake_model.fake_module_a.configuration import FakeModuleAConfig
+    from veomni.models.seed_omni.modules.fake_model.fake_module_a.modeling import FakeModuleA
+    from veomni.models.seed_omni.modules.fake_model.fake_module_b.configuration import FakeModuleBConfig
+    from veomni.models.seed_omni.modules.fake_model.fake_module_b.modeling import FakeModuleB
+
+    hidden_size = 8
+    edges = [{"from": "fake_module_a", "to": "fake_module_b"}, {"from": "fake_module_b", "to": "end"}]
+    a = FakeModuleA(FakeModuleAConfig(hidden_size=hidden_size))
+    b = FakeModuleB(FakeModuleBConfig(hidden_size=hidden_size))
+    config = OmniConfig(
+        modules={"fake_module_a": {"subfolder": "fake_module_a"}, "fake_module_b": {"subfolder": "fake_module_b"}},
+        training_graph=edges,
+        generation_graphs=_minimal_generation_graphs(module="fake_module_a"),
+    )
+    model = OmniModel(config, {"fake_module_a": a, "fake_module_b": b})
+
+    hidden = torch.ones(2, hidden_size)
+    batch: dict = {"hidden": hidden}
+    out = model(batch)
+
+    # Each Linear is ones-initialized, so a row of ones becomes 8, then 64.
+    assert torch.allclose(batch["hidden"], torch.full((2, hidden_size), 64.0))
+    assert out == {"loss": None, "losses": {}}
+
+
 def test_modeling_omni_imports_no_veomni_runtime_package():
     """``modeling_omni`` must stay liftable into another framework.
 
     Everything runtime-specific about running a node (wrapper unwrap,
     ParallelState scoping, metering, profiling) reaches ``OmniModel.forward``
     through its ``node_runner`` argument, so the modeling needs no import from
-    VeOmni's accelerator / distributed / trainer layers — not even a lazy one
+    VeOmni's accelerated / distributed / trainer layers — not even a lazy one
     inside a function body.
     """
     import ast
@@ -362,7 +390,7 @@ def test_modeling_omni_imports_no_veomni_runtime_package():
 
     from veomni.models.seed_omni import modeling_omni
 
-    forbidden = {"accelerator", "distributed", "trainer"}
+    forbidden_packages = {"distributed", "trainer"}
 
     def _veomni_paths(stmt: ast.stmt) -> list[list[str]]:
         """Segments of each imported first-party path, ``veomni.`` prefix stripped."""
@@ -377,10 +405,17 @@ def test_modeling_omni_imports_no_veomni_runtime_package():
             return [[*base, a.name] for a in stmt.names]
         return []
 
+    def _is_runtime_import(path: list[str]) -> bool:
+        if forbidden_packages.intersection(path):
+            return True
+        if "accelerated" not in path:
+            return False
+        idx = path.index("accelerated")
+        # ``modules/<family>/<sub>/accelerated`` is the mixin package, not the runtime layer.
+        return idx == 0 or (idx >= 1 and path[idx - 1] == "seed_omni")
+
     tree = ast.parse(pathlib.Path(modeling_omni.__file__).read_text(encoding="utf-8"))
-    offenders = [
-        ".".join(path) for stmt in ast.walk(tree) for path in _veomni_paths(stmt) if forbidden.intersection(path)
-    ]
+    offenders = [".".join(path) for stmt in ast.walk(tree) for path in _veomni_paths(stmt) if _is_runtime_import(path)]
 
     assert not offenders, f"modeling_omni must not import VeOmni runtime code: {sorted(set(offenders))}"
 
@@ -842,7 +877,7 @@ def test_named_omni_modules_yields_modules_as_attached():
 
 
 def test_iter_named_omni_modules_unwraps_ddp_style_wrapper():
-    from veomni.models.seed_omni.accelerator.utils import iter_named_omni_modules
+    from veomni.models.seed_omni.accelerated.utils import iter_named_omni_modules
 
     edges = _understanding_only_edges()
     g = TrainingGraph(edges)

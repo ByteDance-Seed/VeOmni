@@ -44,7 +44,7 @@ Use this reference to decide which files to trust before editing SeedOmni V2.
   - Decided-but-unimplemented design for audio-bearing video. Read only when
     adding an audio modality.
 - `docs/seed_omni/omni_v2_refactor_migration.md`
-  - Historical merge notes; its path map predates `accelerator/`. Read only for
+  - Historical merge notes; its path map predates `accelerated/`. Read only for
     the CPU preprocessor rationale, and verify every path against the tree.
 - `docs/seed_omni/example_models/janus.md`
   - Janus pipeline notes when present.

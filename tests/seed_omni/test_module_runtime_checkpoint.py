@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from veomni.distributed.torch_compile import CompileConfig
-from veomni.models.seed_omni.accelerator.module_runtime import ModuleRuntime
+from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 
 
 _RESUME_PATH = "/tmp/checkpoint/global_step_10"

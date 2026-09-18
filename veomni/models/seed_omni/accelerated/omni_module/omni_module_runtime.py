@@ -30,21 +30,21 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import FSDPModule
 
-from ....distributed.clip_grad_norm import veomni_omni_module_clip_grad_norm
-from ....distributed.parallel_state import is_parallel_state_registered, use_parallel_state
-from ....utils import logging
-from ....utils.checkpoint_utils import should_skip_hf_weight_load
-from ....utils.device import get_device_type
-from ...model_runtime import VeOmniModelRuntime
-from ..mixins.metric_meter_mixin import MetricMeterMixin, MetricMeterResult
-from ..utils.checkpoint import OmniModuleCheckpointManager
-from .dispatch import unwrap_module_chain
+from .....distributed.clip_grad_norm import veomni_omni_module_clip_grad_norm
+from .....distributed.parallel_state import is_parallel_state_registered, use_parallel_state
+from .....utils import logging
+from .....utils.checkpoint_utils import should_skip_hf_weight_load
+from .....utils.device import get_device_type
+from ....model_runtime import VeOmniModelRuntime
+from ...mixins.metric_meter_mixin import MetricMeterMixin, MetricMeterResult
+from ...utils.checkpoint import OmniModuleCheckpointManager
+from ..utils.dispatch import unwrap_module_chain
 
 
 if TYPE_CHECKING:
-    from ....arguments.arguments_types import AcceleratorConfig
-    from ....arguments.omni_arguments_types import OmniModuleRuntimeArguments, OmniTrainingArguments
-    from ....trainer.callbacks import TrainerState
+    from .....arguments.arguments_types import AcceleratorConfig
+    from .....arguments.omni_arguments_types import OmniModuleRuntimeArguments, OmniTrainingArguments
+    from .....trainer.callbacks import TrainerState
 
 
 logger = logging.get_logger(__name__)
@@ -192,7 +192,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         """Single-process eager load via ``from_pretrained`` + ``device_map``."""
         args = self.args
         assert args.accelerator.fsdp_config.fsdp_mode == "eager"
-        from .. import OMNI_MODEL_REGISTRY, read_model_type
+        from ... import OMNI_MODEL_REGISTRY, read_model_type
 
         model_path = args.model_path
         overrides = dict(args.model_config or {})
@@ -227,7 +227,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         args = self.args
         logger.info_rank0(f"ModuleRuntime '{self.module_name}': build module model")
-        from ....models import build_foundation_model
+        from .....models import build_foundation_model
 
         acc = self.mesh_accelerator
         self.model = build_foundation_model(
@@ -271,7 +271,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         # processors once anything had set its tokenizer -- the public
         # `tokenizer` setter does exactly that.
         try:
-            from ..processing.binding import bind_module_assets
+            from ...modules.module_processing_base import bind_module_assets
 
             bind_module_assets(
                 model,

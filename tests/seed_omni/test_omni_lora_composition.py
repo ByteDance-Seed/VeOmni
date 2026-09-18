@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from veomni.models.seed_omni.accelerator.omni_model_runtime import _reject_lora_that_matched_nothing
+from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import _reject_lora_that_matched_nothing
 
 
 def _runtime(*, lora: bool, trainable: bool) -> SimpleNamespace:

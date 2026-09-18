@@ -17,7 +17,7 @@ Aliased (not subclassed) to the canonical classes so the saved configs keep
 their registered ``*_processor_type`` and stay Auto-loadable.
 
 :class:`Qwen3VLVisionPreprocessor` is the picklable, weight-free CPU worker
-counterpart (see :class:`~veomni.models.seed_omni.processing.base.ModulePreprocessorBase`)
+counterpart (see :class:`~veomni.models.seed_omni.modules.module_processing_base.ModulePreprocessorBase`)
 — built straight off the checkpoint dir, with no model instance involved.
 """
 
@@ -29,8 +29,8 @@ import torch
 from transformers import Qwen2VLImageProcessor
 from transformers.models.qwen3_vl.video_processing_qwen3_vl import Qwen3VLVideoProcessor
 
-from ....processing import ModulePreprocessorBase
 from ....utils.conversation import ConversationItem, iter_desired_items
+from ...module_processing_base import ModulePreprocessorBase
 from .configuration import Qwen3VLVisionEncoderConfig
 
 

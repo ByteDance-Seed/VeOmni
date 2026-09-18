@@ -100,7 +100,7 @@ def test_build_step_contexts_offload_flags():
 
 
 def test_omni_model_runtime_collect_step_metrics_skips_empty_meters():
-    from veomni.models.seed_omni.accelerator.omni_model_runtime import OmniModelRuntime
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
 
     class _MeteredRuntime(_FakeModuleRuntime):
         def collect_step_metrics(self):
@@ -118,7 +118,7 @@ def test_omni_model_runtime_collect_step_metrics_skips_empty_meters():
 
 def test_omni_model_runtime_forwards_composed_model_surface():
     """The runtime is the single model handle: unknown attrs reach the OmniModel."""
-    from veomni.models.seed_omni.accelerator.omni_model_runtime import OmniModelRuntime
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
 
     model = SimpleNamespace(config="omni-config", modules_dict={"a": "module-a"})
     runtime = OmniModelRuntime(model)

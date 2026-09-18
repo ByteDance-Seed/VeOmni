@@ -28,8 +28,8 @@ from veomni.utils.device import IS_NPU_AVAILABLE
 
 from ......distributed.parallel_state import get_parallel_state
 from ......models.checkpoint_tensor_loading import ConvertedCheckpointTensor
-from ....omni_pretrained_model import OmniPreTrainedModel
 from ....utils.conversation import ConversationItem
+from ...module_modeling_base import OmniPreTrainedModel
 from .configuration import Qwen3VLVisionEncoderConfig
 from .processing import (
     _OMNI_GRID,
@@ -197,7 +197,7 @@ class InferenceMixin:
     """FSM ``generate`` — reads patchified image/video items, runs the ViT, scatters
     merged tokens + DeepStack features back onto the carrier.
 
-    Listed *before* :class:`~....omni_pretrained_model.OmniPreTrainedModel` in
+    Listed *before* :class:`~...module_modeling_base.OmniPreTrainedModel` in
     :class:`Qwen3VLVisionEncoder`'s bases so MRO resolves this concrete
     ``generate`` (there are no inference-state resets to worry about shadowing
     here — this module is stateless across FSM steps).

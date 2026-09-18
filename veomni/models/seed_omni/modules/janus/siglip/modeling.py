@@ -5,8 +5,8 @@ from typing import Any, Dict, List, Optional
 import torch
 from transformers.models.janus.modeling_janus import JanusVisionAlignerMLP, JanusVisionModel
 
-from ....omni_pretrained_model import OmniPreTrainedModel
 from ....utils.conversation import ConversationItem
+from ...module_modeling_base import OmniPreTrainedModel
 from .configuration import JanusSiglipConfig
 from .processing import JanusSiglipPreprocessor, JanusSiglipProcessor
 
@@ -14,7 +14,7 @@ from .processing import JanusSiglipPreprocessor, JanusSiglipProcessor
 class InferenceMixin:
     """FSM ``generate`` — HF ``GenerationMixin`` analog.
 
-    Listed *before* :class:`~....omni_pretrained_model.OmniPreTrainedModel` in
+    Listed *before* :class:`~...module_modeling_base.OmniPreTrainedModel` in
     :class:`JanusSiglip`'s bases for consistency with every other module's
     native / accelerated split (this module has no reset/finalize override
     to worry about shadowing — see the sibling ``janus/llama`` and

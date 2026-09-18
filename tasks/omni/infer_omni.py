@@ -8,7 +8,7 @@ This is the **framework** inference path:
 * When every module is ``fsdp_mode: eager``, :class:`~veomni.trainer.omni.omni_inferencer.OmniInferencer`
   loads a composed :class:`~veomni.models.seed_omni.modeling_omni.OmniModel` from the split checkpoint.
 * When any module opts into FSDP2 / DDP / ExtraParallel, the handle becomes
-  :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`.
+  :class:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.OmniModelRuntime`.
 
 For **native eager** inference on a split checkpoint (simple process + generate, no
 VeOmni runtime / YAML launcher), use ``tasks/omni/infer_omni_native.py`` instead.

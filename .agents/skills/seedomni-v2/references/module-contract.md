@@ -6,7 +6,9 @@ Read this before editing `veomni/models/seed_omni/modules/**`.
 
 A SeedOmni V2 module is usually:
 
-- A `configuration.py` with a unique `model_type`.
+- A `configuration.py` with a unique `model_type` (family `PretrainedConfig`;
+  the omni composite stores each slot as an `OmniModuleConfig` descriptor in
+  `OmniConfig.modules`).
 - A `modeling.py` — pure HuggingFace-native, loadable with plain
   `from_pretrained` / `AutoModel`, no VeOmni import required:
   - the concrete model class: weights + `forward` / `encode` / …

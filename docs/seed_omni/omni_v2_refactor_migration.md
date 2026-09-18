@@ -3,8 +3,8 @@
 > **⚠️ Historical document.** The `szl.refact_omni_v2` refactor described here is
 > long merged, and the layout has moved on since: `mixins/module_mixin.py`,
 > `omni_module_trainer.py` and `OmniModuleInferencer` no longer exist (the
-> per-module training runtime is now `accelerator/module_runtime.py`'s
-> `ModuleRuntime`), and per-node execution lives in `accelerator/executor.py`
+> per-module training runtime is now `accelerated/omni_module/omni_module_runtime.py`'s
+> `ModuleRuntime`), and per-node execution lives in `accelerated/utils/executor.py`
 > rather than `TrainingGraph.step`. Read this only to understand *why* things
 > moved; for current structure use
 > [`seed_omni_v2.md`](./seed_omni_v2.md) § 7 (file map).
@@ -112,7 +112,7 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
 - **Now:** `OmniModel.forward` loops the graph exactly like `OmniModel.generate`.
   The graph only *selects* nodes; running one is injected via `node_runner`
   (VeOmni passes `TrainNodeRunner` → `execute_train_node`, both in
-  `accelerator/executor.py`, so the modeling imports no runtime code) — see the
+  `accelerated/utils/executor.py`, so the modeling imports no runtime code) — see the
   current form below:
   ```python
   training_graph.reset()
@@ -126,7 +126,7 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
 
   > Note: an earlier form of this refactor had the graph's `step(modules, batch,
   > ...)` run the node inline. A later change split *selection* (graph
-  > `iter_nodes`) from *execution* (`accelerator/executor.py`), so the graph no
+  > `iter_nodes`) from *execution* (`accelerated/utils/executor.py`), so the graph no
   > longer performs any model forward.
 - **If your code** called `set_node_executors` or relied on `OmniModuleTrainer.forward`,
   delete that wiring — the orchestrator no longer injects an executor.

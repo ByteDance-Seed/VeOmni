@@ -7,8 +7,8 @@ import torch.nn as nn
 
 from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import Qwen3Model
 
-from ....omni_pretrained_model import OmniPreTrainedModel
 from ...base.llm_packing import SimpleArGenerationMixin
+from ...module_modeling_base import OmniPreTrainedModel
 from .configuration import Qwen3LlmConfig
 
 

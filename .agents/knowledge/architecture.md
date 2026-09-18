@@ -33,19 +33,25 @@ veomni/
 │   ├── transformers/   Per-model patches (one subpackage per model family)
 │   ├── diffusers/      Diffusion model families (Wan, LTX, Qwen-Image)
 │   └── seed_omni/      Omni-model architecture (encoder-foundation-decoder)
-│       ├── configuration_omni.py   OmniConfig (pure HF PretrainedConfig, checkpoint I/O,
-│       │                           all generation scenarios keyed by infer_type)
+│       ├── configuration_omni.py   OmniConfig (composite HF PretrainedConfig: modules map + graphs)
 │       ├── modeling_omni.py        OmniModel (eager graph forward/generate)
+│       ├── modules/
+│       │   └── module_configuration_base.py  OmniModuleConfig (per-module HF descriptor)
 │       ├── utils/                  Shared SeedOmni helpers
 │       │   ├── checkpoint.py       OmniModuleCheckpointManager (per-module DCP/HF/LoRA)
 │       │   ├── graph_profiler.py   GraphProfiler (request-local node timing)
 │       │   └── visualize.py        Mermaid export for training/generation graphs
-│       └── accelerator/          VeOmni runtime (graph loops + per-module FSDP)
-│           ├── omni_model_runtime.py  OmniModelRuntime (composed graph loops)
-│           ├── module_runtime.py      ModuleRuntime(VeOmniModelRuntime) — per sub-module
-│           ├── executor.py            TrainNodeRunner (OmniModel.forward's node_runner),
-│           │                          execute_train_node / execute_generation_node
-│           └── dispatch.py            unwrap FSDP/DDP/LoRA wrappers, call_graph_endpoint
+│       └── accelerated/          VeOmni runtime (graph loops + per-module FSDP)
+│           ├── omni_model/
+│           │   ├── omni_model_config.py    OmniModelRuntimeConfig (composite ModelArguments)
+│           │   └── omni_model_runtime.py   OmniModelRuntime (composed graph loops)
+│           ├── omni_module/
+│           │   ├── omni_module_config.py   OmniModuleRuntimeConfig (per-module ModelArguments)
+│           │   └── omni_module_runtime.py  ModuleRuntime(VeOmniModelRuntime)
+│           └── utils/
+│               ├── executor.py             TrainNodeRunner, execute_*_node
+│               ├── dispatch.py             unwrap FSDP/DDP/LoRA wrappers, call_graph_endpoint
+│               └── modules.py              iter_named_omni_modules, save_module_*
 ├── optim/              Optimizer and LR scheduler construction
 │   ├── optimizer.py    build_optimizer() factory + MultiOptimizer wrapper.
 │   │                   For optimizer.type=="muon" splits params Muon vs AdamW
@@ -194,7 +200,7 @@ There are exactly **two** ways to build a SeedOmni model, and the trainer / infe
 | **Bare HF** — `OmniModel.from_pretrained(root)` / `from_config(cfg)` | `OmniModel` (a `PreTrainedModel`) | plain `PreTrainedModel` | non-VeOmni users; all-`eager` inference |
 | **VeOmni** — `OmniModelRuntime.from_runtime_config(cfg)` | `OmniModelRuntime` | one `ModuleRuntime` each | training; distributed inference |
 
-`OmniModelRuntime` composes an `OmniModel` and forwards everything it does not define (`config`, `modules_dict`, `save_pretrained`, `nn.Module` reads) to it, so shared callbacks read `trainer.model` either way. Training **requires** the runtime — only it adds ParallelState scoping, graph tracing and metric metering, which it injects into `OmniModel.forward` as a `node_runner` (`TrainNodeRunner`). The graph walk itself lives in `modeling_omni.py`, which imports nothing from `accelerator/` / `distributed/` / the trainer so it can be lifted into another framework (guarded by `tests/seed_omni/test_graph.py::test_modeling_omni_imports_no_veomni_runtime_package`).
+`OmniModelRuntime` composes an `OmniModel` and forwards everything it does not define (`config`, `modules_dict`, `save_pretrained`, `nn.Module` reads) to it, so shared callbacks read `trainer.model` either way. Training **requires** the runtime — only it adds ParallelState scoping, graph tracing and metric metering, which it injects into `OmniModel.forward` as a `node_runner` (`TrainNodeRunner`). The graph walk itself lives in `modeling_omni.py`, which imports nothing from `accelerated/` / `distributed/` / the trainer so it can be lifted into another framework (guarded by `tests/seed_omni/test_graph.py::test_modeling_omni_imports_no_veomni_runtime_package`).
 
 ```
 OmniTrainer (orchestrator)           -> tasks/omni/train_omni.py
@@ -230,19 +236,19 @@ Config split:
 
 | Layer | Config source | Owns |
 |-------|---------------|------|
-| **OmniModel** | `OmniConfig`, projected from `OmniModelRuntimeArguments.to_hf_config()` | graph topology, module wiring |
-| **ModuleRuntime** | slim `OmniModuleRuntimeArguments` (`model` + `accelerator` + `optimizer`) + launcher `train` | FSDP (or deferred wrap when `fsdp_scope='model'`), optimizer, checkpoint per module |
-| **OmniModelRuntime** | `OmniModelRuntimeArguments` via `from_model_runtime()` | graph loops, module runtimes, graph trace, metering |
+| **OmniModel** | `OmniConfig`, projected from `OmniModelRuntimeConfig.to_hf_config()` | graph topology, module wiring |
+| **OmniModuleConfig** | `OmniConfig.modules[name]` descriptor (`modules/module_configuration_base.py`) | subfolder / `model_path` / `model_config` / processor / hydrate / HF export slim |
+| **ModuleRuntime** | slim `OmniModuleRuntimeConfig` (`accelerated/omni_module/omni_module_config.py`; aliased as `OmniModuleRuntimeArguments`) + launcher `train` | FSDP (or deferred wrap when `fsdp_scope='model'`), optimizer, checkpoint per module |
+| **OmniModelRuntime** | `OmniModelRuntimeConfig` (`accelerated/omni_model/omni_model_config.py`; aliased as `OmniModelRuntimeArguments`) via `from_model_runtime()` | graph loops, module runtimes, graph trace, metering |
 | **OmniTrainer** | launcher YAML + `OmniArguments` | dist init, dataloader, train loop, multi-opt |
 
 Canonical imports:
 
 ```python
 from veomni.trainer.omni import OmniTrainer, OmniInferencer
-from veomni.models.seed_omni.accelerator import OmniModelRuntime
-from veomni.models.seed_omni.accelerator.module_runtime import ModuleRuntime
+from veomni.models.seed_omni.accelerated import OmniModelRuntime, OmniModelRuntimeConfig
+from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 from veomni.arguments.omni_arguments_types import (
-    OmniModelRuntimeArguments,
     build_module_runtime_args,
     build_omni_model_runtime,
     resolve_omni_model,
@@ -251,7 +257,7 @@ from veomni.arguments import OmniArguments
 ```
 
 **Runtime config vs `OmniConfig`.** `resolve_omni_model()` returns an
-`OmniModelRuntimeArguments` — the launcher's whole picture: split-checkpoint root, merged
+`OmniModelRuntimeConfig` — the launcher's whole picture: split-checkpoint root, merged
 per-module blocks with absolute paths and `accelerator`/`train` settings, and every graph.
 Nothing is discarded. Projecting onto the slim, checkpoint-shaped `OmniConfig` is a
 separate explicit step, `.to_hf_config()`, taken only where an HF artefact is needed:
@@ -264,18 +270,24 @@ directly and never convert.
 reading the module subfolder's `config.json`.
 
 `OmniConfig` itself (`configuration_omni.py`) is a plain `PretrainedConfig` and imports
-nothing from `veomni.arguments`: it only reads/writes a checkpoint root. Every path from
-launcher YAML into an `OmniConfig` goes through `veomni.arguments.omni_arguments_types`
-(`resolve_omni_model` / `build_omni_model_runtime`), which also owns the launcher-YAML
-helpers shared with `build_module_runtime_args()`. `OmniModelRuntimeArguments` and these
-resolution helpers live in the same file as `OmniArguments` (no separate `model_runtime.py`)
-so `OmniArguments.model` can be typed directly as `OmniModelRuntimeArguments` without an
-import cycle.
+nothing from `veomni.arguments`: it only reads/writes a checkpoint root. Per-module
+descriptor conversion (subfolder, `model_path`, hydrate, export slim) lives on
+`OmniModuleConfig` in `modules/module_configuration_base.py`. The accelerated
+counterparts are `OmniModuleRuntimeConfig` / `OmniModelRuntimeConfig` in
+`accelerated/omni_module/` and `accelerated/omni_model/` (aliased as
+`OmniModuleRuntimeArguments` / `OmniModelRuntimeArguments`
+for launcher imports). Every path from launcher YAML into an `OmniConfig` goes through
+`veomni.arguments.omni_arguments_types` (`resolve_omni_model` / `build_omni_model_runtime`),
+which also owns the launcher-YAML helpers shared with `build_module_runtime_args()`.
+Those resolution helpers stay next to `OmniArguments` so the launcher can type
+`model:` as the runtime config without an arguments ↔ accelerated import cycle.
+`from veomni.arguments import parse_args` does not import the Omni types, so a V1
+job does not load seed_omni.
 
 **Model-args inheritance**: `BaseModelArguments` (model fields, HDFS localization, the
 lazily parsed and per-index-path cached `fqn_to_index_mapping`) -> `ModelArguments`
 (adds load policy + `accelerator` + `optimizer`, i.e. one complete training unit) ->
-V2's `OmniModuleRuntimeArguments` / `OmniModelRuntimeArguments`. A knob that belongs to a
+V2's `OmniModuleRuntimeConfig` / `OmniModelRuntimeConfig`. A knob that belongs to a
 training unit is therefore declared once and applies per module in V2 and to the one
 model in V1; `AcceleratorConfig.__post_init__` validates the mesh, `ModelArguments.__post_init__`
 the load policy, so a per-module override is checked on the same terms as the top-level default.

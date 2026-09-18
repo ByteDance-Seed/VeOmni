@@ -187,6 +187,15 @@ Training continues from step 500 with the dataloader and RNG state restored.
 
 ## 5. Inference
 
+Two public launches are documented in
+[`seed_omni_v2.md` §4.1](../seed_omni_v2.md#two-launch-paths):
+
+* **Native HF** — `python tasks/omni/infer_omni_native.py --model_path <split-ckpt> …`
+  (`OmniModel.from_pretrained`, `modeling.py`, no runtime).
+* **VeOmni Inferencer** — `python tasks/omni/infer_omni.py <base.yaml> …`
+  (all-eager still loads native `OmniModel`; any FSDP2 / DDP / ExtraParallel
+  module builds `OmniModelRuntime` + `accelerated/accelerated.py`).
+
 `tasks/omni/infer_omni.py` runs a generation graph selected by
 `--infer.infer_type` (a key into the `infer.infer_graph` map in `base.yaml`;
 defaults to `infer_interleave`). Point `--infer.model_path` at a

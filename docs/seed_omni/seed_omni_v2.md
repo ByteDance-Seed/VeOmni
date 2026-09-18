@@ -405,6 +405,89 @@ anchor term described in §2.2. Inference has no such constraint — modules may
 
 ## 4. Inference flow (FSM)
 
+(two-launch-paths)=
+### 4.1 Two launch paths (native HF vs VeOmni Inferencer)
+
+SeedOmni V2 exposes **two public inference launches**. Both walk the same
+generation FSM (`OmniModel.generate`); they differ in how the composed model is
+built.
+
+```mermaid
+flowchart TB
+    subgraph native["1. Native HF"]
+      N1["OmniModel.from_pretrained(split ckpt)"] --> N2["OMNI_MODEL_REGISTRY<br/>modules/*/modeling.py"]
+      N2 --> N3["OmniModel.generate"]
+    end
+    subgraph inferencer["2. VeOmni Inferencer"]
+      I1["OmniInferencer + launcher YAML"] --> I2{any module not eager?}
+      I2 -->|no — all eager| I3["OmniModel.from_pretrained<br/>same native classes"]
+      I2 -->|yes — FSDP2 / DDP / EP| I4["OmniModelRuntime<br/>one ModuleRuntime per module"]
+      I4 --> I5["OMNI_ACCELERATED_MODEL_REGISTRY<br/>modules/*/accelerated/accelerated.py"]
+      I3 --> I6["OmniModel.generate"]
+      I5 --> I6
+    end
+```
+
+| | Native HF | VeOmni Inferencer |
+|--|-----------|-------------------|
+| CLI | `python tasks/omni/infer_omni_native.py` | `python tasks/omni/infer_omni.py <base.yaml>` (distributed: `bash train.sh …`) |
+| Handle | `OmniModel` | all-eager → `OmniModel`; any FSDP2 / DDP / ExtraParallel module → `OmniModelRuntime` |
+| Module class | `modeling.py` via `OMNI_MODEL_REGISTRY` | eager modules: native `modeling.py`; distributed modules: `accelerated/accelerated.py` via `build_foundation_model` |
+| Runtime / YAML | none (checkpoint `config.json` + `--infer_type`) | `OmniArguments` / `base.yaml` (graphs, per-module `accelerator` overlays, `--infer.prompt`) |
+| When to use | single-process HF-style load; no VeOmni launcher | YAML graphs, processor pipeline, FSDP2 / DDP / vocab-parallel inference |
+
+`generate()` itself always lives on native `modeling.py` (`InferenceMixin`). The
+accelerated class only wraps that model with VeOmni training/distributed hooks
+(`pre_forward` / FSDP / SP). An all-eager Inferencer run is therefore the same
+object a native user gets from `OmniModel.from_pretrained` — the launcher is
+only projecting YAML onto `OmniConfig` first.
+
+**Native HF** — split-checkpoint root, then generate:
+
+```python
+from veomni.models.seed_omni import OmniModel, OmniProcessor
+
+model = OmniModel.from_pretrained(checkpoint_root, device_map="auto").eval()
+processor = OmniProcessor.from_pretrained(checkpoint_root)
+inputs = processor(text="Describe this image.", images=["/path/to/image.jpg"])
+model.reset()
+generated = model.generate(inputs, generation_kwargs={"max_new_tokens": 128})
+```
+
+```bash
+python tasks/omni/infer_omni_native.py \
+    --model_path /path/to/split-ckpt \
+    --infer_type infer_und \
+    --prompt "Describe this image." \
+    --image /path/to/image.jpg
+```
+
+**VeOmni Inferencer** — same `base.yaml` as training; override modules for eager
+vs distributed:
+
+```bash
+# all-eager (single process): still OmniModel.from_pretrained under the hood
+python tasks/omni/infer_omni.py \
+    configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+    --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
+    --model.model_config.infer_type infer_und \
+    --infer.prompt "Describe this image." \
+    --infer.image /path/to/image.jpg \
+    --infer.output_dir janus_out
+
+# any FSDP2 / DDP / ExtraParallel module: OmniModelRuntime + accelerated classes
+bash train.sh tasks/omni/infer_omni.py \
+    configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+    --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \
+    --model.model_config.infer_type infer_gen \
+    --infer.prompt "A cat on a windowsill"
+```
+
+Worked recipes: [`janus.md` §5](example_models/janus.md#5-inference),
+[`qwen3vl.md` §5.2](example_models/qwen3vl.md#52-native-eager-infer_omni_nativepy).
+
+### 4.2 Generation FSM
+
 `OmniModel.generate(request, trace, generation_kwargs)` loops: run the current
 state's body, drain any one-shot `generated` payloads, then take the first
 matching transition. It stops at the `done` state or the
@@ -549,7 +632,7 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 | `mixins/base_mixin.py` | shared assets, `_omni_hook_name` registry |
 | `mixins/training_module_mixin.py` | `pre_forward` / `post_forward` dispatch |
 | `mixins/inference_module_mixin.py` | live `reset_*` / `finalize` hooks, plus `pre_generate` / `post_generate` dispatchers that nothing invokes (both FSM drivers call endpoints directly — see §2.1) |
-| `omni_pretrained_model.py` | `OmniPreTrainedModel` — base for every native `modeling.py` class; ships no-op `reset_local_inference_state` / `reset_global_inference_state` / `finalize` defaults, shadowed by each module's `InferenceMixin` (§2.1) |
+| `modules/module_modeling_base.py` | `OmniPreTrainedModel` — base for every native `modeling.py` class; ships no-op `reset_local_inference_state` / `reset_global_inference_state` / `finalize` defaults, shadowed by each module's `InferenceMixin` (§2.1) |
 | `mixins/metric_meter_mixin.py` | `MetricMeterMixin` / `MetricMeterResult` (optional per-module FLOPs meter) |
 | `utils/conversation.py` | `ConversationItem` + carrier helpers |
 | `utils/convert_registry.py` | HF → split-checkpoint conversion registry |
@@ -557,10 +640,18 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 | `graphs/training_graph.py` | DAG view (topological forward order) |
 | `graphs/generation_graph.py` | FSM view (states / transitions / signals) |
 | `configuration_omni.py` | `OmniConfig` — plain `PretrainedConfig`, checkpoint read/write only |
-| `arguments/omni_arguments_types.py` | launcher argument schema (`OmniArguments`) + parse/merge the launcher YAML into `OmniModelRuntimeArguments`; `.to_hf_config()` projects it onto `OmniConfig` |
+| `modules/module_configuration_base.py` | `OmniModuleConfig` — per-module HF descriptor |
+| `accelerated/omni_model/omni_model_config.py` | `OmniModelRuntimeConfig` — accelerated composite (`ModelArguments`); `.to_hf_config()` → `OmniConfig` |
+| `accelerated/omni_model/omni_model_runtime.py` | `OmniModelRuntime` — composed graph loops over one `OmniModel` |
+| `accelerated/omni_module/omni_module_config.py` | `OmniModuleRuntimeConfig` — accelerated per-module (`ModelArguments`); `.to_hf_config(name)` → descriptor |
+| `accelerated/omni_module/omni_module_runtime.py` | `ModuleRuntime(VeOmniModelRuntime)` — per-module FSDP / opt / ckpt |
+| `accelerated/utils/executor.py` | `TrainNodeRunner`, `execute_train_node` / `execute_generation_node` |
+| `accelerated/utils/dispatch.py` | unwrap FSDP/DDP/LoRA wrappers, `call_graph_endpoint` |
+| `arguments/omni_arguments_types.py` | launcher argument schema (`OmniArguments`) + parse/merge YAML into the runtime configs |
 | `modeling_omni.py` | `OmniModel` runtime (train DAG + infer FSM + loss sum) |
 | `modules/<family>/<sub>/` | per-module `configuration.py`, `modeling.py` (native, incl. `generate`), `accelerated/` (training-graph hooks: `accelerated.py` [+ `packed.py`]) [, `processing.py`] |
 | `veomni/trainer/omni/omni_trainer.py` | build + FSDP-wrap modules, drive the loop |
 | `veomni/trainer/omni/omni_inferencer.py` | request loop, `reset` + `finalize` |
+| `tasks/omni/infer_omni_native.py` | native HF launch: `OmniModel.from_pretrained` + `generate` |
+| `tasks/omni/infer_omni.py` | VeOmni Inferencer launch: YAML → `OmniModel` or `OmniModelRuntime` |
 | `configs/seed_omni/<model>/<task>/` | per task: `base.yaml` + `modules_train.yaml` + `graph_train.yaml`; shared across tasks: `infer/graph_infer*.yaml`, `infer/modules_infer_*.yaml`, `data.yaml` |
-```

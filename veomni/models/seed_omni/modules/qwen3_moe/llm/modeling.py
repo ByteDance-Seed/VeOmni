@@ -26,8 +26,8 @@ from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_g
     veomni_swiglu_mlp,
 )
 
-from ....omni_pretrained_model import OmniPreTrainedModel
 from ...base.llm_packing import SimpleArGenerationMixin
+from ...module_modeling_base import OmniPreTrainedModel
 from .configuration import Qwen3MoeLlmConfig
 
 

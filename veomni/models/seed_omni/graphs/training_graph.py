@@ -8,13 +8,13 @@ self-describing ``module[.method]`` string (a bare module defaults to
 ``.forward``). A launcher ``graph_train.yaml`` *is* that list, at the file top
 level with no wrapper key::
 
-    - {from: janus_siglip,             to: janus_llama}
-    - {from: janus_vqvae.encode,       to: janus_llama}
-    - {from: janus_text_encoder.encode, to: janus_llama}
-    - {from: janus_llama,              to: janus_text_encoder.decode}
-    - {from: janus_llama,              to: janus_vqvae.decode}
-    - {from: janus_text_encoder.decode, to: end}   # leaf → end
-    - {from: janus_vqvae.decode,       to: end}    # leaf → end
+    - {from: module_A,         to: module_B}
+    - {from: module_C.encode,  to: module_B}
+    - {from: module_D.encode,  to: module_B}
+    - {from: module_B,         to: module_D.decode}
+    - {from: module_B,         to: module_C.decode}
+    - {from: module_D.decode,  to: end}   # leaf → end
+    - {from: module_C.decode,  to: end}   # leaf → end
 
 Active nodes are *derived* from the endpoints of those edges (excluding the
 virtual :data:`~.graph.END` keyword); a node's identity is its canonical
@@ -27,10 +27,8 @@ queue.
 
 Each active node executes **exactly once** per forward pass.  Edges declare
 **topology only** (execution order) — there is no per-node input routing: every
-node receives the same shared ``batch``. Conversation graphs move state through
-the ``conversation_list`` carrier; packed graphs (Janus ``pack_encode`` /
-``pack_forward`` / ``pack_decode``) read packed tensors already written onto
-that batch dict.
+node receives the same shared ``batch``. Modules read and write keys on that
+dict; a later packed graph can store tensors on it the same way.
 
 Single-loss protocol
 --------------------
@@ -206,7 +204,7 @@ class TrainingGraph:
 
         The graph only *chooses* what runs next; it never runs a model forward.
         The caller executes each yielded ``NodeDef`` (``module`` + ``method``)
-        and mutates the shared ``conversation_list`` carrier in place. After the
+        and mutates the shared ``batch`` dict in place. After the
         caller consumes a node, this generator advances the cursor
         (:meth:`maybe_transition`) and yields the next, until :meth:`is_done`.
         Mirror of :meth:`GenerationGraph.iter_nodes` (one FSM body iteration).

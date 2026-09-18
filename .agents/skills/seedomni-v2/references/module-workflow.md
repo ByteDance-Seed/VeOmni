@@ -30,7 +30,10 @@ Answer these before editing:
 
 Follow the existing folder shape:
 
-- `configuration.py`: config fields, unique `model_type`.
+- `configuration.py`: family `PretrainedConfig` fields, unique `model_type`.
+  The omni composite stores this module's slot as an `OmniModuleConfig`
+  descriptor (`modules/module_configuration_base.py`); the VeOmni runtime
+  counterpart is `OmniModuleRuntimeConfig`.
 - `modeling.py`: weights, `forward`, and — if inference-capable — an in-file
   `InferenceMixin` (`generate()` + FSM state, listed before
   `OmniPreTrainedModel` in the model class's bases; see §2.1 of

@@ -17,7 +17,7 @@
 Unlike single-model trainers (BaseTrainer / VLMTrainer), OmniModel is a
 *composition* of several independent OmniModule sub-models (Janus: siglip /
 vqvae / text_encoder / llama).  Each sub-model is backed by its **own**
-:class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime` — a
+:class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime` — a
 :class:`~veomni.models.model_runtime.VeOmniModelRuntime` subclass, so it inherits
 the whole per-model build sequence (``_build_model`` / ``_setup_lora`` /
 ``_build_parallelized_model`` / ``_build_optimizer`` / ``_build_lr_scheduler``) and
@@ -34,13 +34,13 @@ cascade into every module-trainer so each runs its own checkpoint save/resume.
 
 Division of labour
 ------------------
-* :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime` (per
+* :class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime` (per
   module): ``_build_model`` → ``_freeze_model_module`` (freeze + LoRA) →
   ``_build_parallelized_model`` (FSDP2 wrap + weight load) → ``build_checkpoint``
   (its own per-module DCP manager).  Optimizer is built inside each
   :class:`ModuleRuntime` at compose time; lr-scheduler is built in
   :meth:`OmniTrainer._build_multi_lr_scheduler` once ``train_steps`` is known from the dataset.
-* :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`
+* :class:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.OmniModelRuntime`
   (``self.model``): composes the module runtimes into one :class:`OmniModel` and
   owns the graph loops, ParallelState scoping, graph tracing and metric metering.
 * :class:`OmniTrainer` (orchestrator): global ``_setup`` + data pipeline + trace
@@ -67,8 +67,8 @@ from ...data.data_transform import build_data_transform
 from ...distributed.clip_grad_norm import omni_clip_grad_norm
 from ...distributed.offloading import build_activation_offloading_context
 from ...distributed.parallel_state import init_parallel_state_from_config, use_parallel_state
-from ...models.seed_omni.accelerator import OmniModelRuntime
-from ...models.seed_omni.accelerator.module_runtime import ModuleRuntime
+from ...models.seed_omni.accelerated import OmniModelRuntime
+from ...models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 from ...models.seed_omni.processing_omni import OmniProcessor
 from ...models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
 from ...ops.batch_invariant_ops import set_batch_invariant_mode

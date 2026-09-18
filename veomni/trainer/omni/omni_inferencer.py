@@ -25,7 +25,7 @@ overrides deep-merged into the launcher base):
   :meth:`OmniModel.from_pretrained`, with standard ``PreTrainedModel``
   sub-modules placed by ``device_map``.
 * any FSDP2 / DDP / ExtraParallel module — the handle is an
-  :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`
+  :class:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.OmniModelRuntime`
   composing one :class:`ModuleRuntime` per module.
 """
 
@@ -40,7 +40,7 @@ import torch.distributed as dist
 
 from ...arguments import OmniArguments
 from ...arguments.omni_arguments_types import OmniModuleRuntimeArguments
-from ...models.seed_omni.accelerator import OmniModelRuntime
+from ...models.seed_omni.accelerated import OmniModelRuntime
 from ...models.seed_omni.modeling_omni import OmniModel
 from ...models.seed_omni.processing_omni import OmniProcessor
 from ...models.seed_omni.utils.graph_profiler import GraphProfiler

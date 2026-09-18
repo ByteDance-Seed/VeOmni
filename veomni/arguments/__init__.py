@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CLI argument parsing — V1 ``VeOmniArguments`` and V2 ``OmniArguments``."""
+"""CLI argument parsing — V1 ``VeOmniArguments`` and V2 ``OmniArguments``.
+
+Omni types are lazy: a V1 ``from veomni.arguments import parse_args`` must not
+load ``seed_omni``. The runtime config classes live under
+``veomni.models.seed_omni.accelerated``.
+"""
 
 from __future__ import annotations
+
+from importlib import import_module
 
 from .arguments_types import (
     AcceleratorConfig,
@@ -37,23 +44,35 @@ from .arguments_types import (
     VeOmniArguments,
     WandbConfig,
 )
-from .omni_arguments_types import (
-    DEFAULT_SCENARIO,
-    OMNI_TRAIN_WORKFLOWS,
-    OmniArguments,
-    OmniDataArguments,
-    OmniGraphProfileArguments,
-    OmniInferArguments,
-    OmniModelRuntimeArguments,
-    OmniModuleRuntimeArguments,
-    OmniTrainingArguments,
-    build_module_args,
-    build_module_runtime_args,
-    build_omni_model_runtime,
-    resolve_omni_model,
-)
-from .omni_parser import load_yaml_with_inherit, parse_omni_args
 from .parser import parse_args, save_args
+
+
+_OMNI_LAZY_ATTRS = {
+    "DEFAULT_SCENARIO": ".omni_arguments_types",
+    "OMNI_TRAIN_WORKFLOWS": ".omni_arguments_types",
+    "OmniArguments": ".omni_arguments_types",
+    "OmniDataArguments": ".omni_arguments_types",
+    "OmniGraphProfileArguments": ".omni_arguments_types",
+    "OmniInferArguments": ".omni_arguments_types",
+    "OmniModelRuntimeArguments": ".omni_arguments_types",
+    "OmniModelRuntimeConfig": ".omni_arguments_types",
+    "OmniModuleRuntimeArguments": ".omni_arguments_types",
+    "OmniModuleRuntimeConfig": ".omni_arguments_types",
+    "OmniTrainingArguments": ".omni_arguments_types",
+    "build_module_args": ".omni_arguments_types",
+    "build_module_runtime_args": ".omni_arguments_types",
+    "build_omni_model_runtime": ".omni_arguments_types",
+    "resolve_omni_model": ".omni_arguments_types",
+    "load_yaml_with_inherit": ".omni_parser",
+    "parse_omni_args": ".omni_parser",
+}
+
+
+def __getattr__(name: str):
+    module_name = _OMNI_LAZY_ATTRS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(import_module(module_name, __package__), name)
 
 
 __all__ = [
@@ -81,7 +100,9 @@ __all__ = [
     "OmniGraphProfileArguments",
     "OmniInferArguments",
     "OmniModuleRuntimeArguments",
+    "OmniModuleRuntimeConfig",
     "OmniModelRuntimeArguments",
+    "OmniModelRuntimeConfig",
     "OmniTrainingArguments",
     "OMNI_TRAIN_WORKFLOWS",
     "DEFAULT_SCENARIO",

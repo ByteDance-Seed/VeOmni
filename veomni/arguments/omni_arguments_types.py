@@ -18,11 +18,14 @@ A single ``base.yaml`` drives both
 :class:`~veomni.trainer.omni.omni_trainer.OmniTrainer` and
 :class:`~veomni.trainer.omni.omni_inferencer.OmniInferencer`.
 
-The model blocks extend :mod:`veomni.arguments.arguments_types`: both
-:class:`OmniModuleRuntimeArguments` and :class:`OmniModelRuntimeArguments`
-subclass ``ModelArguments``, so the model fields, the ``accelerator`` /
-``optimizer`` pair, HDFS localization and the cached ``fqn_to_index_mapping`` are
-declared once and shared with the V1 ``ModelArguments``. Only ``data`` /
+The model blocks extend :mod:`veomni.arguments.arguments_types`. Both
+:class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_config.OmniModuleRuntimeConfig`
+and
+:class:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_config.OmniModelRuntimeConfig`
+subclass ``ModelArguments`` (aliased here as :class:`OmniModuleRuntimeArguments`
+/ :class:`OmniModelRuntimeArguments`). The model fields, the ``accelerator`` /
+``optimizer`` pair, HDFS localization and the cached ``fqn_to_index_mapping``
+are declared once and shared with the V1 ``ModelArguments``. Only ``data`` /
 ``train`` / ``infer`` are Omni's own.
 
 Omni-specific layout:
@@ -36,14 +39,11 @@ Omni-specific layout:
   :class:`OmniModuleRuntimeArguments`: same flat fields).
 * ``data`` / ``train`` / ``infer`` remain launcher-wide.
 
-``OmniModelRuntimeArguments`` and its resolution helpers (``resolve_omni_model``,
-``build_omni_model_runtime``, ...) live in this same module rather than a separate
-``model_runtime.py``: :class:`OmniArguments.model` is typed as
-``OmniModelRuntimeArguments`` and :meth:`OmniArguments.resolve_model` /
-:meth:`OmniArguments._to_module_global_args` call the resolution helpers directly,
-which would otherwise form an import cycle (``OmniArguments`` -> resolver ->
-``OmniModelRuntimeArguments`` -> back to ``OmniArguments`` for the ``args:
-OmniArguments`` parameter type) across two files.
+The runtime *classes* live next to :class:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.OmniModelRuntime`
+/ :class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime`.
+Resolution helpers (``resolve_omni_model``, ``build_omni_model_runtime``, …)
+stay in this module so :class:`OmniArguments` can call them without an
+arguments ↔ accelerated import cycle.
 """
 
 from __future__ import annotations
@@ -56,6 +56,8 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Literal
 
+from ..models.seed_omni.accelerated.omni_model.omni_model_config import OmniModelRuntimeConfig
+from ..models.seed_omni.accelerated.omni_module.omni_module_config import OmniModuleRuntimeConfig
 from ..utils import logging
 from ..utils.fs import is_non_local
 from .arguments_types import (
@@ -71,6 +73,10 @@ from .arguments_types import (
 from .parser import _deep_update, _instantiate_recursive
 
 
+OmniModuleRuntimeArguments = OmniModuleRuntimeConfig
+OmniModelRuntimeArguments = OmniModelRuntimeConfig
+
+
 logger = logging.get_logger(__name__)
 
 OMNI_TRAIN_WORKFLOWS = {"train", "offline_cache", "train_with_cache", "train_and_cache"}
@@ -79,50 +85,9 @@ LAUNCHER_CONFIG_KEYS = frozenset({"modules", "train_graph", "train_type", "infer
 
 def _hf_module_model_config(model_config: dict | None) -> dict:
     """Drop launcher layout keys before merging or exporting per-module ``model_config``."""
-    if not model_config:
-        return {}
-    return {key: value for key, value in model_config.items() if key not in LAUNCHER_CONFIG_KEYS}
+    from ..models.seed_omni.accelerated.omni_module.omni_module_config import hf_module_model_config
 
-
-@dataclass
-class OmniModuleRuntimeArguments(ModelArguments):
-    """Per-module runtime — one module's slice of a composed Omni model.
-
-    ``ModelArguments`` already is a complete training unit: the model
-    fields plus this module's own ``accelerator`` and ``optimizer``, with
-    ``model_path`` localized and ``fqn_to_index_mapping`` parsed lazily and cached
-    per index path (several modules routinely share one checkpoint). All this adds
-    is the projection onto an :class:`OmniConfig` entry.
-    """
-
-    def to_hf_config(self, module_name: str) -> dict:
-        """Project onto this module's slim :class:`OmniConfig` entry.
-
-        ``model_path`` is carried through explicitly (not just ``subfolder:
-        module_name``): by the time this runs, ``build_module_runtime_args`` /
-        ``_resolve_model_path`` has already resolved it to an absolute path —
-        usually ``<checkpoint_root>/<module_name>``, but a launcher YAML module
-        override may point it at a wholly different checkpoint (e.g. Qwen3
-        visual-instruction-tuning composing ``qwen3_llm``/``qwen3_text_encoder``
-        from one HF model with ``qwen3vl_vision`` from another). Dropping it
-        and re-deriving ``checkpoint_root/module_name`` downstream (as
-        :meth:`~....models.seed_omni.configuration_omni.OmniConfig.resolve_module_path`
-        does for anything without an explicit ``model_path``) would silently
-        resolve to the wrong path for that module.
-        """
-        model_block: dict = {
-            "ops_implementation": asdict(self.ops_implementation),
-        }
-        if self.model_path:
-            model_block["model_path"] = self.model_path
-        overrides = _hf_module_model_config(self.model_config)
-        if overrides:
-            model_block["model_config"] = deepcopy(overrides)
-        return {
-            "subfolder": module_name,
-            "model": model_block,
-            "processor_config": deepcopy(self.processor_config or {}),
-        }
+    return hf_module_model_config(model_config)
 
 
 def _is_omni_checkpoint_root(path: str | None) -> bool:
@@ -138,96 +103,6 @@ def _try_load_omni_checkpoint_config(path: str | None):
 
 
 DEFAULT_SCENARIO = "default"
-
-
-@dataclass
-class OmniModelRuntimeArguments(ModelArguments):
-    """One composed Omni model — a training unit plus the modules it decomposes into.
-
-    YAML supplies the inherited ``model_path``, ``model_config``,
-    ``ops_implementation``, ``accelerator`` and ``optimizer``, which double as the
-    defaults each module's own block is merged over. :func:`resolve_omni_model`
-    fills ``modules``, the graph scenario maps, and the scenario keys.
-    """
-
-    modules: dict[str, OmniModuleRuntimeArguments] = field(default_factory=dict)
-    training_graphs: dict[str, Any] = field(default_factory=dict)
-    generation_graphs: dict[str, Any] = field(default_factory=dict)
-    train_type: str | None = None
-    infer_type: str | None = None
-    generation_kwargs: dict[str, Any] = field(default_factory=dict)
-
-    def launcher_config(self, key: str, default: Any = None) -> Any:
-        """Read a launcher layout key from ``model_config`` (``modules``, graphs, …)."""
-        return (self.model_config or {}).get(key, default)
-
-    def set_launcher_config(self, key: str, value: Any) -> None:
-        if self.model_config is None:
-            self.model_config = {}
-        self.model_config[key] = value
-
-    @property
-    def resolved_model_path(self) -> str:
-        path = self.model_path
-        if not path:
-            raise ValueError("`model.model_path` (split-checkpoint root) is required for OmniModel V2.")
-        return path
-
-    @property
-    def module_names(self) -> list[str]:
-        return list(self.modules)
-
-    @property
-    def train_types(self) -> list[str]:
-        return list(self.training_graphs)
-
-    @property
-    def infer_types(self) -> list[str]:
-        return list(self.generation_graphs)
-
-    @property
-    def training_graph(self) -> list[dict]:
-        from ..models.seed_omni.configuration_omni import select_graph
-
-        graph = select_graph(
-            self.training_graphs,
-            self.train_type,
-            empty_hint="Populate `model.model_config.train_graph` with at least one scenario.",
-            unknown_hint="train_type",
-        )
-        return list(graph)
-
-    @property
-    def generation_graph(self) -> dict:
-        from ..models.seed_omni.configuration_omni import select_graph
-
-        return select_graph(
-            self.generation_graphs,
-            self.infer_type,
-            empty_hint="Populate `model.model_config.infer_graph` with at least one scenario.",
-            unknown_hint="infer_type",
-        )
-
-    def module_checkpoint_subfolder(self, name: str) -> str:
-        if name not in self.modules:
-            known = ", ".join(self.modules) or "(none)"
-            raise KeyError(f"Module {name!r} not found in model runtime; known modules: {known}.")
-        return name
-
-    def to_hf_config(self):
-        """Project onto the checkpoint-shaped HF :class:`~veomni.models.seed_omni.configuration_omni.OmniConfig`."""
-        from ..models.seed_omni.configuration_omni import OmniConfig
-
-        module_entries = {name: mod.to_hf_config(name) for name, mod in self.modules.items()}
-        return OmniConfig.from_dict(
-            {
-                "training_graph": deepcopy(self.training_graph),
-                "generation_graphs": deepcopy(self.generation_graphs),
-                "infer_type": self.infer_type,
-                "generation_kwargs": dict(self.generation_kwargs),
-                "modules": module_entries,
-            }
-        )
 
 
 def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> OmniModelRuntimeArguments:
@@ -247,7 +122,6 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
         train_modules = {
             name: {
                 "model_path": omni_cfg.module_checkpoint_subfolder(name),
-                **({"ops_implementation": ops} if (ops := omni_cfg.module_ops_implementation(name)) else {}),
                 **({"model_config": overrides} if (overrides := omni_cfg.module_model_config(name)) else {}),
             }
             for name in omni_cfg.module_names
@@ -400,24 +274,13 @@ def build_module_runtime_args(
 
 def build_module_args(config, name: str) -> OmniModuleRuntimeArguments:
     """Instantiate :class:`OmniModuleRuntimeArguments` from an ``OmniConfig.modules`` entry."""
+    from ..models.seed_omni.modules.module_configuration_base import OmniModuleConfig
+
     cfg = config.modules.get(name, None)
     if cfg is None:
         raise KeyError(f"Module '{name}' not found in OmniConfig.modules")
-    if not isinstance(cfg, dict):
-        raise TypeError(f"Module '{name}' must be a mapping for build_module_args().")
-    return _instantiate_recursive(OmniModuleRuntimeArguments, _normalize_module_cfg(cfg))
-
-
-def _normalize_module_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Flatten checkpoint-shaped module entries onto launcher fields."""
-    cfg = deepcopy(cfg)
-    cfg.pop("subfolder", None)
-    model_block = cfg.pop("model", None)
-    if isinstance(model_block, dict):
-        for key, value in model_block.items():
-            if key not in cfg:
-                cfg[key] = value
-    return cfg
+    entry = OmniModuleConfig(name, cfg)
+    return _instantiate_recursive(OmniModuleRuntimeArguments, entry.as_runtime_fields())
 
 
 def _to_module_global_args(model_runtime: OmniModelRuntimeArguments) -> OmniModuleRuntimeArguments:
@@ -969,7 +832,9 @@ __all__ = [
     "OmniGraphProfileArguments",
     "OmniInferArguments",
     "OmniModelRuntimeArguments",
+    "OmniModelRuntimeConfig",
     "OmniModuleRuntimeArguments",
+    "OmniModuleRuntimeConfig",
     "OmniTrainingArguments",
     "_hf_module_model_config",
     "_is_omni_checkpoint_root",

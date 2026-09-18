@@ -247,7 +247,7 @@ def test_composed_wrap_scopes_child_no_split_modules(monkeypatch: pytest.MonkeyP
     """Each child's ``_no_split_modules`` is prefixed with that child's name."""
     from unittest.mock import MagicMock
 
-    from veomni.models.seed_omni.accelerator.omni_model_runtime import OmniModelRuntime
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
 
     class _ChildA(torch.nn.Module):
         _no_split_modules = ["LayerA"]
@@ -285,7 +285,7 @@ def test_composed_wrap_scopes_embedding_to_owning_child(monkeypatch: pytest.Monk
     """TextEncoder ``Embedding`` must not also match a sibling VQ codebook."""
     from unittest.mock import MagicMock
 
-    from veomni.models.seed_omni.accelerator.omni_model_runtime import OmniModelRuntime
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
 
     class _TextEnc(torch.nn.Module):
         _no_split_modules = ["Embedding"]
@@ -330,7 +330,7 @@ def test_composed_wrap_does_not_inspect_module_level_sp():
     """Wrap uses the already-built runtimes; module SP overlays are not compared."""
     from unittest.mock import MagicMock, patch
 
-    from veomni.models.seed_omni.accelerator.omni_model_runtime import OmniModelRuntime
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
 
     omni = OmniModelRuntime.__new__(OmniModelRuntime)
     omni.model = MagicMock()
@@ -351,7 +351,7 @@ def test_composed_wrap_uses_composer_accelerator_not_module_overlay(monkeypatch:
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
-    from veomni.models.seed_omni.accelerator.omni_model_runtime import OmniModelRuntime
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
 
     captured: dict = {}
 
@@ -394,7 +394,7 @@ def test_fsdp_wrap_target_scopes_class_to_child_prefix():
 def test_composed_wrap_skips_when_fsdp_scope_is_module(monkeypatch: pytest.MonkeyPatch):
     from unittest.mock import MagicMock
 
-    from veomni.models.seed_omni.accelerator.omni_model_runtime import OmniModelRuntime
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
 
     called = []
     monkeypatch.setattr(

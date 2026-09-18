@@ -39,16 +39,16 @@ import torch.nn as nn
 from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaModel
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 
-from ....omni_pretrained_model import OmniPreTrainedModel
 from ....utils.conversation import ConversationItem
 from ...base.llm_packing import pack_llm_conversations_for_forward
+from ...module_modeling_base import OmniPreTrainedModel
 from .configuration import JanusLlamaConfig
 
 
 class InferenceMixin:
     """FSM ``generate`` (with classifier-free guidance) — HF ``GenerationMixin`` analog.
 
-    Listed *before* :class:`~....omni_pretrained_model.OmniPreTrainedModel` in
+    Listed *before* :class:`~...module_modeling_base.OmniPreTrainedModel` in
     :class:`JanusLlama`'s bases: ``OmniPreTrainedModel`` ships no-op
     ``reset_local_inference_state`` / ``reset_global_inference_state`` defaults
     (kept as a safety net for modules that don't need real inference state),
