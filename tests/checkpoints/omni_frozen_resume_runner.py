@@ -7,7 +7,7 @@ import torch
 
 from veomni.arguments import OmniArguments, build_module_runtime_args, parse_omni_args
 from veomni.distributed import torch_parallelize
-from veomni.models.seed_omni.accelerator.module_runtime import ModuleRuntime
+from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 from veomni.trainer.omni import OmniTrainer
 
 

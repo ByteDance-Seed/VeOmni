@@ -80,7 +80,7 @@ def _make_mock_runtime(save_path="/tmp/test_ckpt", save_async=False):
         model_assets=trainer.model_assets,
         parallel_state=SimpleNamespace(global_rank=trainer.args.train.global_rank),
         args=trainer.args.model,
-        train=trainer.args.train,
+        train_args=trainer.args.train,
     )
 
 
@@ -292,8 +292,8 @@ class TestModelCheckpointManagerSaveContract:
         from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
 
         runtime = _make_mock_runtime(save_path=str(tmp_path / "run"))
-        runtime.train.checkpoint.stage_dir = str(tmp_path / "stage")
-        runtime.train.checkpoint.save_timeout_seconds = 1234
+        runtime.train_args.checkpoint.stage_dir = str(tmp_path / "stage")
+        runtime.train_args.checkpoint.save_timeout_seconds = 1234
         mock_build_ckpt.return_value = MagicMock()
         manager = ModelCheckpointManager(runtime)
 
@@ -332,13 +332,13 @@ class TestModelCheckpointManagerSaveContract:
         runtime = _make_mock_runtime()
         mock_build_ckpt.return_value = MagicMock()
         manager = ModelCheckpointManager(runtime)
-        assert manager.assets_dir() == runtime.train.checkpoint.model_assets_dir
+        assert manager.assets_dir() == runtime.train_args.checkpoint.model_assets_dir
 
         class Named(ModelCheckpointManager):
             module_name = "vision_encoder"
 
         named = Named(runtime)
-        assert named.assets_dir() == f"{runtime.train.checkpoint.model_assets_dir}/vision_encoder"
+        assert named.assets_dir() == f"{runtime.train_args.checkpoint.model_assets_dir}/vision_encoder"
 
     def test_save_forwards_lr_scheduler_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
         runtime = _make_mock_runtime()
@@ -354,7 +354,7 @@ class TestModelCheckpointManagerSaveContract:
 
     def test_load_forwards_lr_scheduler_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
         runtime = _make_mock_runtime()
-        runtime.train.checkpoint.load_path = "/tmp/ckpt"
+        runtime.train_args.checkpoint.load_path = "/tmp/ckpt"
         mock_checkpointer = MagicMock()
         mock_build_ckpt.return_value = mock_checkpointer
 

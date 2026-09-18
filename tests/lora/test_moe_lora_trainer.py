@@ -273,9 +273,6 @@ class MoeLoraTrainer(BaseTrainer):
     any state the checkpoint callback loaded.
     """
 
-    def _build_model_assets(self) -> None:
-        self.model_assets = [self.model_config]
-
     def _build_data_transform(self) -> None:
         pass
 

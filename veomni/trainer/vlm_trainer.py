@@ -150,7 +150,7 @@ class VLMModelRuntime(VeOmniModelRuntime):
         )
 
     def _freeze_model_module(self):
-        train_args: VLMTrainingArguments = self.train
+        train_args: VLMTrainingArguments = self.train_args
         model_config = self.model_config
         lora_enabled = bool(self.args.lora_config)
         is_omni = model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe")
@@ -207,7 +207,7 @@ class VLMModelRuntime(VeOmniModelRuntime):
         # KeyError: 'betas' on the first step after resume.
         param_groups = []
         if vit_params:
-            param_groups.append({"params": vit_params, "lr": self.train.vit_lr})
+            param_groups.append({"params": vit_params, "lr": self.train_args.vit_lr})
         if other_params:
             param_groups.append({"params": other_params, "lr": self.args.optimizer.lr})
 
@@ -232,7 +232,7 @@ class VLMTrainer:
             self._build_collate_fn()
             self.base._build_dataloader()
         self.base._build_lr_scheduler()
-        self.base._build_training_context()
+        self.base._build_training_context(self.base.model)
         self.base._init_callbacks()
 
     def _build_model_runtime(self) -> VLMModelRuntime:
@@ -305,7 +305,7 @@ class VLMTrainer:
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
-        self.base._reset_async_activation_offload_if_enabled()
+        self.base._reset_async_activation_offload_if_enabled(self.base.model)
         self.on_step_begin(micro_batches=micro_batches)
 
         # Forward and backward for each micro batch

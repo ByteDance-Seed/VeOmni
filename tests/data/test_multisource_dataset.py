@@ -193,7 +193,7 @@ class TrainerTest(BaseTrainer):
     def _build_lr_scheduler(self):
         self.model.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.model.optimizer, lambda _: 1.0)
 
-    def _build_training_context(self):
+    def _build_training_context(self, model=None):
         self.model_fwd_context = nullcontext()
         self.model_bwd_context = nullcontext()
 

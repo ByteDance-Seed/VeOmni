@@ -115,7 +115,9 @@ class ChannelLossComputer:
         while cur is not None and id(cur) not in visited:
             visited.add(id(cur))
             if not isinstance(cur, torch.nn.Module):
-                nxt = getattr(cur, "unwrapped_module", None) or getattr(cur, "model", None)
+                nxt = getattr(cur, "unwrapped_module", None)
+                if nxt is None:
+                    nxt = getattr(cur, "model", None)
                 if isinstance(nxt, torch.nn.Module) and nxt is not cur:
                     cur = nxt
                     continue
