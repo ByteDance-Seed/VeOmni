@@ -26,6 +26,7 @@ Shared bases live next to the families, not at the ``seed_omni/`` package root:
 
 * ``module_modeling_base.py`` — :class:`OmniPreTrainedModel`
 * ``module_processing_base.py`` — :class:`ModulePreprocessorBase` + :func:`bind_module_assets`
+* ``module_configuration_base.py`` — :class:`OmniModuleConfig` (HF descriptor for one ``OmniConfig.modules`` slot)
 
 Concrete modules: ``modules/<family>/<sub_module>/(configuration.py,
 modeling.py[, processing.py])``.  Each sub-module gets its own folder; the
@@ -36,6 +37,7 @@ than re-spelling ``<family>_<sub_module>`` per file.
 from transformers import PretrainedConfig
 
 from ....utils.registry import Registry  # VeOmni shared name→factory registry; not seed_omni-local.
+from .module_configuration_base import OmniModuleConfig
 from .module_modeling_base import OmniPreTrainedModel
 from .module_processing_base import MODULE_ASSET_ATTRS, ModulePreprocessorBase, bind_module_assets
 
@@ -112,6 +114,7 @@ __all__ = [
     "OMNI_MODEL_REGISTRY",
     "OMNI_PROCESSOR_REGISTRY",
     "ModulePreprocessorBase",
+    "OmniModuleConfig",
     "OmniPreTrainedModel",
     "bind_module_assets",
     "read_hf_model_type",

@@ -1,8 +1,11 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modules.module_processing_base import bind_module_assets
 from veomni.models.seed_omni.processing_omni import OmniProcessor
+from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
 class _RecordingPreprocessor:
@@ -11,12 +14,11 @@ class _RecordingPreprocessor:
         self._store = store
 
     def __call__(self, batch, inference=False, **kwargs) -> None:
-        del inference, kwargs
-        batch.setdefault("ran", []).append(self._tag)
+        del batch, inference, kwargs
         self._store.append(self._tag)
 
 
-def test_omni_processor_runs_preprocessors_in_order():
+def test_omni_processor_builds_conversation_and_runs_preprocessors_in_order():
     calls: list[str] = []
     processor = OmniProcessor(
         {
@@ -24,14 +26,41 @@ def test_omni_processor_runs_preprocessors_in_order():
             "b": _RecordingPreprocessor("second", calls),
         }
     )
-    batch = {"tokens": [1, 2, 3]}
 
-    out = processor(batch, inference=True)
+    with patch("veomni.models.seed_omni.processing_omni.load_image", return_value="img"):
+        model_input = processor(text="hello", images=["/tmp/fake.png"])
 
     assert calls == ["first", "second"]
-    assert out is batch
-    assert batch["ran"] == ["first", "second"]
-    assert batch["tokens"] == [1, 2, 3]
+    assert "conversation_list" in model_input
+    conversation = model_input["conversation_list"]
+    assert len(conversation) == 2
+    assert conversation[0].type == "image"
+    assert conversation[1].type == "text"
+    assert conversation[1].value == "hello"
+
+
+def test_omni_processor_rejects_videos_instead_of_dropping_them():
+    """A request that cannot be honoured must say so, not come back text-only.
+
+    Nothing turns videos into conversation items yet. Discarding the argument
+    would hand back a request built from the prompt alone, which looks like a
+    successful call.
+    """
+    processor = OmniProcessor({"a": _RecordingPreprocessor("only", [])})
+
+    with pytest.raises(NotImplementedError, match="videos"):
+        processor(text="hello", videos=["/tmp/fake.mp4"])
+
+
+def test_omni_processor_preprocess_mutates_existing_conversation():
+    calls: list[str] = []
+    processor = OmniProcessor({"a": _RecordingPreprocessor("only", calls)})
+    conversation = [ConversationItem(type="text", value="hi", role="user")]
+
+    out = processor.preprocess(conversation, inference=True)
+
+    assert calls == ["only"]
+    assert out["conversation_list"] is conversation
 
 
 def test_omni_processor_preprocess_batch_runs_with_inference_false():
@@ -43,7 +72,9 @@ def test_omni_processor_preprocess_batch_runs_with_inference_false():
             calls.append(("batch", inference))
 
     processor = OmniProcessor({"a": _FlagPreprocessor()})
-    processor.preprocess_batch({"tokens": [1]}, inference=False)
+    batches = [[ConversationItem(type="text", value="hi", role="user")]]
+
+    processor.preprocess_batch({"conversation_list": batches}, inference=False)
 
     assert calls == [("batch", False)]
 
@@ -76,7 +107,8 @@ def test_omni_processor_from_pretrained_collects_module_preprocessors(
 @patch("veomni.models.seed_omni.processing_omni.OMNI_MODEL_REGISTRY")
 @patch("veomni.models.seed_omni.processing_omni.read_model_type", return_value="encoder_type")
 def test_omni_processor_from_config_forwards_module_model_config_overrides(mock_read_model_type, mock_registry):
-    """A module's YAML `model_config:` override must reach the module's
+    """A module's YAML `model_config:` override (e.g. visual-instruction-tuning's
+    `enable_image: true` on `qwen3_text_encoder`) must reach the module's
     `Preprocessor.from_pretrained` — regression: this used to only pass the
     checkpoint path, silently dropping the override the live model itself receives.
     """
@@ -168,12 +200,3 @@ def test_bind_module_assets_is_a_noop_the_second_time():
     bind_module_assets(model, preprocessor=_TwoAssetPreprocessor())
 
     assert model._image_processor == "swapped-later"
-
-
-def test_omni_processor_from_pretrained_on_fake_chain_has_no_preprocessors(tmp_path):
-    """fake_module_a / fake_module_b declare no ``preprocessor_class`` yet."""
-    from tests.seed_omni.test_modeling_omni_load import _write_omni_checkpoint
-
-    _write_omni_checkpoint(tmp_path)
-    processor = OmniProcessor.from_pretrained(tmp_path)
-    assert len(processor) == 0

@@ -1,8 +1,10 @@
 """OmniConfig — HF ``PretrainedConfig`` for a composed :class:`OmniModel`.
 
-This is the checkpoint-shaped config only: module subfolders, the training DAG,
-and every generation FSM. It reads and writes an on-disk omni checkpoint and
-does not know about VeOmni runtime (ops, FSDP, freeze, launcher YAML).
+This is the checkpoint-shaped composite only: a map of per-module descriptors,
+the training DAG, and every generation FSM. Per-module subfolder / path /
+``model_config`` conversion lives on
+:class:`~veomni.models.seed_omni.modules.module_configuration_base.OmniModuleConfig`.
+This class does not know about VeOmni runtime (ops, FSDP, freeze, launcher YAML).
 
 A checkpoint stores every generation scenario under ``generation_graphs``, keyed
 by ``infer_type``. :attr:`OmniConfig.generation_graph` is the active one.
@@ -23,25 +25,6 @@ from transformers import PretrainedConfig
 
 DEFAULT_TRAINING_GRAPH_FILE = "training_graph.yaml"
 DEFAULT_GENERATION_GRAPH_FILE = "generation_graph.yaml"
-
-
-def _safe_checkpoint_subfolder(name: str) -> str:
-    """Return ``name`` if it is a single relative path component, else raise.
-
-    :meth:`OmniConfig.module_checkpoint_subfolder` joins this onto
-    ``save_directory``. Absolute paths, ``.`` / ``..``, and any separator would
-    let a module key write outside the checkpoint root.
-    """
-    if not name or name in {".", ".."}:
-        raise ValueError(f"Module name {name!r} is not a safe checkpoint subfolder.")
-    if os.path.isabs(name):
-        raise ValueError(
-            f"Module name {name!r} is an absolute path; checkpoint subfolders must be "
-            "a single relative path component."
-        )
-    if os.path.sep in name or (os.path.altsep is not None and os.path.altsep in name):
-        raise ValueError(f"Module name {name!r} is not a safe checkpoint subfolder; use a single path component.")
-    return name
 
 
 def select_graph(
@@ -121,45 +104,25 @@ class OmniConfig(PretrainedConfig):
         # canonical order for serial CPU-preprocessor execution.
         return list(self.modules.keys())
 
+    def module(self, name: str):
+        """HF descriptor for ``name`` (dict, hydrated family config, or path string)."""
+        from .modules.module_configuration_base import OmniModuleConfig
+
+        if name not in self.modules:
+            raise KeyError(f"Module '{name}' not found in OmniConfig.modules")
+        return OmniModuleConfig(name, self.modules[name])
+
     def module_subfolder(self, name: str) -> str:
         """On-disk path segment for ``name`` (relative subfolder, or an absolute load path)."""
-        entry = self.modules.get(name)
-        if entry is None:
-            raise KeyError(f"Module '{name}' not found in OmniConfig.modules")
-        if isinstance(entry, PretrainedConfig):
-            return self.module_checkpoint_subfolder(name)
-        if isinstance(entry, str):
-            return entry
-        if isinstance(entry, dict):
-            model_block = entry.get("model")
-            if isinstance(model_block, dict):
-                path = model_block.get("model_path") or model_block.get("weights_path")
-                if path:
-                    return path
-            subfolder = entry.get("subfolder")
-            if subfolder:
-                return str(subfolder)
-        return name
+        return self.module(name).subfolder
 
     def module_checkpoint_subfolder(self, name: str) -> str:
         """Relative subfolder under an omni checkpoint root for ``name``."""
-        if name not in self.modules:
-            raise KeyError(f"Module '{name}' not found in OmniConfig.modules")
-        return _safe_checkpoint_subfolder(name)
+        return self.module(name).checkpoint_subfolder
 
     def normalize_modules_for_hf_export(self) -> Dict[str, Dict[str, Any]]:
         """Slim ``modules`` block for HF ``config.json`` (subfolder + optional config overrides)."""
-        normalized: Dict[str, Dict[str, Any]] = {}
-        for name in self.module_names:
-            slim: Dict[str, Any] = {"subfolder": self.module_checkpoint_subfolder(name)}
-            model_config = self.module_model_config(name)
-            if model_config:
-                slim["model"] = {"model_config": model_config}
-            processor_config = self.module_processor_config(name)
-            if processor_config:
-                slim["processor_config"] = deepcopy(processor_config)
-            normalized[name] = slim
-        return normalized
+        return {name: self.module(name).to_export_dict() for name in self.module_names}
 
     def copy_for_hf_export(
         self,
@@ -180,30 +143,15 @@ class OmniConfig(PretrainedConfig):
 
     def module_model_config(self, name: str) -> Dict[str, Any]:
         """Per-module ``from_pretrained`` overrides stored on the omni config entry."""
-        entry = self.modules.get(name)
-        if isinstance(entry, PretrainedConfig) or not isinstance(entry, dict):
-            return {}
-        model_block = entry.get("model")
-        if not isinstance(model_block, dict):
-            return {}
-        overrides = model_block.get("model_config")
-        return dict(overrides or {})
+        return self.module(name).model_config_overrides()
 
     def module_processor_config(self, name: str) -> Dict[str, Any]:
         """Per-module preprocessor ``from_pretrained`` kwargs."""
-        entry = self.modules.get(name)
-        if not isinstance(entry, dict):
-            return {}
-        return dict(entry.get("processor_config") or {})
+        return self.module(name).processor_config()
 
     def resolve_module_path(self, checkpoint_root: Optional[Union[str, os.PathLike]], name: str) -> str:
         """Resolve the on-disk path for module ``name`` under ``checkpoint_root``."""
-        subfolder = self.module_subfolder(name)
-        if os.path.isabs(subfolder):
-            return subfolder
-        if checkpoint_root is None:
-            return subfolder
-        return os.path.join(str(checkpoint_root), subfolder)
+        return self.module(name).resolve_path(checkpoint_root)
 
     def to_dict(self) -> Dict[str, Any]:
         """JSON-serializable dict; ``modules`` is slimmed to subfolder stubs."""
@@ -229,30 +177,7 @@ class OmniConfig(PretrainedConfig):
 
     def _hydrate_modules_from_checkpoint(self, checkpoint_root: Union[str, os.PathLike]) -> None:
         """Load each in-root module's ``config.json`` via the omni module registry."""
-        from .modules import OMNI_MODEL_REGISTRY, read_hf_model_type
-
-        root = str(checkpoint_root)
-        hydrated: Dict[str, Any] = {}
-        for name in self.module_names:
-            entry = self.modules.get(name)
-            if isinstance(entry, PretrainedConfig):
-                hydrated[name] = entry
-                continue
-            overrides = self.module_model_config(name)
-            subfolder = self.module_checkpoint_subfolder(name)
-            # Hydrate from ``root/<subfolder>`` only. An entry whose weights live
-            # outside the root has no ``config.json`` here, stays a descriptor,
-            # and :meth:`resolve_module_path` keeps its own path.
-            module_dir = os.path.join(root, subfolder)
-            if not os.path.isfile(os.path.join(module_dir, "config.json")):
-                hydrated[name] = entry if entry is not None else {"subfolder": subfolder}
-                continue
-            model_type = read_hf_model_type(module_dir)
-            hf_config = OMNI_MODEL_REGISTRY[model_type]().config_class.from_pretrained(module_dir)
-            if overrides:
-                hf_config.update(deepcopy(overrides))
-            hydrated[name] = hf_config
-        self.modules = hydrated
+        self.modules = {name: self.module(name).hydrate(checkpoint_root) for name in self.module_names}
 
     def _hydrate_graphs_from_checkpoint(self, checkpoint_root: Union[str, os.PathLike]) -> None:
         """Load ``training_graph`` and ``generation_graphs`` from their YAML sidecars."""

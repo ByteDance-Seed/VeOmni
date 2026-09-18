@@ -1,8 +1,8 @@
 """OmniProcessor — composed request preprocessing for :class:`OmniModel`.
 
 Mirrors HuggingFace ``AutoProcessor``: collect each module's CPU preprocessor in
-``config.module_names`` order, run the preprocessor chain over a batch dict, and
-return a generate-ready request.
+``config.module_names`` order, build a ``conversation_list`` from user inputs,
+run the preprocessor chain, and return a generate-ready request dict.
 
 Every module's :class:`~veomni.models.seed_omni.modules.module_processing_base.ModulePreprocessorBase`
 (defined in its own ``processing.py`` and pointed at by ``preprocessor_class`` on
@@ -12,18 +12,25 @@ no model instance (weight-free, meta-device, or otherwise) is built or required.
 :meth:`OmniProcessor.from_config` reads each module's ``preprocessor_class`` off
 the class registered for its ``model_type`` and is the single code path backing
 both :meth:`OmniProcessor.from_pretrained` (checkpoint on disk) and callers that
-already hold a resolved config in memory.
+already hold a resolved config in memory (e.g. ``OmniTrainer`` builds its
+dataloader's collator this way, decoupled from ``self.model``). Callers that
+need a :class:`~veomni.data.data_collator.SeedOmniCollator` (e.g. ``OmniTrainer``)
+build one directly from a processor — that composition is theirs to own, not
+this module's.
 
 Usage::
 
     processor = OmniProcessor.from_pretrained(checkpoint_root)
     model = OmniModel.from_pretrained(checkpoint_root, device_map="auto")
-    processor.preprocess_batch(batch, inference=True)
+    inputs = processor(text="Describe this image.", images=["/path/to.jpg"])
     model.reset()
-    generated = model.generate(batch, generation_kwargs={"max_new_tokens": 128})
+    generated = model.generate(inputs, generation_kwargs={"max_new_tokens": 128})
 
-Or, when the model is built first, reuse ``model.config`` instead of re-reading
-``checkpoint_root`` a second time::
+Or, when the model is built first (e.g. from an already-resolved launcher-YAML
+config with per-module ``model_config:`` overrides — see ``OmniTrainer`` /
+``OmniInferencer``), reuse ``model.config`` instead of re-reading
+``checkpoint_root`` a second time — saves one redundant ``config.json`` load,
+and keeps the two builds looking at the exact same config::
 
     model = OmniModel.from_pretrained(checkpoint_root, config=my_resolved_config, device_map="auto")
     processor = OmniProcessor.from_config(model.config, checkpoint_root=checkpoint_root)
@@ -32,15 +39,35 @@ Or, when the model is built first, reuse ``model.config`` instead of re-reading
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Mapping, Sequence
+from typing import Any, Union
 
+from PIL import Image
+
+from ...data.multimodal.image_utils import load_image
 from ...utils import logging  # VeOmni shared logger (rank-0 helpers); not seed_omni-local.
 from .configuration_omni import OmniConfig
-from .modules import OMNI_MODEL_REGISTRY, ModulePreprocessorBase, read_model_type
+from .modules import OMNI_MODEL_REGISTRY, read_model_type
+from .modules.module_processing_base import ModulePreprocessorBase
+from .utils.conversation import build_conversation
 
 
 logger = logging.get_logger(__name__)
+
+ImageInput = Union[str, Any]
+MediaInput = Union[ImageInput, Sequence[ImageInput]]
+
+
+def _normalize_images(images: MediaInput) -> list[Any]:
+    if isinstance(images, (str, bytes)) or isinstance(images, Image.Image):
+        images = [images]
+    normalized: list[Any] = []
+    for image in images:
+        if isinstance(image, Image.Image):
+            normalized.append(image)
+        else:
+            normalized.append(load_image(image))
+    return normalized
 
 
 class OmniProcessor:
@@ -54,14 +81,19 @@ class OmniProcessor:
         return len(self._preprocessors)
 
     def bind_dummy_inputs(self, module_configs: Mapping[str, Any], *, dtype: Any = None) -> None:
-        """Training-only: attach each preprocessor's dummy tensor(s).
+        """Training-only: attach each preprocessor's FSDP-anchor dummy tensor(s).
 
         Computed from each module's own already-resolved config + ``dtype``
         alone (see :meth:`ModulePreprocessorBase.bind_dummy_inputs`) — no disk re-read
         here: ``module_configs`` is ``{module_name: config}`` taken straight
-        from the already-built live modules. Call once, right after the training
-        model finishes building. Unnecessary for pure inference: the dummy
-        branch is never exercised there.
+        from the already-built live modules (e.g.
+        ``{name: module_runtime.model_config for name, module_runtime in
+        self.model.module_runtimes.items()}``), so it is already the exact
+        config the live model was built with, overrides included. Call once,
+        right after the training model finishes building
+        (:meth:`~veomni.trainer.omni.omni_trainer.OmniTrainer._build_train_dataloader`
+        runs after ``_build_model``). Unnecessary for pure inference
+        (``OmniInferencer``): the dummy branch is never exercised there.
         """
         for name, preprocessor in self._preprocessors.items():
             config = module_configs.get(name)
@@ -79,15 +111,19 @@ class OmniProcessor:
 
         No live/real module is built or required — see the module docstring. This is
         the single builder both :meth:`from_pretrained` and any caller holding an
-        in-memory config should use.
+        in-memory config (e.g. ``OmniTrainer`` / ``OmniInferencer`` launcher configs,
+        built before or independently of ``self.model``) should use.
 
         Collects CPU preprocessors in ``config.module_names`` order: for each
         module, reads its ``preprocessor_class`` off the class registered for its
         ``model_type`` and calls :meth:`ModulePreprocessorBase.from_pretrained` directly on
-        its checkpoint subfolder. ``config.module_model_config(name)`` (the module's
-        YAML ``model_config:`` block) is forwarded as ``config_overrides``.
-        ``config.module_processor_config(name)`` (YAML ``processor_config:``) is
-        splatted as kwargs, matching ``build_processor(path, **processor_config)``.
+        its checkpoint subfolder — no model instance is built at all (not even a
+        ``meta``-device one). ``config.module_model_config(name)`` (the module's
+        YAML ``model_config:`` block) is forwarded as ``config_overrides`` so a
+        preprocessor that reads a behavior-affecting model field (e.g.
+        ``enable_image``) agrees with the live model. ``config.module_processor_config(name)``
+        (YAML ``processor_config:``) is splatted as kwargs, matching
+        ``build_processor(path, **processor_config)``.
         """
         root = checkpoint_root if checkpoint_root is not None else getattr(config, "_name_or_path", None)
         root = None if root is None else str(root)
@@ -122,14 +158,44 @@ class OmniProcessor:
 
     def __call__(
         self,
-        batch: dict[str, Any],
+        text: str = "",
         *,
-        inference: bool = False,
+        images: MediaInput | None = None,
+        videos: MediaInput | None = None,
+        inference: bool = True,
         **generation_kwargs: Any,
     ) -> dict[str, Any]:
-        """Run the module preprocessor chain over ``batch`` and return it."""
+        """Build and preprocess a single inference request.
+
+        Returns a dict suitable for :meth:`OmniModel.generate` —
+        ``{"conversation_list": [...]}`` (a single conversation).
+        """
+        if videos:
+            # The parameter is here because video follows the same conversation
+            # path as images once callers pass PIL / VideoInputs, but nothing
+            # builds video items yet — say so rather than return a text-only
+            # request as if the videos had been read.
+            raise NotImplementedError(
+                "`videos` is not supported yet by SeedOmni V2 request building. Pass video "
+                "frames as `images`, or build the conversation items directly and call "
+                "`preprocess`."
+            )
+
+        image_items = _normalize_images(images) if images is not None else []
+        conversation = build_conversation(prompt=text, images=image_items)
+        return self.preprocess(conversation, inference=inference, **generation_kwargs)
+
+    def preprocess(
+        self,
+        conversation: list[Any],
+        *,
+        inference: bool = True,
+        **generation_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Run the module preprocessor chain on an existing ``conversation_list``."""
+        batch = {"conversation_list": [conversation]}
         self.preprocess_batch(batch, inference=inference, **generation_kwargs)
-        return batch
+        return {"conversation_list": batch["conversation_list"][0]}
 
     def preprocess_batch(
         self,
@@ -140,8 +206,13 @@ class OmniProcessor:
     ) -> None:
         """Run the module preprocessor chain over a collated batch.
 
-        Training passes ``inference=False`` (default); inference passes
-        ``inference=True``.
+        ``batch`` must contain ``conversation_list`` as
+        ``list[list[ConversationItem]]``. Training collator passes the full
+        feature dict; :meth:`preprocess` builds ``{"conversation_list": [conversation]}``.
+        Packed Janus writes extra tensors onto this same dict.
+
+        Training passes ``inference=False`` (default); single-request inference
+        uses :meth:`preprocess` / :meth:`__call__` with ``inference=True``.
         """
         for preprocessor in self._preprocessors.values():
             preprocessor(
