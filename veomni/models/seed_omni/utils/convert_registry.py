@@ -1,4 +1,4 @@
-"""Registry for monolithic HF checkpoint → SeedOmni V2 split checkpoints.
+"""Registry for monolithic HF checkpoint → SeedOmni split checkpoints.
 
 Each model family registers a converter under its upstream HuggingFace
 ``model_type`` (read from ``config.json`` at ``model_path``).  The unified

@@ -23,7 +23,7 @@ from .base import ModulePreprocessorBase
 
 # Attributes a ``XxxPreprocessor`` may hold that ``forward`` / ``generate`` read
 # directly on the model (``self._image_processor``, ``self.tokenizer``, …).
-MODULE_ASSET_ATTRS = ("_processor", "_image_processor", "_video_processor", "_tokenizer", "_chat_template")
+MODULE_ASSET_ATTRS = ("_processor", "_image_processor", "_video_processor", "_tokenizer")
 
 # Set once this function has run a preprocessor's assets onto a model, so a
 # second bind is a no-op without having to guess which assets that module's

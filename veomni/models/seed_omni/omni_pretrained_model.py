@@ -38,11 +38,9 @@ class OmniPreTrainedModel(PreTrainedModel):
         # ``kwargs`` may carry an HF ``config=<PretrainedConfig>`` (the loaded
         # module config, forwarded by ``OmniModel._load_modules``) — that's a
         # different "config" than the launcher/runtime overrides dict
-        # ``config_overrides`` represents (``support_cache`` / ``train_type`` /
-        # …). Some preprocessors' ``from_pretrained`` forward ``config_overrides``
-        # as ``**kwargs`` into helpers that also take a positional ``config``
-        # (e.g. ``OfflineEncodingMixin.patch_config``), so a passthrough ``config``
-        # key here would collide with it — strip it before binding.
+        # ``config_overrides`` represents. Strip the HF ``config`` key before
+        # binding so it cannot collide with a preprocessor helper that also
+        # takes a positional ``config``.
         config_overrides = {k: v for k, v in kwargs.items() if k != "config"}
         bind_module_assets(
             model,
@@ -56,11 +54,11 @@ class OmniPreTrainedModel(PreTrainedModel):
         return []
 
     def reset_local_inference_state(self) -> None:
-        """Reset per-turn state inside an ongoing conversation."""
+        """Reset per-turn state inside an ongoing generation request."""
         return None
 
     def reset_global_inference_state(self) -> None:
-        """Reset the full conversation-level inference state."""
+        """Reset the full request-level inference state."""
         self.reset_local_inference_state()
 
     def finalize(self, *, ctx: dict[str, Any]) -> dict[str, Any]:

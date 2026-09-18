@@ -1,8 +1,8 @@
 """
-BaseMixin — minimal SeedOmni V2 lifecycle + shared graph-hook registry.
+BaseMixin — minimal SeedOmni lifecycle + shared graph-hook registry.
 
-Every module composes capability mixins (training / inference / meter / …) into a
-local ``VeOmniMixin``; ``modeling.py`` inherits only ``VeOmniMixin`` +
+Every module composes capability mixins (training / inference) into a local
+``VeOmniMixin``; ``modeling.py`` inherits only ``VeOmniMixin`` +
 ``PreTrainedModel``.
 
 Layout

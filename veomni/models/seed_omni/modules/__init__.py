@@ -1,4 +1,4 @@
-"""SeedOmni V2 module mixin registry.
+"""SeedOmni module mixin registry.
 
 Each entry maps a HuggingFace ``model_type`` string (the ``model_type``
 field of each module's :class:`PretrainedConfig` subclass) to the
@@ -51,14 +51,12 @@ def read_hf_model_type(model_path: str) -> str:
     :func:`read_model_type`.
 
     Uses :meth:`PretrainedConfig.get_config_dict` rather than
-    :class:`AutoConfig.from_pretrained` because Janus / future split
-    checkpoints declare custom ``model_type`` values
-    (``janus_siglip`` / ``janus_text_encoder`` / ``janus_llama`` /
-    ``janus_vqvae``) that are NOT in HF's :data:`CONFIG_MAPPING`.
-    ``AutoConfig`` would raise on those families before we even get a chance
-    to consult the registries; reading the raw dict sidesteps that.  See
-    :mod:`veomni.models.loader` for the same pattern in the foundation-model
-    loader.
+    :class:`AutoConfig.from_pretrained` because split-checkpoint modules
+    declare custom ``model_type`` values (``module_A`` / ``module_B`` / …)
+    that are NOT in HF's :data:`CONFIG_MAPPING`.  ``AutoConfig`` would raise
+    on those families before we even get a chance to consult the registries;
+    reading the raw dict sidesteps that.  See :mod:`veomni.models.loader`
+    for the same pattern in the foundation-model loader.
     """
     config_dict, _ = PretrainedConfig.get_config_dict(model_path)
     model_type = config_dict.get("model_type")
@@ -69,7 +67,7 @@ def read_hf_model_type(model_path: str) -> str:
 
 # Side-effect only: attach the @register factories each family declares. Only
 # the shared base/ is here; a model family adds itself to this line in its own
-# PR (janus, qwen3, qwen3_moe, qwen3vl, bagel).
+# PR.
 # Imported after ``read_hf_model_type`` so the convert_registry ↔ modules cycle
 # resolves: each family's ``convert_model`` imports ``convert_registry``, whose
 # ``convert_checkpoint`` reads ``read_hf_model_type`` back from this module.

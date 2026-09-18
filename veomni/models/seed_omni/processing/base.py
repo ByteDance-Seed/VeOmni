@@ -18,9 +18,8 @@ Terminology (three different "processor" layers)
 ------------------------------------------------
 * **HF asset — ``XxxProcessor``** (in each ``modules/*/processing.py``):
   HuggingFace-style checkpoint sidecar — image processor, tokenizer, etc.
-  Saved/loaded via ``save_pretrained`` / ``from_pretrained`` on the asset itself
-  (e.g. ``JanusSiglipProcessor``, ``BagelVAEProcessor``).  Holds resize /
-  normalize constants; no ``nn.Module`` weights.
+  Saved/loaded via ``save_pretrained`` / ``from_pretrained`` on the asset itself.
+  Holds resize / normalize constants; no ``nn.Module`` weights.
 
 * **Module CPU worker — ``XxxPreprocessor(ModulePreprocessorBase)``** (same file):
   Picklable, weight-free object run inside DataLoader workers (training) or
@@ -63,46 +62,17 @@ class ModulePreprocessorBase:
       tensors (no ``device=``).  The main process's thin ``pre_forward`` does the
       single ``.to(device)``.
     * **In-place mutation.** ``__call__`` receives the collator ``batch`` dict
-      (must contain ``conversation_list`` as ``list[list[ConversationItem]]``).
-      The default path mutates those items' ``value`` / ``meta`` in place and
-      tags the module ``source`` so the thin ``pre_forward`` / ``generate``
-      reads the heavy work back uniformly. A packed preprocessor may write
-      tensors onto the same dict instead of walking items.
-    * **Shared by training + inference.** Training runs it inside
-      :class:`~veomni.data.data_collator.SeedOmniCollator` (DataLoader worker);
-      inference runs it once over the request in
-      :meth:`~veomni.trainer.omni.omni_inferencer.OmniInferencer._preprocess_request`,
-      before the FSM. The ``inference`` flag flips the train/infer-only behaviour:
-      image modules **skip dummy injection** (no FSDP anchor at inference) and
-      text encoders **append the assistant generation prompt**. Extra request
-      options (e.g. ``generation_kwargs``) arrive via ``**kwargs`` so a module
-      *could* vary its input-prep by them (classifier-free guidance duplicating the
-      prompt, …); no current module needs them, but the hook is plumbed through.
-    * **Dummy inputs are optional and bound after construction.** A module whose
-      ``inference=False`` (training) branch injects an FSDP-anchor dummy item
-      (image modules only — text encoders never need one) computes that dummy's
-      shape from pure ``(config, dtype)`` — the preprocessor itself still never
-      touches a live model or the checkpoint disk to get that ``config``. The
-      *orchestrator* does, though: :meth:`~veomni.trainer.omni.omni_trainer.OmniTrainer._build_train_dataloader`
-      runs after the training model is already built, so it hands
-      :meth:`OmniProcessor.bind_dummy_inputs` each module's already-resolved
-      ``ModuleRuntime.model_config`` straight from memory (no disk re-read, no
-      config-override re-application) — see :meth:`bind_dummy_inputs`.
-      Inference never exercises the dummy branch, so an unbound dummy is harmless
-      there.
+      and mutates it in place. Subclasses decide which keys they read and write.
+    * **Shared by training + inference.** Training runs it inside a collator
+      (DataLoader worker); inference runs it once over the request before the
+      FSM. The ``inference`` flag flips train/infer-only behaviour.
     """
 
     def __call__(self, batch: dict[str, Any], inference: bool = False, **kwargs: Any) -> None:
         """Run CPU prep on a collated ``batch`` dict (mutates it in place)."""
-        self.preprocess_conversations(batch["conversation_list"], inference=inference, **kwargs)
-
-    def preprocess_conversations(
-        self, conversation_list: list[list[Any]], inference: bool = False, **kwargs: Any
-    ) -> None:
         raise NotImplementedError(
-            f"{type(self).__name__} must implement "
-            "preprocess_conversations(conversation_list, inference=False, **kwargs) "
-            "and mutate it in place."
+            f"{type(self).__name__} must implement __call__(batch, inference=False, **kwargs) "
+            "and mutate the batch in place."
         )
 
     @classmethod
@@ -115,45 +85,24 @@ class ModulePreprocessorBase:
         ``config_overrides`` mirrors the module's YAML ``model_config:`` block
         (the same dict threaded into the live model's ``config_kwargs`` — see
         ``ModuleRuntime.build_model``): a subclass that reads its own
-        ``config.json`` for a behavior-affecting field (e.g. ``enable_image``,
-        ``cache_mode``) must apply these on top of the on-disk defaults —
-        ``XxxConfig.from_pretrained(module_path, **(config_overrides or {}))`` —
-        so a preprocessor built independently of any model instance still
-        agrees with what the live model was actually configured with. Default:
-        this module contributes no preprocessor (e.g. a pure backbone with no
-        CPU-side input prep). Concrete modules override on their own
-        ``processing.py``-defined ``ModulePreprocessorBase`` subclass.
+        ``config.json`` for a behavior-affecting field must apply these on top
+        of the on-disk defaults so a preprocessor built independently of any
+        model instance still agrees with what the live model was actually
+        configured with. Default: this module contributes no preprocessor
+        (e.g. a pure backbone with no CPU-side input prep). Concrete modules
+        override on their own ``processing.py``-defined
+        ``ModulePreprocessorBase`` subclass.
         """
         del module_path, config_overrides, kwargs
         return None
 
     def bind_dummy_inputs(self, config: Any, dtype: Any = None) -> None:
-        """Attach the FSDP-anchor dummy tensor(s) for training's ``inference=False``
-        branch — computed from ``config`` + ``dtype`` alone (no live model).
+        """Attach optional dummy tensor(s) for training's ``inference=False`` branch.
 
-        Called once by :meth:`~veomni.trainer.omni.omni_trainer.OmniTrainer._build_train_dataloader`
-        after the training collator's preprocessors are collected. Default: no-op
-        (text-encoder preprocessors and any module without a dummy branch).
+        Computed from ``config`` + ``dtype`` alone (no live model). Default: no-op.
         """
         del config, dtype
         return None
-
-    @staticmethod
-    def append_batch_anchor(conversation_list: list[list[Any]], item: Any) -> None:
-        """Attach ``item`` as this micro-batch's single FSDP anchor row.
-
-        The anchor exists so a module whose real inputs are absent this step still
-        runs forward and backward, keeping its FSDP2 collectives in step with the
-        other ranks. One row does that: the module's graph hooks batch every row
-        tagged with their ``source`` and flag the batch all-dummy, and every
-        downstream consumer filters dummies out. Appending one per *sample*
-        instead would put a full-size dummy image per sample through the tower —
-        on a batch with no real images for this module that was the single largest
-        term in the step (a 48-sample Janus T2I micro-batch spent more time in the
-        all-dummy SigLIP pass than in the language model).
-        """
-        if conversation_list:
-            conversation_list[0].append(item)
 
 
 __all__ = ["ModulePreprocessorBase"]

@@ -1,5 +1,5 @@
 """
-OmniModel V2 — composable multi-modal model driven by config-specified graphs.
+OmniModel — composable multi-modal model driven by config-specified graphs.
 
 This file holds the **clean modeling definition** — training graph via
 :meth:`OmniModel.forward`, FSM inference via :meth:`OmniModel.generate`, and
@@ -107,7 +107,6 @@ class OmniModel(PreTrainedModel):
 
     config_class = OmniConfig
     base_model_prefix = "omni"
-    main_input_name = "conversation_list"
     supports_gradient_checkpointing = False
     _no_split_modules = []
 
@@ -440,8 +439,7 @@ class OmniModel(PreTrainedModel):
         the default runs each endpoint eagerly (correct for an unwrapped,
         single-process model), while VeOmni injects
         :class:`~veomni.models.seed_omni.accelerator.executor.TrainNodeRunner`
-        to add wrapper unwrap, ``ParallelState`` scoping, metering and graph
-        profiling. The graph walk, loss collection and return contract stay here
+        to add wrapper unwrap and ``ParallelState`` scoping. The graph walk, loss collection and return contract stay here
         so a port to another framework only has to supply a runner.
         """
         del args, kwargs
@@ -459,7 +457,7 @@ class OmniModel(PreTrainedModel):
         return {"loss": _sum_losses(self._losses), "losses": dict(self._losses)}
 
     def reset(self) -> None:
-        """Clear per-conversation inference runtime state."""
+        """Clear per-request inference runtime state."""
         self.generation_graph.reset()
         self._generated.clear()
         for _, module in self.named_omni_modules():
@@ -528,7 +526,7 @@ class OmniModel(PreTrainedModel):
         request: dict[str, Any],
         generation_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Run inference using the FSM (profiler-free eager path).
+        """Run inference using the FSM (eager path).
 
         Parameters
         ----------

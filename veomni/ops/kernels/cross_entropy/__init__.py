@@ -180,7 +180,7 @@ def ForCausalLMLoss(
 
     sp_enabled = get_parallel_state().sp_enabled
 
-    # Explicitly prepared targets take precedence. SeedOmni V2 uses this for
+    # Explicitly prepared targets take precedence. SeedOmni uses this for
     # segment-boundary-aware shifts that cannot be reconstructed here.
     if shift_labels is None:
         if not sp_enabled:
@@ -211,7 +211,7 @@ def ForCausalLMLoss(
         **kwargs,
     )
 
-    # An explicit group lets SeedOmni V2 reduce over its full DP+SP FSDP mesh,
+    # An explicit group lets SeedOmni reduce over its full DP+SP FSDP mesh,
     # while existing callers retain the unified-SP-group default.
     if sp_enabled or loss_reduction_group is not None:
         num_valid_tokens = (shift_labels != ignore_index).sum()
@@ -435,7 +435,7 @@ def _chunk_loss_dispatch(
 
     # ``chunk_loss_function`` owns a fixed causal shift and cannot consume any
     # explicitly pre-shifted targets, including the potentially flattened
-    # targets used by SeedOmni V2 modules. This remains unsupported even when
+    # targets used by SeedOmni modules. This remains unsupported even when
     # the caller's explicit reduction group is ``None``.
     if kwargs.get("shift_labels") is not None:
         raise NotImplementedError(

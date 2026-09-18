@@ -1,4 +1,4 @@
-"""Unit tests for the SeedOmni V2 graph layer (flat edge-list training subset)."""
+"""Unit tests for the SeedOmni graph layer (flat edge-list training subset)."""
 
 from __future__ import annotations
 
@@ -16,25 +16,23 @@ from veomni.models.seed_omni.mixins.base_mixin import BaseMixin
 from veomni.models.seed_omni.mixins.inference_module_mixin import InferenceModuleMixin
 from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleMixin
 from veomni.models.seed_omni.modeling_omni import OmniModel
-from veomni.models.seed_omni.utils import graph_profiler
-from veomni.models.seed_omni.utils.graph_profiler import GraphProfiler
 
 
 def test_from_endpoint_default_method():
-    n = NodeDef.from_endpoint("ar_llm", default_method="forward")
-    assert n.module == "ar_llm" and n.method == "forward"
-    assert n.name == "ar_llm.forward"
+    n = NodeDef.from_endpoint("module_A", default_method="forward")
+    assert n.module == "module_A" and n.method == "forward"
+    assert n.name == "module_A.forward"
 
 
 def test_from_endpoint_dotted_form():
-    n = NodeDef.from_endpoint("vq_decoder.encode", default_method="forward")
-    assert n.module == "vq_decoder" and n.method == "encode"
-    assert n.name == "vq_decoder.encode"
+    n = NodeDef.from_endpoint("module_A.encode", default_method="forward")
+    assert n.module == "module_A" and n.method == "encode"
+    assert n.name == "module_A.encode"
 
 
 def test_from_endpoint_generate_default():
-    n = NodeDef.from_endpoint("ar_llm", default_method="generate")
-    assert n.module == "ar_llm" and n.method == "generate"
+    n = NodeDef.from_endpoint("module_A", default_method="generate")
+    assert n.module == "module_A" and n.method == "generate"
 
 
 def test_from_endpoint_rejects_reserved_end():
@@ -48,21 +46,21 @@ def test_from_endpoint_rejects_empty():
 
 
 def test_parse_edge():
-    e = EdgeDef.parse({"from": "vision_encoder", "to": "run_ar"}, default_method="forward")
-    assert e.from_ == "vision_encoder.forward" and e.to == "run_ar.forward"
-    assert e.from_node.module == "vision_encoder" and e.to_node.module == "run_ar"
+    e = EdgeDef.parse({"from": "module_A", "to": "module_B"}, default_method="forward")
+    assert e.from_ == "module_A.forward" and e.to == "module_B.forward"
+    assert e.from_node.module == "module_A" and e.to_node.module == "module_B"
     assert not e.is_sink()
 
 
 def test_parse_edge_to_end_is_sink():
-    e = EdgeDef.parse({"from": "tok_decode", "to": "end"}, default_method="forward")
+    e = EdgeDef.parse({"from": "module_A.decode", "to": "end"}, default_method="forward")
     assert e.is_sink() and e.to == END and e.to_node is None
-    assert e.from_ == "tok_decode.forward"
+    assert e.from_ == "module_A.decode"
 
 
 def test_parse_edge_rejects_from_end():
     with pytest.raises(ValueError, match="`from: end` is forbidden"):
-        EdgeDef.parse({"from": "end", "to": "run_ar"}, default_method="forward")
+        EdgeDef.parse({"from": "end", "to": "module_B"}, default_method="forward")
 
 
 def test_parse_edge_rejects_node_fields():
@@ -75,26 +73,22 @@ def test_parse_edge_rejects_missing_endpoints():
         EdgeDef.parse({"from": "a"}, default_method="forward")
 
 
-def _janus_joint_edges() -> list[dict]:
-    """Janus joint training edges: vq_decoder appears under TWO methods.
-
-    Adds an explicit ``to: end`` sink for the leaf so every node is visible to
-    the active subset purely from the edge list.
-    """
+def _multi_method_edges() -> list[dict]:
+    """``module_B`` appears under two methods, with an explicit ``to: end`` sink."""
     return [
-        {"from": "vision_encoder", "to": "run_ar"},
-        {"from": "vq_decoder.encode", "to": "run_ar"},
-        {"from": "run_ar", "to": "vq_decoder.gen_loss"},
-        {"from": "vq_decoder.gen_loss", "to": "end"},
+        {"from": "module_A", "to": "module_C"},
+        {"from": "module_B.encode", "to": "module_C"},
+        {"from": "module_C", "to": "module_B.decode"},
+        {"from": "module_B.decode", "to": "end"},
     ]
 
 
-def _understanding_only_edges() -> list[dict]:
-    """Two encoders → ar_llm, simple DAG with end-sink."""
+def _fan_in_edges() -> list[dict]:
+    """Two sources → ``module_C``, simple DAG with end-sink."""
     return [
-        {"from": "vision_encoder", "to": "run_ar"},
-        {"from": "vq_decoder", "to": "run_ar"},
-        {"from": "run_ar", "to": "end"},
+        {"from": "module_A", "to": "module_C"},
+        {"from": "module_B", "to": "module_C"},
+        {"from": "module_C", "to": "end"},
     ]
 
 
@@ -107,69 +101,69 @@ def test_duplicate_edge_raises():
     with pytest.raises(ValueError, match="Duplicate edge"):
         TrainingGraph(
             [
-                {"from": "vision_encoder", "to": "run_ar"},
-                {"from": "vision_encoder", "to": "run_ar"},
+                {"from": "module_A", "to": "module_B"},
+                {"from": "module_A", "to": "module_B"},
             ]
         )
 
 
 def test_single_node_with_only_end_edge():
-    """``[{from: ar_llm, to: end}]`` derives exactly one real node."""
-    g = TrainingGraph([{"from": "ar_llm", "to": "end"}])
-    assert g.execution_order == ["ar_llm.forward"]
-    assert g.sources == ["ar_llm.forward"] and g.sinks == ["ar_llm.forward"]
+    """``[{from: module_A, to: end}]`` derives exactly one real node."""
+    g = TrainingGraph([{"from": "module_A", "to": "end"}])
+    assert g.execution_order == ["module_A.forward"]
+    assert g.sources == ["module_A.forward"] and g.sinks == ["module_A.forward"]
 
 
-def test_understanding_only_topological_order():
-    g = TrainingGraph(_understanding_only_edges())
-    assert g.execution_order[-1] == "run_ar.forward"
-    assert set(g.execution_order[:-1]) == {"vision_encoder.forward", "vq_decoder.forward"}
+def test_fan_in_topological_order():
+    g = TrainingGraph(_fan_in_edges())
+    assert g.execution_order[-1] == "module_C.forward"
+    assert set(g.execution_order[:-1]) == {"module_A.forward", "module_B.forward"}
 
 
-def test_janus_joint_topological_order():
-    """vq_decoder appears as TWO nodes; topo must place them on either side of run_ar."""
-    g = TrainingGraph(_janus_joint_edges())
+def test_multi_method_topological_order():
+    """``module_B`` appears as TWO nodes; topo must place them on either side of module_C."""
+    g = TrainingGraph(_multi_method_edges())
     order = g.execution_order
-    assert order.index("vq_decoder.gen_loss") > order.index("run_ar.forward")
-    assert order.index("run_ar.forward") > order.index("vq_decoder.encode")
-    assert order.index("run_ar.forward") > order.index("vision_encoder.forward")
+    assert order.index("module_B.decode") > order.index("module_C.forward")
+    assert order.index("module_C.forward") > order.index("module_B.encode")
+    assert order.index("module_C.forward") > order.index("module_A.forward")
 
 
 def test_cycle_in_active_set_raises():
     with pytest.raises(ValueError, match="Circular dependency"):
         TrainingGraph(
             [
-                {"from": "vq_decoder", "to": "ar_llm"},
-                {"from": "ar_llm", "to": "vq_decoder"},
+                {"from": "module_A", "to": "module_B"},
+                {"from": "module_B", "to": "module_A"},
             ]
         )
 
 
-def test_sources_and_sinks_understanding_only():
-    g = TrainingGraph(_understanding_only_edges())
-    assert set(g.sources) == {"vision_encoder.forward", "vq_decoder.forward"}
-    # run_ar's only outgoing edge targets `end`, so it's a sink.
-    assert g.sinks == ["run_ar.forward"]
+def test_sources_and_sinks_fan_in():
+    g = TrainingGraph(_fan_in_edges())
+    assert set(g.sources) == {"module_A.forward", "module_B.forward"}
+    # module_C's only outgoing edge targets `end`, so it's a sink.
+    assert g.sinks == ["module_C.forward"]
 
 
-def test_sources_and_sinks_janus_joint():
-    g = TrainingGraph(_janus_joint_edges())
-    assert set(g.sources) == {"vision_encoder.forward", "vq_decoder.encode"}
-    # vq_decoder.gen_loss is the only sink (its only outgoing edge goes to `end`).
-    assert g.sinks == ["vq_decoder.gen_loss"]
+def test_sources_and_sinks_multi_method():
+    g = TrainingGraph(_multi_method_edges())
+    assert set(g.sources) == {"module_A.forward", "module_B.encode"}
+    # module_B.decode is the only sink (its only outgoing edge goes to `end`).
+    assert g.sinks == ["module_B.decode"]
 
 
 def test_module_and_method_lookup():
-    g = TrainingGraph(_janus_joint_edges())
-    assert g.module_of("vq_decoder.encode") == "vq_decoder"
-    assert g.method_of("vq_decoder.encode") == "encode"
-    assert g.module_of("vq_decoder.gen_loss") == "vq_decoder"
-    assert g.method_of("vq_decoder.gen_loss") == "gen_loss"
-    assert g.method_of("run_ar.forward") == "forward"
+    g = TrainingGraph(_multi_method_edges())
+    assert g.module_of("module_B.encode") == "module_B"
+    assert g.method_of("module_B.encode") == "encode"
+    assert g.module_of("module_B.decode") == "module_B"
+    assert g.method_of("module_B.decode") == "decode"
+    assert g.method_of("module_C.forward") == "forward"
 
 
 def test_module_lookup_raises_for_unknown():
-    g = TrainingGraph(_janus_joint_edges())
+    g = TrainingGraph(_multi_method_edges())
     with pytest.raises(KeyError):
         g.module_of("not_a_node")
 
@@ -195,19 +189,19 @@ class _FakeOmniModule(nn.Module, TrainingModuleMixin, BaseMixin, InferenceModule
         return self.forward(**kwargs)
 
     def forward(self, **kwargs):
-        cl = list(kwargs.get("conversation_list", []))
-        cl.append(f"{self.name}.forward")
-        return {"conversation_list": cl}
+        trace = list(kwargs.get("trace", []))
+        trace.append(f"{self.name}.forward")
+        return {"trace": trace}
 
     def encode(self, **kwargs):
-        cl = list(kwargs.get("conversation_list", []))
-        cl.append(f"{self.name}.encode")
-        return {"conversation_list": cl}
+        trace = list(kwargs.get("trace", []))
+        trace.append(f"{self.name}.encode")
+        return {"trace": trace}
 
     def generate(self, **kwargs):
-        cl = list(kwargs.get("conversation_list", []))
-        cl.append(f"{self.name}.generate")
-        return {"conversation_list": cl}
+        trace = list(kwargs.get("trace", []))
+        trace.append(f"{self.name}.generate")
+        return {"trace": trace}
 
 
 def _fake_modules(g: TrainingGraph) -> dict:
@@ -215,7 +209,7 @@ def _fake_modules(g: TrainingGraph) -> dict:
 
 
 def test_cursor_lifecycle():
-    g = TrainingGraph(_understanding_only_edges())
+    g = TrainingGraph(_fan_in_edges())
     assert not g.is_done()
     assert g.current_node_name == g.execution_order[0]
     # Walk the cursor manually.
@@ -231,7 +225,7 @@ def test_cursor_lifecycle():
     assert not g.is_done() and g.current_node_name == g.execution_order[0]
 
 
-def _minimal_generation_graph(module: str = "run_ar") -> dict:
+def _minimal_generation_graph(module: str = "module_C") -> dict:
     return {
         "initial": "run",
         "states": {
@@ -243,13 +237,13 @@ def _minimal_generation_graph(module: str = "run_ar") -> dict:
     }
 
 
-def _minimal_generation_graphs(module: str = "run_ar") -> dict:
+def _minimal_generation_graphs(module: str = "module_C") -> dict:
     return {"infer_gen": _minimal_generation_graph(module)}
 
 
 def test_omni_model_forward_runs_graph_without_a_runner():
     """Without an injected runner the graph runs on the modeling's own eager path."""
-    edges = _understanding_only_edges()
+    edges = _fan_in_edges()
     g = TrainingGraph(edges)
     modules = _fake_modules(g)
     config = OmniConfig(
@@ -259,10 +253,10 @@ def test_omni_model_forward_runs_graph_without_a_runner():
     )
     model = OmniModel(config, modules)
 
-    batch: dict = {"conversation_list": []}
+    batch: dict = {"trace": []}
     out = model(batch)
 
-    assert batch["conversation_list"] == [f"{g.module_of(n)}.forward" for n in g.execution_order]
+    assert batch["trace"] == [f"{g.module_of(n)}.forward" for n in g.execution_order]
     assert out == {"loss": None, "losses": {}}
 
 
@@ -270,7 +264,7 @@ def test_modeling_omni_imports_no_veomni_runtime_package():
     """``modeling_omni`` must stay liftable into another framework.
 
     Everything runtime-specific about running a node (wrapper unwrap,
-    ParallelState scoping, metering, profiling) reaches ``OmniModel.forward``
+    ParallelState scoping) reaches ``OmniModel.forward``
     through its ``node_runner`` argument, so the modeling needs no import from
     VeOmni's accelerator / distributed / trainer layers — not even a lazy one
     inside a function body.
@@ -301,31 +295,6 @@ def test_modeling_omni_imports_no_veomni_runtime_package():
     ]
 
     assert not offenders, f"modeling_omni must not import VeOmni runtime code: {sorted(set(offenders))}"
-
-
-def test_graph_profiler_can_append_request_peak_memory(monkeypatch):
-    class _FakeDevice:
-        def __init__(self):
-            self.reset_calls = 0
-
-        def reset_peak_memory_stats(self):
-            self.reset_calls += 1
-
-        def max_memory_allocated(self):
-            return 2 * 1024**3
-
-        def max_memory_reserved(self):
-            return 3 * 1024**3
-
-    device = _FakeDevice()
-    monkeypatch.setattr(graph_profiler, "get_torch_device", lambda: device)
-
-    profiler = GraphProfiler(enable_memory=True)
-    with profiler.node("forward:run_ar.forward"):
-        pass
-
-    assert device.reset_calls == 1
-    assert profiler.save_records() == ["forward:run_ar.forward | peak_allocated_gb=2.000 | peak_reserved_gb=3.000"]
 
 
 # Generation FSM tests below drive the graph only: it selects nodes, it never calls one.
@@ -455,27 +424,27 @@ def test_a_feedback_edge_does_not_gate_its_destination():
     assert [n.name for n in g.iter_nodes({})] == ["d.generate", "c.generate"]
 
 
-def test_to_mermaid_janus_joint_contains_node_labels_and_end_sink():
-    g = TrainingGraph(_janus_joint_edges())
-    out = g.to_mermaid(title="Janus Joint Training")
+def test_to_mermaid_multi_method_contains_node_labels_and_end_sink():
+    g = TrainingGraph(_multi_method_edges())
+    out = g.to_mermaid(title="Multi-method training")
 
     # Frontmatter, ELK renderer hint, then LR flowchart.
-    assert out.startswith("---\ntitle: Janus Joint Training\n---\n")
+    assert out.startswith("---\ntitle: Multi-method training\n---\n")
     assert "%%{init: {'flowchart': {'defaultRenderer': 'elk'}}}%%" in out
     assert "flowchart LR" in out
 
     # Node ids sanitise dots → underscores; labels keep the canonical name.
-    assert re.search(r'\bvision_encoder_forward\["<i>vision_encoder\.forward</i>"\]', out)
-    assert re.search(r'\bvq_decoder_encode\["<i>vq_decoder\.encode</i>"\]', out)
-    assert re.search(r'\brun_ar_forward\["<i>run_ar\.forward</i>"\]', out)
-    assert re.search(r'\bvq_decoder_gen_loss\["<i>vq_decoder\.gen_loss</i>"\]', out)
+    assert re.search(r'\bmodule_A_forward\["<i>module_A\.forward</i>"\]', out)
+    assert re.search(r'\bmodule_B_encode\["<i>module_B\.encode</i>"\]', out)
+    assert re.search(r'\bmodule_C_forward\["<i>module_C\.forward</i>"\]', out)
+    assert re.search(r'\bmodule_B_decode\["<i>module_B\.decode</i>"\]', out)
 
-    assert "vision_encoder_forward -->" in out and "run_ar_forward" in out
-    assert "vq_decoder_encode -->" in out
-    assert "run_ar_forward -->" in out and "vq_decoder_gen_loss" in out
+    assert "module_A_forward -->" in out and "module_C_forward" in out
+    assert "module_B_encode -->" in out
+    assert "module_C_forward -->" in out and "module_B_decode" in out
 
     # `end` rendered as the dashed terminal.
-    assert "end_sink" in out and "vq_decoder_gen_loss --> end_sink" in out
+    assert "end_sink" in out and "module_B_decode --> end_sink" in out
 
     assert ":::source" in out and ":::sink" in out
 
@@ -483,18 +452,18 @@ def test_to_mermaid_janus_joint_contains_node_labels_and_end_sink():
     assert "subgraph col0" in out and "subgraph col1" in out and "subgraph col2" in out
     assert "style col0 fill:transparent,stroke:none" in out
 
-    assert "data -.-> vision_encoder_forward" in out
-    assert "data -.-> vq_decoder_encode" in out
+    assert "data -.-> module_A_forward" in out
+    assert "data -.-> module_B_encode" in out
 
     # Single-loss protocol — no `losses` collector node.
     assert "losses" not in out
 
 
 def test_to_mermaid_always_draws_data_pseudo_node():
-    g = TrainingGraph(_janus_joint_edges())
+    g = TrainingGraph(_multi_method_edges())
     out = g.to_mermaid()
     assert "data[(data)]" in out
-    assert "data -.-> vision_encoder_forward" in out
+    assert "data -.-> module_A_forward" in out
     assert "losses" not in out
     assert "end_sink" in out
 
@@ -532,7 +501,7 @@ class _DdpStyleWrapper(nn.Module):
 
 def test_named_omni_modules_yields_modules_as_attached():
     """Bare :class:`OmniModel` yields sub-modules exactly as stored (no unwrap)."""
-    edges = _understanding_only_edges()
+    edges = _fan_in_edges()
     g = TrainingGraph(edges)
     raw_modules = _fake_modules(g)
     wrapped_modules = {name: _DdpStyleWrapper(mod) for name, mod in raw_modules.items()}

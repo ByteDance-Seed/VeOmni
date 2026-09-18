@@ -12,12 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SeedOmni V2 mixins: base lifecycle + training / inference graph hooks + metric meter."""
+"""SeedOmni mixins: base lifecycle plus training / inference graph hooks."""
 
 from .base_mixin import BaseMixin
 from .inference_module_mixin import InferenceModuleMixin, post_generate, pre_generate
-from .metric_meter_mixin import MetricMeterMixin, MetricMeterResult
-from .offline_encoding_mixin import OfflineEncodingMixin
 from .training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 
 
@@ -29,7 +27,4 @@ __all__ = [
     "post_forward",
     "pre_generate",
     "post_generate",
-    "MetricMeterMixin",
-    "MetricMeterResult",
-    "OfflineEncodingMixin",
 ]

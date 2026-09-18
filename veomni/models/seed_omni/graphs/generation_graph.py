@@ -21,24 +21,22 @@ Each state specifies:
 
       Each executed node merges its return dict into ``ctx`` directly
       (``ctx.update(out)``).  Edges declare execution order only — they
-      do not route individual fields.  Early FSM steps use
-      ``conversation_list``; later AR steps use ``input_ids`` /
-      ``past_key_values`` / ``hidden_states`` as modules write them.
+      do not route individual fields.  Modules write whatever keys the next
+      node needs onto ``ctx`` (``input_ids``, ``hidden_states``, …).
 
       This rule generalises "first-encounter execution":
 
-        * For purely linear bodies (e.g. ``text_ar`` =
-          ``tok_enc → llama → tok_dec``) it executes every node exactly
+        * For purely linear bodies (e.g. ``s1`` =
+          ``module_A → module_B → module_C``) it executes every node exactly
           once, in declaration order.
-        * For multi-source nodes (e.g. understanding/I2T where
-          ``janus_llama`` consumes both ``inputs_embeds`` and
-          ``und_image_embeds``) the backbone executes only after the
+        * For multi-source nodes (``module_B`` consumes keys written by both
+          ``module_A`` and ``module_C``) the backbone executes only after the
           last in-body fan-in edge has fired — both keys are already
           in ``ctx`` from upstream ``ctx.update(out)`` calls.
-        * For self-feedback bodies (``image_vq`` =
-          ``ar_to_vae_dec, vae_dec_to_ar``) ``vae_decode`` writes
-          ``embed`` (or ``inputs_embeds``) into ``ctx``; the next
-          ``janus_llama`` step reads it directly — no edge renaming.
+        * For self-feedback bodies (``s2`` =
+          ``module_B → module_A, module_A → module_B``) ``module_A`` writes
+          a key into ``ctx``; the next ``module_B`` step reads it directly —
+          no edge renaming.
 
       An edge with ``to: end`` is purely declarative — it pins the producing
       node into the active set without routing anywhere.
@@ -62,14 +60,12 @@ FSM view.  A dotted endpoint (``module.method`` — e.g. ``encode``, ``decode``,
         ``{type: module_signal, key: K}``
             Fires when ``context["module_signal"] == K``.  Modules write a
             one-shot string signal into ``ctx["module_signal"]`` from inside
-            ``generate_step`` / ``decode`` — e.g. ``JanusTextEncoder.decode``
-            sets ``"start_image_gen"`` / ``"text_done"`` after sampling; a VQ
-            decoder sets ``"image_complete"`` on the final patch.  The
-            framework **auto-clears** ``ctx["module_signal"]`` once the
-            transition fires.  This is how an AR loop state (e.g. ``image_vq``)
-            keeps iterating until its module says "done".  The FSM never
-            inspects raw token ids — vocabulary semantics stay inside the
-            module.
+            ``generate_step`` / ``decode`` (e.g. ``module_A.decode`` sets
+            ``"advance"`` / ``"done"``).  The framework **auto-clears**
+            ``ctx["module_signal"]`` once the transition fires.  This is how
+            an AR loop state keeps iterating until its module says "done".
+            The FSM never inspects raw token ids — vocabulary semantics stay
+            inside the module.
 
         ``{type: default}``
             The catch-all (switch-``default``) branch — matches
@@ -373,9 +369,8 @@ class GenerationGraph:
         # for the next iteration / state).  Nodes that never appear as
         # `from_` in body get ``len(body)`` so every incoming edge
         # counts as feed-forward — this is the "to-only sink" case
-        # (e.g. ``janus_llama`` in ``image_vq_start`` whose body is
-        # ``[emit_start_to_janus_llama, janus_llama_sink]`` — the sink edge
-        # triggers ``janus_llama``).
+        # (e.g. ``module_B`` in a body ``[module_A → module_B, module_B → end]``
+        # — the sink edge is what triggers ``module_B``).
         first_from_idx: Dict[str, int] = {}
         for i, e in enumerate(state.body):
             if not is_end(e.from_) and e.from_ not in first_from_idx:

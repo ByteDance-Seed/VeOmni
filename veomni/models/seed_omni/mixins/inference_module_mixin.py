@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generation-FSM hooks shared by every SeedOmni V2 sub-model.
+"""Generation-FSM hooks shared by every SeedOmni sub-model.
 
 Only :meth:`InferenceModuleMixin.reset_global_inference_state` and
 :meth:`InferenceModuleMixin.finalize` are wired in, on both inference paths —
@@ -89,11 +89,11 @@ class InferenceModuleMixin:
         return self.forward(**kwargs)
 
     def reset_local_inference_state(self) -> None:
-        """Reset per-turn state inside an ongoing conversation."""
+        """Reset per-turn state inside an ongoing generation request."""
         return None
 
     def reset_global_inference_state(self) -> None:
-        """Reset the full conversation-level inference state."""
+        """Reset the full request-level inference state."""
         self.reset_local_inference_state()
 
     def finalize(self, *, ctx: dict[str, Any]) -> dict[str, Any]:

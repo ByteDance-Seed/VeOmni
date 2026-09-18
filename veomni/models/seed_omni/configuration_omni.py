@@ -1,5 +1,5 @@
 """
-OmniConfig — central configuration for OmniModel V2.
+OmniConfig — central configuration for OmniModel.
 
 :class:`OmniConfig` describes **only** the composed model: module checkpoint layout,
 training DAG, and every generation FSM.  It is a plain ``PretrainedConfig`` — it reads
@@ -31,8 +31,8 @@ Launcher inputs consumed by that builder (see :class:`~veomni.arguments.OmniArgu
 
 Stored ``modules`` entries look like:
 
-  janus_llama:
-    subfolder: janus_llama
+  module_B:
+    subfolder: module_B
     model:
       ops_implementation:
         attn_implementation: flash_attention_2
@@ -43,13 +43,13 @@ Stored ``modules`` entries look like:
   #    Active nodes are derived from the endpoints.  `to: end` declares a leaf
   #    node (virtual sink) — every node MUST appear on at least one edge.
   training_graph:
-    - {from: siglip,            to: janus_llama}
-    - {from: vqvae.encode,      to: janus_llama}
-    - {from: wte_lm_head.encode, to: janus_llama}
-    - {from: janus_llama,       to: wte_lm_head.decode}
-    - {from: janus_llama,       to: vqvae.decode}
-    - {from: wte_lm_head.decode, to: end}
-    - {from: vqvae.decode,      to: end}
+    - {from: module_A,         to: module_B}
+    - {from: module_C.encode,  to: module_B}
+    - {from: module_D.encode,  to: module_B}
+    - {from: module_B,         to: module_D.decode}
+    - {from: module_B,         to: module_C.decode}
+    - {from: module_D.decode,  to: end}
+    - {from: module_C.decode,  to: end}
 
   # ── Inference FSMs, one per scenario.  Each state.body is a list of inline
   #    `{from, to}` edges (endpoints as `module[.method]` strings, bare module →
@@ -57,31 +57,30 @@ Stored ``modules`` entries look like:
   #    order, excluding `end`).  The `done` state is auto-injected by the
   #    framework — never declare it here, never set `done_state`.  Transitions
   #    whose `next_state: done` land on the built-in terminal state which then
-  #    triggers each active module's `finalize` hook (text decode /
-  #    image save / etc).
+  #    triggers each active module's `finalize` hook.
   #    States carry no iteration budget — a state body iterates until one of
   #    its transitions fires, and modules decide when via signals (the AR
   #    loop) or after a single pass via `default` (bridge/leaf states).
   infer_type: infer_interleave
   generation_graphs:
     infer_interleave:
-      initial: text_ar
+      initial: decode_loop
       states:
-        text_ar:
+        decode_loop:
           body:
-            - {from: wte_lm_head, to: janus_llama}
-            - {from: janus_llama, to: wte_lm_head}
-            - {from: wte_lm_head, to: end}
+            - {from: module_D, to: module_B}
+            - {from: module_B, to: module_D}
+            - {from: module_D, to: end}
           transitions:
-            - {condition: {type: module_signal, key: start_image_gen}, next_state: image_vq}
-        image_vq:
+            - {condition: {type: module_signal, key: advance}, next_state: aux_loop}
+        aux_loop:
           body:
-            - {from: janus_llama, to: vqvae}
-            - {from: vqvae,       to: janus_llama}
+            - {from: module_B, to: module_C}
+            - {from: module_C, to: module_B}
           transitions:
-            - {condition: {type: module_signal, key: image_complete}, next_state: text_ar}
+            - {condition: {type: module_signal, key: complete}, next_state: decode_loop}
     infer_und:
-      initial: text_ar
+      initial: decode_loop
       states: {...}
 """
 
@@ -122,7 +121,7 @@ def select_graph(
 
 
 class OmniConfig(PretrainedConfig):
-    """Configuration for OmniModel V2.
+    """Configuration for OmniModel.
 
     All nested dicts are stored as plain Python dicts for JSON serialisability.
         Typed accessors (``module_model_config``, ``module_processor_config``,
@@ -130,7 +129,7 @@ class OmniConfig(PretrainedConfig):
         runtime / visualisation tools.
 
     Tokenizers and processors are per-module assets saved alongside each
-    module's checkpoint (e.g. ``janus_text_encoder/tokenizer.json``).
+    module's checkpoint (e.g. ``module_A/tokenizer.json``).
     """
 
     model_type = "omni"

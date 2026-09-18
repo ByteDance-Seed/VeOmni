@@ -12,28 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SeedOmni V2 utilities: conversation carrier + HF→split checkpoint conversion."""
+"""SeedOmni utilities: HF → split-checkpoint conversion."""
 
-from .conversation import (
-    ConversationItem,
-    build_conversation,
-    collect_desired_values,
-    is_dummy,
-    iter_desired_items,
-    maybe_merge_outputs,
-    seal_outputs,
-)
 from .convert_registry import OMNI_CONVERT_REGISTRY, convert_checkpoint
 
 
 __all__ = [
-    "ConversationItem",
-    "build_conversation",
-    "is_dummy",
-    "maybe_merge_outputs",
-    "seal_outputs",
-    "iter_desired_items",
-    "collect_desired_values",
     "OMNI_CONVERT_REGISTRY",
     "convert_checkpoint",
 ]

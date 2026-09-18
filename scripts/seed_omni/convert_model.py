@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified entry point for SeedOmni V2 checkpoint conversion.
+"""Unified entry point for SeedOmni checkpoint conversion.
 
 Reads ``model_type`` from the upstream HuggingFace ``config.json`` at
 ``--model_path`` and dispatches to the matching family converter registered
@@ -8,8 +8,8 @@ under ``veomni/models/seed_omni/modules/<family>/convert_model.py``.
 Usage::
 
     python scripts/seed_omni/convert_model.py \\
-        --model_path /mnt/hdfs/veomni/models/transformers/Janus-1.3B \\
-        --output_dir /mnt/hdfs/veomni/models/seed_omni/janus_1.3b
+        --model_path /path/to/hf_checkpoint \\
+        --output_dir /path/to/split_modules
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Convert a monolithic HF checkpoint into SeedOmni V2 modules")
+    parser = argparse.ArgumentParser(description="Convert a monolithic HF checkpoint into SeedOmni modules")
     parser.add_argument(
         "--model_path",
         required=True,
