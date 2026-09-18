@@ -46,7 +46,7 @@ when the selected implementation runs.
 | `async_ulysses_qkv`, `async_ulysses_o` | `standard`, `dit` | `eager` orchestration |
 | `rms_norm` | `standard`, `deepseek_v4`, `unweighted`, `qwen3_5` | `eager`, `liger_kernel`, `npu`, and `triton` where supported |
 | `rope` | `full`, `partial`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
-| `swiglu_mlp` | `standard` | `eager`, `liger_kernel` |
+| `swiglu_mlp` | `standard`, `geglu` | `eager`, `liger_kernel` |
 | `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `fused_npu`, `fused_mlu` as supported by the variant |
 | `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |

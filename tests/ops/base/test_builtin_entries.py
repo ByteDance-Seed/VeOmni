@@ -159,6 +159,8 @@ _BUILTIN_ENTRIES = (
     ("rope", "wan", "npu", "npu", _NPU, ()),
     ("swiglu_mlp", "standard", "eager", "any", _ANY, ()),
     ("swiglu_mlp", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("swiglu_mlp", "geglu", "eager", "any", _ANY, ()),
+    ("swiglu_mlp", "geglu", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
 )
 
 

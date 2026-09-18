@@ -15,6 +15,10 @@
 #      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: Gemma3ForCausalLM.forward
 #      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
+#    - init_modification: Gemma3MLP
+#      Bind instance-local geglu swiglu_mlp VeomniOp
+#    - method_override: Gemma3MLP.forward
+#      Call geglu swiglu_mlp for gelu_pytorch_tanh, otherwise self.act_fn
 #    - init_modification: Gemma3Attention
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Gemma3Attention.forward
@@ -134,7 +138,14 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
         return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)
 
 
+# ======================================================================
+# [MODIFIED CLASS] Gemma3MLP
+# Methods patched: forward, __init__
+# ======================================================================
+
+
 class Gemma3MLP(nn.Module):
+    # [modified __init__] Bind instance-local geglu swiglu_mlp VeomniOp
     def __init__(self, config: Gemma3TextConfig):
         super().__init__()
         self.config = config
@@ -144,10 +155,21 @@ class Gemma3MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_activation]
+        # Bind instance-local geglu swiglu_mlp VeomniOp
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "geglu", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        if self.config.hidden_activation in {"gelu_pytorch_tanh", "gelu_python_tanh"}:
+            return self.veomni_swiglu_mlp(
+                x,
+                self.gate_proj.weight,
+                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+                self.up_proj.weight,
+                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+                self.down_proj.weight,
+                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+            )
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Gemma3RMSNorm(nn.Module):

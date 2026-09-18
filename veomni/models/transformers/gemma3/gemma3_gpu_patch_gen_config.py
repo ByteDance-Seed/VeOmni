@@ -274,6 +274,30 @@ def gemma3_forcausallm_forward_patched(
     )
 
 
+@config.modify_init("Gemma3MLP", description="Bind instance-local geglu swiglu_mlp VeomniOp")
+def gemma3_mlp_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "geglu", resolve_op_impl("swiglu_mlp_implementation"))
+
+
+@config.override_method(
+    "Gemma3MLP.forward",
+    description="Call geglu swiglu_mlp for gelu_pytorch_tanh, otherwise self.act_fn",
+)
+def gemma3_mlp_forward_patched(self, x):
+    if self.config.hidden_activation in {"gelu_pytorch_tanh", "gelu_python_tanh"}:
+        return self.veomni_swiglu_mlp(
+            x,
+            self.gate_proj.weight,
+            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+            self.up_proj.weight,
+            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+            self.down_proj.weight,
+            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+        )
+    return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
 @config.modify_init("Gemma3Attention", description="Bind instance-local rope and attention VeomniOps")
 def gemma3_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)

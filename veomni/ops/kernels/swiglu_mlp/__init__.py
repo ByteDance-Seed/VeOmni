@@ -14,12 +14,15 @@
 
 """SwiGLU MLP kernel family.
 
-Variant ``standard`` is the full MLP: ``down(silu(gate(x)) * up(x))``.
-Empty biases are unused. ``swiglu_limit`` is a keyword for DeepSeek-V4 clamp.
+Variant ``standard`` is ``down(silu(gate(x)) * up(x))`` with optional DSV4
+clamp. Variant ``geglu`` is ``down(gelu_pytorch_tanh(gate(x)) * up(x))``.
+Empty biases are unused.
 """
 
 from ...platform import GpuKernelRequirement
 from ...registry import register_op
+from .geglu import eager as geglu_eager
+from .geglu import liger_kernel as geglu_liger
 from .standard import eager as standard_eager
 from .standard import liger_kernel as standard_liger
 
@@ -43,6 +46,26 @@ register_op(
     standard_liger.forward,
     standard_liger.backward,
     description="Liger Kernel SwiGLU MLP with optional activation clamping",
+    requirement=_GPU,
+    requires=("liger_kernel",),
+)
+
+register_op(
+    "swiglu_mlp",
+    "geglu",
+    "eager",
+    geglu_eager.forward,
+    geglu_eager.backward,
+    description="PyTorch GeGLU MLP with tanh-approximate GELU",
+)
+
+register_op(
+    "swiglu_mlp",
+    "geglu",
+    "liger_kernel",
+    geglu_liger.forward,
+    geglu_liger.backward,
+    description="Liger Kernel GeGLU MLP with tanh-approximate GELU",
     requirement=_GPU,
     requires=("liger_kernel",),
 )
