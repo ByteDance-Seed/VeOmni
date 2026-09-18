@@ -3,6 +3,10 @@ name: Check docs build
 on:
   pull_request:
     paths:
+      - "README.md"
+      - "CONTRIBUTING.md"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - "scripts/**"
       - "docs/**"
       - "configs/**"
       - "tasks/**"
@@ -15,6 +19,10 @@ on:
     branches:
       - main
     paths:
+      - "README.md"
+      - "CONTRIBUTING.md"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - "scripts/**"
       - "docs/**"
       - "configs/**"
       - "tasks/**"
@@ -52,3 +60,9 @@ jobs:
 
       - name: Build documentation with warnings as errors
         run: make -C docs html SPHINXOPTS=-W
+
+      - name: Test documentation integrity checker
+        run: python -m unittest discover -s tests/special_sanity -p test_docs_integrity.py
+
+      - name: Check local links, rendered anchors, and navigation
+        run: python scripts/ci/check_docs_integrity.py
