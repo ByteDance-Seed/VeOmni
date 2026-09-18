@@ -16,7 +16,8 @@
 
 Variants: ``full`` (rotate every channel for text or rank-3 vision layouts),
 ``partial`` (rotate a prefix), ``interleave`` (interleaved pairs in, rotate-half
-out), ``deepseek_v4`` (trailing interleaved slice), and ``wan`` (complex
+out), ``mrope`` (remix 3-axis multimodal tables, then rotate-half),
+``deepseek_v4`` (trailing interleaved slice), and ``wan`` (complex
 multiply by freqs). Each variant registers an eager row plus optional CUDA /
 NPU adapters.
 """
@@ -29,6 +30,7 @@ from .full import eager as full_eager
 from .full import liger_kernel as full_liger
 from .full import npu as full_npu
 from .interleave import eager as interleave_eager
+from .mrope import eager as mrope_eager
 from .partial import eager as partial_eager
 from .partial import npu as partial_npu
 from .wan import eager as wan_eager
@@ -95,6 +97,15 @@ register_op(
     interleave_eager.forward,
     interleave_eager.backward,
     description="PyTorch rotary embedding for interleaved pairs with rotate-half output",
+)
+
+register_op(
+    "rope",
+    "mrope",
+    "eager",
+    mrope_eager.forward,
+    mrope_eager.backward,
+    description="PyTorch multimodal rotary embedding with section-split 3-axis tables",
 )
 
 register_op(

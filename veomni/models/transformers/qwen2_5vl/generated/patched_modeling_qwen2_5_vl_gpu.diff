@@ -66,7 +66,7 @@
 +#    - method_override: Qwen2_5_VLForConditionalGeneration.get_metadata_collate_func
 +#      Expose CPU-side window-attention ViT multimodal-metadata derivation to the VeOmni collator
 +#    - init_modification: Qwen2_5_VLAttention
-+#      Bind instance-local attention VeomniOp
++#      Bind instance-local rope and attention VeomniOps
 +#    - method_override: Qwen2_5_VLAttention.forward
 +#      Always call the local attention VeomniOp
  #
@@ -410,10 +410,17 @@
          return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
 
-@@ -157,20 +416,6 @@
-     return torch.cat((-x2, x1), dim=-1)
+@@ -150,27 +409,6 @@
+         return x
 
 
+-def rotate_half(x):
+-    """Rotates half the hidden dims of the input."""
+-    x1 = x[..., : x.shape[-1] // 2]
+-    x2 = x[..., x.shape[-1] // 2 :]
+-    return torch.cat((-x2, x1), dim=-1)
+-
+-
 -def apply_rotary_pos_emb_vision(
 -    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 -) -> tuple[torch.Tensor, torch.Tensor]:
@@ -431,7 +438,7 @@
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
      """
      This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-@@ -208,7 +453,14 @@
+@@ -208,7 +446,14 @@
      return attn_output, attn_weights
 
 
@@ -446,7 +453,7 @@
      def __init__(self, config: Qwen2_5_VLVisionConfig) -> None:
          super().__init__()
          self.dim = config.hidden_size
-@@ -221,13 +473,19 @@
+@@ -221,13 +466,19 @@
          self.config = config
          self.attention_dropout = 0.0
          self.is_causal = False
@@ -467,7 +474,7 @@
          **kwargs,
      ) -> torch.Tensor:
          seq_length = hidden_states.shape[0]
-@@ -235,19 +493,18 @@
+@@ -235,19 +486,18 @@
              self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
          )
          cos, sin = position_embeddings
@@ -492,7 +499,7 @@
              attn_output, _ = attention_interface(
                  self,
                  query_states,
-@@ -264,12 +521,10 @@
+@@ -264,12 +514,10 @@
                  **kwargs,
              )
          else:
@@ -505,7 +512,7 @@
              attn_outputs = [
                  attention_interface(
                      self,
-@@ -291,6 +546,12 @@
+@@ -291,6 +539,12 @@
          return attn_output
 
 
@@ -518,7 +525,7 @@
  class Qwen2_5_VLVisionBlock(GradientCheckpointingLayer):
      def __init__(self, config, attn_implementation: str = "sdpa") -> None:
          super().__init__()
-@@ -299,21 +560,38 @@
+@@ -299,21 +553,38 @@
          self.attn = Qwen2_5_VLVisionAttention(config=config)
          self.mlp = Qwen2_5_VLMLP(config, bias=True)
 
@@ -558,7 +565,7 @@
              position_embeddings=position_embeddings,
              **kwargs,
          )
-@@ -342,6 +620,12 @@
+@@ -342,6 +613,12 @@
              init.copy_(module.inv_freq, inv_freq)
 
 
@@ -571,7 +578,7 @@
  class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
      config: Qwen2_5_VLVisionConfig
      _no_split_modules = ["Qwen2_5_VLVisionBlock"]
-@@ -403,72 +687,248 @@
+@@ -403,72 +680,248 @@
          )
          return window_index, cu_window_seqlens.tolist()
 
@@ -852,7 +859,7 @@
 
 
  @auto_docstring
-@@ -538,9 +998,15 @@
+@@ -538,9 +991,15 @@
          return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -869,7 +876,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -548,10 +1014,20 @@
+@@ -548,55 +1007,26 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -878,6 +885,51 @@
      def forward(self, x):
 -        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 -        return down_proj
+-
+-
+-def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim=1):
+-    """Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors (https://qwenlm.github.io/blog/qwen2-vl/).
+-
+-    Explanation:
+-        Multimodal 3D rotary position embedding is an extension to 1D rotary position embedding. The input embedding
+-        sequence contains vision (images / videos) embedding and text embedding or just contains text embedding. For
+-        vision embedding part, we apply rotary position embedding on temporal, height and width dimension separately.
+-        Here we split the channel dimension to 3 chunks for the temporal, height and width rotary position embedding.
+-        For text embedding part, we just apply 1D rotary position embedding. The three rotary position index (temporal,
+-        height and width) of text embedding is always the same, so the text embedding rotary position embedding has no
+-        difference with modern LLMs.
+-
+-    Args:
+-        q (`torch.Tensor`): The query tensor.
+-        k (`torch.Tensor`): The key tensor.
+-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+-        sin (`torch.Tensor`): The sine part of the rotary embedding.
+-        position_ids (`torch.Tensor`):
+-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
+-            used to pass offsetted position ids when working with a KV-cache.
+-        mrope_section(`List(int)`):
+-            Multimodal rope section is for channel dimension of temporal, height and width in rope calculation.
+-        unsqueeze_dim (`int`, *optional*, defaults to 1):
+-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+-    Returns:
+-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+-    """
+-    mrope_section = mrope_section * 2
+-    cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1).unsqueeze(
+-        unsqueeze_dim
+-    )
+-    sin = torch.cat([m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1).unsqueeze(
+-        unsqueeze_dim
+-    )
+-
+-    q_embed = (q * cos) + (rotate_half(q) * sin)
+-    k_embed = (k * cos) + (rotate_half(k) * sin)
+-    return q_embed, k_embed
 +        if self.config.hidden_act in {"silu", "swish"}:
 +            return self.veomni_swiglu_mlp(
 +                x,
@@ -889,39 +941,34 @@
 +                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
 +            )
 +        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
-
- def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim=1):
-@@ -599,12 +1075,19 @@
-     return q_embed, k_embed
-
-
++
++
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen2_5_VLAttention
 +# Methods patched: forward, __init__
 +# ======================================================================
-+
-+
+
+
  class Qwen2_5_VLAttention(nn.Module):
-     """
-     Multi-headed attention from 'Attention Is All You Need' paper. Modified to use sliding window attention: Longformer
+@@ -605,6 +1035,7 @@
      and "Generating Long Sequences with Sparse Transformers".
      """
 
-+    # [modified __init__] Bind instance-local attention VeomniOp
++    # [modified __init__] Bind instance-local rope and attention VeomniOps
      def __init__(self, config: Qwen2_5_VLTextConfig, layer_idx: int | None = None):
          super().__init__()
          self.config = config
-@@ -637,6 +1120,8 @@
+@@ -637,6 +1068,9 @@
          self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
          self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
          self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
-+        # Bind instance-local attention VeomniOp
++        # Bind instance-local rope and attention VeomniOps
++        self.veomni_rope = VeomniOp("rope", "mrope", "eager")
 +        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
      def forward(
          self,
-@@ -649,6 +1134,7 @@
+@@ -649,6 +1083,7 @@
          position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
          **kwargs: Unpack[FlashAttentionKwargs],
      ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
@@ -929,7 +976,20 @@
          bsz, q_len, _ = hidden_states.size()
 
          query_states = self.q_proj(hidden_states)
-@@ -667,11 +1153,7 @@
+@@ -660,18 +1095,18 @@
+         value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+
+         cos, sin = position_embeddings
+-        query_states, key_states = apply_multimodal_rotary_pos_emb(
+-            query_states, key_states, cos, sin, self.config.rope_parameters["mrope_section"]
++        query_states, key_states = self.veomni_rope(
++            query_states,
++            key_states,
++            cos,
++            sin,
++            mrope_section=self.config.rope_parameters["mrope_section"],
+         )
+
          if past_key_values is not None:
              key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
@@ -942,7 +1002,7 @@
              self,
              query_states,
              key_states,
-@@ -680,7 +1162,7 @@
+@@ -680,7 +1115,7 @@
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
              sliding_window=self.sliding_window,
@@ -951,7 +1011,7 @@
              **kwargs,
          )
 
-@@ -870,6 +1352,12 @@
+@@ -870,6 +1305,12 @@
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
          )
@@ -964,7 +1024,7 @@
 
 
  @auto_docstring
-@@ -1066,14 +1554,27 @@
+@@ -1066,14 +1507,27 @@
          video_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -997,7 +1057,7 @@
      @accepts_precomputed_kwargs(modality="image")
      @can_return_tuple
      @auto_docstring
-@@ -1083,53 +1584,35 @@
+@@ -1083,53 +1537,35 @@
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -1071,7 +1131,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1180,6 +1663,25 @@
+@@ -1180,6 +1616,25 @@
              position_ids = None
          return position_ids
 
@@ -1097,7 +1157,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1190,39 +1692,166 @@
+@@ -1190,39 +1645,166 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
@@ -1275,7 +1335,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1233,6 +1862,15 @@
+@@ -1233,6 +1815,15 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -1291,7 +1351,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1241,16 +1879,21 @@
+@@ -1241,16 +1832,21 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1314,7 +1374,7 @@
 
 
  @auto_docstring
-@@ -1265,16 +1908,29 @@
+@@ -1265,16 +1861,29 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -1345,7 +1405,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -1314,91 +1970,83 @@
+@@ -1314,91 +1923,83 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -1479,7 +1539,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -1578,5 +2226,49 @@
+@@ -1578,5 +2179,49 @@
 
          return input_ids, model_kwargs
 

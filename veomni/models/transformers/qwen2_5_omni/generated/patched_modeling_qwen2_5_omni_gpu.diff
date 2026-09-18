@@ -86,7 +86,7 @@
 +#    - method_override: Qwen2_5OmniAudioAttention.forward
 +#      Always call the local attention VeomniOp
 +#    - init_modification: Qwen2_5OmniAttention
-+#      Bind instance-local attention VeomniOp
++#      Bind instance-local rope and attention VeomniOps
 +#    - method_override: Qwen2_5OmniAttention.forward
 +#      Always call the local attention VeomniOp
  #
@@ -1009,10 +1009,28 @@
 
      # Ignore copy
      def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
-@@ -973,6 +1268,50 @@
+@@ -973,27 +1268,59 @@
              batch_mask_after_cnn.bool(),
          )
 
+-
+-def rotate_half(x):
+-    """Rotates half the hidden dims of the input."""
+-    x1 = x[..., : x.shape[-1] // 2]
+-    x2 = x[..., x.shape[-1] // 2 :]
+-    return torch.cat((-x2, x1), dim=-1)
+-
+-
+-def apply_rotary_pos_emb_vision(tensor: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+-    orig_dtype = tensor.dtype
+-    tensor = tensor.float()
+-    cos = freqs.cos()
+-    sin = freqs.sin()
+-    cos = cos.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+-    sin = sin.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+-    output = (tensor * cos) + (rotate_half(tensor) * sin)
+-    output = output.to(orig_dtype)
+-    return output
 +    # ================================================================
 +    # Patch: Qwen2_5OmniAudioEncoder._prepare_attention_mask
 +    # 1. Return None for any VARLEN_ATTENTION_TYPES backend (including
@@ -1057,23 +1075,7 @@
 +        aftercnn_lens, _ = self._get_feat_extract_output_lengths(feature_lens)
 +        return self(input_features=input_features, feature_lens=feature_lens, aftercnn_lens=aftercnn_lens)
 +
-
- def rotate_half(x):
-     """Rotates half the hidden dims of the input."""
-@@ -981,19 +1320,14 @@
-     return torch.cat((-x2, x1), dim=-1)
-
-
--def apply_rotary_pos_emb_vision(tensor: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
--    orig_dtype = tensor.dtype
--    tensor = tensor.float()
--    cos = freqs.cos()
--    sin = freqs.sin()
--    cos = cos.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
--    sin = sin.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
--    output = (tensor * cos) + (rotate_half(tensor) * sin)
--    output = output.to(orig_dtype)
--    return output
++
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen2_5OmniVisionAttention
 +# Methods patched: forward, __init__
@@ -1085,7 +1087,7 @@
      def __init__(self, config: Qwen2_5OmniVisionEncoderConfig = None) -> None:
          super().__init__()
          self.dim = config.hidden_size
-@@ -1008,6 +1342,9 @@
+@@ -1008,6 +1335,9 @@
          self.config = config
          self.attention_dropout = 0.0
          self.is_causal = False
@@ -1095,7 +1097,7 @@
 
      @deprecate_kwarg("rotary_pos_emb", version="v5.20", new_name="position_embeddings")
      def forward(
-@@ -1022,21 +1359,20 @@
+@@ -1022,21 +1352,20 @@
          query_states = self.q(hidden_states).reshape(seq_length, self.num_heads, -1)
          key_states = self.k(hidden_states).reshape(seq_length, self.num_heads, -1)
          value_states = self.v(hidden_states).reshape(seq_length, self.num_heads, -1)
@@ -1126,7 +1128,7 @@
              attn_output, _ = attention_interface(
                  self,
                  query_states,
-@@ -1053,7 +1389,7 @@
+@@ -1053,7 +1382,7 @@
                  **kwargs,
              )
          else:
@@ -1135,7 +1137,7 @@
              lengths = cu_seqlens[1:] - cu_seqlens[:-1]
              splits = [
                  torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-@@ -1074,44 +1410,62 @@
+@@ -1074,44 +1403,62 @@
                  for q, k, v in zip(*splits)
              ]
              attn_output = torch.cat(attn_outputs, dim=1)
@@ -1209,7 +1211,7 @@
          return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
 
-@@ -1199,6 +1553,12 @@
+@@ -1199,6 +1546,12 @@
          return x
 
 
@@ -1222,7 +1224,7 @@
  class Qwen2_5OmniVisionEncoder(Qwen2_5OmniPreTrainedModel):
      config: Qwen2_5OmniVisionEncoderConfig
      _no_split_modules = ["Qwen2_5OmniVisionBlock"]
-@@ -1260,12 +1620,27 @@
+@@ -1260,12 +1613,27 @@
          )
          return window_index, cu_window_seqlens.tolist()
 
@@ -1252,7 +1254,7 @@
          Args:
              hidden_states (`torch.Tensor` of shape `(seq_len, hidden_size)`):
                  The final hidden states of the model.
-@@ -1273,58 +1648,199 @@
+@@ -1273,58 +1641,199 @@
                  The temporal, height and width of feature shape of each image in LLM.
 
          Returns:
@@ -1472,36 +1474,79 @@
 
 
  class Qwen2_5OmniRotaryEmbedding(nn.Module):
-@@ -1429,12 +1945,19 @@
-     return q_embed, k_embed
+@@ -1384,49 +1893,10 @@
+         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+-def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim=1):
+-    """Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors (https://qwenlm.github.io/blog/qwen2-vl/).
+-
+-    Explanation:
+-        Multimodal 3D rotary position embedding is an extension to 1D rotary position embedding. The input embedding
+-        sequence contains vision (images / videos) embedding and text embedding or just contains text embedding. For
+-        vision embedding part, we apply rotary position embedding on temporal, height and width dimension separately.
+-        Here we split the channel dimension to 3 chunks for the temporal, height and width rotary position embedding.
+-        For text embedding part, we just apply 1D rotary position embedding. The three rotary position index (temporal,
+-        height and width) of text embedding is always the same, so the text embedding rotary position embedding has no
+-        difference with modern LLMs.
+-
+-    Args:
+-        q (`torch.Tensor`): The query tensor.
+-        k (`torch.Tensor`): The key tensor.
+-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+-        sin (`torch.Tensor`): The sine part of the rotary embedding.
+-        position_ids (`torch.Tensor`):
+-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
+-            used to pass offsetted position ids when working with a KV-cache.
+-        mrope_section(`List(int)`):
+-            Multimodal rope section is for channel dimension of temporal, height and width in rope calculation.
+-        unsqueeze_dim (`int`, *optional*, defaults to 1):
+-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+-    Returns:
+-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+-    """
+-    mrope_section = mrope_section * 2
+-    cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1).unsqueeze(
+-        unsqueeze_dim
+-    )
+-    sin = torch.cat([m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1).unsqueeze(
+-        unsqueeze_dim
+-    )
+-
+-    q_embed = (q * cos) + (rotate_half(q) * sin)
+-    k_embed = (k * cos) + (rotate_half(k) * sin)
+-    return q_embed, k_embed
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen2_5OmniAttention
 +# Methods patched: forward, __init__
 +# ======================================================================
-+
-+
+
+
  class Qwen2_5OmniAttention(nn.Module):
-     """
-     Multi-headed attention from 'Attention Is All You Need' paper. Modified to use sliding window attention: Longformer
+@@ -1435,6 +1905,7 @@
      and "Generating Long Sequences with Sparse Transformers".
      """
 
-+    # [modified __init__] Bind instance-local attention VeomniOp
++    # [modified __init__] Bind instance-local rope and attention VeomniOps
      def __init__(self, config: Qwen2_5OmniConfig, layer_idx: int | None = None):
          super().__init__()
          self.config = config
-@@ -1462,6 +1985,8 @@
+@@ -1462,6 +1933,9 @@
          self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
          self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
          self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
-+        # Bind instance-local attention VeomniOp
++        # Bind instance-local rope and attention VeomniOps
++        self.veomni_rope = VeomniOp("rope", "mrope", "eager")
 +        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
      def forward(
          self,
-@@ -1474,6 +1999,7 @@
+@@ -1474,6 +1948,7 @@
          position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
          **kwargs: Unpack[FlashAttentionKwargs],
      ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
@@ -1509,7 +1554,20 @@
          bsz, q_len, _ = hidden_states.size()
 
          query_states = self.q_proj(hidden_states)
-@@ -1492,11 +2018,7 @@
+@@ -1485,18 +1960,18 @@
+         value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+
+         cos, sin = position_embeddings
+-        query_states, key_states = apply_multimodal_rotary_pos_emb(
+-            query_states, key_states, cos, sin, self.config.rope_parameters["mrope_section"]
++        query_states, key_states = self.veomni_rope(
++            query_states,
++            key_states,
++            cos,
++            sin,
++            mrope_section=self.config.rope_parameters["mrope_section"],
+         )
+
          if past_key_values is not None:
              key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
@@ -1522,7 +1580,7 @@
              self,
              query_states,
              key_states,
-@@ -1505,7 +2027,7 @@
+@@ -1505,7 +1980,7 @@
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
              sliding_window=self.sliding_window,
@@ -1531,7 +1589,7 @@
              **kwargs,
          )
 
-@@ -1514,17 +2036,35 @@
+@@ -1514,17 +1989,35 @@
          return attn_output, attn_weights
 
 
@@ -1568,7 +1626,7 @@
          return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
 
-@@ -1712,6 +2252,12 @@
+@@ -1712,6 +2205,12 @@
          )
 
 
@@ -1581,7 +1639,7 @@
  @auto_docstring(
      custom_intro="""
      The Qwen2.5OmniThinker model which consists of an audio backbone and a language model.
-@@ -1724,7 +2270,27 @@
+@@ -1724,7 +2223,27 @@
      _no_split_modules = ["Qwen2_5OmniAudioEncoder", "Qwen2_5OmniVisionEncoder"]
      _can_compile_fullgraph = True
 
@@ -1610,7 +1668,7 @@
          super().__init__(config)
          self.audio_tower = Qwen2_5OmniAudioEncoder._from_config(config.audio_config)
          self.visual = Qwen2_5OmniVisionEncoder._from_config(config.vision_config)
-@@ -1733,6 +2299,9 @@
+@@ -1733,6 +2252,9 @@
          self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
          self.spatial_merge_size = config.vision_config.spatial_merge_size
          self.rope_deltas = None
@@ -1620,7 +1678,7 @@
          self.post_init()
 
      def get_input_embeddings(self):
-@@ -1746,6 +2315,10 @@
+@@ -1746,6 +2268,10 @@
          # the default `get_decoder` can't find the LLM. The text model lives on `self.model`.
          return self.model
 
@@ -1631,7 +1689,7 @@
      @accepts_precomputed_kwargs(modality="video")
      @can_return_tuple
      @auto_docstring
-@@ -1755,13 +2328,20 @@
+@@ -1755,13 +2281,20 @@
          video_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -1658,7 +1716,7 @@
      @accepts_precomputed_kwargs(modality="image")
      @can_return_tuple
      @auto_docstring
-@@ -1771,47 +2351,42 @@
+@@ -1771,47 +2304,42 @@
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | BaseModelOutputWithPooling:
@@ -1732,7 +1790,7 @@
 
      def get_placeholder_mask(
          self,
-@@ -1911,120 +2486,195 @@
+@@ -1911,120 +2439,195 @@
      @auto_docstring
      def forward(
          self,
@@ -2019,7 +2077,7 @@
 
          outputs = self.model(
              attention_mask=attention_mask,
-@@ -2032,27 +2682,40 @@
+@@ -2032,27 +2635,40 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -2069,7 +2127,7 @@
 
      def _expand_inputs_for_generation(
          self,
-@@ -2117,825 +2780,54 @@
+@@ -2117,825 +2733,54 @@
 
          return position_ids
 
@@ -2943,7 +3001,7 @@
 
 
  def deinterleave_head_dim(x: torch.Tensor) -> torch.Tensor:
-@@ -2943,137 +2835,6 @@
+@@ -2943,137 +2788,6 @@
      `(x0, x2, ..., x1, x3, ...)` so the kernelized `apply_rotary_pos_emb` can be used.
      """
      return torch.cat((x[..., 0::2], x[..., 1::2]), dim=-1)
@@ -3081,7 +3139,7 @@
 
 
  class Qwen2_5OmniSnakeBeta(nn.Module):
-@@ -3295,405 +3056,10 @@
+@@ -3295,405 +3009,10 @@
          super().__init__(*args, **kwargs)
 
 
@@ -3491,7 +3549,7 @@
 
 
  ############################
-@@ -3720,22 +3086,74 @@
+@@ -3720,22 +3039,74 @@
          "Qwen2_5OmniToken2WavModel",
      ]
 
@@ -3576,7 +3634,7 @@
 
      def load_speakers(self, path):
          check_torch_load_is_safe()
-@@ -3797,285 +3215,71 @@
+@@ -3797,285 +3168,71 @@
 
          return model
 

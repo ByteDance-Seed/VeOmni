@@ -21,6 +21,7 @@ import torch
 from torch import Tensor
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import apply_rotary_pos_emb_interleave as hf_interleave_rope
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import apply_rotary_pos_emb as hf_dsv4_rope
+from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb as hf_mrope
 from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb as hf_full_rope
 from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb as hf_partial_rope
 from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb_vision as hf_vision_rope
@@ -141,7 +142,31 @@ def test_interleave_eager_matches_hf(unsqueeze_dim: int):
     assert torch.allclose(k_e.grad, k_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-@pytest.mark.parametrize("kind", ("full", "partial", "vision", "interleave"))
+def test_mrope_eager_matches_hf():
+    torch.manual_seed(0)
+    mrope_section = [4, 2, 2]
+    q = torch.randn(2, 8, 16, 16, dtype=torch.float32, requires_grad=True)
+    k = torch.randn(2, 4, 16, 16, dtype=torch.float32, requires_grad=True)
+    cos = torch.randn(3, 2, 16, 16, dtype=torch.float32)
+    sin = torch.randn(3, 2, 16, 16, dtype=torch.float32)
+
+    q_h, k_h = make_grad_leaves(q, k)
+    out_h = hf_mrope(q_h, k_h, cos, sin, mrope_section, unsqueeze_dim=1)
+
+    q_e, k_e = make_grad_leaves(q, k)
+    out_e = resolve_op("rope", "mrope", "eager").wrapper(
+        q_e, k_e, cos, sin, unsqueeze_dim=1, mrope_section=mrope_section
+    )
+    _assert_pair(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    go = (torch.randn_like(out_e[0]), torch.randn_like(out_e[1]))
+    torch.autograd.backward(out_h, go)
+    torch.autograd.backward(out_e, go)
+    assert torch.allclose(q_e.grad, q_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(k_e.grad, k_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+@pytest.mark.parametrize("kind", ("full", "partial", "vision", "interleave", "mrope"))
 @pytest.mark.parametrize(
     ("cos_requires_grad", "sin_requires_grad"),
     ((True, False), (False, True), (True, True)),
@@ -172,6 +197,14 @@ def test_eager_rope_table_gradients_match_hf(kind: str, cos_requires_grad: bool,
         reference = hf_interleave_rope
         op = resolve_op("rope", "interleave", "eager").wrapper
         attrs = {"unsqueeze_dim": 1}
+    elif kind == "mrope":
+        q = torch.randn(2, 3, 4, 16)
+        k = torch.randn(2, 2, 4, 16)
+        cos = torch.randn(3, 2, 4, 16)
+        sin = torch.randn(3, 2, 4, 16)
+        reference = hf_mrope
+        op = resolve_op("rope", "mrope", "eager").wrapper
+        attrs = {"unsqueeze_dim": 1, "mrope_section": [4, 2, 2]}
     else:
         q = torch.randn(4, 3, 8)
         k = torch.randn(4, 2, 8)

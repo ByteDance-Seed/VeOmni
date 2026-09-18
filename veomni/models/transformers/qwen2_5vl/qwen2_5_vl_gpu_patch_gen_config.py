@@ -38,7 +38,6 @@ from transformers.modeling_utils import (
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLModel,
     Qwen2_5_VLModelOutputWithPast,
-    apply_multimodal_rotary_pos_emb,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
@@ -100,7 +99,12 @@ config.add_import(
     names=["ForCausalLMLoss"],
 )
 config.drop_import_names("Qwen2_5_VLCausalLMOutputWithPast")
-config.exclude_from_output("apply_rotary_pos_emb_vision", "use_kernel_forward_from_hub")
+config.exclude_from_output(
+    "apply_rotary_pos_emb_vision",
+    "apply_multimodal_rotary_pos_emb",
+    "rotate_half",
+    "use_kernel_forward_from_hub",
+)
 config.drop_import_names("use_kernel_forward_from_hub")
 
 
@@ -1228,9 +1232,10 @@ def qwen2_5_vl_get_metadata_collate_func_patched(self):
     )
 
 
-@config.modify_init("Qwen2_5_VLAttention", description="Bind instance-local attention VeomniOp")
+@config.modify_init("Qwen2_5_VLAttention", description="Bind instance-local rope and attention VeomniOps")
 def qwen2_5_vl_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "mrope", "eager")
     self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
 
@@ -1261,8 +1266,12 @@ def qwen2_5_vl_attention_forward_patched(
     value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
     cos, sin = position_embeddings
-    query_states, key_states = apply_multimodal_rotary_pos_emb(
-        query_states, key_states, cos, sin, self.config.rope_parameters["mrope_section"]
+    query_states, key_states = self.veomni_rope(
+        query_states,
+        key_states,
+        cos,
+        sin,
+        mrope_section=self.config.rope_parameters["mrope_section"],
     )
 
     if past_key_values is not None:

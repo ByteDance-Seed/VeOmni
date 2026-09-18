@@ -152,6 +152,7 @@ _BUILTIN_ENTRIES = (
     ("rope", "partial", "eager", "any", _ANY, ()),
     ("rope", "partial", "npu", "npu", _NPU, ()),
     ("rope", "interleave", "eager", "any", _ANY, ()),
+    ("rope", "mrope", "eager", "any", _ANY, ()),
     ("rope", "deepseek_v4", "eager", "any", _ANY, ()),
     ("rope", "deepseek_v4", "triton", "cuda", _GPU, ("triton",)),
     ("rope", "wan", "eager", "any", _ANY, ()),
