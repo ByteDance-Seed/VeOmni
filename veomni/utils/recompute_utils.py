@@ -16,7 +16,7 @@
 
 The framework owns the strategy, models stay unchanged:
 
-* :func:`build_policy` turns ``train.gradient_checkpointing`` into one immutable
+* :func:`build_policy` turns ``model.accelerator.gradient_checkpointing`` into one immutable
   :class:`RecomputePolicy` per training run (no process-global switch).
 * :func:`apply_recompute_policy` runs right after HF's
   ``gradient_checkpointing_enable`` and binds a per-block decision onto every
@@ -287,7 +287,7 @@ def build_policy(
     offload_active: bool = False,
     compile_enabled: bool = False,
 ) -> RecomputePolicy:
-    """Build the run's :class:`RecomputePolicy` from ``train.gradient_checkpointing``.
+    """Build the run's :class:`RecomputePolicy` from ``model.accelerator.gradient_checkpointing``.
 
     SAC requires ``enabled`` and non-reentrant checkpointing; whenever it cannot
     be honoured the counts are kept and only ``context_fn`` is dropped, so those
@@ -319,7 +319,7 @@ def build_policy(
             _warn_once(
                 "sac-disabled",
                 f"selective_n_layers={selective_n_layers} ignored: SAC needs "
-                "train.gradient_checkpointing.enable=True; those layers fall back to full recomputation",
+                "model.accelerator.gradient_checkpointing.enable=True; those layers fall back to full recomputation",
             )
         elif enable_reentrant:
             _warn_once(
@@ -807,4 +807,9 @@ def _plan_for(block: nn.Module) -> BlockPlan:
             f"{type(block).__name__} has no recompute binding; recomputing it in full on every call "
             "(the framework binds blocks during model build)",
         )
-    return BlockPlan(Decision.FULL, {"use_reentrant": False, "early_stop": True})
+    # Only ``use_reentrant`` is pinned here: this entry point is handed the block
+    # alone, so no policy is in reach and the remaining checkpoint options stay
+    # at torch's defaults (``early_stop=True``), rather than echoing a config
+    # value that may say otherwise. ``early_stop`` only affects recomputation
+    # speed, never the numbers.
+    return BlockPlan(Decision.FULL, {"use_reentrant": False})
