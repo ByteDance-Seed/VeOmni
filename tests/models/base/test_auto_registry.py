@@ -556,12 +556,6 @@ _MODEL_CASES = (
     ),
 )
 
-_ARCHITECTURE_CASES = tuple(
-    pytest.param(model_case, architecture, id=f"{model_case.model_type}-{architecture}")
-    for model_case in _MODEL_CASES
-    for architecture in model_case.architectures
-)
-
 
 def test_get_model_class_unknown_type_raises():
     with pytest.raises(RuntimeError, match="unregistered_test_model.*not registered in veomni.models"):
@@ -678,10 +672,11 @@ def test_model_registry_entries(model_case: _ModelCase):
         assert model_case.processor_class_name in MODEL_PROCESSOR_REGISTRY.valid_keys()
 
 
-@pytest.mark.parametrize(("model_case", "architecture"), _ARCHITECTURE_CASES)
-def test_get_model_class_returns_registered_architecture(model_case: _ModelCase, architecture: str):
-    model_cls = get_model_class(model_case.config_factory(architecture))
-    assert model_cls.__name__ == architecture
+@pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
+def test_get_model_class_returns_registered_architectures(model_case: _ModelCase):
+    for architecture in model_case.architectures:
+        model_cls = get_model_class(model_case.config_factory(architecture))
+        assert model_cls.__name__ == architecture, architecture
 
 
 def test_get_model_config_uses_the_registered_dsv4_subclass(tmp_path):

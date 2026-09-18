@@ -54,14 +54,7 @@ def test_flash_shapes_are_none():
     )
 
 
-@pytest.mark.parametrize(
-    "impl",
-    (
-        "flash_attention_2",
-        "veomni_flash_attention_2",
-        "veomni_sage_attention",
-    ),
-)
+@pytest.mark.parametrize("impl", ("flash_attention_2", "veomni_sage_attention"))
 def test_flash_like_causal_shape_preserves_padding(impl):
     attention_2d = torch.tensor([[1, 1, 1, 0]], dtype=torch.bool)
     mask = causal_mask(4, 4, impl=impl, device="cpu", attention_mask=attention_2d)
@@ -76,12 +69,22 @@ def test_sage_mask_builder_is_flash_like_for_causal_only():
         packed_causal_mask(8, 8, impl="veomni_sage_attention", device="cpu", cu_seqlens=torch.tensor([0, 8]))
 
 
-@pytest.mark.parametrize("impl", ("sdpa", "veomni_sdpa"))
-def test_sdpa_causal_aligns_with_hf_builder(impl):
+def test_sdpa_causal_aligns_with_hf_builder():
     built = sdpa_attention_mask_builder(1, 4, 4, device="cpu", allow_is_causal_skip=False)
-    shaped = causal_mask(4, 4, impl=impl, device="cpu")
+    shaped = causal_mask(4, 4, impl="sdpa", device="cpu")
     torch.testing.assert_close(shaped, built)
     torch.testing.assert_close(shaped[0, 0], torch.tril(torch.ones(4, 4, dtype=torch.bool)))
+
+
+def test_shape_masks_treat_veomni_prefix_as_the_stock_name():
+    """Mask dispatch strips ``veomni_``; aliases must not get a second code path."""
+    stock = causal_mask(4, 4, impl="sdpa", device="cpu")
+    aliased = causal_mask(4, 4, impl="veomni_sdpa", device="cpu")
+    torch.testing.assert_close(stock, aliased)
+    torch.testing.assert_close(
+        flex_visible(causal_mask(4, 4, impl="flex_attention", device="cpu"), 4, 4),
+        flex_visible(causal_mask(4, 4, impl="veomni_flex_attention", device="cpu"), 4, 4),
+    )
 
 
 def test_eager_causal_is_additive_like_hf():
@@ -95,10 +98,9 @@ def test_eager_causal_is_additive_like_hf():
     torch.testing.assert_close(blocked, torch.full_like(blocked, torch.finfo(torch.float32).min))
 
 
-@pytest.mark.parametrize("impl", ("sdpa", "veomni_sdpa"))
-def test_sdpa_cached_causal_aligns_with_hf_builder(impl):
+def test_sdpa_cached_causal_aligns_with_hf_builder():
     built = sdpa_attention_mask_builder(1, 2, 4, q_offset=2, device="cpu")
-    shaped = causal_mask(2, 4, impl=impl, device="cpu")
+    shaped = causal_mask(2, 4, impl="sdpa", device="cpu")
     assert built is not None
     torch.testing.assert_close(shaped, built)
     torch.testing.assert_close(shaped[0, 0], torch.ones(2, 4, dtype=torch.bool).tril(diagonal=2))
@@ -153,15 +155,14 @@ def test_eager_packed_with_long_padding_mask_is_additive():
     torch.testing.assert_close(blocked, torch.full_like(blocked, torch.finfo(torch.float32).min))
 
 
-@pytest.mark.parametrize("impl", ("sdpa", "veomni_sdpa"))
 @pytest.mark.parametrize("q_len", (2, 4), ids=("cached", "prefill"))
-def test_sdpa_packed_shape_is_unsupported(impl, q_len):
+def test_sdpa_packed_shape_is_unsupported(q_len):
     """SDPA rejects the packed API for both cached and square attention."""
     with pytest.raises(ValueError, match="SDPA does not support packed_causal_mask"):
         packed_causal_mask(
             q_len,
             4,
-            impl=impl,
+            impl="sdpa",
             device="cpu",
             cu_seqlens=torch.tensor([0, q_len]),
             cu_seq_lens_k=torch.tensor([0, 4]),
@@ -196,16 +197,14 @@ def test_packed_cached_uses_independent_query_and_key_segments(impl, key_lengths
     torch.testing.assert_close(visible, expected)
 
 
-@pytest.mark.parametrize("impl", ("flex_attention", "veomni_flex_attention"))
-def test_flex_causal_aligns_with_hf_builder(impl):
+def test_flex_causal_aligns_with_hf_builder():
     built = flex_attention_mask_builder(1, 4, 4, device="cpu")
-    shaped = causal_mask(4, 4, impl=impl, device="cpu")
+    shaped = causal_mask(4, 4, impl="flex_attention", device="cpu")
     torch.testing.assert_close(flex_visible(shaped, 4, 4), flex_visible(built, 4, 4))
 
 
-@pytest.mark.parametrize("impl", ("flex_attention", "veomni_flex_attention"))
-def test_flex_cached_causal_uses_query_offset(impl):
-    shaped = causal_mask(2, 4, impl=impl, device="cpu")
+def test_flex_cached_causal_uses_query_offset():
+    shaped = causal_mask(2, 4, impl="flex_attention", device="cpu")
     expected = torch.tensor(
         [
             [True, True, True, False],
@@ -230,19 +229,17 @@ def test_flex_shape_forwards_requested_device(monkeypatch):
     assert captured["device"] == "cuda:7"
 
 
-@pytest.mark.parametrize("impl", ("magi_attention", "veomni_magi_attention"))
-def test_magi_causal_aligns_with_hf_builder(impl):
+def test_magi_causal_aligns_with_hf_builder():
     built = magi_attention_mask_builder(1, 4, 4, device="cpu")
-    shaped = causal_mask(4, 4, impl=impl, device="cpu")
+    shaped = causal_mask(4, 4, impl="magi_attention", device="cpu")
     torch.testing.assert_close(shaped.q_ranges, built.q_ranges)
     torch.testing.assert_close(shaped.k_ranges, built.k_ranges)
     torch.testing.assert_close(shaped.attn_type_map, built.attn_type_map)
 
 
-@pytest.mark.parametrize("impl", ("magi_attention", "veomni_magi_attention"))
-def test_magi_cached_causal_uses_bottom_right_alignment(impl):
+def test_magi_cached_causal_uses_bottom_right_alignment():
     built = magi_attention_mask_builder(1, 2, 4, q_offset=2, device="cpu")
-    shaped = causal_mask(2, 4, impl=impl, device="cpu")
+    shaped = causal_mask(2, 4, impl="magi_attention", device="cpu")
     expected = torch.tensor(
         [
             [True, True, True, False],

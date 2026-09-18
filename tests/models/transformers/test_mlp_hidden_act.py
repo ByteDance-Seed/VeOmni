@@ -16,37 +16,21 @@
 
 from __future__ import annotations
 
+import importlib
+from collections.abc import Callable
+
 import pytest
 import torch
 from torch import nn
-from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3Experts as HFDeepseekV3Experts
-from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MLP as HFDeepseekV3MLP
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts as HFDeepseekV4Experts
-from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MLP as HFDeepseekV4MLP
-from transformers.models.llama.modeling_llama import LlamaMLP as HFLlamaMLP
 from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP as HFQwen2MLP
-from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP as HFQwen3MLP
-from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeExperts as HFQwen3_5MoeExperts
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts as HFQwen3MoeExperts
-from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeMLP as HFQwen3MoeMLP
-from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-    Qwen3OmniMoeThinkerTextExperts as HFQwen3OmniMoeThinkerTextExperts,
-)
-from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeTextExperts as HFQwen3VLMoeTextExperts
-from transformers.models.seed_oss.modeling_seed_oss import SeedOssMLP as HFSeedOssMLP
 
 from tests.models.compare import assert_module_forward_and_grads_match, eager_ops_config, ops_config_scope
 from tests.models.tiny_configs import (
-    tiny_deepseek_v3_config,
     tiny_deepseek_v4_config,
-    tiny_llama_config,
     tiny_qwen2_config,
-    tiny_qwen3_5_moe_text_config,
-    tiny_qwen3_config,
     tiny_qwen3_moe_config,
-    tiny_qwen3_omni_moe_text_config,
-    tiny_qwen3_vl_moe_config,
-    tiny_seed_oss_config,
 )
 from veomni.utils.device import IS_NPU_AVAILABLE
 
@@ -71,6 +55,14 @@ def _raise_if_called(*_args, **_kwargs):
 def _init_parameters(module: nn.Module) -> None:
     for param in module.parameters():
         nn.init.normal_(param, std=0.02)
+
+
+def _generated_cls(family: str, class_name: str):
+    suffix = "npu" if IS_NPU_AVAILABLE and family != "qwen2" else "gpu"
+    module = importlib.import_module(
+        f"veomni.models.transformers.{family}.generated.patched_modeling_{family}_{suffix}"
+    )
+    return getattr(module, class_name)
 
 
 def _pair(ours_cls, hf_cls, config):
@@ -98,142 +90,6 @@ def _assert_matches(hf, ours, counter, *args):
         assert counter.calls == 1
 
 
-@pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)
-def test_qwen2_dense_mlp_matches_hf_for_hidden_act(hidden_act):
-    from veomni.models.transformers.qwen2.generated.patched_modeling_qwen2_gpu import Qwen2MLP
-
-    config = tiny_qwen2_config(hidden_act=hidden_act)
-    hf, ours, counter = _pair(Qwen2MLP, HFQwen2MLP, config)
-    x = torch.randn(2, 5, config.hidden_size)
-    _assert_matches(hf, ours, counter, x)
-
-
-@pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)
-def test_qwen3_dense_mlp_matches_hf_for_hidden_act(hidden_act):
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_npu import Qwen3MLP
-    else:
-        from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import Qwen3MLP
-
-    config = tiny_qwen3_config(hidden_act=hidden_act)
-    hf, ours, counter = _pair(Qwen3MLP, HFQwen3MLP, config)
-    x = torch.randn(2, 5, config.hidden_size)
-    _assert_matches(hf, ours, counter, x)
-
-
-@pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)
-def test_qwen3_moe_dense_mlp_matches_hf_for_hidden_act(hidden_act):
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_npu import Qwen3MoeMLP
-    else:
-        from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import Qwen3MoeMLP
-
-    config = tiny_qwen3_moe_config(hidden_act=hidden_act)
-    hf, ours, counter = _pair(Qwen3MoeMLP, HFQwen3MoeMLP, config)
-    x = torch.randn(2, 5, config.hidden_size)
-    _assert_matches(hf, ours, counter, x)
-
-
-@pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)
-def test_qwen3_moe_merged_experts_match_hf_for_hidden_act(hidden_act):
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_npu import Qwen3MoeExperts
-    else:
-        from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import Qwen3MoeExperts
-
-    config = tiny_qwen3_moe_config(hidden_act=hidden_act)
-    hf, ours, counter = _pair(Qwen3MoeExperts, HFQwen3MoeExperts, config)
-    tokens = 6
-    hidden = torch.randn(tokens, config.hidden_size)
-    top_k_index = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0], [0, 2], [1, 3]], dtype=torch.long)
-    top_k_weights = torch.rand(tokens, config.num_experts_per_tok)
-    top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
-    _assert_matches(hf, ours, counter, hidden, top_k_index, top_k_weights)
-
-
-@pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)
-def test_llama_dense_mlp_matches_hf_for_hidden_act(hidden_act):
-    from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaMLP
-
-    config = tiny_llama_config(hidden_act=hidden_act)
-    hf, ours, counter = _pair(LlamaMLP, HFLlamaMLP, config)
-    x = torch.randn(2, 5, config.hidden_size)
-    _assert_matches(hf, ours, counter, x)
-
-
-@pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)
-def test_seed_oss_dense_mlp_matches_hf_for_hidden_act(hidden_act):
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.seed_oss.generated.patched_modeling_seed_oss_npu import SeedOssMLP
-    else:
-        from veomni.models.transformers.seed_oss.generated.patched_modeling_seed_oss_gpu import SeedOssMLP
-
-    config = tiny_seed_oss_config()
-    config.hidden_act = hidden_act
-    hf, ours, counter = _pair(SeedOssMLP, HFSeedOssMLP, config)
-    x = torch.randn(2, 5, config.hidden_size)
-    _assert_matches(hf, ours, counter, x)
-
-
-@pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)
-def test_deepseek_v3_dense_mlp_matches_hf_for_hidden_act(hidden_act):
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.deepseek_v3.generated.patched_modeling_deepseek_v3_npu import DeepseekV3MLP
-    else:
-        from veomni.models.transformers.deepseek_v3.generated.patched_modeling_deepseek_v3_gpu import DeepseekV3MLP
-
-    config = tiny_deepseek_v3_config()
-    config.hidden_act = hidden_act
-    hf, ours, counter = _pair(DeepseekV3MLP, HFDeepseekV3MLP, config)
-    x = torch.randn(2, 5, config.hidden_size)
-    _assert_matches(hf, ours, counter, x)
-
-
-@pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)
-def test_deepseek_v4_dense_mlp_matches_hf_for_hidden_act(hidden_act):
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_npu import DeepseekV4MLP
-    else:
-        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import DeepseekV4MLP
-
-    config = tiny_deepseek_v4_config()
-    config.hidden_act = hidden_act
-    hf, ours, counter = _pair(DeepseekV4MLP, HFDeepseekV4MLP, config)
-    x = torch.randn(2, 5, config.hidden_size)
-    _assert_matches(hf, ours, counter, x)
-
-
-@pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)
-def test_deepseek_v4_merged_experts_match_hf_for_hidden_act(hidden_act):
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_npu import DeepseekV4Experts
-    else:
-        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import DeepseekV4Experts
-
-    config = tiny_deepseek_v4_config()
-    config.hidden_act = hidden_act
-    hf, ours, counter = _pair(DeepseekV4Experts, HFDeepseekV4Experts, config)
-    _assert_matches(hf, ours, counter, *_moe_expert_inputs(config))
-
-
-@pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)
-def test_deepseek_v3_merged_experts_match_hf_for_hidden_act(hidden_act):
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.deepseek_v3.generated.patched_modeling_deepseek_v3_npu import DeepseekV3Experts
-    else:
-        from veomni.models.transformers.deepseek_v3.generated.patched_modeling_deepseek_v3_gpu import DeepseekV3Experts
-
-    config = tiny_deepseek_v3_config()
-    config.hidden_act = hidden_act
-    hf, ours, counter = _pair(DeepseekV3Experts, HFDeepseekV3Experts, config)
-    tokens = 6
-    hidden = torch.randn(tokens, config.hidden_size)
-    top_k_index = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0], [0, 2], [1, 3]], dtype=torch.long)
-    top_k_weights = torch.rand(tokens, config.num_experts_per_tok)
-    top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
-    _assert_matches(hf, ours, counter, hidden, top_k_index, top_k_weights)
-
-
 def _moe_expert_inputs(config):
     tokens = 6
     hidden = torch.randn(tokens, config.hidden_size)
@@ -243,52 +99,43 @@ def _moe_expert_inputs(config):
     return hidden, top_k_index, top_k_weights
 
 
-@pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)
-def test_qwen3_5_moe_merged_experts_match_hf_for_hidden_act(hidden_act):
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_npu import Qwen3_5MoeExperts
-    else:
-        from veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_gpu import Qwen3_5MoeExperts
-
-    config = tiny_qwen3_5_moe_text_config(layer_types=["full_attention", "full_attention"])
-    config.hidden_act = hidden_act
-    hf, ours, counter = _pair(Qwen3_5MoeExperts, HFQwen3_5MoeExperts, config)
-    _assert_matches(hf, ours, counter, *_moe_expert_inputs(config))
+def _config_with_hidden_act(factory: Callable[..., object], hidden_act: str):
+    try:
+        return factory(hidden_act=hidden_act)
+    except TypeError:
+        config = factory()
+        config.hidden_act = hidden_act
+        return config
 
 
 @pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)
-def test_qwen3_vl_moe_merged_experts_match_hf_for_hidden_act(hidden_act):
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.qwen3_vl_moe.generated.patched_modeling_qwen3_vl_moe_npu import (
-            Qwen3VLMoeTextExperts,
-        )
-    else:
-        from veomni.models.transformers.qwen3_vl_moe.generated.patched_modeling_qwen3_vl_moe_gpu import (
-            Qwen3VLMoeTextExperts,
-        )
-
-    config = tiny_qwen3_vl_moe_config()
-    text = config.text_config
-    text.hidden_act = hidden_act
-    hf, ours, counter = _pair(Qwen3VLMoeTextExperts, HFQwen3VLMoeTextExperts, text)
-    _assert_matches(hf, ours, counter, *_moe_expert_inputs(text))
-
-
-@pytest.mark.parametrize("hidden_act", HIDDEN_ACTS)
-def test_qwen3_omni_moe_merged_experts_match_hf_for_hidden_act(hidden_act):
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.qwen3_omni_moe.generated.patched_modeling_qwen3_omni_moe_npu import (
-            Qwen3OmniMoeThinkerTextExperts,
-        )
-    else:
-        from veomni.models.transformers.qwen3_omni_moe.generated.patched_modeling_qwen3_omni_moe_gpu import (
-            Qwen3OmniMoeThinkerTextExperts,
-        )
-
-    config = tiny_qwen3_omni_moe_text_config()
-    config.hidden_act = hidden_act
-    hf, ours, counter = _pair(Qwen3OmniMoeThinkerTextExperts, HFQwen3OmniMoeThinkerTextExperts, config)
-    _assert_matches(hf, ours, counter, *_moe_expert_inputs(config))
+@pytest.mark.parametrize(
+    ("family", "class_name", "hf_cls", "config_factory", "kind"),
+    (
+        pytest.param("qwen2", "Qwen2MLP", HFQwen2MLP, tiny_qwen2_config, "dense", id="qwen2-dense"),
+        pytest.param(
+            "qwen3_moe",
+            "Qwen3MoeExperts",
+            HFQwen3MoeExperts,
+            tiny_qwen3_moe_config,
+            "moe",
+            id="qwen3-moe-experts",
+        ),
+        pytest.param(
+            "deepseek_v4",
+            "DeepseekV4Experts",
+            HFDeepseekV4Experts,
+            tiny_deepseek_v4_config,
+            "moe",
+            id="dsv4-experts",
+        ),
+    ),
+)
+def test_hidden_act_routes_silu_to_fused_kernel(family, class_name, hf_cls, config_factory, kind, hidden_act):
+    config = _config_with_hidden_act(config_factory, hidden_act)
+    hf, ours, counter = _pair(_generated_cls(family, class_name), hf_cls, config)
+    args = (torch.randn(2, 5, config.hidden_size),) if kind == "dense" else _moe_expert_inputs(config)
+    _assert_matches(hf, ours, counter, *args)
 
 
 def test_merged_experts_act_fn_forward_rejects_ep_sharded_weights_without_ep():

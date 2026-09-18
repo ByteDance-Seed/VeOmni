@@ -90,6 +90,12 @@ def _empty_cu_seq_lens() -> torch.Tensor:
     return torch.empty(0, dtype=torch.int32)
 
 
+def _sdpa_ops():
+    ops = eager_ops_config()
+    ops.attn_implementation = "sdpa"
+    return ops
+
+
 def _pin_hf_gdn_to_torch(model: torch.nn.Module) -> None:
     """Force HF GatedDeltaNet onto the torch path our eager kernels match.
 
@@ -206,17 +212,9 @@ def test_qwen3_5_sdpa_full_attention_accepts_single_sequence_cu_seq_lens_q():
     assert torch.isfinite(output.logits).all()
 
 
-@pytest.mark.parametrize(
-    "ops_factory",
-    [
-        lambda: _sdpa_simple_ops(),
-        lambda: _sdpa_public_ops(),
-    ],
-    ids=["sdpa", "veomni_sdpa"],
-)
-def test_qwen3_5_sdpa_packed_sequences_are_isolated(ops_factory):
+def test_qwen3_5_sdpa_packed_sequences_are_isolated():
     torch.manual_seed(0)
-    ops = ops_factory()
+    ops = _sdpa_ops()
     config = _tiny_text_config(layer_types=["full_attention", "full_attention"])
     model = _build_causal(config, ops).eval()
     first_input_ids = torch.tensor([[5, 6, 7, 8]])
@@ -250,17 +248,9 @@ def test_qwen3_5_sdpa_packed_sequences_are_isolated(ops_factory):
     torch.testing.assert_close(packed_logits[:, 4:], second_logits, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize(
-    "ops_factory",
-    [
-        lambda: _sdpa_simple_ops(),
-        lambda: _sdpa_public_ops(),
-    ],
-    ids=["sdpa", "veomni_sdpa"],
-)
-def test_qwen3_5_sdpa_editing_first_packed_sample_does_not_move_second(ops_factory):
+def test_qwen3_5_sdpa_editing_first_packed_sample_does_not_move_second():
     torch.manual_seed(0)
-    ops = ops_factory()
+    ops = _sdpa_ops()
     config = _tiny_text_config(layer_types=["full_attention", "full_attention"])
     model = _build_causal(config, ops).eval()
     packed_input_ids = torch.tensor([[5, 6, 7, 8, 9, 10, 11, 12]])
@@ -290,12 +280,8 @@ def test_qwen3_5_sdpa_editing_first_packed_sample_does_not_move_second(ops_facto
 
 @pytest.mark.parametrize(
     "ops_factory",
-    [
-        lambda: eager_ops_config(),
-        lambda: _sdpa_simple_ops(),
-        lambda: _sdpa_public_ops(),
-    ],
-    ids=["eager", "sdpa", "veomni_sdpa"],
+    [eager_ops_config, _sdpa_ops],
+    ids=["eager", "sdpa"],
 )
 def test_qwen3_5_packed_padding_matches_separate_logits_and_grads(ops_factory):
     torch.manual_seed(0)
@@ -346,15 +332,3 @@ def test_qwen3_5_packed_padding_matches_separate_logits_and_grads(ops_factory):
             if packed_grads[name] is None:
                 continue
             torch.testing.assert_close(packed_grads[name], separate_grads[name], rtol=1e-4, atol=1e-5)
-
-
-def _sdpa_simple_ops():
-    ops = eager_ops_config()
-    ops.attn_implementation = "sdpa"
-    return ops
-
-
-def _sdpa_public_ops():
-    from tests.tools.training_utils import make_eager_ops_config
-
-    return make_eager_ops_config(attn_implementation="sdpa")

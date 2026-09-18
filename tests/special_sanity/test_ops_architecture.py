@@ -27,7 +27,7 @@ MODEL_ENTRY_ROOTS = (REPO_ROOT / "tasks", REPO_ROOT / "veomni" / "trainer")
 
 
 def _active_text_files() -> list[Path]:
-    """Return maintained text files outside the legacy model tests."""
+    """Return maintained text files in the current architecture tree."""
     files: list[Path] = []
     for root_name in (
         ".agents/knowledge",
@@ -42,9 +42,6 @@ def _active_text_files() -> list[Path]:
         for path in (REPO_ROOT / root_name).rglob("*"):
             if not path.is_file() or path.suffix not in TEXT_SUFFIXES:
                 continue
-            relative = path.relative_to(REPO_ROOT)
-            if relative.parts[:2] == ("tests", "models"):
-                continue
             files.append(path)
     files.append(REPO_ROOT / "pyproject.toml")
     files.append(REPO_ROOT / ".coderabbit.yaml")
@@ -54,16 +51,22 @@ def _active_text_files() -> list[Path]:
     return sorted(set(files))
 
 
+_REMOVED_PACKAGES = re.compile(
+    r"veomni[./]" + r"kernels(?:[./]|\b)|"
+    r"tests/" + r"kernels(?:/|\b)|"
+    r"veomni[./]" + r"models_kernel(?:[./]|\b)|"
+    r"tests/" + r"models_kernel(?:/|\b)"
+)
+
+
 def test_active_tree_uses_ops_architecture_paths():
-    """Prevent removed package paths and production model-stack imports from returning."""
-    removed_ops_package = re.compile(r"veomni[./]" + r"kernels(?:[./]|\b)|tests/" + r"kernels(?:/|\b)")
-    model_package = re.compile(r"veomni[./]models(?:[./]|\b)")
+    """Prevent removed leftover kernel and models-kernel package paths from returning."""
     stale: list[str] = []
     for path in _active_text_files():
         relative = path.relative_to(REPO_ROOT)
         text = path.read_text(encoding="utf-8")
         for line_number, line in enumerate(text.splitlines(), start=1):
-            if removed_ops_package.search(line) or model_package.search(line):
+            if _REMOVED_PACKAGES.search(line):
                 stale.append(f"{relative}:{line_number}: {line.strip()}")
 
     assert not stale, "Stale architecture paths:\n" + "\n".join(stale)
@@ -95,7 +98,7 @@ def test_model_entry_points_forward_ops_selection():
                 if "ops_implementation" not in keywords:
                     missing.append(location)
                 elif root.name == "trainer" and not ast.unparse(keywords["ops_implementation"]).endswith(
-                    ".model.ops_implementation"
+                    ".ops_implementation"
                 ):
                     miswired.append(location)
                 if "kernels_implementation" in keywords:

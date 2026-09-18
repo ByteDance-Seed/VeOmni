@@ -65,24 +65,24 @@ def test_sdpa_attention_forward_square_causal_layout(impl, metadata):
     assert torch.isfinite(output).all()
 
 
-@pytest.mark.parametrize(
-    "entrypoint", ("sdpa", "veomni_sdpa", "adapter", "mask", "causal_mask", "sliding_window_mask")
+_PACKED_METADATA_KEYS = (
+    "cu_seqlens",
+    "cu_seqlens_q",
+    "cu_seqlens_k",
+    "cu_seq_lens_q",
+    "cu_seq_lens_k",
+    "max_length_q",
+    "max_length_k",
+    "max_seqlen_q",
+    "max_seqlen_k",
 )
+
+
 @pytest.mark.parametrize(
-    "name",
-    (
-        "cu_seqlens",
-        "cu_seqlens_q",
-        "cu_seqlens_k",
-        "cu_seq_lens_q",
-        "cu_seq_lens_k",
-        "max_length_q",
-        "max_length_k",
-        "max_seqlen_q",
-        "max_seqlen_k",
-    ),
+    "entrypoint",
+    ("sdpa", "veomni_sdpa", "adapter", "mask", "causal_mask", "sliding_window_mask"),
 )
-def test_sdpa_rejects_packed_metadata_before_backend_or_collectives(monkeypatch, entrypoint, name):
+def test_sdpa_rejects_packed_metadata_before_backend_or_collectives(monkeypatch, entrypoint):
     """Every SDPA entry rejects explicit packing, including standalone aliases."""
 
     def unexpected_call(*args, **kwargs):
@@ -91,22 +91,23 @@ def test_sdpa_rejects_packed_metadata_before_backend_or_collectives(monkeypatch,
     monkeypatch.setattr(sdpa_backend, "get_parallel_state", unexpected_call)
     monkeypatch.setattr(sdpa_mask, "should_apply_ulysses", unexpected_call)
     monkeypatch.setattr(F, "scaled_dot_product_attention", unexpected_call)
-    metadata = {name: 0 if name.startswith("max_") else torch.tensor([0, 2, 4])}
-    with pytest.raises(ValueError, match=f"SDPA does not support packed/varlen attention metadata: {name}"):
-        if entrypoint == "mask":
-            sdpa_mask.sdpa_attention_mask_builder(1, 4, 4, device="cpu", **metadata)
-        elif entrypoint == "causal_mask":
-            causal_mask(4, 4, impl="sdpa", device="cpu", **metadata)
-        elif entrypoint == "sliding_window_mask":
-            sliding_window_mask(4, 4, impl="veomni_sdpa", device="cpu", sliding_window=2, **metadata)
-        else:
-            query = torch.ones(1, 2, 4, 8)
-            forward = (
-                sdpa_backend.sdpa_attention_forward
-                if entrypoint == "adapter"
-                else VeomniOp("attention", "standard", entrypoint)
-            )
-            forward(_FakeAttentionModule(), query, query, query, None, **metadata)
+    for name in _PACKED_METADATA_KEYS:
+        metadata = {name: 0 if name.startswith("max_") else torch.tensor([0, 2, 4])}
+        with pytest.raises(ValueError, match=f"SDPA does not support packed/varlen attention metadata: {name}"):
+            if entrypoint == "mask":
+                sdpa_mask.sdpa_attention_mask_builder(1, 4, 4, device="cpu", **metadata)
+            elif entrypoint == "causal_mask":
+                causal_mask(4, 4, impl="sdpa", device="cpu", **metadata)
+            elif entrypoint == "sliding_window_mask":
+                sliding_window_mask(4, 4, impl="sdpa", device="cpu", sliding_window=2, **metadata)
+            else:
+                query = torch.ones(1, 2, 4, 8)
+                forward = (
+                    sdpa_backend.sdpa_attention_forward
+                    if entrypoint == "adapter"
+                    else VeomniOp("attention", "standard", entrypoint)
+                )
+                forward(_FakeAttentionModule(), query, query, query, None, **metadata)
 
 
 def test_sdpa_attention_rejects_zero_dimensions():
