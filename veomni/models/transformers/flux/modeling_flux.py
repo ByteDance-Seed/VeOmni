@@ -16,7 +16,6 @@
 """Adapted from https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/layers.py"""
 
 import torch
-import torch.nn.functional as F
 from einops import rearrange
 from transformers.modeling_utils import PreTrainedModel
 
@@ -35,23 +34,10 @@ from .utils_flux import (
     FluxDiTStateDictConverter,
     TileWorker,
     TimestepEmbeddings,
+    bind_flux_attention,
+    flux_attention,
     init_weights_on_device,
 )
-
-
-try:
-    import flash_attn_interface
-
-    FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
-    FLASH_ATTN_3_AVAILABLE = False
-
-try:
-    import flash_attn
-
-    FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
-    FLASH_ATTN_2_AVAILABLE = False
 
 
 def print_rank_0(message):
@@ -68,52 +54,6 @@ def gather_seq_scatter_heads_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tens
     k = gather_seq_scatter_heads(k, seq_dim, head_dim)
     v = gather_seq_scatter_heads(v, seq_dim, head_dim)
     return q, k, v
-
-
-def rearrange_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rerange_type: str):
-    q = rearrange(q, rerange_type)
-    k = rearrange(k, rerange_type)
-    v = rearrange(v, rerange_type)
-    return q, k, v
-
-
-def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False, attn_mask=None):
-    # bs, head_cont, seq, head_dim = q.shape
-
-    if attn_mask is not None:
-        # flash_attn_func (FA2/FA3) does not accept an arbitrary attention mask, so fall
-        # back to scaled_dot_product_attention, which supports an additive mask. Note that
-        # supplying a mask rules out SDPA's flash backend, so this uses the memory-efficient
-        # kernel (or the math fallback) instead. The flash-attn path below is for the
-        # mask-less case only.
-        if causal:
-            # scaled_dot_product_attention cannot take both `attn_mask` and `is_causal`, so
-            # merge a lower-triangular causal bias into the additive mask to preserve the
-            # caller's causal intent. No in-tree caller passes a mask with causal=True; this
-            # is defensive for future callers.
-            if attn_mask.dtype == torch.bool:
-                attn_mask = torch.zeros_like(attn_mask, dtype=q.dtype).masked_fill_(~attn_mask, float("-inf"))
-            causal_bias = torch.triu(torch.full_like(attn_mask, float("-inf")), diagonal=1)
-            attn_mask = attn_mask + causal_bias
-        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-
-    if FLASH_ATTN_3_AVAILABLE or FLASH_ATTN_2_AVAILABLE:
-        rerange_type_seq_head = "b n s d -> b s n d"
-        rerange_type_head_seq = "b s n d -> b n s d"
-        q, k, v = rearrange_qkv(q, k, v, rerange_type_seq_head)
-
-    if FLASH_ATTN_3_AVAILABLE:
-        x = flash_attn_interface.flash_attn_func(q, k, v, causal=causal)
-        if isinstance(x, tuple):
-            x = x[0]
-    elif FLASH_ATTN_2_AVAILABLE:
-        x = flash_attn.flash_attn_func(q, k, v, causal=causal)
-    else:
-        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        return x
-
-    x = rearrange(x, rerange_type_head_seq)
-    return x
 
 
 class AdaLayerNorm(torch.nn.Module):
@@ -165,9 +105,9 @@ class RMSNorm(torch.nn.Module):
         return self.veomni_rms_norm(hidden_states, self.weight, eps=self.eps)
 
 
-def interact_with_ipadapter(hidden_states, q, ip_k, ip_v, scale=1.0):
+def interact_with_ipadapter(module, hidden_states, q, ip_k, ip_v, scale=1.0):
     batch_size, num_tokens = hidden_states.shape[0:2]
-    ip_hidden_states = torch.nn.functional.scaled_dot_product_attention(q, ip_k, ip_v)
+    ip_hidden_states = flux_attention(module, q, ip_k, ip_v)
     ip_hidden_states = ip_hidden_states.transpose(1, 2).reshape(batch_size, num_tokens, -1)
     hidden_states = hidden_states + scale * ip_hidden_states
     return hidden_states
@@ -219,6 +159,7 @@ class FluxJointAttention(torch.nn.Module):
         self.a_to_out = torch.nn.Linear(dim_a, dim_a)
         if not only_out_a:
             self.b_to_out = torch.nn.Linear(dim_b, dim_b)
+        bind_flux_attention(self)
 
     def apply_rope(self, xq, xk, freqs_cis):
         # 打印输入大小，在一行
@@ -251,7 +192,7 @@ class FluxJointAttention(torch.nn.Module):
         k = torch.concat([k_b, k_a], dim=2)
         v = torch.concat([v_b, v_a], dim=2)
         q, k = self.apply_rope(q, k, image_rotary_emb)
-        hidden_states = flash_attention(q, k, v, causal=False, attn_mask=attn_mask)
+        hidden_states = flux_attention(self, q, k, v, attn_mask)
 
         if get_parallel_state().ulysses_enabled:
             hidden_states = gather_heads_scatter_seq(hidden_states, seq_dim=2, head_dim=1)
@@ -263,7 +204,7 @@ class FluxJointAttention(torch.nn.Module):
             hidden_states[:, hidden_states_b.shape[1] :],
         )
         if ipadapter_kwargs_list is not None:
-            hidden_states_a = interact_with_ipadapter(hidden_states_a, q_a, **ipadapter_kwargs_list)
+            hidden_states_a = interact_with_ipadapter(self, hidden_states_a, q_a, **ipadapter_kwargs_list)
 
         hidden_states_a = self.a_to_out(hidden_states_a)
         if self.only_out_a:
@@ -329,6 +270,7 @@ class FluxSingleAttention(torch.nn.Module):
 
         self.norm_q_a = RMSNorm(head_dim, eps=1e-6)
         self.norm_k_a = RMSNorm(head_dim, eps=1e-6)
+        bind_flux_attention(self)
 
     def apply_rope(self, xq, xk, freqs_cis):
         xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
@@ -347,7 +289,7 @@ class FluxSingleAttention(torch.nn.Module):
 
         q, k = self.apply_rope(q_a, k_a, image_rotary_emb)
 
-        hidden_states = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        hidden_states = flux_attention(self, q, k, v)
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
         hidden_states = hidden_states.to(q.dtype)
@@ -381,6 +323,7 @@ class FluxSingleTransformerBlock(torch.nn.Module):
         self.norm_k_a = RMSNorm(self.head_dim, eps=1e-6)
 
         self.proj_out = torch.nn.Linear(dim * 5, dim)
+        bind_flux_attention(self)
 
     def apply_rope(self, xq, xk, freqs_cis):
         xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
@@ -401,7 +344,7 @@ class FluxSingleTransformerBlock(torch.nn.Module):
 
         q, k = self.apply_rope(q, k, image_rotary_emb)
 
-        hidden_states = flash_attention(q, k, v, causal=False, attn_mask=attn_mask)
+        hidden_states = flux_attention(self, q, k, v, attn_mask)
 
         if get_parallel_state().ulysses_enabled:
             hidden_states = gather_heads_scatter_seq(hidden_states, seq_dim=2, head_dim=1)
@@ -409,7 +352,7 @@ class FluxSingleTransformerBlock(torch.nn.Module):
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
         hidden_states = hidden_states.to(q.dtype)
         if ipadapter_kwargs_list is not None:
-            hidden_states = interact_with_ipadapter(hidden_states, q, **ipadapter_kwargs_list)
+            hidden_states = interact_with_ipadapter(self, hidden_states, q, **ipadapter_kwargs_list)
         return hidden_states
 
     def forward(

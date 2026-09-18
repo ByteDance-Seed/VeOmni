@@ -40,12 +40,19 @@ from veomni.models.diffusers.wan_t2v.wan_transformer.configuration_wan_transform
 _OFFICIAL_FORWARD = OfficialWanTransformer3DModel.forward
 
 
+def _sdpa_ops_config() -> SimpleNamespace:
+    """Portable wan_t2v attention path. This family has no local eager forward."""
+    ops = eager_ops_config()
+    ops.attn_implementation = "sdpa"
+    return ops
+
+
 def _build_ours(config: WanTransformer3DModelConfig, ops: SimpleNamespace | None = None):
     from veomni.models.diffusers.wan_t2v.wan_transformer.modeling_wan_transformer import (
         WanTransformer3DModel,
     )
 
-    with ops_config_scope(ops if ops is not None else eager_ops_config()):
+    with ops_config_scope(ops if ops is not None else _sdpa_ops_config()):
         return WanTransformer3DModel(config)
 
 
@@ -94,7 +101,7 @@ def test_wan_t2v_public_training_forward_matches_official(monkeypatch):
     # Registry resolution installs the production backbone forward. Restore that
     # class-level patch after this test, including when an assertion fails.
     monkeypatch.setattr(OfficialWanTransformer3DModel, "forward", OfficialWanTransformer3DModel.forward)
-    with ops_config_scope(eager_ops_config()):
+    with ops_config_scope(_sdpa_ops_config()):
         ours = get_model_class(config)(config)
     ours.load_state_dict(official.state_dict())
     samples = [
@@ -164,7 +171,7 @@ def test_wan_t2v_flash2_kernel_passes_full_sequence_varlen_kwargs(available_nvid
     assert captured["cu_seq_lens_k"].tolist() == [0, 8, 16]
 
 
-def test_wan_t2v_eager_skips_full_sequence_varlen_kwargs():
+def test_wan_t2v_sdpa_skips_full_sequence_varlen_kwargs():
     model = _build_ours(_tiny_config()).to(dtype=torch.bfloat16)
     attn = model.blocks[0].attn1
     captured: dict = {}
@@ -173,6 +180,7 @@ def test_wan_t2v_eager_skips_full_sequence_varlen_kwargs():
         captured.update(kwargs)
         return query.transpose(1, 2), None
 
+    assert attn.processor.veomni_attn.impl == "sdpa"
     assert not attn.processor._use_flash2
     attn.processor.veomni_attn = record
     hidden = torch.randn(2, 8, attn.to_q.in_features, dtype=torch.bfloat16)

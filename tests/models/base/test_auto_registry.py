@@ -538,12 +538,13 @@ _MODEL_CASES = (
     ),
     _ModelCase(
         model_type="WanTransformer3DModel",
-        eager_ops=(("blocks.0.attn1.processor.veomni_attn", "attention"),),
         config_factory=_tiny_wan_t2v_config,
         architectures=("WanTransformer3DModel",),
         has_registered_config=True,
         registered_config_aliases=("WanTransformer3DConditionModel",),
         registered_model_aliases=("WanTransformer3DConditionModel",),
+        # Portable attention is sdpa; there is no model-local eager forward.
+        eager_ops=(),
     ),
 )
 

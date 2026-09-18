@@ -63,10 +63,10 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
         "attn_implementation": "flash_attention_2",
         "rotary_pos_emb_implementation": "eager",
     },
-    # Qwen-Image runs its dual-stream joint attention through diffusers' own
-    # attention dispatch (Ulysses SP is handled by QwenImageSPAttnProcessor, not
-    # the VeOmni FA2 op), so keep the VeOmni attn/rope ops on eager.
-    "qwen_image": {"attn_implementation": "eager", "rotary_pos_emb_implementation": "eager"},
+    # Qwen-Image joint attention is now VeOmni ``attention/standard``. The
+    # official path builds a ``(B, S)`` padding mask, so keep SDPA rather than
+    # FA. RoPE stays eager because this family has no fused rope row.
+    "qwen_image": {"attn_implementation": "sdpa", "rotary_pos_emb_implementation": "eager"},
     # qwen3_5 / qwen3_5_moe peak GPU memory on the toy config is dominated
     # by the fused Liger cross-entropy kernel materializing the full
     # ``[B, S, V]`` logits buffer. Use ``chunk_loss`` instead: it

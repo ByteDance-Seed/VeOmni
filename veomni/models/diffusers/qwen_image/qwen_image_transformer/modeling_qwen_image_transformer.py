@@ -5,13 +5,13 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 from math import prod
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import QwenImageTransformer2DModel as _QwenImageTransformer2DModel
-from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.transformers.transformer_qwenimage import (
     apply_rotary_emb_qwen,
@@ -20,6 +20,9 @@ from diffusers.models.transformers.transformer_qwenimage import (
 from diffusers.utils import apply_lora_scale
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
+
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
@@ -48,6 +51,38 @@ def _pad_seq(x: torch.Tensor, dim: int, pad_size: int, value: float = 0) -> torc
     return torch.cat([x, pad], dim=dim)
 
 
+_SDPA_ATTN_IMPLS = frozenset({"sdpa", "veomni_sdpa"})
+
+
+class QwenImageAttentionKernelModule:
+    """HF attention-interface view for joint Qwen-Image Q/K/V."""
+
+    def __init__(self, impl: str, attn):
+        target_dtype = attn.to_q.weight.dtype
+        if target_dtype == torch.float32:
+            target_dtype = torch.bfloat16
+        self.config = SimpleNamespace(
+            _attn_implementation=impl,
+            _pre_quantization_dtype=target_dtype,
+        )
+        self.is_causal = False
+        self.layer_idx = getattr(attn, "layer_idx", None)
+        self.num_key_value_groups = 1
+        self._attn = attn
+
+    def modules(self):
+        return self._attn.modules()
+
+
+def _hf_key_padding_mask(attention_mask: torch.Tensor | None) -> torch.Tensor | None:
+    """Expand the joint ``(B, S)`` keep-mask to HF ``(B, 1, 1, S)``."""
+    if attention_mask is None:
+        return None
+    if attention_mask.ndim == 2:
+        return attention_mask[:, None, None, :]
+    return attention_mask
+
+
 class QwenImageSPAttnProcessor:
     """Joint dual-stream attention processor with Ulysses sequence parallelism.
 
@@ -59,14 +94,13 @@ class QwenImageSPAttnProcessor:
     attention mask stays valid without any reordering.
     """
 
-    _attention_backend = None
-    _parallel_config = None
-
     def __init__(self):
-        if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError(
-                "QwenImageSPAttnProcessor requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0."
-            )
+        impl = resolve_op_impl("attn_implementation")
+        self.veomni_attn = VeomniOp("attention", "standard", impl)
+        self.veomni_attn_masked = (
+            self.veomni_attn if impl in _SDPA_ATTN_IMPLS else VeomniOp("attention", "standard", "sdpa")
+        )
+        self.config = SimpleNamespace(_attn_implementation=impl)
 
     def __call__(
         self,
@@ -133,16 +167,17 @@ class QwenImageSPAttnProcessor:
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
-        joint_hidden_states = dispatch_attention_fn(
-            joint_query,
-            joint_key,
-            joint_value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
+        handle = self.veomni_attn_masked if attention_mask is not None else self.veomni_attn
+        joint_hidden_states = handle(
+            QwenImageAttentionKernelModule(self.config._attn_implementation, attn),
+            joint_query.transpose(1, 2),
+            joint_key.transpose(1, 2),
+            joint_value.transpose(1, 2),
+            _hf_key_padding_mask(attention_mask),
+            dropout=0.0,
             is_causal=False,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
-        )
+            skip_ulysses=True,
+        )[0]
 
         # joint_hidden_states: (B, joint_seq, heads_local, head_dim)
         txt_attn_output = joint_hidden_states[:, :seq_txt]

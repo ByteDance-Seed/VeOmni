@@ -33,29 +33,6 @@ from .configuration_wan_transformer import WanTransformer3DModelConfig
 logger = logging.get_logger(__name__)
 
 
-# ================================================================
-# Eager attention forward for WanTransformer (SDPA fallback).
-# Inputs/output follow the ALL_ATTENTION_FUNCTIONS convention:
-#   input : (B, heads, seq, head_dim)
-#   output: (B, seq,   heads, head_dim), None
-# ``VeomniOp("attention", ...)`` looks this name up on the defining module.
-# ================================================================
-def eager_attention_forward(
-    module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask=None,
-    scaling: float | None = None,
-    dropout: float = 0.0,
-    **kwargs,
-) -> tuple[torch.Tensor, None]:
-    attn_output = F.scaled_dot_product_attention(
-        query, key, value, attn_mask=attention_mask, dropout_p=dropout, scale=scaling, is_causal=False
-    )
-    return attn_output.transpose(1, 2), None
-
-
 class WanAttentionKernelModule:
     def __init__(self, config: SimpleNamespace, attn: WanAttention):
         target_dtype = attn.to_q.weight.dtype

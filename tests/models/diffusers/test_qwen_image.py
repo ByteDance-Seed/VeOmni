@@ -23,16 +23,22 @@ import torch
 import torch.nn.functional as F
 from diffusers import QwenImageTransformer2DModel as OfficialQwenImageTransformer2DModel
 
-from tests.models.compare import assert_outputs_and_grads_match, eager_ops_config
+from tests.models.compare import assert_outputs_and_grads_match, eager_ops_config, ops_config_scope
 from tests.models.tiny_configs import tiny_qwen_image_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_qwen_image_config as _tiny_config
 from veomni.models.diffusers.qwen_image.qwen_image_transformer.configuration_qwen_image_transformer import (
     QwenImageTransformer2DModelConfig,
 )
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 _OFFICIAL_FORWARD = OfficialQwenImageTransformer2DModel.forward
+
+
+def _sdpa_ops_config() -> SimpleNamespace:
+    """Portable Qwen-Image attention path. This family has no local eager forward."""
+    ops = eager_ops_config()
+    ops.attn_implementation = "sdpa"
+    return ops
 
 
 def test_qwen_image_configs_roundtrip_through_registry(tmp_path):
@@ -79,12 +85,11 @@ def test_qwen_image_public_forward_matches_official_without_sp(monkeypatch, trai
     config = _tiny_config()
     official = OfficialQwenImageTransformer2DModel(**config.to_diffuser_dict())
     monkeypatch.setattr(OfficialQwenImageTransformer2DModel, "forward", OfficialQwenImageTransformer2DModel.forward)
-    previous = get_ops_config()
-    set_ops_config(eager_ops_config())
-    try:
+    with ops_config_scope(_sdpa_ops_config()):
         ours = get_model_class(config)(config)
-    finally:
-        set_ops_config(previous)
+    processor = ours.transformer_blocks[0].attn.processor
+    assert processor.veomni_attn.impl == "sdpa"
+    assert processor.veomni_attn_masked is processor.veomni_attn
     ours.load_state_dict(official.state_dict())
     samples = [
         {
@@ -136,3 +141,17 @@ def test_qwen_image_public_forward_matches_official_without_sp(monkeypatch, trai
         for key in ("hidden_states", "encoder_hidden_states"):
             assert expected[key].grad is not None
             torch.testing.assert_close(actual[key].grad, expected[key].grad)
+
+
+def test_qwen_image_masked_attention_falls_back_to_sdpa(available_nvidia_ops):
+    from veomni.models.diffusers.qwen_image.qwen_image_transformer.modeling_qwen_image_transformer import (
+        QwenImageSPAttnProcessor,
+    )
+
+    ops = eager_ops_config()
+    ops.attn_implementation = "flash_attention_2"
+    with ops_config_scope(ops):
+        processor = QwenImageSPAttnProcessor()
+    assert processor.veomni_attn.impl == "flash_attention_2"
+    assert processor.veomni_attn_masked.impl == "sdpa"
+    assert processor.veomni_attn_masked is not processor.veomni_attn

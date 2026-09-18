@@ -39,10 +39,17 @@ def _build_ours_rms(dim: int, *, elementwise_affine: bool = True, ops: SimpleNam
         return RMSNorm(dim, eps=1e-6, elementwise_affine=elementwise_affine)
 
 
+def _sdpa_ops_config() -> SimpleNamespace:
+    """Portable Flux attention path. This family has no local eager forward."""
+    ops = eager_ops_config()
+    ops.attn_implementation = "sdpa"
+    return ops
+
+
 def _build_ours_model():
     from veomni.models.transformers.flux.modeling_flux import FluxModel
 
-    with ops_config_scope(eager_ops_config()):
+    with ops_config_scope(_sdpa_ops_config()):
         return FluxModel(_tiny_config())
 
 
@@ -119,19 +126,15 @@ def test_flux_joint_attention_matches_official():
     torch.manual_seed(0)
     from veomni.models.transformers.flux import modeling_flux as ours_flux
 
-    # FA2/FA3 are CUDA-only. Pin the models copy to SDPA so it matches
-    # the adapted CPU snapshot.
-    ours_flags = (ours_flux.FLASH_ATTN_2_AVAILABLE, ours_flux.FLASH_ATTN_3_AVAILABLE)
-    ours_flux.FLASH_ATTN_2_AVAILABLE = False
-    ours_flux.FLASH_ATTN_3_AVAILABLE = False
-
     dim = 64
     num_heads = 4
     head_dim = dim // num_heads
     official = ref_flux.FluxJointAttention(dim, dim, num_heads, head_dim)
 
-    with ops_config_scope(eager_ops_config()):
+    with ops_config_scope(_sdpa_ops_config()):
         ours = ours_flux.FluxJointAttention(dim, dim, num_heads, head_dim)
+    assert ours.veomni_attn.impl == "sdpa"
+    assert ours.veomni_attn_masked is ours.veomni_attn
     ours.load_state_dict(official.state_dict())
 
     hidden_a = torch.randn(2, 4, dim)
@@ -145,46 +148,77 @@ def test_flux_joint_attention_matches_official():
     def call(module):
         return module(hidden_a, hidden_b, image_rotary_emb)
 
-    try:
-        assert_outputs_and_grads_match(official, ours, call)
-    finally:
-        ours_flux.FLASH_ATTN_2_AVAILABLE, ours_flux.FLASH_ATTN_3_AVAILABLE = ours_flags
+    assert_outputs_and_grads_match(official, ours, call)
+
+
+def test_flux_joint_attention_with_mask_matches_official():
+    torch.manual_seed(0)
+    from veomni.models.transformers.flux import modeling_flux as ours_flux
+
+    dim = 64
+    num_heads = 4
+    head_dim = dim // num_heads
+    official = ref_flux.FluxJointAttention(dim, dim, num_heads, head_dim)
+    with ops_config_scope(_sdpa_ops_config()):
+        ours = ours_flux.FluxJointAttention(dim, dim, num_heads, head_dim)
+    ours.load_state_dict(official.state_dict())
+
+    hidden_a = torch.randn(2, 4, dim)
+    hidden_b = torch.randn(2, 3, dim)
+    ids = torch.zeros(2, 7, 3)
+    ids[..., 0] = torch.arange(7)
+    ids[..., 1] = torch.arange(7)
+    ids[..., 2] = torch.arange(7)
+    rotary = ref_flux.RoPEEmbedding(dim, 10000, [8, 4, 4])(ids)
+    attn_mask = torch.zeros(2, 1, 7, 7)
+    attn_mask[:, :, :, -1] = float("-inf")
+
+    def call(module):
+        return module(hidden_a, hidden_b, rotary, attn_mask=attn_mask)
+
+    assert_outputs_and_grads_match(official, ours, call)
+
+
+def test_flux_masked_attention_falls_back_to_sdpa(available_nvidia_ops):
+    from veomni.models.transformers.flux.modeling_flux import FluxJointAttention
+
+    ops = eager_ops_config()
+    ops.attn_implementation = "flash_attention_2"
+    with ops_config_scope(ops):
+        attn = FluxJointAttention(32, 32, 4, 8)
+    assert attn.veomni_attn.impl == "flash_attention_2"
+    assert attn.veomni_attn_masked.impl == "sdpa"
+    assert attn.veomni_attn_masked is not attn.veomni_attn
 
 
 def test_flux_tiny_model_forward_backward_smoke():
     """Check end-to-end connectivity, not numerical parity of the whole backbone."""
-    from veomni.models.transformers.flux import modeling_flux
+    torch.manual_seed(0)
+    model = _build_ours_model()
+    hidden_states = torch.randn(2, 4, 4, 6)
+    timestep = torch.rand(2)
+    prompt_emb = torch.randn(2, 3, 48)
+    pooled_prompt_emb = torch.randn(2, 32)
+    guidance = torch.rand(2)
+    text_ids = torch.zeros(2, 3, 3)
 
-    flags = (modeling_flux.FLASH_ATTN_2_AVAILABLE, modeling_flux.FLASH_ATTN_3_AVAILABLE)
-    modeling_flux.FLASH_ATTN_2_AVAILABLE = False
-    modeling_flux.FLASH_ATTN_3_AVAILABLE = False
-    try:
-        torch.manual_seed(0)
-        model = _build_ours_model()
-        hidden_states = torch.randn(2, 4, 4, 6)
-        timestep = torch.rand(2)
-        prompt_emb = torch.randn(2, 3, 48)
-        pooled_prompt_emb = torch.randn(2, 32)
-        guidance = torch.rand(2)
-        text_ids = torch.zeros(2, 3, 3)
+    output = model(
+        hidden_states,
+        timestep,
+        prompt_emb,
+        pooled_prompt_emb,
+        guidance,
+        text_ids,
+    )
+    assert output.shape == hidden_states.shape
+    assert torch.isfinite(output).all()
 
-        output = model(
-            hidden_states,
-            timestep,
-            prompt_emb,
-            pooled_prompt_emb,
-            guidance,
-            text_ids,
-        )
-        assert output.shape == hidden_states.shape
-        assert torch.isfinite(output).all()
-
-        output.square().mean().backward()
-        assert model.x_embedder.weight.grad is not None
-        assert model.blocks[0].attn.a_to_qkv.weight.grad is not None
-        assert model.single_blocks[0].to_qkv_mlp.weight.grad is not None
-    finally:
-        modeling_flux.FLASH_ATTN_2_AVAILABLE, modeling_flux.FLASH_ATTN_3_AVAILABLE = flags
+    output.square().mean().backward()
+    assert model.x_embedder.weight.grad is not None
+    assert model.blocks[0].attn.a_to_qkv.weight.grad is not None
+    assert model.single_blocks[0].to_qkv_mlp.weight.grad is not None
+    assert model.blocks[0].attn.veomni_attn.impl == "sdpa"
+    assert model.single_blocks[0].veomni_attn.impl == "sdpa"
 
 
 def test_flux_patch_layout_and_image_coordinates():
@@ -241,44 +275,32 @@ def test_flux_final_conditioning_matches_explicit_formula():
 def test_flux_joint_attention_is_non_causal():
     from veomni.models.transformers.flux import modeling_flux
 
-    flags = (modeling_flux.FLASH_ATTN_2_AVAILABLE, modeling_flux.FLASH_ATTN_3_AVAILABLE)
-    modeling_flux.FLASH_ATTN_2_AVAILABLE = False
-    modeling_flux.FLASH_ATTN_3_AVAILABLE = False
-    try:
-        with ops_config_scope(eager_ops_config()):
-            block = modeling_flux.FluxJointAttention(32, 32, 4, 8).eval()
+    with ops_config_scope(_sdpa_ops_config()):
+        block = modeling_flux.FluxJointAttention(32, 32, 4, 8).eval()
 
-        text = torch.randn(1, 1, 32)
-        image = torch.randn(1, 2, 32)
-        rotary = _rotary_embedding(3, 8)
-        with torch.no_grad():
-            _, before = block(image, text, rotary)
-            image[:, -1].add_(1.0)
-            _, after = block(image, text, rotary)
-        assert not torch.allclose(before[0, 0], after[0, 0], atol=1e-5)
-    finally:
-        modeling_flux.FLASH_ATTN_2_AVAILABLE, modeling_flux.FLASH_ATTN_3_AVAILABLE = flags
+    text = torch.randn(1, 1, 32)
+    image = torch.randn(1, 2, 32)
+    rotary = _rotary_embedding(3, 8)
+    with torch.no_grad():
+        _, before = block(image, text, rotary)
+        image[:, -1].add_(1.0)
+        _, after = block(image, text, rotary)
+    assert not torch.allclose(before[0, 0], after[0, 0], atol=1e-5)
 
 
 def test_flux_single_transformer_block_is_non_causal():
     from veomni.models.transformers.flux import modeling_flux
 
-    flags = (modeling_flux.FLASH_ATTN_2_AVAILABLE, modeling_flux.FLASH_ATTN_3_AVAILABLE)
-    modeling_flux.FLASH_ATTN_2_AVAILABLE = False
-    modeling_flux.FLASH_ATTN_3_AVAILABLE = False
-    try:
-        with ops_config_scope(eager_ops_config()):
-            block = modeling_flux.FluxSingleTransformerBlock(32, 4).eval()
+    with ops_config_scope(_sdpa_ops_config()):
+        block = modeling_flux.FluxSingleTransformerBlock(32, 4).eval()
 
-        hidden_states = torch.randn(1, 3, 3 * 32)
-        rotary = _rotary_embedding(3, 8)
-        with torch.no_grad():
-            before = block.process_attention(hidden_states, rotary)
-            hidden_states[:, -1].add_(1.0)
-            after = block.process_attention(hidden_states, rotary)
-        assert not torch.allclose(before[0, 0], after[0, 0], atol=1e-5)
-    finally:
-        modeling_flux.FLASH_ATTN_2_AVAILABLE, modeling_flux.FLASH_ATTN_3_AVAILABLE = flags
+    hidden_states = torch.randn(1, 3, 3 * 32)
+    rotary = _rotary_embedding(3, 8)
+    with torch.no_grad():
+        before = block.process_attention(hidden_states, rotary)
+        hidden_states[:, -1].add_(1.0)
+        after = block.process_attention(hidden_states, rotary)
+    assert not torch.allclose(before[0, 0], after[0, 0], atol=1e-5)
 
 
 def test_flux_diffusers_converter_preserves_projection_layout():
