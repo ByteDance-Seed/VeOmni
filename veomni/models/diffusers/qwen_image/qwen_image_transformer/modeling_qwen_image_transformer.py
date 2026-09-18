@@ -83,6 +83,35 @@ def _hf_key_padding_mask(attention_mask: torch.Tensor | None) -> torch.Tensor | 
     return attention_mask
 
 
+def _joint_keep_mask(
+    *,
+    batch_size: int,
+    image_seq_len: int,
+    txt_seq_len: int,
+    device: torch.device,
+    encoder_hidden_states_mask: torch.Tensor | None = None,
+    img_pad: int = 0,
+    txt_pad: int = 0,
+) -> torch.Tensor | None:
+    """Build a joint ``[text, image]`` keep-mask, or None when every token is valid.
+
+    A dense all-true mask still selects the SDPA fallback, so omit it unless SP
+    padding or the text mask actually drops tokens.
+    """
+    if encoder_hidden_states_mask is None:
+        text_mask = torch.ones((batch_size, txt_seq_len), dtype=torch.bool, device=device)
+        text_drops_tokens = False
+    else:
+        text_mask = encoder_hidden_states_mask.to(dtype=torch.bool)
+        text_drops_tokens = not bool(text_mask.all().item())
+    if img_pad == 0 and txt_pad == 0 and not text_drops_tokens:
+        return None
+    text_mask = _pad_seq(text_mask, dim=1, pad_size=txt_pad, value=False)
+    image_mask = torch.ones((batch_size, image_seq_len), dtype=torch.bool, device=device)
+    image_mask = _pad_seq(image_mask, dim=1, pad_size=img_pad, value=False)
+    return torch.cat([text_mask, image_mask], dim=1)
+
+
 class QwenImageSPAttnProcessor:
     """Joint dual-stream attention processor with Ulysses sequence parallelism.
 
@@ -276,14 +305,19 @@ def QwenImageTransformer2DModel_forward(
         # Build the (padded) joint attention mask on FULL lengths so that, after
         # the per-stream all-to-all inside attention, padded positions on both
         # streams are masked out. Order matches the processor: [text, image].
-        if encoder_hidden_states_mask is not None:
-            text_mask = encoder_hidden_states_mask.to(torch.bool)
-        else:
-            text_mask = torch.ones((batch_size, txt_seq_len_full), dtype=torch.bool, device=hidden_states.device)
-        text_mask = _pad_seq(text_mask, dim=1, pad_size=txt_pad, value=False)
-        image_mask = torch.ones((batch_size, image_seq_len), dtype=torch.bool, device=hidden_states.device)
-        image_mask = _pad_seq(image_mask, dim=1, pad_size=img_pad, value=False)
-        block_attention_kwargs["attention_mask"] = torch.cat([text_mask, image_mask], dim=1)
+        # Omit the mask when nothing is padded and every text token is valid so
+        # a configured Flash/flex impl is not forced onto the SDPA fallback.
+        joint_mask = _joint_keep_mask(
+            batch_size=batch_size,
+            image_seq_len=image_seq_len,
+            txt_seq_len=txt_seq_len_full,
+            device=hidden_states.device,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+            img_pad=img_pad,
+            txt_pad=txt_pad,
+        )
+        if joint_mask is not None:
+            block_attention_kwargs["attention_mask"] = joint_mask
 
         # Pad streams + RoPE to a multiple of sp_size, then slice across ranks.
         hidden_states = _pad_seq(hidden_states, dim=1, pad_size=img_pad, value=0)
@@ -299,9 +333,16 @@ def QwenImageTransformer2DModel_forward(
         encoder_hidden_states = slice_input_tensor(encoder_hidden_states, dim=1, group=sp_group)
         if modulate_index is not None:
             modulate_index = slice_input_tensor(modulate_index, dim=1, group=sp_group)
-    elif encoder_hidden_states_mask is not None:
-        image_mask = torch.ones((batch_size, image_seq_len), dtype=torch.bool, device=hidden_states.device)
-        block_attention_kwargs["attention_mask"] = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
+    else:
+        joint_mask = _joint_keep_mask(
+            batch_size=batch_size,
+            image_seq_len=image_seq_len,
+            txt_seq_len=txt_seq_len_full,
+            device=hidden_states.device,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+        )
+        if joint_mask is not None:
+            block_attention_kwargs["attention_mask"] = joint_mask
 
     for index_block, block in enumerate(self.transformer_blocks):
         if torch.is_grad_enabled() and self.gradient_checkpointing:

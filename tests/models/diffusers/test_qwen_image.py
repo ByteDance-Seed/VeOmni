@@ -118,3 +118,122 @@ def test_qwen_image_public_forward_matches_official_without_sp(monkeypatch, trai
         for key in ("hidden_states", "encoder_hidden_states"):
             assert expected[key].grad is not None
             torch.testing.assert_close(actual[key].grad, expected[key].grad)
+
+
+def test_qwen_image_joint_keep_mask_omits_all_valid_tokens():
+    from veomni.models.diffusers.qwen_image.qwen_image_transformer.modeling_qwen_image_transformer import (
+        _joint_keep_mask,
+    )
+
+    device = torch.device("cpu")
+    all_true = torch.ones(2, 4, dtype=torch.bool)
+    assert (
+        _joint_keep_mask(
+            batch_size=2,
+            image_seq_len=8,
+            txt_seq_len=4,
+            device=device,
+            encoder_hidden_states_mask=all_true,
+        )
+        is None
+    )
+    assert (
+        _joint_keep_mask(
+            batch_size=2,
+            image_seq_len=8,
+            txt_seq_len=4,
+            device=device,
+            encoder_hidden_states_mask=None,
+        )
+        is None
+    )
+
+
+def test_qwen_image_joint_keep_mask_keeps_padding_and_dropped_text():
+    from veomni.models.diffusers.qwen_image.qwen_image_transformer.modeling_qwen_image_transformer import (
+        _joint_keep_mask,
+    )
+
+    device = torch.device("cpu")
+    text_mask = torch.tensor([[True, True, False]])
+    dropped = _joint_keep_mask(
+        batch_size=1,
+        image_seq_len=4,
+        txt_seq_len=3,
+        device=device,
+        encoder_hidden_states_mask=text_mask,
+    )
+    assert dropped is not None
+    assert dropped.shape == (1, 7)
+    assert dropped.tolist() == [[True, True, False, True, True, True, True]]
+
+    padded = _joint_keep_mask(
+        batch_size=1,
+        image_seq_len=3,
+        txt_seq_len=3,
+        device=device,
+        encoder_hidden_states_mask=None,
+        img_pad=1,
+        txt_pad=1,
+    )
+    assert padded is not None
+    assert padded.shape == (1, 8)
+    assert padded.tolist() == [[True, True, True, False, True, True, True, False]]
+
+
+def test_qwen_image_processor_uses_primary_handle_without_mask(monkeypatch):
+    from torch import nn
+
+    from veomni.models.diffusers.qwen_image.qwen_image_transformer import modeling_qwen_image_transformer as modeling
+
+    monkeypatch.setattr(
+        modeling,
+        "get_parallel_state",
+        lambda: SimpleNamespace(sp_enabled=False, ulysses_group=None),
+    )
+    with ops_config_scope(_sdpa_ops_config()):
+        processor = modeling.QwenImageSPAttnProcessor()
+
+    used: dict[str, object] = {}
+
+    def primary(_module, query, _key, _value, attention_mask=None, **_kwargs):
+        used["handle"] = "primary"
+        used["mask"] = attention_mask
+        return query.transpose(1, 2), None
+
+    def masked(_module, query, _key, _value, attention_mask=None, **_kwargs):
+        used["handle"] = "masked"
+        used["mask"] = attention_mask
+        return query.transpose(1, 2), None
+
+    processor.veomni_attn = primary
+    processor.veomni_attn_masked = masked
+
+    heads, dim_head = 2, 4
+    inner = heads * dim_head
+    attn = SimpleNamespace(
+        heads=heads,
+        to_q=nn.Linear(inner, inner, bias=False),
+        to_k=nn.Linear(inner, inner, bias=False),
+        to_v=nn.Linear(inner, inner, bias=False),
+        add_q_proj=nn.Linear(inner, inner, bias=False),
+        add_k_proj=nn.Linear(inner, inner, bias=False),
+        add_v_proj=nn.Linear(inner, inner, bias=False),
+        to_out=[nn.Linear(inner, inner, bias=False)],
+        to_add_out=nn.Linear(inner, inner, bias=False),
+        norm_q=None,
+        norm_k=None,
+        norm_added_q=None,
+        norm_added_k=None,
+        layer_idx=0,
+    )
+    hidden = torch.randn(1, 4, inner)
+    encoder = torch.randn(1, 3, inner)
+
+    processor(attn, hidden, encoder, attention_mask=None)
+    assert used["handle"] == "primary"
+    assert used["mask"] is None
+
+    processor(attn, hidden, encoder, attention_mask=torch.ones(1, 7, dtype=torch.bool))
+    assert used["handle"] == "masked"
+    assert used["mask"] is not None
