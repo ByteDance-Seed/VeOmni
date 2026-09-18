@@ -6,13 +6,15 @@ synthetic conversation dataset; it is not a model-quality or throughput benchmar
 
 ## Prerequisites
 
-- A Linux host with an NVIDIA GPU supported by the [GPU environment](installation/install.md).
+- A Linux host with two NVIDIA GPUs supported by the [GPU environment](installation/install.md).
 - Python 3.11 or 3.12, the locked GPU dependencies, and network access to
   Hugging Face for the model download.
 - Space for the environment, model snapshot, optimizer checkpoint, and export.
   Keep these on local disk for the first run.
 
-The command uses one GPU and short sequences. Memory usage depends on the
+The command uses two GPUs with FSDP2 and short sequences. This keeps the recipe
+on the sharded loading path required by its `init_device: meta` setting; do not
+reduce it to one process without adapting model initialization. Memory usage depends on the
 accelerator and kernel versions; the model's parameter count alone is not a
 memory requirement. For Ascend, ROCm, or MLU, install the platform environment
 and follow the [hardware-specific guidance](../hardware_support/index.md).
@@ -30,7 +32,7 @@ import transformers
 
 print("torch:", torch.__version__)
 print("transformers:", transformers.__version__)
-assert torch.cuda.is_available(), "A CUDA GPU is required for this example"
+assert torch.cuda.device_count() >= 2, "Two CUDA GPUs are required for this example"
 assert transformers.__version__ == "5.16.1"
 print("GPU:", torch.cuda.get_device_name(0))
 PY
@@ -79,13 +81,14 @@ PY
 Reuse the [Qwen3 configuration](../../configs/text/qwen3.yaml) and override only
 the inputs and smoke-test settings. Fixed-size batches make the number of
 examples per step explicit: a global batch of two and one micro-batch example
-on one GPU means two accumulation steps. Dynamic packing can be enabled later.
+per GPU means one micro-step on each of the two GPUs. Dynamic packing can be
+enabled later.
 
 Use a fresh output directory when repeating the example. `train.sh` writes
 `log.txt` in the current directory and replaces it on the next invocation.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 NPROC_PER_NODE=1 \
+CUDA_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2 \
   bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
     --model.model_path downloads/Qwen3-0.6B \
     --data.train_path downloads/quick-start.parquet \
@@ -129,6 +132,14 @@ If startup fails, first check the selected GPU, environment versions, and input
 paths. For an out-of-memory error, reduce the sequence length or use the
 [LoRA guide](../key_features/lora.md). Do not treat a successful model download
 or a checkpoint directory without its completion metadata as a completed run.
+
+## Validation scope
+
+This procedure completed five steps on two NVIDIA H20 GPUs with Python 3.11,
+`torch==2.11.0+cu130`, and `transformers==5.16.1`, using runtime code from
+`77cf73e69`. Both DCP metadata files, per-rank trainer/loader state, the step-5
+manifest, and the HF safetensors export were checked. This establishes a smoke
+run for that environment, not a minimum-memory or convergence claim.
 
 ## Next steps
 
