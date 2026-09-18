@@ -43,6 +43,7 @@ _veomni_hub_kernel_loader_patch_applied = False
 
 _VEOMNI_FLASH_ATTN_IMPL_MAPPING = {
     "veomni_flash_attention_2_with_sp": "flash_attention_2",
+    "veomni_flash_attention_2_hub_with_sp": "flash_attention_2_hub",
     "veomni_flash_attention_3_with_sp": "flash_attention_3",
     "veomni_flash_attention_3_hub_with_sp": "flash_attention_3_hub",
     "veomni_flash_attention_4_with_sp": "flash_attention_4",
@@ -53,18 +54,15 @@ def _is_veomni_custom_flash_attention(implementation: str | None) -> bool:
     return implementation in _VEOMNI_FLASH_ATTN_IMPL_MAPPING
 
 
-@lru_cache(maxsize=1)
-def _load_fa3_hub_kernel():
-    """Load the same pinned FA3 artifact used by verl-omni FSDP2."""
+@lru_cache(maxsize=None)
+def _load_hub_flash_kernel(repository: str):
+    """Load a pinned Hub FlashAttention artifact through ``kernels``."""
     try:
         from kernels import get_kernel
     except ImportError as e:
-        raise ImportError(
-            "VeOmni attention implementation `veomni_flash_attention_3_hub_with_sp` requires "
-            "`kernels` to be installed."
-        ) from e
+        raise ImportError("VeOmni Hub FlashAttention implementations require `kernels` to be installed.") from e
 
-    return get_kernel("kernels-community/flash-attn3", version=1)
+    return get_kernel(repository, version=1)
 
 
 def _load_veomni_flash_kernel(implementation: str) -> SimpleNamespace | object:
@@ -82,6 +80,8 @@ def _load_veomni_flash_kernel(implementation: str) -> SimpleNamespace | object:
                 "VeOmni attention implementation `veomni_flash_attention_2_with_sp` requires "
                 "`flash_attn` (FA2) to be importable."
             ) from e
+    elif implementation == "veomni_flash_attention_2_hub_with_sp":
+        return _load_hub_flash_kernel("kernels-community/flash-attn2")
     elif implementation == "veomni_flash_attention_3_with_sp":
         try:
             from flash_attn_interface import flash_attn_func, flash_attn_varlen_func
@@ -91,7 +91,7 @@ def _load_veomni_flash_kernel(implementation: str) -> SimpleNamespace | object:
                 "`flash_attn_interface` (FA3) to be importable."
             ) from e
     elif implementation == "veomni_flash_attention_3_hub_with_sp":
-        return _load_fa3_hub_kernel()
+        return _load_hub_flash_kernel("kernels-community/flash-attn3")
     elif implementation == "veomni_flash_attention_4_with_sp":
         try:
             from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
@@ -124,8 +124,9 @@ def patch_transformers_hub_kernel_loader_for_veomni():
     corresponding selected kernel functions instead.
 
     Local FA2 and FA3 are handled by explicit branches inside ``_lazy_imports``
-    and never reach the hub-kernel path. FA3-hub and FA4 keep their VeOmni names
-    so this adapter loads the pinned hub artifact or local FA4 implementation.
+    and never reach the hub-kernel path. FA2-hub, FA3-hub, and FA4 keep their
+    VeOmni names so this adapter loads the pinned hub artifact or local FA4
+    implementation.
     """
     global _veomni_hub_kernel_loader_patch_applied
     global _original_load_and_register_attn_kernel
@@ -204,10 +205,10 @@ def flash_attention_forward(
        * FA2/FA3 → plain name (``"flash_attention_2"`` / ``"flash_attention_3"``)
          because ``_lazy_imports`` has an explicit branch for each and resolves
          them without touching the hub-kernel path.
-       * FA3-hub/FA4 → keep their VeOmni names so Transformers v5's hub-kernel
-         fallback is intercepted by VeOmni's monkey-patch of
-         ``load_and_register_attn_kernel``. It loads the pinned hub artifact for
-         FA3-hub and ``flash_attn.cute`` locally for FA4.
+       * FA2-hub/FA3-hub/FA4 → keep their VeOmni names so Transformers v5's
+         hub-kernel fallback is intercepted by VeOmni's monkey-patch of
+         ``load_and_register_attn_kernel``. It loads the pinned hub artifacts
+         for FA2-hub/FA3-hub and ``flash_attn.cute`` locally for FA4.
     """
     if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
         logger.warning_once(
@@ -297,6 +298,8 @@ def flash_attention_forward(
     # ``flash_attn.cute`` locally.
     if module.config._attn_implementation == "veomni_flash_attention_2_with_sp":
         fa_kernel_implementation = "flash_attention_2"
+    elif module.config._attn_implementation == "veomni_flash_attention_2_hub_with_sp":
+        fa_kernel_implementation = "veomni_flash_attention_2_hub_with_sp"
     elif module.config._attn_implementation == "veomni_flash_attention_3_with_sp":
         fa_kernel_implementation = "flash_attention_3"
     elif module.config._attn_implementation == "veomni_flash_attention_3_hub_with_sp":

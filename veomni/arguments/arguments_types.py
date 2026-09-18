@@ -1225,6 +1225,7 @@ class OpsImplementationConfig:
             "eager",
             "sdpa",
             "flash_attention_2",
+            "flash_attention_2_hub",
             "flash_attention_3",
             "flash_attention_3_hub",
             "flash_attention_4",
@@ -1358,6 +1359,7 @@ class OpsImplementationConfig:
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",
+                "flash_attention_2_hub": "veomni_flash_attention_2_hub_with_sp",
                 "flash_attention_3": "veomni_flash_attention_3_with_sp",
                 "flash_attention_3_hub": "veomni_flash_attention_3_hub_with_sp",
                 "flash_attention_4": "veomni_flash_attention_4_with_sp",
@@ -1368,8 +1370,8 @@ class OpsImplementationConfig:
                 new_impl = replacements[self.attn_implementation]
                 logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
                 self.attn_implementation = new_impl
-        elif self.attn_implementation == "flash_attention_3_hub":
-            raise ValueError("flash_attention_3_hub requires MODELING_BACKEND=veomni.")
+        elif self.attn_implementation in ("flash_attention_2_hub", "flash_attention_3_hub"):
+            raise ValueError(f"{self.attn_implementation} requires MODELING_BACKEND=veomni.")
 
         # Legacy alias: ``moe_implementation='fused'`` resolves to a
         # hardware-appropriate fused kernel — Quack on GPU, NPU group-gemm on

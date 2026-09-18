@@ -27,6 +27,7 @@ from veomni.ops.kernels.attention import ulysses as attention_ulysses
 
 _FLASH_IMPLEMENTATIONS = (
     ("veomni_flash_attention_2_with_sp", "flash_attention_2"),
+    ("veomni_flash_attention_2_hub_with_sp", "veomni_flash_attention_2_hub_with_sp"),
     ("veomni_flash_attention_3_with_sp", "flash_attention_3"),
     ("veomni_flash_attention_3_hub_with_sp", "veomni_flash_attention_3_hub_with_sp"),
     ("veomni_flash_attention_4_with_sp", "veomni_flash_attention_4_with_sp"),
@@ -42,26 +43,33 @@ class _FakeAttentionModule(nn.Module):
         self.proj = nn.Linear(4, 4)
 
 
-def test_fa3_hub_loader_uses_pinned_kernels_artifact(monkeypatch):
+@pytest.mark.parametrize(
+    ("implementation", "repository"),
+    [
+        ("veomni_flash_attention_2_hub_with_sp", "kernels-community/flash-attn2"),
+        ("veomni_flash_attention_3_hub_with_sp", "kernels-community/flash-attn3"),
+    ],
+)
+def test_hub_flash_loader_uses_pinned_kernels_artifact(monkeypatch, implementation, repository):
     calls = []
     kernel = SimpleNamespace(flash_attn_func=object(), flash_attn_varlen_func=object())
 
-    def get_kernel(repository, *, version):
-        calls.append((repository, version))
+    def get_kernel(requested_repository, *, version):
+        calls.append((requested_repository, version))
         return kernel
 
     monkeypatch.setitem(sys.modules, "kernels", SimpleNamespace(get_kernel=get_kernel))
-    flash_backend._load_fa3_hub_kernel.cache_clear()
+    flash_backend._load_hub_flash_kernel.cache_clear()
     try:
-        loaded = flash_backend._load_veomni_flash_kernel("veomni_flash_attention_3_hub_with_sp")
+        loaded = flash_backend._load_veomni_flash_kernel(implementation)
         assert loaded is kernel
-        assert flash_backend._load_veomni_flash_kernel("veomni_flash_attention_3_hub_with_sp") is kernel
-        assert calls == [("kernels-community/flash-attn3", 1)]
+        assert flash_backend._load_veomni_flash_kernel(implementation) is kernel
+        assert calls == [(repository, 1)]
     finally:
-        flash_backend._load_fa3_hub_kernel.cache_clear()
+        flash_backend._load_hub_flash_kernel.cache_clear()
 
 
-def test_fa3_hub_loader_reports_missing_kernels_dependency(monkeypatch):
+def test_hub_flash_loader_reports_missing_kernels_dependency(monkeypatch):
     import builtins
 
     real_import = builtins.__import__
@@ -73,12 +81,12 @@ def test_fa3_hub_loader_reports_missing_kernels_dependency(monkeypatch):
 
     monkeypatch.delitem(sys.modules, "kernels", raising=False)
     monkeypatch.setattr(builtins, "__import__", reject_kernels)
-    flash_backend._load_fa3_hub_kernel.cache_clear()
+    flash_backend._load_hub_flash_kernel.cache_clear()
     try:
-        with pytest.raises(ImportError, match="requires `kernels`"):
-            flash_backend._load_veomni_flash_kernel("veomni_flash_attention_3_hub_with_sp")
+        with pytest.raises(ImportError, match="require `kernels`"):
+            flash_backend._load_veomni_flash_kernel("veomni_flash_attention_2_hub_with_sp")
     finally:
-        flash_backend._load_fa3_hub_kernel.cache_clear()
+        flash_backend._load_hub_flash_kernel.cache_clear()
 
 
 def test_flash_attention_forward_public_signature_is_stable():

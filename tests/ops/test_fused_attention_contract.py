@@ -38,6 +38,7 @@ from veomni.ops.kernels.attention.magi import mask as magi_mask_backend
 
 _FLASH_IMPLEMENTATIONS = (
     "veomni_flash_attention_2_with_sp",
+    "veomni_flash_attention_2_hub_with_sp",
     "veomni_flash_attention_3_with_sp",
     "veomni_flash_attention_3_hub_with_sp",
     "veomni_flash_attention_4_with_sp",
@@ -52,24 +53,27 @@ class _FakeAttentionModule(nn.Module):
         self.config = SimpleNamespace(_attn_implementation=implementation)
 
 
-def test_hub_fa3_is_classified_as_varlen_attention():
-    assert "flash_attention_3_hub" in VARLEN_ATTENTION_TYPES
-    assert "veomni_flash_attention_3_hub_with_sp" in VARLEN_ATTENTION_TYPES
+@pytest.mark.parametrize("version", (2, 3))
+def test_hub_flash_is_classified_as_varlen_attention(version):
+    assert f"flash_attention_{version}_hub" in VARLEN_ATTENTION_TYPES
+    assert f"veomni_flash_attention_{version}_hub_with_sp" in VARLEN_ATTENTION_TYPES
 
 
-def test_hub_fa3_config_maps_to_veomni_sp_backend(monkeypatch):
+@pytest.mark.parametrize("version", (2, 3))
+def test_hub_flash_config_maps_to_veomni_sp_backend(monkeypatch, version):
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
 
-    config = OpsImplementationConfig(attn_implementation="flash_attention_3_hub")
+    config = OpsImplementationConfig(attn_implementation=f"flash_attention_{version}_hub")
 
-    assert config.attn_implementation == "veomni_flash_attention_3_hub_with_sp"
+    assert config.attn_implementation == f"veomni_flash_attention_{version}_hub_with_sp"
 
 
-def test_hub_fa3_config_rejects_huggingface_modeling_backend(monkeypatch):
+@pytest.mark.parametrize("version", (2, 3))
+def test_hub_flash_config_rejects_huggingface_modeling_backend(monkeypatch, version):
     monkeypatch.setenv("MODELING_BACKEND", "hf")
 
     with pytest.raises(ValueError, match="requires MODELING_BACKEND=veomni"):
-        OpsImplementationConfig(attn_implementation="flash_attention_3_hub")
+        OpsImplementationConfig(attn_implementation=f"flash_attention_{version}_hub")
 
 
 @pytest.mark.parametrize(

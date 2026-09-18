@@ -31,6 +31,7 @@ same way:
 | Public value | VeOmni registry name |
 |---|---|
 | `flash_attention_2` | `veomni_flash_attention_2_with_sp` |
+| `flash_attention_2_hub` | `veomni_flash_attention_2_hub_with_sp` |
 | `flash_attention_3` | `veomni_flash_attention_3_with_sp` |
 | `flash_attention_3_hub` | `veomni_flash_attention_3_hub_with_sp` |
 | `flash_attention_4` | `veomni_flash_attention_4_with_sp` |
