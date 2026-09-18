@@ -23,4 +23,14 @@ qwen4_exp_ple_2d_parallelism
 :caption: Transformers integration
 
 ../transformers_v5/index
+../transformers_v5/veomni_fused_attention
+../transformers_v5/veomni_flash_attention_kernel_adapter
+../transformers_v5/transformers_v5_moe_weight_loading
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: Migration history
+
+../migrations/index
 ```

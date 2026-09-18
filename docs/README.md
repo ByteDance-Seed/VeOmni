@@ -14,7 +14,9 @@ same checkout, and state a revision explicitly for historical validation results
 | Routine training and data workflows | `usage/` |
 | Model-specific recipes | `examples/` |
 | Feature usage | `key_features/` |
+| Contributor architecture and extension contracts | `developer/` |
 | Implementation rationale | `design/` |
+| Historical upgrades | `migrations/` (older pages may keep their URLs) |
 | Accelerator-specific setup and limits | `hardware_support/` |
 | Agent-specific constraints and procedures | `.agents/` at the repository root |
 
