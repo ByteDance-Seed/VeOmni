@@ -15,6 +15,7 @@ plus its own chat template. VeOmni training-graph hooks (``encode_pre`` /
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedTokenizerBase
@@ -125,7 +126,7 @@ class InferenceMixin:
         last = hidden_states[:, -1, :]
         logits = self._project(last) if last.dim() == 2 else self._project(last.squeeze(0))
         if not do_sample:
-            return int(logits.argmax(dim=-1).item())
+            return self._agree_on_token(int(logits.argmax(dim=-1).item()))
         if temperature != 1.0:
             logits = logits / max(temperature, 1e-6)
         if top_p < 1.0:
@@ -135,7 +136,32 @@ class InferenceMixin:
         # An id, like the greedy branch above returns. Leaking the [1, 1] tensor
         # instead reaches the tokenizer as a nested list and fails there, one
         # whole decode step away from the line that produced it.
-        return int(token.item())
+        return self._agree_on_token(int(token.item()))
+
+    def _agree_on_token(self, token_id: int) -> int:
+        """Return rank 0's token on every rank.
+
+        The generation FSM runs independently on each rank and its stop
+        condition is the sampled id, while the forward that feeds it is full
+        of collectives. So the ranks have to agree on the id: the first one to
+        sample EOS leaves the loop, and every other rank then blocks forever in
+        the next all-to-all waiting for a participant that has gone home.
+
+        That is observed, not hypothetical. ``set_seed`` runs before the model
+        is built, and under ep / emb each rank initialises differently shaped
+        shards -- drawing a different amount of randomness and leaving the
+        generators in different states by the time the first token is sampled.
+
+        Agreement by broadcast rather than by re-seeding, because seeding alone
+        would not be enough: identical sampling also needs identical logits
+        bit-for-bit, which a sharded forward does not owe anyone. One integer a
+        token is a rounding error against a decode step.
+        """
+        if not dist.is_available() or not dist.is_initialized():
+            return token_id
+        agreed = torch.tensor([token_id], dtype=torch.long, device=self.device)
+        dist.broadcast(agreed, src=0)
+        return int(agreed.item())
 
     def _token_id_tensor(self, token_id: int) -> torch.Tensor:
         device = self.device

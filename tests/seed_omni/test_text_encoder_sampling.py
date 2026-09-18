@@ -63,3 +63,45 @@ def test_sampling_survives_a_tokenizer_round_trip():
 def test_top_p_and_temperature_still_return_an_id():
     token = _Sampler()._sample_token(torch.zeros(1, 4, 8), temperature=0.7, top_p=0.9)
     assert isinstance(token, int)
+
+
+class TestRanksAgree:
+    """The sampled id is the FSM's stop condition, so it has to be one id.
+
+    Each rank runs its own copy of the generation loop while the forward
+    feeding it is full of collectives. A rank that samples EOS on its own
+    leaves the loop and strands every other rank in the next all-to-all.
+    """
+
+    def test_single_process_is_left_alone(self):
+        """No process group: nothing to agree with, and no collective to attempt."""
+        assert _Sampler()._agree_on_token(7) == 7
+
+    def test_broadcasts_from_rank_zero(self, monkeypatch):
+        """With a group, every rank returns rank 0's id rather than its own."""
+        import torch.distributed as dist
+
+        from veomni.models.seed_omni.modules.base.text_encoder import modeling
+
+        def fake_broadcast(tensor, src):
+            assert src == 0
+            tensor.fill_(11)
+
+        monkeypatch.setattr(modeling.dist, "is_available", lambda: True)
+        monkeypatch.setattr(modeling.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(modeling.dist, "broadcast", fake_broadcast)
+        del dist
+
+        assert _Sampler()._agree_on_token(4) == 11
+
+    def test_both_branches_agree(self, monkeypatch):
+        """Greedy is deterministic per rank but not across them: shards differ."""
+        from veomni.models.seed_omni.modules.base.text_encoder import modeling
+
+        monkeypatch.setattr(modeling.dist, "is_available", lambda: True)
+        monkeypatch.setattr(modeling.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(modeling.dist, "broadcast", lambda tensor, src: tensor.fill_(3))
+
+        sampler = _Sampler()
+        assert sampler._sample_token(torch.zeros(1, 4, 8), do_sample=False) == 3
+        assert sampler._sample_token(torch.zeros(1, 4, 8)) == 3
