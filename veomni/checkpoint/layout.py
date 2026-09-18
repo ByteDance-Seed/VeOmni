@@ -51,6 +51,9 @@ RANK_FILE_FORMAT = "rank_{}.pt"
 HF_EXPORT_DIRNAME = "hf_ckpt"
 LORA_EXPORT_DIRNAME = "lora_ckpt"
 
+# Run-root sidecars. Written once at train start, beside ``checkpoints/``.
+ASSETS_DIRNAME = "model_assets"
+
 # Step-level completion marker.
 MANIFEST_FILENAME = "checkpoint_manifest.json"
 MANIFEST_FORMAT_VERSION = 1
@@ -119,6 +122,17 @@ def lora_export_dir(step_root: str, module: str = "") -> str:
     return os.path.join(root, module) if module else root
 
 
+def assets_dir(assets_root: str, module: str = "") -> str:
+    """Run-root sidecars: config, tokenizer, processor.
+
+    ``assets_root`` is already ``<output_dir>/model_assets``. Empty ``module``
+    is that directory; a named module nests one level, the same rule as
+    :func:`hf_export_dir`. Two modules cannot share the root: each writes
+    ``config.json`` via ``save_pretrained``.
+    """
+    return os.path.join(assets_root, module) if module else assets_root
+
+
 def manifest_path(step_root: str) -> str:
     return os.path.join(step_root, MANIFEST_FILENAME)
 
@@ -127,7 +141,6 @@ def write_manifest(
     step_root: str,
     global_step: int,
     world_size: int,
-    modules: Sequence[str] | None = None,
 ) -> str:
     """Record that the step's trainer-level state is down. Rank 0 only, and last.
 
@@ -137,14 +150,13 @@ def write_manifest(
     after the cursor files land, and making this file wait for them would mean
     nothing ever overlaps the write.
 
-    ``modules`` is what lets a reader find those markers without walking the
-    tree. Empty for a single-model job. See :func:`checkpoint_is_complete`.
+    The manifest does not list modules. Resume discovery finds them under
+    ``model/``; see :func:`discover_modules`.
     """
     payload = {
         "format_version": MANIFEST_FORMAT_VERSION,
         "global_step": global_step,
         "world_size": world_size,
-        "modules": list(modules or []),
     }
     path = manifest_path(step_root)
     os.makedirs(step_root, exist_ok=True)
@@ -188,6 +200,22 @@ def read_manifest(step_root: str) -> dict[str, Any] | None:
         return None
 
 
+def discover_modules(step_root: str) -> list[str]:
+    """Module names present under ``model/``, from the filesystem.
+
+    The empty string is a single-model job: weights live at ``model/ckpt/``.
+    Named children are a multi-module job: each has its own ``model/<name>/ckpt/``.
+    The trainer half does not list these; resume discovery reads the tree.
+    """
+    root = os.path.join(step_root, MODEL_DIRNAME)
+    if os.path.isdir(os.path.join(root, WEIGHTS_DIRNAME)):
+        return [""]
+    if not os.path.isdir(root):
+        return [""]
+    names = [entry for entry in sorted(os.listdir(root)) if os.path.isdir(os.path.join(root, entry, WEIGHTS_DIRNAME))]
+    return names or [""]
+
+
 def dcp_markers(step_root: str, modules: Sequence[str]) -> list[str]:
     """Every ``.metadata`` a complete step carries, module by module.
 
@@ -209,10 +237,12 @@ def checkpoint_is_complete(step_root: str) -> bool:
     """Whether every part of this step reached disk.
 
     Two halves, neither implying the other. The manifest says the trainer-level
-    state is down and names the modules the job saved; each of those modules
-    then has to carry DCP's markers. A manifest alone would accept a step whose
-    shards are still streaming, and markers alone would accept one that has no
-    cursor to resume from.
+    state is down. Each module under ``model/`` then has to carry DCP's markers.
+    A manifest alone would accept a step whose shards are still streaming, and
+    markers alone would accept one that has no cursor to resume from.
+
+    Modules are whatever ``model/`` contains, not a field on the manifest: the
+    job cursor does not know the model graph.
 
     Local filesystem calls: the writers are POSIX-only, so a step in this layout
     cannot be anywhere this cannot read.
@@ -220,10 +250,11 @@ def checkpoint_is_complete(step_root: str) -> bool:
     manifest = read_manifest(step_root)
     if manifest is None:
         return False
-    return all(os.path.exists(path) for path in dcp_markers(step_root, manifest.get("modules", [])))
+    return all(os.path.exists(path) for path in dcp_markers(step_root, discover_modules(step_root)))
 
 
 __all__ = [
+    "ASSETS_DIRNAME",
     "DCP_MARKER_FILENAME",
     "EXTRA_STATE_DIRNAME",
     "HF_EXPORT_DIRNAME",
@@ -236,8 +267,10 @@ __all__ = [
     "OPTIMIZER_DIRNAME",
     "RANK_FILE_FORMAT",
     "WEIGHTS_DIRNAME",
+    "assets_dir",
     "checkpoint_is_complete",
     "dcp_markers",
+    "discover_modules",
     "extra_state_path",
     "hf_export_dir",
     "loader_path",

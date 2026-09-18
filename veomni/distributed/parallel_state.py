@@ -517,8 +517,11 @@ def _init_parallel_state(
     directly to build a topology no job config can express — a CPU mesh, or a
     rank layout unrelated to ``WORLD_SIZE``.
 
-    If ``name`` is already registered, log a warning and return the existing
-    state without building, caching, or overwriting anything.
+    If ``name`` is already registered, log at debug and return the existing
+    state without building, caching, or overwriting anything. Single-model
+    trainers hit this on every run: ``BaseTrainer._setup`` registers ``"base"``
+    and ``VeOmniModelRuntime.setup`` registers the same name from the same
+    accelerator. A warning there trains people to ignore warnings.
 
     ``name=None`` claims no registry key, for a caller that holds the returned
     state itself rather than looking it up later — it would otherwise have to
@@ -530,7 +533,7 @@ def _init_parallel_state(
     global _PARALLEL_STATE
 
     if name is not None and name in _PARALLEL_STATE_REGISTRY:
-        logger.warning(
+        logger.debug(
             f"Parallel state {name!r} is already registered; returning the existing state without rebuilding."
         )
         return _PARALLEL_STATE_REGISTRY[name]
@@ -732,7 +735,8 @@ def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Opti
     """Build the mesh an :class:`AcceleratorConfig` describes and register it as ``name``.
 
     Every parallelism knob already lives on the config, so a caller that has one
-    should not be restating the mapping.
+    should not be restating the mapping. Both a job's own mesh and a single
+    model's come through here.
     """
     return _init_parallel_state(
         dp_size=accelerator.dp_size,

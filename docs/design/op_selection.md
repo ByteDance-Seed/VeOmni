@@ -69,7 +69,7 @@ OpsImplementationConfig.__post_init__()       # (2) config parse time
   ├─ validate model-agnostic device/backend compatibility
   └─ rewrite public attn names to veomni_* adapters
 
-BaseTrainer._build_model()                    # (3) model build time
+VeOmniModelRuntime._build_model()             # (3) model build time
   └─ models.build_foundation_model(..., ops_implementation=ops)
        ├─ set_ops_config(ops)
        └─ model init + weight loading

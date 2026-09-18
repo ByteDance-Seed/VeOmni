@@ -20,11 +20,11 @@ model:
     lr_decay_style: cosine
   broadcast_model_weights_from_rank0: false
   ep_sharded_stream_load: true
+  chat_template: chatml
 
 data:
   train_path: tulu-3-sft-mixture/data
   data_type: conversation
-  chat_template: chatml
   max_seq_len: 16384
   train_size: 750000
   text_keys: messages
