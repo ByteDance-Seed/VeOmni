@@ -456,3 +456,77 @@ def test_parser_still_accepts_the_new_paths(world_size):
     assert args.accelerator.init_device == "meta"
     assert args.accelerator.gradient_checkpointing.enable is False
     assert args.optimizer.lr == pytest.approx(3.0e-4)
+
+
+class TestExpertParallelIsOneDimension:
+    """``ep_size`` and the ``"ep"`` entry of ``extra_parallel_sizes`` are the same thing.
+
+    The config folds the first into the second, and the mesh is built from the
+    second. They can be set independently, so the fold has to keep them from
+    drifting apart -- a disagreement here is not a config that fails, it is a
+    config that builds the wrong mesh and reports the right number when asked.
+    """
+
+    @staticmethod
+    def _ep(config: AcceleratorConfig) -> int:
+        return dict(zip(config.extra_parallel_names, config.extra_parallel_sizes))["ep"]
+
+    def test_ep_size_reaches_the_mesh(self):
+        config = AcceleratorConfig(ep_size=8)
+        assert self._ep(config) == 8
+
+    def test_a_round_trip_does_not_append_a_second_ep(self):
+        """The case the fold's guard was written for."""
+        config = AcceleratorConfig(
+            ep_size=8,
+            extra_parallel_sizes=[8],
+            extra_parallel_names=["ep"],
+            extra_parallel_placement_innermost=[False],
+        )
+        assert config.extra_parallel_names.count("ep") == 1
+        assert self._ep(config) == 8
+
+    def test_an_overlay_that_raises_ep_size_reaches_the_mesh(self):
+        """A per-module YAML overlay rebuilds the config from an already-folded dict.
+
+        Before, the guard saw ``"ep"`` present and skipped, leaving the entry at
+        the default 1 while ``ep_size`` read back as 8 -- so DeepSeek-V4.1's
+        backbone built a mesh of one and every rank held all 384 experts.
+        """
+        config = AcceleratorConfig(
+            ep_size=8,
+            extra_parallel_sizes=[1],
+            extra_parallel_names=["ep"],
+            extra_parallel_placement_innermost=[False],
+        )
+        assert self._ep(config) == 8
+        assert config.ep_size == 8
+
+    def test_setting_only_the_entry_updates_ep_size(self):
+        """The same divergence read the other way round."""
+        config = AcceleratorConfig(
+            extra_parallel_sizes=[4],
+            extra_parallel_names=["ep"],
+            extra_parallel_placement_innermost=[False],
+        )
+        assert config.ep_size == 4
+        assert self._ep(config) == 4
+
+    def test_two_different_widths_are_refused(self):
+        with pytest.raises(ValueError, match="both ask"):
+            AcceleratorConfig(
+                ep_size=8,
+                extra_parallel_sizes=[4],
+                extra_parallel_names=["ep"],
+                extra_parallel_placement_innermost=[False],
+            )
+
+    def test_another_parallelism_does_not_disturb_ep(self):
+        """`emb` is folded by the caller; `ep` keeps its own default."""
+        config = AcceleratorConfig(
+            extra_parallel_sizes=[8],
+            extra_parallel_names=["emb"],
+            extra_parallel_placement_innermost=[False],
+        )
+        sizes = dict(zip(config.extra_parallel_names, config.extra_parallel_sizes))
+        assert sizes == {"emb": 8, "ep": 1}
