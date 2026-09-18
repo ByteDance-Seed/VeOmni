@@ -55,6 +55,8 @@ from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config imp
     qwen3_5_moe_forconditional_generation_get_position_id_func,
     qwen3_5_moe_forconditional_generation_init_patched,
     qwen3_5_moe_get_parallel_plan_patched,
+    qwen3_5_moe_mlp_forward_patched,
+    qwen3_5_moe_mlp_init_patched,
     qwen3_5_moe_model_forward_patched,
     qwen3_5_moe_model_init_patched,
     qwen3_5_moe_rmsnorm_init_patched,
@@ -150,6 +152,16 @@ config.override_method(
     "Qwen3_5MoeRMSNorm.forward",
     replacement=qwen3_5_rmsnorm_forward_patched,
     description="Always call the local rms_norm qwen3_5 VeomniOp",
+)
+config.override_method(
+    "Qwen3_5MoeMLP.__init__",
+    replacement=qwen3_5_moe_mlp_init_patched,
+    description="Construct a local swiglu_mlp VeomniOp",
+)
+config.override_method(
+    "Qwen3_5MoeMLP.forward",
+    replacement=qwen3_5_moe_mlp_forward_patched,
+    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
 )
 
 # ── Construct generated vision / text towers ──────────────────────────────────

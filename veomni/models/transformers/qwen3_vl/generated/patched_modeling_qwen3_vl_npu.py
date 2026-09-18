@@ -15,6 +15,10 @@
 #      Construct a local rms_norm VeomniOp
 #    - method_override: Qwen3VLTextRMSNorm.forward
 #      Always call the local rms_norm VeomniOp
+#    - method_override: Qwen3VLTextMLP.__init__
+#      Construct a local swiglu_mlp VeomniOp
+#    - method_override: Qwen3VLTextMLP.forward
+#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
 #    - method_override: Qwen3VLVisionAttention.forward
 #      Use precomputed max_seqlen passed from outer forward to avoid per-layer CPU-GPU sync
 #    - method_override: Qwen3VLVisionBlock.forward
@@ -792,20 +796,36 @@ class Qwen3VLTextAttention(nn.Module):
         return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3VLTextMLP
+# Methods patched: __init__, forward
+# ======================================================================
+
+
 class Qwen3VLTextMLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
+    def __init__(self, config, intermediate_size=None):
+        nn.Module.__init__(self)
         self.config = config
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
+        self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        if self.config.hidden_act in {"silu", "swish"}:
+            return self.veomni_swiglu_mlp(
+                x,
+                self.gate_proj.weight,
+                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+                self.up_proj.weight,
+                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+                self.down_proj.weight,
+                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+            )
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):

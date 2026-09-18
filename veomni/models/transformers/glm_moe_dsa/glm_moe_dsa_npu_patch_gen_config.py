@@ -30,6 +30,8 @@ from veomni.models.transformers.glm_moe_dsa.glm_moe_dsa_gpu_patch_gen_config imp
     glm_moe_dsa_forcausallm_forward_patched,
     glm_moe_dsa_forcausallm_init_patched,
     glm_moe_dsa_get_parallel_plan_patched,
+    glm_moe_dsa_mlp_forward_patched,
+    glm_moe_dsa_mlp_init_patched,
     glm_moe_dsa_rmsnorm_forward_patched,
     glm_moe_dsa_rmsnorm_init_patched,
 )
@@ -57,6 +59,16 @@ config.override_method(
     "GlmMoeDsaRMSNorm.forward",
     replacement=glm_moe_dsa_rmsnorm_forward_patched,
     description="Always call the local rms_norm VeomniOp",
+)
+config.override_method(
+    "GlmMoeDsaMLP.__init__",
+    replacement=glm_moe_dsa_mlp_init_patched,
+    description="Construct a local swiglu_mlp VeomniOp",
+)
+config.override_method(
+    "GlmMoeDsaMLP.forward",
+    replacement=glm_moe_dsa_mlp_forward_patched,
+    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
 )
 config.override_method(
     "GlmMoeDsaAttention.__init__",

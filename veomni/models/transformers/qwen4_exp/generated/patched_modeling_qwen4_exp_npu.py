@@ -9,6 +9,10 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Qwen4ExpTextMLP.__init__
+#      Construct a local swiglu_mlp VeomniOp
+#    - method_override: Qwen4ExpTextMLP.forward
+#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
 #    - method_override: Qwen4ExpTextModel.reverse_embedding
 #      Make the upstream reverse-embedding error path ruff-compliant
 #    - method_override: Qwen4ExpModel.__init__
@@ -945,9 +949,15 @@ class Qwen4ExpTextAttention(nn.Module):
         return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen4ExpTextMLP
+# Methods patched: __init__, forward
+# ======================================================================
+
+
 class Qwen4ExpTextMLP(nn.Module):
     def __init__(self, config, intermediate_size=None):
-        super().__init__()
+        nn.Module.__init__(self)
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
@@ -955,10 +965,20 @@ class Qwen4ExpTextMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        if self.config.hidden_act in {"silu", "swish"}:
+            return self.veomni_swiglu_mlp(
+                x,
+                self.gate_proj.weight,
+                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+                self.up_proj.weight,
+                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+                self.down_proj.weight,
+                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+            )
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 # ======================================================================

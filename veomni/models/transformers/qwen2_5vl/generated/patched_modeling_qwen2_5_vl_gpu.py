@@ -13,6 +13,14 @@
 #      Construct a local rms_norm VeomniOp
 #    - method_override: Qwen2_5_VLRMSNorm.forward
 #      Always call the local rms_norm VeomniOp
+#    - method_override: Qwen2_5_VLMLP.__init__
+#      Construct a local swiglu_mlp VeomniOp
+#    - method_override: Qwen2_5_VLMLP.forward
+#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
+#    - method_override: Qwen2MLP.__init__
+#      Construct a local swiglu_mlp VeomniOp
+#    - method_override: Qwen2MLP.forward
+#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
 #    - init_modification: Qwen2_5_VLVisionAttention
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen2_5_VLVisionAttention.forward
@@ -315,17 +323,35 @@ class Qwen2_5_VLRMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen2_5_VLMLP
+# Methods patched: __init__, forward
+# ======================================================================
+
+
 class Qwen2_5_VLMLP(nn.Module):
     def __init__(self, config, bias: bool = False):
-        super().__init__()
+        nn.Module.__init__(self)
+        self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=bias)
         self.act_fn = ACT2FN[config.hidden_act]
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, hidden_state):
+        if self.config.hidden_act in {"silu", "swish"}:
+            return self.veomni_swiglu_mlp(
+                hidden_state,
+                self.gate_proj.weight,
+                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+                self.up_proj.weight,
+                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+                self.down_proj.weight,
+                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+            )
         return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
 
@@ -972,9 +998,15 @@ class Qwen2_5_VLRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen2MLP
+# Methods patched: __init__, forward
+# ======================================================================
+
+
 class Qwen2MLP(nn.Module):
     def __init__(self, config):
-        super().__init__()
+        nn.Module.__init__(self)
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -982,10 +1014,20 @@ class Qwen2MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        if self.config.hidden_act in {"silu", "swish"}:
+            return self.veomni_swiglu_mlp(
+                x,
+                self.gate_proj.weight,
+                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+                self.up_proj.weight,
+                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+                self.down_proj.weight,
+                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+            )
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim=1):

@@ -47,6 +47,8 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_forconditional_generation_init_patched,
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
+    qwen3_5_mlp_forward_patched,
+    qwen3_5_mlp_init_patched,
     qwen3_5_model_forward,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
@@ -163,6 +165,16 @@ config.override_method(
     "Qwen3_5RMSNorm.forward",
     replacement=qwen3_5_rmsnorm_forward_patched,
     description="Always call the local rms_norm qwen3_5 VeomniOp",
+)
+config.override_method(
+    "Qwen3_5MLP.__init__",
+    replacement=qwen3_5_mlp_init_patched,
+    description="Construct a local swiglu_mlp VeomniOp",
+)
+config.override_method(
+    "Qwen3_5MLP.forward",
+    replacement=qwen3_5_mlp_forward_patched,
+    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
 )
 
 

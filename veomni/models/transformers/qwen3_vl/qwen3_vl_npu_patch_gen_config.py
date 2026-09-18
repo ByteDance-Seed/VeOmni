@@ -36,6 +36,8 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_rmsnorm_init_patched,
     qwen3_vl_text_attention_forward_patched,
     qwen3_vl_text_deepstack_process_patched,
+    qwen3_vl_text_mlp_forward_patched,
+    qwen3_vl_text_mlp_init_patched,
     qwen3_vl_vision_attention_forward_patched,
     qwen3_vl_vision_block_forward_patched,
     qwen3_vl_vision_dummy_forward_patched,
@@ -82,6 +84,16 @@ config.override_method(
     "Qwen3VLTextRMSNorm.forward",
     replacement=qwen3_vl_rmsnorm_forward_patched,
     description="Always call the local rms_norm VeomniOp",
+)
+config.override_method(
+    "Qwen3VLTextMLP.__init__",
+    replacement=qwen3_vl_text_mlp_init_patched,
+    description="Construct a local swiglu_mlp VeomniOp",
+)
+config.override_method(
+    "Qwen3VLTextMLP.forward",
+    replacement=qwen3_vl_text_mlp_forward_patched,
+    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
 )
 config.override_method(
     "Qwen3VLVisionAttention.forward",
