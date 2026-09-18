@@ -8,7 +8,15 @@ from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 def _fake_ps(sp_enabled: bool, sp_size: int = 1, sp_rank: int = 0):
-    return types.SimpleNamespace(sp_enabled=sp_enabled, sp_size=sp_size, sp_rank=sp_rank)
+    return types.SimpleNamespace(
+        sp_enabled=sp_enabled,
+        sp_size=sp_size,
+        sp_rank=sp_rank,
+        cp_size=1,
+        cp_rank=0,
+        ulysses_size=sp_size,
+        ulysses_rank=sp_rank,
+    )
 
 
 @pytest.fixture

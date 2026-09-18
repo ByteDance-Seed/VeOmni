@@ -74,7 +74,7 @@ def check_model_build_prerequisites(config: PretrainedConfig) -> None:
         validate()
 
 
-def check_context_parallel_supported(config: PretrainedConfig) -> None:
+def check_context_parallel_supported(config: PretrainedConfig, attn_implementation: Optional[str] = None) -> None:
     """Raise unless this model type implements context parallelism.
 
     A no-op when context parallelism is off, which is every other configuration.
@@ -89,6 +89,21 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
         return
 
     if not get_parallel_state().cp_enabled:
+        return
+
+    state = get_parallel_state()
+    if getattr(state, "cp_layout", "contiguous") == "zigzag":
+        implementation = attn_implementation or getattr(config, "_attn_implementation", None)
+        supported_backends = {"veomni_flash_attention_2_with_sp", "veomni_flash_attention_4_with_sp"}
+        if config.model_type != "qwen3" or implementation not in supported_backends:
+            raise NotImplementedError(
+                "USP zigzag CP currently supports Qwen3 with VeOmni FlashAttention 2 or 4 only. "
+                "Use contiguous CP for DeepSeek V4 or cp_size=1 for other models/backends."
+            )
+        if is_torch_npu_available():
+            raise NotImplementedError("GPU USP does not support NPU yet.")
+        if getattr(config, "attention_dropout", 0.0):
+            raise NotImplementedError("USP requires attention_dropout=0.")
         return
 
     if is_torch_npu_available():
@@ -265,7 +280,7 @@ def build_foundation_model(
     else:
         config = build_config(config_path, **config_kwargs)
 
-    check_context_parallel_supported(config)
+    check_context_parallel_supported(config, attn_implementation)
     check_model_build_prerequisites(config)
 
     if encoder_data_balance:

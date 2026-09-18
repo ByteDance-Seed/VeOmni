@@ -227,7 +227,59 @@ class PackingCollator(DataCollator):
     metadata_collate_func: Optional[MetadataCollateFunc] = None
 
     def __post_init__(self):
-        self.sp_enabled = get_parallel_state().sp_enabled
+        parallel_state = get_parallel_state()
+        self.sp_enabled = parallel_state.sp_enabled
+        self.cp_size = parallel_state.cp_size if getattr(parallel_state, "cp_layout", "contiguous") == "zigzag" else 1
+
+    def _pad_position_ids(self, position_ids: torch.Tensor, dim: int, pad_size: int) -> torch.Tensor:
+        """Extend positions monotonically so CP alignment pads are not segment starts."""
+        dim %= position_ids.dim()
+        last_position = position_ids.select(dim, position_ids.size(dim) - 1).unsqueeze(dim)
+        offset_shape = [1] * position_ids.dim()
+        offset_shape[dim] = pad_size
+        offsets = torch.arange(1, pad_size + 1, dtype=position_ids.dtype, device=position_ids.device).reshape(
+            offset_shape
+        )
+        return torch.cat((position_ids, last_position + offsets), dim=dim)
+
+    def _align_features_for_cp(self, features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Pad every packed document to the zig-zag block alignment."""
+        if self.cp_size <= 1:
+            return features
+
+        alignment = 2 * self.cp_size
+        aligned_features = []
+        for feature in features:
+            document_length = feature["input_ids"].size(-1)
+            pad_size = (-document_length) % alignment
+            if pad_size == 0:
+                aligned_features.append(feature)
+                continue
+
+            aligned_feature = dict(feature)
+            for key, value in feature.items():
+                collate_info = self.collate_infos.get(key)
+                if (
+                    collate_info is None
+                    or collate_info.pack_dim != -1
+                    or collate_info.sp_pad_value is None
+                    or not isinstance(value, torch.Tensor)
+                    or value.size(collate_info.pack_dim) != document_length
+                    or (key == "labels" and self.seq_classification)
+                ):
+                    continue
+
+                if key == "position_ids":
+                    aligned_feature[key] = self._pad_position_ids(value, collate_info.pack_dim, pad_size)
+                else:
+                    aligned_feature[key] = self.pad_feature_to_length(
+                        value,
+                        dim=collate_info.pack_dim,
+                        pad_value=collate_info.sp_pad_value,
+                        pad_size=pad_size,
+                    )
+            aligned_features.append(aligned_feature)
+        return aligned_features
 
     def pad_feature_to_length(
         self,
@@ -265,6 +317,7 @@ class PackingCollator(DataCollator):
         return batch
 
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        features = self._align_features_for_cp(features)
         batch = defaultdict(list)
         for feature in features:
             for key in feature.keys():
@@ -324,10 +377,31 @@ class SequenceParallelCollator(DataCollator):
     metadata_collate_func: Optional[MetadataCollateFunc] = None
 
     def __post_init__(self):
-        self.sp_size = get_parallel_state().sp_size
-        self.sp_rank = get_parallel_state().sp_rank
+        ps = get_parallel_state()
+        self.sp_size = ps.sp_size
+        self.sp_rank = ps.sp_rank
+        # USP (context-parallel / Ring-Attention) layout. When ``cp_size > 1`` the
+        # sequence is split as: ``cp`` OUTER in zig-zag block order (for balanced
+        # causal ring attention) and ``ulysses`` INNER as contiguous sub-chunks
+        # (so the in-attention Ulysses all-to-all reassembles each cp region's
+        # full sequence). See ``sequence_parallel.data.zigzag_reorder`` and the
+        # ring branch in ``veomni/ops/kernels/attention``.
+        self.cp_size = ps.cp_size if getattr(ps, "cp_layout", "contiguous") == "zigzag" else 1
+        self.ulysses_size = ps.ulysses_size
+        self.cp_rank = ps.cp_rank
+        self.ulysses_rank = ps.ulysses_rank
+        # Per-document offsets (on the FULL pre-slice sequence) used by the USP
+        # varlen path to zig-zag split each packed document independently across
+        # ``cp``. Populated per-batch in ``__call__`` when ``cp_size > 1``.
+        self._cp_cu_seqlens = None
 
     def sp_slice(self, key: str, feature: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        if self.cp_size > 1:
+            assert not isinstance(feature, list), (
+                f"context-parallel (cp_size>1) does not support list feature {key!r} "
+                "(multimodal packing under cp is unsupported)"
+            )
+            return self._usp_slice(feature, dim)
         if isinstance(feature, list):
             assert dim == 0, f"Only support dim=0 for {key} as it is a List"
             seq_length = len(feature)
@@ -337,6 +411,87 @@ class SequenceParallelCollator(DataCollator):
             seq_length = feature.size(dim)
             sp_chunk_size = seq_length // self.sp_size
             return feature.narrow(dim, self.sp_rank * sp_chunk_size, sp_chunk_size)
+
+    def _usp_slice(self, feature: torch.Tensor, dim: int) -> torch.Tensor:
+        """cp-outer (zig-zag) + ulysses-inner (contiguous) slice for this rank.
+
+        For packed sequences (``self._cp_cu_seqlens`` set, more than one segment)
+        each document is zig-zag split INDEPENDENTLY across ``cp`` so causal ring
+        attention stays balanced per document. Otherwise the whole sequence is
+        treated as one document (dense zig-zag).
+        """
+        from ..distributed.sequence_parallel.data import zigzag_reorder, zigzag_reorder_varlen
+
+        cu = self._cp_cu_seqlens
+        if cu is not None and cu.numel() > 2:
+            reordered = zigzag_reorder_varlen(feature, cu, dim=dim, cp_size=self.cp_size)
+        else:
+            reordered = zigzag_reorder(feature, dim=dim, cp_size=self.cp_size)
+        cp_chunk = reordered.size(dim) // self.cp_size
+        cp_region = reordered.narrow(dim, self.cp_rank * cp_chunk, cp_chunk)
+        uly_chunk = cp_region.size(dim) // self.ulysses_size
+        return cp_region.narrow(dim, self.ulysses_rank * uly_chunk, uly_chunk).contiguous()
+
+    def _compute_cp_cu_seqlens(
+        self,
+        batch: Dict[str, Any],
+        known_tail_padding_length: int = 0,
+    ) -> Optional["torch.Tensor"]:
+        """Per-document offsets on the FULL SP-padded sequence for USP varlen.
+
+        Document starts are the ``position_ids == 0`` indices (packing
+        convention). Fixed-length and SP padding use ``pad_value == 0``, so every
+        tail token would otherwise register as its own length-1 boundary; the
+        trailing run is coalesced into a single segment (identical to how
+        ``add_flash_attention_kwargs_from_position_ids`` handles it via
+        ``coalesce_tail_padding_cu_seqlens``).
+
+        Balanced ring attention requires EVERY document length (including the
+        coalesced tail-pad segment) to be divisible by ``2 * cp_size`` so each
+        document splits evenly into the ``2*cp_size`` zig-zag blocks. This is
+        asserted here with an actionable error rather than deep inside the
+        reorder helpers. Returns ``None`` when there is a single document (the
+        dense zig-zag path handles that case).
+        """
+        position_ids = batch.get("position_ids")
+        if position_ids is None:
+            return None
+        pack_dim = self.collate_infos["position_ids"].pack_dim
+        pre_pad_len = position_ids.size(pack_dim)
+        padded = self.sp_padding("position_ids", position_ids, dim=pack_dim, pad_value=0)
+        tail_padding_length = known_tail_padding_length + padded.size(pack_dim) - pre_pad_len
+
+        pos = padded
+        if pos.dim() == 3:  # (b, dim, seq)
+            pos = pos[:, 0, :]
+        pos = pos.reshape(-1)
+        total = pos.numel()
+        starts = (pos == 0).nonzero().view(-1)
+        cu = torch.cat(
+            [
+                starts.to(dtype=torch.int32, device=pos.device),
+                torch.tensor([total], dtype=torch.int32, device=pos.device),
+            ]
+        )
+        cu = torch.unique_consecutive(cu)
+        # Fold fixed-length and SP padding into one tail segment so pad tokens do
+        # not appear as length-1 documents.
+        if tail_padding_length > 0:
+            cu = coalesce_tail_padding_cu_seqlens(cu, tail_padding_length)
+        if cu.numel() <= 2:
+            return None
+
+        seglens = (cu[1:] - cu[:-1]).tolist()
+        n_blocks = 2 * self.cp_size
+        bad = [seg for seg in seglens if seg % n_blocks != 0]
+        if bad:
+            raise ValueError(
+                "USP context-parallel (cp_size>1) with packed/varlen data requires every "
+                f"packed document length to be divisible by 2*cp_size ({n_blocks}); got document "
+                f"lengths {seglens} (offending: {bad}). Pack your data so each document (and the "
+                "SP-pad tail) aligns to 2*cp_size, or set cp_size=1 for arbitrary document lengths."
+            )
+        return cu
 
     def sp_padding(
         self,
@@ -352,7 +507,11 @@ class SequenceParallelCollator(DataCollator):
         else:
             seq_length = feature.size(dim)
 
-        scale_sp_size = self.sp_size * pad_scale
+        # Under USP (cp_size>1) each cp rank owns 2 zig-zag blocks, so the
+        # sequence must be divisible by ``2 * cp_size * ulysses_size`` (i.e.
+        # ``2 * sp_size``) rather than just ``sp_size``.
+        zigzag_factor = 2 if self.cp_size > 1 else 1
+        scale_sp_size = self.sp_size * pad_scale * zigzag_factor
         sp_chunk_size = (seq_length + scale_sp_size - 1) // scale_sp_size
         pad_size = sp_chunk_size * scale_sp_size - seq_length
         if pad_size == 0:
@@ -382,6 +541,16 @@ class SequenceParallelCollator(DataCollator):
         # how the text-side cu_seq_lens picks up sp-pad via the position_ids==0
         # convention in ``add_flash_attention_kwargs_from_position_ids``).
         vit_sp_pad: Dict[str, int] = {"pixel_values": 0, "pixel_values_videos": 0}
+
+        # For USP varlen (cp_size>1) precompute per-document offsets on the FULL
+        # SP-padded sequence so every feature is zig-zag split per document with
+        # the SAME boundaries. position_ids is padded with the ``== 0`` boundary
+        # convention, so document starts are exactly the ``position_ids == 0``
+        # indices. Must be computed BEFORE any feature (incl. position_ids) is
+        # sliced, matching constraint 13 (FA kwargs on full position_ids).
+        self._cp_cu_seqlens = None
+        if self.cp_size > 1:
+            self._cp_cu_seqlens = self._compute_cp_cu_seqlens(batch, linear_attn_tail_padding_length)
 
         for key in batch.keys():
             collate_info: DataCollateInfo = self.collate_infos.get(key, None)
@@ -442,6 +611,8 @@ class MainCollator(DataCollator):
             User config to override the default collate info.
         pad_to_length:
             Whether to pad sequence to a fixed length. Default is False.
+            Under context parallelism, each document is first padded to a
+            multiple of ``2 * cp_size``.
         seq_classification:
             If True, sequence classification task. Default is False.
         metadata_collate_func:

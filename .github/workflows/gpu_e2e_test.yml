@@ -119,6 +119,9 @@ jobs:
             sleep 3
             nvidia-smi || true
           fi
+      - name: Run packed USP training equivalence
+        run: |
+          uv run --frozen pytest -s -x tests/e2e/test_usp_training_equivalence.py
       - name: Run FSDP equivalence tests
         run: |
           uv run --frozen pytest -s -x tests/distributed/test_fsdp_equivalence.py
