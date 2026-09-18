@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from torch import Tensor
 
 from ....registry import SavedState
+from ..group import apply_group_size_unweighted
 from . import eager as _eager
 
 
@@ -87,3 +88,6 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor]:
     if grad_weight is not None:
         raise RuntimeError("unweighted Liger backward unexpectedly returned a weight grad")
     return (grad_x,)
+
+
+forward, backward = apply_group_size_unweighted(forward, backward)

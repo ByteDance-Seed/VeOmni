@@ -22,6 +22,7 @@ import torch
 from torch import Tensor
 
 from ....registry import SavedState
+from ..group import apply_group_size_unweighted
 
 
 @dataclass(frozen=True)
@@ -61,3 +62,6 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor]:
     scaled_grad = grad_output.float()
     grad_x = rstd * scaled_grad - (rstd.pow(3) / n) * x_f * (scaled_grad * x_f).sum(dim=-1, keepdim=True)
     return (grad_x.to(x.dtype),)
+
+
+forward, backward = apply_group_size_unweighted(forward, backward)

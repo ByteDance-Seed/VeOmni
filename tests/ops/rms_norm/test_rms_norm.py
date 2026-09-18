@@ -344,3 +344,149 @@ def test_npu_standard_eps_matches_eager(eps: float):
     w = torch.randn(64, device="npu", dtype=torch.float32)
     out_e, out_o = _npu_forward_only("standard", x, w, eps)
     assert torch.allclose(out_e, out_o, atol=1e-5, rtol=1e-5)
+
+
+def _qwen4_grouped_offset(x: Tensor, weight: Tensor, eps: float, group_size: int) -> Tensor:
+    grouped = x.float().reshape(*x.shape[:-1], -1, group_size)
+    output = grouped * torch.rsqrt(grouped.pow(2).mean(-1, keepdim=True) + eps)
+    return (output.flatten(-2) * (1.0 + weight.float())).type_as(x)
+
+
+@pytest.mark.parametrize("variant", ["standard", "offset", "deepseek_v4"])
+def test_weighted_omitted_group_size_matches_explicit_none(variant: str):
+    torch.manual_seed(0)
+    x = torch.randn(2, 8, 64, dtype=torch.float32)
+    weight = torch.randn(64, dtype=torch.float32)
+    eps = 1e-6
+    op = resolve_op("rms_norm", variant, "eager").wrapper
+
+    x_omit, w_omit = make_grad_leaves(x, weight)
+    x_none, w_none = make_grad_leaves(x, weight)
+    out_omit = op(x_omit, w_omit, eps=eps)
+    out_none = op(x_none, w_none, eps=eps, group_size=None)
+    assert torch.equal(out_omit, out_none)
+
+    grad_output = torch.randn_like(out_omit)
+    omit_grads = torch.autograd.grad(out_omit, (x_omit, w_omit), grad_outputs=grad_output)
+    none_grads = torch.autograd.grad(out_none, (x_none, w_none), grad_outputs=grad_output)
+    assert torch.equal(omit_grads[0], none_grads[0])
+    assert torch.equal(omit_grads[1], none_grads[1])
+
+
+def test_unweighted_omitted_group_size_matches_explicit_none():
+    torch.manual_seed(0)
+    x = torch.randn(2, 8, 64, dtype=torch.float32)
+    eps = 1e-6
+    op = resolve_op("rms_norm", "unweighted", "eager").wrapper
+
+    x_omit = x.detach().requires_grad_(True)
+    x_none = x.detach().requires_grad_(True)
+    out_omit = op(x_omit, eps=eps)
+    out_none = op(x_none, eps=eps, group_size=None)
+    assert torch.equal(out_omit, out_none)
+
+    grad_output = torch.randn_like(out_omit)
+    (grad_omit,) = torch.autograd.grad(out_omit, x_omit, grad_outputs=grad_output)
+    (grad_none,) = torch.autograd.grad(out_none, x_none, grad_outputs=grad_output)
+    assert torch.equal(grad_omit, grad_none)
+
+
+@pytest.mark.parametrize("variant", ["standard", "offset", "deepseek_v4"])
+def test_weighted_grouped_matches_reshaped_ungrouped(variant: str):
+    torch.manual_seed(1)
+    group_size = 16
+    x = torch.randn(2, 8, 64, dtype=torch.float32)
+    weight = torch.randn(64, dtype=torch.float32)
+    eps = 1e-6
+    op = resolve_op("rms_norm", variant, "eager").wrapper
+
+    x_grouped, w_grouped = make_grad_leaves(x, weight)
+    out_grouped = op(x_grouped, w_grouped, eps=eps, group_size=group_size)
+
+    x_manual, w_manual = make_grad_leaves(x, weight)
+    out_manual = op(
+        x_manual.reshape(*x.shape[:-1], -1, group_size),
+        w_manual.reshape(-1, group_size),
+        eps=eps,
+    ).reshape(x.shape)
+    assert torch.equal(out_grouped, out_manual)
+
+    grad_output = torch.randn_like(out_grouped)
+    grouped_grads = torch.autograd.grad(out_grouped, (x_grouped, w_grouped), grad_outputs=grad_output)
+    manual_grads = torch.autograd.grad(out_manual, (x_manual, w_manual), grad_outputs=grad_output)
+    assert torch.equal(grouped_grads[0], manual_grads[0])
+    assert torch.equal(grouped_grads[1], manual_grads[1])
+
+
+def test_unweighted_grouped_matches_reshaped_ungrouped():
+    torch.manual_seed(1)
+    group_size = 16
+    x = torch.randn(2, 8, 64, dtype=torch.float32)
+    eps = 1e-6
+    op = resolve_op("rms_norm", "unweighted", "eager").wrapper
+
+    x_grouped = x.detach().requires_grad_(True)
+    out_grouped = op(x_grouped, eps=eps, group_size=group_size)
+
+    x_manual = x.detach().requires_grad_(True)
+    out_manual = op(x_manual.reshape(*x.shape[:-1], -1, group_size), eps=eps).reshape(x.shape)
+    assert torch.equal(out_grouped, out_manual)
+
+    grad_output = torch.randn_like(out_grouped)
+    (grad_grouped,) = torch.autograd.grad(out_grouped, x_grouped, grad_outputs=grad_output)
+    (grad_manual,) = torch.autograd.grad(out_manual, x_manual, grad_outputs=grad_output)
+    assert torch.equal(grad_grouped, grad_manual)
+
+
+def test_grouped_offset_matches_qwen4_formula():
+    torch.manual_seed(2)
+    group_size = 16
+    x = torch.randn(2, 4, 64, dtype=torch.float32, requires_grad=True)
+    weight = torch.zeros(64, dtype=torch.float32)
+    weight = (weight + 0.01 * torch.randn_like(weight)).detach().requires_grad_(True)
+    eps = 1e-6
+
+    x_ref, w_ref = make_grad_leaves(x, weight)
+    out_ref = _qwen4_grouped_offset(x_ref, w_ref, eps, group_size)
+    x_op, w_op = make_grad_leaves(x, weight)
+    out_op = resolve_op("rms_norm", "offset", "eager").wrapper(x_op, w_op, eps=eps, group_size=group_size)
+    assert torch.equal(out_op, out_ref)
+
+    grad_output = torch.randn_like(out_op)
+    ref_grads = torch.autograd.grad(out_ref, (x_ref, w_ref), grad_outputs=grad_output)
+    op_grads = torch.autograd.grad(out_op, (x_op, w_op), grad_outputs=grad_output)
+    torch.testing.assert_close(op_grads[0], ref_grads[0], atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.equal(op_grads[1], ref_grads[1])
+
+
+def test_group_size_rejects_indivisible_last_dim():
+    x = torch.randn(2, 8, 64)
+    weight = torch.randn(64)
+    with pytest.raises(ValueError, match="divisible by group_size"):
+        resolve_op("rms_norm", "standard", "eager").wrapper(x, weight, eps=1e-6, group_size=12)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RMSNorm needs a GPU")
+@pytest.mark.parametrize("variant", ["standard", "offset"])
+def test_liger_grouped_delegates_to_eager(variant: str):
+    """Fused rows accept ``group_size`` and delegate to eager reshape math."""
+    pytest.importorskip("liger_kernel")
+    eager = resolve_op("rms_norm", variant, "eager").wrapper
+    other = resolve_op("rms_norm", variant, "liger_kernel").wrapper
+    torch.manual_seed(0)
+    group_size = 16
+    x = torch.randn(2, 8, 64, device="cuda", dtype=torch.bfloat16)
+    weight = _fused_weight(variant, 64, "cuda", torch.bfloat16)
+    eps = 1e-6
+
+    x_e, w_e = make_grad_leaves(x, weight)
+    x_o, w_o = make_grad_leaves(x, weight)
+    out_e = eager(x_e, w_e, eps=eps, group_size=group_size)
+    out_o = other(x_o, w_o, eps=eps, group_size=group_size)
+    assert torch.equal(out_e, out_o)
+
+    grad_output = torch.randn_like(out_e)
+    out_e.backward(grad_output)
+    out_o.backward(grad_output)
+    assert torch.equal(x_e.grad, x_o.grad)
+    assert torch.equal(w_e.grad, w_o.grad)

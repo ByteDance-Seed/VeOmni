@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from torch import Tensor
 
 from ....registry import SavedState
+from ..group import apply_group_size_fallback_weighted
 from . import eager as _eager
 
 
@@ -62,3 +63,6 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor]:
     (rstd,) = optional_rstd
     scale = 1.0 + weight
     return torch_npu.npu_rms_norm_backward(grad_output.contiguous(), x, scale, rstd)
+
+
+forward, backward = apply_group_size_fallback_weighted(forward, backward, _eager.forward, _eager.backward)

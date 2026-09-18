@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from torch import Tensor
 
 from ....registry import SavedState
+from ..group import apply_group_size_fallback_weighted
 from . import eager as _eager
 
 
@@ -84,3 +85,6 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor]:
         False,
         None,
     )
+
+
+forward, backward = apply_group_size_fallback_weighted(forward, backward, _eager.forward, _eager.backward)

@@ -16,8 +16,9 @@
 
 Variants: ``standard`` (offset 0, llama-style cast), ``deepseek_v4`` (offset 0,
 fp32 affine scale), ``offset`` (offset 1, gemma-style fp32 scale), and
-``unweighted`` (no affine weight). Each variant registers an eager row plus
-optional CUDA / NPU adapters.
+``unweighted`` (no affine weight). Each exported pair accepts optional
+``group_size`` to reduce last-dim chunks independently. Each variant
+registers an eager row plus optional CUDA / NPU adapters.
 """
 
 from ...platform import GpuKernelRequirement, NpuKernelRequirement

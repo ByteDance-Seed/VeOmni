@@ -12,7 +12,7 @@
 #    - method_override: Qwen4ExpTextRMSNorm.__init__
 #      Construct a local rms_norm offset VeomniOp
 #    - method_override: Qwen4ExpTextRMSNorm.forward
-#      Call rms_norm offset when ungrouped; keep grouped last-dim math local
+#      Call rms_norm offset, passing optional group_size
 #    - method_override: Qwen4ExpTextMLP.__init__
 #      Construct a local swiglu_mlp VeomniOp
 #    - method_override: Qwen4ExpTextMLP.forward
@@ -326,12 +326,7 @@ class Qwen4ExpTextRMSNorm(nn.Module):
         return out.flatten(-2) if self.group_size is not None else out
 
     def forward(self, x):
-        if self.group_size is not None:
-            grouped = x.float().reshape(*x.shape[:-1], -1, self.group_size)
-            output = grouped * torch.rsqrt(grouped.pow(2).mean(-1, keepdim=True) + self.eps)
-            output = output.flatten(-2) * (1.0 + self.weight.float())
-            return output.type_as(x)
-        return self.veomni_rms_norm(x, self.weight, eps=self.eps)
+        return self.veomni_rms_norm(x, self.weight, eps=self.eps, group_size=self.group_size)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"

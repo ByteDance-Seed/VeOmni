@@ -44,6 +44,14 @@ def test_qwen4_exp_packed_matches_separate_outputs_and_gradients():
         text_model_cls = _load_text_model_class()
         packed_model = text_model_cls(config).float().eval()
         assert packed_model.layers[1].self_attn.q_norm.veomni_rms_norm.variant == "offset"
+        assert packed_model.layers[1].self_attn.q_norm.group_size is None
+        grouped_norm = next(
+            module
+            for module in packed_model.modules()
+            if type(module).__name__ == "Qwen4ExpTextRMSNorm" and module.group_size is not None
+        )
+        assert grouped_norm.veomni_rms_norm.variant == "offset"
+        assert grouped_norm.group_size == config.hidden_size
         separate_model = text_model_cls(config).float().eval()
         separate_model.load_state_dict(packed_model.state_dict())
 

@@ -23,6 +23,7 @@ from torch import Tensor
 
 from ....registry import SavedState
 from ....triton_cache import cached_triton_kernel
+from ..group import apply_group_size_fallback_weighted
 from . import eager as _eager
 
 
@@ -127,3 +128,6 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor]:
     d = grad_output.float() * weight.float()
     grad_input = (inv_rms * (d - normed * (d * normed).mean(-1, keepdim=True))).to(x.dtype)
     return grad_input, grad_weight
+
+
+forward, backward = apply_group_size_fallback_weighted(forward, backward, _eager.forward, _eager.backward)
