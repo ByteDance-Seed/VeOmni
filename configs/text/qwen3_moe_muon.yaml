@@ -4,7 +4,7 @@
 # embeddings, lm_head, norms and biases.
 
 model:
-  model_path: Qwen3-30B-A3B-merge
+  model_path: Qwen3-30B-A3B
   ops_implementation:
     attn_implementation: flash_attention_2
     moe_implementation: fused_triton
