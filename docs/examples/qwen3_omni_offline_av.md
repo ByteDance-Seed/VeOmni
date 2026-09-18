@@ -232,4 +232,3 @@ processor / tokenizer / config files from the HF checkpoint.
 
 Use the [run checks](index.md#choose-hardware-and-check-a-run) and
 [checkpoint completion contract](../usage/checkpoint.md#completion) for training.
-For preprocessing or inference, inspect the stage-specific outputs described above.
