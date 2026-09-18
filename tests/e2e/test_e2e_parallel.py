@@ -57,7 +57,7 @@ _DEEPSEEK_V4_TILELANG_TRAINING_ARGS = [
 ]
 
 
-def _materialize_weights_dir(config_path: str, output_path: str) -> Path:
+def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
     # Seed CPU RNG and init on CPU so the materialized checkpoint is bit-identical
     # across pytest invocations *and* across GPU architectures (L20 in CI vs A100
     # locally). Without this, the four sub-runs (sp/ep grid) shared weights within
@@ -73,7 +73,7 @@ def _materialize_weights_dir(config_path: str, output_path: str) -> Path:
         ops_implementation=make_eager_ops_config(),
     )
 
-    model.save_pretrained(output_path, save_original_format=True)
+    model.save_pretrained(output_path, save_original_format=save_original_format)
 
 
 def main(
