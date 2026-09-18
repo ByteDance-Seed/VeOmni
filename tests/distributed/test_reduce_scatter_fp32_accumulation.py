@@ -213,6 +213,16 @@ def test_node_identity_requires_valid_kernel_boot_id(monkeypatch, contents, expe
     assert reduce_scatter_module._get_node_id() == expected
 
 
+@pytest.mark.parametrize("ndim", [0, 3, 4])
+def test_transport_policy_rejects_unsupported_mesh_dimensions_before_communication(ndim):
+    def get_group(name):
+        raise AssertionError("invalid mesh must be rejected before looking up process groups")
+
+    mesh = SimpleNamespace(mesh_dim_names=tuple(f"dim{i}" for i in range(ndim)), get_group=get_group)
+    with pytest.raises(ValueError, match="1D or 2D FSDP mesh"):
+        ReduceScatterTransportPolicy().can_use(mesh)
+
+
 def test_unreadable_node_identity_does_not_trust_environment(monkeypatch):
     def read_text(path):
         raise PermissionError("kernel identity unavailable")
