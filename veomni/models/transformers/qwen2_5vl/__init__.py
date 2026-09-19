@@ -9,9 +9,12 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+# See the License for the specific language governing limitations
+# under the License.
+
+"""Qwen2.5-VL modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 
 @MODEL_CONFIG_REGISTRY.register("qwen2_5_vl")
@@ -23,15 +26,15 @@ def register_qwen2_5_vl_config():
 
 
 @MODELING_REGISTRY.register("qwen2_5_vl")
-def register_qwen2_5_vl_modeling(architecture: str):
+def register_qwen2_5_vl_modeling(architecture: str | None):
     from .generated.patched_modeling_qwen2_5_vl_gpu import (
         Qwen2_5_VLForConditionalGeneration,
         Qwen2_5_VLModel,
     )
 
+    architecture = architecture or ""
     if "ForConditionalGeneration" in architecture:
         return Qwen2_5_VLForConditionalGeneration
-    elif "Model" in architecture:
+    if "Model" in architecture:
         return Qwen2_5_VLModel
-    else:
-        return Qwen2_5_VLForConditionalGeneration
+    return Qwen2_5_VLForConditionalGeneration

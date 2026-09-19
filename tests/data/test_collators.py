@@ -7,6 +7,11 @@ from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
+def _assert_host_packed_metadata(out, slices):
+    assert out["packed_sequence_slices"] == slices
+    assert out["attention_mask_is_all_ones"] is True
+
+
 def _fake_ps(sp_enabled: bool, sp_size: int = 1, sp_rank: int = 0):
     return types.SimpleNamespace(sp_enabled=sp_enabled, sp_size=sp_size, sp_rank=sp_rank)
 
@@ -49,6 +54,7 @@ def test_seqcls_collator_sp_disabled(monkeypatch, features_two_samples):
     assert torch.equal(out["cu_seq_lens_k"], exp_cu_seq_lens)
     assert out["max_length_q"] == exp_max_length
     assert out["max_length_k"] == exp_max_length
+    _assert_host_packed_metadata(out, ((0, 3), (3, 5)))
 
 
 def test_seqcls_collator_sp_enabled(monkeypatch, features_two_samples):
@@ -73,6 +79,7 @@ def test_seqcls_collator_sp_enabled(monkeypatch, features_two_samples):
     assert torch.equal(out["cu_seq_lens_k"], exp_cu_seq_lens)
     assert out["max_length_q"] == exp_max_length
     assert out["max_length_k"] == exp_max_length
+    _assert_host_packed_metadata(out, ((0, 3), (3, 5)))
 
 
 def test_data_collator_pad_to_length_sp_disabled(monkeypatch, features_two_samples):
@@ -113,6 +120,7 @@ def test_data_collator_pad_to_length_sp_disabled(monkeypatch, features_two_sampl
     assert int(out["tail_padding_length"]) == 3
     assert out["max_length_q"] == exp_max_length
     assert out["max_length_k"] == exp_max_length
+    _assert_host_packed_metadata(out, ((0, 3), (3, 5), (5, 8)))
 
 
 def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samples):
@@ -152,6 +160,7 @@ def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samp
     assert int(out["tail_padding_length"]) == 3
     assert out["max_length_q"] == exp_max_length
     assert out["max_length_k"] == exp_max_length
+    _assert_host_packed_metadata(out, ((0, 3), (3, 5), (5, 8)))
 
     monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True, sp_size=sp_size, sp_rank=1))
     collator = m.MainCollator(pad_to_length=pad_to_length)
@@ -175,6 +184,7 @@ def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samp
     assert int(out["tail_padding_length"]) == 3
     assert out["max_length_q"] == exp_max_length
     assert out["max_length_k"] == exp_max_length
+    _assert_host_packed_metadata(out, ((0, 3), (3, 5), (5, 8)))
 
 
 def test_packing_collator_clamps_linear_attn_tail_padding_length(monkeypatch, features_two_samples):

@@ -1,0 +1,241 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing limitations
+# under the License.
+
+"""Tensor-native MagiAttention mask contract and Transformers builder."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable
+
+import torch
+from transformers.masking_utils import (
+    bidirectional_mask_function,
+    causal_mask_function,
+)
+
+from ..helper import require_all
+from ..ulysses import effective_sequence_lengths, should_apply_ulysses
+
+
+@dataclass(frozen=True)
+class MagiAttentionMask:
+    """Range-based attention mask consumed by MagiAttention's FFA kernel.
+
+    ``q_ranges`` and ``k_ranges`` contain paired half-open token ranges with
+    shape ``[num_ranges, 2]`` and dtype ``torch.int32``. ``attn_type_map`` is
+    optional; when present, its values are ``0=full``, ``1=causal``,
+    ``2=inverse causal``, and ``3=bidirectional causal``.
+    """
+
+    q_ranges: torch.Tensor
+    k_ranges: torch.Tensor
+    attn_type_map: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        """Validate range tensors after dataclass construction."""
+        _validate_ranges(self.q_ranges, self.k_ranges)
+        if self.attn_type_map is not None:
+            _validate_attn_type_map(self.attn_type_map, num_ranges=self.q_ranges.shape[0], device=self.q_ranges.device)
+
+    @classmethod
+    def from_ranges(
+        cls,
+        q_ranges: torch.Tensor,
+        k_ranges: torch.Tensor,
+        attn_type_map: torch.Tensor | None = None,
+        *,
+        device: torch.device | str | None = None,
+    ) -> MagiAttentionMask:
+        """Build a mask from explicit ranges, casting to the FFA tensor contract."""
+        _validate_integer_input("q_ranges", q_ranges)
+        _validate_integer_input("k_ranges", k_ranges)
+        if attn_type_map is not None:
+            _validate_integer_input("attn_type_map", attn_type_map)
+        device = q_ranges.device if device is None else torch.device(device)
+        q_ranges = q_ranges.to(device=device, dtype=torch.int32).contiguous()
+        k_ranges = k_ranges.to(device=device, dtype=torch.int32).contiguous()
+        if attn_type_map is not None:
+            attn_type_map = attn_type_map.to(device=device, dtype=torch.int32).contiguous()
+        return cls(q_ranges, k_ranges, attn_type_map)
+
+    @classmethod
+    def from_cu_seqlens(
+        cls,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor | None = None,
+        *,
+        causal: bool = True,
+        device: torch.device | str | None = None,
+        q_length: int | None = None,
+        kv_length: int | None = None,
+    ) -> MagiAttentionMask:
+        """Build bottom-right packed ranges with optional complete-coverage checks.
+
+        Query and key segments may have different lengths; Magi applies causal
+        visibility relative to the bottom-right corner of each paired range.
+        """
+        _validate_integer_input("cu_seqlens_q", cu_seqlens_q)
+        if cu_seqlens_k is None:
+            cu_seqlens_k = cu_seqlens_q
+        else:
+            _validate_integer_input("cu_seqlens_k", cu_seqlens_k)
+        device = cu_seqlens_q.device if device is None else torch.device(device)
+        q_ranges = _ranges_from_cu_seqlens(
+            "cu_seqlens_q",
+            cu_seqlens_q,
+            device=device,
+            sequence_length=q_length,
+        )
+        k_ranges = _ranges_from_cu_seqlens(
+            "cu_seqlens_k",
+            cu_seqlens_k,
+            device=device,
+            sequence_length=kv_length,
+        )
+        attn_type_map = torch.ones(q_ranges.shape[0], device=device, dtype=torch.int32) if causal else None
+        return cls.from_ranges(q_ranges, k_ranges, attn_type_map, device=device)
+
+
+def magi_attention_mask_builder(
+    batch_size: int,
+    q_length: int,
+    kv_length: int,
+    q_offset: int = 0,
+    kv_offset: int = 0,
+    mask_function: Callable = causal_mask_function,
+    attention_mask: torch.Tensor | None = None,
+    skip_ulysses: bool = False,
+    **kwargs,
+) -> MagiAttentionMask:
+    """HF-signature Magi mask for unpacked causal / bidirectional attention.
+
+    Expand local lengths only when the adapter would gather Q/K/V itself:
+    sync Ulysses and not ``skip_ulysses``. Unequal causal lengths are accepted
+    when HF offsets describe the same bottom-right alignment as Magi ranges.
+    """
+    if batch_size != 1:
+        raise ValueError(f"MagiAttention mask creation requires physical batch size 1, got {batch_size}.")
+    if mask_function is causal_mask_function:
+        causal = True
+    elif mask_function is bidirectional_mask_function:
+        causal = False
+    else:
+        raise ValueError(
+            "The registered MagiAttention mask builder supports only canonical causal or bidirectional masks. "
+            "Packed and model-specific visibility must use MagiAttentionMask.from_ranges or from_cu_seqlens."
+        )
+
+    if attention_mask is not None:
+        if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+            raise TypeError(
+                "MagiAttention mask creation accepts only a 2D attention mask, "
+                f"got {type(attention_mask).__name__} with shape "
+                f"{getattr(attention_mask, 'shape', None)}."
+            )
+        if attention_mask.shape[0] != batch_size:
+            raise ValueError(
+                f"MagiAttention attention_mask batch size must be {batch_size}, got {attention_mask.shape[0]}."
+            )
+        raise ValueError(
+            "The registered MagiAttention mask builder cannot recover packed boundaries from a 2D attention mask. "
+            "Pass cumulative sequence lengths or explicit ranges to the corresponding MagiAttentionMask constructor."
+        )
+
+    device = kwargs.get("device")
+    if device is None and attention_mask is not None:
+        device = attention_mask.device
+    if device is None:
+        raise ValueError("MagiAttention mask creation requires a device or tensor metadata.")
+    device = torch.device(device)
+
+    apply_ulysses = should_apply_ulysses(skip_ulysses=skip_ulysses)
+    full_q_length, full_kv_length = effective_sequence_lengths(
+        q_length,
+        kv_length,
+        skip_ulysses=skip_ulysses,
+    )
+    if causal:
+        if apply_ulysses and (q_offset != 0 or kv_offset != 0):
+            raise ValueError(
+                "MagiAttention with Ulysses does not support cached mask offsets; "
+                f"got q_offset={q_offset} and kv_offset={kv_offset}."
+            )
+        expected_offset_delta = full_kv_length - full_q_length
+        if q_offset - kv_offset != expected_offset_delta:
+            raise ValueError(
+                "MagiAttention causal ranges are bottom-right aligned, so HF offsets must satisfy "
+                "q_offset - kv_offset == kv_length - q_length; "
+                f"got offsets {q_offset}/{kv_offset} and effective lengths {full_q_length}/{full_kv_length}."
+            )
+    attn_type_map = torch.ones(1, device=device, dtype=torch.int32) if causal else None
+    return MagiAttentionMask.from_ranges(
+        torch.tensor([[0, full_q_length]], device=device, dtype=torch.int32),
+        torch.tensor([[0, full_kv_length]], device=device, dtype=torch.int32),
+        attn_type_map,
+        device=device,
+    )
+
+
+def _ranges_from_cu_seqlens(
+    name: str,
+    cu_seqlens: torch.Tensor,
+    *,
+    device: torch.device,
+    sequence_length: int | None,
+) -> torch.Tensor:
+    """Convert cumulative sequence lengths to contiguous half-open ranges."""
+    _validate_integer_input(name, cu_seqlens)
+    if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+        raise ValueError(f"{name} must have shape [num_sequences + 1], got {tuple(cu_seqlens.shape)}.")
+    cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32)
+    require_all(cu_seqlens[:1] == 0, f"{name} must start at 0.")
+    if sequence_length is not None:
+        require_all(
+            cu_seqlens[-1:] == sequence_length,
+            f"{name} must end at the full sequence length ({sequence_length}).",
+        )
+    require_all(cu_seqlens[1:] > cu_seqlens[:-1], f"{name} must be strictly increasing.")
+    return torch.stack((cu_seqlens[:-1], cu_seqlens[1:]), dim=1).contiguous()
+
+
+def _validate_integer_input(name: str, tensor: torch.Tensor) -> None:
+    """Require an integer tensor before converting it to the FFA int32 ABI."""
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}.")
+    if tensor.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"{name} must have dtype int32 or int64, got {tensor.dtype}.")
+
+
+def _validate_ranges(q_ranges: torch.Tensor, k_ranges: torch.Tensor) -> None:
+    """Validate paired query and key ranges for the Magi FFA contract."""
+    for name, ranges in (("q_ranges", q_ranges), ("k_ranges", k_ranges)):
+        if ranges.dtype != torch.int32 or ranges.ndim != 2 or ranges.shape[1] != 2 or ranges.shape[0] == 0:
+            raise ValueError(f"MagiAttentionMask {name} must have shape [num_ranges, 2] and dtype int32.")
+    if q_ranges.shape[0] != k_ranges.shape[0] or q_ranges.device != k_ranges.device:
+        raise ValueError("MagiAttentionMask q_ranges and k_ranges must share length and device.")
+    starts = torch.cat((q_ranges[:, 0], k_ranges[:, 0]))
+    ends = torch.cat((q_ranges[:, 1], k_ranges[:, 1]))
+    require_all((starts >= 0) & (starts < ends), "MagiAttentionMask ranges must satisfy 0 <= start < end.")
+
+
+def _validate_attn_type_map(attn_type_map: torch.Tensor, *, num_ranges: int, device: torch.device) -> None:
+    """Validate optional per-range Magi attention type codes."""
+    if attn_type_map.dtype != torch.int32 or attn_type_map.ndim != 1 or attn_type_map.shape[0] != num_ranges:
+        raise ValueError("MagiAttentionMask attn_type_map must have shape [num_ranges] and dtype int32.")
+    if attn_type_map.device != device:
+        raise ValueError("MagiAttentionMask attn_type_map must be on the same device as q_ranges.")
+    require_all(
+        (attn_type_map >= 0) & (attn_type_map <= 3), "MagiAttentionMask attn_type_map values must be in [0, 3]."
+    )

@@ -12,20 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3-VL-MoE transformers>=5.16.1 code generation.
+Patch configuration for Qwen3-VL-MoE VeomniOp replacements.
 
-Reuses the full set of qwen3_vl VLM patches via `name_map={"Qwen3VL": "Qwen3VLMoe"}`
-(vision SP, deepstack, async Ulysses attention, precomputed position-ids, fused
-loss) and layers the MoE-specific patches on top:
-  - `Qwen3VLMoeTextExperts` fused-MoE dispatch (gate_up_proj fused path);
-  - `Qwen3VLMoeModel.__init__` propagates `_moe_implementation` to `text_config`;
-  - `Qwen3VLMoeForConditionalGeneration.{forward, get_parallel_plan}` to route
-    through fused loss + aux_loss and register the expert parallel plan.
+Reuses the qwen3_vl VLM patches via `name_map={"Qwen3VL": "Qwen3VLMoe"}`
+and adds MoE-specific VeomniOp calls on top.
 
 Regen command:
 patchgen veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config -o veomni/models/transformers/qwen3_vl_moe/generated --diff
 """
 
+from functools import partial
 from types import SimpleNamespace
 
 import torch
@@ -35,10 +31,8 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     BaseModelOutputWithDeepstackFeatures,
+    Qwen3VLMoeModel,
     Qwen3VLMoeModelOutputWithPast,
-    Qwen3VLMoeTextModel,
-    Qwen3VLMoeVisionModel,
-    load_balancing_loss_func,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
@@ -48,16 +42,23 @@ from veomni.distributed.sequence_parallel import (
     gather_outputs,
     slice_input_tensor,
 )
+from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
-    apply_rotary_pos_emb_patched,
-    apply_rotary_pos_emb_vision_patched,
+    config as qwen3_vl_config,
+)
+from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_get_metadata_collate_func_patched,
     qwen3_vl_get_position_id_func_patched,
     qwen3_vl_model_get_image_features_patched,
     qwen3_vl_model_get_placeholder_mask_patched,
     qwen3_vl_rmsnorm_forward_patched,
+    qwen3_vl_rmsnorm_init_patched,
+    qwen3_vl_text_attention_bind_ops,
     qwen3_vl_text_attention_forward_patched,
     qwen3_vl_text_deepstack_process_patched,
+    qwen3_vl_text_mlp_forward_patched,
+    qwen3_vl_text_mlp_init_patched,
+    qwen3_vl_vision_attention_bind_ops,
     qwen3_vl_vision_attention_forward_patched,
     qwen3_vl_vision_block_forward_patched,
     qwen3_vl_vision_dummy_forward_patched,
@@ -65,9 +66,9 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_vision_forward_patched,
     qwen3_vl_vision_rot_pos_emb_patched,
 )
-from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
-    config as qwen3_vl_config,
-)
+from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import Qwen3VLMoeCausalLMOutputWithLogProbs
 
@@ -75,16 +76,17 @@ from veomni.utils.model_outputs import Qwen3VLMoeCausalLMOutputWithLogProbs
 config = PatchConfig(
     source_module="transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
     target_file="patched_modeling_qwen3_vl_moe_gpu.py",
-    description="Qwen3-VL-MoE with VeOmni v5 compatibility (SP + async Ulysses + deepstack + fused MoE + fused loss)",
+    description="Qwen3-VL-MoE with VeOmni v5 patches and VeomniOp replacements",
 )
+config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
+config.drop_import_names("use_kernelized_func")
 
 
 @config.override_method(
     "Qwen3VLMoeModel.__init__",
-    description="Construct generated towers and propagate the MoE implementation to text_config",
+    description="Construct generated vision and text towers instead of upstream AutoModel classes",
 )
 def qwen3_vl_moe_model_init_patched(self, config):
-    config.text_config._moe_implementation = getattr(config, "_moe_implementation", "eager")
     super().__init__(config)
     self.visual = Qwen3VLMoeVisionModel._from_config(config.vision_config)
     self.language_model = Qwen3VLMoeTextModel._from_config(config.text_config)
@@ -119,18 +121,20 @@ config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "Qwen3VLMoeCausalLMOutputWithLogProbs"],
 )
-config.drop_import_names("Qwen3VLMoeCausalLMOutputWithPast")
-
-config.add_post_import_block(
-    """
-    # ── OpSlot declarations ──────────────────────────────────────────────────
-    # These are bound at model-build time by _bind_veomni_ops() in auto.py.
-    from veomni.ops.dispatch import OpSlot
-    veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
-    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-    veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
-    """
+config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import(
+    "veomni.ops.config",
+    names=["resolve_op_impl"],
 )
+config.add_import(
+    "veomni.models.utils.moe_utils",
+    names=["merged_experts_act_fn_forward"],
+)
+config.add_import(
+    "veomni.models.loss_utils",
+    names=["ForCausalLMLoss", "load_balancing_loss"],
+)
+config.drop_import_names("Qwen3VLMoeCausalLMOutputWithPast")
 
 
 # ================================================================
@@ -163,10 +167,33 @@ class _Qwen3VLMoeFakeForPosID(SimpleNamespace):  # noqa: F821 SimpleNamespace de
 # ================================================================
 _NAME_MAP = {"Qwen3VL": "Qwen3VLMoe"}
 config.override_method(
+    "Qwen3VLMoeTextRMSNorm.__init__",
+    replacement=qwen3_vl_rmsnorm_init_patched,
+    name_map=_NAME_MAP,
+    description="Construct a local rms_norm VeomniOp",
+)
+config.override_method(
     "Qwen3VLMoeTextRMSNorm.forward",
     replacement=qwen3_vl_rmsnorm_forward_patched,
     name_map=_NAME_MAP,
-    description="OpSlot guard for Liger fused RMSNorm (standard formulation)",
+    description="Always call the local rms_norm VeomniOp",
+)
+config.override_method(
+    "Qwen3VLMoeTextMLP.__init__",
+    replacement=qwen3_vl_text_mlp_init_patched,
+    name_map=_NAME_MAP,
+    description="Construct a local swiglu_mlp VeomniOp",
+)
+config.override_method(
+    "Qwen3VLMoeTextMLP.forward",
+    replacement=qwen3_vl_text_mlp_forward_patched,
+    name_map=_NAME_MAP,
+    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
+)
+config.modify_init(
+    "Qwen3VLMoeVisionAttention",
+    replacement=qwen3_vl_vision_attention_bind_ops,
+    description="Bind instance-local rope and attention VeomniOps",
 )
 config.override_method(
     "Qwen3VLMoeVisionAttention.forward",
@@ -204,6 +231,11 @@ config.override_method(
     name_map=_NAME_MAP,
     description="Provide dummy vision forward for FSDP path with SP-aware shape",
 )
+config.modify_init(
+    "Qwen3VLMoeTextAttention",
+    replacement=qwen3_vl_text_attention_bind_ops,
+    description="Bind instance-local rope and attention VeomniOps",
+)
 config.override_method(
     "Qwen3VLMoeTextAttention.forward",
     replacement=qwen3_vl_text_attention_forward_patched,
@@ -240,39 +272,23 @@ config.override_method(
     name_map=_NAME_MAP,
     description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
 )
-config.replace_function(
-    "apply_rotary_pos_emb",
-    replacement=apply_rotary_pos_emb_patched,
-    description="OpSlot guard for Liger fused RoPE",
-)
-config.replace_function(
-    "apply_rotary_pos_emb_vision",
-    replacement=apply_rotary_pos_emb_vision_patched,
-    description="OpSlot guard for Liger fused vision RoPE",
-)
 
 
 # ================================================================
 # Patch: Qwen3VLMoeTextExperts
-# 1. drop the upstream `@use_experts_implementation` decorator — routing
-#    through `ALL_EXPERTS_FUNCTIONS` bypasses our fused kernel
-# 2. add VeOmni fused MoE dispatch via the module-level
-#    ``veomni_moe_experts_forward`` OpSlot; pass `gate_up_proj` directly
-#    as `fc1_1_2_weight` (the v5 modeling already stores it in the
-#    `[E, 2*I, H]` fused layout, so no chunk + contiguous overhead is needed)
+# 1. drop the upstream `@use_experts_implementation` decorator
+# 2. always call a local moe_experts VeomniOp; pass `gate_up_proj`
+#    as merged `fc1_1_2_weight` (v5 already stores `[E, 2*I, H]`)
 # ================================================================
 @config.replace_class(
     "Qwen3VLMoeTextExperts",
-    description="Drop @use_experts_implementation decorator and add VeOmni fused MoE dispatch path",
+    description="Drop @use_experts_implementation and always call moe_experts VeomniOp",
 )
 class PatchedQwen3VLMoeTextExperts(nn.Module):
     """Collection of expert weights stored as 3D tensors.
 
-    Replaces the HF class to remove the `@use_experts_implementation` decorator
-    (which routes to grouped_mm and bypasses our fused MoE path) and to add
-    VeOmni fused MoE dispatch via the OpSlot guard. The OpSlot is bound by
-    ``_bind_veomni_ops`` after model construction; eager mode falls through
-    to the standard expert loop below.
+    Replaces the HF class to remove the `@use_experts_implementation`
+    decorator and to call a local ``moe_experts`` VeomniOp.
     """
 
     def __init__(self, config):
@@ -283,6 +299,8 @@ class PatchedQwen3VLMoeTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
+        self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
 
     def forward(
         self,
@@ -290,30 +308,27 @@ class PatchedQwen3VLMoeTextExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        final_hidden_states = torch.zeros_like(hidden_states)
-        # --- Patch.2 ---
-        if veomni_moe_experts_forward.use_non_eager_impl:
-            return veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
-        # --- Patch.2 ---
-
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-            current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-
-        return final_hidden_states
+        if not self.use_swiglu_mlp:
+            return merged_experts_act_fn_forward(
+                hidden_states,
+                top_k_index,
+                top_k_weights,
+                self.gate_up_proj,
+                self.down_proj,
+                self.act_fn,
+                self.num_experts,
+            )
+        unused = self.gate_up_proj.new_empty(0)
+        return self.veomni_moe(
+            hidden_states,
+            top_k_weights,
+            top_k_index,
+            unused,
+            unused,
+            self.down_proj,
+            self.gate_up_proj,
+            num_experts=self.num_experts,
+        )
 
 
 # ================================================================
@@ -609,16 +624,37 @@ def qwen3_vl_moe_model_forward_patched(
 
 
 # ================================================================
+# Patch: Qwen3VLMoeForConditionalGeneration.__init__
+# Bind ForCausalLMLoss + a local load_balancing_loss VeomniOp.
+# ================================================================
+@config.override_method(
+    "Qwen3VLMoeForConditionalGeneration.__init__",
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
+)
+def qwen3_vl_moe_for_conditional_generation_init_patched(self, config):
+    super().__init__(config)
+    self.model = Qwen3VLMoeModel(config)
+    self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+    self.veomni_lb = VeomniOp(
+        "load_balancing_loss",
+        "standard",
+        resolve_op_impl("load_balancing_loss_implementation"),
+    )
+    self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
+    self.post_init()
+
+
+# ================================================================
 # Patch: Qwen3VLMoeForConditionalGeneration.forward
-# 1. use the unified VeOmni fused loss_function path — avoids
-#    materializing full-vocab logits when labels is provided
-# 2. compute MoE aux_loss via upstream `load_balancing_loss_func` when
-#    `output_router_logits=True`; read config from `config.text_config`
-#    since the VLM top-level wraps a nested text config
+# 1. always call self.loss_function (ForCausalLMLoss + VeomniOp)
+# 2. aux_loss via the model-facing load_balancing_loss helper
 # ================================================================
 @config.override_method(
     "Qwen3VLMoeForConditionalGeneration.forward",
-    description="Use VeOmni fused loss_function and MoE aux_loss path",
+    description="Always call ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 def qwen3_vl_moe_for_conditional_generation_forward_patched(
     self,
@@ -636,11 +672,6 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen3VLMoeCausalLMOutputWithLogProbs:
-    r"""
-    cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-        Indices depicting the position of the input sequence tokens in the sequence. Retained in the
-        signature for callers that pass it positionally; transformers 5.16 moved it into `**kwargs`.
-    """
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,
@@ -664,33 +695,14 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
     logits = None
     fused_linear_aux = None
     if labels is not None:
-        # Modification: OpSlot guard for cross-entropy loss.
-        if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.text_config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-        else:
-            logits = self.lm_head(hidden_states)
-            # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-            # returns (loss, logits, fused_linear_aux); unpack to match the
-            # OpSlot branch above.
-            loss, _, fused_linear_aux = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.text_config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-            if fused_linear_aux is not None:
-                # fused_linear_aux path empties loss/logits slots; clear the local 3D
-                # logits so output mirrors the OpSlot branch's contract.
-                logits = None
+        loss, logits, fused_linear_aux = self.loss_function(
+            logits=logits,
+            labels=labels,
+            vocab_size=self.config.text_config.vocab_size,
+            hidden_states=hidden_states,
+            weights=self.lm_head.weight,
+            **kwargs,
+        )
     else:
         logits = self.lm_head(hidden_states)
     # --- Patch.1 ---
@@ -698,22 +710,13 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
     # --- Patch.2 ---
     aux_loss = None
     if kwargs.get("output_router_logits", False):
-        # Modification: OpSlot guard for load-balancing loss.
-        if veomni_load_balancing_loss.use_non_eager_impl:
-            aux_loss = veomni_load_balancing_loss(
-                outputs.router_logits,
-                self.config.text_config.num_experts,
-                self.config.text_config.num_experts_per_tok,
-                attention_mask,
-            )
-        else:
-            aux_loss = load_balancing_loss_func(
-                outputs.router_logits,
-                self.config.text_config.num_experts,
-                self.config.text_config.num_experts_per_tok,
-                attention_mask,
-            )
-        if labels is not None and isinstance(aux_loss, torch.Tensor):
+        aux_loss = self.load_balancing_loss(
+            outputs.router_logits,
+            self.config.text_config.num_experts,
+            self.config.text_config.num_experts_per_tok,
+            attention_mask,
+        )
+        if isinstance(loss, torch.Tensor) and isinstance(aux_loss, torch.Tensor):
             loss = loss + self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
     # --- Patch.2 ---
 

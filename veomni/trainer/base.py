@@ -60,7 +60,7 @@ from ..distributed.parallel_state import (
 )
 from ..distributed.torch_compile import mark_compile_step_begin
 from ..models.model_runtime import VeOmniModelRuntime
-from ..ops.batch_invariant_ops import set_batch_invariant_mode
+from ..ops.batch_invariant import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.device import (
     get_device_type,

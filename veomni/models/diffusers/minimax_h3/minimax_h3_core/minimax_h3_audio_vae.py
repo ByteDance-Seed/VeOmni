@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Parameter
 
-from .core import attention_forward
+from .core import bind_minimax_attention, minimax_attention
 
 
 class WarpedTensor(torch.nn.Module):
@@ -309,7 +309,7 @@ class GeGluMlp(nn.Module):
 
 
 class CausalAttention(nn.Module):
-    """Causal multi-head attention with backend dispatch via attention_forward."""
+    """Causal multi-head attention through the interned ``attention/standard`` handle."""
 
     def __init__(self, in_dim, out_dim, num_heads):
         super().__init__()
@@ -320,21 +320,17 @@ class CausalAttention(nn.Module):
         self.q_bias = WarpedTensor(torch.empty(in_dim))
         self.zero_k_bias = WarpedTensor(torch.empty(in_dim))
         self.v_bias = WarpedTensor(torch.empty(in_dim))
+        bind_minimax_attention(self, is_causal=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q, k, v = q + self.q_bias(), k + self.zero_k_bias(), v + self.v_bias()
-        x = attention_forward(
-            q,
-            k,
-            v,
-            q_pattern="b s (n d)",
-            k_pattern="b s (n d)",
-            v_pattern="b s (n d)",
-            out_pattern="b n s d",
-            dims={"n": self.num_heads},
-            is_causal=True,
-        )
+        batch, seq_len, _ = q.shape
+        head_dim = q.shape[-1] // self.num_heads
+        q = q.view(batch, seq_len, self.num_heads, head_dim).transpose(1, 2)
+        k = k.view(batch, seq_len, self.num_heads, head_dim).transpose(1, 2)
+        v = v.view(batch, seq_len, self.num_heads, head_dim).transpose(1, 2)
+        x = minimax_attention(self, q, k, v)
         x = torch.mean(x, dim=1)
         x = F.adaptive_avg_pool1d(x, self.out_dim)
         x = self.proj(x)
