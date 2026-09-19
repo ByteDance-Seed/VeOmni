@@ -57,6 +57,14 @@ def _assert_parameter_gradients_close(expected: dict[str, torch.Tensor], actual:
 
 
 class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
+    def _configure_repro(self) -> None:
+        """Seed the worker and disable TF32. Do not set cuDNN flags: pytest freezes them."""
+        set_seed(seed=0, full_determinism=False)
+        try:
+            enable_high_precision_for_bf16()
+        except RuntimeError:
+            pass
+
     @staticmethod
     def _get_input_data():
         heads = 16
@@ -92,6 +100,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
     @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses")
     def test_self_attn(self):
         self._get_process_group()
+        self._configure_repro()
         sp_group = get_ulysses_sequence_parallel_group()
         full_input = self._get_input_data()
         unpad_size = full_input.size(1)
@@ -138,6 +147,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
     @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses")
     def test_self_attn_padding(self):
         self._get_process_group()
+        self._configure_repro()
         sp_group = get_ulysses_sequence_parallel_group()
         full_input = self._get_input_data_for_padding()
         unpad_size = full_input.size(1)
