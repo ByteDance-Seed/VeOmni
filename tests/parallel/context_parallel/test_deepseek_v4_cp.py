@@ -39,6 +39,15 @@ from veomni.utils.device import (
 _PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
 
 
+def _load_dsv4_toy_config():
+    """Toy AutoConfig leaves ``_attn_implementation`` unset; the registry rejects ``None``."""
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config._attn_implementation = "eager"
+    return config
+
+
 def _cuda_device_count() -> int:
     """Devices this suite can run on, which are CUDA devices and nothing else.
 
@@ -203,8 +212,6 @@ def _init_cp_attention(
         world_size=world_size,
     )
 
-    from transformers import AutoConfig
-
     from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.ops.config import set_ops_config
@@ -212,7 +219,7 @@ def _init_cp_attention(
     _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
     set_ops_config(SimpleNamespace(dsa_attention_implementation=dsa_attention_impl))
 
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(0)
     # Layer 0 is HCA and layer 3 is CSA on the toy config, which has no
     # sliding-only layer type, so drop the compressor the way the Ulysses test
@@ -486,14 +493,12 @@ def _run_compressor_cp(
         world_size=world_size,
     )
 
-    from transformers import AutoConfig
-
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
 
     _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
 
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(0)
     compressor_class = dsv4.DeepseekV4HCACompressor if kind == "hca" else dsv4.DeepseekV4CSACompressor
     compressor = compressor_class(config).to(device=device_type, dtype=torch.float32)
@@ -632,10 +637,9 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
         world_size=world_size,
     )
 
-    from transformers import AutoConfig
-
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+    from veomni.ops import resolve_op
     from veomni.ops.config import set_ops_config
 
     _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
@@ -643,7 +647,7 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
     # partitioning of its own; the eager scorer is covered by the CSA layer test.
     set_ops_config(SimpleNamespace(dsa_indexer_implementation="tilelang"))
 
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(0)
     indexer = dsv4.DeepseekV4Indexer(config).to(device=device_type, dtype=torch.bfloat16)
     _init_position_bias(indexer)
@@ -660,7 +664,8 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
     # count, that skip would take the kernel out of the comparison and the
     # parity below would still hold, pinning nothing about the CP query rebasing.
     kernel_runs = []
-    real_kernel = dsv4.v4_lighting_indexer
+    indexer_entry = resolve_op("dsa_indexer", "deepseek_v4", "tilelang")
+    real_kernel = indexer_entry.wrapper
 
     def _counting_kernel(*args, **kwargs):
         kernel_runs.append(None)
@@ -688,7 +693,7 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
             }
 
         kernel_runs.clear()
-        with patch(f"{_PATCHED_MODULE}.v4_lighting_indexer", _counting_kernel):
+        with patch.object(indexer_entry, "wrapper", _counting_kernel):
             no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
             with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
                 baseline = indexer(hidden, q_residual, position_ids, None, 0, **packed_kwargs)
@@ -764,11 +769,9 @@ def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int, 
     so that a guard moved after the halo exchange is caught by the unusable group
     rather than by the compressor's own shard-width check.
     """
-    from transformers import AutoConfig
-
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(0)
     # Layer 0 is HCA and layer 3 is CSA on the toy config; there is no
     # sliding-only layer type, so dropping the compressor is what makes one.
@@ -831,12 +834,10 @@ def test_deepseek_v4_cp_rejects_a_narrow_shard(kind):
     or none does, which is the property that keeps this a clean error instead of
     a ten-minute watchdog timeout.
     """
-    from transformers import AutoConfig
-
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
     class_name, role = _WINDOW_COMPRESSORS[kind]
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(0)
     module = getattr(dsv4, class_name)(config)
     local_len = module.compress_rate - 1
@@ -875,11 +876,9 @@ def test_deepseek_v4_attention_cp_rejects_a_local_length_mask(with_compressor):
 
 def _build_toy_model(seq_len: int):
     """A whole toy model on CPU plus one batch of ids, for the model-forward guards."""
-    from transformers import AutoConfig
-
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(0)
     model = dsv4.DeepseekV4Model(config)
     _init_every_position_bias(model)
@@ -1248,8 +1247,6 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
         world_size=world_size,
     )
 
-    from transformers import AutoConfig
-
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.ops.config import set_ops_config
 
@@ -1261,7 +1258,7 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
         # runs inside a CSA layer under CP.
         set_ops_config(SimpleNamespace(dsa_attention_implementation="tilelang", dsa_indexer_implementation="tilelang"))
 
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config = _load_dsv4_toy_config()
     torch.manual_seed(0)
     model = dsv4.DeepseekV4Model(config).to(device=device_type, dtype=dtype)
     _init_every_position_bias(model)

@@ -420,6 +420,10 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
     config_class = QwenImageTransformer2DModelConfig
     supports_gradient_checkpointing = True
     _no_split_modules = ["QwenImageTransformerBlock"]
+    # Joint attention runs VeOmni ``attention/standard`` SDPA, not HF's SDPA
+    # dispatch table. Still declare support so PreTrainedModel accepts
+    # ``attn_implementation=sdpa`` / ``veomni_sdpa`` at init.
+    _supports_sdpa = True
 
     def __init__(self, config: QwenImageTransformer2DModelConfig, **kwargs):
         PreTrainedModel.__init__(self, config, **kwargs)

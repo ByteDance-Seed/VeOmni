@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import torch
 from torch import Tensor
 
 
@@ -47,4 +48,6 @@ def wrapper(
 
     from ...vendor.tilelang_sparse_mla import sparse_attn_tilelang
 
-    return sparse_attn_tilelang(q, kv, attn_sink, topk_idxs, sm_scale, return_lse)
+    # MixedPrecision / ``param_dtype=bf16`` stores the learnable sink as bf16.
+    # The kernel accumulates in fp32, and upcasting bf16 is lossless.
+    return sparse_attn_tilelang(q, kv, attn_sink.to(dtype=torch.float32), topk_idxs, sm_scale, return_lse)
