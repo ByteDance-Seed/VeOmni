@@ -1,30 +1,133 @@
 # Supported Models
 
-<p class="doc-lead">Find a model, choose a training workflow, and follow its recipe from data preparation to checkpoint validation.</p>
+<p class="doc-lead">Explore VeOmni recipes by model family — from language and multimodal training to image and video generation.</p>
 
-Each model name opens a dedicated recipe. Family overviews help you choose among
-text, multimodal, and diffusion workflows. Configuration links and parallelism
-settings live with the model they belong to.
+Choose a family below to compare workflows, or open a model directly for its
+preparation, launch command, and configuration.
 
 ## Language and multimodal models
 
-| Family | Models and recipes |
-| --- | --- |
-| [DeepSeek](deepseek/index.md) | [DeepSeek V2 / V3 / R1](deepseek/deepseek-v3.md)<br>[DeepSeek V4](deepseek/deepseek-v4.md) |
-| [Qwen](qwen/index.md) | [Qwen3-0.6B / 8B](qwen/qwen3.md)<br>[Qwen3-30B-A3B](qwen/qwen3-moe.md)<br>[Qwen3.5-0.8B / 9B / 35B-A3B](qwen/qwen3-5.md)<br>[Qwen3.8 Flash Next](qwen/qwen3-8-flash-next.md)<br>[Qwen3-VL-8B / 30B-A3B](qwen/qwen3-vl.md)<br>[Qwen3 Omni](qwen/qwen3-omni.md)<br>[Qwen3 Omni: offline AV](qwen/qwen3-omni-offline-av.md)<br>[Qwen3 DPO](qwen/qwen3-dpo.md)<br>[Qwen2.5](qwen/qwen2-5.md)<br>[Qwen2 / Qwen2.5 VL](qwen/qwen2-vl.md)<br>[Qwen2.5 Omni](qwen/qwen2-5-omni.md) |
-| [Llama](llama/index.md) | [Llama3](llama/llama3.md) |
-| [Gemma](gemma/index.md) | [Gemma3-270M](gemma/gemma3.md) |
-| [GPT-OSS](gpt-oss/index.md) | [GPT-OSS-120B LoRA](gpt-oss/gpt-oss.md) |
-| [Seed](seed/index.md) | [Seed-OSS-36B](seed/seed-oss.md) |
+````{container} model-grid
+
+```{container} model-family featured
+
+**[Qwen](qwen/index.md)**
+
+Text · vision-language · audio/video · preference training
+
+- [Qwen3-0.6B / 8B](qwen/qwen3.md)
+- [Qwen3-30B-A3B](qwen/qwen3-moe.md)
+- [Qwen3.5-0.8B / 9B / 35B-A3B](qwen/qwen3-5.md)
+- [Qwen3.8 Flash Next](qwen/qwen3-8-flash-next.md)
+- [Qwen3-VL-8B / 30B-A3B](qwen/qwen3-vl.md)
+- [Qwen3 Omni](qwen/qwen3-omni.md)
+- [Qwen3 Omni: offline AV](qwen/qwen3-omni-offline-av.md)
+- [Qwen3 DPO](qwen/qwen3-dpo.md)
+- [Qwen2.5](qwen/qwen2-5.md)
+- [Qwen2 / Qwen2.5 VL](qwen/qwen2-vl.md)
+- [Qwen2.5 Omni](qwen/qwen2-5-omni.md)
+
+```
+
+```{container} model-family
+
+**[DeepSeek](deepseek/index.md)**
+
+MoE training · generation-specific kernels
+
+- [DeepSeek V2 / V3 / R1](deepseek/deepseek-v3.md)
+- [DeepSeek V4](deepseek/deepseek-v4.md)
+
+```
+
+```{container} model-family
+
+**[Llama](llama/index.md)**
+
+Plain-text continued pre-training
+
+- [Llama3](llama/llama3.md)
+
+```
+
+```{container} model-family
+
+**[Gemma](gemma/index.md)**
+
+Text training with FlexAttention
+
+- [Gemma3-270M](gemma/gemma3.md)
+
+```
+
+```{container} model-family
+
+**[GPT-OSS](gpt-oss/index.md)**
+
+BF16 adapter training with expert parallelism
+
+- [GPT-OSS-120B LoRA](gpt-oss/gpt-oss.md)
+
+```
+
+```{container} model-family
+
+**[Seed](seed/index.md)**
+
+Seed-OSS language-model training
+
+- [Seed-OSS-36B](seed/seed-oss.md)
+
+```
+
+````
 
 ## Diffusion models
 
-| Family | Models and recipes |
-| --- | --- |
-| Qwen | [Qwen-Image](qwen/qwen-image.md) |
-| [Wan](wan/index.md) | [Wan2.1 I2V](wan/wan2-1-i2v.md)<br>[Wan2.1 T2V LoRA](wan/wan2-1-t2v.md) |
-| [LTX](ltx/index.md) | [LTX-2.3](ltx/ltx2-3.md) |
-| [MiniMax](minimax/index.md) | [MiniMax H3](minimax/h3.md) |
+````{container} model-grid
+
+```{container} model-family
+
+**[Qwen-Image](qwen/qwen-image.md)**
+
+Image generation · SFT and LoRA
+
+- [Qwen-Image](qwen/qwen-image.md)
+
+```
+
+```{container} model-family
+
+**[Wan](wan/index.md)**
+
+Image-to-video and text-to-video
+
+- [Wan2.1 I2V](wan/wan2-1-i2v.md)
+- [Wan2.1 T2V LoRA](wan/wan2-1-t2v.md)
+
+```
+
+```{container} model-family
+
+**[LTX](ltx/index.md)**
+
+Audio/video LoRA and reference conditioning
+
+- [LTX-2.3](ltx/ltx2-3.md)
+
+```
+
+```{container} model-family
+
+**[MiniMax](minimax/index.md)**
+
+First/last-frame video and audio generation
+
+- [MiniMax H3](minimax/h3.md)
+
+```
+
+````
 
 ## How to use a recipe
 
