@@ -610,7 +610,7 @@ def _promote_staged_checkpoint(
     ``step_root`` is the step directory, given when the destination may hold a
     pre-split checkpoint whose marker sits there rather than inside
     ``final_path``. Nested files are copied in the data phase, before any
-    ``.metadata`` is. ``lr_scheduler.pt`` is one of those files.
+    ``.metadata`` is. The per-rank ``extra_state/`` files are among those files.
     """
     metadata_name = DCP_MARKER_FILENAME
     is_node_leader = _local_rank() == 0
@@ -793,7 +793,8 @@ class DistributedCheckpointer(CheckpointerBase):
 
         Writes three things under ``model/`` (see ``veomni.checkpoint.layout``):
         ``ckpt/`` for the weights, ``optimizer/`` for the optimizer state, and a
-        replicated ``lr_scheduler.pt``. Weights and optimizer are separate DCP
+        per-rank ``extra_state/`` for model-bound extra state (lr scheduler and
+        condition-model RNG). Weights and optimizer are separate DCP
         directories so the weights can be shipped or converted on their own; a
         single directory interleaves both into the same ``.distcp`` files.
 
@@ -977,13 +978,14 @@ class DistributedCheckpointer(CheckpointerBase):
         load training state from distributed checkpoint
 
         Mirrors :meth:`save`: weights from ``model/<module>/ckpt``, optimizer from
-        ``model/<module>/optimizer``, scheduler from the sidecar beside them. A
-        checkpoint written before the split has no ``model/`` at all and keeps
-        both in one directory; that shape is detected and read as-is.
+        ``model/<module>/optimizer``, model-bound extra state from the per-rank
+        ``extra_state/`` beside them. A checkpoint written before the split has
+        no ``model/`` at all and keeps both in one directory; that shape is
+        detected and read as-is.
 
         args:
             path: step directory to load from
-            state: state to load, "model" is required; "optimizer" and "lr_scheduler" are optional
+            state: state to load, "model" is required; "optimizer" and "extra_state" are optional
             process_group: process group for loading checkpoint
             module: name of the model to load, for a job that trains several.
                 Empty for a single-model job. See :meth:`save`.
@@ -1243,7 +1245,8 @@ class DistributedCheckpointer(CheckpointerBase):
             return
         extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIRNAME)
         os.makedirs(extra_state_dir, exist_ok=True)
-        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(rank))
         torch.save(state[_EXTRA_STATE_KEY], extra_state_path)
 
     @classmethod
@@ -1252,9 +1255,8 @@ class DistributedCheckpointer(CheckpointerBase):
         if _EXTRA_STATE_KEY not in state:
             logger.warning_rank0("extra_state not found in state, skipping extra_state load")
             return
-        extra_state_path = os.path.join(
-            checkpoint_dir, _EXTRA_STATE_DIRNAME, _EXTRA_STATE_FORMAT.format(dist.get_rank())
-        )
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        extra_state_path = os.path.join(checkpoint_dir, _EXTRA_STATE_DIRNAME, _EXTRA_STATE_FORMAT.format(rank))
         if os.path.exists(extra_state_path):
             state[_EXTRA_STATE_KEY] = torch.load(extra_state_path, weights_only=False)
 
