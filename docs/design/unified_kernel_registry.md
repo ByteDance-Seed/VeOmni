@@ -279,6 +279,7 @@ class OpsImplementationConfig:
     rms_norm_gated_implementation: str = "fla"
     causal_conv1d_implementation: str = "fla"
     chunk_gated_delta_rule_implementation: str = "fla"
+    qsa_attention_implementation: str = "eager"
     dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = "eager"
     dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "tilelang"] = "eager"
     mhc_implementation: Literal["eager", "tilelang"] = "eager"
@@ -300,6 +301,7 @@ PR — see `veomni/arguments/arguments_types.py`):
 | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | Qwen3.5 GatedDeltaNet `self.norm`; default `fla` |
 | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | Qwen3.5 GatedDeltaNet pre-mixer; `eager` has no `cu_seqlens` path |
 | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla`, `npu`, `npu_ascendc` | Qwen3.5 linear attention; `flash_qla` is Hopper SM90-only. `npu` uses the vendored MindSpeed-MM Triton kernel; `npu_ascendc` is the AscendC fused `torch.ops.npu.*` path (requires a manual `fla_npu` install) |
+| `qsa_attention_implementation` | `eager`, `tilelang` | Qwen4-Exp only. Eager is the dense reference; TileLang is the sparse training kernel. |
 | `dsa_indexer_implementation` | `eager`, `cudnn`, `tilelang` | GLM-DSA supports `cudnn`; DeepSeek V4 supports `tilelang`. Optimized implementations require compatible NVIDIA hardware. |
 | `dsa_attention_implementation` | `eager`, `flashmla_cudnn`, `tilelang` | GLM-DSA supports `flashmla_cudnn`; DeepSeek V4 supports `tilelang`. Optimized implementations require compatible NVIDIA hardware. |
 | `mhc_implementation` | `eager`, `tilelang` | DeepSeek V4 manifold-constrained Hyper-Connection pre/post/head kernels provided by the `tile-kernels` package. The three `OpSlot("mhc", variant)` instances share this selection and require NVIDIA SM90+ for `tilelang`. |

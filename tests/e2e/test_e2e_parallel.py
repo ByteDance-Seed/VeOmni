@@ -59,16 +59,10 @@ _DEEPSEEK_V4_TILELANG_TRAINING_ARGS = [
 _QWEN4_EXP_CONFIG = "./tests/toy_config/qwen4_exp_toy/config.json"
 _ACCELERATOR = get_torch_device()
 _QWEN4_EXP_TRAINING_ARGS = [
-    "--model.ops_implementation.attn_implementation=eager",
-    "--model.ops_implementation.cross_entropy_loss_implementation=eager",
-    "--model.ops_implementation.rms_norm_implementation=eager",
-    "--model.ops_implementation.swiglu_mlp_implementation=eager",
-    "--model.ops_implementation.rotary_pos_emb_implementation=eager",
-    "--model.ops_implementation.rotary_pos_emb_vision_implementation=eager",
-    "--model.ops_implementation.load_balancing_loss_implementation=eager",
-    "--model.ops_implementation.rms_norm_gated_implementation=eager",
-    "--model.ops_implementation.causal_conv1d_implementation=eager",
-    "--model.ops_implementation.chunk_gated_delta_rule_implementation=eager",
+    "--model.ops_implementation.attn_implementation=flash_attention_2",
+    "--model.ops_implementation.qsa_attention_implementation=tilelang",
+    "--model.ops_implementation.causal_conv1d_implementation=fla",
+    "--model.ops_implementation.chunk_gated_delta_rule_implementation=fla",
     "--model.accelerator.extra_parallel_names=ple",
     "--model.accelerator.extra_parallel_sizes=2",
     "--model.accelerator.extra_parallel_placement_innermost=false",
@@ -623,7 +617,7 @@ def test_qwen4_exp_training_smoke(tmp_path):
 
     dummy_dataset = DummyDataset(
         num_samples=8,
-        seq_len=64,
+        seq_len=63,
         dataset_type="qwen4exp",
         cache_name=f"qwen4_exp_pipeline_{tmp_path.name}",
     )
@@ -634,12 +628,13 @@ def test_qwen4_exp_training_smoke(tmp_path):
             model_path=str(model_path),
             train_path=dummy_dataset.save_path,
             output_dir=str(output_dir),
-            parallel_config=ParallelConfig(sp_size=1, ep_size=2, fsdp_mode="fsdp2"),
+            parallel_config=ParallelConfig(sp_size=2, ep_size=2, fsdp_mode="fsdp2"),
             nproc=2,
             extra_args=[
                 *_QWEN4_EXP_TRAINING_ARGS,
-                "--data.max_seq_len=64",
-                "--data.dataloader.num_workers=0",
+                "--data.datasets_type=iterable",
+                "--data.max_seq_len=63",
+                "--data.dataloader.num_workers=2",
                 "--train.global_batch_size=4",
                 "--model.accelerator.gradient_checkpointing.enable=false",
                 "--model.optimizer.lr=0.01",
