@@ -1,11 +1,11 @@
 """FL2VA and visual Ref2VA packed sequence builders.
 
-Layout: [text | cond | audio | video | pad]
+Layout: [text | cond | audio | video]
 
 Output packed dict fields:
   seq_len, img_pos, audio_pos, text_pos, update_mask,
   img_position_ids [1, seq_len, 3] float64, token_tags [seq_len] int64,
-  cu_seqlens [3] int32,
+  cu_seqlens [2] int32,
   text_len, audio_channel, audio_t, latent_t, latent_h_patched, latent_w_patched, cond_rows
 """
 
@@ -28,7 +28,6 @@ _INTERP = 32
 _T_GROUP = 5
 _FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 _FRAME_RESCALE = 5.0 / 3.0
-_SEQ_ALIGN = 64
 _PATCH_H, _PATCH_W = 2, 2
 
 
@@ -103,7 +102,7 @@ def build_packed_ref2va(
     target_grid = pk["img_position_ids"][0, text_len:old_used].clone()
     target_grid[:, 0] += t_cursor - text_len
     used = old_used + cond_rows
-    seq_len = ((used + _SEQ_ALIGN - 1) // _SEQ_ALIGN) * _SEQ_ALIGN
+    seq_len = used
     positions = torch.zeros(1, seq_len, 3, dtype=torch.float64)
     positions[0, :text_len] = pk["img_position_ids"][0, :text_len]
     positions[0, text_len : text_len + cond_rows] = ref_grid
@@ -120,7 +119,7 @@ def build_packed_ref2va(
         audio_pos=pk["audio_pos"] + cond_rows,
         cond_rows=cond_rows,
         update_mask=torch.cat([torch.zeros(cond_rows, dtype=torch.bool), pk["update_mask"]]),
-        cu_seqlens=torch.tensor([0, used, seq_len], dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, used], dtype=torch.int32),
         task="ref2va",
     )
     return pk
@@ -160,7 +159,7 @@ def build_packed_fl2va(
     num_keyframes = len(keyframe_indices)
     cond_rows = num_keyframes * frame_rows
     used = text_len + cond_rows + audio_rows + video_rows
-    seq_len = ((used + _SEQ_ALIGN - 1) // _SEQ_ALIGN) * _SEQ_ALIGN
+    seq_len = used
 
     # Slice ranges
     text_sl = slice(0, text_len)
@@ -237,7 +236,7 @@ def build_packed_fl2va(
     if text_token_tags is not None:
         token_tags[text_pos] = text_token_tags.long()
 
-    cu = torch.tensor([0, used, seq_len], dtype=torch.int32)
+    cu = torch.tensor([0, used], dtype=torch.int32)
 
     return {
         "seq_len": int(seq_len),

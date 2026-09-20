@@ -90,7 +90,8 @@ def _modulate_gate(x, gate, other, indices):
 
 
 def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale, compatibility_mode=False):
-    out = torch.empty_like(q)
+    # Zero uncovered SP rows so discarded outputs cannot poison parameter gradients.
+    out = torch.zeros_like(q)
     # Host-side segment bounds: the DiT / token-refiner entries convert the
     # cu_seqlens tensor once per forward and pass a tuple. Tensor fallback
     # keeps any external caller working (paying one sync).
@@ -205,14 +206,15 @@ class MiniMaxH3Attention(nn.Module):
             if rope_cos is not None:
                 q = _apply_rope(q, rope_cos, rope_sin)
                 k = _apply_rope(k, rope_cos, rope_sin)
-            if self.varlen_kernel is None:
+            packed_attention = isinstance(cu_seqlens, torch.Tensor)
+            if not packed_attention or self.varlen_kernel is None:
                 out = _sdpa_varlen_attention(
                     q,
                     k,
                     v,
                     cu_seqlens=cu_seqlens,
                     softmax_scale=self.softmax_scale,
-                    compatibility_mode=self.packed_sdpa,
+                    compatibility_mode=packed_attention and self.packed_sdpa,
                 )
             else:
                 if q.dtype not in (torch.float16, torch.bfloat16):
@@ -425,8 +427,6 @@ class MiniMaxH3DiT(nn.Module):
     ):
         super().__init__()
         self._block_offload_enabled = False
-        self.use_varlen_attention = False
-        self.use_remove_padding = False
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_channels_latents = latents_dim
@@ -507,6 +507,7 @@ class MiniMaxH3DiT(nn.Module):
         text_pos,
         refiner_cu_seqlens,
         refiner_max_seqlen,
+        packed_batch,
         seq_len,
         device,
     ):
@@ -521,7 +522,7 @@ class MiniMaxH3DiT(nn.Module):
             text_embed,
             cu_seqlens=refiner_cu_seqlens,
             max_seqlen=refiner_max_seqlen,
-            sample_local=self.use_remove_padding,
+            sample_local=packed_batch,
         )
 
         embeddings = torch.zeros((seq_len, self.hidden_size), device=device, dtype=dtype)
@@ -552,6 +553,7 @@ class MiniMaxH3DiT(nn.Module):
         use_gradient_checkpointing_offload=False,
         update_audio_mask=None,
         skip_mask_out_condition=False,
+        packed_batch=False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inverse_indices = inverse_indices.view(-1).to(torch.long)
         token_tags = token_tags.view(-1).to(torch.long)
@@ -570,10 +572,8 @@ class MiniMaxH3DiT(nn.Module):
         sp_group = get_ulysses_sequence_parallel_group()
         sp_world = dist.get_world_size(sp_group) if sp_group is not None else 1
         sp_rank = dist.get_rank(sp_group) if sp_group is not None else 0
-        if self.use_remove_padding and (
-            sp_world != 1 or self._block_offload_enabled or use_gradient_checkpointing_offload
-        ):
-            raise ValueError("H3 remove-padding does not support sequence parallelism or offload.")
+        if packed_batch and (sp_world != 1 or self._block_offload_enabled or use_gradient_checkpointing_offload):
+            raise ValueError("H3 multi-sample packing does not support sequence parallelism or offload.")
 
         cu_seqlens = packed_seq_params["cu_seqlens_q"].to(torch.int32)
         max_seqlen = int(packed_seq_params["max_seqlen_q"])
@@ -607,10 +607,9 @@ class MiniMaxH3DiT(nn.Module):
             img_pos=img_pos.to(device),
             audio_pos=audio_pos.to(device),
             text_pos=text_pos.to(device),
-            refiner_cu_seqlens=refiner_cu.to(device)
-            if self.use_varlen_attention
-            else tuple(refiner_cu.to(device).tolist()),
+            refiner_cu_seqlens=refiner_cu.to(device) if packed_batch else tuple(refiner_cu.to(device).tolist()),
             refiner_max_seqlen=refiner_max,
+            packed_batch=packed_batch,
             seq_len=padded_seq_len,
             device=device,
         )
@@ -640,9 +639,9 @@ class MiniMaxH3DiT(nn.Module):
         # every block instead of one tolist() per attention module. Bounds stay
         # at the ORIGINAL seq_len: the per-segment SDPA is non-causal, so an
         # extended bound would leak pad keys into the last real rows. Pad rows
-        # fall outside every segment and are dropped by the index_select below
-        # (their uninitialized attention output never reaches the loss).
-        cu_bounds = cu_seqlens if self.use_varlen_attention else tuple(cu_seqlens.tolist())
+        # fall outside every segment, have zero attention output, and are
+        # dropped by the index_select below.
+        cu_bounds = cu_seqlens if packed_batch else tuple(cu_seqlens.tolist())
         block_swap = self._block_swap if self._block_offload_enabled else 0
         for i, block in enumerate(self.blocks):
             if self._block_offload_enabled:

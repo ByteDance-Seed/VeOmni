@@ -33,7 +33,6 @@ _MINIMAX_H3_TIME_DIVISION_REMAINDER = 5
 
 class MiniMaxH3ConditionModel(PreTrainedModel):
     config_class = MiniMaxH3ConditionModelConfig
-    supports_sample_inputs = True
 
     def __init__(self, config: MiniMaxH3ConditionModelConfig, **kwargs):
         super().__init__(config)
@@ -472,8 +471,8 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
     # ── process_condition (add noise + pack) ──────────────────────────
 
     @torch.no_grad()
-    def prepare_samples(self, **collated_inputs) -> list[dict]:
-        """Prepare independently before packing, preserving the single-sample RNG path."""
+    def process_condition(self, **collated_inputs) -> dict[str, Any]:
+        """Prepare each sample independently, preserving its conditioning RNG order."""
         count = len(collated_inputs["input_latents"])
         if count == 0:
             raise ValueError("H3 requires a nonempty sample list.")
@@ -491,25 +490,12 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             ]
             if pk["cond_rows"] and (len(anchors) != 1 or anchors[0].shape != (pk["cond_rows"], 96)):
                 raise ValueError("H3 condition anchor rows must match the packed layout.")
-            inputs = self.process_condition(**single)
-            targets = {key: inputs.pop(key) for key in ("training_target", "training_target_audio")}
-            metadata = {
-                key: inputs.pop(key)
-                for key in (
-                    "cond_rows",
-                    "video_latent_shape",
-                    "audio_latent_shape",
-                    "scheduler_video",
-                    "scheduler_audio",
-                    "t_video",
-                    "t_audio",
-                )
-            }
-            samples.append({"model_inputs": inputs, "targets": targets, "metadata": metadata})
-        return samples
+            samples.append(self._process_single_condition(**single))
+        if count == 1:
+            return samples[0]
+        return {key: [sample[key] for sample in samples] for key in samples[0]}
 
-    @torch.no_grad()
-    def process_condition(
+    def _process_single_condition(
         self,
         input_latents: list[torch.Tensor],
         audio_input_latents: list[torch.Tensor],
@@ -519,6 +505,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         imgvid_cond_noise_aug: float = 0.999,
         audio_cond_noise_aug: float = 1.0,
         use_gradient_checkpointing: bool = True,
+        use_gradient_checkpointing_offload: bool = False,
         ref_visual_anchor: list[torch.Tensor | None] | None = None,
         ref_audio_anchor: list[torch.Tensor | None] | None = None,
         **kwargs,
@@ -545,6 +532,8 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             audio_cond_noise_aug = audio_cond_noise_aug[0]
         if isinstance(use_gradient_checkpointing, list):
             use_gradient_checkpointing = use_gradient_checkpointing[0]
+        if isinstance(use_gradient_checkpointing_offload, list):
+            use_gradient_checkpointing_offload = use_gradient_checkpointing_offload[0]
 
         # Process first sample (batch=1 per micro_batch); reject any other
         # size for every supplied collection so a mismatched length cannot
@@ -645,7 +634,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
 
         # 5. Refiner cu_seqlens (text-only, no padding for refiner)
         text_len = pk["text_len"]
-        refiner_cu = torch.tensor([0, text_len, text_len], dtype=torch.int32)
+        refiner_cu = torch.tensor([0, text_len], dtype=torch.int32)
 
         # 6. Shape info for unpatchify (use keys NOT popped by trainer)
         T_v = pk["latent_t"]
@@ -678,6 +667,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             "skip_mask_out_condition": True,
             "cond_rows": cond_rows,
             "use_gradient_checkpointing": use_gradient_checkpointing,
+            "use_gradient_checkpointing_offload": use_gradient_checkpointing_offload,
             "video_latent_shape": video_latent_shape,
             "audio_latent_shape": audio_latent_shape,
             "training_target": training_target,

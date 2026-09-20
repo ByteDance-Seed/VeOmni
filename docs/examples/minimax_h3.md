@@ -189,17 +189,17 @@ train:
 
 ## Packed Offline Training
 
-`model.use_remove_padding=true` opts H3 into cross-sample packing inside a fixed
-microbatch. Both **FL2VA** and **visual Ref2VA** (image/video references, without
-reference audio) use the shared DiT interface. It does not change rollout/inference
-batching, add dynamic batching, load new encoders, or implement an RL objective.
-The default remains false.
+With `train.micro_batch_size > 1`, H3 packs samples inside its ordinary forward.
+Both **FL2VA** and **visual Ref2VA** (image/video references, without reference
+audio) use `process_condition(**batch) → model(**batch)` and return sample-mean
+scalar losses. There is no Trainer packing switch or alternate output protocol.
+The recipe defaults to one sample. This does not batch inference requests,
+enable dynamic batching, load new encoders, or implement an RL objective.
 
-For existing FL2VA embeddings, reuse the offline recipe:
+Use the offline recipe with the updated packed metadata:
 
 ```shell
 bash train.sh tasks/train_dit.py configs/dit/minimax_h3_fl2va_offline.yaml \
-  --model.use_remove_padding true \
   --train.micro_batch_size 2 \
   --train.global_batch_size 16
 ```
@@ -209,8 +209,18 @@ Keep `train.dyn_bsz=false`, `data.dataloader.drop_last=true`, and FSDP2
 stay FP32/FP64; blanket BF16 input casting is rejected rather than silently
 changing their precision. Targets must have the same video/audio geometry within
 a microbatch, while prompt lengths, reference counts and reference geometry may
-vary. Initial support excludes SP/CP/TP/PP, extra parallelism, LoRA, offload and
-compilation. The shared gate enforces these boundaries.
+vary. Multi-sample packing rejects Ulysses SP and block/checkpoint offload inside
+modeling. Single-device/FSDP2 with SP/CP/TP/PP sizes one is the validation target;
+LoRA, compilation and additional parallel/offload combinations are not validated.
+
+FL2VA and Ref2VA layouts now contain exactly `[text | cond | audio | video]`, with
+`seq_len=used` and `cu_seqlens=[0, used]`. There is no 64-row tail to crop during
+batch packing. Regenerate old cached `packed` metadata with the current builders
+before multi-sample training; latent tensors and embeddings need not be re-encoded.
+Legacy padded metadata is rejected for multi-sample packing. Any divisibility
+padding for single-sample Ulysses remains local to `MiniMaxH3DiT.forward`.
+Uncovered SP attention rows are zero-initialized so discarded outputs cannot
+introduce nonfinite parameter gradients.
 
 ### Visual Ref2VA prepared data
 
@@ -253,7 +263,7 @@ independent main-DiT and text-refiner cumulative boundaries. Its RoPE coordinate
 stay sample-local; timestep tables are remapped, not assumed shared. Reference
 rows are cropped separately for each output. Video/audio signs, unpatchification,
 scheduler weights and sample-mean losses retain their single-sample meanings.
-On the enabled path, the small text token refiner runs separately for each sample. Its BF16 output
+For multi-sample inputs, the small text token refiner runs separately for each sample. Its BF16 output
 projections can round differently when their GEMM row count changes; the deep
 pretrained DiT amplifies those differences. Keeping the refiner sample-local
 preserves its serial arithmetic without disabling packing in the main DiT.
@@ -264,8 +274,8 @@ paths. This feature does not introduce an FP32 gather correction into the shared
 H3 implementation. Low-precision repeated-index reductions can vary even between
 serial repeats, so packed-gradient comparisons must also measure that baseline
 variability; a separate accumulation-precision fix must not silently change the
-disabled path. The refiner's sample-local execution is also restricted to the
-remove-padding opt-in; disabled multi-segment execution retains the legacy path.
+single-sample path. Sample-local refiner execution is restricted to cross-sample
+packing; ordinary single-sample attention dispatch is preserved.
 
 ### Attention and validation
 
@@ -278,20 +288,24 @@ remove-padding opt-in; disabled multi-segment execution retains the legacy path.
   replaced with SDPA.
 
 Native tiny-model CPU tests cover output/loss/gradient equivalence, checkpoint
-recomputation, sample isolation, valid zero rows versus nonzero padding, independent
-attention boundaries, and Ref2VA geometry against the existing inference builder.
-Two-rank tests additionally exercise real FSDP2, mixed precision, DP gradient
-reduction, and a real accumulated optimizer update through the trainer. They do
-not load official H3 weights or validate training convergence.
+recomputation, sample isolation, valid zero rows, independent attention boundaries,
+and Ref2VA geometry against the inference builder. Regressions compare single-sample
+valid-token outputs against a legacy 64-row padded input and verify forward-local
+SP padding with mocked collectives. A poisoned-allocation regression checks that
+uncovered attention tails cannot contaminate gradients. Those mocks do not
+establish distributed SP parity.
+The two-rank suite targets real FSDP2, mixed precision, DP gradient reduction and an
+accumulated optimizer update through the ordinary trainer interface; it does not
+load official H3 weights or validate convergence.
 
 FA2/FA3 protocol tests on CPU use a kernel stub and are **not** hardware kernel
 validation. The GPU suite has real-kernel cases that skip when the package or
-hardware is unavailable (FA3 requires SM90). Local two-rank verification on H20
-passed all eight SDPA/FA2/FA3 cases with torch 2.11.0+cu130, Transformers 5.16.1,
-and Diffusers 0.37.0. These match the core GPU dependency versions, but the
-isolated environment is not a complete frozen-lockfile installation.
-No end-to-end throughput improvement or production convergence is established;
-benchmark against an equivalent, tuned non-packed baseline before making either claim.
+hardware is unavailable (FA3 requires SM90). Historical two-rank SDPA/FA2/FA3 and
+official-weight results used the earlier protocol and layout, not this revision.
+The ordinary-interface/no-tail migration needs fresh accelerator validation;
+occupied GPUs were not interrupted. No updated official-weight parity, end-to-end
+speedup or convergence is claimed. Benchmark against an equivalent, tuned
+non-packed baseline before claiming a performance improvement.
 
 ## 5. Inference
 

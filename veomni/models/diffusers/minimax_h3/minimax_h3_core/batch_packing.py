@@ -1,15 +1,14 @@
-"""Pack prepared H3 samples without changing their local geometry or timestep tables."""
+"""Concatenate complete H3 samples while preserving local geometry and timesteps."""
 
 import torch
 
-from ...packing import validate_diffusion_samples
-
 
 def pack_samples(samples):
-    validate_diffusion_samples(samples, batch_size=len(samples))
+    if not samples:
+        raise ValueError("H3 requires a nonempty microbatch.")
     first = samples[0]
-    shape = (first["metadata"]["video_latent_shape"], first["metadata"]["audio_latent_shape"])
-    checkpointing = first["model_inputs"]["use_gradient_checkpointing"]
+    shape = (first["video_latent_shape"], first["audio_latent_shape"])
+    checkpointing = first["use_gradient_checkpointing"]
     chunks = {
         key: []
         for key in (
@@ -27,29 +26,26 @@ def pack_samples(samples):
     }
     cu, refiner_cu, row_counts = [0], [0], []
     time_offset = 0
-    for sample in samples:
-        inp, meta = sample["model_inputs"], sample["metadata"]
+    for inp in samples:
         if inp["unique_timesteps"].dtype != torch.float32 or inp["img_position_ids"].dtype not in (
             torch.float32,
             torch.float64,
         ):
             raise ValueError("H3 packing must retain timestep/position precision; use cast_forward_inputs=false.")
-        if (meta["video_latent_shape"], meta["audio_latent_shape"]) != shape:
-            raise ValueError("H3 remove-padding currently requires fixed target video/audio geometry.")
+        if (inp["video_latent_shape"], inp["audio_latent_shape"]) != shape:
+            raise ValueError("H3 packing currently requires fixed target video/audio geometry.")
         if inp["use_gradient_checkpointing"] != checkpointing:
-            raise ValueError("H3 remove-padding requires one gradient-checkpointing setting per microbatch.")
+            raise ValueError("H3 packing requires one gradient-checkpointing setting per microbatch.")
         if not inp["skip_mask_out_condition"]:
             raise ValueError("H3 packing requires explicit condition-row output cropping.")
-        used = int(inp["packed_seq_params"]["cu_seqlens_q"][1])
-        text_len = inp["text_pos_info"]["position_ids"].numel()
-        if not 0 < used <= inp["x"].shape[1] or not 0 < text_len <= inp["prompt_embeds"].shape[0]:
-            raise ValueError("Invalid H3 valid-row or text lengths.")
-        for key in ("x", "audio_x", "img_position_ids"):
-            chunks[key].append(inp[key][:, :used])
-        chunks["token_tags"].append(inp["token_tags"][:used])
-        chunks["prompt_embeds"].append(inp["prompt_embeds"][:text_len])
-        chunks["unique_timesteps"].append(inp["unique_timesteps"])
-        chunks["inverse_indices"].append(inp["inverse_indices"][:used] + time_offset)
+        length = inp["x"].shape[1]
+        text_len = inp["prompt_embeds"].shape[0]
+        if length <= 0 or text_len <= 0 or inp["packed_seq_params"]["cu_seqlens_q"].tolist() != [0, length]:
+            raise ValueError("H3 samples must contain one valid segment without tail padding; rebuild cached layouts.")
+        if inp["text_pos_info"]["position_ids"].numel() != text_len:
+            raise ValueError("H3 text rows must match the sample's text positions.")
+        for key in chunks:
+            chunks[key].append(inp[key] + time_offset if key == "inverse_indices" else inp[key])
         for key in positions:
             positions[key].append(inp[key]["position_ids"] + cu[-1])
         row_counts.append(
@@ -59,7 +55,7 @@ def pack_samples(samples):
             )
         )
         time_offset += inp["unique_timesteps"].numel()
-        cu.append(cu[-1] + used)
+        cu.append(cu[-1] + length)
         refiner_cu.append(refiner_cu[-1] + text_len)
     result = {
         key: torch.cat(values, dim=1 if key in ("x", "audio_x", "img_position_ids") else 0)

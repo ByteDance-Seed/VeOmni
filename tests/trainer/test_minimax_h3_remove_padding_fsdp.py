@@ -1,4 +1,4 @@
-"""Two-GPU native H3 regression for the DiT sample-input protocol.
+"""Two-GPU native H3 regression through the ordinary DiT condition/model interface.
 
 No encoders or downloaded checkpoints are used. The reference runs each sample
 through the legacy native H3 forward, averages samples (not tokens), and explicitly
@@ -143,7 +143,9 @@ def _run_fsdp_regression(*, step_driver, checkpointing, attention, task):
     )
     from veomni.distributed.torch_parallelize import build_parallelize_model
     from veomni.models.diffusers.minimax_h3.minimax_h3_core import core as h3_core
-    from veomni.models.diffusers.packing import DiffusionBatchOutput
+    from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
+        MiniMaxH3DiTOutput,
+    )
     from veomni.trainer.base import BaseTrainer
     from veomni.trainer.callbacks.base import TrainerState
     from veomni.trainer.dit_trainer import (
@@ -168,7 +170,7 @@ def _run_fsdp_regression(*, step_driver, checkpointing, attention, task):
     torch.set_num_threads(1)
 
     args = VeOmniDiTArguments(
-        model=DiTModelArguments(config_path="unused-native-h3", use_remove_padding=True),
+        model=DiTModelArguments(config_path="unused-native-h3"),
         data=DiTDataArguments(train_path="unused-offline-latents", log_sample=False),
         train=DiTTrainingArguments(
             training_task="offline_training",
@@ -196,12 +198,11 @@ def _run_fsdp_regression(*, step_driver, checkpointing, attention, task):
             # of the new packed/varlen dispatch (including real FA2/FA3 cases).
             h3_core.ATTENTION_IMPLEMENTATION = "torch"
             reference = tiny_model().float().to(device).train()
-            assert not reference.use_remove_padding
             initial = {name: value.detach().cpu().clone() for name, value in reference.state_dict().items()}
             assert all(torch.isfinite(value).all() for value in initial.values())
             with init_empty_weights():
                 model = type(reference)(deepcopy(reference.config))
-            model.configure_remove_padding(attn_implementation=attention)
+            model._configure_packed_attention(attention)
             model = build_parallelize_model(
                 model,
                 init_device="meta",
@@ -251,11 +252,13 @@ def _run_fsdp_regression(*, step_driver, checkpointing, attention, task):
             noise_seed = 7000 + rank
             torch.manual_seed(noise_seed)
             with torch.no_grad():
-                prepared = [trainer.condition_model.prepare_samples(**trainer.preforward(batch)) for batch in batches]
-            for samples in prepared:
-                assert len(samples) == _SAMPLES_PER_MICROBATCH
-                for sample in samples:
-                    inputs = sample["model_inputs"]
+                prepared = [
+                    trainer.condition_model.process_condition(**trainer.preforward(batch)) for batch in batches
+                ]
+            for columns in prepared:
+                assert all(len(values) == _SAMPLES_PER_MICROBATCH for values in columns.values())
+                for index in range(_SAMPLES_PER_MICROBATCH):
+                    inputs = {key: values[index] for key, values in columns.items()}
                     assert inputs["x"].dtype == inputs["audio_x"].dtype == torch.bfloat16
                     assert inputs["prompt_embeds"].dtype == torch.bfloat16
                     assert inputs["unique_timesteps"].dtype == torch.float32
@@ -276,10 +279,10 @@ def _run_fsdp_regression(*, step_driver, checkpointing, attention, task):
                 bf16_calls[id(module)] += 1
 
             def check_root_inputs(module, positional, keywords):
-                assert not positional and set(keywords) == {"sample_inputs"}
+                assert not positional and set(keywords) == set(prepared[0])
                 micro_step = len(root_calls)
                 expected = dict(_tensor_leaves(prepared[micro_step]))
-                actual = dict(_tensor_leaves(keywords["sample_inputs"]))
+                actual = dict(_tensor_leaves(keywords))
                 assert actual.keys() == expected.keys()
                 assert {t.dtype for t in actual.values() if t.is_floating_point()} >= {
                     torch.bfloat16,
@@ -294,17 +297,14 @@ def _run_fsdp_regression(*, step_driver, checkpointing, attention, task):
                 root_calls.append(micro_step)
 
             def check_root_output(module, positional, keywords, output):
-                assert isinstance(output, DiffusionBatchOutput)
-                assert len(output.sample_predictions) == _SAMPLES_PER_MICROBATCH
-                losses = output.sample_losses
-                assert losses and all(v.shape == (_SAMPLES_PER_MICROBATCH,) for v in losses.values())
+                assert isinstance(output, MiniMaxH3DiTOutput)
+                assert all(p.shape[0] == _SAMPLES_PER_MICROBATCH for p in output.predictions)
+                losses = output.loss
+                assert losses and all(v.ndim == 0 for v in losses.values())
                 assert all(v.requires_grad and v.dtype == torch.float32 for v in losses.values())
                 outputs_seen.append(
                     (
-                        [
-                            {key: value.detach().cpu().clone() for key, value in p.items()}
-                            for p in output.sample_predictions
-                        ],
+                        [p.detach().cpu().clone() for p in output.predictions],
                         {key: value.detach().cpu().clone() for key, value in losses.items()},
                     )
                 )
@@ -353,10 +353,11 @@ def _run_fsdp_regression(*, step_driver, checkpointing, attention, task):
             # match FSDP's param_dtype policy without BF16 optimizer rounding.
             reference_optimizer = torch.optim.SGD(reference.parameters(), lr=_LR, foreach=False)
             reference_losses = {}
-            for micro_step, samples in enumerate(prepared):
+            for micro_step, columns in enumerate(prepared):
                 packed_predictions, packed_losses = outputs_seen[micro_step]
-                for index, sample in enumerate(samples):
-                    legacy_inputs = {**sample["model_inputs"], **sample["targets"], **sample["metadata"]}
+                micro_losses = dict.fromkeys(packed_losses, 0.0)
+                for index in range(_SAMPLES_PER_MICROBATCH):
+                    legacy_inputs = {key: values[index] for key, values in columns.items()}
                     # The oracle does not need checkpoint recomputation (which
                     # would run after functional_call restores FP32 parameters).
                     legacy_inputs["use_gradient_checkpointing"] = False
@@ -369,19 +370,20 @@ def _run_fsdp_regression(*, step_driver, checkpointing, attention, task):
                     assert output.loss.keys() == packed_losses.keys()
                     # Prediction keys are model-owned; native video/audio shapes
                     # are distinct and identify the legacy [video, audio] outputs.
-                    predictions_by_shape = {tuple(p.shape): p for p in packed_predictions[index].values()}
+                    predictions = [packed_predictions[0][index : index + 1], packed_predictions[1][index]]
+                    predictions_by_shape = {tuple(p.shape): p for p in predictions}
                     assert len(predictions_by_shape) == len(output.predictions) == 2
                     for prediction in output.predictions:
                         actual = predictions_by_shape[tuple(prediction.shape)]
                         torch.testing.assert_close(actual, prediction.detach().cpu(), rtol=_BF16_RTOL, atol=_BF16_ATOL)
                     for name, loss in output.loss.items():
-                        torch.testing.assert_close(
-                            packed_losses[name][index], loss.detach().cpu(), rtol=_BF16_RTOL, atol=_BF16_ATOL
-                        )
+                        micro_losses[name] += loss.detach().cpu() / _SAMPLES_PER_MICROBATCH
                         reference_losses[name] = reference_losses.get(name, 0.0) + loss.item() / _LOCAL_SAMPLES
                     # Two equally sized microbatches, two equally weighted
                     # samples each. Modality weights already belong to H3.
                     (torch.stack(list(output.loss.values())).sum() / _LOCAL_SAMPLES).backward()
+                for name, loss in micro_losses.items():
+                    torch.testing.assert_close(packed_losses[name], loss, rtol=_BF16_RTOL, atol=_BF16_ATOL)
 
             assert all(param.grad is not None for param in reference.parameters())
             local_grads = {name: _full_cpu(param.grad) for name, param in reference.named_parameters()}
