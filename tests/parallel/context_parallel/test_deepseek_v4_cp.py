@@ -40,7 +40,6 @@ _PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_mode
 
 
 def _load_dsv4_toy_config():
-    """Toy AutoConfig leaves ``_attn_implementation`` unset; the registry rejects ``None``."""
     from transformers import AutoConfig
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")

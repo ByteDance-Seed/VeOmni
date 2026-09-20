@@ -101,7 +101,10 @@ def add_flash_attention_kwargs_from_position_ids(
     batch["max_length_q"] = max_length_q
     batch["max_length_k"] = max_length_k
     batch["linear_attn_cu_seq_lens_q"] = cu_seq_lens_q
-    batch["packed_sequence_slices"] = packed_sequence_slices_from_cu_seqlens(cu_seq_lens_q)
+    # Slice conversion is host-side. Compile/GPU callers may already have moved
+    # ``cu_seq_lens_q``; copy rather than reject, matching DSV4's fallback.
+    host_cu = cu_seq_lens_q if cu_seq_lens_q.device.type == "cpu" else cu_seq_lens_q.detach().cpu()
+    batch["packed_sequence_slices"] = packed_sequence_slices_from_cu_seqlens(host_cu)
     attention_mask = batch.get("attention_mask")
     if isinstance(attention_mask, torch.Tensor) and attention_mask.device.type == "cpu":
         batch["attention_mask_is_all_ones"] = bool(attention_mask.all())
