@@ -586,7 +586,7 @@ class VeOmniModelRuntime:
         """Write the tokenizer/processor/config sidecars that an export needs."""
         import torch.distributed as dist
 
-        from .module_utils import save_model_assets as write_model_assets
+        from .checkpoint.weights import save_model_assets as write_model_assets
 
         if self.train_args.global_rank == 0:
             write_model_assets(self.checkpoint.assets_dir(), self.model_assets)

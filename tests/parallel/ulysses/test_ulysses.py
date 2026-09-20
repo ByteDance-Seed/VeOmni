@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import create_block_mask
-from transformers.configuration_utils import PreTrainedConfig
 
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_dist_comm_backend, get_torch_device
 
@@ -19,7 +18,6 @@ if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backen
 
 import pytest
 import torch.distributed as dist
-from transformers.masking_utils import create_causal_mask
 
 from veomni.distributed.sequence_parallel.comm import (
     get_ulysses_sequence_parallel_group,
@@ -31,7 +29,7 @@ from veomni.ops.kernels.attention.standard import flash as flash_backend
 from veomni.ops.kernels.attention.standard import flex as flex_backend
 from veomni.ops.kernels.attention.standard import magi as magi_backend
 from veomni.ops.kernels.attention.standard.magi import _kernel as magi_kernel
-from veomni.ops.mask import MagiAttentionMask
+from veomni.ops.mask import MagiAttentionMask, flex_attention_mask_builder
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
 
 from .attention import Attention
@@ -388,8 +386,6 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
             dtype=torch.bfloat16,
             seed=9192,
         )
-        config = PreTrainedConfig()
-        config._attn_implementation = "veomni_flex_attention"
         attention_mask = torch.ones(1, sequence_length, device=device, dtype=torch.long)
         cu_seq_lens_q = torch.tensor([0, 3, 8, 12, 16], device=device, dtype=torch.int32)
         module = _FakeFlexAttentionModule().to(device)
@@ -398,12 +394,14 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
         try:
             flex_backend.should_apply_ulysses = lambda *, skip_ulysses=False: False
             flex_backend.get_parallel_state = lambda: SimpleNamespace(ulysses_size=1, async_enabled=False)
-            baseline_block_mask = create_causal_mask(
-                config=config,
-                inputs_embeds=torch.empty(1, sequence_length, 1, device=device),
+            baseline_block_mask = flex_attention_mask_builder(
+                1,
+                sequence_length,
+                sequence_length,
                 attention_mask=attention_mask,
-                past_key_values=None,
-                cu_seq_lens_q=cu_seq_lens_q,
+                cu_seqlens=cu_seq_lens_q,
+                skip_ulysses=True,
+                device=device,
             )
             baseline_output, _ = flex_backend.flex_attention_forward(
                 module,
@@ -418,12 +416,14 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
                 ulysses_size=world_size,
                 async_enabled=False,
             )
-            local_block_mask = create_causal_mask(
-                config=config,
-                inputs_embeds=torch.empty(1, sequence_length // world_size, 1, device=device),
+            local_block_mask = flex_attention_mask_builder(
+                1,
+                sequence_length // world_size,
+                sequence_length // world_size,
                 attention_mask=attention_mask,
-                past_key_values=None,
-                cu_seq_lens_q=cu_seq_lens_q,
+                cu_seqlens=cu_seq_lens_q,
+                skip_ulysses=False,
+                device=device,
             )
             local_output, _ = flex_backend.flex_attention_forward(
                 module,

@@ -3,7 +3,7 @@
 This note is the breaking-change map from the old OpSlot / `kernel_registry`
 surface to the current op registry. Use it when updating modeling, configs, or
 out-of-tree kernels. Current authoring and selection details live in
-[`op_selection.md`](op_selection.md) and [`veomni/ops/README.md`](../../veomni/ops/README.md).
+[`op_selection.md`](op_selection.md) and `veomni/ops/README.md`.
 
 ## What replaced what
 

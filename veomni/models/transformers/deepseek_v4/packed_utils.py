@@ -19,6 +19,7 @@ from typing import Callable, NamedTuple
 import torch
 
 from veomni.distributed.context_parallel import empty_compressed_rows, rebase_window_indices
+from veomni.utils.device import get_torch_device
 from veomni.utils.seqlen_pos_transform_utils import packed_sequence_slices_from_cu_seqlens
 
 
@@ -69,7 +70,7 @@ def ensure_unmasked_packed_attention(
         raise ValueError(_PACKED_MASK_ERROR)
     if not isinstance(attention_mask, torch.Tensor):
         return
-    if attention_mask.device.type != "cpu" and not _cuda_sync_debug_enabled():
+    if attention_mask.device.type != "cpu" and not _device_sync_debug_enabled():
         return
     if not bool(attention_mask.all()):
         raise ValueError(_PACKED_MASK_ERROR)
@@ -84,11 +85,9 @@ def _require_slices_span_sequence(slices: tuple[tuple[int, int], ...], sequence_
         )
 
 
-def _cuda_sync_debug_enabled() -> bool:
-    cuda = getattr(torch, "cuda", None)
-    if cuda is None or not cuda.is_available():
-        return False
-    getter = getattr(cuda, "get_sync_debug_mode", None)
+def _device_sync_debug_enabled() -> bool:
+    device_module = get_torch_device()
+    getter = getattr(device_module, "get_sync_debug_mode", None)
     return bool(getter is not None and getter())
 
 

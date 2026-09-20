@@ -653,4 +653,4 @@ model:
 
 - Breaking change map from OpSlot / `kernel_registry`: [`opslot_to_veomniop.md`](opslot_to_veomniop.md)
 - Fused MoE scatter/gather and backward launch bounds: [`fused_moe_ops.md`](fused_moe_ops.md)
-- Package layout and registration: [`veomni/ops/README.md`](../../veomni/ops/README.md)
+- Package layout and registration: `veomni/ops/README.md`

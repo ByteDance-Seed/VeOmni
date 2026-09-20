@@ -129,6 +129,7 @@ from veomni.models import (
 )
 from veomni.ops import VeomniOp
 from veomni.ops.config import get_ops_config
+from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 class _UnregisteredConfig(PretrainedConfig):
@@ -155,6 +156,21 @@ class _ModelCase:
     # ops selection stamped before HF construction. resolve_op_impl families
     # leave HF attn as eager; stamping sdpa makes PreTrainedModel reject them.
     stamps_hf_attn: bool = True
+
+
+# NPU glm_moe_dsa indexer keeps Hugging Face scoring and does not bind
+# ``veomni_dsa_indexer``. GPU wiring is covered by the same path below.
+_NPU_ABSENT_EAGER_OPS = frozenset(
+    {
+        "model.layers.0.self_attn.indexer.veomni_dsa_indexer",
+    }
+)
+
+
+def _eager_ops(model_case: _ModelCase) -> tuple[tuple[str, str], ...]:
+    if not IS_NPU_AVAILABLE:
+        return model_case.eager_ops
+    return tuple(item for item in model_case.eager_ops if item[0] not in _NPU_ABSENT_EAGER_OPS)
 
 
 _MODEL_CASES = (
@@ -598,11 +614,13 @@ def test_build_foundation_model_constructs_registered_model(model_case: _ModelCa
         )
         assert get_ops_config() is cfg
     assert model.__class__.__name__ == model_case.architectures[0]
-    for path, expected_op in model_case.eager_ops:
+    for path, expected_op in _eager_ops(model_case):
         op = attrgetter(path)(model)
         assert isinstance(op, VeomniOp), path
         assert op.op == expected_op, path
         assert op.impl == "eager", path
+    if IS_NPU_AVAILABLE and model_case.model_type == "glm_moe_dsa":
+        assert not hasattr(model.model.layers[0].self_attn.indexer, "veomni_dsa_indexer")
 
 
 _ALTERNATE_OP_IMPLS = {
