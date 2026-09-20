@@ -62,8 +62,10 @@ def wrapper(
             gate = gate.clamp(max=swiglu_limit)
             up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
         y = F.silu(gate) * up
-        # Fused order: scale the intermediate, then fc2.
-        y = y * routing_weights[token_idx, top_k_pos, None]
+        # Fused order: scale the intermediate, then fc2. Router scores stay
+        # float32 even under FSDP2 bf16 compute; keep the scale on ``y.dtype``
+        # so batch-invariant ``F.linear`` sees matching activation/weight dtypes.
+        y = y * routing_weights[token_idx, top_k_pos, None].to(dtype=y.dtype)
         y = F.linear(y, fc2_weight[idx])
         output = output.index_add(0, token_idx, y.to(output.dtype))
     return output

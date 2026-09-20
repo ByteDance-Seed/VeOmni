@@ -710,6 +710,27 @@ def test_wan_dit_uses_bfloat16_and_flash_attention():
         assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
 
 
+def test_deepseek_v3_e2e_casts_eager_moe_to_bfloat16():
+    command_list = prepare_exec_cmd(
+        ["train_text_test"],
+        "deepseek_v3",
+        "./tests/toy_config/deepseek_v3_toy",
+        model_path="./deepseek_v3",
+        train_path="./dummy_text",
+        output_dir="./deepseek_v3",
+        is_moe=True,
+        max_ep_size=1,
+    )
+
+    assert command_list
+    for _, cmd_kwargs in command_list:
+        assert cmd_kwargs["extra_args"] == [
+            "--model.accelerator.fsdp_config.mixed_precision.enable=True",
+            "--model.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+            "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+        ]
+
+
 def test_deepseek_v4_e2e_casts_fused_triton_moe_to_bfloat16():
     command_list = prepare_exec_cmd(
         ["train_text_test"],

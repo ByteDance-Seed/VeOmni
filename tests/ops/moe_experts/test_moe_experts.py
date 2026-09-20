@@ -217,6 +217,33 @@ def test_eager_matches_fused_reference():
     assert torch.allclose(fc2_e.grad, fc2_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+def test_eager_keeps_compute_dtype_when_routing_is_fp32():
+    """DSV3-style router scores are fp32 while FSDP2 compute is bf16.
+
+    Scaling the SwiGLU intermediate by those scores must not promote ``y``
+    back to float32, or batch-invariant ``F.linear`` rejects the down-proj.
+    """
+    require_nvidia_cuda()
+    from veomni.ops.batch_invariant import set_batch_invariant_mode
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, num_experts, hidden_dim, ffn_dim, top_k = 6, 3, 16, 8, 2
+    hidden = torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
+    routing, selected = _route(num_tokens, num_experts, top_k, device, torch.float32)
+    fc1_12 = torch.randn(num_experts, 2 * ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc2 = torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
+    empty = _empty(device, dtype)
+    wrapper = resolve_op("moe_experts", "standard", "eager").wrapper
+
+    with set_batch_invariant_mode(True):
+        out = wrapper(hidden, routing, selected, empty, empty, fc2, fc1_12, num_experts=num_experts)
+
+    assert out.dtype == dtype
+    assert out.shape == hidden.shape
+
+
 def test_eager_merged_matches_split():
     torch.manual_seed(1)
     num_tokens, num_experts, hidden_dim, ffn_dim, top_k = 6, 3, 16, 8, 2
