@@ -24,7 +24,7 @@ In this section, we introduce the overall design of EP+FSDP2 in VeOmni so that y
 
 In VeOmni, experts module is defined as tensors of [E, H, I] (Expert number, hidden dim, intermediate size) for down projection weights, and [E, I, H] for gate projection and up projection.
 
-> please see [example of how we merge the Qwen3-MoE expert weight](../examples/qwen3_moe.md)
+> please see [example of how we merge the Qwen3-MoE expert weight](../models/qwen/qwen3-moe.md)
 
 The expert parallelism (EP) is applied on dim-0 (expert number), while FSDP2 is applied on dim-1 instead of default dim-0.
 

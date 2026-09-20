@@ -403,7 +403,7 @@ bash train.sh tasks/train_dit.py configs/dit/wan2.1_I2V_1.3B_lora.yaml \
     --train.num_train_epochs 30
 ```
 
-See [Wan2.1-I2V-1.3B Training Guide](../examples/wan2.1_I2V_1.3B.md) for the complete
+See [Wan2.1-I2V-1.3B Training Guide](../models/wan/wan2-1-t2v.md) for the complete
 dataset preparation and inference workflow.
 
 ### 6.2 Qwen3-0.6B LoRA (LLM, FSDP2)

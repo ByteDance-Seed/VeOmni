@@ -1,8 +1,8 @@
 # Qwen3 Omni MoE: Model Integration Example
 
 This guide maps the current thinker-training integration for contributors.
-For runnable workflows, see the [Omni recipe](../../examples/qwen3_omni_moe.md)
-and [offline audio/video recipe](../../examples/qwen3_omni_offline_av.md).
+For runnable workflows, see the [Omni recipe](../../models/qwen/qwen3-omni.md)
+and [offline audio/video recipe](../../models/qwen/qwen3-omni-offline-av.md).
 
 Read the authored
 [GPU patch configuration](../../../veomni/models/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py),

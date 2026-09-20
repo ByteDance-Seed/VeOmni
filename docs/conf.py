@@ -46,12 +46,67 @@ autosectionlabel_prefix_document = True
 autosectionlabel_maxdepth = 2
 myst_heading_anchors = 4
 
-html_theme = "sphinx_book_theme"
+html_theme = "pydata_sphinx_theme"
 
-html_static_path = []
+templates_path = ["_templates"]
+html_static_path = ["assets/css"]
+html_css_files = ["veomni.css"]
 html_logo = "./assets/logo.png"
 html_favicon = "./assets/icon.ico"
 html_theme_options = {
-    "repository_url": "https://github.com/ByteDance-Seed/VeOmni",
-    "use_repository_button": True,
+    "github_url": "https://github.com/ByteDance-Seed/VeOmni",
+    "show_prev_next": True,
+    "navigation_depth": 4,
+    "show_nav_level": 1,
+    "collapse_navigation": False,
+    "navbar_start": ["navbar-logo"],
+    "navbar_center": [],
+    "article_header_start": ["section-label.html"],
+    "navbar_end": ["theme-switcher", "navbar-icon-links"],
+    "primary_sidebar_end": [],
+    "secondary_sidebar_items": ["page-toc"],
+    "footer_start": ["copyright"],
+    "footer_end": [],
+    "search_bar_text": "Search documentation…",
 }
+html_sidebars = {"**": ["section-sidebar.html"]}
+html_context = {"default_mode": "light"}
+
+# Top-level documents own their sidebar subtree; article URLs remain independent
+# of the section they belong to. Keep this list aligned with index.md's toctree.
+DOC_SECTIONS = [
+    ("guide/index", "User Guide"),
+    ("models/index", "Models"),
+    ("key_features/index", "Features"),
+    ("developer/index", "Developer Guide"),
+    ("design/index", "Design"),
+    ("hardware_support/index", "Hardware"),
+]
+
+
+def page_context(app, pagename, templatename, context, doctree):
+    includes = app.env.toctree_includes
+    section = DOC_SECTIONS[0][0]
+    for root, _ in DOC_SECTIONS:
+        pending, visited = [root], set()
+        while pending:
+            name = pending.pop()
+            if name in visited:
+                continue
+            visited.add(name)
+            pending.extend(includes.get(name, []))
+        if pagename in visited:
+            section = root
+            break
+    if pagename.startswith("examples/"):
+        section = "models/index"
+    context["section_entries"] = [
+        (name, app.env.titles[name].astext()) for name in includes.get(section, []) if name in app.env.titles
+    ]
+    context["doc_sections"] = DOC_SECTIONS
+    context["doc_section"] = section
+    context["doc_section_title"] = dict(DOC_SECTIONS)[section]
+
+
+def setup(app):
+    app.connect("html-page-context", page_context)

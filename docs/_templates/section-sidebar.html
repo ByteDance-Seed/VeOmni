@@ -1,0 +1,19 @@
+<nav class="bd-docs-nav bd-links" aria-label="Section navigation">
+  <a class="veomni-section-title" href="{{ pathto(doc_section) }}">{{ doc_section_title }}</a>
+  {% if pagename in ['index', 'search', 'genindex'] or (meta and 'orphan' in meta) %}
+  <ul class="nav bd-sidenav">
+    {% if pagename.startswith("examples/") %}
+    <li><a href="{{ pathto(doc_section) }}">Overview</a></li>
+    {% for doc, label in section_entries %}<li><a href="{{ pathto(doc) }}">{{ label }}</a></li>{% endfor %}
+    {% else %}
+    <li><a href="{{ pathto('index') }}">Welcome</a></li>
+    <li><a href="{{ pathto('get_started/quick_start') }}">Quick Start</a></li>
+    <li><a href="{{ pathto('get_started/installation/install') }}">Installation</a></li>
+    {% for root, label in doc_sections %}<li><a href="{{ pathto(root) }}">{{ label }}</a></li>{% endfor %}
+    {% endif %}
+  </ul>
+  {% else %}
+  <a class="veomni-overview{% if pagename == doc_section %} active{% endif %}" href="{{ pathto(doc_section) }}"{% if pagename == doc_section %} aria-current="page"{% endif %}>Overview</a>
+  <div class="bd-toc-item navbar-nav">{{ generate_toctree_html('sidebar', startdepth=1, show_nav_level=1, maxdepth=4, collapse=False, includehidden=True, titles_only=True) }}</div>
+  {% endif %}
+</nav>

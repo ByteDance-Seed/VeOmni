@@ -6,5 +6,5 @@ markdown-it-py==4.2.0
 # Sphinx build
 sphinx==9.1.0
 
-# Default book theme
-sphinx-book-theme==1.4.0
+# Documentation navigation and page layout
+pydata-sphinx-theme==0.20.0

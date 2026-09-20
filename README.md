@@ -73,7 +73,7 @@ track `main`; use the documentation from your checkout when working on an older 
 ## ✏️ Models and Recipes
 
 VeOmni includes recipes for dense and MoE text models, vision-language and Omni
-models, and diffusion models. The [model and recipe catalog](docs/examples/index.md)
+models, and diffusion models. The [model and recipe catalog](docs/models/index.md)
 links each family to its checked-in configurations, training guide, and limitations.
 See [hardware support](docs/hardware_support/index.md) for platform-specific setup
 and validation scope.
