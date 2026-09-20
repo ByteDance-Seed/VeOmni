@@ -43,14 +43,19 @@ def build_chat_template(
     """Builds any registered template, text-only or multimodal.
 
     Text-only templates take a tokenizer; multimodal ones take the processor,
-    which carries both the tokenizer and the grid parameters they need. Callers
-    pass whatever their modality has, matching the template their config names.
+    which carries both the tokenizer and the grid parameters they need. A
+    multimodal checkpoint may still be used by a text-only job, so unwrap its
+    processor before constructing a text-only template.
 
     ``kwargs`` reach the template constructor. No template currently declares
     one, so an unrecognised option raises there instead of being silently
     dropped.
     """
-    return CHAT_TEMPLATE_REGISTRY[template_name](tokenizer_or_processor, **kwargs)
+    template_cls = CHAT_TEMPLATE_REGISTRY[template_name]
+    if not issubclass(template_cls, MultimodalChatTemplate):
+        tokenizer_or_processor = getattr(tokenizer_or_processor, "tokenizer", tokenizer_or_processor)
+
+    return template_cls(tokenizer_or_processor, **kwargs)
 
 
 class ChatTemplate(ABC):
