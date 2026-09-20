@@ -201,20 +201,15 @@ YAML Config -> VeOmniArguments -> Trainer
 6. Load weights (`load_model_weights()` or `rank0_load_and_broadcast_weights()`)
 7. Apply parallelization (`build_parallelize_model()`)
 
-## DiT Remove-Padding Interface
+## DiT Fixed Microbatches
 
-`model.use_remove_padding` is DiT-only and defaults to false. The shared contract
-lives in `veomni/models/diffusers/packing.py`; no built-in model opts in yet.
-`DiTTrainer` checks config constraints before distributed setup.
-`DiTModelRuntime._build_model` resolves model and condition capabilities through
-the existing registry before constructing either component, then configures the
-DiT before freeze, wrapping and optimizer construction. The trainer's enabled forward path calls
-`condition_model.prepare_samples` and passes native dict/list `DiffusionSample`
-pytrees through the root model. `DiffusionBatchOutput` preserves sample order and
-per-sample losses, reduced by sample count and then accumulation count. Packing,
-validity masks, attention boundaries and output reconstruction remain model-owned;
-this interface neither uses MainCollator nor enables dynamic batching. See
-`docs/usage/diffusion_remove_padding.md` for the initial support envelope.
+`DiTTrainer` honors `train.micro_batch_size` and keeps `dyn_bsz=false`.
+`DiTDataCollator` produces dict-of-lists microbatches; the existing
+`get_condition` / `process_condition` / model-forward path is unchanged.
+Models return sample-mean scalar losses, and the trainer divides by the number
+of accumulation microbatches. Packing and SP/CP handling remain model-owned.
+Offline embedding allows multiple samples but keeps one microbatch per step.
+See `docs/usage/dit_microbatching.md`.
 
 ## Parallelization Flow
 

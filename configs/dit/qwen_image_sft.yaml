@@ -1,6 +1,4 @@
 model:
-  # The shared interface is opt-in; this model has no remove-padding implementation yet.
-  use_remove_padding: false
   model_path: Qwen/Qwen-Image/transformer
   condition_model_path: Qwen/Qwen-Image
   config_path: ./configs/model_configs/qwen_image/qwen_image_20b.json
