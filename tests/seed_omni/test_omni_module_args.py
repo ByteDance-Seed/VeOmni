@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -364,6 +365,111 @@ def test_launcher_module_args_win_over_the_persisted_kernels(tmp_path):
     # What OmniInferencer passes as `config=` on the eager path.
     from_launcher = relaunched.to_hf_config()
     assert from_launcher.module_ops_implementation("janus_llama")["attn_implementation"] == "sdpa"
+
+
+def _exported_janus_root(tmp_path) -> Path:
+    exported = tmp_path / "exported"
+    _janus_model_runtime(model_path=str(tmp_path)).to_hf_config().save_pretrained(exported)
+    return exported
+
+
+def test_the_checkpoint_fills_in_what_the_launcher_yaml_leaves_out(tmp_path):
+    """A launcher YAML no longer shuts the checkpoint's own values out.
+
+    These used to be either/or: name a ``modules:`` YAML and the checkpoint's
+    entries were never consulted. That made the persisted kernels reachable
+    only by a launcher-less caller, even though the checkpoint is the one layer
+    that knows a module individually without the user restating it. Janus shows
+    the cost — ``modules_train.yaml`` pins each module's attention, and no infer
+    YAML repeats it, so an inference run silently dropped to the global value.
+    """
+    from veomni.arguments import OpsImplementationConfig
+
+    exported = _exported_janus_root(tmp_path)
+    # `janus_vqvae`, because `modules_train.yaml` pins it to eager attention
+    # while the global default is the SP-aware flash variant. Asserting on a
+    # module whose exported value happens to match the global would pass whether
+    # or not the checkpoint was consulted at all.
+    trained_attn = OmniConfig.from_pretrained(exported).module_ops_implementation("janus_vqvae")["attn_implementation"]
+    assert trained_attn != OpsImplementationConfig().attn_implementation
+
+    args = OmniArguments(
+        model=OmniModelRuntimeArguments(
+            model_path=str(exported),
+            model_config={"modules": str(_janus_cfg_dir() / "infer/modules_infer_fsdp.yaml")},
+        ),
+        data=OmniDataArguments(train_path=""),
+        infer=OmniInferArguments(),
+    )
+    modules = args.resolve_model(for_inference=True).modules
+
+    # The infer YAML names no kernels, so the exported ones stand...
+    assert modules["janus_vqvae"].ops_implementation.attn_implementation == trained_attn
+    # ...and it does name parallelism, which the checkpoint must not undo.
+    assert modules["janus_siglip"].accelerator.fsdp_config.fsdp_mode == "eager"
+
+
+def test_a_launcher_yaml_still_wins_where_it_names_the_same_field(tmp_path):
+    """The checkpoint is a default, not a freeze.
+
+    Swapping a training kernel for an inference one is the whole reason the
+    checkpoint layer sits *under* the YAML rather than over it. Deep-merged, so
+    naming one kernel does not drop the module's others.
+    """
+    exported = _exported_janus_root(tmp_path)
+    modules_yaml = {
+        name: {"ops_implementation": {"attn_implementation": "sdpa"}} if name == "janus_llama" else {}
+        for name in OmniConfig.from_pretrained(exported).module_names
+    }
+    args = OmniArguments(
+        model=OmniModelRuntimeArguments(
+            model_path=str(exported),
+            model_config={"modules": modules_yaml},
+        ),
+        data=OmniDataArguments(train_path=""),
+        infer=OmniInferArguments(),
+    )
+    modules = args.resolve_model().modules
+
+    assert modules["janus_llama"].ops_implementation.attn_implementation == "sdpa"
+    # Untouched by the YAML, so still the exported value rather than the global.
+    vqvae_attn = OmniConfig.from_pretrained(exported).module_ops_implementation("janus_vqvae")["attn_implementation"]
+    assert modules["janus_vqvae"].ops_implementation.attn_implementation == vqvae_attn
+
+
+def test_a_checkpoint_accelerator_overlay_reaches_the_veomni_runtime(tmp_path):
+    """Parallelism layers the same way — for the runtime, not the eager path.
+
+    ``OmniModel.from_pretrained`` has no parallelism to configure and reads only
+    ``ops_implementation`` off the entry. The VeOmni runtime does, so an
+    ``accelerator`` block on a checkpoint entry has to survive into the module's
+    args. Export does not write one today (``to_hf_config`` projects the model
+    fields only), hence the hand-written entry here.
+    """
+    exported = _exported_janus_root(tmp_path)
+    config_file = exported / "config.json"
+    payload = json.loads(config_file.read_text(encoding="utf-8"))
+    payload["modules"]["janus_vqvae"]["accelerator"] = {"fsdp_config": {"fsdp_mode": "ddp"}}
+    payload["modules"]["janus_siglip"]["accelerator"] = {"fsdp_config": {"fsdp_mode": "ddp"}}
+    config_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    args = OmniArguments(
+        model=OmniModelRuntimeArguments(
+            model_path=str(exported),
+            model_config={
+                "modules": {
+                    "janus_vqvae": {},
+                    "janus_siglip": {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2"}}},
+                }
+            },
+        ),
+        data=OmniDataArguments(train_path=""),
+        infer=OmniInferArguments(),
+    )
+    modules = args.resolve_model().modules
+
+    assert modules["janus_vqvae"].accelerator.fsdp_config.fsdp_mode == "ddp"
+    assert modules["janus_siglip"].accelerator.fsdp_config.fsdp_mode == "fsdp2"
 
 
 def test_resolve_model_reads_graphs_from_omni_checkpoint(tmp_path):

@@ -117,20 +117,37 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
     model_path = model_runtime.model_path
     omni_cfg = _try_load_omni_checkpoint_config(model_path)
 
-    train_modules = model_runtime.launcher_config("modules")
-    if train_modules is None and omni_cfg is not None:
-        train_modules = {
-            name: {
-                "model_path": omni_cfg.module_checkpoint_subfolder(name),
-                **({"model_config": overrides} if (overrides := omni_cfg.module_model_config(name)) else {}),
-            }
-            for name in omni_cfg.module_names
-        }
-    if train_modules is None:
+    # Three layers, widest first: the launcher's global `model:` block (applied
+    # in `build_module_runtime_args`), then what the checkpoint persisted for
+    # this module, then the launcher's per-module YAML. The checkpoint sits in
+    # the middle because it is the only layer that knows a module individually
+    # without the user restating it — kernels a module was exported with, its
+    # config overrides, an `accelerator` overlay if the entry carries one — and
+    # it must still lose to a YAML that names the same field, which is how a run
+    # swaps a training kernel for an inference one.
+    ckpt_modules = (
+        {name: omni_cfg.module_runtime_fields(name) for name in omni_cfg.module_names}
+        if omni_cfg is not None
+        else None
+    )
+    yaml_modules = model_runtime.launcher_config("modules")
+    if ckpt_modules is None and yaml_modules is None:
         raise ValueError(
             "`model.model_config.modules` (per-module override YAML) is required when "
             "`model_path` is not a self-contained omni checkpoint."
         )
+    if ckpt_modules is None:
+        train_modules = yaml_modules
+    elif yaml_modules is None:
+        train_modules = ckpt_modules
+    else:
+        # Only modules the YAML names are built: it, not the checkpoint, decides
+        # the module set, so a launcher can compose a subset (or point a module
+        # at a different checkpoint) without the root's every module tagging along.
+        train_modules = {
+            name: _deep_update(deepcopy(ckpt_modules.get(name, {})), override)
+            for name, override in _load_launcher_yaml(yaml_modules).items()
+        }
 
     train_graph = model_runtime.launcher_config("train_graph")
     if train_graph is None and omni_cfg is not None:

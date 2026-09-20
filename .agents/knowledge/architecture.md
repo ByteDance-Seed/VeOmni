@@ -267,7 +267,30 @@ Graph-only consumers such as `scripts/visualize_omni_graph.py` use the runtime c
 directly and never convert.
 
 `OmniConfig.from_pretrained()` hydrates each module entry into a `PretrainedConfig` by
-reading the module subfolder's `config.json`.
+reading the module subfolder's `config.json`. Hydration destroys the descriptor's
+`model` block, so `_stash_module_load_options()` captures each entry's launcher-shaped
+fields first; `module_runtime_fields()` / `module_ops_implementation()` read that stash.
+
+**Per-module settings resolve in three layers**, widest first:
+
+1. the launcher's global `model:` block (`_module_base` in `build_module_runtime_args`),
+2. what the checkpoint persisted for that module (`OmniConfig.module_runtime_fields`),
+3. the launcher's per-module `modules:` YAML.
+
+Deep-merged, so naming one field does not drop the module's others. The checkpoint sits
+in the middle because it is the only layer that knows a module individually without the
+user restating it — the kernels it was exported with, its `model_config`, an
+`accelerator` overlay if the entry carries one — while still losing to a YAML that names
+the same field, which is how a run swaps a training kernel for an inference one. The
+`modules:` YAML, not the checkpoint, decides the *module set*: only modules it names are
+built, so a launcher can compose a subset or point a module at another checkpoint.
+
+`to_hf_config()` persists the model fields only (`model_path`, `model_config`,
+`processor_config`, `ops_implementation`) — never `accelerator`, since parallelism
+belongs to a run and not a checkpoint. An `accelerator` block in layer 2 therefore only
+ever comes from a hand-written `config.json`, and only the VeOmni runtime consumes it:
+`OmniModel.from_pretrained` has no parallelism to configure and reads `ops_implementation`
+alone (`_build_module_load_kwargs`, which also hands it to HF as `attn_implementation`).
 
 `OmniConfig` itself (`configuration_omni.py`) is a plain `PretrainedConfig` and imports
 nothing from `veomni.arguments`: it only reads/writes a checkpoint root. Per-module

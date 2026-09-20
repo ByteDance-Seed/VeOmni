@@ -173,13 +173,48 @@ class OmniConfig(PretrainedConfig):
             return dict(ops)
         return self.module(name).ops_implementation()
 
+    def module_runtime_fields(self, name: str) -> Dict[str, Any]:
+        """This module's descriptor flattened onto launcher ``ModelArguments`` keys.
+
+        What the checkpoint contributes when a launcher resolves its modules:
+        ``ops_implementation``, ``model_config``, ``processor_config``, and an
+        ``accelerator`` block if the entry carries one. Callers layer their own
+        per-module YAML on top, so these are defaults rather than the final say.
+
+        ``model_path`` is filled in from the module's subfolder when the entry
+        does not name one, which an exported checkpoint never does — export
+        slims it away precisely because it was an absolute path on the machine
+        that wrote it.
+        """
+        fields = dict(getattr(self, "_module_load_options", {}).get(name, {}))
+        if not fields:
+            module = self.module(name)
+            # A hydrated entry is a PretrainedConfig with no descriptor left to
+            # flatten; the stash above is what survives hydration.
+            if isinstance(module.entry, dict):
+                fields = module.as_runtime_fields()
+        fields = deepcopy(fields)
+        if not fields.get("model_path"):
+            fields["model_path"] = self.module_checkpoint_subfolder(name)
+        return fields
+
     def _stash_module_load_options(self) -> None:
-        """Preserve ``model.ops_implementation`` before module entries are hydrated."""
+        """Preserve the descriptor's launcher-shaped fields before hydration.
+
+        Hydration replaces each entry with a family :class:`PretrainedConfig`,
+        which has nowhere to keep the descriptor's ``model`` block — so
+        everything a launcher or the native load path later wants to read off
+        the checkpoint (kernels, config overrides, any ``accelerator`` overlay)
+        has to be captured here or it is gone.
+        """
         options: Dict[str, Dict[str, Any]] = {}
         for name in self.module_names:
-            ops = self.module(name).ops_implementation()
-            if ops:
-                options[name] = {"ops_implementation": deepcopy(ops)}
+            module = self.module(name)
+            if not isinstance(module.entry, dict):
+                continue
+            fields = module.as_runtime_fields()
+            if fields:
+                options[name] = deepcopy(fields)
         self._module_load_options = options
 
     def resolve_module_path(self, checkpoint_root: Optional[Union[str, os.PathLike]], name: str) -> str:
