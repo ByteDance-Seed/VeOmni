@@ -14,16 +14,27 @@
 
 """VeOmni operation registry and built-in implementations.
 
-Importing this package registers the families that have landed so far.
+``compound`` holds nested-handle helpers. Importing this package registers
+ops whose concrete implementations live under ``kernels``: ``rms_norm``,
+``layer_norm``, ``rope``, ``async_ulysses_*``, ``dsa_attention`` /
+``dsa_indexer``, ``swiglu_mlp``, ``moe_experts``, ``loss`` (LB + CE),
+``gated_delta_rule``, and ``attention``. Process-wide integrations live in
+``install`` and the opt-in
+ATen overrides live in ``batch_invariant``.
 """
 
 from . import kernels as _op_families  # noqa: F401
+from .install import apply_ops_patch
 from .registry import OP_REGISTRY, VeomniOp, register_op, resolve_op
+
+
+apply_ops_patch()
 
 
 __all__ = [
     "OP_REGISTRY",
     "VeomniOp",
+    "apply_ops_patch",
     "register_op",
     "resolve_op",
 ]

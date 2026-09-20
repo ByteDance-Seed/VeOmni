@@ -14,9 +14,12 @@
 
 """Registered kernel families.
 
-Importing this package registers the families that have landed so far.
+Importing this package registers every family on ``OP_REGISTRY``.
+Callers resolve rows through ``veomni.ops``, not this package.
 """
 
+from . import async_ulysses as _async_ulysses  # noqa: F401
+from . import attention as _attention  # noqa: F401
 from . import dsa as _dsa  # noqa: F401
 from . import gated_delta_rule as _gated_delta_rule  # noqa: F401
 from . import layer_norm as _layer_norm  # noqa: F401
