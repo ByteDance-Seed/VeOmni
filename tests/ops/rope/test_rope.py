@@ -259,6 +259,26 @@ def test_eager_rope_fixed_tables_do_not_save_inputs(kind: str):
 
 
 @pytest.mark.parametrize("kind", ("full", "vision"))
+def test_eager_full_rope_pins_saved_tables_to_q_dtype(kind: str):
+    if kind == "vision":
+        q = torch.randn(4, 3, 8, dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(4, 2, 8, dtype=torch.bfloat16, requires_grad=True)
+        cos = torch.randn(4, 8, dtype=torch.float32)
+        sin = torch.randn(4, 8, dtype=torch.float32)
+        output = resolve_op("rope", "full", "eager").wrapper(q, k, cos, sin)
+    else:
+        q = torch.randn(2, 3, 4, 8, dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(2, 2, 4, 8, dtype=torch.bfloat16, requires_grad=True)
+        cos = torch.randn(2, 4, 8, dtype=torch.float32)
+        sin = torch.randn(2, 4, 8, dtype=torch.float32)
+        output = resolve_op("rope", "full", "eager").wrapper(q, k, cos, sin, unsqueeze_dim=1)
+
+    saved_cos, saved_sin = output[0].grad_fn.saved_tensors
+    assert saved_cos.dtype == q.dtype
+    assert saved_sin.dtype == q.dtype
+
+
+@pytest.mark.parametrize("kind", ("full", "vision"))
 def test_rope_accepts_compatible_optional_arguments(kind: str):
     position_ids = torch.arange(4).unsqueeze(0)
     if kind == "full":

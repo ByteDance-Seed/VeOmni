@@ -60,6 +60,19 @@ def _is_vision_layout(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> bool:
     return q.ndim == 3 and k.ndim == 3 and cos.ndim == 2 and sin.ndim == 2
 
 
+def _tables_for_saved_state(q: Tensor, cos: Tensor, sin: Tensor) -> tuple[Tensor, Tensor]:
+    """Pin saved ``cos`` / ``sin`` to ``q.dtype`` without changing compute tensors.
+
+    Non-reentrant checkpoint compares saved-table metadata across the first
+    forward and the recompute. Vision tables are born float32; FSDP2 may cast
+    them to ``q.dtype`` on only one of those passes. Trainable tables stay as
+    given so ``requires_grad`` survives ``Function.forward``.
+    """
+    if cos.requires_grad or sin.requires_grad:
+        return cos, sin
+    return cos.to(dtype=q.dtype), sin.to(dtype=q.dtype)
+
+
 def forward(
     q: Tensor,
     k: Tensor,
@@ -81,7 +94,9 @@ def forward(
     vision_layout = _is_vision_layout(q, k, cos, sin)
     broadcast_dim = -2 if vision_layout else unsqueeze_dim
     if q.numel() == 0 or k.numel() == 0:
-        return (q, k), SavedState((cos, sin), _Meta(True, broadcast_dim, False, vision_layout))
+        return (q, k), SavedState(
+            _tables_for_saved_state(q, cos, sin), _Meta(True, broadcast_dim, False, vision_layout)
+        )
 
     q_compute = q.float() if vision_layout else q
     k_compute = k.float() if vision_layout else k
@@ -91,7 +106,8 @@ def forward(
         cos_u = cos_u.float()
         sin_u = sin_u.float()
     table_gradients = cos.requires_grad or sin.requires_grad
-    tensors = (q, k, cos, sin) if table_gradients else (cos, sin)
+    saved_cos, saved_sin = _tables_for_saved_state(q, cos, sin)
+    tensors = (q, k, saved_cos, saved_sin) if table_gradients else (saved_cos, saved_sin)
     q_embed = _apply(q_compute, cos_u, sin_u).to(q.dtype) if vision_layout else _apply(q_compute, cos_u, sin_u)
     k_embed = _apply(k_compute, cos_u, sin_u).to(k.dtype) if vision_layout else _apply(k_compute, cos_u, sin_u)
     return (q_embed, k_embed), SavedState(tensors, _Meta(False, broadcast_dim, table_gradients, vision_layout))

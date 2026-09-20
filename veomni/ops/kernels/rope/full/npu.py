@@ -42,13 +42,17 @@ def forward(
         sin_u = sin.unsqueeze(0).unsqueeze(2).float()
         q_embed = torch_npu.npu_rotary_mul(q_in, cos_u, sin_u).squeeze(0).to(q.dtype)
         k_embed = torch_npu.npu_rotary_mul(k_in, cos_u, sin_u).squeeze(0).to(k.dtype)
-        return (q_embed, k_embed), SavedState((cos, sin), _eager._Meta(False, -2, False, True))
+        return (q_embed, k_embed), SavedState(
+            _eager._tables_for_saved_state(q, cos, sin), _eager._Meta(False, -2, False, True)
+        )
 
     cos_u = cos.unsqueeze(unsqueeze_dim)
     sin_u = sin.unsqueeze(unsqueeze_dim)
     q_embed = torch_npu.npu_rotary_mul(q, cos_u, sin_u).to(q.dtype)
     k_embed = torch_npu.npu_rotary_mul(k, cos_u, sin_u).to(k.dtype)
-    return (q_embed, k_embed), SavedState((cos, sin), _eager._Meta(False, unsqueeze_dim, False, False))
+    return (q_embed, k_embed), SavedState(
+        _eager._tables_for_saved_state(q, cos, sin), _eager._Meta(False, unsqueeze_dim, False, False)
+    )
 
 
 def backward(
