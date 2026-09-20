@@ -132,7 +132,10 @@ class OmniModel(PreTrainedModel):
                 module._is_hf_initialized = True
         self.post_init()
 
-        self.training_graph = TrainingGraph(config.training_graph)
+        # An inference-only checkpoint round-trips with ``training_graph: []``
+        # (``OmniConfig.save_pretrained`` accepts one), so the DAG is built only
+        # when there is one to build; :meth:`forward` reports its absence.
+        self.training_graph = TrainingGraph(config.training_graph) if config.training_graph else None
         self.generation_graph = GenerationGraph(config.generation_graph)
 
         self._last_printed_state: str | None = None
@@ -250,17 +253,16 @@ class OmniModel(PreTrainedModel):
         ``load_weights=True`` calls ``from_pretrained`` (checkpoint weights).
         ``load_weights=False`` calls ``_from_config`` (architecture only).
         """
-        from transformers import PretrainedConfig
-
         modules: dict[str, nn.Module] = {}
         for name in config.module_names:
             module_path = config.resolve_module_path(checkpoint_root, name)
-            entry = config.modules.get(name)
+            hydrated = config.module_hf_config(name)
             load_kwargs = cls._build_module_load_kwargs(config, name, kwargs)
-            if isinstance(entry, PretrainedConfig):
-                # ``OmniConfig.from_pretrained`` already hydrated this entry.
-                mod_cls = OMNI_MODEL_REGISTRY[entry.model_type]()
-                module_config = entry
+            if hydrated is not None:
+                # ``OmniConfig.from_pretrained`` already read this module's
+                # ``config.json`` and applied its ``model_config`` overrides.
+                mod_cls = OMNI_MODEL_REGISTRY[hydrated.model_type]()
+                module_config = hydrated
             else:
                 # In-memory / launcher descriptor: typed config still lives on disk.
                 mod_cls = OMNI_MODEL_REGISTRY[read_model_type(module_path)]()
@@ -421,6 +423,12 @@ class OmniModel(PreTrainedModel):
         so a port to another framework only has to supply a runner.
         """
         del args, kwargs
+        if self.training_graph is None:
+            raise ValueError(
+                "OmniModel.forward: this model has no training graph. Its config declares an empty "
+                "`training_graph`, which is what an inference-only checkpoint exports; load or pass "
+                "a config carrying the training DAG to train it."
+            )
         run_node = node_runner if node_runner is not None else self._run_train_node
 
         self.training_graph.reset()
@@ -540,8 +548,11 @@ class OmniModel(PreTrainedModel):
             for node in self.generation_graph.iter_nodes(ctx):
                 module = getattr(self, node.module)
                 self._run_generation_node(module, node, ctx, generation_kwargs)
+                # Per node, not per body pass: ``ctx`` is one shared dict, so a
+                # second node emitting ``generated`` overwrites the first's
+                # artefact before a pass-level drain could see it.
+                self._collect_generated(ctx)
             total_steps += 1
-            self._collect_generated(ctx)
             self.generation_graph.maybe_transition(ctx)
 
         self._emit_progress(total_steps)

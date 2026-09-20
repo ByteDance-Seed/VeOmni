@@ -269,6 +269,62 @@ def test_omni_model_forward_runs_fake_module_chain():
     assert out == {"loss": None, "losses": {}}
 
 
+class _ArtefactModule(nn.Module):
+    """Generation stand-in that emits one artefact per ``generate`` call."""
+
+    def __init__(self, name: str):
+        super().__init__()
+        self.name = name
+
+    def generate(self, **kwargs):
+        return {"generated": {"type": "text", "value": self.name}}
+
+
+def test_generate_keeps_every_artefact_a_body_pass_emits():
+    """``ctx`` is one shared dict: a later node overwrites an earlier artefact.
+
+    Draining once per body pass therefore kept only whatever the last node of
+    the pass wrote. Both nodes of an ``a -> b -> end`` body emit here.
+    """
+    config = OmniConfig(
+        modules={"module_A": {"subfolder": "module_A"}, "module_B": {"subfolder": "module_B"}},
+        training_graph=[{"from": "module_A", "to": "module_B"}, {"from": "module_B", "to": "end"}],
+        generation_graphs={
+            "infer_gen": {
+                "initial": "run",
+                "states": {
+                    "run": {
+                        "body": [{"from": "module_A", "to": "module_B"}, {"from": "module_B", "to": "end"}],
+                        "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
+                    }
+                },
+            }
+        },
+    )
+    model = OmniModel(config, {"module_A": _ArtefactModule("module_A"), "module_B": _ArtefactModule("module_B")})
+
+    model.reset()
+    generated = model.generate({})
+
+    assert [item["value"] for item in generated] == ["module_A", "module_B"]
+
+
+def test_omni_model_without_a_training_graph_generates_but_refuses_to_train():
+    """An inference-only checkpoint (``training_graph: []``) must still load."""
+    config = OmniConfig(
+        modules={"module_A": {"subfolder": "module_A"}},
+        training_graph=[],
+        generation_graphs=_minimal_generation_graphs(module="module_A"),
+    )
+
+    model = OmniModel(config, {"module_A": _ArtefactModule("module_A")})
+
+    assert model.training_graph is None
+    assert [item["value"] for item in model.generate({})] == ["module_A"]
+    with pytest.raises(ValueError, match="no training graph"):
+        model({})
+
+
 def test_modeling_omni_imports_no_veomni_runtime_package():
     """``modeling_omni`` must stay liftable into another framework.
 

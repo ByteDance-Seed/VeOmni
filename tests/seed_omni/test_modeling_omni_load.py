@@ -137,9 +137,9 @@ def test_omni_config_from_pretrained_hydrates_graph_sidecars(tmp_path):
     assert config.generation_graphs["infer_und"]["initial"] == "understand"
     assert config.module_subfolder(FAKE_A) == FAKE_A
     assert config.resolve_module_path(tmp_path, FAKE_B) == str(tmp_path / FAKE_B)
-    assert isinstance(config.modules[FAKE_A], FakeModuleAConfig)
-    assert isinstance(config.modules[FAKE_B], FakeModuleBConfig)
-    assert config.modules[FAKE_A].hidden_size == HIDDEN_SIZE
+    assert isinstance(config.module_hf_config(FAKE_A), FakeModuleAConfig)
+    assert isinstance(config.module_hf_config(FAKE_B), FakeModuleBConfig)
+    assert config.module_hf_config(FAKE_A).hidden_size == HIDDEN_SIZE
 
 
 def test_omni_config_from_pretrained_rejects_unregistered_module_type(tmp_path):
@@ -229,13 +229,11 @@ def test_omni_model_from_config_builds_unweighted_modules(tmp_path):
 
 
 def test_a_module_configured_outside_the_root_keeps_its_own_path(tmp_path):
-    """Hydration must leave a module that lives elsewhere alone.
+    """A module living outside the root keeps resolving to its own path.
 
-    Hydrating an entry replaces it with a ``PretrainedConfig``, and
-    ``module_subfolder`` resolves those back to the bare module name. So a
-    module hydrated from a configured custom path would have its weights
-    looked up under ``root/<name>`` regardless — a directory that, for a module
-    living outside the root, does not exist.
+    The root has no ``<name>/`` directory here at all, so hydration has nothing
+    to read; the entry stays a bare descriptor and the configured path is the
+    only thing weight loading can follow.
     """
     _write_omni_checkpoint(tmp_path)
     elsewhere = tmp_path / "elsewhere"
@@ -249,6 +247,77 @@ def test_a_module_configured_outside_the_root_keeps_its_own_path(tmp_path):
     config = OmniConfig.from_pretrained(tmp_path)
 
     assert config.resolve_module_path(str(tmp_path), FAKE_A) == str(elsewhere)
+
+
+def test_hydration_keeps_the_descriptor_a_module_was_declared_with(tmp_path):
+    """Reading a module's ``config.json`` must not cost its descriptor.
+
+    Hydration used to replace the entry with the typed config, and everything
+    the descriptor carried beyond it went with it: ``OmniProcessor.from_config``
+    then built each preprocessor with no ``processor_config`` and no
+    ``config_overrides``, silently disagreeing with the model it serves.
+    """
+    _write_omni_checkpoint(tmp_path)
+    config_path = tmp_path / "config.json"
+    raw = json.loads(config_path.read_text())
+    raw["modules"][FAKE_A] = {
+        "subfolder": FAKE_A,
+        "model": {"model_config": {"hidden_size": 16}},
+        "processor_config": {"packed_preprocess": True},
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    config = OmniConfig.from_pretrained(tmp_path)
+
+    assert config.module_processor_config(FAKE_A) == {"packed_preprocess": True}
+    assert config.module_model_config(FAKE_A) == {"hidden_size": 16}
+    assert config.module_hf_config(FAKE_A).hidden_size == 16
+
+
+def test_an_external_module_path_survives_a_same_named_directory_in_the_root(tmp_path):
+    """A configured ``model_path`` wins over ``root/<name>``, present or not.
+
+    Hydration keyed on ``root/<name>`` and replaced the entry with what it
+    found there, so a module pointed at another checkpoint was loaded from the
+    root instead — the wrong weights, with no error.
+    """
+    _write_omni_checkpoint(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    _write_module_stub(elsewhere, model_type=FAKE_A)
+    (elsewhere / "config.json").write_text(
+        json.dumps({"model_type": FAKE_A, "hidden_size": 32}),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "config.json"
+    raw = json.loads(config_path.read_text())
+    raw["modules"][FAKE_A] = {"subfolder": FAKE_A, "model": {"model_path": str(elsewhere)}}
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    config = OmniConfig.from_pretrained(tmp_path)
+
+    assert config.resolve_module_path(str(tmp_path), FAKE_A) == str(elsewhere)
+    assert config.module_hf_config(FAKE_A).hidden_size == 32
+
+
+def test_from_pretrained_keeps_a_graph_the_caller_passed(tmp_path):
+    """Sidecars are the checkpoint's default, not an override of the caller.
+
+    A launcher runs a checkpoint under the graph its YAML declares; hydrating
+    the sidecars over an explicit kwarg ran the exported graph instead.
+    """
+    _write_omni_checkpoint(tmp_path)
+    caller_training_graph = [{"from": FAKE_B, "to": "end"}]
+    caller_generation_graphs = {"infer_gen": _minimal_generation_graph(module=FAKE_B)}
+
+    config = OmniConfig.from_pretrained(
+        tmp_path,
+        training_graph=caller_training_graph,
+        generation_graphs=caller_generation_graphs,
+    )
+
+    assert config.training_graph == caller_training_graph
+    assert config.generation_graphs == caller_generation_graphs
+    assert OmniConfig.from_pretrained(tmp_path).training_graph == _chain_edges()
 
 
 def test_from_config_forwards_load_kwargs_to_unweighted_modules(tmp_path):
@@ -360,8 +429,8 @@ def test_omni_model_save_pretrained_roundtrip_layout(tmp_path):
 
     reloaded = OmniConfig.from_pretrained(save_root)
     assert reloaded.training_graph[0]["from"] == FAKE_A
-    assert isinstance(reloaded.modules[FAKE_A], PretrainedConfig)
-    assert isinstance(reloaded.modules[FAKE_B], PretrainedConfig)
+    assert isinstance(reloaded.module_hf_config(FAKE_A), PretrainedConfig)
+    assert isinstance(reloaded.module_hf_config(FAKE_B), PretrainedConfig)
     assert json.loads((save_root / FAKE_A / "config.json").read_text(encoding="utf-8"))["model_type"] == FAKE_A
     assert json.loads((save_root / FAKE_B / "config.json").read_text(encoding="utf-8"))["model_type"] == FAKE_B
 

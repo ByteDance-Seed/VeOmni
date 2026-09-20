@@ -149,6 +149,10 @@ class OmniConfig(PretrainedConfig):
         """Per-module preprocessor ``from_pretrained`` kwargs."""
         return self.module(name).processor_config()
 
+    def module_hf_config(self, name: str) -> Optional[PretrainedConfig]:
+        """Module ``name``'s typed ``config.json``, once a checkpoint load hydrated it."""
+        return self.module(name).hydrated_config
+
     def resolve_module_path(self, checkpoint_root: Optional[Union[str, os.PathLike]], name: str) -> str:
         """Resolve the on-disk path for module ``name`` under ``checkpoint_root``."""
         return self.module(name).resolve_path(checkpoint_root)
@@ -169,9 +173,15 @@ class OmniConfig(PretrainedConfig):
         Per-module ``config.json`` is resolved through ``OMNI_MODEL_REGISTRY`` —
         only registered omni modules can live in an :class:`OmniConfig`.
         """
+        # A caller may pass a graph explicitly to run a checkpoint under a graph
+        # it was not exported with (a launcher YAML overriding the sidecar).
+        # Sidecar hydration would otherwise silently discard it.
+        graph_overrides = {key: kwargs[key] for key in ("training_graph", "generation_graphs") if key in kwargs}
         config = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
         root = getattr(config, "_name_or_path", None) or str(pretrained_model_name_or_path)
         config._hydrate_graphs_from_checkpoint(root)
+        for key, value in graph_overrides.items():
+            setattr(config, key, value)
         config._hydrate_modules_from_checkpoint(root)
         return config
 
@@ -212,11 +222,12 @@ class OmniConfig(PretrainedConfig):
         save_directory = str(save_directory)
         os.makedirs(save_directory, exist_ok=True)
 
-        for name, entry in self.modules.items():
-            if isinstance(entry, PretrainedConfig):
+        for name in self.module_names:
+            hf_config = self.module(name).hydrated_config
+            if hf_config is not None:
                 module_dir = os.path.join(save_directory, self.module_checkpoint_subfolder(name))
                 os.makedirs(module_dir, exist_ok=True)
-                entry.save_pretrained(module_dir)
+                hf_config.save_pretrained(module_dir)
 
         export_config = self.copy_for_hf_export()
 

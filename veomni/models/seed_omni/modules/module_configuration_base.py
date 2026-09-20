@@ -32,6 +32,13 @@ from typing import Any
 from transformers import PretrainedConfig
 
 
+# In-memory only: :meth:`OmniModuleConfig.hydrate` parks the module's typed
+# ``config.json`` under this key on the descriptor instead of replacing the
+# descriptor with it, so ``processor_config`` / ``model_config`` / an external
+# ``model_path`` survive hydration. Export slimming never copies it out.
+HYDRATED_CONFIG_KEY = "hf_config"
+
+
 def safe_checkpoint_subfolder(name: str) -> str:
     """Return ``name`` if it is a single relative path component, else raise.
 
@@ -61,6 +68,18 @@ class OmniModuleConfig:
     def __init__(self, name: str, entry: Any = None):
         self.name = name
         self.entry = {} if entry is None else entry
+
+    @property
+    def hydrated_config(self) -> PretrainedConfig | None:
+        """This module's typed ``config.json`` if it has been hydrated, else ``None``."""
+        entry = self.entry
+        if isinstance(entry, PretrainedConfig):
+            return entry
+        if isinstance(entry, dict):
+            hf_config = entry.get(HYDRATED_CONFIG_KEY)
+            if isinstance(hf_config, PretrainedConfig):
+                return hf_config
+        return None
 
     @property
     def checkpoint_subfolder(self) -> str:
@@ -130,6 +149,7 @@ class OmniModuleConfig:
             raise TypeError(f"Module '{self.name}' must be a mapping to flatten onto runtime fields.")
         cfg = deepcopy(self.entry)
         cfg.pop("subfolder", None)
+        cfg.pop(HYDRATED_CONFIG_KEY, None)
         model_block = cfg.pop("model", None)
         if isinstance(model_block, dict):
             for key, value in model_block.items():
@@ -138,26 +158,39 @@ class OmniModuleConfig:
         return cfg
 
     def hydrate(self, checkpoint_root: str | os.PathLike) -> Any:
-        """Load this module's ``config.json`` via the omni module registry when it is in-root."""
+        """Attach this module's typed ``config.json``, read from the path it loads from.
+
+        Hydration reads :meth:`resolve_path`, not ``root/<name>``: an entry that
+        names an external ``model_path`` must be described by the config living
+        with *its* weights, and must keep loading from there even when a
+        same-named directory happens to exist under the root.
+
+        The typed config is parked on the descriptor (:data:`HYDRATED_CONFIG_KEY`)
+        rather than replacing it. Replacing it dropped ``processor_config`` and
+        the ``model_config`` overrides the preprocessors are built with, and
+        re-anchored the module to ``root/<name>``.
+        """
         if isinstance(self.entry, PretrainedConfig):
             return self.entry
 
         from . import OMNI_MODEL_REGISTRY, read_hf_model_type
 
-        root = str(checkpoint_root)
-        overrides = self.model_config_overrides()
         subfolder = self.checkpoint_subfolder
-        # Hydrate from ``root/<subfolder>`` only. An entry whose weights live
-        # outside the root has no ``config.json`` here, stays a descriptor,
-        # and :meth:`resolve_path` keeps its own path.
-        module_dir = os.path.join(root, subfolder)
+        module_dir = self.resolve_path(checkpoint_root)
         if not os.path.isfile(os.path.join(module_dir, "config.json")):
-            return self.entry if self.entry is not None else {"subfolder": subfolder}
+            # No typed config to read (e.g. a descriptor pointing at a Hub id):
+            # stay a descriptor, and let the loader resolve the path itself.
+            return self.entry if self.entry else {"subfolder": subfolder}
+
         model_type = read_hf_model_type(module_dir)
         hf_config = OMNI_MODEL_REGISTRY[model_type]().config_class.from_pretrained(module_dir)
+        overrides = self.model_config_overrides()
         if overrides:
             hf_config.update(deepcopy(overrides))
-        return hf_config
+
+        entry = deepcopy(self.entry) if isinstance(self.entry, dict) else {"subfolder": self.subfolder}
+        entry[HYDRATED_CONFIG_KEY] = hf_config
+        return entry
 
     @classmethod
     def from_runtime(
@@ -189,4 +222,4 @@ class OmniModuleConfig:
         return entry
 
 
-__all__ = ["OmniModuleConfig", "safe_checkpoint_subfolder"]
+__all__ = ["HYDRATED_CONFIG_KEY", "OmniModuleConfig", "safe_checkpoint_subfolder"]
