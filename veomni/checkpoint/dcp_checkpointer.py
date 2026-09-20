@@ -58,14 +58,13 @@ from .layout import (
     step_dir,
     weights_dir,
 )
-from .layout import (
-    LR_SCHEDULER_FILENAME as _LR_SCHEDULER_FILENAME,
-)
 
 
 logger = logging.get_logger(__name__)
 
-_LR_SCHEDULER_KEY = "lr_scheduler"
+_EXTRA_STATE_KEY = "extra_state"
+_EXTRA_STATE_DIRNAME = "extra_state"
+_EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 
 
 class _ModelStrictLoadPlanner(DefaultLoadPlanner):
@@ -611,7 +610,7 @@ def _promote_staged_checkpoint(
     ``step_root`` is the step directory, given when the destination may hold a
     pre-split checkpoint whose marker sits there rather than inside
     ``final_path``. Nested files are copied in the data phase, before any
-    ``.metadata`` is. ``lr_scheduler.pt`` is one of those files.
+    ``.metadata`` is. The per-rank ``extra_state/`` files are among those files.
     """
     metadata_name = DCP_MARKER_FILENAME
     is_node_leader = _local_rank() == 0
@@ -794,7 +793,8 @@ class DistributedCheckpointer(CheckpointerBase):
 
         Writes three things under ``model/`` (see ``veomni.checkpoint.layout``):
         ``ckpt/`` for the weights, ``optimizer/`` for the optimizer state, and a
-        replicated ``lr_scheduler.pt``. Weights and optimizer are separate DCP
+        per-rank ``extra_state/`` for model-bound extra state (lr scheduler and
+        condition-model RNG). Weights and optimizer are separate DCP
         directories so the weights can be shipped or converted on their own; a
         single directory interleaves both into the same ``.distcp`` files.
 
@@ -887,7 +887,7 @@ class DistributedCheckpointer(CheckpointerBase):
         # and it is written only after every module's save has returned — but
         # writing the small replicated file first still means a save that dies
         # part-way leaves less behind.
-        cls._save_lr_scheduler(checkpoint_dir=write_root, state=state)
+        cls._save_extra_state(checkpoint_dir=write_root, state=state)
 
         try:
             cls.execute_save(
@@ -978,13 +978,14 @@ class DistributedCheckpointer(CheckpointerBase):
         load training state from distributed checkpoint
 
         Mirrors :meth:`save`: weights from ``model/<module>/ckpt``, optimizer from
-        ``model/<module>/optimizer``, scheduler from the sidecar beside them. A
-        checkpoint written before the split has no ``model/`` at all and keeps
-        both in one directory; that shape is detected and read as-is.
+        ``model/<module>/optimizer``, model-bound extra state from the per-rank
+        ``extra_state/`` beside them. A checkpoint written before the split has
+        no ``model/`` at all and keeps both in one directory; that shape is
+        detected and read as-is.
 
         args:
             path: step directory to load from
-            state: state to load, "model" is required; "optimizer" and "lr_scheduler" are optional
+            state: state to load, "model" is required; "optimizer" and "extra_state" are optional
             process_group: process group for loading checkpoint
             module: name of the model to load, for a job that trains several.
                 Empty for a single-model job. See :meth:`save`.
@@ -1027,7 +1028,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 process_group=process_group,
                 planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
             )
-            cls._load_lr_scheduler(checkpoint_dir=fused_dir, state=state)
+            cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
             logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
             return state
 
@@ -1048,7 +1049,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 planner=_ModelStrictLoadPlanner(strict_model=False),
             )
 
-        cls._load_lr_scheduler(checkpoint_dir=model_root, state=state)
+        cls._load_extra_state(checkpoint_dir=model_root, state=state)
 
         logger.info_rank0(f"Loaded checkpoint from {model_root}")
 
@@ -1234,54 +1235,30 @@ class DistributedCheckpointer(CheckpointerBase):
         )
 
     @classmethod
-    def _save_lr_scheduler(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
-        """Pickle ``lr_scheduler.state_dict`` into a single ``lr_scheduler.pt``.
+    def _save_extra_state(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
+        """Pickle this rank's ``extra_state`` dict into ``extra_state/``.
 
-        The scheduler is replicated across ranks, so only rank 0 writes. Every
-        rank still joins the reduction afterwards: a failed write must not let
-        peers enter the DCP collective alone.
+        The condition-model RNG is rank-local, so every rank writes its own file.
         """
-        error: Optional[Exception] = None
-        is_writer = (not dist.is_initialized()) or dist.get_rank() == 0
-        if is_writer:
-            try:
-                if _LR_SCHEDULER_KEY not in state:
-                    logger.warning_rank0("lr_scheduler not found in state, skipping lr_scheduler save")
-                else:
-                    lr_scheduler = state[_LR_SCHEDULER_KEY]
-                    if lr_scheduler is not None:
-                        torch.save(lr_scheduler.state_dict(), os.path.join(checkpoint_dir, _LR_SCHEDULER_FILENAME))
-            except Exception as e:  # noqa: BLE001 - raised once every rank has agreed
-                error = e
-        if any_rank_failed(error is not None):
-            raise error or RuntimeError("another rank could not save lr_scheduler")
+        if _EXTRA_STATE_KEY not in state:
+            logger.warning_rank0("extra_state not found in state, skipping extra_state save")
+            return
+        extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIRNAME)
+        os.makedirs(extra_state_dir, exist_ok=True)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(rank))
+        torch.save(state[_EXTRA_STATE_KEY], extra_state_path)
 
     @classmethod
-    def _load_lr_scheduler(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
-        """Load ``lr_scheduler.pt`` into ``lr_scheduler``. Every rank reads the same file."""
-        if _LR_SCHEDULER_KEY not in state:
-            logger.warning_rank0("lr_scheduler not found in state, skipping lr_scheduler load")
+    def _load_extra_state(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
+        """Load this rank's ``extra_state`` dict from ``extra_state/``."""
+        if _EXTRA_STATE_KEY not in state:
+            logger.warning_rank0("extra_state not found in state, skipping extra_state load")
             return
-        lr_scheduler = state[_LR_SCHEDULER_KEY]
-        if lr_scheduler is None:
-            return
-
-        lr_scheduler_path = os.path.join(checkpoint_dir, _LR_SCHEDULER_FILENAME)
-        if os.path.exists(lr_scheduler_path):
-            lr_scheduler.load_state_dict(torch.load(lr_scheduler_path, weights_only=False))
-            return
-
-        # Delete this import (and veomni/checkpoint/legacy_v0_1_12.py) to drop 0.1.12 extra_state resume.
-        from .legacy_v0_1_12 import apply_legacy_lr_scheduler
-
-        if apply_legacy_lr_scheduler(checkpoint_dir, lr_scheduler):
-            return
-
-        raise FileNotFoundError(
-            f"lr_scheduler sidecar not found at {lr_scheduler_path}. "
-            "This layout writes lr_scheduler.pt next to the DCP shards "
-            "(see docs/usage/checkpoint.md)."
-        )
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        extra_state_path = os.path.join(checkpoint_dir, _EXTRA_STATE_DIRNAME, _EXTRA_STATE_FORMAT.format(rank))
+        if os.path.exists(extra_state_path):
+            state[_EXTRA_STATE_KEY] = torch.load(extra_state_path, weights_only=False)
 
 
 def get_dtype_size(dtype: torch.dtype) -> int:
