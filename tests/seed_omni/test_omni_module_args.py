@@ -437,39 +437,98 @@ def test_a_launcher_yaml_still_wins_where_it_names_the_same_field(tmp_path):
     assert modules["janus_vqvae"].ops_implementation.attn_implementation == vqvae_attn
 
 
-def test_a_checkpoint_accelerator_overlay_reaches_the_veomni_runtime(tmp_path):
-    """Parallelism layers the same way — for the runtime, not the eager path.
-
-    ``OmniModel.from_pretrained`` has no parallelism to configure and reads only
-    ``ops_implementation`` off the entry. The VeOmni runtime does, so an
-    ``accelerator`` block on a checkpoint entry has to survive into the module's
-    args. Export does not write one today (``to_hf_config`` projects the model
-    fields only), hence the hand-written entry here.
-    """
-    exported = _exported_janus_root(tmp_path)
-    config_file = exported / "config.json"
-    payload = json.loads(config_file.read_text(encoding="utf-8"))
-    payload["modules"]["janus_vqvae"]["accelerator"] = {"fsdp_config": {"fsdp_mode": "ddp"}}
-    payload["modules"]["janus_siglip"]["accelerator"] = {"fsdp_config": {"fsdp_mode": "ddp"}}
-    config_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-    args = OmniArguments(
-        model=OmniModelRuntimeArguments(
-            model_path=str(exported),
-            model_config={
-                "modules": {
-                    "janus_vqvae": {},
-                    "janus_siglip": {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2"}}},
-                }
-            },
-        ),
+def _janus_args_over(exported: Path, modules: dict) -> OmniArguments:
+    return OmniArguments(
+        model=OmniModelRuntimeArguments(model_path=str(exported), model_config={"modules": modules}),
         data=OmniDataArguments(train_path=""),
         infer=OmniInferArguments(),
     )
-    modules = args.resolve_model().modules
+
+
+def _with_checkpoint_accelerator(exported: Path, **by_module: str) -> None:
+    """Hand-write an ``accelerator`` onto checkpoint entries.
+
+    Export never writes one — ``to_hf_config`` projects the model fields only —
+    so a hand-written ``config.json`` is the only way this layer carries one.
+    """
+    config_file = exported / "config.json"
+    payload = json.loads(config_file.read_text(encoding="utf-8"))
+    for name, mode in by_module.items():
+        payload["modules"][name]["accelerator"] = {"fsdp_config": {"fsdp_mode": mode}}
+    config_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def test_a_checkpoint_accelerator_overlay_reaches_training(tmp_path):
+    """Parallelism layers like everything else, and the YAML still wins."""
+    exported = _exported_janus_root(tmp_path)
+    _with_checkpoint_accelerator(exported, janus_vqvae="ddp", janus_siglip="ddp")
+
+    modules = (
+        _janus_args_over(
+            exported,
+            {"janus_vqvae": {}, "janus_siglip": {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2"}}}},
+        )
+        .resolve_model()
+        .modules
+    )
 
     assert modules["janus_vqvae"].accelerator.fsdp_config.fsdp_mode == "ddp"
     assert modules["janus_siglip"].accelerator.fsdp_config.fsdp_mode == "fsdp2"
+
+
+def test_inference_stays_eager_over_a_checkpoint_accelerator(tmp_path):
+    """A checkpoint must not make an inference run distributed on its own.
+
+    Parallelism belongs to a run, not a checkpoint — the reason `to_hf_config`
+    declines to persist `accelerator` in the first place. So the synthesized
+    inference default sits *above* the checkpoint layer: `eager` is what an
+    inference run gets unless its own YAML says otherwise, and a checkpoint
+    `accelerator` that would silently pull in FSDP2 collectives is masked.
+    """
+    exported = _exported_janus_root(tmp_path)
+    _with_checkpoint_accelerator(exported, janus_vqvae="fsdp2", janus_siglip="fsdp2")
+
+    modules = (
+        _janus_args_over(
+            exported,
+            {"janus_vqvae": {}, "janus_siglip": {"accelerator": {"fsdp_config": {"fsdp_mode": "ddp"}}}},
+        )
+        .resolve_model(for_inference=True)
+        .modules
+    )
+
+    # `janus_vqvae: {}` names the module without saying anything about it. Merging
+    # the layers as whole `{name: fields}` dicts used to read that as "clear it"
+    # rather than "defer", taking the eager default down with it.
+    assert modules["janus_vqvae"].accelerator.fsdp_config.fsdp_mode == "eager"
+    # Still overridable by the run's own YAML, which is the layer above.
+    assert modules["janus_siglip"].accelerator.fsdp_config.fsdp_mode == "ddp"
+
+
+def test_a_launcher_less_inference_run_is_eager_and_keeps_the_exported_kernels(tmp_path):
+    """No ``modules:`` YAML at all: the checkpoint decides the module set.
+
+    The layer that names the modules is also the one with nothing to say about
+    them, so this is where a layering slip shows up first — every module's entry
+    is synthesized empty and the eager default has only the checkpoint beneath it.
+    """
+    exported = _exported_janus_root(tmp_path)
+    _with_checkpoint_accelerator(exported, janus_vqvae="fsdp2")
+    trained_attn = OmniConfig.from_pretrained(exported).module_ops_implementation("janus_vqvae")["attn_implementation"]
+
+    args = OmniArguments(
+        model=OmniModelRuntimeArguments(model_path=str(exported)),
+        data=OmniDataArguments(train_path=""),
+        infer=OmniInferArguments(),
+    )
+    modules = args.resolve_model(for_inference=True).modules
+
+    assert set(modules) == set(OmniConfig.from_pretrained(exported).module_names)
+    assert modules["janus_vqvae"].accelerator.fsdp_config.fsdp_mode == "eager"
+    assert not modules["janus_vqvae"].broadcast_model_weights_from_rank0
+    # The eager default masks parallelism only — the exported kernels still land.
+    assert modules["janus_vqvae"].ops_implementation.attn_implementation == trained_attn
+    assert Path(modules["janus_vqvae"].model_path) == exported / "janus_vqvae"
 
 
 def test_resolve_model_reads_graphs_from_omni_checkpoint(tmp_path):

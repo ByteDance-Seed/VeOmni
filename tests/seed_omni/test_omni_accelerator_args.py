@@ -183,7 +183,7 @@ def test_resolve_omni_model_for_inference_forces_eager_without_broadcast_warning
     """`for_inference=True` forces `fsdp_mode=eager` per module (for modules that don't already
     pin their own `fsdp_mode`, e.g. `janus_text_encoder`); `broadcast_model_weights_from_rank0`
     is forced off alongside it so the eager default does not inherit a rank0-broadcast load
-    policy that cannot run without a wrap (see `_resolve_default_accelerator`).
+    policy that cannot run without a wrap (see `build_module_runtime_args`).
     """
     args = _janus_args()
     with veomni_caplog.at_level("WARNING"):

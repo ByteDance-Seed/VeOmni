@@ -117,14 +117,10 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
     model_path = model_runtime.model_path
     omni_cfg = _try_load_omni_checkpoint_config(model_path)
 
-    # Three layers, widest first: the launcher's global `model:` block (applied
-    # in `build_module_runtime_args`), then what the checkpoint persisted for
-    # this module, then the launcher's per-module YAML. The checkpoint sits in
-    # the middle because it is the only layer that knows a module individually
-    # without the user restating it — kernels a module was exported with, its
-    # config overrides, an `accelerator` overlay if the entry carries one — and
-    # it must still lose to a YAML that names the same field, which is how a run
-    # swaps a training kernel for an inference one.
+    # The checkpoint's per-module fields are their own layer, kept separate from
+    # the launcher YAML so `build_module_runtime_args` can slot the inference
+    # `fsdp_mode: eager` default between the two — see its docstring for the
+    # full order.
     ckpt_modules = (
         {name: omni_cfg.module_runtime_fields(name) for name in omni_cfg.module_names}
         if omni_cfg is not None
@@ -136,18 +132,10 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
             "`model.model_config.modules` (per-module override YAML) is required when "
             "`model_path` is not a self-contained omni checkpoint."
         )
-    if ckpt_modules is None:
-        train_modules = yaml_modules
-    elif yaml_modules is None:
-        train_modules = ckpt_modules
-    else:
-        # Only modules the YAML names are built: it, not the checkpoint, decides
-        # the module set, so a launcher can compose a subset (or point a module
-        # at a different checkpoint) without the root's every module tagging along.
-        train_modules = {
-            name: _deep_update(deepcopy(ckpt_modules.get(name, {})), override)
-            for name, override in _load_launcher_yaml(yaml_modules).items()
-        }
+    # The YAML, when there is one, decides the module *set*: only modules it
+    # names are built, so a launcher can compose a subset (or point a module at
+    # another checkpoint) without the root's every module tagging along.
+    train_modules = yaml_modules if yaml_modules is not None else {name: {} for name in ckpt_modules}
 
     train_graph = model_runtime.launcher_config("train_graph")
     if train_graph is None and omni_cfg is not None:
@@ -180,6 +168,7 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
         model_path,
         train_modules,
         for_inference=for_inference,
+        checkpoint_modules=ckpt_modules,
     )
     for module_args in modules.values():
         _validate_omni_accelerator(module_args.accelerator)
@@ -267,25 +256,57 @@ def build_module_runtime_args(
     modules: str | os.PathLike | dict[str, Any],
     *,
     for_inference: bool = False,
+    checkpoint_modules: dict[str, Any] | None = None,
 ) -> dict[str, OmniModuleRuntimeArguments]:
-    """Merge launcher module YAML onto ``global_args`` without loading graphs."""
+    """Merge launcher module YAML onto ``global_args`` without loading graphs.
+
+    Layers, weakest first:
+
+    1. ``global_args`` — the launcher's global ``model:`` block.
+    2. ``checkpoint_modules`` — what the checkpoint persisted per module. The only
+       layer that knows a module individually without the user restating it: the
+       kernels it was exported with, its ``model_config``, an ``accelerator``
+       overlay if the entry carries one.
+    3. the synthesized ``fsdp_mode: eager`` inference default (``for_inference``).
+    4. ``modules`` — the launcher's per-module YAML.
+
+    Layer 3 sits above the checkpoint rather than below it because parallelism
+    belongs to a run and not to a checkpoint — the same reason ``to_hf_config``
+    declines to persist ``accelerator`` at all. Were it below, a checkpoint
+    carrying an ``accelerator`` block would turn an inference run distributed
+    that never asked to be, and `eager` is what an inference run gets unless its
+    own YAML says otherwise. A checkpoint ``accelerator`` therefore reaches
+    training and is masked for inference.
+    """
     modules_overrides = _load_launcher_yaml(modules)
     modules_overrides = _resolve_model_path(model_path, modules_overrides)
-
-    if for_inference:
-        modules_overrides = _deep_update(
-            _resolve_default_accelerator(modules_overrides, {}),
-            modules_overrides,
-        )
+    checkpoint_defaults = _resolve_model_path(model_path, deepcopy(checkpoint_modules) if checkpoint_modules else {})
+    # `broadcast_model_weights_from_rank0` is only meaningful for `fsdp2`; forcing
+    # it off alongside `fsdp_mode: eager` keeps the single-process eager-inference
+    # default from inheriting a rank0-broadcast load policy that cannot run
+    # without a wrap.
+    inference_default = (
+        {
+            "broadcast_model_weights_from_rank0": False,
+            "accelerator": {"fsdp_config": {"fsdp_mode": "eager"}},
+        }
+        if for_inference
+        else {}
+    )
 
     base_dict = _module_base(asdict(global_args))
     runtime_modules: dict[str, OmniModuleRuntimeArguments] = {}
     for name, override in modules_overrides.items():
-        module_args = _instantiate_recursive(
-            OmniModuleRuntimeArguments,
-            _deep_update(deepcopy(base_dict), override),
-        )
-        runtime_modules[name] = module_args
+        merged = deepcopy(base_dict)
+        # Layer by layer per module rather than merging the layers as whole
+        # `{name: fields}` dicts: `_deep_update` assigns an empty mapping instead
+        # of recursing into it, so a module a layer has nothing to say about
+        # (`janus_vqvae: {}`, a bare name under `modules:`) would wipe the layers
+        # below it rather than defer to them.
+        for layer in (checkpoint_defaults.get(name, {}), inference_default, override):
+            if layer:
+                _deep_update(merged, layer)
+        runtime_modules[name] = _instantiate_recursive(OmniModuleRuntimeArguments, merged)
     return runtime_modules
 
 
@@ -397,25 +418,6 @@ def _resolve_model_path(
             resolved = os.path.join(checkpoint_root, resolved)
         mod_cfg["model_path"] = resolved
     return modules_config
-
-
-def _resolve_default_accelerator(
-    train_modules_config: dict[str, Any],
-    infer_modules_overrides: dict[str, Any] | None,
-) -> dict[str, Any]:
-    # `broadcast_model_weights_from_rank0` is only meaningful for `fsdp2`; forcing it off here
-    # alongside `fsdp_mode: eager` keeps the common single-process eager-inference default
-    # from inheriting a rank0-broadcast load policy that cannot run without a wrap.
-    eager_by_module = {
-        name: {
-            "broadcast_model_weights_from_rank0": False,
-            "accelerator": {
-                "fsdp_config": {"fsdp_mode": "eager"},
-            },
-        }
-        for name in train_modules_config
-    }
-    return _deep_update(eager_by_module, infer_modules_overrides)
 
 
 def _module_base(global_dict: dict[str, Any]) -> dict[str, Any]:
