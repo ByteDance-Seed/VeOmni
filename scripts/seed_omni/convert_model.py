@@ -85,6 +85,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Before reading the checkpoint: a malformed pair is a typo in the command
+    # just typed, and `nargs='*'` makes one easy — `--extra mimi_path=x` and
+    # `--extra mimi_path x` differ by one character and only the first is a pair.
+    # Reporting it after the model read would bury it behind that read's own
+    # failure, or behind the minutes it takes to succeed.
+    extra = _parse_extra(args.extra)
+
     model_type = read_hf_model_type(args.model_path)
     print(f"Detected model_type={model_type!r} from {args.model_path}")
     convert_checkpoint(
@@ -92,7 +99,7 @@ def main() -> None:
         args.output_dir,
         training_graph=args.training_graph,
         generation_graph=args.generation_graph,
-        **_parse_extra(args.extra),
+        **extra,
     )
     print(f"Conversion complete → {args.output_dir}")
 
