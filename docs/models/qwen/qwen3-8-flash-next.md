@@ -46,16 +46,17 @@ bash train.sh tasks/train_text.py configs/text/qwen4exp.yaml \
 
 ## 5. Recipe configuration
 
-The primary YAML sets these values; review the linked configurations before
+The primary recipe uses the settings below. Omitted parallel sizes default to
+1 and an omitted optimizer type defaults to AdamW. Review the linked YAML before
 changing a checkpoint, sequence length, or parallel layout.
 
-| Field | Checked-in value |
+| Field | Recipe setting |
 | --- | --- |
 | `data.max_seq_len` | `16384` |
 | `model.accelerator.ulysses_size` | `1` |
 | `model.accelerator.ep_size` | `4` |
 | `model.optimizer.type` | `adamw` |
-| `train.global_batch_size` | `None` |
+| `train.global_batch_size` | automatic (`null`) |
 | `train.micro_batch_size` | `1` |
 
 The checked-in recipe sets EP=4 and PLE=8 on separate ExtraParallel meshes, with `ep_sharded_stream_load: true`. Read the [PLE layout contract](../../design/qwen4_exp_ple_2d_parallelism.md) before choosing world size. Do not infer a minimum-memory setup from the parallel sizes; this is a large model. The recipe disables HF export and uses a ten-step run by default.

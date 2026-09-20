@@ -46,10 +46,11 @@ bash train.sh tasks/train_text.py configs/text/qwen2_5.yaml \
 
 ## 5. Recipe configuration
 
-The primary YAML sets these values; review the linked configurations before
+The primary recipe uses the settings below. Omitted parallel sizes default to
+1 and an omitted optimizer type defaults to AdamW. Review the linked YAML before
 changing a checkpoint, sequence length, or parallel layout.
 
-| Field | Checked-in value |
+| Field | Recipe setting |
 | --- | --- |
 | `data.max_seq_len` | `8192` |
 | `model.accelerator.ulysses_size` | `1` |
