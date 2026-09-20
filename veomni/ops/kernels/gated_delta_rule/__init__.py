@@ -11,292 +11,178 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Gated delta-rule kernels: gated RMSNorm, causal conv1d, chunk gated delta rule.
 
-These three ops back Qwen3.5's ``GatedDeltaNet`` linear-attention layer.
-Linear attention has many variants; this sub-package is scoped to the
-gated delta-rule family that Qwen3.5 uses. Unlike the kernel families in
-sibling sub-packages, none of them have a torch eager fallback that
-supports varlen training: HF's "eager" path here is essentially "raise at
-the first packed-sequence step". The GPU non-eager backends come from the
-``flash-linear-attention`` (``fla``) library, plus an alternative
-``flash_qla`` implementation of ``chunk_gated_delta_rule`` from QwenLM. On
-NPU, all three ops ship a ``npu`` backend backed by vendored Triton kernels
-(``triton-ascend``, kept under ``_ascend/``).
+"""Gated delta-rule kernels used by Qwen3.5 GatedDeltaNet.
 
-Selection is driven by three fields on ``OpsImplementationConfig``:
+Three independent families share this package. They are not a compound
+kernel and are not ``rms_norm`` variants.
 
-- ``rms_norm_gated_implementation``    -> ``OpSlot("rms_norm_gated", "standard")``
-- ``causal_conv1d_implementation``     -> ``OpSlot("causal_conv1d", "standard")``
-- ``chunk_gated_delta_rule_implementation`` ->
-  ``OpSlot("chunk_gated_delta_rule", "standard")``
-
-Backends per op:
-
-- ``rms_norm_gated``: ``fla`` (GPU), ``npu``.
-- ``causal_conv1d``: ``fla`` (GPU), ``npu``.
-- ``chunk_gated_delta_rule``: ``fla`` (GPU), ``flash_qla`` (GPU ``gpu`` extra,
-  Hopper SM90), ``npu`` (vendored Triton), ``npu_ascendc`` (AscendC fused ops).
-
-The ``npu`` ``causal_conv1d`` backend is a thin adapter (``npu_causal_conv1d``)
-over the vendored kernel; the ``npu`` ``chunk_gated_delta_rule`` binds the
-vendored kernel directly (its signature already matches the call site).
-
-The ``npu_ascendc`` ``chunk_gated_delta_rule`` backend is a second NPU path that
-delegates the heavy compute to the external ``fla_npu`` package
-(``torch.ops.npu.*`` fused ops, installed manually on NPU), using a few Triton
-kernels from ``_ascend/triton_core`` (a newer generation of Triton kernels) as
-glue around them. It coexists with the pure-Triton ``npu`` backend, which stays
-as the fallback.
+``rms_norm_gated`` is ``weight * rms_norm(x) * silu(gate)``. Functional extra
+is *weight*. FLA's unused norm bias and ``activation`` are accepted.
+``causal_conv1d`` is depthwise causal conv on ``[B, S, D]``. ``None`` or empty
+bias / ``cu_seqlens`` are unused. FLA ``seq_idx`` / ``backend`` are accepted.
+Eager has no varlen path.
+``chunk_gated_delta_rule`` takes FLA ``[B, T, H, D]``. ``None`` or empty
+``initial_state`` / ``cu_seqlens`` are unused. NPU varlen tables are accepted.
+Eager has no varlen path.
 """
 
-from __future__ import annotations
+from ...platform import (
+    GpuKernelRequirement,
+    MluKernelRequirement,
+    NpuKernelRequirement,
+    NvidiaGpuPlatform,
+)
+from ...registry import register_op
+from .causal_conv1d.standard import eager as conv_eager
+from .causal_conv1d.standard import fla as conv_fla
+from .causal_conv1d.standard import npu as conv_npu
+from .chunk_gated_delta_rule.standard import eager as chunk_eager
+from .chunk_gated_delta_rule.standard import fla as chunk_fla
+from .chunk_gated_delta_rule.standard import flash_qla as chunk_flash_qla
+from .chunk_gated_delta_rule.standard import npu as chunk_npu
+from .chunk_gated_delta_rule.standard import npu_ascendc as chunk_ascendc
+from .rms_norm_gated.standard import eager as rms_eager
+from .rms_norm_gated.standard import fla as rms_fla
+from .rms_norm_gated.standard import npu as rms_npu
 
-from ...kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
+
+_GPU = GpuKernelRequirement()
+_FLASH_QLA_GPU = GpuKernelRequirement(platforms=(NvidiaGpuPlatform(min_cc=90, max_cc=100),))
 
 
-# ── rms_norm_gated (Torch_npu FusedRMSNormGated) ───────────────────────────────────
-
-
-def _npu_fused_rms_norm_gated_factory():
-    """Return the ``NPUFusedRMSNormGated`` *class*.
-
-    The kernel is consumed inside ``Qwen3_5GatedDeltaNet.__init__`` like a
-    constructor — ``self.norm = veomni_rms_norm_gated(dim, eps=..., ...)``
-    — so the slot stores the class itself, not an instance. Lazily imported
-    via the factory so hosts without torch_npu can still load the module.
-    """
-    from .npu_rms_norm_gated import NPUFusedRMSNormGated
-
-    return NPUFusedRMSNormGated
-
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="npu",
-        op_name="rms_norm_gated",
-        variant="standard",
-        factory=_npu_fused_rms_norm_gated_factory,
-        hardware=HardwareRequirement(device_type="npu"),
-        description="NPUFusedRMSNormGated (RMSNorm + SiLU gate fused)",
-    )
+register_op(
+    "rms_norm_gated",
+    "standard",
+    "eager",
+    description="PyTorch RMSNorm with a SiLU gate",
+    wrapper=rms_eager.wrapper,
 )
 
-
-# ── rms_norm_gated (FLA FusedRMSNormGated) ───────────────────────────────────
-
-
-def _fla_fused_rms_norm_gated_factory():
-    """Return the ``FusedRMSNormGated`` *class* from ``fla.modules``.
-
-    The kernel is consumed inside ``Qwen3_5GatedDeltaNet.__init__`` like a
-    constructor — ``self.norm = veomni_rms_norm_gated(dim, eps=..., ...)``
-    — so the slot stores the class itself, not an instance. Lazily imported
-    via the factory so hosts without ``flash-linear-attention`` installed
-    can still load the module.
-    """
-    from fla.modules import FusedRMSNormGated
-
-    return FusedRMSNormGated
-
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="fla",
-        op_name="rms_norm_gated",
-        variant="standard",
-        factory=_fla_fused_rms_norm_gated_factory,
-        hardware=HardwareRequirement(device_type=["gpu", "mlu"]),
-        description="flash-linear-attention FusedRMSNormGated (RMSNorm + SiLU gate fused)",
-    )
+register_op(
+    "rms_norm_gated",
+    "standard",
+    "fla",
+    description="flash-linear-attention fused RMSNorm with a SiLU gate",
+    wrapper=rms_fla.wrapper,
+    requirement=_GPU,
+    requires=("fla",),
 )
 
-
-# ── causal_conv1d (FLA Triton causal conv) ───────────────────────────────────
-
-
-def _fla_causal_conv1d_factory():
-    """Return ``fla.modules.convolution.causal_conv1d`` — the Triton varlen
-    depthwise conv used by Qwen3.5's GatedDeltaNet pre-mixer."""
-    from fla.modules.convolution import causal_conv1d
-
-    return causal_conv1d
-
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="fla",
-        op_name="causal_conv1d",
-        variant="standard",
-        factory=_fla_causal_conv1d_factory,
-        hardware=HardwareRequirement(device_type=["gpu", "mlu"]),
-        description="flash-linear-attention causal conv1d (Triton, varlen-aware)",
-    )
+register_op(
+    "rms_norm_gated",
+    "standard",
+    "fla",
+    description="flash-linear-attention fused RMSNorm with a SiLU gate",
+    wrapper=rms_fla.wrapper,
+    requirement=MluKernelRequirement(),
+    requires=("fla",),
 )
 
-
-# ── causal_conv1d (NPU vendored Triton) ──────────────────────────────────────
-
-
-def _npu_causal_conv1d_factory():
-    """Return the NPU causal conv1d adapter over the vendored Triton kernel.
-
-    Lazily imported so hosts without ``triton-ascend`` can still load this
-    module; the import (and its transitive Triton import) only fires when the
-    ``npu`` backend is actually selected and bound at ``OpSlot.bind()`` time.
-    """
-    from .npu_causal_conv1d import causal_conv1d
-
-    return causal_conv1d
-
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="npu",
-        op_name="causal_conv1d",
-        variant="standard",
-        factory=_npu_causal_conv1d_factory,
-        hardware=HardwareRequirement(device_type="npu"),
-        description="NPU vendored Triton causal conv1d (varlen-aware, MindSpeed-MM)",
-    )
+register_op(
+    "rms_norm_gated",
+    "standard",
+    "npu",
+    description="Fused RMSNorm with a SiLU gate using torch_npu",
+    wrapper=rms_npu.wrapper,
+    requirement=NpuKernelRequirement(),
 )
 
-
-# ── chunk_gated_delta_rule (FLA + FlashQLA) ──────────────────────────────────
-
-
-def _fla_chunk_gated_delta_rule_factory():
-    """Return ``fla.ops.gated_delta_rule.chunk_gated_delta_rule``."""
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-
-    return chunk_gated_delta_rule
-
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="fla",
-        op_name="chunk_gated_delta_rule",
-        variant="standard",
-        factory=_fla_chunk_gated_delta_rule_factory,
-        hardware=HardwareRequirement(device_type=["gpu", "mlu"]),
-        description="flash-linear-attention chunk gated delta rule (Triton, varlen-aware)",
-    )
+register_op(
+    "causal_conv1d",
+    "standard",
+    "eager",
+    description="PyTorch depthwise causal convolution",
+    wrapper=conv_eager.wrapper,
 )
 
-
-def _flash_qla_chunk_gated_delta_rule_factory():
-    """Return the FlashQLA implementation of chunk gated delta rule.
-
-    Source: https://github.com/QwenLM/FlashQLA — shipped under the ``gpu``
-    extra (Hopper SM90 only). FlashQLA mirrors the FLA call signature
-    (``query, key, value, g, beta, initial_state, output_final_state,
-    use_qk_l2norm_in_kernel, cu_seqlens``) so the call site in
-    ``Qwen3_5GatedDeltaNet.forward`` does not need to branch.
-    """
-    from flash_qla.ops.gated_delta_rule import chunk_gated_delta_rule
-
-    return chunk_gated_delta_rule
-
-
-# FlashQLA today only ships SM90 kernels — neither older arches (Ampere, Ada)
-# nor newer ones (Blackwell SM100/SM120) work; the SM10x wheels are WIP per
-# https://github.com/QwenLM/FlashQLA/issues/2. Pin exactly SM90 so the
-# registry rejects the kernel early at OpSlot.bind() time on every other arch
-# (and we drop max_compute_capability once upstream adds support).
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="flash_qla",
-        op_name="chunk_gated_delta_rule",
-        variant="standard",
-        factory=_flash_qla_chunk_gated_delta_rule_factory,
-        hardware=HardwareRequirement(device_type="gpu", min_compute_capability=90, max_compute_capability=90),
-        description="QwenLM FlashQLA chunk gated delta rule (Hopper SM90 only, alternative TileLang implementation)",
-    )
+register_op(
+    "causal_conv1d",
+    "standard",
+    "fla",
+    description="flash-linear-attention depthwise causal convolution with variable-length support",
+    wrapper=conv_fla.wrapper,
+    requirement=_GPU,
+    requires=("fla",),
 )
 
-
-# ── chunk_gated_delta_rule (NPU vendored Triton) ─────────────────────────────
-
-
-def _npu_chunk_gated_delta_rule_factory():
-    """Return the vendored NPU chunk gated delta rule kernel directly.
-
-    Its public signature already matches the ``Qwen3_5GatedDeltaNet.forward``
-    call site (``q, k, v, g, beta, ..., use_qk_l2norm_in_kernel, cu_seqlens``)
-    and it returns ``(o, final_state)``, so no adapter is needed. Lazily
-    imported so the transitive Triton import only fires under the ``npu``
-    backend.
-    """
-    from ._ascend.chunk_gated_delta_rule_mm import chunk_gated_delta_rule
-
-    return chunk_gated_delta_rule
-
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="npu",
-        op_name="chunk_gated_delta_rule",
-        variant="standard",
-        factory=_npu_chunk_gated_delta_rule_factory,
-        hardware=HardwareRequirement(device_type="npu"),
-        description="NPU vendored Triton chunk gated delta rule (varlen-aware, MindSpeed-MM)",
-    )
+register_op(
+    "causal_conv1d",
+    "standard",
+    "fla",
+    description="flash-linear-attention depthwise causal convolution with variable-length support",
+    wrapper=conv_fla.wrapper,
+    requirement=MluKernelRequirement(),
+    requires=("fla",),
 )
 
+register_op(
+    "causal_conv1d",
+    "standard",
+    "npu",
+    conv_npu.forward,
+    conv_npu.backward,
+    description="Vendored Triton depthwise causal convolution with variable-length support",
+    requirement=NpuKernelRequirement(),
+    requires=("triton",),
+)
 
-# ── chunk_gated_delta_rule (NPU AscendC fused) ───────────────────────────────
+register_op(
+    "chunk_gated_delta_rule",
+    "standard",
+    "eager",
+    description="PyTorch chunked gated delta rule",
+    wrapper=chunk_eager.wrapper,
+)
 
+register_op(
+    "chunk_gated_delta_rule",
+    "standard",
+    "fla",
+    description="flash-linear-attention chunked gated delta rule with variable-length support",
+    wrapper=chunk_fla.wrapper,
+    requirement=_GPU,
+    requires=("fla",),
+)
 
-def _npu_ascendc_chunk_gated_delta_rule_factory():
-    """Return the AscendC chunk gated delta rule (``npu_ascendc_gated_delta_rule``).
+register_op(
+    "chunk_gated_delta_rule",
+    "standard",
+    "fla",
+    description="flash-linear-attention chunked gated delta rule with variable-length support",
+    wrapper=chunk_fla.wrapper,
+    requirement=MluKernelRequirement(),
+    requires=("fla",),
+)
 
-    Unlike the pure-Triton ``npu`` backend above, this path offloads the heavy
-    GDN compute to the external ``fla_npu`` package (registered as
-    ``torch.ops.npu.*`` fused ops), wrapping a few ``_ascend/triton_core`` Triton
-    kernels around them as glue. The underlying ``flash_gated_delta_rule`` entry
-    expects ``q/k/v`` in ``[B, H, T, D]``, but the ``Qwen3_5GatedDeltaNet.forward``
-    call site feeds the FLA layout ``[B, T, H, D]`` — so a thin adapter
-    (``npu_ascendc_gated_delta_rule``) transposes the seq/head dims at the op
-    boundary rather than replicating MM's per-implementation forward branching.
+register_op(
+    "chunk_gated_delta_rule",
+    "standard",
+    "flash_qla",
+    description="FlashQLA chunked gated delta rule",
+    wrapper=chunk_flash_qla.wrapper,
+    requirement=_FLASH_QLA_GPU,
+    requires=("flash_qla",),
+)
 
-    Lazily imported so the transitive ``torch_npu`` / ``fla_npu`` / triton-ascend
-    imports only fire when this backend is selected. ``fla_npu`` is installed
-    manually on NPU (not a declared dependency); re-raise its absence with an
-    actionable message instead of a bare ``ModuleNotFoundError``.
-    """
-    try:
-        from .npu_ascendc_gated_delta_rule import chunk_gated_delta_rule
-    except ModuleNotFoundError as e:
-        if e.name == "triton":
-            # triton-ascend (imported as `triton`) backs the `triton_core` glue
-            # kernels; it is a separate install from fla_npu. `npu` needs it too,
-            # so the only dep-free fallback here is `eager`.
-            raise RuntimeError(
-                "chunk_gated_delta_rule 'npu_ascendc' backend requires the 'triton-ascend' "
-                "package (imported as 'triton'), which is not installed. Install it on NPU "
-                "(pip install triton-ascend==3.2.1 "
-                "--extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple), or set "
-                "chunk_gated_delta_rule_implementation to 'eager'."
-            ) from e
-        if e.name in ("fla_npu", "torch_npu"):
-            raise RuntimeError(
-                f"chunk_gated_delta_rule 'npu_ascendc' backend requires the '{e.name}' package, "
-                "which is not installed. Install fla_npu manually on NPU "
-                "(https://github.com/flashserve/flash-linear-attention-npu), or set "
-                "chunk_gated_delta_rule_implementation to 'npu' (vendored Triton) or 'eager'."
-            ) from e
-        raise
+register_op(
+    "chunk_gated_delta_rule",
+    "standard",
+    "npu",
+    chunk_npu.forward,
+    chunk_npu.backward,
+    description="Vendored Triton chunked gated delta rule with variable-length support",
+    requirement=NpuKernelRequirement(),
+    requires=("triton",),
+)
 
-    return chunk_gated_delta_rule
-
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="npu_ascendc",
-        op_name="chunk_gated_delta_rule",
-        variant="standard",
-        factory=_npu_ascendc_chunk_gated_delta_rule_factory,
-        hardware=HardwareRequirement(device_type="npu"),
-        description="NPU AscendC fused chunk gated delta rule (torch.ops.npu.* via fla_npu, varlen-aware, MindSpeed-MM triton_core)",
-    )
+register_op(
+    "chunk_gated_delta_rule",
+    "standard",
+    "npu_ascendc",
+    chunk_ascendc.forward,
+    chunk_ascendc.backward,
+    description="AscendC chunked gated delta rule with variable-length support",
+    requirement=NpuKernelRequirement(),
+    requires=("fla_npu", "triton"),
 )
