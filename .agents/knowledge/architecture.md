@@ -16,18 +16,20 @@ veomni/
 │   ├── torch_parallelize.py  build_parallelize_model(), parallelize_model_fsdp2()
 │   ├── parallel_plan.py    ParallelPlan for ExtraParallel (EP, embedding shard)
 │   ├── async_offload.py    Async activation offload (SwapTensor, OffloadManager, async_save_on_cpu)
+│   ├── hccl_premul_sum.py  Idempotent HCCL PREMUL_SUM collective compatibility patch
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
 │   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
-├── models/             Model loading and patching
+├── models/      Model loading, patchgen configs, and kernel-aware modeling
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
-│   ├── loader.py       Registry-based model loading (MODELING_REGISTRY, MODEL_CONFIG_REGISTRY)
+│   ├── registry.py     Import-time model/config/processor registries
 │   ├── model_runtime.py  VeOmniModelRuntime: the model-bound half of a job
 │   │                   (build, freeze/LoRA, parallelize, optimizer,
 │   │                   lr-scheduler, grad clip, its own ParallelState)
-│   ├── checkpoint_manager.py  ModelCheckpointManager: DCP / HF / LoRA I/O (runtime-owned)
-│   ├── transformers/   Per-model patches (one subpackage per model family)
-│   └── diffusers/      Diffusion model families (Wan, LTX, Qwen-Image)
+│   ├── checkpoint/     Weight I/O, tensor conversion, and ModelCheckpointManager
+│   ├── transformers/   Model classes/configs with instance-local VeomniOp handles
+│   ├── diffusers/      Diffusion model families
+│   └── loss_utils/     Model-facing CE, load-balancing, and chunked-loss policy
 ├── optim/              Optimizer and LR scheduler construction
 │   ├── optimizer.py    build_optimizer() factory + MultiOptimizer wrapper.
 │   │                   For optimizer.type=="muon" splits params Muon vs AdamW
@@ -48,36 +50,13 @@ veomni/
 │   │                   experts go through one all-to-all-gather over the
 │   │                   ep_fsdp mesh.
 │   └── lr_scheduler.py LR scheduler construction
-├── ops/                Optimized kernels and dispatch
-│   ├── kernel_registry.py  KERNEL_REGISTRY: (op_name, variant) ->
-│   │                   {impl_name: KernelSpec}. register() takes one
-│   │                   KernelSpec; it is not a decorator. The mechanism
-│   │                   new kernels should use.
-│   ├── dispatch.py     OpSlot placeholders declared in patchgen-generated
-│   │                   modeling; bound by _bind_veomni_ops() in models/auto.py
-│   ├── config/         Legacy per-model / global dispatch, still live
-│   │   ├── registry.py OpSpec/BackendSpec/OpScope. apply_global_ops() resolves
-│   │   │               OpScope.GLOBAL ops for every run (called from
-│   │   │               apply_ops_config); apply_per_model_patches() resolves
-│   │   │               OpScope.PER_MODEL ops and is called only from the
-│   │   │               device_patch.py of wan, deepseek_v3 and deepseek_v4
-│   │   └── singleton.py  get_ops_config()/set_ops_config() for patch files
-│   ├── kernels/        Kernel implementations (one subdir per op)
-│   │   ├── deepseek_sparse_attention/  DSA indexer/top-k selection
-│   │   ├── deepseek_v4/  TileLang sparse attention/indexer + precision helpers
-│   │   ├── attention/  Flash attention v2/3/4 + SP-aware variants
-│   │   ├── cross_entropy/  eager/liger/npu-chunk loss variants
-│   │   ├── gated_delta_rule/  Qwen3.5 linear-attention kernels
-│   │   ├── load_balancing_loss/  eager + triton variants
-│   │   ├── mhc/        TileKernels DeepSeek V4 pre/post/head adapters
-│   │   ├── rms_norm/   Liger/NPU/batch-invariant Triton RMSNorm
-│   │   ├── rotary/     Liger/NPU + DeepSeek V3 deterministic + Wan Triton
-│   │   ├── swiglu/     Liger SwiGLU MLP
-│   │   └── moe/        Fused MoE kernels + group_gemm sub-kernels
-│   ├── platform/       Platform-specific runtime patches
-│   │   └── npu/        HCCL pre-mul sum patch
-│   ├── liger/          Liger kernel adapters
-│   └── batch_invariant_ops/  Mode switch for deterministic ops
+├── ops/                Tensor-native op registry and implementations
+│   ├── registry.py     OP_REGISTRY, OpEntry, register_op, resolve_op, VeomniOp
+│   ├── platform/       GPU/NPU/MLU availability requirements
+│   ├── install.py      Idempotent process-wide attention integration
+│   ├── batch_invariant/  Scoped deterministic ATen patch
+│   ├── qat/            Functional quantization-aware-training helpers
+│   └── kernels/        Registered per-op/variant eager and optimized rows
 ├── lora/               LoRA / PEFT injection: linear + MoE-expert adapters,
 │                       DCP + HF-adapter save/load, target mapping
 ├── patchgen/           Patch specs + codegen driver consumed by the `patchgen`
@@ -134,7 +113,7 @@ then, outside that scope (these do not need ambient groups):
 and past construction:
 - `_build_lr_scheduler(total_steps)` -> left to the trainer, since `total_steps` is only known once the dataset is built
 - `clip_grad_norm()` -> gradient clipping under this model's mesh
-- `load()` / `save_dcp()` / `save_hf_or_lora()` -> what this model persists, delegated to the `ModelCheckpointManager` at `checkpoint` (`veomni/models/checkpoint_manager.py`), which owns how: DCP load/save, HF and LoRA export, and the directory layout for all three
+- `load()` / `save_dcp()` / `save_hf_or_lora()` -> what this model persists, delegated to the `ModelCheckpointManager` at `checkpoint` (`veomni/models/checkpoint/manager.py`), which owns how: DCP load/save, HF and LoRA export, and the directory layout for all three
 
 Which preprocessor a model gets follows from what the checkpoint holds, not from a declaration: `_build_model_assets` always calls `build_processor`, since `AutoProcessor` falls back to `AutoTokenizer` when a repository has no processor to offer. If a real `ProcessorMixin` comes back, `processor` is set and `tokenizer` is taken from inside it (never loaded twice, so the object the data pipeline reads through is the object exported); otherwise only `tokenizer` is set. `processor is not None` is therefore the job's signal that a model sees more than text. `DiTModelRuntime` overrides this to load neither. A path with no preprocessor to load warns rather than raises — a toy config exercising the loop on synthetic batches has none and never asks for one.
 
@@ -165,6 +144,8 @@ Those cursor files are written **per rank**, where V2 writes a single rank-0 `tr
 
 Subclasses override specific methods (e.g., `compute_loss()`, custom data transforms) rather than the entire training loop. Note that `TextTrainer`, `VLMTrainer`, `DiTTrainer` and `TextDPOTrainer` *compose* a `BaseTrainer` in `self.base` rather than subclassing it, and drive the build steps one at a time (constraint 24).
 
+**Checkpointing**: `CheckpointCallback` owns cadence for DCP, HF/LoRA, and the one-shot tokenizer/config sidecars; `GlobalStateCallback` owns the job cursor; `BaseTrainer.load` / `save_dcp` / `save_hf_or_lora` / `save_model_assets` fan out to the model handle; `ModelCheckpointManager` (`veomni/models/checkpoint/manager.py`) owns DCP / HF / LoRA I/O, drain-async, `empty_cache`, barrier, and directory layout. The scheduler is a single `lr_scheduler.pt` next to the DCP shards; the job cursor is `trainer_state_rank_{R}.pt`. VeOmni 0.1.12 `extra_state/` resume is `veomni/checkpoint/legacy_v0_1_12.py` (delete that file to drop it). On-disk layout: `docs/usage/checkpoint.md`.
+
 **Parallel-state scoping**: `BaseTrainer._setup(args)` registers `"base"` via `init_parallel_state_from_config` before seed/determinism — it is a staticmethod because everything it does is job-level and runs before any model exists. A model then derives its own mesh in `VeOmniModelRuntime.setup()`; `VeOmniModelRuntime.__init__` scopes the mesh-dependent build to that mesh, so the trainer's remaining build steps need no scope of their own. Run time is **per-op**: `forward_backward_step` wraps `use_parallel_state(self.model.parallel_state)` around forward, postforward, and backward so none of them hard-code `"base"` (DPO wraps policy vs reference itself). `clip_grad_norm()` still wraps itself. The `parallel_state` property is a by-name registry lookup, never a stored state object, so the registry stays the single source of truth. See `.agents/knowledge/constraints.md` §7 and `docs/design/local_parallel_state.md`.
 
 ## Data Flow
@@ -193,13 +174,18 @@ YAML Config -> VeOmniArguments -> Trainer
 
 ## Model Loading Flow
 
-1. Read `config.json` -> `AutoConfig.from_pretrained()` -> check `MODEL_CONFIG_REGISTRY`
-2. If registered: use VeOmni custom config class; else: use HF config
-3. Determine model class via `MODELING_REGISTRY` (keyed by `model_type`)
+1. `models.build_foundation_model()` installs the supplied ops selection.
+2. Read `config.json` -> `AutoConfig.from_pretrained()` -> check `MODEL_CONFIG_REGISTRY`.
+3. Determine the model class via `MODELING_REGISTRY` (keyed by `model_type`); an unregistered model fails explicitly unless `MODELING_BACKEND=hf` selects the upstream class.
 4. Instantiate model on meta device (`init_empty_weights()`)
-5. Apply VeOmni patches (flash attention, sequence parallel hooks)
+5. Construct instance-local `VeomniOp` handles from the installed selection.
 6. Load weights (`load_model_weights()` or `rank0_load_and_broadcast_weights()`)
 7. Apply parallelization (`build_parallelize_model()`)
+
+The public configuration field remains `model.ops_implementation`. Trainer and
+inference entry points pass it to the model builder as
+`ops_implementation`; changing the config field would break existing CLI
+and YAML inputs.
 
 ## Parallelization Flow
 
@@ -244,9 +230,9 @@ configs/
 
 ```
 tests/
-├── models/         Model loading, patching, registry tests
+├── models/  Kernel-aware model loading, integration, and helper tests
+├── kernels/        Registry contracts and per-family kernel tests
 ├── data/           Data pipeline, collator, transform tests
-├── ops/            Kernel operation tests
 ├── parallel/       Distributed parallelism tests (ulysses, data balance)
 ├── distributed/    dummy forward, torch.compile, FSDP equivalence, grad ckpt
 ├── trainer/        Callback / trainer-unit tests (channel loss, step sync, DPO)
@@ -267,8 +253,8 @@ tests/
 | Change in | Test command |
 |-----------|-------------|
 | `veomni/models/` | `pytest tests/models/` |
-| `veomni/data/` | `pytest tests/data/` |
 | `veomni/ops/` | `pytest tests/ops/` |
+| `veomni/data/` | `pytest tests/data/` |
 | `veomni/distributed/` | `pytest tests/parallel/ tests/distributed/` |
 | `veomni/checkpoint/` | `pytest tests/checkpoints/` |
 | `veomni/utils/` | `pytest tests/utils/` |

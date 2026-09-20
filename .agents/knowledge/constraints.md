@@ -4,14 +4,18 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
 
 ## Model Loading & Registry
 
-1. **Model registration must happen at import time**
-   - `MODELING_REGISTRY`, `MODEL_CONFIG_REGISTRY`, and `MODEL_PROCESSOR_REGISTRY` in `veomni/models/loader.py` are populated when model `__init__.py` files are imported.
+1. **Supported model registration must happen at import time**
+   - `MODELING_REGISTRY`, `MODEL_CONFIG_REGISTRY`, and `MODEL_PROCESSOR_REGISTRY` in `veomni/models/registry.py` are populated when model `__init__.py` files are imported.
    - Moving registrations into functions or delaying them breaks `build_foundation_model()`.
-   - All model `__init__.py` files must import and register their modeling classes at module level.
+   - Every model imported by `veomni/models/transformers/__init__.py` must
+     register its modeling classes at module level. Placeholder packages for
+     pending model migrations must not be imported there or exposed through the
+     public registry.
 
 2. **Model config `model_type` must match registry key**
    - The `model_type` field in a model's `config.json` is used as the lookup key in registries.
-   - Mismatches cause fallback to vanilla HuggingFace loading, which misses VeOmni patches (flash attention, sequence parallel).
+   - Mismatches fail explicitly under the VeOmni backend. Set `MODELING_BACKEND=hf`
+     only when loading the upstream HuggingFace class without VeOmni model kernels.
 
 3. **Patchgen-generated files must not be edited manually**
    - Files under `veomni/models/transformers/*/generated/` are created by the `patchgen` CLI (entry point installed by the `patchgen` package).
@@ -84,7 +88,7 @@ Core entry points:
    - The gate is `param.is_meta`, not `init_device`. The flag states an intent the model builder is free to ignore — `tests/data/*` construct their model eagerly and leave the flag at its `meta` default — and materializing a model that already holds real weights discards them, or raises outright on a plain `nn.Module` with no `init_weights`. A model built under `cuda` arrives with weights already loaded (`empty_init=False` in `veomni/models/auto.py`) and must be left alone. `parallelize_model_fsdp2()` keeps its call unconditional because `arguments_types.py` asserts `init_device == "meta"` for fsdp2, so a real model cannot reach it.
    - `init_device == "cpu"` is refused for `ddp`, by an assert in `AcceleratorConfig._validate_init_device()` alongside the one that pins fsdp2 to `meta` — not in `parallelize_model_ddp()`. Parse time is the right place: every rank fails together, before a model is built or a snapshot read. It never worked for the wrap: `device_ids=[local_rank]` has been passed since the first commit, and torch rejects that together with a CPU module (`torch/nn/parallel/distributed.py`), so rank0's CPU replica cannot be wrapped while every other rank builds empty and skips the load (`veomni/models/loader.py`). It was FSDP1's `sync_module_states` recipe (rank0 reads, the wrapper broadcasts), dropped in #756; fsdp2 replaced it with `broadcast_model_weights_from_rank0`.
    - Dropping `"cpu"` from the field's `Literal` is *not* what enforces this, and no `Literal` in the arguments layer enforces anything. The parser turns it into argparse `choices`, which covers the CLI only; a YAML value goes straight to the dataclass constructor via `_instantiate_recursive()` (`veomni/arguments/parser.py`), and annotations are never checked at runtime. Any config value that must actually be rejected needs an explicit assert in `__post_init__`.
-   - Two other users of `"cpu"` are unaffected and must not be swept up in that: `build_foundation_model(init_device="cpu")` is a live public API (several tests build on CPU that way), and `materialize_device="cpu"` is how fsdp2 CPU offload reaches `load_model_weights()`. The `init_device` parameters in `veomni/models/module_utils.py` are fed by the latter, not by `model.accelerator.init_device`.
+   - Two other users of `"cpu"` are unaffected and must not be swept up in that: `build_foundation_model(init_device="cpu")` is a live public API (several tests build on CPU that way), and `materialize_device="cpu"` is how fsdp2 CPU offload reaches `load_model_weights()`. The `init_device` parameters in `veomni/models/checkpoint/weights.py` are fed by the latter, not by `model.accelerator.init_device`.
    - `should_skip_hf_weight_load` must be honoured here too: a distributed-checkpoint resume is about to overwrite every parameter, so reading the HF snapshot doubles peak memory, and the snapshot may not exist at all.
    - `broadcast_model_weights_from_rank0` is honoured here under both FSDP2 and DDP. `rank0_load_and_broadcast_weights()` broadcasts over the default (world) group from global rank0 (`dist.broadcast(..., src=0)`, no `group=`), which is what a DDP replica wants. It defaults to `True`.
    - After the load pass, `parallelize_model_ddp()` re-checks `param.is_meta` and raises with the offending parameter names. A loader that leaves one behind would otherwise surface inside DDP's constructor as `Tensor.item() cannot be called on meta tensors`, which names neither the parameter nor the cause.
@@ -200,7 +204,7 @@ Core files:
 
 22. **Non-CUDA accelerator code paths require guards**
     - There are three backends today: CUDA, Ascend NPU and Cambricon MLU. Guard vendor-specific code with `is_torch_npu_available()` / `IS_NPU_AVAILABLE` or `is_torch_mlu_available()` / `IS_MLU_AVAILABLE` (`veomni/utils/import_utils.py`, `veomni/utils/device.py`).
-    - NPU kernels live in `veomni/ops/kernels/{rms_norm,rotary}/npu.py` and `veomni/ops/platform/npu/`; the MLU kernel is `veomni/ops/kernels/moe/mlu_group_gemm.py`. They must not be imported on a host without that vendor's runtime.
+    - Vendor kernels live in their op family under `veomni/ops/kernels/`. The HCCL compatibility patch lives in `veomni/distributed/hccl_premul_sum.py`. Vendor-only dependencies must not be imported on hosts without that runtime.
     - Device-type sets, not `== "cuda"`, decide dispatch: `MOE_TRITON_DEVICE_TYPES` in `veomni/utils/device.py` is `("cuda", "mlu")` today. Adding a backend means auditing those sets, not just adding a branch.
 
 23. **Device-agnostic code must use `veomni.utils.device` helpers**
@@ -213,14 +217,14 @@ Core files:
    - `TextDPOTrainer` and `DiTTrainer` compose a `BaseTrainer` and override `forward_backward_step()`; they do not inherit the base implementation.
    - Lifecycle work added only inside `BaseTrainer.forward_backward_step()` is skipped by these trainers. Update every supported override or reject the unsupported trainer explicitly.
 
-25. **Module-level OpSlots are shared by every model instance**
-   - Modeling modules expose `OpSlot` objects such as `veomni_causal_lm_loss` as globals. Policy/reference models in DPO can therefore use the same slot.
-   - Temporary interception must use forward-scoped ownership and reference-counted dispatch. A closure bound to one model or callback can observe another model's forward and corrupt side-channel state.
+25. **Kernel handles belong to model instances**
+   - Modeling classes construct `VeomniOp` handles from the installed ops selection and store them on the instance. Do not introduce mutable module-level dispatch callables.
+   - Model-specific input normalization and loss policy stay in `models`; the registered wrapper remains a tensor-level contract shared by every consumer.
 
 26. **DCP full resume skips HF weight materialization**
     - When `train.checkpoint.load_path` is set and the run is not LoRA/PEFT, `BaseTrainer` / omni train pass `should_skip_hf_weight_load=True` into `build_parallelize_model`, which forwards it to `parallelize_model_fsdp2` / `parallelize_model_ddp`.
     - The model is materialized without an HF weight read; parameters are restored by DCP in `CheckpointCallback.on_train_begin`.
-    - Materialize through `_to_empty_preserving_nonpersistent_buffers()`, never bare `to_empty()`, on the random-init path as much as the resume path. `init_empty_weights()` patches `register_parameter` only, so a meta-built model holds *real* buffer values and `to_empty()` swaps every one for uninitialized memory. What restores them is narrower than it looks: DCP saves `state_dict()`, which omits `persistent=False`, and HF's `_init_weights` recomputes a rope table only for a module exposing `original_inv_freq` — which leaves Gemma3's per-layer-type `{type}_inv_freq`, its `embed_scale` and the Omni audio tower's sinusoidal `positional_embedding` with nothing behind them. A buffer built from a parameter is itself on meta, has no data to copy out of, and is skipped with a warning; no model registers one today. Note `veomni/models/module_utils.py` has the same unguarded pattern on the HF-load path.
+    - Materialize through `_to_empty_preserving_nonpersistent_buffers()`, never bare `to_empty()`, on the random-init path as much as the resume path. `init_empty_weights()` patches `register_parameter` only, so a meta-built model holds *real* buffer values and `to_empty()` swaps every one for uninitialized memory. What restores them is narrower than it looks: DCP saves `state_dict()`, which omits `persistent=False`, and HF's `_init_weights` recomputes a rope table only for a module exposing `original_inv_freq` — which leaves Gemma3's per-layer-type `{type}_inv_freq`, its `embed_scale` and the Omni audio tower's sinusoidal `positional_embedding` with nothing behind them. A buffer built from a parameter is itself on meta, has no data to copy out of, and is skipped with a warning; no model registers one today. The same rule applies to the HuggingFace-load path in `veomni/models/checkpoint/weights.py`.
     - LoRA/PEFT must not set `should_skip_hf_weight_load` (and `_materialize_and_load_weights()` raises if both are set): LoRA DCP is trainable-only and still needs the HF base from `model.model_path`.
     - After DCP load, `empty_cache()` is called to reduce first-step NCCL OOM risk from allocator fragmentation on near-OOM MoE jobs.
 

@@ -1,10 +1,19 @@
-# VeOmni Fused Attention Interface
+# VeOmni Attention Interface
 
-VeOmni registers sequence-parallel FlashAttention, FlexAttention, and
-MagiAttention FFA adapters in Transformers' `ALL_ATTENTION_FUNCTIONS`
-registry. Models continue to select an attention implementation through
-`config._attn_implementation`; VeOmni's registered names all enter one
-model-facing facade and then dispatch to a backend-specific adapter.
+VeOmni registers sequence-parallel FlashAttention, FlexAttention, SDPA,
+SageAttention, and MagiAttention FFA adapters in Transformers'
+`ALL_ATTENTION_FUNCTIONS`. There is no `fused_attention_forward` facade and
+no replaceable module-level `_flash_attention_forward` slots. Patched models
+bind `VeomniOp("attention", "standard", config._attn_implementation)` once in `__init__` / `modify_init` and call
+`self.veomni_attn` from `forward`.
+
+Public names such as `flash_attention_2` rewrite to `veomni_flash_attention_2`
+(not a `_with_sp` suffix). Ulysses wrapping lives inside those registered
+adapters.
+
+Models continue to select an attention implementation through
+`config._attn_implementation`; modeling code stores that choice in a local
+`VeomniOp("attention", "standard", implementation)` handle.
 
 ## Configuration
 
@@ -25,16 +34,16 @@ hard-codes SDPA/FlashAttention, constructs only dense masks, or bypasses
 Transformers' mask registry needs model-level patchgen adaptation first.
 
 With `MODELING_BACKEND=veomni`, `OpsImplementationConfig` rewrites this public
-value to `veomni_flex_attention_with_sp`. Flash values are rewritten in the
+value to `veomni_flex_attention`. Flash values are rewritten in the
 same way:
 
 | Public value | VeOmni registry name |
 |---|---|
-| `flash_attention_2` | `veomni_flash_attention_2_with_sp` |
-| `flash_attention_3` | `veomni_flash_attention_3_with_sp` |
-| `flash_attention_4` | `veomni_flash_attention_4_with_sp` |
-| `flex_attention` | `veomni_flex_attention_with_sp` |
-| `magi_attention` | `veomni_magi_attention_with_sp` |
+| `flash_attention_2` | `veomni_flash_attention_2` |
+| `flash_attention_3` | `veomni_flash_attention_3` |
+| `flash_attention_4` | `veomni_flash_attention_4` |
+| `flex_attention` | `veomni_flex_attention` |
+| `magi_attention` | `veomni_magi_attention` |
 
 The native Transformers `flex_attention` registry entry is left unchanged.
 Only the VeOmni-specific name routes through VeOmni's SP-aware facade.
@@ -44,29 +53,28 @@ Only the VeOmni-specific name routes through VeOmni's SP-aware facade.
 The model-facing call path is:
 
 ```text
-ALL_ATTENTION_FUNCTIONS[config._attn_implementation]
-  -> fused_attention_forward(...)
-       -> one of:
-            flash_attention_forward(...)
-            flex_attention_forward(...)
-            magi_attention_forward(...)
+model-local VeomniOp("attention", "standard", implementation)
+  -> registered attention row created by attention.lookup(implementation)
+       -> ALL_ATTENTION_FUNCTIONS.get_interface(implementation, eager_default)
+            -> flash_attention_forward(...)
+             | flex_attention_forward(...)
+             | magi_attention_forward(...)
+             | sage_attention_forward(...)
+             | sdpa_attention_forward(...)
 ```
 
-The facade resolves only VeOmni's private dispatch table; it does not look the
-name up in `ALL_ATTENTION_FUNCTIONS` again. This avoids recursive dispatch and
-keeps the Flash, Flex, and Magi adapters independently testable.
-
-The backend compute functions are replaceable module-level slots:
-
-- `attention.flash._flash_attention_forward`, defaulting to Transformers'
-  `_flash_attention_forward`;
-- `attention.flex._flex_attention_forward`, defaulting to Transformers'
-  `flex_attention_forward`;
-- `attention.magi._magi_attention_forward`, defaulting to VeOmni's architecture-aware FA4 adapter.
+`apply_veomni_attention_patch()` registers the concrete `veomni_*` forward
+functions and matching mask builders in the Transformers registries. Each ops
+row then uses the same Transformers interface lookup as the model-facing path.
+The `eager` row falls back to the modeling module's local
+`eager_attention_forward`, because Transformers does not register eager
+attention globally. The short `magi_attention` row deliberately resolves the
+`veomni_magi_attention` interface so its dependency and hardware requirements
+remain visible to the ops registry.
 
 The Magi default prepares an explicit `FA4AttnArg` and reuses it while the range tensors and attention shape remain unchanged, avoiding the upstream facade's repeated GPU-to-CPU range conversion in every transformer layer. VeOmni's FA4 autograd function passes that prepared argument directly to MagiAttention's lower-level `fa4_fwd` and `fa4_bwd` functions. SM90 uses the precompiled CUTLASS `ffa_fa3` backend, while SM100 and newer GPUs use the CUTE DSL/JIT backend. VeOmni prepares and validates the selected backend once per device.
 
-All three public callables use the Transformers attention-forward convention.
+All registered adapters use the Transformers attention-forward convention.
 Q/K/V inputs use `[batch, heads, sequence, head_dim]`; the returned attention
 output uses `[batch, sequence, heads, head_dim]`.
 
@@ -102,13 +110,16 @@ The current adapter requires `cp_size == 1`, batch size 1, zero attention dropou
 
 ### Unified MagiAttention mask builder
 
-VeOmni registers `create_magi_mask` as the Transformers mask builder for `veomni_magi_attention_with_sp`. Canonical unpacked causal and bidirectional models that call the Transformers mask registry without a 2D attention mask can therefore select MagiAttention without defining another mask builder. Models with richer visibility call the same builder directly with one of these metadata forms:
+VeOmni registers `magi_attention_mask_builder` as the Transformers mask builder for `veomni_magi_attention`. Canonical unpacked causal and bidirectional models that call the Transformers mask registry without a 2D attention mask can therefore select MagiAttention without defining another mask builder. The registered builder only consumes `q_length`, `kv_length`, HF offsets, `mask_function`, and `device`. It always returns one unpacked range pair `[[0, q_length]]` / `[[0, kv_length]]`. Passing `cu_seq_lens_q`, `cu_seq_lens_k`, `q_ranges`, or `k_ranges` as extra kwargs is ignored and drops packed sample isolation.
 
-- `cu_seq_lens_q` and `cu_seq_lens_k` for packed causal or bidirectional sequences;
-- explicit `q_ranges`, `k_ranges`, and `attn_type_map` for mixed or asymmetric visibility;
-- `q_length` and `kv_length` for one unpacked sequence.
+Packed and mixed visibility must use the mask constructors, not the HF builder:
 
-The builder deliberately does not materialize or reverse-engineer an arbitrary Transformers `mask_function`. Predicate-to-range conversion would require an O(sequence length squared) dense mask and cannot preserve every model-specific visibility rule efficiently. A 2D attention mask also does not expose packed boundaries because VeOmni uses an all-ones mask and records boundaries in `position_ids` and precomputed cumulative sequence lengths. Registry calls with a 2D mask but without explicit range metadata are rejected rather than silently allowing cross-sample attention. Models with packed, sliding-window, prefix, multimodal, or mixed visibility must pass declarative metadata explicitly.
+- `MagiAttentionMask.from_cu_seqlens` for packed causal or bidirectional sequences
+- `MagiAttentionMask.from_ranges` for mixed or asymmetric visibility
+
+The shape helper `packed_causal_mask(..., impl="magi_attention")` already routes through `from_cu_seqlens`.
+
+The builder deliberately does not materialize or reverse-engineer an arbitrary Transformers `mask_function`. Predicate-to-range conversion would require an O(sequence length squared) dense mask and cannot preserve every model-specific visibility rule efficiently. A 2D attention mask also does not expose packed boundaries because VeOmni uses an all-ones mask and records boundaries in `position_ids` and precomputed cumulative sequence lengths. Registry calls with a 2D mask are rejected rather than silently allowing cross-sample attention.
 
 The optional `magi` extra requires `gpu` (`veomni[gpu]`) and installs MagiAttention and the CUTE DSL/JIT dependencies used on SM100 and newer GPUs:
 
@@ -155,8 +166,10 @@ With Ulysses, the ranges describe the full sequence after the
 sequence-gather/head-scatter exchange and must be identical on every Ulysses
 rank. A layer that passes `skip_ulysses=True` must build local ranges by passing
 the same flag to `create_magi_mask`. The forward adapter validates range
-endpoints against the actual post-exchange query and key lengths before
-launching the kernel. A future Magi Context Parallel implementation may reuse
+endpoints against the actual post-exchange query and key lengths, and caches
+that check with the FA4 metadata while the mask tensors and Q/K shape stay
+unchanged. On CUDA this skips later `.all()` reductions; it does not remove a
+host sync. A future Magi Context Parallel implementation may reuse
 this mask carrier, but distributed dispatch/calc/undispatch and `cp_size > 1`
 are outside the current contract.
 

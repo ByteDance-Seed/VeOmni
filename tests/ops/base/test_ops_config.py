@@ -19,8 +19,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from tests.models.compare import eager_ops_config, ops_config_scope
 
+from tests.models.compare import eager_ops_config, ops_config_scope
 from veomni.ops.config import get_ops_config, resolve_op_impl, set_ops_config
 
 

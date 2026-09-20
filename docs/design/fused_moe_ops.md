@@ -1,6 +1,6 @@
-# Fused MoE Kernel Notes
+# Fused MoE Op Notes
 
-This note records implementation invariants for VeOmni's GPU fused MoE kernels.
+This note records implementation invariants for VeOmni's GPU fused MoE ops.
 The DeepSeek-V4 hash-MoE CI failure exposed one of these invariants, but the
 invariant itself is generic and applies to the non-EP `fused_triton` MoE path.
 

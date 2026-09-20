@@ -37,7 +37,7 @@ import types
 from pathlib import Path
 from typing import Any, Optional
 
-from .patch_spec import Patch, PatchConfig
+from .patch_spec import Patch, PatchConfig, get_source_code
 
 
 class CodegenError(Exception):
@@ -255,17 +255,15 @@ def get_object_source_with_leading_comments(obj: Any) -> str:
     return "".join(leading) + "".join(src_lines)
 
 
-def extract_source_segment(source_lines: list[str], start_line: int, end_line: int) -> str:
+def extract_source_span(source_lines: list[str], start_line: int, end_line: int) -> tuple[int, str]:
     """
-    Extract a segment of source code from source lines, preserving comments and blank lines.
+    Extract a source span, including leading comments and decorators.
 
-    Also includes any leading comments and decorators that precede the definition.
-    Line numbers are 1-indexed (as in AST).
+    Line numbers are 1-indexed (as in AST). Returns ``(first_line, segment)``
+    where ``first_line`` is the 1-indexed start of the extracted text.
     """
-    # Look backwards for leading comments and blank lines
     actual_start = start_line - 1  # Convert to 0-indexed
 
-    # Include leading comments/decorators (lines starting with # or @)
     while actual_start > 0:
         prev_line = source_lines[actual_start - 1].strip()
         if prev_line.startswith("#") or prev_line.startswith("@") or prev_line == "":
@@ -273,9 +271,45 @@ def extract_source_segment(source_lines: list[str], start_line: int, end_line: i
         else:
             break
 
-    # Extract the segment
     segment = source_lines[actual_start:end_line]
-    return "\n".join(segment)
+    return actual_start + 1, "\n".join(segment)
+
+
+def extract_source_segment(source_lines: list[str], start_line: int, end_line: int) -> str:
+    """
+    Extract a segment of source code from source lines, preserving comments and blank lines.
+
+    Also includes any leading comments and decorators that precede the definition.
+    Line numbers are 1-indexed (as in AST).
+    """
+    _, segment = extract_source_span(source_lines, start_line, end_line)
+    return segment
+
+
+def _decorator_mentions_names(decorator: ast.expr, names: set[str]) -> bool:
+    return any(isinstance(node, ast.Name) and node.id in names for node in ast.walk(decorator))
+
+
+def strip_decorators_referencing_names(node: ast.AST, source: str, extract_start: int, names: set[str]) -> str:
+    """Drop decorator lines from ``source`` when they reference ``names``."""
+    decorator_list = getattr(node, "decorator_list", None)
+    if not names or not decorator_list:
+        return source
+
+    drop_ranges = []
+    for decorator in decorator_list:
+        if not _decorator_mentions_names(decorator, names):
+            continue
+        start_idx = decorator.lineno - extract_start
+        end_idx = (decorator.end_lineno or decorator.lineno) - extract_start
+        drop_ranges.append((start_idx, end_idx))
+    if not drop_ranges:
+        return source
+
+    lines = source.split("\n")
+    for start_idx, end_idx in sorted(drop_ranges, reverse=True):
+        del lines[start_idx : end_idx + 1]
+    return "\n".join(lines)
 
 
 def get_node_end_line(node: ast.AST, source_lines: list[str]) -> int:
@@ -433,6 +467,71 @@ def _is_empty_class_body_node(node: ast.AST) -> bool:
 def create_comment_node(comment: str) -> ast.Expr:
     """Create an AST node representing a comment (as a string expression)."""
     return ast.Expr(value=ast.Constant(value=f"# {comment}"))
+
+
+def extra_init_statements(patch: Patch) -> str:
+    """Return statements that ``modify_init`` appends after the upstream body.
+
+    The replacement must take ``original_init`` as its first argument and call
+    it once. Remaining statements are inlined into ``__init__``.
+    """
+    replacement = patch.replacement
+    if replacement is None:
+        raise CodegenError(f"modify_init({patch.target!r}) has no replacement function")
+    source = get_object_source_with_leading_comments(replacement) or get_source_code(replacement)
+    if not source:
+        raise CodegenError(f"modify_init({patch.target!r}) could not read replacement source")
+    source = strip_patch_decorators(textwrap.dedent(source))
+    tree = parse_source_to_ast(source)
+    func = next((node for node in tree.body if isinstance(node, ast.FunctionDef)), None)
+    if func is None:
+        raise CodegenError(f"modify_init({patch.target!r}) replacement is not a function")
+    if not func.args.args:
+        raise CodegenError(f"modify_init({patch.target!r}) replacement must take original_init as the first argument")
+    original_init_name = func.args.args[0].arg
+    extras: list[ast.stmt] = []
+    called_original = False
+    for stmt in func.body:
+        if (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Name)
+            and stmt.value.func.id == original_init_name
+        ):
+            called_original = True
+            continue
+        extras.append(stmt)
+    if not called_original:
+        raise CodegenError(
+            f"modify_init({patch.target!r}) must call {original_init_name}(...) so the upstream body is kept"
+        )
+    if not extras:
+        raise CodegenError(f"modify_init({patch.target!r}) has no statements after {original_init_name}(...)")
+    return "\n".join(ast.unparse(stmt) for stmt in extras)
+
+
+def function_body_indent(source: str) -> int:
+    """Indent of the first executable statement, not the last source line.
+
+    A trailing ``if cond:`` body is nested deeper. ``modify_init`` extras must
+    stay at the function-body indent so they always run.
+    """
+    tree = parse_source_to_ast(source)
+    func = next((node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+    if func is None:
+        raise CodegenError("modify_init extras need a function body to indent against")
+    body = list(func.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    if body:
+        return body[0].col_offset
+    def_line = next(line for line in source.splitlines() if line.lstrip().startswith(("def ", "async def ")))
+    return len(def_line) - len(def_line.lstrip()) + 4
 
 
 def strip_patch_decorators(source: str) -> str:
@@ -1062,6 +1161,32 @@ class ModelingCodeGenerator:
         new_source_lines.extend(indented_preserved_lines)
         return "\n".join(new_source_lines)
 
+    def _compose_modified_init(self, class_node: ast.ClassDef, patch: Patch) -> str:
+        """Keep the upstream ``__init__`` body and append ``modify_init`` extras."""
+        init_node = next(
+            (
+                item
+                for item in class_node.body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == "__init__"
+            ),
+            None,
+        )
+        if init_node is None:
+            raise CodegenError(f"modify_init({class_node.name!r}) requires an upstream __init__")
+        original = textwrap.dedent(
+            extract_source_segment(
+                self.source_lines,
+                get_node_start_line(init_node),
+                get_node_end_line(init_node, self.source_lines),
+            )
+        )
+        extras = extra_init_statements(patch)
+        indent = function_body_indent(original)
+        comment = patch.description or "Instance-local VeomniOp handles"
+        extra_block = textwrap.indent(f"# {comment}\n{extras}", " " * indent)
+        header = f"# [modified __init__] {comment}"
+        return header + "\n" + original.rstrip() + "\n" + extra_block + "\n"
+
     def _generate_class_source(self, class_node: ast.ClassDef, patches: dict[str, Patch]) -> str:
         """Generate source code for a class, applying any relevant patches."""
         class_name = class_node.name
@@ -1087,8 +1212,19 @@ class ModelingCodeGenerator:
                 if applied and replacement_source:
                     method_replacement_sources[method_name] = replacement_source
 
+        init_patch = self.config.get_init_modifications().get(class_name)
+        if init_patch is not None and f"{class_name}.__init__" not in method_overrides:
+            methods_patched.append("__init__")
+            method_replacement_sources["__init__"] = self._compose_modified_init(class_node, init_patch)
+
         # Generate output
         lines = []
+        end_line = get_node_end_line(class_node, self.source_lines)
+        start_line = get_node_start_line(class_node)
+        extract_start, class_source = extract_source_span(self.source_lines, start_line, end_line)
+        class_source = strip_decorators_referencing_names(
+            class_node, class_source, extract_start, set(self.config.exclude)
+        )
         if methods_patched:
             lines.append("")
             lines.append(f"# {'=' * 70}")
@@ -1097,20 +1233,12 @@ class ModelingCodeGenerator:
             lines.append(f"# {'=' * 70}")
             # Preserve original class formatting/comments for untouched methods,
             # and replace only the patched methods in-place.
-            end_line = get_node_end_line(class_node, self.source_lines)
-            start_line = get_node_start_line(class_node)
-            class_source = extract_source_segment(self.source_lines, start_line, end_line)
-
-            # Replace the unparsed method bodies with comment-preserved versions
             for method_name, preserved_source in method_replacement_sources.items():
                 class_source = self._replace_method_body_with_preserved(class_source, method_name, preserved_source)
 
             lines.append(class_source)
         else:
-            # No patches - use original source with comments preserved
-            end_line = get_node_end_line(class_node, self.source_lines)
-            start_line = get_node_start_line(class_node)
-            lines.append(extract_source_segment(self.source_lines, start_line, end_line))
+            lines.append(class_source)
 
         return "\n".join(lines)
 
