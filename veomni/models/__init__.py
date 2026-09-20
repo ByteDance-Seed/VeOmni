@@ -14,10 +14,11 @@
 
 """Public model construction, registration, and checkpoint interfaces.
 
-Family packages are imported by later commits. This commit exposes the
-shared construction and checkpoint surface.
+Importing this package registers the supported Transformers families.
+Diffusers families land in the next commit.
 """
 
+from . import transformers
 from .auto import (
     build_config,
     build_foundation_model,
@@ -61,4 +62,5 @@ __all__ = [
     "rank0_load_and_broadcast_weights",
     "save_model_assets",
     "save_model_weights",
+    "transformers",
 ]

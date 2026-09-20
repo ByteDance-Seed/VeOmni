@@ -18,9 +18,8 @@ These tests are a layer up from the hook-API unit tests in
 ``tests/utils/test_moe_router_replay.py``. They instantiate the actually
 patched ``SparseMoeBlock`` of each wired family (``Qwen3MoeSparseMoeBlock``,
 ``Qwen3_5MoeSparseMoeBlock``) from the generated ``patched_modeling_*.py``
-modules, run real forward passes (with VeOmni's Liger fused MoE experts in
-the loop for Test A), and verify the two RR guarantees that the API alone
-cannot:
+modules, run real eager forward passes, and verify the two RR guarantees
+that the API alone cannot:
 
 A. **RECORD mode is bit-identical to the no-RR baseline.** The patched
    forward must produce byte-equal output whether or not a RECORD-mode
@@ -30,24 +29,24 @@ B. **REPLAY-with-native-indices reproduces the native ``(idx, w)`` pair
    bit-for-bit at the experts call site, validated against vanilla HF
    as the oracle.** Combined with a small plumbing assertion that REPLAY
    with alt indices actually substitutes, this verifies the recompute
-   path (``softmax → gather → renorm → cast`` for qwen3_moe; ``gather →
-   renorm → cast`` for qwen3_5_moe) is bytewise equivalent to the native
-   router's internal post-topk math, independent of the indices chosen.
+   path (``softmax → gather → renorm → cast`` for both ``qwen3_moe`` and
+   ``qwen3_5_moe``) is bytewise equivalent to the native router's internal
+   post-topk math, independent of the indices chosen.
 
 The capture-experts pattern in Test B replaces ``block.experts`` with a
 sink that records ``(idx, w)`` and returns zeros. This isolates the
 comparison to RR's actual responsibility — what tuple is fed to the
-experts module — and avoids both expert-weight-layout incompatibilities
-between the patched class (Liger merged ``gate_up_proj``) and vanilla HF
-(separate ``gate_proj``/``up_proj``), and any potential nondeterminism in
-the fused expert kernel itself.
+experts module — and avoids any potential nondeterminism in the fused
+expert kernel itself. Hugging Face 5.16 already stores merged
+``gate_up_proj`` experts for these families; the sink is not compensating
+for a split ``gate_proj`` / ``up_proj`` layout.
 
-Test A keeps Liger experts in the loop (no capture) so the RECORD
-no-perturbation guarantee is verified end-to-end including the fused
-kernel path.
+Test A keeps eager experts in the loop (no capture) so the RECORD
+no-perturbation guarantee is verified end-to-end. Optimized expert kernels
+have their own numerical coverage under ``tests/ops/moe_experts``.
 
 Scope:
-  - Single GPU, in-process. No torchrun / SP / FSDP.
+  - CPU, in-process. No torchrun / SP / FSDP.
   - Forward pass invariants only. Backward / gradient bit-equality is a
     separate (stronger) property left to a future test.
   - Toy config (``hidden_size=64, num_experts=4, top_k=2``) — sufficient
@@ -60,30 +59,12 @@ import pytest
 import torch
 import torch.nn as nn
 
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+from tests.models.compare import eager_ops_config
+from veomni.ops.config import get_ops_config, set_ops_config
 from veomni.utils.moe_router_replay import set_active_replay
 
 
-# ----------------------------------------------------------------- skip gate
-
-# All tests in this file require CUDA + Liger fused MoE. We skip at the
-# module level rather than per-test to keep the skip message clean and
-# avoid spending import time on transformers when the env is not GPU.
-# The skip uses ``IS_CUDA_AVAILABLE`` from ``veomni.utils.device`` rather
-# than calling the torch availability check directly, so this file passes
-# the ``check_device_api_usage`` CI lint (no raw device-name literals in
-# non-whitelisted files).
-pytestmark = pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE,
-    reason="RR invariant tests require CUDA + Liger fused MoE experts.",
-)
-
-
-# Device string used for tensor placement inside the test bodies. Resolves
-# to the GPU device name on a GPU host (the only env where these tests run,
-# per the skip gate above); kept as a module-level constant so individual
-# asserts don't repeat the lookup.
-_DEVICE = get_device_type()
+_DEVICE = torch.device("cpu")
 
 
 # ----------------------------------------------------------------- fixtures
@@ -91,10 +72,13 @@ _DEVICE = get_device_type()
 
 @pytest.fixture(autouse=True)
 def _restore_active_replay():
-    """Guard the module-level RR singleton between tests."""
+    """Guard the module-level RR singleton and select eager experts."""
+    previous_ops = get_ops_config()
+    set_ops_config(eager_ops_config())
     set_active_replay(None)
     yield
     set_active_replay(None)
+    set_ops_config(previous_ops)
 
 
 # ----------------------------------------------------------------- mocks
@@ -216,7 +200,7 @@ def _init_block_deterministic(block: nn.Module, seed: int = 0) -> None:
 # ----------------------------------------------------------------- block builders
 
 
-def _build_patched_qwen3_moe_block(config, device=_DEVICE, dtype=torch.bfloat16):
+def _build_patched_qwen3_moe_block(config, device=_DEVICE, dtype=torch.float32):
     from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import (
         Qwen3MoeSparseMoeBlock as PatchedQwen3MoeSparseMoeBlock,
     )
@@ -226,7 +210,7 @@ def _build_patched_qwen3_moe_block(config, device=_DEVICE, dtype=torch.bfloat16)
     return block
 
 
-def _build_vanilla_qwen3_moe_block(config, device=_DEVICE, dtype=torch.bfloat16):
+def _build_vanilla_qwen3_moe_block(config, device=_DEVICE, dtype=torch.float32):
     """Build vanilla HF ``Qwen3MoeSparseMoeBlock`` for use as the Test B oracle.
 
     VeOmni's qwen3_moe registration does not mutate the HF module — patches
@@ -242,7 +226,7 @@ def _build_vanilla_qwen3_moe_block(config, device=_DEVICE, dtype=torch.bfloat16)
     return block
 
 
-def _build_patched_qwen3_5_moe_block(config, device=_DEVICE, dtype=torch.bfloat16):
+def _build_patched_qwen3_5_moe_block(config, device=_DEVICE, dtype=torch.float32):
     from veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_gpu import (
         Qwen3_5MoeSparseMoeBlock as PatchedQwen3_5MoeSparseMoeBlock,
     )
@@ -252,7 +236,7 @@ def _build_patched_qwen3_5_moe_block(config, device=_DEVICE, dtype=torch.bfloat1
     return block
 
 
-def _build_vanilla_qwen3_5_moe_block(config, device=_DEVICE, dtype=torch.bfloat16):
+def _build_vanilla_qwen3_5_moe_block(config, device=_DEVICE, dtype=torch.float32):
     """qwen3_5_moe ships only the patchgen-generated path in VeOmni — vanilla
     HF import is always pristine, no unpatch dance required."""
     from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
@@ -264,7 +248,7 @@ def _build_vanilla_qwen3_5_moe_block(config, device=_DEVICE, dtype=torch.bfloat1
     return block
 
 
-def _make_hidden_states(config, batch=2, seq=16, dtype=torch.bfloat16, seed=42):
+def _make_hidden_states(config, batch=2, seq=16, dtype=torch.float32, seed=42):
     """Deterministic hidden_states tensor sized for the toy config."""
     g = torch.Generator(device=_DEVICE).manual_seed(seed)
     return torch.randn(
@@ -284,11 +268,11 @@ def _sync_gate_weight(src: nn.Module, dst: nn.Module) -> None:
 
 
 # =================================================================
-# Test A: RECORD mode does not perturb forward (end-to-end with Liger)
+# Test A: RECORD mode does not perturb eager forward end-to-end
 # =================================================================
 
 
-def test_qwen3_moe_record_mode_is_bitwise_baseline_with_liger_experts():
+def test_qwen3_moe_record_mode_is_bitwise_baseline_with_eager_experts():
     config = _make_qwen3_moe_config()
     block = _build_patched_qwen3_moe_block(config)
     h = _make_hidden_states(config)
@@ -302,7 +286,7 @@ def test_qwen3_moe_record_mode_is_bitwise_baseline_with_liger_experts():
     out_record = block(h).clone()
     set_active_replay(None)
 
-    # End-to-end (Liger fused experts in loop) bit equality.
+    # End-to-end eager-expert bit equality.
     assert torch.equal(out_baseline, out_record), (
         "RECORD mode perturbed the forward output — RR is supposed to be a passive observer, not a transform."
     )
@@ -312,7 +296,7 @@ def test_qwen3_moe_record_mode_is_bitwise_baseline_with_liger_experts():
     assert tuple(ctrl.recorded.shape) == expected_shape
 
 
-def test_qwen3_5_moe_record_mode_is_bitwise_baseline_with_liger_experts():
+def test_qwen3_5_moe_record_mode_is_bitwise_baseline_with_eager_experts():
     config = _make_qwen3_5_moe_config()
     block = _build_patched_qwen3_5_moe_block(config)
     h = _make_hidden_states(config)
@@ -422,11 +406,10 @@ def test_qwen3_5_moe_replay_native_matches_vanilla_hf_at_expert_input():
     _sync_gate_weight(patched, vanilla)
     h = _make_hidden_states(config)
 
-    # See qwen3_moe variant for the dtype-cast rationale. For qwen3_5_moe
-    # the cast is typically a no-op (vanilla HF and patched both end up in
-    # fp32 because the router locally rebinds ``router_logits`` to its
-    # softmax output and casts top-k values to that dtype), but applying it
-    # uniformly future-proofs against either side gaining a perf cast.
+    # See qwen3_moe variant for the dtype-cast rationale. transformers 5.16
+    # Qwen3.5-MoE ``TopKRouter`` returns pre-softmax ``router_logits`` the
+    # same way as Qwen3-MoE, so the patched recompute is also
+    # ``softmax → gather → renorm → cast``.
     idx_vanilla, w_vanilla_native_dtype = _capture_block_experts_inputs(vanilla, h)
 
     idx_patched_off, w_patched_off = _capture_block_experts_inputs(patched, h)
@@ -441,15 +424,9 @@ def test_qwen3_5_moe_replay_native_matches_vanilla_hf_at_expert_input():
     set_active_replay(None)
 
     assert torch.equal(idx_replay, idx_vanilla)
-    # For qwen3_5_moe, the recompute uses ``router_logits`` (which is already
-    # post-softmax due to the latent double-softmax quirk in upstream's
-    # ``Qwen3_5MoeTopKRouter.forward``) — see the comment in
-    # ``qwen3_5_moe_gpu_patch_gen_config.py``. If this assertion fails AFTER
-    # an upstream fix lands, the patch must switch to the qwen3_moe form
-    # (recompute softmax from raw logits).
     assert torch.equal(w_replay, w_vanilla), (
-        "Recompute path (gather + renorm + cast) is not bitwise-equivalent "
-        "to the native router's internal post-topk math."
+        "Recompute path (softmax + gather + renorm + cast) is not "
+        "bitwise-equivalent to the native router's internal post-topk math."
     )
 
     alt = (idx_vanilla + 1) % config.num_experts

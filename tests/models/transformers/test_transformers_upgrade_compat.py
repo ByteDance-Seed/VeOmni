@@ -13,7 +13,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
-_TOY_CONFIGS = Path(__file__).parents[1] / "toy_config"
+_TOY_CONFIGS = Path(__file__).parents[2] / "toy_config"
 
 
 @pytest.mark.parametrize("backend", ["gpu", "npu"])
