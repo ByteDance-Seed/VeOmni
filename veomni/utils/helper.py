@@ -111,7 +111,9 @@ def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
         return [0]
 
 
-def _compute_image_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+def _compute_image_seqlens(
+    micro_batch: Dict[str, "torch.Tensor"], config: Optional["PretrainedConfig"] = None
+) -> List[int]:
     image_shape_keys = ["image_grid_thw", "video_grid_thw", "audio_grid_thw"]
     image_seqlens = []
     for key in image_shape_keys:
@@ -119,6 +121,12 @@ def _compute_image_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
             grid_thw = micro_batch[key]
             seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).tolist()
             image_seqlens.extend(seqlens)
+    if not image_seqlens and config is not None and getattr(config, "model_type", None) == "gemma3":
+        pixel_values = micro_batch.get("pixel_values")
+        if isinstance(pixel_values, torch.Tensor) and pixel_values.ndim == 4:
+            patch_size = config.vision_config.patch_size
+            tokens_per_image = (pixel_values.shape[-2] // patch_size) * (pixel_values.shape[-1] // patch_size)
+            image_seqlens.extend([tokens_per_image] * pixel_values.shape[0])
     return image_seqlens
 
 
@@ -236,12 +244,12 @@ class EnvironMeter:
             if isinstance(micro_batch, List):
                 for sample in micro_batch:
                     self.batch_seqlens.extend(_compute_seqlens(sample))
-                    self.images_seqlens.extend(_compute_image_seqlens(sample))
+                    self.images_seqlens.extend(_compute_image_seqlens(sample, self.config))
                     if self.enable_multisource:
                         self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
             else:
                 self.batch_seqlens.extend(_compute_seqlens(micro_batch))
-                self.images_seqlens.extend(_compute_image_seqlens(micro_batch))
+                self.images_seqlens.extend(_compute_image_seqlens(micro_batch, self.config))
                 if self.enable_multisource:
                     self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
         else:  # dit diffusers model
