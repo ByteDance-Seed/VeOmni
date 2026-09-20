@@ -1320,8 +1320,8 @@ def qwen3_5_moe_causal_lm_get_parallel_plan_patched(self):
     return _get_causal_lm_parallel_plan()
 
 
-config.add_import("transformers.utils", names=["logging"])
+config.add_import("veomni.utils", names=["logging"])
 config.add_post_import_block("""
-from transformers.utils import logging
+from veomni.utils import logging
 logger = logging.get_logger(__name__)
 """)

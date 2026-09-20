@@ -445,8 +445,8 @@ config.override_method(
     replacement=qwen3_5_moe_causal_lm_get_parallel_plan_patched,
     description="Register Qwen3_5MoeForCausalLM expert parallel plan for v5 generated modeling",
 )
-config.add_import("transformers.utils", names=["logging"])
+config.add_import("veomni.utils", names=["logging"])
 config.add_post_import_block("""
-from transformers.utils import logging
+from veomni.utils import logging
 logger = logging.get_logger(__name__)
 """)

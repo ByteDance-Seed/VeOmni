@@ -100,7 +100,7 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeVisionConfig,
 )
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import (
     accepts_precomputed_kwargs,
@@ -120,6 +120,7 @@ from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_se
 # linear-attention slots replace the previous import-time fla/torch
 # selection inside Qwen3_5MoeGatedDeltaNet.__init__ /forward.
 from veomni.ops.dispatch import OpSlot
+from veomni.utils import logging
 from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin, MoeCausalLMOutputWithLogProbs
