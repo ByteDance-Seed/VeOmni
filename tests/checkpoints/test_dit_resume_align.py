@@ -275,7 +275,11 @@ def _materialize_toy_dit_weights(target_dir: str) -> None:
     from veomni.models.auto import build_foundation_model
     from veomni.ops import apply_ops_config
 
-    apply_ops_config(OpsImplementationConfig())
+    # Wan's ``rope_apply`` has a non-standard signature, so its device patch
+    # explicitly disables the liger RoPE backend. The framework default for
+    # ``rotary_pos_emb_implementation`` is ``liger_kernel``, which would raise
+    # here; every Wan YAML pins ``eager`` for the same reason.
+    apply_ops_config(OpsImplementationConfig(rotary_pos_emb_implementation="eager"))
     model = build_foundation_model(
         config_path="tests/toy_config/wan_t2v_toy/config.json",
         weights_path=None,
@@ -335,6 +339,9 @@ def _run_trainer(run: str, train_path: str, weights_dir: str, load_path: str | N
         "--train.checkpoint.save_epochs=0",
         "--train.checkpoint.save_hf_weights=False",
         f"--train.checkpoint.output_dir={output_dir}",
+        # Wan's RoPE signature is non-standard, so the liger backend is
+        # explicitly disabled for it; pin the eager backend the Wan YAMLs use.
+        "--model.ops_implementation.rotary_pos_emb_implementation=eager",
         "--model.accelerator.fsdp_config.fsdp_mode=fsdp2",
         "--model.accelerator.init_device=meta",
         # Gradient checkpointing is orthogonal to the RNG question, and its
