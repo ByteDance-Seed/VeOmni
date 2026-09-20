@@ -9,21 +9,24 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# See the License for the specific language governing limitations
+# under the License.
 
 """Transformer modeling that calls local ``VeomniOp`` handles.
 
-Diffusion families that live under this package land in the next commit.
+Importing this package registers the models listed below on the
+``models`` registries. Add the next model here when it is ready.
 """
 
 from . import (
     deepseek_v3,
     deepseek_v4,
+    flux,
     gemma3,
     glm_moe_dsa,
     gpt_oss,
     llama,
+    movqgan,
     qwen2,
     qwen2_5_omni,
     qwen2_5vl,
@@ -37,16 +40,19 @@ from . import (
     qwen3_vl_moe,
     qwen4_exp,
     seed_oss,
+    wan,
 )
 
 
 __all__ = [
     "deepseek_v3",
     "deepseek_v4",
+    "flux",
     "gemma3",
     "glm_moe_dsa",
     "gpt_oss",
     "llama",
+    "movqgan",
     "qwen2",
     "qwen2_5_omni",
     "qwen2_5vl",
@@ -60,4 +66,5 @@ __all__ = [
     "qwen3_vl_moe",
     "qwen4_exp",
     "seed_oss",
+    "wan",
 ]

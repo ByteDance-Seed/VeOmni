@@ -9,15 +9,22 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# See the License for the specific language governing limitations
+# under the License.
 
 """Public model construction, registration, and checkpoint interfaces.
 
-Importing this package registers the supported Transformers families.
-Diffusers families land in the next commit.
+Use ``build_config`` to load a configuration and ``build_foundation_model``
+to construct a model with explicit ops selection and initialization/weight
+loading settings. ``get_model_class`` exposes architecture resolution for
+callers that need the class itself. Importing this package registers the
+supported Transformers families and, when available, Diffusers families.
+
+Model implementations consume instance-local ``VeomniOp`` handles. This
+package also exports tokenizer/processor builders and checkpoint weight I/O.
 """
 
+from ..utils.import_utils import is_diffusers_available
 from . import transformers
 from .auto import (
     build_config,
@@ -64,3 +71,8 @@ __all__ = [
     "save_model_weights",
     "transformers",
 ]
+
+if is_diffusers_available():
+    from . import diffusers
+
+    __all__.append("diffusers")

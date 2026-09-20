@@ -1,15 +1,17 @@
+"""Adapted from https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/transformers/transformer_qwenimage.py"""
+
 from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
 from math import prod
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import QwenImageTransformer2DModel as _QwenImageTransformer2DModel
-from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.transformers.transformer_qwenimage import (
     apply_rotary_emb_qwen,
@@ -18,6 +20,9 @@ from diffusers.models.transformers.transformer_qwenimage import (
 from diffusers.utils import apply_lora_scale
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
+
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
@@ -46,6 +51,67 @@ def _pad_seq(x: torch.Tensor, dim: int, pad_size: int, value: float = 0) -> torc
     return torch.cat([x, pad], dim=dim)
 
 
+_SDPA_ATTN_IMPLS = frozenset({"sdpa", "veomni_sdpa"})
+
+
+class QwenImageAttentionKernelModule:
+    """HF attention-interface view for joint Qwen-Image Q/K/V."""
+
+    def __init__(self, impl: str, attn):
+        target_dtype = attn.to_q.weight.dtype
+        if target_dtype == torch.float32:
+            target_dtype = torch.bfloat16
+        self.config = SimpleNamespace(
+            _attn_implementation=impl,
+            _pre_quantization_dtype=target_dtype,
+        )
+        self.is_causal = False
+        self.layer_idx = getattr(attn, "layer_idx", None)
+        self.num_key_value_groups = 1
+        self._attn = attn
+
+    def modules(self):
+        return self._attn.modules()
+
+
+def _hf_key_padding_mask(attention_mask: torch.Tensor | None) -> torch.Tensor | None:
+    """Expand the joint ``(B, S)`` keep-mask to HF ``(B, 1, 1, S)``."""
+    if attention_mask is None:
+        return None
+    if attention_mask.ndim == 2:
+        return attention_mask[:, None, None, :]
+    return attention_mask
+
+
+def _joint_keep_mask(
+    *,
+    batch_size: int,
+    image_seq_len: int,
+    txt_seq_len: int,
+    device: torch.device,
+    encoder_hidden_states_mask: torch.Tensor | None = None,
+    img_pad: int = 0,
+    txt_pad: int = 0,
+) -> torch.Tensor | None:
+    """Build a joint ``[text, image]`` keep-mask, or None when every token is valid.
+
+    A dense all-true mask still selects the SDPA fallback, so omit it unless SP
+    padding or the text mask actually drops tokens.
+    """
+    if encoder_hidden_states_mask is None:
+        text_mask = torch.ones((batch_size, txt_seq_len), dtype=torch.bool, device=device)
+        text_drops_tokens = False
+    else:
+        text_mask = encoder_hidden_states_mask.to(dtype=torch.bool)
+        text_drops_tokens = not bool(text_mask.all().item())
+    if img_pad == 0 and txt_pad == 0 and not text_drops_tokens:
+        return None
+    text_mask = _pad_seq(text_mask, dim=1, pad_size=txt_pad, value=False)
+    image_mask = torch.ones((batch_size, image_seq_len), dtype=torch.bool, device=device)
+    image_mask = _pad_seq(image_mask, dim=1, pad_size=img_pad, value=False)
+    return torch.cat([text_mask, image_mask], dim=1)
+
+
 class QwenImageSPAttnProcessor:
     """Joint dual-stream attention processor with Ulysses sequence parallelism.
 
@@ -57,14 +123,13 @@ class QwenImageSPAttnProcessor:
     attention mask stays valid without any reordering.
     """
 
-    _attention_backend = None
-    _parallel_config = None
-
     def __init__(self):
-        if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError(
-                "QwenImageSPAttnProcessor requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0."
-            )
+        impl = resolve_op_impl("attn_implementation")
+        self.veomni_attn = VeomniOp("attention", "standard", impl)
+        self.veomni_attn_masked = (
+            self.veomni_attn if impl in _SDPA_ATTN_IMPLS else VeomniOp("attention", "standard", "sdpa")
+        )
+        self.config = SimpleNamespace(_attn_implementation=impl)
 
     def __call__(
         self,
@@ -131,16 +196,17 @@ class QwenImageSPAttnProcessor:
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
-        joint_hidden_states = dispatch_attention_fn(
-            joint_query,
-            joint_key,
-            joint_value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
+        handle = self.veomni_attn_masked if attention_mask is not None else self.veomni_attn
+        joint_hidden_states = handle(
+            QwenImageAttentionKernelModule(self.config._attn_implementation, attn),
+            joint_query.transpose(1, 2),
+            joint_key.transpose(1, 2),
+            joint_value.transpose(1, 2),
+            _hf_key_padding_mask(attention_mask),
+            dropout=0.0,
             is_causal=False,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
-        )
+            skip_ulysses=True,
+        )[0]
 
         # joint_hidden_states: (B, joint_seq, heads_local, head_dim)
         txt_attn_output = joint_hidden_states[:, :seq_txt]
@@ -239,14 +305,19 @@ def QwenImageTransformer2DModel_forward(
         # Build the (padded) joint attention mask on FULL lengths so that, after
         # the per-stream all-to-all inside attention, padded positions on both
         # streams are masked out. Order matches the processor: [text, image].
-        if encoder_hidden_states_mask is not None:
-            text_mask = encoder_hidden_states_mask.to(torch.bool)
-        else:
-            text_mask = torch.ones((batch_size, txt_seq_len_full), dtype=torch.bool, device=hidden_states.device)
-        text_mask = _pad_seq(text_mask, dim=1, pad_size=txt_pad, value=False)
-        image_mask = torch.ones((batch_size, image_seq_len), dtype=torch.bool, device=hidden_states.device)
-        image_mask = _pad_seq(image_mask, dim=1, pad_size=img_pad, value=False)
-        block_attention_kwargs["attention_mask"] = torch.cat([text_mask, image_mask], dim=1)
+        # Omit the mask when nothing is padded and every text token is valid so
+        # a configured Flash/flex impl is not forced onto the SDPA fallback.
+        joint_mask = _joint_keep_mask(
+            batch_size=batch_size,
+            image_seq_len=image_seq_len,
+            txt_seq_len=txt_seq_len_full,
+            device=hidden_states.device,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+            img_pad=img_pad,
+            txt_pad=txt_pad,
+        )
+        if joint_mask is not None:
+            block_attention_kwargs["attention_mask"] = joint_mask
 
         # Pad streams + RoPE to a multiple of sp_size, then slice across ranks.
         hidden_states = _pad_seq(hidden_states, dim=1, pad_size=img_pad, value=0)
@@ -262,9 +333,16 @@ def QwenImageTransformer2DModel_forward(
         encoder_hidden_states = slice_input_tensor(encoder_hidden_states, dim=1, group=sp_group)
         if modulate_index is not None:
             modulate_index = slice_input_tensor(modulate_index, dim=1, group=sp_group)
-    elif encoder_hidden_states_mask is not None:
-        image_mask = torch.ones((batch_size, image_seq_len), dtype=torch.bool, device=hidden_states.device)
-        block_attention_kwargs["attention_mask"] = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
+    else:
+        joint_mask = _joint_keep_mask(
+            batch_size=batch_size,
+            image_seq_len=image_seq_len,
+            txt_seq_len=txt_seq_len_full,
+            device=hidden_states.device,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+        )
+        if joint_mask is not None:
+            block_attention_kwargs["attention_mask"] = joint_mask
 
     for index_block, block in enumerate(self.transformer_blocks):
         if torch.is_grad_enabled() and self.gradient_checkpointing:
