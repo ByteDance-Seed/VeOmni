@@ -28,7 +28,7 @@ from veomni.models.transformers.deepseek_v4.packed_utils import (
     resolve_packed_sequence_slices,
     shard_packed_compression_metadata,
 )
-from veomni.utils.device import IS_CUDA_AVAILABLE
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
 from veomni.utils.seqlen_pos_transform_utils import packed_sequence_slices_from_cu_seqlens
 
 
@@ -156,7 +156,7 @@ def test_packed_sequence_slices_from_cu_seqlens_rejects_gpu_tensor():
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
     with pytest.raises(ValueError, match="requires CPU cu_seqlens"):
-        packed_sequence_slices_from_cu_seqlens(torch.tensor([0, 8], device="cuda", dtype=torch.int32))
+        packed_sequence_slices_from_cu_seqlens(torch.tensor([0, 8], device=get_device_type(), dtype=torch.int32))
 
 
 def test_resolve_packed_sequence_slices_prefers_host_slices(monkeypatch):
@@ -180,7 +180,7 @@ def test_resolve_packed_sequence_slices_prefers_host_slices(monkeypatch):
 def test_resolve_packed_sequence_slices_copies_missing_gpu_cu_seqlens():
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
-    cu_seq_lens_q = torch.tensor([0, 4, 8], device="cuda", dtype=torch.int32)
+    cu_seq_lens_q = torch.tensor([0, 4, 8], device=get_device_type(), dtype=torch.int32)
     assert resolve_packed_sequence_slices(None, cu_seq_lens_q, 8) == ((0, 4), (4, 8))
 
 
@@ -206,13 +206,14 @@ def test_ensure_unmasked_packed_attention_checks_cpu_mask():
 def test_ensure_unmasked_packed_attention_skips_gpu_mask_outside_debug():
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
-    mask = torch.zeros(1, 4, device="cuda")
-    previous = torch.cuda.get_sync_debug_mode()
-    torch.cuda.set_sync_debug_mode(0)
+    device_module = get_torch_device()
+    mask = torch.zeros(1, 4, device=get_device_type())
+    previous = device_module.get_sync_debug_mode()
+    device_module.set_sync_debug_mode(0)
     try:
         ensure_unmasked_packed_attention(mask, attention_mask_is_all_ones=None)
     finally:
-        torch.cuda.set_sync_debug_mode(previous)
+        device_module.set_sync_debug_mode(previous)
 
 
 def test_shard_packed_compression_metadata_keeps_global_compressed_slots():

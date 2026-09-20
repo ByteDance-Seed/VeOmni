@@ -24,6 +24,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from tests.models.compare import eager_ops_config, ops_config_scope, qwen_image_inputs, stamp_attn_implementation
@@ -247,6 +248,11 @@ def test_ltx_forward_keeps_construction_impls():
 
 
 def test_minimax_h3_forward_keeps_construction_impls():
+    from veomni.utils.device import IS_NPU_AVAILABLE
+
+    if IS_NPU_AVAILABLE:
+        pytest.skip("MiniMax H3 RoPE calls npu_rotary_mul, which cannot run on CPU tensors")
+
     from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
         MiniMaxH3DiTModel,
     )

@@ -33,6 +33,7 @@ from tests.models.compare import (
     ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_gpt_oss_config as _tiny_config
+from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_quack_gemm_available
 
 
@@ -88,7 +89,7 @@ def test_gpt_oss_eager_matches_hf_aux_loss():
 
 @pytest.mark.skipif(not is_quack_gemm_available(), reason="GPT-OSS fused_quack needs SM90+ quack")
 def test_gpt_oss_fused_quack_matches_eager():
-    device = torch.device("cuda")
+    device = torch.device(get_device_type())
     dtype = torch.bfloat16
     torch.manual_seed(0)
     config = _tiny_config()

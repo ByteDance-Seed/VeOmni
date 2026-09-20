@@ -108,3 +108,11 @@ def test_deepseek_v4_ops_overrides_follow_active_device(monkeypatch, device_type
 
     assert "--model.ops_implementation.attn_implementation=eager" in overrides
     assert f"--model.ops_implementation.moe_implementation={expected_moe}" in overrides
+
+
+def test_deepseek_v3_gpu_e2e_keeps_eager_moe_for_fp32(monkeypatch):
+    monkeypatch.setattr(training_utils, "get_device_type", lambda: MOE_TRITON_DEVICE_TYPES[0])
+
+    overrides = training_utils.resolve_ops_overrides("deepseek_v3")
+
+    assert "--model.ops_implementation.moe_implementation=eager" in overrides

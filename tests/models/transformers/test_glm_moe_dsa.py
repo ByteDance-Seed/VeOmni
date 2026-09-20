@@ -32,7 +32,7 @@ from tests.models.compare import (
 )
 from tests.models.tiny_configs import tiny_glm_moe_dsa_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_RTOL
-from veomni.utils.device import IS_CUDA_AVAILABLE
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 def _glm_cls(architecture: str):
@@ -279,9 +279,10 @@ def test_glm_moe_dsa_fused_cuda_forward_does_not_scan_standard_causal(monkeypatc
 
     monkeypatch.setattr(mask_mod, "is_standard_causal_mask", unexpected_scan)
     config = _tiny_config()
-    model = _build_ours(config).cuda()
+    device = get_device_type()
+    model = _build_ours(config).to(device)
     model.eval()
-    input_ids = torch.randint(3, config.vocab_size, (2, 8), device="cuda")
+    input_ids = torch.randint(3, config.vocab_size, (2, 8), device=device)
     attn_spy = _FusedAttentionSpy()
     indexer_spy = _FusedIndexerSpy(config.index_topk)
     model.model.layers[0].self_attn.veomni_dsa_attention = attn_spy

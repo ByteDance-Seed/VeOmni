@@ -85,6 +85,11 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # native interleaved gate/up training layout needs either eager reference
     # math or the dedicated SM90-only Quack path. Keep the shared helper on the
     # portable eager baseline; capability-gated tests append FA4/Quack flags.
+    # FP32 e2e alignment materializes toy weights in float32. fused_triton
+    # group-gemm only accepts bf16/fp16, so keep DeepSeek-V3 on eager MoE.
+    "deepseek_v3": {
+        "moe_implementation": "eager",
+    },
     "gpt_oss": {
         "attn_implementation": "eager",
         "moe_implementation": "eager",

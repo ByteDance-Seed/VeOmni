@@ -25,6 +25,7 @@ from veomni.distributed.sequence_parallel.comm import (
 )
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
+from veomni.ops.kernels.attention import ulysses as attn_ulysses
 from veomni.ops.kernels.attention.standard import flash as flash_backend
 from veomni.ops.kernels.attention.standard import flex as flex_backend
 from veomni.ops.kernels.attention.standard import magi as magi_backend
@@ -391,9 +392,11 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
         module = _FakeFlexAttentionModule().to(device)
         original_get_parallel_state = flex_backend.get_parallel_state
         original_should_apply = flex_backend.should_apply_ulysses
+        original_ulysses_state = attn_ulysses.get_parallel_state
         try:
             flex_backend.should_apply_ulysses = lambda *, skip_ulysses=False: False
             flex_backend.get_parallel_state = lambda: SimpleNamespace(ulysses_size=1, async_enabled=False)
+            attn_ulysses.get_parallel_state = lambda: SimpleNamespace(ulysses_size=1, async_enabled=False)
             baseline_block_mask = flex_attention_mask_builder(
                 1,
                 sequence_length,
@@ -412,6 +415,11 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
 
             flex_backend.should_apply_ulysses = lambda *, skip_ulysses=False: not skip_ulysses
             flex_backend.get_parallel_state = lambda: SimpleNamespace(
+                ulysses_group=group,
+                ulysses_size=world_size,
+                async_enabled=False,
+            )
+            attn_ulysses.get_parallel_state = lambda: SimpleNamespace(
                 ulysses_group=group,
                 ulysses_size=world_size,
                 async_enabled=False,
@@ -446,6 +454,7 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
         finally:
             flex_backend.get_parallel_state = original_get_parallel_state
             flex_backend.should_apply_ulysses = original_should_apply
+            attn_ulysses.get_parallel_state = original_ulysses_state
 
     @pytest.mark.skipif(
         not IS_CUDA_AVAILABLE or not _MAGI_PACKAGE_AVAILABLE or get_torch_device().device_count() < 2,
