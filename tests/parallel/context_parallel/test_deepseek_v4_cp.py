@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -171,6 +172,7 @@ def _init_cp_attention(
     batch_size: int = 1,
     sample_slices=None,
     dtype: torch.dtype = torch.float32,
+    dsa_attention_impl: str = "eager",
 ):
     """Enter the process group, build the shared layer, and return the fixture.
 
@@ -205,8 +207,10 @@ def _init_cp_attention(
 
     from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.ops.config import set_ops_config
 
     _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    set_ops_config(SimpleNamespace(dsa_attention_implementation=dsa_attention_impl))
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
@@ -313,6 +317,16 @@ def _stub_sparse_attn_tilelang(query: torch.Tensor, *_args, **_kwargs) -> torch.
     return torch.zeros_like(query)
 
 
+class _StubTileLangDsaAttention:
+    """TileLang-shaped handle used to exercise candidate building on pre-SM90 GPUs."""
+
+    impl = "tilelang"
+
+    def __call__(self, query: torch.Tensor, *_args, **_kwargs) -> torch.Tensor:
+        """Return a shape-compatible output without launching the hardware kernel."""
+        return _stub_sparse_attn_tilelang(query)
+
+
 def _run_attention_cp_sparse_indices(rank: int, world_size: int, init_file: str, seq_len: int) -> None:
     """The compact candidates a shard builds must be the global build's own rows.
 
@@ -329,10 +343,18 @@ def _run_attention_cp_sparse_indices(rank: int, world_size: int, init_file: str,
     """
     from veomni.distributed.parallel_state import clear_parallel_state
 
-    dsv4, _, _forward, full_hidden, full_position_ids, full_mask = _init_cp_attention(
-        rank, world_size, init_file, seq_len, with_compressor=False, dtype=torch.bfloat16
+    dsv4, layer, _forward, full_hidden, full_position_ids, full_mask = _init_cp_attention(
+        rank,
+        world_size,
+        init_file,
+        seq_len,
+        with_compressor=False,
+        dtype=torch.bfloat16,
     )
-    dsv4.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+    # Keep the production registry's SM90 requirement intact. This test only
+    # needs a handle whose implementation name selects compact candidates and a
+    # shape-compatible callable in place of the actual TileLang launch.
+    layer.veomni_dsa_attention = _StubTileLangDsaAttention()
 
     built = []
     build_indices = dsv4.build_sparse_attention_indices
@@ -347,7 +369,6 @@ def _run_attention_cp_sparse_indices(rank: int, world_size: int, init_file: str,
     with (
         torch.no_grad(),
         patch(f"{_PATCHED_MODULE}.build_sparse_attention_indices", _record),
-        patch(f"{_PATCHED_MODULE}.sparse_attn_tilelang", _stub_sparse_attn_tilelang),
     ):
         no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
         with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
@@ -615,11 +636,12 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
 
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+    from veomni.ops.config import set_ops_config
 
     _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
     # The TileLang kernel is the production scorer and the only one with a query
     # partitioning of its own; the eager scorer is covered by the CSA layer test.
-    dsv4.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+    set_ops_config(SimpleNamespace(dsa_indexer_implementation="tilelang"))
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
@@ -632,10 +654,10 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
     dist.broadcast(hidden, src=0)
     dist.broadcast(q_residual, src=0)
 
-    # ``use_tilelang`` degrades to the eager scorer rather than failing when the
-    # canonical positions it checks do not line up, and the eager scorer reads the
-    # global ``position_ids`` and so stays right. Without this count, dropping the
-    # query offset entirely would take the kernel out of the comparison and the
+    # Count kernel entries so the comparison cannot stay green after the
+    # TileLang path is skipped. The eager scorer reads global ``position_ids``
+    # and so stays right even if the query offset is dropped. Without this
+    # count, that skip would take the kernel out of the comparison and the
     # parity below would still hold, pinning nothing about the CP query rebasing.
     kernel_runs = []
     real_kernel = dsv4.v4_lighting_indexer
@@ -1229,6 +1251,7 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
     from transformers import AutoConfig
 
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.ops.config import set_ops_config
 
     _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
     if tilelang:
@@ -1236,8 +1259,7 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
         # with the TileLang attention selected, so this is the arm that reaches
         # the compact-candidate path -- and the only place the TileLang indexer
         # runs inside a CSA layer under CP.
-        dsv4.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
-        dsv4.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+        set_ops_config(SimpleNamespace(dsa_attention_implementation="tilelang", dsa_indexer_implementation="tilelang"))
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
@@ -1260,9 +1282,7 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
     # pass that never entered the kernel it exists to exercise.
     counts = dict.fromkeys(("sparse_attn_tilelang", "v4_lighting_indexer"), 0)
 
-    def _counted(name):
-        real = getattr(dsv4, name)
-
+    def _counted(name, real):
         def wrapper(*args, **kwargs):
             counts[name] += 1
             return real(*args, **kwargs)
@@ -1274,10 +1294,26 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
 
     local_len = seq_len // world_size
     begin = rank * local_len
-    with (
-        patch(f"{_PATCHED_MODULE}.sparse_attn_tilelang", _counted("sparse_attn_tilelang")),
-        patch(f"{_PATCHED_MODULE}.v4_lighting_indexer", _counted("v4_lighting_indexer")),
-    ):
+    with ExitStack() as stack:
+        if tilelang:
+            from veomni.ops import resolve_op
+
+            attention_entry = resolve_op("dsa_attention", "deepseek_v4", "tilelang")
+            indexer_entry = resolve_op("dsa_indexer", "deepseek_v4", "tilelang")
+            stack.enter_context(
+                patch.object(
+                    attention_entry,
+                    "wrapper",
+                    _counted("sparse_attn_tilelang", attention_entry.wrapper),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    indexer_entry,
+                    "wrapper",
+                    _counted("v4_lighting_indexer", indexer_entry.wrapper),
+                )
+            )
         # Baseline: the whole packed batch with the parallel state stubbed out.
         no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
         with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):

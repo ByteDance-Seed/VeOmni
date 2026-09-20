@@ -1,5 +1,6 @@
 import pytest
 
+from tests.tools.training_utils import make_eager_ops_config, unbuilt_runtime
 from veomni.models import build_foundation_model
 from veomni.trainer.vlm_trainer import (
     VeOmniVLMArguments,
@@ -8,8 +9,6 @@ from veomni.trainer.vlm_trainer import (
     VLMModelRuntime,
     _get_vlm_visual_module,
 )
-
-from ..tools.training_utils import make_eager_ops_config, unbuilt_runtime
 
 
 _FREEZE_VIT_VLM_CASES = [

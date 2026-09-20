@@ -36,6 +36,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -44,7 +45,7 @@ import transformers
 import yaml
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
-from veomni.models import build_foundation_model
+from veomni.models import MODELING_REGISTRY, build_foundation_model
 from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
@@ -76,7 +77,7 @@ class LoraYamlSpec:
         yaml: Path (relative to repo root) of the LoRA fine-tuning yaml.
         min_transformers_version: Minimum ``transformers`` version where
             this model family is registered (mirrors the gate in
-            ``veomni/models/transformers/<model>/__init__.py``). Tests skip
+            the model package's ``__init__.py``). Tests skip
             on older envs rather than failing during model build.
     """
 
@@ -129,11 +130,10 @@ def full_eager_ops() -> OpsImplementationConfig:
 def fused_triton_moe_ops() -> OpsImplementationConfig:
     """Eager everywhere *except* MoE, which uses the Triton group-gemm backend.
 
-    Selecting ``moe_implementation="fused_triton"`` triggers
-    ``apply_veomni_fused_moe_patch("triton")`` during ``build_foundation_model``,
-    which is what installs ``veomni.lora.ops._fused_lora_moe_forward``.
-    The fused MoE-LoRA tests need that pointer to be non-``None`` to actually
-    exercise the kernel path inside ``LoraSharedExperts.forward``.
+    Selecting ``moe_implementation="fused_triton"`` installs the ops config that
+    ``LoraSharedExperts`` / ``LoraIndependentExperts`` read via
+    ``resolve_op_impl("moe_implementation")`` to construct
+    ``VeomniOp("moe_experts_lora", variant, "fused_triton")``.
     """
     return OpsImplementationConfig(
         attn_implementation="eager",
@@ -149,9 +149,8 @@ def fused_triton_moe_ops() -> OpsImplementationConfig:
 def fused_npu_moe_ops() -> OpsImplementationConfig:
     """Eager everywhere *except* MoE, which uses the Ascend NPU group-gemm backend.
 
-    Selecting ``moe_implementation="fused_npu"`` triggers
-    ``apply_veomni_fused_moe_patch("npu")``, which binds both the base fused MoE
-    pointer and the LoRA-aware NPU kernels in ``veomni.lora.ops``.
+    Selecting ``moe_implementation="fused_npu"`` installs the ops config that
+    LoRA wrappers read to construct ``VeomniOp("moe_experts_lora", variant, "fused_npu")``.
     """
     return OpsImplementationConfig(
         attn_implementation="eager",
@@ -162,6 +161,23 @@ def fused_npu_moe_ops() -> OpsImplementationConfig:
         rotary_pos_emb_implementation="eager",
         load_balancing_loss_implementation="eager",
     )
+
+
+def build_lora_test_model(config_path: str, **kwargs):
+    """Build a registered model family through ``veomni.models``.
+
+    LoRA tests may receive an unsupported toy configuration, so skip model
+    types that are not present in the public registry.
+    """
+    config_file = Path(config_path)
+    if config_file.is_dir():
+        config_file = config_file / "config.json"
+    model_type = yaml.safe_load(config_file.read_text(encoding="utf-8"))["model_type"]
+
+    if model_type not in MODELING_REGISTRY.valid_keys():
+        pytest.skip(f"{model_type}: not registered in veomni.models yet")
+
+    return build_foundation_model(config_path=config_path, **kwargs)
 
 
 def build_toy(toy_dir: str, *, ops: OpsImplementationConfig | None = None):
@@ -178,7 +194,7 @@ def build_toy(toy_dir: str, *, ops: OpsImplementationConfig | None = None):
     cfg_path = os.path.join(TOY_CONFIG_ROOT, toy_dir)
     if not os.path.isfile(os.path.join(cfg_path, "config.json")):
         pytest.skip(f"toy config not found: {cfg_path}")
-    return build_foundation_model(
+    return build_lora_test_model(
         config_path=cfg_path,
         weights_path=None,
         torch_dtype="bfloat16",

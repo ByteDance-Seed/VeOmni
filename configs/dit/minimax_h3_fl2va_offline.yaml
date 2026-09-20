@@ -32,7 +32,7 @@ model:
     audio_cond_noise_aug: 1.0
 
   ops_implementation:
-    attn_implementation: eager
+    attn_implementation: sdpa
     rotary_pos_emb_implementation: eager
     rms_norm_implementation: eager
     swiglu_mlp_implementation: eager
