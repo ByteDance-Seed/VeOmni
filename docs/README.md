@@ -120,7 +120,8 @@ list is generated from the current page. Presentation lives in `_templates/` and
 
 Model recipe sources live in `models/<family>/`. Published `examples/*.md` URLs
 remain as orphan compatibility includes with relative-link rewriting, so they
-render the maintained recipe rather than a second copy. Use an explicit anchor
+render the maintained recipe rather than a second copy. Mark these compatibility
+pages `no-search: true` so search results point to the canonical model page. Use an explicit anchor
 when renaming a previously published heading. Test the old and new URLs.
 
 After a layout change, check desktop and mobile widths, section switching, family

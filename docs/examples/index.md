@@ -1,5 +1,6 @@
 ---
 orphan: true
+no-search: true
 ---
 
 # Models and Recipes
