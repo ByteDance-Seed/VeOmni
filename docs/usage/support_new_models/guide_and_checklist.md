@@ -147,7 +147,7 @@ logging, and checkpoint cadence under `train`. Check field names against the
 [arguments reference](../arguments.md) and the actual dataclasses.
 
 Add a recipe with prerequisites, preparation, launch, output checks, and limits,
-then link its configuration in the [catalog](../../examples/index.md).
+then link its configuration in the [catalog](../../models/index.md).
 
 ### Step 10: Test
 

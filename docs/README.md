@@ -12,7 +12,7 @@ same checkout, and state a revision explicitly for historical validation results
 | Contribution workflow | Root `CONTRIBUTING.md` |
 | Installation and the first training run | `get_started/` |
 | Routine training and data workflows | `usage/` |
-| Model-specific recipes | `examples/` |
+| Model family overviews and recipes | `models/<family>/`; catalog in `models/index.md` |
 | Feature usage | `key_features/` |
 | Contributor architecture and extension contracts | `developer/` |
 | Implementation rationale | `design/` |
@@ -42,8 +42,11 @@ Group navigation by reader task even when older files retain their paths.
    the current source. Distinguish a provided recipe from a hardware-validated
    recipe; record the environment and revision for validation claims.
 
-Training recipes should cover: scope and supported variants; prerequisites;
-model and data preparation; launch; expected outputs; limitations and next steps.
+Model recipes use six H2 sections: model introduction; variants and recipes;
+environment and data; launch training; recipe configuration; validation and next
+steps. Add each recipe to its family overview and toctree, then link the model
+name from `models/index.md`. Keep YAML paths and implementation details on the
+recipe page rather than in the top-level model catalog.
 Mark placeholders explicitly. Separate a short user procedure from lengthy
 implementation explanations and link the two.
 
@@ -106,3 +109,19 @@ External URL availability, source-only heading fragments in root Markdown,
 configuration semantics, and hardware validation still require review. Model
 catalog links are checked like other local configuration references; listing a
 configuration does not certify a hardware combination.
+
+## Navigation and presentation
+
+The site uses the pinned PyData Sphinx theme with a small header/sidebar override.
+`conf.py` defines the top-level section tabs; keep `DOC_SECTIONS` aligned with the
+root toctree. Each section owns its sidebar subtree, while the right-hand contents
+list is generated from the current page. Presentation lives in `_templates/` and
+`assets/css/veomni.css`; it does not require external fonts or a client-side build.
+
+Model recipe sources live in `models/<family>/`. Published `examples/*.md` URLs
+remain as orphan compatibility includes with relative-link rewriting, so they
+render the maintained recipe rather than a second copy. Use an explicit anchor
+when renaming a previously published heading. Test the old and new URLs.
+
+After a layout change, check desktop and mobile widths, section switching, family
+expansion, search, keyboard navigation, and both color modes in a browser.

@@ -1,0 +1,12 @@
+<div class="veomni-header bd-page-width">
+  <div class="veomni-header-top">
+    <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation"><span class="fa-solid fa-bars"></span></button>
+    <a class="veomni-brand" href="{{ pathto('index') }}"><img src="{{ pathto('_static/logo.png', 1) }}" alt="VeOmni"><span>Documentation</span></a>
+    <button class="veomni-search search-button search-button__button pst-js-only" aria-label="Search documentation"><span class="fa-solid fa-magnifying-glass" aria-hidden="true"></span><span>Search documentation…</span><kbd>Ctrl K</kbd></button>
+    <div class="veomni-header-actions">{% include "theme-switcher.html" %}<a href="https://github.com/ByteDance-Seed/VeOmni" aria-label="VeOmni on GitHub"><span class="fa-brands fa-github" aria-hidden="true"></span></a></div>
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page"><span class="fa-solid fa-outdent"></span></button>
+  </div>
+  <nav class="veomni-tabs" aria-label="Documentation sections">
+    {% for root, label in doc_sections %}<a href="{{ pathto(root) }}"{% if doc_section == root %} class="active" aria-current="true"{% endif %}>{{ label }}</a>{% endfor %}
+  </nav>
+</div>

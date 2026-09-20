@@ -12,9 +12,4 @@ installation/install_ascend_x86
 installation/install_ascend_arm
 ```
 
-```{toctree}
-:maxdepth: 1
-:caption: Other accelerators and operations
-
-../hardware_support/index
-```
+For vendor environments and platform-specific operations, see [Hardware](../hardware_support/index.md).

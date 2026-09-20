@@ -1,7 +1,7 @@
 # Qwen3 VL: Model Integration Example
 
 This is a contributor's map of the current generated Qwen3 VL integration.
-For training commands, use the [Qwen3 VL recipe](../../examples/qwen3_vl.md).
+For training commands, use the [Qwen3 VL recipe](../../models/qwen/qwen3-vl.md).
 Follow the [integration checklist](guide_and_checklist.md) when adding a model.
 
 The authoritative modeling input is the

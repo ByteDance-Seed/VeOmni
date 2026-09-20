@@ -13,7 +13,7 @@ Select the environment for your accelerator. Platform guides describe their own 
 
 Follow each guide's dependency instructions. Do not apply the NVIDIA uv extra
 to a vendor-provided ROCm or MLU environment. For model configurations, use the
-[recipe catalog](../examples/index.md).
+[recipe catalog](../models/index.md).
 
 ```{toctree}
 :maxdepth: 1

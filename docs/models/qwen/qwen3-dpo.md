@@ -1,0 +1,137 @@
+<span id="qwen3-dpo-training-guide"></span>
+
+# Qwen3 DPO
+
+## 1. Model introduction
+
+### Scope and prerequisites
+
+Preference training with Qwen3 and chosen/rejected conversation pairs.
+
+Configuration: [training YAML](../../../configs/text/qwen3_dpo.yaml). Read the
+[catalog prerequisites and validation scope](../index.md#choose-hardware-and-check-a-run)
+before following the model-specific steps below.
+
+DPO training with **Qwen3-0.6B** on the
+[trl-lib/ultrafeedback_binarized](https://huggingface.co/datasets/trl-lib/ultrafeedback_binarized) dataset.
+
+Config: [`configs/text/qwen3_dpo.yaml`](../../../configs/text/qwen3_dpo.yaml)
+
+---
+
+## 2. Variants and recipes
+
+| Variant / component | Model repository | Recipe scope |
+| --- | --- | --- |
+| Qwen3-0.6B | [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Chosen / rejected conversation pairs |
+
+This table identifies checkpoints used by the recipe. Full-size hardware validation
+is separate from configuration availability; see the [validation scope](../index.md#choose-hardware-and-check-a-run).
+
+## 3. Environment and data
+
+Install the [environment for your accelerator](../../hardware_support/index.md)
+and run the commands from the repository root. Replace example filesystem paths
+with your own model, dataset, and output locations.
+
+### Step 1 — Prepare the dataset
+
+```shell
+python scripts/download_hf_data.py \
+    --repo_id trl-lib/ultrafeedback_binarized \
+    --local_dir ./ultrafeedback_binarized \
+    --allow_patterns "*.parquet"
+```
+
+This downloads all train and test Parquet files from the Hub into `./ultrafeedback_binarized/`.
+
+---
+
+### Step 2 — Prepare the model
+
+```shell
+python scripts/download_hf_model.py \
+    --repo_id Qwen/Qwen3-0.6B \
+    --local_dir .
+```
+
+The script appends the model name to `--local_dir`, saving to `./Qwen3-0.6B`.
+
+---
+
+## 4. Launch training
+
+### Step 3 — Start DPO training
+
+```shell
+bash train.sh tasks/train_text_dpo.py configs/text/qwen3_dpo.yaml
+```
+
+Key config values (full DPO argument reference: [arguments.md — DPOConfig](../../usage/arguments.md#dpoconfig)):
+
+| Parameter | Value |
+|---|---|
+| `model.model_path` | `./Qwen3-0.6B` |
+| `data.train_path` | `./ultrafeedback_binarized` |
+| `data.max_seq_len` | `2048` |
+| `train.global_batch_size` | `8` |
+| `train.micro_batch_size` | `1` |
+| `train.num_train_epochs` | `1` |
+| `dpo_config.beta` | `0.1` |
+| `dpo_config.loss_type` | `sigmoid` |
+| frozen reference | copies `model`; custom `reference_model` config is not supported |
+| `train.checkpoint.output_dir` | `Qwen3-0.6B-dpo-ultrafeedback` |
+| `train.wandb.project` | `VeOmni` |
+| `train.wandb.name` | `Qwen3-0.6B-dpo-ultrafeedback` |
+
+---
+
+## 5. Recipe configuration
+
+| Configuration | Data | Sequence length | SP / EP | Global batch |
+| --- | --- | --- | --- | --- |
+| [qwen3_dpo.yaml](../../../configs/text/qwen3_dpo.yaml) | dpo | 2048 | default / default | 8 |
+
+These are checked-in defaults, not minimum hardware requirements. Match the
+world size, batch size, and parallel topology to your checkpoint and memory budget.
+
+## 6. Validation and next steps
+
+### Step 4 — Monitor training
+
+Training outputs (DPO loss, chosen/rejected rewards, reward accuracy, grad norm) are printed every
+step and logged to Weights & Biases.
+
+---
+
+### Checkpoints
+
+Checkpoints are saved under `train.checkpoint.output_dir` every `save_steps` steps.
+With `save_hf_weights: true`, a HuggingFace-compatible checkpoint is also written:
+
+```
+Qwen3-0.6B-dpo-ultrafeedback/
+└── checkpoints/
+    └── global_step_200/
+        ├── checkpoint_manifest.json ← written last; marks the step resumable
+        ├── model/
+        │   ├── ckpt/                ← DCP shards: weights
+        │   ├── optimizer/           ← DCP shards: optimizer state
+        │   └── lr_scheduler.pt
+        ├── loader/rank_{R}.pt       ← dataloader cursor
+        ├── extra_state/rank_{R}.pt  ← step, rng, meters
+        └── hf_ckpt/                 ← HuggingFace safetensors (when save_hf_weights)
+```
+
+File-by-file contract: [Checkpoint layout](../../usage/checkpoint.md).
+
+### Check outputs and continue
+
+Use the [run checks](../index.md#choose-hardware-and-check-a-run) and
+[checkpoint completion contract](../../usage/checkpoint.md#completion) for training.
+
+### Related guides
+
+- [Checkpoint save, resume, and export](../../usage/checkpoint.md)
+- [LoRA](../../key_features/lora.md)
+- [Model families](../index.md)

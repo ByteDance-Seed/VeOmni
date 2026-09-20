@@ -81,6 +81,6 @@ For MagiAttention, use the optional uv extra described above.
 ## Next steps
 
 - Complete the [Quick Start](../quick_start.md), then explore the
-  [Qwen3 training guide](../../examples/qwen3.md).
+  [Qwen3 training guide](../../models/qwen/qwen3.md).
 - For code or documentation contributions, read the
   [contribution guide](https://github.com/ByteDance-Seed/VeOmni/blob/main/CONTRIBUTING.md).

@@ -144,7 +144,7 @@ run for that environment, not a minimum-memory or convergence claim.
 ## Next steps
 
 - Replace the synthetic records with a real dataset using the
-  [Qwen3 recipe](../examples/qwen3.md).
+  [Qwen3 recipe](../models/qwen/qwen3.md).
 - Enable [packing and dynamic batching](../usage/data_packing_and_dyn_bsz.md).
-- Choose a different modality from [Models and Recipes](../examples/index.md).
+- Choose a different modality from [Models and Recipes](../models/index.md).
 - Look up overrides in the [arguments reference](../usage/arguments.md).

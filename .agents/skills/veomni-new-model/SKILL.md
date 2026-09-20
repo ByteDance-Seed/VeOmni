@@ -135,7 +135,7 @@ Come back here once the model loads and its registry / patch tests pass.
 5. **Update documentation**:
    - Add usage example to `docs/` (training command, config reference).
    - Update `.agents/knowledge/architecture.md` if the model adds a new module or trainer path.
-   - Update the model and recipe catalog in `docs/examples/index.md`; the project `README.md` links to it.
+   - Update the model and recipe catalog in `docs/models/index.md` and its family guide; the project `README.md` links to it.
 
 ## Common Pitfalls
 

@@ -1,37 +1,53 @@
-# Welcome to VeOmni
+# VeOmni
 
-VeOmni is a PyTorch-native framework for text, vision-language, audio/video, and
-diffusion model training. Reusable model runtimes, data pipelines, and distributed
-components support pre-training and post-training workflows.
+<p class="doc-lead">Train language, vision, audio, and diffusion models with a composable PyTorch framework.</p>
 
-## Start here
+VeOmni combines reusable model runtimes, data pipelines, and distributed training
+components for pre-training and post-training. Start with a short training run,
+or go directly to the recipe for your model.
 
-| Your goal | Guide |
+<div class="doc-cards">
+<a class="doc-card" href="get_started/quick_start.html"><strong>Quick Start →</strong><span>Prepare a small dataset, train Qwen3, and verify your first checkpoint.</span></a>
+<a class="doc-card" href="models/index.html"><strong>Supported Models →</strong><span>Explore model families and complete text, multimodal, and diffusion recipes.</span></a>
+<a class="doc-card" href="hardware_support/index.html"><strong>Installation & hardware →</strong><span>Choose the environment and kernel settings for your accelerator.</span></a>
+<a class="doc-card" href="developer/index.html"><strong>Developer Guide →</strong><span>Understand the architecture, integrate a model, and contribute changes.</span></a>
+</div>
+
+## Training workflows
+
+- **Language models:** plaintext pre-training, supervised fine-tuning, LoRA, and DPO.
+- **Multimodal models:** image, video, and audio conversations with model-specific processors.
+- **Diffusion models:** full-model training, adapters, and offline conditioning pipelines.
+- **Distributed execution:** FSDP2, Ulysses sequence parallelism, and expert parallelism.
+
+See [Models](models/index.md) for the recipe-specific combinations and
+[Features](key_features/index.md) for configuration and usage.
+
+## Explore the documentation
+
+| Section | What you will find |
 | --- | --- |
-| Run your first training job | [Quick Start](get_started/quick_start.md) |
-| Install for your hardware | [Getting Started](get_started/index.md) |
-| Choose a model and configuration | [Models and Recipes](examples/index.md) |
-| Prepare data or manage checkpoints | [User Guide](usage/index.md) |
-| Configure parallelism or LoRA | [Features](key_features/index.md) |
-| Look up a configuration field | [Reference](reference/index.md) |
-| Extend or contribute to VeOmni | [Developer Guide](developer/index.md) |
+| [User Guide](guide/index.md) | Installation, data, checkpoints, and configuration reference |
+| [Models](models/index.md) | Family overviews and model-specific preparation / launch recipes |
+| [Features](key_features/index.md) | Parallelism, LoRA, and training features |
+| [Developer Guide](developer/index.md) | Architecture, model integration, and contribution workflows |
+| [Design](design/index.md) | Implementation contracts and migration history |
+| [Hardware](hardware_support/index.md) | Platform setup, evidence, and operating notes |
 
-The `latest` documentation tracks `main`. For an older checkout, use that
-revision's documentation and configurations together. See the
-[project README](https://github.com/ByteDance-Seed/VeOmni) for milestones,
-roadmaps, and community links.
+The `latest` documentation follows `main`. For another checkout, use documentation
+and configurations from the same revision. See the
+[project README](https://github.com/ByteDance-Seed/VeOmni) for milestones and community links.
 
 ```{toctree}
 :hidden:
-:maxdepth: 2
+:maxdepth: 3
 
-get_started/index
-usage/index
-examples/index
-key_features/index
-reference/index
-developer/index
-design/index
+User Guide <guide/index>
+Models <models/index>
+Features <key_features/index>
+Developer Guide <developer/index>
+Design <design/index>
+Hardware <hardware_support/index>
 ```
 
 ## Citation

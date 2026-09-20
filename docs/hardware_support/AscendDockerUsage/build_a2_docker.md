@@ -214,7 +214,7 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5/qwen3_5_vl.yaml \
     --train.max_steps 20
 ```
 
-See the [Qwen3.5 training guide](../../examples/qwen3_5.md#start-training-on-npu)
+See the [Qwen3.5 training guide](../../models/qwen/qwen3-5.md#start-training-on-npu)
 for backend details and the Qwen3.5 MoE example.
 
 ## Step 5: Stop and Remove the Container
