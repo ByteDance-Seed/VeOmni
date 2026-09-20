@@ -72,6 +72,8 @@ class OmniModuleRuntimeConfig(ModelArguments):
         does for anything without an explicit ``model_path``) would silently
         resolve to the wrong path for that module.
         """
+        from dataclasses import asdict
+
         from ...modules.module_configuration_base import OmniModuleConfig
 
         return OmniModuleConfig.from_runtime(
@@ -79,6 +81,7 @@ class OmniModuleRuntimeConfig(ModelArguments):
             model_path=self.model_path,
             model_config=hf_module_model_config(self.model_config),
             processor_config=self.processor_config,
+            ops_implementation=asdict(self.ops_implementation),
         )
 
 

@@ -64,7 +64,7 @@ def test_runtime_config_keeps_the_full_launcher_view():
 
 
 def test_to_hf_config_projects_onto_the_checkpoint_view():
-    """The HF config stores subfolder and optional model_config; ops stay on runtime args."""
+    """The HF config stores subfolder, this module's kernels, and optional model_config."""
     runtime_cfg = _janus_model_runtime()
     cfg = runtime_cfg.to_hf_config()
 
@@ -82,14 +82,19 @@ def test_to_hf_config_projects_onto_the_checkpoint_view():
     # of silently re-deriving the wrong `checkpoint_root/module_name` path). It
     # still never reaches an actually persisted checkpoint: `copy_for_hf_export` /
     # `normalize_modules_for_hf_export` rebuild each module from subfolder +
-    # optional `model_config`, dropping `model_path`. Ops live on the runtime
-    # args and are never written onto OmniConfig.
+    # optional `model_config` / `ops_implementation`, dropping `model_path`.
     assert cfg.modules["janus_siglip"]["model"]["model_path"] == runtime_cfg.modules["janus_siglip"].model_path
+    # Ops DO travel with the module. Per-module kernel choices are set per module
+    # in the launcher YAML (`janus_vqvae` runs eager attention where the LLM does
+    # not), and the native load path — `OmniModel.from_pretrained` with no
+    # launcher — has no other carrier for them: without this, every slot on every
+    # module falls back to the caller's single global config, which for a MoE
+    # module means the eager per-expert dispatch.
     for name in ("janus_vqvae", "janus_llama"):
         runtime_ops = runtime_cfg.modules[name].ops_implementation
         assert runtime_ops.attn_implementation is not None
         model_block = cfg.modules[name].get("model") or {}
-        assert "ops_implementation" not in model_block
+        assert model_block["ops_implementation"]["attn_implementation"] == runtime_ops.attn_implementation
 
 
 def test_hf_export_strips_model_path_from_the_persisted_checkpoint():
@@ -324,7 +329,41 @@ def test_runtime_to_hf_config_roundtrips_through_checkpoint(tmp_path):
         assert reloaded.module_subfolder(name) == name
         assert os.path.basename(hf_cfg.module_subfolder(name)) == name
         exported_model = reloaded.normalize_modules_for_hf_export()[name].get("model") or {}
-        assert "ops_implementation" not in exported_model
+        assert "model_path" not in exported_model
+        # Kernels survive load→save. `from_pretrained` replaces each descriptor
+        # with a hydrated family config, which has nowhere to keep the `model`
+        # block, so without the stash this is where a re-export would drop them.
+        assert (
+            exported_model["ops_implementation"]["attn_implementation"]
+            == runtime_cfg.modules[name].ops_implementation.attn_implementation
+        )
+
+
+def test_launcher_module_args_win_over_the_persisted_kernels(tmp_path):
+    """Persisting kernels does not freeze them into the checkpoint.
+
+    The checkpoint's value is the fallback for a caller that has no launcher —
+    a bare ``OmniModel.from_pretrained(root)``. Everything that *does* go
+    through VeOmni re-states it from the per-module launcher args instead:
+    ``ModuleRuntime._build_model`` passes ``args.ops_implementation`` to
+    ``build_foundation_model`` without consulting :class:`OmniConfig` at all,
+    and the eager-inference path (``OmniInferencer``) hands
+    ``OmniModel.from_pretrained`` a ``config=`` projected from those same args.
+    This pins the second one, which is the one that reads the config and so the
+    one that could plausibly have picked the stale value up.
+    """
+    export_root = tmp_path / "exported"
+    _janus_model_runtime(model_path=str(tmp_path)).to_hf_config().save_pretrained(export_root)
+
+    persisted = OmniConfig.from_pretrained(export_root)
+    assert persisted.module_ops_implementation("janus_llama")["attn_implementation"] is not None
+
+    relaunched = _janus_model_runtime(model_path=str(tmp_path))
+    relaunched.modules["janus_llama"].ops_implementation.attn_implementation = "sdpa"
+
+    # What OmniInferencer passes as `config=` on the eager path.
+    from_launcher = relaunched.to_hf_config()
+    assert from_launcher.module_ops_implementation("janus_llama")["attn_implementation"] == "sdpa"
 
 
 def test_resolve_model_reads_graphs_from_omni_checkpoint(tmp_path):

@@ -123,7 +123,16 @@ class OmniConfig(PretrainedConfig):
 
     def normalize_modules_for_hf_export(self) -> Dict[str, Dict[str, Any]]:
         """Slim ``modules`` block for HF ``config.json`` (subfolder + optional config overrides)."""
-        return {name: self.module(name).to_export_dict() for name in self.module_names}
+        normalized: Dict[str, Dict[str, Any]] = {}
+        for name in self.module_names:
+            slim = self.module(name).to_export_dict()
+            # A hydrated entry has no descriptor left to read the kernels off,
+            # so re-export is where a load→save round trip would drop them.
+            ops = self.module_ops_implementation(name)
+            if ops:
+                slim.setdefault("model", {})["ops_implementation"] = deepcopy(ops)
+            normalized[name] = slim
+        return normalized
 
     def copy_for_hf_export(
         self,
@@ -150,6 +159,29 @@ class OmniConfig(PretrainedConfig):
         """Per-module preprocessor ``from_pretrained`` kwargs."""
         return self.module(name).processor_config()
 
+    def module_ops_implementation(self, name: str) -> Dict[str, Any]:
+        """Per-module VeOmni kernel options persisted in the checkpoint.
+
+        Reads the stash first: :meth:`from_pretrained` hydrates each entry into
+        a family :class:`PretrainedConfig`, which has no room for the descriptor's
+        ``model`` block, so the value would otherwise be gone by the time
+        ``OmniModel._load_modules`` asks for it.
+        """
+        cached = getattr(self, "_module_load_options", {}).get(name, {})
+        ops = cached.get("ops_implementation")
+        if ops:
+            return dict(ops)
+        return self.module(name).ops_implementation()
+
+    def _stash_module_load_options(self) -> None:
+        """Preserve ``model.ops_implementation`` before module entries are hydrated."""
+        options: Dict[str, Dict[str, Any]] = {}
+        for name in self.module_names:
+            ops = self.module(name).ops_implementation()
+            if ops:
+                options[name] = {"ops_implementation": deepcopy(ops)}
+        self._module_load_options = options
+
     def resolve_module_path(self, checkpoint_root: Optional[Union[str, os.PathLike]], name: str) -> str:
         """Resolve the on-disk path for module ``name`` under ``checkpoint_root``."""
         return self.module(name).resolve_path(checkpoint_root)
@@ -172,6 +204,7 @@ class OmniConfig(PretrainedConfig):
         """
         config = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
         root = getattr(config, "_name_or_path", None) or str(pretrained_model_name_or_path)
+        config._stash_module_load_options()
         config._hydrate_graphs_from_checkpoint(root)
         config._hydrate_modules_from_checkpoint(root)
         return config
