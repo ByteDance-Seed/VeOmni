@@ -17,25 +17,14 @@
 # ruff: noqa
 # Adapted from veomni/ops/kernels/deepseek_v4/tilelang_sparse_mla_bwd.py for
 # Qwen4-Exp QSA.
-# Key differences from DeepSeek-V4:
-#   - GQA: K and V are separate tensors with ``kv_heads`` heads. dP uses
-#     dO @ V^T (MLA could reuse its single KV tensor), and dK/dV are two
-#     separate atomic-scatter accumulators.
-#   - No attention sink gradient.
-#   - dQ and dK/dV are computed by two separate kernels. A single fused kernel
-#     must hold acc_dq plus both [block_size, D] fp32 KV-gradient accumulators,
-#     which at D=256 spills ~2x the register file to local memory and measured
-#     3.3x slower than the DeepSeek-V4 kernel at the same shape. Splitting
-#     recomputes P in the dKV kernel but keeps every fragment resident.
-#   - No KV-block padding: QSA queries and keys share one row space
-#     (S == S_kv), so rounding S_kv would not reduce the specialization count;
-#     the kernels recompile when the packed sequence length changes, which is
-#     fixed for a given token budget in training.
+# dQ retains the query-owned sparse gather kernel. dK/dV are reduced by
+# KV-owned CTAs in tilelang_qsa_dkv.py, using exact reverse adjacency and
+# disjoint FP32 partials instead of floating-point atomic scatter.
 import tilelang
 import torch
 from tilelang import language as T
 
-from ....utils.device import get_torch_device
+from .tilelang_qsa_dkv import qsa_dkv_owned
 
 
 def cta_threads(block_H, block_size):
@@ -54,32 +43,6 @@ def cta_threads(block_H, block_size):
     kernel.
     """
     return min(256, block_size * block_H // 4)
-
-
-def _dkv_split_store(block_H, block_size, D):
-    """Pick the dKV atomic-store staging split for a ``(block_H, block_size, D)`` tile.
-
-    The staging buffer is ``[block_size // split_store, D]`` fp32 shared memory.
-    With the naive 2-way split at D=256 the kernel needs 118784 B of dynamic
-    shared memory, which exceeds the 101376 B opt-in limit of cut-down Ada
-    parts (L20/L4); splitting the staged rows finer trades a few extra copy
-    loops for a buffer that fits every GPU the forward runs on.
-    """
-    base = (
-        2 * block_H * D * 2  # Q, dO
-        + 2 * block_size * D * 2  # K, V
-        + 2 * block_H * block_size * 2  # P/dP staging casts
-        + block_size  # mask
-    )
-    try:
-        limit = get_torch_device().get_device_properties(None).shared_memory_per_block_optin
-    except (RuntimeError, AttributeError):
-        limit = 101376  # conservative floor: cut-down Ada (L20/L4)
-    budget = limit - base - 1024  # headroom for allocator alignment
-    split_store = 2
-    while split_store < block_size and (block_size // split_store) * D * 4 > budget:
-        split_store *= 2
-    return split_store
 
 
 @tilelang.jit(out_idx=[-1])
@@ -118,35 +81,6 @@ def preprocess(
             T.copy(delta, Delta[bz, by * block_ND : (by + 1) * block_ND, bx])
 
     return preprocess_kernel
-
-
-@tilelang.jit(out_idx=[-1])
-def postprocess(
-    B,
-    N,
-    D,
-    block_N=64,
-    threads=128,
-    dtype=T.bfloat16,
-    accum_dtype=T.float32,
-):
-    """Cast an fp32 gradient accumulator to bf16; N folds the KV-head axis."""
-    assert dtype == T.bfloat16
-    assert accum_dtype == T.float32
-    shape = [B, N, D]
-
-    @T.prim_func
-    def postprocess_kernel(
-        dG: T.Tensor(shape, accum_dtype),
-        dG_out: T.Tensor(shape, dtype),
-    ):
-        with T.Kernel(T.ceildiv(N, block_N), B, threads=threads) as (bx, by):
-            T.copy(
-                dG[by, bx * block_N : (bx + 1) * block_N, :],
-                dG_out[by, bx * block_N : (bx + 1) * block_N, :],
-            )
-
-    return postprocess_kernel
 
 
 @tilelang.jit(
@@ -286,197 +220,6 @@ def bwd_dq(
     return qsa_bwd_dq_kernel
 
 
-@tilelang.jit(
-    out_idx=None,
-    pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: False,
-    },
-)
-def bwd_dkv(
-    B,
-    S,
-    S_kv,
-    kv_heads,
-    group_width,
-    D,
-    topk,
-    sm_scale=None,
-    block_size=64,
-    num_stages=0,
-    threads=None,
-    indices_dtype=T.int32,
-    dtype=T.bfloat16,
-    accum_dtype=T.float32,
-):
-    """dK/dV kernel: atomic-scatter dS^T @ Q and P^T @ dO into fp32 accumulators."""
-    assert topk % block_size == 0, f"topk ({topk}) must be divisible by block_size ({block_size})"
-    assert dtype == T.bfloat16
-    assert accum_dtype == T.float32
-
-    if sm_scale is None:
-        sm_scale = D ** (-0.5)
-    sm_scale_mul_reciprocal_log2 = sm_scale * 1.44269504  # log2(e)
-
-    H = kv_heads * group_width
-    q_shape = [B, S, H, D]
-    kv_shape = [B, S_kv, kv_heads, D]
-    o_shape = [B, S, H, D]
-    indices_shape = [B, S, topk]
-    delta_shape = [B, S, H]
-    lse_shape = [B, S, H]
-
-    block_H = min(64, group_width)
-    assert group_width % block_H == 0
-    NH = group_width // block_H
-    BS = block_size
-    NS = tilelang.cdiv(topk, block_size)
-
-    if threads is None:
-        threads = cta_threads(block_H, BS)
-    assert threads % 32 == 0 and threads & (threads - 1) == 0, (
-        f"threads ({threads}) must be a power-of-two multiple of the 32-lane warp"
-    )
-    assert threads <= BS * block_H // 4, (
-        f"threads ({threads}) exceeds the GEMM warp-tile bound {BS * block_H // 4} "
-        f"for block_H={block_H}, block_size={BS}"
-    )
-
-    split_store = _dkv_split_store(block_H, BS, D)
-
-    @T.prim_func
-    def qsa_bwd_dkv_kernel(
-        Q: T.Tensor(q_shape, dtype),
-        K: T.Tensor(kv_shape, dtype),
-        V: T.Tensor(kv_shape, dtype),
-        dO: T.Tensor(o_shape, dtype),
-        Indices: T.Tensor(indices_shape, indices_dtype),
-        Lse: T.Tensor(lse_shape, accum_dtype),
-        Delta: T.Tensor(delta_shape, accum_dtype),
-        dK: T.Tensor(kv_shape, accum_dtype),
-        dV: T.Tensor(kv_shape, accum_dtype),
-    ):
-        with T.Kernel(S, B, kv_heads * NH, threads=threads) as (s_i, by, bz):
-            kv_head = bz // NH
-            h0 = kv_head * group_width + (bz % NH) * block_H
-
-            Q_shared = T.alloc_shared([block_H, D], dtype)
-            K_shared = T.alloc_shared([BS, D], dtype)
-            V_shared = T.alloc_shared([BS, D], dtype)
-            dO_shared = T.alloc_shared([block_H, D], dtype)
-            mask = T.alloc_fragment([BS], "bool")
-            mask_shared = T.alloc_shared([BS], "bool")
-            safe_indices = T.alloc_fragment([BS], indices_dtype)
-
-            P_shared_cast = T.alloc_shared([block_H, BS], dtype)
-            dP_shared_cast = T.alloc_shared([block_H, BS], dtype)
-
-            acc_p = T.alloc_fragment([block_H, BS], accum_dtype)
-            acc_dp = T.alloc_fragment([block_H, BS], accum_dtype)
-            acc_dk = T.alloc_fragment([BS, D], accum_dtype)
-            acc_dv = T.alloc_fragment([BS, D], accum_dtype)
-            acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
-
-            T.copy(Q[by, s_i, h0 : h0 + block_H, :D], Q_shared)
-            T.copy(dO[by, s_i, h0 : h0 + block_H, :D], dO_shared)
-
-            for i_i in T.Pipelined(NS, num_stages=num_stages):
-                for bi_i in T.Parallel(BS):
-                    mask[bi_i] = Indices[by, s_i, i_i * BS + bi_i] >= 0 and Indices[by, s_i, i_i * BS + bi_i] < S_kv
-                    safe_indices[bi_i] = T.if_then_else(mask[bi_i], Indices[by, s_i, i_i * BS + bi_i], 0)
-                # Stage the mask through shared memory: reading the mask *fragment*
-                # inside the [block_H, BS] pre-set loop below forces a per-tile
-                # cross-thread layout conversion of the fragment (measured ~2.7x at
-                # S=16K, topk=2112, D=256). A shared read broadcasts per bank instead.
-                T.copy(mask, mask_shared)
-
-                for h_i, bi_i in T.Parallel(block_H, BS):
-                    acc_p[h_i, bi_i] = T.if_then_else(mask_shared[bi_i], 0, -T.infinity(acc_p.dtype))
-
-                for bi_i, d_i in T.Parallel(BS, D):
-                    K_shared[bi_i, d_i] = K[
-                        by, T.max(T.min(Indices[by, s_i, i_i * BS + bi_i], S_kv - 1), 0), kv_head, d_i
-                    ]
-                for bi_i, d_i in T.Parallel(BS, D):
-                    V_shared[bi_i, d_i] = V[
-                        by, T.max(T.min(Indices[by, s_i, i_i * BS + bi_i], S_kv - 1), 0), kv_head, d_i
-                    ]
-
-                T.gemm(Q_shared, K_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
-
-                # P = exp2(scores * sm_scale_log2e - LSE)
-                for h_i, bi_i in T.Parallel(block_H, BS):
-                    acc_p[h_i, bi_i] = T.exp2(acc_p[h_i, bi_i] * sm_scale_mul_reciprocal_log2 - Lse[by, s_i, h0 + h_i])
-
-                T.copy(acc_p, P_shared_cast)
-
-                # dS = P * (dO @ V^T - Delta) * sm_scale
-                T.gemm(
-                    dO_shared, V_shared, acc_dp, transpose_B=True, policy=T.GemmWarpPolicy.FullCol, clear_accum=True
-                )
-
-                for h_i, bi_i in T.Parallel(block_H, BS):
-                    acc_dp[h_i, bi_i] = acc_p[h_i, bi_i] * (acc_dp[h_i, bi_i] - Delta[by, s_i, h0 + h_i]) * sm_scale
-
-                T.copy(acc_dp, dP_shared_cast)
-
-                # dK = dS^T @ Q, dV = P^T @ dO (per tile; scattered below)
-                T.gemm(
-                    dP_shared_cast,
-                    Q_shared,
-                    acc_dk,
-                    transpose_A=True,
-                    policy=T.GemmWarpPolicy.FullCol,
-                    clear_accum=True,
-                )
-                T.gemm(
-                    P_shared_cast,
-                    dO_shared,
-                    acc_dv,
-                    transpose_A=True,
-                    policy=T.GemmWarpPolicy.FullCol,
-                    clear_accum=True,
-                )
-
-                # Atomic stores with a shared-memory staging split: the gemm fragment
-                # layout does not give a thread four consecutive D elements, so the
-                # vectorized x4 store stages through shared memory; one buffer serves
-                # dK then dV.
-                for s in range(split_store):
-                    for bi_i, d_i in T.Parallel(BS, D):
-                        if bi_i < BS // split_store:
-                            acc_dkv_shared[bi_i, d_i] = acc_dk[bi_i + s * (BS // split_store), d_i]
-                    for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
-                        if mask_shared[bi_i + s * (BS // split_store)]:
-                            T.atomic_addx4(
-                                dK[
-                                    by,
-                                    safe_indices[bi_i + s * (BS // split_store)],
-                                    kv_head,
-                                    d_i * 4,
-                                ],
-                                acc_dkv_shared[bi_i, d_i * 4],
-                            )
-                for s in range(split_store):
-                    for bi_i, d_i in T.Parallel(BS, D):
-                        if bi_i < BS // split_store:
-                            acc_dkv_shared[bi_i, d_i] = acc_dv[bi_i + s * (BS // split_store), d_i]
-                    for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
-                        if mask_shared[bi_i + s * (BS // split_store)]:
-                            T.atomic_addx4(
-                                dV[
-                                    by,
-                                    safe_indices[bi_i + s * (BS // split_store)],
-                                    kv_head,
-                                    d_i * 4,
-                                ],
-                                acc_dkv_shared[bi_i, d_i * 4],
-                            )
-
-    return qsa_bwd_dkv_kernel
-
-
 def qsa_bwd_interface(q, k, v, o, do, selected_indices, lse, sm_scale=None):
     """Backward interface for Qwen4-Exp sparse GQA attention.
 
@@ -501,6 +244,8 @@ def qsa_bwd_interface(q, k, v, o, do, selected_indices, lse, sm_scale=None):
     assert o.is_contiguous() and do.is_contiguous()
     assert selected_indices.is_contiguous() and lse.is_contiguous()
     B, S, H, D = q.shape
+    if sm_scale is None:
+        sm_scale = D**-0.5
     S_kv, kv_heads = k.shape[1], k.shape[2]
     assert v.shape == k.shape, f"k/v shapes must match; got k={k.shape}, v={v.shape}"
     # The gather clamps candidate rows into [0, S_kv - 1], which needs a row to exist.
@@ -538,16 +283,10 @@ def qsa_bwd_interface(q, k, v, o, do, selected_indices, lse, sm_scale=None):
 
     preprocess_kernel = preprocess(B, S, kv_heads * padded_group, padded_dim)
     dq_kernel = bwd_dq(B, S, S_kv, kv_heads, padded_group, padded_dim, topk, sm_scale)
-    dkv_kernel = bwd_dkv(B, S, S_kv, kv_heads, padded_group, padded_dim, topk, sm_scale)
-    postprocess_kernel = postprocess(B, S_kv * kv_heads, padded_dim)
 
     delta = preprocess_kernel(o, do)
-    dk = torch.zeros_like(k, dtype=torch.float32)
-    dv = torch.zeros_like(v, dtype=torch.float32)
     dq = dq_kernel(q, k, v, do, selected_indices, lse, delta)
-    dkv_kernel(q, k, v, do, selected_indices, lse, delta, dk, dv)
-    dk = postprocess_kernel(dk.view(B, S_kv * kv_heads, padded_dim)).view(B, S_kv, kv_heads, padded_dim)
-    dv = postprocess_kernel(dv.view(B, S_kv * kv_heads, padded_dim)).view(B, S_kv, kv_heads, padded_dim)
+    dk, dv = qsa_dkv_owned(q, k, v, do, selected_indices, lse, delta, sm_scale)
     return (
         _slice_query_heads(dq, kv_heads, group_width)[..., :D].contiguous(),
         dk[..., :D].contiguous(),

@@ -117,6 +117,7 @@ def _make_qsa_tensors(batch, seq_len, heads, kv_heads, dim, topk, seed=0):
         (1, 32, 4, 1, 256, 65),  # MQA + non-multiple-of-64 topk padding path
         (1, 33, 6, 6, 128, 32),  # no GQA expansion
         (2, 64, 8, 2, 256, 64),  # production head dim
+        (1, 513, 24, 2, 256, 129),  # 12 heads/group and multiple dKV reduction splits
     ],
 )
 def test_tilelang_qsa_forward_backward_matches_reference(batch, seq_len, heads, kv_heads, dim, topk):
@@ -153,6 +154,75 @@ def test_tilelang_qsa_default_scale_uses_unpadded_head_dim():
     actual.backward(grad)
     for actual_grad, expected_grad in zip((q.grad, k.grad, v.grad), expected_grads, strict=True):
         assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+
+
+@pytest.mark.parametrize("topk", [0, 65, 333])
+def test_qsa_reverse_tiles_preserve_exact_selections(topk):
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.qwen4_exp.tilelang_qsa_dkv import build_reverse_tiles
+
+    batch, seq, kv_len = 2, 37, 301 if topk == 333 else 61
+    torch.manual_seed(19)
+    indices = torch.full((batch, seq, topk), -1, dtype=torch.int32, device=DEVICE)
+    if topk:
+        valid_count = kv_len - 7 if topk == 333 else 31
+        indices[..., :valid_count] = torch.rand(batch, seq, kv_len, device=DEVICE).argsort(-1)[..., :valid_count]
+        indices[:, 0] = -1
+        # A single selected token in the final, incomplete KV storage tile.
+        indices[:, 1] = -1
+        indices[:, 1, -1] = kv_len - 1
+    original = indices.clone()
+    offsets, queries, masks = (t.cpu() for t in build_reverse_tiles(indices, kv_len))
+    actual = torch.zeros(batch, seq, kv_len, dtype=torch.bool)
+    num_blocks = (kv_len + 15) // 16
+    for b in range(batch):
+        for block in range(num_blocks):
+            first, last = offsets[b * num_blocks + block : b * num_blocks + block + 2].tolist()
+            rows = queries[first:last].tolist()
+            assert len(rows) == len(set(rows))
+            for row, mask in zip(rows, masks[first:last].tolist(), strict=True):
+                assert 0 <= row < seq and mask != 0
+                for offset in range(16):
+                    if mask & (1 << offset):
+                        token = block * 16 + offset
+                        assert token < kv_len
+                        actual[b, row, token] = True
+    reference_indices = indices.cpu().long()
+    expected = torch.zeros(batch, seq, kv_len + 1, dtype=torch.bool).scatter_(
+        -1, reference_indices.masked_fill(reference_indices < 0, kv_len), True
+    )[..., :kv_len]
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(indices, original)
+
+
+def test_tilelang_qsa_unequal_lengths_and_unused_kv_gradients():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.qwen4_exp import qsa_attn_tilelang
+
+    torch.manual_seed(23)
+    q = torch.randn(2, 24, 33, 64, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(2, 2, 79, 64, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    indices = torch.full((2, 33, 17), -1, device=DEVICE, dtype=torch.int64)
+    # Cross storage-tile boundaries, leaving complete KV tiles unused.
+    indices[0, 1:, :5] = torch.tensor([78, 16, 0, 15, 77], device=DEVICE)
+    actual = qsa_attn_tilelang(q, k, v, indices)
+    expected = _qsa_reference(q, k, v, indices, 64**-0.5)
+    torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
+    grad = torch.randn_like(actual)
+    borrowed_grad = grad.clone()
+    actual_grads = torch.autograd.grad(actual, (q, k, v), grad)
+    expected_grads = torch.autograd.grad(expected, (q, k, v), grad.float())
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        # Many queries accumulate onto just five tokens. Local cancellation
+        # makes a per-element relative tolerance misleading for BF16 sums.
+        assert torch.isfinite(actual_grad).all()
+        relative_error = (actual_grad.float() - expected_grad.float()).norm() / expected_grad.float().norm()
+        assert relative_error < 1e-2
+        assert torch.count_nonzero(actual_grad[1]) == 0
+    assert torch.count_nonzero(actual_grads[1][:, :, 17:77]) == 0
+    assert torch.count_nonzero(actual_grads[2][:, :, 17:77]) == 0
+    torch.testing.assert_close(grad, borrowed_grad)
 
 
 def test_tilelang_qsa_causal_packed_indices_match_reference():
