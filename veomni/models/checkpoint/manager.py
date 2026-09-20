@@ -33,14 +33,14 @@ from typing import TYPE_CHECKING, Optional
 
 import torch.distributed as dist
 
-from ..checkpoint import CheckpointerBase, build_checkpointer, layout
-from ..utils import helper
+from ...checkpoint import CheckpointerBase, build_checkpointer, layout
+from ...utils import helper
 
 
 if TYPE_CHECKING:
-    from ..arguments import CheckpointConfig
-    from ..trainer.callbacks import TrainerState
-    from .model_runtime import VeOmniModelRuntime
+    from ...arguments import CheckpointConfig
+    from ...trainer.callbacks import TrainerState
+    from ..model_runtime import VeOmniModelRuntime
 
 
 logger = helper.create_logger(__name__)
@@ -233,7 +233,7 @@ class ModelCheckpointManager:
         return layout.weights_dir(self.step_dir(state), self.module_name)
 
     def save_hf(self, state: "TrainerState", stage: str = "step_end") -> None:
-        from ..utils.save_safetensor_utils import save_hf_safetensor
+        from ...utils.save_safetensor_utils import save_hf_safetensor
 
         weights_path = self._prepare_export(state, stage)
 
@@ -252,7 +252,7 @@ class ModelCheckpointManager:
         dist.barrier()
 
     def save_lora(self, state: "TrainerState", stage: str = "step_end", adapter_name: str = "default") -> None:
-        from ..utils.save_safetensor_utils import save_lora_adapter_with_dcp
+        from ...utils.save_safetensor_utils import save_lora_adapter_with_dcp
 
         self._prepare_export(state, stage)
         save_lora_adapter_with_dcp(

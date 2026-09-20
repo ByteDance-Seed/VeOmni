@@ -69,7 +69,8 @@ from typing import Optional
 
 import torch
 
-from ....distributed.parallel_state import get_parallel_state
+from veomni.distributed.parallel_state import get_parallel_state
+
 from .chunk_logprobs import (
     _per_token_entropy_from_logits,
     _per_token_log_probs_from_logits,
@@ -413,9 +414,9 @@ def chunk_topk_distill_function(
         log_probs = torch.nn.functional.pad(log_probs, (0, 1), value=0.0)
         entropy = torch.nn.functional.pad(entropy, (0, 1), value=0.0)
         distill = torch.nn.functional.pad(distill, (0, 1), value=0.0)
-        # ``F.pad`` produces a fresh tensor that re-enters the autograd graph;
-        # re-detach the mass outputs so callers can rely on
-        # ``requires_grad=False`` (metrics-only contract).
-        student_mass = torch.nn.functional.pad(student_mass, (0, 1), value=0.0).detach()
-        teacher_mass = torch.nn.functional.pad(teacher_mass, (0, 1), value=0.0).detach()
-    return log_probs, entropy, distill, student_mass, teacher_mass
+        student_mass = torch.nn.functional.pad(student_mass, (0, 1), value=0.0)
+        teacher_mass = torch.nn.functional.pad(teacher_mass, (0, 1), value=0.0)
+    # ``apply`` attaches ``grad_fn`` even after the inner detach. Mass
+    # outputs are metrics-only on every branch, including explicit shift
+    # and sequence-parallel.
+    return log_probs, entropy, distill, student_mass.detach(), teacher_mass.detach()

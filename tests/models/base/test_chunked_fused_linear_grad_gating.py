@@ -17,8 +17,8 @@
 import pytest
 import torch
 
-import veomni.ops.kernels.cross_entropy.chunk_logprobs as cl
-import veomni.ops.kernels.cross_entropy.chunk_topk_distill as ctkd
+import veomni.models.loss_utils.chunk_logprobs as cl
+import veomni.models.loss_utils.chunk_topk_distill as ctkd
 
 
 class _FakePS:

@@ -12,22 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end test for ``return_log_probs=True`` on a real (toy-config) model.
+"""Model-forward integration tests for fused log-probability outputs.
 
-Builds a tiny Qwen3 from ``tests/toy_config/qwen3_toy/`` via
-``build_foundation_model`` and asserts:
+Construct Qwen3 and Qwen3-VL generated classes directly from toy configs;
+both families use text-only inputs here. With labels and
+``return_log_probs=True``, the model's loss helper returns log-probabilities
+and entropy in ``output.fused_linear_aux``, with ``loss`` and ``logits`` set
+to ``None``. Outputs match the label shape after next-token shifting, ignore-label
+masking, and trailing zero padding.
 
-1. ``model(..., return_log_probs=True).log_probs`` carries per-token
-   actual log-probabilities (non-positive) matching the input label
-   shape (``[B, L]``); ``output.logits`` is None (cleared by the
-   ``build_foundation_model`` postprocess wrapper).
-2. The values are **bitwise identical** to ``-F.cross_entropy(
-   reduction='none')`` on the model's full-logits forward, when full
-   determinism + batch-invariant mode are enabled and ``chunk_size``
-   covers the whole sequence (so the chunked ``F.linear`` reduces to
-   a single call against the same weight).
-3. Backward through ``output.fused_linear_aux.log_probs`` flows gradients into
-   ``model.lm_head.weight``.
+The bitwise check compares against a full-logits forward using the same
+token-level log-probability and entropy helpers, under deterministic settings
+and with one chunk covering the packed batch. It tests model/loss integration
+and projection boundaries, not independent kernel numerics. Additional cases
+check the verl-style consumer fields, top-k distillation outputs, and gradients
+to ``lm_head.weight``. Public registry/build coverage lives in
+``tests/models/base/test_auto_registry.py``.
 """
 
 import gc
@@ -53,7 +53,7 @@ os.environ.setdefault("MASTER_PORT", "12356")
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 TOY_QWEN3 = os.path.join(REPO_ROOT, "tests", "toy_config", "qwen3_toy")
 TOY_QWEN3_VL = os.path.join(REPO_ROOT, "tests", "toy_config", "qwen3vl_toy")
 IGNORE_INDEX = -100
@@ -66,10 +66,28 @@ def _release():
 
 
 def _apply_determinism():
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_backend_flags():
+    """Scope mutable CUDA backend flags so test order cannot freeze or leak them."""
+    if not IS_CUDA_AVAILABLE:
+        yield
+        return
+
+    prev_deterministic = torch.are_deterministic_algorithms_enabled()
+    with torch.backends.cudnn.flags(
+        enabled=torch.backends.cudnn.enabled,
+        benchmark=False,
+        benchmark_limit=torch.backends.cudnn.benchmark_limit,
+        deterministic=True,
+        allow_tf32=False,
+    ):
+        try:
+            yield
+        finally:
+            torch.use_deterministic_algorithms(prev_deterministic, warn_only=True)
 
 
 def _have_python_dev_headers() -> bool:
@@ -85,20 +103,14 @@ def _reference_log_probs_and_entropy_from_logits(
     labels: torch.Tensor,
     ignore_index: int = IGNORE_INDEX,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reference per-token log-probabilities (non-positive) and entropy (non-negative).
+    """Compute a full-logits reference with the shared token-level helpers.
 
-    Routes the per-token NLL through the same
-    ``_per_token_log_probs_from_logits`` helper the kernel uses (which
-    prefers ``flash_attn``'s triton ``cross_entropy_loss`` — same op
-    verl's ``FusedLinearForPPOFunction`` calls — falling back to
-    ``log_softmax + gather`` when flash_attn isn't importable). The
-    only remaining numerical difference between this path and the
-    chunked-fused-linear path is the lm_head matmul boundary —
-    identical when ``chunk_size`` covers the whole seq, so the kernel
-    output stays bitwise equal. Entropy is computed via the same
-    ``_per_token_entropy_from_logits`` helper for the same reason.
+    Shift labels to next-token targets, evaluate FP32 logits, zero ignored
+    positions, and pad the last output position. Sharing log-probability and
+    entropy math with the fused path isolates model integration and chunked
+    projection behavior; this is not an independent reference for those ops.
     """
-    from veomni.ops.kernels.cross_entropy.chunk_logprobs import (
+    from veomni.models.loss_utils.chunk_logprobs import (
         _per_token_entropy_from_logits,
         _per_token_log_probs_from_logits,
     )
@@ -118,27 +130,40 @@ def _reference_log_probs_and_entropy_from_logits(
 
 
 def _build_model(toy_path: str, ce_impl: str = "chunk_loss"):
-    """Build a tiny model from a toy config (text or VLM).
+    """Construct a generated Qwen3 or Qwen3-VL class for forward-path tests.
 
-    Forces eager attention (toy config dtype is fp32; flash_attn requires
-    fp16/bf16) and pins the cross-entropy backend.
+    Install eager ops with the requested CE implementation during construction,
+    restore the previous selection, and move the model to the current device
+    in FP32. Direct construction isolates the generated forward/loss contract;
+    public model registration and loading are tested separately.
     """
-    from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.models.auto import build_foundation_model
+    from transformers import AutoConfig
 
-    ops_implementation = OpsImplementationConfig(
-        attn_implementation="eager",
-        cross_entropy_loss_implementation=ce_impl,
-    )
+    from tests.models.compare import eager_ops_config, pin_eager_attn_implementation
+    from veomni.ops.config import get_ops_config, set_ops_config
 
-    return build_foundation_model(
-        config_path=toy_path,
-        weights_path=None,
-        torch_dtype="float32",
-        attn_implementation="eager",
-        init_device=get_device_type() if IS_CUDA_AVAILABLE else "cpu",
-        ops_implementation=ops_implementation,
-    )
+    config = AutoConfig.from_pretrained(toy_path)
+    if config.model_type == "qwen3":
+        from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import (
+            Qwen3ForCausalLM as ModelClass,
+        )
+    elif config.model_type == "qwen3_vl":
+        from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+            Qwen3VLForConditionalGeneration as ModelClass,
+        )
+    else:
+        raise ValueError(f"Unsupported toy model type: {config.model_type}")
+
+    ops = eager_ops_config()
+    ops.cross_entropy_loss_implementation = ce_impl
+    previous = get_ops_config()
+    set_ops_config(ops)
+    try:
+        model = ModelClass(config)
+    finally:
+        set_ops_config(previous)
+    pin_eager_attn_implementation(model)
+    return model.to(device=get_device_type(), dtype=torch.float32)
 
 
 def _skip_unless_cuda(toy_path: str):
@@ -155,34 +180,16 @@ _MODELS = [
 
 
 @pytest.mark.parametrize("toy_path,family", _MODELS)
-@pytest.mark.parametrize(
-    "ce_impl",
-    [
-        pytest.param("chunk_loss", id="chunk_loss"),
-        pytest.param("eager", id="eager"),
-    ],
-)
-def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, family):
-    """End-to-end: return_log_probs path is bitwise identical to gather-on-logits.
+def test_return_log_probs_bitwise_matches_logits_reference(toy_path, family):
+    """Compare fused auxiliary outputs against a full-logits forward bitwise.
 
-    Covers both **text** (Qwen3) and **VLM** (Qwen3-VL) models — every
-    in-tree patched modeling file forwards ``**kwargs`` from the outer
-    ``forward`` into ``self.loss_function(...)``, so the same
-    ``return_log_probs=True`` flag activates the chunked-NLL path
-    uniformly across model families.
-
-    With:
-    - full determinism (deterministic cuBLAS, deterministic algorithms,
-      no TF32),
-    - batch-invariant mode when available (deterministic
-      mm/addmm/log_softmax — falls back gracefully when the underlying
-      Triton kernels can't JIT in the current environment),
-    - chunk_size >= L so the chunked ``F.linear`` is a single matmul
-      against the same weight tensor as ``model.lm_head``,
-
-    the per-token NLL returned by the kernel and the reference computed
-    by ``F.cross_entropy(reduction='none')`` on the full logits differ
-    by at most zero — they execute the same ops on the same data.
+    ``return_log_probs=True`` bypasses the CE op, so the selected CE
+    implementation is not part of this contract. Exercise text-only Qwen3 and
+    Qwen3-VL inputs. The reference shares the token-level log-probability and
+    entropy helpers with the model's loss path. Deterministic backend settings
+    and optional batch-invariant mode control rounding; a chunk covering the
+    whole packed batch avoids a different projection boundary. Also check
+    next-token label alignment, ignore-label masking, and trailing zero padding.
     """
     _skip_unless_cuda(toy_path)
     _apply_determinism()
@@ -196,17 +203,17 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
     bi_active = _have_python_dev_headers()
     bi_ctx = None
     if bi_active:
-        from veomni.ops.batch_invariant_ops import set_batch_invariant_mode
+        from veomni.ops.batch_invariant import set_batch_invariant_mode
 
         bi_ctx = set_batch_invariant_mode(True)
         bi_ctx.__enter__()
 
     try:
         torch.manual_seed(0)
-        model = _build_model(toy_path, ce_impl=ce_impl).eval()
+        model = _build_model(toy_path).eval()
 
         B, L = 2, 16
-        # Vocab floor of 32000 dodges the multimodal placeholder ids
+        # Keeping token IDs below 32000 avoids the multimodal placeholder ids
         # (image_token_id, video_token_id, ...) used by VLM configs;
         # this keeps the forward on the text-only path so we can compare
         # bitwise against the lm_head reference.
@@ -220,12 +227,10 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
             ref_logits = model(input_ids=input_ids, use_cache=False).logits
             ref_log_probs, ref_entropy = _reference_log_probs_and_entropy_from_logits(ref_logits, labels)
 
-            # New path: model wrapper installed by ``build_foundation_model``
-            # makes ``model(..., return_log_probs=True)`` return
-            # ``output.fused_linear_aux.log_probs`` (actual log-probabilities, sign already
-            # flipped) and ``output.fused_linear_aux.entropy`` (per-token softmax entropy)
-            # and clear ``output.logits``. ``chunk_size=B*L+1`` forces a
-            # single chunk over the whole packed batch so the matmul
+            # The generated forward returns the loss helper's log-probabilities
+            # and entropy in fused_linear_aux, leaving loss and logits None.
+            # ``chunk_size=B*L+1`` forces a single chunk over the whole packed
+            # batch so the matmul
             # boundary matches the reference forward exactly — using
             # ``L+1`` alone would split B=2 into 2 chunks and surface
             # fp32 epsilon drift from cuBLAS algorithm selection at the
@@ -242,7 +247,7 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
             bi_ctx.__exit__(None, None, None)
 
     assert out.loss is None, "loss must be None when return_log_probs=True"
-    assert out.logits is None, "logits must be cleared when return_log_probs=True"
+    assert out.logits is None, "logits must be None when return_log_probs=True"
     assert out.fused_linear_aux.log_probs is not None, "log_probs must be populated when return_log_probs=True"
     assert out.fused_linear_aux.log_probs.shape == labels.shape, (
         f"shape mismatch: got {tuple(out.fused_linear_aux.log_probs.shape)} expected {tuple(labels.shape)}"
@@ -256,7 +261,7 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
         ne = out.fused_linear_aux.log_probs != ref_log_probs
         first_idx = torch.nonzero(ne, as_tuple=False)[:5].tolist()
         raise AssertionError(
-            f"[{family}/{ce_impl}] per-token log_probs not bitwise equal: "
+            f"[{family}] per-token log_probs not bitwise equal: "
             f"{int(ne.sum().item())}/{out.fused_linear_aux.log_probs.numel()} mismatched, "
             f"max_abs_diff={diff.max().item():.3e}, first_idx={first_idx}"
         )
@@ -264,18 +269,16 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
     # Entropy contract: same shape as log_probs, populated, bitwise equal
     # to the reference (same ``_per_token_entropy_from_logits`` helper on
     # the same fp32 logits).
-    assert out.fused_linear_aux.entropy is not None, (
-        f"[{family}/{ce_impl}] entropy must be populated when return_log_probs=True"
-    )
+    assert out.fused_linear_aux.entropy is not None, f"[{family}] entropy must be populated when return_log_probs=True"
     assert out.fused_linear_aux.entropy.shape == labels.shape, (
-        f"[{family}/{ce_impl}] entropy shape {tuple(out.fused_linear_aux.entropy.shape)} != labels shape {tuple(labels.shape)}"
+        f"[{family}] entropy shape {tuple(out.fused_linear_aux.entropy.shape)} != labels shape {tuple(labels.shape)}"
     )
     if not torch.equal(out.fused_linear_aux.entropy, ref_entropy):
         diff = (out.fused_linear_aux.entropy - ref_entropy).abs()
         ne = out.fused_linear_aux.entropy != ref_entropy
         first_idx = torch.nonzero(ne, as_tuple=False)[:5].tolist()
         raise AssertionError(
-            f"[{family}/{ce_impl}] per-token entropy not bitwise equal: "
+            f"[{family}] per-token entropy not bitwise equal: "
             f"{int(ne.sum().item())}/{out.fused_linear_aux.entropy.numel()} mismatched, "
             f"max_abs_diff={diff.max().item():.3e}, first_idx={first_idx}"
         )
@@ -291,19 +294,19 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
     masked_ent = out.fused_linear_aux.entropy[shifted_target_is_ign]
     valid_ent = out.fused_linear_aux.entropy[~shifted_target_is_ign]
     assert torch.all(masked_lp == 0.0), (
-        f"[{family}/{ce_impl}] IGN-target positions must emit 0.0 log_probs, got max_abs={masked_lp.abs().max().item():.3e}"
+        f"[{family}] IGN-target positions must emit 0.0 log_probs, got max_abs={masked_lp.abs().max().item():.3e}"
     )
     assert torch.all(masked_ent == 0.0), (
-        f"[{family}/{ce_impl}] IGN-target positions must emit 0.0 entropy, got max_abs={masked_ent.abs().max().item():.3e}"
+        f"[{family}] IGN-target positions must emit 0.0 entropy, got max_abs={masked_ent.abs().max().item():.3e}"
     )
     # log p(.) < 0 strictly for any non-degenerate distribution at random
     # init (probability < 1).
     assert torch.all(valid_lp < 0), (
-        f"[{family}/{ce_impl}] valid-target positions must emit negative log_probs, got max={valid_lp.max().item():.3e}"
+        f"[{family}] valid-target positions must emit negative log_probs, got max={valid_lp.max().item():.3e}"
     )
     # H[p] > 0 strictly for any non-degenerate distribution.
     assert torch.all(valid_ent > 0), (
-        f"[{family}/{ce_impl}] valid-target positions must emit positive entropy, got min={valid_ent.min().item():.3e}"
+        f"[{family}] valid-target positions must emit positive entropy, got min={valid_ent.min().item():.3e}"
     )
 
     del model, ref_logits, ref_log_probs, ref_entropy, out
@@ -312,27 +315,13 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
 
 @pytest.mark.parametrize("toy_path,family", _MODELS)
 def test_plain_forward_matches_verl_consumer_contract(toy_path, family):
-    """Pin the verl-consumer contract on the **plain model forward path**.
+    """Check the fused-output fields read by verl-style consumers.
 
-    Verl's ``FSDPEngineWithLMHead.prepare_model_outputs`` does
-    ``log_probs = output.fused_linear_aux.log_probs.squeeze(0)`` and
-    ``entropy_rmpad = output.fused_linear_aux.entropy.squeeze(0)`` in its
-    ``use_fused_kernels=True`` branch and expects actual
-    log-probabilities (non-positive) plus per-token entropy
-    (non-negative). The integration story is: verl calls
-    ``self.module(..., return_log_probs=True)`` directly — no helper
-    imports, no engine override — and the
-    ``build_foundation_model``-installed wrapper makes the output's
-    ``log_probs`` and ``entropy`` fields populated automatically.
-
-    This test pins exactly that contract:
-
-    1. ``output.fused_linear_aux.log_probs`` and ``output.fused_linear_aux.entropy`` are populated, finite,
-       shape matches labels.
-    2. ``output.logits`` is None — wrapper cleared it after promotion.
-    3. ``output.loss`` is None.
-    4. ``output.fused_linear_aux.log_probs <= 0`` everywhere (actual log-probabilities).
-    5. ``output.fused_linear_aux.entropy >= 0`` everywhere (softmax entropy).
+    Call the generated model directly with labels and ``return_log_probs=True``,
+    without a loader adapter or engine override. The model/loss path must return
+    finite, label-shaped ``fused_linear_aux.log_probs`` and
+    ``fused_linear_aux.entropy``, with non-positive log-probabilities,
+    non-negative entropy, and both ``loss`` and ``logits`` set to ``None``.
     """
     _skip_unless_cuda(toy_path)
     _apply_determinism()
@@ -351,13 +340,9 @@ def test_plain_forward_matches_verl_consumer_contract(toy_path, family):
         out = model(input_ids=input_ids, labels=labels, use_cache=False, return_log_probs=True)
 
     assert out.loss is None, f"[{family}] loss must be None when return_log_probs=True"
-    assert out.logits is None, f"[{family}] logits must be cleared by the build_foundation_model wrapper"
-    assert out.fused_linear_aux.log_probs is not None, (
-        f"[{family}] log_probs must be populated by the build_foundation_model wrapper"
-    )
-    assert out.fused_linear_aux.entropy is not None, (
-        f"[{family}] entropy must be populated by the build_foundation_model wrapper"
-    )
+    assert out.logits is None, f"[{family}] logits must be None when return_log_probs=True"
+    assert out.fused_linear_aux.log_probs is not None, f"[{family}] fused_linear_aux.log_probs must be populated"
+    assert out.fused_linear_aux.entropy is not None, f"[{family}] fused_linear_aux.entropy must be populated"
     assert out.fused_linear_aux.log_probs.shape == labels.shape, (
         f"[{family}] log_probs shape {tuple(out.fused_linear_aux.log_probs.shape)} != labels shape {tuple(labels.shape)}"
     )
@@ -379,10 +364,10 @@ def test_plain_forward_matches_verl_consumer_contract(toy_path, family):
 
 @pytest.mark.parametrize("toy_path,family", _MODELS)
 def test_return_log_probs_backward_flows_gradients(toy_path, family):
-    """Backward through per-token NLL must populate lm_head.weight.grad.
+    """A loss built from fused log-probabilities must train the LM head.
 
-    Same kwargs-flow contract as the bitwise test — exercised on both
-    text and VLM model families.
+    Exercise ``output.fused_linear_aux.log_probs`` on both text and VLM classes
+    and require finite, nonzero ``lm_head.weight.grad``.
     """
     _skip_unless_cuda(toy_path)
     _apply_determinism()
@@ -415,37 +400,23 @@ def test_return_log_probs_backward_flows_gradients(toy_path, family):
 
 @pytest.mark.parametrize("toy_path,family", _MODELS)
 def test_return_log_probs_with_topk_distill_populates_three_fields(toy_path, family):
-    """Pin the **distillation consumer contract** on the plain model forward path.
+    """Check top-k distillation outputs on the plain model forward path.
 
-    The integration story for verl's VeOmni engine: it calls
-    ``self.module(..., return_log_probs=True, teacher_topk_ids=...,
-    teacher_topk_log_probs=...)`` directly — no helper imports, no
-    engine override — and the ``build_foundation_model``-installed
-    wrapper routes through ``chunk_topk_distill_function`` and assigns
-    ``output.fused_linear_aux.distillation_losses`` / ``output.fused_linear_aux.student_mass`` /
-    ``output.fused_linear_aux.teacher_mass`` automatically.
+    Teacher top-k IDs and log-probabilities reach the model's loss helper via
+    forward kwargs. The helper returns distillation losses, student mass, and
+    teacher mass inside ``output.fused_linear_aux``, alongside log-probabilities
+    and entropy.
 
-    This test pins exactly that contract end-to-end on a real toy model
-    (both text and VLM families):
-
-    1. The three new ``output`` fields are populated, finite, and have
-       the same shape as the existing ``log_probs`` / ``entropy``.
-    2. ``output.fused_linear_aux.distillation_losses >= 0`` (forward KL is non-negative).
-    3. ``output.fused_linear_aux.student_mass`` and ``output.fused_linear_aux.teacher_mass`` are in
-       ``[0, 1]`` (sums of softmax probabilities on the top-k support).
-    4. ``output.fused_linear_aux.student_mass`` and ``output.fused_linear_aux.teacher_mass`` are detached
-       (``requires_grad=False``) — verl reports them as metrics.
-    5. ``output.fused_linear_aux.distillation_losses`` matches the same kernel computed
-       on the model's penultimate hidden state directly — bitwise on
-       fp32 under determinism. Proves the per-model patchgen wiring is
-       correct.
-    6. Backward through ``output.fused_linear_aux.distillation_losses`` flows gradients
-       into ``model.lm_head.weight``.
+    Check finite, label-shaped outputs and detached probability masses in
+    [0, 1]. The loss-sign assertion is specific to this synthetic teacher/student
+    setup; truncated-support KL is not generally non-negative. When hidden
+    states are exposed, compare bitwise with the same distillation helper called
+    directly. Backward through the distillation loss must train the LM head.
     """
     _skip_unless_cuda(toy_path)
     _apply_determinism()
 
-    from veomni.ops.kernels.cross_entropy.chunk_topk_distill import chunk_topk_distill_function
+    from veomni.models.loss_utils import chunk_topk_distill_function
 
     torch.manual_seed(0)
     model = _build_model(toy_path, ce_impl="chunk_loss").train()
@@ -478,7 +449,7 @@ def test_return_log_probs_with_topk_distill_populates_three_fields(toy_path, fam
         teacher_topk_log_probs=teacher_topk_log_probs,
     )
 
-    # 1) Three new fields populated, finite, correct shape.
+    # 1) Distillation fields populated, finite, correct shape.
     assert out.fused_linear_aux.distillation_losses is not None, f"[{family}] distillation_losses must be populated"
     assert out.fused_linear_aux.student_mass is not None, f"[{family}] student_mass must be populated"
     assert out.fused_linear_aux.teacher_mass is not None, f"[{family}] teacher_mass must be populated"

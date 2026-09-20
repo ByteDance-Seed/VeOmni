@@ -17,8 +17,8 @@ Checkpoint tensor converter utilities for runtime weight format conversion.
 
 Models that need to convert HuggingFace checkpoint tensors at load time (e.g. MoE
 per-expert weights -> fused format) register a ``_create_checkpoint_tensor_converter``
-class attribute.  The helpers here retrieve and apply such converters during weight
-loading in ``module_utils.py``.
+class attribute.  The helpers here retrieve and apply such converters during
+streaming weight load.
 
 Models that need to rename per-expert HF ``weight_map`` keys for sharded HF export
 register a ``_convert_fqn_to_index_mapping`` class attribute (same module as the
@@ -35,9 +35,8 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 
 from veomni.distributed import parallel_state
-
-from ..utils import logging
-from ..utils.device import get_device_id, get_device_type
+from veomni.utils import logging
+from veomni.utils.device import get_device_id, get_device_type
 
 
 if TYPE_CHECKING:
@@ -91,9 +90,9 @@ class CheckpointTensorConverter(Protocol):
         ``name`` is appending trailing zero rows on dim-0 (no fusion/reshape/dtype change).
 
         Zero-padding dim-0 commutes with a ``Shard(0)`` split, so a per-rank dim-0
-        streaming loader (:func:`veomni.models.module_utils.load_model_weights_ep_sharded`)
-        can read a rank's real-row slice straight from the checkpoint and zero-fill any
-        tail past the checkpoint's real row count -- never materializing the whole tensor.
+        streaming loader (:func:`load_model_weights_ep_sharded`) can read a rank's
+        real-row slice straight from the checkpoint and zero-fill any tail past the
+        checkpoint's real row count -- never materializing the whole tensor.
         A converter that fuses or otherwise needs the whole tensor set must return
         ``False`` (and its ``finalize`` may be non-empty). Implementing this method is
         optional; the loader treats a missing method as ``False``.

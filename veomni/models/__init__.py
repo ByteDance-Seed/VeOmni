@@ -12,10 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ..utils.import_utils import is_diffusers_available
-from . import transformers
-from .auto import build_foundation_model, build_processor, build_tokenizer
-from .module_utils import (
+"""Public model construction, registration, and checkpoint interfaces.
+
+Family packages are imported by later commits. This commit exposes the
+shared construction and checkpoint surface.
+"""
+
+from .auto import (
+    build_config,
+    build_foundation_model,
+    build_processor,
+    build_tokenizer,
+    check_context_parallel_supported,
+    check_model_build_prerequisites,
+)
+from .checkpoint import ModelCheckpointManager
+from .checkpoint.weights import (
     init_empty_weights,
     load_model_weights,
     load_model_weights_ep_sharded,
@@ -23,23 +35,30 @@ from .module_utils import (
     save_model_assets,
     save_model_weights,
 )
+from .registry import (
+    MODEL_CONFIG_REGISTRY,
+    MODEL_PROCESSOR_REGISTRY,
+    MODELING_REGISTRY,
+    get_model_class,
+)
 
 
 __all__ = [
+    "MODEL_CONFIG_REGISTRY",
+    "MODEL_PROCESSOR_REGISTRY",
+    "MODELING_REGISTRY",
+    "ModelCheckpointManager",
+    "build_config",
     "build_foundation_model",
     "build_processor",
     "build_tokenizer",
+    "check_context_parallel_supported",
+    "check_model_build_prerequisites",
+    "get_model_class",
     "init_empty_weights",
     "load_model_weights",
     "load_model_weights_ep_sharded",
     "rank0_load_and_broadcast_weights",
     "save_model_assets",
     "save_model_weights",
-    "transformers",
-    "diffusers",
 ]
-
-if is_diffusers_available():
-    from . import diffusers
-
-    __all__ += ["diffusers"]

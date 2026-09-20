@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Empty-init, load, and save helpers for models checkpoints.
+
+Public entry points cover meta-device construction, safetensors / bin load,
+ExtraParallel slice streaming, rank-0 broadcast, and sharded save.
+"""
 
 import itertools
 import json
@@ -31,7 +36,7 @@ import torch
 try:
     from hdfs_io import copy  # for internal use only
 except ImportError:
-    from ..utils.hdfs_io import copy
+    from veomni.utils.hdfs_io import copy
 from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import distributed as dist
@@ -41,24 +46,24 @@ from tqdm import tqdm
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 
-from ..distributed.parallel_state import get_parallel_state
-from ..utils import logging
-from ..utils.device import get_device_type, synchronize
-from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
-from ..utils.import_utils import is_diffusers_available
-from .checkpoint_tensor_loading import (
+from veomni.distributed.parallel_state import get_parallel_state
+from veomni.models.checkpoint.convert import (
     checkpoint_converter_is_dim0_zero_pad,
     checkpoint_converter_record_skip_without_loading,
     checkpoint_converter_should_skip_without_loading,
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
 )
+from veomni.utils import logging
+from veomni.utils.device import get_device_type, synchronize
+from veomni.utils.helper import empty_cache, get_cache_dir, get_dtype_size
+from veomni.utils.import_utils import is_diffusers_available
 
 
 if TYPE_CHECKING:
     from transformers import GenerationConfig, PretrainedConfig, PreTrainedModel, PreTrainedTokenizer, ProcessorMixin
 
-    from ..distributed.parallel_plan import ParallelPlan
+    from veomni.distributed.parallel_plan import ParallelPlan
 
     ModelAssets = Union[GenerationConfig, PretrainedConfig, PreTrainedTokenizer, ProcessorMixin]
 
@@ -314,7 +319,7 @@ def _init_parameter(
     """
     pieces = name.split(".")
     if any(p.startswith("lora_") for p in pieces):
-        from ..lora.weight_loading import init_lora_parameter
+        from veomni.lora.weight_loading import init_lora_parameter
 
         init_lora_parameter(module, name, parameter_names_left=parameter_names_left)
         return
@@ -387,7 +392,7 @@ def load_model_weights(
     # full PEFT-namespaced ``full_param_name`` it'll see below.
     parallel_plan = None
     if hasattr(model, "get_parallel_plan"):
-        from ..distributed.parallel_plan import get_runtime_parallel_plan
+        from veomni.distributed.parallel_plan import get_runtime_parallel_plan
 
         parallel_plan = get_runtime_parallel_plan(model)
 
@@ -397,7 +402,7 @@ def load_model_weights(
     # through the ``base_layer.weight`` rename. No-op when not PEFT.
     is_peft_model = kwargs.get("is_peft_model", False)
     adapter_path = kwargs.get("adapter_path", None)
-    from ..lora.weight_loading import make_peft_key_mapper
+    from veomni.lora.weight_loading import make_peft_key_mapper
 
     _apply_peft_override = make_peft_key_mapper(model, is_peft_model)
 
@@ -436,7 +441,7 @@ def load_model_weights(
         # Load LoRA adapter weights when an adapter_path is provided; otherwise
         # they are initialised in post_process_after_weight_loading. The native
         # VeOmniLoraModel reads the PEFT-format file without importing peft.
-        from ..lora.weight_loading import load_lora_weights
+        from veomni.lora.weight_loading import load_lora_weights
 
         load_lora_weights(
             model,
@@ -456,7 +461,7 @@ def load_model_weights(
 
     fqn_to_index_mapping = kwargs.get("fqn_to_index_mapping")
     if fqn_to_index_mapping is not None:
-        from .checkpoint_tensor_loading import prepare_fqn_to_index_mapping_for_model
+        from veomni.models.checkpoint.convert import prepare_fqn_to_index_mapping_for_model
 
         prepare_fqn_to_index_mapping_for_model(model, fqn_to_index_mapping)
 
@@ -687,7 +692,7 @@ def load_model_weights_ep_sharded(
     # stay EP ``Shard(0)``, and ``LoraIndependentExperts`` per-expert LoRA tensors
     # are added as ``Shard(0)`` (shared-LoRA tensors are left replicated). For a
     # non-PEFT / non-LoRA model this is a passthrough of ``get_parallel_plan()``.
-    from ..distributed.parallel_plan import get_runtime_parallel_plan
+    from veomni.distributed.parallel_plan import get_runtime_parallel_plan
 
     parallel_plan = get_runtime_parallel_plan(model)
     if parallel_plan is None or not getattr(parallel_plan, "extra_parallel_plan", None):
@@ -695,7 +700,7 @@ def load_model_weights_ep_sharded(
 
     # Base-checkpoint keys (bare base-model FQNs) -> their PEFT-wrapped destinations
     # (``base_model.model.<...>.base_layer.weight``). No-op when not PEFT.
-    from ..lora.weight_loading import make_peft_key_mapper
+    from veomni.lora.weight_loading import make_peft_key_mapper
 
     _apply_peft_override = make_peft_key_mapper(model, is_peft_model)
 
@@ -751,7 +756,7 @@ def load_model_weights_ep_sharded(
                     f"'{bare_name}' (e.g. per-expert -> fused MoE experts). Per-rank slice "
                     f"streaming cannot reconstruct the whole tensor set from a single shard, so "
                     f"this model/checkpoint combination is unsupported. Either save the checkpoint "
-                    f"in the model's fused expert layout, or disable model.ep_sharded_stream_load "
+                    f"in the model's fused expert layout, or disable train.ep_sharded_stream_load "
                     f"to use the whole-tensor loader (broadcast or every-rank-read)."
                 )
 
@@ -926,7 +931,7 @@ def _stream_lora_adapter_ep_sharded(
     streamed per-rank). Newly saved adapters are safetensors (see
     :func:`save_lora_adapter_with_dcp`).
     """
-    from ..lora.state_dict import _find_adapter_file, insert_adapter_name
+    from veomni.lora.state_dict import _find_adapter_file, insert_adapter_name
 
     # Fail closed: an explicitly configured adapter_path must resolve. Soft-skip
     # would let post_process fresh-init a random adapter and training would
@@ -934,7 +939,7 @@ def _stream_lora_adapter_ep_sharded(
     file_path, is_safetensors = _find_adapter_file(adapter_path)
 
     if not is_safetensors:
-        from ..lora.weight_loading import load_lora_weights
+        from veomni.lora.weight_loading import load_lora_weights
 
         logger.warning_rank0(
             f"ep_sharded adapter: {adapter_path} is a pickled .bin (not sliceable); falling back to "
@@ -1020,7 +1025,7 @@ def rank0_load_and_broadcast_weights(
     # so PEFT-prefix bridging happens once per call (see ``load_model_weights``).
     parallel_plan = None
     if hasattr(model, "get_parallel_plan"):
-        from ..distributed.parallel_plan import get_runtime_parallel_plan
+        from veomni.distributed.parallel_plan import get_runtime_parallel_plan
 
         parallel_plan = get_runtime_parallel_plan(model)
 
@@ -1029,7 +1034,7 @@ def rank0_load_and_broadcast_weights(
     # lora-layer: xxx.xxx.weight -> base_model.model.xxx.xxx.base_layer.weight
     is_peft_model = kwargs.get("is_peft_model", False)
     adapter_path = kwargs.get("adapter_path", None)
-    from ..lora.weight_loading import make_peft_key_mapper
+    from veomni.lora.weight_loading import make_peft_key_mapper
 
     _apply_peft_override = make_peft_key_mapper(model, is_peft_model)
 
@@ -1412,7 +1417,7 @@ def rank0_load_and_broadcast_weights(
         # ``[E_local, ...]`` shape inside ``_dispatch_parameter`` before the
         # DTensor ``.copy_()`` -- without this the copy asserts on a global-shape
         # mismatch (the ep_size=2 + ``mode=="independent"`` failure mode).
-        from ..lora.weight_loading import rank0_load_and_broadcast_lora_weights
+        from veomni.lora.weight_loading import rank0_load_and_broadcast_lora_weights
 
         rank0_load_and_broadcast_lora_weights(
             model,
@@ -1429,7 +1434,7 @@ def rank0_load_and_broadcast_weights(
 
     fqn_to_index_mapping = kwargs.get("fqn_to_index_mapping")
     if fqn_to_index_mapping is not None:
-        from .checkpoint_tensor_loading import prepare_fqn_to_index_mapping_for_model
+        from veomni.models.checkpoint.convert import prepare_fqn_to_index_mapping_for_model
 
         prepare_fqn_to_index_mapping_for_model(model, fqn_to_index_mapping)
 
@@ -1655,6 +1660,7 @@ def save_model_weights(
 
 
 def save_model_assets(output_dir: Union[str, "os.PathLike"], model_assets: Sequence["ModelAssets"]):
+    """Save tokenizer / config / processor assets next to the weight shards."""
     if output_dir.startswith("hdfs://"):
         hdfs_dir = output_dir
         hdfs_upper_dir = output_dir.rstrip("/")

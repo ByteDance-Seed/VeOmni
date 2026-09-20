@@ -23,7 +23,7 @@ teacher_mass)``. We exercise:
   ``flash_attn``) so it runs in the default CI matrix.
 - Bitwise parity vs verl's ``compute_forward_kl_topk`` on CUDA under
   deterministic + batch-invariant mode, mirroring the pattern in
-  ``tests/ops/test_chunk_logprobs.py``.
+  ``tests/models/base/test_chunk_logprobs.py``.
 - Closed-form backward correctness via a direct comparison against
   PyTorch's autograd through the dense reference.
 - IGNORE_INDEX masking → exact zero on all five outputs and zero
@@ -39,9 +39,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import veomni.ops.kernels.cross_entropy.chunk_logprobs as cl
-import veomni.ops.kernels.cross_entropy.chunk_topk_distill as ctkd
-from veomni.ops.kernels.cross_entropy import chunk_logprobs_function
+import veomni.models.loss_utils.chunk_logprobs as cl
+import veomni.models.loss_utils.chunk_topk_distill as ctkd
+from veomni.models.loss_utils import chunk_logprobs_function
 from veomni.utils.constants import IGNORE_INDEX
 
 
@@ -261,15 +261,24 @@ def test_log_prob_min_clamp_affects_only_clamped_entries():
     torch.testing.assert_close(outs_clamped[2], ref[2], rtol=0, atol=0)
 
 
-def test_mass_outputs_are_detached():
-    """``student_mass`` / ``teacher_mass`` carry ``requires_grad=False``."""
+@pytest.mark.parametrize("path", ["default", "explicit_shift", "sequence_parallel"])
+def test_mass_outputs_are_detached(path, monkeypatch):
+    """``student_mass`` / ``teacher_mass`` stay metrics-only on every shift path."""
     h, w, labels, ids, tlp = _make_inputs(B=1, L=8, H=4, V=16, K=3, seed=4)
     h = h.detach().clone().requires_grad_(True)
     w = w.detach().clone().requires_grad_(True)
+    kwargs = {"chunk_size": 4}
+    if path == "explicit_shift":
+        kwargs["shift_labels"] = labels
+    elif path == "sequence_parallel":
+        monkeypatch.setattr(ctkd, "get_parallel_state", lambda: type("State", (), {"sp_enabled": True})())
 
-    _, _, _, smass, tmass = ctkd.chunk_topk_distill_function(h, w, labels, ids, tlp, chunk_size=4)
-    assert not smass.requires_grad, "student_mass must be detached"
-    assert not tmass.requires_grad, "teacher_mass must be detached"
+    _, _, distill, smass, tmass = ctkd.chunk_topk_distill_function(h, w, labels, ids, tlp, **kwargs)
+    assert distill.requires_grad, "distill must stay on the graph"
+    assert not smass.requires_grad, f"student_mass must be detached on the {path} path"
+    assert not tmass.requires_grad, f"teacher_mass must be detached on the {path} path"
+    assert smass.grad_fn is None
+    assert tmass.grad_fn is None
 
 
 def test_backward_matches_dense_reference():
@@ -409,9 +418,11 @@ def test_chunk_topk_distill_saves_memory_vs_eager():
     tensor is ~525 MB for B*L=2048 — well above any per-chunk
     allocation the kernel does internally (the kernel only ever holds
     ``chunk_size × V`` ≈ 256 KB worth of logits + log-softmax at a
-    time). The assertion uses a conservative 3× margin so the test
-    survives PyTorch allocator-block rounding and small fluctuations.
-    Skipped on CPU and on devices with less than 4 GB free.
+    time). Compare peak-minus-baseline so leftover suite allocations
+    do not cancel the ratio. The assertion uses a 2× margin: H20
+    incremental saving is about 2.7×, and 3× is too tight after
+    allocator-block rounding. Skipped on CPU and on devices with less
+    than 4 GB free.
 
     Routes all device APIs through ``veomni.utils.device`` so the
     test runs unchanged on CUDA and NPU (both back ends expose
@@ -449,13 +460,14 @@ def test_chunk_topk_distill_saves_memory_vs_eager():
     # the per-top-k log-probs we'd KL-mix with the teacher.
     synchronize()
     torch_device_module.reset_peak_memory_stats(device)
+    eager_baseline = torch_device_module.memory_allocated(device)
     student_logits = F.linear(h, w)  # [B, L, V] fp32 — the OOM-target tensor
     student_log_probs = student_logits.log_softmax(dim=-1)  # [B, L, V] fp32
     student_topk_log_probs = student_log_probs.gather(dim=-1, index=teacher_topk_ids)  # [B, L, K]
     distill_eager = (teacher_topk_log_probs.exp() * (teacher_topk_log_probs - student_topk_log_probs)).sum(dim=-1)
     distill_eager.sum().backward()
     synchronize()
-    eager_peak = torch_device_module.max_memory_allocated(device)
+    eager_delta = torch_device_module.max_memory_allocated(device) - eager_baseline
 
     # Free everything before the fused timing — the eager path's grads
     # would otherwise inflate the fused-path baseline.
@@ -469,24 +481,22 @@ def test_chunk_topk_distill_saves_memory_vs_eager():
     # `chunk_size × V` fp32, not `B*L × V`.
     synchronize()
     torch_device_module.reset_peak_memory_stats(device)
+    fused_baseline = torch_device_module.memory_allocated(device)
     _lp, _ent, distill_fused, _smass, _tmass = ctkd.chunk_topk_distill_function(
         h, w, labels, teacher_topk_ids, teacher_topk_log_probs, chunk_size=128
     )
     distill_fused.sum().backward()
     synchronize()
-    fused_peak = torch_device_module.max_memory_allocated(device)
+    fused_delta = torch_device_module.max_memory_allocated(device) - fused_baseline
 
-    # Conservative margin (3×) to allow allocator-block rounding +
-    # the fact that the fused kernel still has to hold h, w, labels,
-    # teacher tensors, and the [B, L] outputs — none of which scale
-    # with V. On the eager path, the dominant term is the [T, V]
-    # tensor, which alone is ~525 MB at this size. Empirically the
-    # fused path peaks well under the eager path / 5×.
-    eager_mb = eager_peak / 1024**2
-    fused_mb = fused_peak / 1024**2
-    assert fused_peak * 3 < eager_peak, (
+    # Compare increments so leftover suite allocations do not dominate
+    # the ratio. 2× still requires the fused path to avoid the dense
+    # [T, V] logits; H20 incremental saving is about 2.7×.
+    eager_mb = eager_delta / 1024**2
+    fused_mb = fused_delta / 1024**2
+    assert fused_delta * 2 < eager_delta, (
         f"top-k fused linear kernel did not save memory vs eager [T, V] path: "
-        f"fused_peak={fused_mb:.1f} MB, eager_peak={eager_mb:.1f} MB "
-        f"(expected fused × 3 < eager). Configuration: B={B}, L={L}, H={H}, V={V}, K={K}, "
+        f"fused_delta={fused_mb:.1f} MB, eager_delta={eager_mb:.1f} MB "
+        f"(expected fused × 2 < eager). Configuration: B={B}, L={L}, H={H}, V={V}, K={K}, "
         f"dense [B*L, V] fp32 = {B * L * V * 4 / 1024**2:.1f} MB."
     )

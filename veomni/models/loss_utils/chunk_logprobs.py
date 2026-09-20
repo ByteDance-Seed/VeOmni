@@ -73,7 +73,7 @@ from typing import Optional
 
 import torch
 
-from ....distributed.parallel_state import get_parallel_state
+from veomni.distributed.parallel_state import get_parallel_state
 
 
 try:

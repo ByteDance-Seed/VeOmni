@@ -12,12 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Model-facing loss policy around local ``VeomniOp`` handles."""
 
-VARLEN_ATTENTION_TYPES = (
-    "flash_attention_2",
-    "flash_attention_3",
-    "flash_attention_4",
-    "veomni_flash_attention_2_with_sp",
-    "veomni_flash_attention_3_with_sp",
-    "veomni_flash_attention_4_with_sp",
-)
+from .chunk_logprobs import chunk_logprobs_function
+from .chunk_topk_distill import chunk_topk_distill_function
+from .cross_entropy_loss import ForCausalLMLoss, ForSequenceClassificationLoss
+from .load_balancing_loss import load_balancing_loss
+
+
+__all__ = [
+    "ForCausalLMLoss",
+    "ForSequenceClassificationLoss",
+    "chunk_logprobs_function",
+    "chunk_topk_distill_function",
+    "load_balancing_loss",
+]
