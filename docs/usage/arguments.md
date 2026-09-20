@@ -118,7 +118,7 @@ live on `model.*` — see the **Model** section above.
 DPO-specific hyperparameters, accessed via `dpo_config.*`.  
 Root config: `VeOmniDPOArguments` (extends `VeOmniArguments`).
 
-* `DPOConfig` — `dpo_config.*`
+* `DPOConfig` — `dpo_config.*`. The frozen reference always copies `model`; a custom `reference_model` config is not supported.
 
 ---
 
@@ -155,7 +155,9 @@ own `safetensor_idx_path`.
 | config_path | `Optional[str]` | `None` | Path to the model HuggingFace config (e.g. `config.json`). Defaults to `model_path`. |
 | model_path | `Optional[str]` | `None` | Path to the pre-trained model weights. If unset, random init is used. |
 | model_config | `Optional[Dict]` | `{}` | Values used to override the loaded foundation-model config. |
+| processor_config | `Optional[Dict]` | `{}` | Kwargs used to override the loaded processor / tokenizer config. See below. |
 | tokenizer_path | `Optional[str]` | `None` | Path to the tokenizer. Defaults to `config_path`. |
+| chat_template | `Optional[str]` | `None` | Registered chat-template name used to lay conversations out into training samples. Leave unset for data with no conversation structure (plaintext, diffusion) or for a model that formats prompts through its own processor (Qwen-Omni). |
 | safetensor_idx_path | `Optional[str]` | `None` | Path to `model.safetensors.index.json`. |
 | basic_modules | `Optional[List[str]]` | `[]` | Additional modules beyond `_no_split_modules` to shard in FSDP. |
 | lora_config | `Optional[Dict]` | `{}` | Native VeOmni LoRA configuration. See the LoRA feature guide. |
@@ -164,6 +166,18 @@ own `safetensor_idx_path`.
 | ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule for this model. |
 | accelerator | `AcceleratorConfig` | — | Parallelism, sharding, and placement for this model. |
+
+`processor_config` is to the preprocessor what `model_config` is to the architecture: its keys are forwarded to `AutoProcessor.from_pretrained`, overriding what the checkpoint ships. Leave it empty and the repository's own `preprocessor_config.json` is authoritative. Pixel budgets belong in `data.mm_configs`.
+
+```yaml
+model:
+  processor_config:
+    size:
+      shortest_edge: 3136
+      longest_edge: 602112
+```
+
+> Do not use the legacy `max_pixels` / `min_pixels` keys. Transformers v5 accepts them only for backward compatibility and maps them onto `size`, mutating the image-processor class attribute in place — every processor of that class built later in the same process inherits the value.
 
 ### OpsImplementationConfig
 
@@ -353,7 +367,6 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | source_name | `str` | `None` | Dataset name. Loaded from multisource YAML if multisource is enabled. |
 | dyn_bsz_buffer_size | `int` | `200` | Buffer size for dynamic batch size. |
 | text_keys | `str` | `None` | Key to retrieve text from data. Auto-resolved: `"content_split"` for plaintext, `"messages"` for conversation, `"text"` for classification, `"chosen"` for DPO. |
-| chat_template | `str` | `"default"` | Chat template name. |
 | max_seq_len | `int` | `2048` | Maximum sequence length. |
 | silent_exception | `bool` | `False` | Whether to ignore exceptions when loading data. |
 | dataloader | `DataloaderConfig` | — | DataLoader construction parameters. |
@@ -612,13 +625,15 @@ and is not intended to be captured by `torch.compile`.
 
 ### CheckpointConfig
 
-`train.checkpoint.*` — Checkpoint saving and loading.
+`train.checkpoint.*` — Checkpoint saving and loading. On-disk layout: [Checkpoint layout](checkpoint.md).
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | output_dir | `str` | `"output"` | Path to save model checkpoints. |
 | manager | `str` | `"dcp"` | Checkpoint manager. |
 | save_async | `bool` | `False` | Save checkpoints asynchronously. |
+| stage_dir | `Optional[str]` | `None` | Write the checkpoint here and copy it to `output_dir` afterwards, for a destination slow enough that writing straight to it blocks the training loop past the collective timeout. Nothing is probed: point it at a node-local filesystem that can hold every rank on the node writing the model plus its optimizer state. Cannot be combined with `save_async`. |
+| save_timeout_seconds | `Optional[int]` | `None` | Collective timeout in seconds for the gloo groups that checkpoint saves run their own collectives on: a staged save's copy to `output_dir`, and each `save_async` write. Must outlast the work; unset keeps gloo's 30-minute default. |
 | dcp_save_to_lowest_rank | `bool` | `False` | Write each replicated DCP shard from the lowest global rank that holds it instead of load-balancing across replicas. On a non-shared filesystem this concentrates the deduplicated copy onto the lowest-ranked replica group rather than scattering it across replicas; in the standard HSDP layout (shard within a node, replicate across nodes) that group is one node, which then holds a complete checkpoint. Only affects replicated data — unique expert/tensor/pipeline-parallel shards stay distributed. Leave `False` when `output_dir` is shared. |
 | load_path | `Optional[str]` | `None` | Path to checkpoint for resuming training. Use `"auto"` for auto-detection. |
 | save_steps | `int` | `0` | Steps between checkpoint saves. `0` to disable. |
@@ -720,3 +735,5 @@ derived argument groups below.
 | loss_type | `"sigmoid" \| "ipo"` | `"sigmoid"` | DPO loss variant: `sigmoid` for standard DPO, `ipo` for Identity Preference Optimization. |
 | average_log_prob | `bool` | `False` | If `True`, average log probs per token instead of summing. |
 | refer_model_precision | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype used to load the frozen reference model. |
+
+The frozen reference always copies `model`. A custom `reference_model` config is not supported.

@@ -37,8 +37,8 @@ import torch
 from torch.distributed.checkpoint import FileSystemReader
 
 from veomni.arguments import VeOmniArguments, parse_args
+from veomni.checkpoint.layout import weights_dir
 from veomni.data import build_dummy_dataset
-from veomni.models.checkpoint_manager import ModelCheckpointManager
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
@@ -130,7 +130,7 @@ class _LoraCheckpointCallback(CheckpointCallback):
             # silently get restored on load and defeat the size optimisation.
             model_keys = [
                 k
-                for k in FileSystemReader(self.trainer.dcp_ckpt_path).read_metadata().state_dict_metadata
+                for k in FileSystemReader(weights_dir(self.trainer.dcp_ckpt_path)).read_metadata().state_dict_metadata
                 if k.startswith("model.")
             ]
             base_keys_in_dcp = [k for k in model_keys if "lora_" not in k]
@@ -202,9 +202,6 @@ class LoraTrainerSaveLoadTest(BaseTrainer):
 
     # -- dataset / asset overrides -----------------------------------------
 
-    def _build_model_assets(self) -> None:
-        self.model_assets = [self.model_config]
-
     def _build_data_transform(self) -> None:
         pass
 
@@ -217,7 +214,6 @@ class LoraTrainerSaveLoadTest(BaseTrainer):
     # -- callbacks ----------------------------------------------------------
 
     def _init_callbacks(self) -> None:
-        self.checkpoint = ModelCheckpointManager(self)
         self.environ_meter_callback = _EnvironMeterCallbackTest(self)
         self.checkpoint_callback = _LoraCheckpointCallback(self)
         self.check_callback = _LoraCheckCallback(self)

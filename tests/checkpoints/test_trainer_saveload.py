@@ -12,8 +12,8 @@ import yaml
 try:
     from .checkpoint_verification_utils import verify_dcp_to_hf_conversion
     from .utils import (
-        get_checkpoint_dir,
         get_checkpoint_test_command,
+        get_dcp_weights_dir,
         get_hf_output_dir,
         get_merge_dcp_to_hf_command,
         get_output_dir,
@@ -21,8 +21,8 @@ try:
 except Exception as _:
     from checkpoint_verification_utils import verify_dcp_to_hf_conversion
 from veomni.arguments import parse_args
+from veomni.checkpoint.layout import weights_dir
 from veomni.data import build_dummy_dataset
-from veomni.models.checkpoint_manager import ModelCheckpointManager
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
@@ -104,9 +104,6 @@ class TrainerTest(BaseTrainer):
     dcp_weights_path: str
     hf_weights_path: str
 
-    def _build_model_assets(self):
-        self.model_assets = [self.model_config]
-
     def _build_data_transform(self):
         pass
 
@@ -117,7 +114,6 @@ class TrainerTest(BaseTrainer):
         self.train_steps = args.train_steps
 
     def _init_callbacks(self):
-        self.checkpoint = ModelCheckpointManager(self)
         self.environ_meter_callback = EnvironMeterCallbackTest(self)
         self.checkpoint_callback = CheckpointCallbackTest(self)
         self.check_callback = CheckCallback(self)
@@ -177,11 +173,14 @@ class CheckpointCallbackTest(CheckpointCallback):
     def on_epoch_end(self, state: TrainerState, **kwargs):
         if state.epoch == 0:
             self.trainer.golden_model_sd = copy.deepcopy(self.trainer.model.state_dict())
-            self.trainer.golden_optim_sd = copy.deepcopy(self.trainer.optimizer.state_dict())
+            self.trainer.golden_optim_sd = copy.deepcopy(self.trainer.model.optimizer.state_dict())
             self._save_dcp(state)
-            self.trainer.dcp_weights_path = os.path.join(
+            # Two different paths: resume takes the step directory, while a
+            # reader of raw shards wants the DCP directory inside it.
+            self.trainer.step_ckpt_path = os.path.join(
                 self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}"
             )
+            self.trainer.dcp_weights_path = weights_dir(self.trainer.step_ckpt_path)
             self.trainer.dcp_global_step = state.global_step
             dtypes_before_hf_save = capture_param_dtypes(self.trainer.model)
             self._save_hf(state)
@@ -210,7 +209,7 @@ class CheckCallback(Callback):
                 safe_serialization=True,
             ), "HF checkpoint verification failed"
 
-        self.trainer.args.train.checkpoint.load_path = self.trainer.dcp_weights_path
+        self.trainer.args.train.checkpoint.load_path = self.trainer.step_ckpt_path
         self.trainer.load()
 
         tied_weights_keys = None
@@ -218,7 +217,7 @@ class CheckCallback(Callback):
             tied_weights_keys = self.trainer.model._tied_weights_keys
 
         check_state_dict(self.trainer.golden_model_sd, self.trainer.model.state_dict(), tied_weights_keys)
-        check_state_dict(self.trainer.golden_optim_sd, self.trainer.optimizer.state_dict(), need_flatten=True)
+        check_state_dict(self.trainer.golden_optim_sd, self.trainer.model.optimizer.state_dict(), need_flatten=True)
 
 
 def main():
@@ -242,7 +241,7 @@ def _run_trainer_saveload_and_verify(model_name: str, ep_size: int, dp_replicate
     assert merge_result.returncode == 0
 
     assert verify_dcp_to_hf_conversion(
-        dcp_checkpoint_dir=get_checkpoint_dir(model_name, ep_size, dp_replicate_size),
+        dcp_checkpoint_dir=get_dcp_weights_dir(model_name, ep_size, dp_replicate_size),
         hf_checkpoint_dir=get_hf_output_dir(model_name, ep_size, dp_replicate_size),
         safe_serialization=True,
     ), (

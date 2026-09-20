@@ -790,7 +790,13 @@ class CheckpointConfig:
     )
     save_async: bool = field(
         default=False,
-        metadata={"help": "Whether to save checkpoint asynchronously."},
+        metadata={
+            "help": (
+                "Return from the checkpoint save while the write is still in flight. "
+                "Cannot be combined with `stage_dir`: the staged copy is dropped when the "
+                "save returns, which an in-flight write would then be reading from."
+            )
+        },
     )
     stage_dir: Optional[str] = field(
         default=None,
@@ -804,6 +810,18 @@ class CheckpointConfig:
                 "so point it at a node-local filesystem that can hold every rank on the node "
                 "writing the model plus its optimizer state at once. Unset (default) writes "
                 "directly. Cannot be combined with `save_async`."
+            )
+        },
+    )
+    save_timeout_seconds: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Collective timeout in seconds for the gloo groups checkpoint saves run their "
+                "own collectives on: a staged save's copy to `output_dir`, and each `save_async` "
+                "write. A positive integer that must outlast the work, since the ranks not "
+                "writing wait on it for the whole duration. Unset (default) keeps gloo's "
+                "30-minute default."
             )
         },
     )
@@ -848,6 +866,48 @@ class CheckpointConfig:
         default=True,
         metadata={"help": "Save the huggingface format weights to the last checkpoint dir."},
     )
+
+    def __post_init__(self):
+        """Reject a save configuration that cannot do what it says.
+
+        ``DistributedCheckpointer.save`` rejects ``stage_dir`` with
+        ``save_async`` too, but not until the first checkpoint is due -- a
+        ``save_steps``-long wait to be told the configuration was never valid.
+        """
+        if self.stage_dir and self.save_async:
+            raise ValueError(
+                "stage_dir cannot be combined with save_async: the staged copy is dropped when the save "
+                "returns, which an in-flight write would then be reading from."
+            )
+
+        if self.save_timeout_seconds is None:
+            return
+
+        # ``bool`` is an ``int`` subclass and the parser passes YAML through
+        # untouched: a stray ``true`` would be a one-second timeout. ``__index__``
+        # rather than ``isinstance(int)`` because a numpy scalar -- what a
+        # programmatic caller tends to hold -- is not an ``int`` subclass but is
+        # an integer in every way that matters here; ``float`` has no ``__index__``.
+        if (
+            isinstance(self.save_timeout_seconds, bool)
+            or not hasattr(self.save_timeout_seconds, "__index__")
+            or self.save_timeout_seconds <= 0
+        ):
+            raise ValueError(f"save_timeout_seconds must be a positive integer, got {self.save_timeout_seconds!r}.")
+
+        # Normalized here so everything downstream holds a builtin ``int``:
+        # ``timedelta(seconds=...)`` rejects a numpy scalar outright.
+        self.save_timeout_seconds = int(self.save_timeout_seconds)
+
+        # It only bounds the gloo groups those two paths create; a direct
+        # synchronous save has none and keeps the training backend's timeout.
+        # Truthiness rather than ``is None``: an empty ``stage_dir`` is what the
+        # checkpointer reads as unset, so it creates no group here either.
+        if not self.stage_dir and not self.save_async:
+            logger.warning_rank0(
+                f"save_timeout_seconds={self.save_timeout_seconds} has no effect: it bounds the gloo "
+                "groups used by `stage_dir` and `save_async`, and neither is enabled."
+            )
 
 
 @dataclass
@@ -1022,6 +1082,8 @@ class TrainingArguments:
             self.dataloader_batch_size = self.global_batch_size // acc.dp_size  # = micro bsz * grad accu
 
     def _resolve_checkpoint_paths(self):
+        from ..checkpoint.layout import ASSETS_DIRNAME
+
         ckpt = self.checkpoint
 
         if ckpt.load_path == "auto":
@@ -1043,13 +1105,14 @@ class TrainingArguments:
                 logger.warning("load_checkpoint_path should be under output_dir.")
 
         # output_dir/
-        # ├── checkpoints/          # DCP training checkpoints (model + optimizer + extra_state)
+        # ├── checkpoints/          # DCP: model + optimizer + lr_scheduler.pt + trainer_state
         # │   ├── global_step_100/
         # │   └── global_step_200/
         # │       └── hf_ckpt/      # HF safetensors saved under the last checkpoint folder
-        # └── model_assets/
+        # └── model_assets/         # or model_assets/<module>/ in a multi-module job
+        # See docs/usage/checkpoint.md.
         ckpt.save_path = os.path.join(ckpt.output_dir, "checkpoints")
-        ckpt.model_assets_dir = os.path.join(ckpt.output_dir, "model_assets")
+        ckpt.model_assets_dir = os.path.join(ckpt.output_dir, ASSETS_DIRNAME)
 
     def _resolve_profile(self):
         if self.profile.enable:
@@ -1509,6 +1572,25 @@ class BaseModelArguments:
         default_factory=dict,
         metadata={"help": "Config to overwrite foundation model config."},
     )
+    processor_config: Optional[Dict] = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "Kwargs to overwrite the processor/tokenizer config, e.g. "
+                "`size: {shortest_edge: 3136, longest_edge: 602112}` for a Qwen-VL image processor."
+            )
+        },
+    )
+    chat_template: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Registered chat-template name used to lay conversations out into training samples. "
+                "Leave unset for data with no conversation structure (plaintext, diffusion) or for a "
+                "model that formats prompts through its own processor (Qwen-Omni)."
+            )
+        },
+    )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
@@ -1599,7 +1681,7 @@ class ModelArguments(BaseModelArguments):
     ep_sharded_stream_load: bool = field(
         default=False,
         metadata={
-            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
+            "help": "Opt-in fast/low-memory loader for large ExtraParallel-sharded checkpoint tensors (for example MoE experts or PLE embedding tables): each rank reads only its dim-0 slice straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
         },
     )
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
@@ -1615,6 +1697,19 @@ class ModelArguments(BaseModelArguments):
             "model.broadcast_model_weights_from_rank0=False "
             "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
         )
+
+        extra_parallel_sizes = dict(zip(self.accelerator.extra_parallel_names, self.accelerator.extra_parallel_sizes))
+        ple_size = extra_parallel_sizes.get("ple", 1)
+        if ple_size > 1:
+            if self.accelerator.dp_shard_size % ple_size != 0:
+                raise ValueError(
+                    f"PLE size ({ple_size}) must divide the FSDP shard size ({self.accelerator.dp_shard_size})."
+                )
+            if not self.ep_sharded_stream_load:
+                raise ValueError(
+                    "PLE two-dimensional parallelism requires model.ep_sharded_stream_load=true so each rank "
+                    "reads only its local row-by-column checkpoint rectangle."
+                )
 
 
 # ================================ Data Arguments ======================================
@@ -1722,10 +1817,6 @@ class DataArguments:
     text_keys: str = field(
         default=None,
         metadata={"help": "Key to get text from the training data."},
-    )
-    chat_template: str = field(
-        default="default",
-        metadata={"help": "Chat template to use."},
     )
     max_seq_len: int = field(
         default=2048,
