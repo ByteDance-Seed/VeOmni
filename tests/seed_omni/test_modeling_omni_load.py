@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -26,6 +27,7 @@ from veomni.models.seed_omni.modules.fake_model.fake_module_a.configuration impo
 from veomni.models.seed_omni.modules.fake_model.fake_module_a.modeling import FakeModuleA
 from veomni.models.seed_omni.modules.fake_model.fake_module_b.configuration import FakeModuleBConfig
 from veomni.models.seed_omni.modules.fake_model.fake_module_b.modeling import FakeModuleB
+from veomni.models.seed_omni.modules.module_configuration_base import OmniModuleConfig
 
 
 FAKE_A = "fake_module_a"
@@ -217,6 +219,79 @@ def test_omni_model_from_pretrained_forwards_dtype_to_modules(tmp_path):
     assert loaded.get_module(FAKE_B).proj.weight.dtype == torch.bfloat16
 
 
+def test_from_pretrained_takes_each_module_attention_from_the_checkpoint(tmp_path):
+    """The persisted kernels have to reach the per-module ``from_pretrained``.
+
+    This entry point has no launcher behind it, so the checkpoint is the only
+    place a module's attention can come from — and it is per module, which is
+    the whole reason it is not a single load-wide kwarg. Without this the two
+    modules both silently take HF's default.
+    """
+    _build_omni_model().save_pretrained(tmp_path)
+    config = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    config["modules"][FAKE_A]["model"] = {"ops_implementation": {"attn_implementation": "eager"}}
+    config["modules"][FAKE_B]["model"] = {"ops_implementation": {"attn_implementation": "sdpa"}}
+    (tmp_path / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+    seen: dict[str, str | None] = {}
+
+    def record(cls, path, *args, **kwargs):
+        # Built straight from the config: the point here is which kwarg arrives,
+        # and a real load would first have HF reject `sdpa` on a stub module
+        # that never declared support for it.
+        seen[cls.config_class.model_type] = kwargs.get("attn_implementation")
+        return cls(kwargs["config"])
+
+    with (
+        patch.object(FakeModuleA, "from_pretrained", classmethod(record)),
+        patch.object(FakeModuleB, "from_pretrained", classmethod(record)),
+    ):
+        OmniModel.from_pretrained(tmp_path)
+
+    assert seen == {FAKE_A: "eager", FAKE_B: "sdpa"}
+
+
+def test_ops_implementation_survives_hydrate_and_reexport(tmp_path):
+    """Kernels are a checkpoint load option and must round-trip like ``model_config``.
+
+    Hydration parks the typed config on the descriptor, so a load→save must
+    still emit ``ops_implementation`` — otherwise a launcher-less caller that
+    re-exports would silently drop per-module kernels.
+    """
+    _write_omni_checkpoint(tmp_path)
+    config_path = tmp_path / "config.json"
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["modules"][FAKE_A]["model"] = {
+        "model_config": {"hidden_size": 16},
+        "ops_implementation": {"attn_implementation": "eager"},
+    }
+    config_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+
+    config = OmniConfig.from_pretrained(tmp_path)
+    assert config.module_ops_implementation(FAKE_A)["attn_implementation"] == "eager"
+    assert config.module_runtime_fields(FAKE_A)["ops_implementation"]["attn_implementation"] == "eager"
+    assert config.module_hf_config(FAKE_A).hidden_size == 16
+
+    exported = tmp_path / "exported"
+    config.save_pretrained(exported)
+    saved = json.loads((exported / "config.json").read_text(encoding="utf-8"))
+    assert saved["modules"][FAKE_A]["model"]["ops_implementation"]["attn_implementation"] == "eager"
+    assert saved["modules"][FAKE_A]["model"]["model_config"]["hidden_size"] == 16
+    assert "model_path" not in saved["modules"][FAKE_A]["model"]
+
+
+def test_from_runtime_persists_ops_implementation_on_the_descriptor():
+    entry = OmniModuleConfig.from_runtime(
+        FAKE_A,
+        model_path="/ckpt/fake_module_a",
+        ops_implementation={"attn_implementation": "eager"},
+    )
+    module = OmniModuleConfig(FAKE_A, entry)
+    assert module.ops_implementation() == {"attn_implementation": "eager"}
+    assert module.to_export_dict()["model"]["ops_implementation"]["attn_implementation"] == "eager"
+    assert "model_path" not in module.to_export_dict()["model"]
+
+
 def test_omni_model_from_config_builds_unweighted_modules(tmp_path):
     _write_omni_checkpoint(tmp_path)
     config = OmniConfig.from_pretrained(tmp_path)
@@ -262,7 +337,10 @@ def test_hydration_keeps_the_descriptor_a_module_was_declared_with(tmp_path):
     raw = json.loads(config_path.read_text())
     raw["modules"][FAKE_A] = {
         "subfolder": FAKE_A,
-        "model": {"model_config": {"hidden_size": 16}},
+        "model": {
+            "model_config": {"hidden_size": 16},
+            "ops_implementation": {"attn_implementation": "eager"},
+        },
         "processor_config": {"packed_preprocess": True},
     }
     config_path.write_text(json.dumps(raw), encoding="utf-8")
@@ -271,6 +349,7 @@ def test_hydration_keeps_the_descriptor_a_module_was_declared_with(tmp_path):
 
     assert config.module_processor_config(FAKE_A) == {"packed_preprocess": True}
     assert config.module_model_config(FAKE_A) == {"hidden_size": 16}
+    assert config.module_ops_implementation(FAKE_A) == {"attn_implementation": "eager"}
     assert config.module_hf_config(FAKE_A).hidden_size == 16
 
 

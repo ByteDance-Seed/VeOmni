@@ -33,7 +33,7 @@ endpoint directly (no pre/post hooks).  Stop when ``is_done()`` or
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
 import torch.distributed as dist
 import torch.nn as nn
@@ -45,6 +45,10 @@ from .graphs.base import NodeDef
 from .graphs.generation_graph import GenerationGraph
 from .graphs.training_graph import TrainingGraph
 from .modules import OMNI_MODEL_REGISTRY, read_model_type
+
+
+if TYPE_CHECKING:
+    from ...arguments import OpsImplementationConfig
 
 
 logger = helper.create_logger(__name__)
@@ -176,8 +180,9 @@ class OmniModel(PreTrainedModel):
 
         Remaining kwargs are forwarded to **every** sub-module's
         ``from_pretrained`` as global load options (e.g. ``torch_dtype``,
-        ``device_map``).  Per-module ``model_config`` overrides persisted in the
-        checkpoint are merged on top via :meth:`_build_module_load_kwargs`.
+        ``device_map``).  Per-module ``model_config`` overrides and
+        ``ops_implementation`` persisted in the checkpoint are merged on top
+        via :meth:`_build_module_load_kwargs`.
 
         Pass ``config=`` to load the weights under an already-resolved
         :class:`OmniConfig` instead of the root ``config.json`` — how
@@ -222,9 +227,40 @@ class OmniModel(PreTrainedModel):
         config: OmniConfig,
         name: str,
         base_kwargs: dict[str, Any],
+        base_ops: OpsImplementationConfig | None = None,
     ) -> dict[str, Any]:
-        """Merge per-module ``model_config`` overrides onto the caller's load kwargs."""
-        return {**base_kwargs, **config.module_model_config(name)}
+        """Merge this module's ``model_config`` overrides and its persisted kernels.
+
+        This entry point is the one caller with nothing but the checkpoint to go
+        on: anything reaching a module through a VeOmni launcher gets its
+        kernels from ``ModuleRuntime`` instead. So this is where a module's
+        persisted ``ops_implementation`` is read back and turned into the two
+        things a load can act on — the process-wide ops config, and
+        ``attn_implementation``, which HF's ``from_pretrained`` takes directly
+        (the same knob an upstream inference script passes as
+        ``attn_implementation="flash_attention_2"``; without it every module
+        here silently gets the HF default).
+
+        ``base_ops`` is the config in force when the load started. A module with
+        no persisted block is restored to it rather than left under whichever
+        module was installed before it, so a module's kernels do not depend on
+        its position in ``config.module_names``.
+        """
+        from ...arguments import OpsImplementationConfig
+        from ...ops import apply_ops_config
+
+        load_kwargs = {**base_kwargs, **config.module_model_config(name)}
+        ops_dict = config.module_ops_implementation(name)
+        if not ops_dict:
+            if base_ops is not None:
+                apply_ops_config(base_ops)
+            return load_kwargs
+
+        ops = OpsImplementationConfig(**ops_dict)
+        apply_ops_config(ops)
+        if ops.attn_implementation is not None:
+            load_kwargs["attn_implementation"] = ops.attn_implementation
+        return load_kwargs
 
     @staticmethod
     def _init_only_load_kwargs(load_kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -253,11 +289,16 @@ class OmniModel(PreTrainedModel):
         ``load_weights=True`` calls ``from_pretrained`` (checkpoint weights).
         ``load_weights=False`` calls ``_from_config`` (architecture only).
         """
+        from ...ops import apply_ops_config
+        from ...ops.config.singleton import get_ops_config
+        from ..auto import bind_ops_to_modeling
+
+        base_ops = get_ops_config()
         modules: dict[str, nn.Module] = {}
         for name in config.module_names:
             module_path = config.resolve_module_path(checkpoint_root, name)
             hydrated = config.module_hf_config(name)
-            load_kwargs = cls._build_module_load_kwargs(config, name, kwargs)
+            load_kwargs = cls._build_module_load_kwargs(config, name, kwargs, base_ops)
             if hydrated is not None:
                 # ``OmniConfig.from_pretrained`` already read this module's
                 # ``config.json`` and applied its ``model_config`` overrides.
@@ -269,10 +310,16 @@ class OmniModel(PreTrainedModel):
                 module_config = mod_cls.config_class.from_pretrained(module_path)
                 for key, value in config.module_model_config(name).items():
                     setattr(module_config, key, value)
+            # After `_build_module_load_kwargs` installed this module's config.
+            bind_ops_to_modeling(mod_cls)
             if load_weights:
                 modules[name] = mod_cls.from_pretrained(module_path, config=module_config, **load_kwargs)
             else:
                 modules[name] = mod_cls._from_config(module_config, **cls._init_only_load_kwargs(load_kwargs))
+
+        # Don't leave the caller's config holding the last module's override.
+        if base_ops is not None:
+            apply_ops_config(base_ops)
         return modules
 
     @staticmethod

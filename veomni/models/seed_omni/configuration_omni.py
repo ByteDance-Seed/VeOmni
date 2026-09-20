@@ -2,9 +2,12 @@
 
 This is the checkpoint-shaped composite only: a map of per-module descriptors,
 the training DAG, and every generation FSM. Per-module subfolder / path /
-``model_config`` conversion lives on
+``model_config`` / ``ops_implementation`` conversion lives on
 :class:`~veomni.models.seed_omni.modules.module_configuration_base.OmniModuleConfig`.
-This class does not know about VeOmni runtime (ops, FSDP, freeze, launcher YAML).
+This class does not know about VeOmni runtime (FSDP, freeze, launcher YAML).
+Per-module ``ops_implementation`` is a checkpoint load option, persisted next
+to ``model_config`` so a launcher-less ``OmniModel.from_pretrained`` can restore
+the kernels each module was exported with.
 
 A checkpoint stores every generation scenario under ``generation_graphs``, keyed
 by ``infer_type``. :attr:`OmniConfig.generation_graph` is the active one.
@@ -148,6 +151,34 @@ class OmniConfig(PretrainedConfig):
     def module_processor_config(self, name: str) -> Dict[str, Any]:
         """Per-module preprocessor ``from_pretrained`` kwargs."""
         return self.module(name).processor_config()
+
+    def module_ops_implementation(self, name: str) -> Dict[str, Any]:
+        """Per-module VeOmni kernel options persisted in the checkpoint.
+
+        Hydration parks the typed ``config.json`` on the descriptor rather than
+        replacing it, so the ``model`` block — and these kernels — stay readable
+        after :meth:`from_pretrained`.
+        """
+        return self.module(name).ops_implementation()
+
+    def module_runtime_fields(self, name: str) -> Dict[str, Any]:
+        """This module's descriptor flattened onto launcher ``ModelArguments`` keys.
+
+        What the checkpoint contributes when a launcher resolves its modules:
+        ``ops_implementation``, ``model_config``, ``processor_config``, and an
+        ``accelerator`` block if the entry carries one. Callers layer their own
+        per-module YAML on top, so these are defaults rather than the final say.
+
+        ``model_path`` is filled in from the module's subfolder when the entry
+        does not name one, which an exported checkpoint never does — export
+        slims it away precisely because it was an absolute path on the machine
+        that wrote it.
+        """
+        module = self.module(name)
+        fields = deepcopy(module.as_runtime_fields()) if isinstance(module.entry, dict) else {}
+        if not fields.get("model_path"):
+            fields["model_path"] = self.module_checkpoint_subfolder(name)
+        return fields
 
     def module_hf_config(self, name: str) -> Optional[PretrainedConfig]:
         """Module ``name``'s typed ``config.json``, once a checkpoint load hydrated it."""

@@ -34,8 +34,9 @@ from transformers import PretrainedConfig
 
 # In-memory only: :meth:`OmniModuleConfig.hydrate` parks the module's typed
 # ``config.json`` under this key on the descriptor instead of replacing the
-# descriptor with it, so ``processor_config`` / ``model_config`` / an external
-# ``model_path`` survive hydration. Export slimming never copies it out.
+# descriptor with it, so ``processor_config`` / ``model_config`` /
+# ``ops_implementation`` / an external ``model_path`` survive hydration.
+# Export slimming never copies it out.
 HYDRATED_CONFIG_KEY = "hf_config"
 
 
@@ -123,6 +124,24 @@ class OmniModuleConfig:
             return {}
         return dict(entry.get("processor_config") or {})
 
+    def ops_implementation(self) -> dict[str, Any]:
+        """Per-module VeOmni kernel options persisted in the checkpoint.
+
+        Written onto the descriptor on export and read back on the native load
+        path so a module keeps the kernels it was exported with (see
+        ``OmniModel._load_modules``). A checkpoint converted straight from HF
+        weights carries none, and the caller's ops config applies instead.
+        Hydration parks the typed config on the descriptor, so this stays
+        readable after :meth:`~veomni.models.seed_omni.configuration_omni.OmniConfig.from_pretrained`.
+        """
+        entry = self.entry
+        if isinstance(entry, PretrainedConfig) or not isinstance(entry, dict):
+            return {}
+        model_block = entry.get("model")
+        if not isinstance(model_block, dict):
+            return {}
+        return dict(model_block.get("ops_implementation") or {})
+
     def resolve_path(self, checkpoint_root: str | os.PathLike | None) -> str:
         """Resolve the on-disk path for this module under ``checkpoint_root``."""
         subfolder = self.subfolder
@@ -135,9 +154,15 @@ class OmniModuleConfig:
     def to_export_dict(self) -> dict[str, Any]:
         """Slim descriptor for HF ``config.json`` (subfolder + optional config overrides)."""
         slim: dict[str, Any] = {"subfolder": self.checkpoint_subfolder}
+        model_block: dict[str, Any] = {}
+        ops_implementation = self.ops_implementation()
+        if ops_implementation:
+            model_block["ops_implementation"] = deepcopy(ops_implementation)
         model_config = self.model_config_overrides()
         if model_config:
-            slim["model"] = {"model_config": model_config}
+            model_block["model_config"] = model_config
+        if model_block:
+            slim["model"] = model_block
         processor_config = self.processor_config()
         if processor_config:
             slim["processor_config"] = deepcopy(processor_config)
@@ -200,6 +225,7 @@ class OmniModuleConfig:
         model_path: str | None = None,
         model_config: dict[str, Any] | None = None,
         processor_config: dict[str, Any] | None = None,
+        ops_implementation: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build an ``OmniConfig.modules`` descriptor dict from runtime fields.
 
@@ -209,6 +235,8 @@ class OmniModuleConfig:
         module override may point at a wholly different checkpoint.
         """
         model_block: dict[str, Any] = {}
+        if ops_implementation:
+            model_block["ops_implementation"] = deepcopy(ops_implementation)
         if model_path:
             model_block["model_path"] = model_path
         if model_config:
