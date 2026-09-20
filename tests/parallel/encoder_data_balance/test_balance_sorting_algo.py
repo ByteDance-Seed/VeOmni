@@ -156,7 +156,7 @@ def test_linear_and_quadratic_costs_assign_differently(device):
     sorter = SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"]
     quadratic = sorter(table, 2, 1)
     linear = sorter(table, 2, 1, cost_exponent=1)
-    callable_linear = sorter(table, 2, 1, cost_fn=lambda lengths: lengths)
+    callable_linear = sorter(table, 2, 1, cost_fn=lambda table, dim: table[:, dim])
     assert [b[:, 0].tolist() for b in quadratic] == [[0, 3], [1, 2, 4]]
     assert [b[:, 0].tolist() for b in linear] == [[0, 3, 4], [1, 2]]
     assert all(torch.equal(a, b) for a, b in zip(linear, callable_linear))
@@ -169,7 +169,7 @@ def test_custom_costs_not_sorted_by_length_or_squared_twice(device):
         table,
         2,
         1,
-        cost_fn=lambda lengths: torch.tensor([10, 9, 8, 7, 6], device=lengths.device),
+        cost_fn=lambda table, dim: torch.tensor([10, 9, 8, 7, 6], device=table.device),
     )
     assert [b[:, 0].tolist() for b in result] == [[0, 3, 4], [1, 2]]
 
@@ -181,7 +181,7 @@ def test_custom_large_integer_costs_preserve_order(device):
         table,
         2,
         1,
-        cost_fn=lambda lengths: torch.tensor([2**60, 2**60 + 1], device=lengths.device),
+        cost_fn=lambda table, dim: torch.tensor([2**60, 2**60 + 1], device=table.device),
     )
     assert [b[:, 0].tolist() for b in result] == [[1], [0]]
 
@@ -197,18 +197,44 @@ def test_invalid_exponent(exponent):
         )
 
 
-def test_overflowing_cost():
-    with pytest.raises(ValueError):
+def test_exact_integer_cost_does_not_overflow():
+    table = torch.tensor([[1000], [999], [998]])
+    result = SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](table, 2, 0, cost_exponent=200)
+    assert [bucket[:, 0].tolist() for bucket in result] == [[1000], [999, 998]]
+
+
+@pytest.mark.parametrize("exponent", [2, 1, -3])
+def test_callable_and_explicit_exponent_are_mutually_exclusive(exponent):
+    with pytest.raises(ValueError, match="not both"):
         SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](
-            torch.tensor([[2]]),
-            2,
-            0,
-            cost_exponent=1024,
+            torch.ones(2, 1), 2, 0, cost_exponent=exponent, cost_fn=lambda table, dim: table[:, dim]
+        )
+
+
+def test_callable_receives_independent_full_table():
+    table = torch.tensor([[0, 1, 10], [1, 2, 20]])
+
+    def cost_fn(rows, dim):
+        assert dim == 1
+        rows[:, dim] = 0
+        return rows[:, 2:3]
+
+    result = SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](table, 2, 1, cost_fn=cost_fn)
+    assert torch.equal(table, torch.tensor([[0, 1, 10], [1, 2, 20]]))
+    assert [bucket[:, 0].tolist() for bucket in result] == [[1], [0]]
+    assert torch.equal(torch.cat(result)[[1, 0]], table)
+
+
+def test_vector_costs_are_explicitly_reserved():
+    with pytest.raises(NotImplementedError, match="Vector cost"):
+        SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](
+            torch.ones(2, 2), 2, 0, cost_fn=lambda table, dim: table
         )
 
 
 @pytest.mark.parametrize(
-    "costs", [torch.tensor([-1.0]), torch.tensor([float("nan")]), torch.tensor([float("inf")]), torch.ones(1, 1), [1]]
+    "costs",
+    [torch.tensor([-1.0]), torch.tensor([float("nan")]), torch.tensor([float("inf")]), torch.ones(1, 1, 1), [1]],
 )
 def test_invalid_callable_costs(costs):
     with pytest.raises(ValueError):
@@ -216,7 +242,7 @@ def test_invalid_callable_costs(costs):
             torch.tensor([[1]]),
             2,
             0,
-            cost_fn=lambda lengths: costs,
+            cost_fn=lambda table, dim: costs,
         )
 
 

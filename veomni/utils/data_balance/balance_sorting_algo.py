@@ -26,8 +26,8 @@ def post_mbs_balancing_greedy_without_pad(
     num_replicas: int,
     dim: int,
     *,
-    cost_exponent: float = 2,
-    cost_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    cost_exponent: Optional[float] = None,
+    cost_fn: Optional[Callable[[torch.Tensor, int], torch.Tensor]] = None,
 ) -> List[torch.Tensor]:
     """
     A greedy bin-packing sorting algorithm designed for encoder data balance.
@@ -36,7 +36,7 @@ def post_mbs_balancing_greedy_without_pad(
 
     The default load is the sum of lengths^2 (legacy ViT behavior). A module can
     provide a different exponent or a callable returning one scheduling cost per
-    input length. Custom costs are sorted descending and accumulated directly;
+    input row. Custom costs are sorted descending and accumulated directly;
     they are not squared again. Neither costs nor assignments redefine token counts.
 
     The bin with the smallest load is tracked with a min-heap keyed on ``(accumulated_load, dp_rank)``. This costs
@@ -49,9 +49,12 @@ def post_mbs_balancing_greedy_without_pad(
         all_data_lengths: the length information of data gathered from all dp ranks
         num_replicas: the size of dp group
         dim: the dimension along with the data in all_data_lengths is used for sorting
-        cost_exponent: nonnegative finite exponent; 1 models linear token cost
-        cost_fn: optional callable from the length vector to a same-shaped cost
-            tensor; overrides cost_exponent. It must be deterministic across ranks.
+        cost_exponent: nonnegative finite exponent; omitted means integer 2. An
+            integer exponent keeps integer costs exact; a float exponent uses floats.
+        cost_fn: callable receiving a cloned item table and dim, returning [N]
+            or [N, 1] scalar costs. [N, K] with K > 1 is reserved for vector
+            scheduling and raises NotImplementedError. Must be deterministic
+            across ranks; cannot be combined with an explicit cost_exponent.
 
     Returns:
         a list of ${dp group size} tensors, where each tensor stores the sequence length and coordinate of the data
@@ -60,35 +63,42 @@ def post_mbs_balancing_greedy_without_pad(
     if all_data_lengths.ndim != 2 or not 0 <= dim < all_data_lengths.shape[1] or num_replicas < 1:
         raise ValueError("Expected a 2D item table, valid length column, and positive replica count.")
     lengths = all_data_lengths[:, dim]
-    if lengths.is_complex() or not bool(torch.isfinite(lengths).all()) or bool((lengths < 0).any()):
+    if lengths.is_complex():
         raise ValueError("Item lengths must be finite and nonnegative.")
-    if cost_fn is None and (not math.isfinite(cost_exponent) or cost_exponent < 0):
+    if cost_fn is not None and cost_exponent is not None:
+        raise ValueError("Specify either cost_exponent or cost_fn, not both.")
+    exponent = 2 if cost_exponent is None else cost_exponent
+    if not math.isfinite(exponent) or exponent < 0:
         raise ValueError("Cost exponent must be finite and nonnegative.")
-    if cost_fn is not None:
-        costs = cost_fn(lengths)
-        if not isinstance(costs, torch.Tensor) or costs.shape != lengths.shape:
-            raise ValueError("Cost callable must return a tensor with one cost per item.")
-        if costs.is_complex() or not bool(torch.isfinite(costs).all()) or bool((costs < 0).any()):
+    if cost_fn is None:
+        # Preserve the legacy device sort, including equal-length tie ordering.
+        sort_indice = torch.argsort(lengths.float(), descending=True)
+        order = None
+    else:
+        costs = cost_fn(all_data_lengths.clone(), dim)
+        if not isinstance(costs, torch.Tensor) or costs.ndim not in (1, 2) or costs.shape[0] != lengths.shape[0]:
+            raise ValueError("Cost callable must return an [N] or [N, K] tensor.")
+        if costs.ndim == 2:
+            if costs.shape[1] != 1:
+                raise NotImplementedError("Vector cost scheduling (K != 1) is not implemented.")
+            costs = costs[:, 0]
+        if costs.is_complex():
             raise ValueError("Scheduling costs must be finite and nonnegative.")
-        # Custom costs can be non-monotone in length. Sort host scalars so large
-        # integer costs do not become false ties when cast to float32 on AiCore.
         cost_values = costs.cpu().tolist()
+        if any(not math.isfinite(cost) or cost < 0 for cost in cost_values):
+            raise ValueError("Scheduling costs must be finite and nonnegative.")
         order = sorted(range(len(cost_values)), key=lambda i: (-cost_values[i], i))
         sort_indice = torch.tensor(order, dtype=torch.long, device=all_data_lengths.device)
-    else:
-        # Keep the exact legacy tie ordering for every existing caller. All
-        # nonnegative powers are monotone, so length order is also cost order.
-        sort_indice = torch.argsort(lengths.float(), descending=True)
-        try:
-            cost_values = [length**cost_exponent for length in lengths.cpu().tolist()]
-            if any(not math.isfinite(cost) for cost in cost_values):
-                raise ValueError("Scheduling costs must be finite.")
-        except OverflowError as exc:
-            raise ValueError("Scheduling costs must be finite.") from exc
-    # Note: AiCore does not support dtype int32 or int 64 for argsort. Sort descending by length, then move the rows to
-    # host so the greedy loop below works on cheap Python scalars rather than issuing per-item device ops.
+
     sorted_rows = all_data_lengths[sort_indice].cpu().tolist()
-    sorted_costs = [cost_values[i] for i in sort_indice.cpu().tolist()]
+    sorted_lengths = [row[dim] for row in sorted_rows]
+    if any(not math.isfinite(length) or length < 0 for length in sorted_lengths):
+        raise ValueError("Item lengths must be finite and nonnegative.")
+    sorted_costs = (
+        [length**exponent for length in sorted_lengths] if order is None else [cost_values[i] for i in order]
+    )
+    if any(isinstance(cost, float) and not math.isfinite(cost) for cost in sorted_costs):
+        raise ValueError("Scheduling costs must be finite.")
 
     # Seed one bin per rank; the largest items pre-fill the first `pre_fill_num` bins so every rank starts non-empty.
     pre_fill_num = min(num_replicas, len(sorted_rows))
