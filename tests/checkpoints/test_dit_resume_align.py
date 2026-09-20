@@ -151,7 +151,7 @@ class _AlignConditionModel:
 def _build_trainer_class():
     """Import the trainer lazily so pytest can import this module standalone."""
     from veomni.trainer.callbacks import Callback, TrainerState
-    from veomni.trainer.dit_trainer import DiTTrainer, VeOmniDiTArguments
+    from veomni.trainer.dit_trainer import DiTModelRuntime, DiTTrainer, VeOmniDiTArguments, VeOmniModelRuntime
 
     class SignatureCallback(Callback):
         def __init__(self, trainer) -> None:
@@ -172,6 +172,29 @@ def _build_trainer_class():
             with open(os.path.join(output_dir, SIGNATURE_FILE), "w") as handle:
                 json.dump(self.signatures, handle, indent=2, sort_keys=True)
 
+    class AlignDiTModelRuntime(DiTModelRuntime):
+        """A DiT runtime whose condition model is the RNG stand-in.
+
+        The condition model is built by the runtime, not the trainer, so
+        swapping in the stand-in means overriding here. Its per-rank seed
+        derivation and the ``rng_state_dict``/``load_rng_state_dict`` pair are
+        what the resume path under test actually persists.
+        """
+
+        def _build_condition_model(self, condition_model_type: str) -> None:
+            from veomni.distributed.parallel_state import get_parallel_state
+
+            # Same per-rank seed derivation as the real condition models.
+            self.condition_model = _AlignConditionModel(seed=STANDIN_SEED, dp_rank=get_parallel_state().dp_rank)
+
+        def _freeze_model_module(self) -> None:
+            """Freeze the DiT only.
+
+            The real runtime freezes the condition model alongside it, but the
+            stand-in is deliberately not an ``nn.Module`` and owns no parameters.
+            """
+            VeOmniModelRuntime._freeze_model_module(self)
+
     class ResumeAlignDiTTrainer(DiTTrainer):
         def __init__(self, args: "VeOmniDiTArguments"):
             args.train.training_task = "offline_training"
@@ -184,21 +207,8 @@ def _build_trainer_class():
             # consumer on every forward pass.
             self._model_dropout = torch.nn.Dropout(DROPOUT_P)
 
-        def _build_condition_model(self, condition_model_type: str) -> None:
-            from veomni.distributed.parallel_state import get_parallel_state
-
-            # Same per-rank seed derivation as the real condition models.
-            self.condition_model = _AlignConditionModel(seed=STANDIN_SEED, dp_rank=get_parallel_state().dp_rank)
-            # ``GlobalStateCallback`` reaches the condition model through the
-            # reused ``BaseTrainer`` instance, exactly as the real DiT trainer
-            # arranges it.
-            self.base.condition_model = self.condition_model
-
-        def _freeze_model_module(self) -> None:
-            self.base.lora = False
-
-        def _build_model_assets(self) -> None:
-            self.base.model_assets = [self.base.model.config]
+        def _build_model_runtime(self) -> DiTModelRuntime:
+            return AlignDiTModelRuntime(self.base.args.model, "base", train=self.base.args.train)
 
         def _build_data_transform(self) -> None:
             def process_dummy_example(example: dict, **kwargs):
