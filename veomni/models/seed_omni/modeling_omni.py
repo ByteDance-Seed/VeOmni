@@ -33,7 +33,8 @@ endpoint directly (no pre/post hooks).  Stop when ``is_done()`` or
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Iterator, Mapping
+import sys
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
 import torch.distributed as dist
 import torch.nn as nn
@@ -45,6 +46,10 @@ from .graphs.base import NodeDef
 from .graphs.generation_graph import GenerationGraph
 from .graphs.training_graph import TrainingGraph
 from .modules import OMNI_MODEL_REGISTRY, read_model_type
+
+
+if TYPE_CHECKING:
+    from ...arguments import OpsImplementationConfig
 
 
 logger = helper.create_logger(__name__)
@@ -219,9 +224,58 @@ class OmniModel(PreTrainedModel):
         config: OmniConfig,
         name: str,
         base_kwargs: dict[str, Any],
+        base_ops: OpsImplementationConfig | None = None,
     ) -> dict[str, Any]:
-        """Merge per-module ``model_config`` overrides onto the caller's load kwargs."""
-        return {**base_kwargs, **config.module_model_config(name)}
+        """Merge this module's ``model_config`` overrides and its persisted kernels.
+
+        This entry point is the one caller with nothing but the checkpoint to go
+        on: anything reaching a module through a VeOmni launcher gets its
+        kernels from ``ModuleRuntime`` instead. So this is where a module's
+        persisted ``ops_implementation`` is read back and turned into the two
+        things a load can act on — the process-wide ops config, and
+        ``attn_implementation``, which HF's ``from_pretrained`` takes directly
+        (the same knob an upstream inference script passes as
+        ``attn_implementation="flash_attention_2"``; without it every module
+        here silently gets the HF default).
+
+        ``base_ops`` is the config in force when the load started. A module with
+        no persisted block is restored to it rather than left under whichever
+        module was installed before it, so a module's kernels do not depend on
+        its position in ``config.module_names``.
+        """
+        from ...arguments import OpsImplementationConfig
+        from ...ops import apply_ops_config
+
+        load_kwargs = {**base_kwargs, **config.module_model_config(name)}
+        ops_dict = config.module_ops_implementation(name)
+        if not ops_dict:
+            if base_ops is not None:
+                apply_ops_config(base_ops)
+            return load_kwargs
+
+        ops = OpsImplementationConfig(**ops_dict)
+        apply_ops_config(ops)
+        if ops.attn_implementation is not None:
+            load_kwargs["attn_implementation"] = ops.attn_implementation
+        return load_kwargs
+
+    @staticmethod
+    def _bind_module_ops(mod_cls: type) -> None:
+        """Resolve ``mod_cls``'s OpSlots against the ops config now in force.
+
+        A seam, not an inline: slot binding is on its way out in favour of
+        resolving each op at call time, and when that lands this method is the
+        only thing deleted. What has to outlive it is the step before it —
+        :meth:`_build_module_load_kwargs` installing the module's ops config —
+        because a call-time lookup reads that same config.
+        """
+        from ...ops.config.singleton import get_ops_config
+        from ..auto import _bind_veomni_ops
+
+        ops_config = get_ops_config()
+        modeling_module = sys.modules.get(mod_cls.__module__)
+        if modeling_module is not None and ops_config is not None:
+            _bind_veomni_ops(modeling_module, ops_config)
 
     @staticmethod
     def _init_only_load_kwargs(load_kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -252,11 +306,15 @@ class OmniModel(PreTrainedModel):
         """
         from transformers import PretrainedConfig
 
+        from ...ops import apply_ops_config
+        from ...ops.config.singleton import get_ops_config
+
+        base_ops = get_ops_config()
         modules: dict[str, nn.Module] = {}
         for name in config.module_names:
             module_path = config.resolve_module_path(checkpoint_root, name)
             entry = config.modules.get(name)
-            load_kwargs = cls._build_module_load_kwargs(config, name, kwargs)
+            load_kwargs = cls._build_module_load_kwargs(config, name, kwargs, base_ops)
             if isinstance(entry, PretrainedConfig):
                 # ``OmniConfig.from_pretrained`` already hydrated this entry.
                 mod_cls = OMNI_MODEL_REGISTRY[entry.model_type]()
@@ -267,10 +325,15 @@ class OmniModel(PreTrainedModel):
                 module_config = mod_cls.config_class.from_pretrained(module_path)
                 for key, value in config.module_model_config(name).items():
                     setattr(module_config, key, value)
+            cls._bind_module_ops(mod_cls)
             if load_weights:
                 modules[name] = mod_cls.from_pretrained(module_path, config=module_config, **load_kwargs)
             else:
                 modules[name] = mod_cls._from_config(module_config, **cls._init_only_load_kwargs(load_kwargs))
+
+        # Don't leave the caller's config holding the last module's override.
+        if base_ops is not None:
+            apply_ops_config(base_ops)
         return modules
 
     @staticmethod

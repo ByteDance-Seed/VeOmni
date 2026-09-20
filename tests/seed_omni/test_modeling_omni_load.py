@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -215,6 +216,38 @@ def test_omni_model_from_pretrained_forwards_dtype_to_modules(tmp_path):
 
     assert loaded.get_module(FAKE_A).proj.weight.dtype == torch.bfloat16
     assert loaded.get_module(FAKE_B).proj.weight.dtype == torch.bfloat16
+
+
+def test_from_pretrained_takes_each_module_attention_from_the_checkpoint(tmp_path):
+    """The persisted kernels have to reach the per-module ``from_pretrained``.
+
+    This entry point has no launcher behind it, so the checkpoint is the only
+    place a module's attention can come from — and it is per module, which is
+    the whole reason it is not a single load-wide kwarg. Without this the two
+    modules both silently take HF's default.
+    """
+    _build_omni_model().save_pretrained(tmp_path)
+    config = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    config["modules"][FAKE_A]["model"] = {"ops_implementation": {"attn_implementation": "eager"}}
+    config["modules"][FAKE_B]["model"] = {"ops_implementation": {"attn_implementation": "sdpa"}}
+    (tmp_path / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+    seen: dict[str, str | None] = {}
+
+    def record(cls, path, *args, **kwargs):
+        # Built straight from the config: the point here is which kwarg arrives,
+        # and a real load would first have HF reject `sdpa` on a stub module
+        # that never declared support for it.
+        seen[cls.config_class.model_type] = kwargs.get("attn_implementation")
+        return cls(kwargs["config"])
+
+    with (
+        patch.object(FakeModuleA, "from_pretrained", classmethod(record)),
+        patch.object(FakeModuleB, "from_pretrained", classmethod(record)),
+    ):
+        OmniModel.from_pretrained(tmp_path)
+
+    assert seen == {FAKE_A: "eager", FAKE_B: "sdpa"}
 
 
 def test_omni_model_from_config_builds_unweighted_modules(tmp_path):
