@@ -550,7 +550,12 @@ def group_gemm_fused_moe_forward(
     pre-activations (``gate.clamp(max=L)``, ``up.clamp(min=-L, max=L)``).
     ``None`` disables the clamp with zero overhead for models that use standard
     SwiGLU.
+
+    Router scores stay float32 even under FSDP2 bf16 compute. Cast them onto
+    ``hidden_states.dtype`` before the fused scale so group-gemm does not see
+    an fp32 activation.
     """
+    routing_weights = routing_weights.to(dtype=hidden_states.dtype)
     # EP comm is outside the Function so all2all is not under no_grad.
     if get_parallel_state().ep_enabled:
         from .....distributed.moe import dispatch_to_ep_class

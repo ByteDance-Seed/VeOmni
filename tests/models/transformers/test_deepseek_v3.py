@@ -64,6 +64,34 @@ def test_deepseek_v3_eager_matches_hf():
     assert_eager_matches_hf(hf, ours, input_ids=input_ids)
 
 
+def test_deepseek_v3_experts_cast_router_scores_to_hidden_dtype():
+    config = _tiny_config()
+    model = _build_ours(config)
+    experts = next(layer.mlp.experts for layer in model.model.layers if hasattr(layer.mlp, "experts"))
+    hidden_states = torch.linspace(-0.7, 0.8, steps=4 * config.hidden_size).reshape(4, config.hidden_size)
+    selected_experts = torch.tensor([[0, 1], [2, 0], [1, 2], [0, 2]], dtype=torch.long)
+    top_k_weights = torch.tensor(
+        [[0.7, 0.3], [0.6, 0.4], [0.55, 0.45], [0.8, 0.2]],
+        dtype=torch.float32,
+    )
+    captured = {}
+
+    def record(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return torch.zeros_like(hidden_states)
+
+    experts.veomni_moe = record
+    actual = experts(hidden_states, selected_experts, top_k_weights)
+    args = captured["args"]
+
+    assert args[0] is hidden_states
+    torch.testing.assert_close(args[1], top_k_weights.to(hidden_states.dtype), rtol=0, atol=0)
+    assert args[2] is selected_experts
+    assert captured["kwargs"] == {"num_experts": experts.num_experts}
+    torch.testing.assert_close(actual, torch.zeros_like(hidden_states), rtol=0, atol=0)
+
+
 def test_deepseek_v3_registry_installs_checkpoint_hooks():
     from veomni.models import get_model_class
 

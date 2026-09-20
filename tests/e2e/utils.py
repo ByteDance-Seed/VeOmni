@@ -168,11 +168,9 @@ def prepare_exec_cmd(
             )
             if model_name == "wan_t2v":
                 cmd_kwargs["extra_args"] = list(_WAN_BFLOAT16_TRAINING_ARGS)
-            elif model_name in {"deepseek_v3", "deepseek_v4"}:
-                # Toy checkpoints are materialized in float32. V4 fused_triton
-                # needs bf16/fp16 activations. V3 stays on eager MoE; FSDP2
-                # bf16 still pairs activations with expert weights so
-                # batch-invariant ``F.linear`` does not see a dtype split.
+            elif model_name == "deepseek_v4":
+                # fused_triton MoE needs bf16/fp16 activations; the toy
+                # checkpoint is materialized in float32.
                 cmd_kwargs["extra_args"] = list(_WAN_BFLOAT16_TRAINING_ARGS)
             elif model_name == "gpt_oss":
                 cmd_kwargs["extra_args"] = list(_GPT_OSS_FA4_QUACK_TRAINING_ARGS)

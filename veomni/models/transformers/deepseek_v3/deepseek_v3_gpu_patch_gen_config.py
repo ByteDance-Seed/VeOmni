@@ -250,7 +250,7 @@ class PatchedDeepseekV3Experts(nn.Module):
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,
-                top_k_weights,
+                top_k_weights.to(hidden_states.dtype),
                 self.gate_up_proj,
                 self.down_proj,
                 self.act_fn,
@@ -259,7 +259,7 @@ class PatchedDeepseekV3Experts(nn.Module):
         unused = self.gate_up_proj.new_empty(0)
         return self.veomni_moe(
             hidden_states,
-            top_k_weights,
+            top_k_weights.to(hidden_states.dtype),
             top_k_index,
             unused,
             unused,
