@@ -189,15 +189,34 @@ class ModuleRuntime(VeOmniModelRuntime):
             return super().__call__(*args, **kwargs)
 
     def _init_eager_inference(self) -> None:
-        """Single-process eager load via ``from_pretrained`` + ``device_map``."""
+        """Single-process eager load via ``from_pretrained`` + ``device_map``.
+
+        ``fsdp_mode='eager'`` says only that this module skips the wrapper and
+        loads through plain HF modeling with a ``device_map``. It says nothing
+        about kernels, so this path resolves ``ops_implementation`` exactly as
+        the wrapped path does through ``build_foundation_model`` — otherwise a
+        purely parallelism-level choice would silently downgrade the module's
+        ops, and in a mixed run (Janus infers with ``janus_siglip`` eager
+        beside FSDP2 modules) two modules in one process would disagree about
+        which kernels the launcher asked for.
+        """
         args = self.args
         assert args.accelerator.fsdp_config.fsdp_mode == "eager"
+        from .....ops import apply_ops_config
+        from ....auto import bind_ops_to_modeling
         from ... import OMNI_MODEL_REGISTRY, read_model_type
 
         model_path = args.model_path
         overrides = dict(args.model_config or {})
         model_type = read_model_type(model_path)
         cls = OMNI_MODEL_REGISTRY[model_type]()
+        ops = args.ops_implementation
+        if ops is not None:
+            apply_ops_config(ops)
+            if ops.attn_implementation is not None:
+                overrides.setdefault("attn_implementation", ops.attn_implementation)
+        # Before construction: slots read inside ``__init__`` need the binding.
+        bind_ops_to_modeling(cls)
         if dist.is_initialized():
             device_map = {"": f"{get_device_type()}:{int(os.getenv('LOCAL_RANK', 0))}"}
         else:

@@ -33,7 +33,6 @@ endpoint directly (no pre/post hooks).  Stop when ``is_done()`` or
 from __future__ import annotations
 
 import os
-import sys
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
 import torch.distributed as dist
@@ -260,24 +259,6 @@ class OmniModel(PreTrainedModel):
         return load_kwargs
 
     @staticmethod
-    def _bind_module_ops(mod_cls: type) -> None:
-        """Resolve ``mod_cls``'s OpSlots against the ops config now in force.
-
-        A seam, not an inline: slot binding is on its way out in favour of
-        resolving each op at call time, and when that lands this method is the
-        only thing deleted. What has to outlive it is the step before it —
-        :meth:`_build_module_load_kwargs` installing the module's ops config —
-        because a call-time lookup reads that same config.
-        """
-        from ...ops.config.singleton import get_ops_config
-        from ..auto import _bind_veomni_ops
-
-        ops_config = get_ops_config()
-        modeling_module = sys.modules.get(mod_cls.__module__)
-        if modeling_module is not None and ops_config is not None:
-            _bind_veomni_ops(modeling_module, ops_config)
-
-    @staticmethod
     def _init_only_load_kwargs(load_kwargs: dict[str, Any]) -> dict[str, Any]:
         """Narrow module load options to what ``_from_config`` consumes.
 
@@ -308,6 +289,7 @@ class OmniModel(PreTrainedModel):
 
         from ...ops import apply_ops_config
         from ...ops.config.singleton import get_ops_config
+        from ..auto import bind_ops_to_modeling
 
         base_ops = get_ops_config()
         modules: dict[str, nn.Module] = {}
@@ -325,7 +307,8 @@ class OmniModel(PreTrainedModel):
                 module_config = mod_cls.config_class.from_pretrained(module_path)
                 for key, value in config.module_model_config(name).items():
                     setattr(module_config, key, value)
-            cls._bind_module_ops(mod_cls)
+            # After `_build_module_load_kwargs` installed this module's config.
+            bind_ops_to_modeling(mod_cls)
             if load_weights:
                 modules[name] = mod_cls.from_pretrained(module_path, config=module_config, **load_kwargs)
             else:

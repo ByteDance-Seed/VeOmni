@@ -20,10 +20,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from veomni.models.seed_omni import read_model_type
+from veomni.ops import apply_ops_config
 from veomni.trainer.omni.omni_inferencer import InferenceRequest, OmniInferencer
 
 
@@ -158,6 +160,60 @@ def test_module_needs_distributed_only_when_declared_non_eager():
             },
         )
     )
+
+
+def test_eager_inference_keeps_the_launcher_kernels(tmp_path):
+    """``fsdp_mode: eager`` is a parallelism choice and must not pick kernels.
+
+    It says only that the module skips the wrapper and loads through plain HF
+    modeling with a ``device_map``. A mixed run makes the cost concrete: Janus
+    infers with ``janus_siglip`` eager beside FSDP2 modules, and those go
+    through ``build_foundation_model``, so without this the two halves of one
+    process disagree about which attention the launcher asked for.
+    """
+    from veomni.arguments import OmniModuleRuntimeArguments
+    from veomni.arguments.parser import _instantiate_recursive
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
+    from veomni.models.seed_omni.modules.fake_model.fake_module_a.modeling import FakeModuleA
+    from veomni.ops.config.singleton import get_ops_config
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "fake_module_a", "hidden_size": 8}), encoding="utf-8"
+    )
+    args = _instantiate_recursive(
+        OmniModuleRuntimeArguments,
+        {
+            "model_path": str(tmp_path),
+            "ops_implementation": {"attn_implementation": "flash_attention_2"},
+            "accelerator": {"fsdp_config": {"fsdp_mode": "eager"}},
+        },
+    )
+    runtime = ModuleRuntime.__new__(ModuleRuntime)
+    runtime.args = args
+    runtime.model_name = "fake"
+
+    seen = {}
+
+    def record(cls, path, **kwargs):
+        seen.update(kwargs)
+        return FakeModuleA(cls.config_class(hidden_size=8))
+
+    restore = get_ops_config()
+    try:
+        with (
+            patch.object(FakeModuleA, "from_pretrained", classmethod(record)),
+            patch.object(ModuleRuntime, "_build_model_assets", lambda self: None),
+        ):
+            runtime._init_eager_inference()
+    finally:
+        if restore is not None:
+            apply_ops_config(restore)
+
+    # Against the resolved value, not the literal written above: with
+    # MODELING_BACKEND=veomni the args layer promotes this to the SP-aware
+    # variant, and what matters is that the module gets whatever the wrapped
+    # modules got — not which name that turned out to be.
+    assert seen["attn_implementation"] == args.ops_implementation.attn_implementation
 
 
 def test_build_module_args_from_checkpoint_module_entry():
