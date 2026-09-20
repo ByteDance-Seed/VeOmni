@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,13 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Registered kernel families.
-
-Importing this package registers the families that have landed so far.
-"""
-
-from . import layer_norm as _layer_norm  # noqa: F401
-from . import loss as _loss  # noqa: F401
-from . import rms_norm as _rms_norm  # noqa: F401
-from . import rope as _rope  # noqa: F401
-from . import swiglu_mlp as _swiglu_mlp  # noqa: F401
+"""standard affine LayerNorm implementations."""

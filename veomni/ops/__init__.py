@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""VeOmni operation registry.
+"""VeOmni operation registry and built-in implementations.
 
-Importing this package exposes ``OP_REGISTRY`` and ``VeomniOp``. Built-in
-families are registered as they land.
+Importing this package registers the families that have landed so far.
 """
 
+from . import kernels as _op_families  # noqa: F401
 from .registry import OP_REGISTRY, VeomniOp, register_op, resolve_op
 
 
