@@ -89,7 +89,7 @@ class OmniInferencer:
         )
         if self._distributed:
             self.device = OmniTrainer.setup_distributed(args)
-        helper.set_seed(args.infer.seed)
+        helper.set_seed(args.infer.seed, args.infer.enable_full_determinism)
         self._build_model()
 
         # Nest artefacts under <output_dir>/<infer_type>/ (infer_type is resolved

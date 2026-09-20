@@ -448,6 +448,33 @@ full; `image_vq_end` emits `<end_of_image>`.
 to open an image span (`start_image_gen` on a sampled `<boi>`), so `text_ar`
 and `image_vq` transition into each other instead of straight to `done`.
 
+### 4.1 One token stream, many ranks
+
+A multi-rank generate is not data-parallel: every rank holds the whole request
+and walks the *same* FSM, because the module forwards are full of collectives.
+So the same logical token is sampled once per rank, and the ranks have to agree
+on it — each rank judges `done` locally, so a single disagreement leaves the
+rank that saw the stop token outside the loop while the others block forever in
+the next collective.
+
+Two things make them agree, and both are needed:
+
+- `InferenceMixin._sample_token` broadcasts the drawn token from rank 0. This is
+  the guarantee; it holds no matter how the logits were produced.
+- `infer.enable_full_determinism` defaults to **true** (it is false for
+  training). Without it the MoE top-k combine — a `scatter_add_` in
+  `veomni/distributed/moe/moe_utils.py` that adds `topk` expert outputs onto one
+  token row — races its atomics, so identical inputs give different last bits
+  *run to run*, and the logits differ on every rank at every step. Measured on
+  DeepSeek-V4.1-Flash over 8×H20: 211 of 211 decode steps had per-rank logits
+  that differed by a few bf16 ULP, enough to flip `argmax` at 4 of them. It also
+  means that without this flag a single-GPU generate does not reproduce itself.
+
+The flag buys reproducibility at the cost of cuDNN (`enable_full_determinism`
+disables it) and of any op with no deterministic kernel falling back with a
+warning. Turn it off only when neither reproducibility nor a rank-consistent
+baseline matters.
+
 ---
 
 ## 5. The Janus modules
