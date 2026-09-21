@@ -201,6 +201,16 @@ YAML Config -> VeOmniArguments -> Trainer
 6. Load weights (`load_model_weights()` or `rank0_load_and_broadcast_weights()`)
 7. Apply parallelization (`build_parallelize_model()`)
 
+## DiT Fixed Microbatches
+
+`DiTTrainer` honors `train.micro_batch_size` and keeps `dyn_bsz=false`.
+`DiTDataCollator` produces dict-of-lists microbatches; the existing
+`get_condition` / `process_condition` / model-forward path is unchanged.
+Models return sample-mean scalar losses, and the trainer divides by the number
+of accumulation microbatches. Packing and SP/CP handling remain model-owned.
+Offline embedding allows multiple samples but keeps one microbatch per step.
+See `docs/usage/dit_microbatching.md`.
+
 ## Parallelization Flow
 
 VeOmni uses FSDP2 exclusively.
