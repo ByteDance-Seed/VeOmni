@@ -1297,7 +1297,16 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
 # MLU compatibility tables for ``_validate_implementations``.
 # ``fused_triton`` is the same group-gemm as on GPU; ``fused_mlu`` is Apex grouped-GEMM.
 _MLU_ALLOWED: Dict[str, frozenset] = {
-    "moe_implementation": frozenset({"fused_mlu", "fused_triton"}),
+    "rms_norm_implementation": frozenset({"liger_kernel"}),
+    "rotary_pos_emb_implementation": frozenset({"liger_kernel"}),
+    "swiglu_mlp_implementation": frozenset({"liger_kernel"}),
+    "cross_entropy_loss_implementation": frozenset({"liger_kernel"}),
+    "moe_implementation": frozenset({"fused_mlu", "fused_mlu_triton"}),
+}
+
+_MLU_DEFAULT_FALLBACK: Dict[str, str | frozenset] = {
+    "load_balancing_loss_implementation": "eager",
+    "moe_implementation": frozenset({"fused_mlu", "fused_mlu_triton"}),
 }
 
 # Values renamed by the OpSlot -> VeomniOp migration. They still parse, resolve to
