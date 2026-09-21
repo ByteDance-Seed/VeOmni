@@ -1336,10 +1336,10 @@ def deepseek_v4_indexer_forward_patched(
 
     # --- Patch.1 ---
     indexer_implementation = veomni_dsa_indexer_implementation.value
-    if indexer_implementation not in {"eager", "tilelang"}:
+    if indexer_implementation not in {"eager", "npu", "tilelang"}:
         raise ValueError(
             "DeepSeek-V4 does not support "
-            f"dsa_indexer_implementation={indexer_implementation!r}; expected 'eager' or 'tilelang'"
+            f"dsa_indexer_implementation={indexer_implementation!r}; expected 'eager', 'npu' or 'tilelang'"
         )
     # A local query row ``i`` is global row ``query_offset + i``; off the context
     # parallel path ``query_offset`` is zero and this is the arange it always was.
@@ -1347,6 +1347,33 @@ def deepseek_v4_indexer_forward_patched(
         (torch.arange(seq_len, device=position_ids.device) + query_offset).unsqueeze(0).expand_as(position_ids)
     )
     packed_ranges = None if rate_metadata is None else packed_compressed_causal_ranges(rate_metadata)
+    single_full_sequence = packed_sequence_slices is None or (
+        len(packed_sequence_slices) == 1
+        and packed_sequence_slices[0][0] == 0
+        and packed_sequence_slices[0][1] == seq_len
+    )
+    use_npu = (
+        indexer_implementation == "npu"
+        and hidden_states.device.type == "npu"
+        and cache_layer is None
+        and not cp_enabled
+        and not parallel_state.ulysses_enabled
+        and single_full_sequence
+        and compressed_len > 0
+        and torch.equal(position_ids, canonical_positions)
+    )
+    if indexer_implementation == "npu" and not use_npu and compressed_len > 0:
+        raise ValueError(
+            "dsa_indexer_implementation='npu' was requested outside the fused Lightning Indexer "
+            "contract (training/prefill, one full sequence with canonical positions, no SP/CP)"
+        )
+    if use_npu:
+        from veomni.ops.kernels.deepseek_v4.npu_lightning_indexer import npu_lightning_indexer
+
+        top_k_indices, _ = npu_lightning_indexer(
+            q, compressed_kv, weights, top_k, compress_rate=self.compress_rate
+        )
+        return top_k_indices.to(torch.long)
     # Operand dtypes are the kernel's contract and are enforced by
     # ``v4_lighting_indexer`` itself, which reports the offending dtype. Only
     # structural conditions belong here.
@@ -1576,6 +1603,15 @@ def deepseek_v4_attention_forward_patched(
     # alone and claims the compact path on hosts where the kernel cannot run and the
     # dispatch silently falls back to eager -- which then ignores the indices and
     # uses the dense mask, so the compact work is wasted at best.
+    use_npu_sparse = (
+        veomni_dsa_attention_implementation.value == "npu"
+        and past_key_values is None
+        and q.device.type == "npu"
+        and q.dtype == torch.bfloat16
+        and not ulysses_enabled
+        and not cp_enabled
+        and kwargs.get("packed_sequence_slices") is None
+    )
     use_compact_sparse_indices = (
         veomni_dsa_attention_implementation.value == "tilelang"
         and past_key_values is None
@@ -1604,13 +1640,13 @@ def deepseek_v4_attention_forward_patched(
             self.layer_idx,
             packed_sequence_slices=kwargs.get("packed_sequence_slices"),
             packed_compression_metadata=kwargs.get("packed_compression_metadata"),
-            return_topk_indices=use_compact_sparse_indices,
+            return_topk_indices=use_compact_sparse_indices or use_npu_sparse,
             build_block_bias=not mask_free_sparse,
             # --- Patch.3 ---
             build_indexer_loss=build_indexer_loss,
             # --- Patch.3 ---
         )
-        if use_compact_sparse_indices:
+        if use_compact_sparse_indices or use_npu_sparse:
             compressed_kv, block_bias, compressed_candidates = compressor_output
         else:
             compressed_kv, block_bias = compressor_output
@@ -1629,6 +1665,9 @@ def deepseek_v4_attention_forward_patched(
     # Not ``kv.shape[-2] - q.shape[-2]``: that assumed the query and
     # full-resolution KV lengths are equal, which is what CP breaks.
     compressed_len = compressed_kv.shape[2] if self.compressor is not None else 0
+    if use_npu_sparse and compressed_candidates is not None:
+        kwargs["npu_compressed_topk_indices"] = compressed_candidates.topk_indices
+        kwargs["npu_compressed_len"] = compressed_len
     if mask_free_sparse:
         kwargs["sparse_topk_indices"] = build_packed_sparse_attention_indices(
             position_ids=compressor_position_ids,
@@ -1773,11 +1812,45 @@ def deepseek_v4_eager_attention_forward_patched(
 ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     # --- Patch.1 ---
     attention_implementation = veomni_dsa_attention_implementation.value
-    if attention_implementation not in {"eager", "tilelang"}:
+    if attention_implementation not in {"eager", "npu", "tilelang"}:
         raise ValueError(
             "DeepSeek-V4 does not support "
-            f"dsa_attention_implementation={attention_implementation!r}; expected 'eager' or 'tilelang'"
+            f"dsa_attention_implementation={attention_implementation!r}; expected 'eager', 'npu' or 'tilelang'"
         )
+    compressed_len = int(kwargs.get("npu_compressed_len", 0))
+    use_npu = (
+        attention_implementation == "npu"
+        and query.device.type == "npu"
+        and query.dtype == torch.bfloat16
+        and key.dtype == torch.bfloat16
+        and dropout == 0
+        and key.shape[1] == 1
+        and compressed_len > 0
+    )
+    if attention_implementation == "npu" and not use_npu and compressed_len > 0:
+        raise ValueError(
+            "dsa_attention_implementation='npu' requires BF16 NPU tensors, one KV head and dropout=0"
+        )
+    if use_npu:
+        from veomni.ops.kernels.deepseek_v4.npu_sparse_flash_mla import npu_sparse_flash_mla
+
+        original_len = key.shape[-2] - compressed_len
+        original_kv = key[:, :, :original_len].transpose(1, 2).contiguous()
+        compressed_kv = key[:, :, original_len:].transpose(1, 2).contiguous() if compressed_len else None
+        output = npu_sparse_flash_mla(
+            query.transpose(1, 2).contiguous(),
+            original_kv,
+            compressed_kv,
+            kwargs.get("npu_compressed_topk_indices"),
+            sinks=kwargs.get("s_aux", module.sinks).float(),
+            softmax_scale=scaling,
+            cmp_ratio=getattr(getattr(module, "compressor", None), "compress_rate", 1),
+            ori_mask_mode=4,
+            cmp_mask_mode=3,
+            ori_win_left=module.sliding_window - 1,
+            ori_win_right=0,
+        )
+        return output, None
     # Operand dtypes are the kernel's contract and are enforced by
     # ``sparse_attn_tilelang`` itself, which reports the offending dtype. Only
     # structural conditions belong here.

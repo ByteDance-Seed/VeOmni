@@ -1,0 +1,5 @@
+{
+  "format_version": 1,
+  "global_step": 1000,
+  "world_size": 16
+}

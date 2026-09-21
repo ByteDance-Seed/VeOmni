@@ -1,0 +1,184 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from collections import defaultdict
+from typing import Any, Dict, List
+
+import torch
+
+from ..arguments import VeOmniArguments
+from ..data import (
+    build_data_transform,
+)
+from ..distributed.parallel_state import use_parallel_state
+from ..distributed.torch_compile import mark_compile_step_begin
+from ..utils import helper
+from ..utils.device import synchronize
+from ..utils.loss_utils import count_loss_token, reduce_global_loss_token
+from .base import BaseTrainer, VeOmniIter, mean_aux_metrics
+
+
+logger = helper.create_logger(__name__)
+
+
+class TextTrainer:
+    base: BaseTrainer
+
+    def __init__(self, args: VeOmniArguments):
+        # BaseTrainer.__init__ is NOT called here; we call its private
+        # helpers one-by-one so the sequence is explicit.
+        self.base = BaseTrainer.__new__(BaseTrainer)
+        self.base.args = args
+
+        self.base.device = self.base._setup(args)  # registers ParallelState("base") before seed
+        self.base.model = self.base._build_model_runtime()
+
+        with use_parallel_state(self.base.model.parallel_state):
+            # rewrite build_data_transform to support conversation dataset
+            self._build_data_transform()
+            self.base._build_dataset()
+            self.base._build_collate_fn()
+            self.base._build_dataloader()
+        self.base._build_lr_scheduler()
+        self.base._build_training_context(self.base.model)
+        self.base._init_callbacks()
+
+    def _build_data_transform(self):
+        args: VeOmniArguments = self.base.args
+        self.base.data_transform = build_data_transform(
+            args.data.data_type,
+            tokenizer=self.base.model.tokenizer,
+            chat_template=self.base.model.chat_template,
+            max_seq_len=args.data.max_seq_len,
+            text_keys=args.data.text_keys,
+        )
+
+    def on_train_begin(self):
+        self.base.on_train_begin()
+
+    def on_train_end(self):
+        self.base.on_train_end()
+
+    def on_epoch_begin(self):
+        self.base.on_epoch_begin()
+
+    def on_epoch_end(self):
+        self.base.on_epoch_end()
+
+    def on_step_begin(self, micro_batches=None):
+        self.base.on_step_begin(micro_batches=micro_batches)
+
+    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
+        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=aux_metrics)
+
+    def train_step(
+        self,
+        data_iterator: Any,
+    ) -> Dict[str, float]:
+        self.base.state.global_step += 1
+
+        micro_batches: List[Dict[str, Any]] = next(data_iterator)
+
+        self.base._reset_async_activation_offload_if_enabled(self.base.model)
+        self.on_step_begin(micro_batches=micro_batches)
+
+        # Forward and backward for each micro batch
+        self.base.sync_before_train_step()
+
+        total_loss = 0.0
+        total_loss_dict = defaultdict(int)
+        total_aux_metrics = defaultdict(float)
+
+        # token num for fixed_ce_loss in postforward
+        self.base.micro_batches_token_len = count_loss_token(micro_batches)
+        self.base.global_micro_batches_token_len = reduce_global_loss_token(self.base.micro_batches_token_len)
+        num_micro_steps = len(micro_batches)
+        # forward and backward pass with gradient_accumulationsteps
+        for micro_step, micro_batch in enumerate(micro_batches):
+            mark_compile_step_begin(getattr(self.base.model, "_veomni_compile_uses_cuda_graphs", False))
+            self.base.model_reshard(micro_step, num_micro_steps)
+            self.base._configure_hsdp_allreduce(micro_step, num_micro_steps)
+            loss: torch.Tensor
+            loss_dict: Dict[str, torch.Tensor]
+            aux_metrics: Dict[str, torch.Tensor]
+            # token num for fixed_ce_loss in postforward
+            self.base.micro_batch_token_len = count_loss_token(micro_batch)
+            loss, loss_dict, aux_metrics = self.base.forward_backward_step(micro_batch)
+
+            total_loss += loss.item()
+            for k, v in loss_dict.items():
+                total_loss_dict[k] += v.item()
+            for k, v in aux_metrics.items():
+                total_aux_metrics[k] += v.item()
+
+        # Gradient clipping (reads FSDP/EP groups from current ParallelState)
+        grad_norm = self.base.model.clip_grad_norm()
+
+        # Optimizer and scheduler step
+        self.base.model.optimizer.step()
+        self.base.model.lr_scheduler.step()
+        self.base.model.optimizer.zero_grad()
+
+        self.on_step_end(
+            loss=total_loss,
+            loss_dict=total_loss_dict,
+            grad_norm=grad_norm,
+            aux_metrics=mean_aux_metrics(total_aux_metrics, num_micro_steps),
+        )
+
+    def train(self):
+        args: VeOmniArguments = self.base.args
+        self.on_train_begin()
+        logger.info(
+            f"Rank{args.train.local_rank} Start training. "
+            f"Start step: {self.base.start_step}. "
+            f"Train steps: {args.train_steps}. "
+            f"Start epoch: {self.base.start_epoch}. "
+            f"Train epochs: {args.train.num_train_epochs}."
+        )
+
+        for epoch in range(self.base.start_epoch, args.train.num_train_epochs):
+            if hasattr(self.base.train_dataloader, "set_epoch"):
+                self.base.train_dataloader.set_epoch(epoch)
+            self.base.state.epoch = epoch
+
+            self.on_epoch_begin()
+
+            # Create a batch generator
+            self.base.data_iterator = VeOmniIter(
+                self.base.train_dataloader, use_background_prefetcher=args.data.dataloader.use_background_prefetcher
+            )
+
+            for _ in range(self.base.start_step, args.train_steps):
+                try:
+                    self.train_step(self.base.data_iterator)
+                except StopIteration:
+                    logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
+                    break
+
+            self.on_epoch_end()
+
+            self.base.start_step = 0
+            helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+            if args.data.dataloader.use_background_prefetcher:
+                self.base.data_iterator.stop()
+
+        self.on_train_end()
+
+        if args.data.dataloader.use_background_prefetcher:
+            self.base.data_iterator.stop()
+
+        synchronize()
+
+        self.base.destroy_distributed()

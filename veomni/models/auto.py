@@ -156,6 +156,11 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
             )
             if impl_name != "eager" and obj.variant == "standard":
                 moe_experts_kernel = impl_name
+        elif obj.op_name == "mhc" and obj.variant in {"pre", "post"}:
+            # A variant override is optional and inherits the legacy shared field,
+            # preserving every existing config while allowing accuracy-qualified
+            # NPU post-mixing to be used with the eager pre/Sinkhorn backward.
+            impl_name = getattr(ops_config, f"mhc_{obj.variant}_implementation") or ops_config.mhc_implementation
         else:
             impl_name = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
         obj.bind(impl_name)
