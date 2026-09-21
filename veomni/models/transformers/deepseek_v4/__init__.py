@@ -15,7 +15,14 @@
 from functools import partial
 
 from ....utils.device import IS_NPU_AVAILABLE
-from ...loader import MODELING_REGISTRY
+from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+
+
+@MODEL_CONFIG_REGISTRY.register("deepseek_v4")
+def register_deepseek_v4_config():
+    from .configuration_deepseek_v4 import DeepseekV4Config
+
+    return DeepseekV4Config
 
 
 @MODELING_REGISTRY.register("deepseek_v4")
@@ -35,6 +42,16 @@ def register_deepseek_v4_modeling(architecture: str):
 
     DeepseekV4ForCausalLM = gen.DeepseekV4ForCausalLM
     DeepseekV4Model = gen.DeepseekV4Model
+
+    # Checkpoints produced before Transformers v5 stored the index scorer
+    # projection directly under ``indexer``. VeOmni applies this mapping before
+    # its tensor converter, so register it on both model entry points.
+    scorer_key_migration = {
+        r"\.indexer\.weights_proj\.": ".indexer.scorer.weights_proj.",
+    }
+    for model_cls in (DeepseekV4ForCausalLM, DeepseekV4Model):
+        existing_mapping = dict(getattr(model_cls, "_checkpoint_conversion_mapping", {}))
+        model_cls._checkpoint_conversion_mapping = {**scorer_key_migration, **existing_mapping}
 
     DeepseekV4ForCausalLM._create_checkpoint_tensor_converter = staticmethod(
         create_deepseek_v4_checkpoint_tensor_converter

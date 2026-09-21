@@ -47,7 +47,7 @@ class MoERouterMonitorCallback(Callback):
             logger.info_rank0("MoE router monitor disabled (moe_load_balance_monitor_interval=0).")
             return
 
-        config = self.trainer.model_config
+        config = self.trainer.model.model_config
         if not hasattr(config, "num_experts"):
             logger.warning_rank0(
                 "moe_load_balance_monitor_interval > 0 but model config has no 'num_experts'. "
@@ -183,15 +183,41 @@ class ProfileTraceCallback(Callback):
                 self.profiler.stop()
 
 
+# Names ``on_step_end`` below publishes into the ``training/`` namespace itself,
+# rather than taking from ``loss_dict``. A model's ``aux_metrics`` key that matches
+# one of these collides in that namespace even though it does not collide with any
+# loss, so ``BaseTrainer.postforward`` rejects them; keeping the set here means it
+# is updated next to the code that decides the names.
+#
+# Both collision directions are silent, which is why they are worth a guard:
+# ``total_loss`` is assigned *before* the metrics are merged, so an auxiliary
+# metric replaces it and ``training/total_loss`` then reports the metric. So do
+# ``avg_effective_len`` and ``avg_sample_seq_len``, which ``EnvironMeter.step``
+# emits already prefixed and which the merge at the end of ``on_step_end`` lets
+# ``training/`` values win over. ``grad_norm`` and ``lr`` are assigned *after* the
+# merge, so they win instead and the auxiliary metric is dropped without a trace.
+RESERVED_TRAINING_METRIC_NAMES = frozenset(
+    {
+        "total_loss",
+        "grad_norm",
+        "lr",
+        "avg_effective_len",
+        "avg_sample_seq_len",
+    }
+)
+
+
 class EnvironMeterCallback(Callback):
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
 
         args: "VeOmniArguments" = self.trainer.args
-        self.lora_config = trainer.model.get_lora_config() if hasattr(trainer.model, "get_lora_config") else None
+        # LoRA config lives on VeOmniLoraModel, which DDP does not forward.
+        module = getattr(trainer.model, "unwrapped_module", None)
+        self.lora_config = module.get_lora_config() if hasattr(module, "get_lora_config") else None
         self.freeze_vit = getattr(args.train, "freeze_vit", None) if self.lora_config is None else None
         self.trainer.environ_meter = helper.EnvironMeter(
-            config=trainer.model_config,
+            config=trainer.model.model_config,
             global_batch_size=args.train.global_batch_size,
             empty_cache_steps=args.train.empty_cache_steps,
             enable_multisource=args.data.enable_multisource,
@@ -207,7 +233,13 @@ class EnvironMeterCallback(Callback):
         self.start_time = time.time()
 
     def on_step_end(
-        self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
+        self,
+        state: TrainerState,
+        loss: float,
+        loss_dict: Dict[str, float],
+        grad_norm: float,
+        aux_metrics: Dict[str, float] = None,
+        **kwargs,
     ) -> None:
         delta_time = time.time() - self.start_time
         step_env_metrics = self.trainer.environ_meter.step(
@@ -221,6 +253,12 @@ class EnvironMeterCallback(Callback):
             "total_loss": loss,
         }
         step_train_metrics.update(loss_dict)
+        # Auxiliary metrics arrive in their own dict -- they are diagnostics, not
+        # part of the objective -- but are published beside the losses, and merged
+        # before the reduction below so they are averaged over the FSDP group too.
+        # ``BaseTrainer.postforward`` has already rejected any name that would
+        # collide here.
+        step_train_metrics.update(aux_metrics or {})
         step_train_metrics["grad_norm"] = grad_norm
 
         # gather training_step_info from all ranks
@@ -228,8 +266,8 @@ class EnvironMeterCallback(Callback):
             f"training/{k}": all_reduce(v, group=self.parallel_state.fsdp_group) for k, v in step_train_metrics.items()
         }
 
-        if self.trainer.lr_scheduler is not None:
-            lr = max(self.trainer.lr_scheduler.get_last_lr())
+        if self.trainer.model.lr_scheduler is not None:
+            lr = max(self.trainer.model.lr_scheduler.get_last_lr())
             step_train_metrics["training/lr"] = lr
 
         step_env_metrics.update(step_train_metrics)

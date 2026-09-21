@@ -30,70 +30,16 @@ model:
     rms_norm_implementation: eager
     rotary_pos_emb_implementation: eager
     swiglu_mlp_implementation: eager
-    # Ascend DeepSeek-V4 paths ported from MindSpeed-LLM/CANN. Sliding
-    # attention safely retains the eager path; compressed attention layers
-    # dispatch to Lightning Indexer and Sparse MLA when their input contract
-    # is satisfied. mHC pre/post use the CANN fused operators.
+    # dsa_indexer_implementation / dsa_attention_implementation /
+    # mhc_implementation all default to "eager" already (their "tilelang"
+    # backends are CUDA SM90+ only) — no override needed for NPU, left unset
+    # here on purpose so a future CUDA run of this same file doesn't need
+    # editing.
     dsa_indexer_implementation: npu
     dsa_attention_implementation: npu
     mhc_implementation: npu
-
-data:
-  train_path: fineweb_100BT
-  train_size: 1000000000000
-  dataloader:
-    type: native
-    # Keep tokenization/I/O ahead of the NPU training loop.
-    num_workers: 4
-    worker_num_threads: 1
-    prefetch_factor: 2
-    pin_memory: true
-    use_background_prefetcher: true
-    drop_last: true
-  datasets_type: iterable
-  data_type: plaintext
-  max_seq_len: 4096
-  text_keys: text
-  dyn_bsz_buffer_size: 200
-
-train:
-  # The fused DSA kernels currently require canonical, unpacked positions.
-  # dyn_bsz=True supplies packed_sequence_slices and intentionally falls back
-  # to eager attention/indexer, so keep it disabled for the fused NPU path.
-  dyn_bsz: false
-  # This checkpoint still requires the DeepSeek-V4 tensor converter, so rank0
-  # must reconstruct converted tensors and distribute their nested EP+FSDP
-  # shards. Every-rank loading OOMs on conversion temporaries; EP streaming is
-  # rejected because embed/expert transforms need the complete tensor set.
-  broadcast_model_weights_from_rank0: true
-  ep_sharded_stream_load: false
-  accelerator:
-    # DeepSeek-V4's Ulysses SP path (Q head all-to-all + sequence all-gather
-    # around compressors / sparse attention) is backend-agnostic but has not
-    # been validated on NPU with this model yet — keep ulysses_size at 1
-    # until it has been.
-    ulysses_size: 1
-    ep_size: 8
-    fsdp_config:
-      fsdp_mode: fsdp2
-      # Memory-efficient FSDP2 lifecycle with communication prefetched ahead
-      # of the next decoder block.
-      reshard_after_forward: true
-      reshard_after_backward: true
-      forward_prefetch: true
-      offload: false
-      mixed_precision:
-        enable: true
-        param_dtype: bfloat16
-        reduce_dtype: float32
-        cast_forward_inputs: true
-    offload:
-      enable_activation: false
-  gradient_checkpointing:
-    enable: true
-  global_batch_size: 32
-  micro_batch_size: 1
-  bsz_warmup_ratio: 0.007
+    mhc_pre_implementation: eager
+    mhc_post_implementation: npu
   optimizer:
     type: adamw
     lr: 3.0e-4
@@ -102,8 +48,39 @@ train:
     lr_decay_ratio: 1.0
     weight_decay: 0.01
     max_grad_norm: 1.0
-  init_device: meta
-  max_steps: 1000
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    # DeepSeek-V4's Ulysses SP path (Q head all-to-all + sequence all-gather
+    # around compressors / sparse attention) is backend-agnostic but has not
+    # been validated on NPU with this model yet — keep ulysses_size at 1
+    # until it has been.
+    ulysses_size: 1
+    ep_size: 8
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+
+data:
+  train_path: fineweb_100BT
+  train_size: 1000000000000
+  dataloader:
+    type: native
+    drop_last: true
+  datasets_type: iterable
+  data_type: plaintext
+  max_seq_len: 8192
+  text_keys: text
+  dyn_bsz_buffer_size: 200
+
+train:
+  global_batch_size: 32
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
   enable_full_determinism: false
   empty_cache_steps: 500
   checkpoint:

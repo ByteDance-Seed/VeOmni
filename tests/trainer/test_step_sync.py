@@ -1,5 +1,8 @@
 import inspect
+from contextlib import nullcontext
 from types import SimpleNamespace
+
+import pytest
 
 import veomni.trainer.base as base_module
 from veomni.trainer.base import BaseTrainer
@@ -33,11 +36,62 @@ def test_train_step_uses_sync_helper():
         assert "synchronize()" not in source
 
 
+def test_reset_async_activation_offload_skips_missing_config(monkeypatch):
+    calls = []
+    monkeypatch.setattr(base_module, "reset_async_activation_offload", lambda model: calls.append(model))
+
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    model = SimpleNamespace(args=SimpleNamespace(accelerator=SimpleNamespace()))
+
+    trainer._reset_async_activation_offload_if_enabled(model)
+    assert calls == []
+
+    model.args.accelerator.offload_config = SimpleNamespace(enable_async_activation=True)
+    trainer._reset_async_activation_offload_if_enabled(model)
+    assert calls == [model]
+
+
+def test_unset_base_trainer_model_raises():
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    with pytest.raises(AttributeError, match="model is unset"):
+        _ = trainer.model
+
+
+def test_unset_base_trainer_model_is_getattr_defaultable():
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    assert getattr(trainer, "model", None) is None
+
+
+def test_build_training_context_requires_model_args():
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    with pytest.raises(AttributeError):
+        trainer._build_training_context(object())
+
+
+def test_build_training_context_without_offload_config(monkeypatch):
+    contexts = (nullcontext(), nullcontext())
+    monkeypatch.setattr(base_module, "build_activation_offloading_context", lambda *args, **kwargs: contexts)
+
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    model = SimpleNamespace(
+        args=SimpleNamespace(
+            accelerator=SimpleNamespace(
+                gradient_checkpointing=SimpleNamespace(enable=False),
+            ),
+        )
+    )
+
+    trainer._build_training_context(model)
+
+    assert trainer.model_fwd_context is contexts[0]
+    assert trainer.model_bwd_context is contexts[1]
+
+
 def test_configure_hsdp_allreduce_toggles_outer_micro_steps():
     calls = []
     trainer = BaseTrainer.__new__(BaseTrainer)
     trainer.args = SimpleNamespace(
-        train=SimpleNamespace(
+        model=SimpleNamespace(
             accelerator=SimpleNamespace(
                 fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
                 dp_replicate_size=2,
@@ -50,6 +104,13 @@ def test_configure_hsdp_allreduce_toggles_outer_micro_steps():
         trainer._configure_hsdp_allreduce(micro_step, 4)
 
     assert calls == [False, True]
+
+
+def test_train_step_uses_async_offload_reset_helper():
+    for wrapper_cls in (BaseTrainer, TextTrainer, VLMTrainer, TextDPOTrainer, DiTTrainer):
+        source = inspect.getsource(wrapper_cls.train_step)
+
+        assert "_reset_async_activation_offload_if_enabled(" in source
 
 
 def test_train_step_uses_hsdp_allreduce_helper():

@@ -10,8 +10,10 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from veomni.arguments.arguments_types import (
+    AcceleratorConfig,
     DataArguments,
     ModelArguments,
+    OffloadConfig,
     OpsImplementationConfig,
     TrainingArguments,
     VeOmniArguments,
@@ -30,10 +32,11 @@ from veomni.distributed.torch_compile import (
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
-def _model_args() -> ModelArguments:
+def _model_args(**kwargs) -> ModelArguments:
     return ModelArguments(
         config_path="dummy_config.json",
         ops_implementation=OpsImplementationConfig(load_balancing_loss_implementation="eager"),
+        **kwargs,
     )
 
 
@@ -150,7 +153,7 @@ def test_compile_decoder_blocks_rejects_unvalidated_multimodal_model(monkeypatch
 def test_compile_decoder_blocks_rejects_qwen3_vl_dynamic_shapes(monkeypatch):
     monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
 
-    with pytest.raises(RuntimeError, match="train.torch_compile.dynamic=False"):
+    with pytest.raises(RuntimeError, match="model.accelerator.torch_compile.dynamic=False"):
         compile_decoder_blocks(
             ToyQwen3VLModel(ToyDecoderLayer()),
             CompileConfig(dynamic=True),
@@ -421,28 +424,38 @@ def test_mark_compile_step_begin_skips_without_torch_compiler(monkeypatch):
 
 
 def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
+    from veomni.trainer.base import BaseTrainer
     from veomni.trainer.vlm_trainer import VLMTrainer
 
     marks = []
     monkeypatch.setattr("veomni.trainer.vlm_trainer.mark_compile_step_begin", marks.append)
     monkeypatch.setattr("veomni.trainer.vlm_trainer.count_loss_token", lambda _: 1)
     monkeypatch.setattr("veomni.trainer.vlm_trainer.reduce_global_loss_token", lambda token_count: token_count)
-    monkeypatch.setattr("veomni.trainer.vlm_trainer.use_parallel_state", lambda _: nullcontext())
-    monkeypatch.setattr("veomni.trainer.vlm_trainer.veomni_clip_grad_norm", lambda *_: torch.tensor(0.0))
 
     trainer = VLMTrainer.__new__(VLMTrainer)
+    model_args = SimpleNamespace(
+        optimizer=SimpleNamespace(max_grad_norm=1.0),
+        accelerator=SimpleNamespace(offload_config=OffloadConfig()),
+    )
     trainer.base = SimpleNamespace(
-        args=SimpleNamespace(train=SimpleNamespace(optimizer=SimpleNamespace(max_grad_norm=1.0))),
+        args=SimpleNamespace(model=model_args),
         state=SimpleNamespace(global_step=0),
-        model=SimpleNamespace(_veomni_compile_uses_cuda_graphs=True),
+        model=SimpleNamespace(
+            args=model_args,
+            _veomni_compile_uses_cuda_graphs=True,
+            clip_grad_norm=lambda: torch.tensor(0.0),
+            optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda: None),
+            lr_scheduler=SimpleNamespace(step=lambda: None),
+        ),
         model_reshard=lambda *_: None,
         _configure_hsdp_allreduce=lambda *_: None,
         sync_before_train_step=lambda: None,
-        forward_backward_step=lambda _: (torch.tensor(1.0), {}),
-        optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda: None),
-        lr_scheduler=SimpleNamespace(step=lambda: None),
+        forward_backward_step=lambda _: (torch.tensor(1.0), {}, {}),
         on_step_begin=lambda **_: None,
         on_step_end=lambda **_: None,
+    )
+    trainer.base._reset_async_activation_offload_if_enabled = (
+        lambda model: BaseTrainer._reset_async_activation_offload_if_enabled(trainer.base, model)
     )
 
     trainer.train_step(iter([[{}, {}]]))
@@ -450,32 +463,41 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
     assert marks == [True, True]
 
 
-def test_vlm_trainer_rejects_unsupported_compile_model_before_data_setup(monkeypatch):
-    from veomni.trainer.vlm_trainer import VLMTrainer
+def test_vlm_runtime_rejects_unsupported_compile_model_while_building(monkeypatch):
+    # The rejection has to land during the model build, which the runtime does on
+    # construction — i.e. before the trainer touches data.
+    from veomni.trainer.vlm_trainer import VLMModelRuntime
 
     calls = []
 
-    def build_unsupported_model(trainer):
-        calls.append("build_model")
-        trainer.base.model = ToyModel()
-        trainer.base.model.config = SimpleNamespace(model_type="qwen2_5_vl", vision_config=SimpleNamespace())
-        trainer.base.model.input_modalities = ("image", "text")
+    def build_unsupported_model(runtime):
+        calls.append("_build_model")
+        runtime.model = ToyModel()
+        runtime.model.config = SimpleNamespace(model_type="qwen2_5_vl", vision_config=SimpleNamespace())
+        runtime.model.input_modalities = ("image", "text")
+        runtime.model_config = runtime.model.config
+        runtime._validate_torch_compile()
 
-    monkeypatch.setattr("veomni.trainer.vlm_trainer.BaseTrainer._setup", lambda _: None)
-    monkeypatch.setattr("veomni.trainer.vlm_trainer.use_parallel_state", lambda _: nullcontext())
-    monkeypatch.setattr(VLMTrainer, "_build_model", build_unsupported_model)
-    monkeypatch.setattr(VLMTrainer, "_freeze_model_module", lambda _: calls.append("freeze_model"))
+    # No mesh is registered here, and none is needed: the rejection happens
+    # before anything reads one. Stubbing ``setup`` alone would leave the
+    # build's own scope looking for a state that was never registered.
+    monkeypatch.setattr(VLMModelRuntime, "setup", lambda _: None)
+    monkeypatch.setattr("veomni.models.model_runtime.use_parallel_state", lambda _name: nullcontext())
+    monkeypatch.setattr(VLMModelRuntime, "_build_model", build_unsupported_model)
+    monkeypatch.setattr(VLMModelRuntime, "_freeze_model_module", lambda _: calls.append("_freeze_model_module"))
 
     args = SimpleNamespace(
-        train=SimpleNamespace(
+        accelerator=SimpleNamespace(
             torch_compile=ArgumentsTorchCompileConfig(enable=True),
-            accelerator=SimpleNamespace(ulysses_size=1, cp_size=1, enable_async=False),
-        )
+            ulysses_size=1,
+            cp_size=1,
+            enable_async=False,
+        ),
     )
     with pytest.raises(RuntimeError, match="only for dense Qwen3-VL"):
-        VLMTrainer(args)
+        VLMModelRuntime(args, train=SimpleNamespace())
 
-    assert calls == ["build_model"]
+    assert calls == ["_build_model"]
 
 
 def test_compile_config_detects_cuda_graphs():
@@ -570,35 +592,37 @@ def test_torch_compile_config_defaults():
 
 
 def test_enable_compile_requires_dynamic_batching():
-    with pytest.raises(ValueError, match="train.torch_compile.enable requires train.dyn_bsz=True"):
+    with pytest.raises(ValueError, match="model.accelerator.torch_compile.enable requires train.dyn_bsz=True"):
         VeOmniArguments(
-            model=_model_args(),
+            model=_model_args(accelerator=AcceleratorConfig(torch_compile=ArgumentsTorchCompileConfig(enable=True))),
             data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
             train=TrainingArguments(
-                torch_compile=ArgumentsTorchCompileConfig(enable=True), dyn_bsz=False, pad_to_length=False
+                dyn_bsz=False,
+                pad_to_length=False,
             ),
         )
 
 
 def test_enable_compile_requires_padding_for_dynamic_batching():
     with pytest.raises(
-        ValueError, match="train.torch_compile.enable requires train.dyn_bsz=True and train.pad_to_length=True"
+        ValueError,
+        match="model.accelerator.torch_compile.enable requires train.dyn_bsz=True and train.pad_to_length=True",
     ):
         VeOmniArguments(
-            model=_model_args(),
+            model=_model_args(accelerator=AcceleratorConfig(torch_compile=ArgumentsTorchCompileConfig(enable=True))),
             data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
             train=TrainingArguments(
-                torch_compile=ArgumentsTorchCompileConfig(enable=True), dyn_bsz=True, pad_to_length=False
+                dyn_bsz=True,
+                pad_to_length=False,
             ),
         )
 
 
 def test_enable_compile_accepts_static_padded_dynamic_batching():
     args = VeOmniArguments(
-        model=_model_args(),
+        model=_model_args(accelerator=AcceleratorConfig(torch_compile=ArgumentsTorchCompileConfig(enable=True))),
         data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
         train=TrainingArguments(
-            torch_compile=ArgumentsTorchCompileConfig(enable=True),
             dyn_bsz=True,
             pad_to_length=True,
             micro_batch_size=2,
@@ -618,10 +642,9 @@ class ToyMultimodalDataArguments(DataArguments):
 def test_enable_compile_rejects_unsupported_data_pipeline():
     with pytest.raises(ValueError, match="not supported by this data pipeline"):
         VeOmniArguments(
-            model=_model_args(),
+            model=_model_args(accelerator=AcceleratorConfig(torch_compile=ArgumentsTorchCompileConfig(enable=True))),
             data=ToyMultimodalDataArguments(train_path="dummy.jsonl", max_seq_len=8),
             train=TrainingArguments(
-                torch_compile=ArgumentsTorchCompileConfig(enable=True),
                 dyn_bsz=True,
                 pad_to_length=True,
                 micro_batch_size=2,
@@ -633,10 +656,9 @@ def test_enable_compile_accepts_vlm_static_padded_dynamic_batching():
     from veomni.trainer.vlm_trainer import VeOmniVLMArguments, VLMMDataArguments
 
     args = VeOmniVLMArguments(
-        model=_model_args(),
+        model=_model_args(accelerator=AcceleratorConfig(torch_compile=ArgumentsTorchCompileConfig(enable=True))),
         data=VLMMDataArguments(train_path="dummy.jsonl", max_seq_len=8),
         train=TrainingArguments(
-            torch_compile=ArgumentsTorchCompileConfig(enable=True),
             dyn_bsz=True,
             pad_to_length=True,
             micro_batch_size=2,
@@ -653,10 +675,9 @@ class ToyTextDataArguments(DataArguments):
 
 def test_enable_compile_accepts_text_data_argument_subclass():
     args = VeOmniArguments(
-        model=_model_args(),
+        model=_model_args(accelerator=AcceleratorConfig(torch_compile=ArgumentsTorchCompileConfig(enable=True))),
         data=ToyTextDataArguments(train_path="dummy.jsonl", max_seq_len=8),
         train=TrainingArguments(
-            torch_compile=ArgumentsTorchCompileConfig(enable=True),
             dyn_bsz=True,
             pad_to_length=True,
             micro_batch_size=2,

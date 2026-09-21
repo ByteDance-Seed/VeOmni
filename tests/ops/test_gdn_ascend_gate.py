@@ -64,9 +64,10 @@ def test_opslot_npu_backend_on_gpu_raises(op_name):
 @pytest.mark.parametrize("op_name", _GDN_OPS)
 @patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", False)
 @patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", True)
+@patch(f"{_REGISTRY_MODULE}.IS_MLU_AVAILABLE", False)
 def test_opslot_fla_backend_on_npu_raises(op_name):
     slot = OpSlot(op_name, "standard")
-    with pytest.raises(RuntimeError, match="device_type='gpu'"):
+    with pytest.raises(RuntimeError, match=r"\['gpu', 'mlu'\]"):
         slot.bind("fla")
 
 

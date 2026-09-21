@@ -99,6 +99,31 @@ model:
     cross_entropy_loss_implementation: eager
     moe_implementation: eager
     load_balancing_loss_implementation: eager
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_decay_style: linear
+    lr_min: 1.0e-5  # 10% of lr, matches LTX-2 LinearLR end_factor=0.1
+    lr_warmup_ratio: 0.0  # no warmup, matches LTX-2 (which uses LinearLR without warmup)
+    weight_decay: 0.01  # matches LTX-2's AdamW default (0.01)
+    max_grad_norm: 1.0
+  accelerator:
+    # "meta" required for FSDP2
+    init_device: meta
+    # reduces memory at ~20-30% slower training
+    gradient_checkpointing:
+      enable: true
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      offload: true
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        cast_forward_inputs: false
+    offload_config:
+      enable_activation: true
+      activation_gpu_limit: 2.0
 
 # -----------------------------------------------------------------------------
 # Data Configuration
@@ -136,40 +161,14 @@ train:
   micro_batch_size: 1
   dyn_bsz: false
 
-  # Device for model init — "meta" required for FSDP2
-  init_device: meta
   seed: 42
 
   num_train_epochs: 1
   max_steps: 2000
 
-  # Gradient checkpointing — reduces memory at ~20-30% slower training
-  gradient_checkpointing:
-    enable: true
-
   # Optimizer settings
-  optimizer:
-    type: adamw
-    lr: 1.0e-4
-    lr_decay_style: linear
-    lr_min: 1.0e-5  # 10% of lr, matches LTX-2 LinearLR end_factor=0.1
-    lr_warmup_ratio: 0.0  # no warmup, matches LTX-2 (which uses LinearLR without warmup)
-    weight_decay: 0.01  # LTX-2 uses PyTorch default (no weight decay)
-    max_grad_norm: 1.0
 
   # Parallelism & mixed precision
-  accelerator:
-    ulysses_size: 1
-    fsdp_config:
-      fsdp_mode: fsdp2
-      offload: true
-      mixed_precision:
-        enable: true
-        param_dtype: bfloat16
-        cast_forward_inputs: false
-    offload_config:
-      enable_activation: true
-      activation_gpu_limit: 2.0
 
   # Checkpoint settings
   checkpoint:

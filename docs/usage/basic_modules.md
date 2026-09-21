@@ -43,7 +43,7 @@ class Arguments(VeOmniArguments):
 
 if __name__ == "__main__":
     args = parse_args(Arguments)
-    print(args.train.optimizer.lr)  # Access default arguments
+    print(args.model.optimizer.lr)  # Access default arguments
 ```
 
 **Custom Parameter Extension**:  
@@ -65,9 +65,10 @@ class Arguments(VeOmniArguments):
 
 ## Parallel State
 VeOmni uses PyTorch DeviceMesh to manage multidimensional parallel topologies.
-`init_parallel_state` registers a state under a logical name, while
-`use_parallel_state` scopes operations that need to resolve the current
-process groups. See [Local Parallel State Registry and Scoping](../design/local_parallel_state.md)
+`init_parallel_state_from_config` registers a state under a logical name,
+while `use_parallel_state` scopes operations that need to resolve the current
+process groups. The topology comes straight off `model.accelerator`, so no call
+site restates it. See [Local Parallel State Registry and Scoping](../design/local_parallel_state.md)
 for the registry, topology-cache, and teardown rules.
 
 More details about torch device mesh, you can refer to the [Getting Started with DeviceMesh](https://pytorch.org/tutorials/recipes/distributed_device_mesh.html).
@@ -78,25 +79,13 @@ More details about torch device mesh, you can refer to the [Getting Started with
 from veomni.distributed.parallel_state import (
     get_parallel_state,
     get_parallel_state_by_name,
-    init_parallel_state,
+    init_parallel_state_from_config,
     use_parallel_state,
 )
 
-init_parallel_state(
-    dp_size=args.train.accelerator.dp_size, # data parallel size
-    dp_replicate_size=args.train.accelerator.dp_replicate_size, # data parallel replicate size
-    dp_shard_size=args.train.accelerator.dp_shard_size, # data parallel shard degree
-    tp_size=args.train.accelerator.tp_size, # tensor parallel size
-    pp_size=args.train.accelerator.pp_size, # pipeline parallel size, not support now
-    cp_size=args.train.accelerator.cp_size, # context parallel size, not support now
-    ulysses_size=args.train.accelerator.ulysses_size, # ulysses parallel size
-    extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes, # including expert parallel size
-    extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
-    extra_parallel_names=args.train.accelerator.extra_parallel_names,
-    dp_mode=args.train.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp" or "fsdp2"
-    async_enabled=args.train.accelerator.enable_async, # async ulysses
-    name="base",
-)
+# Reads dp / tp / pp / cp / ulysses / extra-parallel sizes, the FSDP mode and
+# async ulysses off the config; see `model.accelerator.*` for each knob.
+init_parallel_state_from_config(args.model.accelerator, name="base")
 
 parallel_state = get_parallel_state()
 assert parallel_state is get_parallel_state_by_name("base")
@@ -174,7 +163,7 @@ If your dataset is mapping, you are recommended to pass `len(train_dataset)` to 
 ```python
 dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
 if args.data.datasets_type == "mapping":
-    dataset_length = dataset_length / args.train.accelerator.dp_size
+    dataset_length = dataset_length / args.model.accelerator.dp_size
 args.compute_train_steps(dataset_length)
 train_steps = args.train_steps
 ```
@@ -224,12 +213,12 @@ transform = build_data_transform(
 )
 ```
 
-**SFT Example**:  
+**SFT Example**: (building the template by hand — inside a trainer you read `self.model.chat_template`, which the model runtime already built; see [Chat Template](#chat-template))
 ```python
 from veomni.data import build_data_transform
 from veomni.data.chat_template import build_chat_template
 
-chat_template = build_chat_template(args.data.chat_template, tokenizer)
+chat_template = build_chat_template(args.model.chat_template, tokenizer)
 transform = build_data_transform(
     "conversation",
     chat_template=chat_template,
@@ -244,19 +233,15 @@ VeOmni offers unified multimodal transform functions in [veomni/data/data_transf
 1. `process_sample_qwen_vl` for Qwen2-VL, Qwen2.5-VL, Qwen3-VL, and Qwen3.5
 2. `process_sample_qwen_omni` for Qwen2.5-Omni and Qwen3-Omni-MoE
 
-Example usage in `_build_data_transform` in [veomni/trainer/vlm_trainer.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/vlm_trainer.py).
+Example usage in `_build_data_transform` in [veomni/trainer/vlm_trainer.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/vlm_trainer.py) — the runtime already owns the processor and template:
 ```python
-from veomni.data import build_chat_template, build_data_transform
-from veomni.models import build_processor
+from veomni.data import build_data_transform
 
-processor = build_processor(args.model.tokenizer_path)
-chat_template = build_chat_template(args.data.chat_template, processor)
-position_id_func = model.get_position_id_func()
 transform = build_data_transform(
     model.config.model_type,
-    processor=processor,
-    chat_template=chat_template,
-    position_id_func=position_id_func,
+    processor=model.processor,
+    chat_template=model.chat_template,
+    position_id_func=model.get_position_id_func(),
     **args.data.mm_configs,
 )
 ```
@@ -272,6 +257,9 @@ Multimodal dataset transform follows the similar pipeline:
 
 ### Chat Template
 VeOmni default supports several chat templates, text-only and multimodal alike, all registered in [veomni/data/chat_template.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/chat_template.py) and built by name through the single `build_chat_template` entrypoint.
+
+In a training job you do not call it yourself: the model runtime builds the template named by `model.chat_template` right after it loads the preprocessor, and exposes it as `model.chat_template` for the data transform to read. Leave `chat_template` unset when the job needs none — plaintext and diffusion data carry no conversation to lay out, and a Qwen-Omni model formats prompts through its processor's own template.
+
 You can add your custom chat template by implementing the `ChatTemplate` class — or `MultimodalChatTemplate` if it needs the per-modality token counts. A `ChatTemplate` is built from a tokenizer; a `MultimodalChatTemplate` is built from the processor instead, since laying out placeholders also needs the grid parameters the processor used.
 **Custom Template Implementation**:  
 ```python
@@ -281,10 +269,9 @@ class CustomTemplate(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         # Implement encoding logic
         pass
-
-    def get_jinja_template(self) -> str:
-        return ""  # Jinja template string
 ```
+
+`encode_messages` is the only method you have to write: training lays out tokens through it, including the assistant-only label mask that jinja cannot express. `get_jinja_template` is optional and read by nothing in the training or export path — an exported checkpoint keeps whatever chat template it shipped with, so selecting a template here never rewrites it.
 
 
 ## DataLoader
@@ -355,8 +342,8 @@ from veomni.models import build_foundation_model
 model = build_foundation_model(
     config_path=args.model.config_path, # model config path, can be None if weights_path is not None
     weights_path=args.model.model_path, # model weights path, can be None if config_path is not None
-    init_device=args.train.init_device, # model init device
-    torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
+    init_device=args.model.accelerator.init_device, # model init device
+    torch_dtype="float32" if args.model.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
     ops_implementation=args.model.ops_implementation,
     config_kwargs=config_kwargs,
 )
@@ -370,27 +357,27 @@ model = build_foundation_model(
 from veomni.distributed.torch_parallelize import build_parallelize_model
 model = build_parallelize_model(
     model,
-    init_device=args.train.init_device, # model init device
+    init_device=args.model.accelerator.init_device, # model init device
     weights_path=args.model.model_path,
-    enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward, # enable reshard after forward for FSDP2
-    mixed_precision=args.train.accelerator.fsdp_config.mixed_precision, # enable mixed precision
-    enable_gradient_checkpointing=args.train.gradient_checkpointing.enable, # enable gradient checkpointing
-    enable_fsdp_offload=args.train.accelerator.fsdp_config.offload, # enable fsdp offload
+    enable_reshard_after_forward=args.model.accelerator.fsdp_config.reshard_after_forward, # enable reshard after forward for FSDP2
+    mixed_precision=args.model.accelerator.fsdp_config.mixed_precision, # enable mixed precision
+    enable_gradient_checkpointing=args.model.accelerator.gradient_checkpointing.enable, # enable gradient checkpointing
+    enable_fsdp_offload=args.model.accelerator.fsdp_config.offload, # enable fsdp offload
     basic_modules=list(set(getattr(model, "_no_split_modules", None) or []) | set(args.model.basic_modules)), # FSDP basic modules
-    enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
-    early_stop=args.train.gradient_checkpointing.early_stop,
-    enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
-    broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0, # load model weights
-    ep_sharded_stream_load=args.train.ep_sharded_stream_load,
-    max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size, # max load broadcast size
+    enable_reentrant=args.model.accelerator.gradient_checkpointing.enable_reentrant,
+    early_stop=args.model.accelerator.gradient_checkpointing.early_stop,
+    enable_forward_prefetch=args.model.accelerator.fsdp_config.forward_prefetch,
+    broadcast_model_weights_from_rank0=args.model.broadcast_model_weights_from_rank0, # load model weights
+    ep_sharded_stream_load=args.model.ep_sharded_stream_load,
+    max_load_broadcast_size=args.model.accelerator.fsdp_config.max_load_broadcast_size, # max load broadcast size
     # Muon's zero-comm expert layout is decided here, not by build_optimizer.
-    muon_expert_zero_comm=args.train.optimizer.type == "muon" and args.train.optimizer.muon_expert_zero_comm,
+    muon_expert_zero_comm=args.model.optimizer.type == "muon" and args.model.optimizer.muon_expert_zero_comm,
 )
 ```
 
 ### Optimizer and LR Scheduler
 
-`build_optimizer` supports three optimizer types via `train.optimizer.type`:
+`build_optimizer` supports three optimizer types via `model.optimizer.type`:
 
 | Type | Description |
 |------|-------------|
@@ -398,7 +385,7 @@ model = build_parallelize_model(
 | `anyprecision_adamw` | Mixed-precision AdamW (Llama-recipes' AnyPrecisionAdamW). |
 | `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases and norms. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
 
-Muon-specific hyperparameters live under `train.optimizer.muon_*` (e.g. `muon_lr`, `muon_momentum`, `muon_adjust_lr_fn`); `lr` / `weight_decay` / `betas` / `eps` continue to drive the AdamW sibling group.
+Muon-specific hyperparameters live under `model.optimizer.muon_*` (e.g. `muon_lr`, `muon_momentum`, `muon_adjust_lr_fn`); `lr` / `weight_decay` / `betas` continue to drive the AdamW sibling group.
 
 Muon-specific knobs (only consulted when `optimizer.type == "muon"`):
 
@@ -416,7 +403,7 @@ Muon-specific knobs (only consulted when `optimizer.type == "muon"`):
 | `muon_ns_implementation` | `gram_quack` | Newton–Schulz backend: `std`, `gram` (pure PyTorch Gram-NS), or `gram_quack` (default; Dao-AILab + quack CuTeDSL GEMM; falls back to `gram` with a warning if unavailable). |
 | `muon_gram_ns_reset_iterations` | `[2]` | Restart indices for Gram-NS (`gram` / `gram_quack` only). |
 | `muon_head_group_size` | `0` | Attention heads per orthogonalization block ("Muon Split", see below). `0` keeps one polar factor per projection, `1` is fully per-head, `g>1` groups `g` heads per block. Any value `>= 1` also requires `muon_head_split_modules`. |
-| `muon_head_split_modules` | `[]` | Leaf module names to head-split, matched exactly against the children of an attention module. **Required** when `muon_head_group_size >= 1`; there is no default list. |
+| `muon_head_split_modules` | `[]` | Projections to head-split, each matched as a leaf module name or a dotted path suffix (`self_attn.q_b_proj`). **Required** when `muon_head_group_size >= 1`; there is no default list. See below for the nested-name rule. |
 
 On build, VeOmni logs a one-line `[Muon]` summary (NS backend, resolved LRs, `expert_zero_comm`). Whether zero-comm sharding actually activated is logged separately as `[muon_expert_zero_comm]` during parallelize.
 
@@ -431,11 +418,11 @@ default would quietly change the update math for every model whose attention use
 the same names:
 
 ```yaml
-train:
+model:
   optimizer:
     type: muon
     muon_head_group_size: 1            # heads per block
-    muon_head_split_modules: [q_b_proj]  # which projections to split
+    muon_head_split_modules: [self_attn.q_b_proj]  # which projections to split
 ```
 
 Whether this helps depends on the shape of the stacked matrix:
@@ -462,11 +449,48 @@ Mechanics worth knowing when running an A/B:
   `sqrt(32)`-times-larger step and the experiment would really be measuring a
   learning-rate change.
 - Splitting is applied by name, so pick the list deliberately. Reasonable
-  starting points: `[q_b_proj]` for DeepSeek V3/V4 MLA up-projections,
+  starting points: `[self_attn.q_b_proj]` for DeepSeek V3/V4 MLA up-projections,
   `[q_proj, k_proj, v_proj]` for GQA attention, `[wq_b]` for a GLM MoE DSA
   indexer. Nothing stops you from listing `o_proj` (head-structured along
   *columns*) or MLA `kv_b_proj` (interleaves K and V inside each head), but row
   blocks would not line up with heads there.
+- Each entry matches a leaf module name **or any dotted path suffix**, so
+  `q_b_proj`, `self_attn.q_b_proj` and `compressor.indexer.q_b_proj` all address
+  the projections they name. That is how DeepSeek-V4 is disambiguated: its DSA
+  indexer, which sits *inside* the MLA under the compressor, names its own
+  up-projection `q_b_proj` too, so a bare `[q_b_proj]` would head-split the MLA's
+  8 heads and the indexer's `[index_n_heads * index_head_dim, q_lora_rank]` stack
+  at once. Rather than pick one, VeOmni rejects the entry and names the two
+  qualified forms:
+
+  ```
+  muon_head_split_modules entry 'q_b_proj' is ambiguous: it selects
+  model.layers.3.self_attn.q_b_proj (8 heads) and
+  model.layers.3.self_attn.compressor.indexer.q_b_proj (64 heads), and the second
+  sits inside the module holding the first, so the name cannot say which one was
+  meant. Replace it with 'self_attn.q_b_proj' or 'indexer.q_b_proj' -- list both
+  to split both.
+  ```
+
+  Note **replace**, not supplement: `[q_b_proj, self_attn.q_b_proj]` is refused
+  too, because the bare entry still selects both sites. The rule is per pair of
+  selected projections rather than per entry, so there is no spelling that slips
+  a nested pair through, and it holds at every `muon_head_group_size` — including
+  the sizes where one side of the pair stops splitting on its own.
+
+  Only *nested* matches are rejected. Sibling matches stay selected together,
+  because there the plain reading is unambiguous: Qwen2.5-Omni's text and audio
+  towers both name a `q_proj`, neither encloses the other, and `[q_proj]` means
+  both. GLM MoE DSA needs nothing special either — its indexer calls its
+  up-projection `wq_b` while the attention around it uses `q_b_proj`, so the two
+  names never collide.
+
+  **Migration.** `muon_head_split_modules: [q_b_proj]` was previously accepted on
+  DeepSeek-V4 and quietly split the indexer along with the MLA; it now fails at
+  optimizer construction. Use `[self_attn.q_b_proj]` for the MLA alone, or add
+  `indexer.q_b_proj` to keep splitting both. Every other model in the repo is
+  unaffected — no other pair of head-declaring modules shares a child name
+  through nesting.
 - The head count is never guessed from the shape alone: a projection is split
   only when its row count equals a *declared* head count times a *declared*
   per-head dim (`num_heads`/`n_heads`/config equivalents against
@@ -498,14 +522,15 @@ from veomni.optim import build_lr_scheduler, build_optimizer
 
 optimizer = build_optimizer(
     model,
-    lr=args.train.optimizer.lr,
-    weight_decay=args.train.optimizer.weight_decay,
-    optimizer_type=args.train.optimizer.type,
+    lr=args.model.optimizer.lr,
+    betas=args.model.optimizer.betas,
+    weight_decay=args.model.optimizer.weight_decay,
+    optimizer_type=args.model.optimizer.type,
     # Hand over the config so optimizer-specific knobs (the muon_* fields) are
     # read here instead of being unpacked by each trainer. The one exception is
     # muon_expert_zero_comm, which picks an FSDP shard layout and so has to be
     # passed to build_parallelize_model above.
-    optimizer_config=args.train.optimizer,
+    optimizer_config=args.model.optimizer,
     # ... other parameters
 )
 
@@ -518,7 +543,7 @@ lr_scheduler = build_lr_scheduler(
 
 
 ## Train Loop
-After the parallel_state, model, optimizer, and dataloader are initialized, you can start the training loop.
+After the parallel_state, model, optimizer, and dataloader are initialized, you can start the training loop. The supported path is [`BaseTrainer`](./trainer.md), which owns this loop and reads optimizer / clip / preprocessor off `trainer.model` (`VeOmniModelRuntime`). The snippet below is the same shape, written out by hand:
 
 ```python
 for epoch in range(args.train.num_train_epochs):
