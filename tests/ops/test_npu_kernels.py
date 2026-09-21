@@ -466,3 +466,45 @@ class TestNPUKernelRegistry:
         assert "npu" in KERNEL_REGISTRY.list_available(op_name, variant), (
             f"Expected 'npu' kernel registered for ({op_name!r}, {variant!r})"
         )
+
+
+class TestNPUMHC:
+    """Numerical coverage for the supported DeepSeek-V4 MHC NPU path."""
+
+    def test_post_forward_backward_matches_eager(self):
+        from veomni.ops.kernels.mhc.npu import mhc_post_npu
+
+        torch.manual_seed(23)
+        output = torch.randn(1, 3, 128, device=DEVICE, dtype=torch.bfloat16)
+        residual = torch.randn(1, 3, 4, 128, device=DEVICE, dtype=torch.bfloat16)
+        post = torch.randn(1, 3, 4, device=DEVICE, dtype=torch.float32)
+        comb = torch.randn(1, 3, 4, 4, device=DEVICE, dtype=torch.float32)
+
+        actual_inputs = [tensor.clone().requires_grad_() for tensor in (output, residual, post, comb)]
+        expected_inputs = [tensor.clone().requires_grad_() for tensor in (output, residual, post, comb)]
+
+        actual = mhc_post_npu(*actual_inputs)
+        expected = expected_inputs[2].to(torch.bfloat16).unsqueeze(-1) * expected_inputs[0].unsqueeze(
+            -2
+        ) + torch.matmul(
+            expected_inputs[3].to(torch.bfloat16).transpose(-1, -2),
+            expected_inputs[1],
+        )
+
+        grad_output = torch.randn_like(actual)
+        actual.backward(grad_output)
+        expected.backward(grad_output)
+
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=4e-2)
+        for actual_input, expected_input in zip(actual_inputs, expected_inputs, strict=True):
+            torch.testing.assert_close(
+                actual_input.grad.float(),
+                expected_input.grad.float(),
+                rtol=2e-2,
+                atol=7e-2,
+            )
+
+    def test_post_kernel_registered(self):
+        from veomni.ops.kernel_registry import KERNEL_REGISTRY
+
+        assert "npu" in KERNEL_REGISTRY.list_available("mhc", "post")
