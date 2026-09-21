@@ -72,6 +72,48 @@ def test_convert_checkpoint_uses_caller_graph_yaml(tmp_path):
     assert config.generation_graph["initial"] == "run"
 
 
+def test_extra_pairs_reach_the_family_converter(tmp_path):
+    """``--extra KEY=VALUE`` is how a family gets an input this CLI knows nothing about.
+
+    qwen3omni needs a second checkpoint (a Mimi encoder, since Qwen3-Omni ships
+    an audio decoder but no tokenizer). Declaring that as its own CLI flag would
+    put a qwen3omni-shaped argument on the entry point every other family shares,
+    so the flag stays generic and the family's converter signature is what names
+    the input.
+    """
+    from scripts.seed_omni.convert_model import _parse_extra
+
+    assert _parse_extra(["mimi_path=kyutai/mimi", "revision=main"]) == {
+        "mimi_path": "kyutai/mimi",
+        "revision": "main",
+    }
+    # A value may itself contain '=' (query strings, base64); only the first splits.
+    assert _parse_extra(["url=a=b"]) == {"url": "a=b"}
+    with pytest.raises(SystemExit, match="KEY=VALUE"):
+        _parse_extra(["mimi_path"])
+
+    seen = {}
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "extra_kwargs_test"}), encoding="utf-8")
+    training_graph, generation_graphs = load_family_graphs()
+
+    def _record_extra(model_path: str, **kwargs) -> dict:
+        del model_path
+        seen.update(kwargs)
+        return {
+            "modules": {FAKE_A: FakeModuleA(FakeModuleAConfig()), FAKE_B: FakeModuleB(FakeModuleBConfig())},
+            "training_graph": training_graph,
+            "generation_graphs": generation_graphs,
+        }
+
+    if "extra_kwargs_test" not in OMNI_CONVERT_REGISTRY.valid_keys():
+        OMNI_CONVERT_REGISTRY.register("extra_kwargs_test", lambda: _record_extra)
+
+    convert_checkpoint(str(source), str(tmp_path / "omni"), **_parse_extra(["mimi_path=kyutai/mimi"]))
+    assert seen["mimi_path"] == "kyutai/mimi"
+
+
 def test_convert_fake_omni_writes_both_graphs_and_loads(tmp_path):
     source = _write_fake_omni_source(tmp_path / "src", hidden_size=8)
     output = tmp_path / "omni"
