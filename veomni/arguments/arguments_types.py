@@ -1172,15 +1172,15 @@ _NPU_DEFAULT_FALLBACK: Dict[str, str] = {
 
 # MLU compatibility tables for ``_validate_implementations``.
 _MLU_ALLOWED: Dict[str, frozenset] = {
+    "rms_norm_implementation": frozenset({"liger_kernel"}),
+    "rotary_pos_emb_implementation": frozenset({"liger_kernel"}),
+    "swiglu_mlp_implementation": frozenset({"liger_kernel"}),
+    "cross_entropy_loss_implementation": frozenset({"liger_kernel"}),
     "moe_implementation": frozenset({"fused_mlu", "fused_mlu_triton"}),
 }
 
 _MLU_DEFAULT_FALLBACK: Dict[str, str | frozenset] = {
-    "rms_norm_implementation": "eager",
-    "rotary_pos_emb_implementation": "eager",
-    "swiglu_mlp_implementation": "eager",
     "load_balancing_loss_implementation": "eager",
-    "cross_entropy_loss_implementation": "eager",
     "moe_implementation": frozenset({"fused_mlu", "fused_mlu_triton"}),
 }
 
