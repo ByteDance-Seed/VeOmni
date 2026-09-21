@@ -360,7 +360,6 @@ class DiTTrainer:
         # registers ParallelState("base") before seed
         self.base.device = self.base._setup(args)
         args.train.dyn_bsz = False
-        args.train.micro_batch_size = 1
         # dataloader_batch_size was computed in __post_init__ when dyn_bsz was still True
         # (default), so it was set to 1. Recompute now that dyn_bsz=False.
         args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
@@ -375,11 +374,10 @@ class DiTTrainer:
             args.data.shuffle = False
             args.train.checkpoint.save_epochs = 0
             args.train.checkpoint.save_hf_weights = False
-            # No gradient accumulation needed; process one sample per step to
-            # avoid broadcast_object_list serialising all micro-batches at once
-            # which can OOM CPU memory with large video data.
-            args.train.global_batch_size = get_parallel_state().dp_size
-            args.train.dataloader_batch_size = 1
+            # Keep one microbatch per step to limit video broadcast memory; embedding needs no accumulation.
+            args.train.global_batch_size = args.train.micro_batch_size * get_parallel_state().dp_size
+            args.train.dataloader_batch_size = args.train.micro_batch_size
+            args.train.gradient_accumulation_steps = 1
             logger.info_rank0(
                 f"Task offline_embedding. Drop last: {args.data.drop_last}, shuffle: {args.data.shuffle}"
             )
@@ -421,7 +419,8 @@ class DiTTrainer:
                     math.ceil(self.base.train_dataset.data_len / args.train.global_batch_size)
                     * args.train.global_batch_size
                 )
-                self.base.train_dataset.data_len = padded_len
+                # Keep the source length intact for MappingDataset's repeated-index mapping.
+                self.base.train_dataset = torch.utils.data.Subset(self.base.train_dataset, range(padded_len))
                 args._train_steps = padded_len // dp_size // args.train.dataloader_batch_size
                 self.base.train_steps = args.train_steps
             else:
@@ -467,6 +466,7 @@ class DiTTrainer:
                 persistent_workers=args.data.dataloader.persistent_workers,
                 in_order=args.data.dataloader.in_order,
                 seed=args.train.seed,
+                shuffle=args.data.shuffle,
                 collate_fn=DiTDataCollator(),
                 save_steps=args.train.checkpoint.save_steps,
             )
