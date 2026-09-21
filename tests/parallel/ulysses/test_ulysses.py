@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import torch
@@ -40,6 +41,17 @@ from .utils import (
 )
 
 
+@contextmanager
+def _ieee_fp32_matmul():
+    """Disable TF32 so fp32 Linear/SDPA compare SP vs DP at atol=1e-6 on H20."""
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+
+
 class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
     @staticmethod
     def _get_input_data():
@@ -74,100 +86,102 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
 
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_self_attn(self):
-        self._get_process_group()
-        sp_group = get_ulysses_sequence_parallel_group()
-        full_input = self._get_input_data()
-        unpad_size = full_input.size(1)
-        part_input = slice_input_tensor(full_input, dim=1, group=sp_group)
-        full_input.requires_grad = True
-        part_input.requires_grad = True
+        with _ieee_fp32_matmul():
+            self._get_process_group()
+            sp_group = get_ulysses_sequence_parallel_group()
+            full_input = self._get_input_data()
+            unpad_size = full_input.size(1)
+            part_input = slice_input_tensor(full_input, dim=1, group=sp_group)
+            full_input.requires_grad = True
+            part_input.requires_grad = True
 
-        # initialize attn module
-        attn_dp = Attention(
-            dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
-        ).to(get_device_type())
-        attn_sp = Attention(
-            dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
-        ).to(get_device_type())
-        attn_sp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
-        attn_dp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
+            # initialize attn module
+            attn_dp = Attention(
+                dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
+            ).to(get_device_type())
+            attn_sp = Attention(
+                dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
+            ).to(get_device_type())
+            attn_sp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
+            attn_dp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
 
-        loss_func = self._overlapping_grad
+            loss_func = self._overlapping_grad
 
-        # forward & backward for sp
-        sp_rst = attn_sp(part_input, unpad_size)
-        sp_full_rst = gather_outputs(
-            sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
-        )
-        loss_sp = loss_func(sp_rst)
-        loss_sp.backward()
-        attn_sp_o_grad = attn_sp.proj_o.weight.grad.detach().clone()
-        attn_sp_q_grad = attn_sp.q_proj.weight.grad.detach().clone()
-        part_input_grad = part_input.grad.detach().clone()
-        dist.all_reduce(attn_sp_o_grad)
-        dist.all_reduce(attn_sp_q_grad)
-        part_input_grad = sync_tensor(part_input_grad, 1)
-        part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
+            # forward & backward for sp
+            sp_rst = attn_sp(part_input, unpad_size)
+            sp_full_rst = gather_outputs(
+                sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
+            )
+            loss_sp = loss_func(sp_rst)
+            loss_sp.backward()
+            attn_sp_o_grad = attn_sp.proj_o.weight.grad.detach().clone()
+            attn_sp_q_grad = attn_sp.q_proj.weight.grad.detach().clone()
+            part_input_grad = part_input.grad.detach().clone()
+            dist.all_reduce(attn_sp_o_grad)
+            dist.all_reduce(attn_sp_q_grad)
+            part_input_grad = sync_tensor(part_input_grad, 1)
+            part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
-        # forward & backward for dp
-        set_ulysses_sequence_parallel_group(None)
-        dp_rst = attn_dp(full_input, unpad_size)
-        loss_dp = loss_func(dp_rst)
-        loss_dp.backward()
-        attn_dp_o_grad = attn_dp.proj_o.weight.grad.detach().clone()
-        attn_dp_q_grad = attn_dp.q_proj.weight.grad.detach().clone()
-        full_input_grad = full_input.grad.detach().clone()
+            # forward & backward for dp
+            set_ulysses_sequence_parallel_group(None)
+            dp_rst = attn_dp(full_input, unpad_size)
+            loss_dp = loss_func(dp_rst)
+            loss_dp.backward()
+            attn_dp_o_grad = attn_dp.proj_o.weight.grad.detach().clone()
+            attn_dp_q_grad = attn_dp.q_proj.weight.grad.detach().clone()
+            full_input_grad = full_input.grad.detach().clone()
 
-        torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
-        torch.testing.assert_close(attn_dp_o_grad, attn_sp_o_grad, atol=1e-3, rtol=1e-4)
-        torch.testing.assert_close(attn_dp_q_grad, attn_sp_q_grad, atol=2e-3, rtol=1e-4)
-        torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
+            torch.testing.assert_close(attn_dp_o_grad, attn_sp_o_grad, atol=1e-3, rtol=1e-4)
+            torch.testing.assert_close(attn_dp_q_grad, attn_sp_q_grad, atol=2e-3, rtol=1e-4)
+            torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
 
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_self_attn_padding(self):
-        self._get_process_group()
-        sp_group = get_ulysses_sequence_parallel_group()
-        full_input = self._get_input_data_for_padding()
-        unpad_size = full_input.size(1)
-        part_input = slice_input_tensor(full_input, dim=1, group=sp_group)
-        full_input.requires_grad = True
-        part_input.requires_grad = True
+        with _ieee_fp32_matmul():
+            self._get_process_group()
+            sp_group = get_ulysses_sequence_parallel_group()
+            full_input = self._get_input_data_for_padding()
+            unpad_size = full_input.size(1)
+            part_input = slice_input_tensor(full_input, dim=1, group=sp_group)
+            full_input.requires_grad = True
+            part_input.requires_grad = True
 
-        attn_dp = Attention(
-            dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
-        ).to(get_device_type())
-        attn_sp = Attention(
-            dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
-        ).to(get_device_type())
-        attn_sp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
-        attn_dp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
+            attn_dp = Attention(
+                dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
+            ).to(get_device_type())
+            attn_sp = Attention(
+                dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
+            ).to(get_device_type())
+            attn_sp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
+            attn_dp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
 
-        sp_rst = attn_sp(part_input, unpad_size)
-        sp_full_rst = gather_outputs(
-            sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
-        )
-        loss_sp = self._non_overlapping_grad(sp_rst)
-        loss_sp.backward()
-        attn_sp_o_grad = attn_sp.proj_o.weight.grad.detach().clone()
-        attn_sp_q_grad = attn_sp.q_proj.weight.grad.detach().clone()
-        part_input_grad = part_input.grad.detach().clone()
-        dist.all_reduce(attn_sp_o_grad)
-        dist.all_reduce(attn_sp_q_grad)
-        part_input_grad = sync_tensor(part_input_grad, 1)
-        part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
+            sp_rst = attn_sp(part_input, unpad_size)
+            sp_full_rst = gather_outputs(
+                sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
+            )
+            loss_sp = self._non_overlapping_grad(sp_rst)
+            loss_sp.backward()
+            attn_sp_o_grad = attn_sp.proj_o.weight.grad.detach().clone()
+            attn_sp_q_grad = attn_sp.q_proj.weight.grad.detach().clone()
+            part_input_grad = part_input.grad.detach().clone()
+            dist.all_reduce(attn_sp_o_grad)
+            dist.all_reduce(attn_sp_q_grad)
+            part_input_grad = sync_tensor(part_input_grad, 1)
+            part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
-        set_ulysses_sequence_parallel_group(None)
-        dp_rst = attn_dp(full_input, unpad_size)
-        loss_dp = self._non_overlapping_grad(dp_rst)
-        loss_dp.backward()
-        attn_dp_o_grad = attn_dp.proj_o.weight.grad.detach().clone()
-        attn_dp_q_grad = attn_dp.q_proj.weight.grad.detach().clone()
-        full_input_grad = full_input.grad.detach().clone()
+            set_ulysses_sequence_parallel_group(None)
+            dp_rst = attn_dp(full_input, unpad_size)
+            loss_dp = self._non_overlapping_grad(dp_rst)
+            loss_dp.backward()
+            attn_dp_o_grad = attn_dp.proj_o.weight.grad.detach().clone()
+            attn_dp_q_grad = attn_dp.q_proj.weight.grad.detach().clone()
+            full_input_grad = full_input.grad.detach().clone()
 
-        torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
-        torch.testing.assert_close(attn_dp_o_grad, attn_sp_o_grad, atol=1e-4, rtol=1e-4)
-        torch.testing.assert_close(attn_dp_q_grad, attn_sp_q_grad, atol=2e-3, rtol=1e-4)
-        torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
+            torch.testing.assert_close(attn_dp_o_grad, attn_sp_o_grad, atol=1e-4, rtol=1e-4)
+            torch.testing.assert_close(attn_dp_q_grad, attn_sp_q_grad, atol=2e-3, rtol=1e-4)
+            torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
 
 
 class _FakeFlashAttentionModule(nn.Module):
