@@ -25,6 +25,23 @@ from ..utils import logging
 logger = logging.get_logger(__name__)
 
 
+def _mark_padding(micro_batch: Any) -> None:
+    """Flag a micro batch as padding so downstream loss masking skips it.
+
+    ``micro_batch`` is a dict once a collate_fn has merged the raw samples, but it
+    stays a ``list[dict]`` when none has: ``collate_fn=None`` is
+    ``DynamicBatchSizeDataLoader``'s own default, and ``build_dataloader`` installs
+    ``NoopDataCollator`` for ``build_collate_fn=False`` (the RL trainer collates in
+    preforward instead). ``count_loss_token`` looks for ``padding_flag`` on every
+    dict it reaches, so mark each sample in that case.
+    """
+    if isinstance(micro_batch, dict):
+        micro_batch["padding_flag"] = True
+    else:
+        for sample in micro_batch:
+            sample["padding_flag"] = True
+
+
 # TODO: add state dict for buffer to resume training.
 class DynBszBuffer:
     """
@@ -336,12 +353,17 @@ class DynamicBatchSizeDataLoader:
                                 self.step += 1
                                 batch = []
 
-                        while len(batch) < self.num_micro_batch:
-                            padding_batch = copy.deepcopy(micro_batch)
-                            padding_batch["padding_flag"] = True
-                            batch.append(padding_batch)
-                        yield batch
-                        self.step += 1
+                        if batch:
+                            # Only pad a genuinely incomplete final step. When the
+                            # drain above already produced full steps, `batch` is
+                            # empty and emitting a step here would fabricate one made
+                            # purely of duplicated, already-yielded samples.
+                            while len(batch) < self.num_micro_batch:
+                                padding_batch = copy.deepcopy(micro_batch)
+                                _mark_padding(padding_batch)
+                                batch.append(padding_batch)
+                            yield batch
+                            self.step += 1
                         return
                     else:
                         return

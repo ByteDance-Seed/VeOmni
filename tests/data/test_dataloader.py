@@ -3,9 +3,11 @@ from functools import partial
 from typing import Literal
 
 import pytest
+import torch
 from utils import DummyDataset, process_dummy_example
 
 from veomni.data import build_dataloader, build_dataset
+from veomni.data.data_collator import NoopDataCollator
 from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 
 
@@ -295,3 +297,74 @@ def test_build_dataloader_rejects_invalid_physical_overflow_ratio(monkeypatch, d
             prefetch_factor=None,
             seed=0,
         )
+
+
+class _RestartableLoader:
+    """Minimal stand-in for the per-rank torch DataLoader that
+    DynamicBatchSizeDataLoader wraps: a plain, restartable, sized iterable."""
+
+    def __init__(self, items):
+        """Keep the samples to replay on every iteration."""
+        self._items = items
+
+    def __iter__(self):
+        """Start a fresh pass over the samples."""
+        return iter(self._items)
+
+    def __len__(self):
+        """Number of samples per pass."""
+        return len(self._items)
+
+
+def _dyn_bsz_sample(index: int, num_tokens: int = 10):
+    """Build a raw sample whose token ids all equal ``index``."""
+    return {
+        "id": index,
+        "input_ids": torch.full((num_tokens,), index, dtype=torch.long),
+        "attention_mask": torch.ones(num_tokens, dtype=torch.long),
+    }
+
+
+def _merging_collate_fn(samples):
+    """A collate_fn that merges the raw samples into one dict, like MainCollator."""
+    return {"ids": [sample["id"] for sample in samples]}
+
+
+def _is_padding(micro_batch) -> bool:
+    """True if a (collated or uncollated) micro batch is flagged as padding."""
+    if isinstance(micro_batch, dict):
+        return bool(micro_batch.get("padding_flag", False))
+    return all(bool(sample.get("padding_flag", False)) for sample in micro_batch)
+
+
+@pytest.mark.parametrize("collate_fn", [_merging_collate_fn, NoopDataCollator(), None])
+def test_dynamic_batch_dataloader_drop_last_false_tail(collate_fn):
+    """``drop_last=False`` must pad only a genuinely incomplete tail step.
+
+    Two regressions are covered:
+
+    1. the tail drain emitted a step even when the leftover samples already filled
+       whole steps, fabricating one made entirely of duplicated, already-yielded
+       samples;
+    2. flagging the padding micro batch assumed it was a dict, so it raised
+       ``TypeError: list indices must be integers or slices, not str`` for the
+       uncollated ``list[dict]`` shape -- which is what ``collate_fn=None`` (this
+       class's own default) and ``NoopDataCollator`` (installed by
+       ``build_dataloader(build_collate_fn=False)``) produce.
+    """
+    num_samples, num_micro_batch, train_steps = 9, 2, 8
+    dataloader = DynamicBatchSizeDataLoader(
+        dataloader=_RestartableLoader([_dyn_bsz_sample(i) for i in range(num_samples)]),
+        batching_strategy=TextBatchingStrategy(token_micro_bsz=10, buffer_size=3),
+        collate_fn=collate_fn,
+        num_micro_batch=num_micro_batch,
+        length=train_steps,
+        drop_last=False,
+    )
+
+    steps = list(dataloader)
+
+    assert not any(all(_is_padding(micro_batch) for micro_batch in step) for step in steps), (
+        "an all-padding step carries no real data and no loss tokens; it must not be emitted"
+    )
+    assert len(steps) <= train_steps + 1, f"at most one padded tail step may follow the {train_steps} requested steps"
