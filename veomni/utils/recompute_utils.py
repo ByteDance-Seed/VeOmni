@@ -66,8 +66,8 @@ logger = logging.get_logger(__name__)
 # Default policy (Megatron/Flash selective style): attention ops keep their
 # outputs (``MUST_SAVE``), everything else is recomputed.
 #
-# Known restrictions: needs non-reentrant checkpointing, and is not combined with
-# activation offload, Ulysses sequence parallel or torch.compile (see build_policy).
+# Known restrictions: needs non-reentrant checkpointing; activation offload owns
+# the checkpoint boundary instead, and torch.compile is unverified (build_policy).
 
 #: Substring tokens matched against an operator's ``namespace::name``: a match
 #: means the operator's forward output is kept (``MUST_SAVE``) instead of being
@@ -104,10 +104,11 @@ _SELECTIVE_VETO_TOKENS: tuple[str, ...] = (
     "mla_prolog",  # npu_mla_prolog*: output is q + the compressed KV
 )
 
-#: Candidate operator namespaces probed for custom attention kernels. Extended
-#: at runtime with every registered namespace matching a default token, so a
-#: backend whose namespace is not listed here (``flash_attn_3``) still resolves.
-#: Only namespaces that match no token need an entry here (``DSA``, ``npu``).
+#: Candidate operator namespaces probed for custom attention kernels. Only the
+#: four whose own name matches no default token need an entry — ``npu``,
+#: ``npu_extension``, ``DSA``, ``xformers``. The rest are listed to show what the
+#: default set covers; the runtime discovery behind ``_selective_namespaces``
+#: adds them anyway, and also a backend that is registered without being listed.
 _SELECTIVE_NS_CANDIDATES: tuple[str, ...] = (
     "npu",
     "npu_extension",
@@ -309,8 +310,10 @@ class RecomputePolicy:
     """Immutable recomputation policy for one training run.
 
     ``context_fn`` is None whenever SAC is unavailable (disabled, reentrant, or
-    activation offload owns the checkpoint boundary); the layer counts stay
-    meaningful in that case — they gate full recomputation too.
+    activation offload owns the checkpoint boundary); the layer counts still
+    decide the full-recompute range, which every model that arms checkpointing at
+    all does honour. With ``enabled=False`` an HF-style model never arms it, so
+    the plan is then computed and logged but nothing runs it.
     """
 
     recompute_last_n_layers: int = -1  # -1 = every layer, N = the last N, 0 = none
@@ -417,6 +420,17 @@ class BlockPlan:
     checkpoint_kwargs: dict[str, Any]
 
 
+def _full_recompute_kwargs(policy: RecomputePolicy) -> dict[str, Any]:
+    """Checkpoint options of a block that recomputes everything.
+
+    torch rejects ``context_fn`` and ignores ``early_stop`` on the reentrant path,
+    so the two cases differ by more than the flag.
+    """
+    if policy.use_reentrant:
+        return {"use_reentrant": True}
+    return {"use_reentrant": False, "early_stop": policy.early_stop}
+
+
 def _clamp_recompute_n(count: int, total: int) -> int:
     """Clamp ``recompute_last_n_layers`` against the model depth; -1 = every layer."""
     if count < 0:
@@ -448,16 +462,16 @@ def plan_block(policy: RecomputePolicy, index: int, total: int) -> BlockPlan:
     if index < recompute_start:
         return BlockPlan(Decision.DIRECT, {})
 
-    if policy.use_reentrant:
-        # torch rejects context_fn (and early_stop) on the reentrant path.
-        return BlockPlan(Decision.FULL, {"use_reentrant": True})
-
-    if policy.context_fn is not None and index - recompute_start < policy.selective_n_layers:
+    if (
+        not policy.use_reentrant
+        and policy.context_fn is not None
+        and index - recompute_start < policy.selective_n_layers
+    ):
         return BlockPlan(
             Decision.SAC,
             {"use_reentrant": False, "context_fn": policy.context_fn, "early_stop": policy.early_stop},
         )
-    return BlockPlan(Decision.FULL, {"use_reentrant": False, "early_stop": policy.early_stop})
+    return BlockPlan(Decision.FULL, _full_recompute_kwargs(policy))
 
 
 # ---------------------------------------------------------------------------
@@ -628,10 +642,8 @@ def _as_stack(*candidates: _Candidate) -> BlockStack:
 
 @dataclass(frozen=True)
 class BlockBinding:
-    """Where a block sits in its stack, and how it should be checkpointed."""
+    """How one block of a stack is checkpointed."""
 
-    index: int
-    total: int
     plan: BlockPlan
 
 
@@ -690,9 +702,7 @@ def apply_recompute_policy(
         return RecomputeReport(policy=policy)
 
     for index, block in enumerate(stack.modules):
-        _block_bindings[block] = BlockBinding(
-            index=index, total=stack.total, plan=plan_block(policy, index, stack.total)
-        )
+        _block_bindings[block] = BlockBinding(plan_block(policy, index, stack.total))
 
     patched_blocks = 0
     patched_containers = 0
@@ -737,8 +747,6 @@ def _block_checkpoint_func(binding: BlockBinding) -> Callable[..., Any]:
             return func(*args, **kwargs)
         return _run_checkpoint(func, args, kwargs, plan.checkpoint_kwargs)
 
-    checkpointed._veomni_layer_index = binding.index
-    checkpointed._veomni_decision = plan.decision
     return checkpointed
 
 
@@ -750,9 +758,7 @@ def _container_checkpoint_func(policy: RecomputePolicy) -> Callable[..., Any]:
     binding decides. Blocks that were never bound keep full recomputation, which
     is what those loops did before.
     """
-    fallback_kwargs: dict[str, Any] = {"use_reentrant": policy.use_reentrant}
-    if not policy.use_reentrant:
-        fallback_kwargs["early_stop"] = policy.early_stop
+    fallback_kwargs = _full_recompute_kwargs(policy)
 
     def checkpointed(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         block = _resolve_block(func, args)
@@ -824,13 +830,6 @@ def _describe_decisions(decisions: Sequence[Decision]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _create_custom_forward(function: Callable[..., Any]) -> Callable[..., Any]:
-    def custom_forward(*inputs, **kwargs):
-        return function(*inputs, **kwargs)
-
-    return custom_forward
-
-
 def _run_checkpoint(function: Callable[..., Any], args: tuple, kwargs: dict, checkpoint_kwargs: dict[str, Any]) -> Any:
     """Checkpoint one call, refusing the shape reentrant checkpointing cannot carry.
 
@@ -839,6 +838,14 @@ def _run_checkpoint(function: Callable[..., Any], args: tuple, kwargs: dict, che
     its own, and folding the keywords into a closure instead would drop the
     gradient of every keyword tensor that needs one — so the combination is
     reported where it is decided, naming the key that turns it off.
+
+    The callable goes to torch as it came in. ``enable_reentrant=True`` makes the
+    framework swap in its own ``CheckpointFunction``
+    (:mod:`veomni.distributed.checkpoint`), which reads ``run_function.__self__``
+    to find the module whose FSDP pre-backward hook it has to run — a block
+    arriving inside a closure has no ``__self__`` and would raise
+    ``AttributeError`` there instead of checkpointing. The keywords need no
+    closure either: torch hands them to the callable itself.
     """
     if kwargs and checkpoint_kwargs.get("use_reentrant"):
         block = _resolve_block(function, args)
@@ -849,7 +856,7 @@ def _run_checkpoint(function: Callable[..., Any], args: tuple, kwargs: dict, che
             "saves positional tensors only, so a keyword tensor would lose its gradient silently. "
             "Set enable_reentrant=False (the default), or pass those arguments positionally."
         )
-    return torch.utils.checkpoint.checkpoint(_create_custom_forward(function), *args, **kwargs, **checkpoint_kwargs)
+    return torch.utils.checkpoint.checkpoint(function, *args, **kwargs, **checkpoint_kwargs)
 
 
 def checkpoint_forward(

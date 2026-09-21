@@ -444,8 +444,9 @@ class GradientCheckpointingConfig:
                 "the framework finds the block stack itself (_no_split_modules / "
                 "basic_modules) and folds sibling stacks into one sequence. A "
                 "model with several stacks (a VLM tower beside the decoder) "
-                "counts the trainable one, the deepest one if both train; list "
-                "a class in model.basic_modules to count that one instead."
+                "counts the trainable one, the one with more blocks if both "
+                "train; list a class in model.basic_modules to count that one "
+                "instead."
             )
         },
     )
@@ -477,8 +478,9 @@ class GradientCheckpointingConfig:
     )
 
     def __post_init__(self) -> None:
-        # YAML values reach the dataclass untyped (parser only casts CLI args),
-        # so a quoted "10" would blow up later inside the forward pass.
+        # YAML values reach the dataclass untyped (the parser casts CLI args only),
+        # so a quoted "10" would otherwise fail much later, comparing against an
+        # int in the policy builder.
         for name in ("recompute_last_n_layers", "selective_n_layers"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int):
