@@ -15,7 +15,7 @@
 """MoE Router Replay (RR) bitwise invariant tests.
 
 These tests are a layer up from the hook-API unit tests in
-``tests/utils/test_moe_router_replay.py``. They instantiate the actually
+``tests/utils/test_moe_router_replay_api.py``. They instantiate the actually
 patched ``SparseMoeBlock`` of each wired family (``Qwen3MoeSparseMoeBlock``,
 ``Qwen3_5MoeSparseMoeBlock``) from the generated ``patched_modeling_*.py``
 modules, run real eager forward passes, and verify the two RR guarantees

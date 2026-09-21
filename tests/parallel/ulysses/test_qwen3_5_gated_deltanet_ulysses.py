@@ -9,6 +9,7 @@ Validates:
 import os
 import random
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,7 +20,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_dist_comm_backend, get_torch_device
 
 
 # Only run in CI when ulysses SP or Qwen3.5 model code is touched.
@@ -63,10 +64,35 @@ def _configured_qwen3_5_kernels():
         set_ops_config(previous)
 
 
+@contextmanager
+def _deterministic_backend_flags():
+    """Scope deterministic CUDA flags without assigning global cudnn state."""
+    previous_deterministic = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    with torch.backends.cudnn.flags(
+        enabled=torch.backends.cudnn.enabled,
+        benchmark=False,
+        benchmark_limit=torch.backends.cudnn.benchmark_limit,
+        deterministic=True,
+        allow_tf32=False,
+    ):
+        torch.use_deterministic_algorithms(True)
+        try:
+            yield
+        finally:
+            torch.use_deterministic_algorithms(previous_deterministic, warn_only=previous_warn_only)
+
+
+@pytest.fixture(autouse=True)
+def _scope_deterministic_backend_flags():
+    if not IS_CUDA_AVAILABLE:
+        yield
+        return
+    with _deterministic_backend_flags():
+        yield
+
+
 def _set_deterministic(seed=42):
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(True)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -226,82 +252,83 @@ def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str, bsz
     # parent fixture, so install the same FLA selections in each child.
     _install_fla_kernel_config()
 
-    _set_deterministic(42)
-    config = _TinyQwen3_5Config()
-    layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(device_type)
-    layer.train()
+    with _deterministic_backend_flags():
+        _set_deterministic(42)
+        config = _TinyQwen3_5Config()
+        layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(device_type)
+        layer.train()
 
-    hidden = config.hidden_size
+        hidden = config.hidden_size
 
-    if rank == 0:
-        full_input = torch.randn(bsz, seq_len, hidden, device=device_type)
-    else:
-        full_input = torch.empty(bsz, seq_len, hidden, device=device_type)
-    dist.broadcast(full_input, src=0)
+        if rank == 0:
+            full_input = torch.randn(bsz, seq_len, hidden, device=device_type)
+        else:
+            full_input = torch.empty(bsz, seq_len, hidden, device=device_type)
+        dist.broadcast(full_input, src=0)
 
-    shard_len = seq_len // world_size
-    local_input = full_input[:, rank * shard_len : (rank + 1) * shard_len].contiguous()
+        shard_len = seq_len // world_size
+        local_input = full_input[:, rank * shard_len : (rank + 1) * shard_len].contiguous()
 
-    # Baseline forward/backward on rank 0 with SP disabled
-    baseline_out = None
-    baseline_param_grads = None
-    if rank == 0:
-        no_sp_state = SimpleNamespace(ulysses_enabled=False)
-        with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
-            baseline_out = layer(full_input, attention_mask=None, cu_seq_lens_q=None)
-            baseline_loss = baseline_out.mean()
-            baseline_loss.backward()
-            baseline_param_grads = {
-                name: param.grad.detach().clone() if param.grad is not None else None
-                for name, param in layer.named_parameters()
-            }
-            layer.zero_grad(set_to_none=True)
-            baseline_out = baseline_out.detach()
+        # Baseline forward/backward on rank 0 with SP disabled
+        baseline_out = None
+        baseline_param_grads = None
+        if rank == 0:
+            no_sp_state = SimpleNamespace(ulysses_enabled=False)
+            with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+                baseline_out = layer(full_input, attention_mask=None, cu_seq_lens_q=None)
+                baseline_loss = baseline_out.mean()
+                baseline_loss.backward()
+                baseline_param_grads = {
+                    name: param.grad.detach().clone() if param.grad is not None else None
+                    for name, param in layer.named_parameters()
+                }
+                layer.zero_grad(set_to_none=True)
+                baseline_out = baseline_out.detach()
 
-    dist.barrier()
+        dist.barrier()
 
-    # SP forward/backward
-    sp_out_local = layer(local_input, attention_mask=None, cu_seq_lens_q=None)
-    total_numel = bsz * seq_len * sp_out_local.shape[-1]
-    sp_loss = sp_out_local.sum() / total_numel
-    sp_loss.backward()
+        # SP forward/backward
+        sp_out_local = layer(local_input, attention_mask=None, cu_seq_lens_q=None)
+        total_numel = bsz * seq_len * sp_out_local.shape[-1]
+        sp_loss = sp_out_local.sum() / total_numel
+        sp_loss.backward()
 
-    for param in layer.parameters():
-        if param.grad is not None:
-            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+        for param in layer.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
 
-    out_list = [torch.empty_like(sp_out_local) for _ in range(world_size)]
-    dist.all_gather(out_list, sp_out_local.detach())
-    sp_out_full = torch.cat(out_list, dim=1)
+        out_list = [torch.empty_like(sp_out_local) for _ in range(world_size)]
+        dist.all_gather(out_list, sp_out_local.detach())
+        sp_out_full = torch.cat(out_list, dim=1)
 
-    if rank == 0:
-        for name, param in layer.named_parameters():
-            baseline_grad = baseline_param_grads.get(name)
-            if baseline_grad is None and param.grad is None:
-                continue
-            assert baseline_grad is not None and param.grad is not None, f"Missing grad for {name}"
-            # 1e-5 absolute tolerance: bfloat16-level grad noise can land
-            # just above the previous 3e-6 floor (observed 3.8e-6 on
-            # norm.weight, ~0.5% relative). The SP-vs-baseline check is
-            # really validating that the partition mechanics are sound,
-            # not bit-exact reproducibility under reduced precision.
-            torch.testing.assert_close(
-                param.grad,
-                baseline_grad,
-                rtol=0,
-                atol=1e-5,
-                msg=lambda msg, n=name: f"{msg}\nGradient mismatch for {n}",
-            )
+        if rank == 0:
+            for name, param in layer.named_parameters():
+                baseline_grad = baseline_param_grads.get(name)
+                if baseline_grad is None and param.grad is None:
+                    continue
+                assert baseline_grad is not None and param.grad is not None, f"Missing grad for {name}"
+                # 1e-5 absolute tolerance: bfloat16-level grad noise can land
+                # just above the previous 3e-6 floor (observed 3.8e-6 on
+                # norm.weight, ~0.5% relative). The SP-vs-baseline check is
+                # really validating that the partition mechanics are sound,
+                # not bit-exact reproducibility under reduced precision.
+                torch.testing.assert_close(
+                    param.grad,
+                    baseline_grad,
+                    rtol=0,
+                    atol=1e-5,
+                    msg=lambda msg, n=name: f"{msg}\nGradient mismatch for {n}",
+                )
 
-    if rank == 0:
-        # 5e-3 abs tol: SP forward in bfloat16 with all-to-all reductions
-        # accumulates noise scaling with both batch size and seq length;
-        # observed ~1.2e-3 on the [seq=2048, bsz=8] case. Still small vs
-        # per-element output magnitudes.
-        torch.testing.assert_close(sp_out_full, baseline_out, rtol=0, atol=5e-3)
+        if rank == 0:
+            # 5e-3 abs tol: SP forward in bfloat16 with all-to-all reductions
+            # accumulates noise scaling with both batch size and seq length;
+            # observed ~1.2e-3 on the [seq=2048, bsz=8] case. Still small vs
+            # per-element output magnitudes.
+            torch.testing.assert_close(sp_out_full, baseline_out, rtol=0, atol=5e-3)
 
-    dist.barrier()
-    dist.destroy_process_group()
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("world_size", [2])
@@ -349,26 +376,27 @@ def _run_gated_deltanet_sp_determinism(rank: int, world_size: int, init_file: st
     _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
     _install_fla_kernel_config()
 
-    _set_deterministic(42)
-    config = _TinyQwen3_5Config()
-    layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(device_type)
-    layer.train()
+    with _deterministic_backend_flags():
+        _set_deterministic(42)
+        config = _TinyQwen3_5Config()
+        layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(device_type)
+        layer.train()
 
-    hidden = config.hidden_size
+        hidden = config.hidden_size
 
-    if rank == 0:
-        full_input = torch.randn(bsz, seq_len, hidden, device=device_type)
-    else:
-        full_input = torch.empty(bsz, seq_len, hidden, device=device_type)
-    dist.broadcast(full_input, src=0)
+        if rank == 0:
+            full_input = torch.randn(bsz, seq_len, hidden, device=device_type)
+        else:
+            full_input = torch.empty(bsz, seq_len, hidden, device=device_type)
+        dist.broadcast(full_input, src=0)
 
-    shard_len = seq_len // world_size
-    local_input = full_input[:, rank * shard_len : (rank + 1) * shard_len].contiguous()
+        shard_len = seq_len // world_size
+        local_input = full_input[:, rank * shard_len : (rank + 1) * shard_len].contiguous()
 
-    _assert_forward_deterministic(layer, local_input, repeats=100)
+        _assert_forward_deterministic(layer, local_input, repeats=100)
 
-    dist.barrier()
-    dist.destroy_process_group()
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("world_size", [2])
