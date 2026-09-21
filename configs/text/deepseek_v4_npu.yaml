@@ -35,6 +35,11 @@ model:
     # backends are CUDA SM90+ only) — no override needed for NPU, left unset
     # here on purpose so a future CUDA run of this same file doesn't need
     # editing.
+    dsa_indexer_implementation: npu
+    dsa_attention_implementation: npu
+    mhc_implementation: npu
+    mhc_pre_implementation: eager
+    mhc_post_implementation: npu
   optimizer:
     type: adamw
     lr: 3.0e-4
