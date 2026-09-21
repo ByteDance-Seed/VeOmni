@@ -73,6 +73,7 @@ def make_config(**overrides) -> DeepseekV41LlmConfig:
         candidate_block_size=2,
         engram_layer_ids=list(ENGRAM_LAYERS),
         dspark_target_layer_ids=list(DRAFT_TARGETS),
+        dspark_n_routed_experts=8,
         max_position_embeddings=256,
         n_routed_experts=8,
         num_experts_per_tok=2,
@@ -215,6 +216,13 @@ class TestLoopOrdering:
         backbone = stub_backbone(config)
         embeds, positions, rows = self._inputs(config)
         assert "draft_hiddens" not in backbone(embeds, positions, rows)
+
+    def test_eval_collects_draft_hiddens_when_dspark_stages_exist(self):
+        config = make_config()
+        backbone = stub_backbone(config).eval()
+        embeds, positions, rows = self._inputs(config)
+        drafts = backbone(embeds, positions, rows)["draft_hiddens"]
+        assert len(drafts) == len(DRAFT_TARGETS)
 
     def test_first_layer_collapses_with_the_identity_mix(self):
         config = make_config()
@@ -370,4 +378,135 @@ class TestModuleShape:
         assert set(DeepseekV41Llm._no_split_modules) == {
             "DeepseekV41DecoderLayer",
             "DeepseekV41EngramConnection",
+            "DeepseekV41DSparkBlock",
         }
+
+    def test_dspark_stages_match_the_config(self):
+        config = make_config()
+        backbone = DeepseekV41Backbone(config)
+        assert len(backbone.mtp) == config.num_nextn_predict_layers
+        assert backbone.mtp[0].stage_id == 0
+        assert hasattr(backbone.mtp[0], "main_proj")
+        last = backbone.mtp[-1]
+        assert hasattr(last, "markov_head")
+        assert last.mlp.gate.num_experts == config.dspark_n_routed_experts
+        for stage in backbone.mtp:
+            assert stage.self_attn.compress_ratio == 0
+
+    def test_seed_dspark_windows_writes_the_window_cache(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.decode import DeepseekV41DecodeCache
+
+        config = make_config()
+        backbone = DeepseekV41Backbone(config).eval()
+        seq_len = 8
+        hidden = torch.randn(1, seq_len, HIDDEN)
+        drafts = [hidden + i for i in range(len(config.dspark_target_layer_ids))]
+        cache = DeepseekV41DecodeCache.empty(config)
+        positions = torch.arange(seq_len).unsqueeze(0)
+        backbone.seed_dspark_windows(drafts, positions, cache.dspark)
+        width = min(config.sliding_window, seq_len)
+        for slot in cache.dspark:
+            assert slot.window is not None
+            assert slot.window.shape == (1, width, config.head_dim)
+
+    def test_forward_spec_returns_a_draft_block(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.decode import DeepseekV41DecodeCache
+
+        config = make_config()
+        backbone = DeepseekV41Backbone(config).eval()
+        seq_len = 8
+        hidden = torch.randn(1, seq_len, HIDDEN)
+        drafts = [hidden + i for i in range(len(config.dspark_target_layer_ids))]
+        cache = DeepseekV41DecodeCache.empty(config)
+        positions = torch.arange(seq_len).unsqueeze(0)
+        main_x = backbone.seed_dspark_windows(drafts, positions, cache.dspark)
+        block = torch.randn(1, config.dspark_block_size, HIDDEN)
+        spec = backbone.forward_spec(block, position=seq_len - 1, caches=cache.dspark, main_x=main_x[:, -1:])
+        assert spec.shape == (1, config.dspark_block_size, HIDDEN)
+
+
+class TestDsparkDraftSampling:
+    def test_draft_fills_the_proposal_queue(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.text_encoder.configuration import (
+            DeepseekV41TextEncoderConfig,
+        )
+        from veomni.models.seed_omni.modules.deepseek_v41.text_encoder.modeling import DeepseekV41TextEncoder
+
+        config = DeepseekV41TextEncoderConfig(vocab_size=32, hidden_size=8, dspark_block_size=3)
+        encoder = DeepseekV41TextEncoder(config)
+        hidden = torch.randn(1, 3, 8)
+        start = torch.tensor([[4]])
+        rank = 4
+        encoder.draft(
+            conversation_list=[],
+            generation_kwargs={"do_sample": False},
+            dspark_hiddens=hidden,
+            dspark_start_id=start,
+            dspark_markov_embed_weight=torch.randn(32, rank),
+            dspark_markov_head_weight=torch.randn(32, rank),
+        )
+        assert len(encoder._dspark_queue) == 3
+        assert all(0 <= token < 32 for token in encoder._dspark_queue)
+
+    def test_draft_is_a_no_op_without_spec_outputs(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.text_encoder.configuration import (
+            DeepseekV41TextEncoderConfig,
+        )
+        from veomni.models.seed_omni.modules.deepseek_v41.text_encoder.modeling import DeepseekV41TextEncoder
+
+        encoder = DeepseekV41TextEncoder(DeepseekV41TextEncoderConfig(vocab_size=32, hidden_size=8))
+        out = encoder.draft(conversation_list=[])
+        assert out["conversation_list"] == []
+        assert encoder._dspark_queue == []
+
+    def _encoder_ready_to_sample(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.text_encoder.configuration import (
+            DeepseekV41TextEncoderConfig,
+        )
+        from veomni.models.seed_omni.modules.deepseek_v41.text_encoder.modeling import DeepseekV41TextEncoder
+        from veomni.models.seed_omni.utils.conversation import ConversationItem
+
+        config = DeepseekV41TextEncoderConfig(
+            vocab_size=32,
+            hidden_size=8,
+            dspark_block_size=3,
+            eos_token_id=1,
+            dspark_noise_token_id=31,
+        )
+        encoder = DeepseekV41TextEncoder(config)
+        encoder._prompt_encoded = True
+        conversation = [ConversationItem(type="output", value=torch.randn(1, 8), role="assistant")]
+        return encoder, conversation
+
+    def test_generate_keeps_the_rest_of_the_queue_when_the_draft_matches(self):
+        encoder, conversation = self._encoder_ready_to_sample()
+        encoder._dspark_queue = [7, 8, 9]
+        encoder._sample_token = lambda *args, **kwargs: 7
+        encoder.generate(conversation, generation_kwargs={"do_sample": False})
+        assert encoder._dspark_queue == [8, 9]
+        assert conversation[-1].meta["dspark_embeds"].shape[-2] == 3
+
+    def test_generate_discards_the_queue_on_a_mismatch(self):
+        encoder, conversation = self._encoder_ready_to_sample()
+        encoder._dspark_queue = [7, 8, 9]
+        encoder._sample_token = lambda *args, **kwargs: 4
+        encoder.generate(conversation, generation_kwargs={"do_sample": False})
+        assert encoder._dspark_queue == []
+
+
+class TestDsparkSpecOnGenerate:
+    def test_run_spec_waits_until_the_first_decode_token(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.decode import DeepseekV41DecodeCache
+        from veomni.models.seed_omni.utils.conversation import ConversationItem
+
+        model = DeepseekV41Llm(make_config())
+        model.eval()
+        model._decode_cache = DeepseekV41DecodeCache.empty(model.config)
+        model._decode_cache.dspark_main = torch.randn(1, 1, HIDDEN)
+        model._next_position = 4
+        tail = ConversationItem(type="output", value=torch.randn(1, HIDDEN), role="assistant")
+        tail.meta["dspark_embeds"] = torch.randn(model.config.dspark_block_size, HIDDEN)
+        assert model._run_spec(tail) is None
+        model._decode_cache.dspark_ready = True
+        spec = model._run_spec(tail)
+        assert spec.shape == (1, model.config.dspark_block_size, HIDDEN)

@@ -47,6 +47,8 @@ class DeepseekV41TextEncoderConfig(TextEncoderConfig):
         pad_token_id: int = 2,
         bos_token_id: int = 0,
         eos_token_id: int = 1,
+        dspark_block_size: int = 5,
+        dspark_noise_token_id: int = 128799,
         **kwargs,
     ):
         super().__init__(
@@ -62,6 +64,10 @@ class DeepseekV41TextEncoderConfig(TextEncoderConfig):
         self.thinking_mode = thinking_mode
         self.reasoning_effort = reasoning_effort
         self.image_token_id = image_token_id
+        # Copied from the backbone config so generate can build the noise-padded
+        # draft block without reading a sibling module. 0 disables DSpark.
+        self.dspark_block_size = dspark_block_size
+        self.dspark_noise_token_id = dspark_noise_token_id
 
 
 __all__ = ["DeepseekV41TextEncoderConfig"]

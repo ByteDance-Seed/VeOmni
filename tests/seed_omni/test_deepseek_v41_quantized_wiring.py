@@ -414,3 +414,52 @@ class TestEngram:
         engram = DeepseekV41EngramConnection(config, layer_idx=1)
         assert engram.q_weight.dtype is torch.float32
         assert engram.k_weight.dtype is torch.float32
+
+
+class TestKvStorageRecipes:
+    """Window / compressed / indexer use the released V4.1 recipes, not V4's FP8/64 NoPE helper."""
+
+    def test_training_without_qat_is_a_no_op(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.quantization import (
+            round_compress_kv,
+            round_index_act,
+            round_window_kv,
+        )
+
+        kv = torch.randn(2, 3, 32, dtype=torch.bfloat16)
+        torch.testing.assert_close(round_window_kv(kv, training=True), kv)
+        torch.testing.assert_close(round_compress_kv(kv, training=True), kv)
+        torch.testing.assert_close(round_index_act(kv, training=True), kv)
+
+    def test_eval_rounds_window_kv_as_fp8_over_the_whole_head(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.quantization import WINDOW_KV_FP8_BLOCK, round_window_kv
+
+        assert WINDOW_KV_FP8_BLOCK == 32
+        # 32 is the official group and is *not* divisible by V4 QAT's 64-wide NoPE block.
+        kv = torch.full((1, 2, 32), 100.0, dtype=torch.bfloat16)
+        rounded = round_window_kv(kv, training=False)
+        assert rounded.shape == kv.shape
+        assert rounded.dtype == kv.dtype
+        assert not torch.equal(rounded, kv)
+
+    def test_eval_rounds_compressed_kv_as_fp4_groups_of_16(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.quantization import (
+            COMPRESS_KV_FP4_GROUP,
+            round_compress_kv,
+        )
+
+        assert COMPRESS_KV_FP4_GROUP == 16
+        # 16 matches compressed KV and would raise if this still used the indexer's 32.
+        kv = torch.full((1, 2, 16), 100.0, dtype=torch.bfloat16)
+        rounded = round_compress_kv(kv, training=False)
+        assert rounded.shape == kv.shape
+        assert not torch.equal(rounded, kv)
+
+    def test_eval_rounds_indexer_as_fp4_groups_of_32(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.quantization import INDEX_FP4_GROUP, round_index_act
+
+        assert INDEX_FP4_GROUP == 32
+        keys = torch.full((1, 4, 32), 50.0, dtype=torch.bfloat16)
+        rounded = round_index_act(keys, training=False)
+        assert rounded.shape == keys.shape
+        assert not torch.equal(rounded, keys)

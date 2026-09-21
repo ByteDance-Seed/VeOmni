@@ -58,7 +58,8 @@ class DeepseekV41DecoderLayer(GradientCheckpointingLayer):
         super().__init__()
         self.layer_idx = layer_idx
         self.self_attn = DeepseekV41Attention(config, layer_idx)
-        self.mlp = DeepseekV41SparseMoeBlock(config)
+        n_routed, n_activated = config.moe_config_for_layer(layer_idx)
+        self.mlp = DeepseekV41SparseMoeBlock(config, n_routed_experts=n_routed, num_experts_per_tok=n_activated)
         self.input_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attn_hc = DeepseekV41HyperConnection(config)

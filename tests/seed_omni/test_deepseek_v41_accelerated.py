@@ -75,6 +75,7 @@ def make_config(**overrides) -> DeepseekV41LlmConfig:
         candidate_block_size=2,
         engram_layer_ids=[1, 5],
         dspark_target_layer_ids=[5, 6, 7],
+        dspark_n_routed_experts=8,
         max_position_embeddings=256,
         n_routed_experts=8,
         num_experts_per_tok=2,
@@ -161,6 +162,8 @@ class TestParallelPlan:
         assert set(ep) == {
             "model.layers.*.mlp.experts.gate_up_proj",
             "model.layers.*.mlp.experts.down_proj",
+            "model.mtp.*.mlp.experts.gate_up_proj",
+            "model.mtp.*.mlp.experts.down_proj",
         }
 
     def test_plan_fqns_resolve_against_the_real_module_tree(self):
@@ -192,6 +195,10 @@ class TestParallelPlan:
             "model.layers.*.mlp.experts.down_proj",
             "model.layers.*.mlp.experts.gate_up_proj_scale",
             "model.layers.*.mlp.experts.down_proj_scale",
+            "model.mtp.*.mlp.experts.gate_up_proj",
+            "model.mtp.*.mlp.experts.down_proj",
+            "model.mtp.*.mlp.experts.gate_up_proj_scale",
+            "model.mtp.*.mlp.experts.down_proj_scale",
         }
         names = {name for name, _ in model.named_parameters()}
         for pattern in ep:

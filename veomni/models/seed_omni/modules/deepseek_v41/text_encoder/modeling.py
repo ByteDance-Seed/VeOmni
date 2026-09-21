@@ -19,13 +19,15 @@ The module is the generic :class:`TextEncoder` -- ``embed_tokens`` + an untied
 
 It is also, by the G1 ruling, where the DSpark draft stages get their embedding
 and their logits: ``mtp.*`` in the released checkpoint aliases the backbone's
-``embed`` / ``head`` rather than carrying its own, so the draft path calls
-:meth:`encode` / :meth:`decode` here instead of duplicating 1.32B of parameters
-inside ``deepseek_v41_llm``. (``DSparkMarkovHead``'s own small rank-256 embed and
-head are a separate thing and do live in the backbone module.)
+``embed`` / ``head`` rather than carrying its own. ``generate`` writes the
+noise-padded draft block onto the carrier; ``draft`` samples it with the LM
+head plus the Markov residual from the last MTP stage.
 """
 
 from typing import Any, Dict, List, Optional
+
+import torch
+import torch.nn.functional as F
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....utils.conversation import ConversationItem, maybe_merge_outputs
@@ -52,6 +54,11 @@ class DeepseekV41TextEncoder(TextEncoder):
 
     def __init__(self, config: DeepseekV41TextEncoderConfig):
         super().__init__(config)
+        self._dspark_queue: List[int] = []
+
+    def reset_global_inference_state(self) -> None:
+        super().reset_global_inference_state()
+        self._dspark_queue = []
 
     def generate(
         self,
@@ -76,6 +83,10 @@ class DeepseekV41TextEncoder(TextEncoder):
             hidden_states = hidden_states.unsqueeze(0)
         sampling = self._extract_sampling_kwargs(generation_kwargs, 1.0, 1.0, {})
         output_token_id = self._sample_token(hidden_states, **sampling)
+        if self._dspark_queue:
+            proposed = self._dspark_queue.pop(0)
+            if proposed != output_token_id:
+                self._dspark_queue.clear()
         self._text_token_cache.append(output_token_id)
         input_ids = self._token_id_tensor(output_token_id)
         inputs_embeds = self.encode(input_ids)["inputs_embeds"]
@@ -91,13 +102,94 @@ class DeepseekV41TextEncoder(TextEncoder):
         # on the pre-merge item would be dropped on the step that merges -- the
         # n-gram node would then hash a stale id with nothing raising.
         conversation_list[-1].meta["input_ids"] = input_ids
+        self._stash_dspark_block(conversation_list[-1], output_token_id)
 
         # V4.1 has one stop token: the turn ends on the end-of-sentence marker that
         # `_render_assistant` appends. There is no second ChatML-style `im_end`.
-        if output_token_id == self._chat_template.eos_token_id:
+        if output_token_id == self.config.eos_token_id:
             outputs[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
             outputs["generated"] = self._flush_text_generated(conversation_list)
         return outputs
+
+    def draft(
+        self,
+        conversation_list: Optional[List[ConversationItem]] = None,
+        generation_kwargs: Dict[str, Any] = dict,
+        dspark_hiddens: Optional[torch.Tensor] = None,
+        dspark_start_id: Optional[torch.Tensor] = None,
+        dspark_markov_embed_weight: Optional[torch.Tensor] = None,
+        dspark_markov_head_weight: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Sample the DSpark block with the shared LM head plus the Markov residual.
+
+        Official ``DSparkBlock.forward_head``: for each draft slot, add
+        ``markov_head(token_i)`` to ``lm_head(hidden_i)`` and sample token i+1.
+        The resulting ids are proposed for later AR steps; ``generate`` only
+        keeps a proposal when it matches the token the backbone actually
+        sampled, so the output distribution stays the AR one.
+        """
+        del kwargs
+        if (
+            dspark_hiddens is None
+            or dspark_start_id is None
+            or dspark_markov_embed_weight is None
+            or dspark_markov_head_weight is None
+            or self.config.dspark_block_size <= 0
+        ):
+            return {"conversation_list": conversation_list}
+        hidden = dspark_hiddens.to(self.device)
+        if hidden.dim() == 2:
+            hidden = hidden.unsqueeze(0)
+        sampling = self._extract_sampling_kwargs(generation_kwargs, 1.0, 1.0, {})
+        token_id = int(dspark_start_id.reshape(-1)[0].item())
+        drafts: List[int] = []
+        for index in range(hidden.shape[1]):
+            logits = self._project(hidden[:, index])
+            token = torch.tensor([token_id], dtype=torch.long, device=self.device)
+            markov_embed = F.embedding(token, dspark_markov_embed_weight)
+            logits = logits + F.linear(markov_embed, dspark_markov_head_weight)
+            token_id = self._sample_from_logits(logits, **sampling)
+            drafts.append(token_id)
+            if token_id == self.config.eos_token_id:
+                break
+        self._dspark_queue = drafts
+        return {"conversation_list": conversation_list}
+
+    def _stash_dspark_block(self, tail: ConversationItem, token_id: int) -> None:
+        block_size = self.config.dspark_block_size
+        if block_size <= 0:
+            return
+        block = torch.full(
+            (1, block_size),
+            self.config.dspark_noise_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+        block[0, 0] = token_id
+        tail.meta["dspark_input_ids"] = block
+        tail.meta["dspark_embeds"] = self.encode(block)["inputs_embeds"]
+
+    def _sample_from_logits(
+        self,
+        logits: torch.Tensor,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        do_sample: bool = True,
+        **kwargs,
+    ) -> int:
+        del kwargs
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+        if not do_sample:
+            return self._agree_on_token(int(logits.argmax(dim=-1).item()))
+        if temperature != 1.0:
+            logits = logits / max(temperature, 1e-6)
+        if top_p < 1.0:
+            logits = self._top_p_filter(logits, top_p)
+        probs = F.softmax(logits, dim=-1)
+        token = torch.multinomial(probs, num_samples=1)
+        return self._agree_on_token(int(token.item()))
 
 
 __all__ = ["DeepseekV41TextEncoder", "SIGNAL_TEXT_DONE"]

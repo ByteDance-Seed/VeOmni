@@ -143,6 +143,19 @@ class DeepseekV41LlmInferenceMixin:
                 f"nan_rows={int(nan_rows.numel())}/{orig_len} "
                 f"last_row_finite={bool(row_ok[-1])} layer0_window_nan={window_nan}"
             )
+        draft_hiddens = outputs.get("draft_hiddens")
+        if draft_hiddens and self._decode_cache.dspark:
+            self.model.seed_dspark_windows(
+                [hidden[:, :orig_len] for hidden in draft_hiddens],
+                position_ids[:, :orig_len],
+                self._decode_cache.dspark,
+            )
+            self._decode_cache.dspark_main = (
+                self.model.mtp[0]
+                .project_main([hidden[:, orig_len - 1 : orig_len] for hidden in draft_hiddens])
+                .detach()
+            )
+        self._decode_cache.dspark_ready = False
         self._next_position = orig_len
         return self._emit(conversation_list, hidden_states)
 
@@ -191,6 +204,7 @@ class DeepseekV41LlmInferenceMixin:
             )
 
         inputs_embeds = tail.value[-1:].to(self.device).unsqueeze(0)
+        spec_hiddens = self._run_spec(tail)
         hidden_states = decode_backbone_step(
             self.model,
             inputs_embeds,
@@ -202,7 +216,42 @@ class DeepseekV41LlmInferenceMixin:
             image_mask=None,
         )
         self._next_position += 1
-        return self._emit(conversation_list, hidden_states)
+        self._decode_cache.dspark_ready = True
+        outputs = self._emit(conversation_list, hidden_states)
+        # Always write these: ctx.update does not drop stale keys, and the
+        # draft node would otherwise resample a previous step's block.
+        markov = None if spec_hiddens is None else self.model.mtp[-1].markov_head
+        outputs["dspark_hiddens"] = spec_hiddens
+        outputs["dspark_start_id"] = None if spec_hiddens is None else tail.meta.get("input_ids")
+        outputs["dspark_markov_embed_weight"] = None if markov is None else markov.embed.weight
+        outputs["dspark_markov_head_weight"] = None if markov is None else markov.head.weight
+        return outputs
+
+    def _run_spec(self, tail: ConversationItem) -> Optional[torch.Tensor]:
+        """Draft a block from the previous verified token, matching official decode ``forward_spec``.
+
+        The first generated token only fills ``dspark_main``; official
+        ``forward_spec(..., start_pos=0)`` is seed-only and we already did that
+        at prefill. Spec starts on the second decode step.
+        """
+        cache = self._decode_cache
+        if (
+            not self.model.mtp
+            or cache is None
+            or not cache.dspark_ready
+            or cache.dspark_main is None
+            or tail.meta.get("dspark_embeds") is None
+        ):
+            return None
+        embeds = tail.meta["dspark_embeds"]
+        if not torch.is_tensor(embeds):
+            return None
+        return self.model.forward_spec(
+            embeds.to(self.device),
+            self._next_position - 1,
+            cache.dspark,
+            cache.dspark_main,
+        )
 
     def _emit(self, conversation_list: List[ConversationItem], hidden_states: torch.Tensor) -> Dict[str, Any]:
         conversation_list.append(

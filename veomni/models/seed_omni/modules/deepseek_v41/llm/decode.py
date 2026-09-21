@@ -63,7 +63,7 @@ from .attention import (
     select_candidate_blocks,
 )
 from .mhc import expand_to_streams, identity_pre_mix, mhc_collapse, mhc_expand
-from .quantization import fake_quant_act, fake_quant_kv, fake_quant_linear
+from .quantization import fake_quant_linear, round_compress_kv, round_index_act, round_window_kv
 
 
 if TYPE_CHECKING:
@@ -141,10 +141,14 @@ class DeepseekV41DecodeCache:
     """Every layer's state, plus the position the next token will occupy."""
 
     layers: List[DeepseekV41AttentionCache]
+    dspark: List[DeepseekV41AttentionCache]
     position: int = 0
+    dspark_main: Optional[torch.Tensor] = None
+    dspark_ready: bool = False
 
     @classmethod
     def empty(cls, config) -> "DeepseekV41DecodeCache":
+        n_draft = config.num_nextn_predict_layers if config.dspark_block_size else 0
         return cls(
             layers=[
                 DeepseekV41AttentionCache(
@@ -152,7 +156,11 @@ class DeepseekV41DecodeCache:
                     compress_ratio=config.compress_ratios[idx],
                 )
                 for idx in range(config.num_hidden_layers)
-            ]
+            ],
+            dspark=[
+                DeepseekV41AttentionCache(sliding_window=config.sliding_window, compress_ratio=0)
+                for _ in range(n_draft)
+            ],
         )
 
 
@@ -201,7 +209,7 @@ def _absorb(
     if attn.indexer is not None:
         keys = attn.indexer.build_keys(latent, group_cos, group_sin)
         cache.index_k = keys if cache.index_k is None else torch.cat([cache.index_k, keys], dim=1)
-    rotated = fake_quant_kv(apply_interleaved_rope(latent, group_cos, group_sin), attn.rope_head_dim)
+    rotated = round_compress_kv(apply_interleaved_rope(latent, group_cos, group_sin), training=attn.training)
     cache.compress_kv = rotated if cache.compress_kv is None else torch.cat([cache.compress_kv, rotated], dim=1)
 
 
@@ -227,7 +235,7 @@ def _decode_topk(
 
     query = indexer.wq_b(q_residual).unflatten(-1, (indexer.n_heads, indexer.index_head_dim))
     query = apply_interleaved_rope(query, cos.unsqueeze(-2), sin.unsqueeze(-2))
-    query = fake_quant_act(query)
+    query = round_index_act(query, training=indexer.training)
     weights = indexer.weights_proj(hidden_states) * (indexer.softmax_scale * indexer.n_heads**-0.5)
 
     scores = torch.einsum("bshd,btd->bsht", query, index_k)
@@ -291,7 +299,7 @@ def decode_attention_step(
 
     kv = attn.kv_norm(fake_quant_linear(attn.wkv, hidden_states))
     kv = apply_interleaved_rope(kv, cos, sin)
-    kv = fake_quant_kv(kv, attn.rope_head_dim)
+    kv = round_window_kv(kv, training=attn.training)
     cache.append_window(kv)
 
     # The window rows are all causal and all inside the window by construction,
@@ -429,11 +437,15 @@ def decode_backbone_step(
     shared = SharedAttentionState()
     hidden_streams = expand_to_streams(inputs_embeds, backbone.config.hc_mult)
     pre_mix = identity_pre_mix(hidden_streams, backbone.config.hc_mult)
+    draft_targets = set(backbone.config.dspark_target_layer_ids)
+    draft_hiddens: List[torch.Tensor] = []
 
     for layer_idx, layer in enumerate(backbone.layers):
         if str(layer_idx) in backbone.engram:
             connection = backbone.engram[str(layer_idx)]
             hidden_streams = connection(hidden_streams, ngram_embeds[connection.layer_hash_index], token_mask)
+        if backbone.mtp and layer_idx in draft_targets:
+            draft_hiddens.append(hidden_streams.mean(dim=2))
         hidden_streams, pre_mix = decode_layer_step(
             layer,
             hidden_streams,
@@ -444,6 +456,12 @@ def decode_backbone_step(
             cache.layers[layer_idx],
             image_mask,
         )
+
+    if draft_hiddens and backbone.mtp:
+        # Spec, not the backbone step, writes the DSpark window: official
+        # DSparkAttention only runs inside forward_spec. Keep the projected
+        # main so the next spec can seed from this verified token.
+        cache.dspark_main = backbone.mtp[0].project_main(draft_hiddens).detach()
 
     return backbone.norm(mhc_collapse(hidden_streams, pre_mix))
 

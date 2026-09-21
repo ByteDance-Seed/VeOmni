@@ -37,6 +37,7 @@ from veomni.models.seed_omni.modules.deepseek_v41.convert_model import (
     ShardWriter,
     TensorSource,
     _llm_layer_names,
+    _mtp_layer_names,
     convert_deepseek_v41_checkpoint,
     convert_llm,
     convert_vision,
@@ -81,6 +82,7 @@ def llm_config():
         candidate_block_size=2,
         engram_layer_ids=list(ENGRAM_LAYERS),
         dspark_target_layer_ids=[1],
+        dspark_n_routed_experts=N_EXPERTS,
         max_position_embeddings=256,
         n_routed_experts=N_EXPERTS,
         num_experts_per_tok=2,
@@ -179,6 +181,49 @@ def build_released_checkpoint(path, config):
             weight, scale = fp8_pair(*module_shapes[f"model.engram.{layer}.wkv.weight"])
             tensors[f"{engram}.wkv.weight"] = weight
             tensors[f"{engram}.wkv.scale"] = scale
+
+    n_mtp = config.num_nextn_predict_layers
+    n_mtp_experts = config.dspark_n_routed_experts or config.n_routed_experts
+    for stage in range(n_mtp):
+        for released, target in _mtp_layer_names(stage).items():
+            shape = module_shapes.get(target)
+            if shape is None:
+                continue
+            if any(released.endswith(f"{suffix}.weight") for suffix in QUANTIZED_SUFFIXES):
+                weight, scale = fp8_pair(*shape)
+                tensors[released] = weight
+                tensors[f"{released[: -len('.weight')]}.scale"] = scale
+            else:
+                tensors[released] = torch.randn(*shape) if len(shape) > 1 else torch.ones(*shape)
+        fused_shape = module_shapes[f"model.mtp.{stage}.mlp.experts.gate_up_proj"]
+        down_shape = module_shapes[f"model.mtp.{stage}.mlp.experts.down_proj"]
+        inter, hidden = fused_shape[1] // 2, fused_shape[2]
+        for expert in range(n_mtp_experts):
+            prefix = f"mtp.{stage}.ffn.experts.{expert}"
+            for part, (out_dim, in_dim) in (
+                ("w1", (inter, hidden)),
+                ("w3", (inter, hidden)),
+                ("w2", (down_shape[1], down_shape[2])),
+            ):
+                packed, scale = fp4_pair(out_dim, in_dim)
+                tensors[f"{prefix}.{part}.weight"] = packed
+                tensors[f"{prefix}.{part}.scale"] = scale
+
+    last = n_mtp - 1
+    weight, scale = fp8_pair(*module_shapes["model.mtp.0.main_proj.weight"])
+    tensors["mtp.0.main_proj.weight"] = weight
+    tensors["mtp.0.main_proj.scale"] = scale
+    tensors["mtp.0.main_norm.weight"] = torch.ones(*module_shapes["model.mtp.0.main_norm.weight"])
+    tensors[f"mtp.{last}.norm.weight"] = torch.ones(*module_shapes[f"model.mtp.{last}.norm.weight"])
+    tensors[f"mtp.{last}.markov_head.embed.weight"] = torch.randn(
+        *module_shapes[f"model.mtp.{last}.markov_head.embed.weight"]
+    )
+    tensors[f"mtp.{last}.markov_head.head.weight"] = torch.randn(
+        *module_shapes[f"model.mtp.{last}.markov_head.head.weight"]
+    )
+    tensors[f"mtp.{last}.confidence_head.proj.weight"] = torch.randn(
+        *module_shapes[f"model.mtp.{last}.confidence_head.proj.weight"]
+    )
 
     tensors["norm.weight"] = torch.ones(*module_shapes["model.norm.weight"])
     tensors["vision.norm.weight"] = torch.ones(HIDDEN)
@@ -368,6 +413,11 @@ class TestNameMapping:
         assert names["layers.0.attn.wq_a.weight"] == "model.layers.0.self_attn.wq_a.weight"
         assert names["layers.0.attn.attn_sink"] == "model.layers.0.self_attn.attn_sink"
 
+    def test_mtp_layers_map_under_model_mtp(self):
+        names = _mtp_layer_names(0)
+        assert names["mtp.0.attn.wq_a.weight"] == "model.mtp.0.self_attn.wq_a.weight"
+        assert names["mtp.0.attn_norm.weight"] == "model.mtp.0.input_layernorm.weight"
+
 
 def _load_converted_llm(tmp_path, released):
     config, _, path = released
@@ -422,6 +472,16 @@ class TestLlmConversionLoads:
         assert set(missing) <= allowed, (
             f"module parameters the converter never filled: {sorted(set(missing) - allowed)[:5]}"
         )
+
+    def test_dspark_stages_land_in_the_llm_folder(self, tmp_path, released):
+        _, state = _load_converted_llm(tmp_path, released)
+        assert "model.mtp.0.main_proj.weight" in state
+        assert "model.mtp.0.self_attn.wq_a.weight" in state
+        last = llm_config().num_nextn_predict_layers - 1
+        assert f"model.mtp.{last}.markov_head.embed.weight" in state
+        assert f"model.mtp.{last}.confidence_head.proj.weight" in state
+        assert "model.mtp.0.embed.weight" not in state
+        assert "model.mtp.0.head.weight" not in state
 
     def test_the_router_biases_land_on_the_buffers(self, tmp_path, released):
         from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import DeepseekV41Llm

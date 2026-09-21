@@ -35,11 +35,10 @@ Engram write lands *before* its layer, the DSpark hook reads the stream *before*
 the layer rather than after, and the final collapse uses the last layer's FFN
 ``pre`` rather than one computed from the final stream.
 
-This module is training-only. Every cache in the reference exists to carry state
-between decode steps, and the attention stack dropped them deliberately (see
-``attention.py``); wiring a generation mixin that expects ``past_key_values``
-would produce a model that runs and answers wrongly. Generation is the
-``deepseek_v41`` generation graph's problem, and it is not wired yet.
+Generation is ``DeepseekV41LlmInferenceMixin``: batched prefill captures the
+decode caches, then each AR step calls ``decode_backbone_step`` and, after the
+first generated token, ``forward_spec`` so the DSpark stages draft the next
+block. There is no HF ``past_key_values``.
 """
 
 from __future__ import annotations
@@ -60,6 +59,7 @@ from .attention import (
 )
 from .configuration import DeepseekV41LlmConfig
 from .decoder_layer import DeepseekV41DecoderLayer
+from .dspark import build_dspark_blocks
 from .engram_connection import build_engram_connections
 from .inference import DeepseekV41LlmInferenceMixin
 from .mhc import expand_to_streams, identity_pre_mix, mhc_collapse
@@ -82,6 +82,7 @@ class DeepseekV41Backbone(nn.Module):
             [DeepseekV41DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.engram = build_engram_connections(config)
+        self.mtp = build_dspark_blocks(config)
         self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # One instance for the whole stack: the two frequency schedules depend on
         # the config alone, and a per-layer copy would be 40 identical buffers.
@@ -142,12 +143,11 @@ class DeepseekV41Backbone(nn.Module):
                 # the trained weights never produced.
                 connection = self.engram[str(layer_idx)]
                 hidden_streams = connection(hidden_streams, ngram_embeds[connection.layer_hash_index], token_mask)
-            if return_draft_hiddens and layer_idx in draft_targets:
+            if (return_draft_hiddens or (self.mtp and not self.training)) and layer_idx in draft_targets:
                 # The MTP head reads its target layer's *input*, not its output --
                 # `main_hiddens.append(h.mean(dim=2))` sits above `layer(...)` in
-                # the reference. Collected here so the DSpark work has the hook at
-                # the right place; off by default because three [B, S, D] tensors
-                # are not free and nothing consumes them yet.
+                # the reference. Collected at inference whenever DSpark stages
+                # exist, so the draft window can be seeded from the same tensor.
                 draft_hiddens.append(hidden_streams.mean(dim=2))
 
             hidden_streams, pre_mix, layer_logits, indexer_loss = layer(
@@ -195,9 +195,59 @@ class DeepseekV41Backbone(nn.Module):
             # layers happened to carry one.
             outputs["indexer_kl_layers"] = len(indexer_terms)
             outputs["indexer_query_tokens"] = hidden_states.shape[0] * hidden_states.shape[1]
-        if return_draft_hiddens:
+        if draft_hiddens:
             outputs["draft_hiddens"] = draft_hiddens
         return outputs
+
+    def seed_dspark_windows(
+        self,
+        draft_hiddens: List[torch.Tensor],
+        position_ids: torch.Tensor,
+        caches: List[DeepseekV41AttentionCache],
+    ) -> Optional[torch.Tensor]:
+        """Write each DSpark stage's window KV from the backbone's target-layer inputs."""
+        if not self.mtp:
+            return None
+        if len(draft_hiddens) != len(self.config.dspark_target_layer_ids):
+            raise ValueError(
+                f"DSpark expected {len(self.config.dspark_target_layer_ids)} target-layer hiddens, "
+                f"got {len(draft_hiddens)}"
+            )
+        if len(caches) != len(self.mtp):
+            raise ValueError(f"DSpark cache has {len(caches)} slots but there are {len(self.mtp)} stages")
+        main_x = self.mtp[0].project_main(draft_hiddens)
+        for stage, cache in zip(self.mtp, caches):
+            stage.seed_window(main_x, position_ids, self.rotary_emb, cache)
+        return main_x
+
+    def forward_spec(
+        self,
+        draft_embeds: torch.Tensor,
+        position: int,
+        caches: List[DeepseekV41AttentionCache],
+        main_x: torch.Tensor,
+    ) -> torch.Tensor:
+        """One DSpark block after a verified token, matching official ``forward_spec``.
+
+        ``draft_embeds`` is ``[B, block_size, D]`` -- the sampled token in slot 0
+        and noise tokens after. ``position`` is the verified token's index.
+        ``main_x`` is ``project_main`` of that token's target-layer inputs.
+        """
+        if not self.mtp:
+            raise RuntimeError("forward_spec was called but this backbone has no DSpark stages")
+        if draft_embeds.dim() == 2:
+            draft_embeds = draft_embeds.unsqueeze(0)
+        if main_x.dim() == 2:
+            main_x = main_x.unsqueeze(0)
+        batch = draft_embeds.shape[0]
+        position_ids = torch.full((batch, 1), position, dtype=torch.long, device=draft_embeds.device)
+        hidden_streams = expand_to_streams(draft_embeds, self.config.hc_mult)
+        pre_mix = identity_pre_mix(hidden_streams, self.config.hc_mult)
+        for stage, cache in zip(self.mtp, caches):
+            hidden_streams, pre_mix = stage.forward_draft(
+                hidden_streams, pre_mix, position_ids, self.rotary_emb, cache, main_x
+            )
+        return self.mtp[-1].collapse_draft(hidden_streams, pre_mix)
 
 
 class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
@@ -215,7 +265,7 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
     # policy covers the stack. The connections are wrapped separately: at layers
     # 1 and 14 only, `wkv` is 5120 x (hidden * (hc_mult + 1)), which is large
     # enough to be worth its own shard and too irregular to fold into the layer.
-    _no_split_modules = ["DeepseekV41DecoderLayer", "DeepseekV41EngramConnection"]
+    _no_split_modules = ["DeepseekV41DecoderLayer", "DeepseekV41EngramConnection", "DeepseekV41DSparkBlock"]
     supports_gradient_checkpointing = True
 
     @staticmethod

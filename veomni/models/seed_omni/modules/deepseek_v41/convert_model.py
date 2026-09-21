@@ -47,11 +47,8 @@ scale at load; inference keeps the quantized modules. See ``dequant.py`` and
 
 Not converted
 -------------
-The 2,401 ``mtp.*`` tensors are the DSpark draft stages, which this repo does
-not implement yet. They are counted and reported rather than silently dropped,
-so the number is there to check against when DSpark lands. Adding them later is
-cheap -- they are 7.4 GiB against the experts' 269 GiB -- and ``modules``
-exists so that run does not have to redo the expensive folders.
+Tied ``mtp.*.embed.weight`` / ``mtp.*.head.weight`` alias the text encoder and
+are skipped. Everything else under ``mtp.*`` lands in ``deepseek_v41_llm``.
 
 Output
 ------
@@ -61,7 +58,7 @@ Output
       deepseek_v41_vision/        # ViT + aligner + the three image marker embeddings
       deepseek_v41_text_encoder/  # embed_tokens + lm_head + tokenizer
       deepseek_v41_ngram/         # the two n-gram tables + the baked token_map
-      deepseek_v41_llm/           # 40 decoder layers, Engram connections, final norm
+      deepseek_v41_llm/           # 40 decoder layers, Engram connections, DSpark, final norm
 """
 
 from __future__ import annotations
@@ -501,8 +498,18 @@ def _llm_layer_names(layer: int) -> Dict[str, str]:
     return names
 
 
+def _mtp_layer_names(stage: int) -> Dict[str, str]:
+    """Released ``mtp.{stage}.*`` -> ``model.mtp.{stage}.*``, same inner mapping as a backbone layer."""
+    return {
+        released.replace(f"layers.{stage}", f"mtp.{stage}", 1): target.replace(
+            f"model.layers.{stage}", f"model.mtp.{stage}", 1
+        )
+        for released, target in _llm_layer_names(stage).items()
+    }
+
+
 def convert_llm(source: TensorSource, output_dir: str, config, engram_layer_ids: List[int]) -> int:
-    """The 40 decoder layers, the Engram connections and the final norm."""
+    """The 40 decoder layers, DSpark stages, the Engram connections and the final norm."""
     writer = ShardWriter(os.path.join(output_dir, "deepseek_v41_llm"))
     emitter = Emitter(source, writer)
 
@@ -522,11 +529,47 @@ def convert_llm(source: TensorSource, output_dir: str, config, engram_layer_ids:
                 emitter.emit(f"{connection}.{part}", f"layers.{layer}.engram.{part}")
             emitter.emit(f"{connection}.wkv.weight", f"layers.{layer}.engram.wkv.weight")
 
+    _convert_mtp(emitter, source, config)
     emitter.emit("model.norm.weight", "norm.weight")
     return writer.finalize(config)
 
 
-def _convert_layer_experts(emitter: Emitter, layer: int, n_routed_experts: int) -> None:
+def _convert_mtp(emitter: Emitter, source: TensorSource, config) -> None:
+    """DSpark stages under ``mtp.*``. Tied embed/head are skipped on purpose."""
+    n_stages = config.num_nextn_predict_layers
+    if n_stages <= 0 or "mtp.0.attn.wq_a.weight" not in source:
+        return
+    n_experts = config.dspark_n_routed_experts or config.n_routed_experts
+    last = n_stages - 1
+    for stage in range(n_stages):
+        for released, target in _mtp_layer_names(stage).items():
+            if released not in source:
+                continue
+            emitter.emit(target, released)
+        _convert_layer_experts(emitter, stage, n_experts, source_prefix="mtp", dest_prefix="model.mtp")
+
+    if "mtp.0.main_proj.weight" in source:
+        emitter.emit("model.mtp.0.main_proj.weight", "mtp.0.main_proj.weight")
+    if "mtp.0.main_norm.weight" in source:
+        emitter.emit("model.mtp.0.main_norm.weight", "mtp.0.main_norm.weight")
+    if f"mtp.{last}.norm.weight" in source:
+        emitter.emit(f"model.mtp.{last}.norm.weight", f"mtp.{last}.norm.weight")
+    for released, target in (
+        (f"mtp.{last}.markov_head.embed.weight", f"model.mtp.{last}.markov_head.embed.weight"),
+        (f"mtp.{last}.markov_head.head.weight", f"model.mtp.{last}.markov_head.head.weight"),
+        (f"mtp.{last}.confidence_head.proj.weight", f"model.mtp.{last}.confidence_head.proj.weight"),
+    ):
+        if released in source:
+            emitter.emit(target, released)
+
+
+def _convert_layer_experts(
+    emitter: Emitter,
+    layer: int,
+    n_routed_experts: int,
+    source_prefix: str = "layers",
+    dest_prefix: str = "model.layers",
+) -> None:
     """One layer's routed experts, fused and stacked into the module's layout.
 
     This is the memory high-water mark, which is why the caller loops per layer
@@ -539,8 +582,8 @@ def _convert_layer_experts(emitter: Emitter, layer: int, n_routed_experts: int) 
     both concatenate along it -- the gate rows keep their scales and the up rows
     keep theirs.
     """
-    prefix = f"layers.{layer}.ffn.experts"
-    target = f"model.layers.{layer}.mlp.experts"
+    prefix = f"{source_prefix}.{layer}.ffn.experts"
+    target = f"{dest_prefix}.{layer}.mlp.experts"
 
     gate_up, gate_up_scale, down, down_scale = [], [], [], []
     for expert in range(n_routed_experts):
@@ -583,6 +626,8 @@ def _build_configs(hf_config: Dict[str, Any]):
         vocab_size=text["vocab_size"],
         hidden_size=text["hidden_size"],
         tie_word_embeddings=text.get("tie_word_embeddings", False),
+        dspark_block_size=text.get("dspark_block_size", 5),
+        dspark_noise_token_id=text.get("dspark_noise_token_id", 128799),
     )
     ngram_config = NgramConfig(
         layer_ids=text["engram_layer_ids"],
@@ -645,10 +690,14 @@ def convert_deepseek_v41_checkpoint(
     vision_config, text_encoder_config, ngram_config, llm_config = _build_configs(hf_config)
     source = TensorSource(model_path)
 
-    skipped = sum(1 for name in source.names() if name.startswith("mtp."))
+    tied_mtp = sum(
+        1
+        for name in source.names()
+        if name.startswith("mtp.") and name.split(".", 2)[-1] in ("embed.weight", "head.weight")
+    )
     print(f"Converting {model_path} -> {output_dir}")
     print(f"  modules={sorted(selected)}")
-    print(f"  {len(source.weight_map)} tensors, of which {skipped} are mtp.* (DSpark, not implemented)")
+    print(f"  {len(source.weight_map)} tensors ({tied_mtp} tied mtp embed/head skipped)")
 
     if "deepseek_v41_vision" in selected:
         print("Extracting deepseek_v41_vision ...")

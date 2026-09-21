@@ -46,6 +46,7 @@ BASE_PATH = CONFIG_ROOT / "train/base.yaml"
 VISION = "deepseek_v41_vision.generate"
 NGRAM = "deepseek_v41_ngram.generate"
 TEXT_ENCODER = "deepseek_v41_text_encoder.generate"
+TEXT_ENCODER_DRAFT = "deepseek_v41_text_encoder.draft"
 LLM = "deepseek_v41_llm.generate"
 
 
@@ -75,7 +76,7 @@ class TestBodyOrder:
 
     def test_a_decode_step_samples_hashes_then_steps(self, graph):
         graph._transition_to("text_ar", {})
-        assert order(graph) == [TEXT_ENCODER, NGRAM, LLM]
+        assert order(graph) == [TEXT_ENCODER, NGRAM, LLM, TEXT_ENCODER_DRAFT]
 
     def test_the_sampler_precedes_the_hash(self, graph):
         """The load-bearing order, and the one with no symptom if reversed.
@@ -87,7 +88,7 @@ class TestBodyOrder:
         """
         graph._transition_to("text_ar", {})
         names = order(graph)
-        assert names.index(TEXT_ENCODER) < names.index(NGRAM) < names.index(LLM)
+        assert names.index(TEXT_ENCODER) < names.index(NGRAM) < names.index(LLM) < names.index(TEXT_ENCODER_DRAFT)
 
     def test_vision_does_not_run_per_token(self, graph):
         graph._transition_to("text_ar", {})
@@ -159,7 +160,7 @@ class TestGraphShape:
         names = set(order(graph))
         graph._transition_to("text_ar", {})
         names |= set(order(graph))
-        assert names == {VISION, NGRAM, TEXT_ENCODER, LLM}
+        assert names == {VISION, NGRAM, TEXT_ENCODER, TEXT_ENCODER_DRAFT, LLM}
         for name in names:
             module = name.split(".")[0]
             assert module in OMNI_MODEL_REGISTRY, f"'{module}' is not a registered OmniModule"

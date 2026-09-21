@@ -62,6 +62,7 @@ weight decay to a quantity whose whole job is to track load.
 
 from __future__ import annotations
 
+import copy
 from typing import Optional, Tuple
 
 import torch
@@ -146,8 +147,20 @@ class DeepseekV41TopKRouter(nn.Module):
 class DeepseekV41SparseMoeBlock(nn.Module):
     """Routed experts plus the one shared expert every token passes through."""
 
-    def __init__(self, config: DeepseekV41LlmConfig) -> None:
+    def __init__(
+        self,
+        config: DeepseekV41LlmConfig,
+        *,
+        n_routed_experts: Optional[int] = None,
+        num_experts_per_tok: Optional[int] = None,
+    ) -> None:
         super().__init__()
+        if n_routed_experts is not None or num_experts_per_tok is not None:
+            config = copy.copy(config)
+            if n_routed_experts is not None:
+                config.n_routed_experts = n_routed_experts
+            if num_experts_per_tok is not None:
+                config.num_experts_per_tok = num_experts_per_tok
         self.gate = DeepseekV41TopKRouter(config)
         self.experts = DeepseekV41QuantizedExperts(config, quant_dtype=expert_quant_dtype(config))
         self.shared_experts = DeepseekV41SharedExpert(config, quant_dtype=linear_quant_dtype(config))

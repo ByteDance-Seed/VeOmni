@@ -45,9 +45,10 @@ layer loop costs nothing and cannot go stale.
 ``y.copy_(x)``, which is free during inference and here would either break
 autograd or corrupt a saved activation.
 
-**Quantization becomes fake quantization.** The in-place ``act_quant`` /
-``fp4_act_quant`` round-trips become the hooks in ``quantization.py``, which
-round the same tensors without materializing the low-precision form.
+**Quantization becomes a storage round-trip.** The reference's in-place
+``act_quant`` / ``fp4_act_quant`` writes are the hooks in ``quantization.py``:
+window KV as FP8/32, compressed KV as FP4/16 with E4M3 scales, indexer Q/K as
+FP4/32 with E8M0. Inference always rounds; training rounds only under QAT.
 
 Packed sequences are the one concept this file adds. Dynamic batching hands the
 model several samples in one row, so a compression group must not straddle a
@@ -68,7 +69,7 @@ import torch.nn as nn
 
 from ......ops.kernels.deepseek_v4 import sparse_attn_tilelang, sparse_mqa_target_fwd
 from .configuration import DeepseekV41LlmConfig
-from .quantization import fake_quant_act, fake_quant_kv, fake_quant_linear
+from .quantization import fake_quant_linear, round_compress_kv, round_index_act, round_window_kv
 from .quantized import DeepseekV41GroupedLinear, DeepseekV41Linear, linear_quant_dtype
 from .reuse import DeepseekV4RMSNorm
 
@@ -614,7 +615,7 @@ class DeepseekV41Indexer(nn.Module):
         """
         keys = self.k_norm(self.wk(latent))
         keys = apply_interleaved_rope(keys, cos, sin)
-        return fake_quant_act(keys)
+        return round_index_act(keys, training=self.training)
 
     def forward(
         self,
@@ -638,7 +639,7 @@ class DeepseekV41Indexer(nn.Module):
 
         query = self.wq_b(q_residual).unflatten(-1, (self.n_heads, self.index_head_dim))
         query = apply_interleaved_rope(query, cos.unsqueeze(-2), sin.unsqueeze(-2))
-        query = fake_quant_act(query)
+        query = round_index_act(query, training=self.training)
         weights = self.weights_proj(hidden_states) * (self.softmax_scale * self.n_heads**-0.5)
 
         visible = plan.visibility_mask(device)
@@ -788,7 +789,7 @@ class DeepseekV41Attention(nn.Module):
 
         kv = self.kv_norm(fake_quant_linear(self.wkv, hidden_states))
         kv = apply_interleaved_rope(kv, cos, sin)
-        kv = fake_quant_kv(kv, self.rope_head_dim)
+        kv = round_window_kv(kv, training=self.training)
         if capture is not None:
             # After rotation and rounding, before the compressed rows are
             # concatenated for the attention call -- the window cache is this
@@ -940,7 +941,7 @@ class DeepseekV41Attention(nn.Module):
             if self.indexer is not None:
                 shared.index_k = self.indexer.build_keys(latent, group_cos, group_sin)
             rotated = apply_interleaved_rope(latent, group_cos, group_sin)
-            shared.compress_kv = fake_quant_kv(rotated, self.rope_head_dim)
+            shared.compress_kv = round_compress_kv(rotated, training=self.training)
             if capture is not None:
                 # Source layers only: consumers read these from ``shared`` during
                 # the same forward and must not copy them onto their own cache.

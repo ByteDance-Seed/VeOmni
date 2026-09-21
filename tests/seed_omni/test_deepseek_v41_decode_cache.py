@@ -89,7 +89,11 @@ def make_config(**overrides) -> DeepseekV41LlmConfig:
         candidate_block_size=2,
         engram_layer_ids=[1],
         dspark_target_layer_ids=[5, 6, 7],
+        dspark_n_routed_experts=8,
         max_position_embeddings=256,
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
     )
     kwargs.update(overrides)
     return DeepseekV41LlmConfig(**kwargs)
@@ -526,6 +530,8 @@ class TestCacheState:
         cache = DeepseekV41DecodeCache.empty(config)
         assert len(cache.layers) == config.num_hidden_layers
         assert cache.layers[0].compress_ratio == config.compress_ratios[0]
+        assert len(cache.dspark) == config.num_nextn_predict_layers
+        assert all(slot.compress_ratio == 0 for slot in cache.dspark)
         assert cache.position == 0
 
     def test_a_multi_token_step_is_refused(self):

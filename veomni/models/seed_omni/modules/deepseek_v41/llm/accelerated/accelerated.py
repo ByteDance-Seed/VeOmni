@@ -274,6 +274,8 @@ class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
         ep_plan = {
             "model.layers.*.mlp.experts.gate_up_proj": Shard(0),
             "model.layers.*.mlp.experts.down_proj": Shard(0),
+            "model.mtp.*.mlp.experts.gate_up_proj": Shard(0),
+            "model.mtp.*.mlp.experts.down_proj": Shard(0),
         }
         # A quantized expert weight is two tensors, and both are indexed by the
         # expert on dim 0. Sharding the slab without its scales would leave
@@ -288,6 +290,8 @@ class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
         if quantized_storage_dtype(self.config) is not None:
             ep_plan["model.layers.*.mlp.experts.gate_up_proj_scale"] = Shard(0)
             ep_plan["model.layers.*.mlp.experts.down_proj_scale"] = Shard(0)
+            ep_plan["model.mtp.*.mlp.experts.gate_up_proj_scale"] = Shard(0)
+            ep_plan["model.mtp.*.mlp.experts.down_proj_scale"] = Shard(0)
         return ParallelPlan(extra_parallel_plan={"ep": ep_plan})
 
 
