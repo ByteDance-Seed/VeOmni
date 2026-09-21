@@ -42,6 +42,7 @@ from veomni.models.seed_omni.modules.deepseek_v41.llm.attention import (
     DeepseekV41RotaryEmbedding,
     SharedAttentionState,
     build_compression_plans,
+    trailing_partial_group,
 )
 from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig
 from veomni.models.seed_omni.modules.deepseek_v41.llm.decode import (
@@ -541,3 +542,178 @@ class TestCacheState:
                 SharedAttentionState(),
                 cache,
             )
+
+
+def _clone_tensor(tensor):
+    return None if tensor is None else tensor.detach().clone()
+
+
+def _snapshot_layer_cache(cache):
+    return {
+        "window": _clone_tensor(cache.window),
+        "compress_kv": _clone_tensor(cache.compress_kv),
+        "index_k": _clone_tensor(cache.index_k),
+        "pending": _clone_tensor(cache.pending),
+    }
+
+
+def _assert_same_tensor(got, want, name, **tol):
+    if want is None or got is None:
+        assert got is None and want is None, f"{name}: one side is None"
+        return
+    assert got.shape == want.shape, f"{name} shape {tuple(got.shape)} != {tuple(want.shape)}"
+    if tol:
+        torch.testing.assert_close(got, want, msg=name, **tol)
+        return
+    assert torch.equal(got, want), f"{name} is not bitwise equal; max abs {(got - want).abs().max().item():.3g}"
+
+
+class TestBatchedPrefillMatchesPerPosition:
+    """The capture the batched prefill writes must be the per-position cache.
+
+    ``_prefill`` fills the decode cache from one training forward; ``_prefill_per_position``
+    is the loop it replaced. If they disagree, decode after a fast prefill attends
+    to the wrong history and the text stays fluent.
+
+    Bitwise equality holds for anything that never enters the compressor's fp32
+    pool: the source layer's window and pending (functions of the prompt
+    embeddings) and the None-ness of every non-source field. The compressed
+    history, later layers, and the tail hidden go through that pool -- prefill
+    matmuls over the whole sequence, a decode step over one group -- and are
+    held to the same ``FP32_POOLED`` tolerance as :class:`TestDecodeMatchesPrefill`.
+    Discrete token ids after further decode steps must match exactly.
+    """
+
+    def _llm(self, config, seed=0):
+        torch.manual_seed(seed)
+        model = DeepseekV41Llm(config).double()
+        for param in model.parameters():
+            param.data.normal_(0, 0.05)
+        for layer in model.model.layers:
+            layer.self_attn.attn_sink.data.normal_(0, 0.5)
+        return model.eval()
+
+    def _ngram_embeds(self, config, seq_len):
+        cols = (config.engram_max_ngram_size - 1) * config.engram_n_heads
+        return [
+            torch.randn(1, seq_len, cols, config.engram_head_dim, dtype=torch.float64) for _ in config.engram_layer_ids
+        ]
+
+    def _run_prefill(self, model, method, embeds, ngram_embeds):
+        carrier = [ConversationItem(type="text", value=embeds[0].clone(), role="user")]
+        outputs = method(
+            carrier,
+            ngram_embeds=[e.clone() for e in ngram_embeds],
+        )
+        return (
+            outputs["conversation_list"][-1].value.detach().clone(),
+            [_snapshot_layer_cache(layer) for layer in model._decode_cache.layers],
+            int(model._next_position),
+        )
+
+    def _decode_tokens(self, model, embeds, ngram_embeds, start, n_steps, lm_head):
+        tokens = []
+        carrier = None
+        for position in range(start, start + n_steps):
+            if carrier is None:
+                # Standing in for the text encoder after prefill: it samples from
+                # the tail hidden and writes the next token's embedding on it.
+                carrier = [
+                    ConversationItem(type="text", value=embeds[0, :start], role="user"),
+                    ConversationItem(type="output", value=embeds[0, position : position + 1], role="assistant"),
+                ]
+            else:
+                carrier[-1].value = embeds[0, position : position + 1]
+            carrier = model.generate(
+                conversation_list=carrier,
+                ngram_embeds=[e[:, position : position + 1] for e in ngram_embeds],
+            )["conversation_list"]
+            tokens.append(int((carrier[-1].value.squeeze(0).double() @ lm_head).argmax()))
+        return tokens
+
+    @torch.no_grad()
+    def test_tail_and_every_cache_field_agree_bitwise(self):
+        config = make_backbone_config()
+        # 5 tokens at ratio 2: two complete groups and a trailing partial, so
+        # window, compress_kv, index_k and pending all have something to say.
+        prompt_len = 5
+        assert prompt_len > RATIO and prompt_len % RATIO == 1
+
+        torch.manual_seed(1)
+        embeds = torch.randn(1, prompt_len, HIDDEN, dtype=torch.float64)
+        ngram_embeds = self._ngram_embeds(config, prompt_len)
+
+        stepped = self._llm(config)
+        want_tail, want_cache, want_pos = self._run_prefill(
+            stepped, stepped._prefill_per_position, embeds, ngram_embeds
+        )
+
+        batched = self._llm(config)
+        got_tail, got_cache, got_pos = self._run_prefill(batched, batched._prefill, embeds, ngram_embeds)
+
+        assert got_pos == want_pos == prompt_len
+        _assert_same_tensor(got_tail, want_tail, "tail hidden", **FP32_POOLED)
+        assert len(got_cache) == len(want_cache) == config.num_hidden_layers
+        source_ids = set(config.kv_source_layer_ids)
+        for layer_idx, (got, want) in enumerate(zip(got_cache, want_cache)):
+            # The source layer's window and pending are functions of the prompt
+            # embeddings, which both paths share, so they must agree bit for bit.
+            # Everything downstream of the compressor's fp32 pool is close, not equal.
+            window_tol = {} if layer_idx == 0 else FP32_POOLED
+            _assert_same_tensor(got["window"], want["window"], f"layer {layer_idx} window", **window_tol)
+            if layer_idx in source_ids:
+                _assert_same_tensor(
+                    got["compress_kv"], want["compress_kv"], f"layer {layer_idx} compress_kv", **FP32_POOLED
+                )
+                _assert_same_tensor(got["index_k"], want["index_k"], f"layer {layer_idx} index_k", **FP32_POOLED)
+                pending_tol = {} if layer_idx == 0 else FP32_POOLED
+                _assert_same_tensor(got["pending"], want["pending"], f"layer {layer_idx} pending", **pending_tol)
+            else:
+                for field in ("compress_kv", "index_k", "pending"):
+                    _assert_same_tensor(got[field], want[field], f"layer {layer_idx} {field}")
+
+        source = config.kv_source_layer_ids[0]
+        assert got_cache[source]["pending"] is not None
+        assert got_cache[source]["pending"].shape[1] == prompt_len % RATIO
+        assert got_cache[source]["compress_kv"] is not None
+        assert got_cache[source]["compress_kv"].shape[1] == prompt_len // RATIO
+        for layer_idx, snapshot in enumerate(got_cache):
+            if layer_idx in config.kv_source_layer_ids:
+                continue
+            assert snapshot["compress_kv"] is None
+            assert snapshot["index_k"] is None
+            assert snapshot["pending"] is None
+
+    @torch.no_grad()
+    def test_decode_after_either_prefill_emits_the_same_tokens(self):
+        config = make_backbone_config()
+        prompt_len = 5
+        n_steps = 4
+        total = prompt_len + n_steps
+
+        torch.manual_seed(1)
+        embeds = torch.randn(1, total, HIDDEN, dtype=torch.float64)
+        ngram_embeds = self._ngram_embeds(config, total)
+        torch.manual_seed(0)
+        lm_head = torch.randn(HIDDEN, 32, dtype=torch.float64)
+
+        tokens = []
+        for method_name in ("_prefill_per_position", "_prefill"):
+            model = self._llm(config)
+            getattr(model, method_name)(
+                [ConversationItem(type="text", value=embeds[0, :prompt_len].clone(), role="user")],
+                [e[:, :prompt_len].clone() for e in ngram_embeds],
+            )
+            tokens.append(self._decode_tokens(model, embeds, ngram_embeds, prompt_len, n_steps, lm_head))
+
+        assert tokens[0] == tokens[1]
+        assert len(tokens[0]) == n_steps
+
+    def test_pending_is_the_last_packed_samples_partial_group(self):
+        """Packed remainders must not be concatenated -- that would look like a full group."""
+        hidden = torch.arange(10, dtype=torch.float64).view(1, 10, 1).expand(1, 10, HIDDEN).contiguous()
+        position_ids = torch.tensor([[0, 1, 2, 3, 4, 0, 1, 2, 3, 4]])
+        pending = trailing_partial_group(hidden, position_ids, RATIO)
+        assert pending is not None
+        assert pending.shape[1] == 1
+        torch.testing.assert_close(pending[0, 0], hidden[0, 9])

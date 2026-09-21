@@ -56,8 +56,9 @@ def dequantize_rows(rows: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
 class DeepseekV41NgramTable(nn.Embedding):
     """One n-gram memory table, optionally over the released fp8 rows.
 
-    ``quant_dtype=None`` is an ordinary ``nn.Embedding``, which is what the
-    bf16 artifact and the training path get, down to the parameter name.
+    ``quant_dtype=None`` is an ordinary ``nn.Embedding``. The converted
+    checkpoint keeps ``weight_quantization``, so both train and infer stay on
+    the fp8 tables.
 
     Quantized, the weight is built through ``_weight`` rather than by letting
     ``nn.Embedding`` allocate and initialize one. That is not a micro

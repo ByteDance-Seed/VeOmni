@@ -107,7 +107,17 @@ def stub_backbone(config, indexer_layers=()):
     backbone.seen = {}
 
     def make_stub(layer_idx):
-        def stub(hidden_streams, pre_mix, position_ids, rotary_emb, shared, plans, image_mask=None):
+        def stub(
+            hidden_streams,
+            pre_mix,
+            position_ids,
+            rotary_emb,
+            shared,
+            plans,
+            image_mask=None,
+            capture=None,
+            capture_seq_len=None,
+        ):
             backbone.seen[layer_idx] = {
                 "streams": hidden_streams.detach().clone(),
                 "pre_mix": pre_mix.detach().clone(),

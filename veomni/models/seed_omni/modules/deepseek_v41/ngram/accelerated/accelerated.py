@@ -104,7 +104,8 @@ class VeOmniMixin(BaseMixin, TrainingMixin):
         # A quantized table is two tensors, both indexed by row, so both shard
         # the same way -- the lookup ships a row and its scales together and
         # dequantizes after the gather. The scale entry is added only when the
-        # tables are quantized; on the bf16 artifact it would resolve to nothing.
+        # tables are quantized; a bf16 Embedding has no scale Parameter and a
+        # plan entry that resolved to nothing would look like a stale prefix.
         quantized = quantized_storage_dtype(self.config) is not None
         emb_plan = {}
         for index in range(len(self.config.layer_ids)):

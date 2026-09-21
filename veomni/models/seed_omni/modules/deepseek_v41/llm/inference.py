@@ -28,10 +28,10 @@ that helper is its reader. It yields a flat ``arange`` of positions, which is
 exactly what ``build_compression_plans`` wants -- the compression groups and the
 window are derived from ``position_ids`` and from nothing else.
 
-Prefill steps the prompt rather than calling the batched ``forward``, because
-the batched pass builds no cache and the prompt would have to be walked anyway
-to fill one. See :meth:`DeepseekV41LlmInferenceMixin._prefill` for what that
-costs and what making it fast would take.
+Prefill is one batched ``forward`` that captures the window, compressed KV,
+index keys and pending tail each layer's attention already computed. The
+per-position loop remains as :meth:`DeepseekV41LlmInferenceMixin._prefill_per_position`
+so the capture can be checked against it.
 """
 
 from __future__ import annotations
@@ -104,20 +104,58 @@ class DeepseekV41LlmInferenceMixin:
         conversation_list: List[ConversationItem],
         ngram_embeds: Optional[List[torch.Tensor]],
     ) -> Dict[str, Any]:
-        """Step the prompt, keeping the caches and the last position's hidden.
+        """One batched backbone forward, capturing the decode caches from it.
 
-        Not the batched ``forward``. A batched prefill would still leave the
-        caches empty -- the training forward builds none -- so the prompt would
-        have to be walked token by token afterwards anyway to fill them, and the
-        batched pass would be work done twice. Stepping is both the cheaper
-        option and the one that keeps a single code path.
+        The training forward already computes every window row, compressed group
+        and index key decode needs, then throws them away. Capture writes those
+        tensors onto :class:`DeepseekV41DecodeCache` instead of walking the prompt
+        token by token. Grouping is a function of ``position_ids`` alone, so the
+        batched groups and the per-position groups are the same groups.
 
-        The cost is real and worth naming: a prompt of S tokens is S sequential
-        steps, which is the slow part of a first turn. Making it fast means
-        filling the caches from a batched pass's intermediates, and that would
-        be a third expression of the compression and window rules, free to
-        disagree with the two that exist. Worth doing behind the per-position
-        test, not before it.
+        The per-position loop is :meth:`_prefill_per_position`, kept as the
+        reference the capture is tested against.
+        """
+        inputs_embeds, _, position_ids, _ = pack_llm_conversations_for_forward([conversation_list], self.device)
+        if inputs_embeds.shape[1] == 0:
+            raise ValueError("deepseek_v41_llm was asked to prefill an empty conversation.")
+        image_mask = build_image_mask(conversation_list, self.device)
+
+        orig_len = int(inputs_embeds.shape[1])
+        self._decode_cache = DeepseekV41DecodeCache.empty(self.config)
+        outputs = self.model(
+            inputs_embeds,
+            position_ids,
+            ngram_embeds=ngram_embeds,
+            image_mask=image_mask,
+            capture=self._decode_cache.layers,
+            capture_seq_len=orig_len,
+        )
+        hidden_states = outputs["hidden_states"][:, :orig_len]
+        if hidden_states.numel() and not torch.isfinite(hidden_states).all():
+            window = self._decode_cache.layers[0].window
+            row_ok = torch.isfinite(hidden_states[0]).all(dim=-1)
+            nan_rows = (~row_ok).nonzero(as_tuple=True)[0]
+            window_nan = 0 if window is None else int(torch.isnan(window).sum())
+            raise RuntimeError(
+                "batched prefill produced non-finite hidden states: "
+                f"shape={tuple(hidden_states.shape)} dtype={hidden_states.dtype} "
+                f"nan={int(torch.isnan(hidden_states).sum())} inf={int(torch.isinf(hidden_states).sum())} "
+                f"nan_rows={int(nan_rows.numel())}/{orig_len} "
+                f"last_row_finite={bool(row_ok[-1])} layer0_window_nan={window_nan}"
+            )
+        self._next_position = orig_len
+        return self._emit(conversation_list, hidden_states)
+
+    def _prefill_per_position(
+        self,
+        conversation_list: List[ConversationItem],
+        ngram_embeds: Optional[List[torch.Tensor]],
+    ) -> Dict[str, Any]:
+        """Step the prompt one token at a time.
+
+        The reference implementation for the batched-capture path. Each step is
+        :func:`decode_backbone_step`, which is also how decode continues after
+        either prefill. Not used by :meth:`generate`.
         """
         inputs_embeds, _, _, _ = pack_llm_conversations_for_forward([conversation_list], self.device)
         image_mask = build_image_mask(conversation_list, self.device)

@@ -280,10 +280,11 @@ class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
         # ~15.6 GiB of scales replicated on every rank -- enough, together with
         # the n-gram tables, to put eight H20s over their 97 GiB.
         #
-        # Added only when they exist. The bf16 artifact has no scales, and a
-        # plan entry that resolves to nothing is exactly what a stale prefix
-        # looks like -- the thing `test_plan_fqns_resolve_against_the_real_
-        # module_tree` exists to catch.
+        # Added only when they exist. A bf16 training module has no scale
+        # Parameters -- the load converter spent them -- and a plan entry that
+        # resolves to nothing is exactly what a stale prefix looks like -- the
+        # thing `test_plan_fqns_resolve_against_the_real_module_tree` exists to
+        # catch.
         if quantized_storage_dtype(self.config) is not None:
             ep_plan["model.layers.*.mlp.experts.gate_up_proj_scale"] = Shard(0)
             ep_plan["model.layers.*.mlp.experts.down_proj_scale"] = Shard(0)

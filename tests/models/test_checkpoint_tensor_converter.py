@@ -30,6 +30,13 @@ from veomni.models.checkpoint_tensor_loading import (
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
 )
+from veomni.models.seed_omni.modules.deepseek_v41.checkpoint_tensor_converter import (
+    DeepseekV41DequantConverter,
+    create_deepseek_v41_llm_checkpoint_tensor_converter,
+    dequant_converted_weight,
+)
+from veomni.models.seed_omni.modules.deepseek_v41.dequant import dequant_fp8_blockwise
+from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import DeepseekV41Llm
 from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
     DeepseekV4CheckpointTensorConverter,
     _dequantize_scaled_weight,
@@ -1377,3 +1384,87 @@ class TestQwen3OmniMoeConverterIntegration:
         assert down_res is not None and torch.equal(down_res.tensor, down)
         # Nothing was buffered.
         assert converter.finalize() == []
+
+
+# ---------------------------------------------------------------------------
+# Tests for DeepseekV41DequantConverter (split checkpoint, load-time dequant)
+# ---------------------------------------------------------------------------
+
+
+_V41_QUANT = {
+    "quant_method": "fp8",
+    "weight_block_size": [32, 32],
+    "scale_fmt": "ue8m0",
+}
+
+
+def _v41_e8m0(*shape):
+    return torch.randint(123, 132, shape, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+
+
+class TestDeepseekV41DequantConverter:
+    def setup_method(self):
+        self.converter = DeepseekV41DequantConverter()
+
+    def test_handles_scale_keys_and_quantized_tensors(self):
+        weight = torch.randn(64, 64).to(torch.float8_e4m3fn)
+        assert self.converter.can_handle("model.layers.0.self_attn.wq_a.weight_scale")
+        assert self.converter.can_handle_tensor("model.layers.0.self_attn.wq_a.weight", weight)
+        assert not self.converter.can_handle("model.layers.0.self_attn.wq_a.weight")
+        bf16 = torch.randn(4, 4, dtype=torch.bfloat16)
+        assert not self.converter.can_handle_tensor("model.norm.weight", bf16)
+
+    def test_dequantizes_fp8_weight_when_the_scale_arrives(self):
+        weight = torch.randn(64, 64).to(torch.float8_e4m3fn)
+        scale = _v41_e8m0(2, 2)
+        name = "model.layers.0.self_attn.wq_a.weight"
+        assert maybe_convert_checkpoint_tensor(name, weight, self.converter) is None
+        result = maybe_convert_checkpoint_tensor(f"{name}_scale", scale, self.converter)
+        assert result is not None
+        assert result.name == name
+        torch.testing.assert_close(result.tensor, dequant_fp8_blockwise(weight, scale))
+        torch.testing.assert_close(result.tensor, dequant_converted_weight(weight, scale))
+        assert self.converter.finalize() == []
+
+    def test_dequantizes_stacked_fp4_experts(self):
+        packed = torch.randint(0, 256, (4, 32, 16), dtype=torch.uint8).view(torch.int8)
+        scale = _v41_e8m0(4, 32, 1)
+        name = "model.layers.0.mlp.experts.gate_up_proj"
+        assert maybe_convert_checkpoint_tensor(f"{name}_scale", scale, self.converter) is None
+        result = maybe_convert_checkpoint_tensor(name, packed, self.converter)
+        assert result is not None
+        assert result.tensor.shape == (4, 32, 32)
+        assert result.tensor.dtype == torch.bfloat16
+        torch.testing.assert_close(result.tensor, dequant_converted_weight(packed, scale))
+        assert self.converter.finalize() == []
+
+    def test_passthrough_leaves_unquantized_tensors(self):
+        tensor = torch.ones(8, dtype=torch.float32)
+        result = maybe_convert_checkpoint_tensor("model.norm.weight", tensor, self.converter)
+        assert result is not None
+        assert result.name == "model.norm.weight"
+        assert torch.equal(result.tensor, tensor)
+
+    def test_finalize_raises_on_an_orphan_scale(self):
+        scale = _v41_e8m0(2, 2)
+        assert (
+            maybe_convert_checkpoint_tensor("model.layers.0.self_attn.wq_a.weight_scale", scale, self.converter)
+            is None
+        )
+        with pytest.raises(RuntimeError, match="unpaired weight/scale"):
+            self.converter.finalize()
+
+    def test_factory_skips_quantized_modules(self):
+        model = SimpleNamespace(config=SimpleNamespace(weight_quantization=_V41_QUANT))
+        assert create_deepseek_v41_llm_checkpoint_tensor_converter(model) is None
+
+    def test_factory_installs_on_bf16_modules(self):
+        model = SimpleNamespace(config=SimpleNamespace(weight_quantization=None))
+        converter = create_deepseek_v41_llm_checkpoint_tensor_converter(model)
+        assert isinstance(converter, DeepseekV41DequantConverter)
+
+    def test_llm_hook_is_the_factory(self):
+        model = SimpleNamespace(config=SimpleNamespace(weight_quantization=None))
+        model._create_checkpoint_tensor_converter = staticmethod(DeepseekV41Llm._create_checkpoint_tensor_converter)
+        converter = get_checkpoint_tensor_converter(model)
+        assert isinstance(converter, DeepseekV41DequantConverter)

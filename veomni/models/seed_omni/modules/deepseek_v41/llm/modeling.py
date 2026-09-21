@@ -51,6 +51,7 @@ import torch.nn as nn
 
 from ....omni_pretrained_model import OmniPreTrainedModel
 from .attention import (
+    DeepseekV41AttentionCache,
     DeepseekV41RotaryEmbedding,
     IndexerLossTerms,
     SharedAttentionState,
@@ -92,6 +93,8 @@ class DeepseekV41Backbone(nn.Module):
         position_ids: torch.Tensor,
         ngram_embeds: Optional[List[torch.Tensor]] = None,
         image_mask: Optional[torch.Tensor] = None,
+        capture: Optional[List[DeepseekV41AttentionCache]] = None,
+        capture_seq_len: Optional[int] = None,
         return_draft_hiddens: bool = False,
     ) -> Dict[str, Any]:
         if ngram_embeds is None and self.engram:
@@ -106,6 +109,11 @@ class DeepseekV41Backbone(nn.Module):
                 f"{len(self.config.engram_layer_ids)} layers. They are positional -- entry i belongs to "
                 f"layer {list(self.config.engram_layer_ids)[:1]}... -- so a length mismatch silently "
                 "pairs a layer with another layer's table."
+            )
+        if capture is not None and len(capture) != len(self.layers):
+            raise ValueError(
+                f"capture has {len(capture)} entries but the backbone has {len(self.layers)} layers. "
+                "Prefill writes one cache slot per layer, matching DeepseekV41DecodeCache.empty."
             )
 
         # Image tokens take no part in an n-gram, so the Engram gate is zeroed
@@ -143,7 +151,15 @@ class DeepseekV41Backbone(nn.Module):
                 draft_hiddens.append(hidden_streams.mean(dim=2))
 
             hidden_streams, pre_mix, layer_logits, indexer_loss = layer(
-                hidden_streams, pre_mix, position_ids, self.rotary_emb, shared, plans, image_mask
+                hidden_streams,
+                pre_mix,
+                position_ids,
+                self.rotary_emb,
+                shared,
+                plans,
+                image_mask,
+                capture=None if capture is None else capture[layer_idx],
+                capture_seq_len=capture_seq_len,
             )
             router_logits.append(layer_logits)
             if indexer_loss is not None:
@@ -202,6 +218,13 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
     _no_split_modules = ["DeepseekV41DecoderLayer", "DeepseekV41EngramConnection"]
     supports_gradient_checkpointing = True
 
+    @staticmethod
+    def _create_checkpoint_tensor_converter(model: "DeepseekV41Llm"):
+        """Dequant fp8/fp4 into bf16 when this module was built for training."""
+        from ..checkpoint_tensor_converter import create_deepseek_v41_llm_checkpoint_tensor_converter
+
+        return create_deepseek_v41_llm_checkpoint_tensor_converter(model)
+
     def __init__(self, config: DeepseekV41LlmConfig) -> None:
         super().__init__(config)
         self.config = config
@@ -234,6 +257,8 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
         position_ids: Optional[torch.Tensor] = None,
         ngram_embeds: Optional[List[torch.Tensor]] = None,
         image_mask: Optional[torch.Tensor] = None,
+        capture: Optional[List[DeepseekV41AttentionCache]] = None,
+        capture_seq_len: Optional[int] = None,
         return_draft_hiddens: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
@@ -266,6 +291,8 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
             position_ids=position_ids,
             ngram_embeds=ngram_embeds,
             image_mask=image_mask,
+            capture=capture,
+            capture_seq_len=capture_seq_len,
             return_draft_hiddens=return_draft_hiddens,
         )
 

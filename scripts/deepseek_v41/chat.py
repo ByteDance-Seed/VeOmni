@@ -50,7 +50,7 @@ from typing import Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-DEFAULT_MODEL_PATH = "/mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash-native"
+DEFAULT_MODEL_PATH = "/mnt/hdfs/veomni/models/seed_omni/DeepSeek-V4.1-Flash"
 BASE_CONFIG = "configs/seed_omni/DeepSeek/deepseek_v41_flash/train/base.yaml"
 MODULES_CONFIG = "configs/seed_omni/DeepSeek/deepseek_v41_flash/infer/modules_infer_fsdp.yaml"
 

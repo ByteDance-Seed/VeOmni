@@ -1,12 +1,13 @@
 """Teacher-forcing forward over the converted DeepSeek-V4.1-Flash checkpoint.
 
-The backbone is 1.1 TB in bf16 and this box has 765 GB of GPU memory, so no
-arrangement holds every layer at once. A single forward pass does not need one:
-layers run in order and nothing reads a layer's weights after it has run. Each
-layer's parameters are read from the shards just before it runs and released
-right after, so the peak is one layer -- about 28 GB -- instead of the whole
-backbone. CPU is not an option here because the sparse attention is a TileLang
-GPU kernel.
+The converted files keep the released dtypes (~468 GiB). A full-parameter bf16
+copy of the backbone is ~1.1 TB and this box has 765 GB of GPU memory, so no
+arrangement holds every dequantized layer at once. A single forward pass does
+not need one: layers run in order and nothing reads a layer's weights after it
+has run. Each layer's parameters are read from the shards, dequantized, and
+released right after, so the peak is one bf16 layer -- about 28 GB -- instead
+of the whole backbone. CPU is not an option here because the sparse attention
+is a TileLang GPU kernel.
 
 The measurement is cross-entropy on coherent natural text. A correctly converted
 trained model puts it low; an error anywhere in the chain -- dequantisation,
@@ -36,6 +37,11 @@ import torch.nn as nn
 from accelerate import init_empty_weights
 from safetensors import safe_open
 
+from veomni.models.seed_omni.modules.deepseek_v41.checkpoint_tensor_converter import (
+    dequant_converted_weight,
+    scale_key,
+)
+from veomni.models.seed_omni.modules.deepseek_v41.dequant import dequant_fp8_blockwise
 from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig
 from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import DeepseekV41Llm
 from veomni.models.seed_omni.modules.deepseek_v41.ngram.configuration import DeepseekV41NgramConfig
@@ -74,12 +80,21 @@ class ShardIndex:
             self._handles[file_name] = handle
         return handle.get_tensor(name)
 
+    def get_dequantized(self, name: str) -> torch.Tensor:
+        """A parameter as bf16, spending ``name_scale`` when the file has one."""
+        tensor = self.get(name)
+        scale_name = scale_key(name)
+        if scale_name not in self.weight_map:
+            return tensor
+        return dequant_converted_weight(tensor, self.get(scale_name))
+
     def get_rows(self, name: str, rows: torch.Tensor) -> torch.Tensor:
         """Gather individual rows without reading the whole tensor.
 
-        The n-gram tables are 197 GB each and a short prompt touches a few
-        thousand rows, so reading them whole to use 0.001% would dominate
-        everything else this script does.
+        The n-gram tables are ~92 GB of fp8 each and a short prompt touches a
+        few thousand rows, so reading them whole to use 0.001% would dominate
+        everything else this script does. When a scale sibling exists, the
+        gathered rows are dequantized the same way training load would.
         """
         file_name = self.weight_map[name]
         handle = self._handles.get(file_name)
@@ -88,11 +103,28 @@ class ShardIndex:
             self._handles[file_name] = handle
         table = handle.get_slice(name)
         order = torch.argsort(rows)  # ascending reads are kinder to the mount
-        gathered = torch.empty((rows.numel(), table.get_shape()[1]), dtype=torch.bfloat16)
+        cols = table.get_shape()[1]
+        first = int(rows[int(order[0])])
+        probe = table[first : first + 1][0]
+        gathered = torch.empty((rows.numel(), cols), dtype=probe.dtype)
         for position in order.tolist():
             row = int(rows[position])
             gathered[position] = table[row : row + 1][0]
-        return gathered
+        scale_name = scale_key(name)
+        if scale_name not in self.weight_map:
+            return gathered
+        scale_file = self.weight_map[scale_name]
+        scale_handle = self._handles.get(scale_file)
+        if scale_handle is None:
+            scale_handle = safe_open(os.path.join(self.module_dir, scale_file), framework="pt", device="cpu")
+            self._handles[scale_file] = scale_handle
+        scale_table = scale_handle.get_slice(scale_name)
+        scale_probe = scale_table[first : first + 1][0]
+        gathered_scale = torch.empty((rows.numel(), scale_table.get_shape()[1]), dtype=scale_probe.dtype)
+        for position in order.tolist():
+            row = int(rows[position])
+            gathered_scale[position] = scale_table[row : row + 1][0]
+        return dequant_fp8_blockwise(gathered, gathered_scale)
 
 
 def _buffers_to(model: nn.Module, device: torch.device) -> None:
@@ -119,7 +151,7 @@ def materialize(module: nn.Module, prefix: str, index: ShardIndex, device: torch
     """Replace ``module``'s meta parameters and buffers with real ones on ``device``."""
     moved = 0
     for name, _ in list(module.named_parameters(recurse=True)):
-        tensor = index.get(prefix + name).to(device)
+        tensor = index.get_dequantized(prefix + name).to(device)
         owner, attr = _owner_and_attr(module, name)
         owner._parameters[attr] = nn.Parameter(tensor, requires_grad=False)
         moved += 1
@@ -131,7 +163,7 @@ def materialize(module: nn.Module, prefix: str, index: ShardIndex, device: torch
                 raise RuntimeError(f"{prefix + name} is on meta and absent from the checkpoint")
             continue
         owner, attr = _owner_and_attr(module, name)
-        setattr(owner, attr, index.get(prefix + name).to(device))
+        setattr(owner, attr, index.get_dequantized(prefix + name).to(device))
         moved += 1
     return moved
 
@@ -332,6 +364,8 @@ def load_llm(checkpoint: str, device: torch.device) -> Tuple[DeepseekV41Llm, Sha
     """Real config, parameters on meta, everything outside the layers resident."""
     llm_dir = os.path.join(checkpoint, "deepseek_v41_llm")
     raw = {k: v for k, v in json.load(open(os.path.join(llm_dir, "config.json"))).items() if k != "model_type"}
+    # Files stay quantized; this harness wants the bf16 training graph.
+    raw["weight_quantization"] = None
     config = DeepseekV41LlmConfig(**raw)
     index = ShardIndex(llm_dir)
 
@@ -343,10 +377,10 @@ def load_llm(checkpoint: str, device: torch.device) -> Tuple[DeepseekV41Llm, Sha
     layer_prefixes = tuple(f"model.layers.{i}." for i in range(config.num_hidden_layers))
     resident = 0
     for name in index.names():
-        if name.startswith(layer_prefixes):
+        if name.startswith(layer_prefixes) or name.endswith("_scale"):
             continue
         owner, attr = _owner_and_attr(model, name)
-        tensor = index.get(name).to(device)
+        tensor = index.get_dequantized(name).to(device)
         if attr in owner._parameters:
             owner._parameters[attr] = nn.Parameter(tensor, requires_grad=False)
         else:

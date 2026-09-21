@@ -48,8 +48,9 @@ SCALE_DTYPE = torch.float8_e8m0fnu
 def quantized_storage_dtype(config) -> Optional[torch.dtype]:
     """The dtype the released weights are stored in, or ``None`` for bf16.
 
-    ``config.weight_quantization`` is present only on the native artifact; the
-    bf16 one has been dequantized at conversion and keeps ordinary layers.
+    ``config.weight_quantization`` is present on the converted files (released
+    dtypes). Training clears it so the llm allocates bf16 Parameters and
+    ``DeepseekV41DequantConverter`` spends the scales at load.
 
     The scheme is checked rather than assumed. The kernels index a weight's
     scale by the same block counter as the activation's, so a checkpoint

@@ -1,7 +1,8 @@
 # Per-module overrides for sharded inference -- DeepSeek-V4.1-Flash, 8 ranks.
 #
-# Sized for the native artifact, which keeps the released fp8 and fp4 weights
-# rather than dequantizing them. Measured on disk:
+# Sized for the converted checkpoint, which keeps the released fp8 and fp4
+# weights. Training dequantizes the llm at load; inference does not. Measured
+# on disk:
 #
 #   vision          0.9 GiB   bf16 throughout
 #   text_encoder    2.5 GiB   bf16
@@ -11,8 +12,8 @@
 #   total         468   GiB   -> 58.5 GiB a rank if everything shards
 #
 # Against 8 x H20 that is 468 of 776 GiB, leaving room per rank for the KV
-# cache and activations. The bf16 artifact is 1.5 TB and does not fit here at
-# all; it is the training input, not this.
+# cache and activations. Dequantizing the llm to bf16 at load is the training
+# path; it does not fit this inference layout.
 #
 # Gradient checkpointing is off everywhere, as in the eager file: it trades
 # compute for activation memory across a backward, and there is no backward.

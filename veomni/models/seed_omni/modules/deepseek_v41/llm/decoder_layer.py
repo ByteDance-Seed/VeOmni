@@ -40,6 +40,7 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from .attention import (
     CompressionPlan,
     DeepseekV41Attention,
+    DeepseekV41AttentionCache,
     DeepseekV41RotaryEmbedding,
     IndexerLossTerms,
     SharedAttentionState,
@@ -72,6 +73,8 @@ class DeepseekV41DecoderLayer(GradientCheckpointingLayer):
         shared: SharedAttentionState,
         plans: Dict[int, CompressionPlan],
         image_mask: Optional[torch.Tensor] = None,
+        capture: Optional[DeepseekV41AttentionCache] = None,
+        capture_seq_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[IndexerLossTerms]]:
         """``[B, S, hc, D]`` in and out, plus the next ``pre``, router logits and indexer KL.
 
@@ -87,7 +90,13 @@ class DeepseekV41DecoderLayer(GradientCheckpointingLayer):
         attn_pre, attn_post, attn_comb = self.attn_hc(hidden_streams)
         collapsed = mhc_collapse(hidden_streams, pre_mix)
         attn_out, indexer_loss = self.self_attn(
-            self.input_layernorm(collapsed), position_ids, rotary_emb, shared, plans
+            self.input_layernorm(collapsed),
+            position_ids,
+            rotary_emb,
+            shared,
+            plans,
+            capture=capture,
+            capture_seq_len=capture_seq_len,
         )
         hidden_streams = mhc_expand(attn_out, residual, attn_post, attn_comb)
 

@@ -170,15 +170,14 @@ class DeepseekV41LlmConfig(PretrainedConfig):
         # would otherwise be dropped on load and change routing silently.
         self.gate_temp = gate_temp
         self.expert_dtype = expert_dtype
-        # The released `quantization_config`, verbatim, or None when the weights
-        # have been dequantized to bf16. Two things make this a separate field
-        # rather than that name:
+        # The released `quantization_config`, verbatim, or None when this
+        # module should allocate bf16 Parameters and dequant at load. Two
+        # things make this a separate field rather than that name:
         #
         # `expert_dtype` above is about QAT -- which format training should
         # fake-quantize the routed experts to, in bf16 arithmetic. This one is
-        # about storage: whether the weights on disk are the quantized ones and
-        # so need the quantized GEMMs. A bf16 checkpoint still declares an
-        # `expert_dtype`, and must, or QAT would silently change.
+        # about storage: whether the live module keeps the quantized GEMMs.
+        # Training YAML sets this to null; the files on disk stay quantized.
         #
         # And `quantization_config` is a reserved name. transformers reads it
         # off the config in `get_hf_quantizer`, and `quant_method: "fp8"` is a

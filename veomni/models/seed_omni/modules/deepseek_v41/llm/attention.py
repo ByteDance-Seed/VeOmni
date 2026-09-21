@@ -101,6 +101,49 @@ class SharedAttentionState:
 
 
 @dataclass
+class DeepseekV41AttentionCache:
+    """One layer's carried state, and nothing a forward could recompute.
+
+    Three tensors with three different growth laws, which is why they are three
+    fields rather than one buffer:
+
+    ``window``
+        the last ``sliding_window`` KV rows this layer produced, already rotated
+        and rounded. Bounded, and the only field every layer has.
+    ``compress_kv`` / ``index_k``
+        the compressed history, append-only and unbounded, held solely by layers
+        in ``kv_source_layer_ids``. Group ``j`` is a function of the hidden states
+        at positions ``[j * ratio, (j + 1) * ratio)`` and of nothing later, so
+        once written it never changes -- the property the whole scheme rests on.
+    ``pending``
+        the hidden states of the group still being filled, at most ``ratio - 1``
+        of them. Prefill has no counterpart: it sees every token of every group at
+        once and a trailing partial group simply contributes no row.
+    """
+
+    sliding_window: int
+    compress_ratio: int
+    window: Optional[torch.Tensor] = None
+    compress_kv: Optional[torch.Tensor] = None
+    index_k: Optional[torch.Tensor] = None
+    pending: Optional[torch.Tensor] = None
+
+    @property
+    def window_len(self) -> int:
+        return 0 if self.window is None else int(self.window.shape[1])
+
+    @property
+    def compressed_len(self) -> int:
+        return 0 if self.compress_kv is None else int(self.compress_kv.shape[1])
+
+    def append_window(self, kv: torch.Tensor) -> None:
+        """Keep the newest ``sliding_window`` rows, oldest first."""
+        self.window = kv if self.window is None else torch.cat([self.window, kv], dim=1)
+        if self.window.shape[1] > self.sliding_window:
+            self.window = self.window[:, -self.sliding_window :]
+
+
+@dataclass
 class IndexerLossTerms:
     """One layer's contribution to the indexer objective.
 
@@ -228,6 +271,28 @@ def sequence_slices_from_positions(position_ids: torch.Tensor) -> Tuple[Tuple[in
         )
     ends = starts[1:] + [seq_len]
     return tuple(zip(starts, ends))
+
+
+def trailing_partial_group(
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+    ratio: int,
+) -> Optional[torch.Tensor]:
+    """Hidden states ``_absorb`` would leave pending after this packed sequence.
+
+    Walks the same packed slices as :func:`build_compression_plans`. A complete
+    group contributes no row; each sample's leftover ``length % ratio`` tokens
+    are that sample's pending buffer. Decode continues the last sample, so that
+    sample's tail is what is returned. A ratio of 0 or 1 never leaves a partial
+    group -- 0 does not compress, 1 emits a group on every token.
+    """
+    if ratio <= 1:
+        return None
+    pending = None
+    for start, end in sequence_slices_from_positions(position_ids):
+        remainder = (end - start) % ratio
+        pending = hidden_states[:, end - remainder : end] if remainder else None
+    return pending
 
 
 def build_compression_plans(
@@ -696,6 +761,8 @@ class DeepseekV41Attention(nn.Module):
         rotary_emb: DeepseekV41RotaryEmbedding,
         shared: SharedAttentionState,
         plans: Dict[int, CompressionPlan],
+        capture: Optional[DeepseekV41AttentionCache] = None,
+        capture_seq_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[IndexerLossTerms]]:
         """``[B, S, hidden]``, and this layer's indexer KL when it builds one.
 
@@ -703,6 +770,14 @@ class DeepseekV41Attention(nn.Module):
         every forward with the objective off, but the arity does not change --
         the alternative is three call sites each re-deriving which layers return
         what, and a stale copy in any one of them is an unpacking error.
+
+        ``capture`` is an inference out-param. Training leaves it ``None``. When
+        set, this forward writes the window (and, on a KV source, the compressed
+        history and pending tail) that decode would have accumulated, so prefill
+        can be one batched pass instead of one step per prompt token. It is
+        threaded like :class:`SharedAttentionState` rather than held as a global:
+        under activation checkpointing a global would hold the wrong source
+        layer's publication.
         """
         batch, seq_len, _ = hidden_states.shape
         cos, sin = rotary_emb(position_ids, compressed=self.rope_is_compressed)
@@ -714,12 +789,33 @@ class DeepseekV41Attention(nn.Module):
         kv = self.kv_norm(fake_quant_linear(self.wkv, hidden_states))
         kv = apply_interleaved_rope(kv, cos, sin)
         kv = fake_quant_kv(kv, self.rope_head_dim)
+        if capture is not None:
+            # After rotation and rounding, before the compressed rows are
+            # concatenated for the attention call -- the window cache is this
+            # layer's own KV, not the shared history it attends over. Prefill
+            # may have padded the sequence for GEMM alignment; index by the
+            # unpadded length so the window is the real prefix, not the pad.
+            valid = seq_len if capture_seq_len is None else capture_seq_len
+            if valid < 1 or valid > seq_len:
+                raise ValueError(
+                    f"capture_seq_len={capture_seq_len} is outside the forward's sequence length {seq_len}"
+                )
+            width = min(self.sliding_window, valid)
+            capture.window = kv[:, valid - width : valid].detach().clone()
 
         student = None
         topk_idxs = self._window_indices(position_ids, seq_len)
         if self.compress_ratio:
             compress_kv, compress_idxs, student = self._compressed_kv(
-                hidden_states, q_residual, position_ids, rotary_emb, shared, plans, offset=seq_len
+                hidden_states,
+                q_residual,
+                position_ids,
+                rotary_emb,
+                shared,
+                plans,
+                offset=seq_len,
+                capture=capture,
+                capture_seq_len=capture_seq_len,
             )
             kv = torch.cat([kv, compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
@@ -729,11 +825,22 @@ class DeepseekV41Attention(nn.Module):
         topk_idxs = topk_idxs.contiguous()
         sink = self.attn_sink.float().contiguous()
 
+        # Prefill-with-capture must use decode's dense gather, not the training
+        # TileLang kernel: decode continues from this forward's tail and cache,
+        # and a kernel that is not dense_sparse_attn has already been observed
+        # to hand the sampler NaN logits on the first generated token.
+        if capture is not None:
+            from .decode import dense_sparse_attn
+
+            attn_impl = dense_sparse_attn
+        else:
+            attn_impl = sparse_attn_tilelang
+
         indexer_loss = None
         if student is None:
-            output = sparse_attn_tilelang(query, kv, sink, topk_idxs, self.softmax_scale)
+            output = attn_impl(query, kv, sink, topk_idxs, self.softmax_scale)
         else:
-            output, lse = sparse_attn_tilelang(query, kv, sink, topk_idxs, self.softmax_scale, return_lse=True)
+            output, lse = attn_impl(query, kv, sink, topk_idxs, self.softmax_scale, return_lse=True)
             indexer_loss = self._indexer_loss(query, kv, topk_idxs, lse, student)
 
         # The KV is cached in one shared rotated form, so the query's rotation is
@@ -813,6 +920,8 @@ class DeepseekV41Attention(nn.Module):
         shared: SharedAttentionState,
         plans: Dict[int, CompressionPlan],
         offset: int,
+        capture: Optional[DeepseekV41AttentionCache] = None,
+        capture_seq_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """The shared compressed KV and this layer's selection into it.
 
@@ -832,6 +941,21 @@ class DeepseekV41Attention(nn.Module):
                 shared.index_k = self.indexer.build_keys(latent, group_cos, group_sin)
             rotated = apply_interleaved_rope(latent, group_cos, group_sin)
             shared.compress_kv = fake_quant_kv(rotated, self.rope_head_dim)
+            if capture is not None:
+                # Source layers only: consumers read these from ``shared`` during
+                # the same forward and must not copy them onto their own cache.
+                # Slice to the unpadded prefix so GEMM-alignment pad tokens do
+                # not complete an extra group or sit in ``pending``.
+                valid = hidden_states.shape[1] if capture_seq_len is None else capture_seq_len
+                prefix_ids = position_ids[:, :valid]
+                n_groups = sum(
+                    (end - start) // self.compress_ratio for start, end in sequence_slices_from_positions(prefix_ids)
+                )
+                capture.compress_kv = shared.compress_kv[:, :n_groups].detach().clone()
+                if self.indexer is not None and shared.index_k is not None:
+                    capture.index_k = shared.index_k[:, :n_groups].detach().clone()
+                pending = trailing_partial_group(hidden_states[:, :valid], prefix_ids, self.compress_ratio)
+                capture.pending = None if pending is None else pending.detach().clone()
 
         if shared.compress_kv is None:
             raise RuntimeError(
@@ -870,6 +994,7 @@ class DeepseekV41Attention(nn.Module):
 __all__ = [
     "CompressionPlan",
     "DeepseekV41Attention",
+    "DeepseekV41AttentionCache",
     "DeepseekV41Compressor",
     "DeepseekV41Indexer",
     "DeepseekV41RotaryEmbedding",
@@ -880,4 +1005,5 @@ __all__ = [
     "indexer_kl_terms",
     "select_candidate_blocks",
     "sequence_slices_from_positions",
+    "trailing_partial_group",
 ]

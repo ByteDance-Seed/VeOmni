@@ -56,6 +56,7 @@ import torch
 from .attention import (
     CompressionPlan,
     DeepseekV41Attention,
+    DeepseekV41AttentionCache,
     DeepseekV41RotaryEmbedding,
     SharedAttentionState,
     apply_interleaved_rope,
@@ -133,49 +134,6 @@ def dense_sparse_attn(
     # (``sparse_mqa_target_fwd``, for the indexer teacher) takes the LSE as a
     # renormalizer and a uniformly scaled one still yields a distribution.
     return out, ((shift + denominator.log()) / math.log(2.0)).float()
-
-
-@dataclass
-class DeepseekV41AttentionCache:
-    """One layer's carried state, and nothing a forward could recompute.
-
-    Three tensors with three different growth laws, which is why they are three
-    fields rather than one buffer:
-
-    ``window``
-        the last ``sliding_window`` KV rows this layer produced, already rotated
-        and rounded. Bounded, and the only field every layer has.
-    ``compress_kv`` / ``index_k``
-        the compressed history, append-only and unbounded, held solely by layers
-        in ``kv_source_layer_ids``. Group ``j`` is a function of the hidden states
-        at positions ``[j * ratio, (j + 1) * ratio)`` and of nothing later, so
-        once written it never changes -- the property the whole scheme rests on.
-    ``pending``
-        the hidden states of the group still being filled, at most ``ratio - 1``
-        of them. Prefill has no counterpart: it sees every token of every group at
-        once and a trailing partial group simply contributes no row.
-    """
-
-    sliding_window: int
-    compress_ratio: int
-    window: Optional[torch.Tensor] = None
-    compress_kv: Optional[torch.Tensor] = None
-    index_k: Optional[torch.Tensor] = None
-    pending: Optional[torch.Tensor] = None
-
-    @property
-    def window_len(self) -> int:
-        return 0 if self.window is None else int(self.window.shape[1])
-
-    @property
-    def compressed_len(self) -> int:
-        return 0 if self.compress_kv is None else int(self.compress_kv.shape[1])
-
-    def append_window(self, kv: torch.Tensor) -> None:
-        """Keep the newest ``sliding_window`` rows, oldest first."""
-        self.window = kv if self.window is None else torch.cat([self.window, kv], dim=1)
-        if self.window.shape[1] > self.sliding_window:
-            self.window = self.window[:, -self.sliding_window :]
 
 
 @dataclass

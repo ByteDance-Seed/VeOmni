@@ -70,6 +70,62 @@ from ..quant_scheme import QUANT_BLOCK_SIZE, SCALE_DTYPE, SCALE_FMT, quantized_s
 from .reuse import DeepseekV4Experts, DeepseekV4GroupedLinear, DeepseekV4MLP
 
 
+# Matches TileLang ``fp8_gemm`` / ``fp4_gemm`` ``block_M``.
+_GEMM_M_ALIGN = 32
+_FP8_MAX = 448.0
+_FP8_MAX_INV = 1.0 / _FP8_MAX
+
+
+def _eager_act_quant(
+    rows: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Block-wise FP8 activation quant, in PyTorch rather than TileLang.
+
+    The TileLang ``act_quant`` kernel writes NaNs for many prefill-sized M
+    (including 256, 512, 1013) while M=1 (decode) is fine. The GEMM still
+    consumes the same ``[M, K/block]`` scale layout, including ue8m0 storage.
+    """
+    features = rows.shape[-1]
+    n_blocks = features // QUANT_BLOCK_SIZE
+    blocks = rows.float().reshape(rows.shape[0], n_blocks, QUANT_BLOCK_SIZE)
+    amax = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-4)
+    scaled = (amax * _FP8_MAX_INV).contiguous()
+    bits = scaled.view(torch.int32)
+    exponent = ((bits >> 23) & 0xFF) - 127
+    log2_ceil = exponent + ((bits & ((1 << 23) - 1)) != 0).to(torch.int32)
+    scales = ((log2_ceil + 127) << 23).view(torch.float32)
+    quantized = (blocks / scales).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
+    return quantized.reshape(rows.shape).contiguous(), scales.reshape(rows.shape[0], n_blocks).to(
+        SCALE_DTYPE
+    ).contiguous()
+
+
+def _quantized_matmul_rows(
+    rows: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
+    """One TileLang GEMM over a 2D activation ``[M, K]`` already row-contiguous."""
+    quantized_x, x_scale = _eager_act_quant(rows)
+    if weight.dtype == torch.float8_e4m3fn:
+        return fp8_gemm(
+            quantized_x,
+            x_scale,
+            weight,
+            scale,
+            scale_dtype=SCALE_DTYPE,
+            block_size=QUANT_BLOCK_SIZE,
+            out_dtype=out_dtype,
+        )
+    return fp4_gemm(
+        quantized_x,
+        x_scale,
+        weight.view(torch.float4_e2m1fn_x2),
+        scale,
+        scale_dtype=SCALE_DTYPE,
+        act_block_size=QUANT_BLOCK_SIZE,
+        out_dtype=out_dtype,
+    )
+
+
 def is_quantized(weight: torch.Tensor) -> bool:
     """Whether ``weight`` needs a scale and a kernel rather than ``F.linear``.
 
@@ -114,27 +170,25 @@ def quantized_matmul(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor)
 
     Both paths quantize the activation to fp8 first; fp4 weights take an fp8
     activation too, and the kernel handles the mixed precision.
+
+    TileLang ``act_quant`` / ``fp8_gemm`` / ``fp4_gemm`` tile ``block_M=32`` over
+    the flattened row count. Some lengths -- including aligned 256 and 512, and
+    a 1013-row prefill -- write NaNs; M=1 (decode) and other 32-row tiles do
+    not. Launch one kernel per 32 rows so every call stays in the regime the
+    kernels actually get right, then concatenate. Expert slices and grouped
+    linear rows have their own M, which is why this lives here rather than on
+    the sequence.
     """
-    quantized_x, x_scale = act_quant(x, QUANT_BLOCK_SIZE, SCALE_FMT, SCALE_DTYPE)
-    if weight.dtype == torch.float8_e4m3fn:
-        return fp8_gemm(
-            quantized_x,
-            x_scale,
-            weight,
-            scale,
-            scale_dtype=SCALE_DTYPE,
-            block_size=QUANT_BLOCK_SIZE,
-            out_dtype=x.dtype,
-        )
-    return fp4_gemm(
-        quantized_x,
-        x_scale,
-        weight.view(torch.float4_e2m1fn_x2),
-        scale,
-        scale_dtype=SCALE_DTYPE,
-        act_block_size=QUANT_BLOCK_SIZE,
-        out_dtype=x.dtype,
-    )
+    in_shape = x.shape
+    rows = x.reshape(-1, in_shape[-1]).contiguous()
+    n_rows = rows.shape[0]
+    if n_rows == 0:
+        return x.new_empty(*in_shape[:-1], weight.shape[0])
+    chunks = [
+        _quantized_matmul_rows(rows[start : start + _GEMM_M_ALIGN], weight, scale, x.dtype)
+        for start in range(0, n_rows, _GEMM_M_ALIGN)
+    ]
+    return torch.cat(chunks, dim=0).view(*in_shape[:-1], weight.shape[0])
 
 
 class QuantizedWeightMixin:
@@ -467,6 +521,7 @@ __all__ = [
     "QuantizedEPExperts",
     "DeepseekV41SharedExpert",
     "QuantizedWeightMixin",
+    "act_quant",
     "expert_quant_dtype",
     "is_quantized",
     "linear_quant_dtype",

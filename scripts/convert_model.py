@@ -33,14 +33,6 @@ def main() -> None:
         help="Directory to write split module sub-checkpoints",
     )
     parser.add_argument(
-        "--precision",
-        choices=["bf16", "native"],
-        help=(
-            "Dequantize to bf16 for training, or keep the released dtypes for inference. "
-            "Only families with quantized releases accept this"
-        ),
-    )
-    parser.add_argument(
         "--modules",
         nargs="+",
         help="Convert only these module subfolders instead of all of them",
@@ -50,7 +42,7 @@ def main() -> None:
     # Only forward what was asked for. These are per-family options, and a
     # converter that does not take them should not have to grow a signature to
     # ignore a default nobody set.
-    options = {name: value for name, value in (("precision", args.precision), ("modules", args.modules)) if value}
+    options = {name: value for name, value in (("modules", args.modules),) if value}
 
     model_type = read_hf_model_type(args.model_path)
     print(f"Detected model_type={model_type!r} from {args.model_path}")
