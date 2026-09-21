@@ -368,3 +368,32 @@ def test_dynamic_batch_dataloader_drop_last_false_tail(collate_fn):
         "an all-padding step carries no real data and no loss tokens; it must not be emitted"
     )
     assert len(steps) <= train_steps + 1, f"at most one padded tail step may follow the {train_steps} requested steps"
+
+
+@pytest.mark.parametrize("collate_fn", [_merging_collate_fn, NoopDataCollator(), None])
+def test_dynamic_batch_dataloader_drop_last_false_pads_incomplete_tail(collate_fn):
+    """A genuinely incomplete tail step is padded up to ``num_micro_batch``.
+
+    Four one-sample micro batches, three per step and two requested steps leave two
+    real micro batches in the drain, so exactly one padding copy must be appended,
+    for the collated ``dict`` shape as well as the uncollated ``list[dict]`` one.
+    """
+    num_samples, num_micro_batch, train_steps = 4, 3, 2
+    dataloader = DynamicBatchSizeDataLoader(
+        dataloader=_RestartableLoader([_dyn_bsz_sample(i) for i in range(num_samples)]),
+        batching_strategy=TextBatchingStrategy(token_micro_bsz=10, buffer_size=3),
+        collate_fn=collate_fn,
+        num_micro_batch=num_micro_batch,
+        length=train_steps,
+        drop_last=False,
+    )
+
+    steps = list(dataloader)
+
+    assert len(steps) == train_steps + 1, "the incomplete tail must be emitted as one extra step"
+    assert all(len(step) == num_micro_batch for step in steps)
+    assert not any(_is_padding(micro_batch) for step in steps[:-1] for micro_batch in step), (
+        "only the tail step may carry padding"
+    )
+    assert [_is_padding(micro_batch) for micro_batch in steps[-1]] == [False, False, True]
+    assert steps[-1][-1] is not steps[-1][-2], "the padding micro batch must be a copy, not an alias"
