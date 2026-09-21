@@ -607,16 +607,15 @@ class OmniInferArguments:
     output_dir: str = field(default="output", metadata={"help": "Root output directory."})
     seed: int = field(default=42, metadata={"help": "Random seed."})
     enable_full_determinism: bool = field(
-        default=True,
+        default=False,
         metadata={
             "help": (
-                "Ask for bitwise-reproducible generation. On by default, unlike "
-                "training: a seeded prompt should give the same answer twice, and "
-                "without this the MoE top-k combine (a scatter_add over repeated "
-                "token rows) races its atomics, so logits move in their last bits "
-                "run to run and across ranks. Costs cuDNN (disabled by "
-                "enable_full_determinism) and any op that has no deterministic "
-                "kernel falls back with a warning."
+                "Opt into bitwise-reproducible generation (NCCL_DETERMINISTIC, "
+                "torch.use_deterministic_algorithms, cuDNN off). Off by default, "
+                "same as training and as vLLM serving: the rank-0 token broadcast "
+                "already keeps a multi-rank FSM from deadlocking on a last-bit "
+                "MoE scatter_add race. Turn this on only when a seeded prompt "
+                "must give the same answer twice; it is a large latency tax."
             )
         },
     )

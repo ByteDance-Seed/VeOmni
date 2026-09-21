@@ -53,9 +53,9 @@ def _combine_operands(num_tokens: int, num_experts: int, topk: int, hidden: int,
     return tokens, routing_weights, torch.Size([num_tokens, hidden]), mapping, routing_map
 
 
-def test_inference_asks_for_full_determinism_by_default():
-    """Unlike training: the same prompt and seed should give the same answer twice."""
-    assert OmniInferArguments().enable_full_determinism is True
+def test_inference_full_determinism_is_opt_in():
+    """Serving default matches training / vLLM: bitwise kernels are opt-in."""
+    assert OmniInferArguments().enable_full_determinism is False
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="scatter_add_ only races on CUDA")

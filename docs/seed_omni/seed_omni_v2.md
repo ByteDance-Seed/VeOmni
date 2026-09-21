@@ -457,23 +457,21 @@ on it — each rank judges `done` locally, so a single disagreement leaves the
 rank that saw the stop token outside the loop while the others block forever in
 the next collective.
 
-Two things make them agree, and both are needed:
+Ranks agree because `InferenceMixin._sample_token` broadcasts the drawn token
+from rank 0. That is the guarantee; it holds no matter how the logits were
+produced. A sharded MoE forward does not owe anyone bit-identical logits: the
+top-k combine is a `scatter_add_` in `veomni/distributed/moe/moe_utils.py`, and
+on CUDA that is an atomicAdd whose order races. Measured on DeepSeek-V4.1-Flash
+over 8×H20: 211 of 211 decode steps had per-rank logits that differed by a few
+bf16 ULP, enough to flip `argmax` at 4 of them. The broadcast absorbs that; a
+single-GPU generate also does not reproduce itself without extra machinery.
 
-- `InferenceMixin._sample_token` broadcasts the drawn token from rank 0. This is
-  the guarantee; it holds no matter how the logits were produced.
-- `infer.enable_full_determinism` defaults to **true** (it is false for
-  training). Without it the MoE top-k combine — a `scatter_add_` in
-  `veomni/distributed/moe/moe_utils.py` that adds `topk` expert outputs onto one
-  token row — races its atomics, so identical inputs give different last bits
-  *run to run*, and the logits differ on every rank at every step. Measured on
-  DeepSeek-V4.1-Flash over 8×H20: 211 of 211 decode steps had per-rank logits
-  that differed by a few bf16 ULP, enough to flip `argmax` at 4 of them. It also
-  means that without this flag a single-GPU generate does not reproduce itself.
-
-The flag buys reproducibility at the cost of cuDNN (`enable_full_determinism`
-disables it) and of any op with no deterministic kernel falling back with a
-warning. Turn it off only when neither reproducibility nor a rank-consistent
-baseline matters.
+`infer.enable_full_determinism` is **off** by default (same as training, same
+as vLLM serving). Turning it on asks for bitwise kernels (`NCCL_DETERMINISTIC`,
+`torch.use_deterministic_algorithms`, cuDNN disabled) so a seeded prompt gives
+the same answer twice. That is a large latency tax; pass
+`--infer.enable_full_determinism true` only when you need the paper-grade
+baseline.
 
 ---
 

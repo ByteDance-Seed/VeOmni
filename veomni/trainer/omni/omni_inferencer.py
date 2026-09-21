@@ -90,6 +90,12 @@ class OmniInferencer:
         if self._distributed:
             self.device = OmniTrainer.setup_distributed(args)
         helper.set_seed(args.infer.seed, args.infer.enable_full_determinism)
+        if args.infer.enable_full_determinism:
+            logger.info_rank0(
+                "OmniInferencer: full determinism is ON "
+                "(NCCL_DETERMINISTIC / cuDNN disabled). "
+                "Pass --infer.enable_full_determinism false for serving speed."
+            )
         self._build_model()
 
         # Nest artefacts under <output_dir>/<infer_type>/ (infer_type is resolved

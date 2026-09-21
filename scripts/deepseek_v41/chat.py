@@ -101,6 +101,10 @@ def build_command(args: argparse.Namespace) -> list[str]:
         args.image,
         "--infer.output_dir",
         args.output_dir,
+        # Serving path: do not pay NCCL_DETERMINISTIC / cuDNN-off. Rank
+        # agreement is the rank-0 token broadcast, not bitwise kernels.
+        "--infer.enable_full_determinism",
+        "false",
     ]
 
 
