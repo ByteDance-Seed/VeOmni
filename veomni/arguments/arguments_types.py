@@ -442,7 +442,10 @@ class GradientCheckpointingConfig:
                 "all layers (default), 0 = none, N = the last N layers. Values "
                 "above the model depth mean all layers. Applies to every model: "
                 "the framework finds the block stack itself (_no_split_modules / "
-                "basic_modules) and folds sibling stacks into one sequence."
+                "basic_modules) and folds sibling stacks into one sequence. A "
+                "model with several stacks (a VLM tower beside the decoder) "
+                "counts the trainable one, the deepest one if both train; list "
+                "a class in model.basic_modules to count that one instead."
             )
         },
     )
@@ -463,7 +466,7 @@ class GradientCheckpointingConfig:
             )
         },
     )
-    selective_ops: list = field(
+    selective_ops: List[str] = field(
         default_factory=list,
         metadata={
             "help": (
