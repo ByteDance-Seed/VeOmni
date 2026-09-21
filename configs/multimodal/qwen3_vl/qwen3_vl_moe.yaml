@@ -1,0 +1,48 @@
+model:
+  model_path: Qwen3-VL-30B-A3B-Instruct
+  ops_implementation:
+    moe_implementation: fused_triton
+    attn_implementation: flash_attention_2
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
+  accelerator:
+    gradient_checkpointing:
+      enable_reentrant: false
+    init_device: meta
+    ep_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+  chat_template: qwen3vl
+
+data:
+  train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
+  data_type: conversation
+  max_seq_len: 4096
+  train_size: 80000000
+  mm_configs:
+    image_max_pixels: 602112 # 28 * 28 * 768
+    video_max_pixels: 602112 # 28 * 28 * 768
+    video_total_pixels: 2889523 # max_seq_len * 28^2 * 0.9, dynamic per-frame budget
+    max_frames: 16
+    fps: 2.0
+    use_audio_in_video: false
+
+train:
+  wandb:
+    enable: false
+    project: qwen3_vl_moe
+    name: qwen3_vl_moe
+  freeze_vit: false
+  num_train_epochs: 2
+  micro_batch_size: 1
+  global_batch_size: 32
+  max_steps: 500
+  profile:
+    enable: true
+    start_step: 20
+    end_step: 21
+    record_shapes: true
+  checkpoint:
+    output_dir: qwen3_vl_moe_sft
+    manager: dcp

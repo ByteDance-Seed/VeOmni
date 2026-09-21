@@ -1,0 +1,56 @@
+model:
+  # Set this to the target DeepSeek checkpoint, e.g. DeepSeek-V3/R1 or DeepSeek-V4.
+  # model_path: deepseek-ai/DeepSeek-V3-0324
+  # model_path: <path-or-id-to-DeepSeek-V4-checkpoint>
+  ops_implementation:
+    # DeepSeek-V4 attention is eager-only; set this to eager for V4 checkpoints.
+    # Keep moe_implementation as fused_triton on GPU so V4 uses clamp-aware fused MoE.
+    attn_implementation: flash_attention_2
+    moe_implementation: fused_triton
+  optimizer:
+    type: adamw
+    lr: 3.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    ulysses_size: 1
+    ep_size: 8
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+
+data:
+  train_path: fineweb_100BT
+  train_size: 1000000000000
+  dataloader:
+    type: native
+    drop_last: true
+  datasets_type: iterable
+  data_type: plaintext
+  max_seq_len: 8192
+  text_keys: text
+  dyn_bsz_buffer_size: 200
+
+train:
+  global_batch_size: 32
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: deepseek_v3
+    manager: dcp
+    save_steps: 100
+    save_hf_weights: true
+  wandb:
+    project: DeepSeek-V3
+    name: dsv3_pretrain_ep8

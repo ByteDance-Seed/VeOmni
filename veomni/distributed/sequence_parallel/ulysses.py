@@ -1,0 +1,474 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+from typing import Any, Optional, Tuple
+
+import torch
+import torch.distributed as dist
+from torch import Tensor
+from torch.distributed import ProcessGroup
+
+from ...utils.device import get_device_id, is_nccl_backend
+from .comm import (
+    get_ulysses_sequence_parallel_group,
+    get_ulysses_sequence_parallel_world_size,
+)
+from .utils import (
+    pad_tensor,
+    unpad_tensor,
+)
+
+
+def _all_gather(
+    x: Tensor,
+    group: dist.ProcessGroup,
+):
+    """All-gather ``x`` over ``group``, returning the per-rank tensors and their shapes.
+
+    Shards may differ in length, but every rank must pass the same number of
+    dimensions. Shapes are exchanged first and read back to the host with a single
+    ``tolist()``: materializing them as ``torch.Size`` from per-rank device tensors
+    instead costs one device-to-host sync per dimension per rank, and with a gather in
+    every layer that drains the device queue thousands of times per step. Shapes are
+    returned as plain ints for the same reason.
+    """
+    group = get_ulysses_sequence_parallel_group() if group is None else group
+    sp_world_size = dist.get_world_size(group)
+    ndim = x.dim()
+    x_size = torch.tensor(x.size(), dtype=torch.int64, device=x.device)
+    all_sizes = torch.empty(sp_world_size * ndim, dtype=torch.int64, device=x.device)
+    dist.all_gather_into_tensor(all_sizes, x_size, group=group)
+    flat_sizes = all_sizes.tolist()
+    size_list = [flat_sizes[i * ndim : (i + 1) * ndim] for i in range(sp_world_size)]
+    tensor_list = [torch.empty(size, dtype=x.dtype, device=x.device) for size in size_list]
+    dist.all_gather(tensor_list, x, group=group)
+    return tensor_list, size_list
+
+
+def _all_gather_into_tensor(
+    x: Tensor,
+    group: dist.ProcessGroup,
+):
+    dim_size = list(x.size())
+
+    group = get_ulysses_sequence_parallel_group() if group is None else group
+    sp_world_size = dist.get_world_size(group)
+    dim_size[0] = dim_size[0] * sp_world_size
+    output = torch.empty(dim_size, dtype=x.dtype, device=get_device_id())
+    dist.all_gather_into_tensor(output, x, group=group)
+    return output
+
+
+def _all_to_all(
+    local_input: Tensor,
+    scatter_dim: int,
+    gather_dim: int,
+    group: Optional[dist.ProcessGroup] = None,
+    async_op: bool = False,
+):
+    group = get_ulysses_sequence_parallel_group() if group is None else group
+    seq_world_size = dist.get_world_size(group)
+    input_list = [t.contiguous() for t in torch.tensor_split(local_input, seq_world_size, scatter_dim)]
+    output_list = [torch.empty_like(input_list[0]) for _ in range(seq_world_size)]
+    comm = dist.all_to_all(output_list, input_list, group=group, async_op=async_op)
+    if async_op:
+
+        def wait():
+            comm.wait()
+            return torch.cat(output_list, dim=gather_dim).contiguous()
+
+        return wait
+    return torch.cat(output_list, dim=gather_dim).contiguous()
+
+
+def _all_to_all_single(
+    x: Tensor, scatter_dim: int, gather_dim: int, group: Optional[dist.ProcessGroup] = None, async_op: bool = False
+):
+    """
+    A function to do all-to-all on the first two dim
+    """
+    group = get_ulysses_sequence_parallel_group() if group is None else group
+    sp_world_size = dist.get_world_size(group)
+    assert scatter_dim <= 1, "scatter_dim must be 0 or 1 when using all_to_all_single!"
+    assert gather_dim <= 1, "gather_dim must be 0 or 1 when using all_to_all_single!"
+    if scatter_dim != 0:
+        gather_dim_bef = x.shape[gather_dim]
+        scatter_dim_bef = x.shape[scatter_dim]
+        x = (
+            x.reshape([gather_dim_bef, sp_world_size, scatter_dim_bef // sp_world_size] + list(x.shape[2:]))
+            .transpose(0, 1)
+            .reshape([gather_dim_bef * sp_world_size, scatter_dim_bef // sp_world_size] + list(x.shape[2:]))
+            .contiguous()
+        )
+
+    # Materialize the input before allocating with empty_like: otherwise the output
+    # can inherit a non-contiguous stride that NCCL all_to_all_single rejects.
+    x = x.contiguous()
+    output = torch.empty_like(x)
+    comm = dist.all_to_all_single(output, x, group=group, async_op=async_op)
+
+    if async_op:
+
+        def wait():
+            comm.wait()
+            if scatter_dim == 0:
+                return torch.cat(output.split(x.size(0) // sp_world_size), dim=gather_dim)
+            else:
+                return output
+
+        return wait
+
+    if scatter_dim == 0:
+        output = torch.cat(output.split(x.size(0) // sp_world_size), dim=gather_dim)
+    return output
+
+
+def all_to_all_tensor(
+    x: Tensor,
+    scatter_dim: int,
+    gather_dim: int,
+    group: dist.ProcessGroup,
+    async_op: bool = False,
+):
+    if scatter_dim <= 1 and gather_dim <= 1:
+        return _all_to_all_single(x, scatter_dim, gather_dim, group, async_op)
+    else:
+        return _all_to_all(x, scatter_dim, gather_dim, group, async_op)
+
+
+class _SeqAllToAll(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        group: dist.ProcessGroup,
+        local_input: Tensor,
+        scatter_dim: int,
+        gather_dim: int,
+    ) -> Tensor:
+        ctx.group = group
+        ctx.scatter_dim = scatter_dim
+        ctx.gather_dim = gather_dim
+        return all_to_all_tensor(local_input, scatter_dim, gather_dim, group)
+
+    @staticmethod
+    def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor, None, None]:
+        input_t = grad_output[0]
+        return (
+            None,
+            all_to_all_tensor(input_t, ctx.gather_dim, ctx.scatter_dim, ctx.group, False),
+            None,
+            None,
+        )
+
+
+class _Slice(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, group: dist.ProcessGroup, local_input: Tensor, dim: int, scale_grad: bool) -> Tensor:
+        ctx.group = group
+        ctx.rank = dist.get_rank(group)
+        seq_world_size = dist.get_world_size(group)
+        ctx.seq_world_size = seq_world_size
+        ctx.dim = dim
+        ctx.scale_grad = scale_grad
+        dim_size = local_input.shape[dim]
+        return local_input.split(dim_size // seq_world_size, dim=dim)[ctx.rank].contiguous()
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor, None]:
+        dim_size = list(grad_output.size())
+        split_size = dim_size[0]
+        output = _all_gather_into_tensor(grad_output, group=ctx.group)
+        if ctx.scale_grad:
+            output = output / ctx.seq_world_size
+        return (None, torch.cat(output.split(split_size), dim=ctx.dim), None, None)
+
+
+class _Gather(torch.autograd.Function):
+    """All-gather + concat over the SP group; backward slices the incoming
+    full-sequence grad back to this rank's local segment.
+
+    ``sum_grad`` selects the backward semantics:
+    - True (default): sum the grad across ranks. After a mid-model gather each
+      rank consumed a DIFFERENT segment of the full sequence downstream, so its
+      grads only cover its own rows — summing reconstructs the full grad.
+    - False: no all-reduce. Used at the model output, where the downstream loss
+      (e.g. the MiniMaxH3 wrapper's MSE over the full output) is identical on
+      every SP rank, so the incoming grad is already the true full grad and a
+      sum would multiply it by the SP world size.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        group: dist.ProcessGroup,
+        local_input: Tensor,
+        dim: int,
+        grad_scale: Optional[bool] = False,
+        sum_grad: Optional[bool] = True,
+    ) -> Tensor:
+        ctx.group = group
+        ctx.rank = dist.get_rank(group)
+        ctx.dim = dim
+        ctx.grad_scale = grad_scale
+        ctx.sum_grad = sum_grad
+        seq_world_size = dist.get_world_size(group)
+        ctx.seq_world_size = seq_world_size
+        output, size_list = _all_gather(local_input.contiguous(), group=ctx.group)
+        ctx.dim_size_list = [size[dim] for size in size_list]
+        return torch.cat(output, dim=dim)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor, None, None, None]:
+        if not ctx.sum_grad:
+            grad_input = grad_output.split(ctx.dim_size_list, dim=ctx.dim)[ctx.rank]
+            if ctx.grad_scale:
+                grad_input = grad_input * ctx.seq_world_size
+            grad_input = grad_input.contiguous()
+        elif (
+            is_nccl_backend(dist.get_backend(ctx.group))
+            and not grad_output.is_complex()
+            and all(size > 0 for size in ctx.dim_size_list)
+            and grad_output.numel() > 0
+        ):
+            # Reduce this rank's shard without modifying the shared input.
+            # Collective selection must not depend on rank-local strides/view bits.
+            dim = ctx.dim % grad_output.ndim
+            shape = list(grad_output.shape)
+            shape[dim] = ctx.dim_size_list[ctx.rank]
+            if len(set(ctx.dim_size_list)) == 1:
+                # Stacked rank-major input avoids the list API's internal flatten.
+                packed = grad_output.unflatten(dim, (ctx.seq_world_size, ctx.dim_size_list[0])).movedim(dim, 0)
+                owns_packed = ctx.grad_scale or packed.is_neg() or not packed.is_contiguous()
+                if ctx.grad_scale or packed.is_neg():
+                    packed = packed.clone(memory_format=torch.contiguous_format)
+                else:
+                    packed = packed.contiguous()
+                if ctx.grad_scale:
+                    # Scale before summing to preserve low-precision overflow semantics.
+                    packed.mul_(ctx.seq_world_size)
+                if owns_packed and (ctx.seq_world_size == 1 or all(size == 1 for size in shape[:dim])):
+                    # NCCL allows an in-place output at this rank's input offset.
+                    # Reuse owned packing when the old all-reduce shard also
+                    # retained full storage, avoiding another local allocation.
+                    grad_input = packed[ctx.rank]
+                else:
+                    grad_input = torch.empty(shape, dtype=grad_output.dtype, device=grad_output.device)
+                dist.reduce_scatter_tensor(grad_input, packed, group=ctx.group)
+            else:
+                # NCCL's uneven list path reduces each differently sized shard.
+                chunks = grad_output.split(ctx.dim_size_list, dim=dim)
+                chunks = [
+                    chunk.clone(memory_format=torch.contiguous_format)
+                    if ctx.grad_scale or chunk.is_neg()
+                    else chunk.contiguous()
+                    for chunk in chunks
+                ]
+                if ctx.grad_scale:
+                    for chunk in chunks:
+                        chunk.mul_(ctx.seq_world_size)
+                grad_input = torch.empty(shape, dtype=grad_output.dtype, device=grad_output.device)
+                dist.reduce_scatter(grad_input, chunks, group=ctx.group)
+        else:
+            # Preserve other backends and NCCL's complex/empty all-reduce path.
+            # Own this in-place buffer, reusing it for optional scaling as well.
+            grad_output = grad_output.clone(memory_format=torch.contiguous_format)
+            if ctx.grad_scale:
+                grad_output.mul_(ctx.seq_world_size)
+            dist.all_reduce(grad_output, group=ctx.group)
+            grad_input = grad_output.split(ctx.dim_size_list, dim=ctx.dim)[ctx.rank].contiguous()
+        return None, grad_input, None, None, None
+
+
+def gather_heads_scatter_seq(x: Tensor, head_dim: int, seq_dim: int, group: ProcessGroup = None) -> Tensor:
+    """
+    A func to sync attention result with alltoall in sequence parallel
+    """
+    group = get_ulysses_sequence_parallel_group() if group is None else group
+    if not group:
+        return x
+    dim_size = x.size(seq_dim)
+    sp_world = get_ulysses_sequence_parallel_world_size(group)
+    if dim_size % sp_world != 0:
+        padding_size = sp_world - (dim_size % sp_world)
+        x = pad_tensor(x, seq_dim, padding_size)
+    return _SeqAllToAll.apply(group, x, seq_dim, head_dim)
+
+
+def gather_seq_scatter_heads(
+    x: Tensor,
+    seq_dim: int,
+    head_dim: int,
+    unpadded_dim_size: int = 0,
+    group: ProcessGroup = None,
+) -> Tensor:
+    """
+    A func to sync embedding input with alltoall in sequence parallel
+    """
+    group = get_ulysses_sequence_parallel_group() if group is None else group
+    if not group:
+        return x
+    sp_world = get_ulysses_sequence_parallel_world_size(group)
+    x = _SeqAllToAll.apply(group, x, head_dim, seq_dim)
+    if unpadded_dim_size and unpadded_dim_size % sp_world != 0:
+        padding_size = x.size(seq_dim) - unpadded_dim_size
+        x = unpad_tensor(x, seq_dim, padding_size)
+    return x
+
+
+def gather_seq_scatter_heads_qkv(
+    qkv_tensor: Tensor,
+    seq_dim: int,
+    unpadded_dim_size: Optional[int] = None,
+    restore_shape: bool = True,
+    group: ProcessGroup = None,
+) -> Tensor:
+    """
+    A func to sync splited qkv tensor
+    qkv_tensor: the tensor we want to do alltoall with. The last dim must
+        be the projection_idx, which we will split into 3 part. After
+        spliting, the gather idx will be projecttion_idx + 1
+    seq_dim: gather_dim for all2all comm
+    restore_shape: if True, output will has the same shape length as input
+    """
+    group = get_ulysses_sequence_parallel_group() if group is None else group
+    if not group:
+        return qkv_tensor
+    sp_world = get_ulysses_sequence_parallel_world_size(group)
+    orig_shape = qkv_tensor.shape
+    scatter_dim = qkv_tensor.dim()
+    bef_all2all_shape = list(orig_shape)
+    qkv_proj_dim = bef_all2all_shape[-1]
+    bef_all2all_shape = bef_all2all_shape[:-1] + [3, qkv_proj_dim // 3]
+    qkv_tensor = qkv_tensor.view(bef_all2all_shape)
+
+    qkv_tensor = _SeqAllToAll.apply(group, qkv_tensor, scatter_dim, seq_dim)
+
+    if restore_shape:
+        out_shape = list(orig_shape)
+        out_shape[seq_dim] *= sp_world
+        out_shape[-1] = qkv_proj_dim // sp_world
+        qkv_tensor = qkv_tensor.view(out_shape)
+
+    # remove padding
+    if unpadded_dim_size and unpadded_dim_size % sp_world != 0:
+        padding_size = qkv_tensor.size(seq_dim) - unpadded_dim_size
+        qkv_tensor = unpad_tensor(qkv_tensor, seq_dim, padding_size)
+
+    return qkv_tensor
+
+
+class _AlltoAllRegion(torch.autograd.Function):
+    """balance the intermediate tensors in the sequence parallel region"""
+
+    @staticmethod
+    def forward(ctx, group, x, input_splits, output_splits):
+        ctx.group = group
+        ctx.input_splits = input_splits
+        ctx.output_splits = output_splits
+        input_tensor_list = list(x.split(input_splits, dim=0))
+        input_tensor_list = [t.contiguous() for t in input_tensor_list]
+        output_tensor_list = [torch.empty([o, *x.shape[1:]], dtype=x.dtype, device=x.device) for o in output_splits]
+        dist.all_to_all(output_tensor_list, input_tensor_list, group=group)
+        return torch.cat(output_tensor_list, dim=0)
+
+    def backward(ctx, dy):
+        dx_list = [torch.empty([i, *dy.shape[1:]], dtype=dy.dtype, device=dy.device) for i in ctx.input_splits]
+        dy_list = list(dy.split(ctx.output_splits, dim=0))
+        dist.all_to_all(dx_list, dy_list, group=ctx.group)
+        return None, torch.cat(dx_list, dim=0), None, None
+
+
+def all_to_all_images(image_embeds, in_splits, out_splits):
+    if not in_splits:
+        return image_embeds
+    image_embeds = image_embeds[: sum(in_splits)]
+    group = get_ulysses_sequence_parallel_group()
+    return _AlltoAllRegion.apply(group, image_embeds, in_splits, out_splits)
+
+
+class _Roll(torch.autograd.Function):
+    """
+    Distributed implementation of `torch.roll` using batched isend / irecv
+    """
+
+    @staticmethod
+    def _impl(input: torch.Tensor, shifts: int, dims: int, group: dist.ProcessGroup):
+        world_size = dist.get_world_size(group)
+        rank = dist.get_rank(group)
+        dimlen = input.size(dims)
+        assert abs(shifts) <= dimlen
+        if shifts > 0:  # roll afterwards
+            splits = [dimlen - shifts, shifts]
+            body, chunk = torch.split(input, splits, dims)
+            dst = (rank + 1 + world_size) % world_size
+            src = (rank - 1 + world_size) % world_size
+        else:
+            splits = [-shifts, dimlen + shifts]
+            chunk, body = torch.split(input, splits, dims)
+            dst = (rank - 1 + world_size) % world_size
+            src = (rank + 1 + world_size) % world_size
+        chunk = chunk.contiguous()
+        recv_chunk = torch.empty_like(chunk)
+        ops = [
+            dist.P2POp(dist.irecv, recv_chunk, dist.get_global_rank(group, src), group),
+            dist.P2POp(dist.isend, chunk, dist.get_global_rank(group, dst), group),
+        ]
+        works = dist.batch_isend_irecv(ops)
+        for work in works:
+            work.wait()
+        if shifts > 0:
+            output = torch.cat([recv_chunk, body], dims)
+        else:
+            output = torch.cat([body, recv_chunk], dims)
+        return output.contiguous()
+
+    @staticmethod
+    def forward(ctx, input: torch.Tensor, shifts: int, dims: int, group: dist.ProcessGroup):
+        ctx.group = group
+        ctx.shifts = shifts
+        ctx.dims = dims
+        assert isinstance(shifts, int), "shifts must be an integer"
+        assert isinstance(dims, int), "dims must be an integer"
+        if group is None or shifts == 0:
+            return torch.roll(input, shifts, dims)
+        return _Roll._impl(input, shifts, dims, group)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        group = ctx.group
+        shifts = ctx.shifts
+        dims = ctx.dims
+        if group is None or shifts == 0:
+            return torch.roll(grad_output, -shifts, dims), None, None, None
+        return _Roll._impl(grad_output, -shifts, dims, group), None, None, None
+
+
+def roll_with_sequence_parallel(
+    input: torch.Tensor, shifts: int, dims: int, group: dist.ProcessGroup = None
+) -> torch.Tensor:
+    """
+    Roll the tensor within sequence parallel region. This is the
+    distributed implementation version of `torch.roll`
+
+    args:
+        input: input tensor of shape (sliced_tokens, num_head, head_dim)
+        shifts: number of positions to shift
+        dims: dimension to shift
+    returns:
+        rolled_tensor: rolled tensor of shape (sliced_tokens, num_head, head_dim)
+    """
+    group = get_ulysses_sequence_parallel_group() if group is None else group
+
+    return _Roll.apply(input, shifts, dims, group)

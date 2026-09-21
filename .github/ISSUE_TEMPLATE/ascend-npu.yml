@@ -1,0 +1,12 @@
+name: Ascend NPU
+description: Submit a Ascend NPU related issue to help us improve veomni
+title: "[Ascend]: "
+labels: [ "ascend" ]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Add a description
+      placeholder: Type your description here...
+    validations:
+      required: true

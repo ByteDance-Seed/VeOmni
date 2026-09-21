@@ -1,0 +1,30 @@
+# Data manifest for the Qwen3-Omni offline-A/V recipe (audio-enabled video that
+# was offline-decoded into frame bytes + audio bytes ahead of training).
+#
+# Replace the placeholder source path below with your own dataset that follows
+# the shape documented in docs/examples/qwen3_omni_offline_av.md:
+#
+#   {
+#     "videos": [
+#       {
+#         "frames": [png_bytes_0, png_bytes_1, ...],   # List[bytes] — paired frames
+#         "audio":  wav_bytes,                          # bytes or ndarray — paired audio
+#         # optional: "video_fps": 2.0, "audio_fps": 16000
+#       }
+#     ],
+#     "audios": ["<path-or-bytes>"],   # optional, for standalone audio turns
+#     "conversations": [
+#       {"from": "human", "value": "<video>\nWhat happens?"},
+#       {"from": "gpt",   "value": "..."}
+#     ]
+#   }
+#
+# Mix multiple sources by adding more entries to `sources` / `names` and
+# rebalancing `weights`.
+sources:
+- /path/to/your_offline_av_dataset
+names:
+- qwen_omni_offline_av
+schedule:
+- schedule_type: const
+  weights: [1.0]

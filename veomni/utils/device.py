@@ -1,0 +1,247 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Following codes are inspired from https://github.com/volcengine/verl/blob/main/verl/utils/device.py
+
+from typing import Any
+
+import torch
+
+from . import logging
+from .import_utils import is_torch_mlu_available, is_torch_npu_available
+
+
+logger = logging.get_logger(__name__)
+
+
+IS_CUDA_AVAILABLE = torch.cuda.is_available()
+IS_NPU_AVAILABLE = is_torch_npu_available()
+IS_MLU_AVAILABLE = is_torch_mlu_available()
+
+if IS_NPU_AVAILABLE:
+    torch.npu.config.allow_internal_format = False
+
+MOE_TRITON_DEVICE_TYPES = ("cuda", "mlu")
+
+
+def get_device_type() -> str:
+    """Get device type based on current machine, currently only support CPU, CUDA, NPU, MLU."""
+    if IS_CUDA_AVAILABLE:
+        device = "cuda"
+    elif IS_NPU_AVAILABLE:
+        device = "npu"
+    elif IS_MLU_AVAILABLE:
+        device = "mlu"
+    else:
+        device = "cpu"
+
+    return device
+
+
+def get_device_name() -> str:
+    """Get real device name, e.g. A100, H100"""
+    return get_torch_device().get_device_name()
+
+
+def get_torch_device() -> Any:
+    """Get torch attribute based on device type, e.g. torch.cuda or torch.npu"""
+    device_name = get_device_type()
+
+    try:
+        return getattr(torch, device_name)
+    except AttributeError:
+        logger.warning(f"Device namespace '{device_name}' not found in torch, try to load 'torch.cuda'.")
+        return torch.cuda
+
+
+def get_device_id() -> int:
+    """Get current device id based on device type."""
+    return get_torch_device().current_device()
+
+
+def is_moe_kernel_supported(device: torch.device | str) -> bool:
+    """Return True if ``device`` is one of the supported accelerator types (CUDA/MLU)."""
+    device_type = getattr(device, "type", device)
+    return str(device_type) in MOE_TRITON_DEVICE_TYPES
+
+
+def get_dist_comm_backend() -> str:
+    """Return distributed communication backend type based on device type."""
+    if IS_CUDA_AVAILABLE:
+        return "nccl"
+    elif IS_NPU_AVAILABLE:
+        return "hccl"
+    elif IS_MLU_AVAILABLE:
+        return "cncl"
+    else:
+        raise RuntimeError(f"No available distributed communication backend found on device type {get_device_type()}.")
+
+
+def synchronize() -> None:
+    """Execute torch synchronize operation."""
+    get_torch_device().synchronize()
+
+
+def stream_synchronize() -> None:
+    """Execute device stream synchronize operation."""
+    if IS_CUDA_AVAILABLE:
+        torch.cuda.current_stream().synchronize()
+    elif IS_NPU_AVAILABLE:
+        torch.npu.current_stream().synchronize()
+    elif IS_MLU_AVAILABLE:
+        torch.mlu.current_stream().synchronize()
+    else:
+        synchronize()
+
+
+def empty_cache() -> None:
+    """Execute torch empty cache operation."""
+    get_torch_device().empty_cache()
+
+
+def set_device(device: torch.types.Device) -> None:
+    """Execute set device operation."""
+    get_torch_device().set_device(device)
+
+
+def get_device_rng_state() -> Any:
+    """Snapshot the accelerator's default RNG state, or ``None`` if unsupported.
+
+    ``torch.get_rng_state()`` only covers the CPU generator, while diffusion
+    condition models draw noise and timesteps from the device default RNG. A
+    checkpoint that restores only the CPU state therefore resumes a different
+    device random stream than an uninterrupted run.
+
+    The accelerator namespaces differ (``torch.cuda`` / ``torch.npu`` /
+    ``torch.mlu``), and a namespace may not expose the accessor at all, so this
+    returns ``None`` rather than failing the checkpoint.
+    """
+    if get_device_type() == "cpu":
+        return torch.get_rng_state()
+
+    getter = getattr(get_torch_device(), "get_rng_state", None)
+    if getter is None:
+        logger.warning(f"Device RNG state is not available on {get_device_type()}; checkpoint will not restore it.")
+        return None
+    return getter()
+
+
+def set_device_rng_state(state: Any) -> None:
+    """Restore a snapshot produced by :func:`get_device_rng_state`."""
+    if state is None:
+        return
+
+    if get_device_type() == "cpu":
+        torch.set_rng_state(state)
+        return
+
+    setter = getattr(get_torch_device(), "set_rng_state", None)
+    if setter is None:
+        logger.warning(f"Device RNG state cannot be restored on {get_device_type()}; ignoring the snapshot.")
+        return
+    setter(state)
+
+
+def is_nccl_backend(backend: str | None = None) -> bool:
+    """Check if the distributed communication backend is NCCL."""
+    return (backend or get_dist_comm_backend()) == "nccl"
+
+
+def is_hccl_backend() -> bool:
+    """Check if the distributed communication backend is HCCL."""
+    return get_dist_comm_backend() == "hccl"
+
+
+def is_cncl_backend() -> bool:
+    """Check if the distributed communication backend is CNCL."""
+    return get_dist_comm_backend() == "cncl"
+
+
+def get_gpu_compute_capability(device: torch.types.Device | int | None = None) -> int:
+    """Return the compute capability as an integer (e.g. 70, 80, 90), or 0 if no GPU."""
+    if not IS_CUDA_AVAILABLE:
+        return 0
+    major, minor = torch.cuda.get_device_capability(device)
+    return major * 10 + minor
+
+
+def is_sm90_or_above() -> bool:
+    """Check if the current CUDA device has SM90+ capability."""
+    return get_gpu_compute_capability() >= 90
+
+
+def create_stream(device: torch.device | None = None, priority: int = 0) -> Any:
+    """Create a device stream (CUDA/NPU-agnostic)."""
+    device_type = get_device_type()
+    device_api = get_torch_device()
+
+    # ``torch.cpu.Stream`` intentionally has a smaller constructor than the
+    # CUDA/NPU stream implementations.  Passing ``device`` or ``priority``
+    # through unconditionally makes CPU-only unit tests fail before they can
+    # exercise the device-agnostic caller.
+    if device_type == "cpu":
+        return device_api.Stream()
+
+    kwargs = {}
+    if device is not None:
+        kwargs["device"] = device
+    if priority:
+        kwargs["priority"] = priority
+    return device_api.Stream(**kwargs)
+
+
+def create_event(enable_timing: bool = False, blocking: bool = False) -> Any:
+    """Create a device event (CUDA/NPU-agnostic)."""
+    device_api = get_torch_device()
+    if get_device_type() == "cpu":
+        # ``torch.cpu.Event`` is a no-argument synchronization marker.
+        return device_api.Event()
+    return device_api.Event(enable_timing=enable_timing, blocking=blocking)
+
+
+def get_current_stream() -> Any:
+    """Get the current device stream."""
+    return get_torch_device().current_stream()
+
+
+def switch_to_specified_stream(stream: Any) -> Any:
+    """Context manager to switch to a specified device stream."""
+    return get_torch_device().stream(stream)
+
+
+def get_compute_units():
+    """
+    Returns the number of streaming multiprocessors (SMs) or equivalent compute units
+    for the available accelerator. Assigns the value to NUM_SMS.
+    """
+    NUM_SMS = None
+    device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
+
+    # Use match/case for device-specific logic (Python 3.10+)
+    match device_type:
+        case "cuda":
+            device_properties = torch.cuda.get_device_properties(0)
+            NUM_SMS = device_properties.multi_processor_count
+        case "xpu":
+            device_properties = torch.xpu.get_device_properties(0)
+            NUM_SMS = device_properties.max_compute_units
+        case "mlu":
+            device_properties = torch.mlu.get_device_properties(0)
+            NUM_SMS = device_properties.multi_processor_count
+        case _:
+            print("No CUDA, XPU, or MLU device available. Using CPU.")
+            # For CPU, you might want to use the number of CPU cores
+            NUM_SMS = torch.get_num_threads()
+
+    return NUM_SMS

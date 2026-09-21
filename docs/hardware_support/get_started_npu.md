@@ -1,0 +1,125 @@
+# Get Started with Ascend NPU
+
+## Overview
+
+This guide provides comprehensive information for using VeOmni framework with Ascend NPUs. Ascend NPUs are high-performance AI accelerators designed for efficient model training and inference. VeOmni's support for Ascend NPUs enables users to leverage these powerful accelerators for distributed training of multi-modal models.
+
+### What This Guide Covers
+
+- **Supported Hardware**: List of Ascend NPU products compatible with VeOmni
+- **Installation**: Step-by-step instructions for setting up VeOmni on Ascend NPU platforms
+- **Supported Models**: List of multi-modal models that can be trained on Ascend NPUs
+- **Environment Configuration**: Important environment variables and settings for optimal performance
+- **Typical Usage**: Complete example for training a Qwen3-VL 8B model on Ascend NPUs
+- **FAQ**: Common questions and solutions for Ascend NPU usage
+
+## Key Updates
+
+2026/7/14: VeOmni main uses PyTorch and torch_npu 2.10.0.
+
+2026/5/11: VeOmni provides images based on Ascend CANN 9.0.0.
+
+2025/12/23: VeOmni supports training on Ascend NPU.
+
+## Supported Hardware
+
+Product Hardware Support List
+
+|Product| Supported |
+|--|:---------:|
+|<term>Ascend 950 Series Products</term>|     ✅     |
+|<term>Atlas A3 Training Series Products</term>|     ✅     |
+|<term>Atlas A2 Training Series Products</term>|     ✅     |
+
+- For the operating systems supported by each hardware product in bare-metal deployment scenarios, please refer to the Compatibility Query Assistant(https://www.hiascend.com/hardware/compatibility).
+- For the operating systems supported by each hardware product in virtual machine and container deployment scenarios, please refer to the "Operating System Compatibility Description"(https://www.hiascend.com/document/detail/zh/canncommercial/900/softwareinst/instg/instg_0101.html?OS=openEuler&InstallType=netyum) chapter of the CANN Software Installation Guide(Commercial Edition) or the "Operating System Compatibility Description"(https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0101.html?OS=openEuler&InstallType=netyum) chapter (Community Edition).
+
+## Installation
+
+VeOmni supports two installation methods for Ascend NPUs: `uv` (recommended for faster installation) and `pip`.
+
+### Installation Options
+
+- **x86 Architecture**: Supports both `uv` and `pip` installation methods
+- **ARM Architecture**: Supports both `uv` and `pip` through the `npu_aarch64` extra
+
+### Detailed Installation Guide
+
+Please refer to the specific installation guides based on your architecture:
+
+- [Installation with Ascend NPU (x86)](../get_started/installation/install_ascend_x86.md)
+- [Installation with Ascend NPU (ARM)](../get_started/installation/install_ascend_arm.md)
+
+### Docker Support
+
+VeOmni also provides Docker support for Ascend NPUs. For detailed instructions on building and using Ascend Docker images, please refer to:
+
+- [Ascend A3 Docker Image Build and Usage Guide](./AscendDockerUsage/build_a3_docker.md)
+- [Ascend A2 Docker Image Build and Usage Guide](./AscendDockerUsage/build_a2_docker.md)
+
+## Version Compatibility
+
+The following table shows the supported software versions for VeOmni when running on Ascend NPUs:
+
+| VeOmni Version | PyTorch | torch_npu | CANN Version | Python Version |
+|----------------|-------- | -----------|--------------|----------------|
+| 0.1.0 | 2.7.1                | 2.7.1             | 8.3rc2/9.0.0      | 3.11           |
+| main  | 2.10.0 | 2.10.0 | 9.0.0 (CI) | 3.11/3.12 |
+
+Repository Docker definitions also cover CANN 8.3.RC2. Treat the PyTorch,
+torch_npu, CANN, and `triton-ascend` versions as one compatibility set and
+validate non-CI combinations on the target hardware.
+
+## Supported Models
+
+VeOmni supports a wide range of models on Ascend NPUs, including large language models, multimodal models, and diffusion models. Below is a comprehensive list of supported models with their features:
+
+| Model | Model Size | Support | FSDP2 | EP | SP | Note |
+|---|---|---|---|---|---|---|
+| [Qwen3](../examples/qwen3.md) | 8B | ✅ | ✅ | | ✅ | |
+| | 30B | ✅ | ✅ | ✅ | ✅ | |
+| [Qwen3.5](../examples/qwen3_5.md) | 9B | ✅ | ✅ | | ✅ | Requires explicit GatedDeltaNet NPU kernels; generic NPU E2E coverage pending |
+| | 35B-A3B | ✅ | ✅ | ✅ | ✅ | Requires explicit GatedDeltaNet NPU kernels; generic NPU E2E coverage pending |
+| [Qwen3-VL](../examples/qwen3_vl.md) | 8B | ✅ | ✅ | | ✅ | |
+| | 30B | ✅ | ✅ | ✅ | ✅ | |
+| [Wan2.1](../examples/wan2.1.md) | 1.3B | ✅ | ✅ | | ✅ | Prototype |
+| [Qwen3-Omni](../examples/qwen3_omni_moe.md) | 30B | ✅ | ✅ | | ✅ | Prototype |
+
+**Legend:**
+- **FSDP2**: PyTorch composable Fully Sharded Data Parallel, the only FSDP backend supported by VeOmni
+- **EP**: Expert Parallel - for MoE models
+- **SP**: Sequence Parallel - enables longer sequence training
+
+For detailed configuration files and training examples, please refer to the [configs](https://github.com/ByteDance-Seed/VeOmni/tree/main/configs) directory in the repository.
+
+For information about optimizing environment variables for Ascend NPUs, please refer to our dedicated documentation:
+
+[Ascend Environment Variables Configuration Guide](npu_variables.md)
+
+## Typical Usage
+
+For a complete step-by-step guide on training the Qwen3-VL 8B model on Ascend NPUs, including dataset preparation, model configuration, training, and checkpoint management, please refer to our dedicated documentation:
+
+[Typical Usage: Qwen3-VL 8B Training on Ascend NPU](typical_usage.md)
+
+## Common Precision Issues and Solutions
+
+For detailed guidance on how to identify and resolve precision issues on Ascend NPUs, including version compatibility checks, debugging tools, and common issue patterns, please refer to our dedicated documentation:
+
+[Precision Analysis and Troubleshooting Guide](precision_analysis.md)
+
+## Ascend Profiling Collection and Analysis
+
+For detailed guidance on how to collect and analyze profiling data on Ascend NPUs, including configuration settings, key metrics, and performance optimization strategies, please refer to our dedicated documentation:
+
+[Profiling Collection, Analysis and Optimization Guide](profiling_analysis.md)
+
+## FAQ
+
+For answers to frequently asked questions about using VeOmni with Ascend NPUs, including memory management, multi-node training configuration, operator selection, and more, please refer to our dedicated FAQ document:
+
+[FAQ: Common Issues and Solutions for Ascend NPU](FAQ.md)
+
+## Declarations
+
+The Ascend support code, Dockerfile and image provided in the documentation are for reference only. If you intend to use them in a production environment, please contact the official channels. Thank you.

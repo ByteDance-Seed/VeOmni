@@ -1,0 +1,391 @@
+"""Shared training utilities for distributed and e2e tests.
+
+Provides helpers for building torchrun commands, materializing model weights,
+running training configurations, and comparing results.
+"""
+
+import gc
+import json
+import os
+import subprocess
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+from veomni.arguments.arguments_types import OpsImplementationConfig
+from veomni.utils.device import get_device_type
+
+from .launch_utils import find_free_port
+
+
+# NPU ops_implementation overrides per model. The public
+# ``OpsImplementationConfig`` defaults are GPU-optimal (Liger / Triton) and
+# raise on NPU at config validation time, so every NPU test must override
+# every per-op field. ``_NPU_OPS_DEFAULTS`` is the baseline; entries in
+# ``_NPU_PER_MODEL_OVERRIDES`` (DeepSeek-V3/V4, Qwen-VL family) pin
+# specific fields to ``eager`` where the model has no NPU kernel.
+_NPU_OPS_DEFAULTS: Dict[str, str] = {
+    "attn_implementation": "flash_attention_2",
+    "moe_implementation": "fused_npu",
+    "cross_entropy_loss_implementation": "chunk_loss",
+    "rms_norm_implementation": "npu",
+    "rotary_pos_emb_implementation": "npu",
+    "swiglu_mlp_implementation": "eager",  # no NPU backend
+    # NPU ships ``triton-ascend`` (not mainline ``triton``); the validator
+    # gates ``triton`` on ``is_package_available("triton")`` so the fused
+    # load-balancing-loss kernel would raise on the NPU runner. Pin to eager.
+    "load_balancing_loss_implementation": "eager",
+}
+
+_NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
+    "deepseek_v3": {
+        # batch-invariant RMSNorm + deterministic RoPE are GPU-only Triton
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
+    "deepseek_v4": {
+        # DeepSeek-V4 attention, RMSNorm, and partial RoPE remain eager-only on NPU.
+        # The generic NPU rotary backend is incompatible with V4's partial layout.
+        # Routed experts keep fused_npu; its clamp-aware activation uses Ascend
+        # Triton when available and preserves the eager training fallback otherwise.
+        "attn_implementation": "eager",
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
+    # Multimodal RoPE has no NPU backend in the Qwen-VL family.
+    "qwen2vl": {"rotary_pos_emb_implementation": "eager"},
+    "qwen25vl": {"rotary_pos_emb_implementation": "eager"},
+    # qwen2 / qwen3_moe / llama3.1 / qwen2_5_omni patchgen-generated modeling
+    # declares OpSlots for rotary_pos_emb and rms_norm but KERNEL_REGISTRY
+    # has no ``npu`` KernelSpec for either — only ``liger_kernel`` (GPU). Pin
+    # both to eager until NPU KernelSpecs are registered.
+    "qwen2": {
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
+    "qwen3_moe": {
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
+    "llama3.1": {
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
+    # qwen2_5_omni inherits the same KERNEL_REGISTRY gap; mm RoPE has no
+    # NPU backend either, so pinning both keeps the thinker text path on
+    # eager kernels on NPU.
+    "qwen2_5_omni": {
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
+}
+
+# GPU per-model overrides for models whose patched ops disable a default
+# backend. Wan uses FA2 in real DiT configs, while RoPE stays eager because
+# its ``rope_apply(x, **kwargs)`` signature is incompatible with the
+# registry-default Liger RoPE.
+_GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
+    "wan_t2v": {
+        "attn_implementation": "flash_attention_2",
+        "rotary_pos_emb_implementation": "eager",
+    },
+    # Qwen-Image runs its dual-stream joint attention through diffusers' own
+    # attention dispatch (Ulysses SP is handled by QwenImageSPAttnProcessor, not
+    # the VeOmni FA2 op), so keep the VeOmni attn/rope ops on eager.
+    "qwen_image": {"attn_implementation": "eager", "rotary_pos_emb_implementation": "eager"},
+    # qwen3_5 / qwen3_5_moe peak GPU memory on the toy config is dominated
+    # by the fused Liger cross-entropy kernel materializing the full
+    # ``[B, S, V]`` logits buffer. Use ``chunk_loss`` instead: it
+    # processes the vocab in chunks so peak allocation stays well below
+    # the ~5 GiB Liger asks for, which lets these tests survive shared
+    # L20 runners where another job is still holding part of the card.
+    "qwen3_5": {"cross_entropy_loss_implementation": "chunk_loss"},
+    "qwen3_5_moe": {"cross_entropy_loss_implementation": "chunk_loss"},
+    # GPT-OSS intentionally does not register a Triton MoE backend because its
+    # native interleaved gate/up training layout needs either eager reference
+    # math or the dedicated SM90-only Quack path. Keep the shared helper on the
+    # portable eager baseline; capability-gated tests append FA4/Quack flags.
+    "gpt_oss": {
+        "attn_implementation": "eager",
+        "moe_implementation": "eager",
+        "cross_entropy_loss_implementation": "eager",
+        "load_balancing_loss_implementation": "eager",
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
+    # DeepSeek-V4 attention is eager-only. RoPE matches the shipped
+    # configs/text/deepseek_v4.yaml so the fused partial-interleaved Triton
+    # kernel is exercised under FSDP2, Ulysses SP and the TileLang paths rather
+    # than only by the standalone kernel tests. MoE uses the GPU-default
+    # fused_triton backend, while weighted/unweighted RMSNorm and the
+    # shared-expert MLP use their default Liger OpSlots.
+    "deepseek_v4": {
+        "attn_implementation": "eager",
+        "moe_implementation": "fused_triton",
+        "rotary_pos_emb_implementation": "triton",
+    },
+}
+
+
+def _npu_overrides(model_name: Optional[str]) -> Dict[str, str]:
+    merged = dict(_NPU_OPS_DEFAULTS)
+    if model_name is not None:
+        merged.update(_NPU_PER_MODEL_OVERRIDES.get(model_name, {}))
+    return merged
+
+
+def resolve_ops_overrides(model_name: Optional[str]) -> List[str]:
+    """Return ``--model.ops_implementation.X=Y`` flags for the active hardware.
+
+    On GPU returns per-model overrides for models whose patched ops disable a
+    default backend (for example Wan's RoPE and DeepSeek-V4's eager-only
+    attention); empty otherwise — dataclass defaults are GPU-optimal. On NPU
+    returns the NPU-supported backend per op, with per-model eager fallbacks for
+    ops without an NPU kernel for that model.
+    """
+    if get_device_type() != "npu":
+        overrides = _GPU_PER_MODEL_OVERRIDES.get(model_name, {}) if model_name else {}
+        return [f"--model.ops_implementation.{k}={v}" for k, v in overrides.items()]
+    return [f"--model.ops_implementation.{k}={v}" for k, v in _npu_overrides(model_name).items()]
+
+
+def make_eager_ops_config(**overrides) -> OpsImplementationConfig:
+    """Hardware-agnostic ``OpsImplementationConfig`` with every field = ``"eager"``.
+
+    For tests / inference scripts that don't need fused kernels and shouldn't
+    depend on liger / triton or the active accelerator. ``**overrides`` flips
+    specific fields (e.g. ``make_eager_ops_config(attn_implementation="flash_attention_2")``)
+    without enumerating the rest.
+    """
+    return OpsImplementationConfig(
+        attn_implementation=overrides.pop("attn_implementation", "eager"),
+        moe_implementation=overrides.pop("moe_implementation", "eager"),
+        cross_entropy_loss_implementation=overrides.pop("cross_entropy_loss_implementation", "eager"),
+        rms_norm_implementation=overrides.pop("rms_norm_implementation", "eager"),
+        swiglu_mlp_implementation=overrides.pop("swiglu_mlp_implementation", "eager"),
+        rotary_pos_emb_implementation=overrides.pop("rotary_pos_emb_implementation", "eager"),
+        load_balancing_loss_implementation=overrides.pop("load_balancing_loss_implementation", "eager"),
+        rms_norm_gated_implementation=overrides.pop("rms_norm_gated_implementation", "eager"),
+        causal_conv1d_implementation=overrides.pop("causal_conv1d_implementation", "eager"),
+        chunk_gated_delta_rule_implementation=overrides.pop("chunk_gated_delta_rule_implementation", "eager"),
+        **overrides,
+    )
+
+
+def make_npu_ops_config(model_name: Optional[str] = None, **overrides) -> OpsImplementationConfig:
+    """NPU-recommended ``OpsImplementationConfig`` for tests running on Ascend.
+
+    Encodes the per-op NPU backend table (``_NPU_OPS_DEFAULTS``) plus per-model
+    eager fallbacks for ops without an NPU kernel (DeepSeek-V3, Qwen-VL family).
+    ``**overrides`` flips specific fields after the recommended values are
+    applied.
+    """
+    merged = _npu_overrides(model_name)
+    merged.update(overrides)
+    # Qwen3.5 GatedDeltaNet ops have no NPU kernel today — pin to eager so the
+    # config validates at parse time.
+    merged.setdefault("rms_norm_gated_implementation", "eager")
+    merged.setdefault("causal_conv1d_implementation", "eager")
+    merged.setdefault("chunk_gated_delta_rule_implementation", "eager")
+    return OpsImplementationConfig(**merged)
+
+
+def unbuilt_runtime(args, *, cls=None, name: str = "base", train=None):
+    """A runtime holding only its config, for tests about seams rather than models.
+
+    Constructing one normally builds the model it wraps — the whole point of the
+    class — so a test that wants to inspect a config seam, or to drop a fake
+    module in by hand, has to bypass the constructor. ``args`` is this model's
+    own arguments, exactly as the constructor takes them; ``train`` is required
+    of a real runtime but optional here, since a seam that reads no job-wide
+    setting has no use for it.
+    """
+    from veomni.models.model_runtime import VeOmniModelRuntime
+
+    cls = cls or VeOmniModelRuntime
+    runtime = cls.__new__(cls)
+    runtime.args = args
+    runtime.model_name = name
+    runtime.train_args = train
+    runtime.model_assets = []
+    return runtime
+
+
+def release_device_memory():
+    """Synchronize GPU, run garbage collection, and empty CUDA cache."""
+    from veomni.utils.device import empty_cache, synchronize
+
+    synchronize()
+    gc.collect()
+    empty_cache()
+
+
+@dataclass(frozen=True)
+class ParallelConfig:
+    """Describes a parallelism configuration for distributed tests."""
+
+    sp_size: int = 1
+    ep_size: int = 1
+    fsdp_mode: str = "fsdp2"
+
+    @property
+    def world_size(self) -> int:
+        return max(self.sp_size, self.ep_size) * 2
+
+    def __str__(self) -> str:
+        return f"fsdp_{self.fsdp_mode}_sp{self.sp_size}_ep{self.ep_size}"
+
+
+def build_torchrun_cmd(
+    script: str,
+    config_path: str,
+    model_path: str,
+    train_path: str,
+    output_dir: str,
+    parallel_config: Optional[ParallelConfig] = None,
+    extra_args: Optional[List[str]] = None,
+    nproc: Optional[int] = None,
+    init_device: str = "meta",
+    model_name: Optional[str] = None,
+) -> List[str]:
+    """Build a torchrun command for distributed test execution.
+
+    Args:
+        parallel_config: Parallelism configuration. When None, no parallel
+            args (fsdp_mode, ulysses_size, ep_size) are passed -- suitable
+            for plain single-GPU training.
+        init_device: Device for model initialization. Use "meta" for FSDP
+            (multi-GPU), device type for single-GPU (no FSDP wrapping).
+        model_name: Short model identifier (e.g. ``"qwen3_moe"``,
+            ``"deepseek_v3"``). Forwarded to ``resolve_ops_overrides`` so
+            NPU runs pick the right per-model eager fallbacks. ``None`` is
+            fine for tests not tied to a specific model.
+    """
+    port = find_free_port()
+    if nproc is not None:
+        n = nproc
+    elif parallel_config is not None:
+        n = parallel_config.world_size
+    else:
+        n = 1
+
+    cmd = [
+        "torchrun",
+        "--nnodes=1",
+        f"--nproc_per_node={n}",
+        f"--master_port={port}",
+        script,
+        f"--model.config_path={config_path}",
+        f"--data.train_path={train_path}",
+        "--data.dyn_bsz_buffer_size=1",
+        # Keep micro_batch=1 (already minimum) and global=8 so the
+        # grad-accum cycles per step stay small. The qwen3_5 toy with
+        # its full 248K vocab embedding fragments the PyTorch allocator
+        # quickly; fewer fw+bw passes per step ⇒ less cache thrash and
+        # less GPU memory required on the L20 (44 GiB) runners.
+        "--train.global_batch_size=8",
+        "--train.micro_batch_size=1",
+        f"--model.accelerator.init_device={init_device}",
+        "--train.bsz_warmup_ratio=0",
+        "--train.num_train_epochs=1",
+        "--train.checkpoint.save_epochs=0",
+        "--train.checkpoint.save_steps=0",
+        "--train.checkpoint.save_hf_weights=False",
+        "--train.enable_full_determinism=True",
+        "--train.enable_batch_invariant_mode=True",
+        "--train.max_steps=2",
+        f"--train.checkpoint.output_dir={output_dir}",
+        f"--model.model_path={model_path}",
+        *resolve_ops_overrides(model_name),
+    ]
+
+    if parallel_config is not None:
+        cmd.extend(
+            [
+                f"--model.accelerator.fsdp_config.fsdp_mode={parallel_config.fsdp_mode}",
+                f"--model.accelerator.ulysses_size={parallel_config.sp_size}",
+                f"--model.accelerator.ep_size={parallel_config.ep_size}",
+            ]
+        )
+
+    if extra_args:
+        cmd.extend(extra_args)
+
+    return cmd
+
+
+# ---------------------------------------------------------------------------
+# Training helpers
+# ---------------------------------------------------------------------------
+
+
+def materialize_weights(config_path: str, output_path: str, save_original_format: bool = True) -> None:
+    """Build a model from toy config and save random weights to disk.
+
+    This avoids downloading real model weights for CI tests.
+    """
+    from veomni.models.auto import build_foundation_model
+    from veomni.utils.device import empty_cache, get_device_type
+
+    model = build_foundation_model(
+        config_path=config_path,
+        weights_path=None,
+        torch_dtype="float32",
+        init_device=get_device_type(),
+        ops_implementation=make_eager_ops_config(),
+    )
+    model.save_pretrained(output_path, save_original_format=save_original_format)
+    # The fp32 model can pin tens of GiB on the device (e.g. qwen3_5's full
+    # 248K-vocab embedding alone ≈ 4 GiB at fp32; the full model on L20 hits
+    # ~28 GiB). Subsequent torchrun children loading at bf16 then OOM the card
+    # because the pytest parent's CUDA context still holds the fp32 weights.
+    del model
+    gc.collect()
+    empty_cache()
+
+
+def run_training_config(
+    script: str,
+    config_path: str,
+    model_path: str,
+    train_path: str,
+    output_dir: str,
+    task_name: str,
+    parallel_config: Optional[ParallelConfig] = None,
+    nproc: Optional[int] = None,
+    extra_args: Optional[List[str]] = None,
+    init_device: str = "meta",
+    model_name: Optional[str] = None,
+) -> Dict:
+    """Run a single training configuration and return metrics from log.
+
+    Args:
+        model_name: Short model identifier (forwarded to ``build_torchrun_cmd``
+            for NPU-aware ops_implementation overrides).
+
+    Returns:
+        Dict of {metric_name: list_of_values} loaded from the JSON log.
+    """
+    run_output_dir = os.path.join(output_dir, task_name)
+    cmd = build_torchrun_cmd(
+        script=script,
+        config_path=config_path,
+        model_path=model_path,
+        train_path=train_path,
+        output_dir=run_output_dir,
+        parallel_config=parallel_config,
+        nproc=nproc,
+        extra_args=extra_args,
+        init_device=init_device,
+        model_name=model_name,
+    )
+
+    print(f"\n{'=' * 60}")
+    print(f"Running: {task_name}")
+    print(f"Config: {parallel_config}")
+    print(f"{'=' * 60}")
+
+    subprocess.run(cmd, check=True)
+
+    log_path = os.path.join(run_output_dir, "log_dict.json")
+    with open(log_path) as f:
+        return json.load(f)

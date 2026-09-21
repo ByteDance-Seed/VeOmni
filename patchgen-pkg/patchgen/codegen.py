@@ -1,0 +1,1256 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+AST-based Code Generator for Modeling Patches.
+
+This module provides the core code generation functionality that:
+1. Loads the source HuggingFace modeling code via inspect
+2. Parses it into an AST
+3. Applies patches (class replacements, method overrides, function replacements)
+4. Generates a self-contained output file with clear comments
+
+The generated file will:
+- Be fully self-contained (no hidden monkey patches)
+- Have clear comments showing what was patched and why
+- Maintain the original code structure where not patched
+"""
+
+import ast
+import importlib
+import importlib.util
+import inspect
+import re
+import sys
+import textwrap
+import types
+from pathlib import Path
+from typing import Any, Optional
+
+from .patch_spec import Patch, PatchConfig
+
+
+class CodegenError(Exception):
+    """Exception raised during code generation."""
+
+    pass
+
+
+def _find_module_file(module_name: str) -> Optional[Path]:
+    """Walk ``sys.path`` (and CWD) to locate ``module_name`` as a ``.py`` file.
+
+    Returns the first matching path or ``None`` when nothing is found. We do
+    not import the module — important for drift checking from CI lint envs
+    where the upstream HF modeling file would otherwise pull in ``torch`` /
+    GPU kernels just to read its source.
+    """
+    parts = module_name.split(".")
+    rel = Path(*parts).with_suffix(".py")
+    candidates = [Path(root) / rel for root in sys.path if root]
+    candidates.append(Path.cwd() / rel)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def get_module_source(module_name: str) -> str:
+    """
+    Get the full source code of a module.
+
+    Args:
+        module_name: Fully qualified module name (e.g., "transformers.models.qwen3.modeling_qwen3")
+
+    Returns:
+        The source code as a string.
+
+    Raises:
+        CodegenError: If the source cannot be obtained.
+
+    Resolution order:
+        1. File-walk ``sys.path`` (and CWD) for ``module_name``'s ``.py`` file
+           and read it directly — does NOT import the module. This lets drift
+           checks run in lightweight envs that don't have the module's runtime
+           dependencies (torch, transformers) installed.
+        2. Fall back to ``importlib.import_module`` + ``inspect.getsource`` for
+           namespace packages, ``.pyc``-only installs, or anything else that
+           the file walk cannot resolve.
+    """
+    file_path = _find_module_file(module_name)
+    if file_path is not None:
+        try:
+            return file_path.read_text(encoding="utf-8")
+        except OSError as e:
+            raise CodegenError(f"Cannot read source for '{module_name}' at {file_path}: {e}") from e
+
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as e:
+        raise CodegenError(f"Cannot import module '{module_name}': {e}") from e
+
+    try:
+        source = inspect.getsource(module)
+    except (OSError, TypeError) as e:
+        raise CodegenError(f"Cannot get source for module '{module_name}': {e}") from e
+
+    return source
+
+
+def load_patch_config_module(module_name: str, search_roots: Optional[list[Path]] = None) -> types.ModuleType:
+    """Load a patch-config module via ``spec_from_file_location`` when possible.
+
+    The benefit kicks in when the patch config is **self-contained** —
+    i.e. its body only imports from ``patchgen`` and third-party
+    libraries, with no imports from its own package or siblings. In that
+    case the loader skips executing the config's package ``__init__.py``
+    (which a downstream project might use to register custom HF models,
+    pull in custom CUDA kernels, etc.).
+
+    Configs that **do** import siblings under the same package re-trigger
+    that package's ``__init__.py``. This is unavoidable: Python's import
+    machinery always materializes parent packages when resolving any
+    sub-package name, whether the import is relative
+    (``from .sibling import ...``) or fully qualified
+    (``from <pkg>.sibling import ...``). Once a parent is cached in
+    ``sys.modules`` (e.g. an earlier config under the same parent was
+    already loaded), subsequent loads no-op the parent.
+
+    The "skip parent ``__init__``" benefit is scoped to the patch
+    config's own package — importing ``patchgen`` itself only loads
+    stdlib + this package's own modules and has no side effects on the
+    consuming project's runtime.
+
+    Resolution order:
+      1. If ``module_name`` maps to a file on disk under ``search_roots`` /
+         ``sys.path`` / CWD, load it via ``importlib.util.spec_from_file_location``.
+      2. Otherwise fall back to ordinary ``importlib.import_module``.
+
+    Contract: every call re-executes the file and overwrites
+    ``sys.modules[module_name]``. Callers must not cache class objects
+    returned from one call and reuse them after a subsequent call for the
+    same name — the cached classes belong to a stale module instance.
+    """
+    parts = module_name.split(".")
+    rel = Path(*parts).with_suffix(".py")
+    candidates: list[Path] = []
+    if search_roots:
+        candidates.extend(root / rel for root in search_roots)
+    candidates.extend(Path(p) / rel for p in sys.path if p)
+    candidates.append(Path.cwd() / rel)
+
+    file_path = next((p for p in candidates if p.is_file()), None)
+    if file_path is None:
+        return importlib.import_module(module_name)
+
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    if spec is None or spec.loader is None:
+        return importlib.import_module(module_name)
+
+    mod = importlib.util.module_from_spec(spec)
+    # Register in sys.modules BEFORE exec so:
+    #   1. inspect.getsource(cls) on classes defined inside ``mod`` succeeds
+    #      — inspect resolves source via ``sys.modules[cls.__module__].__file__``,
+    #      so an unregistered leaf breaks ``@config.replace_class`` codegen.
+    #   2. classes inside ``mod`` that reference each other via dotted name
+    #      can resolve those references during decoration.
+    # Skipping parent ``__init__.py`` execution (the whole point of this
+    # loader) still works: Python does not lazily import parents when the
+    # leaf is already registered.
+    # Stash the previous entry (if any) so we restore it on exec failure
+    # instead of leaking a missing key — otherwise a partially-loaded
+    # second call would wipe out the previous successful load.
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        if previous is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
+        raise
+    return mod
+
+
+def _unwrap_to_inspectable(obj: Any) -> Any:
+    """Follow ``__wrapped__`` links so ``inspect`` can find source.
+
+    Decorators like ``functools.lru_cache`` return wrapper objects that
+    ``inspect.getsourcelines`` cannot resolve. The original function is
+    reachable via ``__wrapped__`` (set by ``functools.wraps``).
+    """
+    while hasattr(obj, "__wrapped__"):
+        obj = obj.__wrapped__
+    return obj
+
+
+def get_object_source(obj: Any) -> str:
+    """Get the source code of a class or function, preserving comments."""
+    try:
+        return inspect.getsource(_unwrap_to_inspectable(obj))
+    except (OSError, TypeError):
+        return ""
+
+
+def get_object_source_with_leading_comments(obj: Any) -> str:
+    """Get object source including contiguous leading ``#`` comment lines.
+
+    ``inspect.getsource`` starts at the first decorator and drops any comment
+    block sitting directly above it. Patch config files use those blocks to
+    document *why* a patch exists (e.g. the numbered ``Patch.N`` headers), so
+    we rewind through preceding comment/blank lines and prepend them.
+    """
+    obj = _unwrap_to_inspectable(obj)
+    try:
+        src_lines, start_lineno = inspect.getsourcelines(obj)
+        source_file = inspect.getsourcefile(obj)
+    except (OSError, TypeError):
+        return ""
+
+    if not source_file:
+        return "".join(src_lines)
+
+    try:
+        with open(source_file, encoding="utf-8") as f:
+            all_lines = f.readlines()
+    except OSError:
+        return "".join(src_lines)
+
+    # start_lineno is 1-indexed; walk backwards collecting contiguous
+    # comment and blank lines (stop at any code line).
+    idx = start_lineno - 1
+    actual_start = idx
+    while actual_start > 0:
+        raw = all_lines[actual_start - 1].rstrip("\n")
+        stripped = raw.strip()
+        if stripped == "":
+            actual_start -= 1
+            continue
+        # Only absorb comments that sit at column 0 — otherwise we'd cross
+        # into the previous function's indented trailing comments.
+        if raw.startswith("#"):
+            actual_start -= 1
+            continue
+        break
+
+    leading = all_lines[actual_start:idx]
+    # Trim pure-blank lines on both sides so the comment hugs the
+    # definition — otherwise blanks between the comment and the
+    # decorator/def survive into the generated file and bloat the diff.
+    while leading and leading[0].strip() == "":
+        leading.pop(0)
+    while leading and leading[-1].strip() == "":
+        leading.pop()
+
+    return "".join(leading) + "".join(src_lines)
+
+
+def extract_source_segment(source_lines: list[str], start_line: int, end_line: int) -> str:
+    """
+    Extract a segment of source code from source lines, preserving comments and blank lines.
+
+    Also includes any leading comments and decorators that precede the definition.
+    Line numbers are 1-indexed (as in AST).
+    """
+    # Look backwards for leading comments and blank lines
+    actual_start = start_line - 1  # Convert to 0-indexed
+
+    # Include leading comments/decorators (lines starting with # or @)
+    while actual_start > 0:
+        prev_line = source_lines[actual_start - 1].strip()
+        if prev_line.startswith("#") or prev_line.startswith("@") or prev_line == "":
+            actual_start -= 1
+        else:
+            break
+
+    # Extract the segment
+    segment = source_lines[actual_start:end_line]
+    return "\n".join(segment)
+
+
+def get_node_end_line(node: ast.AST, source_lines: list[str]) -> int:
+    """
+    Get the end line of an AST node.
+
+    For nodes with end_lineno, use that. Otherwise, estimate by finding
+    the next definition or end of file.
+    """
+    if hasattr(node, "end_lineno") and node.end_lineno is not None:
+        return node.end_lineno
+
+    # Fallback: use unparse to count lines (less accurate but works)
+    try:
+        unparsed = ast.unparse(node)
+        return node.lineno + unparsed.count("\n")
+    except Exception:
+        return node.lineno + 10  # Rough estimate
+
+
+def get_node_start_line(node: ast.AST) -> int:
+    """
+    Get the start line of an AST node, including decorators when present.
+
+    For decorated classes/functions this returns the first decorator line.
+    """
+    if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.decorator_list:
+        decorator_lines = [decorator.lineno for decorator in node.decorator_list if hasattr(decorator, "lineno")]
+        if decorator_lines:
+            return min(decorator_lines)
+    return node.lineno
+
+
+class ImportCollector(ast.NodeVisitor):
+    """
+    Collects all import statements from an AST.
+    """
+
+    def __init__(self):
+        self.imports: list[ast.stmt] = []
+        self.import_names: set[str] = set()
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self.imports.append(node)
+        for alias in node.names:
+            name = alias.asname if alias.asname else alias.name
+            self.import_names.add(name)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self.imports.append(node)
+        for alias in node.names:
+            name = alias.asname if alias.asname else alias.name
+            self.import_names.add(name)
+
+
+class ClassAndFunctionCollector(ast.NodeVisitor):
+    """
+    Collects all class and function definitions from an AST.
+    """
+
+    def __init__(self):
+        self.classes: dict[str, ast.ClassDef] = {}
+        self.functions: dict[str, ast.FunctionDef] = {}
+        self.other_statements: list[ast.stmt] = []
+        self._in_class = False
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.classes[node.name] = node
+        # Don't recurse into class body for top-level collection
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        if not self._in_class:
+            self.functions[node.name] = node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        if not self._in_class:
+            self.functions[node.name] = node
+
+
+class MethodReplacer(ast.NodeTransformer):
+    """
+    AST transformer that replaces specific methods within a class.
+    """
+
+    def __init__(self, method_name: str, new_method_ast: ast.FunctionDef, comment: str = ""):
+        self.method_name = method_name
+        self.new_method_ast = new_method_ast
+        self.comment = comment
+        self.replaced = False
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        if node.name == self.method_name:
+            self.replaced = True
+            # Preserve the original method name
+            self.new_method_ast.name = self.method_name
+            # Add docstring comment about the patch
+            if self.comment:
+                # Check if there's already a docstring
+                if (
+                    self.new_method_ast.body
+                    and isinstance(self.new_method_ast.body[0], ast.Expr)
+                    and isinstance(self.new_method_ast.body[0].value, ast.Constant)
+                ):
+                    # Prepend patch info to existing docstring
+                    existing = self.new_method_ast.body[0].value.value
+                    self.new_method_ast.body[0].value.value = f"[PATCHED] {self.comment}\n\n{existing}"
+            return self.new_method_ast
+        return node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AsyncFunctionDef:
+        if node.name == self.method_name:
+            self.replaced = True
+            self.new_method_ast.name = self.method_name
+            return self.new_method_ast
+        return node
+
+
+def parse_source_to_ast(source: str) -> ast.Module:
+    """Parse Python source code to AST."""
+    try:
+        return ast.parse(source)
+    except SyntaxError as e:
+        raise CodegenError(f"Syntax error in source code: {e}") from e
+
+
+def ast_to_source(node: ast.AST) -> str:
+    """Convert AST node back to source code."""
+    return ast.unparse(node)
+
+
+def get_class_method_ast(class_node: ast.ClassDef, method_name: str) -> Optional[ast.FunctionDef]:
+    """Get the AST node for a specific method in a class."""
+    for item in class_node.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == method_name:
+            return item
+    return None
+
+
+def _is_empty_class_body_node(node: ast.AST) -> bool:
+    """Whether ``node`` is the lone body member of an "empty" class definition.
+
+    Recognizes both ``class Foo: pass`` and the v5-style inline ``class Foo(...): ...``
+    (where the body is a single ``Expr(Constant(Ellipsis))``). Method-injection paths
+    treat both the same: replace the empty body with the patched method instead of
+    appending after it (which would produce ``class Foo: ...    def bar(...):`` — a
+    syntax error).
+    """
+    if isinstance(node, ast.Pass):
+        return True
+    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and node.value.value is Ellipsis:
+        return True
+    return False
+
+
+def create_comment_node(comment: str) -> ast.Expr:
+    """Create an AST node representing a comment (as a string expression)."""
+    return ast.Expr(value=ast.Constant(value=f"# {comment}"))
+
+
+def strip_patch_decorators(source: str) -> str:
+    """Remove patch decorator lines from replacement source code.
+
+    Handles multi-line decorators such as::
+
+        @config.replace_class(
+            "Qwen3MoeExperts",
+            description="...",
+        )
+
+    by tracking parenthesis depth until the decorator is fully closed.
+    """
+    _PATCH_DECORATOR_RE = re.compile(
+        r"@(?:config\.)?(?:replace_class|replace_function|override_method|modify_init|add_helper|add_helper_after)\b"
+    )
+    source_lines = source.splitlines()
+    filtered_lines: list[str] = []
+    in_patch_decorator = False
+    paren_depth = 0
+    for line in source_lines:
+        stripped = line.strip()
+        if not in_patch_decorator and _PATCH_DECORATOR_RE.match(stripped):
+            in_patch_decorator = True
+            paren_depth = stripped.count("(") - stripped.count(")")
+            if paren_depth <= 0:
+                in_patch_decorator = False
+            continue
+        if in_patch_decorator:
+            paren_depth += stripped.count("(") - stripped.count(")")
+            if paren_depth <= 0:
+                in_patch_decorator = False
+            continue
+        filtered_lines.append(line)
+    return "\n".join(filtered_lines)
+
+
+def _split_leading_comments(source: str) -> tuple[list[str], str]:
+    """Split ``source`` into (leading comment lines, rest starting at def/decorator).
+
+    Used to relocate the patch-header comment block *above* the HF decorators
+    when injecting a replacement method into a class.
+    """
+    lines = source.splitlines()
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].lstrip()
+        if stripped.startswith(("def ", "async def ", "@", "class ")):
+            break
+        i += 1
+    leading = lines[:i]
+    while leading and leading[-1].strip() == "":
+        leading.pop()
+    return leading, "\n".join(lines[i:])
+
+
+def _collapse_blank_lines(source: str, max_consecutive: int = 2) -> str:
+    """Collapse runs of more than ``max_consecutive`` blank lines."""
+    lines = source.splitlines()
+    out: list[str] = []
+    blank_run = 0
+    for line in lines:
+        if line.strip() == "":
+            blank_run += 1
+            if blank_run <= max_consecutive:
+                out.append(line)
+        else:
+            blank_run = 0
+            out.append(line)
+    return "\n".join(out)
+
+
+def _apply_name_map(source: str, name_map: dict[str, str] | None) -> str:
+    """Apply text substitutions from *name_map* to *source*.
+
+    Keys are sorted by descending length so that longer prefixes are replaced
+    first (e.g. ``Qwen3_5Moe`` before ``Qwen3_5``).
+    """
+    if not name_map:
+        return source
+    for old, new in sorted(name_map.items(), key=lambda kv: len(kv[0]), reverse=True):
+        source = source.replace(old, new)
+    return source
+
+
+class ModelingCodeGenerator:
+    """
+    Main code generator class that applies patches and generates output.
+
+    This class orchestrates the entire code generation process:
+    1. Load source module
+    2. Parse into AST
+    3. Apply patches
+    4. Generate output with comments
+    """
+
+    def __init__(self, config: PatchConfig):
+        self.config = config
+        self.source_code: str = ""
+        self.source_lines: list[str] = []
+        self.source_ast: Optional[ast.Module] = None
+        self.output_parts: list[str] = []
+
+    def load_source(self) -> None:
+        """Load the source module code."""
+        self.source_code = get_module_source(self.config.source_module)
+        self.source_lines = self.source_code.splitlines()
+        self.source_ast = parse_source_to_ast(self.source_code)
+
+    def _collect_imports(self) -> tuple[list[ast.stmt], set[str]]:
+        """Collect all imports from the source AST."""
+        collector = ImportCollector()
+        collector.visit(self.source_ast)
+        return collector.imports, collector.import_names
+
+    def _collect_definitions(self) -> tuple[dict[str, ast.ClassDef], dict[str, ast.FunctionDef]]:
+        """Collect all class and function definitions."""
+        collector = ClassAndFunctionCollector()
+        collector.visit(self.source_ast)
+        return collector.classes, collector.functions
+
+    def _get_transformers_version(self) -> str:
+        """Get the installed transformers version."""
+        try:
+            import transformers
+
+            return transformers.__version__
+        except ImportError:
+            return "unknown"
+
+    def _generate_header(self) -> str:
+        """Generate the file header with patch information."""
+        transformers_version = self.config.transformers_version or self._get_transformers_version()
+
+        lines = [
+            "# " + "=" * 78,
+            "#  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY",
+            "# " + "=" * 78,
+            "#",
+            f"#  Source: {self.config.source_module}",
+            f"#  Based on: transformers=={transformers_version}",
+            "#",
+            "#  This file was generated by the modeling code generator.",
+            "#  It contains a patched version of the original HuggingFace modeling code.",
+            "#",
+            "#  Patches applied:",
+        ]
+
+        for patch in self.config.patches:
+            lines.append(f"#    - {patch.patch_type.value}: {patch.target}")
+            if patch.description:
+                lines.append(f"#      {patch.description}")
+
+        lines.append("#")
+        lines.append("# " + "=" * 78)
+        lines.append("")
+
+        return "\n".join(lines)
+
+    def _transform_imports(self, import_nodes: list[ast.stmt]) -> str:
+        """
+        Transform and filter imports for the generated file.
+
+        This handles:
+        - Converting relative imports to absolute imports
+        - Dropping configured imported names from source imports
+        - Adding custom post-import code blocks
+        - Adding additional imports from the patch config
+        """
+        output_lines = []
+        drop_imported_names = self.config.drop_imported_names
+
+        def _should_keep_alias(alias: ast.alias) -> bool:
+            if not drop_imported_names:
+                return True
+
+            candidates = {alias.name, alias.name.rsplit(".", 1)[-1]}
+            if alias.asname:
+                candidates.add(alias.asname)
+
+            return candidates.isdisjoint(drop_imported_names)
+
+        for node in import_nodes:
+            if isinstance(node, ast.ImportFrom):
+                filtered_names = [alias for alias in node.names if _should_keep_alias(alias)]
+                if not filtered_names:
+                    continue
+
+                filtered_node = ast.ImportFrom(module=node.module, names=filtered_names, level=node.level)
+
+                # Handle relative imports - convert to absolute
+                if filtered_node.level > 0:
+                    # Try to resolve to absolute import
+                    # The base module is self.config.source_module
+                    base_parts = self.config.source_module.split(".")
+                    if filtered_node.level <= len(base_parts):
+                        absolute_module = ".".join(base_parts[: -filtered_node.level])
+                        if filtered_node.module:
+                            absolute_module = f"{absolute_module}.{filtered_node.module}"
+                        new_node = ast.ImportFrom(module=absolute_module, names=filtered_node.names, level=0)
+                        output_lines.append(ast_to_source(new_node))
+                    else:
+                        output_lines.append(ast_to_source(filtered_node))
+                else:
+                    output_lines.append(ast_to_source(filtered_node))
+            else:
+                filtered_names = [alias for alias in node.names if _should_keep_alias(alias)]
+                if not filtered_names:
+                    continue
+                filtered_node = ast.Import(names=filtered_names)
+                output_lines.append(ast_to_source(filtered_node))
+
+        # Add additional imports from config first — keep these before the
+        # post-import blocks (and before helpers) so helper bodies can rely
+        # on any names declared via ``add_import``.
+        if self.config.additional_imports:
+            output_lines.append("")
+            output_lines.append("# Additional imports for patches")
+            for imp in self.config.additional_imports:
+                if imp.is_from_import:
+                    if imp.names:
+                        names_str = ", ".join(imp.names)
+                        output_lines.append(f"from {imp.module} import {names_str}")
+                    else:
+                        output_lines.append(f"from {imp.module} import *")
+                else:
+                    if imp.alias:
+                        output_lines.append(f"import {imp.module} as {imp.alias}")
+                    else:
+                        output_lines.append(f"import {imp.module}")
+
+        # Add custom post-import blocks from config
+        if self.config.post_import_blocks:
+            output_lines.append("")
+            output_lines.append("# Additional import blocks for patches")
+            for block in self.config.post_import_blocks:
+                block = textwrap.dedent(block).strip()
+                if block:
+                    output_lines.append(block)
+                    output_lines.append("")
+            if output_lines and output_lines[-1] == "":
+                output_lines.pop()
+
+        return "\n".join(output_lines)
+
+    def _generate_helpers(self) -> str:
+        """Emit module-level helpers registered via ``config.add_helper``.
+
+        Each helper's source (including any leading ``#`` comment block) is
+        copied verbatim, with the ``@config.add_helper`` decorator stripped
+        so the generated file stays self-contained.
+        """
+        if not self.config.helpers:
+            return ""
+
+        lines: list[str] = [
+            "",
+            f"# {'=' * 70}",
+            "# [HELPERS] Module-level helpers injected via config.add_helper",
+            f"# {'=' * 70}",
+        ]
+        for helper in self.config.helpers:
+            src = self._render_helper_source(helper)
+            if not src:
+                continue
+            lines.append("")
+            lines.append(src)
+        return "\n".join(lines)
+
+    def _render_helper_source(self, helper: Any) -> str:
+        src = get_object_source_with_leading_comments(helper)
+        if not src:
+            return ""
+        src = textwrap.dedent(src)
+        src = strip_patch_decorators(src)
+        return src.rstrip()
+
+    def _generate_positioned_helpers_after(self, target: str) -> str:
+        helpers = [h.helper for h in self.config.positioned_helpers if h.target == target and h.placement == "after"]
+        if not helpers:
+            return ""
+
+        lines: list[str] = [
+            "",
+            f"# {'=' * 70}",
+            f"# [HELPERS AFTER] {target}",
+            f"# {'=' * 70}",
+        ]
+        for helper in helpers:
+            src = self._render_helper_source(helper)
+            if not src:
+                continue
+            lines.append("")
+            lines.append(src)
+        return "\n".join(lines)
+
+    def _apply_class_replacement(
+        self,
+        original_class: ast.ClassDef,
+        patch: Patch,
+    ) -> str:
+        """
+        Apply a class replacement patch.
+
+        Returns the source code for the replaced class with comments preserved.
+        """
+        lines = []
+        lines.append("")
+        lines.append(f"# {'=' * 70}")
+        lines.append(f"# [PATCHED CLASS] {original_class.name}")
+        lines.append(
+            f"# Original class replaced with: {patch.replacement.__name__ if patch.replacement else 'external'}"
+        )
+        if patch.description:
+            lines.append(f"# Reason: {patch.description}")
+        if patch.source_module:
+            lines.append(f"# Source: {patch.source_module}")
+        lines.append(f"# {'=' * 70}")
+
+        if patch.replacement:
+            # Get source of replacement class (preserves comments)
+            replacement_source = get_object_source_with_leading_comments(patch.replacement)
+            if replacement_source:
+                # Rename the class to match original using simple text replacement
+                replacement_source = textwrap.dedent(replacement_source)
+                replacement_source = _apply_name_map(replacement_source, patch.name_map)
+                replacement_source = strip_patch_decorators(replacement_source)
+
+                # Rename the class (simple text replacement for class definition line)
+                old_name = patch.replacement.__name__
+                if old_name != original_class.name:
+                    # Replace "class OldName" with "class NewName"
+                    replacement_source = replacement_source.replace(
+                        f"class {old_name}",
+                        f"class {original_class.name}",
+                        1,  # Only replace first occurrence
+                    )
+                lines.append(replacement_source)
+            else:
+                # Fallback: generate a placeholder
+                lines.append(f"# Could not get source for {patch.replacement.__name__}")
+                lines.append("# Using original class as fallback")
+                end_line = get_node_end_line(original_class, self.source_lines)
+                start_line = get_node_start_line(original_class)
+                lines.append(extract_source_segment(self.source_lines, start_line, end_line))
+        elif patch.replacement_source:
+            # External replacement - generate import and alias
+            lines.append(f"# Import from: {patch.replacement_source}")
+            module, name = patch.replacement_source.rsplit(".", 1)
+            lines.append(f"from {module} import {name} as {original_class.name}")
+        else:
+            end_line = get_node_end_line(original_class, self.source_lines)
+            start_line = get_node_start_line(original_class)
+            lines.append(extract_source_segment(self.source_lines, start_line, end_line))
+
+        return "\n".join(lines)
+
+    def _apply_method_override(
+        self,
+        class_node: ast.ClassDef,
+        method_name: str,
+        patch: Patch,
+    ) -> tuple[ast.ClassDef, str, bool]:
+        """
+        Apply a method override to a class.
+
+        Returns a tuple of (modified class AST, replacement method source with comments).
+        The replacement source is preserved separately to maintain comments.
+        """
+        if not patch.replacement:
+            return class_node, "", False
+
+        # Get source of replacement method (preserves leading comment block too)
+        replacement_source = get_object_source_with_leading_comments(patch.replacement)
+        if not replacement_source:
+            return class_node, "", False
+
+        # Dedent and clean up the replacement source
+        replacement_source = textwrap.dedent(replacement_source)
+        replacement_source = _apply_name_map(replacement_source, patch.name_map)
+        cleaned_replacement_source = strip_patch_decorators(replacement_source)
+
+        # Rename the function to match the target method name
+        old_name = patch.replacement.__name__
+        if old_name != method_name:
+            cleaned_replacement_source = cleaned_replacement_source.replace(
+                f"def {old_name}(",
+                f"def {method_name}(",
+                1,  # Only replace first occurrence
+            )
+
+        # Parse the replacement method for AST manipulation
+        try:
+            replacement_ast = parse_source_to_ast(replacement_source)
+        except CodegenError:
+            return class_node, "", False
+
+        # Find the function definition in the parsed AST
+        new_method = None
+        for node in ast.walk(replacement_ast):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                new_method = node
+                # Remove decorators (they were for patch definition, not runtime)
+                new_method.decorator_list = []
+                break
+
+        if not new_method:
+            return class_node, "", False
+
+        # Use the MethodReplacer transformer
+        replacer = MethodReplacer(
+            method_name, new_method, comment=patch.description or f"Replaced with {patch.replacement.__name__}"
+        )
+        modified_class = replacer.visit(class_node)
+        applied = replacer.replaced
+
+        # If the target method does not exist in the source class (e.g., class body is `pass`
+        # or `...`), inject the method into the class so override_method still works for newer
+        # HF refactors.
+        if not replacer.replaced:
+            new_method.name = method_name
+            if len(modified_class.body) == 1 and _is_empty_class_body_node(modified_class.body[0]):
+                modified_class.body = [new_method]
+            else:
+                modified_class.body.append(new_method)
+            modified_class = ast.fix_missing_locations(modified_class)
+            applied = True
+
+        return modified_class, cleaned_replacement_source, applied
+
+    def _apply_function_replacement(
+        self,
+        original_func: ast.FunctionDef,
+        patch: Patch,
+    ) -> str:
+        """
+        Apply a function replacement patch.
+
+        Returns the source code for the replaced function with comments preserved.
+        """
+        lines = []
+        lines.append("")
+        lines.append(f"# {'=' * 70}")
+        lines.append(f"# [PATCHED FUNCTION] {original_func.name}")
+        if patch.description:
+            lines.append(f"# Reason: {patch.description}")
+        if patch.source_module:
+            lines.append(f"# Source: {patch.source_module}")
+        lines.append(f"# {'=' * 70}")
+
+        if patch.replacement:
+            replacement_source = get_object_source_with_leading_comments(patch.replacement)
+            if replacement_source:
+                replacement_source = textwrap.dedent(replacement_source)
+                replacement_source = _apply_name_map(replacement_source, patch.name_map)
+                replacement_source = strip_patch_decorators(replacement_source)
+
+                # Rename the function if necessary (simple text replacement)
+                old_name = patch.replacement.__name__
+                if old_name != original_func.name:
+                    # Replace "def old_name" with "def new_name"
+                    replacement_source = replacement_source.replace(
+                        f"def {old_name}",
+                        f"def {original_func.name}",
+                        1,  # Only replace first occurrence
+                    )
+                lines.append(replacement_source)
+            else:
+                lines.append("# Could not get source for replacement")
+                end_line = get_node_end_line(original_func, self.source_lines)
+                start_line = get_node_start_line(original_func)
+                lines.append(extract_source_segment(self.source_lines, start_line, end_line))
+        else:
+            end_line = get_node_end_line(original_func, self.source_lines)
+            start_line = get_node_start_line(original_func)
+            lines.append(extract_source_segment(self.source_lines, start_line, end_line))
+
+        return "\n".join(lines)
+
+    def _indent_preserved_source(self, preserved_source: str, target_indent: int) -> list[str]:
+        """
+        Re-indent preserved source lines to target indentation.
+
+        Args:
+            preserved_source: Source text to re-indent
+            target_indent: Number of spaces for the first non-empty line
+
+        Returns:
+            Re-indented lines
+        """
+        preserved_lines = preserved_source.splitlines()
+        first_non_empty = next((line for line in preserved_lines if line.strip()), "")
+        preserved_indent = len(first_non_empty) - len(first_non_empty.lstrip())
+
+        indented_lines = []
+        for line in preserved_lines:
+            if line.strip():
+                stripped = line[preserved_indent:] if len(line) >= preserved_indent else line.lstrip()
+                indented_lines.append(" " * target_indent + stripped)
+            else:
+                indented_lines.append("")
+        return indented_lines
+
+    def _replace_method_body_with_preserved(self, class_source: str, method_name: str, preserved_source: str) -> str:
+        """
+        Replace a method in the class source with its comment-preserved version.
+
+        Since ast.unparse() strips comments, we need to do text-based replacement
+        to preserve the comments in the replacement method source.
+
+        Args:
+            class_source: The unparsed class source (no comments in method bodies)
+            method_name: Name of the method to replace
+            preserved_source: The source-preserved version of the method (with comments)
+
+        Returns:
+            The class source with the method body replaced
+        """
+        # Parse the class source to find the method boundaries
+        try:
+            class_ast = parse_source_to_ast(class_source)
+        except CodegenError:
+            return class_source
+
+        # Find the class definition
+        class_def = None
+        for node in ast.walk(class_ast):
+            if isinstance(node, ast.ClassDef):
+                class_def = node
+                break
+
+        if not class_def:
+            return class_source
+
+        source_lines = class_source.splitlines()
+
+        # Find class indentation from class definition line
+        class_start = class_def.lineno - 1
+        if class_start < len(source_lines):
+            class_line = source_lines[class_start]
+            class_indent = len(class_line) - len(class_line.lstrip())
+        else:
+            class_indent = 0
+
+        # Find the method in the class
+        method_node = None
+        for item in class_def.body:
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == method_name:
+                method_node = item
+                break
+
+        if method_node:
+            # Replace existing method body while preserving untouched class formatting.
+            method_start = method_node.lineno - 1  # 0-indexed; `def` line
+            method_end = (
+                method_node.end_lineno
+                if hasattr(method_node, "end_lineno") and method_node.end_lineno
+                else method_start + 1
+            )
+            if method_start < len(source_lines):
+                original_line = source_lines[method_start]
+                method_indent = len(original_line) - len(original_line.lstrip())
+            else:
+                method_indent = class_indent + 4
+
+            # Place patch-header comments *above* the decorators rather than
+            # between `@decorator` lines and `def`. Decorators from the HF
+            # source (e.g. `@capture_outputs`) stay in place.
+            leading_lines, def_source = _split_leading_comments(preserved_source)
+            indented_leading = (
+                self._indent_preserved_source("\n".join(leading_lines), method_indent) if leading_lines else []
+            )
+            indented_def = self._indent_preserved_source(def_source, method_indent)
+
+            if method_node.decorator_list:
+                decorator_start = min(d.lineno for d in method_node.decorator_list) - 1
+            else:
+                decorator_start = method_start
+
+            new_source_lines = (
+                source_lines[:decorator_start]
+                + indented_leading
+                + source_lines[decorator_start:method_start]
+                + indented_def
+                + source_lines[method_end:]
+            )
+            return "\n".join(new_source_lines)
+
+        # If the method does not exist, inject it while preserving class formatting.
+        # Prefer replacing an empty body when present: either ``pass`` or the v5-style
+        # inline ``class X(...): ...`` Ellipsis literal (``ast.Expr(Constant(Ellipsis))``).
+        empty_body_node = next((item for item in class_def.body if _is_empty_class_body_node(item)), None)
+        method_indent = class_indent + 4
+        indented_preserved_lines = self._indent_preserved_source(preserved_source, method_indent)
+
+        if empty_body_node is not None:
+            empty_start = empty_body_node.lineno - 1
+            empty_end = (
+                empty_body_node.end_lineno
+                if hasattr(empty_body_node, "end_lineno") and empty_body_node.end_lineno
+                else empty_start + 1
+            )
+            # ``class Foo(...): ...`` keeps the empty marker on the same line as the
+            # class header. Rewriting only the marker leaves ``class Foo(...):`` open
+            # and inserts the new method below it. The post-colon segment is stripped
+            # of any trailing ``# comment`` before the {"pass", "..."} membership check,
+            # otherwise an annotated empty body like ``class Foo: ...  # placeholder``
+            # would fall through to the else-branch and delete the entire header line
+            # (since ``empty_start`` points at the header for the inline form).
+            class_header_line = source_lines[empty_start]
+            colon_idx = class_header_line.rfind(":")
+            after_colon_no_comment = class_header_line[colon_idx + 1 :].split("#", 1)[0] if colon_idx != -1 else ""
+            if colon_idx != -1 and after_colon_no_comment.strip() in {"pass", "..."}:
+                header_only = class_header_line[: colon_idx + 1].rstrip()
+                new_source_lines = (
+                    source_lines[:empty_start] + [header_only] + indented_preserved_lines + source_lines[empty_end:]
+                )
+            else:
+                new_source_lines = source_lines[:empty_start] + indented_preserved_lines + source_lines[empty_end:]
+            return "\n".join(new_source_lines)
+
+        # Otherwise append to the class body.
+        new_source_lines = source_lines.copy()
+        if new_source_lines and new_source_lines[-1].strip():
+            new_source_lines.append("")
+        new_source_lines.extend(indented_preserved_lines)
+        return "\n".join(new_source_lines)
+
+    def _generate_class_source(self, class_node: ast.ClassDef, patches: dict[str, Patch]) -> str:
+        """Generate source code for a class, applying any relevant patches."""
+        class_name = class_node.name
+
+        # Check for class replacement
+        if class_name in self.config.get_class_replacements():
+            return self._apply_class_replacement(class_node, self.config.get_class_replacements()[class_name])
+
+        # Check for method overrides
+        method_overrides = self.config.get_method_overrides()
+        modified_class = class_node
+
+        methods_patched = []
+        method_replacement_sources = {}
+        for target, patch in method_overrides.items():
+            if target.startswith(f"{class_name}."):
+                method_name = target.split(".", 1)[1]
+                modified_class, replacement_source, applied = self._apply_method_override(
+                    modified_class, method_name, patch
+                )
+                if applied:
+                    methods_patched.append(method_name)
+                if applied and replacement_source:
+                    method_replacement_sources[method_name] = replacement_source
+
+        # Generate output
+        lines = []
+        if methods_patched:
+            lines.append("")
+            lines.append(f"# {'=' * 70}")
+            lines.append(f"# [MODIFIED CLASS] {class_name}")
+            lines.append(f"# Methods patched: {', '.join(methods_patched)}")
+            lines.append(f"# {'=' * 70}")
+            # Preserve original class formatting/comments for untouched methods,
+            # and replace only the patched methods in-place.
+            end_line = get_node_end_line(class_node, self.source_lines)
+            start_line = get_node_start_line(class_node)
+            class_source = extract_source_segment(self.source_lines, start_line, end_line)
+
+            # Replace the unparsed method bodies with comment-preserved versions
+            for method_name, preserved_source in method_replacement_sources.items():
+                class_source = self._replace_method_body_with_preserved(class_source, method_name, preserved_source)
+
+            lines.append(class_source)
+        else:
+            # No patches - use original source with comments preserved
+            end_line = get_node_end_line(class_node, self.source_lines)
+            start_line = get_node_start_line(class_node)
+            lines.append(extract_source_segment(self.source_lines, start_line, end_line))
+
+        return "\n".join(lines)
+
+    def _generate_function_source(self, func_node: ast.FunctionDef) -> str:
+        """Generate source code for a function, applying any relevant patches."""
+        func_name = func_node.name
+
+        # Check for function replacement
+        func_replacements = self.config.get_function_replacements()
+        if func_name in func_replacements:
+            return self._apply_function_replacement(func_node, func_replacements[func_name])
+
+        # No patches - use original source with comments preserved
+        end_line = get_node_end_line(func_node, self.source_lines)
+        start_line = get_node_start_line(func_node)
+        return extract_source_segment(self.source_lines, start_line, end_line)
+
+    def generate(self, output_path: Optional[Path] = None) -> str:
+        """
+        Generate the patched modeling code.
+
+        Args:
+            output_path: Optional path to write the output file.
+
+        Returns:
+            The generated source code as a string.
+        """
+        if not self.source_ast:
+            self.load_source()
+
+        output_parts = []
+        emitted_positioned_targets: set[str] = set()
+
+        # 1. Generate header
+        output_parts.append(self._generate_header())
+
+        # 2. Collect and transform imports
+        import_nodes, import_names = self._collect_imports()
+        output_parts.append(self._transform_imports(import_nodes))
+        output_parts.append("")
+
+        # 3. Emit module-level helpers (config.add_helper) after the import
+        # block so subsequent classes / functions can reference them.
+        helpers_block = self._generate_helpers()
+        if helpers_block:
+            output_parts.append(helpers_block)
+            output_parts.append("")
+
+        # 4. Process ALL module-level nodes in their original order
+        # This preserves the exact structure of the original file
+        for node in self.source_ast.body:
+            # Skip import statements (already handled above)
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+
+            if isinstance(node, ast.ClassDef):
+                if node.name not in self.config.exclude:
+                    output_parts.append(self._generate_class_source(node, {}))
+                    output_parts.append("")
+                    positioned_helpers = self._generate_positioned_helpers_after(node.name)
+                    if positioned_helpers:
+                        output_parts.append(positioned_helpers)
+                        output_parts.append("")
+                        emitted_positioned_targets.add(node.name)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name not in self.config.exclude:
+                    output_parts.append(self._generate_function_source(node))
+                    output_parts.append("")
+                    positioned_helpers = self._generate_positioned_helpers_after(node.name)
+                    if positioned_helpers:
+                        output_parts.append(positioned_helpers)
+                        output_parts.append("")
+                        emitted_positioned_targets.add(node.name)
+            elif isinstance(node, ast.Assign):
+                # Module-level assignments (like __all__, DOCSTRINGS, etc.)
+                # Special case: if this is `__all__ = [...]` of string literals,
+                # filter out names that `exclude_from_output` dropped so the
+                # generated module doesn't claim to export missing classes
+                # (would otherwise fail F822 and break `from ... import *`).
+                if (
+                    self.config.exclude
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "__all__"
+                    and isinstance(node.value, (ast.List, ast.Tuple))
+                    and all(isinstance(elt, ast.Constant) and isinstance(elt.value, str) for elt in node.value.elts)
+                ):
+                    kept = [elt.value for elt in node.value.elts if elt.value not in self.config.exclude]
+                    rendered = "__all__ = [\n" + "".join(f'    "{name}",\n' for name in kept) + "]"
+                    output_parts.append(rendered)
+                    output_parts.append("")
+                else:
+                    # Use source extraction to preserve any associated comments
+                    end_line = get_node_end_line(node, self.source_lines)
+                    output_parts.append(extract_source_segment(self.source_lines, node.lineno, end_line))
+                    output_parts.append("")
+            elif isinstance(node, ast.Expr):
+                # Module-level expressions (docstrings)
+                if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                    # This is a module docstring - use source extraction
+                    end_line = get_node_end_line(node, self.source_lines)
+                    output_parts.append(extract_source_segment(self.source_lines, node.lineno, end_line))
+                    output_parts.append("")
+
+        missing_positioned_targets = sorted(
+            {h.target for h in self.config.positioned_helpers if h.placement == "after"} - emitted_positioned_targets
+        )
+        if missing_positioned_targets:
+            raise CodegenError(
+                "Positioned helper target(s) not found in generated output: " + ", ".join(missing_positioned_targets)
+            )
+
+        # 4. Join and format output
+        output = "\n".join(output_parts)
+        output = _collapse_blank_lines(output, max_consecutive=2)
+
+        # 5. Write to file if path provided
+        if output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(output, encoding="utf-8")
+            print(f"Generated: {output_path}")
+
+        return output
+
+
+def generate_from_config(config: PatchConfig, output_dir: Optional[Path] = None) -> str:
+    """
+    Convenience function to generate patched code from a config.
+
+    Args:
+        config: The patch configuration.
+        output_dir: Optional directory to write output file.
+
+    Returns:
+        The generated source code.
+    """
+    generator = ModelingCodeGenerator(config)
+
+    output_path = None
+    if output_dir:
+        output_path = output_dir / config.target_file
+
+    return generator.generate(output_path)

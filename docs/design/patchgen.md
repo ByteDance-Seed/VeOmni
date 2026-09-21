@@ -1,0 +1,615 @@
+# Modeling Code Generation (patchgen)
+
+A code generation framework for creating patched HuggingFace modeling files. Instead of runtime monkey patches that are hard to debug, this tool generates self-contained, readable modeling code with all patches applied at code-generation time.
+
+The codegen library ships as a standalone package (`patchgen`) under
+`patchgen-pkg/`. VeOmni and downstream projects can install it with
+`pip install patchgen`. VeOmni's compatibility integration is the
+`veomni/patchgen/` package, which re-exports the public patchgen API for callers
+such as `from veomni.patchgen import PatchConfig`.
+
+## Quick Start
+
+```bash
+# Generate patched Qwen3 GPU modeling code
+# (writes to veomni/models/transformers/qwen3/generated/)
+patchgen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config
+
+# With verbose output
+patchgen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config -v
+
+# Dry run (preview without writing)
+patchgen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --dry-run
+
+# Custom output directory
+patchgen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config -o /path/to/output
+
+# List available patch configurations
+patchgen --list
+
+# Save unified diff alongside generated modeling code
+patchgen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff
+
+# Drift gate (CI mode): exit 1 if checked-in generated files are stale
+patchgen --check
+```
+
+The `patchgen` console script reads `[tool.patchgen]` from the nearest `pyproject.toml` (walked up from CWD) to learn where to discover `*_patch_gen_config.py` files. VeOmni's section pins:
+
+```toml
+[tool.patchgen]
+search_root = "veomni/models/transformers"
+package_prefix = "veomni.models.transformers"
+legacy_patches_prefix = "veomni.models.transformers.qwen3.patches"
+```
+
+## Project Structure
+
+```
+Open-VeOmni/
+├── patchgen-pkg/                    # patchgen library (separately published)
+│   ├── pyproject.toml               # [project].name = "patchgen"
+│   └── patchgen/
+│       ├── patch_spec.py            # Patch specification DSL
+│       ├── codegen.py               # AST-based code generator
+│       ├── run_codegen.py           # CLI factory: build_cli(discovery)
+│       ├── check_patchgen.py        # CLI factory: build_cli(discovery)
+│       ├── _normalize.py            # Shared ruff fix+format pipeline
+│       └── cli.py                   # `patchgen` console-script entry
+├── veomni/
+│   ├── patchgen.py                  # back-compat shim: from patchgen import *
+│   └── models/transformers/qwen3/
+│       ├── qwen3_gpu_patch_gen_config.py      # Qwen3 GPU patch config
+│       ├── patches/
+│       │   └── qwen3_gpu_patches.py            # Qwen3 GPU patch implementations
+│       └── generated/
+│           ├── patched_modeling_qwen3_gpu.py   # Generated output
+│           └── patched_modeling_qwen3_gpu.diff # Unified diff vs original
+└── pyproject.toml                   # depends on patchgen + holds [tool.patchgen]
+```
+
+The outer dir is `patchgen-pkg/` rather than `patchgen/` so that `import patchgen` from cwd=`Open-VeOmni/` does not match an empty PEP 420 namespace-package portion at `Open-VeOmni/patchgen/` (which would shadow the editable install via PathFinder's precedence over later meta-path finders).
+
+## Core Design
+
+### The Problem
+
+When adapting HuggingFace models for training frameworks (VeOmni, veRL, etc.), we need to apply various modifications:
+
+- **Attention replacement**: Custom flash attention, Ulysses sequence parallelism
+- **Kernel fusion**: LigerKernel RMSNorm, fused rotary embeddings
+- **MoE optimizations**: Fused MoE with expert parallelism
+- **Framework-specific code**: Gradient checkpointing, loss computation
+
+Current approaches have significant drawbacks:
+
+```python
+# BAD: Runtime monkey patching - hard to debug, order-dependent
+apply_ops_patch()
+apply_logprobs_patch()
+apply_xpu_patch()
+
+ALL_ATTENTION_FUNCTIONS["flash_attention_2"] = my_impl
+
+class OptimizedQwen3Model(Qwen3Model):
+    ...
+Qwen3Model = OptimizedQwen3Model  # Who knows what this is now?
+```
+
+**Problems with monkey patching:**
+
+- Cannot see the final patched code
+- Import order affects behavior
+- Difficult to debug
+- Multiple patches can conflict
+- Hard to maintain across HF version upgrades
+
+### The Solution
+
+Generate a single, self-contained modeling file with all patches applied:
+
+```python
+# GOOD: Generated file - everything is visible
+# ======================================================================
+# [PATCHED CLASS] Qwen3RMSNorm
+# Reason: Use fused RMSNorm kernel for better performance
+# ======================================================================
+class Qwen3RMSNorm(nn.Module):
+    def forward(self, hidden_states):
+        # Patched implementation - fully visible
+        ...
+```
+
+**Benefits:**
+
+- Complete visibility of final code
+- Easy to debug and understand
+- Clear documentation of what changed and why
+- No runtime surprises
+- Can diff against original HF code
+- Comments in patch code are preserved in output
+
+### Design Principles
+
+1. **AST-based transformation**: Uses Python AST for robust code manipulation, not fragile regex
+1. **Declarative patches**: Define what to patch using decorators, not imperative monkey patches
+1. **Source preservation**: Extracts source from installed transformers at generation time
+1. **Comment preservation**: Comments in replacement code are preserved in the generated output
+1. **Self-contained output**: Generated file has no hidden dependencies on patch code
+
+## How to Use
+
+### 1. Create a Patch Configuration
+
+Create a new file under `veomni/models/transformers/<model>/`:
+
+```python
+# Either form works — patchgen.* is the canonical import path; the
+# veomni.patchgen.* form goes through the back-compat shim and resolves to
+# the same modules.
+from patchgen import PatchConfig
+# or, equivalently:
+# from veomni.patchgen.patch_spec import PatchConfig
+
+# Define the configuration
+config = PatchConfig(
+    source_module="transformers.models.qwen3.modeling_qwen3",
+    target_file="patched_modeling_qwen3_gpu.py",
+    description="Qwen3 GPU patches",
+)
+```
+
+### 2. Define Patches
+
+#### Class Replacement
+
+Replace an entire class with a custom implementation:
+
+```python
+@config.replace_class("Qwen3RMSNorm", description="Use fused kernel")
+class OptimizedRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        # Your optimized implementation
+        ...
+```
+
+#### Function Replacement
+
+Replace a module-level function:
+
+```python
+@config.replace_function("apply_rotary_pos_emb", description="Use fused RoPE")
+def optimized_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    # Your optimized implementation
+    ...
+```
+
+#### Method Override
+
+Replace a specific method within a class (keeps the rest of the class unchanged):
+
+```python
+@config.override_method("Qwen3Attention.forward", description="Add Ulysses SP")
+def ulysses_attention_forward(self, hidden_states, position_embeddings, ...):
+    # Your modified forward pass
+    # Comments here will be preserved in the generated output!
+
+    # ==========================================================================
+    # BEGIN ULYSSES SEQUENCE PARALLEL MODIFICATIONS
+    # ==========================================================================
+    # These comments will appear in the generated file
+    ...
+```
+
+### 3. Add Supporting Imports
+
+```python
+# Add imports needed by your patches
+config.add_import("torch.distributed", names=["all_gather", "all_reduce"])
+
+# Exclude classes you don't need
+config.exclude_from_output("Qwen3ForTokenClassification")
+```
+
+### 4. Generate Code
+
+```bash
+patchgen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config -v
+```
+
+## Patch Types Reference
+
+| Type                 | Decorator                                 | Use Case                                             |
+| -------------------- | ----------------------------------------- | ---------------------------------------------------- |
+| Class Replacement    | `@config.replace_class("ClassName")`      | Replace entire class (e.g., RMSNorm -> LigerRMSNorm) |
+| Function Replacement | `@config.replace_function("func_name")`   | Replace module-level function                        |
+| Method Override      | `@config.override_method("Class.method")` | Replace single method, keep rest of class            |
+
+## Generated Output Format
+
+The generated file includes:
+
+1. **Header** with metadata:
+
+    ```python
+    # ==============================================================================
+    #  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
+    # ==============================================================================
+    #  Source: transformers.models.qwen3.modeling_qwen3
+    #  Based on: transformers==5.16.1
+    #
+    #  Patches applied:
+    #    - class_replacement: Qwen3RMSNorm
+    #    - function_replacement: apply_rotary_pos_emb
+    #    - method_override: Qwen3Attention.forward
+    # ==============================================================================
+    ```
+
+1. **Converted imports** (relative -> absolute):
+
+    ```python
+    # Original relative import: from ...activations import ACT2FN
+    from transformers.activations import ACT2FN
+    ```
+
+1. **Patch markers** for modified code:
+
+    ```python
+    # ======================================================================
+    # [PATCHED CLASS] Qwen3RMSNorm
+    # Reason: Use fused RMSNorm kernel for better performance
+    # ======================================================================
+    class Qwen3RMSNorm(nn.Module):
+        ...
+    ```
+
+1. **Preserved comments** in patched methods:
+
+    ```python
+    # ======================================================================
+    # [MODIFIED CLASS] Qwen3Attention
+    # Methods patched: forward
+    # ======================================================================
+    class Qwen3Attention(nn.Module):
+        def forward(self, hidden_states, ...):
+            # ==========================================================================
+            # BEGIN ULYSSES SEQUENCE PARALLEL MODIFICATIONS
+            # ==========================================================================
+            # All your inline comments are preserved!
+            ...
+    ```
+
+## Example: Qwen3 GPU Patches
+
+See `veomni/models/transformers/qwen3/qwen3_gpu_patch_gen_config.py` for a complete example that includes:
+
+- **LigerRMSNorm**: Fused kernel replacement for `Qwen3RMSNorm`
+- **LigerSwiGLUMLP**: Fused SwiGLU MLP replacement for `Qwen3MLP`
+- **apply_rotary_pos_emb**: LigerKernel rotary position embedding
+
+Run it:
+
+```bash
+patchgen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config -v
+```
+
+Output: `veomni/models/transformers/qwen3/generated/patched_modeling_qwen3_gpu.py` (~600 lines of self-contained code)
+
+## Comparing Generated vs Original Code
+
+Use the `--diff` flag to save a unified diff file next to the generated modeling file:
+
+```bash
+# Generate patched modeling code and save a .diff file in output directory
+patchgen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff
+```
+
+With `--diff`, `patchgen` writes:
+
+- Compares the generated file against the original HuggingFace source
+- Saves unified diff as `<generated_modeling_name>.diff` in the output directory
+- Shows exactly which classes, methods, and functions were modified
+
+Example output:
+
+```diff
+-class Qwen3RMSNorm(nn.Module):
+-    def forward(self, hidden_states):
+-        input_dtype = hidden_states.dtype
+-        hidden_states = hidden_states.to(torch.float32)
+-        ...
++# ======================================================================
++# [PATCHED CLASS] Qwen3RMSNorm
++# Reason: Use fused RMSNorm kernel for better performance
++# ======================================================================
++class Qwen3RMSNorm(nn.Module):
++    def forward(self, hidden_states):
++        # Optimized implementation with comments preserved
++        ...
+```
+
+## Advanced Usage
+
+### External Class References
+
+For large classes from external libraries, reference them without copying source:
+
+```python
+from patchgen import create_patch_from_external
+
+patch = create_patch_from_external(
+    target="Qwen3RMSNorm",
+    replacement_module="liger_kernel.transformers.rms_norm",
+    replacement_name="LigerRMSNorm",
+)
+config.patches.append(patch)
+```
+
+### Programmatic Generation
+
+```python
+from pathlib import Path
+from patchgen import ModelingCodeGenerator
+from veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config import config
+
+generator = ModelingCodeGenerator(config)
+generator.load_source()
+output = generator.generate(
+    Path("veomni/models/transformers/qwen3/generated/patched_modeling_qwen3_gpu.py")
+)
+```
+
+### Init Modification
+
+Modify `__init__` methods without replacing the entire class:
+
+```python
+@config.modify_init("Qwen3Attention")
+def modified_init(original_init, self, config, layer_idx):
+    original_init(self, config, layer_idx)
+    self.custom_attr = some_value
+```
+
+## CLI Reference
+
+```
+usage: patchgen [-h] [-o OUTPUT_DIR] [-c CONFIG_NAME] [--list] [--all]
+                [--dry-run] [--diff] [-v] [--check] [--fix]
+                [patch_module]
+
+positional arguments:
+  patch_module          Patch module to use (e.g., 'veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config')
+
+options:
+  -h, --help            Show help message
+  -o, --output-dir      Output directory (default: sibling generated/ next to patch module)
+  -c, --config-name     Config variable name in the patch module (default: config)
+  --list                List available patch configurations
+  --all                 Regenerate all discovered patch configs at once
+  --dry-run             Show what would be generated without writing files
+  --diff                Save a unified .diff file alongside generated modeling code
+  -v, --verbose         Print detailed progress
+  --check               Drift-check mode: compare regen against checked-in files, exit 1 on drift
+  --fix                 With --check: overwrite checked-in files with the regen output
+```
+
+`--check` switches the CLI from codegen mode to drift-check mode; all other flags are mode-specific. Discovery is always loaded from `[tool.patchgen]` in the nearest `pyproject.toml`.
+
+## CI and Regeneration
+
+Generated files are checked into the repo and guarded by CI to prevent drift.
+
+### Regenerating all configs
+
+```bash
+# Regenerate all configs at once (writes .py and .diff files)
+patchgen --all --diff
+
+# Or use the Makefile shortcut
+make patchgen
+```
+
+### CI check
+
+The `check_patchgen.yml` workflow runs on PRs that touch `patchgen-pkg/**`,
+`veomni/patchgen/**`, `veomni/models/transformers/**`, `pyproject.toml`, or
+`uv.lock`. It:
+
+1. Discovers all `*_patch_gen_config.py` files via the `[tool.patchgen]` section
+2. Regenerates each config to a temp file
+3. Runs `ruff check --fix` and `ruff format` on the output (mirroring `run_codegen`'s own normalization step)
+4. Compares against checked-in `.py` and `.diff` files
+5. Fails with a unified diff if there is any drift
+
+### Checking locally
+
+```bash
+# Check for drift (exits 1 on mismatch)
+patchgen --check
+
+# Or use the Makefile shortcut
+make check-patchgen
+
+# Fix drift by overwriting checked-in files
+patchgen --check --fix
+```
+
+### Listing configs
+
+```bash
+patchgen --list
+```
+
+### Adding a new model
+
+1. Create `veomni/models/transformers/<model>/` with an `__init__.py` that
+   registers the generated class in `MODELING_REGISTRY` under the config's
+   exact `model_type`. Register a custom config or processor in
+   `MODEL_CONFIG_REGISTRY` or `MODEL_PROCESSOR_REGISTRY` when the integration
+   provides one. Import the package from `veomni.models.transformers` so all
+   module-level registration runs at import time.
+2. Create `<model>_gpu_patch_gen_config.py` at the model root. Point its
+   `PatchConfig` at the pinned Transformers source module and declare only the
+   imports, methods, classes, or op slots that VeOmni must change.
+3. Review the generated model's integration points for the selected backend,
+   including attention dispatch, mask construction, and any backend-specific
+   metadata passed through model forward. Add only the narrow patchgen
+   overrides that the model requires.
+4. Run
+   `patchgen veomni.models.transformers.<model>.<model>_gpu_patch_gen_config --dry-run`,
+   then regenerate with `--diff -v`.
+5. Review both the generated output under
+   `veomni/models/transformers/<model>/generated/` and its diff against the
+   upstream source. Never patch the generated file directly.
+6. Add a toy config plus registry, forward/backward, backend-routing, and
+   parallelism tests appropriate to the model. Follow
+   [Testing a New Model](../transformers_v5/testing_new_model.md).
+7. Run `patchgen --check` and the focused model tests before committing.
+
+> **Note:** When enabling FlexAttention for packed sequences, use VeOmni's
+> causal/sliding mask wrappers instead of the corresponding Transformers
+> helpers, and pass `cu_seq_lens_q` into mask construction. The wrappers add
+> packed-sample boundaries to the native mask so tokens from different samples
+> cannot attend to each other. See the
+> [FlexAttention integration guide](../transformers_v5/veomni_fused_attention.md#integrating-a-new-patchgen-model).
+
+## Using patchgen from a dependent project
+
+`patchgen` is a standalone PyPI-shaped package, so projects that want to patch their own models — i.e. that hold patch configs **outside** the `veomni/models/transformers/` tree — depend on it directly and do not need to vendor any code or write their own CLI wrapper.
+
+### 1. Depend on patchgen
+
+```toml
+# <your_project>/pyproject.toml
+[project.optional-dependencies]
+dev = ["patchgen>=0.1.0"]
+```
+
+### 2. Declare discovery in `[tool.patchgen]`
+
+```toml
+[tool.patchgen]
+search_root = "<your_project>/models"
+package_prefix = "<your_project>.models"
+
+# Optional knobs:
+# If your project's ruff config does NOT globally ignore E501, generated
+# files may still contain occasional long lines from upstream HF. Adding
+# E501 here aligns the drift-checker's temp-file normalization with the
+# per-file-ignore your checked-in generated/ files get from pyproject.
+ruff_extra_ignore = ["E501"]
+# Run ruff with --isolated so normalization is deterministic regardless
+# of which pyproject.toml ruff happens to discover. Recommended.
+ruff_isolated = true
+# Legacy patches.<name> shorthand expansion (rarely needed; VeOmni uses
+# this for its qwen3 tree).
+# legacy_patches_prefix = "<your_project>.models.qwen3.patches"
+```
+
+The `patchgen` console script walks up from CWD looking for the nearest `pyproject.toml` with a `[tool.patchgen]` section and builds its `DiscoveryConfig` from that. CLI flags are unchanged.
+
+### 3. Wire CI / Makefile / pre-commit
+
+```bash
+# Makefile (or scripts/)
+patchgen-regen:   ## regen all configs
+	patchgen --all --diff
+
+patchgen-check:   ## drift gate
+	patchgen --check
+
+# pre-commit-config.yaml
+# - repo: local
+#   hooks:
+#     - id: patchgen-check
+#       name: patchgen drift gate
+#       entry: patchgen --check
+#       language: system
+#       pass_filenames: false
+```
+
+### Transformers version
+
+The codegen layer is **transformers-version-agnostic**: `get_module_source(module_name)` walks `sys.path` for the module's `.py` file and reads it directly — it does **not** `import transformers`. The patch config itself only needs to resolve `source_module` to an actual file on the installed transformers. (Patch config decorators are free to live under `if TYPE_CHECKING:` blocks if their replacement bodies reference torch- or HF-version-specific symbols only at codegen time.)
+
+### What the library guarantees
+
+- `patchgen <module>` writes ruff-normalized output, then builds the `.diff` against that normalized output. `patchgen --check` regenerates the same way. The two are byte-for-byte identical, so a fresh regen never produces immediate drift.
+- `load_patch_config_module` loads patch configs via `importlib.util.spec_from_file_location`, so the **patch config's own package `__init__.py`** (e.g. a project-specific `models/<name>/__init__.py` that registers a custom HF model or pulls in heavy 3rdparty kernels) is **not** executed — *provided the config is self-contained*. Configs that import siblings under the same package (relative `from .sibling import …` or fully-qualified `from <pkg>.sibling import …`) re-trigger that package's `__init__.py`, because Python's import machinery materializes parent packages when resolving any sub-package name. Once cached in `sys.modules`, subsequent loads no-op the parent.
+- `get_module_source` reads source from disk; it does not import the patched module. This is what makes the layer transformers-version agnostic.
+
+### Library API (advanced)
+
+When the `patchgen` console script doesn't fit (e.g. you want to mount your own argparse-shaped CLI under a different name, or call codegen programmatically from a build script), the public Python API is:
+
+```python
+from patchgen import (
+    PatchConfig,
+    DiscoveryConfig,
+    ModelingCodeGenerator,        # programmatic codegen
+    build_run_codegen_cli,        # main()-shaped CLI factory
+    build_check_cli,              # main()-shaped drift-check factory
+    list_patch_configs,
+    run_codegen,
+)
+```
+
+`build_run_codegen_cli(discovery)` / `build_check_cli(discovery)` each return a `main(argv=None)` callable that mounts the same arguments as the `patchgen` script but rooted at the caller-supplied `DiscoveryConfig`. This bypasses the `[tool.patchgen]` discovery flow entirely.
+
+## Background: Why Not Monkey Patching?
+
+### Existing Approaches and Their Trade-offs
+
+| Approach            | Example | Pros                 | Cons                              |
+| ------------------- | ------- | -------------------- | --------------------------------- |
+| **Monkey Patching** | veRL    | Reuses HF code       | Hard to debug, order-dependent    |
+| **Copy + Modify**   | VeOmni  | Fully visible code   | Manual maintenance, drift from HF |
+| **Inheritance**     | Various | Code reuse           | Deep inheritance chains           |
+| **Custom Backend**  | vLLM    | Maximum optimization | Accuracy black hole               |
+
+### This Tool's Approach
+
+Inspired by HuggingFace's own `modular_model_converter.py`, we:
+
+1. **Define patches declaratively** in Python files
+1. **Generate code at build time**, not runtime
+1. **Produce readable output** with clear patch markers
+1. **Preserve comments** from patch definitions
+1. **Support easy regeneration** when HF updates
+
+## Common Patch Scenarios
+
+| Scenario                    | Patch Type           | Example              |
+| --------------------------- | -------------------- | -------------------- |
+| Fused kernels (LigerKernel) | Class replacement    | RMSNorm, SwiGLU      |
+| Optimized RoPE              | Function replacement | apply_rotary_pos_emb |
+| Sequence parallelism        | Method override      | Attention.forward    |
+| Expert parallelism          | Method override      | MoE.forward          |
+| Custom loss                 | Function replacement | cross_entropy        |
+| VLM modifications           | Method override      | Model.forward        |
+
+## Limitations
+
+- **Python 3.10+** required (matches the standalone `patchgen` package metadata)
+- Generated code may need manual adjustment for complex patches
+- Some HF decorators (e.g., `@use_kernel_forward_from_hub`) may need special handling
+- Does not handle dynamic/conditional patches (use config flags in patches instead)
+- Empty class bodies written as `class Foo(Bar): ...` (inline ellipsis) and
+  `class Foo(Bar):\n    pass` are both supported by `override_method` since the
+  Llama migration. If a HF release introduces a *new* empty-body syntax the
+  codegen helper `_is_empty_class_body_node` does not recognize, the generated
+  file will fail to import with `IndentationError`. Models in the HF tree that
+  currently use the inline ellipsis form include `llama`, `mistral`, `nemotron`,
+  `persimmon`, `phimoe`, `qwen2_moe`, `stablelm`, `jetmoe`.
+
+## Contributing
+
+To add support for a new model, follow
+[Adding a new model](#adding-a-new-model). In addition to generating and
+reviewing the modeling file, that workflow includes registry wiring,
+backend-contract audits, focused tests, and the patchgen drift gate.

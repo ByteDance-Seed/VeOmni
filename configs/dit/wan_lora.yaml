@@ -1,0 +1,69 @@
+model:
+  model_path: Wan-AI/Wan2.1-I2V-14B-480P
+  config_path: ./configs/model_configs/wan/wani2v_14b.json
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    # Wan's RoPE has a non-standard signature (rope_apply takes a single
+    # tensor plus freqs/head_dim kwargs) so the framework's default
+    # liger_kernel RoPE cannot drop in. Pin to eager explicitly until a
+    # Wan-specific liger wrapper exists.
+    rotary_pos_emb_implementation: eager
+  lora_config:
+    rank: 32
+    alpha: 32
+    lora_modules:
+      - q
+      - k
+      - v
+      - o
+      - ffn.0
+      - ffn.2
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    ulysses_size: 4
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: false
+    offload_config:
+      enable_activation: false
+
+data:
+  train_path: Wanmini480
+  train_size: 1000000000000
+  dataloader:
+    type: native
+    drop_last: true
+  datasets_type: iterable
+  data_type: diffusion
+  max_seq_len: 8192
+  text_keys: text
+  dyn_bsz_buffer_size: 200
+
+train:
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: wan2.1-i2v-14b-480p
+    manager: dcp
+    save_epochs: 1
+    save_hf_weights: true
+  max_steps: 200
+  num_train_epochs: 20
+  wandb:
+    enable: false
+    project: Wan2.1-I2V-14B-480P
+    name: lora_wan_i2v_14b
