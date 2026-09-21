@@ -497,9 +497,8 @@ def test_inference_stays_eager_over_a_checkpoint_accelerator(tmp_path):
         .modules
     )
 
-    # `janus_vqvae: {}` names the module without saying anything about it. Merging
-    # the layers as whole `{name: fields}` dicts used to read that as "clear it"
-    # rather than "defer", taking the eager default down with it.
+    # `janus_vqvae: {}` names the module without saying anything about it, so the
+    # layers beneath it stand.
     assert modules["janus_vqvae"].accelerator.fsdp_config.fsdp_mode == "eager"
     # Still overridable by the run's own YAML, which is the layer above.
     assert modules["janus_siglip"].accelerator.fsdp_config.fsdp_mode == "ddp"

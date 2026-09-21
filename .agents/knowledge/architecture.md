@@ -290,10 +290,15 @@ YAML, the checkpoint's module set is used and every entry is empty.
 
 Layer 3 sits *above* the checkpoint because parallelism belongs to a run and not a
 checkpoint: an inference run is eager unless its own YAML says otherwise, so a checkpoint
-`accelerator` reaches training and is masked for inference. Layers merge one module at a
-time rather than as whole `{name: fields}` dicts — `_deep_update` assigns an empty mapping
-instead of recursing into it, so a module a layer has nothing to say about (`janus_vqvae:
-{}`, a bare name under `modules:`) would otherwise wipe the layers below it.
+`accelerator` reaches training and is masked for inference. Only the VeOmni runtime acts on
+parallelism at all — `_init_eager_inference` reads `model_path`, `model_config` and
+`ops_implementation` and has no parallelism to configure.
+
+All of this rests on `_deep_update` (`arguments/parser.py`), shared with `__inherit__` base
+merging: nested mappings merge, lists and scalars replace, an explicit `None` clears, and
+an **empty mapping is a merge of nothing rather than an erasure** — which is how a layer
+says it has nothing to say about a key (`accelerator: {}`, a bare module name under
+`modules:`) without taking the layers below it down. See `tests/seed_omni/test_config_merge.py`.
 
 `to_hf_config()` persists the model fields only (`model_path`, `model_config`,
 `processor_config`, `ops_implementation`) — never `accelerator`, for the same reason.

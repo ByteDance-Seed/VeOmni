@@ -75,13 +75,17 @@ def _deep_update(source: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str,
     """
     Recursively update the source dictionary with the overrides dictionary.
     This ensures nested dictionaries are merged rather than overwritten.
+
+    An empty mapping is a merge of nothing, not an erasure: an override that names
+    a key without saying anything under it (``accelerator: {}``, a bare module
+    name under ``modules:``) leaves what is already there alone. Lists and scalars
+    replace, and an explicit ``None`` still clears.
     """
     for key, value in overrides.items():
-        if isinstance(value, dict) and value:
-            returned = _deep_update(source.get(key, {}), value)
-            source[key] = returned
+        if isinstance(value, dict):
+            source[key] = _deep_update(source.get(key, {}), value)
         else:
-            source[key] = overrides[key]
+            source[key] = value
     return source
 
 

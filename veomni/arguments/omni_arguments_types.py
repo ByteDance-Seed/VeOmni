@@ -298,14 +298,8 @@ def build_module_runtime_args(
     runtime_modules: dict[str, OmniModuleRuntimeArguments] = {}
     for name, override in modules_overrides.items():
         merged = deepcopy(base_dict)
-        # Layer by layer per module rather than merging the layers as whole
-        # `{name: fields}` dicts: `_deep_update` assigns an empty mapping instead
-        # of recursing into it, so a module a layer has nothing to say about
-        # (`janus_vqvae: {}`, a bare name under `modules:`) would wipe the layers
-        # below it rather than defer to them.
         for layer in (checkpoint_defaults.get(name, {}), inference_default, override):
-            if layer:
-                _deep_update(merged, layer)
+            _deep_update(merged, layer)
         runtime_modules[name] = _instantiate_recursive(OmniModuleRuntimeArguments, merged)
     return runtime_modules
 
