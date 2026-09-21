@@ -26,8 +26,11 @@ The framework owns the strategy, models stay unchanged:
   in one of the two supported styles — HF ``GradientCheckpointingLayer`` blocks,
   or a block loop calling ``self._gradient_checkpointing_func`` — to get both
   layer selection and SAC from configuration alone.
-* :func:`checkpoint_forward` is the model-side entry for hand-written block loops
-  (MiniMax-H3 style): it looks up the binding applied to the block.
+* :func:`checkpoint_forward` is the model-side entry, kept for out-of-tree
+  models: the same execution rule as above, for a model that owns a bare
+  ``torch.utils.checkpoint`` call and finds the block itself. No in-tree model
+  needs it — a block loop calls ``self._gradient_checkpointing_func``, which the
+  install step replaces.
 
 ``recompute_last_n_layers`` picks the recompute range from the last block
 (``-1`` = every layer, the default). Within that range, ``selective_n_layers``
@@ -48,23 +51,10 @@ from weakref import WeakKeyDictionary
 import torch
 import torch.nn as nn
 
-from veomni.utils import helper
+from veomni.utils import logging
 
 
-logger = helper.create_logger(__name__)
-
-_LOG_PREFIX = "recompute: "
-
-#: Concerns already reported, so the per-layer hot path logs at most once each.
-_warned: set = set()
-
-
-def _warn_once(key: str, message: str) -> None:
-    """Log ``message`` at most once per process; ``key`` identifies the concern."""
-    if key in _warned:
-        return
-    _warned.add(key)
-    logger.warning("%s%s", _LOG_PREFIX, message)
+logger = logging.get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -79,30 +69,54 @@ def _warn_once(key: str, message: str) -> None:
 # Known restrictions: needs non-reentrant checkpointing, and is not combined with
 # activation offload, Ulysses sequence parallel or torch.compile (see build_policy).
 
-#: Substring tokens matched against an operator's ``namespace::name`` as a
-#: fallback when exact ``OpOverload`` resolution misses an operator (e.g. a
-#: backend custom op not registered at configure time). Over-matching only
-#: saves more activations (memory), never changes numerics.
+#: Substring tokens matched against an operator's ``namespace::name``: a match
+#: means the operator's forward output is kept (``MUST_SAVE``) instead of being
+#: recomputed. One entry per attention family VeOmni can select, on CUDA and on
+#: NPU; a backend whose operator *name* is not listed here is still covered when
+#: its namespace matches (see ``_selective_namespaces``), and ``selective_ops``
+#: in the config is the escape hatch for anything left over.
+#:
+#: Only the *attention core* belongs here: operators whose output is the
+#: attention result (O(S·H·D)) and whose recompute costs a full attention pass.
+#: Fused kernels that produce a much larger intermediate (qkv projections, MLA
+#: prolog) are vetoed instead of saved — saving them costs more memory than the
+#: recompute they would avoid, see ``_SELECTIVE_VETO_TOKENS``.
 DEFAULT_SELECTIVE_TOKENS: tuple[str, ...] = (
-    "_scaled_dot_product",  # aten SDPA family (fused or math variants)
-    "npu_fusion_attention",  # torch_npu fused flash attention
-    "flash_attn",  # flash-attn-2/3 namespaces
-    "flash_attention",
-    "sageattn",
-    "memory_efficient_attention",  # xformers
+    "attention",  # every attention_* / *_attention operator: torch_npu families, xformers
+    # cutlass, flex, flash-attention, nsa, floyd, quant-fusion, multi-head, cuDNN
+    "attn",  # abbreviated names: npu_attn_softmax_, npu_advance_step_flashattn
+    "scaled_dot_product",  # aten SDPA family, including the composite entry point
+    "flash_attn",  # FlashAttention 2/3/4 operator names (no "attention" in them)
+    "flashattn",  # written without the underscore
+    "mla",  # FlashMLA / sparse MLA kernels
+    "indexer",  # DSA / lightning indexer (torch_npu and cuDNN FE)
+    "sageattn",  # SageAttention entry point
 )
 
-#: Substrings that must never be saved even if they match a token (e.g. the
-#: decomposed efficient-attention helpers materialize the attention matrix,
-#: which is exactly what we do not want to persist).
-_SELECTIVE_IGNORE_TOKENS: tuple[str, ...] = ("_efficient_attention",)
+#: Substrings that veto any match: never saved, whichever branch matched. Two
+#: reasons: the implementation materializes the attention matrix (exactly what
+#: we do not want to persist), or the fused kernel's output is far larger than
+#: an attention output, so saving it would cost more than the SAC budget.
+_SELECTIVE_VETO_TOKENS: tuple[str, ...] = (
+    "_efficient_attention_forward",  # xformers decomposition, materializes scores
+    "_efficient_attention_backward",
+    "qkv",  # npu_fused_attention_qkv_grad / _layernorm_qkv_fwd: output is qkv or its grad
+    "mla_prolog",  # npu_mla_prolog*: output is q + the compressed KV
+)
 
-#: Candidate operator namespaces probed for custom attention kernels.
+#: Candidate operator namespaces probed for custom attention kernels. Extended
+#: at runtime with every registered namespace matching a default token, so a
+#: backend whose namespace is not listed here (``flash_attn_3``) still resolves.
+#: Only namespaces that match no token need an entry here (``DSA``, ``npu``).
 _SELECTIVE_NS_CANDIDATES: tuple[str, ...] = (
     "npu",
     "npu_extension",
+    "DSA",  # cuDNN FE sparse attention / indexer wrappers
     "flashattn",
     "flash_attn",
+    "flash_attn_3",
+    "flash_attn_4",
+    "flash_mla",
     "sageattention",
     "xformers",
 )
@@ -155,9 +169,40 @@ def _op_qualname(op: Any) -> str:
     return str(op).replace("torch.ops.", "").split(".", 1)[-1]
 
 
-def _token_matches_qualname(qualname: str, tokens: Sequence[str]) -> bool:
+def _matches_tokens(qualname: str, tokens: Sequence[str]) -> bool:
+    """True when any token is a substring of the operator's ``namespace::name``."""
     lowered = qualname.lower()
-    return any(t in lowered for t in tokens) and not any(i in lowered for i in _SELECTIVE_IGNORE_TOKENS)
+    return any(t in lowered for t in tokens)
+
+
+def _is_vetoed(qualname: str) -> bool:
+    """True when the operator must never be saved (see ``_SELECTIVE_VETO_TOKENS``)."""
+    return _matches_tokens(qualname, _SELECTIVE_VETO_TOKENS)
+
+
+def _registered_namespaces() -> list[str]:
+    """Namespaces of every operator the dispatcher knows about.
+
+    ``dir(torch.ops)`` only lists namespaces already touched in this process, so
+    an out-of-tree library that registered its schemas without being accessed
+    (``flash_attn_3::_flash_attn_forward``) would be invisible. The schemas are
+    therefore read from the dispatcher instead.
+    """
+    try:
+        schemas = torch._C._jit_get_all_schemas()
+    except AttributeError:  # pragma: no cover - very old or stripped builds
+        return [name for name in dir(torch.ops) if not name.startswith("_")]
+    return sorted({schema.name.split("::", 1)[0] for schema in schemas if "::" in schema.name})
+
+
+def _selective_namespaces(registered: Sequence[str]) -> list[str]:
+    """Namespaces to probe: the fixed candidates plus any registered one whose
+    own name matches a default attention token."""
+    namespaces = set(_SELECTIVE_NS_CANDIDATES)
+    for name in registered:
+        if not name.startswith("_") and _matches_tokens(name, DEFAULT_SELECTIVE_TOKENS):
+            namespaces.add(name)
+    return sorted(namespaces)
 
 
 def resolve_exact_ops(extra_op_names: Sequence[str] | None = None) -> tuple[list[Any], list[str]]:
@@ -179,13 +224,14 @@ def resolve_exact_ops(extra_op_names: Sequence[str] | None = None) -> tuple[list
             ops.append(default)
 
     # Custom namespaces: probe candidate namespaces for token-matching ops.
-    for ns_name in _SELECTIVE_NS_CANDIDATES:
+    for ns_name in _selective_namespaces(_registered_namespaces()):
         try:
             ns = getattr(torch.ops, ns_name)
         except AttributeError:
             continue
         for op_name in dir(ns):
-            if not _token_matches_qualname(op_name, DEFAULT_SELECTIVE_TOKENS):
+            qualname = f"{ns_name}::{op_name}"
+            if not _matches_tokens(qualname, DEFAULT_SELECTIVE_TOKENS) or _is_vetoed(qualname):
                 continue
             default = getattr(getattr(ns, op_name), "default", None)
             if default is not None:
@@ -199,7 +245,7 @@ def resolve_exact_ops(extra_op_names: Sequence[str] | None = None) -> tuple[list
                 raise TypeError("op string must end with an overload name")
             ops.append(op)
         except (AttributeError, TypeError) as exc:
-            logger.warning("%scannot resolve extra selective op %r (%s)", _LOG_PREFIX, op_str, exc)
+            logger.warning(f"cannot resolve extra selective op {op_str!r} ({exc})")
             failed.append(op_str)
 
     # De-duplicate while preserving order (OpOverloads are hashable singletons).
@@ -212,22 +258,28 @@ def resolve_exact_ops(extra_op_names: Sequence[str] | None = None) -> tuple[list
     return unique, failed
 
 
-def _make_selective_policy(exact_ops: Sequence[Any], prefix_mode: bool) -> Callable[[Any, Any, tuple, dict], Any]:
+def _make_selective_policy(exact_ops: Sequence[Any]) -> Callable[[Any, Any, tuple, dict], Any]:
     """Policy fn for ``create_selective_checkpoint_contexts``.
 
-    Returns MUST_SAVE for resolved attention ops (exact identity) or, in prefix
-    mode, for any op whose qualname matches a default token; otherwise
-    PREFER_RECOMPUTE. Both directions of mismatch are numerically safe (they
-    only change how much is saved vs recomputed).
+    Returns MUST_SAVE for resolved attention ops (exact identity) *and* for any
+    op whose qualname matches a default token; otherwise PREFER_RECOMPUTE. The
+    name match is kept alongside the exact list so an operator that resolved
+    neither precisely nor at probe time (a backend registering after the policy
+    was built) is still saved. Both directions of mismatch are numerically safe
+    (they only change how much is saved vs recomputed).
+
+    ``_SELECTIVE_VETO_TOKENS`` wins over both branches: a fused kernel whose
+    output is much larger than an attention output is recomputed even when it
+    matched by identity or by name.
     """
     op_set = set(exact_ops)
 
     def policy(ctx, op, *args, **kwargs):
         del ctx, args, kwargs  # unused
-        if prefix_mode:
-            if _token_matches_qualname(_op_qualname(op), DEFAULT_SELECTIVE_TOKENS):
-                return torch.utils.checkpoint.CheckpointPolicy.MUST_SAVE
-        elif op in op_set:
+        qualname = _op_qualname(op)
+        if _is_vetoed(qualname):
+            return torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
+        if op in op_set or _matches_tokens(qualname, DEFAULT_SELECTIVE_TOKENS):
             return torch.utils.checkpoint.CheckpointPolicy.MUST_SAVE
         return torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
 
@@ -237,16 +289,13 @@ def _make_selective_policy(exact_ops: Sequence[Any], prefix_mode: bool) -> Calla
 def _build_context_fn(extra_op_names: Sequence[str] | None) -> Callable[[], tuple[Any, Any]]:
     """Build the ``context_fn`` for ``torch.utils.checkpoint.checkpoint``."""
     exact_ops, failed = resolve_exact_ops(extra_op_names)
-    if exact_ops:
-        logger.info_rank0("%sSAC enabled with %d exact attention ops", _LOG_PREFIX, len(exact_ops))
-        return functools.partial(torch.utils.checkpoint.create_selective_checkpoint_contexts, list(exact_ops))
-
-    _warn_once(
-        "sac-prefix",
-        f"no attention operator resolved (failed extras: {failed or 'none'}); using the name-substring policy",
-    )
+    if failed:
+        logger.warning_once(
+            f"cannot resolve extra selective op(s) {failed!r}; they are covered by the name-substring policy only"
+        )
+    logger.info_rank0(f"SAC enabled with {len(exact_ops)} exact attention ops plus the name-substring fallback")
     return functools.partial(
-        torch.utils.checkpoint.create_selective_checkpoint_contexts, _make_selective_policy((), prefix_mode=True)
+        torch.utils.checkpoint.create_selective_checkpoint_contexts, _make_selective_policy(exact_ops)
     )
 
 
@@ -295,49 +344,43 @@ def build_policy(
     counts are clamped instead.
     """
     if recompute_last_n_layers < -1:
-        _warn_once(
-            "recompute-count",
-            f"recompute_last_n_layers={recompute_last_n_layers} invalid (< -1), using -1 (every layer)",
+        logger.warning_once(
+            f"recompute_last_n_layers={recompute_last_n_layers} invalid (< -1), using -1 (every layer)"
         )
         recompute_last_n_layers = -1
     if selective_n_layers < 0:
-        _warn_once(
-            "selective-count",
+        logger.warning_once(
             f"selective_n_layers={selective_n_layers} invalid (< 0), using 0 (SAC off); "
-            "use a value >= the model depth for every recomputed layer",
+            "use a value >= the model depth for every recomputed layer"
         )
         selective_n_layers = 0
     if selective_n_layers > 0 and recompute_last_n_layers == 0:
-        _warn_once(
-            "selective-without-recompute",
-            "selective_n_layers is set but recompute_last_n_layers=0 recomputes no layer at all, so SAC never applies",
+        logger.warning_once(
+            "selective_n_layers is set but recompute_last_n_layers=0 recomputes no layer at all, so SAC never applies"
         )
 
     context_fn = None
     if selective_n_layers > 0:
         if not enabled:
-            _warn_once(
-                "sac-disabled",
+            logger.warning_once(
                 f"selective_n_layers={selective_n_layers} ignored: SAC needs "
-                "model.accelerator.gradient_checkpointing.enable=True; those layers fall back to full recomputation",
+                "model.accelerator.gradient_checkpointing.enable=True; those layers fall back to full recomputation"
             )
         elif enable_reentrant:
-            _warn_once(
-                "sac-reentrant",
+            logger.warning_once(
                 f"selective_n_layers={selective_n_layers} ignored: SAC needs "
-                "enable_reentrant=False; those layers fall back to full recomputation",
+                "enable_reentrant=False; those layers fall back to full recomputation"
             )
         elif offload_active:
-            _warn_once(
-                "sac-offload",
+            logger.warning_once(
                 f"selective_n_layers={selective_n_layers} ignored: activation offload owns the "
-                "checkpoint boundary; those layers fall back to full recomputation",
+                "checkpoint boundary; those layers fall back to full recomputation"
             )
         else:
             context_fn = _build_context_fn(extra_op_names)
 
     if context_fn is not None and compile_enabled:
-        _warn_once("sac-compile", "torch.compile is enabled; SAC with torch.compile is unverified")
+        logger.warning_once("torch.compile is enabled; SAC with torch.compile is unverified")
 
     return RecomputePolicy(
         recompute_last_n_layers=recompute_last_n_layers,
@@ -365,8 +408,9 @@ class Decision(IntEnum):
 class BlockPlan:
     """Pre-computed checkpoint behaviour of a single block.
 
-    ``checkpoint_kwargs`` always carries ``use_reentrant``; SAC adds
-    ``context_fn``, non-reentrant full recomputation adds ``early_stop``.
+    ``checkpoint_kwargs`` is empty for ``DIRECT``, which never checkpoints;
+    otherwise it carries ``use_reentrant``, plus ``early_stop`` on the
+    non-reentrant paths and ``context_fn`` for SAC.
     """
 
     decision: Decision
@@ -378,7 +422,7 @@ def _clamp_recompute_n(count: int, total: int) -> int:
     if count < 0:
         return -1
     if count > total:
-        _warn_once("clamped:recompute", f"recompute_last_n_layers={count} >= {total} blocks, using every layer")
+        logger.warning_once(f"recompute_last_n_layers={count} >= {total} blocks, using every layer")
         return -1
     return count
 
@@ -459,19 +503,20 @@ class _Candidate:
         return len(self.modules)
 
 
-def _target_class_names(model: nn.Module, target_classes: Sequence[str]) -> tuple[str, ...]:
+def _target_class_names(model: nn.Module, basic_modules: Sequence[str] | None) -> tuple[str, ...]:
     """Class names that identify a transformer block in ``model``, in priority order.
 
     ``_no_split_modules`` plus ``basic_modules`` is what FSDP shards on, so both
-    frameworks agree on what a block is. The order is kept: a model declares its
-    main block first, which is what tells a vision tower and a text decoder
-    apart. Models that declare neither fall back to the HF marker attribute,
-    which checkpointing layers always carry.
+    frameworks agree on what a block is. Only ``basic_modules`` carries an order
+    worth reading — it comes from the configuration, so the operator's own
+    ordering is kept. The model's ``_no_split_modules`` is a membership test:
+    HF turns it into a set in ``post_init``, and set iteration order follows the
+    process hash seed, so it is sorted to stay stable between runs. Models that
+    declare neither fall back to the HF marker attribute, which checkpointing
+    layers always carry.
     """
-    names: list[str] = []
-    for name in target_classes:
-        if name and name not in names:
-            names.append(name)
+    names: list[str] = [name for name in dict.fromkeys(basic_modules or []) if name]
+    names.extend(name for name in sorted(getattr(model, "_no_split_modules", None) or []) if name not in names)
     if names:
         return tuple(names)
     return tuple(
@@ -486,20 +531,21 @@ def _target_class_names(model: nn.Module, target_classes: Sequence[str]) -> tupl
 
 
 def discover_block_stack(
-    model: nn.Module, target_classes: Sequence[str]
+    model: nn.Module, basic_modules: Sequence[str] | None = None
 ) -> tuple[BlockStack | None, list[BlockStack]]:
     """Find ``model``'s main block stack; report the stacks left out of the filter.
 
     Containers of matching blocks are folded into one sequence when they share a
     parent — flux runs ``blocks`` then ``single_blocks`` — while containers under
     another parent (a vision tower next to the text layers, say) are excluded:
-    a single "last N layers" count cannot speak about two independent stacks. The
-    main stack is the one holding the block class the model declared first, and
-    among those the deepest — so a vision tower with more blocks than the decoder
-    still loses.
+    a single "last N layers" count cannot speak about two independent stacks.
+
+    Which stack becomes the main one is decided from the model's structure alone,
+    never from set iteration order, so two processes of the same run always
+    schedule recomputation the same way — see :func:`_stack_rank`.
     """
-    class_names = _target_class_names(model, target_classes)
-    class_rank = {name: index for index, name in enumerate(class_names)}
+    class_names = _target_class_names(model, basic_modules)
+    declared_rank = {name: index for index, name in enumerate(basic_modules or []) if name}
     class_set = set(class_names)
     candidates: list[_Candidate] = []
     for fqn, container in model.named_modules():
@@ -524,19 +570,40 @@ def discover_block_stack(
     for candidate in candidates:
         by_parent.setdefault(candidate.parent_fqn, []).append(candidate)
 
-    main_parent = max(by_parent, key=lambda parent: _stack_rank(by_parent[parent], class_rank))
+    main_parent = max(by_parent, key=lambda parent: (_stack_rank(by_parent[parent], declared_rank), parent))
     main = by_parent.pop(main_parent)
     excluded = [_as_stack(candidate) for group in by_parent.values() for candidate in group]
     return _as_stack(*main), excluded
 
 
-def _stack_rank(candidates: Sequence[_Candidate], class_rank: dict[str, int]) -> tuple[int, int]:
-    """Order candidate containers: declared block class first, then block count."""
-    undeclared = len(class_rank)
+def _stack_rank(candidates: Sequence[_Candidate], declared_rank: dict[str, int]) -> tuple[int, int, int]:
+    """Order candidate containers from the model's structure, never from a set.
+
+    Highest wins, in this order:
+
+    1. a block class named in ``basic_modules`` — an explicit statement about
+       which stack the layer counts are meant for;
+    2. a stack holding trainable parameters — a frozen tower runs without
+       gradients, so there is nothing there to recompute;
+    3. the stack with more blocks, and past that the parent's qualified name
+       (applied by the caller), which no ordering can depend on.
+    """
+    undeclared = len(declared_rank)
     declared = min(
-        class_rank.get(type(module).__name__, undeclared) for candidate in candidates for module in candidate.modules
+        (
+            declared_rank.get(type(module).__name__, undeclared)
+            for candidate in candidates
+            for module in candidate.modules
+        ),
+        default=undeclared,
     )
-    return (-declared, sum(candidate.total for candidate in candidates))
+    trainable = any(
+        parameter.requires_grad
+        for candidate in candidates
+        for module in candidate.modules
+        for parameter in module.parameters()
+    )
+    return (-declared, int(trainable), sum(candidate.total for candidate in candidates))
 
 
 def _parent_fqn(fqn: str) -> str:
@@ -577,10 +644,16 @@ class RecomputeReport:
     excluded: tuple[BlockStack, ...] = ()
     bound_blocks: int = 0
     patched_blocks: int = 0
+    patched_containers: int = 0
 
     @property
     def bound(self) -> bool:
         return self.bound_blocks > 0
+
+    @property
+    def covered(self) -> bool:
+        """Whether the model has a checkpoint entry point the policy could reach."""
+        return self.patched_blocks > 0 or self.patched_containers > 0
 
 
 #: Block -> binding, keyed by module so a weak reference keeps no model alive.
@@ -606,15 +679,13 @@ def apply_recompute_policy(
     if not policy.active:
         return RecomputeReport(policy=policy)
 
-    # The model's own list comes first: it declares the main block class first,
-    # and the framework's ``basic_modules`` is a set union by the time it arrives.
-    stack, excluded = discover_block_stack(
-        model, list(getattr(model, "_no_split_modules", None) or []) + list(basic_modules or [])
-    )
+    # ``basic_modules`` is the configured list, so its order decides between
+    # several declared block classes; the model's own ``_no_split_modules`` is
+    # read as a set of names inside ``discover_block_stack``.
+    stack, excluded = discover_block_stack(model, basic_modules)
     if stack is None:
-        _warn_once(
-            "no-stack",
-            f"no block stack found in {type(model).__name__}; the layer counts and SAC are not applied",
+        logger.warning_once(
+            f"no block stack found in {type(model).__name__}; the layer counts and SAC are not applied"
         )
         return RecomputeReport(policy=policy)
 
@@ -624,12 +695,18 @@ def apply_recompute_policy(
         )
 
     patched_blocks = 0
+    patched_containers = 0
     for module in model.modules():
         if "_gradient_checkpointing_func" not in vars(module):
             continue
         binding = _block_bindings.get(module)
         if binding is not None:
             patched_blocks += 1
+        else:
+            # A non-block holding the entry point is the container of a
+            # hand-written loop (flux style) or a model that arms the function
+            # itself (MiniMax-H3 style); either way the policy now reaches it.
+            patched_containers += 1
         module._gradient_checkpointing_func = (
             _block_checkpoint_func(binding) if binding is not None else _container_checkpoint_func(policy)
         )
@@ -640,6 +717,7 @@ def apply_recompute_policy(
         excluded=tuple(excluded),
         bound_blocks=stack.total,
         patched_blocks=patched_blocks,
+        patched_containers=patched_containers,
     )
     _log_recompute_report(report, model)
     return report
@@ -657,7 +735,7 @@ def _block_checkpoint_func(binding: BlockBinding) -> Callable[..., Any]:
     def checkpointed(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         if plan.decision is Decision.DIRECT:
             return func(*args, **kwargs)
-        return torch.utils.checkpoint.checkpoint(func, *args, **kwargs, **plan.checkpoint_kwargs)
+        return _run_checkpoint(func, args, kwargs, plan.checkpoint_kwargs)
 
     checkpointed._veomni_layer_index = binding.index
     checkpointed._veomni_decision = plan.decision
@@ -680,10 +758,10 @@ def _container_checkpoint_func(policy: RecomputePolicy) -> Callable[..., Any]:
         block = _resolve_block(func, args)
         binding = _block_bindings.get(block) if block is not None else None
         if binding is None:
-            return torch.utils.checkpoint.checkpoint(func, *args, **kwargs, **fallback_kwargs)
+            return _run_checkpoint(func, args, kwargs, fallback_kwargs)
         if binding.plan.decision is Decision.DIRECT:
             return func(*args, **kwargs)
-        return torch.utils.checkpoint.checkpoint(func, *args, **kwargs, **binding.plan.checkpoint_kwargs)
+        return _run_checkpoint(func, args, kwargs, binding.plan.checkpoint_kwargs)
 
     return checkpointed
 
@@ -707,33 +785,25 @@ def _log_recompute_report(report: RecomputeReport, model: nn.Module) -> None:
     total = report.stack.total
     decisions = [plan_block(report.policy, index, total).decision for index in range(total)]
     logger.info_rank0(
-        "%spolicy applied to %s: stack=%s; %s",
-        _LOG_PREFIX,
-        type(model).__name__,
-        report.stack.describe(),
-        _describe_decisions(decisions),
+        f"policy applied to {type(model).__name__}: stack={report.stack.describe()}; {_describe_decisions(decisions)}"
     )
-    if report.patched_blocks == 0:
-        # Two models land here and they cannot be told apart from the outside: one
-        # reads the bindings through checkpoint_forward (MiniMax-H3 style), the
-        # other drives torch.utils.checkpoint itself and never sees the policy.
+    if not report.covered:
+        # The stack was found but nothing on the model calls a checkpoint
+        # function the framework can replace: a model driving
+        # torch.utils.checkpoint itself never sees the policy.
         logger.info_rank0(
-            "%sno block-level _gradient_checkpointing_func in %s; blocks are registered for "
-            "checkpoint_forward only, so a model that runs torch.utils.checkpoint itself is not covered",
-            _LOG_PREFIX,
-            type(model).__name__,
+            f"no _gradient_checkpointing_func in {type(model).__name__}; blocks are registered for "
+            "checkpoint_forward only, so a model that runs torch.utils.checkpoint itself is not covered "
+            "unless it calls that entry point"
         )
     if Decision.DIRECT in decisions:
         logger.info_rank0(
-            "%sblocks outside recompute_last_n_layers=%d keep their activations (memory grows); "
-            "selective_n_layers only says which recomputed blocks run SAC",
-            _LOG_PREFIX,
-            report.policy.recompute_last_n_layers,
+            f"blocks outside recompute_last_n_layers={report.policy.recompute_last_n_layers} keep their "
+            "activations (memory grows); selective_n_layers only says which recomputed blocks run SAC"
         )
     for stack in report.excluded:
-        _warn_once(
-            f"excluded:{stack.fqn}",
-            f"stack {stack.describe()} is not a sibling of {report.stack.fqn} and stays outside the layer counts",
+        logger.warning_once(
+            f"stack {stack.describe()} is not a sibling of {report.stack.fqn} and stays outside the layer counts"
         )
 
 
@@ -754,15 +824,32 @@ def _describe_decisions(decisions: Sequence[Decision]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _create_custom_forward(module: nn.Module) -> Callable[..., Any]:
+def _create_custom_forward(function: Callable[..., Any]) -> Callable[..., Any]:
     def custom_forward(*inputs, **kwargs):
-        return module(*inputs, **kwargs)
+        return function(*inputs, **kwargs)
 
     return custom_forward
 
 
-def _run_checkpoint(block: nn.Module, args: tuple, kwargs: dict, checkpoint_kwargs: dict[str, Any]) -> Any:
-    return torch.utils.checkpoint.checkpoint(_create_custom_forward(block), *args, **kwargs, **checkpoint_kwargs)
+def _run_checkpoint(function: Callable[..., Any], args: tuple, kwargs: dict, checkpoint_kwargs: dict[str, Any]) -> Any:
+    """Checkpoint one call, refusing the shape reentrant checkpointing cannot carry.
+
+    Reentrant checkpointing re-runs the function from the tensors it was handed
+    positionally: a keyword argument does not cross the boundary. Torch raises on
+    its own, and folding the keywords into a closure instead would drop the
+    gradient of every keyword tensor that needs one — so the combination is
+    reported where it is decided, naming the key that turns it off.
+    """
+    if kwargs and checkpoint_kwargs.get("use_reentrant"):
+        block = _resolve_block(function, args)
+        raise ValueError(
+            "model.accelerator.gradient_checkpointing.enable_reentrant=True cannot checkpoint a block "
+            f"that is called with keyword arguments ({', '.join(sorted(kwargs))}); "
+            f"{type(block).__name__ if block is not None else 'this block'} is. Reentrant checkpointing "
+            "saves positional tensors only, so a keyword tensor would lose its gradient silently. "
+            "Set enable_reentrant=False (the default), or pass those arguments positionally."
+        )
+    return torch.utils.checkpoint.checkpoint(_create_custom_forward(function), *args, **kwargs, **checkpoint_kwargs)
 
 
 def checkpoint_forward(
@@ -774,13 +861,22 @@ def checkpoint_forward(
 ) -> Any:
     """Run ``block`` with the recomputation strategy bound to it.
 
-    Model-side entry point for hand-written block loops (MiniMax-H3 style); the
-    framework binds the strategy, so the loop passes no layer information. A
-    block that was never bound is checkpointed in full — the default behaviour —
-    and warns once when that happens while a policy is in force elsewhere.
+    Model-side entry point for a hand-written loop that owns its checkpoint
+    call and finds the block itself; the framework binds the strategy, so the
+    loop passes no layer information. No in-tree model needs it — loops that
+    call ``self._gradient_checkpointing_func`` are patched directly — but it
+    stays the documented way for a model to keep driving its own checkpointing.
+    A block that was never bound is checkpointed in full, the default
+    behaviour, and warns once when that happens while a policy is in force
+    elsewhere.
 
-    Priority, same as the per-block entry points the framework set up: activation
-    offload > SAC > full checkpoint > direct call.
+    Highest priority first, and the same rule for every block:
+
+    1. the block is outside the recompute range (``DIRECT``) — called directly;
+    2. activation offload — checkpointed with ``save_on_cpu``, which is the
+       offload switch's own boundary and carries no SAC context;
+    3. checkpointing on — checkpointed with the block's plan, SAC or full;
+    4. checkpointing off — called directly.
     """
     plan = _plan_for(block)
 
@@ -802,10 +898,9 @@ def _plan_for(block: nn.Module) -> BlockPlan:
         # Bindings exist, so a policy is in force somewhere and this block
         # escaped it: worth saying. With no binding at all the run is on the
         # defaults, where full recomputation is the documented behaviour.
-        _warn_once(
-            "unbound-block",
+        logger.warning_once(
             f"{type(block).__name__} has no recompute binding; recomputing it in full on every call "
-            "(the framework binds blocks during model build)",
+            "(the framework binds blocks during model build)"
         )
     # Only ``use_reentrant`` is pinned here: this entry point is handed the block
     # alone, so no policy is in reach and the remaining checkpoint options stay

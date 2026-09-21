@@ -409,7 +409,10 @@ class VeOmniModelRuntime:
             enable_reshard_after_forward=args.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=args.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=gc_cfg.enable,
-            basic_modules=list(set(getattr(self.model, "_no_split_modules", None) or []) | set(args.basic_modules)),
+            # Configured classes only, in configuration order: parallelize reads
+            # the model's own ``_no_split_modules`` itself, and recompute needs
+            # this list unmerged and ordered so it can rank the block stacks.
+            basic_modules=list(args.basic_modules or []),
             recompute_policy=recompute_policy,
             enable_reentrant=gc_cfg.enable_reentrant,
             early_stop=gc_cfg.early_stop,

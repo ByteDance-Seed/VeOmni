@@ -31,7 +31,6 @@ from ..arguments.arguments_types import validate_low_precision_reduce_scatter_co
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
 from ..utils import logging, recompute_utils
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
-from ..utils.recompute_utils import RecomputePolicy
 from .checkpoint import CheckpointFunction
 from .fsdp2.reduce_scatter import (
     ReduceScatterTransportPolicy,
@@ -903,7 +902,7 @@ def build_parallelize_model(
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
-    recompute_policy: Optional[RecomputePolicy] = None,
+    recompute_policy: Optional[recompute_utils.RecomputePolicy] = None,
     muon_expert_zero_comm: bool = False,
     low_precision_reduce_scatter_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
@@ -915,6 +914,8 @@ def build_parallelize_model(
     Args:
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
+        recompute_policy: Per-block recomputation strategy, bound after HF has
+            enabled gradient checkpointing and before FSDP2 shards the blocks.
     """
     parallel_state = get_parallel_state()
     if low_precision_reduce_scatter_comm is not False:

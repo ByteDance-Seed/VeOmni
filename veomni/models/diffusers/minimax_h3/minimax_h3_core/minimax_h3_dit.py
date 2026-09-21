@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
@@ -13,7 +14,6 @@ from veomni.distributed.sequence_parallel.ulysses import (
     _Gather,
 )
 from veomni.utils.device import IS_NPU_AVAILABLE
-from veomni.utils.recompute_utils import checkpoint_forward as gradient_checkpoint_forward
 
 from .core import attention_forward
 
@@ -385,6 +385,13 @@ class MiniMaxH3DiT(nn.Module):
     ):
         super().__init__()
         self._block_offload_enabled = False
+        # Same shim HF puts on a PreTrainedModel, so the block loop below reads
+        # the checkpoint function off the instance: the recompute policy is
+        # installed by replacing this attribute, exactly as it is for a model
+        # that checkpoints through HF layers. The default is what the loop did
+        # before the policy existed, for runs that enable checkpointing through
+        # the data pipeline while the policy stays inactive.
+        self._gradient_checkpointing_func = functools.partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_channels_latents = latents_dim
@@ -591,6 +598,18 @@ class MiniMaxH3DiT(nn.Module):
         # (their uninitialized attention output never reaches the loss).
         cu_bounds = tuple(cu_seqlens.tolist())
         block_swap = self._block_swap if self._block_offload_enabled else 0
+        # Every block takes the same arguments; what differs per block is the
+        # recompute decision, which the framework folds into the instance's
+        # ``_gradient_checkpointing_func``.
+        block_kwargs = {
+            "t_emb": t_emb,
+            "combined_indices": combined_indices,
+            "rope_cos": rope_cos,
+            "rope_sin": rope_sin,
+            "cu_seqlens": cu_bounds,
+            "max_seqlen": max_seqlen,
+            "use_ulysses": sp_world > 1,
+        }
         for i, block in enumerate(self.blocks):
             if self._block_offload_enabled:
                 if i == 0:
@@ -601,19 +620,13 @@ class MiniMaxH3DiT(nn.Module):
                         b.to("cpu")
                     for b in self.blocks[block_swap:]:
                         b.to(device)
-            hidden = gradient_checkpoint_forward(
-                block,
-                use_gradient_checkpointing,
-                use_gradient_checkpointing_offload,
-                hidden,
-                t_emb=t_emb,
-                combined_indices=combined_indices,
-                rope_cos=rope_cos,
-                rope_sin=rope_sin,
-                cu_seqlens=cu_bounds,
-                max_seqlen=max_seqlen,
-                use_ulysses=sp_world > 1,
-            )
+            if use_gradient_checkpointing_offload:
+                with torch.autograd.graph.save_on_cpu():
+                    hidden = self._gradient_checkpointing_func(block, hidden, **block_kwargs)
+            elif use_gradient_checkpointing:
+                hidden = self._gradient_checkpointing_func(block, hidden, **block_kwargs)
+            else:
+                hidden = block(hidden, **block_kwargs)
 
         if self._block_offload_enabled:
             for b in self.blocks[block_swap:]:

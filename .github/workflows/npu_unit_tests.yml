@@ -185,10 +185,11 @@ jobs:
       - name: Run checkpoint tests
         run: |
           uv run --frozen pytest -v -s -x tests/checkpoints/
-      - name: Run distributed tests (dummy_forward)
+      - name: Run distributed tests (dummy_forward, gradient_checkpointing)
         run: |
           uv run --frozen pytest -v -s -x tests/distributed/test_async_offload_unit.py
           uv run --frozen pytest -v -s -x tests/distributed/test_dummy_forward.py
+          uv run --frozen pytest -v -s -x tests/distributed/test_gradient_checkpointing.py
       - name: Run data tests
         run: |
           uv run --frozen pytest -v -s -x tests/data
