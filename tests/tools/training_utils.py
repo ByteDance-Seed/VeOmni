@@ -189,6 +189,27 @@ def make_npu_ops_config(model_name: Optional[str] = None, **overrides) -> OpsImp
     return OpsImplementationConfig(**merged)
 
 
+def unbuilt_runtime(args, *, cls=None, name: str = "base", train=None):
+    """A runtime holding only its config, for tests about seams rather than models.
+
+    Constructing one normally builds the model it wraps — the whole point of the
+    class — so a test that wants to inspect a config seam, or to drop a fake
+    module in by hand, has to bypass the constructor. ``args`` is this model's
+    own arguments, exactly as the constructor takes them; ``train`` is required
+    of a real runtime but optional here, since a seam that reads no job-wide
+    setting has no use for it.
+    """
+    from veomni.models.model_runtime import VeOmniModelRuntime
+
+    cls = cls or VeOmniModelRuntime
+    runtime = cls.__new__(cls)
+    runtime.args = args
+    runtime.model_name = name
+    runtime.train_args = train
+    runtime.model_assets = []
+    return runtime
+
+
 def release_device_memory():
     """Synchronize GPU, run garbage collection, and empty CUDA cache."""
     from veomni.utils.device import empty_cache, synchronize
@@ -263,7 +284,7 @@ def build_torchrun_cmd(
         # less GPU memory required on the L20 (44 GiB) runners.
         "--train.global_batch_size=8",
         "--train.micro_batch_size=1",
-        f"--train.init_device={init_device}",
+        f"--model.accelerator.init_device={init_device}",
         "--train.bsz_warmup_ratio=0",
         "--train.num_train_epochs=1",
         "--train.checkpoint.save_epochs=0",
@@ -280,9 +301,9 @@ def build_torchrun_cmd(
     if parallel_config is not None:
         cmd.extend(
             [
-                f"--train.accelerator.fsdp_config.fsdp_mode={parallel_config.fsdp_mode}",
-                f"--train.accelerator.ulysses_size={parallel_config.sp_size}",
-                f"--train.accelerator.ep_size={parallel_config.ep_size}",
+                f"--model.accelerator.fsdp_config.fsdp_mode={parallel_config.fsdp_mode}",
+                f"--model.accelerator.ulysses_size={parallel_config.sp_size}",
+                f"--model.accelerator.ep_size={parallel_config.ep_size}",
             ]
         )
 

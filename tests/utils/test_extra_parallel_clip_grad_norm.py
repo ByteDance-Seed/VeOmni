@@ -13,10 +13,10 @@ import torch.nn as nn
 from packaging.version import Version
 from torch.distributed._tensor import DTensor, Shard
 
-from veomni.arguments import TrainingArguments, parse_args
+from veomni.arguments import ModelArguments, TrainingArguments, parse_args
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.parallel_plan import ParallelPlan
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.optim import build_optimizer
 from veomni.utils import helper
@@ -42,6 +42,7 @@ def _torch_npu_version() -> str:
 
 @dataclass
 class Argument:
+    model: "ModelArguments" = field(default_factory=ModelArguments)
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
 
 
@@ -126,33 +127,33 @@ def main():
     args = parse_args(Argument)
 
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
-    init_parallel_state(
-        dp_size=args.train.accelerator.dp_size,
-        dp_replicate_size=args.train.accelerator.dp_replicate_size,
-        dp_shard_size=args.train.accelerator.dp_shard_size,
-        tp_size=args.train.accelerator.tp_size,
-        pp_size=args.train.accelerator.pp_size,
-        cp_size=args.train.accelerator.cp_size,
-        ulysses_size=args.train.accelerator.ulysses_size,
-        extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes,
-        extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
-        extra_parallel_names=args.train.accelerator.extra_parallel_names,
-        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
+    _init_parallel_state(
+        dp_size=args.model.accelerator.dp_size,
+        dp_replicate_size=args.model.accelerator.dp_replicate_size,
+        dp_shard_size=args.model.accelerator.dp_shard_size,
+        tp_size=args.model.accelerator.tp_size,
+        pp_size=args.model.accelerator.pp_size,
+        cp_size=args.model.accelerator.cp_size,
+        ulysses_size=args.model.accelerator.ulysses_size,
+        extra_parallel_sizes=args.model.accelerator.extra_parallel_sizes,
+        extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
+        extra_parallel_names=args.model.accelerator.extra_parallel_names,
+        dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
     )
 
     model = ToyMoeAndEmbedModel()
     model = build_parallelize_model(
         model,
-        init_device=args.train.init_device,
+        init_device=args.model.accelerator.init_device,
         weights_path=None,
-        mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
-        enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
-        enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
+        mixed_precision=args.model.accelerator.fsdp_config.mixed_precision,
+        enable_gradient_checkpointing=args.model.accelerator.gradient_checkpointing.enable,
+        enable_fsdp_offload=args.model.accelerator.fsdp_config.offload,
         basic_modules=[],
-        enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
-        enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
-        broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
-        max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
+        enable_reentrant=args.model.accelerator.gradient_checkpointing.enable_reentrant,
+        enable_forward_prefetch=args.model.accelerator.fsdp_config.forward_prefetch,
+        broadcast_model_weights_from_rank0=args.model.broadcast_model_weights_from_rank0,
+        max_load_broadcast_size=args.model.accelerator.fsdp_config.max_load_broadcast_size,
     )
 
     from veomni.distributed.parallel_state import get_parallel_state
@@ -173,12 +174,12 @@ def main():
     # build optimizer to register ep param groups when ep is enabled
     _ = build_optimizer(
         model,
-        lr=args.train.optimizer.lr,
-        weight_decay=args.train.optimizer.weight_decay,
+        lr=args.model.optimizer.lr,
+        weight_decay=args.model.optimizer.weight_decay,
         fused=True,
-        optimizer_type=args.train.optimizer.type,
-        no_decay_modules=args.train.optimizer.no_decay_modules,
-        no_decay_params=args.train.optimizer.no_decay_params,
+        optimizer_type=args.model.optimizer.type,
+        no_decay_modules=args.model.optimizer.no_decay_modules,
+        no_decay_params=args.model.optimizer.no_decay_params,
     )
     logger.info_rank0(
         "group sizes - fsdp: %s, ep: %s, ep_fsdp: %s, emb: %s, emb_fsdp: %s",
@@ -190,7 +191,7 @@ def main():
     )
     device_type = get_device_type()
     tensor_device = torch.device(f"{device_type}:{get_device_id()}")
-    max_grad_norm = args.train.optimizer.max_grad_norm
+    max_grad_norm = args.model.optimizer.max_grad_norm
 
     def check_model_param_grad_one_by_one(expected_grad, ep_expected_grad, emb_expected_grad, msg):
         # check them one-by-one
@@ -295,13 +296,14 @@ def _run_clip_grad_norm_fsdp2_test(
         "--nproc_per_node=8",
         "--master_port=4321",
         "tests/utils/test_extra_parallel_clip_grad_norm.py",
-        f"--train.accelerator.ep_size={ep_size}",
-        "--train.accelerator.ep_outside=False",
-        f"--train.accelerator.extra_parallel_sizes={emb_size}",
-        "--train.accelerator.extra_parallel_placement_innermost=False",
-        "--train.accelerator.extra_parallel_names=emb",
-        "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
-        "--train.init_device=meta",
+        "--model.config_path=test",
+        f"--model.accelerator.ep_size={ep_size}",
+        "--model.accelerator.ep_outside=False",
+        f"--model.accelerator.extra_parallel_sizes={emb_size}",
+        "--model.accelerator.extra_parallel_placement_innermost=False",
+        "--model.accelerator.extra_parallel_names=emb",
+        "--model.accelerator.fsdp_config.fsdp_mode=fsdp2",
+        "--model.accelerator.init_device=meta",
         "--train.checkpoint.output_dir='debug'",
     ]
     # HSDP: split the dp dim into (dp_replicate, dp_shard). dp_shard is inferred
@@ -309,9 +311,9 @@ def _run_clip_grad_norm_fsdp2_test(
     # total grad norm is identical to the pure-FSDP case: the clip reduces over
     # the shard group only, so replicating over dp_replicate must NOT inflate it.
     if dp_replicate_size is not None:
-        command.append(f"--train.accelerator.dp_replicate_size={dp_replicate_size}")
+        command.append(f"--model.accelerator.dp_replicate_size={dp_replicate_size}")
     if cpu_offload:
-        command.append("--train.accelerator.fsdp_config.offload=True")
+        command.append("--model.accelerator.fsdp_config.offload=True")
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
 
@@ -429,12 +431,20 @@ class _FakeParallelState:
     def extra_parallel_group(self, name: str) -> object | None:
         return None
 
+    def extra_parallel_flat_group(self, name: str) -> object | None:
+        return None
 
-def _make_model(param_groups: dict[str, list[nn.Parameter]], replicated_ids: set) -> nn.Module:
+
+def _make_model(
+    param_groups: dict[str, list[nn.Parameter]],
+    replicated_ids: set,
+    persistent_ids: set | None = None,
+) -> nn.Module:
     """Wrap a ``param_groups`` dict in the duck-typed object the clipper expects."""
     m = nn.Module()
     m._extra_parallel_param_groups = param_groups
     m._ep_replicated_lora_param_ids = replicated_ids
+    m._persistent_extra_parallel_param_ids = persistent_ids or set()
     return m
 
 
@@ -477,7 +487,10 @@ def test_inf_norm_with_replicated_bucket_does_not_crash(extra_names):
 
     model = _make_model(param_groups, replicated_ids)
     expected = torch.stack(grads_seen).max().to(torch.float32)
-    with mock.patch.object(cgn_mod, "get_parallel_state", return_value=fake_ps):
+    with (
+        mock.patch.object(cgn_mod, "get_parallel_state", return_value=fake_ps),
+        mock.patch.object(cgn_mod, "get_device_type", return_value="cpu"),
+    ):
         total = extra_parallel_fsdp2_clip_grad_norm(
             model, max_norm=1e9, norm_type=math.inf, error_if_nonfinite=False, foreach=False
         )
@@ -504,12 +517,108 @@ def test_inf_norm_single_axis_no_replicated_still_works():
     )
     model = _make_model({"non_extra_parallel": [p_non], "ep": [p_ep]}, replicated_ids=set())
 
-    with mock.patch.object(cgn_mod, "get_parallel_state", return_value=fake_ps):
+    with (
+        mock.patch.object(cgn_mod, "get_parallel_state", return_value=fake_ps),
+        mock.patch.object(cgn_mod, "get_device_type", return_value="cpu"),
+    ):
         total = extra_parallel_fsdp2_clip_grad_norm(
             model, max_norm=1e9, norm_type=math.inf, error_if_nonfinite=False, foreach=False
         )
 
     assert total.item() == pytest.approx(6.0, abs=1e-6)
+
+
+def test_persistent_extra_parallel_norm_reduces_once_over_flat_mesh():
+    """A persistent 2D shard owns unique values and needs one flat-mesh reduction."""
+    p_non = _param_with_grad(torch.tensor([12.0]))
+    p_persistent = _param_with_grad(torch.tensor([3.0, 4.0]))
+    fake_ps = _FakeParallelState(
+        extra_parallel_names=["ple"],
+        extra_parallel_fsdp_device_mesh={"ple": None},
+    )
+    fake_ps.extra_parallel_enabled = lambda _name: True
+    fake_ps.extra_parallel_group = lambda name: f"{name}_group"
+    fake_ps.extra_parallel_flat_group = lambda name: f"{name}_flat_group"
+    model = _make_model(
+        {"non_extra_parallel": [p_non], "ple": [p_persistent]},
+        replicated_ids=set(),
+        persistent_ids={id(p_persistent)},
+    )
+    reduce_calls = []
+
+    def record_reduce(params, norm_type, reduce_groups):
+        reduce_calls.append((list(params), list(reduce_groups)))
+        return cgn_mod._local_pth_sum(params, float(norm_type))
+
+    with (
+        mock.patch.object(cgn_mod, "get_parallel_state", return_value=fake_ps),
+        mock.patch.object(cgn_mod, "get_device_type", return_value="cpu"),
+        mock.patch.object(cgn_mod, "_fsdp2_reduce_group", side_effect=record_reduce),
+    ):
+        total = extra_parallel_fsdp2_clip_grad_norm(
+            model, max_norm=1e9, norm_type=2.0, error_if_nonfinite=False, foreach=False
+        )
+
+    assert total.item() == pytest.approx(13.0, abs=1e-6)
+    persistent_calls = [call for call in reduce_calls if len(call[0]) == 1 and call[0][0] is p_persistent]
+    assert len(persistent_calls) == 1
+    assert persistent_calls[0][1] == [("ple_flat", "ple_flat_group")]
+
+
+def test_persistent_ple_and_ep_norm_use_independent_reduction_groups():
+    """PLE uses one flat reduction while ordinary EP uses EP-FSDP then EP."""
+
+    class _FakeMesh:
+        def __init__(self, group):
+            self.group = group
+
+        def get_group(self):
+            return self.group
+
+    p_non = _param_with_grad(torch.tensor([12.0]))
+    p_ple = _param_with_grad(torch.tensor([3.0, 4.0]))
+    p_ep = _param_with_grad(torch.tensor([5.0, 12.0]))
+    fake_ps = _FakeParallelState(
+        extra_parallel_names=["ple", "ep"],
+        extra_parallel_fsdp_device_mesh={
+            "ple": {"ple_fsdp": _FakeMesh("ple_fsdp_group")},
+            "ep": {"ep_fsdp": _FakeMesh("ep_fsdp_group")},
+        },
+    )
+    fake_ps.extra_parallel_enabled = lambda _name: True
+    fake_ps.extra_parallel_group = lambda name: f"{name}_group"
+    fake_ps.extra_parallel_flat_group = lambda name: f"{name}_flat_group"
+    model = _make_model(
+        {
+            "non_extra_parallel": [p_non],
+            "ple": [p_ple],
+            "ep": [p_ep],
+        },
+        replicated_ids=set(),
+        persistent_ids={id(p_ple)},
+    )
+    reduce_calls = []
+
+    def record_reduce(params, norm_type, reduce_groups):
+        reduce_calls.append((list(params), list(reduce_groups)))
+        return cgn_mod._local_pth_sum(params, float(norm_type))
+
+    with (
+        mock.patch.object(cgn_mod, "get_parallel_state", return_value=fake_ps),
+        mock.patch.object(cgn_mod, "get_device_type", return_value="cpu"),
+        mock.patch.object(cgn_mod, "_fsdp2_reduce_group", side_effect=record_reduce),
+    ):
+        total = extra_parallel_fsdp2_clip_grad_norm(
+            model, max_norm=1e9, norm_type=2.0, error_if_nonfinite=False, foreach=False
+        )
+
+    assert total.item() == pytest.approx(math.sqrt(338.0), abs=1e-6)
+    ple_calls = [call for call in reduce_calls if len(call[0]) == 1 and call[0][0] is p_ple]
+    ep_calls = [call for call in reduce_calls if len(call[0]) == 1 and call[0][0] is p_ep]
+    assert len(ple_calls) == 1
+    assert ple_calls[0][1] == [("ple_flat", "ple_flat_group")]
+    assert len(ep_calls) == 1
+    assert ep_calls[0][1] == [("ep_fsdp", "ep_fsdp_group"), ("ep", "ep_group")]
 
 
 if __name__ == "__main__":

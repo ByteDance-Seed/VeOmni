@@ -28,6 +28,8 @@ def eager_cross_entropy(
     shift_labels: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> torch.Tensor:
+    if shift_labels is not None:
+        labels = shift_labels
     if logits is None:
         hidden_states = kwargs.pop("hidden_states")
         weights = kwargs.pop("weights")

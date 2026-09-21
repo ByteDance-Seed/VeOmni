@@ -29,7 +29,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.optim.muon import DistributedMuon
 from veomni.utils.device import (
     get_device_type,
@@ -411,7 +411,7 @@ def _run_qwen3_moe(use_zero_comm: bool) -> None:
     rank = dist.get_rank()
     assert world_size == 4, f"this test expects exactly 4 ranks, got {world_size}"
 
-    init_parallel_state(
+    _init_parallel_state(
         dp_size=world_size,
         dp_shard_size=world_size,
         extra_parallel_sizes=(EP_SIZE,),

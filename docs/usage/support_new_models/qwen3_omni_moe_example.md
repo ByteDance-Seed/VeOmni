@@ -13,7 +13,7 @@ This document provides in-depth implementation details for each patch applied in
 > (declarative patchgen config emitted into `generated/`) rather than applied
 > at import time. See
 > [the patchgen design guide](../../design/patchgen.md) and
-> the `veomni-migrate-transformers-v5` agent skill for the current flow.
+> the `veomni-patchgen-model` agent skill for the current flow.
 
 ---
 

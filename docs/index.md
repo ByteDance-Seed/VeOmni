@@ -29,10 +29,12 @@ usage/arguments.md
 usage/basic_modules.md
 usage/multimodal_data_processing.md
 usage/data_packing_and_dyn_bsz.md
+usage/dit_microbatching.md
 usage/support_new_models/guide_and_checklist.md
 usage/support_new_models/qwen3_vl_example.md
 usage/support_new_models/qwen3_omni_moe_example.md
 usage/support_new_models/dit_model_guide.md
+usage/checkpoint.md
 usage/checkpoint_conversion.md
 usage/trainer.md
 usage/agent_workflow.md
@@ -86,6 +88,7 @@ key_features/ep_fsdp2.md
 key_features/extra_parallel.md
 key_features/ulysses.md
 key_features/lora.md
+key_features/mtp.md
 
 ```
 
@@ -97,6 +100,7 @@ design/kernel_selection.md
 design/fused_moe_kernels.md
 design/local_parallel_state.md
 design/patchgen.md
+design/qwen4_exp_ple_2d_parallelism.md
 design/unified_kernel_registry.md
 design/verl_topk_distill_integration.md
 design/deepseek_v4_context_parallel.md

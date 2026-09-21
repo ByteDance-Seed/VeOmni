@@ -115,6 +115,44 @@ def set_device(device: torch.types.Device) -> None:
     get_torch_device().set_device(device)
 
 
+def get_device_rng_state() -> Any:
+    """Snapshot the accelerator's default RNG state, or ``None`` if unsupported.
+
+    ``torch.get_rng_state()`` only covers the CPU generator, while diffusion
+    condition models draw noise and timesteps from the device default RNG. A
+    checkpoint that restores only the CPU state therefore resumes a different
+    device random stream than an uninterrupted run.
+
+    The accelerator namespaces differ (``torch.cuda`` / ``torch.npu`` /
+    ``torch.mlu``), and a namespace may not expose the accessor at all, so this
+    returns ``None`` rather than failing the checkpoint.
+    """
+    if get_device_type() == "cpu":
+        return torch.get_rng_state()
+
+    getter = getattr(get_torch_device(), "get_rng_state", None)
+    if getter is None:
+        logger.warning(f"Device RNG state is not available on {get_device_type()}; checkpoint will not restore it.")
+        return None
+    return getter()
+
+
+def set_device_rng_state(state: Any) -> None:
+    """Restore a snapshot produced by :func:`get_device_rng_state`."""
+    if state is None:
+        return
+
+    if get_device_type() == "cpu":
+        torch.set_rng_state(state)
+        return
+
+    setter = getattr(get_torch_device(), "set_rng_state", None)
+    if setter is None:
+        logger.warning(f"Device RNG state cannot be restored on {get_device_type()}; ignoring the snapshot.")
+        return
+    setter(state)
+
+
 def is_nccl_backend(backend: str | None = None) -> bool:
     """Check if the distributed communication backend is NCCL."""
     return (backend or get_dist_comm_backend()) == "nccl"

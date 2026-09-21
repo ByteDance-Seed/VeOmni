@@ -17,6 +17,9 @@ eliminates the syncs entirely and lets the model forward consume CPU-int /
 CPU-tensor values that are batched up onto the device by the normal trainer
 `.to(device)` step.
 
+`tests/models/test_model_forward_no_implicit_sync.py` is the regression gate: it
+asserts the wired models' forwards stay sync-free.
+
 ## The derivation is model-owned, not framework-generic
 
 The ViT metadata formula is **Qwen-VL-family-specific**, not a framework-wide

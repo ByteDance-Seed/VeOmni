@@ -122,7 +122,7 @@ model:
 data:
   train_path: dataset/minimax-h3-demo/minimax_h3/MiniMax-H3-FL2VA/metadata.csv
   data_transform: minimax_h3_online         # Stage 1 encodes raw video online
-  datasets_type: minimax_h3_online
+  datasets_type: mapping
   dataloader:
     num_workers: 0                          # Stage 1 is encode-heavy; use 0 workers to avoid memory contention
     drop_last: false
@@ -138,7 +138,7 @@ data:
 
 **Important**:
 
-- `train_path` must point to the **metadata.csv file**, not a directory, otherwise you get `png files are not supported`
+- `train_path` must point to the **metadata.csv file** (or a directory that contains it). Directories are scanned for `parquet` / `json` / `csv` / `arrow` files only, so leftover images or `veomni_cli.yaml` are ignored.
 - When changing data, `fps/min_frames/max_frames/height/width` must match the actual video parameters; the frame count must satisfy `(N-5) % 17 == 0`
 - `offline_embedding_save_dir` must match Stage 2's `data.train_path`
 
@@ -152,34 +152,33 @@ model:
     skip_encoder_load: true                 # must be true: do not load VAE/TextEncoder
     video_max_frames: 120
     video_max_resolution: 832
-
-data:
-  train_path: output/minimax_h3_fl2va_embedding    # output dir of Stage 1
-  data_transform: dit_offline
-  datasets_type: minimax_h3_offline
-  shuffle: false
-  mm_configs:
-    repeat: 100                             # dataset repeat count (must be > 1 for small datasets)
-
-train:
-  training_task: offline_training
-  global_batch_size: 8
-  micro_batch_size: 1
-  init_device: meta
-  max_steps: 30
-  gradient_checkpointing:
-    enable: true                            # turning this off OOMs when memory is tight
   optimizer:
     type: adamw
     lr: 1.0e-5
     max_grad_norm: 1.0e9
   accelerator:
+    init_device: meta
+    gradient_checkpointing:
+      enable: true                            # turning this off OOMs when memory is tight
     fsdp_config:
       fsdp_mode: fsdp2
       mixed_precision:
         enable: true
         param_dtype: bfloat16
         reduce_dtype: float32
+
+data:
+  train_path: output/minimax_h3_fl2va_embedding    # output dir of Stage 1
+  data_transform: dit_offline
+  datasets_type: iterable
+  shuffle: false
+  dataset_repeat: true
+
+train:
+  training_task: offline_training
+  global_batch_size: 8
+  micro_batch_size: 1
+  max_steps: 30
   checkpoint:
     output_dir: output/minimax_h3_fl2va_offline
     save_steps: 10

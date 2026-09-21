@@ -32,7 +32,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
@@ -41,6 +40,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Model,
     Qwen3_5ModelOutputWithPast,
     Qwen3_5RMSNormGated,
+    Qwen3_5TextConfig,
     apply_mask_to_padding_states,
     torch_chunk_gated_delta_rule,
 )
@@ -66,6 +66,19 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_5_gpu.py",
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
 )
+
+
+@config.override_method(
+    "Qwen3_5Model.__init__",
+    description="Construct generated vision and text towers instead of upstream AutoModel classes",
+)
+def qwen3_5_model_init_patched(self, config):
+    super().__init__(config)
+    self.visual = Qwen3_5VisionModel._from_config(config.vision_config)
+    self.language_model = Qwen3_5TextModel._from_config(config.text_config)
+    self.rope_deltas = None
+    self.post_init()
+
 
 config.add_import("copy", names=["copy"])
 config.add_import("functools", names=["partial"])
@@ -94,33 +107,13 @@ config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
-config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+config.add_import("veomni.utils.constants", names=["IGNORE_INDEX", "IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "chunk_gated_delta_rule",
     "fused_recurrent_gated_delta_rule",
-)
-config.add_post_import_block(
-    """
-    # Selection of FusedRMSNormGated / causal_conv1d / chunk_gated_delta_rule
-    # used to come from `try: from fla.modules import ... except ImportError`
-    # at module import time. That selection now lives in OpSlot guards (see
-    # below) — picked from OpsImplementationConfig instead of "is the library
-    # importable". These None placeholders only exist so:
-    #   (1) the upstream HF module-level
-    #       `is_fast_path_available = all((causal_conv1d_fn, ...))`
-    #       resolves to False (legacy warning behaviour preserved); and
-    #   (2) the decode-only `*_update` / `fused_recurrent_*` paths, which raise
-    #       NotImplementedError in our patched forward, still satisfy the
-    #       `<fla_name> or <torch_fallback>` assignments in __init__.
-    FusedRMSNormGated = None
-    causal_conv1d_fn = None
-    causal_conv1d_update = None
-    chunk_gated_delta_rule = None
-    fused_recurrent_gated_delta_rule = None
-    """
 )
 
 config.add_post_import_block(
@@ -153,12 +146,9 @@ config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = True")
 # Dummy definitions for names that exist in the generated file's scope but not here.
 # The patchgen only extracts the function body; these are resolved at codegen time.
 Qwen3_5GatedDeltaNet = None
-causal_conv1d_update = None  # decode-only; placeholder set in post-import block above
-torch_causal_conv1d_update = None
+causal_conv1d_update = None  # decode-only; upstream module-level torch impl
 torch_chunk_gated_delta_rule = None  # noqa: F811 — also imported above for the forward patch
-fused_recurrent_gated_delta_rule = None  # decode-only; placeholder set in post-import block above
-torch_recurrent_gated_delta_rule = None
-is_fast_path_available = None
+torch_recurrent_gated_delta_rule = None  # decode-only; upstream module-level torch impl
 gather_seq_scatter_heads = None
 gather_heads_scatter_seq = None
 gather_outputs = None
@@ -219,7 +209,6 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
     self.conv_kernel_size = config.linear_conv_kernel_dim
     self.layer_idx = layer_idx
     self.activation = config.hidden_act
-    self.act = ACT2FN[config.hidden_act]
     self.layer_norm_epsilon = config.rms_norm_eps
 
     # QKV
@@ -237,7 +226,8 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
     # instantiate once and copy inv_dt in init_weights of PretrainedModel
     self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
 
-    A = torch.empty(self.num_v_heads).uniform_(0, 16)
+    # Lower bound kept away from 0 so log(A) never becomes -inf
+    A = torch.empty(self.num_v_heads).uniform_(0.01, 16)
     self.A_log = nn.Parameter(torch.log(A))
 
     # Modification: OpSlot dispatch for fused gated RMSNorm. The slot stores
@@ -257,6 +247,8 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
 
     self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
+    self.layer_type = config.layer_types[layer_idx]
+
     # Modification: OpSlot dispatch for causal conv1d / chunk gated delta-rule.
     # We freeze the resolved kernel (or None for eager) on the instance via
     # `.bound_kernel()`; storing the OpSlot itself would couple the instance to
@@ -266,17 +258,14 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
     # falls back to the torch chunk_gated_delta_rule, which `forward` rejects
     # for varlen training; the decode-only `*_update` aliases are kept None
     # because the precomputed-state path raises NotImplementedError anyway.
+    # transformers 5.16 dropped the `<fla_name> or <torch_fallback>` pairs:
+    # `causal_conv1d_update` / `torch_recurrent_gated_delta_rule` are now the
+    # upstream module-level torch implementations, so the `or` fallbacks (and
+    # the removed `is_fast_path_available` warning) no longer apply.
     self.causal_conv1d_fn = veomni_causal_conv1d.bound_kernel()
-    self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
+    self.causal_conv1d_update = causal_conv1d_update
     self.chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel() or torch_chunk_gated_delta_rule
-    self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
-
-    if not is_fast_path_available:
-        logger.warning_once(
-            "The fast path is not available because one of the required library is not installed. Falling back to "
-            "torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and"
-            " https://github.com/Dao-AILab/causal-conv1d"
-        )
+    self.recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
 
     self.in_proj_qkv = nn.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
     self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
@@ -514,40 +503,104 @@ def qwen3_5_gated_deltanet_forward_patched(
     return output
 
 
+# NOTE: `Qwen3_5TextModel._update_linear_attn_mask` was removed in transformers
+# 5.16. `Qwen3_5TextModel.forward` now builds a per-attention-type mask mapping
+# with `create_causal_mask` / `create_recurrent_attention_mask`, so the previous
+# override (which avoided the `cache_position[0] > 0` host sync) had nothing left
+# to hook. Upstream's `create_recurrent_attention_mask` already decides the
+# cached-forward case from shapes (`inputs_embeds.shape[1] == 1`) and — unlike
+# the old override — trims the 2-D mask to the local sequence instead of
+# dropping it, which is the more correct behaviour for chunked prefill. It still
+# reads `torch.all(attention_mask == 1)` (guarded by `is_tracing`), so the
+# all-ones host sync is upstream behaviour now; re-optimising that belongs in a
+# separate change.
+
+
 @config.override_method(
-    "Qwen3_5TextModel._update_linear_attn_mask",
-    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
+    "Qwen3_5TextModel.forward",
+    description="Expose the MTP head's inputs on demand via mtp_context",
 )
-def qwen3_5_text_model_update_linear_attn_mask(self, attention_mask, cache_position):
+def qwen3_5_text_model_forward_patched(
+    self,
+    input_ids: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    use_cache: bool | None = None,
+    return_mtp_context: bool = False,
+    **kwargs: Unpack[TransformersKwargs],
+) -> Qwen3_5ModelOutputWithPast:
+    """Run the text backbone and expose the inputs required by the MTP head.
+
+    Args:
+        return_mtp_context (`bool`, *optional*): Whether to retain the backbone inputs required by the MTP objective.
     """
-    Build the attention mask passed to the linear-attention (gated DeltaNet) layers.
+    if (input_ids is None) ^ (inputs_embeds is not None):
+        raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-    Upstream returns ``None`` — disabling the per-token zeroing in ``apply_mask_to_padding_states``
-    — when ``cache_position[0] > 0`` (a cached forward) or ``torch.all(attention_mask == 1)`` (the
-    batch has no padding). Both predicates read a 0-D GPU tensor and force an implicit ``.item()``
-    / host-device sync on *every* forward, which serialises the host against the device in
-    VeOmni's otherwise sync-free training step.
+    if inputs_embeds is None:
+        inputs_embeds = self.embed_tokens(input_ids)
 
-    We keep the cached-forward branch — it is a correctness guard, not just an optimization:
-    ``apply_mask_to_padding_states`` does ``hidden_states * attention_mask[:, :, None]``, and in a
-    cached forward the 2-D ``attention_mask`` spans ``past + current`` tokens while ``hidden_states``
-    only covers the current chunk, so the shapes wouldn't broadcast (or would broadcast wrongly for
-    a 1-token decode step). But we detect it host-side from tensor shapes — ``attention_mask`` has
-    ``shape[-1] == past + current`` whereas ``cache_position`` has ``shape[-1] == current`` — rather
-    than reading ``cache_position[0]``, so no sync.
+    if use_cache and past_key_values is None:
+        past_key_values = DynamicCache(config=self.config)
 
-    The all-ones short-circuit is the one we drop: returning the all-ones mask makes
-    ``apply_mask_to_padding_states`` a no-op multiply, so it is equivalent to upstream's ``None``
-    while avoiding the ``torch.all`` reduction + sync. A genuinely padded mask is still returned and
-    correctly zeroed.
-    """
-    if attention_mask is None:
-        return None
-    # Cached forward (decode / continuation): see docstring — shapes wouldn't line up in
-    # apply_mask_to_padding_states, and upstream returns None here. Detected from shapes only.
-    if cache_position is not None and attention_mask.shape[-1] != cache_position.shape[-1]:
-        return None
-    return attention_mask
+    if position_ids is None:
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+        position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
+    elif position_ids.ndim == 2:
+        position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
+
+    if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+        text_position_ids = position_ids[0]
+        position_ids = position_ids[1:]
+    else:
+        text_position_ids = None
+
+    if not isinstance(causal_mask_mapping := attention_mask, dict):
+        mask_kwargs = {
+            "config": self.config,
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "position_ids": text_position_ids,
+        }
+        causal_mask_mapping = {
+            "full_attention": create_causal_mask(**mask_kwargs),
+            "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
+        }
+
+    hidden_states = inputs_embeds
+    position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+    for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+        hidden_states = decoder_layer(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=causal_mask_mapping[self.config.layer_types[i]],
+            position_ids=text_position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **kwargs,
+        )
+
+    hidden_states = self.norm(hidden_states)
+
+    mtp_context = None
+    if return_mtp_context:
+        mtp_context = {
+            "inputs_embeds": inputs_embeds,
+            "position_embeddings": position_embeddings,
+            "attention_mask": causal_mask_mapping["full_attention"],
+            "position_ids": text_position_ids,
+        }
+
+    return Qwen3_5MTPContextOutput(  # noqa: F821 defined via add_helper_after
+        last_hidden_state=hidden_states,
+        past_key_values=past_key_values,
+        mtp_context=mtp_context,
+    )
 
 
 @config.override_method(
@@ -577,7 +630,7 @@ def qwen3_5_decoder_layer_forward_patched(
     linear_attn_cu_seq_lens_q = kwargs.pop("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
 
     # Token Mixer
-    if self.layer_type == "linear_attention":
+    if self.block_type == "linear_attention":
         # Modification: pass linear-attention cu_seqlens through to Qwen3_5GatedDeltaNet.forward.
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
@@ -586,7 +639,7 @@ def qwen3_5_decoder_layer_forward_patched(
             attention_mask=attention_mask,
             cu_seq_lens_q=linear_attn_cu_seq_lens_q,
         )
-    elif self.layer_type == "full_attention":
+    elif self.block_type == "full_attention":
         # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
@@ -606,6 +659,130 @@ def qwen3_5_decoder_layer_forward_patched(
     hidden_states = self.mlp(hidden_states)
     hidden_states = residual + hidden_states
     return hidden_states
+
+
+# ── MTP (multi-token prediction) ─────────────────────────────────────────────
+
+
+@config.add_helper
+def _mtp_loss_weight(text_config):
+    """Resolve the MTP loss weight, or None when MTP is disabled."""
+    weight = getattr(text_config, "mtp_loss_weight", None)
+    if weight is None:
+        return None
+    weight = float(weight)
+    if weight <= 0.0:
+        return None
+    if int(getattr(text_config, "mtp_num_hidden_layers", 0) or 0) <= 0:
+        return None
+    return weight
+
+
+@config.add_helper
+def compute_mtp_loss(mtp_loss_fn, hidden_states, mtp_labels, weights, vocab_size, **kwargs):
+    """Compute one token-normalized loss over all MTP depths."""
+    if mtp_labels.ndim != 3:
+        raise ValueError(
+            f"MTP labels must have shape [batch, depth, sequence]; got mtp_labels.shape={tuple(mtp_labels.shape)}."
+        )
+    if len(hidden_states) != mtp_labels.shape[1]:
+        raise ValueError(
+            "MTP hidden-state depth must match the label depth; "
+            f"got {len(hidden_states)} hidden-state row(s) and {mtp_labels.shape[1]} label row(s)."
+        )
+
+    batch_size, num_depths, sequence_length = mtp_labels.shape
+    stacked_hidden_states = torch.stack(hidden_states, dim=1)
+    flat_hidden_states = stacked_hidden_states.reshape(batch_size * num_depths, sequence_length, -1)
+    flat_labels = mtp_labels.reshape(batch_size * num_depths, sequence_length)
+
+    valid_target_count = (flat_labels != IGNORE_INDEX).sum()  # noqa: F821
+    has_valid_target = valid_target_count > 0
+    safe_labels = flat_labels.clone()
+    safe_labels.reshape(-1)[0] = torch.where(
+        has_valid_target,
+        safe_labels.reshape(-1)[0],
+        safe_labels.new_zeros(()),
+    )
+
+    loss_kwargs = dict(kwargs)
+    loss_kwargs.pop("shift_labels", None)
+    loss_kwargs["num_items_in_batch"] = valid_target_count.clamp_min(1)
+    mtp_loss, _, _ = mtp_loss_fn(
+        logits=None,
+        labels=safe_labels,
+        vocab_size=vocab_size,
+        hidden_states=flat_hidden_states,
+        weights=weights,
+        shift_labels=safe_labels,
+        **loss_kwargs,
+    )
+    return mtp_loss * has_valid_target.to(mtp_loss.dtype)
+
+
+@config.add_helper_after("Qwen3_5DecoderLayer")
+class Qwen3_5MTP(nn.Module):
+    """Qwen3.5 multi-token-prediction head."""
+
+    def __init__(self, config: Qwen3_5TextConfig):
+        """Build MTP decoder layers that share the foundation embeddings and head."""
+        super().__init__()
+        assert not getattr(config, "mtp_use_dedicated_embeddings", False), (
+            "mtp_use_dedicated_embeddings=True is not supported: the MTP head shares the main "
+            "model's embed_tokens, and the checkpoint carries no mtp.embed_tokens weight."
+        )
+        num_layers = int(config.mtp_num_hidden_layers)
+        assert "full_attention" in config.layer_types, (
+            f"Qwen3.5 MTP requires a full_attention layer type to mirror; got layer_types={config.layer_types}"
+        )
+        mtp_layer_idx = config.layer_types.index("full_attention")
+
+        self.pre_fc_norm_embedding = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.layers = nn.ModuleList(
+            [Qwen3_5DecoderLayer(config, mtp_layer_idx) for _ in range(num_layers)]  # noqa: F821
+        )
+        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, ...]:
+        """Return one recurrently teacher-forced hidden-state row per MTP depth."""
+        assert kwargs.get("past_key_values") is None and not kwargs.get("use_cache", False), (
+            "Qwen3.5 MTP only supports full-sequence objective computation; cached decoding runs in the "
+            "inference engine."
+        )
+
+        depth_hidden_states = []
+        for depth, decoder_layer in enumerate(self.layers):
+            shift = depth + 1
+            shifted_embeds = F.pad(inputs_embeds, (0, 0, 0, shift))[:, shift:, :]
+            hidden_states = self.fc(
+                torch.cat(
+                    [self.pre_fc_norm_embedding(shifted_embeds), self.pre_fc_norm_hidden(hidden_states)],
+                    dim=-1,
+                )
+            )
+            hidden_states = decoder_layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                use_cache=False,
+                **kwargs,
+            )
+            hidden_states = self.norm(hidden_states)
+            depth_hidden_states.append(hidden_states)
+
+        return tuple(depth_hidden_states)
 
 
 @config.override_method(
@@ -1318,10 +1495,7 @@ def qwen3_5_model_forward(
         **kwargs,
     )
 
-    return Qwen3_5ModelOutputWithPast(
-        **outputs,
-        rope_deltas=self.rope_deltas,
-    )
+    return Qwen3_5MTPContextOutput(**outputs, rope_deltas=self.rope_deltas)  # noqa: F821
 
 
 @config.override_method(
@@ -1446,6 +1620,17 @@ class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Causal
     """
 
 
+@config.add_helper_after("Qwen3_5ModelOutputWithPast")
+@dataclass
+class Qwen3_5MTPContextOutput(Qwen3_5ModelOutputWithPast):
+    r"""
+    mtp_context (`dict`, *optional*):
+        Inputs retained when the outer model requests an MTP objective.
+    """
+
+    mtp_context: dict | None = None
+
+
 @config.add_helper
 def mm_token_type_ids_from_input_ids(input_ids, config):
     # transformers v5 VLMs require `mm_token_type_ids` to compute multimodal
@@ -1553,6 +1738,33 @@ class _Qwen3_5FakeForPosID(SimpleNamespace):
 
 
 @config.override_method(
+    "Qwen3_5ForConditionalGeneration.__init__",
+    description="Build the MTP head when text_config.mtp_loss_weight is set",
+)
+def qwen3_5_forconditional_generation_init_patched(self, config):
+    """Initialize conditional generation and construct the MTP head when enabled."""
+    super().__init__(config)
+    self.model = Qwen3_5Model(config)  # noqa: F821
+    self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+
+    self.mtp = None
+    mtp_loss_weight = _mtp_loss_weight(config.text_config)  # noqa: F821 defined via add_helper
+    if mtp_loss_weight is not None:
+        parallel_state = get_parallel_state()
+        assert not parallel_state.sp_enabled, (
+            "Qwen3.5 MTP does not support Ulysses/context sequence parallel yet: the MTP embedding "
+            "shift crosses rank boundaries, and ForCausalLMLoss ignores shift_labels when SP is on. "
+            "Set train.accelerator.ulysses_size=1 and cp_size=1, or unset text_config.mtp_loss_weight."
+        )
+        self.mtp = Qwen3_5MTP(config.text_config)  # noqa: F821 defined via add_helper_after
+        logger.info_rank0(
+            f"Qwen3.5 MTP enabled: {config.text_config.mtp_num_hidden_layers} layer(s), loss weight {mtp_loss_weight}."
+        )
+
+    self.post_init()
+
+
+@config.override_method(
     "Qwen3_5ForConditionalGeneration.get_position_id_func",
     description="Expose get_position_id_func to pre-computes position IDs per sample during data preprocessing in worker processes.",
 )
@@ -1598,8 +1810,16 @@ def qwen3_5_forconditional_generation_forward_patched(
     video_grid_thw: torch.LongTensor | None = None,
     cache_position: torch.LongTensor | None = None,
     logits_to_keep: int | torch.Tensor = 0,
+    mtp_labels: torch.LongTensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen3_5CausalLMOutputWithLogProbs:
+    """Run conditional generation and combine foundation and weighted MTP losses."""
+    requires_mtp_context = self.mtp is not None and labels is not None
+    if requires_mtp_context and mtp_labels is None:
+        raise ValueError("Qwen3.5 MTP loss requires `mtp_labels` when `labels` are provided.")
+
+    model_kwargs = dict(kwargs)
+    model_kwargs["return_mtp_context"] = requires_mtp_context
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,
@@ -1611,7 +1831,7 @@ def qwen3_5_forconditional_generation_forward_patched(
         past_key_values=past_key_values,
         inputs_embeds=inputs_embeds,
         cache_position=cache_position,
-        **kwargs,
+        **model_kwargs,
     )
 
     hidden_states = outputs[0]
@@ -1650,7 +1870,35 @@ def qwen3_5_forconditional_generation_forward_patched(
     else:
         logits = self.lm_head(hidden_states)
 
-    return Qwen3_5CausalLMOutputWithLogProbs(
+    loss_dict = None
+    if requires_mtp_context:
+        mtp_context = getattr(outputs, "mtp_context", None)
+        if mtp_context is None:
+            raise RuntimeError("Qwen3.5 MTP context was requested but the language model did not return it.")
+        mtp_hidden_states = self.mtp(
+            hidden_states=outputs[0],
+            inputs_embeds=mtp_context["inputs_embeds"],
+            position_embeddings=mtp_context["position_embeddings"],
+            attention_mask=mtp_context["attention_mask"],
+            position_ids=mtp_context["position_ids"],
+            cu_seq_lens_q=kwargs.get("cu_seq_lens_q"),
+            cu_seq_lens_k=kwargs.get("cu_seq_lens_k"),
+            max_length_q=kwargs.get("max_length_q"),
+            max_length_k=kwargs.get("max_length_k"),
+        )
+        mtp_loss_fn = veomni_causal_lm_loss if veomni_causal_lm_loss.use_non_eager_impl else self.loss_function
+        mtp_loss = compute_mtp_loss(  # noqa: F821 defined via add_helper
+            mtp_loss_fn,
+            mtp_hidden_states,
+            mtp_labels,
+            weights=self.lm_head.weight,
+            vocab_size=self.config.text_config.vocab_size,
+            **kwargs,
+        )
+        weight = _mtp_loss_weight(self.config.text_config)  # noqa: F821 defined via add_helper
+        loss_dict = {"foundation_loss": loss, "mtp_loss": weight * mtp_loss}
+
+    output = Qwen3_5CausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
@@ -1659,3 +1907,13 @@ def qwen3_5_forconditional_generation_forward_patched(
         rope_deltas=outputs.rope_deltas,
         fused_linear_aux=fused_linear_aux,
     )
+    if loss_dict is not None:
+        output.loss = loss_dict
+    return output
+
+
+config.add_import("transformers.utils", names=["logging"])
+config.add_post_import_block("""
+from transformers.utils import logging
+logger = logging.get_logger(__name__)
+""")
