@@ -24,7 +24,6 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from tests.models.compare import eager_ops_config, ops_config_scope, qwen_image_inputs, stamp_attn_implementation
@@ -288,11 +287,6 @@ def test_minimax_h3_forward_keeps_construction_impls():
 
 
 def test_qwen_image_forward_keeps_construction_impls():
-    from veomni.utils.device import IS_NPU_AVAILABLE
-
-    if IS_NPU_AVAILABLE:
-        pytest.skip("Qwen-Image RMSNorm calls npu_rms_norm, which cannot run on CPU tensors")
-
     from veomni.models.diffusers.qwen_image.qwen_image_transformer.modeling_qwen_image_transformer import (
         QwenImageTransformer2DModel,
     )
