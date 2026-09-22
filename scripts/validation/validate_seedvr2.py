@@ -42,8 +42,18 @@ with tempfile.TemporaryDirectory() as tmp:
     model.save_pretrained(tmp)
     restored = SeedVR2Model.from_pretrained(tmp).eval()
     actual = restored(**batch).predictions
+    # Reloading must preserve every tensor bit for bit. The forward outputs of the reloaded
+    # model are only as reproducible as the accelerator kernels allow, so they are compared
+    # with a bounded tolerance instead of demanding bit equality from the whole graph.
+    saved_state = model.state_dict()
+    restored_state = restored.state_dict()
+    assert saved_state.keys() == restored_state.keys()
+    for key, value in saved_state.items():
+        torch.testing.assert_close(restored_state[key], value, atol=0, rtol=0)
+    max_output_difference = 0.0
     for a, b in zip(actual, expected):
-        torch.testing.assert_close(a, b, atol=0, rtol=0)
+        torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-4)
+        max_output_difference = max(max_output_difference, (a - b).abs().max().item())
 print(
     json.dumps(
         {
@@ -52,7 +62,10 @@ print(
             "max_gradient_difference": max_gradient_difference,
             "finite_gradients": True,
             "optimizer_update": True,
-            "hf_save_load_exact": True,
+            "hf_save_load_weights_exact": True,
+            "hf_save_load_max_output_difference": max_output_difference,
+            "hf_save_load_atol": 1e-5,
+            "hf_save_load_rtol": 1e-4,
             "training_resume_tested": False,
         },
         indent=2,

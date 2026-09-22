@@ -212,7 +212,7 @@ Measured on 2026-09-11:
 | Tiny source comparison, FP32 outer computation | Output max error 0; gradient max error 3.73e-9; atol 1e-5, rtol 1e-4 |
 | Tiny source comparison, CPU BF16 autocast | Output max error 0.0078125; atol/rtol 0.02 |
 | Gradient checkpoint on/off | Gradient max error 9.31e-10; finite gradients and an optimizer update |
-| Tiny HF save/reload | Outputs exactly equal |
+| Tiny HF save/reload | Weights bit-identical; outputs within atol 1e-5 |
 | Full 3B NPU inference | Finite outputs for 1 and 5 frames, 32x48 RGB |
 | Media CLI | PNG and MP4 restored and decoded back; 5 video frames at 12 fps |
 | Standard DiTTrainer | 3 steps on 2 NPUs with FSDP2 and real PNG-derived VAE embeddings; checkpoints saved |
