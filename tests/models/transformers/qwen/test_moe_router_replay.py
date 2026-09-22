@@ -248,6 +248,11 @@ def _build_vanilla_qwen3_5_moe_block(config, device=_DEVICE, dtype=torch.float32
     return block
 
 
+def _moe_block_hidden(output):
+    """Qwen3 SparseMoeBlock returns hidden states; Qwen3.5 returns ``(hidden, router_logits)``."""
+    return output[0] if isinstance(output, tuple) else output
+
+
 def _make_hidden_states(config, batch=2, seq=16, dtype=torch.float32, seed=42):
     """Deterministic hidden_states tensor sized for the toy config."""
     g = torch.Generator(device=_DEVICE).manual_seed(seed)
@@ -278,12 +283,12 @@ def test_qwen3_moe_record_mode_is_bitwise_baseline_with_eager_experts():
     h = _make_hidden_states(config)
 
     # Baseline: no manager installed.
-    out_baseline = block(h).clone()
+    out_baseline = _moe_block_hidden(block(h)).clone()
 
     # Record mode: manager active, captures indices, does not substitute.
     ctrl = _IndexController()
     set_active_replay(ctrl)
-    out_record = block(h).clone()
+    out_record = _moe_block_hidden(block(h)).clone()
     set_active_replay(None)
 
     # End-to-end eager-expert bit equality.
@@ -301,11 +306,11 @@ def test_qwen3_5_moe_record_mode_is_bitwise_baseline_with_eager_experts():
     block = _build_patched_qwen3_5_moe_block(config)
     h = _make_hidden_states(config)
 
-    out_baseline = block(h).clone()
+    out_baseline = _moe_block_hidden(block(h)).clone()
 
     ctrl = _IndexController()
     set_active_replay(ctrl)
-    out_record = block(h).clone()
+    out_record = _moe_block_hidden(block(h)).clone()
     set_active_replay(None)
 
     assert torch.equal(out_baseline, out_record), (

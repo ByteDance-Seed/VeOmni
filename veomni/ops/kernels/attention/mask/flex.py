@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import importlib.util
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 import torch
 from torch.nn.attention.flex_attention import BlockMask
@@ -28,8 +30,42 @@ from transformers.masking_utils import (
     sliding_window_overlay,
 )
 
+from veomni.utils.device import IS_NPU_AVAILABLE
+
 from ..ulysses import effective_sequence_lengths, should_apply_ulysses
 from .packed import packed_mask_function
+
+
+def _flex_block_mask_compile_enabled() -> bool:
+    """HF compiles ``create_block_mask`` on torch>=2.6.
+
+    That inductor path needs Triton. ``torch_npu`` also intercepts inductor and
+    still imports Triton, which NPU CI does not ship.
+    """
+    if IS_NPU_AVAILABLE:
+        return False
+    return importlib.util.find_spec("triton") is not None
+
+
+@contextmanager
+def _flex_create_block_mask(*, compile_block_mask: bool) -> Iterator[None]:
+    if compile_block_mask:
+        yield
+        return
+
+    import transformers.masking_utils as masking_utils
+
+    original = masking_utils.create_block_mask
+
+    def create_block_mask_eager(*args, **kwargs):
+        kwargs["_compile"] = False
+        return original(*args, **kwargs)
+
+    masking_utils.create_block_mask = create_block_mask_eager
+    try:
+        yield
+    finally:
+        masking_utils.create_block_mask = original
 
 
 def flex_attention_mask_builder(
@@ -43,6 +79,7 @@ def flex_attention_mask_builder(
     skip_ulysses: bool = False,
     cu_seqlens: torch.Tensor | None = None,
     cu_seqlens_k: torch.Tensor | None = None,
+    compile_block_mask: bool | None = None,
     **kwargs,
 ) -> BlockMask:
     """Build a Transformers FlexAttention mask.
@@ -104,13 +141,16 @@ def flex_attention_mask_builder(
             device=device,
         )
 
-    return ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"](
-        batch_size=batch_size,
-        q_length=q_length,
-        kv_length=kv_length,
-        q_offset=q_offset,
-        kv_offset=kv_offset,
-        mask_function=mask_function,
-        attention_mask=attention_mask,
-        **kwargs,
-    )
+    if compile_block_mask is None:
+        compile_block_mask = _flex_block_mask_compile_enabled()
+    with _flex_create_block_mask(compile_block_mask=compile_block_mask):
+        return ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"](
+            batch_size=batch_size,
+            q_length=q_length,
+            kv_length=kv_length,
+            q_offset=q_offset,
+            kv_offset=kv_offset,
+            mask_function=mask_function,
+            attention_mask=attention_mask,
+            **kwargs,
+        )

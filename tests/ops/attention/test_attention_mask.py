@@ -52,6 +52,8 @@ def test_mask_builder_return_types():
     assert sdpa.shape == (1, 1, 4, 4)
     flex = flex_attention_mask_builder(1, 4, 4, device="cpu")
     assert isinstance(flex, BlockMask)
+    flex_eager = flex_attention_mask_builder(1, 4, 4, device="cpu", compile_block_mask=False)
+    assert isinstance(flex_eager, BlockMask)
     magi = magi_attention_mask_builder(1, 4, 4, device="cpu")
     assert isinstance(magi, MagiAttentionMask)
     assert magi.q_ranges.dtype == torch.int32
