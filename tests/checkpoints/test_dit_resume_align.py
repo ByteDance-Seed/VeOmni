@@ -273,18 +273,18 @@ def _materialize_toy_dit_weights(target_dir: str) -> None:
     """
     from veomni.arguments.arguments_types import OpsImplementationConfig
     from veomni.models.auto import build_foundation_model
-    from veomni.ops import apply_ops_config
 
     # Wan's ``rope_apply`` has a non-standard signature, so its device patch
     # explicitly disables the liger RoPE backend. The framework default for
     # ``rotary_pos_emb_implementation`` is ``liger_kernel``, which would raise
     # here; every Wan YAML pins ``eager`` for the same reason.
-    apply_ops_config(OpsImplementationConfig(rotary_pos_emb_implementation="eager"))
+    ops = OpsImplementationConfig(rotary_pos_emb_implementation="eager")
     model = build_foundation_model(
         config_path="tests/toy_config/wan_t2v_toy/config.json",
         weights_path=None,
         torch_dtype="float32",
         init_device="cpu",
+        ops_implementation=ops,
     )
     model.save_pretrained(target_dir)
 

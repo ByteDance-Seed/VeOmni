@@ -68,7 +68,7 @@ def flex_attention_forward(
     # PyTorch AUTO may pick Flex Decoding for short CUDA queries and then fail
     # in Inductor. Pin Triton on CUDA only. CPU and NPU have no Triton Flex
     # backend; keep an explicit caller override on every device.
-    if query.device.type == "cuda":
+    if query.is_cuda:
         kernel_options.setdefault("BACKEND", "TRITON")
 
     parallel_state = get_parallel_state()
