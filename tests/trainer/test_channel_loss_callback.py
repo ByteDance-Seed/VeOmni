@@ -1309,3 +1309,61 @@ def test_channel_loss_callback_strict_requires_source_id():
     callback = ChannelLossCallback(trainer)
     with pytest.raises(ValueError, match="no configured source ID"):
         callback.on_step_begin(TrainerState(global_step=1), micro_batches=[{"input_ids": torch.tensor([[1]])}])
+
+
+def test_base_callback_lifecycle_captures_channel_metadata_before_meter_only_on_begin():
+    calls = []
+
+    class RecordingCallback:
+        def __init__(self, name, consume_metadata=False):
+            self.name = name
+            self.consume_metadata = consume_metadata
+
+        def on_step_begin(self, state, micro_batches=None, **kwargs):
+            calls.append(("begin", self.name, "ds_idx" in micro_batches[0]))
+            if self.consume_metadata:
+                micro_batches[0].pop("ds_idx")
+                micro_batches[0].pop("source_name")
+
+        def on_step_end(self, state, **kwargs):
+            calls.append(("end", self.name))
+
+    trainer = object.__new__(BaseTrainer)
+    trainer.state = TrainerState(global_step=1)
+    trainer.channel_loss_callback = RecordingCallback("channel")
+    meter = RecordingCallback("meter", consume_metadata=True)
+    tail = RecordingCallback("tail")
+    trainer._callbacks = [meter, trainer.channel_loss_callback, tail]
+    micro_batches = [{"ds_idx": torch.tensor([7]), "source_name": ["repoqa"]}]
+
+    BaseTrainer.on_step_begin(trainer, micro_batches=micro_batches)
+    BaseTrainer.on_step_end(trainer)
+
+    assert calls == [
+        ("begin", "channel", True),
+        ("begin", "meter", True),
+        ("begin", "tail", False),
+        ("end", "meter"),
+        ("end", "channel"),
+        ("end", "tail"),
+    ]
+
+
+def test_base_step_begin_skips_unregistered_channel_loss_callback():
+    calls = []
+
+    class RecordingCallback:
+        def __init__(self, name):
+            self.name = name
+
+        def on_step_begin(self, state, micro_batches=None, **kwargs):
+            calls.append(self.name)
+
+    trainer = object.__new__(BaseTrainer)
+    trainer.state = TrainerState(global_step=1)
+    trainer.channel_loss_callback = RecordingCallback("unregistered-channel")
+    trainer._callbacks = [RecordingCallback("registered")]
+
+    BaseTrainer.on_step_begin(trainer, micro_batches=[{"input_ids": torch.tensor([1, 2])}])
+
+    assert calls == ["registered"]
