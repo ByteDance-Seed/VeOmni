@@ -73,6 +73,7 @@ examples/qwen3_omni_offline_av.md
 examples/minimax_h3.md
 examples/wan2.1.md
 examples/wan2.1_I2V_1.3B.md
+examples/seedvr2.md
 examples/ltx-2.3.md
 examples/qwen3_dpo.md
 examples/seed_oss.md

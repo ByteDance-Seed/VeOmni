@@ -102,7 +102,7 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 | Feature / refactoring | `/veomni-develop` |
 | Bug fix / debugging | `/veomni-debug` |
 | Code review (before opening a PR) | `/veomni-review` |
-| Add new model | `/veomni-new-model` |
+| Add or migrate an unsupported model | `/veomni-new-model` |
 | Write or refresh a model's patchgen modeling | `/veomni-patchgen-model` |
 | Add new op/kernel | `/veomni-new-op` |
 | Update dependencies (uv) | `/veomni-uv-update` |
@@ -112,7 +112,7 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 
 ### Quick Decision Guide
 
-- **"Add support for model X"** → `/veomni-new-model`
+- **"Add support for model X" / "Migrate an external model into VeOmni"** → `/veomni-new-model`
 - **"Write a patch_gen_config" / "regenerate the generated modeling" / "add NPU patchgen" / "port X to patchgen"** → `/veomni-patchgen-model` (also the modeling step inside `/veomni-new-model`)
 - **"Add a new kernel / fused op"** → `/veomni-new-op`
 - **"Fix this error" / "training hangs" / "wrong results"** → `/veomni-debug`

@@ -18,6 +18,7 @@ def test_generated_multimodal_children(monkeypatch, toy_name):
 
 
 local_test_cases = [
+    pytest.param("./tests/toy_config/seedvr2_toy", False, False, [], ["config", "model"]),
     pytest.param("./tests/toy_config/qwen2vl_toy", True, False, ["config", "model", "processor"], ["model"]),
     pytest.param("./tests/toy_config/movqgan_toy", False, True, [], ["config", "model", "processor"]),
     pytest.param("./tests/toy_config/gpt_oss_toy", True, False, ["config", "model"], ["model"]),

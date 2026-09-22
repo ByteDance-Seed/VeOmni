@@ -1,0 +1,18 @@
+{
+  "model_type": "seedvr2",
+  "architectures": ["SeedVR2Model"],
+  "vid_in_channels": 33,
+  "vid_out_channels": 16,
+  "vid_dim": 2560,
+  "txt_in_dim": 5120,
+  "txt_dim": 2560,
+  "emb_dim": 15360,
+  "heads": 20,
+  "head_dim": 128,
+  "num_layers": 32,
+  "mm_layers": 10,
+  "rope_dim": 128,
+  "expand_ratio": 4,
+  "patch_size": [1, 2, 2],
+  "window": [4, 3, 3]
+}

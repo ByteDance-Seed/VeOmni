@@ -1,0 +1,17 @@
+# Reusable VeOmni DataArguments template. Replace every TBD from direct evidence.
+data:
+  train_path: TBD_DATASET_PATH  # file, directory, or multisource YAML
+  data_type: TBD  # plaintext, conversation, diffusion, classification, or dpo
+  datasets_type: mapping  # mapping or iterable; verify against the trainer
+  source_name: TBD_SOURCE_NAME
+  # Required for diffusion/custom schemas too: DataArguments otherwise cannot
+  # infer a primary field for the diffusion data type.
+  text_keys: TBD_PRIMARY_FIELD
+  max_seq_len: 2048
+  # VLM/DiT argument subclasses may also accept data_transform and mm_configs.
+  # Add them only after checking the selected trainer's current dataclass.
+  dataloader:
+    type: native
+    num_workers: 4
+    drop_last: true
+    prefetch_factor: 2
