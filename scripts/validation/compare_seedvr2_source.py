@@ -61,34 +61,48 @@ config.txt_in_norm = "layer"
 source = NaDiT(**config.backbone_kwargs()).train()
 target = SeedVR2Model(config).train()
 target.dit.load_state_dict(source.state_dict(), strict=True)
-vid, vs = na.flatten([torch.randn(3, 8, 8, 9), torch.randn(1, 4, 4, 9)])
-txt, ts = na.flatten([torch.randn(3, 24), torch.randn(5, 24)])
-kwargs = dict(vid=vid, txt=txt, vid_shape=vs, txt_shape=ts, timestep=torch.tensor([1000.0, 800.0]))
-a = source(**kwargs).vid_sample
-b = target(**kwargs).vid_sample
-torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-4)
-a.float().square().mean().backward()
-b.float().square().mean().backward()
+# Upstream indexes one text block per sample into every window, so a packed batch feeds the
+# first sample's text to the samples behind it; the port materializes one copy per window
+# instead (docs/examples/seedvr2.md). Parity is therefore asserted the way the port runs the
+# DiT - one sample at a time - where both implementations agree, and the corrected packed
+# behaviour is covered by tests/models/test_seedvr2_window_attention.py.
+samples = [
+    (torch.randn(3, 8, 8, 9), torch.randn(3, 24)),
+    (torch.randn(1, 4, 4, 9), torch.randn(5, 24)),
+]
+max_output_error = 0.0
+max_bf16_output_error = 0.0
+for video, text in samples:
+    vid, vs = na.flatten([video])
+    txt, ts = na.flatten([text])
+    kwargs = dict(vid=vid, txt=txt, vid_shape=vs, txt_shape=ts, timestep=torch.tensor([1000.0]))
+    a = source(**kwargs).vid_sample
+    b = target(**kwargs).vid_sample
+    torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-4)
+    max_output_error = max(max_output_error, (a - b).abs().max().item())
+    a.float().square().mean().backward()
+    b.float().square().mean().backward()
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        mixed_source = source(**kwargs).vid_sample
+        mixed_target = target(**kwargs).vid_sample
+    torch.testing.assert_close(mixed_source, mixed_target, atol=2e-2, rtol=2e-2)
+    max_bf16_output_error = max(max_bf16_output_error, (mixed_source - mixed_target).abs().max().item())
 max_grad = 0.0
 for name, p in source.named_parameters():
     q = dict(target.dit.named_parameters())[name]
     assert p.grad is not None and q.grad is not None, name
     torch.testing.assert_close(p.grad, q.grad, atol=1e-5, rtol=1e-4)
     max_grad = max(max_grad, (p.grad - q.grad).abs().max().item())
-with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
-    mixed_source = source(**kwargs).vid_sample
-    mixed_target = target(**kwargs).vid_sample
-torch.testing.assert_close(mixed_source, mixed_target, atol=2e-2, rtol=2e-2)
 print(
     json.dumps(
         {
             "source_revision": "e4de8c24441a67e1b7df56abea10645059bb1185",
-            "shape": list(a.shape),
-            "max_output_error": (a - b).abs().max().item(),
+            "shape": [list(video.shape) for video, _ in samples],
+            "max_output_error": max_output_error,
             "max_gradient_error": max_grad,
             "atol": 1e-5,
             "rtol": 1e-4,
-            "bf16_max_output_error": (mixed_source - mixed_target).abs().max().item(),
+            "bf16_max_output_error": max_bf16_output_error,
             "bf16_atol": 2e-2,
             "bf16_rtol": 2e-2,
             "substitutions": [

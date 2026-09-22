@@ -14,7 +14,6 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
-from itertools import chain
 from typing import Optional, Tuple, Union
 
 import torch
@@ -207,30 +206,32 @@ class NaSwinAttention(NaMMAttention):
         txt_len_win = cache_win("txt_len", lambda: txt_len.repeat_interleave(window_count))
         all_len_win = cache_win("all_len", lambda: vid_len_win + txt_len_win)
         concat_win, unconcat_win = cache_win(
-            "mm_pnp", lambda: na.repeat_concat_idx(vid_len_win, txt_len, window_count)
+            "mm_pnp", lambda: na.repeat_concat_idx(vid_len_win, txt_len_win, window_count)
         )
+
+        def expand_text(x: torch.Tensor) -> torch.Tensor:
+            """Materialize each sample's text once per window, keeping the window order."""
+            _, num_h, _ = x.shape
+            x = rearrange(x, "l h d -> l (h d)")
+            x = na.unflatten(x, txt_shape)
+            x = [sample.repeat(windows, 1) for sample, windows in zip(x, window_count.tolist())]
+            x, _ = na.flatten(x)
+            return rearrange(x, "l (h d) -> l h d", h=num_h)
+
+        # Window attention pairs every window with its own text copy, matching `txt_len_win`.
+        txt_q, txt_k, txt_v = expand_text(txt_q), expand_text(txt_k), expand_text(txt_v)
 
         # window rope
         if self.rope:
             if self.rope.mm:
-                # repeat text q and k for window mmrope
-                _, num_h, _ = txt_q.shape
-                txt_q_repeat = rearrange(txt_q, "l h d -> l (h d)")
-                txt_q_repeat = na.unflatten(txt_q_repeat, txt_shape)
-                txt_q_repeat = [[x] * n for x, n in zip(txt_q_repeat, window_count)]
-                txt_q_repeat = list(chain(*txt_q_repeat))
-                txt_q_repeat, txt_shape_repeat = na.flatten(txt_q_repeat)
-                txt_q_repeat = rearrange(txt_q_repeat, "l (h d) -> l h d", h=num_h)
-
-                txt_k_repeat = rearrange(txt_k, "l h d -> l (h d)")
-                txt_k_repeat = na.unflatten(txt_k_repeat, txt_shape)
-                txt_k_repeat = [[x] * n for x, n in zip(txt_k_repeat, window_count)]
-                txt_k_repeat = list(chain(*txt_k_repeat))
-                txt_k_repeat, _ = na.flatten(txt_k_repeat)
-                txt_k_repeat = rearrange(txt_k_repeat, "l (h d) -> l h d", h=num_h)
-
                 vid_q, vid_k, txt_q, txt_k = self.rope(
-                    vid_q, vid_k, window_shape, txt_q_repeat, txt_k_repeat, txt_shape_repeat, cache_win
+                    vid_q,
+                    vid_k,
+                    window_shape,
+                    txt_q,
+                    txt_k,
+                    txt_shape.repeat_interleave(window_count, dim=0),
+                    cache_win,
                 )
             else:
                 vid_q, vid_k = self.rope(vid_q, vid_k, window_shape, cache_win)

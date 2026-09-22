@@ -87,56 +87,46 @@ def unconcat(
     return vid, txt
 
 
-def repeat_concat(
-    vid: torch.FloatTensor,  # (VL ... c)
-    txt: torch.FloatTensor,  # (TL ... c)
-    vid_len: torch.LongTensor,  # (n*b)
-    txt_len: torch.LongTensor,  # (b)
-    txt_repeat: List,  # (n)
-) -> torch.FloatTensor:  # (L ... c)
-    vid = torch.split(vid, vid_len.tolist())
-    txt = torch.split(txt, txt_len.tolist())
-    txt = [[x] * n for x, n in zip(txt, txt_repeat)]
-    txt = list(chain(*txt))
-    return torch.cat(list(chain(*zip(vid, txt))))
-
-
 def repeat_concat_idx(
-    vid_len: torch.LongTensor,  # (n*b)
-    txt_len: torch.LongTensor,  # (b)
-    txt_repeat: torch.LongTensor,  # (n)
+    vid_len: torch.LongTensor,  # (n*b) per-window video lengths
+    txt_len: torch.LongTensor,  # (n*b) per-window text lengths
+    txt_repeat: torch.LongTensor,  # (b) windows per sample
 ) -> Tuple[
     Callable,
     Callable,
 ]:
+    """Interleave every video window with its own copy of the sample's text.
+
+    ``vid`` and ``txt`` both arrive in window order with ``txt`` already holding one copy of
+    its sample's text per window, so ``txt_len`` carries the per-window text lengths and
+    ``txt_repeat`` only drives the text pooling on the way out.
+    """
     device = vid_len.device
+    txt_repeat_list = txt_repeat.tolist()
     vid_idx = torch.arange(vid_len.sum(), device=device)
     txt_idx = torch.arange(len(vid_idx), len(vid_idx) + txt_len.sum(), device=device)
-    txt_repeat_list = txt_repeat.tolist()
-    tgt_idx = repeat_concat(vid_idx, txt_idx, vid_len, txt_len, txt_repeat)
+    tgt_idx = concat(vid_idx, txt_idx, vid_len, txt_len)
     src_idx = torch.argsort(tgt_idx)
     txt_idx_len = len(tgt_idx) - len(vid_idx)
-    repeat_txt_len = (txt_len * txt_repeat).tolist()
+    repeat_txt_len = [int(chunk.sum()) for chunk in txt_len.split(txt_repeat_list)]
 
     def unconcat_coalesce(all):
         """
-        Un-concat vid & txt, and coalesce the repeated txt.
-        e.g. vid [0 1 2 3 4 5 6 7 8] -> 3 splits -> [0 1 2] [3 4 5] [6 7 8]
-             txt [9 10]
-             repeat_concat ==> [0 1 2 9 10 3 4 5 9 10 6 7 8 9 10]
-             1. argsort re-index ==> [0 1 2 3 4 5 6 7 8 9 9 9 10 10 10]
-                           split ==> vid_out [0 1 2 3 4 5 6 7 8] txt_out [9 9 9 10 10 10]
+        Un-concat vid & txt, and coalesce the per-window text copies of each sample.
+        e.g. vid [0 1 2] [3 4 5] -> 2 windows of one sample
+             txt [6 7] [6 7]
+             concat ==> [0 1 2 6 7 3 4 5 6 7]
+             1. argsort re-index ==> [0 1 2 3 4 5 6 7 6 7]
+                           split ==> vid_out [0 1 2 3 4 5] txt_out [6 7 6 7]
              2. reshape & mean for each sample to coalesce the repeated txt.
         """
         vid_out, txt_out = all[src_idx].split([len(vid_idx), txt_idx_len])
-        txt_out_coalesced = []
-        for txt, repeat_time in zip(txt_out.split(repeat_txt_len), txt_repeat_list):
-            txt = txt.reshape(-1, repeat_time, *txt.shape[1:]).mean(1)
-            txt_out_coalesced.append(txt)
+        txt_out_coalesced = [
+            txt.reshape(windows, -1, *txt.shape[1:]).mean(0)
+            for txt, windows in zip(txt_out.split(repeat_txt_len), txt_repeat_list)
+        ]
         return vid_out, torch.cat(txt_out_coalesced)
 
-    # Note: Backward of torch.index_select is non-deterministic when existing repeated index,
-    # the difference may cumulative like torch.repeat_interleave, so we use vanilla index here.
     return (
         lambda vid, txt: torch.cat([vid, txt])[tgt_idx],
         lambda all: unconcat_coalesce(all),

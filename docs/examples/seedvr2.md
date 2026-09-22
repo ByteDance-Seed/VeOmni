@@ -156,6 +156,11 @@ separate from this model port. Do not treat checkpoint reload as exact resume.
   fresh per-block caches.
 - Sequence/context parallelism is not implemented; nonlocal sequence execution
   raises an error. FSDP2 is a separate path.
+- Upstream's windowed attention reuses one text index block for every window, so
+  in a packed batch a sample that follows a multi-window sample reads the earlier
+  sample's text. The port materializes one text copy per window before the
+  attention and pools the text outputs back onto their sample, so a packed batch
+  matches independent per-sample execution.
 - The eager path contains host synchronization and per-window loops. No fused
   kernel speedup, high-resolution throughput, CUDA numerical parity, or full
   3B training convergence is claimed.
@@ -180,7 +185,16 @@ Convolution inflation preserves strict loading checks; an incomplete VAE
 checkpoint must fail rather than leave randomly initialized parameters.
 The source comparison uses the pinned upstream model with explicitly disclosed
 native attention/normalization substitutes and a bounded, equivalent RoPE grid.
-It does not execute the original CUDA kernels.
+It compares one sample at a time, because the corrected windowed text indexing
+intentionally differs from upstream on a packed multi-window batch, where
+upstream feeds an earlier sample's text to the samples behind it. It does not
+execute the original CUDA kernels.
+
+Two model regressions are enumerated in both unit workflows. In
+`tests/models/test_seedvr2_window_attention.py` a packed batch must match
+independent per-sample execution, because every window has to attend to its own
+sample's text.
+
 
 Measured on 2026-09-11:
 
