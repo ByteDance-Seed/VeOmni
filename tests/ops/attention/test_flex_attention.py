@@ -214,9 +214,29 @@ def test_flex_attention_accepts_sliding_window_metadata_with_block_mask(monkeypa
     )
     assert captured["attention_mask"] is block_mask
     assert "sliding_window" not in captured["kwargs"]
-    assert captured["kwargs"]["kernel_options"] == {"BACKEND": "TRITON"}
+    assert captured["kwargs"]["kernel_options"] == {}
     torch.testing.assert_close(output, query.transpose(1, 2))
     assert auxiliary is None
+
+
+def test_flex_attention_cpu_forward_does_not_pin_triton_backend(monkeypatch):
+    captured = {}
+
+    def fake_backend(module, query, key, value, attention_mask, **kwargs):
+        captured["kwargs"] = kwargs
+        return query.transpose(1, 2), None
+
+    monkeypatch.setattr(flex_backend, "hf_flex_attention_forward", fake_backend)
+    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
+    query = torch.randn(1, 4, 8, 8)
+    flex_backend.flex_attention_forward(
+        _FakeAttentionModule(),
+        query,
+        query,
+        query,
+        _causal_block_mask(8, query.device),
+    )
+    assert "BACKEND" not in captured["kwargs"]["kernel_options"]
 
 
 def test_flex_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):

@@ -65,10 +65,11 @@ def flex_attention_forward(
     del sliding_window
 
     kernel_options = dict(kwargs.pop("kernel_options", {}) or {})
-    # PyTorch's AUTO backend may select Flex Decoding for short queries and then
-    # fail during Inductor kernel selection. Use the standard Triton FlexAttention
-    # kernel by default while preserving an explicit caller override.
-    kernel_options.setdefault("BACKEND", "TRITON")
+    # PyTorch AUTO may pick Flex Decoding for short CUDA queries and then fail
+    # in Inductor. Pin Triton on CUDA only. CPU and NPU have no Triton Flex
+    # backend; keep an explicit caller override on every device.
+    if query.device.type == "cuda":
+        kernel_options.setdefault("BACKEND", "TRITON")
 
     parallel_state = get_parallel_state()
     ulysses_enabled = should_apply_ulysses(skip_ulysses=skip_ulysses)
