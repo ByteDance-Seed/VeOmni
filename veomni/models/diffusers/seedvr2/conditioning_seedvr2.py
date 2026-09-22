@@ -59,6 +59,11 @@ class SeedVR2ConditionModel(PreTrainedModel):
             if not isinstance(self.text_embedding, torch.Tensor) or self.text_embedding.ndim != 2:
                 raise ValueError("Expected the official packed positive text embedding tensor.")
 
+    def clear_vae_cache(self):
+        """Release the VAE causal-convolution caches before this model is offloaded."""
+        if self.vae is not None:
+            self.vae.clear_causal_cache()
+
     @torch.no_grad()
     def encode_video(self, video):
         """Encode normalized C,T,H,W video into scaled T,H,W,C latents."""

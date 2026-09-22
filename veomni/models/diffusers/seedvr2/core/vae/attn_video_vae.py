@@ -1297,6 +1297,17 @@ class VideoAutoencoderKLWrapper(VideoAutoencoderKL):
             if isinstance(module, InflatedCausalConv3d):
                 module.set_memory_device(memory_device)
 
+    def clear_causal_cache(self):
+        """Drop the causal-convolution caches before the VAE leaves the accelerator.
+
+        ``InflatedCausalConv3d.memory`` is a plain attribute, so ``Module.to`` neither moves
+        nor releases it: the caches of the last sliced encode/decode would stay resident and
+        keep paying for accelerator memory while another model runs.
+        """
+        for module in self.modules():
+            if isinstance(module, InflatedCausalConv3d):
+                module.memory = None
+
     def set_memory_limit(self, conv_max_mem: Optional[float], norm_max_mem: Optional[float]):
         set_norm_limit(norm_max_mem)
         for m in self.modules():

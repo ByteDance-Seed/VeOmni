@@ -81,6 +81,8 @@ class SeedVR2Restorer:
         self.condition.to(device=self.device, dtype=self.dtype)
         latents = self.condition.encode_video(video)
         text = self.condition.text_embedding
+        # `to("cpu")` leaves the VAE's causal-convolution caches on the accelerator.
+        self.condition.clear_vae_cache()
         self.condition.to("cpu")
         self.model.to(self.device)
         with torch.autocast(self.device.type, dtype=self.dtype, enabled=self.dtype != torch.float32):
@@ -88,5 +90,6 @@ class SeedVR2Restorer:
         self.model.to("cpu")
         self.condition.to(device=self.device, dtype=self.dtype)
         samples = self.condition.decode_latents(restored)
+        self.condition.clear_vae_cache()
         self.condition.to("cpu")
         return (samples[:, : frames.shape[0]].permute(1, 0, 2, 3).float().cpu().clamp(-1, 1) + 1) / 2

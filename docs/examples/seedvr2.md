@@ -195,6 +195,12 @@ Two model regressions are enumerated in both unit workflows. In
 independent per-sample execution, because every window has to attend to its own
 sample's text.
 
+In `tests/models/test_seedvr2_vae_offload.py` offloading the VAE must first
+release its causal-convolution caches, which are compared before and after by
+live and peak accelerator memory on the same nine-frame clip while asserting the
+outputs are unchanged. `SeedVR2Restorer.__call__` calls
+`SeedVR2ConditionModel.clear_vae_cache()` before each `to("cpu")` for that
+reason.
 
 Measured on 2026-09-11:
 
