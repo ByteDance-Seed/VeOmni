@@ -19,13 +19,40 @@ from veomni.models.registry import MODELING_REGISTRY
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
-def _convert_qwen3_5_moe_wrapped_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
-    return convert_fused_moe_lora_targets(
+_LANGUAGE_GATE_UP = "model.language_model.layers.*.mlp.experts.gate_up_proj"
+_LANGUAGE_DOWN = "model.language_model.layers.*.mlp.experts.down_proj"
+_MTP_GATE_UP = "mtp.layers.*.mlp.experts.gate_up_proj"
+_MTP_DOWN = "mtp.layers.*.mlp.experts.down_proj"
+
+
+def _has_mtp_experts(model) -> bool:
+    """Return whether MTP fused-expert globs should be included.
+
+    Architecture-level mapping (``model is None``) includes MTP. Instance
+    mapping only adds those globs when the live model actually has MTP experts,
+    so ``resolve_fused_moe_lora_targets`` does not assert unmatched patterns.
+    """
+    if model is None:
+        return True
+    mtp = getattr(model, "mtp", None)
+    if mtp is None:
+        return False
+    return any(".mlp.experts." in name for name, _ in mtp.named_parameters())
+
+
+def _convert_qwen3_5_moe_wrapped_lora_targets_to_parameters(model, lora_modules, target_parameter_patterns):
+    target_modules, patterns = convert_fused_moe_lora_targets(
         lora_modules,
         target_parameter_patterns,
-        "model.language_model.layers.*.mlp.experts.gate_up_proj",
-        "model.language_model.layers.*.mlp.experts.down_proj",
+        _LANGUAGE_GATE_UP,
+        _LANGUAGE_DOWN,
     )
+    if _has_mtp_experts(model):
+        if _LANGUAGE_GATE_UP in patterns:
+            patterns.append(_MTP_GATE_UP)
+        if _LANGUAGE_DOWN in patterns:
+            patterns.append(_MTP_DOWN)
+    return target_modules, patterns
 
 
 def _convert_qwen3_5_moe_model_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):

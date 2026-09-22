@@ -23,9 +23,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
-from torch.nn.attention.flex_attention import create_block_mask
 
-from tests.ops.attention.attention_cases import clone_qkv, dense_mask, flex_mask, math_sdpa_reference
+from tests.ops.attention.attention_cases import (
+    clone_qkv,
+    dense_mask,
+    eager_create_block_mask,
+    flex_mask,
+    math_sdpa_reference,
+)
 from tests.ops.attention.utils import UlyssesHelperRecorder
 from tests.ops.tol import (
     ATTN_ATOL,
@@ -83,7 +88,7 @@ def cleanup_compiled_cuda_state():
 
 
 def _causal_block_mask(sequence_length: int, device: torch.device):
-    return create_block_mask(
+    return eager_create_block_mask(
         lambda batch_idx, head_idx, query_idx, key_idx: query_idx >= key_idx,
         B=None,
         H=None,
@@ -165,7 +170,7 @@ def test_flex_attention_rejects_unsupported_masks(monkeypatch):
         with pytest.raises(TypeError, match="requires a BlockMask"):
             flex_backend.flex_attention_forward(module, query, query, query, unsupported_mask, sliding_window=4)
 
-    head_specific_mask = create_block_mask(
+    head_specific_mask = eager_create_block_mask(
         lambda batch_idx, head_idx, query_idx, key_idx: query_idx >= key_idx,
         B=None,
         H=query.shape[1],
@@ -190,7 +195,7 @@ def test_flex_attention_accepts_sliding_window_metadata_with_block_mask(monkeypa
     monkeypatch.setattr(flex_backend, "hf_flex_attention_forward", fake_backend)
     monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
     query = torch.randn(1, 4, 8, 8)
-    block_mask = create_block_mask(
+    block_mask = eager_create_block_mask(
         lambda batch_idx, head_idx, query_idx, key_idx: (query_idx >= key_idx) & (query_idx - key_idx < 4),
         B=None,
         H=None,

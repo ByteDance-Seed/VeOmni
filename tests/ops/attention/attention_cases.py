@@ -24,6 +24,15 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 from veomni.ops.mask import MagiAttentionMask
 
 
+def eager_create_block_mask(*args, **kwargs):
+    """Build a BlockMask without compiling ``create_block_mask``.
+
+    Compiled ``create_block_mask`` belongs on magi-vs-flex, not this branch.
+    """
+    kwargs["_compile"] = False
+    return create_block_mask(*args, **kwargs)
+
+
 _2D_MASK_MODES = ("causal", "noise", "full", "causal")
 
 
@@ -95,7 +104,7 @@ def flex_2d_mask(sequence_length: int, device: torch.device | str) -> BlockMask:
         )
         return first | noise | full | last
 
-    return create_block_mask(
+    return eager_create_block_mask(
         mask_mod,
         B=None,
         H=None,
@@ -135,7 +144,7 @@ def magi_mask(mask_case: str, sequence_length: int, device: torch.device | str) 
 
 def flex_mask(mask_case: str, sequence_length: int, device: torch.device | str) -> BlockMask:
     if mask_case == "causal":
-        return create_block_mask(
+        return eager_create_block_mask(
             lambda batch_idx, head_idx, query_idx, key_idx: query_idx >= key_idx,
             B=None,
             H=None,

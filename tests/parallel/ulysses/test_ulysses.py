@@ -340,6 +340,7 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
             KV_LEN=16,
             device=device,
             BLOCK_SIZE=128,
+            _compile=False,
         )
         module = _FakeFlexAttentionModule().to(device)
         original_get_parallel_state = flex_backend.get_parallel_state

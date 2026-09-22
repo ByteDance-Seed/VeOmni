@@ -766,6 +766,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             local_key_dim = self.key_dim
             local_value_dim = self.value_dim
 
+        # Host-gated NPU kernels must follow the activation device. Unconditional
+        # `.npu()` breaks CPU unit tests on Ascend hosts.
+        if cu_seq_lens_q is not None and mixed_qkv.device.type == "npu":
+            cu_seq_lens_q = cu_seq_lens_q.npu()
+
         if use_precomputed_states:
             # Modification: keep this disabled until FLA causal_conv1d_update decode path is validated.
             raise NotImplementedError("use_precomputed_states=True is not supported yet for causal_conv1d_update now.")
@@ -787,7 +792,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 mixed_qkv,
                 conv_weight,
                 self.conv1d.bias,
-                cu_seq_lens_q.npu() if cu_seq_lens_q is not None else None,
+                cu_seq_lens_q,
                 activation=self.activation,
                 seq_idx=None,
                 backend="triton",
@@ -829,7 +834,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 g,
                 beta,
                 None,
-                cu_seq_lens_q.npu() if cu_seq_lens_q is not None else None,
+                cu_seq_lens_q,
                 output_final_state=cache_params is not None,
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens_list=cu_seqlens_list,

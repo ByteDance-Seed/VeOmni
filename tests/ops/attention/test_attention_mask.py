@@ -26,6 +26,7 @@ from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, create_caus
 
 from tests.ops.attention.attention_cases import (
     dense_2d_mask,
+    eager_create_block_mask,
     flex_2d_mask,
     flex_visible,
     magi_2d_mask,
@@ -67,6 +68,16 @@ def test_flex_mask_builder_keeps_create_block_mask_eager(monkeypatch):
     monkeypatch.setattr(torch, "compile", boom)
     mask = flex_attention_mask_builder(1, 4, 4, device="cpu")
     assert isinstance(mask, BlockMask)
+    helper_mask = eager_create_block_mask(
+        lambda batch_idx, head_idx, query_idx, key_idx: query_idx >= key_idx,
+        B=None,
+        H=None,
+        Q_LEN=4,
+        KV_LEN=4,
+        device="cpu",
+    )
+    assert isinstance(helper_mask, BlockMask)
+    assert isinstance(flex_2d_mask(16, "cpu"), BlockMask)
 
 
 @pytest.mark.parametrize("allow_skip", (None, False, True))
