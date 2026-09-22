@@ -67,3 +67,11 @@ def test_a_later_named_init_adopts_the_cached_anonymous_state(single_rank_group)
 
     assert named is anonymous
     assert get_parallel_state_by_name("base") is anonymous
+
+
+def test_cp_layout_is_part_of_topology_cache(single_rank_group):
+    contiguous = _init_parallel_state(dp_size=1, device_type="cpu", cp_layout="contiguous", name=None)
+    zigzag = _init_parallel_state(dp_size=1, device_type="cpu", cp_layout="zigzag", name=None)
+    assert zigzag is not contiguous
+    assert zigzag.cp_layout == "zigzag"
+    assert _init_parallel_state(dp_size=1, device_type="cpu", cp_layout="zigzag", name=None) is zigzag
