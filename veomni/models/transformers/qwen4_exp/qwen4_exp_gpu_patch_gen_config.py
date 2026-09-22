@@ -66,7 +66,7 @@ from veomni.ops.kernels.attention.ulysses import prepare_ulysses_qkv, restore_ul
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
-from veomni.utils.seqlen_pos_transform_utils import culen2pos, pos2culen
+from veomni.utils.seqlen_pos_transform_utils import pos2culen
 
 
 config = PatchConfig(
@@ -98,7 +98,7 @@ config.add_import(
 config.add_import("veomni.ops.kernels.qwen4_exp", names=["qsa_attn_tilelang"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 config.add_import("veomni.utils.model_outputs", names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin"])
-config.add_import("veomni.utils.seqlen_pos_transform_utils", names=["culen2pos", "pos2culen"])
+config.add_import("veomni.utils.seqlen_pos_transform_utils", names=["pos2culen"])
 config.add_post_import_block(
     """
     # Bound by ``_bind_veomni_ops`` before model construction. Qwen4-Exp
@@ -255,6 +255,7 @@ def qwen4_exp_gated_deltanet_forward_patched(
     cache_params: Cache | None = None,
     attention_mask: torch.Tensor | None = None,
     cu_seq_lens_q: torch.Tensor | None = None,
+    packed_seq_lens: list[int] | tuple[int, ...] | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ):
     # --- Patch.1 ---
@@ -266,12 +267,18 @@ def qwen4_exp_gated_deltanet_forward_patched(
     batch_size, seq_len, _ = hidden_states.shape
     parallel_state = get_parallel_state()
     ulysses_enabled = parallel_state.ulysses_enabled
-    packed_seq_lens = None
-    if cu_seq_lens_q is not None:
+    # --- Patch.2: Reuse host-side packed lengths threaded through kwargs. ---
+    # The trainer moves cu_seq_lens_q onto the device, so deriving the lengths
+    # here would sync GPU->CPU once per layer; the model forward exports the
+    # list once and threads it through kwargs instead.
+    if cu_seq_lens_q is None:
+        packed_seq_lens = None
+    else:
         sequence_length = seq_len * parallel_state.ulysses_size if ulysses_enabled else seq_len
-        packed_seq_lens = _qwen4_exp_validate_packed_seq_lens(
-            cu_seq_lens_q.diff().tolist(), batch_size, sequence_length
-        )
+        if packed_seq_lens is None:
+            packed_seq_lens = cu_seq_lens_q.diff().tolist()
+        packed_seq_lens = _qwen4_exp_validate_packed_seq_lens(packed_seq_lens, batch_size, sequence_length)
+    # --- Patch.2 ---
 
     if ulysses_enabled and cache_params is not None:
         raise NotImplementedError("Qwen4-Exp GatedDeltaNet does not support KV/recurrent cache state under Ulysses.")
@@ -531,6 +538,7 @@ def qwen4_exp_qsa_indexer_forward_patched(
     attention_mask: torch.Tensor | None,
     past_key_values: Cache | None,
     cu_seq_lens_q: torch.Tensor | None = None,
+    packed_seq_lens: list[int] | tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     # --- Patch.1: Select compact global QSA token indices under Ulysses. ---
     # Using sequence-local RoPE inputs and gathering only the compressed keys
@@ -569,7 +577,15 @@ def qwen4_exp_qsa_indexer_forward_patched(
     if cu_seq_lens_q is None:
         segments = [(batch_idx, 0, global_seq_len) for batch_idx in range(batch_size)]
     else:
-        boundaries = [int(value) for value in cu_seq_lens_q.tolist()]
+        # --- Patch.2: Prefer the host-side packed lengths exported once by the
+        # model forward; only direct callers without them pay one GPU->CPU sync. ---
+        if packed_seq_lens is None:
+            boundaries = [int(value) for value in cu_seq_lens_q.tolist()]
+        else:
+            boundaries = [0]
+            for length in packed_seq_lens:
+                boundaries.append(boundaries[-1] + length)
+        # --- Patch.2 ---
         if not boundaries or boundaries[0] != 0 or boundaries[-1] != batch_size * global_seq_len:
             raise ValueError(
                 "Qwen4-Exp compact QSA requires cu_seq_lens_q to cover the complete padded batch; "
@@ -602,11 +618,39 @@ def qwen4_exp_qsa_indexer_forward_patched(
         for start in range(segment_start, segment_end - self.compress_ratio + 1, self.compress_ratio)
     ]
     owned_blocks = [block for block in blocks if block[2] // local_seq_len == rank]
-    counts = torch.tensor(
-        [sum(block_start // local_seq_len == owner for _, _, block_start in blocks) for owner in range(world_size)],
-        dtype=torch.long,
-        device=hidden_states.device,
+    gathered_blocks = [block for owner in range(world_size) for block in blocks if block[2] // local_seq_len == owner]
+    # --- Patch.3: Upload all host-derived block metadata in one flat H2D copy. ---
+    # The previous per-list ``torch.tensor(..., device=...)`` calls each blocked
+    # the host on a pageable copy once per full-attention layer; batching them
+    # into a single flat upload leaves one (unavoidable without a pinned
+    # staging buffer) copy for the whole indexer call.
+    count_list = [
+        sum(block_start // local_seq_len == owner for _, _, block_start in blocks) for owner in range(world_size)
+    ]
+    local_batch_id_list = [batch_idx for _, batch_idx, _ in owned_blocks]
+    local_block_start_list = [start for _, _, start in owned_blocks]
+    gathered_segment_id_list = [segment_id for segment_id, _, _ in gathered_blocks]
+    gathered_start_list = [start for _, _, start in gathered_blocks]
+    meta_sections = (
+        count_list,
+        local_batch_id_list,
+        local_block_start_list,
+        gathered_segment_id_list,
+        gathered_start_list,
     )
+    flat_meta = torch.tensor([value for section in meta_sections for value in section], dtype=torch.long).to(
+        hidden_states.device
+    )
+    counts_end = len(count_list)
+    local_ids_end = counts_end + len(local_batch_id_list)
+    local_starts_end = local_ids_end + len(local_block_start_list)
+    gathered_seg_ids_end = local_starts_end + len(gathered_segment_id_list)
+    counts = flat_meta[:counts_end]
+    local_batch_ids = flat_meta[counts_end:local_ids_end]
+    local_block_starts = flat_meta[local_ids_end:local_starts_end]
+    block_segment_ids = flat_meta[local_starts_end:gathered_seg_ids_end]
+    block_starts = flat_meta[gathered_seg_ids_end:]
+    # --- Patch.3 ---
 
     halo = self.compress_ratio - 1
     if halo == 0 or world_size == 1:
@@ -644,19 +688,12 @@ def qwen4_exp_qsa_indexer_forward_patched(
 
     if world_size > 1:
         pooled_keys = all_gather_compressed_rows(pooled_keys, counts, group)
-    gathered_blocks = [block for owner in range(world_size) for block in blocks if block[2] // local_seq_len == owner]
     output_width = self.token_budget + self.compress_ratio - 1
     query_positions = local_start + torch.arange(local_seq_len, device=hidden_states.device)
     local_segment_ids = segment_ids[:, local_start : local_start + local_seq_len]
     local_segment_starts = segment_starts[:, local_start : local_start + local_seq_len]
 
     if gathered_blocks:
-        block_segment_ids = torch.tensor(
-            [segment_id for segment_id, _, _ in gathered_blocks], dtype=torch.long, device=hidden_states.device
-        )
-        block_starts = torch.tensor(
-            [start for _, _, start in gathered_blocks], dtype=torch.long, device=hidden_states.device
-        )
         top_count = min(self.block_topk, len(gathered_blocks))
         block_offsets = torch.arange(self.compress_ratio, device=hidden_states.device)
         elements_per_query = max(1, batch_size * len(gathered_blocks) * self.index_n_heads)
@@ -748,13 +785,17 @@ def qwen4_exp_text_attention_forward_patched(
             )
     # --- Patch.1 ---
 
+    # --- Patch.4: Forward the host-side packed lengths so the indexer never
+    # syncs on cu_seq_lens_q inside the training hot path. ---
     selection = self.indexer(
         hidden_states,
         position_embeddings,
         attention_mask,
         past_key_values,
         cu_seq_lens_q=kwargs.get("cu_seq_lens_q"),
+        packed_seq_lens=kwargs.get("packed_seq_lens"),
     )
+    # --- Patch.4 ---
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
     query_states, gate = torch.chunk(
@@ -974,6 +1015,10 @@ class PatchedQwen4ExpTextExperts(nn.Module):
 #    all-gathering parameters.
 # 5. Cast lookup results to the requested compute dtype before communicating
 #    them, while retaining FP32 master parameters.
+# 6. Reuse host-side packed lengths threaded through kwargs so the PLE lookup
+#    never derives them from the on-device cu_seq_lens_q (GPU->CPU sync).
+# 7. Sort shard ids once and pay a single host sync for the per-shard split
+#    sizes instead of one nonzero sync per shard in every PLE lookup.
 # ================================================================
 @config.add_helper
 class _Qwen4ExpScaleGradient(torch.autograd.Function):
@@ -1077,13 +1122,24 @@ class PatchedQwen4ExpTextNGramEmbedding(nn.Module):
             (shard_ids.numel(), first_weight.shape[1]),
             dtype=output_dtype or first_weight.dtype,
         )
-        for shard_idx, embedding in enumerate(self.ngram_embedding.values()):
-            positions = torch.where(shard_ids == shard_idx)[0]
-            weight = embedding.weight
-            if hasattr(weight, "to_local"):
-                weight = weight.to_local()
-            values = nn.functional.embedding(row_ids[positions], weight).to(output.dtype)
-            output = output.index_copy(0, positions, values)
+        # --- Patch.7: Sort once and take a single host sync for the per-shard
+        # split sizes. The previous ``torch.where(shard_ids == shard_idx)[0]``
+        # nonzero-synced the match count to the host once per shard per lookup,
+        # serialising the host against the device on the PLE hot path. ---
+        order = torch.argsort(shard_ids, stable=True)
+        shard_counts = torch.bincount(shard_ids, minlength=len(self.ngram_embedding)).tolist()
+        shard_start = 0
+        for embedding, shard_count in zip(self.ngram_embedding.values(), shard_counts, strict=True):
+            shard_end = shard_start + shard_count
+            if shard_end > shard_start:
+                positions = order[shard_start:shard_end]
+                weight = embedding.weight
+                if hasattr(weight, "to_local"):
+                    weight = weight.to_local()
+                values = nn.functional.embedding(row_ids[positions], weight).to(output.dtype)
+                output = output.index_copy(0, positions, values)
+            shard_start = shard_end
+        # --- Patch.7 ---
         return output
 
     def _distributed_lookup(
@@ -1187,24 +1243,32 @@ class PatchedQwen4ExpTextNGramEmbedding(nn.Module):
         past_key_values: Cache | None,
         output_dtype: torch.dtype | None = None,
         cu_seq_lens_q: torch.Tensor | None = None,
+        packed_seq_lens: list[int] | tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         input_ids = input_ids.long()
         parallel_state = get_parallel_state()
-        packed_seq_lens = None
         full_input_ids = input_ids
-        if cu_seq_lens_q is not None and parallel_state.ulysses_enabled:
+        # --- Patch.6: Reuse host-side packed lengths threaded through kwargs. ---
+        if cu_seq_lens_q is None:
+            packed_seq_lens = None
+        elif parallel_state.ulysses_enabled:
             gathered_input_ids = [torch.empty_like(input_ids) for _ in range(parallel_state.ulysses_size)]
             dist.all_gather(gathered_input_ids, input_ids, group=parallel_state.ulysses_group)
             full_input_ids = torch.cat(gathered_input_ids, dim=1)
+            if packed_seq_lens is None:
+                packed_seq_lens = cu_seq_lens_q.diff().tolist()
             packed_seq_lens = _qwen4_exp_validate_packed_seq_lens(
-                cu_seq_lens_q.diff().tolist(), full_input_ids.shape[0], full_input_ids.shape[1]
+                packed_seq_lens, full_input_ids.shape[0], full_input_ids.shape[1]
             )
-        elif cu_seq_lens_q is not None:
+        else:
+            if packed_seq_lens is None:
+                packed_seq_lens = cu_seq_lens_q.diff().tolist()
             packed_seq_lens = _qwen4_exp_validate_packed_seq_lens(
-                cu_seq_lens_q.diff().tolist(), input_ids.shape[0], input_ids.shape[1]
+                packed_seq_lens, input_ids.shape[0], input_ids.shape[1]
             )
             if past_key_values is not None:
                 raise ValueError("Qwen4-Exp packed PLE n-gram history does not support cache state.")
+        # --- Patch.6 ---
         if parallel_state.ulysses_enabled and past_key_values is not None:
             raise NotImplementedError("Qwen4-Exp PLE n-gram history does not support cache state under Ulysses.")
         if packed_seq_lens is not None:
@@ -1286,12 +1350,17 @@ def qwen4_exp_text_ple_layer_short_conv_patched(
     hidden_states: torch.Tensor,
     past_key_values: Cache | None,
     cu_seq_lens_q: torch.Tensor | None = None,
+    packed_seq_lens: list[int] | tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     parallel_state = get_parallel_state()
     if not parallel_state.ulysses_enabled:
         if cu_seq_lens_q is not None:
+            # --- Patch.3: Reuse host-side packed lengths threaded through kwargs. ---
+            if packed_seq_lens is None:
+                packed_seq_lens = cu_seq_lens_q.diff().tolist()
+            # --- Patch.3 ---
             packed_seq_lens = _qwen4_exp_validate_packed_seq_lens(
-                cu_seq_lens_q.diff().tolist(), hidden_states.shape[0], hidden_states.shape[1]
+                packed_seq_lens, hidden_states.shape[0], hidden_states.shape[1]
             )
             if past_key_values is not None:
                 raise ValueError("Qwen4-Exp packed PLE convolution does not support cache state.")
@@ -1332,9 +1401,11 @@ def qwen4_exp_text_ple_layer_short_conv_patched(
     if cu_seq_lens_q is not None:
         local_seq_len = hidden_states.shape[1]
         global_seq_len = local_seq_len * parallel_state.ulysses_size
-        packed_seq_lens = _qwen4_exp_validate_packed_seq_lens(
-            cu_seq_lens_q.diff().tolist(), hidden_states.shape[0], global_seq_len
-        )
+        # --- Patch.3: Reuse host-side packed lengths threaded through kwargs. ---
+        if packed_seq_lens is None:
+            packed_seq_lens = cu_seq_lens_q.diff().tolist()
+        # --- Patch.3 ---
+        packed_seq_lens = _qwen4_exp_validate_packed_seq_lens(packed_seq_lens, hidden_states.shape[0], global_seq_len)
         boundaries = [0]
         for length in packed_seq_lens:
             boundaries.append(boundaries[-1] + length)
@@ -1387,6 +1458,7 @@ def qwen4_exp_text_ple_layer_forward_patched(
     past_key_values: Cache | None,
     conv_mask: torch.Tensor | None = None,
     cu_seq_lens_q: torch.Tensor | None = None,
+    packed_seq_lens: list[int] | tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     # --- Patch.1: Run the PLE layer with VeOmni sequence-parallel handling. ---
     # Keep FP32 PLE master weights while casting sparse lookup results to the
@@ -1396,6 +1468,7 @@ def qwen4_exp_text_ple_layer_forward_patched(
         past_key_values,
         output_dtype=hidden_states.dtype,
         cu_seq_lens_q=cu_seq_lens_q,
+        packed_seq_lens=packed_seq_lens,
     )
     # --- Patch.1 ---
     key_normed = self.norm_key(self.key_proj(embeddings)).unflatten(-1, (self.hc_count, self.hidden_size))
@@ -1413,8 +1486,78 @@ def qwen4_exp_text_ple_layer_forward_patched(
         gated_value_normed,
         past_key_values,
         cu_seq_lens_q=cu_seq_lens_q,
+        packed_seq_lens=packed_seq_lens,
     )
     return output
+
+
+# Patch: Qwen4ExpTextDecoderLayer.forward
+# 1. Thread the collator's packed boundaries into the PLE token mixers, so
+#    the PLE n-gram history and short convolution reset state at every packed
+#    boundary instead of leaking context across segments (upstream
+#    DecoderLayer.forward never forwards cu_seq_lens_q to self.ple).
+# 2. Forward the host-side packed lengths exported once per forward alongside
+#    the device tensor, so the PLE mixers reuse them instead of re-deriving
+#    them (GPU->CPU sync) from the on-device cu_seq_lens_q.
+# ================================================================
+@config.override_method(
+    "Qwen4ExpTextDecoderLayer.forward",
+    description="Pass packed sequence boundaries to Qwen4-Exp PLE",
+)
+def qwen4_exp_text_decoder_layer_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None = None,
+    conv_mask: torch.Tensor | None = None,
+    past_key_values: Cache | None = None,
+    ple_input_ids: torch.LongTensor | None = None,
+    cu_seq_lens_q: torch.Tensor | None = None,
+    packed_seq_lens: list[int] | tuple[int, ...] | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> torch.FloatTensor:
+    # --- Patch.1: Thread the packed boundaries into the PLE token mixers. ---
+    if self.ple is not None:
+        hidden_states = hidden_states + self.ple(
+            hidden_states,
+            ple_input_ids,
+            past_key_values,
+            conv_mask=conv_mask,
+            cu_seq_lens_q=cu_seq_lens_q,
+            packed_seq_lens=packed_seq_lens,
+        )
+    # --- Patch.1 ---
+
+    hidden_states, hyper_input, injection_weights = self.attn_hyper_connection(hidden_states)
+    if self.layer_type == "linear_attention":
+        hidden_states = self.linear_attn(
+            hidden_states,
+            cache_params=past_key_values,
+            attention_mask=conv_mask,
+            cu_seq_lens_q=cu_seq_lens_q,
+            packed_seq_lens=packed_seq_lens,
+            **kwargs,
+        )
+    else:
+        hidden_states, _ = self.self_attn(
+            hidden_states,
+            position_embeddings,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            cu_seq_lens_q=cu_seq_lens_q,
+            packed_seq_lens=packed_seq_lens,
+            **kwargs,
+        )
+
+    injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
+    hidden_states = hyper_input + injection.flatten(-2)
+
+    hidden_states, hyper_input, injection_weights = self.mlp_hyper_connection(hidden_states)
+    hidden_states = self.mlp(hidden_states)
+
+    injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
+    hidden_states = hyper_input + injection.flatten(-2)
+    return hidden_states
 
 
 @config.override_method(
@@ -1453,6 +1596,23 @@ def qwen4_exp_text_model_forward_patched(
     if parallel_state.ulysses_enabled and (use_cache or past_key_values is not None):
         raise NotImplementedError("Qwen4-Exp does not support cache prefill or decode under Ulysses.")
     # --- Patch.1 ---
+    # --- Patch.5: Export host-side packed lengths once per forward. ---
+    # The trainer moves cu_seq_lens_q onto the device, so every layer deriving
+    # the segment lengths from it would sync GPU->CPU once per layer. Pop the
+    # list exported by the top-level VLM forward, or derive it here exactly
+    # once for direct TextModel callers (external inference, unit tests).
+    packed_seq_lens = kwargs.pop("packed_seq_lens", None)
+    cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
+    if cu_seq_lens_q is not None and packed_seq_lens is None:
+        sequence_length = (
+            inputs_embeds.shape[1] * parallel_state.ulysses_size
+            if parallel_state.ulysses_enabled
+            else inputs_embeds.shape[1]
+        )
+        packed_seq_lens = _qwen4_exp_validate_packed_seq_lens(
+            cu_seq_lens_q.diff().tolist(), inputs_embeds.shape[0], sequence_length
+        )
+    # --- Patch.5 ---
     # CODEPATH: @ArthurZucker fix flagging for no reason here
     if self.config.ple_layer_ids and ple_input_ids is None:
         # If we do not have input_ids but have ple, we need to revert the embeddings to find back the ids
@@ -1541,6 +1701,7 @@ def qwen4_exp_text_model_forward_patched(
             conv_mask=conv_mask,
             past_key_values=past_key_values,
             ple_input_ids=ple_input_ids,
+            packed_seq_lens=packed_seq_lens,
             **kwargs,
         )
     # --- Patch.4 ---
@@ -1929,10 +2090,26 @@ def qwen4_exp_model_forward_patched(
         cu_seq_lens_q = pos2culen(position_ids[0])
         lm_kwargs["cu_seq_lens_q"] = cu_seq_lens_q
     global_sequence_length = inputs_embeds.shape[1] * parallel_state.ulysses_size
-    _qwen4_exp_validate_packed_seq_lens(cu_seq_lens_q.diff().tolist(), inputs_embeds.shape[0], global_sequence_length)
+    # --- Patch.7: Export host-side packed lengths once per forward. ---
+    # Every GDN/QSA/PLE layer needs the same segment boundaries. The trainer
+    # moves cu_seq_lens_q onto the device, so deriving lengths per layer would
+    # sync GPU->CPU once per layer; derive them here once and thread the list
+    # through lm_kwargs for all layers to reuse.
+    packed_seq_lens = _qwen4_exp_validate_packed_seq_lens(
+        cu_seq_lens_q.diff().tolist(), inputs_embeds.shape[0], global_sequence_length
+    )
+    lm_kwargs["packed_seq_lens"] = packed_seq_lens
+    # --- Patch.7 ---
     # the final shape passed to language_model is [4, B, S_local]
     if position_ids.shape[0] == 3:
-        text_position_ids = culen2pos(cu_seq_lens_q).to(device=position_ids.device, dtype=position_ids.dtype)
+        # --- Patch.7: Rebuild text positions from the host list; culen2pos
+        # would sync again through its internal .cpu() call. ---
+        text_position_ids = (
+            torch.cat([torch.arange(length, device=position_ids.device) for length in packed_seq_lens])
+            .unsqueeze(0)
+            .to(dtype=position_ids.dtype)
+        )
+        # --- Patch.7 ---
         if parallel_state.ulysses_enabled:
             text_position_ids = slice_input_tensor(
                 text_position_ids,
