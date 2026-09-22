@@ -9,6 +9,10 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Qwen4ExpTextQSAIndexer.forward
+#      Expose raw selector indices for the CUDA QSA Triton path
+#    - method_override: Qwen4ExpTextAttention.forward
+#      Use selector-index QSA Triton attention on supported CUDA inputs
 #    - method_override: Qwen4ExpTextModel.reverse_embedding
 #      Make the upstream reverse-embedding error path ruff-compliant
 #    - method_override: Qwen4ExpModel.__init__
@@ -104,15 +108,21 @@ from transformers.vision_utils import (
 
 from veomni.distributed.moe.comm import all_to_all
 from veomni.distributed.parallel_state import get_parallel_state
-
-# Additional import blocks for patches
-# Bound by ``_bind_veomni_ops`` before model construction. Qwen4-Exp
-# keeps the upstream eager/SDPA QSA implementation while expert, loss,
-# and GDN paths can opt into VeOmni kernels.
-from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 from veomni.utils.seqlen_pos_transform_utils import culen2pos, pos2culen
+
+
+# Additional import blocks for patches
+try:
+    from veomni.ops.kernels.attention.qwen4_exp_qsa import qsa_is_supported, qsa_sparse_attention
+except ImportError:
+    qsa_is_supported = None
+    qsa_sparse_attention = None
+
+# Bound by ``_bind_veomni_ops`` before model construction. Expert,
+# loss, and GDN paths can opt into VeOmni kernels.
+from veomni.ops.dispatch import OpSlot
 
 
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
@@ -733,6 +743,12 @@ def apply_rotary_pos_emb(q, k=None, cos=None, sin=None, unsqueeze_dim=1):
         return q_rotated
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen4ExpTextQSAIndexer
+# Methods patched: forward
+# ======================================================================
+
+
 class Qwen4ExpTextQSAIndexer(nn.Module):
     """Select QSA token indices from compressed key blocks."""
 
@@ -753,16 +769,22 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         self.q_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
         self.k_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
 
+    # ================================================================
+    # Patch: Qwen4ExpTextQSAIndexer.forward
+    # 1. Preserve the upstream dense mask API by default.
+    # 2. Return selector indices/counts for the CUDA QSA Triton path without
+    #    reconstructing them from the dense mask.
+    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor,
         past_key_values: Cache | None,
-    ) -> torch.Tensor:
+        return_indices: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_length, _ = hidden_states.shape
         hidden_shape = (batch_size, seq_length, -1, self.index_head_dim)
-        # The cos/sin here are the full positions for the keys, so we need to slice to get only the current positions for the queries
         full_cos, full_sin = position_embeddings
         current_cos, current_sin = full_cos[:, -seq_length:, :], full_sin[:, -seq_length:, :]
 
@@ -779,10 +801,7 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         if past_key_values is not None:
             raw_keys = past_key_values.update_indexer(raw_keys, self.layer_idx)
 
-        # Note that the mask is never None here as we only allow eager and sdpa, and we do not allow sdpa's mask skip
-        # It's always 4D with either bool (sdpa) or float (eager) and already gives us the valid indices
         visible_token_indices = attention_mask if attention_mask.dtype == torch.bool else attention_mask == 0
-
         selected_token_indices = torch.full(
             (batch_size, seq_length, self.token_budget + self.compress_ratio - 1),
             -1,
@@ -795,30 +814,24 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
                     visible_token_indices[batch_idx, 0, query_idx], as_tuple=False
                 ).flatten()
                 num_complete_blocks = local_visible_indices.shape[-1] // self.compress_ratio
-                # Compute selected tokens
                 if num_complete_blocks > 0:
                     block_token_indices = local_visible_indices[: num_complete_blocks * self.compress_ratio].view(
                         num_complete_blocks, self.compress_ratio
                     )
-
                     key_groups = raw_keys[batch_idx].index_select(0, block_token_indices.flatten())
                     key_groups = key_groups.view(*block_token_indices.shape, self.index_head_dim)
-                    pooled_keys = key_groups.float().mean(dim=1).to(raw_keys.dtype)
-                    pooled_keys = self.k_layernorm(pooled_keys)
+                    pooled_keys = self.k_layernorm(key_groups.float().mean(dim=1).to(raw_keys.dtype))
                     group_starts = block_token_indices[:, 0]
                     block_key_states = apply_rotary_pos_emb(
                         pooled_keys.unsqueeze(1),
                         cos=full_cos[batch_idx].index_select(0, group_starts),
                         sin=full_sin[batch_idx].index_select(0, group_starts),
                     ).squeeze(1)
-
                     scores = torch.matmul(
                         q[batch_idx, query_idx].float(), block_key_states.float().transpose(-1, -2)
                     ).transpose(-1, -2)
                     scores = torch.relu(scores).sum(dim=-1) / math.sqrt(self.index_head_dim)
-
                     selected_block_indices = scores.topk(min(self.block_topk, num_complete_blocks), dim=0).indices
-                    # Remap the indices of the blocks to the indices of individual tokens
                     selected_tokens = block_token_indices.index_select(0, selected_block_indices).flatten()
                 else:
                     selected_tokens = torch.tensor([], device=hidden_states.device)
@@ -826,19 +839,20 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
                 selected_tokens = torch.cat([selected_tokens, tail]).to(torch.int32)
                 selected_token_indices[batch_idx, query_idx, : selected_tokens.numel()] = selected_tokens
 
-        # Create the additive mask to be added to the main causal mask
+        selected_counts = (selected_token_indices >= 0).sum(dim=-1, dtype=torch.int32)
+        if return_indices:
+            kernel_indices = selected_token_indices.masked_fill(selected_token_indices < 0, 0).contiguous()
+            return kernel_indices, selected_counts.contiguous()
+
         kv_length = attention_mask.shape[-1]
         selected_token_mask = torch.zeros(
             (*selected_token_indices.shape[:-1], kv_length + 1), device=attention_mask.device, dtype=torch.bool
         )
-        # We absorb all the -1 by scaterring them to the last index that we will drop
         scatter_indices = torch.where(selected_token_indices >= 0, selected_token_indices, kv_length)
         selected_token_mask = selected_token_mask.scatter(-1, scatter_indices, True)[..., :kv_length].unsqueeze(1)
-        # if using eager, convert to float mask
         if attention_mask.is_floating_point():
             min_dtype = torch.finfo(attention_mask.dtype).min
             selected_token_mask = torch.where(selected_token_mask, attention_mask.new_zeros(()), min_dtype)
-
         return selected_token_mask
 
 
@@ -879,6 +893,12 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen4ExpTextAttention
+# Methods patched: forward
+# ======================================================================
+
+
 class Qwen4ExpTextAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -907,6 +927,12 @@ class Qwen4ExpTextAttention(nn.Module):
         self.k_norm = Qwen4ExpTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.indexer = Qwen4ExpTextQSAIndexer(config, layer_idx)
 
+    # ================================================================
+    # Patch: Qwen4ExpTextAttention.forward
+    # 1. Feed raw selector indices into the CUDA QSA kernel.
+    # 2. Preserve the upstream eager/SDPA implementation outside the supported
+    #    CUDA training contract.
+    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -915,51 +941,81 @@ class Qwen4ExpTextAttention(nn.Module):
         past_key_values: Cache | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        selected_token_mask = self.indexer(hidden_states, position_embeddings, attention_mask, past_key_values)
-        # Combine both masks (they are never None, and are always 4D with either bool for sdpa, or float for eager)
-        if attention_mask.is_floating_point():
-            attention_mask = attention_mask + selected_token_mask
+        full_position_embeddings = position_embeddings
+        qsa_candidate = (
+            hidden_states.device.type == "cuda"
+            and qsa_is_supported is not None
+            and past_key_values is None
+            and hidden_states.dtype in (torch.float16, torch.bfloat16)
+            and self.config.num_attention_heads % self.config.num_key_value_heads == 0
+            and not (self.training and self.attention_dropout != 0.0)
+            and not kwargs.get("output_attentions", False)
+        )
+        if qsa_candidate:
+            selected_indices, selected_counts = self.indexer(
+                hidden_states,
+                full_position_embeddings,
+                attention_mask,
+                past_key_values,
+                return_indices=True,
+            )
         else:
-            attention_mask = attention_mask & selected_token_mask
+            selected_token_mask = self.indexer(
+                hidden_states, full_position_embeddings, attention_mask, past_key_values
+            )
 
-        # The cos/sin are the full positions here due to the indexer, so we need to slice to get current positions
-        position_embeddings = (x[:, -hidden_states.shape[1] :, :] for x in position_embeddings)
+        position_embeddings = tuple(x[:, -hidden_states.shape[1] :, :] for x in full_position_embeddings)
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-
         query_states, gate = torch.chunk(
             self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1
         )
         gate = gate.reshape(*input_shape, -1)
-
         query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_values is not None:
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
-
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
+        if qsa_candidate and qsa_is_supported(
+            query_states, key_states, value_states, selected_indices, selected_counts
+        ):
+            attn_output = qsa_sparse_attention(
+                query_states,
+                key_states,
+                value_states,
+                selected_indices,
+                selected_counts,
+                sm_scale=self.scaling,
+            ).transpose(1, 2)
+            attn_weights = None
+        else:
+            if qsa_candidate:
+                selected_token_mask = self.indexer(
+                    hidden_states, full_position_embeddings, attention_mask, past_key_values
+                )
+            if attention_mask.is_floating_point():
+                combined_attention_mask = attention_mask + selected_token_mask
+            else:
+                combined_attention_mask = attention_mask & selected_token_mask
+            if past_key_values is not None:
+                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+            attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+                self.config._attn_implementation, eager_attention_forward
+            )
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                combined_attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = attn_output * torch.sigmoid(gate)
-
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
