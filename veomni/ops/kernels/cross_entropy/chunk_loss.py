@@ -66,9 +66,15 @@ class ChunkLoss(torch.autograd.Function):
         for i in range(len(hidden_states_chunks)):
             hidden_states_chunk = hidden_states_chunks[i]
             grad_inputs_chunk = grad_inputs_chunks[i]
-            (chunk_grad_input, chunk_grad_weight), (chunk_loss, _) = torch.func.grad_and_value(
-                loss_forward, argnums=(0, 1), has_aux=True
-            )(hidden_states_chunk, head_weight, None, **loss_kwargs_chunks[i])
+            # Function.forward runs without grad tracking. Build a local graph
+            # on detached leaves so its backward cannot traverse the model.
+            # Unlike torch.func.grad_and_value, autograd supports the saved
+            # tensor hooks used by activation offload and checkpointing.
+            with torch.enable_grad():
+                chunk_input = hidden_states_chunk.detach().requires_grad_(True)
+                chunk_weight = head_weight.detach().requires_grad_(True)
+                chunk_loss, _ = loss_forward(chunk_input, chunk_weight, None, **loss_kwargs_chunks[i])
+                chunk_grad_input, chunk_grad_weight = torch.autograd.grad(chunk_loss, (chunk_input, chunk_weight))
 
             accumulated_loss.add_(chunk_loss)
             grad_inputs_chunk.copy_(chunk_grad_input)
