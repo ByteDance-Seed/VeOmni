@@ -205,11 +205,15 @@ def mlu_group_gemm_fused_moe_forward(
     fc2_weight: Tensor,
     fc1_1_2_weight: Tensor | None = None,
     swiglu_limit: float | None = None,
+    assume_distinct_experts: bool = False,
 ) -> Tensor:
     """MLU grouped-gemm fused MoE. Empty weights are ``None``.
 
     Split or merged fc1. EP comm stays outside the Function.
+    ``assume_distinct_experts`` only tightens the Triton grouped-GEMM
+    launch bound, so the flag is a no-op here.
     """
+    del assume_distinct_experts
     if get_parallel_state().ep_enabled:
         from .....distributed.moe import preprocess, token_pre_all2all, tokens_post_all2all
 
@@ -280,6 +284,7 @@ def wrapper(
     *,
     num_experts: int,
     swiglu_limit: float | None = None,
+    assume_distinct_experts: bool = False,
 ) -> Tensor:
     """Call the MLU fused MoE path. Empty weights are ``None``."""
     return mlu_group_gemm_fused_moe_forward(
@@ -292,4 +297,5 @@ def wrapper(
         fc2_weight,
         fc1_1_2_weight if fc1_1_2_weight.numel() else None,
         swiglu_limit=swiglu_limit,
+        assume_distinct_experts=assume_distinct_experts,
     )

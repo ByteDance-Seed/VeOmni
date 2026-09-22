@@ -32,12 +32,15 @@ def wrapper(
     *,
     num_experts: int,
     swiglu_limit: float | None = None,
+    assume_distinct_experts: bool = False,
 ) -> Tensor:
     """Routed expert MLP. Empty ``fc1_*`` means that layout is unused.
 
     Routing weights scale the SwiGLU intermediate, then ``fc2``. Regular
-    autograd, no custom backward.
+    autograd, no custom backward. ``assume_distinct_experts`` only tightens
+    the Triton grouped-GEMM launch bound, so it is unused here.
     """
+    del assume_distinct_experts
     has_split = fc1_1_weight.numel() > 0
     has_merged = fc1_1_2_weight.numel() > 0
     if has_split == has_merged:

@@ -64,6 +64,7 @@ from .deepseek_v4_gpu_patch_gen_config import (
     deepseek_v4_rms_norm_forward_patched,
     deepseek_v4_rms_norm_init_patched,
     deepseek_v4_rotary_embedding_forward_patched,
+    deepseek_v4_sparse_moe_block_init_patched,
     deepseek_v4_topk_router_forward_patched,
     deepseek_v4_unweighted_rmsnorm_forward_patched,
     deepseek_v4_unweighted_rmsnorm_init_patched,
@@ -203,6 +204,12 @@ config.override_method(
     replacement=deepseek_v4_forcausallm_init_patched,
     description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
+config.override_method(
+    "DeepseekV4SparseMoeBlock.__init__",
+    replacement=deepseek_v4_sparse_moe_block_init_patched,
+    description="Flag routed experts to use the conservative max_M bound under non-distinct hash routing",
+)
+
 config.override_method(
     "DeepseekV4ForCausalLM.forward",
     replacement=deepseek_v4_forcausallm_forward_patched,

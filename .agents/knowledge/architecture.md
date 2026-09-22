@@ -187,6 +187,16 @@ inference entry points pass it to the model builder as
 `ops_implementation`; changing the config field would break existing CLI
 and YAML inputs.
 
+## DiT Fixed Microbatches
+
+`DiTTrainer` honors `train.micro_batch_size` and keeps `dyn_bsz=false`.
+`DiTDataCollator` produces dict-of-lists microbatches; the existing
+`get_condition` / `process_condition` / model-forward path is unchanged.
+Models return sample-mean scalar losses, and the trainer divides by the number
+of accumulation microbatches. Packing and SP/CP handling remain model-owned.
+Offline embedding allows multiple samples but keeps one microbatch per step.
+See `docs/usage/dit_microbatching.md`.
+
 ## Parallelization Flow
 
 VeOmni uses FSDP2 exclusively.

@@ -654,6 +654,7 @@ def quack_gemm_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    assume_distinct_experts: bool = False,  # intentionally unused; see the del below
 ):
     """Quack GEMM fused MoE forward pass.
 
@@ -662,7 +663,13 @@ def quack_gemm_fused_moe_forward(
 
     ``swiglu_limit``: gpt-oss / DeepSeek-V4 style clamp on SwiGLU
     pre-activations. ``None`` disables the clamp (default, zero overhead).
+
+    ``assume_distinct_experts`` is intentionally unused here; see below.
     """
+    # ``assume_distinct_experts`` only tightens the grouped-GEMM ``max_M``
+    # launch bound in the Triton backend. Quack routes every expert through a
+    # CUTLASS varlen GEMM from ``cu_seqlens_m``, so the flag is a no-op here.
+    del assume_distinct_experts
     # EP comm is outside the Function so all2all is not under no_grad.
     if get_parallel_state().ep_enabled:
         from .....distributed.moe import preprocess, token_pre_all2all, tokens_post_all2all
@@ -765,6 +772,7 @@ def wrapper(
     *,
     num_experts: int,
     swiglu_limit: float | None = None,
+    assume_distinct_experts: bool = False,
 ) -> Tensor:
     """Call the Quack fused MoE Function. Empty weights are ``None``."""
     # Empty tensor = unused layout. Registry args stay tensors.
@@ -778,4 +786,5 @@ def wrapper(
         fc2_weight,
         fc1_1_2_weight if fc1_1_2_weight.numel() else None,
         swiglu_limit=swiglu_limit,
+        assume_distinct_experts=assume_distinct_experts,
     )

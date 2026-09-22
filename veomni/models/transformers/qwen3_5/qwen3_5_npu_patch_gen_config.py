@@ -34,8 +34,12 @@ from transformers.utils import TransformersKwargs
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
+    Qwen3_5MTP,
+    Qwen3_5MTPContextOutput,
+    _mtp_loss_weight,
     _Qwen3_5FakeForPosID,
     collate_multimodal_metadata,
+    compute_mtp_loss,
     get_position_id,
     mm_token_type_ids_from_input_ids,
     qwen3_5_attention_forward_patched,
@@ -94,7 +98,7 @@ config.add_import(
 config.add_import(
     "veomni.distributed.sequence_parallel", names=["gather_outputs", "slice_input_tensor", "sp_pad_and_slice"]
 )
-config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+config.add_import("veomni.utils.constants", names=["IGNORE_INDEX", "IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 # Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` (re-used
 # from the GPU config) can return per-token log-probs in the unified output
 # dataclass.
@@ -114,6 +118,12 @@ config.add_import(
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
+)
+config.drop_import_names(
+    "FusedRMSNormGated",
+    "causal_conv1d_fn",
+    "chunk_gated_delta_rule",
+    "fused_recurrent_gated_delta_rule",
 )
 # Dummy definitions for names that exist in the generated file's scope but not here.
 # The patchgen only extracts the function body; these are resolved at codegen time.
@@ -154,6 +164,12 @@ config.add_helper(mm_token_type_ids_from_input_ids)
 config.add_helper(get_position_id)
 config.add_helper(collate_multimodal_metadata)
 config.add_helper(_Qwen3_5FakeForPosID)
+
+# MTP helpers shared with the GPU patch.
+config.add_helper(_mtp_loss_weight)
+config.add_helper(compute_mtp_loss)
+config.add_helper_after("Qwen3_5DecoderLayer", Qwen3_5MTP)
+config.add_helper_after("Qwen3_5ModelOutputWithPast", Qwen3_5MTPContextOutput)
 
 
 config.override_method(
@@ -208,6 +224,7 @@ def qwen3_5_gated_deltanet_forward_patched(
     chunk_indices: dict | None = None,
     chunk_indices_list: dict | None = None,
 ):
+    """Run GatedDeltaNet with precomputed varlen metadata on Ascend NPU."""
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
     # Set up dimensions for reshapes later
@@ -470,8 +487,14 @@ def qwen3_5_text_model_forward_patched(
     past_key_values: Cache | None = None,
     inputs_embeds: torch.FloatTensor | None = None,
     use_cache: bool | None = None,
+    return_mtp_context: bool = False,
     **kwargs: Unpack[TransformersKwargs],
 ) -> Qwen3_5ModelOutputWithPast:
+    """Run the NPU text backbone and expose precomputed MTP and varlen context.
+
+    Args:
+        return_mtp_context (`bool`, *optional*): Whether to retain the backbone inputs required by the MTP objective.
+    """
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -547,9 +570,25 @@ def qwen3_5_text_model_forward_patched(
 
     hidden_states = self.norm(hidden_states)
 
-    return Qwen3_5ModelOutputWithPast(
+    mtp_context = None
+    if return_mtp_context:
+        mtp_context = {
+            "inputs_embeds": inputs_embeds,
+            "position_embeddings": position_embeddings,
+            "attention_mask": causal_mask_mapping["full_attention"],
+            "position_ids": text_position_ids,
+        }
+
+    if mtp_context is None:
+        return Qwen3_5ModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+        )
+
+    return Qwen3_5MTPContextOutput(
         last_hidden_state=hidden_states,
         past_key_values=past_key_values,
+        mtp_context=mtp_context,
     )
 
 
@@ -803,7 +842,7 @@ config.override_method(
 config.override_method(
     "Qwen3_5ForConditionalGeneration.__init__",
     replacement=qwen3_5_forconditional_generation_init_patched,
-    description="Bind ForCausalLMLoss VeomniOp on Qwen3_5ForConditionalGeneration",
+    description="Bind ForCausalLMLoss VeomniOp and build the MTP head when text_config.mtp_loss_weight is set",
 )
 config.override_method(
     "Qwen3_5ForConditionalGeneration.forward",
@@ -843,3 +882,8 @@ config.override_method(
     replacement=qwen3_5_attention_forward_patched,
     description="Always call the local rope and attention VeomniOps",
 )
+config.add_import("transformers.utils", names=["logging"])
+config.add_post_import_block("""
+from transformers.utils import logging
+logger = logging.get_logger(__name__)
+""")

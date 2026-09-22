@@ -568,6 +568,19 @@ class VeOmniModelRuntime:
         """Write this model's resumable checkpoint for ``state.global_step``."""
         self.checkpoint.save_dcp(state)
 
+    def extra_state(self) -> Dict[str, Any]:
+        """Model-bound state to persist beside the weights.
+
+        Models with extra state (e.g. the DiT condition model's noise/timestep
+        generator) contribute it here. The checkpoint manager merges the result
+        into the model's extra_state blob. Default: nothing.
+        """
+        return {}
+
+    def load_extra_state(self, extra_state: Dict[str, Any]) -> None:
+        """Restore what :meth:`extra_state` produced. Default: nothing."""
+        return
+
     def save_hf_or_lora(self, state: "TrainerState", stage: str = "step_end") -> None:
         """Export this model in whichever format it was trained in.
 

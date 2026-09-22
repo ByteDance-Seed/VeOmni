@@ -24,7 +24,7 @@ import torch
 from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
-from ..shared.scatter import compute_expert_scatter_index
+from ..shared.scatter import compute_expert_scatter_index, compute_max_expert_tokens
 from ..shared.swiglu import apply_swiglu_clamp
 
 
@@ -42,6 +42,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         fc1_2_weight,
         fc2_weight,
         swiglu_limit=None,
+        assume_distinct_experts=False,
     ):
         # MOE Step 3: dispatch input tokens to the experts
         # result shape is (batch_size * sequence_len * topk, hidden_size)
@@ -67,11 +68,32 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         # MOE Step 4: compute linear layer 1-1
         # Not consistent.
         cumsum_t = torch.cumsum(splits, dim=0)
+        # ``max_M`` is the per-expert launch bound of the grouped GEMM: the grid
+        # walks ``cdiv(max_M, BLOCK_M)`` row-tiles for *every* expert and each
+        # tile early-exits once it passes that expert's real row count. So
+        # ``max_M`` only has to be ``>= max_e counts[e]`` to stay correct, and
+        # any slack over that just wastes launched (early-returning) tiles.
+        #
+        # With standard top-k routing (``torch.topk`` over the router logits)
+        # every token picks ``top_k`` *distinct* experts, so a given expert
+        # receives at most one row per token: ``max_e counts[e] <= T`` where
+        # ``T = expert_index.shape[0]`` is the token count. A caller that has
+        # verified its router is distinct opts in with
+        # ``assume_distinct_experts=True`` to use ``T`` instead of the full
+        # scattered row count ``T * top_k`` (``scatter_output.shape[0]``),
+        # shrinking the launched grid ``top_k``x on the M dimension. The default
+        # is ``False`` (conservative ``T * top_k``): the grouped-GEMM output is
+        # ``torch.empty`` and tiles past ``max_M`` never launch, so an unsafe
+        # tight bound leaves uninitialized rows rather than zeros. Distinctness
+        # is a per-router property, so ``T`` must be opted into explicitly (e.g.
+        # DeepSeek-V4's learned top-k layers) and hash-style routers keep the
+        # conservative default. See ``compute_max_expert_tokens``.
+        max_expert_tokens = compute_max_expert_tokens(expert_index, expert_index.shape[1], assume_distinct_experts)
         fc1_1_output = group_gemm_same_nk(
             a=scatter_output,
             b=fc1_1_weight,
             cumsum_M=cumsum_t,
-            max_M=scatter_output.shape[0],
+            max_M=max_expert_tokens,
             transpose_a=False,
             transpose_b=True,
         )
@@ -82,7 +104,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             a=scatter_output,
             b=fc1_2_weight,
             cumsum_M=cumsum_t,
-            max_M=scatter_output.shape[0],
+            max_M=max_expert_tokens,
             transpose_a=False,
             transpose_b=True,
         )
@@ -118,7 +140,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             a=fc1_weighted_output,
             b=fc2_weight,
             cumsum_M=cumsum_t,
-            max_M=scatter_output.shape[0],
+            max_M=max_expert_tokens,
             transpose_a=False,
             transpose_b=True,
         )
@@ -310,6 +332,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             grad_fc1_2_weight,  # fc1_2_weight
             grad_fc2_weight,  # fc2_weight
             None,  # swiglu_limit
+            None,  # assume_distinct_experts
         )
 
 
@@ -330,6 +353,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         fc1_1_2_weight,
         fc2_weight,
         swiglu_limit=None,
+        assume_distinct_experts=False,
     ):
         """Scatter, merged fc1 GEMM, SwiGLU, fc2, gather."""
         from ..shared.dispatch import expert_histogram, moe_gather, moe_scatter
@@ -341,12 +365,19 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         cumsum_t = torch.cumsum(splits, dim=0)
 
+        # See ``TritonFusedMoeExpertFunction.forward`` for why ``T`` (the token
+        # count) is a valid, tighter per-expert launch bound than the full
+        # scattered row count under distinct top-k routing. The default is the
+        # conservative ``T * top_k`` bound; distinct routers opt in explicitly
+        # with ``assume_distinct_experts=True``.
+        max_expert_tokens = compute_max_expert_tokens(expert_index, expert_index.shape[1], assume_distinct_experts)
+
         # Single fc1 gemm: output shape [T, 2I]
         fc1_output = group_gemm_same_nk(
             a=scatter_output,
             b=fc1_1_2_weight,
             cumsum_M=cumsum_t,
-            max_M=scatter_output.shape[0],
+            max_M=max_expert_tokens,
             transpose_a=False,
             transpose_b=True,
         )
@@ -375,7 +406,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             a=fc1_weighted_output,
             b=fc2_weight,
             cumsum_M=cumsum_t,
-            max_M=scatter_output.shape[0],
+            max_M=max_expert_tokens,
             transpose_a=False,
             transpose_b=True,
         )
@@ -521,6 +552,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             grad_fc1_1_2_weight,  # fc1_1_2_weight
             grad_fc2_weight,  # fc2_weight
             None,  # swiglu_limit
+            None,  # assume_distinct_experts
         )
 
 
@@ -534,6 +566,7 @@ def group_gemm_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    assume_distinct_experts: bool = False,
 ):
     """Triton grouped-gemm fused MoE forward pass.
 
@@ -554,6 +587,11 @@ def group_gemm_fused_moe_forward(
     Router scores stay float32 even under FSDP2 bf16 compute. Cast them onto
     ``hidden_states.dtype`` before the fused scale so group-gemm does not see
     an fp32 activation.
+
+    ``assume_distinct_experts``: whether every token routes to ``top_k``
+    distinct experts (true for ``torch.topk``-gated routers). Defaults to
+    ``False`` (conservative ``T * top_k`` launch bound). Opt in with ``True``
+    for the tight ``max_M = T`` bound. Only affects the non-EP Triton path.
     """
     routing_weights = routing_weights.to(dtype=hidden_states.dtype)
     # EP comm is outside the Function so all2all is not under no_grad.
@@ -600,6 +638,7 @@ def group_gemm_fused_moe_forward(
                 fc1_1_2_weight,
                 fc2_weight,
                 swiglu_limit,
+                assume_distinct_experts,
             )
         else:
             if fc1_1_weight is None or fc1_2_weight is None:
@@ -613,6 +652,7 @@ def group_gemm_fused_moe_forward(
                 fc1_2_weight,
                 fc2_weight,
                 swiglu_limit,
+                assume_distinct_experts,
             )
     return final_hidden_states
 
@@ -628,6 +668,7 @@ def wrapper(
     *,
     num_experts: int,
     swiglu_limit: float | None = None,
+    assume_distinct_experts: bool = False,
 ) -> Tensor:
     """Call the Triton fused MoE Function. Empty weights are ``None``."""
     # Empty tensor = unused layout. Registry args stay tensors.
@@ -641,4 +682,5 @@ def wrapper(
         fc2_weight,
         fc1_1_2_weight if fc1_1_2_weight.numel() else None,
         swiglu_limit=swiglu_limit,
+        assume_distinct_experts=assume_distinct_experts,
     )

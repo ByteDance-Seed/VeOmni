@@ -181,8 +181,36 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit():
     assert args[4].numel() == 0
     assert args[5] is experts.down_proj
     assert args[6] is experts.gate_up_proj
-    assert kwargs == {"num_experts": experts.num_experts, "swiglu_limit": config.swiglu_limit}
+    assert kwargs == {
+        "num_experts": experts.num_experts,
+        "swiglu_limit": config.swiglu_limit,
+        "assume_distinct_experts": True,
+    }
     torch.testing.assert_close(actual, torch.zeros_like(hidden_states), rtol=0, atol=0)
+
+
+def test_deepseek_v4_sparse_moe_block_opts_topk_layers_into_tight_max_m_bound():
+    config = _tiny_config()
+    model = _build_ours(config)
+    modeling = _dsv4_module()
+    block = model.model.layers[3].mlp
+
+    assert config.mlp_layer_types[3] == "moe"
+    assert block.is_hash is False
+    assert isinstance(block.gate, modeling.DeepseekV4TopKRouter)
+    assert block.experts.assume_distinct_experts is True
+
+
+def test_deepseek_v4_sparse_moe_block_keeps_hash_layers_conservative():
+    config = _tiny_config()
+    model = _build_ours(config)
+    modeling = _dsv4_module()
+    block = model.model.layers[0].mlp
+
+    assert config.mlp_layer_types[0] == "hash_moe"
+    assert block.is_hash is True
+    assert isinstance(block.gate, modeling.DeepseekV4HashRouter)
+    assert block.experts.assume_distinct_experts is False
 
 
 @pytest.mark.parametrize("seq_len", [7, 19], ids=["before-hca-window", "compressed-topk"])
