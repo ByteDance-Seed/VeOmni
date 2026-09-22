@@ -118,7 +118,7 @@ live on `model.*` — see the **Model** section above.
 DPO-specific hyperparameters, accessed via `dpo_config.*`.  
 Root config: `VeOmniDPOArguments` (extends `VeOmniArguments`).
 
-* `DPOConfig` — `dpo_config.*`
+* `DPOConfig` — `dpo_config.*`. The frozen reference always copies `model`; a custom `reference_model` config is not supported.
 
 ---
 
@@ -155,7 +155,9 @@ own `safetensor_idx_path`.
 | config_path | `Optional[str]` | `None` | Path to the model HuggingFace config (e.g. `config.json`). Defaults to `model_path`. |
 | model_path | `Optional[str]` | `None` | Path to the pre-trained model weights. If unset, random init is used. |
 | model_config | `Optional[Dict]` | `{}` | Values used to override the loaded foundation-model config. |
+| processor_config | `Optional[Dict]` | `{}` | Kwargs used to override the loaded processor / tokenizer config. See below. |
 | tokenizer_path | `Optional[str]` | `None` | Path to the tokenizer. Defaults to `config_path`. |
+| chat_template | `Optional[str]` | `None` | Registered chat-template name used to lay conversations out into training samples. Leave unset for data with no conversation structure (plaintext, diffusion) or for a model that formats prompts through its own processor (Qwen-Omni). |
 | safetensor_idx_path | `Optional[str]` | `None` | Path to `model.safetensors.index.json`. |
 | basic_modules | `Optional[List[str]]` | `[]` | Additional modules beyond `_no_split_modules` to shard in FSDP. |
 | lora_config | `Optional[Dict]` | `{}` | Native VeOmni LoRA configuration. See the LoRA feature guide. |
@@ -164,6 +166,18 @@ own `safetensor_idx_path`.
 | ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule for this model. |
 | accelerator | `AcceleratorConfig` | — | Parallelism, sharding, and placement for this model. |
+
+`processor_config` is to the preprocessor what `model_config` is to the architecture: its keys are forwarded to `AutoProcessor.from_pretrained`, overriding what the checkpoint ships. Leave it empty and the repository's own `preprocessor_config.json` is authoritative. Pixel budgets belong in `data.mm_configs`.
+
+```yaml
+model:
+  processor_config:
+    size:
+      shortest_edge: 3136
+      longest_edge: 602112
+```
+
+> Do not use the legacy `max_pixels` / `min_pixels` keys. Transformers v5 accepts them only for backward compatibility and maps them onto `size`, mutating the image-processor class attribute in place — every processor of that class built later in the same process inherits the value.
 
 ### OpsImplementationConfig
 
@@ -353,7 +367,6 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | source_name | `str` | `None` | Dataset name. Loaded from multisource YAML if multisource is enabled. |
 | dyn_bsz_buffer_size | `int` | `200` | Buffer size for dynamic batch size. |
 | text_keys | `str` | `None` | Key to retrieve text from data. Auto-resolved: `"content_split"` for plaintext, `"messages"` for conversation, `"text"` for classification, `"chosen"` for DPO. |
-| chat_template | `str` | `"default"` | Chat template name. |
 | max_seq_len | `int` | `2048` | Maximum sequence length. |
 | silent_exception | `bool` | `False` | Whether to ignore exceptions when loading data. |
 | dataloader | `DataloaderConfig` | — | DataLoader construction parameters. |
@@ -722,3 +735,5 @@ derived argument groups below.
 | loss_type | `"sigmoid" \| "ipo"` | `"sigmoid"` | DPO loss variant: `sigmoid` for standard DPO, `ipo` for Identity Preference Optimization. |
 | average_log_prob | `bool` | `False` | If `True`, average log probs per token instead of summing. |
 | refer_model_precision | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype used to load the frozen reference model. |
+
+The frozen reference always copies `model`. A custom `reference_model` config is not supported.

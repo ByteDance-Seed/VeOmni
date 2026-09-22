@@ -83,7 +83,6 @@ import yaml
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.checkpoint.layout import weights_dir
 from veomni.data import build_dummy_dataset
-from veomni.models.checkpoint_manager import ModelCheckpointManager
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback
@@ -274,9 +273,6 @@ class MoeLoraTrainer(BaseTrainer):
     any state the checkpoint callback loaded.
     """
 
-    def _build_model_assets(self) -> None:
-        self.model_assets = [self.model_config]
-
     def _build_data_transform(self) -> None:
         pass
 
@@ -287,7 +283,6 @@ class MoeLoraTrainer(BaseTrainer):
         self.train_steps = args.train_steps
 
     def _init_callbacks(self) -> None:
-        self.checkpoint = ModelCheckpointManager(self)
         self.environ_meter_callback = _EnvironMeterCallbackTest(self)
         # CheckpointCallback drives DCP save+load and the HF LoRA export; the
         # ``train.checkpoint.load_path`` resume case in the resume test
