@@ -52,12 +52,21 @@ def test_mask_builder_return_types():
     assert sdpa.shape == (1, 1, 4, 4)
     flex = flex_attention_mask_builder(1, 4, 4, device="cpu")
     assert isinstance(flex, BlockMask)
-    flex_eager = flex_attention_mask_builder(1, 4, 4, device="cpu", compile_block_mask=False)
-    assert isinstance(flex_eager, BlockMask)
     magi = magi_attention_mask_builder(1, 4, 4, device="cpu")
     assert isinstance(magi, MagiAttentionMask)
     assert magi.q_ranges.dtype == torch.int32
     assert magi.q_ranges.shape == (1, 2)
+
+
+def test_flex_mask_builder_keeps_create_block_mask_eager(monkeypatch):
+    """Compiled ``create_block_mask`` is magi-vs-flex work, not this branch."""
+
+    def boom(*args, **kwargs):
+        raise AssertionError("flex_attention_mask_builder must not torch.compile create_block_mask")
+
+    monkeypatch.setattr(torch, "compile", boom)
+    mask = flex_attention_mask_builder(1, 4, 4, device="cpu")
+    assert isinstance(mask, BlockMask)
 
 
 @pytest.mark.parametrize("allow_skip", (None, False, True))

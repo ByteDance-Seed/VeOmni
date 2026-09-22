@@ -16,12 +16,12 @@
 
 from __future__ import annotations
 
-import importlib.util
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
 import torch
-from torch.nn.attention.flex_attention import BlockMask
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+from transformers import masking_utils
 from transformers.masking_utils import (
     ALL_MASK_ATTENTION_FUNCTIONS,
     and_masks,
@@ -30,38 +30,24 @@ from transformers.masking_utils import (
     sliding_window_overlay,
 )
 
-from veomni.utils.device import IS_NPU_AVAILABLE
-
 from ..ulysses import effective_sequence_lengths, should_apply_ulysses
 from .packed import packed_mask_function
 
 
-def _flex_block_mask_compile_enabled() -> bool:
-    """HF compiles ``create_block_mask`` on torch>=2.6.
+def _eager_create_block_mask(*args, **kwargs):
+    """Keep ``create_block_mask`` uncompiled.
 
-    That inductor path needs Triton. ``torch_npu`` also intercepts inductor and
-    still imports Triton, which NPU CI does not ship.
+    Transformers still passes ``_compile=True`` on torch>=2.6. Compiled
+    ``create_block_mask`` belongs on the magi-vs-flex branch, not here.
     """
-    if IS_NPU_AVAILABLE:
-        return False
-    return importlib.util.find_spec("triton") is not None
+    kwargs["_compile"] = False
+    return create_block_mask(*args, **kwargs)
 
 
 @contextmanager
-def _flex_create_block_mask(*, compile_block_mask: bool) -> Iterator[None]:
-    if compile_block_mask:
-        yield
-        return
-
-    import transformers.masking_utils as masking_utils
-
+def _eager_hf_create_block_mask() -> Iterator[None]:
     original = masking_utils.create_block_mask
-
-    def create_block_mask_eager(*args, **kwargs):
-        kwargs["_compile"] = False
-        return original(*args, **kwargs)
-
-    masking_utils.create_block_mask = create_block_mask_eager
+    masking_utils.create_block_mask = _eager_create_block_mask
     try:
         yield
     finally:
@@ -79,7 +65,6 @@ def flex_attention_mask_builder(
     skip_ulysses: bool = False,
     cu_seqlens: torch.Tensor | None = None,
     cu_seqlens_k: torch.Tensor | None = None,
-    compile_block_mask: bool | None = None,
     **kwargs,
 ) -> BlockMask:
     """Build a Transformers FlexAttention mask.
@@ -141,9 +126,7 @@ def flex_attention_mask_builder(
             device=device,
         )
 
-    if compile_block_mask is None:
-        compile_block_mask = _flex_block_mask_compile_enabled()
-    with _flex_create_block_mask(compile_block_mask=compile_block_mask):
+    with _eager_hf_create_block_mask():
         return ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"](
             batch_size=batch_size,
             q_length=q_length,
