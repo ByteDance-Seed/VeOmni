@@ -239,8 +239,9 @@ def build_foundation_model(
     from ..ops.config.singleton import get_ops_config
 
     if ops_implementation is not None:
-        attn_implementation = ops_implementation.attn_implementation
-        OpsImplementationConfig.validate_hub_attention_backend(attn_implementation)
+        attn_implementation = OpsImplementationConfig.normalize_hub_attention_backend(
+            ops_implementation.attn_implementation
+        )
         _validate_attention_parallelism(attn_implementation)
         apply_ops_config(ops_implementation)
     else:
@@ -260,7 +261,7 @@ def build_foundation_model(
         # variant the user selected.
         if attn_implementation is None:
             attn_implementation = installed.attn_implementation
-        OpsImplementationConfig.validate_hub_attention_backend(attn_implementation)
+        attn_implementation = OpsImplementationConfig.normalize_hub_attention_backend(attn_implementation)
         _validate_attention_parallelism(attn_implementation)
 
     if config_kwargs is None:

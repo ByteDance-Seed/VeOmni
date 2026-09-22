@@ -1376,14 +1376,21 @@ class OpsImplementationConfig:
         if get_env("MODELING_BACKEND") != "veomni":
             raise ValueError(f"{implementation} requires MODELING_BACKEND=veomni.")
 
+    @staticmethod
+    def normalize_hub_attention_backend(implementation: Optional[str]) -> Optional[str]:
+        """Validate Hub requests and resolve their registered VeOmni names."""
+        OpsImplementationConfig.validate_hub_attention_backend(implementation)
+        return {
+            "flash_attention_2_hub": "veomni_flash_attention_2_hub_with_sp",
+            "flash_attention_3_hub": "veomni_flash_attention_3_hub_with_sp",
+        }.get(implementation, implementation)
+
     def __post_init__(self):
-        self.validate_hub_attention_backend(self.attn_implementation)
+        self.attn_implementation = self.normalize_hub_attention_backend(self.attn_implementation)
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",
-                "flash_attention_2_hub": "veomni_flash_attention_2_hub_with_sp",
                 "flash_attention_3": "veomni_flash_attention_3_with_sp",
-                "flash_attention_3_hub": "veomni_flash_attention_3_hub_with_sp",
                 "flash_attention_4": "veomni_flash_attention_4_with_sp",
                 "flex_attention": "veomni_flex_attention_with_sp",
                 "magi_attention": "veomni_magi_attention_with_sp",

@@ -14,7 +14,7 @@ selection knob.
 
 | Kernel | Config field | Available values | Default | Selection time |
 |--------|-------------|------------------|---------|----------------|
-| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
+| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_2_hub`, `flash_attention_3_hub`, `flash_attention_4`, `flex_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+) | `"eager"` | Model build via three `OpSlot`s (`pre`, `post`, `head`) |
@@ -124,9 +124,17 @@ model:
 | `sdpa` | `F.scaled_dot_product_attention` | No | — |
 | `flash_attention_2` | Flash Attention v2 | Yes | `flash-attn` |
 | `flash_attention_3` | Flash Attention v3 | Yes | `flash-attn-interface` |
+| `flash_attention_2_hub` | Hub Flash Attention v2 | Yes | `kernels==0.16.0`, compatible `kernels-community/flash-attn2` version 1 artifact; VeOmni backend only, not Ascend NPU |
+| `flash_attention_3_hub` | Hub Flash Attention v3 | Yes | `kernels==0.16.0`, compatible `kernels-community/flash-attn3` version 1 artifact; VeOmni backend only, not Ascend NPU |
 | `flash_attention_4` | Flash Attention v4 | Yes | `flash-attn.cute` |
 | `flex_attention` | PyTorch FlexAttention | Yes | Native `BlockMask`; CUDA for compiled training |
 | `native-sparse` | Sparse attention | No | — |
+
+Hub backends are explicit opt-ins; local FA2/FA3 remain the defaults. Config parsing
+and `build_foundation_model()` normalize Hub short names to
+`veomni_flash_attention_{2,3}_hub_with_sp`. Both forms are rejected on Ascend NPU
+before HF preloading can silently select built-in NPU attention. Missing dependencies
+or artifact download failures raise instead of falling back to another kernel.
 
 When `MODELING_BACKEND=veomni` (the default), `__post_init__` automatically
 rewrites `flash_attention_2/3/4` and `flex_attention` to VeOmni SP-aware

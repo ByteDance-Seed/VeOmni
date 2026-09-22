@@ -132,6 +132,32 @@ def test_hub_flash_model_build_rejects_before_preload(
     hub_load.assert_not_called()
 
 
+@pytest.mark.parametrize("implementation", _HUB_FLASH_IMPLEMENTATIONS)
+@pytest.mark.parametrize("entry", ("ops", "override", "installed"))
+def test_hub_flash_model_build_passes_normalized_name_to_loader(monkeypatch, implementation, entry):
+    from veomni.models import auto
+
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_npu_available", lambda: False)
+    monkeypatch.setattr(auto, "is_torch_npu_available", lambda: False)
+    monkeypatch.setattr(auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=False, global_rank=0))
+    config = SimpleNamespace(attn_implementation=implementation if entry != "override" else "eager")
+    monkeypatch.setattr("veomni.ops.config.singleton.get_ops_config", lambda: config)
+    monkeypatch.setattr("veomni.ops.apply_ops_config", Mock())
+    model = nn.Linear(1, 1)
+    load_model = Mock(return_value=model)
+    monkeypatch.setattr(auto, "get_loader", lambda config: SimpleNamespace(load_model=load_model))
+    kwargs = {"ops_implementation": config} if entry == "ops" else {}
+    if entry == "override":
+        kwargs["attn_implementation"] = implementation
+
+    assert auto.build_foundation_model(PreTrainedConfig(), init_device="cpu", **kwargs) is model
+
+    expected = implementation if implementation.startswith("veomni_") else f"veomni_{implementation}_with_sp"
+    assert load_model.call_args.kwargs["init_kwargs"]["attn_implementation"] == expected
+    assert ALL_ATTENTION_FUNCTIONS[expected] is veomni_attention.fused_attention_forward
+
+
 @pytest.mark.parametrize("on_npu", (False, True))
 @pytest.mark.parametrize("version", (2, 3))
 def test_local_flash_config_is_unchanged(monkeypatch, on_npu, version):
