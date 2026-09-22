@@ -91,6 +91,13 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
     if not get_parallel_state().cp_enabled:
         return
 
+    state = get_parallel_state()
+    model_type = getattr(config, "model_type", None)
+    if model_type in {"qwen4_exp", "qwen4_exp_text"}:
+        if state.cp_size in (2, 4) and state.ulysses_size == 8 and getattr(state, "allow_hybrid_cp", False):
+            return
+        raise NotImplementedError("Qwen4-Exp CP candidate requires explicit allow_hybrid_cp with U8/CP2 or U8/CP4.")
+
     if is_torch_npu_available():
         raise NotImplementedError("Context parallelism is GPU-only in this release; set cp_size=1 on Ascend/NPU runs.")
 

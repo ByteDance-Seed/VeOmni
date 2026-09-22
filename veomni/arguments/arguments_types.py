@@ -687,6 +687,7 @@ class AcceleratorConfig:
         default=1,
         metadata={"help": "Context parallel size."},
     )
+    allow_hybrid_cp: bool = field(default=False, metadata={"help": "Opt in to model-specific Ulysses with CP."})
     init_device: Literal["cuda", "meta", "npu", "mlu"] = field(
         default="meta",
         metadata={
@@ -734,7 +735,7 @@ class AcceleratorConfig:
             )
         assert self.tp_size == 1, "Tensor parallel size not supported yet."
         assert self.pp_size == 1, "Pipeline parallel size not supported yet."
-        if self.cp_size > 1 and self.ulysses_size > 1:
+        if self.cp_size > 1 and self.ulysses_size > 1 and not self.allow_hybrid_cp:
             raise NotImplementedError(
                 "Context parallelism cannot be combined with Ulysses yet; "
                 f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "
@@ -1323,6 +1324,8 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
+    qwen4_gdn_cp_implementation: Literal["headwise"] = field(default="headwise")
+    qsa_attention_implementation: Literal["eager", "npu_fused"] = field(default="eager")
     dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = field(
         default="eager",
         metadata={"help": "DeepSeek sparse attention top-k indexer implementation: 'eager', 'cudnn', or 'tilelang'."},
