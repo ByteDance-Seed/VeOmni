@@ -15,7 +15,7 @@ Audit documentation and apply only corrections supported by evidence. This skill
 
 ## Mechanical checks
 
-Use `rg --files` or `git ls-files` to enumerate candidates. Search for Markdown links/images (including reference definitions), HTML `a[href]` and `img[src]`, headings, code fences, and repeated words. Search output is a candidate list, not proof that all links were found: multiline Markdown, footnotes, comments, code spans, MyST directives, and HTML can defeat simple patterns. Use an available Markdown parser or renderer when comprehensive coverage matters, without introducing a permanent dependency just for this skill.
+Enumerate candidates with `git ls-files --cached --others --exclude-standard -- '*.md' '*.mdx'`. Do not use `rg --files`, which skips hidden paths such as `.agents/`, or plain `git ls-files`, which omits untracked files. Search for Markdown links/images (including reference definitions), HTML `a[href]` and `img[src]`, headings, code fences, and repeated words. Search output is a candidate list, not proof that all links were found: multiline Markdown, footnotes, comments, code spans, MyST directives, and HTML can defeat simple patterns. Use an available Markdown parser or renderer when comprehensive coverage matters, without introducing a permanent dependency just for this skill.
 
 For each candidate link or image:
 
