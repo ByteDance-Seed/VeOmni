@@ -660,6 +660,9 @@ their gradients are genuine FP32 values, so low-precision transport would discar
 
 Finite gradients computed in the matching 16-bit dtype round-trip through the FP32 reduction buffer exactly.
 The final reduction need not be bitwise identical to native FP32 ReduceScatter because addition order may differ.
+Exact conversion also does not guarantee the same overflow behavior as native AVG: this path sums
+before scaling, so extreme finite BF16 values can overflow an intermediate FP32 sum even when their
+average is representable. Leave the option disabled when native AVG overflow behavior is required.
 
 This exact-conversion argument does not cover externally modified FP32 gradients or delayed ReduceScatter
 via PyTorch's `set_requires_gradient_sync(False)`, which may accumulate gradients in FP32 before transport.

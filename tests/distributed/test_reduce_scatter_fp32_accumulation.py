@@ -74,6 +74,20 @@ def test_fp16_transport_obeys_fp16_finite_range(monkeypatch):
     assert torch.isfinite(bf16_output).all()
 
 
+def test_bf16_postscale_can_overflow_before_a_representable_average(monkeypatch):
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(dist, "all_to_all_single", lambda output, input, group, async_op: output.copy_(input))
+    input_tensor = torch.full((2,), torch.finfo(torch.bfloat16).max, dtype=torch.float32)
+    output_tensor = torch.empty(1, dtype=torch.float32)
+    comm = FP32ReduceScatterWithLowPrecisionTransport(torch.bfloat16, reduction_scale=0.5)
+
+    comm(output_tensor, input_tensor, object(), dist.ReduceOp.SUM)
+
+    # Characterize SUM-before-scale, not a promise of native AVG overflow behavior.
+    assert torch.isinf(output_tensor).all()
+    assert torch.isfinite((input_tensor * 0.5).sum())
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_low_precision_reduce_scatter_rejects_async(dtype):
     with pytest.raises(NotImplementedError, match="async_op=True"):
