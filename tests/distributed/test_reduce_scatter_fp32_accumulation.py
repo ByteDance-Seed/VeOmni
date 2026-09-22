@@ -112,32 +112,33 @@ def test_low_precision_reduce_scatter_validates_contract(monkeypatch, dtype):
         )
 
 
+class _FakeFSDPModule:
+    def __init__(self) -> None:
+        self.comms = []
+        self.gradient_divide_factors = []
+        self.force_sum_reductions = []
+
+    def set_gradient_divide_factor(self, factor) -> None:
+        self.gradient_divide_factors.append(factor)
+
+    def set_force_sum_reduction_for_comms(self, enable) -> None:
+        self.force_sum_reductions.append(enable)
+
+    def set_custom_reduce_scatter(self, comm) -> None:
+        self.comms.append(comm)
+
+
 def test_registers_only_selected_fsdp_modules_and_moves_scaling_into_hook(monkeypatch):
-    class FakeFSDPModule:
-        def __init__(self) -> None:
-            self.comms = []
-            self.gradient_divide_factors = []
-            self.force_sum_reductions = []
-
-        def set_gradient_divide_factor(self, factor) -> None:
-            self.gradient_divide_factors.append(factor)
-
-        def set_force_sum_reduction_for_comms(self, enable) -> None:
-            self.force_sum_reductions.append(enable)
-
-        def set_custom_reduce_scatter(self, comm) -> None:
-            self.comms.append(comm)
-
     class FakeModel:
         def __init__(self) -> None:
-            self.fsdp1 = FakeFSDPModule()
+            self.fsdp1 = _FakeFSDPModule()
             self.unwrapped = object()
-            self.fsdp2 = FakeFSDPModule()
+            self.fsdp2 = _FakeFSDPModule()
 
         def modules(self):
             return [self, self.fsdp1, self.unwrapped, self.fsdp2]
 
-    monkeypatch.setattr(reduce_scatter_module, "FSDPModule", FakeFSDPModule)
+    monkeypatch.setattr(reduce_scatter_module, "FSDPModule", _FakeFSDPModule)
     model = FakeModel()
 
     count = register_fp32_reduce_scatter_with_low_precision_transport(
@@ -159,14 +160,7 @@ def test_registers_only_selected_fsdp_modules_and_moves_scaling_into_hook(monkey
 
 @pytest.mark.parametrize("use_low_precision_transport", [False, True])
 def test_fsdp_gradient_scaling_uses_custom_path_only_when_needed(use_low_precision_transport):
-    class FakeFSDPModule:
-        def __init__(self) -> None:
-            self.gradient_divide_factors = []
-
-        def set_gradient_divide_factor(self, factor) -> None:
-            self.gradient_divide_factors.append(factor)
-
-    module = FakeFSDPModule()
+    module = _FakeFSDPModule()
     reduction_scales = {}
     _configure_fsdp_gradient_reduction(
         module,
@@ -531,19 +525,22 @@ def test_matching_transport_round_trip_preserves_all_finite_16bit_values(dtype):
     assert torch.equal(values.float().to(dtype).view(torch.int16), values.view(torch.int16))
 
 
+@pytest.fixture
+def mock_fsdp_builder(monkeypatch):
+    state = SimpleNamespace(any_extra_parallel_enabled=False, extra_parallel_names=[], fsdp_mesh=None)
+    monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(torch_parallelize, "fully_shard", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch_parallelize, "_materialize_and_load_weights", lambda *args, **kwargs: None)
+    return state
+
+
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float32"])
 @pytest.mark.parametrize("enable", [False, True])
 @pytest.mark.parametrize("low_precision_comm", [False, True])
-def test_native_transport_does_not_register_custom_collective(monkeypatch, dtype, enable, low_precision_comm):
-    class ParallelState:
-        any_extra_parallel_enabled = False
-        extra_parallel_names = []
-        fsdp_mesh = None
-
-    monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: ParallelState())
-    monkeypatch.setattr(torch_parallelize, "fully_shard", lambda *args, **kwargs: None)
+def test_native_transport_does_not_register_custom_collective(
+    monkeypatch, mock_fsdp_builder, dtype, enable, low_precision_comm
+):
     monkeypatch.setattr(torch_parallelize, "get_device_type", lambda: "cpu")
-    monkeypatch.setattr(torch_parallelize, "_materialize_and_load_weights", lambda *args, **kwargs: None)
 
     def fail_registration(*args, **kwargs):
         raise AssertionError("native paths must not register a custom ReduceScatter or inspect topology")
@@ -566,33 +563,12 @@ def test_native_transport_does_not_register_custom_collective(monkeypatch, dtype
     assert result is model
 
 
-@pytest.mark.parametrize(
-    ("mesh_dim_names", "sizes"),
-    [
-        (("dp_shard",), {"dp_shard": 4}),
-        (("dp_replicate", "dp_shard"), {"dp_replicate": 2, "dp_shard": 2}),
-    ],
-)
 @pytest.mark.parametrize("transport_dtype", ["bfloat16", "float16"])
 @pytest.mark.parametrize("node_local", [False, True])
-def test_parallelize_registers_transport_only_for_eligible_fsdp_and_hsdp(
-    monkeypatch, mesh_dim_names, sizes, transport_dtype, node_local
+def test_parallelize_registers_transport_only_for_eligible_mesh(
+    monkeypatch, mock_fsdp_builder, transport_dtype, node_local
 ):
-    class FakeMesh:
-        def __init__(self):
-            self.mesh_dim_names = mesh_dim_names
-
-        def size(self):
-            result = 1
-            for size in sizes.values():
-                result *= size
-            return result
-
-    class ParallelState:
-        any_extra_parallel_enabled = False
-        extra_parallel_names = []
-        fsdp_mesh = FakeMesh()
-
+    mock_fsdp_builder.fsdp_mesh = SimpleNamespace(size=lambda: 4)
     registration_calls = []
     topology_calls = []
 
@@ -605,11 +581,8 @@ def test_parallelize_registers_transport_only_for_eligible_fsdp_and_hsdp(
         registration_calls.append((model, transport_dtype, dict(reduction_scales)))
         return len(reduction_scales)
 
-    monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: ParallelState())
     monkeypatch.setattr(torch_parallelize, "ReduceScatterTransportPolicy", FakeTransportPolicy)
     monkeypatch.setattr(device_utils, "IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr(torch_parallelize, "fully_shard", lambda *args, **kwargs: None)
-    monkeypatch.setattr(torch_parallelize, "_materialize_and_load_weights", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         torch_parallelize,
         "register_fp32_reduce_scatter_with_low_precision_transport",
@@ -630,12 +603,14 @@ def test_parallelize_registers_transport_only_for_eligible_fsdp_and_hsdp(
 
     assert result is model
     assert registration_calls == [(model, getattr(torch, transport_dtype), {model: 0.25} if node_local else {})]
-    assert topology_calls == [ParallelState.fsdp_mesh]
+    assert topology_calls == [mock_fsdp_builder.fsdp_mesh]
 
 
 @pytest.mark.parametrize("dense_eligible", [False, True])
 @pytest.mark.parametrize("expert_eligible", [False, True])
-def test_parallelize_checks_dense_and_expert_meshes_independently(monkeypatch, dense_eligible, expert_eligible):
+def test_parallelize_checks_dense_and_expert_meshes_independently(
+    monkeypatch, mock_fsdp_builder, dense_eligible, expert_eligible
+):
     class FakeMesh:
         mesh_dim_names = ("ep_fsdp", "ep")
 
@@ -716,7 +691,6 @@ def test_parallelize_checks_dense_and_expert_meshes_independently(monkeypatch, d
     monkeypatch.setattr(torch_parallelize, "ReduceScatterTransportPolicy", FakeTransportPolicy)
     monkeypatch.setattr(device_utils, "IS_CUDA_AVAILABLE", True)
     monkeypatch.setattr(torch_parallelize, "fully_shard", record_wrap)
-    monkeypatch.setattr(torch_parallelize, "_materialize_and_load_weights", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         torch_parallelize, "register_fp32_reduce_scatter_with_low_precision_transport", record_registration
     )
