@@ -1751,6 +1751,7 @@ class PatchedDeepseekV4Experts(nn.Module):
             self.gate_up_proj, self.expert_dtype, qat_implementation=self.qat_implementation
         )
         if not self.use_swiglu_mlp:
+            # The act_fn loop does not use grouped-GEMM ``max_M``.
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,
@@ -1760,7 +1761,6 @@ class PatchedDeepseekV4Experts(nn.Module):
                 self.act_fn,
                 self.num_experts,
                 swiglu_limit=self.limit,
-                assume_distinct_experts=self.assume_distinct_experts,
             )
         unused = gate_up_proj.new_empty(0)
         return self.veomni_moe(
