@@ -14,6 +14,7 @@
 
 import inspect
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -43,6 +44,12 @@ _FLASH_IMPLEMENTATIONS = (
     "veomni_flash_attention_3_hub_with_sp",
     "veomni_flash_attention_4_with_sp",
 )
+_HUB_FLASH_IMPLEMENTATIONS = (
+    "flash_attention_2_hub",
+    "flash_attention_3_hub",
+    "veomni_flash_attention_2_hub_with_sp",
+    "veomni_flash_attention_3_hub_with_sp",
+)
 _FLEX_IMPLEMENTATION = "veomni_flex_attention_with_sp"
 _MAGI_IMPLEMENTATION = "veomni_magi_attention_with_sp"
 
@@ -59,21 +66,82 @@ def test_hub_flash_is_classified_as_varlen_attention(version):
     assert f"veomni_flash_attention_{version}_hub_with_sp" in VARLEN_ATTENTION_TYPES
 
 
-@pytest.mark.parametrize("version", (2, 3))
-def test_hub_flash_config_maps_to_veomni_sp_backend(monkeypatch, version):
+@pytest.mark.parametrize("implementation", _HUB_FLASH_IMPLEMENTATIONS)
+def test_hub_flash_config_maps_to_veomni_sp_backend(monkeypatch, implementation):
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_npu_available", lambda: False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
 
-    config = OpsImplementationConfig(attn_implementation=f"flash_attention_{version}_hub")
+    config = OpsImplementationConfig(attn_implementation=implementation)
 
-    assert config.attn_implementation == f"veomni_flash_attention_{version}_hub_with_sp"
+    expected = implementation if implementation.startswith("veomni_") else f"veomni_{implementation}_with_sp"
+    assert config.attn_implementation == expected
 
 
-@pytest.mark.parametrize("version", (2, 3))
-def test_hub_flash_config_rejects_huggingface_modeling_backend(monkeypatch, version):
+@pytest.mark.parametrize("implementation", _HUB_FLASH_IMPLEMENTATIONS)
+def test_hub_flash_config_rejects_huggingface_modeling_backend(monkeypatch, implementation):
     monkeypatch.setenv("MODELING_BACKEND", "hf")
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_npu_available", lambda: False)
 
     with pytest.raises(ValueError, match="requires MODELING_BACKEND=veomni"):
-        OpsImplementationConfig(attn_implementation=f"flash_attention_{version}_hub")
+        OpsImplementationConfig(attn_implementation=implementation)
+
+
+@pytest.mark.parametrize("implementation", _HUB_FLASH_IMPLEMENTATIONS)
+def test_hub_flash_config_rejects_npu(monkeypatch, implementation):
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_npu_available", lambda: True)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+
+    with pytest.raises(ValueError, match="not supported on Ascend NPU"):
+        OpsImplementationConfig(attn_implementation=implementation)
+
+
+@pytest.mark.parametrize("implementation", _HUB_FLASH_IMPLEMENTATIONS)
+@pytest.mark.parametrize("explicit_ops", (False, True))
+@pytest.mark.parametrize(
+    "on_npu,modeling_backend,error", [(True, "veomni", "Ascend NPU"), (False, "hf", "MODELING_BACKEND")]
+)
+def test_hub_flash_model_build_rejects_before_preload(
+    monkeypatch, implementation, explicit_ops, on_npu, modeling_backend, error
+):
+    from veomni.models import auto
+
+    monkeypatch.setenv("MODELING_BACKEND", modeling_backend)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_npu_available", lambda: on_npu)
+    config = SimpleNamespace(attn_implementation=implementation if explicit_ops else "eager")
+    monkeypatch.setattr("veomni.ops.config.singleton.get_ops_config", lambda: config)
+    apply_ops = Mock()
+    build_config = Mock(side_effect=AssertionError("Model loading must not start"))
+    preload = Mock(side_effect=AssertionError("HF preloading must not start"))
+    hub_load = Mock(side_effect=AssertionError("Hub loading must not start"))
+    monkeypatch.setattr("veomni.ops.apply_ops_config", apply_ops)
+    monkeypatch.setattr(auto, "build_config", build_config)
+    monkeypatch.setattr("transformers.modeling_utils.lazy_import_flash_attention", preload)
+    monkeypatch.setattr("transformers.integrations.hub_kernels.load_and_register_attn_kernel", hub_load)
+
+    with pytest.raises(ValueError, match=error):
+        if explicit_ops:
+            auto.build_foundation_model("unused", ops_implementation=config)
+        else:
+            auto.build_foundation_model("unused", attn_implementation=implementation)
+
+    apply_ops.assert_not_called()
+    build_config.assert_not_called()
+    preload.assert_not_called()
+    hub_load.assert_not_called()
+
+
+@pytest.mark.parametrize("on_npu", (False, True))
+@pytest.mark.parametrize("version", (2, 3))
+def test_local_flash_config_is_unchanged(monkeypatch, on_npu, version):
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_npu_available", lambda: on_npu)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+
+    config = OpsImplementationConfig(attn_implementation=f"flash_attention_{version}")
+
+    assert config.attn_implementation == f"veomni_flash_attention_{version}_with_sp"
 
 
 @pytest.mark.parametrize(

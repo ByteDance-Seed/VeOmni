@@ -1355,7 +1355,29 @@ class OpsImplementationConfig:
         },
     )
 
+    @staticmethod
+    def validate_hub_attention_backend(implementation: Optional[str]) -> None:
+        """Reject unsupported Hub attention requests before HF kernel preloading."""
+        if implementation not in (
+            "flash_attention_2_hub",
+            "flash_attention_3_hub",
+            "veomni_flash_attention_2_hub_with_sp",
+            "veomni_flash_attention_3_hub_with_sp",
+        ):
+            return
+
+        from ..utils.import_utils import is_torch_npu_available
+
+        if is_torch_npu_available():
+            raise ValueError(
+                f"{implementation} is not supported on Ascend NPU; "
+                "select a supported non-Hub attention backend instead."
+            )
+        if get_env("MODELING_BACKEND") != "veomni":
+            raise ValueError(f"{implementation} requires MODELING_BACKEND=veomni.")
+
     def __post_init__(self):
+        self.validate_hub_attention_backend(self.attn_implementation)
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",
@@ -1370,8 +1392,6 @@ class OpsImplementationConfig:
                 new_impl = replacements[self.attn_implementation]
                 logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
                 self.attn_implementation = new_impl
-        elif self.attn_implementation in ("flash_attention_2_hub", "flash_attention_3_hub"):
-            raise ValueError(f"{self.attn_implementation} requires MODELING_BACKEND=veomni.")
 
         # Legacy alias: ``moe_implementation='fused'`` resolves to a
         # hardware-appropriate fused kernel — Quack on GPU, NPU group-gemm on

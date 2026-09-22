@@ -77,6 +77,7 @@ After `import veomni`:
 
 - This adapter is a compatibility bridge for Transformers 5.x behavior around flash preload.
 - It does not change VeOmni SP attention semantics.
+- Hub FA2/FA3 require `MODELING_BACKEND=veomni` and are rejected on Ascend NPU, including their normalized `veomni_*_hub_with_sp` aliases. Config parsing and model construction reject these requests before HF preloading, which would otherwise silently select built-in NPU attention instead of the requested Hub kernel.
 - Local FA2/FA3/FA4 names do not require the `kernels` Python package. The explicit `flash_attention_2_hub` and `flash_attention_3_hub` backends require `kernels`, which is included in the GPU extra, and download or reuse version 1 of `kernels-community/flash-attn2` or `kernels-community/flash-attn3`, respectively.
 - FA2 and local FA3 have dedicated branches in `_lazy_imports` and are resolved
   directly without reaching the hub-kernel path. The adapter is therefore a
