@@ -8,13 +8,14 @@ VeOmni also supports other hardware platforms. See the installation guides for
 
 ## Required Environment
 
+Use Linux and Python 3.11 or 3.12, as declared in `pyproject.toml`.
 CUDA 13.0 (the `gpu` extra targets `+cu130` torch wheels and the `nvcr.io/nvidia/pytorch:25.11-py3` base image).
 
-## Install with uv or pip
+## Install with uv (recommended)
 
-**UV**
-
-> Recommend to use [uv](https://docs.astral.sh/uv/) for faster and easier installation.
+Use [uv](https://docs.astral.sh/uv/) in the version range declared in
+`pyproject.toml`. The lockfile includes the accelerator packages and the
+default dependency groups, including the supported Transformers pin.
 
 ```bash
 git clone https://github.com/ByteDance-Seed/VeOmni.git
@@ -58,13 +59,27 @@ The verified default enables BF16/FP16 inputs, the hdim128 bucket, and nfunc 1/3
 > brew install ffmpeg
 > ```
 
-**Pip**
+## Using pip in an existing environment
+
+The commands below assume the matching accelerator dependencies are already
+installed, for example in a prepared container. Pip does not consume
+`tool.uv.sources`, the uv dependency groups, or `uv.lock`; a bare
+`pip install -e '.[gpu]'` does not reproduce the uv environment. Use the uv
+workflow above when creating a new environment.
 
 ```bash
 git clone https://github.com/ByteDance-Seed/VeOmni.git
 cd VeOmni
 
-pip3 install -e .[gpu]
+python -m pip install -e . --no-deps
+python -m pip install transformers==5.16.1
 ```
 
-Add MagiAttention with `pip3 install -e ".[gpu,magi]"`.
+The supported Transformers version is also recorded in `pyproject.toml`.
+For MagiAttention, use the optional uv extra described above.
+
+## Next steps
+
+- Run the [Qwen3 training guide](../../examples/qwen3.md).
+- For code or documentation contributions, read the
+  [contribution guide](https://github.com/ByteDance-Seed/VeOmni/blob/main/CONTRIBUTING.md).
