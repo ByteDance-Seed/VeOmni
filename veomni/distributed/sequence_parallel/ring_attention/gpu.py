@@ -34,6 +34,7 @@ the ``cp`` group on the resulting shard (see
 """
 
 import inspect
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -92,7 +93,8 @@ if not _FA_AVAILABLE:
         _fa4_fwd_params = inspect.signature(_fa4_fwd).parameters
         _fa4_bwd_params = inspect.signature(_fa4_bwd).parameters
         _fa4_ok = all(p in _fa4_fwd_params for p in ("return_lse", "cu_seqlens_q", "max_seqlen_q")) and all(
-            p in _fa4_bwd_params for p in ("dq", "dk", "dv", "cu_seqlens_q", "max_seqlen_q", "window_size_left")
+            p in _fa4_bwd_params
+            for p in ("dq", "dk", "dv", "cu_seqlens_q", "max_seqlen_q", "window_size_left", "deterministic")
         )
         if _fa4_ok:
             _FA_AVAILABLE = True
@@ -159,6 +161,7 @@ def _fa_backward(dout, q, k, v, out, lse, softmax_scale, causal, dropout_p=0.0):
             causal=causal,
             window_size_left=-1,
             window_size_right=-1,
+            deterministic=os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") == "1",
             dq=dq,
             dk=dk,
             dv=dv,
@@ -181,7 +184,7 @@ def _fa_backward(dout, q, k, v, out, lse, softmax_scale, causal, dropout_p=0.0):
         window_size_right=-1,
         softcap=0.0,
         alibi_slopes=None,
-        deterministic=False,
+        deterministic=os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") == "1",
         rng_state=None,
     )
     return dq, dk, dv
@@ -391,6 +394,7 @@ def _zigzag_ring_backward(group, dout, q, k, v, out, lse, softmax_scale):
                 causal=causal,
                 window_size_left=-1,
                 window_size_right=-1,
+                deterministic=os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") == "1",
                 dq=dq_b[:, :sq],
                 dk=dk_b[:, :skv],
                 dv=dv_b[:, :skv],
@@ -413,7 +417,7 @@ def _zigzag_ring_backward(group, dout, q, k, v, out, lse, softmax_scale):
             window_size_right=-1,
             softcap=0.0,
             alibi_slopes=None,
-            deterministic=False,
+            deterministic=os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") == "1",
             rng_state=None,
         )
 
@@ -594,6 +598,7 @@ def _fa_varlen_backward(dout, q, k, v, out, lse, dq, dk, dv, cu_q, cu_k, max_q, 
             cu_seqlens_k=cu_k,
             max_seqlen_q=max_q,
             max_seqlen_k=max_k,
+            deterministic=os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") == "1",
             dq=dq,
             dk=dk,
             dv=dv,
@@ -620,7 +625,7 @@ def _fa_varlen_backward(dout, q, k, v, out, lse, dq, dk, dv, cu_q, cu_k, max_q, 
         window_size_right=-1,
         softcap=0.0,
         alibi_slopes=None,
-        deterministic=False,
+        deterministic=os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") == "1",
         rng_state=None,
     )
 
