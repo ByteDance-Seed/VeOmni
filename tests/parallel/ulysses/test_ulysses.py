@@ -1,6 +1,5 @@
 import importlib.util
 import sys
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import torch
@@ -20,6 +19,7 @@ if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backen
 import pytest
 import torch.distributed as dist
 
+from tests.tools.common_utils import ieee_fp32_matmul
 from veomni.distributed.sequence_parallel.comm import (
     get_ulysses_sequence_parallel_group,
     set_ulysses_sequence_parallel_group,
@@ -39,17 +39,6 @@ from .utils import (
     SequenceParallelTest,
     sync_tensor,
 )
-
-
-@contextmanager
-def _ieee_fp32_matmul():
-    """Disable TF32 so fp32 Linear/SDPA compare SP vs DP at atol=1e-6 on H20."""
-    previous = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False
-    try:
-        yield
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = previous
 
 
 class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
@@ -86,7 +75,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
 
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_self_attn(self):
-        with _ieee_fp32_matmul():
+        with ieee_fp32_matmul():
             self._get_process_group()
             sp_group = get_ulysses_sequence_parallel_group()
             full_input = self._get_input_data()
@@ -138,7 +127,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
 
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_self_attn_padding(self):
-        with _ieee_fp32_matmul():
+        with ieee_fp32_matmul():
             self._get_process_group()
             sp_group = get_ulysses_sequence_parallel_group()
             full_input = self._get_input_data_for_padding()

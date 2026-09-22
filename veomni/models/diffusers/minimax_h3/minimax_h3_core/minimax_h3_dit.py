@@ -90,7 +90,7 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
     # cos/sin are precomputed once per forward and shared across all blocks.
     rot_dim = cos.shape[-1]
     x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
-    if IS_NPU_AVAILABLE:
+    if IS_NPU_AVAILABLE and x_rot.device.type == "npu":
         x_rot = npu_rotary_mul(x_rot, cos, sin, rotary_mode="half")
     else:
         x_rot = (x_rot * cos) + (_rotate_half(x_rot) * sin)
