@@ -240,6 +240,33 @@ class DiTModelRuntime(VeOmniModelRuntime):
         if self.train_args.training_task != "offline_embedding":
             super()._freeze_model_module()
 
+    def extra_state(self) -> dict[str, Any]:
+        """Model-bound state: the condition model's noise/timestep generator."""
+        rng_state_dict = getattr(self.condition_model, "rng_state_dict", None)
+        if (
+            self.condition_model is not None
+            and rng_state_dict is None
+            and getattr(self.condition_model, "generator", None) is not None
+        ):
+            logger.warning_rank0(
+                "Condition model owns a ``generator`` but exposes no ``rng_state_dict``; "
+                "its noise/timestep stream will not be restored across a resume."
+            )
+        return {} if rng_state_dict is None else {"condition_model_rng_state": rng_state_dict()}
+
+    def load_extra_state(self, extra_state: dict[str, Any]) -> None:
+        condition_model_rng_state = extra_state.get("condition_model_rng_state")
+        if condition_model_rng_state is None:
+            return
+        loader = getattr(self.condition_model, "load_rng_state_dict", None)
+        if loader is None:
+            logger.warning_rank0(
+                "Checkpoint carries condition-model RNG state but the model cannot restore it; "
+                "the resumed run may replay its initial noise stream."
+            )
+        else:
+            loader(condition_model_rng_state)
+
     def _build_parallelized_model(self) -> None:
         """``offline_embedding`` builds no DiT, so there is nothing to wrap."""
         if self.train_args.training_task != "offline_embedding":

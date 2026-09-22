@@ -656,6 +656,7 @@ def quack_gemm_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    assume_distinct_experts: bool = False,  # intentionally unused; see the del below
 ):
     """Quack GEMM fused MoE forward pass.
 
@@ -664,7 +665,19 @@ def quack_gemm_fused_moe_forward(
 
     ``swiglu_limit``: gpt-oss / DeepSeek-V4 style clamp on SwiGLU
     pre-activations. ``None`` disables the clamp (default, zero overhead).
+
+    ``assume_distinct_experts`` is intentionally unused here; see below.
     """
+    # ``assume_distinct_experts`` only tightens the grouped-GEMM ``max_M``
+    # launch bound in the Triton backend (see ``compute_max_expert_tokens`` in
+    # ``group_gemm.py``). Quack routes every expert through a CUTLASS varlen
+    # GEMM that derives per-expert work from ``cu_seqlens_m``, so there is no
+    # launch-grid bound to tighten and the flag is a no-op here. It stays in the
+    # signature only so the unified ``fused_moe_forward`` dispatch and the
+    # OpSlot adapter can forward it to any backend uniformly. The ``del`` makes
+    # the deliberate non-use explicit rather than an oversight.
+    del assume_distinct_experts
+
     if get_parallel_state().ep_enabled:
         if fc1_1_2_weight is not None:
             if fc1_1_weight is not None or fc1_2_weight is not None:

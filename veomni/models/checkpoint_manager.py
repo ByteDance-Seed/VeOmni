@@ -29,7 +29,7 @@ Two blobs, two owners:
   :class:`~veomni.trainer.callbacks.global_state_callback.GlobalStateCallback`.
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch.distributed as dist
 
@@ -160,40 +160,64 @@ class ModelCheckpointManager:
         """Block until the in-flight async save is on disk, if there is one."""
         self.checkpointer.wait_for_pending_save()
 
+    def _extra_state(self, state: "TrainerState") -> Dict[str, Any]:
+        """Model-bound state to store beside the weights.
+
+        The lr scheduler plus whatever the runtime contributes via
+        ``extra_state()`` (e.g. the DiT condition model's generator).
+        """
+        lr_scheduler = self.runtime.lr_scheduler
+        extra_state = {
+            "lr_scheduler": None if lr_scheduler is None else lr_scheduler.state_dict(),
+        }
+        extra_state.update(self.runtime.extra_state())
+        return extra_state
+
+    def _load_extra_state(self, extra_state: Dict[str, Any]) -> None:
+        lr_state = extra_state.get("lr_scheduler")
+        lr_scheduler = self.runtime.lr_scheduler
+        if lr_state is not None and lr_scheduler is not None:
+            lr_scheduler.load_state_dict(lr_state)
+
+        self.runtime.load_extra_state(extra_state)
+
     def load(self) -> None:
-        """Restore model, optimizer and lr_scheduler from ``load_path``."""
+        """Restore model, optimizer and model-bound extra state from ``load_path``."""
         load_dir = self.load_dir()
         if load_dir is None:
             return
 
         self.wait_for_pending_save()
+        state: Dict[str, Any] = {
+            "model": self.runtime.model,
+            "optimizer": self.runtime.optimizer,
+            "extra_state": {},
+        }
         self.checkpointer.load(
             load_dir,
-            {
-                "model": self.runtime.model,
-                "optimizer": self.runtime.optimizer,
-                "lr_scheduler": self.runtime.lr_scheduler,
-            },
+            state,
             module=self.module_name,
             trainable_only=self.trainable_only,
             parallel_state=self.parallel_state,
         )
+        self._load_extra_state(state["extra_state"])
         dist.barrier()
         logger.info_rank0(f"Load distributed checkpoint from {load_dir} successfully!")
 
     def save_dcp(self, state: "TrainerState") -> None:
-        """Write model, optimizer and lr_scheduler for ``state.global_step``.
+        """Write model, optimizer and model-bound extra state for ``state.global_step``.
 
         Only model-bound state goes in here. Job-level state — where the
         dataloader is, the rng — has its own writer.
         """
+        extra_state = self._extra_state(state)
         helper.empty_cache()
         self.checkpointer.save(
             self.config.save_path,
             {
                 "model": self.runtime.model,
                 "optimizer": self.runtime.optimizer,
-                "lr_scheduler": self.runtime.lr_scheduler,
+                "extra_state": extra_state,
             },
             global_steps=state.global_step,
             module=self.module_name,
