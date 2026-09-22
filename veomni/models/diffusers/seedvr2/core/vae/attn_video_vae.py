@@ -899,7 +899,6 @@ class Decoder3D(nn.Module):
         # up
         reversed_block_out_channels = list(reversed(block_out_channels))
         output_channel = reversed_block_out_channels[0]
-        print(f"slicing_up_num: {slicing_up_num}")
         for i, up_block_type in enumerate(up_block_types):
             prev_output_channel = output_channel
             output_channel = reversed_block_out_channels[i]
