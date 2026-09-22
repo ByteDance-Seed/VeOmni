@@ -122,6 +122,8 @@ def test_qwen3_5_moe_parallel_plans_cover_multimodal_and_text_wrappers():
     assert set(conditional_ep_plan) == {
         "model.language_model.layers.*.mlp.experts.gate_up_proj",
         "model.language_model.layers.*.mlp.experts.down_proj",
+        "mtp.layers.*.mlp.experts.gate_up_proj",
+        "mtp.layers.*.mlp.experts.down_proj",
     }
     assert set(causal_ep_plan) == {
         "model.layers.*.mlp.experts.gate_up_proj",
