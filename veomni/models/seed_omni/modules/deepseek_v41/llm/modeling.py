@@ -35,10 +35,12 @@ Engram write lands *before* its layer, the DSpark hook reads the stream *before*
 the layer rather than after, and the final collapse uses the last layer's FFN
 ``pre`` rather than one computed from the final stream.
 
-Generation is ``DeepseekV41LlmInferenceMixin``: batched prefill captures the
-decode caches, then each AR step calls ``decode_backbone_step`` and, after the
-first generated token, ``forward_spec`` so the DSpark stages draft the next
-block. There is no HF ``past_key_values``.
+Generation is ``DeepseekV41LlmInferenceMixin``. Training still uses this
+module's full-sequence ``forward``. Prefill capture is
+:meth:`DeepseekV41Backbone.forward_ced_prefill`: encoder on the full prompt,
+decoder only the last sliding window. Each AR step is ``decode_backbone_step``;
+a DSpark hit verifies the rest of the block and rolls the KV back on a miss.
+There is no HF ``past_key_values``.
 """
 
 from __future__ import annotations
@@ -193,6 +195,141 @@ class DeepseekV41Backbone(nn.Module):
             # objective stays a sum: dividing the sum by the layer count here would
             # make the gradient each indexer receives depend on how many other
             # layers happened to carry one.
+            outputs["indexer_kl_layers"] = len(indexer_terms)
+            outputs["indexer_query_tokens"] = hidden_states.shape[0] * hidden_states.shape[1]
+        if draft_hiddens:
+            outputs["draft_hiddens"] = draft_hiddens
+        return outputs
+
+    def forward_ced_prefill(
+        self,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        ngram_embeds: Optional[List[torch.Tensor]] = None,
+        image_mask: Optional[torch.Tensor] = None,
+        capture: Optional[List[DeepseekV41AttentionCache]] = None,
+        capture_seq_len: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Prefill capture: encoder on the full prompt, decoder on the last window.
+
+        Training uses :meth:`forward`. Official decode still runs every layer
+        (16B); this only cuts decoder *prefill* to the sliding window.
+        """
+        if capture is None:
+            raise ValueError("forward_ced_prefill writes decode caches; capture is required.")
+        if len(capture) != len(self.layers):
+            raise ValueError(f"capture has {len(capture)} entries but the backbone has {len(self.layers)} layers.")
+        if ngram_embeds is None and self.engram:
+            raise ValueError(
+                f"this backbone has Engram connections at layers {list(self.config.engram_layer_ids)} but no "
+                "ngram_embeds were passed."
+            )
+        if ngram_embeds is not None and len(ngram_embeds) != len(self.config.engram_layer_ids):
+            raise ValueError(
+                f"ngram_embeds has {len(ngram_embeds)} entries but engram_layer_ids names "
+                f"{len(self.config.engram_layer_ids)} layers."
+            )
+        token_mask = None if image_mask is None else ~image_mask
+        full_position_ids = position_ids
+        valid_len = int(inputs_embeds.shape[1]) if capture_seq_len is None else int(capture_seq_len)
+        split = int(self.config.candidate_source_layer_id)
+        window = int(self.config.sliding_window)
+        if not (0 < split < len(self.layers)):
+            raise ValueError(f"forward_ced_prefill needs 0 < candidate_source_layer_id < n_layers, got {split}.")
+        if valid_len <= window:
+            raise ValueError(
+                f"forward_ced_prefill needs a prompt longer than sliding_window={window}, got {valid_len}."
+            )
+        plans = build_compression_plans(self.config, position_ids, sequence_slices_from_positions(position_ids))
+        shared = SharedAttentionState()
+        hidden_streams = expand_to_streams(inputs_embeds, self.config.hc_mult)
+        pre_mix = identity_pre_mix(hidden_streams, self.config.hc_mult)
+        draft_hiddens: List[torch.Tensor] = []
+        router_logits: List[torch.Tensor] = []
+        indexer_terms: List[IndexerLossTerms] = []
+        draft_targets = set(self.config.dspark_target_layer_ids)
+
+        def run_layer(
+            layer_idx: int,
+            *,
+            layer_plans: Dict,
+            layer_capture_seq_len: Optional[int],
+            layer_ngram: Optional[List[torch.Tensor]],
+            layer_image_mask: Optional[torch.Tensor],
+            layer_token_mask: Optional[torch.Tensor],
+            layer_position_ids: torch.Tensor,
+            compress_hidden: Optional[torch.Tensor] = None,
+            compress_position_ids: Optional[torch.Tensor] = None,
+        ) -> None:
+            nonlocal hidden_streams, pre_mix
+            layer = self.layers[layer_idx]
+            if str(layer_idx) in self.engram:
+                connection = self.engram[str(layer_idx)]
+                hidden_streams = connection(hidden_streams, layer_ngram[connection.layer_hash_index], layer_token_mask)
+            if self.mtp and layer_idx in draft_targets:
+                draft_hiddens.append(hidden_streams.mean(dim=2))
+            hidden_streams, pre_mix, layer_logits, indexer_loss = layer(
+                hidden_streams,
+                pre_mix,
+                layer_position_ids,
+                self.rotary_emb,
+                shared,
+                layer_plans,
+                layer_image_mask,
+                capture=capture[layer_idx],
+                capture_seq_len=layer_capture_seq_len,
+                compress_hidden=compress_hidden,
+                compress_position_ids=compress_position_ids,
+            )
+            router_logits.append(layer_logits)
+            if indexer_loss is not None:
+                indexer_terms.append(indexer_loss)
+
+        for layer_idx in range(split):
+            run_layer(
+                layer_idx,
+                layer_plans=plans,
+                layer_capture_seq_len=capture_seq_len,
+                layer_ngram=ngram_embeds,
+                layer_image_mask=image_mask,
+                layer_token_mask=token_mask,
+                layer_position_ids=position_ids,
+            )
+
+        boundary = self.layers[split]
+        compress_hidden = boundary.input_layernorm(mhc_collapse(hidden_streams, pre_mix))
+        start = valid_len - window
+        hidden_streams = hidden_streams[:, -window:]
+        pre_mix = pre_mix[:, -window:]
+        position_ids = full_position_ids[:, -window:]
+        image_mask = None if image_mask is None else image_mask[:, -window:]
+        token_mask = None if token_mask is None else token_mask[:, -window:]
+        ngram_embeds = None if ngram_embeds is None else [row[:, -window:] for row in ngram_embeds]
+        decoder_plans = {ratio: plan.narrow_queries(start, valid_len) for ratio, plan in plans.items()}
+        for layer_idx in range(split, len(self.layers)):
+            run_layer(
+                layer_idx,
+                layer_plans=decoder_plans,
+                layer_capture_seq_len=window,
+                layer_ngram=ngram_embeds,
+                layer_image_mask=image_mask,
+                layer_token_mask=token_mask,
+                layer_position_ids=position_ids,
+                compress_hidden=compress_hidden if layer_idx == split else None,
+                compress_position_ids=full_position_ids if layer_idx == split else None,
+            )
+        if draft_hiddens:
+            width = hidden_streams.shape[1]
+            draft_hiddens[:] = [hidden[:, -width:] for hidden in draft_hiddens]
+
+        hidden_states = self.norm(mhc_collapse(hidden_streams, pre_mix))
+        outputs: Dict[str, Any] = {
+            "hidden_states": hidden_states,
+            "router_logits": router_logits,
+        }
+        if indexer_terms:
+            outputs["indexer_kl_total"] = torch.stack([term.kl for term in indexer_terms]).sum()
+            outputs["indexer_uniform_total"] = torch.stack([term.uniform for term in indexer_terms]).sum()
             outputs["indexer_kl_layers"] = len(indexer_terms)
             outputs["indexer_query_tokens"] = hidden_states.shape[0] * hidden_states.shape[1]
         if draft_hiddens:

@@ -723,3 +723,131 @@ class TestBatchedPrefillMatchesPerPosition:
         assert pending is not None
         assert pending.shape[1] == 1
         torch.testing.assert_close(pending[0, 0], hidden[0, 9])
+
+    @torch.no_grad()
+    def test_a_rejected_draft_leaves_the_cache_at_one_token(self):
+        config = make_backbone_config()
+        prompt_len = 5
+        torch.manual_seed(1)
+        embeds = torch.randn(1, prompt_len + 3, HIDDEN, dtype=torch.float64)
+        ngram_embeds = self._ngram_embeds(config, prompt_len + 3)
+
+        one = self._llm(config)
+        one._prefill(
+            [ConversationItem(type="text", value=embeds[0, :prompt_len].clone(), role="user")],
+            [e[:, :prompt_len].clone() for e in ngram_embeds],
+        )
+        one.generate(
+            conversation_list=[
+                ConversationItem(type="text", value=embeds[0, :prompt_len].clone(), role="user"),
+                ConversationItem(
+                    type="output", value=embeds[0, prompt_len : prompt_len + 1].clone(), role="assistant"
+                ),
+            ],
+            ngram_embeds=[e[:, prompt_len : prompt_len + 1].clone() for e in ngram_embeds],
+        )
+        want = [_snapshot_layer_cache(layer) for layer in one._decode_cache.layers]
+        want_pos = int(one._next_position)
+
+        many = self._llm(config)
+        many._prefill(
+            [ConversationItem(type="text", value=embeds[0, :prompt_len].clone(), role="user")],
+            [e[:, :prompt_len].clone() for e in ngram_embeds],
+        )
+        tail = ConversationItem(type="output", value=embeds[0, prompt_len : prompt_len + 3].clone(), role="assistant")
+        tail.meta["dspark_spec_ids"] = torch.tensor([10**9, 10**9])
+        many._step(
+            [
+                ConversationItem(type="text", value=embeds[0, :prompt_len].clone(), role="user"),
+                tail,
+            ],
+            [e[:, prompt_len : prompt_len + 3].clone() for e in ngram_embeds],
+            {
+                "dspark_lm_head_weight": torch.randn(32, HIDDEN, dtype=torch.float64),
+                "dspark_sampling": {"do_sample": False},
+            },
+        )
+        got = [_snapshot_layer_cache(layer) for layer in many._decode_cache.layers]
+        assert int(many._next_position) == want_pos == prompt_len + 1
+        for layer_idx, (got_layer, want_layer) in enumerate(zip(got, want)):
+            for field in ("window", "compress_kv", "index_k", "pending"):
+                _assert_same_tensor(got_layer[field], want_layer[field], f"layer {layer_idx} {field}", **FP32_POOLED)
+
+    @torch.no_grad()
+    def test_a_merged_prefill_hidden_decodes_as_one_token(self):
+        """Prefill hidden concatenated with the first embed must not verify as a block.
+
+        The n-gram node only hashed the new id. Walking both rows would slice an
+        empty n-gram lookup, Engram would broadcast sequence length to 0, and
+        decode_attention_step would raise ``got 0``.
+        """
+        config = make_backbone_config()
+        prompt_len = 5
+        torch.manual_seed(1)
+        embeds = torch.randn(1, prompt_len + 1, HIDDEN, dtype=torch.float64)
+        ngram_embeds = self._ngram_embeds(config, prompt_len + 1)
+        model = self._llm(config)
+        model._prefill(
+            [ConversationItem(type="text", value=embeds[0, :prompt_len].clone(), role="user")],
+            [e[:, :prompt_len].clone() for e in ngram_embeds],
+        )
+        hidden = torch.randn(1, HIDDEN, dtype=torch.float64)
+        tail = ConversationItem(
+            type="output",
+            value=torch.cat([hidden, embeds[0, prompt_len : prompt_len + 1]], dim=0),
+            role="assistant",
+        )
+        tail.meta["input_ids"] = torch.tensor([[1]])
+        model._step(
+            [
+                ConversationItem(type="text", value=embeds[0, :prompt_len].clone(), role="user"),
+                tail,
+            ],
+            [e[:, prompt_len : prompt_len + 1].clone() for e in ngram_embeds],
+            {},
+        )
+        assert int(model._next_position) == prompt_len + 1
+
+    @torch.no_grad()
+    def test_ced_encoder_caches_match_a_full_prefill(self):
+        """Encoder caches and the boundary compressor must match a full prefill.
+
+        Decoder layers past ``candidate_source_layer_id`` only replay the sliding
+        window, so their windows are not the last rows of a 40-layer prompt
+        forward -- that is the CED saving, not a capture bug.
+        """
+        config = make_backbone_config(
+            candidate_source_layer_id=4,
+            kv_source_layer_ids=[0, 4],
+            index_source_layer_ids=[0, 4],
+        )
+        prompt_len = SEQ_LEN
+        torch.manual_seed(1)
+        embeds = torch.randn(1, prompt_len, HIDDEN, dtype=torch.float64)
+        ngram_embeds = self._ngram_embeds(config, prompt_len)
+
+        stepped = self._llm(config)
+        _, want_cache, want_pos = self._run_prefill(stepped, stepped._prefill_per_position, embeds, ngram_embeds)
+        batched = self._llm(config)
+        got_tail, got_cache, got_pos = self._run_prefill(batched, batched._prefill, embeds, ngram_embeds)
+
+        assert got_pos == want_pos == prompt_len
+        assert torch.isfinite(got_tail).all()
+        split = config.candidate_source_layer_id
+        for layer_idx in range(split + 1):
+            _assert_same_tensor(
+                got_cache[layer_idx]["window"],
+                want_cache[layer_idx]["window"],
+                f"layer {layer_idx} window",
+                **FP32_POOLED,
+            )
+        for layer_idx in config.kv_source_layer_ids:
+            _assert_same_tensor(
+                got_cache[layer_idx]["compress_kv"],
+                want_cache[layer_idx]["compress_kv"],
+                f"layer {layer_idx} compress_kv",
+                **FP32_POOLED,
+            )
+        window = min(config.sliding_window, prompt_len)
+        for layer_idx in range(split, config.num_hidden_layers):
+            assert got_cache[layer_idx]["window"].shape[1] == window

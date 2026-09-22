@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -162,6 +162,25 @@ class DeepseekV41DecodeCache:
                 for _ in range(n_draft)
             ],
         )
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Clone every layer so a rejected speculative token can roll the stack back."""
+        return {
+            "layers": [layer.snapshot() for layer in self.layers],
+            "dspark": [layer.snapshot() for layer in self.dspark],
+            "position": self.position,
+            "dspark_main": None if self.dspark_main is None else self.dspark_main.clone(),
+            "dspark_ready": self.dspark_ready,
+        }
+
+    def restore(self, snap: Dict[str, Any]) -> None:
+        for layer, layer_snap in zip(self.layers, snap["layers"]):
+            layer.restore(layer_snap)
+        for layer, layer_snap in zip(self.dspark, snap["dspark"]):
+            layer.restore(layer_snap)
+        self.position = snap["position"]
+        self.dspark_main = snap["dspark_main"]
+        self.dspark_ready = snap["dspark_ready"]
 
 
 def _group_plan(ratio: int, first_position: int, device: torch.device) -> CompressionPlan:
@@ -432,6 +451,16 @@ def decode_backbone_step(
             f"{sorted(int(idx) for idx in backbone.engram)} but no ngram_embeds were passed. "
             "The deepseek_v41_ngram step must run before this one."
         )
+    seq = int(inputs_embeds.shape[1])
+    if seq != 1:
+        raise ValueError(f"decode_backbone_step carries one token, got {seq}")
+    if ngram_embeds is not None:
+        for index, row in enumerate(ngram_embeds):
+            if int(row.shape[1]) != seq:
+                raise ValueError(
+                    f"decode_backbone_step ngram_embeds[{index}] covers {row.shape[1]} "
+                    f"positions but the token embed has {seq}"
+                )
 
     token_mask = None if image_mask is None else ~image_mask
     shared = SharedAttentionState()

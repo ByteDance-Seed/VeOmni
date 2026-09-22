@@ -76,6 +76,8 @@ class DeepseekV41DecoderLayer(GradientCheckpointingLayer):
         image_mask: Optional[torch.Tensor] = None,
         capture: Optional[DeepseekV41AttentionCache] = None,
         capture_seq_len: Optional[int] = None,
+        compress_hidden: Optional[torch.Tensor] = None,
+        compress_position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[IndexerLossTerms]]:
         """``[B, S, hc, D]`` in and out, plus the next ``pre``, router logits and indexer KL.
 
@@ -98,6 +100,8 @@ class DeepseekV41DecoderLayer(GradientCheckpointingLayer):
             plans,
             capture=capture,
             capture_seq_len=capture_seq_len,
+            compress_hidden=compress_hidden,
+            compress_position_ids=compress_position_ids,
         )
         hidden_streams = mhc_expand(attn_out, residual, attn_post, attn_comb)
 

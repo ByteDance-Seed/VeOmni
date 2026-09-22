@@ -68,6 +68,16 @@ class DeepseekV41NgramCache:
     def from_config(cls, config) -> "DeepseekV41NgramCache":
         return cls(lookback=config.max_ngram_size - 1)
 
+    def snapshot(self) -> tuple:
+        """Clone the tail so a rejected speculative token can rewind the hash."""
+        history = None if self.history is None else self.history.clone()
+        return history, self.start_pos
+
+    def restore(self, snap: tuple) -> None:
+        history, start_pos = snap
+        self.history = None if history is None else history.clone()
+        self.start_pos = start_pos
+
     def advance(self, compressed: torch.Tensor) -> None:
         """Absorb a step's compressed ids, keeping only the reachable tail."""
         self.history = compressed if self.history is None else torch.cat([self.history, compressed], dim=1)

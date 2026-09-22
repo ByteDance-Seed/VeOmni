@@ -143,6 +143,21 @@ class DeepseekV41AttentionCache:
         if self.window.shape[1] > self.sliding_window:
             self.window = self.window[:, -self.sliding_window :]
 
+    def snapshot(self) -> Dict[str, Optional[torch.Tensor]]:
+        """Clone every carried tensor so a rejected draft can roll this layer back."""
+        return {
+            "window": None if self.window is None else self.window.clone(),
+            "compress_kv": None if self.compress_kv is None else self.compress_kv.clone(),
+            "index_k": None if self.index_k is None else self.index_k.clone(),
+            "pending": None if self.pending is None else self.pending.clone(),
+        }
+
+    def restore(self, snap: Dict[str, Optional[torch.Tensor]]) -> None:
+        self.window = snap["window"]
+        self.compress_kv = snap["compress_kv"]
+        self.index_k = snap["index_k"]
+        self.pending = snap["pending"]
+
 
 @dataclass
 class IndexerLossTerms:
@@ -245,6 +260,21 @@ class CompressionPlan:
         """``[S, compressed_len]`` bool: may query ``t`` attend to group ``c``?"""
         groups = torch.arange(self.compressed_len, device=device)
         return (groups >= self.range_starts.unsqueeze(-1)) & (groups < self.range_ends.unsqueeze(-1))
+
+    def narrow_queries(self, start: int, end: int) -> "CompressionPlan":
+        """Keep the full compressed axis, but only the query rows ``[start, end)``.
+
+        CED prefill compresses the encoder on the whole prompt, then replays the
+        decoder on the sliding window. The compressor still needs every group;
+        the decoder queries only need the visibility of the last ``n_win`` rows.
+        """
+        return CompressionPlan(
+            ratio=self.ratio,
+            window_indices=self.window_indices,
+            window_positions=self.window_positions,
+            range_starts=self.range_starts[start:end],
+            range_ends=self.range_ends[start:end],
+        )
 
 
 def sequence_slices_from_positions(position_ids: torch.Tensor) -> Tuple[Tuple[int, int], ...]:
@@ -764,6 +794,8 @@ class DeepseekV41Attention(nn.Module):
         plans: Dict[int, CompressionPlan],
         capture: Optional[DeepseekV41AttentionCache] = None,
         capture_seq_len: Optional[int] = None,
+        compress_hidden: Optional[torch.Tensor] = None,
+        compress_position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[IndexerLossTerms]]:
         """``[B, S, hidden]``, and this layer's indexer KL when it builds one.
 
@@ -817,6 +849,8 @@ class DeepseekV41Attention(nn.Module):
                 offset=seq_len,
                 capture=capture,
                 capture_seq_len=capture_seq_len,
+                compress_hidden=compress_hidden,
+                compress_position_ids=compress_position_ids,
             )
             kv = torch.cat([kv, compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
@@ -923,6 +957,8 @@ class DeepseekV41Attention(nn.Module):
         offset: int,
         capture: Optional[DeepseekV41AttentionCache] = None,
         capture_seq_len: Optional[int] = None,
+        compress_hidden: Optional[torch.Tensor] = None,
+        compress_position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """The shared compressed KV and this layer's selection into it.
 
@@ -936,7 +972,11 @@ class DeepseekV41Attention(nn.Module):
         plan = plans[self.compress_ratio]
 
         if self.is_kv_source:
-            latent = self.compressor(hidden_states, plan)
+            # CED prefill hands the full encoder hidden here while the queries
+            # (``hidden_states``) are already the sliding-window replay.
+            source_h = hidden_states if compress_hidden is None else compress_hidden
+            source_pos = position_ids if compress_position_ids is None else compress_position_ids
+            latent = self.compressor(source_h, plan)
             group_cos, group_sin = rotary_emb(plan.window_positions, compressed=True)
             if self.indexer is not None:
                 shared.index_k = self.indexer.build_keys(latent, group_cos, group_sin)
@@ -947,15 +987,18 @@ class DeepseekV41Attention(nn.Module):
                 # the same forward and must not copy them onto their own cache.
                 # Slice to the unpadded prefix so GEMM-alignment pad tokens do
                 # not complete an extra group or sit in ``pending``.
-                valid = hidden_states.shape[1] if capture_seq_len is None else capture_seq_len
-                prefix_ids = position_ids[:, :valid]
+                if compress_hidden is None:
+                    valid = hidden_states.shape[1] if capture_seq_len is None else capture_seq_len
+                else:
+                    valid = source_h.shape[1]
+                prefix_ids = source_pos[:, :valid]
                 n_groups = sum(
                     (end - start) // self.compress_ratio for start, end in sequence_slices_from_positions(prefix_ids)
                 )
                 capture.compress_kv = shared.compress_kv[:, :n_groups].detach().clone()
                 if self.indexer is not None and shared.index_k is not None:
                     capture.index_k = shared.index_k[:, :n_groups].detach().clone()
-                pending = trailing_partial_group(hidden_states[:, :valid], prefix_ids, self.compress_ratio)
+                pending = trailing_partial_group(source_h[:, :valid], prefix_ids, self.compress_ratio)
                 capture.pending = None if pending is None else pending.detach().clone()
 
         if shared.compress_kv is None:

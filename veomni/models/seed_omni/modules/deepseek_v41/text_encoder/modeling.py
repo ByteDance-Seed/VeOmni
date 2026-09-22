@@ -83,26 +83,48 @@ class DeepseekV41TextEncoder(TextEncoder):
             hidden_states = hidden_states.unsqueeze(0)
         sampling = self._extract_sampling_kwargs(generation_kwargs, 1.0, 1.0, {})
         output_token_id = self._sample_token(hidden_states, **sampling)
+        spec_rest: List[int] = []
         if self._dspark_queue:
             proposed = self._dspark_queue.pop(0)
-            if proposed != output_token_id:
-                self._dspark_queue.clear()
+            if proposed == output_token_id and output_token_id != self.config.eos_token_id:
+                spec_rest = list(self._dspark_queue)
+            self._dspark_queue.clear()
         self._text_token_cache.append(output_token_id)
-        input_ids = self._token_id_tensor(output_token_id)
+        token_ids = [output_token_id, *spec_rest]
+        input_ids = torch.tensor(token_ids, dtype=torch.long, device=self.device).unsqueeze(0)
         inputs_embeds = self.encode(input_ids)["inputs_embeds"]
 
         tail.value = inputs_embeds
-        maybe_merge_outputs(conversation_list)
-        # The id, not just its embedding: deepseek_v41_ngram hashes token ids and
-        # this is the only place the sampled one reaches the carrier. The key
-        # matches what the chat template stashes on prompt text items, so the
-        # n-gram node reads one field whether it is prefilling or stepping.
+        # Concatenate only consecutive *sampled* output spans. Prefill writes a
+        # hidden-state output with no ``input_ids``; merging that with the first
+        # token's embedding makes the backbone see a multi-token block whose
+        # n-gram lookup still covers one position. Engram then broadcasts the
+        # empty slice to sequence length 0 and decode refuses it.
+        if (
+            len(conversation_list) >= 2
+            and conversation_list[-2].type == "output"
+            and "input_ids" in conversation_list[-2].meta
+        ):
+            maybe_merge_outputs(conversation_list)
+        # The ids, not just their embeddings: deepseek_v41_ngram hashes token ids
+        # and this is the only place the sampled ones reach the carrier. A hit
+        # writes the rest of the DSpark block too, so one FSM step can verify
+        # several drafts instead of launching the graph once per token.
         #
         # After the merge, not before: merging rebuilds the tail, and a meta set
         # on the pre-merge item would be dropped on the step that merges -- the
         # n-gram node would then hash a stale id with nothing raising.
-        conversation_list[-1].meta["input_ids"] = input_ids
-        self._stash_dspark_block(conversation_list[-1], output_token_id)
+        tail = conversation_list[-1]
+        tail.meta["input_ids"] = input_ids
+        if spec_rest:
+            tail.meta["dspark_spec_ids"] = torch.tensor(spec_rest, dtype=torch.long, device=self.device)
+        else:
+            tail.meta.pop("dspark_spec_ids", None)
+        self._stash_dspark_block(tail, output_token_id)
+        outputs["dspark_lm_head_weight"] = (
+            self.embed_tokens.weight if self.config.tie_word_embeddings else self.lm_head.weight
+        )
+        outputs["dspark_sampling"] = sampling
 
         # V4.1 has one stop token: the turn ends on the end-of-sentence marker that
         # `_render_assistant` appends. There is no second ChatML-style `im_end`.
@@ -119,6 +141,7 @@ class DeepseekV41TextEncoder(TextEncoder):
         dspark_start_id: Optional[torch.Tensor] = None,
         dspark_markov_embed_weight: Optional[torch.Tensor] = None,
         dspark_markov_head_weight: Optional[torch.Tensor] = None,
+        dspark_accepted_ids: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Sample the DSpark block with the shared LM head plus the Markov residual.
@@ -128,8 +151,21 @@ class DeepseekV41TextEncoder(TextEncoder):
         The resulting ids are proposed for later AR steps; ``generate`` only
         keeps a proposal when it matches the token the backbone actually
         sampled, so the output distribution stays the AR one.
+
+        ``dspark_accepted_ids`` are extra drafts the backbone already verified
+        this step -- they go on the token cache here because ``generate`` only
+        committed the first sampled id before the verify ran.
         """
         del kwargs
+        outputs: Dict[str, Any] = {"conversation_list": conversation_list}
+        if dspark_accepted_ids is not None:
+            for token_id in dspark_accepted_ids.reshape(-1).tolist():
+                token_id = int(token_id)
+                self._text_token_cache.append(token_id)
+                if token_id == self.config.eos_token_id:
+                    outputs[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
+                    outputs["generated"] = self._flush_text_generated(conversation_list)
+                    return outputs
         if (
             dspark_hiddens is None
             or dspark_start_id is None
@@ -137,7 +173,7 @@ class DeepseekV41TextEncoder(TextEncoder):
             or dspark_markov_head_weight is None
             or self.config.dspark_block_size <= 0
         ):
-            return {"conversation_list": conversation_list}
+            return outputs
         hidden = dspark_hiddens.to(self.device)
         if hidden.dim() == 2:
             hidden = hidden.unsqueeze(0)
@@ -154,7 +190,7 @@ class DeepseekV41TextEncoder(TextEncoder):
             if token_id == self.config.eos_token_id:
                 break
         self._dspark_queue = drafts
-        return {"conversation_list": conversation_list}
+        return outputs
 
     def _stash_dspark_block(self, tail: ConversationItem, token_id: int) -> None:
         block_size = self.config.dspark_block_size
@@ -169,6 +205,8 @@ class DeepseekV41TextEncoder(TextEncoder):
         block[0, 0] = token_id
         tail.meta["dspark_input_ids"] = block
         tail.meta["dspark_embeds"] = self.encode(block)["inputs_embeds"]
+        noise = torch.tensor([[self.config.dspark_noise_token_id]], dtype=torch.long, device=self.device)
+        tail.meta["dspark_noise_embed"] = self.encode(noise)["inputs_embeds"]
 
     def _sample_from_logits(
         self,

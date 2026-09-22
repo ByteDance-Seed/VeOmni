@@ -226,3 +226,16 @@ class TestTheCacheStaysSmall:
 
     def test_from_config_reads_the_lookback_off_the_ngram_size(self):
         assert DeepseekV41NgramCache.from_config(make_config()).lookback == MAX_NGRAM - 1
+
+    def test_a_rejected_draft_rewinds_the_tail(self):
+        """Batch-verify hashes the whole block, then restores tokens that missed."""
+        module = make_module()
+        cache = DeepseekV41NgramCache.from_config(module.config)
+        first = module.compress(make_ids(seq_len=4, seed=4))
+        extra = module.compress(make_ids(seq_len=2, seed=5))
+        cache.advance(first)
+        snap = cache.snapshot()
+        cache.advance(extra)
+        cache.restore(snap)
+        assert cache.start_pos == 4
+        assert torch.equal(cache.history, first[:, -(MAX_NGRAM - 1) :] if first.shape[1] > MAX_NGRAM - 1 else first)

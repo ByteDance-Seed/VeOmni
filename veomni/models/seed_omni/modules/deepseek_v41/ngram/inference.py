@@ -69,17 +69,33 @@ class DeepseekV41NgramInferenceMixin:
         else:
             input_ids, token_mask = self._sampled_token(conversation_list)
 
+        snapshot = self._ngram_cache.snapshot()
+        compressed = self.compress(input_ids, token_mask)
+        n_tokens = int(input_ids.shape[1])
+
+        def dspark_ngram_commit(n_accepted: int) -> None:
+            """Rewind hashes of rejected draft tokens. Prefill never calls this."""
+            if n_accepted >= n_tokens:
+                return
+            self._ngram_cache.restore(snapshot)
+            if n_accepted > 0:
+                self._ngram_cache.advance(compressed[:, :n_accepted])
+
         hash_ids = self.hash_ids(
             input_ids,
             token_mask,
-            history=self._ngram_cache.history,
-            start_pos=self._ngram_cache.start_pos,
+            history=snapshot[0],
+            start_pos=snapshot[1],
         )
-        self._ngram_cache.advance(self.compress(input_ids, token_mask))
-        return {"conversation_list": conversation_list, "ngram_embeds": self.lookup(hash_ids)}
+        self._ngram_cache.advance(compressed)
+        return {
+            "conversation_list": conversation_list,
+            "ngram_embeds": self.lookup(hash_ids),
+            "dspark_ngram_commit": dspark_ngram_commit,
+        }
 
     def _sampled_token(self, conversation_list: List[ConversationItem]) -> tuple:
-        """The one id the text encoder just sampled, and its always-true mask."""
+        """The ids the text encoder just sampled, and their always-true mask."""
         tail = conversation_list[-1]
         token_ids = tail.meta.get("input_ids")
         if token_ids is None:

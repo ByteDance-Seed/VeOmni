@@ -35,7 +35,10 @@ nothing while producing a falling loss.
 import pytest
 import torch
 
-from veomni.models.seed_omni.modules.deepseek_v41.llm.attention import sequence_slices_from_positions
+from veomni.models.seed_omni.modules.deepseek_v41.llm.attention import (
+    DeepseekV41AttentionCache,
+    sequence_slices_from_positions,
+)
 from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig
 from veomni.models.seed_omni.modules.deepseek_v41.llm.mhc import mhc_collapse
 from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import DeepseekV41Backbone, DeepseekV41Llm
@@ -118,6 +121,8 @@ def stub_backbone(config, indexer_layers=()):
             image_mask=None,
             capture=None,
             capture_seq_len=None,
+            compress_hidden=None,
+            compress_position_ids=None,
         ):
             backbone.seen[layer_idx] = {
                 "streams": hidden_streams.detach().clone(),
@@ -257,6 +262,24 @@ class TestLoopOrdering:
         last_pre = torch.full(final_streams.shape[:-1], 0.1 * N_LAYERS)
         expected = backbone.norm(mhc_collapse(final_streams, last_pre))
         torch.testing.assert_close(outputs["hidden_states"], expected, atol=1e-5, rtol=1e-5)
+
+    def test_capture_replays_decoder_on_the_sliding_window(self):
+        """CED prefill: encoder sees the prompt, decoder only the last n_win tokens."""
+        config = make_config(candidate_source_layer_id=4)
+        backbone = stub_backbone(config)
+        seq_len = 17
+        embeds, positions, rows = self._inputs(config, seq_len=seq_len)
+        capture = [
+            DeepseekV41AttentionCache(sliding_window=config.sliding_window, compress_ratio=config.compress_ratios[idx])
+            for idx in range(config.num_hidden_layers)
+        ]
+        backbone.forward_ced_prefill(embeds, positions, rows, capture=capture)
+        window = config.sliding_window
+        for layer_idx in range(4):
+            assert backbone.seen[layer_idx]["streams"].shape[1] == seq_len, layer_idx
+        for layer_idx in range(4, N_LAYERS):
+            assert backbone.seen[layer_idx]["streams"].shape[1] == window, layer_idx
+        assert backbone.seen[4]["streams"].shape[1] == window
 
 
 class TestMasks:
@@ -483,8 +506,10 @@ class TestDsparkDraftSampling:
         encoder._dspark_queue = [7, 8, 9]
         encoder._sample_token = lambda *args, **kwargs: 7
         encoder.generate(conversation, generation_kwargs={"do_sample": False})
-        assert encoder._dspark_queue == [8, 9]
-        assert conversation[-1].meta["dspark_embeds"].shape[-2] == 3
+        assert encoder._dspark_queue == []
+        assert encoder._text_token_cache == [7]
+        assert conversation[-1].meta["input_ids"].reshape(-1).tolist() == [7, 8, 9]
+        assert conversation[-1].meta["dspark_spec_ids"].tolist() == [8, 9]
 
     def test_generate_discards_the_queue_on_a_mismatch(self):
         encoder, conversation = self._encoder_ready_to_sample()
@@ -492,6 +517,32 @@ class TestDsparkDraftSampling:
         encoder._sample_token = lambda *args, **kwargs: 4
         encoder.generate(conversation, generation_kwargs={"do_sample": False})
         assert encoder._dspark_queue == []
+        assert conversation[-1].meta["input_ids"].reshape(-1).tolist() == [4]
+        assert "dspark_spec_ids" not in conversation[-1].meta
+
+    def test_draft_appends_verified_extra_tokens(self):
+        encoder, conversation = self._encoder_ready_to_sample()
+        encoder._text_token_cache = [7]
+        encoder.draft(
+            conversation_list=conversation,
+            dspark_accepted_ids=torch.tensor([8, 9]),
+        )
+        assert encoder._text_token_cache == [7, 8, 9]
+
+    def test_generate_does_not_merge_a_prefill_hidden_into_the_first_token(self):
+        from veomni.models.seed_omni.utils.conversation import ConversationItem
+
+        encoder, _ = self._encoder_ready_to_sample()
+        hidden = torch.randn(1, 8)
+        conversation = [
+            ConversationItem(type="text", value=torch.randn(4, 8), role="user"),
+            ConversationItem(type="output", value=hidden.clone(), role="assistant"),
+            ConversationItem(type="output", value=hidden.clone(), role="assistant"),
+        ]
+        encoder._sample_token = lambda *args, **kwargs: 4
+        encoder.generate(conversation, generation_kwargs={"do_sample": False})
+        assert conversation[-1].meta["input_ids"].reshape(-1).tolist() == [4]
+        assert conversation[-1].value.shape[-2] == 1
 
 
 class TestDsparkSpecOnGenerate:

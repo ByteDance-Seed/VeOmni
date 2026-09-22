@@ -28,17 +28,22 @@ that helper is its reader. It yields a flat ``arange`` of positions, which is
 exactly what ``build_compression_plans`` wants -- the compression groups and the
 window are derived from ``position_ids`` and from nothing else.
 
-Prefill is one batched ``forward`` that captures the window, compressed KV,
-index keys and pending tail each layer's attention already computed. The
-per-position loop remains as :meth:`DeepseekV41LlmInferenceMixin._prefill_per_position`
-so the capture can be checked against it.
+Prefill captures the window, compressed KV, index keys and pending tail.
+Training's full-sequence ``forward`` is used when the prompt fits in the
+sliding window (or there is no encoder/decoder split). Longer prompts use
+:meth:`DeepseekV41Backbone.forward_ced_prefill`: encoder on the full prompt,
+decoder on the last window. The per-position loop remains as
+:meth:`DeepseekV41LlmInferenceMixin._prefill_per_position` so the capture can
+be checked against it.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 
 from ....utils.conversation import ConversationItem, is_dummy
 from ...base.llm_packing import pack_llm_conversations_for_forward
@@ -94,10 +99,9 @@ class DeepseekV41LlmInferenceMixin:
         ngram_embeds: Optional[List[torch.Tensor]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        del kwargs
         if getattr(self, "_decode_cache", None) is None:
             return self._prefill(conversation_list, ngram_embeds)
-        return self._step(conversation_list, ngram_embeds)
+        return self._step(conversation_list, ngram_embeds, kwargs)
 
     def _prefill(
         self,
@@ -106,11 +110,11 @@ class DeepseekV41LlmInferenceMixin:
     ) -> Dict[str, Any]:
         """One batched backbone forward, capturing the decode caches from it.
 
-        The training forward already computes every window row, compressed group
-        and index key decode needs, then throws them away. Capture writes those
-        tensors onto :class:`DeepseekV41DecodeCache` instead of walking the prompt
-        token by token. Grouping is a function of ``position_ids`` alone, so the
-        batched groups and the per-position groups are the same groups.
+        Short prompts (and configs with no encoder/decoder split) go through
+        the training ``forward``. Longer CED prompts go through
+        :meth:`DeepseekV41Backbone.forward_ced_prefill`. Grouping is a function
+        of ``position_ids`` alone, so the batched groups and the per-position
+        groups are the same groups on the encoder.
 
         The per-position loop is :meth:`_prefill_per_position`, kept as the
         reference the capture is tested against.
@@ -122,7 +126,12 @@ class DeepseekV41LlmInferenceMixin:
 
         orig_len = int(inputs_embeds.shape[1])
         self._decode_cache = DeepseekV41DecodeCache.empty(self.config)
-        outputs = self.model(
+        split = int(self.config.candidate_source_layer_id)
+        window = int(self.config.sliding_window)
+        prefill = (
+            self.model.forward_ced_prefill if 0 < split < len(self.model.layers) and orig_len > window else self.model
+        )
+        outputs = prefill(
             inputs_embeds,
             position_ids,
             ngram_embeds=ngram_embeds,
@@ -132,28 +141,20 @@ class DeepseekV41LlmInferenceMixin:
         )
         hidden_states = outputs["hidden_states"][:, :orig_len]
         if hidden_states.numel() and not torch.isfinite(hidden_states).all():
-            window = self._decode_cache.layers[0].window
-            row_ok = torch.isfinite(hidden_states[0]).all(dim=-1)
-            nan_rows = (~row_ok).nonzero(as_tuple=True)[0]
-            window_nan = 0 if window is None else int(torch.isnan(window).sum())
             raise RuntimeError(
                 "batched prefill produced non-finite hidden states: "
-                f"shape={tuple(hidden_states.shape)} dtype={hidden_states.dtype} "
-                f"nan={int(torch.isnan(hidden_states).sum())} inf={int(torch.isinf(hidden_states).sum())} "
-                f"nan_rows={int(nan_rows.numel())}/{orig_len} "
-                f"last_row_finite={bool(row_ok[-1])} layer0_window_nan={window_nan}"
+                f"shape={tuple(hidden_states.shape)} dtype={hidden_states.dtype}"
             )
         draft_hiddens = outputs.get("draft_hiddens")
         if draft_hiddens and self._decode_cache.dspark:
+            seed_width = int(draft_hiddens[0].shape[1])
             self.model.seed_dspark_windows(
-                [hidden[:, :orig_len] for hidden in draft_hiddens],
-                position_ids[:, :orig_len],
+                draft_hiddens,
+                position_ids[:, -seed_width:],
                 self._decode_cache.dspark,
             )
             self._decode_cache.dspark_main = (
-                self.model.mtp[0]
-                .project_main([hidden[:, orig_len - 1 : orig_len] for hidden in draft_hiddens])
-                .detach()
+                self.model.mtp[0].project_main([hidden[:, -1:] for hidden in draft_hiddens]).detach()
             )
         self._decode_cache.dspark_ready = False
         self._next_position = orig_len
@@ -194,6 +195,7 @@ class DeepseekV41LlmInferenceMixin:
         self,
         conversation_list: List[ConversationItem],
         ngram_embeds: Optional[List[torch.Tensor]],
+        kwargs: Dict[str, Any],
     ) -> Dict[str, Any]:
         tail = conversation_list[-1]
         if tail.type != "output":
@@ -203,29 +205,159 @@ class DeepseekV41LlmInferenceMixin:
                 "means the FSM body ran the two in the wrong order."
             )
 
-        inputs_embeds = tail.value[-1:].to(self.device).unsqueeze(0)
-        spec_hiddens = self._run_spec(tail)
-        hidden_states = decode_backbone_step(
-            self.model,
-            inputs_embeds,
-            self._next_position,
-            self._decode_cache,
-            ngram_embeds=ngram_embeds,
-            # A sampled token is text by construction: an image reaches the
-            # carrier from the vision module, never from the sampler.
-            image_mask=None,
-        )
-        self._next_position += 1
+        inputs_embeds, ngram_embeds = self._this_step_inputs(tail, ngram_embeds)
+        n_tokens = int(inputs_embeds.shape[1])
+        spec_ids = tail.meta.get("dspark_spec_ids")
+        ngram_commit: Optional[Callable[[int], None]] = kwargs.get("dspark_ngram_commit")
+
+        if n_tokens == 1 or spec_ids is None:
+            spec_hiddens = self._run_spec(tail)
+            hidden_states = decode_backbone_step(
+                self.model,
+                inputs_embeds,
+                self._next_position,
+                self._decode_cache,
+                ngram_embeds=ngram_embeds,
+                image_mask=None,
+            )
+            accepted = 1
+            self._next_position += 1
+        else:
+            spec_hiddens = None
+            accepted, hidden_states = self._verify_block(
+                inputs_embeds,
+                ngram_embeds,
+                spec_ids,
+                kwargs.get("dspark_lm_head_weight"),
+                kwargs.get("dspark_sampling") or {},
+            )
+            self._fill_spec_embeds(tail, inputs_embeds, accepted)
+
         self._decode_cache.dspark_ready = True
+        if n_tokens > 1:
+            spec_hiddens = self._run_spec(tail)
+        if ngram_commit is not None:
+            ngram_commit(accepted)
+
         outputs = self._emit(conversation_list, hidden_states)
-        # Always write these: ctx.update does not drop stale keys, and the
-        # draft node would otherwise resample a previous step's block.
         markov = None if spec_hiddens is None else self.model.mtp[-1].markov_head
+        last_id = tail.meta.get("input_ids")
+        if last_id is not None:
+            last_id = last_id.reshape(-1)[accepted - 1 : accepted]
+        extras = None
+        if spec_ids is not None and accepted > 1:
+            extras = spec_ids.reshape(-1)[: accepted - 1]
         outputs["dspark_hiddens"] = spec_hiddens
-        outputs["dspark_start_id"] = None if spec_hiddens is None else tail.meta.get("input_ids")
+        outputs["dspark_start_id"] = None if spec_hiddens is None else last_id
         outputs["dspark_markov_embed_weight"] = None if markov is None else markov.embed.weight
         outputs["dspark_markov_head_weight"] = None if markov is None else markov.head.weight
+        outputs["dspark_accepted_ids"] = extras
         return outputs
+
+    def _verify_block(
+        self,
+        inputs_embeds: torch.Tensor,
+        ngram_embeds: Optional[List[torch.Tensor]],
+        spec_ids: Optional[torch.Tensor],
+        lm_head_weight: Optional[torch.Tensor],
+        sampling: Dict[str, Any],
+    ) -> tuple:
+        """Run K draft tokens, keep the AR prefix, roll the KV back on the first miss.
+
+        Verify incrementally: decode token i, then sample from token i-1's hidden
+        to decide whether token i was a real hit. Decoding the whole block first
+        would pay K backbone steps on a miss -- slower than not speculating.
+        """
+        n_tokens = int(inputs_embeds.shape[1])
+        position = self._next_position
+        spec = [] if spec_ids is None else [int(token) for token in spec_ids.reshape(-1).tolist()]
+        hiddens = []
+        accepted = 1
+        for index in range(n_tokens):
+            snap = self._decode_cache.snapshot()
+            hidden = decode_backbone_step(
+                self.model,
+                inputs_embeds[:, index : index + 1],
+                position + index,
+                self._decode_cache,
+                ngram_embeds=self._token_ngram(ngram_embeds, index),
+                image_mask=None,
+            )
+            if index > 0:
+                if not spec or lm_head_weight is None or index - 1 >= len(spec):
+                    self._decode_cache.restore(snap)
+                    break
+                sampled = self._sample_hidden(hiddens[-1], lm_head_weight, sampling)
+                if sampled != spec[index - 1]:
+                    self._decode_cache.restore(snap)
+                    break
+                accepted = index + 1
+            hiddens.append(hidden)
+
+        self._next_position = position + accepted
+        return accepted, hiddens[accepted - 1]
+
+    def _fill_spec_embeds(self, tail: ConversationItem, inputs_embeds: torch.Tensor, accepted: int) -> None:
+        """Point DSpark's next draft at the last verified token, not the first of the block."""
+        block = tail.meta.get("dspark_embeds")
+        if block is None or accepted <= 1:
+            return
+        last = inputs_embeds[:, accepted - 1]
+        noise = tail.meta.get("dspark_noise_embed")
+        if not torch.is_tensor(block):
+            return
+        if block.dim() == 2:
+            block = block.unsqueeze(0)
+        filled = last.unsqueeze(1).expand(-1, block.shape[1], -1).clone()
+        if torch.is_tensor(noise) and block.shape[1] > 1:
+            filled[:, 1:] = noise.reshape(1, 1, -1).expand(filled.shape[0], filled.shape[1] - 1, -1)
+        tail.meta["dspark_embeds"] = filled.squeeze(0) if filled.shape[0] == 1 else filled
+
+    @staticmethod
+    def _token_ngram(ngram_embeds: Optional[List[torch.Tensor]], index: int) -> Optional[List[torch.Tensor]]:
+        if ngram_embeds is None:
+            return None
+        return [row[:, index : index + 1] for row in ngram_embeds]
+
+    def _sample_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        sampling: Dict[str, Any],
+    ) -> int:
+        last = hidden_states[:, -1, :] if hidden_states.dim() == 3 else hidden_states[-1]
+        logits = F.linear(last, lm_head_weight)
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+        do_sample = bool(sampling.get("do_sample", True))
+        if not do_sample:
+            return self._agree_on_token(int(logits.argmax(dim=-1).item()), last.device)
+        temperature = float(sampling.get("temperature", 1.0))
+        if temperature != 1.0:
+            logits = logits / max(temperature, 1e-6)
+        top_p = float(sampling.get("top_p", 1.0))
+        if top_p < 1.0:
+            logits = self._top_p_filter(logits, top_p)
+        probs = F.softmax(logits, dim=-1)
+        token = torch.multinomial(probs, num_samples=1)
+        return self._agree_on_token(int(token.item()), last.device)
+
+    @staticmethod
+    def _top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        sorted_probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        sorted_indices_to_remove = cumulative - sorted_probs > top_p
+        sorted_logits[sorted_indices_to_remove] = float("-inf")
+        return logits.scatter(1, sorted_indices, sorted_logits)
+
+    @staticmethod
+    def _agree_on_token(token_id: int, device: torch.device) -> int:
+        if not dist.is_available() or not dist.is_initialized():
+            return token_id
+        agreed = torch.tensor([token_id], dtype=torch.long, device=device)
+        dist.broadcast(agreed, src=0)
+        return int(agreed.item())
 
     def _run_spec(self, tail: ConversationItem) -> Optional[torch.Tensor]:
         """Draft a block from the previous verified token, matching official decode ``forward_spec``.
@@ -253,10 +385,54 @@ class DeepseekV41LlmInferenceMixin:
             cache.dspark_main,
         )
 
+    def _this_step_inputs(
+        self,
+        tail: ConversationItem,
+        ngram_embeds: Optional[List[torch.Tensor]],
+    ) -> tuple:
+        """Embeddings and n-gram rows for *this* decode step, same width.
+
+        ``maybe_merge_outputs`` concatenates consecutive output items. Prefill's
+        hidden and a later sampled embedding must not be verified as a DSpark
+        block: the n-gram node only hashed the new ids, and an empty n-gram
+        slice broadcasts Engram's stream to sequence length 0.
+        """
+        inputs_embeds = tail.value.to(self.device)
+        if inputs_embeds.dim() == 1:
+            inputs_embeds = inputs_embeds.view(1, 1, -1)
+        elif inputs_embeds.dim() == 2:
+            inputs_embeds = inputs_embeds.unsqueeze(0)
+
+        n_tokens = int(inputs_embeds.shape[1])
+        stored_ids = tail.meta.get("input_ids")
+        if stored_ids is not None:
+            n_tokens = min(n_tokens, int(stored_ids.reshape(-1).numel()))
+        ngram_len = None if not ngram_embeds else int(ngram_embeds[0].shape[1])
+        if ngram_len is not None:
+            n_tokens = min(n_tokens, ngram_len)
+        if n_tokens < 1:
+            raise ValueError(
+                "decode step has no tokens: "
+                f"embeds={tuple(tail.value.shape)} ngram_len={ngram_len} "
+                f"input_ids={None if stored_ids is None else int(stored_ids.numel())}"
+            )
+        if inputs_embeds.shape[1] != n_tokens:
+            inputs_embeds = inputs_embeds[:, -n_tokens:]
+        if ngram_embeds is not None and ngram_len != n_tokens:
+            ngram_embeds = [row[:, -n_tokens:] for row in ngram_embeds]
+        if tail.meta.get("dspark_spec_ids") is None and n_tokens > 1:
+            inputs_embeds = inputs_embeds[:, -1:]
+            ngram_embeds = None if ngram_embeds is None else [row[:, -1:] for row in ngram_embeds]
+        return inputs_embeds, ngram_embeds
+
     def _emit(self, conversation_list: List[ConversationItem], hidden_states: torch.Tensor) -> Dict[str, Any]:
-        conversation_list.append(
-            ConversationItem(type="output", value=self._tail_hidden(hidden_states), role="assistant")
-        )
+        hidden = self._tail_hidden(hidden_states)
+        if conversation_list and conversation_list[-1].type == "output":
+            # In-place: appending a second output lets maybe_merge_outputs cat the
+            # previous hidden (or token embed) onto the next sampled embedding.
+            conversation_list[-1].value = hidden
+        else:
+            conversation_list.append(ConversationItem(type="output", value=hidden, role="assistant"))
         return {"conversation_list": conversation_list}
 
     @staticmethod

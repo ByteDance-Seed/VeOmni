@@ -177,6 +177,9 @@ nsysoutput/
 # Agents worksspace should not be tracked by the primary repo.
 .agents_workspace/
 
+# Official released dump. VeOmni's port is veomni/models/seed_omni/modules/deepseek_v41/.
+DeepSeek-V4.1-Flash/
+
 # Mermaid diagrams written by scripts/visualize_omni_graph.py. The authoritative
 # copies are the ones OmniConfig.save_pretrained writes into the model directory.
 /graphs/
