@@ -16,7 +16,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from tests.tools.launch_utils import torchrun
+from ..tools.launch_utils import torchrun
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device, is_nccl_backend
 
 
@@ -72,7 +72,7 @@ def _assert_relative_l2(actual, expected, *, label):
 
 
 def _raw_microbatches(rank, *, checkpointing, task):
-    from tests.models.test_minimax_h3_remove_padding import raw_sample
+    from ..models.test_minimax_h3_remove_padding import raw_sample
     from veomni.models.diffusers.minimax_h3.minimax_h3_core.packed_sequence import (
         build_packed_fl2va,
         build_packed_ref2va,
@@ -134,7 +134,7 @@ def _run_fsdp_regression(*, step_driver, checkpointing, attention, task):
     from torch.distributed.tensor import DTensor
     from torch.func import functional_call
 
-    from tests.models.test_minimax_h3_remove_padding import condition_model, tiny_model
+    from ..models.test_minimax_h3_remove_padding import condition_model, tiny_model
     from veomni.arguments import MixedPrecisionConfig
     from veomni.distributed.parallel_state import (
         clear_parallel_state,
