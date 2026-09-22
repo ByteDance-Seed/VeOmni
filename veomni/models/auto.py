@@ -100,8 +100,8 @@ def check_context_parallel_supported(config: PretrainedConfig, attn_implementati
                 "USP zigzag CP currently supports Qwen3 with VeOmni FlashAttention 2 or 4 only. "
                 "Use contiguous CP for DeepSeek V4 or cp_size=1 for other models/backends."
             )
-        if is_torch_npu_available():
-            raise NotImplementedError("GPU USP does not support NPU yet.")
+        if is_torch_npu_available() and implementation != "veomni_flash_attention_2_with_sp":
+            raise NotImplementedError("Ascend USP uses the VeOmni FlashAttention 2 adapter with torch_npu.")
         if getattr(config, "attention_dropout", 0.0):
             raise NotImplementedError("USP requires attention_dropout=0.")
         return
