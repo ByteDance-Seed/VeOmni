@@ -23,11 +23,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ....utils import helper
 from ..base import Callback, TrainerState
 
 
 if TYPE_CHECKING:
     from ...omni.omni_trainer import OmniTrainer
+
+
+logger = helper.create_logger(__name__)
 
 
 class OmniModuleDcpCallback(Callback):
@@ -56,7 +60,13 @@ class OmniModuleDcpCallback(Callback):
 
 
 class OmniModuleHfCallback(Callback):
-    """Schedule HF / LoRA export via :meth:`OmniTrainer.save_hf_or_lora`."""
+    """Schedule HF / LoRA export via :meth:`OmniTrainer.save_hf_or_lora`.
+
+    Keeps its own last-exported step, like
+    :class:`~veomni.trainer.callbacks.CheckpointCallback`: the module managers'
+    ``last_saved_step`` counts DCP saves, and a step that wrote its DCP still
+    owes its HF export.
+    """
 
     trainer: OmniTrainer
 
@@ -66,25 +76,35 @@ class OmniModuleHfCallback(Callback):
         self.save_hf_weights = ckpt.save_hf_weights
         self.every_n_steps = ckpt.hf_save_steps
         self.every_n_epochs = ckpt.hf_save_epochs
+        self._last_hf_step: int = -1
+
+    def _save(self, state: TrainerState) -> None:
+        if state.global_step == self._last_hf_step:
+            logger.info_rank0(
+                f"Skipping duplicate HF export at {state.stage} (global_step {state.global_step} already exported)."
+            )
+            return
+        self.trainer.save_hf_or_lora(state)
+        self._last_hf_step = state.global_step
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         if not self.save_hf_weights:
             return
-        self.trainer.save_hf_or_lora(state)
+        self._save(state)
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         if not self.save_hf_weights or not self.every_n_steps:
             return
         if state.global_step % self.every_n_steps != 0:
             return
-        self.trainer.save_hf_or_lora(state)
+        self._save(state)
 
     def on_epoch_end(self, state: TrainerState, **kwargs) -> None:
         if not self.save_hf_weights or not self.every_n_epochs:
             return
         if (state.epoch + 1) % self.every_n_epochs != 0:
             return
-        self.trainer.save_hf_or_lora(state)
+        self._save(state)
 
 
 __all__ = ["OmniModuleDcpCallback", "OmniModuleHfCallback"]

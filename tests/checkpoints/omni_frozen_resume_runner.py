@@ -8,6 +8,7 @@ import torch
 from veomni.arguments import OmniArguments, build_module_runtime_args, parse_omni_args
 from veomni.distributed import torch_parallelize
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
+from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.trainer.omni import OmniTrainer
 
 
@@ -52,6 +53,12 @@ def main() -> None:
         {MODULE_NAME: {"model_path": MODULE_NAME}},
     )[MODULE_NAME]
 
+    # A module config is only ever loaded through the composed OmniConfig.
+    omni_config = OmniConfig(
+        _module_entries={MODULE_NAME: {"model_path": MODULE_NAME}}, training_graphs={}, generation_graphs={}
+    )
+    omni_config.load_checkpoint_sidecars(args.model.model_path)
+
     module_dcp_path = Path(args.train.checkpoint.load_path) / MODULE_NAME
     assert not module_dcp_path.exists(), "The frozen module must not have a DCP payload in this regression scenario."
 
@@ -61,7 +68,12 @@ def main() -> None:
         "load_model_weights",
         wraps=original_load_model_weights,
     ) as load_model_weights:
-        module_runtime = ModuleRuntime(module_args, module_name=MODULE_NAME, train=args.train)
+        module_runtime = ModuleRuntime(
+            module_args,
+            module_name=MODULE_NAME,
+            module_config=omni_config._module_configs[MODULE_NAME],
+            train=args.train,
+        )
 
     assert module_runtime.has_trainable_parameters is False
     assert load_model_weights.call_count == 1, "A frozen module with persistent state must load its HF snapshot."

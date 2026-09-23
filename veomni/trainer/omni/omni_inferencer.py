@@ -129,9 +129,11 @@ class OmniInferencer:
                 for_inference=True,
             )
         else:
+            config = self.omni_model_runtime.to_hf_config()
+            config.load_checkpoint_sidecars(self.checkpoint_root)
             self.model = OmniModel.from_pretrained(
                 self.checkpoint_root,
-                config=self.omni_model_runtime.to_hf_config(),
+                config=config,
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
             ).eval()

@@ -150,7 +150,7 @@ def test_accelerated_qkv_preserves_hf_checkpoint_schema_and_loaders(tmp_path) ->
     assert "model.layers.0.self_attn.qkv_proj_und.weight" not in checkpoint_keys
     assert "model.layers.0.self_attn.qkv_proj_gen.weight" not in checkpoint_keys
 
-    hf_loaded = accelerated.BagelQwen2MoTAccelerated.from_pretrained(tmp_path)
+    hf_loaded = accelerated.BagelQwen2MoTAccelerated.from_pretrained(tmp_path, config=_flex_config())
     veomni_loaded = accelerated.BagelQwen2MoTAccelerated(_flex_config())
     load_model_weights(veomni_loaded, str(tmp_path), init_device="cpu")
     for name in ("qkv_proj_und", "qkv_proj_gen"):

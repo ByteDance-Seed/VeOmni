@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.seed_omni.helpers import load_from_omni, save_as_omni
 from veomni.arguments import OmniArguments, OmniDataArguments, OmniModelRuntimeArguments, build_omni_model_runtime
 from veomni.models.seed_omni import (
     OMNI_ACCELERATED_MODEL_REGISTRY,
@@ -256,17 +257,15 @@ def test_all_registered_classes_are_module_mixins():
 
 
 def test_text_encoder_save_reload_via_registry(tmp_path: Path):
-    """Verifies config/model round-trip through OMNI registry classes."""
+    """Verifies config/model round-trip through OmniModel and the OMNI registry."""
     TextEncoder = _model_cls("text_encoder")
     TextEncoderConfig = _config_cls("text_encoder")
 
     te = TextEncoder(TextEncoderConfig(vocab_size=128, hidden_size=64, tie_word_embeddings=True))
-    te.save_pretrained(tmp_path)
+    save_as_omni(tmp_path, "text_encoder", te)
 
-    cfg = TextEncoderConfig.from_pretrained(tmp_path)
+    cfg, te2 = load_from_omni(tmp_path, "text_encoder")
     assert cfg.model_type == "text_encoder"
-
-    te2 = TextEncoder.from_pretrained(tmp_path)
     assert isinstance(te2, TextEncoder)
     assert te2.config.vocab_size == 128
 
@@ -276,12 +275,10 @@ def test_janus_llama_save_reload_via_registry(tmp_path: Path):
     JanusLlamaConfig = _config_cls("janus_llama")
 
     jl = JanusLlama(JanusLlamaConfig(text_config=_tiny_text_cfg()))
-    jl.save_pretrained(tmp_path)
+    save_as_omni(tmp_path, "janus_llama", jl)
 
-    cfg = JanusLlamaConfig.from_pretrained(tmp_path)
+    cfg, jl2 = load_from_omni(tmp_path, "janus_llama")
     assert cfg.model_type == "janus_llama"
-
-    jl2 = JanusLlama.from_pretrained(tmp_path)
     assert isinstance(jl2, JanusLlama)
     # embed_tokens dropped via Identity — reloaded module also has Identity.
     from torch.nn import Identity
@@ -301,15 +298,12 @@ def test_janus_text_encoder_save_reload_via_registry(tmp_path: Path):
         end_of_image_token_id=67890,
     )
     jte = JanusTextEncoder(cfg)
-    jte.save_pretrained(tmp_path)
-    _save_fake_fast_tokenizer(tmp_path)
+    _save_fake_fast_tokenizer(save_as_omni(tmp_path, "janus_text_encoder", jte))
 
-    rcfg = JanusTextEncoderConfig.from_pretrained(tmp_path)
+    rcfg, jte2 = load_from_omni(tmp_path, "janus_text_encoder")
     assert rcfg.model_type == "janus_text_encoder"
     assert rcfg.begin_of_image_token_id == 12345
     assert rcfg.end_of_image_token_id == 67890
-
-    jte2 = JanusTextEncoder.from_pretrained(tmp_path)
     assert isinstance(jte2, JanusTextEncoder)
     assert jte2.config.vocab_size == 128
 
@@ -655,12 +649,10 @@ def test_qwen3_llm_save_reload_via_registry(tmp_path: Path):
     Qwen3LlmConfig = _config_cls("qwen3_llm")
 
     llm = Qwen3Llm(Qwen3LlmConfig(text_config=_tiny_qwen3_cfg()))
-    llm.save_pretrained(tmp_path)
+    save_as_omni(tmp_path, "qwen3_llm", llm)
 
-    cfg = Qwen3LlmConfig.from_pretrained(tmp_path)
+    cfg, llm2 = load_from_omni(tmp_path, "qwen3_llm")
     assert cfg.model_type == "qwen3_llm"
-
-    llm2 = Qwen3Llm.from_pretrained(tmp_path)
     assert isinstance(llm2, Qwen3Llm)
     from torch.nn import Identity
 
@@ -672,13 +664,10 @@ def test_qwen3_text_encoder_save_reload_via_registry(tmp_path: Path):
     Qwen3TextEncoderConfig = _config_cls("qwen3_text_encoder")
 
     te = Qwen3TextEncoder(Qwen3TextEncoderConfig(vocab_size=128, hidden_size=64, tie_word_embeddings=True))
-    te.save_pretrained(tmp_path)
-    _save_fake_fast_tokenizer(tmp_path)
+    _save_fake_fast_tokenizer(save_as_omni(tmp_path, "qwen3_text_encoder", te))
 
-    rcfg = Qwen3TextEncoderConfig.from_pretrained(tmp_path)
+    rcfg, te2 = load_from_omni(tmp_path, "qwen3_text_encoder")
     assert rcfg.model_type == "qwen3_text_encoder"
-
-    te2 = Qwen3TextEncoder.from_pretrained(tmp_path)
     assert isinstance(te2, Qwen3TextEncoder)
     assert te2.config.vocab_size == 128
 

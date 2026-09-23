@@ -26,7 +26,6 @@ from .....utils.logging import get_logger
 from ...mixins.metric_meter_mixin import MetricMeterResult
 from ...modeling_omni import OmniModel
 from ...utils.graph_profiler import GraphProfiler
-from ..utils.dispatch import unwrap_module_chain
 from ..utils.executor import TrainNodeRunner, execute_generation_node
 from ..utils.modules import iter_named_omni_modules, save_module_subdirectory
 
@@ -109,6 +108,12 @@ class OmniModelRuntime:
       :class:`OmniModel` so FSDP root hooks fire; this class supplies
       ParallelState scoping, graph tracing and metric metering.
 
+    The two lines stay apart: :class:`OmniModel` holds each runtime's bare
+    module (:attr:`ModuleRuntime.omni_module`), and whatever a runtime wrapped
+    it in (DDP, LoRA) stays on the runtime. Nodes, generation and export call
+    the module through its runtime (:meth:`_module_to_call`), so a DDP
+    module still syncs its gradients.
+
     Both are used through the single ``self.model`` handle on the trainer /
     inferencer. APIs that need no wrapper handling are forwarded via
     :meth:`__getattr__` (``config``, ``modules_dict``, …).
@@ -125,15 +130,9 @@ class OmniModelRuntime:
         module_runtimes: Mapping[str, ModuleRuntime] | None = None,
         module_parallel_state_names: Iterable[str] | None = None,
         omni_model_runtime_args: OmniModelRuntimeConfig | None = None,
-        wrapped_modules: Mapping[str, Any] | None = None,
     ) -> None:
         self.model = model
         self.module_runtimes = dict(module_runtimes or {})
-        # DDP / LoRA wrappers, keyed by module name. :class:`OmniModel` holds only
-        # the bare :class:`PretrainedOmniModule` it can validate, but a node must
-        # still be called through its wrapper (DDP syncs gradients from its own
-        # ``forward``).
-        self._wrapped_modules = dict(wrapped_modules or {})
         self._module_parallel_state_names = set(module_parallel_state_names or ())
         self.omni_model_runtime_args = omni_model_runtime_args
         self._step_profiler: GraphProfiler | None = None
@@ -155,6 +154,7 @@ class OmniModelRuntime:
         from ..omni_module.omni_module_runtime import ModuleRuntime
 
         omni_config = omni_model_runtime_args.to_hf_config()
+        omni_config.load_checkpoint_sidecars(omni_model_runtime_args.resolved_model_path)
         module_runtime_args = omni_model_runtime_args.modules
         module_runtimes: dict[str, ModuleRuntime] = {}
         for name in omni_config.module_names:
@@ -162,6 +162,7 @@ class OmniModelRuntime:
             module_runtime = ModuleRuntime(
                 module_args,
                 module_name=name,
+                module_config=omni_config._module_configs[name],
                 train=train,
                 for_inference=for_inference,
                 global_accelerator=omni_model_runtime_args.accelerator,
@@ -175,15 +176,11 @@ class OmniModelRuntime:
         )
         if not for_inference:
             _reject_lora_that_matched_nothing(module_runtimes, train)
-        wrapped = {name: rt.model for name, rt in module_runtimes.items()}
         runtime = cls(
-            OmniModel(omni_config, {name: unwrap_module_chain(module) for name, module in wrapped.items()}),
+            OmniModel(omni_config, {name: rt.omni_module for name, rt in module_runtimes.items()}),
             module_runtimes=module_runtimes,
             module_parallel_state_names=[name for name in module_runtimes if is_parallel_state_registered(name)],
             omni_model_runtime_args=omni_model_runtime_args,
-            wrapped_modules={
-                name: module for name, module in wrapped.items() if module is not unwrap_module_chain(module)
-            },
         )
         runtime._parallelize_composed_model(for_inference=for_inference)
         return runtime
@@ -351,7 +348,7 @@ class OmniModelRuntime:
         runner = TrainNodeRunner(profiler=profiler, scope_fn=self.module_context)
 
         def run_node(module: Any, node: Any, batch: dict[str, Any]) -> None:
-            runner(self._wrapped_modules.get(node.module, module), node, batch)
+            runner(self._module_to_call(node.module), node, batch)
 
         return self.model(batch, node_runner=run_node)
 
@@ -373,7 +370,7 @@ class OmniModelRuntime:
         profiler = profiler if profiler is not None else self._step_profiler
         model = self.model
         ctx: dict[str, Any] = request
-        modules = {name: self._runtime_module(name) for name in model._module_names}
+        modules = {name: self._module_to_call(name) for name in model._module_names}
         generation_kwargs = model.resolve_generation_kwargs(generation_kwargs)
         max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
         total_steps = 0
@@ -419,9 +416,10 @@ class OmniModelRuntime:
         if profiler is not None and len(generated) > before:
             profiler.record(f"{label}:{generated[-1]['type']}")
 
-    def _runtime_module(self, name: str) -> Any:
-        """Module ``name`` as its runtime built it: the wrapper when there is one."""
-        return self._wrapped_modules.get(name, self.model.modules_dict[name])
+    def _module_to_call(self, name: str) -> Any:
+        """Module ``name`` as its runtime wrapped it, else the bare module :class:`OmniModel` holds."""
+        module_runtime = self.module_runtimes.get(name)
+        return module_runtime.model if module_runtime is not None else self.model.modules_dict[name]
 
     def named_omni_modules(self) -> Iterator[tuple[str, Any]]:
         """Yield ``(name, BaseMixin)`` for every graph participant (unwraps wrappers)."""
@@ -463,7 +461,7 @@ class OmniModelRuntime:
             "max_shard_size": max_shard_size,
         }
         for name in model._module_names:
-            module = self._runtime_module(name)
+            module = self._module_to_call(name)
             save_module_subdirectory(
                 name,
                 module,

@@ -19,6 +19,7 @@ base build sequence, and that the handful of places a *module* legitimately
 differs from a standalone model are the places that override it.
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -36,7 +37,7 @@ def _unbuilt(model: nn.Module | None = None, **args_fields) -> ModuleRuntime:
     runtime.model = model
     runtime.model_name = "vision_encoder"
     runtime.args = SimpleNamespace(model_path="/tmp/hf-model", lora_config=None, **args_fields)
-    runtime.train = None
+    runtime.train_args = None
     return runtime
 
 
@@ -105,9 +106,9 @@ def test_module_specific_steps_are_overridden(method):
     assert method in vars(ModuleRuntime), f"{method} must state how a module differs"
 
 
-def test_build_model_reads_the_modules_own_directory(monkeypatch):
-    """``config_path`` is inherited from the composed model and points at the omni
-    checkpoint root, whose ``config.json`` is the OmniConfig — not this module."""
+def test_build_model_uses_the_config_the_omni_config_loaded(monkeypatch):
+    """A module never reads its own ``config.json``: the composed OmniConfig loaded
+    it and hands it in. ``model_path`` is only where the weights live."""
     captured = {}
 
     def fake_build_foundation_model(**kwargs):
@@ -127,9 +128,11 @@ def test_build_model_reads_the_modules_own_directory(monkeypatch):
             fsdp_config=SimpleNamespace(mixed_precision=SimpleNamespace(enable=False)),
         ),
     )
+    runtime.module_config = SimpleNamespace(model_type="fake")
     runtime._build_model()
 
-    assert captured["config_path"] == "/tmp/hf-model"
+    assert captured["config_path"] is runtime.module_config
+    assert captured["weights_path"] == "/tmp/hf-model"
 
 
 # The base declares these as class attributes defaulting to ``None``, so a test
@@ -180,6 +183,42 @@ def test_a_trainable_module_does_get_a_checkpoint_manager(monkeypatch):
 
     assert runtime.checkpoint == "manager"
     assert built == [runtime]
+
+
+def test_the_real_checkpoint_manager_reads_the_modules_train_args():
+    """The base manager reads ``runtime.train_args``; a module that stored its
+    training args under another name would resolve it on the wrapped model."""
+    from veomni.models.seed_omni.utils.checkpoint import OmniModuleCheckpointManager
+
+    runtime = _unbuilt(nn.Linear(2, 2), accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="fsdp2")))
+    checkpoint = SimpleNamespace(manager="dcp", load_path=None)
+    runtime.train_args = SimpleNamespace(checkpoint=checkpoint)
+
+    manager = OmniModuleCheckpointManager(runtime)
+
+    assert manager.config is checkpoint
+    assert manager.module_name == "vision_encoder"
+
+
+def test_the_constructor_stores_training_args_where_the_base_reads_them(monkeypatch):
+    for step in (
+        "setup",
+        "_build_model",
+        "_build_model_assets",
+        "_freeze_model_module",
+        "_build_parallelized_model",
+        "_scope_recompute_to_parallel_state",
+        "_build_optimizer",
+        "build_checkpoint",
+    ):
+        monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, **k: None)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+    train = SimpleNamespace(checkpoint=SimpleNamespace(load_path=None))
+    args = SimpleNamespace(accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope="module")))
+
+    runtime = ModuleRuntime(args, "vision_encoder", module_config=SimpleNamespace(), train=train)
+
+    assert vars(runtime)["train_args"] is train
 
 
 def test_a_module_the_lora_config_missed_stays_frozen_instead_of_failing():

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
+from tests.seed_omni.helpers import load_from_omni, save_as_omni
 from veomni.models.seed_omni.modules import (
     OMNI_ACCELERATED_MODEL_REGISTRY,
     OMNI_CONFIG_REGISTRY,
@@ -153,13 +154,10 @@ def test_text_encoder_save_reload_via_registry(tmp_path: Path):
     TextEncoderConfig = OMNI_CONFIG_REGISTRY["qwen3vl_text_encoder"]()
 
     te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16, tie_word_embeddings=True))
-    te.save_pretrained(tmp_path)
-    _save_fake_fast_tokenizer(tmp_path)
+    _save_fake_fast_tokenizer(save_as_omni(tmp_path, "qwen3vl_text_encoder", te))
 
-    rcfg = TextEncoderConfig.from_pretrained(tmp_path)
+    rcfg, te2 = load_from_omni(tmp_path, "qwen3vl_text_encoder")
     assert rcfg.model_type == "qwen3vl_text_encoder"
-
-    te2 = TextEncoder.from_pretrained(tmp_path)
     assert isinstance(te2, TextEncoder)
     assert te2.config.vocab_size == 64
     assert te2.config.hidden_size == 16

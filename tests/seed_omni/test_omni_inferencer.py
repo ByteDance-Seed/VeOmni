@@ -191,6 +191,7 @@ def test_eager_inference_keeps_the_launcher_kernels(tmp_path):
     runtime = ModuleRuntime.__new__(ModuleRuntime)
     runtime.args = args
     runtime.model_name = "fake"
+    runtime.module_config = FakeModuleA.config_class(hidden_size=8)
 
     seen = {}
 

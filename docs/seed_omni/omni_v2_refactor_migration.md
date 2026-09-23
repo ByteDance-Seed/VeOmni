@@ -257,9 +257,13 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
   dataclass init that skips its parents' `__init__`. Such a class needs an explicit
   `__init__(self, **kwargs): super().__init__(**kwargs)`. When mixing with an HF config
   that has no custom init (e.g. `Qwen2Config`), list `OmniModuleConfig` first in the bases.
-- `OmniModel` only accepts bare `PretrainedOmniModule`s. `OmniModelRuntime` keeps
-  DDP / LoRA wrappers aside (`wrapped_modules`) and routes train nodes, generation and save
-  through them.
+- A module is only loaded through the composed model. `OmniConfig` loads every module
+  config (`_module_configs`), and `OmniModelRuntime` hands each `ModuleRuntime` its config
+  as `module_config`; `ModuleRuntime` reads `model_path` only for weights. Tests that
+  round-trip a module save it inside an `OmniModel` (`tests/seed_omni/helpers.py`).
+- `OmniModel` holds each runtime's bare module (`ModuleRuntime.omni_module`); a DDP / LoRA
+  wrapper stays on the `ModuleRuntime`, and `OmniModelRuntime` calls modules through their
+  runtimes for train nodes, generation and export.
 
 ## 4. Mechanical merge recipe (for an agent)
 

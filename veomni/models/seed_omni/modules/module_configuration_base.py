@@ -128,9 +128,7 @@ class OmniModuleConfig(PretrainedConfig):
 
             cls = OMNI_MODEL_REGISTRY[read_model_type(str(pretrained_model_name_or_path))]().config_class
 
-        # ``PreTrainedModel.from_pretrained`` asks for ``(config, unused_kwargs)``.
-        return_unused_kwargs = kwargs.get("return_unused_kwargs", False)
-        loaded = super().from_pretrained(
+        hf_config = super().from_pretrained(
             pretrained_model_name_or_path,
             cache_dir=cache_dir,
             force_download=force_download,
@@ -139,7 +137,6 @@ class OmniModuleConfig(PretrainedConfig):
             revision=revision,
             **kwargs,
         )
-        hf_config, unused_kwargs = loaded if return_unused_kwargs else (loaded, None)
         if not isinstance(hf_config, OmniModuleConfig):
             raise TypeError(
                 f"Module config loaded from {pretrained_model_name_or_path} is a "
@@ -151,7 +148,7 @@ class OmniModuleConfig(PretrainedConfig):
             ops_implementation=entry_ops,
             base_ops_implementation=base_ops,
         )
-        return (hf_config, unused_kwargs) if return_unused_kwargs else hf_config
+        return hf_config
 
     def _apply_composed_overwrites(
         self,

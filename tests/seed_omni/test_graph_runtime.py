@@ -179,23 +179,6 @@ def test_omni_model_runtime_forward_enters_composed_model_call(monkeypatch: pyte
     assert called and called[0] == id(model)
 
 
-def test_runtime_calls_each_node_through_its_wrapper():
-    """``OmniModel`` holds the bare module; DDP still has to see the call."""
-    edges = [{"from": "module_A", "to": "module_C"}, {"from": "module_C", "to": "end"}]
-    modules = {name: _FakeOmniModule(name) for name in ("module_A", "module_C")}
-    wrapped_a = _DdpStyleWrapper(modules["module_A"])
-    runtime = OmniModelRuntime(_omni_model(edges, modules), wrapped_modules={"module_A": wrapped_a})
-
-    batch: dict = {"trace": []}
-    runtime.forward(batch)
-    assert batch["trace"] == ["module_A.forward", "module_C.forward"]
-    assert wrapped_a.calls == 1
-
-    assert runtime._runtime_module("module_A") is wrapped_a
-    assert runtime._runtime_module("module_C") is modules["module_C"]
-    assert dict(runtime.named_omni_modules())["module_A"] is modules["module_A"]
-
-
 def test_graph_profiler_can_append_request_peak_memory(monkeypatch):
     class _FakeDevice:
         def __init__(self):

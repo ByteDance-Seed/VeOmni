@@ -113,7 +113,7 @@ def load_audio(audio: AudioInput, audio_sampling_rate: int | None = None) -> tup
     return _to_mono_float32(samples, channel_axis=1), int(rate)
 
 
-def _decode_via_audioread(source: "str | BytesIO") -> tuple[np.ndarray, int]:
+def _decode_via_audioread(source: str | BytesIO) -> tuple[np.ndarray, int]:
     """Second-chance decode for a container libsndfile does not know.
 
     ``audioread`` picks among ffmpeg / gstreamer / coreaudio, so which one runs

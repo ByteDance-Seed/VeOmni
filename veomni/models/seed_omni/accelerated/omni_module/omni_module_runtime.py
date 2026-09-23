@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from .....arguments.arguments_types import AcceleratorConfig
     from .....arguments.omni_arguments_types import OmniModuleRuntimeArguments, OmniTrainingArguments
     from .....trainer.callbacks import TrainerState
+    from ...modules.module_configuration_base import OmniModuleConfig
 
 
 logger = logging.get_logger(__name__)
@@ -65,8 +66,9 @@ class ModuleRuntime(VeOmniModelRuntime):
     every one of those reads — so what is written here is only what a *module*
     does differently from a standalone model:
 
-    * its config lives beside its weights, not at the composed checkpoint root
-      (:meth:`_build_model`);
+    * its config is not read here: the composed :class:`OmniConfig` loads it
+      (``_module_configs[name]``) and hands it in as ``module_config``, so a
+      module is never loaded on its own (:meth:`_build_model`);
     * its preprocessor is bound onto the model itself rather than held by the
       runtime, because the graph calls the module and the module needs it
       (:meth:`_build_model_assets`);
@@ -102,7 +104,7 @@ class ModuleRuntime(VeOmniModelRuntime):
     _global_accelerator: Optional["AcceleratorConfig"] = None
 
     args: "OmniModuleRuntimeArguments"
-    train: Optional["OmniTrainingArguments"] = None
+    train_args: Optional["OmniTrainingArguments"] = None
     _has_trainable_parameters: Optional[bool] = None
 
     def __init__(
@@ -110,13 +112,15 @@ class ModuleRuntime(VeOmniModelRuntime):
         args: "OmniModuleRuntimeArguments",
         module_name: str,
         *,
+        module_config: "OmniModuleConfig",
         train: Optional["OmniTrainingArguments"] = None,
         for_inference: bool = False,
         global_accelerator: Optional["AcceleratorConfig"] = None,
     ):
         self.args = args
         self.model_name = module_name
-        self.train = train
+        self.module_config = module_config
+        self.train_args = train
         self.optimizer = None
         self.lr_scheduler = None
         self._defer_parallelize = False
@@ -171,6 +175,15 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         return self.model_name
 
+    @property
+    def omni_module(self) -> nn.Module:
+        """The bare module this runtime built, for :class:`OmniModel` to hold.
+
+        ``self.model`` may be a DDP / LoRA wrapper around it; that wrapper stays
+        on the runtime side and is what :class:`OmniModelRuntime` calls.
+        """
+        return unwrap_module(self.model)
+
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Run this module's forward inside its own ``ParallelState``.
 
@@ -204,17 +217,17 @@ class ModuleRuntime(VeOmniModelRuntime):
         assert args.accelerator.fsdp_config.fsdp_mode == "eager"
         from .....ops import apply_ops_config
         from ....auto import bind_ops_to_modeling
-        from ... import OMNI_MODEL_REGISTRY, read_model_type
+        from ... import OMNI_MODEL_REGISTRY
 
         model_path = args.model_path
-        overrides = dict(args.model_config or {})
-        model_type = read_model_type(model_path)
+        model_type = self.module_config.model_type
         cls = OMNI_MODEL_REGISTRY[model_type]()
+        load_kwargs = {}
         ops = args.ops_implementation
         if ops is not None:
             apply_ops_config(ops)
             if ops.attn_implementation is not None:
-                overrides.setdefault("attn_implementation", ops.attn_implementation)
+                load_kwargs["attn_implementation"] = ops.attn_implementation
         # Before construction: slots read inside ``__init__`` need the binding.
         bind_ops_to_modeling(cls)
         if dist.is_initialized():
@@ -227,9 +240,10 @@ class ModuleRuntime(VeOmniModelRuntime):
         )
         self.model = cls.from_pretrained(
             model_path,
+            config=self.module_config,
             torch_dtype=torch.bfloat16,
             device_map=device_map,
-            **overrides,
+            **load_kwargs,
         ).eval()
         self.model_config = self.model.config
         self._build_model_assets()
@@ -237,12 +251,11 @@ class ModuleRuntime(VeOmniModelRuntime):
     # ── Build (model, assets, parallelize) ────────────────────────────────────
 
     def _build_model(self) -> None:
-        """Meta-init this module's sub-model from the config beside its weights.
+        """Meta-init this module's sub-model from ``module_config``.
 
-        Unlike a standalone model, a module reads ``model_path`` rather than
-        ``config_path``: the latter is inherited from the composed model's
-        arguments and points at the Omni checkpoint *root*, whose ``config.json``
-        is the :class:`OmniConfig`, not this module's architecture.
+        The config comes from the composed :class:`OmniConfig`, which already
+        applied this module's ``model_config`` overwrites; ``model_path`` is
+        read only for the weights.
         """
         args = self.args
         logger.info_rank0(f"ModuleRuntime '{self.module_name}': build module model")
@@ -250,12 +263,11 @@ class ModuleRuntime(VeOmniModelRuntime):
 
         acc = self.mesh_accelerator
         self.model = build_foundation_model(
-            config_path=args.model_path,
+            config_path=self.module_config,
             weights_path=args.model_path,
             torch_dtype="float32" if acc.fsdp_config.mixed_precision.enable else "bfloat16",
             init_device=acc.init_device,
             ops_implementation=args.ops_implementation,
-            config_kwargs=args.model_config,
         )
         self.model_config = self.model.config
 
@@ -464,7 +476,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         :meth:`build_checkpoint` installs no checkpoint manager at all, so nothing
         would ever write its weights and it must load the released HF ones.
         """
-        load_path = self.train.checkpoint.load_path if self.train is not None else None
+        load_path = self.train_args.checkpoint.load_path if self.train_args is not None else None
         if not should_skip_hf_weight_load(load_path, self.args.lora_config):
             return False
 
@@ -615,18 +627,15 @@ class ModuleRuntime(VeOmniModelRuntime):
 
         ``stage`` is part of the base signature; the omni path reads
         ``state.stage``, which the orchestrator sets before every save.
+
+        Not deduplicated here: ``ckpt.last_saved_step`` counts DCP saves, so a
+        step whose DCP was written would skip its HF export. Same-step HF
+        dedupe is :class:`~veomni.trainer.callbacks.omni_callbacks.OmniModuleHfCallback`'s,
+        which tracks HF saves on their own.
         """
         del stage
         ckpt = self.checkpoint
         if ckpt is None:
-            return
-        # Only epoch_end / train_end can revisit a global_step that step_end already
-        # wrote; step_end is never deduplicated because DCP and HF share one counter.
-        if state.stage in ("epoch_end", "train_end") and ckpt.last_saved_step == state.global_step:
-            logger.info_rank0(
-                f"Skipping duplicate hf save for module '{self.module_name}' at {state.stage} "
-                f"(global_step {state.global_step} already saved)."
-            )
             return
         ckpt.save_hf_or_lora(state)
 
