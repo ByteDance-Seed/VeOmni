@@ -351,6 +351,7 @@ def mlu_group_gemm_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    assume_distinct_experts: bool = False,  # intentionally unused; see the del below
 ):
     """Triton grouped-gemm fused MoE forward pass.
 
@@ -361,7 +362,18 @@ def mlu_group_gemm_fused_moe_forward(
     pre-activations (``gate.clamp(max=L)``, ``up.clamp(min=-L, max=L)``).
     ``None`` disables the clamp (default, zero overhead — used by every legacy
     MoE model).
+
+    ``assume_distinct_experts`` is intentionally unused here; see below.
     """
+    # ``assume_distinct_experts`` only tightens the grouped-GEMM ``max_M``
+    # launch bound in the Triton backend (see ``compute_max_expert_tokens`` in
+    # ``group_gemm.py``). The MLU group GEMM derives per-expert work from a
+    # cumsum of expert counts, so there is no launch-grid bound to tighten and
+    # the flag is a no-op here. It stays in the signature only so the unified
+    # ``fused_moe_forward`` dispatch and the OpSlot adapter can forward it to
+    # any backend uniformly.
+    del assume_distinct_experts
+
     if get_parallel_state().ep_enabled:
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
         # preprocess, permute token for ep
