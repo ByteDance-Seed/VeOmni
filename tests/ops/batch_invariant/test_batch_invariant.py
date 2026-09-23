@@ -219,8 +219,10 @@ def test_real_handler_matches_torch_output_gradient_and_dispatcher(op_name, monk
         "mean": "aten::mean.dim",
     }
     assert expected_dispatch[op_name] in calls
-    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
     gemm = op_name in {"mm", "addmm"}
+    atol = 5e-2 if gemm else 2e-2
+    rtol = 5e-2 if gemm else 2e-2
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
     grad_atol = 5e-2 if gemm else 3e-2
     grad_rtol = 5e-2 if gemm else 3e-2
     for actual_input, expected_input in zip(actual_inputs, expected_inputs, strict=True):

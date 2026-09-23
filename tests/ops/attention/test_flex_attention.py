@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import importlib.util
 from types import SimpleNamespace
 
 import pytest
@@ -43,6 +44,9 @@ from tests.ops.tol import (
 )
 from veomni.ops.kernels.attention.standard import flex as flex_backend
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+
+
+_FLEX_COMPILE_AVAILABLE = importlib.util.find_spec("triton") is not None
 
 
 class _FakeAttentionModule(nn.Module):
@@ -99,6 +103,10 @@ def _causal_block_mask(sequence_length: int, device: torch.device):
     )
 
 
+@pytest.mark.skipif(
+    not _FLEX_COMPILE_AVAILABLE,
+    reason="HF FlexAttention compiles through inductor, which needs triton",
+)
 def test_flex_attention_cpu_forward_uses_block_mask_and_hf_layout():
     sequence_length = 17
     query = torch.randn(2, 4, sequence_length, 8)
