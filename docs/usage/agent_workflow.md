@@ -52,12 +52,18 @@ still works by invoking `/skill-name` explicitly.
 | "Analyze this Chrome trace" | `/veomni-profile` |
 | "Submit the current branch as a PR" | `/create-pr` |
 
-`veomni-new-model` inspects the actual implementation to select Transformers,
-Diffusers, or other-framework integration, including component-level routing for
-mixed systems. Weight conversion, training, resume, and hardware checks apply
-according to the requested behavior and the actual adaptations. Source analysis,
-configuration, and task-specific scripts are handled directly by the agent;
-there are no mandatory analysis tools or report templates.
+`veomni-new-model` carries the migration workflow in its `SKILL.md`: source
+analysis, modeling/registration, weight loading or conversion, real-data training,
+validation/resume, and reproducible delivery. By default it covers pretrained
+initialization, a short real-data training run, and fresh-process resume; an
+explicit inference-only or partial request narrows those checks.
+
+The agent derives configs, mappings, and model-specific scripts from actual
+source and current VeOmni interfaces. Compatible checkpoints load directly;
+necessary converters belong in the project's model-conversion directory.
+Auxiliary skill tools may be added for demonstrated repeated needs, without
+requiring generic analyzers or report templates. Backend claims require actual
+execution, and missing weights or hardware remain explicit validation blockers.
 
 ## Directory Structure
 
