@@ -66,29 +66,44 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         self._configure_packed_attention(config._attn_implementation)
 
     def _configure_packed_attention(self, attn_implementation):
-        """Configure this instance's packed kernels without changing single-sample dispatch."""
-        from .....ops.kernels.attention.flash import _load_veomni_local_flash_kernel
-
+        """Validate packed attention; FlashAttention loads only on the first packed forward."""
         if (
             self.config.latents_dim != 24
             or self.config.audio_latents_dim != 32
             or tuple(self.config.patch_size) != (1, 2, 2)
         ):
             raise ValueError("H3 remove-padding requires the native 24-video/32-audio patch geometry.")
-        if attn_implementation in (None, "eager", "sdpa"):
-            kernel = None
-        elif attn_implementation in ("veomni_flash_attention_2_with_sp", "veomni_flash_attention_3_with_sp"):
-            kernel = _load_veomni_local_flash_kernel(attn_implementation).flash_attn_varlen_func
-        else:
+        if attn_implementation not in (
+            None,
+            "eager",
+            "sdpa",
+            "veomni_flash_attention_2_with_sp",
+            "veomni_flash_attention_3_with_sp",
+        ):
             raise ValueError(f"Unsupported H3 remove-padding backend: {attn_implementation}")
+        self._packed_attn_implementation = attn_implementation
         for module in self.dit.modules():
             if isinstance(module, MiniMaxH3Attention):
-                module.packed_sdpa = kernel is None
-                module.varlen_kernel = kernel
+                module.packed_sdpa = attn_implementation in (None, "eager", "sdpa")
+                module.varlen_kernel = None
+
+    def _load_packed_attention_kernel(self):
+        implementation = self._packed_attn_implementation
+        if implementation in (None, "eager", "sdpa"):
+            return
+        attention_modules = [module for module in self.dit.modules() if isinstance(module, MiniMaxH3Attention)]
+        if all(module.varlen_kernel is not None for module in attention_modules):
+            return
+        from .....ops.kernels.attention.flash import _load_veomni_local_flash_kernel
+
+        kernel = _load_veomni_local_flash_kernel(implementation).flash_attn_varlen_func
+        for module in attention_modules:
+            module.varlen_kernel = kernel
 
     def _forward_batch(self, samples):
         if any(sample.get("use_gradient_checkpointing_offload", False) for sample in samples):
             raise ValueError("H3 multi-sample packing does not support checkpoint offload.")
+        self._load_packed_attention_kernel()
         packed_inputs, row_counts = pack_samples(samples)
         video, audio = self.dit(**packed_inputs, packed_batch=True)
         video_parts = video.split([v for v, _ in row_counts])

@@ -404,6 +404,77 @@ def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(mon
     assert len(calls) == 4 and calls[2] == calls[3] and len(calls[2]) == 3
 
 
+def test_flash_backend_defers_packed_kernel_until_multisample_forward(monkeypatch):
+    import sys
+
+    from transformers import modeling_flash_attention_utils as hf_flash
+
+    from veomni.ops.kernels.attention import flash
+
+    loads = []
+
+    def unavailable(name):
+        loads.append(name)
+        raise ImportError("flash_attn unavailable")
+
+    def npu_attention(q, k, v, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None, max_seqlen_k=None):
+        raise AssertionError("construction must not run NPU attention")
+
+    # Mirror Ascend: Transformers resolves its native NPU FA before VeOmni's loader.
+    monkeypatch.setattr(flash, "_load_veomni_local_flash_kernel", unavailable)
+    monkeypatch.setattr(hf_flash, "is_flash_attn_2_available", lambda: False)
+    monkeypatch.setattr(hf_flash, "is_torch_npu_available", lambda: True)
+    for name in (
+        "_loaded_implementation",
+        "_flash_fn",
+        "_flash_varlen_fn",
+        "_flash_with_kvcache_fn",
+        "_pad_fn",
+        "_unpad_fn",
+        "_process_flash_kwargs_fn",
+    ):
+        monkeypatch.setattr(hf_flash, name, None if name == "_loaded_implementation" else getattr(hf_flash, name))
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers.integrations.npu_flash_attention",
+        SimpleNamespace(
+            npu_flash_attn_func=npu_attention,
+            npu_flash_attn_varlen_func=npu_attention,
+            npu_flash_attn_with_kvcache=npu_attention,
+        ),
+    )
+    config = tiny_model().config
+    config._attn_implementation = "veomni_flash_attention_2_with_sp"
+    model = MiniMaxH3DiTModel(config)
+    samples = prepare(condition_model(), [raw_sample(3), raw_sample(7)])
+
+    serial(model, samples[:1])
+    assert loads == []
+    with pytest.raises(ImportError, match="flash_attn unavailable"):
+        model(**batch(samples))
+    assert loads == ["veomni_flash_attention_2_with_sp"]
+
+
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_packed_sdpa_slices_with_host_bounds(monkeypatch, checkpointing):
+    sdpa = minimax_h3_dit._sdpa_varlen_attention
+    bounds = []
+
+    def record(q, k, v, cu_seqlens, softmax_scale, compatibility_mode=False):
+        bounds.append(cu_seqlens)
+        return sdpa(q, k, v, cu_seqlens, softmax_scale, compatibility_mode)
+
+    monkeypatch.setattr(minimax_h3_dit, "_sdpa_varlen_attention", record)
+    raws = [raw_sample(3), raw_sample(7)]
+    for row in raws:
+        row["use_gradient_checkpointing"] = checkpointing
+    out = tiny_model()(**batch(prepare(condition_model(), raws)))
+    sum(out.loss.values()).backward()
+
+    assert len(bounds) == 4 + 2 * checkpointing
+    assert all(type(bound) is tuple and all(type(value) is int for value in bound) for bound in bounds)
+
+
 @pytest.mark.parametrize("task", ["fl2va", "ref2va"])
 def test_refiner_preserves_linear_row_counts_with_main_dit_packed(task):
     model = tiny_model()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -89,13 +90,20 @@ def _modulate_gate(x, gate, other, indices):
     return (x + gate.index_select(0, indices) * other).to(x.dtype)
 
 
+class _PackedBounds(NamedTuple):
+    """Packed segment bounds as device ``int32`` tensor and host integers."""
+
+    device: torch.Tensor
+    host: tuple[int, ...]
+
+
 def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale, compatibility_mode=False):
     # Zero uncovered SP rows so discarded outputs cannot poison parameter gradients.
     out = torch.zeros_like(q)
     # Host-side segment bounds: the DiT / token-refiner entries convert the
     # cu_seqlens tensor once per forward and pass a tuple. Tensor fallback
     # keeps any external caller working (paying one sync).
-    bounds = tuple(cu_seqlens) if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
+    bounds = tuple(cu_seqlens.tolist()) if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
     for start, stop in zip(bounds[:-1], bounds[1:]):
         if stop == start:
             continue
@@ -206,15 +214,17 @@ class MiniMaxH3Attention(nn.Module):
             if rope_cos is not None:
                 q = _apply_rope(q, rope_cos, rope_sin)
                 k = _apply_rope(k, rope_cos, rope_sin)
-            packed_attention = isinstance(cu_seqlens, torch.Tensor)
+            packed_attention = isinstance(cu_seqlens, _PackedBounds)
+            if packed_attention and not self.packed_sdpa and self.varlen_kernel is None:
+                raise RuntimeError("H3 packed FlashAttention kernel was not loaded before the packed forward.")
             if not packed_attention or self.varlen_kernel is None:
                 out = _sdpa_varlen_attention(
                     q,
                     k,
                     v,
-                    cu_seqlens=cu_seqlens,
+                    cu_seqlens=cu_seqlens.host if packed_attention else cu_seqlens,
                     softmax_scale=self.softmax_scale,
-                    compatibility_mode=packed_attention and self.packed_sdpa,
+                    compatibility_mode=packed_attention,
                 )
             else:
                 if q.dtype not in (torch.float16, torch.bfloat16):
@@ -223,8 +233,8 @@ class MiniMaxH3Attention(nn.Module):
                     q.contiguous(),
                     k.contiguous(),
                     v.contiguous(),
-                    cu_seqlens_q=cu_seqlens,
-                    cu_seqlens_k=cu_seqlens,
+                    cu_seqlens_q=cu_seqlens.device,
+                    cu_seqlens_k=cu_seqlens.device,
                     max_seqlen_q=max_seqlen,
                     max_seqlen_k=max_seqlen,
                     softmax_scale=self.softmax_scale,
@@ -307,8 +317,8 @@ class MiniMaxH3TokenRefiner(nn.Module):
         self.final_norm = _norm(hidden_size, eps=final_norm_eps)
 
     def forward(self, x, *, cu_seqlens, max_seqlen, sample_local=False):
-        if sample_local and len(cu_seqlens) > 2:
-            bounds = cu_seqlens.tolist() if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
+        if sample_local and isinstance(cu_seqlens, _PackedBounds) and len(cu_seqlens.host) > 2:
+            bounds = cu_seqlens.host
             segments = [(start, stop) for start, stop in zip(bounds, bounds[1:]) if stop > start]
             if len(segments) > 1:
                 # Small BF16 refiner GEMMs can change rounding with the row count.
@@ -317,9 +327,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
                 outputs = []
                 for start, stop in segments:
                     length = stop - start
-                    local_cu = (
-                        cu_seqlens.new_tensor([0, length]) if isinstance(cu_seqlens, torch.Tensor) else (0, length)
-                    )
+                    local_cu = _PackedBounds(cu_seqlens.device.new_tensor([0, length]), (0, length))
                     outputs.append(self.forward(x[start:stop], cu_seqlens=local_cu, max_seqlen=length))
                 return torch.cat(outputs, dim=0)
         for block in self.blocks:
@@ -579,6 +587,9 @@ class MiniMaxH3DiT(nn.Module):
         max_seqlen = int(packed_seq_params["max_seqlen_q"])
         refiner_cu = refiner_packed_seq_params["cu_seqlens_q"].to(torch.int32)
         refiner_max = int(refiner_packed_seq_params["max_seqlen_q"])
+        # Read segment bounds once per forward; SDPA loops then slice with host integers.
+        cu_host = tuple(cu_seqlens.tolist())
+        refiner_host = tuple(refiner_cu.tolist())
 
         if x.dim() != 3 or x.shape[0] != 1:
             raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
@@ -607,7 +618,7 @@ class MiniMaxH3DiT(nn.Module):
             img_pos=img_pos.to(device),
             audio_pos=audio_pos.to(device),
             text_pos=text_pos.to(device),
-            refiner_cu_seqlens=refiner_cu.to(device) if packed_batch else tuple(refiner_cu.to(device).tolist()),
+            refiner_cu_seqlens=_PackedBounds(refiner_cu.to(device), refiner_host) if packed_batch else refiner_host,
             refiner_max_seqlen=refiner_max,
             packed_batch=packed_batch,
             seq_len=padded_seq_len,
@@ -634,14 +645,12 @@ class MiniMaxH3DiT(nn.Module):
             inverse_indices = inverse_indices.narrow(0, unit * sp_rank, unit)
 
         hidden = decoder_input
-        cu_seqlens = cu_seqlens.to(device)
-        # Single device→host sync per forward: segment bounds shared across
-        # every block instead of one tolist() per attention module. Bounds stay
+        # Host bounds were read once above and are shared by every block. Bounds stay
         # at the ORIGINAL seq_len: the per-segment SDPA is non-causal, so an
         # extended bound would leak pad keys into the last real rows. Pad rows
         # fall outside every segment, have zero attention output, and are
         # dropped by the index_select below.
-        cu_bounds = cu_seqlens if packed_batch else tuple(cu_seqlens.tolist())
+        cu_bounds = _PackedBounds(cu_seqlens.to(device), cu_host) if packed_batch else cu_host
         block_swap = self._block_swap if self._block_offload_enabled else 0
         for i, block in enumerate(self.blocks):
             if self._block_offload_enabled:

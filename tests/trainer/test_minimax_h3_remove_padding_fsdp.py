@@ -16,8 +16,9 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from ..tools.launch_utils import torchrun
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device, is_nccl_backend
+
+from ..tools.launch_utils import torchrun
 
 
 _WORLD_SIZE = 2
@@ -72,12 +73,13 @@ def _assert_relative_l2(actual, expected, *, label):
 
 
 def _raw_microbatches(rank, *, checkpointing, task):
-    from ..models.test_minimax_h3_remove_padding import raw_sample
     from veomni.models.diffusers.minimax_h3.minimax_h3_core.packed_sequence import (
         build_packed_fl2va,
         build_packed_ref2va,
     )
     from veomni.trainer.dit_trainer import DiTDataCollator
+
+    from ..models.test_minimax_h3_remove_padding import raw_sample
 
     generator = torch.Generator().manual_seed(3000 + rank)
     batches = []
@@ -134,7 +136,6 @@ def _run_fsdp_regression(*, step_driver, checkpointing, attention, task):
     from torch.distributed.tensor import DTensor
     from torch.func import functional_call
 
-    from ..models.test_minimax_h3_remove_padding import condition_model, tiny_model
     from veomni.arguments import MixedPrecisionConfig
     from veomni.distributed.parallel_state import (
         clear_parallel_state,
@@ -156,6 +157,8 @@ def _run_fsdp_regression(*, step_driver, checkpointing, attention, task):
         DiTTrainingArguments,
         VeOmniDiTArguments,
     )
+
+    from ..models.test_minimax_h3_remove_padding import condition_model, tiny_model
 
     assert IS_CUDA_AVAILABLE
     assert dist.get_world_size() == _WORLD_SIZE
