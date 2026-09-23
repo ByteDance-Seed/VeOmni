@@ -93,6 +93,7 @@ class _TinyLossModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.tensor(1.0))
+        self.parallel_state = object()
 
     def forward(self, x, use_cache=False):
         return SimpleNamespace(loss=(self.weight * x).sum())
@@ -889,8 +890,8 @@ def test_dpo_forward_backward_scopes_channel_loss_to_policy_model(monkeypatch):
     _stub_parallel_state(monkeypatch)
     cfg = ChannelLossConfig(enable=True, interval=1)
     state = TrainerState(global_step=1)
-    policy_model = object()
-    reference_model = object()
+    policy_model = SimpleNamespace(parallel_state=object())
+    reference_model = SimpleNamespace(parallel_state=object())
     base = SimpleNamespace(
         args=SimpleNamespace(
             train=SimpleNamespace(channel_loss=cfg, enable_batch_invariant_mode=False),
@@ -916,6 +917,7 @@ def test_dpo_forward_backward_scopes_channel_loss_to_policy_model(monkeypatch):
     base.preforward = preforward
     trainer = object.__new__(TextDPOTrainer)
     trainer.base = base
+    trainer.policy_model = policy_model
     trainer.reference_model = reference_model
     forward_calls = []
 
@@ -960,6 +962,7 @@ def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
             super().__init__()
             self.scale = torch.nn.Parameter(torch.tensor(1.0))
             self.loss_calls = 0
+            self.parallel_state = object()
 
         def loss_function(self, logits, labels, vocab_size, **kwargs):
             self.loss_calls += 1
@@ -995,20 +998,16 @@ def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
         preforward=lambda micro_batch: micro_batch,
     )
     base.channel_loss_callback = ChannelLossCallback(base)
-    step_begin_args = {}
-
-    def on_step_begin(micro_batches=None, **kwargs):
-        step_begin_args["source_repeat"] = kwargs.get("source_repeat", 1)
-        base.channel_loss_callback.on_step_begin(
-            state,
-            micro_batches=micro_batches,
-            **kwargs,
-        )
-
-    base.on_step_begin = on_step_begin
     trainer = object.__new__(TextDPOTrainer)
     trainer.base = base
+    trainer.policy_model = policy_model
     trainer.reference_model = reference_model
+    trainer.state = state
+    trainer.channel_loss_callback = base.channel_loss_callback
+    base._callbacks = [base.channel_loss_callback]
+    base.on_step_begin = lambda micro_batches=None, **kwargs: BaseTrainer.on_step_begin(
+        base, micro_batches=micro_batches, **kwargs
+    )
     trainer.post_forward = SimpleNamespace(compute_seqlens_func=lambda micro_batch: [2, 2, 2, 2])
     trainer.sp_enabled = False
     micro_batch = {
@@ -1022,7 +1021,6 @@ def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
     try:
         base.channel_loss_callback.computer.install(policy_model)
         TextDPOTrainer.on_step_begin(trainer, micro_batches=[micro_batch])
-        assert step_begin_args == {"source_repeat": 2}
         assert base.channel_loss_callback.computer._per_mb_source_ids == [[3, 3, 4, 4]]
         TextDPOTrainer.forward_backward_step(trainer, micro_batch)
 

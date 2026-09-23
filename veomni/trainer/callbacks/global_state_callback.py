@@ -21,25 +21,30 @@ the part a job may want to replace or drop on its own: an Energon or
 multisource-sampler state is large, and resuming weights onto a different
 dataset means keeping ``extra_state/`` while discarding ``loader/``.
 
+"the rng" spans three streams: the CPU default generator, the accelerator
+default generator (diffusion condition models sample noise and timesteps from
+it), and any per-run ``torch.Generator`` a condition model owns. Restoring only
+the first resumes a different noise stream than an uninterrupted run.
+
 This callback also writes ``checkpoint_manifest.json``, which records that the
-files above are down and names the modules the job saved. It says nothing about
-the model state: that is covered by DCP's own ``.metadata``, one per directory,
-and a step counts as resumable only when both are there. Model weights,
-optimizer, HF/LoRA export and the tokenizer/config sidecars are scheduled by
+files above are down. It says nothing about the model state: that is covered by
+DCP's own ``.metadata``, one per directory under ``model/``, and a step counts
+as resumable only when both halves are there. Model weights, optimizer, HF/LoRA
+export and the tokenizer/config sidecars are scheduled by
 :mod:`~veomni.trainer.callbacks.checkpoint_callback`, on the same cadences.
 
 On-disk contract: ``docs/usage/checkpoint.md``.
 """
 
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
 
 from ...checkpoint import layout
 from ...utils import helper
-from ...utils.device import get_device_type
+from ...utils.device import get_device_rng_state, get_device_type, set_device_rng_state
 from ...utils.dist_utils import raise_if_any_rank_failed
 from .base import Callback, TrainerState
 
@@ -133,17 +138,8 @@ class GlobalStateCallback(Callback):
             "environ_meter": self.trainer.environ_meter.state_dict(),
             "channel_loss_callback": channel_loss_state,
             "torch_rng_state": torch.get_rng_state(),
+            "device_rng_state": get_device_rng_state(),
         }
-
-    def module_names(self) -> List[str]:
-        """Names of the models this job checkpoints, for the manifest.
-
-        Empty for a single-model job. A multi-module trainer overrides this to
-        list every module it saved.
-        """
-        checkpoint = getattr(self.trainer, "checkpoint", None)
-        name = getattr(checkpoint, "module_name", "")
-        return [name] if name else []
 
     def save_global_state(self, state: TrainerState) -> None:
         """Clear the step's manifest, write this rank's cursor files, write it back.
@@ -199,8 +195,9 @@ class GlobalStateCallback(Callback):
         raise_if_any_rank_failed(write_error, "writing the trainer state")
 
         # Every rank's cursor is down by now, so the trainer-level half of the
-        # step can be recorded. It names the modules so that whoever validates
-        # the step can find their markers without walking the tree.
+        # step can be recorded. Model completeness is DCP's ``.metadata`` under
+        # ``model/``, discovered from the filesystem — this file does not list
+        # modules.
         manifest_error: Optional[Exception] = None
         if self.rank == 0:
             try:
@@ -208,7 +205,6 @@ class GlobalStateCallback(Callback):
                     step_root,
                     global_step=state.global_step,
                     world_size=args.train.world_size,
-                    modules=self.module_names(),
                 )
             except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
                 logger.error(f"[RANK {self.rank}] failed to write the manifest under {step_root}", exc_info=True)
@@ -235,7 +231,7 @@ class GlobalStateCallback(Callback):
         if os.path.exists(loader_file):
             merged.update(torch.load(loader_file, map_location="cpu", weights_only=False))
         else:
-            logger.warning_rank0(f"No dataloader cursor at {loader_file}; the dataloader restarts from its beginning.")
+            logger.warning(f"No dataloader cursor at {loader_file}; the dataloader restarts from its beginning.")
         return merged
 
     def load_global_state(self) -> Optional[Dict[str, Any]]:
@@ -292,6 +288,9 @@ class GlobalStateCallback(Callback):
         rng_state = global_state.get("torch_rng_state")
         if rng_state is not None:
             torch.set_rng_state(rng_state)
+        # ``.get`` keeps checkpoints written before these fields existed loadable;
+        # the device namespace may also not support RNG state at all.
+        set_device_rng_state(global_state.get("device_rng_state"))
         if self.trainer.start_step == 0 and self.trainer.train_dataloader is not None:
             iter(self.trainer.train_dataloader)
 

@@ -27,10 +27,15 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
 from ..arguments import MixedPrecisionConfig
+from ..arguments.arguments_types import validate_low_precision_reduce_scatter_comm
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
+from .fsdp2.reduce_scatter import (
+    ReduceScatterTransportPolicy,
+    register_fp32_reduce_scatter_with_low_precision_transport,
+)
 from .parallel_plan import ParallelPlan, get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
 from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_runtime
@@ -310,6 +315,20 @@ def _can_shard_extra_parallel_dim0(
     return True
 
 
+def _configure_fsdp_gradient_reduction(
+    module: FSDPModule,
+    *,
+    gradient_divide_factor: float,
+    use_low_precision_transport: bool,
+    transport_reduction_scales: dict[nn.Module, float],
+) -> None:
+    if use_low_precision_transport:
+        transport_reduction_scales[module] = 1.0 / gradient_divide_factor
+    else:
+        # Singleton, cross-node and unknown-placement groups keep native scaling.
+        module.set_gradient_divide_factor(gradient_divide_factor)
+
+
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str] = None,
@@ -317,6 +336,7 @@ def parallelize_model_fsdp2(
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
+    low_precision_reduce_scatter_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
@@ -345,6 +365,15 @@ def parallelize_model_fsdp2(
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
     parallel_state = get_parallel_state()
+
+    use_low_precision_transport = validate_low_precision_reduce_scatter_comm(
+        low_precision_reduce_scatter_comm, mixed_precision
+    )
+    if use_low_precision_transport:
+        if get_device_type() != "cuda":
+            raise RuntimeError("Low-precision ReduceScatter transport is only supported on CUDA/NCCL.")
+    elif low_precision_reduce_scatter_comm:
+        logger.info_rank0("Parameter dtype matches reduce dtype; using the native PyTorch collective.")
 
     model_no_split_modules = getattr(model, "_no_split_modules", None) or []
     target_classes = set(model_no_split_modules) | set(basic_modules or [])
@@ -667,6 +696,18 @@ def parallelize_model_fsdp2(
     #   e.g. sorted_fqn_list = ['decoder.embed_tokens', 'embed_tokens', 'decoder']
     sorted_fqn_list = sort_fqn_by_submodule_first(list(layer_pairs.keys()))
     layer_pairs_list = [(fqn, layer_pairs[fqn]) for fqn in sorted_fqn_list]
+    if use_low_precision_transport:
+        transport_reduction_scales = {}
+        transport_policy = ReduceScatterTransportPolicy()
+        fsdp_transport_enabled = transport_policy.can_use(parallel_state.fsdp_mesh)
+        extra_parallel_transport_enabled = {
+            para: transport_policy.can_use(para_kwargs["mesh"])
+            for para, para_kwargs in extra_parallel_fsdp_kwargs.items()
+            if para_kwargs is not None
+        }
+        fsdp_reduction_scale = 1.0 / parallel_state.fsdp_mesh.size()
+    else:
+        transport_reduction_scales = None
 
     for layer_fqn, (layer_mod, extra_parallel_mod) in layer_pairs_list:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
@@ -703,9 +744,15 @@ def parallelize_model_fsdp2(
                 if IS_NPU_AVAILABLE:
                     # NPU is using torch 2.7
                     _para_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
-                else:
-                    # from torch 2.8
+                elif transport_reduction_scales is None:
                     _para_mod.set_gradient_divide_factor(gradient_divide_factor)
+                else:
+                    _configure_fsdp_gradient_reduction(
+                        _para_mod,
+                        gradient_divide_factor=gradient_divide_factor,
+                        use_low_precision_transport=extra_parallel_transport_enabled[para],
+                        transport_reduction_scales=transport_reduction_scales,
+                    )
                 layer_mod._fsdp_modules.append(_para_mod)
 
         # shard module that needs to ignore mixed precision control
@@ -713,6 +760,8 @@ def parallelize_model_fsdp2(
             for sub_mod in layer_mod.modules():
                 if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
                     fully_shard(sub_mod, **fsdp_kwargs_without_mp)
+                    # Keep these modules off transport_reduction_scales: their genuine FP32
+                    # gradients need native FP32 communication, not a lossy wire cast.
                     layer_mod._fsdp_modules.append(sub_mod)
 
         # Shard everything else in the module:
@@ -723,6 +772,8 @@ def parallelize_model_fsdp2(
         #      no need to shard layer_mod again.
         if not isinstance(layer_mod, FSDPModule):
             fully_shard(layer_mod, **fsdp_kwargs)
+            if transport_reduction_scales is not None and fsdp_transport_enabled:
+                transport_reduction_scales[layer_mod] = fsdp_reduction_scale
             layer_mod._fsdp_modules.append(layer_mod)
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
 
@@ -742,6 +793,20 @@ def parallelize_model_fsdp2(
     # gradient clipping can reduce their unique local shards once over the
     # flattened 2D mesh instead of traversing the two mesh axes separately.
     model._persistent_extra_parallel_param_ids = {id(param) for param in persistent_extra_parallel_params}
+
+    if use_low_precision_transport:
+        assert transport_reduction_scales is not None
+        if fsdp_transport_enabled:
+            transport_reduction_scales[model] = fsdp_reduction_scale
+        registered = register_fp32_reduce_scatter_with_low_precision_transport(
+            model,
+            transport_dtype=getattr(torch, mixed_precision.param_dtype),
+            reduction_scales=transport_reduction_scales,
+        )
+        logger.info_rank0(
+            f"Registered {mixed_precision.param_dtype} ReduceScatter transport with FP32 output on "
+            f"{registered} FSDP module{'s' if registered != 1 else ''}."
+        )
 
     # configure manual prefetching when needed
     need_manual_prefetch = (
@@ -879,6 +944,7 @@ def build_parallelize_model(
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
+    low_precision_reduce_scatter_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
@@ -890,6 +956,11 @@ def build_parallelize_model(
             EP-local dim is divisible by ``ep_fsdp_size``.
     """
     parallel_state = get_parallel_state()
+    if low_precision_reduce_scatter_comm is not False:
+        # Only literal False bypasses validation; false-like non-booleans must still raise.
+        validate_low_precision_reduce_scatter_comm(
+            low_precision_reduce_scatter_comm, mixed_precision, fsdp_mode=parallel_state.dp_mode
+        )
     compile_config = compile_config or CompileConfig()
 
     if not parallel_state.fsdp_enabled:
@@ -934,6 +1005,7 @@ def build_parallelize_model(
                 mixed_precision=mixed_precision,
                 basic_modules=basic_modules,
                 muon_expert_zero_comm=muon_expert_zero_comm,
+                low_precision_reduce_scatter_comm=low_precision_reduce_scatter_comm,
                 compile_config=compile_config,
                 should_skip_hf_weight_load=should_skip_hf_weight_load,
                 **kwargs,

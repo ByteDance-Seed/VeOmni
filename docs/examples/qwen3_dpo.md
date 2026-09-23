@@ -50,6 +50,7 @@ Key config values (full DPO argument reference: [arguments.md — DPOConfig](../
 | `train.num_train_epochs` | `1` |
 | `dpo_config.beta` | `0.1` |
 | `dpo_config.loss_type` | `sigmoid` |
+| frozen reference | copies `model`; custom `reference_model` config is not supported |
 | `train.checkpoint.output_dir` | `Qwen3-0.6B-dpo-ultrafeedback` |
 | `train.wandb.project` | `VeOmni` |
 | `train.wandb.name` | `Qwen3-0.6B-dpo-ultrafeedback` |

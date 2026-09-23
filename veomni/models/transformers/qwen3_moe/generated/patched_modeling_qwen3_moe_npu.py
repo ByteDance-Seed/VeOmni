@@ -84,6 +84,7 @@ def rotate_half(x):
 # Reason: OpSlot guard for NPU fused RoPE
 # Source: veomni.models.transformers.qwen3_moe.qwen3_moe_gpu_patch_gen_config
 # ======================================================================
+@use_kernel_forward_from_hub("rotary_pos_emb")
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,

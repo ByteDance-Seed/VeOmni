@@ -749,6 +749,7 @@ class Qwen3VLTextRMSNorm(nn.Module):
 # Source: veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config
 # ======================================================================
 # ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
+@use_kernel_forward_from_hub("rotary_pos_emb")
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
