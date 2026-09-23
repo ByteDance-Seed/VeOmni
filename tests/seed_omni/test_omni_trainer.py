@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.omni_callbacks import OmniModuleHfCallback
@@ -65,6 +67,31 @@ def test_cascade_module_reshard_keeps_params_gathered_between_micro_steps(micro_
             runtime._model_reshard.assert_not_called()
         else:
             runtime._model_reshard.assert_called_once_with(expected)
+
+
+def _accumulate_grads(num_micro_steps: int) -> torch.Tensor:
+    weight = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+
+    def forward(micro_batch):
+        loss = (weight * micro_batch["x"]).pow(2).mean()
+        return {"loss": loss, "losses": {}}
+
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.model = SimpleNamespace(forward=forward, module_runtimes={})
+    trainer.args = SimpleNamespace(train=SimpleNamespace(enable_batch_invariant_mode=False))
+    trainer.fwd_activation_offload_ctx = nullcontext()
+    trainer.bwd_activation_offload_ctx = nullcontext()
+    trainer.preforward = lambda micro_batch: micro_batch
+
+    micro_batch = {"x": torch.tensor([3.0, -1.0])}
+    for micro_step in range(num_micro_steps):
+        trainer.forward_backward_step(micro_batch, micro_step=micro_step, num_micro_steps=num_micro_steps)
+    return weight.grad
+
+
+def test_gradient_accumulation_averages_micro_batch_gradients():
+    """Accumulating N copies of one micro-batch must match a single step on it."""
+    torch.testing.assert_close(_accumulate_grads(2), _accumulate_grads(1))
 
 
 def test_multi_lr_scheduler_without_schedulers_reports_zero_lr():

@@ -576,6 +576,11 @@ class OmniTrainer:
         ``OmniModelRuntime.forward`` returns ``{"loss", "losses"}`` where ``loss``
         is the summed per-node ``_loss``; a single backward then propagates across
         every FSDP2 unit.
+
+        Each node's loss is a mean over its own micro-batch, so the backward is
+        scaled by ``1 / num_micro_steps``: accumulated gradients are then the mean
+        over micro-batches, not a sum that grows with the accumulation count. The
+        returned loss stays unscaled for logging.
         """
         micro_batch = self.preforward(micro_batch)
         self._cascade_module_reshard(micro_step, num_micro_steps)
@@ -589,7 +594,7 @@ class OmniTrainer:
 
         # Backward: separate offload hook stack (may differ from forward when GC is on).
         with self.bwd_activation_offload_ctx, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-            total_loss.backward()
+            (total_loss / num_micro_steps).backward()
 
         del micro_batch
         return total_loss, loss_dict
