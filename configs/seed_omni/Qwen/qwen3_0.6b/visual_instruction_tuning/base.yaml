@@ -2,27 +2,24 @@
 # understanding using the Qwen3-VL ViT, training ONLY the ViT patch merger + the
 # vision special-token embedding rows (ViT blocks + LLM frozen).
 #
-# No bespoke modeling/script: assemble the split checkpoint from the two standard
-# per-model converts, then combine. The merger retarget + freeze + image behaviour
-# are switched on via ``model_config:`` overrides in the modules YAML.
+# No bespoke modeling/script and no combined checkpoint: ``model_path`` is the
+# converted Qwen3-0.6B root and the modules YAML points ``qwen3vl_vision`` at the
+# converted Qwen3-VL root's subfolder. The merger retarget + freeze + image
+# behaviour are switched on via ``model_config:`` overrides in the modules YAML.
 #
-#   # 1) text LLM -> qwen3_llm/ + qwen3_text_encoder/
 #   python scripts/seed_omni/convert_model.py \
-#     --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-0.6B \
-#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-visual-instruction-tuning
-#   # 2) Qwen3-VL -> qwen3vl_vision/ (+ others); keep only the vision tower
+#     --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
+#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-v2
 #   python scripts/seed_omni/convert_model.py \
-#     --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-VL-2B-Instruct \
-#     --output_dir /tmp/qwen3vl_split
-#   cp -r /tmp/qwen3vl_split/qwen3vl_vision \
-#     /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-visual-instruction-tuning/
+#     --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-VL-2B-Instruct \
+#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct-v2
 #
 # Train:
 #   bash train.sh tasks/omni/train_omni.py \
 #     configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml
 
 model:
-  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
+  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-v2
   model_config:
     modules: configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/modules_train.yaml
     train_graph: configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/graph_train.yaml

@@ -9,7 +9,7 @@ Examples
 Janus image understanding:
 
     python tasks/omni/infer_omni_native.py \\
-        --model_path /mnt/hdfs/.../Janus-1.3B-hf \\
+        --model_path /mnt/hdfs/.../Janus-1.3B-v2 \\
         --infer_type infer_und \\
         --prompt "Describe this image briefly." \\
         --image /path/to/image.jpg

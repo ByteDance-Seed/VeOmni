@@ -11,11 +11,11 @@
 # Prerequisite — split the upstream Qwen3-MoE checkpoint (needs ample CPU RAM;
 # Qwen3MoeForCausalLM merges per-expert weights into the fused layout at load):
 #   python scripts/seed_omni/convert_model.py \
-#     --model_path /mnt/hdfs/veomni/models/Qwen3-30B-A3B \
-#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B
+#     --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-30B-A3B \
+#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B-v2
 
 model:
-  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B
+  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B-v2
   model_config:
     modules: configs/seed_omni/Qwen/qwen3_30b_a3b/train/modules_train.yaml
     train_graph: configs/seed_omni/Qwen/qwen3_30b_a3b/train/graph_train.yaml

@@ -1,14 +1,17 @@
 # Janus-1.3B self-contained HF omni checkpoint — inference-only launcher.
 #
-# ``model_path`` points at an exported omni root (``config.json`` + graph sidecars
-# + module subfolders). Training graph, generation graphs and ``infer_type`` are
-# all read from that checkpoint's own ``config.json`` — this launcher declares
-# no ``model_config`` at all. ``resolve_model(for_inference=True)`` defaults
+# ``model_path`` points at a converted omni root (``config.json`` + graph sidecars
+# + module subfolders). Training graph, generation graphs, ``infer_type`` and
+# ``generation_kwargs`` are all read from that checkpoint's own ``config.json`` —
+# this launcher declares no ``model_config`` at all. The root's default
+# ``infer_type`` is ``infer_interleave``; pass ``--model.model_config.infer_type
+# infer_gen`` for text-to-image. ``resolve_model(for_inference=True)`` defaults
 # every module to eager (single-process replica) when no ``modules`` override
 # is given.
 #
-# Eager single-process T2I (default, no override):
+# Eager single-process T2I:
 #   python tasks/omni/infer_omni.py configs/seed_omni/Janus/janus_1.3b_hf/train/base.yaml \
+#     --model.model_config.infer_type infer_gen \
 #     --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
 #     --infer.output_dir outputs/runtime_hf
 #
@@ -16,10 +19,11 @@
 #   bash train.sh tasks/omni/infer_omni.py \
 #     configs/seed_omni/Janus/janus_1.3b_hf/train/base.yaml \
 #     --model.model_config.modules configs/seed_omni/Janus/janus_1.3b_hf/infer/modules_infer_fsdp.yaml \
+#     --model.model_config.infer_type infer_gen \
 #     --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
 #     --infer.output_dir outputs/runtime_hf_fsdp
 model:
-  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-hf
+  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-v2
   ops_implementation:
     attn_implementation: flash_attention_2
   accelerator:

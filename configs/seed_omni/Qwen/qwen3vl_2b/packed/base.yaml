@@ -10,7 +10,7 @@
 # Combine with a single FSDP tree over the composed OmniModel:
 #   --accelerator.fsdp_config.fsdp_scope model
 model:
-  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct
+  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct-v2
   model_config:
     modules: configs/seed_omni/Qwen/qwen3vl_2b/packed/modules_train.yaml
     train_graph: configs/seed_omni/Qwen/qwen3vl_2b/packed/graph_train.yaml

@@ -41,7 +41,7 @@ converter.
 ```bash
 python scripts/seed_omni/convert_model.py \
   --model_path /mnt/hdfs/user_dir/veomni_omni/models/transformers/Janus-1.3B \
-  --output_dir /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
+  --output_dir /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-v2
 ```
 
 The `output_dir` becomes `model.model_path` in `base.yaml` (a split-checkpoint
@@ -251,7 +251,7 @@ bash train.sh tasks/omni/infer_omni.py \
   configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
   --infer.infer_type infer_und \
   --infer.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \
-  --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
+  --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-v2 \
   --infer.prompt "What do you see in this image?" \
   --infer.image /path/to/image.png \
   --infer.output_dir janus_out \
@@ -266,7 +266,7 @@ python tasks/omni/infer_omni.py \
   configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
   --infer.infer_type infer_und \
   --infer.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
-  --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
+  --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-v2 \
   --infer.prompt "What do you see in this image?" \
   --infer.image /path/to/image.png \
   --infer.output_dir janus_out \
@@ -282,7 +282,7 @@ bash train.sh tasks/omni/infer_omni.py \
   configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
   --infer.infer_type infer_gen \
   --infer.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \
-  --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
+  --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-v2 \
   --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
   --infer.output_dir janus_out \
   --infer.generation_kwargs.max_new_tokens 2048 \
@@ -297,7 +297,7 @@ python tasks/omni/infer_omni.py \
   configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
   --infer.infer_type infer_gen \
   --infer.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
-  --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
+  --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-v2 \
   --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
   --infer.output_dir janus_out \
   --infer.generation_kwargs.max_new_tokens 2048 \

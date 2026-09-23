@@ -11,7 +11,7 @@ graph model. This is the minimal **text-only** omni model: the monolithic
 | `qwen3_llm` | decoder backbone (no embed / no head) | `inputs_embeds → hidden_states` |
 
 All paths below assume the upstream HuggingFace checkpoint (the post-trained
-chat model) lives at `/mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-0.6B`. Adjust to your own
+chat model) lives at `/mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B`. Adjust to your own
 storage.
 
 Config dir: `configs/seed_omni/Qwen/qwen3_0.6b/`.
@@ -38,8 +38,8 @@ into `qwen3_text_encoder/` (embeddings + tokenizer) and `qwen3_llm/` (backbone).
 
 ```bash
 python scripts/seed_omni/convert_model.py \
-  --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-0.6B \
-  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
+  --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
+  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-v2
 ```
 
 The `output_dir` becomes `model.model_path` in `base.yaml`.
@@ -94,7 +94,7 @@ Quick 1-node smoke run (no wandb, tiny step budget):
 ```bash
 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
-  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B \
+  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-v2 \
   --train.max_steps 15 \
   --train.global_batch_size 8 \
   --train.micro_batch_size 1 \
@@ -158,7 +158,7 @@ this layout, so you can infer directly:
 python tasks/omni/infer_omni.py \
   configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
   --infer.infer_type infer_text \
-  --infer.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B \
+  --infer.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-v2 \
   --infer.prompt "What is 2+2?" \
   --infer.output_dir qwen3_out \
   --infer.generation_kwargs.max_new_tokens 1024
@@ -191,8 +191,8 @@ monolithic `Qwen3ForCausalLM` and through the split path
 
 ```bash
 python scripts/seed_omni/check_qwen3_alignment.py \
-  --base /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-0.6B \
-  --split /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
+  --base /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
+  --split /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-v2
 # -> max|logit diff| ~8e-5, CE loss identical to 6 d.p. (RESULT: ALIGNED)
 ```
 
@@ -201,7 +201,7 @@ data and compare the loss curve:
 
 ```bash
 bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
-  --model.model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-0.6B \
+  --model.model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
   --data.train_path /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/mini_data \
   --data.max_seq_len 2048 --train.global_batch_size 8 --train.micro_batch_size 1 \
   --train.max_steps 15 --train.wandb.enable false
@@ -279,29 +279,26 @@ decoupled decay would erode the frozen rows). Both are set in `train/modules_tra
 > stub). They start training from there; if you want a better starting point,
 > mean-init them before training (HF `mean_resizing` trick).
 
-### 7.3 Assemble the split checkpoint (two standard converts + combine)
+### 7.3 Checkpoints (two standard converts, no combine step)
 
-No dual-source script: run the two per-model converters, then copy the vision
-tower in:
+No dual-source script and no combined directory: convert each upstream model once,
+then let the launcher compose them. `model.model_path` is the Qwen3-0.6B root
+(`qwen3_llm/`, `qwen3_text_encoder/` + tokenizer) and `modules_train.yaml` points
+`qwen3vl_vision` at the Qwen3-VL root's subfolder (ViT + image/video processors):
 
 ```bash
-# text LLM -> qwen3_llm/ + qwen3_text_encoder/
 python scripts/seed_omni/convert_model.py \
-  --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-0.6B \
-  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-visual-instruction-tuning
+  --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-0.6B \
+  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-v2
 
-# Qwen3-VL -> qwen3vl_vision/ (+ others); keep only the vision tower
 python scripts/seed_omni/convert_model.py \
-  --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-VL-2B-Instruct \
-  --output_dir /tmp/qwen3vl_split
-cp -r /tmp/qwen3vl_split/qwen3vl_vision \
-  /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-visual-instruction-tuning/
+  --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-VL-2B-Instruct \
+  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct-v2
 ```
 
-The combined dir holds `qwen3_llm/`, `qwen3_text_encoder/` (+ tokenizer) and
-`qwen3vl_vision/` (ViT + image/video processors). At train time the
-`out_hidden_size` override retargets the merger and its mismatched `linear_fc2` is
-re-initialised; `disable_deepstack` drops the unused DeepStack mergers.
+At train time the `out_hidden_size` override retargets the merger and its
+mismatched `linear_fc2` is re-initialised; `disable_deepstack` drops the unused
+DeepStack mergers.
 
 ### 7.4 Config
 
@@ -345,11 +342,15 @@ NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
 
 ### 7.6 Inference
 
+Run straight from `base.yaml`, this pairs the base Qwen3-0.6B root with the raw
+Qwen3-VL ViT whose merger `linear_fc2` is re-initialised for `out_hidden_size:
+1024`, so it only checks the wiring — the reply is meaningless until trained.
+Use the trained-checkpoint command below for real outputs.
+
 ```bash
 python tasks/omni/infer_omni.py \
   configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml \
   --infer.infer_type understanding \
-  --infer.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-visual-instruction-tuning \
   --infer.image /path/to/image.jpg \
   --infer.prompt "What is in this image?" \
   --infer.output_dir qwen3_vit_out

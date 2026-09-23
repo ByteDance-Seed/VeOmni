@@ -10,7 +10,7 @@
 # Combine with a single FSDP tree over the composed OmniModel:
 #   --accelerator.fsdp_config.fsdp_scope model
 model:
-  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
+  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-v2
   model_config:
     modules: configs/seed_omni/Janus/janus_1.3b/packed/modules_train.yaml
     train_graph: configs/seed_omni/Janus/janus_1.3b/packed/graph_train.yaml

@@ -29,7 +29,7 @@ Two Qwen3-VL specifics the backbone reconstructs from `conversation_list`:
   into `Qwen3VLTextModel` as `deepstack_visual_embeds` + `visual_pos_masks`.
 
 All paths below assume the upstream HuggingFace checkpoint lives at
-`/mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-VL-2B-Instruct`. Adjust to your
+`/mnt/hdfs/veomni/models/Qwen/Qwen3-VL-2B-Instruct`. Adjust to your
 own storage.
 
 Config dir: `configs/seed_omni/Qwen/qwen3vl_2b/`
@@ -53,8 +53,8 @@ tokenizer) and `qwen3vl_llm/` (backbone).
 
 ```bash
 python scripts/seed_omni/convert_model.py \
-  --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-VL-2B-Instruct \
-  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct
+  --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-VL-2B-Instruct \
+  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct-v2
 ```
 
 The `output_dir` becomes `model.model_path` in `base.yaml`.
@@ -215,7 +215,7 @@ CLI equivalent:
 
 ```bash
 python tasks/omni/infer_omni_native.py \
-  --model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct \
+  --model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct-v2 \
   --infer_type vision_understanding \
   --prompt "Describe this image." \
   --image /path/to/image.jpg \
