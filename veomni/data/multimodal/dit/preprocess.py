@@ -16,17 +16,31 @@ def tom_and_jerry_preprocess(conversations, **kwargs):
 @PREPROCESSOR_REGISTRY.register("Qwen-Image")
 @PREPROCESSOR_REGISTRY.register("QwenImage")
 def qwen_image_preprocess(conversations, **kwargs):
-    prompt = conversations.get("prompt") or conversations.get("text") or conversations.get("caption")
-    image = (
-        conversations.get("image")
-        or conversations.get("image_bytes")
-        or conversations.get("image_path")
-        or conversations.get("target_image")
+    prompt = next(
+        (conversations[key] for key in ("prompt", "text", "caption") if conversations.get(key) is not None), None
+    )
+    image = next(
+        (
+            conversations[key]
+            for key in ("image", "image_bytes", "image_path", "target_image")
+            if conversations.get(key) is not None
+        ),
+        None,
     )
     if prompt is None:
         raise ValueError("Qwen-Image data requires one of: prompt, text, caption.")
     if image is None:
         raise ValueError("Qwen-Image data requires one of: image, image_bytes, image_path, target_image.")
+    if not isinstance(prompt, str) or not isinstance(image, (str, bytes)):
+        raise ValueError("Qwen-Image requires a text prompt and an image path, URL, or bytes.")
+    data_dir = kwargs.get("data_dir", "")
+    if (
+        data_dir
+        and isinstance(image, str)
+        and not os.path.isabs(image)
+        and not image.startswith(("http://", "https://"))
+    ):
+        image = os.path.join(data_dir, image)
     return prompt, {}, [image], []
 
 

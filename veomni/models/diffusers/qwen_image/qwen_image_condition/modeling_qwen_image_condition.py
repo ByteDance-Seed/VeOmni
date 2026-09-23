@@ -68,6 +68,25 @@ class QwenImageConditionModel(PreTrainedModel):
             base,
             subfolder=self.config.scheduler_subfolder,
         )
+        # Offline training needs normalization metadata, but no VAE weights.
+        self.vae_config = AutoencoderKLQwenImage.load_config(base, subfolder=self.config.vae_subfolder)
+        spatial_factor = 2 ** len(self.vae_config["temperal_downsample"])
+        if self.config.height % (2 * spatial_factor) or self.config.width % (2 * spatial_factor):
+            raise ValueError(f"Qwen-Image height and width must be divisible by {2 * spatial_factor}.")
+        if self.config.training_recipe == "diffsynth":
+            # DiffSynth's Qwen-Image SFT recipe uses a fixed exponential shift
+            # and terminal sigma, independent of the inference resolution.
+            self.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+                self.scheduler.config,
+                num_train_timesteps=1000,
+                use_dynamic_shifting=True,
+                time_shift_type="exponential",
+                shift_terminal=0.02,
+                invert_sigmas=False,
+                use_karras_sigmas=False,
+                use_exponential_sigmas=False,
+                use_beta_sigmas=False,
+            )
         if self.meta_init:
             return
 
@@ -95,6 +114,8 @@ class QwenImageConditionModel(PreTrainedModel):
 
     @staticmethod
     def _pack_latents(latents: torch.Tensor) -> torch.Tensor:
+        if latents.ndim != 5 or latents.shape[2] != 1 or any(dim % 2 for dim in latents.shape[-2:]):
+            raise ValueError("Qwen-Image latents must have shape [B, C, 1, H, W] with even H and W.")
         batch_size, num_channels_latents, _num_frames, height, width = latents.shape
         latents = latents[:, :, 0]
         latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
@@ -102,21 +123,27 @@ class QwenImageConditionModel(PreTrainedModel):
         return latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
 
     def _normalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        latents_mean = torch.tensor(self.vae.config.latents_mean, device=latents.device, dtype=latents.dtype).view(
-            1, self.vae.config.z_dim, 1, 1, 1
+        latents_mean = torch.tensor(self.vae_config["latents_mean"], device=latents.device, dtype=latents.dtype).view(
+            1, self.vae_config["z_dim"], 1, 1, 1
         )
-        latents_std = torch.tensor(self.vae.config.latents_std, device=latents.device, dtype=latents.dtype).view(
-            1, self.vae.config.z_dim, 1, 1, 1
+        latents_std = torch.tensor(self.vae_config["latents_std"], device=latents.device, dtype=latents.dtype).view(
+            1, self.vae_config["z_dim"], 1, 1, 1
         )
         return (latents - latents_mean) / latents_std
 
     def _image_to_tensor(self, image) -> torch.Tensor:
         image = image.convert("RGB")
-        image = functional.resize(
-            image,
-            [self.config.height, self.config.width],
-            interpolation=InterpolationMode.BICUBIC,
-        )
+        if self.config.image_resize_mode == "center_crop":
+            width, height = image.size
+            scale = max(self.config.width / width, self.config.height / height)
+            image = functional.resize(
+                image, (round(height * scale), round(width * scale)), interpolation=InterpolationMode.BILINEAR
+            )
+            image = functional.center_crop(image, (self.config.height, self.config.width))
+        else:
+            image = functional.resize(
+                image, [self.config.height, self.config.width], interpolation=InterpolationMode.BICUBIC
+            )
         image = functional.to_tensor(image).unsqueeze(0).unsqueeze(2)
         return image.mul(2.0).sub(1.0)
 
@@ -199,9 +226,8 @@ class QwenImageConditionModel(PreTrainedModel):
 
     def _encode_image_to_latents(self, image) -> tuple[torch.Tensor, list[tuple[int, int, int]]]:
         # Return the raw posterior parameters ([1, 2*z_dim, F, H, W]) alongside the
-        # packed image grid ``[(1, H // 2, W // 2)]`` so downstream callers can resample a
-        # fresh latent on every training step (mode() reduces diversity) without
-        # re-deriving the grid from the latent shape.
+        # packed image grid. Both online and offline training take posterior.mode()
+        # before normalization, matching the DiffSynth Qwen-Image VAE convention.
         image_tensor = self._image_to_tensor(image).to(device=self.vae.device, dtype=self.vae.dtype)
         posterior: DiagonalGaussianDistribution = self.vae.encode(image_tensor).latent_dist
         parameters = posterior.parameters
@@ -211,6 +237,8 @@ class QwenImageConditionModel(PreTrainedModel):
     @torch.no_grad()
     def get_condition(self, inputs, images, **kwargs) -> dict[str, Any]:
         prompts = inputs if isinstance(inputs, list) else [inputs]
+        if not prompts or len(prompts) != len(images) or not all(isinstance(prompt, str) for prompt in prompts):
+            raise ValueError("Qwen-Image expects equally sized, nonempty lists of text prompts and target images.")
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompt=prompts)
 
         latents_list = []
@@ -279,6 +307,11 @@ class QwenImageConditionModel(PreTrainedModel):
         encoder_hidden_states_list = self._as_list(encoder_hidden_states, len(latents_list))
         encoder_hidden_states_mask_list = self._as_list(encoder_hidden_states_mask, len(latents_list))
         img_shapes_list = self._as_list(img_shapes, len(latents_list))
+        if not latents_list or any(
+            len(items) != len(latents_list)
+            for items in (encoder_hidden_states_list, encoder_hidden_states_mask_list, img_shapes_list)
+        ):
+            raise ValueError("Qwen-Image condition fields must have the same nonzero sample count.")
 
         def _seq_len(grid: list[tuple[int, int, int]]) -> int:
             return sum(f * h * w for f, h, w in grid)
@@ -305,11 +338,22 @@ class QwenImageConditionModel(PreTrainedModel):
                 scheduler_cfg.get("base_shift", 0.5),
                 scheduler_cfg.get("max_shift", 1.15),
             )
-            self.scheduler.set_timesteps(
-                self.config.num_train_timesteps,
-                device=self.generator.device,
-                mu=mu,
-            )
+            if self.config.training_recipe == "diffsynth":
+                self.scheduler.set_timesteps(
+                    sigmas=torch.linspace(1, 0, self.config.num_train_timesteps + 1)[:-1].numpy(),
+                    device=self.generator.device,
+                    mu=0.8,
+                )
+                timesteps = self.scheduler.timesteps
+                weights = torch.exp(-2 * ((timesteps - 500) / 1000) ** 2)
+                weights = weights - weights.min()
+                weights = weights * (1000 / weights.sum())
+                if len(timesteps) != 1000:
+                    weights = weights * (len(timesteps) / 1000)
+                    weights = weights + weights[1]
+                self._training_weights = weights
+            else:
+                self.scheduler.set_timesteps(self.config.num_train_timesteps, device=self.generator.device, mu=mu)
             self._timesteps_ready = True
             self._timesteps_image_seq_len = image_seq_len
 
@@ -324,13 +368,20 @@ class QwenImageConditionModel(PreTrainedModel):
         }
         if self.config.guidance_scale is not None:
             packed_conditions["guidance"] = []
+        if self.config.training_recipe == "diffsynth":
+            packed_conditions["loss_weights"] = []
 
         for sample_params, sample_context, sample_context_mask, sample_img_shapes in zip(
             latents_list, encoder_hidden_states_list, encoder_hidden_states_mask_list, img_shapes_list
         ):
+            if sample_params.ndim != 5 or sample_params.shape[1] != 2 * self.vae_config["z_dim"]:
+                raise ValueError("Qwen-Image cache must contain raw VAE posterior parameters [B, 2*z_dim, 1, H, W].")
             sample_latents_raw = DiagonalGaussianDistribution(sample_params).mode()
             sample_latents_norm = self._normalize_latents(sample_latents_raw).to(self.generator.device)
             sample_latents = self._pack_latents(sample_latents_norm)
+            expected_grid = [(1, sample_params.shape[-2] // 2, sample_params.shape[-1] // 2)]
+            if [tuple(grid) for grid in sample_img_shapes] != expected_grid:
+                raise ValueError(f"Qwen-Image img_shapes must match the packed latent grid {expected_grid}.")
 
             noise = torch.randn(
                 sample_latents.shape,
@@ -345,10 +396,11 @@ class QwenImageConditionModel(PreTrainedModel):
                 device=self.generator.device,
                 generator=self.generator,
             ).to(sample_latents.device)
-            timestep = self.scheduler.timesteps[timestep_ids].to(
-                device=sample_latents.device, dtype=sample_latents.dtype
-            )
-            noisy_latents = self.scheduler.scale_noise(sample_latents, timestep, noise)
+            timestep = self.scheduler.timesteps[timestep_ids]
+            # Index sigmas directly: low precision cached latents must not round
+            # timesteps before the scheduler looks up their corresponding sigma.
+            sigma = self.scheduler.sigmas[timestep_ids].to(sample_latents.dtype).view(-1, 1, 1)
+            noisy_latents = (1 - sigma) * sample_latents + sigma * noise
             training_target = noise - sample_latents
 
             packed_conditions["hidden_states"].append(noisy_latents)
@@ -361,6 +413,8 @@ class QwenImageConditionModel(PreTrainedModel):
             packed_conditions["img_shapes"].append(sample_img_shapes)
             packed_conditions["training_target"].append(training_target)
             packed_conditions["latents"].append(sample_latents)
+            if self.config.training_recipe == "diffsynth":
+                packed_conditions["loss_weights"].append(self._training_weights[timestep_ids])
             if self.config.guidance_scale is not None:
                 guidance = torch.full(
                     [sample_latents.shape[0]],
