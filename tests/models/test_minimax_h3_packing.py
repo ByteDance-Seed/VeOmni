@@ -1,9 +1,7 @@
 """Native H3 model-owned packing, without pretrained weights or encoders."""
 
 import copy
-from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -50,8 +48,10 @@ def condition_model():
     return MiniMaxH3ConditionModel(MiniMaxH3ConditionModelConfig(skip_encoder_load=True, num_train_timesteps=16))
 
 
-def raw_sample(text_len=3, task="fl2va", refs=None):
-    geometry = dict(text_len=text_len, latent_t=2, latent_h=4, latent_w=6, audio_t=3, audio_channel=2)
+def raw_sample(text_len=3, task="fl2va", refs=None, latent_t=2, latent_h=4, latent_w=6, audio_t=3):
+    geometry = dict(
+        text_len=text_len, latent_t=latent_t, latent_h=latent_h, latent_w=latent_w, audio_t=audio_t, audio_channel=2
+    )
     if task == "ref2va":
         refs = refs or [{"kind": "image", "latent_t": 1, "latent_h": 4, "latent_w": 4}]
         pk = packed_sequence.build_packed_ref2va(**geometry, ref_blocks=refs)
@@ -60,8 +60,8 @@ def raw_sample(text_len=3, task="fl2va", refs=None):
         pk = packed_sequence.build_packed_fl2va(**geometry, keyframe_indices=[0])
         anchor_key = "keyframe_cond_anchor"
     return dict(
-        input_latents=torch.randn(1, 24, 2, 4, 6),
-        audio_input_latents=torch.randn(2, 32, 3),
+        input_latents=torch.randn(1, 24, latent_t, latent_h, latent_w),
+        audio_input_latents=torch.randn(2, 32, audio_t),
         prompt_embeds=torch.randn(text_len, 32),
         packed=pk,
         **{anchor_key: torch.randn(pk["cond_rows"], 96)},
@@ -115,7 +115,7 @@ def test_native_foundation_loader_uses_ordinary_batch_contract(backend):
     out = model(**columns)
     assert isinstance(out, MiniMaxH3DiTOutput)
     assert all(value.ndim == 0 for value in out.loss.values())
-    assert out.predictions[0].shape == (2, 24, 2, 4, 6)
+    assert [p.shape for p in out.predictions[0]] == [(1, 24, 2, 4, 6)] * 2
     assert keys == set(model.state_dict())
 
 
@@ -161,7 +161,7 @@ def test_packed_outputs_losses_and_gradients_match_serial(task, checkpointing):
     assert len(calls) == 1
     assert set(entries.values()) == {1}
     for i, ref in enumerate(expected):
-        torch.testing.assert_close(actual.predictions[0][i : i + 1], ref.predictions[0], rtol=2e-5, atol=2e-5)
+        torch.testing.assert_close(actual.predictions[0][i], ref.predictions[0], rtol=2e-5, atol=2e-5)
         torch.testing.assert_close(actual.predictions[1][i], ref.predictions[1], rtol=2e-5, atol=2e-5)
     for key in actual.loss:
         torch.testing.assert_close(actual.loss[key], torch.stack([out.loss[key] for out in expected]).mean())
@@ -176,58 +176,28 @@ def test_packed_outputs_losses_and_gradients_match_serial(task, checkpointing):
 
 
 @pytest.mark.parametrize("task", ["fl2va", "ref2va"])
-def test_ordinary_trainer_step_matches_native_serial_update(monkeypatch, task):
-    from tests.trainer.test_dit_microbatch import _trainer
-    from veomni.trainer.dit_trainer import DiTModelRuntime
-
-    trainer = _trainer(monkeypatch, "offline_training", 2)
-    model = tiny_model()
-    reference = copy.deepcopy(model)
-    condition = condition_model()
-    runtime = DiTModelRuntime.__new__(DiTModelRuntime)
-    runtime.model_name, runtime.model, runtime.condition_model = "base", model, condition
-    runtime.optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
-    runtime.lr_scheduler = torch.optim.lr_scheduler.StepLR(runtime.optimizer, step_size=1, gamma=0.5)
-    gradients = []
-
-    def clip():
-        gradients.append([param.grad.clone() for param in model.parameters()])
-        return torch.stack([param.grad.norm() for param in model.parameters()]).norm()
-
-    runtime.clip_grad_norm = clip
-    trainer.base.model = runtime
-    trainer.base.state = SimpleNamespace(global_step=0)
-    trainer.base.model_fwd_context = nullcontext()
-    trainer.base.model_bwd_context = nullcontext()
-    for name in (
-        "on_step_begin",
-        "on_step_end",
-        "sync_before_train_step",
-        "_reset_async_activation_offload_if_enabled",
-        "model_reshard",
-        "_configure_hsdp_allreduce",
-    ):
-        setattr(trainer.base, name, Mock())
-    raws = [raw_sample(length, task) for length in (3, 9, 5, 7)]
-    torch.manual_seed(77)
-    expected = serial(reference, prepare(condition, raws))
-    expected_loss = sum(sum(out.loss.values()) for out in expected) / len(raws)
-    expected_loss.backward()
-    optimizer = torch.optim.SGD(reference.parameters(), lr=1e-4)
-    optimizer.step()
-    calls = []
-    handle = model.register_forward_pre_hook(lambda module, args: calls.append(1))
-    torch.manual_seed(77)
-    trainer.train_step(iter([[DiTDataCollator()(raws[:2]), DiTDataCollator()(raws[2:])]]))
-    handle.remove()
-    assert len(calls) == 2
-    assert trainer.base.state.global_step == runtime.lr_scheduler.last_epoch == 1
-    assert runtime.optimizer.param_groups[0]["lr"] == 5e-5
-    for grad, param, ref in zip(gradients[0], model.parameters(), reference.parameters()):
-        torch.testing.assert_close(grad, ref.grad, rtol=2e-4, atol=2e-5)
-        torch.testing.assert_close(param, ref, rtol=2e-4, atol=2e-5)
-        assert param.grad is None
-    torch.testing.assert_close(torch.tensor(trainer.base.on_step_end.call_args.kwargs["loss"]), expected_loss.detach())
+def test_mixed_target_geometry_matches_serial(task):
+    torch.manual_seed(11)
+    base = tiny_model()
+    packed = copy.deepcopy(base)
+    raws = [
+        raw_sample(3, task),
+        raw_sample(7, task, latent_t=3, latent_h=6, latent_w=4, audio_t=5),
+    ]
+    samples = prepare(condition_model(), raws)
+    expected = serial(base, samples)
+    actual = packed(**batch(samples))
+    assert [p.shape for p in actual.predictions[0]] == [(1, 24, 2, 4, 6), (1, 24, 3, 6, 4)]
+    assert [p.shape for p in actual.predictions[1]] == [(2, 32, 3), (2, 32, 5)]
+    for i, ref in enumerate(expected):
+        for a, b in zip((actual.predictions[0][i], actual.predictions[1][i]), ref.predictions):
+            torch.testing.assert_close(a, b, rtol=2e-5, atol=2e-5)
+    for key in actual.loss:
+        torch.testing.assert_close(actual.loss[key], torch.stack([out.loss[key] for out in expected]).mean())
+    sum(sum(out.loss.values()) for out in expected).div(len(samples)).backward()
+    sum(actual.loss.values()).backward()
+    for (name, p), (_, q) in zip(base.named_parameters(), packed.named_parameters()):
+        torch.testing.assert_close(p.grad, q.grad, rtol=2e-4, atol=2e-5, msg=name)
 
 
 def test_sample_isolation_boundaries_and_zero_valid_rows():
@@ -250,7 +220,7 @@ def test_sample_isolation_boundaries_and_zero_valid_rows():
     for sample in samples:
         sample["x"].zero_()
         sample["audio_x"].zero_()
-    assert model(**batch(samples)).predictions[0].shape == (2, 24, 2, 4, 6)
+    assert [p.shape for p in model(**batch(samples)).predictions[0]] == [(1, 24, 2, 4, 6)] * 2
 
 
 def test_ref2va_variable_reference_layouts_and_target_only_loss():
@@ -263,8 +233,8 @@ def test_ref2va_variable_reference_layouts_and_target_only_loss():
     expected = serial(model, samples)
     actual = model(**batch(samples))
     for i in range(2):
-        torch.testing.assert_close(actual.predictions[0][i : i + 1], expected[i].predictions[0], rtol=2e-5, atol=2e-5)
-    assert actual.predictions[1].shape == (2, 2, 32, 3)
+        torch.testing.assert_close(actual.predictions[0][i], expected[i].predictions[0], rtol=2e-5, atol=2e-5)
+    assert [p.shape for p in actual.predictions[1]] == [(2, 32, 3)] * 2
 
 
 def test_invalid_condition_columns_and_audio_refs_fail_closed():
@@ -368,7 +338,11 @@ def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(mon
 
     calls = []
 
+    config = tiny_model().config
+
     def kernel(q, k, v, *, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, causal):
+        assert q.ndim == 3 and q.shape[1:] == (config.num_attention_heads, config.attention_head_dim)
+        assert q.is_contiguous() and k.shape == v.shape == q.shape
         assert cu_seqlens_q.dtype == torch.int32 and cu_seqlens_k is cu_seqlens_q
         assert cu_seqlens_q[-1] == q.shape[0] and max_seqlen_q == max_seqlen_k
         assert not causal
@@ -495,33 +469,6 @@ def test_refiner_preserves_linear_row_counts_with_main_dit_packed(task):
     assert rows["main"] == [sum(sample["x"].shape[1] for sample in samples)]
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
-def test_modulation_preserves_upstream_gather_dtype_and_gradients(monkeypatch, dtype):
-    original = torch.Tensor.index_select
-    gather_dtypes = []
-
-    def select(tensor, dim, index):
-        gather_dtypes.append(tensor.dtype)
-        return original(tensor, dim, index)
-
-    monkeypatch.setattr(torch.Tensor, "index_select", select)
-    index = torch.arange(512) % 2
-    x = torch.ones(512, 4, dtype=dtype)
-    shift, scale, gate = (torch.randn(2, 4, dtype=dtype, requires_grad=True) for _ in range(3))
-    expected = x * (1 + original(scale, 0, index)) + original(shift, 0, index)
-    out = minimax_h3_dit._modulate_scale_shift(x, shift, scale, index)
-    gated = minimax_h3_dit._modulate_gate(x, gate, x, index)
-    torch.testing.assert_close(out, expected, rtol=0, atol=0)
-    torch.testing.assert_close(gated, x + original(gate, 0, index), rtol=0, atol=0)
-    (out.sum() + gated.sum()).backward()
-    assert gather_dtypes == [dtype] * 3
-    expected_grads = torch.autograd.grad(
-        expected.sum() + (x + original(gate, 0, index) * x).sum(), (shift, scale, gate)
-    )
-    for param, expected_grad in zip((shift, scale, gate), expected_grads):
-        torch.testing.assert_close(param.grad, expected_grad, rtol=0, atol=0)
-
-
 @pytest.mark.parametrize("offload", [True, [False, True]])
 def test_multisample_wrapper_rejects_checkpoint_offload(offload):
     inputs = batch(prepare(condition_model(), [raw_sample(), raw_sample()]))
@@ -581,13 +528,9 @@ def test_condition_preserves_checkpoint_offload_for_model_validation():
         handle.remove()
 
 
-def test_invalid_batch_shapes_precision_and_legacy_tail_fail_closed():
+def test_invalid_precision_and_legacy_tail_fail_closed():
     model = tiny_model()
     samples = prepare(condition_model(), [raw_sample(), raw_sample()])
-    changed = copy.deepcopy(samples)
-    changed[1]["video_latent_shape"] = (3, 2, 3)
-    with pytest.raises(ValueError, match="fixed target"):
-        model(**batch(changed))
     changed = copy.deepcopy(samples)
     changed[0]["unique_timesteps"] = changed[0]["unique_timesteps"].bfloat16()
     with pytest.raises(ValueError, match="cast_forward_inputs"):

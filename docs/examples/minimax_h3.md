@@ -207,9 +207,9 @@ bash train.sh tasks/train_dit.py configs/dit/minimax_h3_fl2va_offline.yaml \
 Keep `train.dyn_bsz=false`, `data.dataloader.drop_last=true`, and FSDP2
 `mixed_precision.cast_forward_inputs=false`. Timesteps stay FP32 and positions
 stay FP32/FP64; blanket BF16 input casting is rejected rather than silently
-changing their precision. Targets must have the same video/audio geometry within
-a microbatch, while prompt lengths, reference counts and reference geometry may
-vary. Multi-sample packing rejects Ulysses SP and block/checkpoint offload inside
+changing their precision. Samples in one microbatch may differ in target
+video/audio geometry, prompt length, reference count and reference geometry;
+multi-sample outputs return per-sample prediction lists. Multi-sample packing rejects Ulysses SP and block/checkpoint offload inside
 modeling. Single-device/FSDP2 with SP/CP/TP/PP sizes one is the validation target;
 LoRA, compilation and additional parallel/offload combinations are not validated.
 
@@ -287,25 +287,15 @@ packing; ordinary single-sample attention dispatch is preserved.
   kernel package and BF16/FP16 are required; unavailable kernels are not silently
   replaced with SDPA.
 
-Native tiny-model CPU tests cover output/loss/gradient equivalence, checkpoint
-recomputation, sample isolation, valid zero rows, independent attention boundaries,
-and Ref2VA geometry against the inference builder. Regressions compare single-sample
-valid-token outputs against a legacy 64-row padded input and verify forward-local
-SP padding with mocked collectives. A poisoned-allocation regression checks that
-uncovered attention tails cannot contaminate gradients. Those mocks do not
-establish distributed SP parity.
-The two-rank suite targets real FSDP2, mixed precision, DP gradient reduction and an
-accumulated optimizer update through the ordinary trainer interface; it does not
-load official H3 weights or validate convergence.
-
-FA2/FA3 protocol tests on CPU use a kernel stub and are **not** hardware kernel
-validation. The GPU suite has real-kernel cases that skip when the package or
-hardware is unavailable (FA3 requires SM90). Historical two-rank SDPA/FA2/FA3 and
-official-weight results used the earlier protocol and layout, not this revision.
-The ordinary-interface/no-tail migration needs fresh accelerator validation;
-occupied GPUs were not interrupted. No updated official-weight parity, end-to-end
-speedup or convergence is claimed. Benchmark against an equivalent, tuned
-non-packed baseline before claiming a performance improvement.
+`tests/models/test_minimax_h3_packing.py` uses a native tiny model on CPU to
+check packed-versus-serial outputs, losses and gradients (including mixed target
+geometry and checkpoint recomputation), sample isolation, Ref2VA variable
+references, forward-local SP padding and fail-closed inputs. SP collectives are
+mocked there, so it does not establish distributed SP parity. The FA2/FA3 call
+site is checked with a kernel stub that asserts the varlen layout; kernel
+correctness itself is covered by `tests/ops/test_flash_attn_varlen_padding.py`.
+No end-to-end speedup or convergence is claimed. Benchmark against an equivalent,
+tuned non-packed baseline before claiming a performance improvement.
 
 ## 5. Inference
 

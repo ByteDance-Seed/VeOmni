@@ -7,7 +7,6 @@ def pack_samples(samples):
     if not samples:
         raise ValueError("H3 requires a nonempty microbatch.")
     first = samples[0]
-    shape = (first["video_latent_shape"], first["audio_latent_shape"])
     checkpointing = first["use_gradient_checkpointing"]
     chunks = {
         key: []
@@ -32,8 +31,6 @@ def pack_samples(samples):
             torch.float64,
         ):
             raise ValueError("H3 packing must retain timestep/position precision; use cast_forward_inputs=false.")
-        if (inp["video_latent_shape"], inp["audio_latent_shape"]) != shape:
-            raise ValueError("H3 packing currently requires fixed target video/audio geometry.")
         if inp["use_gradient_checkpointing"] != checkpointing:
             raise ValueError("H3 packing requires one gradient-checkpointing setting per microbatch.")
         if not inp["skip_mask_out_condition"]:

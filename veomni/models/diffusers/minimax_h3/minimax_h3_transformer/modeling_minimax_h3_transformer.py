@@ -67,12 +67,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
 
     def _configure_packed_attention(self, attn_implementation):
         """Validate packed attention; FlashAttention loads only on the first packed forward."""
-        if (
-            self.config.latents_dim != 24
-            or self.config.audio_latents_dim != 32
-            or tuple(self.config.patch_size) != (1, 2, 2)
-        ):
-            raise ValueError("H3 remove-padding requires the native 24-video/32-audio patch geometry.")
         if attn_implementation not in (
             None,
             "eager",
@@ -80,7 +74,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             "veomni_flash_attention_2_with_sp",
             "veomni_flash_attention_3_with_sp",
         ):
-            raise ValueError(f"Unsupported H3 remove-padding backend: {attn_implementation}")
+            raise ValueError(f"Unsupported H3 packing backend: {attn_implementation}")
         self._packed_attn_implementation = attn_implementation
         for module in self.dit.modules():
             if isinstance(module, MiniMaxH3Attention):
@@ -116,11 +110,9 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             if outputs[0].loss is None
             else {key: torch.stack([out.loss[key] for out in outputs]).mean() for key in outputs[0].loss}
         )
+        # Per-sample lists: samples in one microbatch may differ in video/audio geometry.
         return MiniMaxH3DiTOutput(
-            predictions=[
-                torch.cat([out.predictions[0] for out in outputs], dim=0),
-                torch.stack([out.predictions[1] for out in outputs]),
-            ],
+            predictions=[[out.predictions[0] for out in outputs], [out.predictions[1] for out in outputs]],
             loss=losses,
         )
 
