@@ -1,0 +1,17 @@
+# Distributed inference: the chain keeps its training wraps, so a module that
+# pins `fsdp_mode` here is not forced to eager by `for_inference=True`.
+fake_module_a:
+  model_path: fake_module_a
+  broadcast_model_weights_from_rank0: false # only meaningful for fsdp2
+  accelerator:
+    init_device: cuda # ddp doesn't need meta-init's broadcast dance
+    fsdp_config:
+      fsdp_mode: ddp
+    gradient_checkpointing:
+      enable: false
+
+fake_module_b:
+  model_path: fake_module_b
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
