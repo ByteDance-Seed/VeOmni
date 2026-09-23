@@ -106,9 +106,9 @@ def test_module_specific_steps_are_overridden(method):
     assert method in vars(ModuleRuntime), f"{method} must state how a module differs"
 
 
-def test_build_model_reads_the_modules_own_directory(monkeypatch):
-    """``config_path`` is inherited from the composed model and points at the omni
-    checkpoint root, whose ``config.json`` is the OmniConfig — not this module."""
+def test_build_model_uses_the_config_the_omni_config_loaded(monkeypatch):
+    """A module never reads its own ``config.json``: the composed OmniConfig loaded
+    it and hands it in. ``model_path`` is only where the weights live."""
     captured = {}
 
     def fake_build_foundation_model(**kwargs):
@@ -128,9 +128,11 @@ def test_build_model_reads_the_modules_own_directory(monkeypatch):
             fsdp_config=SimpleNamespace(mixed_precision=SimpleNamespace(enable=False)),
         ),
     )
+    runtime.module_config = SimpleNamespace(model_type="fake")
     runtime._build_model()
 
-    assert captured["config_path"] == "/tmp/hf-model"
+    assert captured["config_path"] is runtime.module_config
+    assert captured["weights_path"] == "/tmp/hf-model"
 
 
 # The base declares these as class attributes defaulting to ``None``, so a test
@@ -214,7 +216,7 @@ def test_the_constructor_stores_training_args_where_the_base_reads_them(monkeypa
     train = SimpleNamespace(checkpoint=SimpleNamespace(load_path=None))
     args = SimpleNamespace(accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope="module")))
 
-    runtime = ModuleRuntime(args, "vision_encoder", train=train)
+    runtime = ModuleRuntime(args, "vision_encoder", module_config=SimpleNamespace(), train=train)
 
     assert vars(runtime)["train_args"] is train
 

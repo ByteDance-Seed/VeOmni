@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from .....arguments.arguments_types import AcceleratorConfig
     from .....arguments.omni_arguments_types import OmniModuleRuntimeArguments, OmniTrainingArguments
     from .....trainer.callbacks import TrainerState
+    from ...modules.module_configuration_base import OmniModuleConfig
 
 
 logger = logging.get_logger(__name__)
@@ -64,8 +65,9 @@ class ModuleRuntime(VeOmniModelRuntime):
     every one of those reads — so what is written here is only what a *module*
     does differently from a standalone model:
 
-    * its config lives beside its weights, not at the composed checkpoint root
-      (:meth:`_build_model`);
+    * its config is not read here: the composed :class:`OmniConfig` loads it
+      (``_module_configs[name]``) and hands it in as ``module_config``, so a
+      module is never loaded on its own (:meth:`_build_model`);
     * its preprocessor is bound onto the model itself rather than held by the
       runtime, because the graph calls the module and the module needs it
       (:meth:`_build_model_assets`);
@@ -109,12 +111,14 @@ class ModuleRuntime(VeOmniModelRuntime):
         args: "OmniModuleRuntimeArguments",
         module_name: str,
         *,
+        module_config: "OmniModuleConfig",
         train: Optional["OmniTrainingArguments"] = None,
         for_inference: bool = False,
         global_accelerator: Optional["AcceleratorConfig"] = None,
     ):
         self.args = args
         self.model_name = module_name
+        self.module_config = module_config
         self.train_args = train
         self.optimizer = None
         self.lr_scheduler = None
@@ -191,11 +195,10 @@ class ModuleRuntime(VeOmniModelRuntime):
         """Single-process eager load via ``from_pretrained`` + ``device_map``."""
         args = self.args
         assert args.accelerator.fsdp_config.fsdp_mode == "eager"
-        from ... import OMNI_MODEL_REGISTRY, read_model_type
+        from ... import OMNI_MODEL_REGISTRY
 
         model_path = args.model_path
-        overrides = dict(args.model_config or {})
-        model_type = read_model_type(model_path)
+        model_type = self.module_config.model_type
         cls = OMNI_MODEL_REGISTRY[model_type]()
         if dist.is_initialized():
             device_map = {"": f"{get_device_type()}:{int(os.getenv('LOCAL_RANK', 0))}"}
@@ -207,9 +210,9 @@ class ModuleRuntime(VeOmniModelRuntime):
         )
         self.model = cls.from_pretrained(
             model_path,
+            config=self.module_config,
             torch_dtype=torch.bfloat16,
             device_map=device_map,
-            **overrides,
         ).eval()
         self.model_config = self.model.config
         self._build_model_assets()
@@ -217,12 +220,11 @@ class ModuleRuntime(VeOmniModelRuntime):
     # ── Build (model, assets, parallelize) ────────────────────────────────────
 
     def _build_model(self) -> None:
-        """Meta-init this module's sub-model from the config beside its weights.
+        """Meta-init this module's sub-model from ``module_config``.
 
-        Unlike a standalone model, a module reads ``model_path`` rather than
-        ``config_path``: the latter is inherited from the composed model's
-        arguments and points at the Omni checkpoint *root*, whose ``config.json``
-        is the :class:`OmniConfig`, not this module's architecture.
+        The config comes from the composed :class:`OmniConfig`, which already
+        applied this module's ``model_config`` overwrites; ``model_path`` is
+        read only for the weights.
         """
         args = self.args
         logger.info_rank0(f"ModuleRuntime '{self.module_name}': build module model")
@@ -230,12 +232,11 @@ class ModuleRuntime(VeOmniModelRuntime):
 
         acc = self.mesh_accelerator
         self.model = build_foundation_model(
-            config_path=args.model_path,
+            config_path=self.module_config,
             weights_path=args.model_path,
             torch_dtype="float32" if acc.fsdp_config.mixed_precision.enable else "bfloat16",
             init_device=acc.init_device,
             ops_implementation=args.ops_implementation,
-            config_kwargs=args.model_config,
         )
         self.model_config = self.model.config
 

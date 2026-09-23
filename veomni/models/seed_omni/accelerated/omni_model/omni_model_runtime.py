@@ -147,6 +147,7 @@ class OmniModelRuntime:
         from ..omni_module.omni_module_runtime import ModuleRuntime
 
         omni_config = omni_model_runtime_args.to_hf_config()
+        omni_config.load_checkpoint_sidecars(omni_model_runtime_args.resolved_model_path)
         module_runtime_args = omni_model_runtime_args.modules
         module_runtimes: dict[str, ModuleRuntime] = {}
         for name in omni_config.module_names:
@@ -154,6 +155,7 @@ class OmniModelRuntime:
             module_runtime = ModuleRuntime(
                 module_args,
                 module_name=name,
+                module_config=omni_config._module_configs[name],
                 train=train,
                 for_inference=for_inference,
                 global_accelerator=omni_model_runtime_args.accelerator,
