@@ -43,6 +43,7 @@ still works by invoking `/skill-name` explicitly.
 | What you say | Agent uses |
 |---|---|
 | "Add support for Llama 4" | `/veomni-new-model` |
+| "Migrate an external model and checkpoint into VeOmni" | `/veomni-new-model` |
 | "Fix the OOM error in VLM training" | `/veomni-debug` |
 | "Add a fused RoPE kernel" | `/veomni-new-op` |
 | "Refactor the data collator" | `/veomni-develop` |
@@ -50,6 +51,13 @@ still works by invoking `/skill-name` explicitly.
 | "Write the patchgen config for Qwen3" | `/veomni-patchgen-model` |
 | "Analyze this Chrome trace" | `/veomni-profile` |
 | "Submit the current branch as a PR" | `/create-pr` |
+
+`veomni-new-model` inspects the actual implementation to select Transformers,
+Diffusers, or other-framework integration, including component-level routing for
+mixed systems. Weight conversion, training, resume, and hardware checks apply
+according to the requested behavior and the actual adaptations. Source analysis,
+configuration, and task-specific scripts are handled directly by the agent;
+there are no mandatory analysis tools or report templates.
 
 ## Directory Structure
 
@@ -62,7 +70,7 @@ Each skill is a folder containing a `SKILL.md` file with YAML frontmatter (`name
 ├── veomni-develop/SKILL.md    # Feature development and refactoring
 ├── veomni-debug/SKILL.md      # Bug fix and debugging (quick path + full protocol)
 ├── veomni-review/SKILL.md     # Pre-PR code review (mandatory)
-├── veomni-new-model/SKILL.md  # Add a new model to VeOmni
+├── veomni-new-model/SKILL.md  # Integrate an existing external model
 ├── veomni-patchgen-model/SKILL.md  # Author a model's patchgen-generated modeling
 ├── veomni-new-op/SKILL.md     # Add a new kernel/operator
 ├── veomni-uv-update/SKILL.md  # Dependency management with uv
