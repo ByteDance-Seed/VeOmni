@@ -8,6 +8,8 @@ once it is served under VeOmni.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
@@ -118,3 +120,33 @@ def test_runtime_generation_matches_eager_generation():
     )
     assert [item["value"] for item in runtime_generated] == [item["value"] for item in eager_generated]
     assert [item["value"] for item in runtime_generated] == ["module_a", "module_b"]
+
+
+class _DdpStyleWrapper(torch.nn.Module):
+    """DDP-shaped: the module lives on ``.module``; counts the calls it receives."""
+
+    def __init__(self, inner: torch.nn.Module):
+        super().__init__()
+        self.module = inner
+        self.calls = 0
+
+    def forward(self, *args, **kwargs):
+        self.calls += 1
+        return self.module(*args, **kwargs)
+
+
+def test_runtime_calls_a_wrapped_module_through_its_runtime():
+    """OmniModel holds the bare module; DDP syncs gradients only if its own forward runs."""
+    model = _model()
+    wrapped = _DdpStyleWrapper(model.modules_dict["module_a"])
+    runtime = OmniModelRuntime(model, module_runtimes={"module_a": SimpleNamespace(model=wrapped)})
+
+    runtime.forward({})
+    assert wrapped.calls == 1
+
+    runtime.reset()
+    ctx: dict = {}
+    runtime.generate(ctx)
+    assert wrapped.calls == 2
+    assert ctx["trace"][:3] == ["module_a:pre", "module_a:generate", "module_a:post"]
+    assert dict(runtime.named_omni_modules())["module_a"] is model.modules_dict["module_a"]

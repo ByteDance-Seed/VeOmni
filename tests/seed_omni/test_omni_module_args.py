@@ -357,7 +357,7 @@ def test_resolve_model_reads_graphs_from_omni_checkpoint(tmp_path):
 
 def test_from_model_runtime_projects_onto_hf_config(tmp_path):
     """from_model_runtime builds OmniModel from ``to_hf_config()``; each ModuleRuntime
-    gets the module config that OmniConfig loaded."""
+    gets the module config that OmniConfig loaded, and OmniModel gets the bare module."""
     from unittest.mock import MagicMock, patch
 
     from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
@@ -366,16 +366,18 @@ def test_from_model_runtime_projects_onto_hf_config(tmp_path):
         config.save_pretrained(tmp_path / name)
     runtime_cfg = _model_runtime(model_path=str(tmp_path))
     with patch("veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime") as mock_rt_cls:
-        mock_rt_cls.side_effect = lambda *a, **k: MagicMock(model=MagicMock())
+        mock_rt_cls.side_effect = lambda *a, **k: MagicMock(model=MagicMock(), omni_module=MagicMock())
         with patch("veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.OmniModel") as mock_omni_model:
-            OmniModelRuntime.from_model_runtime(runtime_cfg)
-            omni_config = mock_omni_model.call_args[0][0]
+            runtime = OmniModelRuntime.from_model_runtime(runtime_cfg)
+            omni_config, modules = mock_omni_model.call_args[0]
             assert isinstance(omni_config, OmniConfig)
             assert set(omni_config.module_names) == set(runtime_cfg.module_names)
 
     for call in mock_rt_cls.call_args_list:
         name = call.kwargs["module_name"]
         assert call.kwargs["module_config"] is omni_config._module_configs[name]
+    for name, module_runtime in runtime.module_runtimes.items():
+        assert modules[name] is module_runtime.omni_module
 
 
 def test_omni_module_config_owns_descriptor_conversion():

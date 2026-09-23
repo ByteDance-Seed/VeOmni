@@ -174,6 +174,15 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         return self.model_name
 
+    @property
+    def omni_module(self) -> nn.Module:
+        """The bare module this runtime built, for :class:`OmniModel` to hold.
+
+        ``self.model`` may be a DDP / LoRA wrapper around it; that wrapper stays
+        on the runtime side and is what :class:`OmniModelRuntime` calls.
+        """
+        return unwrap_module(self.model)
+
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Run this module's forward inside its own ``ParallelState``.
 

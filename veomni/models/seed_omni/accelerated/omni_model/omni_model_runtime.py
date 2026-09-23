@@ -107,6 +107,12 @@ class OmniModelRuntime:
       :class:`OmniModel` so FSDP root hooks fire; this class supplies
       ParallelState scoping, graph tracing and metric metering.
 
+    The two lines stay apart: :class:`OmniModel` holds each runtime's bare
+    module (:attr:`ModuleRuntime.omni_module`), and whatever a runtime wrapped
+    it in (DDP, LoRA) stays on the runtime. Nodes, generation and export call
+    the module through its runtime (:meth:`_module_to_call`), so a DDP
+    module still syncs its gradients.
+
     Both are used through the single ``self.model`` handle on the trainer /
     inferencer. APIs that need no wrapper handling are forwarded via
     :meth:`__getattr__` (``config``, ``modules_dict``, …).
@@ -170,7 +176,7 @@ class OmniModelRuntime:
         if not for_inference:
             _reject_lora_that_matched_nothing(module_runtimes, train)
         runtime = cls(
-            OmniModel(omni_config, {name: rt.model for name, rt in module_runtimes.items()}),
+            OmniModel(omni_config, {name: rt.omni_module for name, rt in module_runtimes.items()}),
             module_runtimes=module_runtimes,
             module_parallel_state_names=[name for name in module_runtimes if is_parallel_state_registered(name)],
             omni_model_runtime_args=omni_model_runtime_args,
@@ -339,7 +345,11 @@ class OmniModelRuntime:
         """
         profiler = profiler if profiler is not None else self._step_profiler
         runner = TrainNodeRunner(profiler=profiler, scope_fn=self.module_context)
-        return self.model(batch, node_runner=runner)
+
+        def run_node(module: Any, node: Any, batch: dict[str, Any]) -> None:
+            runner(self._module_to_call(node.module), node, batch)
+
+        return self.model(batch, node_runner=run_node)
 
     def generate(
         self,
@@ -359,7 +369,7 @@ class OmniModelRuntime:
         profiler = profiler if profiler is not None else self._step_profiler
         model = self.model
         ctx: dict[str, Any] = request
-        modules = model.modules_dict
+        modules = {name: self._module_to_call(name) for name in model._module_names}
         generation_kwargs = model.resolve_generation_kwargs(generation_kwargs)
         max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
         total_steps = 0
@@ -405,6 +415,11 @@ class OmniModelRuntime:
         if profiler is not None and len(generated) > before:
             profiler.record(f"{label}:{generated[-1]['type']}")
 
+    def _module_to_call(self, name: str) -> Any:
+        """Module ``name`` as its runtime wrapped it, else the bare module :class:`OmniModel` holds."""
+        module_runtime = self.module_runtimes.get(name)
+        return module_runtime.model if module_runtime is not None else self.model.modules_dict[name]
+
     def named_omni_modules(self) -> Iterator[tuple[str, Any]]:
         """Yield ``(name, BaseMixin)`` for every graph participant (unwraps wrappers)."""
         yield from iter_named_omni_modules(self.model._module_names, self.model.modules_dict)
@@ -445,7 +460,7 @@ class OmniModelRuntime:
             "max_shard_size": max_shard_size,
         }
         for name in model._module_names:
-            module = model.modules_dict[name]
+            module = self._module_to_call(name)
             save_module_subdirectory(
                 name,
                 module,
