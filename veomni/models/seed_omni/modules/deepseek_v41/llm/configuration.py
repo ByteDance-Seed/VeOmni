@@ -307,6 +307,17 @@ class DeepseekV41LlmConfig(PretrainedConfig):
                     f"dspark_target_layer_ids contains layer {layer_idx}, which is not a backbone layer: "
                     "the draft stages read the backbone's residual stream, not their own."
                 )
+        if not 0 <= self.candidate_source_layer_id < self.num_hidden_layers:
+            raise ValueError(
+                f"candidate_source_layer_id={self.candidate_source_layer_id} is outside "
+                f"[0, {self.num_hidden_layers}). Shrinking the stack is not just num_hidden_layers: "
+                "the six layer-index lists have to move with it. See shrink_layer_schedule."
+            )
+        if self.candidate_source_layer_id > 0 and self.candidate_source_layer_id not in self.kv_source_layer_ids:
+            raise ValueError(
+                f"candidate_source_layer_id={self.candidate_source_layer_id} starts the CED decoder "
+                "and must also be a KV source, matching released L20."
+            )
         if self.head_dim <= self.qk_rope_head_dim:
             raise ValueError(f"head_dim={self.head_dim} must exceed qk_rope_head_dim={self.qk_rope_head_dim}.")
         if self.num_attention_heads % self.o_groups:
@@ -316,4 +327,109 @@ class DeepseekV41LlmConfig(PretrainedConfig):
             )
 
 
-__all__ = ["DeepseekV41LlmConfig"]
+RELEASED_NUM_HIDDEN_LAYERS = 40
+RELEASED_ENCODER_LAYERS = 20
+RELEASED_KV_SOURCE_LAYER_IDS = [2, 8, 14, 20]
+RELEASED_INDEX_SOURCE_LAYER_IDS = [2, 8, 14, 20, 24, 28, 32, 36]
+RELEASED_CANDIDATE_SOURCE_LAYER_ID = 20
+RELEASED_ENGRAM_LAYER_IDS = [1, 14]
+RELEASED_DSPARK_TARGET_LAYER_IDS = [37, 38, 39]
+
+
+def _even_pick(values: List[int], k: int) -> List[int]:
+    """``k`` unique entries spaced across ``values``, keeping the endpoints when k>1."""
+    if k <= 0:
+        return []
+    if k >= len(values):
+        return list(values)
+    if k == 1:
+        return [values[len(values) // 2]]
+    last = len(values) - 1
+    picked: List[int] = []
+    seen = set()
+    for i in range(k):
+        idx = int(round(i * last / (k - 1)))
+        idx = min(max(idx, 0), last)
+        while idx in seen and idx < last:
+            idx += 1
+        while idx in seen and idx > 0:
+            idx -= 1
+        seen.add(idx)
+        picked.append(values[idx])
+    return picked
+
+
+def shrink_layer_schedule(n_layers: int, n_draft: int = 3) -> Dict[str, Any]:
+    """Remap the released 40-layer CED lists onto ``n_layers`` backbone layers.
+
+    Changing only ``num_hidden_layers`` leaves ``kv_source_layer_ids`` etc. pointing
+    at layers that no longer exist. The rules are the Step 5 ones: encoder and
+    decoder each keep a half; each half keeps a KV source and the decoder's first
+    layer is also the candidate source; Engram keeps one layer per half; DSpark
+    targets the new last three layers.
+    """
+    if n_layers < 2:
+        raise ValueError(f"shrinking the CED backbone needs at least 2 layers, got {n_layers}")
+    if n_draft < 0:
+        raise ValueError(f"n_draft must be >= 0, got {n_draft}")
+    if n_layers == RELEASED_NUM_HIDDEN_LAYERS:
+        return {
+            "num_hidden_layers": RELEASED_NUM_HIDDEN_LAYERS,
+            "num_nextn_predict_layers": n_draft,
+            "compress_ratios": DeepseekV41LlmConfig._default_ratios()[: RELEASED_NUM_HIDDEN_LAYERS + n_draft],
+            "kv_source_layer_ids": list(RELEASED_KV_SOURCE_LAYER_IDS),
+            "index_source_layer_ids": list(RELEASED_INDEX_SOURCE_LAYER_IDS),
+            "candidate_source_layer_id": RELEASED_CANDIDATE_SOURCE_LAYER_ID,
+            "engram_layer_ids": list(RELEASED_ENGRAM_LAYER_IDS),
+            "dspark_target_layer_ids": list(RELEASED_DSPARK_TARGET_LAYER_IDS),
+        }
+
+    n_enc = n_layers // 2
+    n_dec = n_layers - n_enc
+    released_ratios = DeepseekV41LlmConfig._default_ratios()
+    encoder_kv = [idx for idx in RELEASED_KV_SOURCE_LAYER_IDS if idx < RELEASED_ENCODER_LAYERS]
+    encoder_pool = list(range(RELEASED_ENCODER_LAYERS))
+    if n_enc == 1:
+        enc_keep = [encoder_kv[0]]
+    else:
+        enc_keep = _even_pick(encoder_pool, n_enc)
+        if not any(idx in encoder_kv for idx in enc_keep):
+            enc_keep[-1] = encoder_kv[-1]
+            enc_keep = sorted(set(enc_keep))
+            drop_from = [idx for idx in enc_keep if idx not in encoder_kv]
+            while len(enc_keep) > n_enc and drop_from:
+                enc_keep.remove(drop_from.pop(0))
+
+    decoder_rest = [
+        idx
+        for idx in range(RELEASED_ENCODER_LAYERS, RELEASED_NUM_HIDDEN_LAYERS)
+        if idx != RELEASED_CANDIDATE_SOURCE_LAYER_ID
+    ]
+    dec_keep = [RELEASED_CANDIDATE_SOURCE_LAYER_ID] + _even_pick(decoder_rest, n_dec - 1)
+    kept = enc_keep + dec_keep
+    remap = {orig: new for new, orig in enumerate(kept)}
+
+    kv_ids = sorted({remap[idx] for idx in RELEASED_KV_SOURCE_LAYER_IDS if idx in remap})
+    if n_enc not in kv_ids:
+        kv_ids = sorted(kv_ids + [n_enc])
+    index_ids = sorted({remap[idx] for idx in RELEASED_INDEX_SOURCE_LAYER_IDS if idx in remap} | set(kv_ids))
+
+    enc_engram = next((remap[idx] for idx in RELEASED_ENGRAM_LAYER_IDS if idx in remap and remap[idx] < n_enc), 0)
+    dec_engram = n_layers - 1
+    engram_ids = sorted({enc_engram, dec_engram})
+
+    n_dspark = min(3, n_layers)
+    dspark_ids = list(range(n_layers - n_dspark, n_layers))
+    return {
+        "num_hidden_layers": n_layers,
+        "num_nextn_predict_layers": n_draft,
+        "compress_ratios": [released_ratios[idx] for idx in kept] + [0] * n_draft,
+        "kv_source_layer_ids": kv_ids,
+        "index_source_layer_ids": index_ids,
+        "candidate_source_layer_id": n_enc,
+        "engram_layer_ids": engram_ids,
+        "dspark_target_layer_ids": dspark_ids,
+    }
+
+
+__all__ = ["DeepseekV41LlmConfig", "shrink_layer_schedule"]

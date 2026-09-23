@@ -46,7 +46,9 @@ class TrainingMixin(BaseTrainingMixin):
         conversation_list: Optional[list[list[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        return super().encode_pre(conversation_list, **kwargs)
+        # The shared batch still holds ngram_embeds from the sibling node.
+        del kwargs
+        return super().encode_pre(conversation_list)
 
     @post_forward("encode")
     def encode_post(self, **outputs: Any) -> Dict[str, Any]:
@@ -58,7 +60,8 @@ class TrainingMixin(BaseTrainingMixin):
         conversation_list: Optional[list[list[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        return super().decode_pre(conversation_list, **kwargs)
+        del kwargs
+        return super().decode_pre(conversation_list)
 
     @post_forward("decode")
     def decode_post(self, **outputs: Any) -> Dict[str, Any]:

@@ -33,6 +33,7 @@ import pytest
 import yaml
 
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
+from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
 
 
 CONFIG_ROOT = Path("configs/seed_omni/DeepSeek/deepseek_v41_flash")
@@ -164,3 +165,25 @@ class TestGraphShape:
         for name in names:
             module = name.split(".")[0]
             assert module in OMNI_MODEL_REGISTRY, f"'{module}' is not a registered OmniModule"
+
+
+class TestTrainGraph:
+    def test_vision_runs_before_ngram(self):
+        """Image span length is the ViT's output width; hashing first cannot size it."""
+        graph = TrainingGraph(yaml.safe_load((CONFIG_ROOT / "train/graph_train.yaml").read_text()))
+        names = [node.name for node in graph.iter_nodes()]
+        vision = "deepseek_v41_vision.forward"
+        ngram = "deepseek_v41_ngram.forward"
+        encode = "deepseek_v41_text_encoder.encode"
+        llm = "deepseek_v41_llm.forward"
+        decode = "deepseek_v41_text_encoder.decode"
+        assert names.index(vision) < names.index(ngram) < names.index(llm)
+        assert names.index(encode) < names.index(llm)
+        assert names[-1] == decode
+
+    def test_training_turns_the_indexer_kl_on_and_skips_dspark(self):
+        train = yaml.safe_load(MODULES_TRAIN_PATH.read_text())
+        llm = train["deepseek_v41_llm"]["model_config"]
+        assert llm["dsa_indexer_loss"] is True
+        assert llm["dspark_block_size"] == 0
+        assert llm["weight_quantization"] is None

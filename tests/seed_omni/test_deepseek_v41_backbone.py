@@ -39,7 +39,7 @@ from veomni.models.seed_omni.modules.deepseek_v41.llm.attention import (
     DeepseekV41AttentionCache,
     sequence_slices_from_positions,
 )
-from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig
+from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig, shrink_layer_schedule
 from veomni.models.seed_omni.modules.deepseek_v41.llm.mhc import mhc_collapse
 from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import DeepseekV41Backbone, DeepseekV41Llm
 
@@ -265,7 +265,7 @@ class TestLoopOrdering:
 
     def test_capture_replays_decoder_on_the_sliding_window(self):
         """CED prefill: encoder sees the prompt, decoder only the last n_win tokens."""
-        config = make_config(candidate_source_layer_id=4)
+        config = make_config(candidate_source_layer_id=4, kv_source_layer_ids=[0, 4])
         backbone = stub_backbone(config)
         seq_len = 17
         embeds, positions, rows = self._inputs(config, seq_len=seq_len)
@@ -349,6 +349,44 @@ class TestIndexerKLAggregation:
         config = make_config(dsa_indexer_loss=True)
         with pytest.raises(RuntimeError, match="no layer built an indexer KL"):
             self._run(config, indexer_layers=())
+
+
+class TestShrinkSchedule:
+    def test_a_two_layer_toy_keeps_the_ced_split(self):
+        schedule = shrink_layer_schedule(2)
+        config = make_config(**schedule, n_routed_experts=8, num_experts_per_tok=2)
+        assert config.num_hidden_layers == 2
+        assert config.candidate_source_layer_id == 1
+        assert config.candidate_source_layer_id in config.kv_source_layer_ids
+        assert any(idx < 1 for idx in config.kv_source_layer_ids)
+        assert any(idx < 1 for idx in config.engram_layer_ids)
+        assert any(idx >= 1 for idx in config.engram_layer_ids)
+        assert config.dspark_target_layer_ids == [0, 1]
+        assert config.compress_ratios[1] != 0
+
+    def test_forty_layers_is_the_released_schedule(self):
+        schedule = shrink_layer_schedule(40)
+        assert schedule["kv_source_layer_ids"] == [2, 8, 14, 20]
+        assert schedule["candidate_source_layer_id"] == 20
+        assert schedule["engram_layer_ids"] == [1, 14]
+        assert schedule["dspark_target_layer_ids"] == [37, 38, 39]
+        DeepseekV41LlmConfig(**schedule)
+
+    def test_candidate_source_must_move_with_the_layer_count(self):
+        with pytest.raises(ValueError, match="shrink_layer_schedule"):
+            make_config(
+                num_hidden_layers=2,
+                compress_ratios=[2, 1, 0, 0, 0],
+                kv_source_layer_ids=[0],
+                index_source_layer_ids=[0],
+                engram_layer_ids=[0],
+                dspark_target_layer_ids=[0, 1],
+                candidate_source_layer_id=20,
+            )
+
+    def test_decoder_start_must_be_a_kv_source(self):
+        with pytest.raises(ValueError, match="must also be a KV source"):
+            make_config(candidate_source_layer_id=4, kv_source_layer_ids=[0])
 
 
 class TestRefusals:

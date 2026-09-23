@@ -49,6 +49,11 @@ deepseek_v41_llm:
     # Checkpoint files stay fp8/fp4. Clearing this makes the module allocate
     # bf16 Parameters; DeepseekV41DequantConverter spends the scales at load.
     weight_quantization: null
+    # Indexer weights only get a gradient through this KL -- top-k does not
+    # backprop into the scores. Off, the indexer is frozen in all but name.
+    dsa_indexer_loss: true
+    # DSpark is serving-only; skip the 14B draft stack so training fits.
+    dspark_block_size: 0
   accelerator:
     ep_size: 8
     ep_outside: false

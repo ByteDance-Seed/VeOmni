@@ -88,6 +88,22 @@ def build_packed_image_mask(
     return torch.cat(flags).unsqueeze(0)
 
 
+def fold_indexer_kl_loss(outputs: Dict[str, Any], coef: float) -> Optional[torch.Tensor]:
+    """Mean indexer KL, scaled by ``dsa_indexer_loss_coef``, or None when the objective is off.
+
+    The backbone sums KL over query rows so each source layer's gradient does not
+    depend on how many other layers built a term. The language-model loss is a
+    mean, so the fold-in uses the same mean -- matching
+    ``DeepseekV4ForCausalLM`` -- rather than adding a sum onto a mean.
+    """
+    total = outputs.get("indexer_kl_total")
+    if total is None or coef <= 0:
+        return None
+    tokens = outputs.get("indexer_query_tokens")
+    denom = 1 if not tokens else max(int(tokens), 1)
+    return coef * (total / denom)
+
+
 class TrainingMixin(TrainingModuleMixin):
     """Training-graph hooks: pack in, scatter out, thread the n-gram rows."""
 
@@ -181,14 +197,13 @@ class TrainingMixin(TrainingModuleMixin):
         scatter_llm_hidden_states(conversation, unflatten(hidden_states, pack_shape))
 
         forwarded: Dict[str, Any] = {"conversation_list": conversation}
-        # The auxiliary KL rides along to whatever computes the loss. It is a
-        # value on the output rather than an attribute on the module for the same
-        # reason it leaves the decoder layer that way: gradient checkpointing
-        # rebuilds the graph from the returned tensors, and a KL reaching the loss
-        # by any other route would fall while the indexer received nothing.
-        for key in ("indexer_kl_total", "indexer_uniform_total", "indexer_kl_layers", "indexer_query_tokens"):
-            if key in outputs:
-                forwarded[key] = outputs[key]
+        # OmniModel only collects ``_loss``. Leaving the KL tensors on the batch
+        # would hand them to ``text_encoder.decode`` as unexpected kwargs; folding
+        # here is how the indexer gets a gradient at all -- top-k does not
+        # backprop into the scores it ranked.
+        kl_loss = fold_indexer_kl_loss(outputs, self.config.dsa_indexer_loss_coef)
+        if kl_loss is not None:
+            forwarded["_loss"] = kl_loss
         return forwarded
 
 
@@ -302,4 +317,5 @@ class DeepseekV41LlmAccelerated(VeOmniMixin, DeepseekV41Llm):
 __all__ = [
     "DeepseekV41LlmAccelerated",
     "build_packed_image_mask",
+    "fold_indexer_kl_loss",
 ]

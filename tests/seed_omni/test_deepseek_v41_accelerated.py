@@ -33,6 +33,7 @@ import torch
 from veomni.models.seed_omni.modules.deepseek_v41.llm.accelerated.accelerated import (
     DeepseekV41LlmAccelerated,
     build_packed_image_mask,
+    fold_indexer_kl_loss,
 )
 from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig
 from veomni.models.seed_omni.utils.conversation import ConversationItem
@@ -279,6 +280,17 @@ class TestMeter:
 
         value = self._flops([32768])
         assert value > 0 and math.isfinite(value)
+
+
+class TestIndexerKlFoldIn:
+    def test_the_mean_kl_becomes_the_module_loss(self):
+        loss = fold_indexer_kl_loss({"indexer_kl_total": torch.tensor(6.0), "indexer_query_tokens": 3}, 0.5)
+        assert loss is not None
+        assert loss.item() == pytest.approx(1.0)
+
+    def test_a_missing_or_zero_coef_drops_the_term(self):
+        assert fold_indexer_kl_loss({}, 1.0) is None
+        assert fold_indexer_kl_loss({"indexer_kl_total": torch.tensor(1.0)}, 0.0) is None
 
 
 class TestSequenceParallelRefusal:
