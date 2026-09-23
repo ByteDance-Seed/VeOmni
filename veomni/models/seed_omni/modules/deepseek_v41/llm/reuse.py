@@ -63,6 +63,12 @@ DeepseekV4Experts = _generated.DeepseekV4Experts
 #: and one-sided on ``gate``, and FP8 QAT on all three projections.
 DeepseekV4MLP = _generated.DeepseekV4MLP
 
+#: Routed-expert / shared-MLP QAT. The helpers close over this slot in the
+#: generated module, so ``_bind_veomni_ops`` will not see it unless a V4.1
+#: modeling module re-exports the same object (``llm/modeling.py``,
+#: ``llm/accelerated/accelerated.py``).
+veomni_qat_implementation = _generated.veomni_qat_implementation
+
 
 __all__ = [
     "DeepseekV4Experts",
@@ -70,4 +76,5 @@ __all__ = [
     "DeepseekV4MLP",
     "DeepseekV4RMSNorm",
     "DeepseekV4UnweightedRMSNorm",
+    "veomni_qat_implementation",
 ]

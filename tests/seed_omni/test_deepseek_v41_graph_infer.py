@@ -187,3 +187,5 @@ class TestTrainGraph:
         assert llm["dsa_indexer_loss"] is True
         assert llm["dspark_block_size"] == 0
         assert llm["weight_quantization"] is None
+        assert llm["n_trainable_layers"] == 2
+        assert train["deepseek_v41_llm"]["ops_implementation"]["qat_implementation"] == "fp8_blockwise"

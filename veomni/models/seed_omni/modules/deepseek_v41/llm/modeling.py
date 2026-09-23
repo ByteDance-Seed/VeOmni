@@ -65,7 +65,9 @@ from .dspark import build_dspark_blocks
 from .engram_connection import build_engram_connections
 from .inference import DeepseekV41LlmInferenceMixin
 from .mhc import expand_to_streams, identity_pre_mix, mhc_collapse
+from .quantization import veomni_qat_implementation
 from .reuse import DeepseekV4RMSNorm
+from .reuse import veomni_qat_implementation as veomni_v4_expert_qat_implementation
 
 
 class DeepseekV41Backbone(nn.Module):
@@ -438,6 +440,28 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
             "deepseek_v41_llm holds no token embedding; set it on deepseek_v41_text_encoder instead."
         )
 
+    def freeze_model(self) -> None:
+        """Keep the first ``n_trainable_layers`` trainable; freeze the rest.
+
+        ``None`` is a no-op (full-parameter). Engram connections follow their
+        layer index, not the decoder-layer wrap, so a connection at layer 14 is
+        frozen when N=2 even though it is not a child of ``layers.14``. The final
+        RMSNorm rides the frozen tail. DSpark stages are serving-only and freeze
+        whenever they exist.
+        """
+        n = self.config.n_trainable_layers
+        if n is None:
+            return
+        for layer_idx, layer in enumerate(self.model.layers):
+            if layer_idx >= n:
+                layer.requires_grad_(False)
+        for key, connection in self.model.engram.items():
+            if int(key) >= n:
+                connection.requires_grad_(False)
+        self.model.mtp.requires_grad_(False)
+        if n < self.config.num_hidden_layers:
+            self.model.norm.requires_grad_(False)
+
     def forward(  # type: ignore[override]
         self,
         inputs_embeds: Optional[torch.Tensor] = None,
@@ -484,4 +508,9 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
         )
 
 
-__all__ = ["DeepseekV41Backbone", "DeepseekV41Llm"]
+__all__ = [
+    "DeepseekV41Backbone",
+    "DeepseekV41Llm",
+    "veomni_qat_implementation",
+    "veomni_v4_expert_qat_implementation",
+]

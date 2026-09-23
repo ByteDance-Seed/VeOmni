@@ -26,6 +26,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+import pytest
 import torch
 import yaml
 
@@ -205,8 +206,8 @@ def tiny_text_config() -> DeepseekV41TextEncoderConfig:
     )
 
 
-def build_toy_modules():
-    llm_config = tiny_llm_config()
+def build_toy_modules(*, n_trainable_layers=None):
+    llm_config = tiny_llm_config(n_trainable_layers=n_trainable_layers)
     ngram = DeepseekV41NgramAccelerated(tiny_ngram_config(llm_config.engram_layer_ids))
     torch.manual_seed(0)
     ngram.token_map.copy_(torch.arange(VOCAB) % ngram.config.compressed_vocab_size)
@@ -218,11 +219,13 @@ def build_toy_modules():
     # decode takes the fused linear+CE contract (``logits=None`` + hidden/weights).
     text.loss_function = ForCausalLMLoss
 
+    llm = DeepseekV41LlmAccelerated(llm_config)
+    llm.freeze_model()
     return {
         VISION: DeepseekV41VisionEncoderAccelerated(tiny_vision_config()),
         NGRAM: ngram,
         TEXT: text,
-        LLM: DeepseekV41LlmAccelerated(llm_config),
+        LLM: llm,
     }
 
 
@@ -317,3 +320,71 @@ class TestToyTrainStep:
         ngram_names = {name for name, _ in modules[NGRAM].named_parameters()}
         for pattern in modules[NGRAM].get_parallel_plan().extra_parallel_plan["emb"]:
             assert pattern in ngram_names, f"{pattern} matches nothing on the toy n-gram tables"
+
+
+class TestFirstNLayersFreeze:
+    def test_unset_leaves_the_stack_trainable(self):
+        llm = DeepseekV41LlmAccelerated(tiny_llm_config())
+        llm.freeze_model()
+        assert all(p.requires_grad for p in llm.parameters())
+
+    def test_out_of_range_is_refused(self):
+        with pytest.raises(ValueError, match="n_trainable_layers"):
+            tiny_llm_config(n_trainable_layers=N_LAYERS + 1)
+
+    def test_later_layers_and_their_engram_freeze(self):
+        llm = DeepseekV41LlmAccelerated(tiny_llm_config(n_trainable_layers=1))
+        llm.freeze_model()
+        by_layer = {0: [], 1: []}
+        for name, param in llm.named_parameters():
+            if name.startswith("model.layers.0."):
+                by_layer[0].append(param.requires_grad)
+            elif name.startswith("model.layers.1."):
+                by_layer[1].append(param.requires_grad)
+        assert by_layer[0] and all(by_layer[0])
+        assert by_layer[1] and not any(by_layer[1])
+        assert all(p.requires_grad for n, p in llm.named_parameters() if n.startswith("model.engram.0."))
+        assert all(not p.requires_grad for n, p in llm.named_parameters() if n.startswith("model.engram.1."))
+        assert all(not p.requires_grad for n, p in llm.named_parameters() if n.startswith("model.norm."))
+
+    def test_frozen_tail_gets_no_grad(self, monkeypatch):
+        _patch_cpu_attention(monkeypatch)
+        modules = build_toy_modules(n_trainable_layers=1)
+        model = build_toy_omni(modules)
+        model.train()
+        out = model({"conversation_list": toy_conversation()})
+        out["loss"].backward()
+        frozen = [p for n, p in modules[LLM].named_parameters() if n.startswith("model.layers.1.")]
+        trained = [p for n, p in modules[LLM].named_parameters() if n.startswith("model.layers.0.")]
+        assert frozen and all(p.grad is None for p in frozen)
+        assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in trained)
+
+
+class TestQatOpsSlotBinding:
+    def test_bind_on_accelerated_module_enables_dense_and_expert_qat(self):
+        """YAML ``qat_implementation`` is a no-op unless both slots live here.
+
+        ``_bind_veomni_ops`` only scans the OmniModule's Python module. Dense
+        GEMM / KV / indexer QAT is in ``quantization.py``; routed-expert QAT
+        closes over the reused V4 generated slot. Both have to be attributes
+        of ``accelerated.py`` or the 8xH20 job trains in bf16 while thinking
+        it is doing QAT.
+        """
+        from veomni.arguments.arguments_types import OpsImplementationConfig
+        from veomni.models.auto import _bind_veomni_ops
+        from veomni.models.seed_omni.modules.deepseek_v41.llm import quantization as qat
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.accelerated import accelerated as acc
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.reuse import veomni_qat_implementation as expert_slot
+
+        dense_slot = qat.veomni_qat_implementation
+        dense_before, expert_before = dense_slot.value, expert_slot.value
+        try:
+            ops = OpsImplementationConfig()
+            ops.qat_implementation = "fp8_blockwise"
+            assert _bind_veomni_ops(acc, ops)
+            assert qat.qat_enabled()
+            assert expert_slot.value == "fp8_blockwise"
+            assert dense_slot is not expert_slot
+        finally:
+            dense_slot._value = dense_before
+            expert_slot._value = expert_before

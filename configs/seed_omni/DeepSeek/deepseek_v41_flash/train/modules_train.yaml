@@ -54,6 +54,15 @@ deepseek_v41_llm:
     dsa_indexer_loss: true
     # DSpark is serving-only; skip the 14B draft stack so training fits.
     dspark_block_size: 0
+    # 8xH20 cannot hold AdamW moments for 40 layers of experts. First two stay
+    # full-param bf16; ``DeepseekV41Llm.freeze_model`` freezes the rest.
+    n_trainable_layers: 2
+  ops_implementation:
+    # Fake-quant dense GEMMs to fp8 and routed experts to fp4 (`expert_dtype`).
+    # Needs SM90+ (the 8xH20 job); `none` trains in bf16 with no rounding.
+    # Bound through the slots re-exported on the llm accelerated module --
+    # without those, this field is accepted and the helpers stay off.
+    qat_implementation: fp8_blockwise
   accelerator:
     ep_size: 8
     ep_outside: false

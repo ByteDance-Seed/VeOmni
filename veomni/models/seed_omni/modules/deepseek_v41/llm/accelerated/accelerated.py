@@ -56,6 +56,8 @@ from ....base.llm_packing import pack_llm_conversations_for_forward, scatter_llm
 from ...quant_scheme import quantized_storage_dtype
 from ..configuration import DeepseekV41LlmConfig
 from ..modeling import DeepseekV41Llm
+from ..quantization import veomni_qat_implementation
+from ..reuse import veomni_qat_implementation as veomni_v4_expert_qat_implementation
 
 
 def build_packed_image_mask(
@@ -318,4 +320,6 @@ __all__ = [
     "DeepseekV41LlmAccelerated",
     "build_packed_image_mask",
     "fold_indexer_kl_loss",
+    "veomni_qat_implementation",
+    "veomni_v4_expert_qat_implementation",
 ]

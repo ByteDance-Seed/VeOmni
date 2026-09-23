@@ -43,6 +43,9 @@ from ......ops.qat import (
 
 
 veomni_qat_implementation = OpsConfigSlot("qat_implementation")
+# ``_bind_veomni_ops`` only scans the OmniModule's own Python module
+# (``modeling.py`` / ``accelerated.py``). Those files re-export this object
+# so ``ops_implementation.qat_implementation`` actually reaches ``qat_enabled``.
 
 #: Official ``fp8_block_size`` for window KV (and dense GEMM activations).
 WINDOW_KV_FP8_BLOCK = 32

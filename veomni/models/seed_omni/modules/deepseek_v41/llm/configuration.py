@@ -129,6 +129,10 @@ class DeepseekV41LlmConfig(PretrainedConfig):
         # Multimodal
         image_token_id: int = 129264,
         enable_vision_routing_bias: bool = True,
+        # Training-only. None trains every backbone layer; an int freezes
+        # ``layers[n:]`` so an 8xH20 SFT can keep the first two. Absent from the
+        # released config, same as ``dsa_indexer_loss``.
+        n_trainable_layers: Optional[int] = None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -227,6 +231,7 @@ class DeepseekV41LlmConfig(PretrainedConfig):
 
         self.image_token_id = image_token_id
         self.enable_vision_routing_bias = enable_vision_routing_bias
+        self.n_trainable_layers = n_trainable_layers
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
         self.validate_layer_schedule()
 
@@ -324,6 +329,11 @@ class DeepseekV41LlmConfig(PretrainedConfig):
             raise ValueError(
                 f"num_attention_heads={self.num_attention_heads} must be divisible by o_groups={self.o_groups}: "
                 "the output projection is block-diagonal over head groups."
+            )
+        if self.n_trainable_layers is not None and not 0 <= self.n_trainable_layers <= self.num_hidden_layers:
+            raise ValueError(
+                f"n_trainable_layers={self.n_trainable_layers} is outside [0, {self.num_hidden_layers}]. "
+                "None trains the whole stack; 0 freezes it."
             )
 
 
