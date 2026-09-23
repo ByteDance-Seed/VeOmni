@@ -17,6 +17,26 @@ model:
     cross_entropy_loss_implementation: eager
     load_balancing_loss_implementation: eager
     moe_implementation: eager
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    dp_replicate_size: 1
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: false
+    offload_config:
+      enable_activation: false
 
 data:
   train_path: /path/to/qwen_image_train.jsonl
@@ -35,29 +55,9 @@ data:
     data_dir: /path/to/images
 train:
   training_task: online_training
-  accelerator:
-    dp_replicate_size: 1
-    ulysses_size: 1
-    fsdp_config:
-      fsdp_mode: fsdp2
-      mixed_precision:
-        enable: false
-    offload_config:
-      enable_activation: false
-  gradient_checkpointing:
-    enable: true
   global_batch_size: 8
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007
-  optimizer:
-    type: adamw
-    lr: 1.0e-5
-    lr_warmup_ratio: 0.007
-    lr_decay_style: constant
-    lr_decay_ratio: 1.0
-    weight_decay: 0.01
-    max_grad_norm: 1.0
-  init_device: meta
   enable_full_determinism: false
   empty_cache_steps: 500
   checkpoint:

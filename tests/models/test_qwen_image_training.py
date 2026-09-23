@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,12 +18,15 @@ from tokenizers.pre_tokenizers import ByteLevel
 from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
 
 from veomni.arguments import parse_args
-from veomni.arguments.arguments_types import OpsImplementationConfig
+from veomni.arguments.arguments_types import AcceleratorConfig, OpsImplementationConfig
 from veomni.data import build_data_transform, build_dataloader, build_dataset
 from veomni.data.multimodal.dit.preprocess import qwen_image_preprocess
+from veomni.distributed import parallel_state
+from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.models import build_foundation_model
 from veomni.models.auto import build_config
 from veomni.models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.trainer.dit_trainer import DiTDataCollator, DiTTrainer, VeOmniDiTArguments
 
 
@@ -41,9 +45,12 @@ def single_process_rank(tmp_path_factory):
         # Only device selection is controlled; every numerical component is real.
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(modeling_qwen_image_condition, "get_device_type", lambda: "cpu")
+            patch.setattr(parallel_state, "get_device_type", lambda: "cpu")
+            parallel_state.init_parallel_state_from_config(AcceleratorConfig(), name="base")
             yield
     finally:
         torch.distributed.destroy_process_group()
+        parallel_state.clear_parallel_state()
 
 
 def eager_ops():
@@ -128,11 +135,11 @@ def condition_model(snapshot, recipe="diffsynth", offline=False, **kwargs):
     return model.requires_grad_(False).eval()
 
 
-def transformer():
+def transformer(dtype="float32"):
     return build_foundation_model(
         str(ROOT / "tests/toy_config/qwen_image_toy/config.json"),
         init_device="cpu",
-        torch_dtype="float32",
+        torch_dtype=dtype,
         ops_implementation=eager_ops(),
     )
 
@@ -150,12 +157,21 @@ def test_yaml_registry_and_dataclasses(monkeypatch):
     assert args.train.training_task == "online_training"
     assert args.data.source_name == "Qwen-Image"
     assert args.model.condition_model_cfg["training_recipe"] == "diffsynth"
+    assert args.model.optimizer.type == "adamw"
+    assert args.model.optimizer.lr == 1e-5
+    assert args.model.optimizer.max_grad_norm == 1.0
+    assert args.model.accelerator.init_device == "meta"
+    assert args.model.accelerator.gradient_checkpointing.enable
+    assert args.model.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+    assert not args.model.accelerator.fsdp_config.mixed_precision.enable
+    assert args.model.accelerator.dp_replicate_size == 1
     cfg = build_config(str(ROOT / "tests/toy_config/qwen_image_toy/config.json"))
     assert cfg.condition_model_type == "QwenImageConditionModel"
     assert MODELING_REGISTRY[cfg.model_type]().__name__ == "QwenImageTransformer2DModel"
 
 
-def test_native_data_to_optimizer_and_checkpoint(snapshot, tmp_path, capsys):
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_native_data_to_optimizer_and_checkpoint(snapshot, tmp_path, capsys, dtype):
     records = []
     for idx, prompt in enumerate(["red", "a blue rectangle on a white wall"]):
         name = f"{idx}.png"
@@ -183,30 +199,43 @@ def test_native_data_to_optimizer_and_checkpoint(snapshot, tmp_path, capsys):
         collate_fn=DiTDataCollator(),
     )
     condition = condition_model(snapshot)
-    model = transformer().train()
+    model = transformer(dtype).train()
     model.gradient_checkpointing_enable()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    optimizer = build_optimizer(model, lr=1e-3)
+    scheduler = build_lr_scheduler(optimizer, train_steps=1, lr=1e-3)
     before = model.proj_out.weight.detach().clone()
-    # Exercise the trainer's real loss contract without initializing accelerator/FSDP state.
+    # Use the actual trainer step and single-rank mesh, without accelerator/FSDP wrapping.
     trainer = DiTTrainer.__new__(DiTTrainer)
-    trainer.base = SimpleNamespace(num_micro_batches=2)
+    trainer.base = SimpleNamespace(
+        num_micro_batches=2,
+        model=model,
+        device=torch.device("cpu"),
+        LOG_SAMPLE=False,
+        model_fwd_context=nullcontext(),
+        model_bwd_context=nullcontext(),
+    )
+    trainer.condition_model = condition
+    trainer.training_task = "online_training"
     losses = []
-    for batch in next(iter(loader)):
-        inputs = condition.process_condition(**condition.get_condition(**batch))
-        outputs = model(**inputs)
-        assert outputs.loss["mse_loss"].ndim == 0
-        loss, _ = trainer.postforward(outputs, inputs)
-        assert torch.isfinite(loss)
-        loss.backward()
+    micro_batches = next(iter(loader))
+    assert len(micro_batches) == trainer.base.num_micro_batches
+    for batch in micro_batches:
+        loss, loss_dict = trainer.forward_backward_step(batch)
+        assert loss.ndim == 0 and torch.isfinite(loss)
+        torch.testing.assert_close(loss, loss_dict["mse_loss"])
         losses.append(float(loss.detach()))
     grads = [param.grad for param in model.parameters() if param.grad is not None]
     assert grads and all(torch.isfinite(grad).all() for grad in grads)
     assert sum(float(grad.abs().sum()) for grad in grads) > 0
     assert all(param.grad is None for param in condition.parameters())
+    grad_norm = veomni_clip_grad_norm(model, max_norm=1.0, error_if_nonfinite=True)
+    assert torch.isfinite(grad_norm) and grad_norm > 0
     optimizer.step()
+    scheduler.step()
     assert not torch.equal(before, model.proj_out.weight)
     model.eval()
     with torch.no_grad():
+        inputs = condition.process_condition(**condition.get_condition(**micro_batches[-1]))
         expected = model(**inputs).predictions[0]
     checkpoint = tmp_path / "transformer"
     model.save_pretrained(checkpoint)
@@ -214,7 +243,7 @@ def test_native_data_to_optimizer_and_checkpoint(snapshot, tmp_path, capsys):
         str(checkpoint),
         weights_path=str(checkpoint),
         init_device="cpu",
-        torch_dtype="float32",
+        torch_dtype=dtype,
         ops_implementation=eager_ops(),
     ).eval()
     with torch.no_grad():
@@ -222,7 +251,7 @@ def test_native_data_to_optimizer_and_checkpoint(snapshot, tmp_path, capsys):
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
     with capsys.disabled():
         print(
-            f"QWEN_IMAGE_UPDATE_PASS losses={losses}, changed_parameters=True, checkpoint_max_abs={(actual - expected).abs().max().item()}"
+            f"QWEN_IMAGE_UPDATE_PASS dtype={dtype}, losses={losses}, grad_norm={float(grad_norm)}, changed_parameters=True, checkpoint_max_abs={(actual - expected).abs().max().item()}"
         )
 
 

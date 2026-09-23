@@ -20,8 +20,8 @@ from PIL import Image
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
-from veomni.arguments.arguments_types import MixedPrecisionConfig, OpsImplementationConfig
-from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state
+from veomni.arguments.arguments_types import AcceleratorConfig, MixedPrecisionConfig, OpsImplementationConfig
+from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state_from_config
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model
 from veomni.models.auto import build_config
@@ -293,17 +293,18 @@ def capture(fixture, output, *, device="cpu", dtype="fp32", backend="veomni", st
     if device != "cpu":
         set_device(int(os.environ.get("LOCAL_RANK", "0")))
     owns_group = False
-    if world > 1:
-        torch.distributed.init_process_group(get_dist_comm_backend())
-        owns_group = True
-        init_parallel_state(dp_size=world, dp_shard_size=world, device_type=device)
-    if rank == 0:
-        (output / "tensors").mkdir(parents=True)
-    if world > 1:
-        torch.distributed.barrier()
-    recorder = TensorRecorder(output, rank)
     hooks = []
     try:
+        if world > 1:
+            accelerator = AcceleratorConfig(dp_replicate_size=1, dp_shard_size=world)
+            torch.distributed.init_process_group(get_dist_comm_backend())
+            owns_group = True
+            init_parallel_state_from_config(accelerator, name=None)
+        if rank == 0:
+            (output / "tensors").mkdir(parents=True)
+        if world > 1:
+            torch.distributed.barrier()
+        recorder = TensorRecorder(output, rank)
         config = build_config(str(fixture / "model"))
         if backend == "veomni":
             model = build_foundation_model(

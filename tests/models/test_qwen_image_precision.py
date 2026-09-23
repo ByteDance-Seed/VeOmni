@@ -8,9 +8,11 @@ import torch
 import yaml
 from PIL import Image
 from safetensors.torch import load_file, save_file
+from torch.utils.checkpoint import CheckpointError, _CheckpointFrame
 
 from scripts.precision.qwen_image import capture, compare, encode, prepare, sha256, tensor_difference, verify_fixture
 from tests.models.test_qwen_image_training import snapshot as snapshot
+from tests.models.test_qwen_image_training import transformer
 from veomni.arguments.arguments_types import MixedPrecisionConfig
 from veomni.distributed.parallel_state import ParallelState, use_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -50,6 +52,31 @@ def test_parallel_builder_has_no_removed_chunk_dependency():
             enable_gradient_checkpointing=False,
         )
     assert result is model
+
+
+def test_parallel_builder_preserves_checkpoint_validation(monkeypatch):
+    # Restore global state even when checking an older builder that disables validation.
+    monkeypatch.setattr(
+        _CheckpointFrame, "check_recomputed_tensors_match", _CheckpointFrame.check_recomputed_tensors_match
+    )
+    model = transformer()
+    with use_parallel_state(ParallelState(device_type="cpu")):
+        build_parallelize_model(
+            model,
+            init_device="cuda",
+            mixed_precision=MixedPrecisionConfig(enable=False),
+            enable_gradient_checkpointing=True,
+        )
+    recompute = False
+
+    def inconsistent_forward(value):
+        return (value.double() if recompute else value).sin()
+
+    value = torch.randn(4, requires_grad=True)
+    loss = model._gradient_checkpointing_func(inconsistent_forward, value).sum()
+    recompute = True
+    with pytest.raises(CheckpointError, match="different metadata"):
+        loss.backward()
 
 
 @pytest.fixture(scope="module")
