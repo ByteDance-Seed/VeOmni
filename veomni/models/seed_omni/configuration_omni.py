@@ -376,30 +376,43 @@ class OmniConfig(PretrainedConfig):
         config that comes back is the resolved one, and handing it to
         ``OmniModel.from_pretrained(path, config=...)`` loads the same model.
         """
-        from .modules.module_configuration_base import OmniModuleConfig
-
         # Out before transformers sees them: it would turn each one into a
         # config attribute. Judged against this config's entries once it exists.
         omni_kwargs = pop_omni_kwargs(kwargs)
-        # A caller may pass a graph explicitly to run a checkpoint under a graph
-        # it was not exported with (a launcher YAML overriding the sidecar), so
-        # the sidecar read skips whatever the caller already supplied.
         config = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
         root = config.checkpoint_root or str(pretrained_model_name_or_path)
         config.apply_omni_kwargs(omni_kwargs)
-        config._load_graphs_from_pretrained(root)
-        for name in config.module_names:
-            entry = config._module_entries[name]
+        config.load_checkpoint_sidecars(root)
+        return config
+
+    def load_checkpoint_sidecars(self, checkpoint_root: Union[str, os.PathLike]) -> None:
+        """Load what a split checkpoint keeps beside its root ``config.json``.
+
+        That is the graph YAML sidecars and each module's typed config. A config
+        built in memory rather than read from disk (a launcher's
+        ``OmniModelRuntimeConfig.to_hf_config()``) has its entries and graphs
+        but no module configs; this fills them from ``checkpoint_root`` so the
+        config can be handed to ``OmniModel.from_pretrained(path, config=...)``.
+
+        A graph map already populated is kept: a caller may run a checkpoint
+        under a graph it was not exported with (a launcher YAML overriding the
+        sidecar).
+        """
+        from .modules.module_configuration_base import OmniModuleConfig
+
+        root = str(checkpoint_root)
+        self._load_graphs_from_pretrained(root)
+        for name in self.module_names:
+            entry = self._module_entries[name]
             module_name_or_path = OmniModuleConfig.resolve_path(root, name, entry.get("model_path"))
             # Ops rank: the file's own, then this config's base, then this entry.
-            config._module_configs[name] = OmniModuleConfig.from_pretrained(
+            self._module_configs[name] = OmniModuleConfig.from_pretrained(
                 module_name_or_path,
                 model_config=entry.get("model_config"),
                 processor_config=entry.get("processor_config"),
                 ops_implementation=entry.get("ops_implementation"),
-                base_ops_implementation=config.ops_implementation,
+                base_ops_implementation=self.ops_implementation,
             )
-        return config
 
     def _load_graphs_from_pretrained(self, checkpoint_root: Union[str, os.PathLike]) -> None:
         """Load ``training_graphs`` and ``generation_graphs`` from YAML sidecars when present.

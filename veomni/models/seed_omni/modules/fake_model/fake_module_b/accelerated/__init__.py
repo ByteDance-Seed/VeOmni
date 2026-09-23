@@ -12,25 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ... import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
+from .accelerated import FakeModuleBAccelerated
 
 
-@OMNI_CONFIG_REGISTRY.register("fake_module_b")
-def register_fake_module_b_config():
-    from .configuration import FakeModuleBConfig
-
-    return FakeModuleBConfig
-
-
-@OMNI_MODEL_REGISTRY.register("fake_module_b")
-def register_fake_module_b_modeling():
-    from .modeling import FakeModuleB
-
-    return FakeModuleB
-
-
-@OMNI_ACCELERATED_MODEL_REGISTRY.register("fake_module_b")
-def register_fake_module_b_accelerated_model():
-    from .accelerated import FakeModuleBAccelerated
-
-    return FakeModuleBAccelerated
+__all__ = ["FakeModuleBAccelerated"]
