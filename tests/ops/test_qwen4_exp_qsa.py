@@ -113,3 +113,39 @@ def test_qwen4_exp_qsa_kernel_padding_does_not_change_sparse_result(selector_cap
     output = qsa_sparse_attention(q, k, v, indices, counts)
     reference = _sparse_eager_qsa(q.float(), k.float(), v.float(), indices, counts, 16**-0.5)
     torch.testing.assert_close(output.float(), reference, rtol=1e-2, atol=1e-2)
+
+
+def test_qwen4_exp_qsa_empty_selector_rows_are_finite_zero():
+    if not torch.cuda.is_available() or qsa_sparse_attention is None:
+        pytest.skip("Qwen4-Exp QSA Triton requires CUDA and Triton.")
+
+    torch.manual_seed(2)
+    seq_len, capacity = 6, 4
+    q = torch.randn(1, 2, seq_len, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, 1, seq_len, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(1, 1, seq_len, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    counts = torch.tensor([[2, 0, 1, 0, 3, 0]], device="cuda", dtype=torch.int32)
+    indices = torch.zeros(1, seq_len, capacity, device="cuda", dtype=torch.int32)
+    for query_idx in range(seq_len):
+        count = int(counts[0, query_idx])
+        if count:
+            indices[0, query_idx, :count] = torch.arange(count, device="cuda", dtype=torch.int32)
+
+    output = qsa_sparse_attention(q, k, v, indices, counts)
+    (output.float() ** 2).sum().backward()
+
+    # Empty selector rows (cnt == 0) must produce finite, zero attention output
+    # rather than the 0/0 -> NaN that an unguarded streaming softmax would emit,
+    # so masked/padded query positions cannot corrupt training gradients.
+    assert torch.isfinite(output).all()
+    empty_rows = counts[0] == 0
+    torch.testing.assert_close(output[:, :, empty_rows].float(), torch.zeros_like(output[:, :, empty_rows]).float())
+    for grad in (q.grad, k.grad, v.grad):
+        assert torch.isfinite(grad).all()
+
+    # Non-empty rows still match the sparse eager oracle.
+    nonempty = ~empty_rows
+    reference = _sparse_eager_qsa(
+        q.detach().float(), k.detach().float(), v.detach().float(), indices, counts, 16**-0.5
+    )
+    torch.testing.assert_close(output[:, :, nonempty].float(), reference[:, :, nonempty], rtol=1e-2, atol=1e-2)

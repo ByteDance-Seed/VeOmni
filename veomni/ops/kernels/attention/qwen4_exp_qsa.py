@@ -88,8 +88,15 @@ def _qsa_fwd_tail_kernel(
     D: tl.constexpr,
     FULL_S: tl.constexpr,
     TAIL_N: tl.constexpr,
+    S_MAX: tl.constexpr,
     GQA_N_REP: tl.constexpr,
 ):
+    """Streaming-softmax forward over the per-query selector index list.
+
+    Rows whose selector is empty (``cnt == 0``) contribute no keys, so the
+    accumulator stays at its initial ``-inf`` running max; the final store maps
+    those rows to a zero output instead of the ``-inf - -inf`` NaN.
+    """
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
     q_idx = tl.program_id(2)
@@ -103,6 +110,7 @@ def _qsa_fwd_tail_kernel(
     q = tl.load(q_off + off_d * stride_qd, mask=d_mask, other=0.0)
     q_f32 = q.to(tl.float32)
     cnt = tl.load(cnt_ptr + pid_b * stride_cb + q_idx * stride_ct)
+    cnt = tl.minimum(cnt, S_MAX)
     k_base = k_ptr + pid_b * stride_kb + kv_head * stride_kh
     v_base = v_ptr + pid_b * stride_vb + kv_head * stride_vh
     idx_base = idx_ptr + pid_b * stride_ib + q_idx * stride_it
@@ -123,8 +131,13 @@ def _qsa_fwd_tail_kernel(
         score = tl.sum(q_f32[None, :] * k.to(tl.float32), axis=1) * sm_scale
         score = tl.where(sel_mask, score, float("-inf"))
         m_ij = tl.maximum(m_i, tl.max(score, axis=0, keep_dims=True))
-        prob = tl.exp(score - m_ij)
-        alpha = tl.exp(m_i - m_ij)
+        # Guard the running max against the empty/all-masked case: when m_ij is
+        # still -inf, ``score - m_ij`` would be ``-inf - -inf = NaN`` and poison
+        # the acc/l_i reductions. Subtracting 0.0 instead keeps masked scores at
+        # ``exp(-inf) = 0`` so empty rows accumulate nothing.
+        m_ij_safe = tl.where(m_ij == float("-inf"), 0.0, m_ij)
+        prob = tl.exp(score - m_ij_safe)
+        alpha = tl.exp(m_i - m_ij_safe)
         acc = acc * alpha + tl.sum(prob[:, None] * v.to(tl.float32), axis=0)
         l_i = l_i * alpha + tl.sum(prob, axis=0, keep_dims=True)
         m_i = m_ij
@@ -141,16 +154,20 @@ def _qsa_fwd_tail_kernel(
         score = tl.sum(q_f32[None, :] * k.to(tl.float32), axis=1) * sm_scale
         score = tl.where(sel_mask, score, float("-inf"))
         m_ij = tl.maximum(m_i, tl.max(score, axis=0, keep_dims=True))
-        prob = tl.exp(score - m_ij)
-        alpha = tl.exp(m_i - m_ij)
+        m_ij_safe = tl.where(m_ij == float("-inf"), 0.0, m_ij)
+        prob = tl.exp(score - m_ij_safe)
+        alpha = tl.exp(m_i - m_ij_safe)
         acc = acc * alpha + tl.sum(prob[:, None] * v.to(tl.float32), axis=0)
         l_i = l_i * alpha + tl.sum(prob, axis=0, keep_dims=True)
         m_i = m_ij
 
     o_off = out_ptr + pid_b * stride_ob + pid_h * stride_oh + q_idx * stride_ot
-    tl.store(o_off + off_d * stride_od, acc / l_i, mask=d_mask)
+    # Empty rows never accumulated (l_i == 0); emit a finite zero instead of 0/0.
+    safe_l = tl.where(l_i > 0.0, l_i, 1.0)
+    tl.store(o_off + off_d * stride_od, acc / safe_l, mask=d_mask)
     lse_off = lse_ptr + pid_b * stride_lb + pid_h * stride_lh + q_idx * stride_lt
-    tl.store(lse_off + tl.arange(0, 1), m_i + tl.log(l_i))
+    lse_val = tl.where(l_i > 0.0, m_i + tl.log(safe_l), float("-inf"))
+    tl.store(lse_off + tl.arange(0, 1), lse_val)
 
 
 @triton.jit
@@ -213,6 +230,7 @@ def _qsa_bwd_outdelta_kernel(
     D: tl.constexpr,
     FULL_S: tl.constexpr,
     TAIL_N: tl.constexpr,
+    S_MAX: tl.constexpr,
     GQA_N_REP: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
@@ -235,6 +253,7 @@ def _qsa_bwd_outdelta_kernel(
     delta = tl.sum(do_f32 * out_f32, axis=0, keep_dims=True)
     lse = tl.load(lse_ptr + pid_b * stride_lb + pid_h * stride_lh + q_idx * stride_lt)
     cnt = tl.load(cnt_ptr + pid_b * stride_cb + q_idx * stride_ct)
+    cnt = tl.minimum(cnt, S_MAX)
     k_base = k_ptr + pid_b * stride_kb + kv_head * stride_kh
     v_base = v_ptr + pid_b * stride_vb + kv_head * stride_vh
     dk_base = dk_ptr + pid_b * stride_dkb + kv_head * stride_dkh
@@ -337,6 +356,7 @@ class _QSASparseAttention(torch.autograd.Function):
             D=dim,
             FULL_S=full_s,
             TAIL_N=tail_n,
+            S_MAX=s_max,
             GQA_N_REP=gqa_n_rep,
         )
         ctx.save_for_backward(q, k, v, out, lse, selected_indices, selected_counts)
@@ -414,6 +434,7 @@ class _QSASparseAttention(torch.autograd.Function):
             D=dim,
             FULL_S=full_s,
             TAIL_N=tail_n,
+            S_MAX=s_max,
             GQA_N_REP=gqa_n_rep,
             maxnreg=128,
             num_warps=8,
