@@ -586,18 +586,15 @@ class ModuleRuntime(VeOmniModelRuntime):
 
         ``stage`` is part of the base signature; the omni path reads
         ``state.stage``, which the orchestrator sets before every save.
+
+        Not deduplicated here: ``ckpt.last_saved_step`` counts DCP saves, so a
+        step whose DCP was written would skip its HF export. Same-step HF
+        dedupe is :class:`~veomni.trainer.callbacks.omni_callbacks.OmniModuleHfCallback`'s,
+        which tracks HF saves on their own.
         """
         del stage
         ckpt = self.checkpoint
         if ckpt is None:
-            return
-        # Only epoch_end / train_end can revisit a global_step that step_end already
-        # wrote; step_end is never deduplicated because DCP and HF share one counter.
-        if state.stage in ("epoch_end", "train_end") and ckpt.last_saved_step == state.global_step:
-            logger.info_rank0(
-                f"Skipping duplicate hf save for module '{self.module_name}' at {state.stage} "
-                f"(global_step {state.global_step} already saved)."
-            )
             return
         ckpt.save_hf_or_lora(state)
 

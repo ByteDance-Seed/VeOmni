@@ -131,11 +131,13 @@ class GlobalStateCallback(Callback):
 
         channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
         channel_loss_state = channel_loss_callback.state_dict() if channel_loss_callback is not None else {}
+        # Optional: ``OmniTrainer`` runs without a meter.
+        environ_meter = getattr(self.trainer, "environ_meter", None)
 
         return {
             "global_step": state.global_step,
             "train_dataloader": train_dataloader_state,
-            "environ_meter": self.trainer.environ_meter.state_dict(),
+            "environ_meter": environ_meter.state_dict() if environ_meter is not None else None,
             "channel_loss_callback": channel_loss_state,
             "torch_rng_state": torch.get_rng_state(),
             "device_rng_state": get_device_rng_state(),
@@ -284,7 +286,9 @@ class GlobalStateCallback(Callback):
         if self.trainer.train_dataloader is not None and global_state.get("train_dataloader") is not None:
             self.trainer.train_dataloader.load_state_dict(global_state["train_dataloader"])
 
-        self.trainer.environ_meter.load_state_dict(global_state["environ_meter"])
+        environ_meter = getattr(self.trainer, "environ_meter", None)
+        if environ_meter is not None and global_state.get("environ_meter") is not None:
+            environ_meter.load_state_dict(global_state["environ_meter"])
         rng_state = global_state.get("torch_rng_state")
         if rng_state is not None:
             torch.set_rng_state(rng_state)

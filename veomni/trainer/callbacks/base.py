@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from veomni.distributed.parallel_state import get_parallel_state
 
@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 class TrainerState:
     global_step: int = 0
     epoch: int = 0
+    stage: Optional[str] = None
 
 
 class Callback:

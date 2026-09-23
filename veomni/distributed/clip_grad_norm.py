@@ -162,3 +162,48 @@ def veomni_omni_module_clip_grad_norm(
         torch.nn.utils.clip_grads_with_norm_(params, max_norm, total_norm)
 
     return total_norm.item()
+
+
+def omni_clip_grad_norm(
+    module_runtimes: dict,
+    max_grad_norm: float,
+    grad_clip_scope: str = "per_module",
+) -> float:
+    """Clip grads across OmniModule runtimes according to ``grad_clip_scope``.
+
+    * ``per_module`` (default): each module clips against **its own**
+      ``args.optimizer.max_grad_norm`` — every OmniModule carries its own
+      optimizer config, so *max_grad_norm* here is only the model-level value
+      they inherit from. Returns ``sqrt(sum n_i^2)`` of the per-module (pre-clip)
+      norms for logging.
+    * ``global``: measure each module with ``max_norm=inf`` (no scale),
+      ``total = sqrt(sum n_i^2)``, then if ``total > max_grad_norm`` scale **all**
+      module grads by one coefficient — single-model / seedream
+      ``gradient_clip_val`` semantics. A single threshold is inherent to this
+      scope, so the per-module values do not apply.
+
+    Each ``clip_grad_norm`` enters the module's own ``ParallelState``; the
+    ``global`` rescale re-enters it via ``_scoped()`` for the same reason.
+    """
+    runtimes = list(module_runtimes.values()) if isinstance(module_runtimes, dict) else list(module_runtimes)
+    if not runtimes:
+        return 0.0
+
+    scope = grad_clip_scope or "per_module"
+    if scope == "per_module":
+        module_norms = [rt.clip_grad_norm(rt.args.optimizer.max_grad_norm) for rt in runtimes]
+        return math.sqrt(sum(g * g for g in module_norms))
+
+    if scope != "global":
+        raise ValueError(f"Unknown grad_clip_scope={scope!r}; expected 'per_module' or 'global'")
+
+    module_norms = [rt.clip_grad_norm(float("inf")) for rt in runtimes]
+    total = math.sqrt(sum(g * g for g in module_norms))
+    if max_grad_norm is not None and max_grad_norm > 0 and total > float(max_grad_norm):
+        coeff = float(max_grad_norm) / (total + 1e-6)
+        for rt in runtimes:
+            with rt._scoped():
+                for p in rt.model.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(coeff)
+    return total
