@@ -5,10 +5,11 @@ Registered under ``OMNI_CONVERT_REGISTRY["qwen3_moe"]`` and dispatched by
 Graphs come from ``configs/seed_omni/Qwen/qwen3_30b_a3b/train/``.
 
 The upstream is a standard HF checkpoint (``Qwen3MoeForCausalLM``); no DeepSeek
--> HF pre-step is needed (unlike Janus).  ``Qwen3MoeForCausalLM.from_pretrained``
-merges the per-expert HF weights into the v5 **fused** layout at load time via
-the registered ``Qwen3MoeCheckpointTensorConverter``, so the saved backbone
-subfolder is already fused.
+-> HF pre-step is needed (unlike Janus).  The source is loaded with the stock
+transformers class, whose weight-conversion mapping merges the per-expert HF
+weights into the v5 **fused** layout; the VeOmni patched class skips that
+mapping (VeOmni's own loader fuses instead), so it would leave the experts at
+their init.  The saved backbone subfolder is therefore already fused.
 
 The text encoder (``embed_tokens`` + ``lm_head``) is vocabulary-only and
 MoE-agnostic, so it reuses the dense ``qwen3_text_encoder`` module verbatim.
@@ -24,19 +25,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, Qwen3MoeForCausalLM
 from transformers.initialization import no_init_weights
 
 from veomni.models.module_utils import init_empty_weights
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 from ...utils.convert_registry import OMNI_CONVERT_REGISTRY, attach_module_assets, load_family_graphs
-
-
-if IS_NPU_AVAILABLE:
-    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_npu import Qwen3MoeForCausalLM
-else:
-    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import Qwen3MoeForCausalLM
 
 
 def convert_qwen3_moe_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
@@ -59,8 +53,10 @@ def convert_qwen3_moe_checkpoint(model_path: str, **kwargs: Any) -> dict[str, An
     Qwen3TextEncoder = OMNI_MODEL_REGISTRY["qwen3_text_encoder"]()
     Qwen3TextEncoderConfig = OMNI_CONFIG_REGISTRY["qwen3_text_encoder"]()
 
-    # from_pretrained merges per-expert HF weights into the fused v5 layout.
-    model = Qwen3MoeForCausalLM.from_pretrained(model_path, device_map="cpu")
+    model, loading_info = Qwen3MoeForCausalLM.from_pretrained(model_path, device_map="cpu", output_loading_info=True)
+    if loading_info["missing_keys"]:
+        missing = sorted(loading_info["missing_keys"])
+        raise RuntimeError(f"Qwen3-MoE weights missing from {model_path}: {missing[:8]} ({len(missing)} total)")
     model.eval()
     cfg = model.config
 
