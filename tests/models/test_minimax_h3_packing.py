@@ -266,10 +266,8 @@ def test_audio_loss_skips_samples_without_audio():
     assert expected[1].loss["mse_audio"] == 0
     actual = packed(**batch(samples))
     torch.testing.assert_close(actual.loss["mse_video"], torch.stack([o.loss["mse_video"] for o in expected]).mean())
-    torch.testing.assert_close(
-        actual.loss["mse_audio"], (expected[0].loss["mse_audio"] + expected[2].loss["mse_audio"]) / 2
-    )
-    (sum(o.loss["mse_video"] for o in expected) / 3 + sum(o.loss["mse_audio"] for o in expected) / 2).backward()
+    torch.testing.assert_close(actual.loss["mse_audio"], torch.stack([o.loss["mse_audio"] for o in expected]).mean())
+    (sum(o.loss["mse_video"] + o.loss["mse_audio"] for o in expected) / 3).backward()
     sum(actual.loss.values()).backward()
     for (name, p), (_, q) in zip(base.named_parameters(), packed.named_parameters()):
         torch.testing.assert_close(p.grad, q.grad, rtol=2e-4, atol=2e-5, msg=name)
@@ -280,6 +278,27 @@ def test_audio_loss_skips_samples_without_audio():
     silent_samples = prepare(condition_model(), silent)
     for out in (base(**silent_samples[0]), base(**batch(silent_samples))):
         assert out.loss["mse_audio"] == 0 and out.loss["mse_audio"].requires_grad
+
+
+def test_accumulated_microbatches_weight_each_sample_like_single_sample():
+    """With the trainer's /K, packed microbatches weight every sample 1/G whatever their audio mix."""
+    torch.manual_seed(19)
+    model = tiny_model()
+    raws = [raw_sample(3), raw_sample(5), raw_sample(4, "ref2va"), raw_sample(6)]
+    raws[1]["has_audio"] = False  # microbatches [audio, no-audio] and [audio, audio]
+    samples = prepare(condition_model(), raws)
+    reference = sum(sum(out.loss.values()) for out in serial(model, samples)) / len(samples)
+    accumulated = sum(sum(model(**batch(part)).loss.values()) / 2 for part in (samples[:2], samples[2:]))
+    torch.testing.assert_close(accumulated, reference)
+
+
+def test_unsupported_backend_fails_only_on_packed_forward():
+    model = tiny_model()
+    model._configure_packed_attention("veomni_flash_attention_4_with_sp")  # what __init__ runs; must not raise
+    samples = prepare(condition_model(), [raw_sample(3), raw_sample(5)])
+    serial(model, samples)
+    with pytest.raises(ValueError, match="Unsupported H3 packing backend"):
+        model(**batch(samples))
 
 
 def test_sample_isolation_boundaries_and_zero_valid_rows():

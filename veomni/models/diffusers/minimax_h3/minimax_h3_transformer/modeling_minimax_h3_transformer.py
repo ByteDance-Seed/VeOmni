@@ -26,8 +26,18 @@ from .configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
 
 @dataclass
 class MiniMaxH3DiTOutput(ModelOutput):
+    """``predictions`` is ``(video, audio)`` for one sample and ``[videos, audios]`` per-sample lists when packed."""
+
     loss: dict | None = None
     predictions: list | None = None
+
+
+_PACKED_FLASH_BACKENDS = (
+    "veomni_flash_attention_2_with_sp",
+    "veomni_flash_attention_2_hub_with_sp",
+    "veomni_flash_attention_3_with_sp",
+    "veomni_flash_attention_3_hub_with_sp",
+)
 
 
 class MiniMaxH3DiTModel(PreTrainedModel):
@@ -66,17 +76,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         self._configure_packed_attention(config._attn_implementation)
 
     def _configure_packed_attention(self, attn_implementation):
-        """Validate packed attention; FlashAttention loads only on the first packed forward."""
-        if attn_implementation not in (
-            None,
-            "eager",
-            "sdpa",
-            "veomni_flash_attention_2_with_sp",
-            "veomni_flash_attention_2_hub_with_sp",
-            "veomni_flash_attention_3_with_sp",
-            "veomni_flash_attention_3_hub_with_sp",
-        ):
-            raise ValueError(f"Unsupported H3 packing backend: {attn_implementation}")
+        """Record the packed backend; it is validated and loaded on the first packed forward."""
         self._packed_attn_implementation = attn_implementation
         for module in self.dit.modules():
             if isinstance(module, MiniMaxH3Attention):
@@ -87,6 +87,8 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         implementation = self._packed_attn_implementation
         if implementation in (None, "eager", "sdpa"):
             return
+        if implementation not in _PACKED_FLASH_BACKENDS:
+            raise ValueError(f"Unsupported H3 packing backend: {implementation}")
         attention_modules = [module for module in self.dit.modules() if isinstance(module, MiniMaxH3Attention)]
         if all(module.varlen_kernel is not None for module in attention_modules):
             return
@@ -109,10 +111,9 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             raise ValueError("All H3 samples must consistently supply or omit training targets.")
         losses = None
         if outputs[0].loss is not None:
+            # Plain sample mean (no-audio samples are already zero-weighted): with the trainer's /K this
+            # weights every sample 1/G, as with M=1, regardless of which samples share a microbatch.
             losses = {key: torch.stack([out.loss[key] for out in outputs]).mean() for key in outputs[0].loss}
-            # Audio loss averages only over samples with real audio (others are zero-weighted).
-            audio_count = sum(sample.get("has_audio") is not False for sample in samples)
-            losses["mse_audio"] = torch.stack([out.loss["mse_audio"] for out in outputs]).sum() / max(audio_count, 1)
         # Per-sample lists: samples in one microbatch may differ in video/audio geometry.
         return MiniMaxH3DiTOutput(
             predictions=[[out.predictions[0] for out in outputs], [out.predictions[1] for out in outputs]],

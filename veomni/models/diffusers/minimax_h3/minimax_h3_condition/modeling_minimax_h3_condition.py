@@ -535,7 +535,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
     ) -> dict[str, Any]:
         """Add noise + pack latents into model.forward() inputs.
 
-        Per-sample (batch is list of samples, this processes sample 0):
+        Called by ``process_condition`` with one sample wrapped in single-element lists:
 
         1. Sample shared timestep_id ~ Uniform(0, 999)
         2. Compute sigma_video, sigma_audio from respective schedulers
@@ -560,29 +560,8 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         # Caches written before has_audio existed supervise audio as before.
         has_audio = True if not has_audio or has_audio[0] is None else bool(has_audio[0])
 
-        # Process first sample (batch=1 per micro_batch); reject any other
-        # size for every supplied collection so a mismatched length cannot
-        # silently truncate to index 0.
-        supplied = {
-            "input_latents": input_latents,
-            "audio_input_latents": audio_input_latents,
-            "prompt_embeds": prompt_embeds,
-            "packed": packed,
-        }
-        if keyframe_cond_anchor is not None:
-            supplied["keyframe_cond_anchor"] = keyframe_cond_anchor
-        if ref_visual_anchor is not None:
-            supplied["ref_visual_anchor"] = ref_visual_anchor
-        if ref_audio_anchor is not None:
-            if any(anchor is not None for anchor in ref_audio_anchor):
-                raise NotImplementedError("Ref2VA audio references are not supported.")
-            supplied["ref_audio_anchor"] = ref_audio_anchor
-        for name, coll in supplied.items():
-            if len(coll) != 1:
-                raise ValueError(
-                    f"MiniMaxH3ConditionModel.process_condition supports micro_batch_size=1 only, "
-                    f"got {len(coll)} samples in {name}."
-                )
+        if ref_audio_anchor is not None and any(anchor is not None for anchor in ref_audio_anchor):
+            raise NotImplementedError("Ref2VA audio references are not supported.")
         clean_video = input_latents[0]
         clean_audio = audio_input_latents[0]
         prompt = prompt_embeds[0]

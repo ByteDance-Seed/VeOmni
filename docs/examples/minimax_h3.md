@@ -226,9 +226,11 @@ introduce nonfinite parameter gradients.
 
 Samples encoded without an audio track keep the silent placeholder latent, so the
 layout is unchanged, but carry `has_audio=False` (also saved in offline
-embeddings). They contribute no audio loss, and a microbatch averages `mse_audio`
-only over samples with audio (zero when none have it). Caches written without
-`has_audio` keep supervising audio as before.
+embeddings). Their `mse_audio` is zero-weighted, and a packed microbatch takes
+the plain sample mean, so after the trainer's division by the accumulation steps
+every sample keeps weight `1/G`, as with `micro_batch_size=1`. Normalizing by the
+global audio-sample count is not implemented. Caches written without `has_audio`
+keep supervising audio as before.
 
 ### Visual Ref2VA prepared data
 
