@@ -14,9 +14,11 @@ from veomni.models.seed_omni.graphs.base import END
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
 from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
 from veomni.models.seed_omni.mixins.base_mixin import BaseMixin
-from veomni.models.seed_omni.mixins.inference_module_mixin import InferenceModuleMixin
+from veomni.models.seed_omni.mixins.inference_module_mixin import InferenceModuleMixin, post_generate, pre_generate
 from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleMixin
 from veomni.models.seed_omni.modeling_omni import OmniModel
+from veomni.models.seed_omni.modules.module_configuration_base import OmniModuleConfig
+from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
 
 
 def test_from_endpoint_default_method():
@@ -108,6 +110,34 @@ def test_duplicate_edge_raises():
         )
 
 
+def test_training_graph_rejects_missing_method():
+    class Mod:
+        def forward(self):
+            return {}
+
+    with pytest.raises(ValueError, match=r"Mod\.encode"):
+        TrainingGraph([{"from": "a.encode", "to": "end"}], modules={"a": Mod()})
+
+
+def test_generation_graph_rejects_missing_method():
+    class Mod:
+        pass
+
+    with pytest.raises(ValueError, match=r"Mod\.generate"):
+        GenerationGraph(
+            {
+                "initial": "run",
+                "states": {
+                    "run": {
+                        "body": [{"from": "a", "to": "end"}],
+                        "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
+                    }
+                },
+            },
+            modules={"a": Mod()},
+        )
+
+
 def test_single_node_with_only_end_edge():
     """``[{from: module_A, to: end}]`` derives exactly one real node."""
     g = TrainingGraph([{"from": "module_A", "to": "end"}])
@@ -169,15 +199,23 @@ def test_module_lookup_raises_for_unknown():
         g.module_of("not_a_node")
 
 
-class _FakeOmniModule(nn.Module, TrainingModuleMixin, BaseMixin, InferenceModuleMixin):
+class _StubConfig(OmniModuleConfig):
+    """Config for the weightless stand-ins below."""
+
+    model_type = "stub_omni_module"
+
+
+class _FakeOmniModule(PretrainedOmniModule, TrainingModuleMixin, BaseMixin, InferenceModuleMixin):
     """Minimal stand-in for an OmniModule: callable (→ forward) + pre/post hooks.
 
     ``__call__`` delegates to ``self.forward`` so the non-``forward`` alias trick
     (``raw.forward = encode``) works exactly as on a real ``nn.Module``.
     """
 
+    config_class = _StubConfig
+
     def __init__(self, name: str):
-        super().__init__()
+        super().__init__(_StubConfig())
         self.name = name
 
     def pre_forward(self, method, **kwargs):
@@ -254,8 +292,11 @@ def test_omni_model_forward_runs_fake_module_chain():
     a = FakeModuleA(FakeModuleAConfig(hidden_size=hidden_size))
     b = FakeModuleB(FakeModuleBConfig(hidden_size=hidden_size))
     config = OmniConfig(
-        modules={"fake_module_a": {"subfolder": "fake_module_a"}, "fake_module_b": {"subfolder": "fake_module_b"}},
-        training_graph=edges,
+        _module_entries={
+            "fake_module_a": {"model_path": "fake_module_a"},
+            "fake_module_b": {"model_path": "fake_module_b"},
+        },
+        training_graphs={"default": edges},
         generation_graphs=_minimal_generation_graphs(module="fake_module_a"),
     )
     model = OmniModel(config, {"fake_module_a": a, "fake_module_b": b})
@@ -269,15 +310,71 @@ def test_omni_model_forward_runs_fake_module_chain():
     assert out == {"loss": None, "losses": {}}
 
 
-class _ArtefactModule(nn.Module):
+class _ArtefactModule(PretrainedOmniModule):
     """Generation stand-in that emits one artefact per ``generate`` call."""
 
+    config_class = _StubConfig
+
     def __init__(self, name: str):
-        super().__init__()
+        super().__init__(_StubConfig())
         self.name = name
 
     def generate(self, **kwargs):
         return {"generated": {"type": "text", "value": self.name}}
+
+
+class _HookedGenerationModule(PretrainedOmniModule, InferenceModuleMixin, BaseMixin):
+    """Generation stand-in that opts into the ``@pre_generate`` / ``@post_generate`` hooks."""
+
+    config_class = _StubConfig
+
+    def __init__(self):
+        super().__init__(_StubConfig())
+
+    @pre_generate("generate")
+    def generate_pre(self, **kwargs):
+        return {**kwargs, "trace": [*kwargs.get("trace", []), "pre"]}
+
+    def generate(self, generation_kwargs=None, **kwargs):
+        del generation_kwargs
+        return {"trace": [*kwargs.get("trace", []), "generate"]}
+
+    @post_generate("generate")
+    def generate_post(self, **outputs):
+        return {**outputs, "trace": [*outputs.get("trace", []), "post"]}
+
+
+def test_generation_node_wraps_the_endpoint_in_pre_post_hooks():
+    """Generation mirrors training: pre-hook → endpoint → post-hook.
+
+    Exercises the whole chain — the decorator's marker, ``BaseMixin``'s registry
+    lookup, the mixin dispatcher, and ``OmniModel._run_generation_node``.
+    """
+    config = OmniConfig(
+        _module_entries={"module_A": {"model_path": "module_A"}},
+        training_graphs={},
+        generation_graphs=_minimal_generation_graphs(module="module_A"),
+    )
+    model = OmniModel(config, {"module_A": _HookedGenerationModule()})
+
+    ctx: dict = {}
+    model.reset()
+    model.generate(ctx)
+
+    assert ctx["trace"] == ["pre", "generate", "post"]
+
+
+def test_generation_node_runs_bare_without_the_inference_mixin():
+    """A module that never opted in keeps the hookless path."""
+    config = OmniConfig(
+        _module_entries={"module_A": {"model_path": "module_A"}},
+        training_graphs={},
+        generation_graphs=_minimal_generation_graphs(module="module_A"),
+    )
+    model = OmniModel(config, {"module_A": _ArtefactModule("module_A")})
+
+    model.reset()
+    assert [item["value"] for item in model.generate({})] == ["module_A"]
 
 
 def test_generate_keeps_every_artefact_a_body_pass_emits():
@@ -287,8 +384,8 @@ def test_generate_keeps_every_artefact_a_body_pass_emits():
     the pass wrote. Both nodes of an ``a -> b -> end`` body emit here.
     """
     config = OmniConfig(
-        modules={"module_A": {"subfolder": "module_A"}, "module_B": {"subfolder": "module_B"}},
-        training_graph=[{"from": "module_A", "to": "module_B"}, {"from": "module_B", "to": "end"}],
+        _module_entries={"module_A": {"model_path": "module_A"}, "module_B": {"model_path": "module_B"}},
+        training_graphs={"default": [{"from": "module_A", "to": "module_B"}, {"from": "module_B", "to": "end"}]},
         generation_graphs={
             "infer_gen": {
                 "initial": "run",
@@ -312,8 +409,8 @@ def test_generate_keeps_every_artefact_a_body_pass_emits():
 def test_omni_model_without_a_training_graph_generates_but_refuses_to_train():
     """An inference-only checkpoint (``training_graph: []``) must still load."""
     config = OmniConfig(
-        modules={"module_A": {"subfolder": "module_A"}},
-        training_graph=[],
+        _module_entries={"module_A": {"model_path": "module_A"}},
+        training_graphs={},
         generation_graphs=_minimal_generation_graphs(module="module_A"),
     )
 
@@ -325,14 +422,27 @@ def test_omni_model_without_a_training_graph_generates_but_refuses_to_train():
         model({})
 
 
+def test_omni_model_without_a_generation_graph_refuses_to_generate():
+    """A module-only split (no FSM yet) must still load; generate waits for a sidecar or override."""
+    config = OmniConfig(
+        _module_entries={"module_A": {"model_path": "module_A"}},
+        training_graphs={"default": [{"from": "module_A", "to": "end"}]},
+        generation_graphs={},
+    )
+
+    model = OmniModel(config, {"module_A": _ArtefactModule("module_A")})
+
+    assert model.generation_graph is None
+    with pytest.raises(ValueError, match="no generation graph"):
+        model.generate({})
+
+
 def test_modeling_omni_imports_no_veomni_runtime_package():
     """``modeling_omni`` must stay liftable into another framework.
 
-    Everything runtime-specific about running a node (wrapper unwrap,
-    ParallelState scoping) reaches ``OmniModel.forward``
-    through its ``node_runner`` argument, so the modeling needs no import from
-    VeOmni's accelerator / distributed / trainer layers — not even a lazy one
-    inside a function body.
+    It runs each node eagerly and knows nothing about wrapper unwrap or
+    ParallelState scoping, so it needs no import from VeOmni's accelerator /
+    distributed / trainer layers — not even a lazy one inside a function body.
     """
     import ast
     import pathlib
@@ -553,46 +663,40 @@ def test_generation_graph_mermaid_stacks_state_body_nodes():
     assert "prompt__encoder_encode --> prompt__decoder_decode" in out
 
 
-class _DdpStyleWrapper(nn.Module):
-    """Minimal DDP-shaped wrapper: hooks live on ``.module``."""
-
-    def __init__(self, inner: nn.Module):
-        super().__init__()
-        self.module = inner
-
-    def forward(self, *args, **kwargs):
-        return self.module(*args, **kwargs)
-
-
 def test_named_omni_modules_yields_modules_as_attached():
-    """Bare :class:`OmniModel` yields sub-modules exactly as stored (no unwrap)."""
+    """:class:`OmniModel` yields sub-modules exactly as stored, in declaration order."""
     edges = _fan_in_edges()
     g = TrainingGraph(edges)
-    raw_modules = _fake_modules(g)
-    wrapped_modules = {name: _DdpStyleWrapper(mod) for name, mod in raw_modules.items()}
+    modules = _fake_modules(g)
     config = OmniConfig(
-        modules={name: {"subfolder": name} for name in raw_modules},
-        training_graph=edges,
-        generation_graphs=_minimal_generation_graphs(),
+        _module_entries={name: {"model_path": name} for name in modules},
+        training_graphs={"default": edges},
+        generation_graphs={},
     )
-    model = OmniModel(config, wrapped_modules)
+    model = OmniModel(config, modules)
 
     resolved = dict(model.named_omni_modules())
-    assert set(resolved) == set(wrapped_modules)
+    assert set(resolved) == set(modules)
     for name, mod in resolved.items():
-        assert mod is wrapped_modules[name]
+        assert mod is modules[name]
 
 
-def test_named_omni_modules_yields_all_graph_participants():
+def test_omni_model_rejects_a_participant_that_is_not_an_omni_module():
+    """``__init__`` is the single enforcement point for the participant contract.
+
+    Everything downstream — the graph walk, ``get_module``, ``save_pretrained`` —
+    assumes a :class:`PretrainedOmniModule`, so a plain ``nn.Module`` has to be
+    refused where it enters rather than where it first breaks something.
+    """
+
     class _PlainModule(nn.Module):
         def forward(self, x):
             return x
 
-    plain = _PlainModule()
     config = OmniConfig(
-        modules={"plain": {"subfolder": "plain"}},
-        training_graph=[{"from": "plain", "to": "end"}],
-        generation_graphs=_minimal_generation_graphs("plain"),
+        _module_entries={"plain": {"model_path": "plain"}},
+        training_graphs={"default": [{"from": "plain", "to": "end"}]},
+        generation_graphs={},
     )
-    model = OmniModel(config, {"plain": plain})
-    assert list(model.named_omni_modules()) == [("plain", plain)]
+    with pytest.raises(TypeError, match="must be a PretrainedOmniModule"):
+        OmniModel(config, {"plain": _PlainModule()})

@@ -46,16 +46,16 @@ def _default_config_dir() -> Path:
             return candidate
     raise FileNotFoundError(
         f"Could not find {_CONFIG_RELATIVE / _TRAIN_GRAPH_NAME} above {__file__}. "
-        "Pass train_graph= / generation_graph= explicitly, or run convert from a VeOmni checkout."
+        "Pass training_graph= / generation_graph= explicitly, or run convert from a VeOmni checkout."
     )
 
 
 def load_family_graphs(
     *,
-    train_graph: str | Path | None = None,
+    training_graph: str | Path | None = None,
     generation_graph: str | Path | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Read the training DAG and generation FSMs from YAML under ``configs/``."""
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
+    """Read the training DAGs and generation FSMs from YAML under ``configs/``."""
     config_dir: Path | None = None
 
     def configs() -> Path:
@@ -64,11 +64,12 @@ def load_family_graphs(
             config_dir = _default_config_dir()
         return config_dir
 
-    train_path = Path(train_graph) if train_graph is not None else configs() / _TRAIN_GRAPH_NAME
+    train_path = Path(training_graph) if training_graph is not None else configs() / _TRAIN_GRAPH_NAME
     generation_path = Path(generation_graph) if generation_graph is not None else configs() / _INFER_GRAPH_NAME
-    training = OmniConfig._read_graph_file(str(train_path), "training_graph")
-    generation = OmniConfig._read_generation_graphs(str(generation_path))
-    return training, generation
+    return (
+        OmniConfig._read_graph_file(str(train_path), list),
+        OmniConfig._read_graph_file(str(generation_path), dict),
+    )
 
 
 @OMNI_CONVERT_REGISTRY.register("fake_omni")
@@ -77,8 +78,8 @@ def register_fake_omni_convert():
 
 
 def convert_fake_omni(model_path: str, **kwargs: Any) -> dict[str, Any]:
-    """Build the two-module stand-in chain; caller writes via ``save_converted_omni``."""
-    train_graph = kwargs.pop("train_graph", None)
+    """Build the two-module stand-in chain; :func:`convert_checkpoint` writes the split directory."""
+    training_graph = kwargs.pop("training_graph", None)
     generation_graph = kwargs.pop("generation_graph", None)
     del kwargs
     from .fake_module_a.configuration import FakeModuleAConfig
@@ -88,8 +89,8 @@ def convert_fake_omni(model_path: str, **kwargs: Any) -> dict[str, Any]:
 
     cfg_dict, _ = PretrainedConfig.get_config_dict(model_path)
     hidden_size = int(cfg_dict.get("hidden_size", 8))
-    training_graph, generation_graphs = load_family_graphs(
-        train_graph=train_graph,
+    training_graphs, generation_graphs = load_family_graphs(
+        training_graph=training_graph,
         generation_graph=generation_graph,
     )
     return {
@@ -97,7 +98,8 @@ def convert_fake_omni(model_path: str, **kwargs: Any) -> dict[str, Any]:
             FAKE_A: FakeModuleA(FakeModuleAConfig(hidden_size=hidden_size)),
             FAKE_B: FakeModuleB(FakeModuleBConfig(hidden_size=hidden_size)),
         },
-        "training_graph": training_graph,
+        "training_graphs": training_graphs,
         "generation_graphs": generation_graphs,
+        "train_type": "default",
         "infer_type": "infer_gen",
     }

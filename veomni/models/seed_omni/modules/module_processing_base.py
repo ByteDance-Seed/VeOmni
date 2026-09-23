@@ -33,7 +33,7 @@ Terminology (three different "processor" layers)
 
 This module is the **middle** layer: the abstract CPU-worker base, plus
 :func:`bind_module_assets` which copies those assets onto a live
-:class:`~veomni.models.seed_omni.modules.module_modeling_base.OmniPreTrainedModel`.
+:class:`~veomni.models.seed_omni.modules.module_modeling_base.PretrainedOmniModule`.
 Each module's native model class declares ``preprocessor_class = XxxPreprocessor``.
 """
 

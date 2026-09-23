@@ -16,17 +16,20 @@ from typing import Any
 
 import torch.nn as nn
 
-from ...module_modeling_base import OmniPreTrainedModel
+from ...module_modeling_base import PretrainedOmniModule
 from .configuration import FakeModuleBConfig
 
 
-class FakeModuleB(OmniPreTrainedModel):
+class FakeModuleB(PretrainedOmniModule):
     """Identity-sized linear map: ``hidden → hidden``. No preprocessor / conversation."""
 
     config_class = FakeModuleBConfig
     base_model_prefix = "fake_module_b"
     supports_gradient_checkpointing = False
     _no_split_modules = ["FakeModuleB"]
+    # See FakeModuleA: opens HF's `_sdpa_can_dispatch` gate so the omni load
+    # path can be exercised with a non-`eager` `attn_implementation`.
+    _supports_sdpa = True
 
     def __init__(self, config: FakeModuleBConfig, **kwargs):
         super().__init__(config, **kwargs)

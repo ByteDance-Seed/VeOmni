@@ -14,11 +14,10 @@
 
 """SeedOmni utilities: HF → split-checkpoint conversion."""
 
-from .convert_registry import OMNI_CONVERT_REGISTRY, convert_checkpoint, save_converted_omni
+from .convert_registry import OMNI_CONVERT_REGISTRY, convert_checkpoint
 
 
 __all__ = [
     "OMNI_CONVERT_REGISTRY",
     "convert_checkpoint",
-    "save_converted_omni",
 ]

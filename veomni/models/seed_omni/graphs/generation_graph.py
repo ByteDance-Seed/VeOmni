@@ -99,6 +99,7 @@ See also
 ``training_graph.py``  — DAG view driven by ``OmniConfig.training_graph``.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -106,6 +107,7 @@ from .base import (
     EdgeDef,
     NodeDef,
     is_end,
+    validate_graph_modules,
 )
 
 
@@ -258,6 +260,8 @@ class GenerationGraph:
     def __init__(
         self,
         generation_graph: Dict,
+        *,
+        modules: Optional[Mapping[str, Any]] = None,
     ):
         # `done` is reserved — auto-injected below.  Users must NOT redeclare
         # it; doing so silently lets a custom body/transitions override the
@@ -288,6 +292,9 @@ class GenerationGraph:
                 for node in (edge.from_node, edge.to_node):
                     if node is not None and node.name not in self._node_pool:
                         self._node_pool[node.name] = node
+
+        if modules is not None:
+            validate_graph_modules(self._node_pool.values(), modules)
 
         if self._initial not in self._states:
             raise KeyError(

@@ -1,3 +1,4 @@
-# Launcher-style training DAG: a top-level edge list (bare module → .forward).
+# Convert-time training DAGs, keyed by train_type.
+default:
 - {from: fake_module_a, to: fake_module_b}
 - {from: fake_module_b, to: end}

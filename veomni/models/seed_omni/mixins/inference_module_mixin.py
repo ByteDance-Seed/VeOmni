@@ -14,22 +14,26 @@
 
 """Generation-FSM hooks shared by every SeedOmni sub-model.
 
-Only :meth:`InferenceModuleMixin.reset_global_inference_state` and
-:meth:`InferenceModuleMixin.finalize` are wired in, on both inference paths —
-eager (``OmniModel.reset`` / abort-only ``OmniModel._invoke_module_finalize``)
-and distributed (``OmniModelRuntime``). ``finalize`` runs when the driver
+:meth:`InferenceModuleMixin.pre_generate` / :meth:`~InferenceModuleMixin.post_generate`
+wrap every graph endpoint in ``OmniModel._run_generation_node``, mirroring what
+``pre_forward`` / ``post_forward`` do for the training walk. A module opts in by
+decorating a method with ``@pre_generate("<method>")``; a module without the
+mixin runs its endpoint bare.
+
+:meth:`~InferenceModuleMixin.reset_global_inference_state` and
+:meth:`~InferenceModuleMixin.finalize` are driven by ``OmniModel.reset`` and the
+abort-only tail of ``OmniModel.generate``. ``finalize`` runs when the driver
 hits ``max_new_tokens`` *before* ``done``, not after a normal FSM completion.
 
-The ``pre_generate`` / ``post_generate`` / ``generate_step`` surface has NO
-call-site: both FSM drivers invoke each graph endpoint directly with no hooks
-(``accelerator/executor.py::execute_generation_node``,
-``OmniModel._run_generation_node``), so a module cannot opt in without new
-plumbing.
+``generate_step`` still has no call-site: both FSM drivers resolve a bare
+endpoint to ``generate``, never to ``generate_step``.
 """
 
 from __future__ import annotations
 
 from typing import Any, Callable
+
+from .base_mixin import hook_name, mark_hook
 
 
 def pre_generate(*contexts: str) -> Callable[[Callable], Callable]:
@@ -39,8 +43,7 @@ def pre_generate(*contexts: str) -> Callable[[Callable], Callable]:
         raise ValueError("@pre_generate requires at least one context.")
 
     def decorator(fn: Callable) -> Callable:
-        fn._omni_pre_generate_context = tuple(contexts)
-        return fn
+        return mark_hook(fn, "_omni_pre_generate_context", tuple(contexts))
 
     return decorator
 
@@ -52,8 +55,7 @@ def post_generate(*contexts: str) -> Callable[[Callable], Callable]:
         raise ValueError("@post_generate requires at least one context.")
 
     def decorator(fn: Callable) -> Callable:
-        fn._omni_post_generate_context = tuple(contexts)
-        return fn
+        return mark_hook(fn, "_omni_post_generate_context", tuple(contexts))
 
     return decorator
 
@@ -61,22 +63,27 @@ def post_generate(*contexts: str) -> Callable[[Callable], Callable]:
 class InferenceModuleMixin:
     """Inference-graph hooks — ``pre_generate`` / ``post_generate`` / ``generate*`` / reset.
 
-    Hook-name lookup lives on :class:`~veomni.models.seed_omni.mixins.base_mixin.BaseMixin`.
+    Hook-name lookup is :func:`~veomni.models.seed_omni.mixins.base_mixin.hook_name`.
 
     Module-local ``InferenceMixin`` subclasses should define ``__init__`` to set
     inference-side runtime caches after ``super().__init__(...)``.
     """
 
+    # Supplied by the host class this mixin is composed onto (the native
+    # ``modeling.py`` class, or ``TrainingModuleMixin``); ``generate_step``
+    # delegates to it. Annotation only — it must not shadow the real method.
+    forward: Callable[..., dict[str, Any]]
+
     def pre_generate(self, method: str, **kwargs: Any) -> dict[str, Any]:
         """Dispatch to the ``@pre_generate(method)``-decorated hook for this call-site."""
-        name = type(self)._omni_hook_name("_omni_pre_generate_context", method)
+        name = hook_name(type(self), "_omni_pre_generate_context", method)
         if name is None:
             return kwargs
         return getattr(self, name)(**kwargs)
 
     def post_generate(self, method: str, **outputs: Any) -> dict[str, Any]:
         """Dispatch to the ``@post_generate(method)``-decorated hook for this call-site."""
-        name = type(self)._omni_hook_name("_omni_post_generate_context", method)
+        name = hook_name(type(self), "_omni_post_generate_context", method)
         if name is None:
             return outputs
         return getattr(self, name)(**outputs)

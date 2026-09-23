@@ -16,17 +16,22 @@ from typing import Any
 
 import torch.nn as nn
 
-from ...module_modeling_base import OmniPreTrainedModel
+from ...module_modeling_base import PretrainedOmniModule
 from .configuration import FakeModuleAConfig
 
 
-class FakeModuleA(OmniPreTrainedModel):
+class FakeModuleA(PretrainedOmniModule):
     """Identity-sized linear map: ``hidden → hidden``. No preprocessor / conversation."""
 
     config_class = FakeModuleAConfig
     base_model_prefix = "fake_module_a"
     supports_gradient_checkpointing = False
     _no_split_modules = ["FakeModuleA"]
+    # No attention here at all, so every implementation is equally vacuous. The
+    # flag is what opens HF's `_sdpa_can_dispatch` gate, without which the omni
+    # load path cannot be exercised end to end with anything but `eager` --
+    # `attn_implementation` would raise before reaching this module's __init__.
+    _supports_sdpa = True
 
     def __init__(self, config: FakeModuleAConfig, **kwargs):
         super().__init__(config, **kwargs)

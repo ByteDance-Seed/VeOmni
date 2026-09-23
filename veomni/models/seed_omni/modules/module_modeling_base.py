@@ -16,12 +16,13 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from transformers import PreTrainedModel
 
 
-class OmniPreTrainedModel(PreTrainedModel):
+class PretrainedOmniModule(PreTrainedModel):
     """Base for every ``modules/<family>/<sub>/modeling.py`` class.
 
     Subclasses hold weights, ``forward``, and FSM ``generate`` endpoints only.
@@ -46,6 +47,30 @@ class OmniPreTrainedModel(PreTrainedModel):
             config_overrides=config_overrides,
         )
         return model
+
+    def save_pretrained(
+        self,
+        save_directory: str | os.PathLike,
+        *args: Any,
+        save_module_weights: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        """Write this module's config and its processor / tokenizer sidecars.
+
+        ``save_module_weights=False`` skips the weight files. The sidecars are
+        written either way, so a weights-free export can still preprocess.
+        Weights go last so this module's ``config.json`` is the one that remains.
+        """
+        save_directory = str(save_directory)
+        os.makedirs(save_directory, exist_ok=True)
+        for attr in ("_processor", "_image_processor", "_video_processor", "_tokenizer"):
+            asset = getattr(self, attr, None)
+            if asset is not None and hasattr(asset, "save_pretrained"):
+                asset.save_pretrained(save_directory)
+        if not save_module_weights:
+            self.config.save_pretrained(save_directory)
+            return
+        super().save_pretrained(save_directory, *args, **kwargs)
 
     def get_assets(self) -> list[Any]:
         """Module-owned auxiliary artefacts to save alongside the weights."""
@@ -79,4 +104,4 @@ class OmniPreTrainedModel(PreTrainedModel):
         return {}
 
 
-__all__ = ["OmniPreTrainedModel"]
+__all__ = ["PretrainedOmniModule"]

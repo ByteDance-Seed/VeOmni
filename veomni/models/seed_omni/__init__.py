@@ -32,7 +32,7 @@ from .modules import (
     OMNI_MODEL_REGISTRY,
     OMNI_PROCESSOR_REGISTRY,
     OmniModuleConfig,
-    OmniPreTrainedModel,
+    PretrainedOmniModule,
     read_hf_model_type,
     read_model_type,
 )
@@ -44,7 +44,7 @@ __all__ = [
     "OmniConfig",
     "OmniModel",
     "OmniModuleConfig",
-    "OmniPreTrainedModel",
+    "PretrainedOmniModule",
     "OmniProcessor",
     "BaseMixin",
     "TrainingModuleMixin",

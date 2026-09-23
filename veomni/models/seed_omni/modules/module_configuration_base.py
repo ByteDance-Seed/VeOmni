@@ -12,15 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""HF-native per-module config for a composed :class:`OmniConfig`.
+"""HF-native base config for every SeedOmni sub-module.
 
-Family ``configuration.py`` files keep their own ``PretrainedConfig`` subclasses
-(the hydrated ``config.json`` next to a module's weights). This module owns the
-*slot* in ``OmniConfig.modules[name]``: descriptor dict, hydrated family config,
-subfolder / ``model_path`` resolution, export slimming, and the flatten back
-onto launcher fields.
-
-The VeOmni runtime counterpart is per-module launcher ``ModelArguments``.
+A module's own ``config.json`` is a subclass instance: its hyperparameters plus
+the kernels it was exported with. ``OmniConfig._module_configs[name]`` is that
+object. ``OmniConfig._module_entries[name]`` is the checkpoint dict that says
+where the module lives and what the composed model overwrites. Loading merges
+the file's kernels, the composed model's default, and that entry onto this
+config.
 """
 
 from __future__ import annotations
@@ -32,222 +31,160 @@ from typing import Any
 from transformers import PretrainedConfig
 
 
-# In-memory only: :meth:`OmniModuleConfig.hydrate` parks the module's typed
-# ``config.json`` under this key on the descriptor instead of replacing the
-# descriptor with it, so ``processor_config`` / ``model_config`` /
-# ``ops_implementation`` / an external ``model_path`` survive hydration.
-# Export slimming never copies it out.
-HYDRATED_CONFIG_KEY = "hf_config"
+class OmniModuleConfig(PretrainedConfig):
+    """Base for every ``modules/<family>/<sub>/configuration.py`` config class.
 
-
-def safe_checkpoint_subfolder(name: str) -> str:
-    """Return ``name`` if it is a single relative path component, else raise.
-
-    Joined onto ``save_directory`` by omni checkpoint writers. Absolute paths,
-    ``.`` / ``..``, and any separator would let a module key write outside the
-    checkpoint root.
-    """
-    if not name or name in {".", ".."}:
-        raise ValueError(f"Module name {name!r} is not a safe checkpoint subfolder.")
-    if os.path.isabs(name):
-        raise ValueError(
-            f"Module name {name!r} is an absolute path; checkpoint subfolders must be "
-            "a single relative path component."
-        )
-    if os.path.sep in name or (os.path.altsep is not None and os.path.altsep in name):
-        raise ValueError(f"Module name {name!r} is not a safe checkpoint subfolder; use a single path component.")
-    return name
-
-
-class OmniModuleConfig:
-    """HF-native view of one ``OmniConfig.modules[name]`` entry.
-
-    ``entry`` is a descriptor dict (``subfolder`` / ``model`` / ``processor_config``),
-    a hydrated family :class:`~transformers.PretrainedConfig`, or a path string.
+    Subclasses add the module's own hyperparameters and a ``model_type``. The
+    fields here are what an omni checkpoint records about a module: where it
+    lives, and the kernels / config / processor overwrites applied when the
+    composed model loads it.
     """
 
-    def __init__(self, name: str, entry: Any = None):
-        self.name = name
-        self.entry = {} if entry is None else entry
-
-    @property
-    def hydrated_config(self) -> PretrainedConfig | None:
-        """This module's typed ``config.json`` if it has been hydrated, else ``None``."""
-        entry = self.entry
-        if isinstance(entry, PretrainedConfig):
-            return entry
-        if isinstance(entry, dict):
-            hf_config = entry.get(HYDRATED_CONFIG_KEY)
-            if isinstance(hf_config, PretrainedConfig):
-                return hf_config
-        return None
-
-    @property
-    def checkpoint_subfolder(self) -> str:
-        """Relative subfolder under an omni checkpoint root for this module."""
-        return safe_checkpoint_subfolder(self.name)
-
-    @property
-    def subfolder(self) -> str:
-        """On-disk path segment (relative subfolder, or an absolute load path)."""
-        entry = self.entry
-        if isinstance(entry, PretrainedConfig):
-            return self.checkpoint_subfolder
-        if isinstance(entry, str):
-            return entry
-        if isinstance(entry, dict):
-            model_block = entry.get("model")
-            if isinstance(model_block, dict):
-                path = model_block.get("model_path") or model_block.get("weights_path")
-                if path:
-                    return path
-            subfolder = entry.get("subfolder")
-            if subfolder:
-                return str(subfolder)
-        return self.name
-
-    def model_config_overrides(self) -> dict[str, Any]:
-        """Per-module ``from_pretrained`` overrides stored on the omni entry."""
-        entry = self.entry
-        if isinstance(entry, PretrainedConfig) or not isinstance(entry, dict):
-            return {}
-        model_block = entry.get("model")
-        if not isinstance(model_block, dict):
-            return {}
-        overrides = model_block.get("model_config")
-        return dict(overrides or {})
-
-    def processor_config(self) -> dict[str, Any]:
-        """Per-module preprocessor ``from_pretrained`` kwargs."""
-        entry = self.entry
-        if not isinstance(entry, dict):
-            return {}
-        return dict(entry.get("processor_config") or {})
-
-    def ops_implementation(self) -> dict[str, Any]:
-        """Per-module VeOmni kernel options persisted in the checkpoint.
-
-        Written onto the descriptor on export and read back on the native load
-        path so a module keeps the kernels it was exported with (see
-        ``OmniModel._load_modules``). A checkpoint converted straight from HF
-        weights carries none, and the caller's ops config applies instead.
-        Hydration parks the typed config on the descriptor, so this stays
-        readable after :meth:`~veomni.models.seed_omni.configuration_omni.OmniConfig.from_pretrained`.
-        """
-        entry = self.entry
-        if isinstance(entry, PretrainedConfig) or not isinstance(entry, dict):
-            return {}
-        model_block = entry.get("model")
-        if not isinstance(model_block, dict):
-            return {}
-        return dict(model_block.get("ops_implementation") or {})
-
-    def resolve_path(self, checkpoint_root: str | os.PathLike | None) -> str:
-        """Resolve the on-disk path for this module under ``checkpoint_root``."""
-        subfolder = self.subfolder
-        if os.path.isabs(subfolder):
-            return subfolder
-        if checkpoint_root is None:
-            return subfolder
-        return os.path.join(str(checkpoint_root), subfolder)
-
-    def to_export_dict(self) -> dict[str, Any]:
-        """Slim descriptor for HF ``config.json`` (subfolder + optional config overrides)."""
-        slim: dict[str, Any] = {"subfolder": self.checkpoint_subfolder}
-        model_block: dict[str, Any] = {}
-        ops_implementation = self.ops_implementation()
-        if ops_implementation:
-            model_block["ops_implementation"] = deepcopy(ops_implementation)
-        model_config = self.model_config_overrides()
-        if model_config:
-            model_block["model_config"] = model_config
-        if model_block:
-            slim["model"] = model_block
-        processor_config = self.processor_config()
-        if processor_config:
-            slim["processor_config"] = deepcopy(processor_config)
-        return slim
-
-    def as_runtime_fields(self) -> dict[str, Any]:
-        """Flatten a checkpoint-shaped descriptor onto launcher ``ModelArguments`` keys."""
-        if not isinstance(self.entry, dict):
-            raise TypeError(f"Module '{self.name}' must be a mapping to flatten onto runtime fields.")
-        cfg = deepcopy(self.entry)
-        cfg.pop("subfolder", None)
-        cfg.pop(HYDRATED_CONFIG_KEY, None)
-        model_block = cfg.pop("model", None)
-        if isinstance(model_block, dict):
-            for key, value in model_block.items():
-                if key not in cfg:
-                    cfg[key] = value
-        return cfg
-
-    def hydrate(self, checkpoint_root: str | os.PathLike) -> Any:
-        """Attach this module's typed ``config.json``, read from the path it loads from.
-
-        Hydration reads :meth:`resolve_path`, not ``root/<name>``: an entry that
-        names an external ``model_path`` must be described by the config living
-        with *its* weights, and must keep loading from there even when a
-        same-named directory happens to exist under the root.
-
-        The typed config is parked on the descriptor (:data:`HYDRATED_CONFIG_KEY`)
-        rather than replacing it. Replacing it dropped ``processor_config`` and
-        the ``model_config`` overrides the preprocessors are built with, and
-        re-anchored the module to ``root/<name>``.
-        """
-        if isinstance(self.entry, PretrainedConfig):
-            return self.entry
-
-        from . import OMNI_MODEL_REGISTRY, read_hf_model_type
-
-        subfolder = self.checkpoint_subfolder
-        module_dir = self.resolve_path(checkpoint_root)
-        if not os.path.isfile(os.path.join(module_dir, "config.json")):
-            # No typed config to read (e.g. a descriptor pointing at a Hub id):
-            # stay a descriptor, and let the loader resolve the path itself.
-            return self.entry if self.entry else {"subfolder": subfolder}
-
-        model_type = read_hf_model_type(module_dir)
-        hf_config = OMNI_MODEL_REGISTRY[model_type]().config_class.from_pretrained(module_dir)
-        overrides = self.model_config_overrides()
-        if overrides:
-            hf_config.update(deepcopy(overrides))
-
-        entry = deepcopy(self.entry) if isinstance(self.entry, dict) else {"subfolder": self.subfolder}
-        entry[HYDRATED_CONFIG_KEY] = hf_config
-        return entry
-
-    @classmethod
-    def from_runtime(
-        cls,
-        name: str,
-        *,
+    def __init__(
+        self,
         model_path: str | None = None,
+        ops_implementation: dict[str, Any] | None = None,
         model_config: dict[str, Any] | None = None,
         processor_config: dict[str, Any] | None = None,
-        ops_implementation: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Build an ``OmniConfig.modules`` descriptor dict from runtime fields.
+        **kwargs,
+    ):
+        # Relative (resolved against the omni checkpoint root) or absolute (an
+        # external checkpoint). ``None`` on a module's own config.json, where
+        # the file's own directory is the answer.
+        self.model_path = model_path
+        # Sparse: only what this location explicitly selected. A composed load
+        # merges the file, the model's default, and the module entry per field.
+        self.ops_implementation = dict(ops_implementation or {})
+        # Overrides the composed model applies to the module: hyperparameters
+        # for the model, kwargs for the preprocessor.
+        self.model_config = dict(model_config or {})
+        self.processor_config = dict(processor_config or {})
+        super().__init__(**kwargs)
 
-        ``model_path`` is carried through explicitly (not just ``subfolder:
-        name``): by the time this runs, the launcher has already resolved it
-        to an absolute path — usually ``<checkpoint_root>/<name>``, but a
-        module override may point at a wholly different checkpoint.
+    def to_diff_dict(self) -> dict[str, Any]:
+        """Drop the composed-model fields this config never set.
+
+        HF keeps any key ``PretrainedConfig`` itself does not define, even when
+        the value still equals this class' default. Without this, every
+        module's own ``config.json`` grows four empty fields — and three of
+        them (``model_path``, ``model_config``, ``processor_config``) are
+        things only a composed model says about a module.
         """
-        model_block: dict[str, Any] = {}
-        if ops_implementation:
-            model_block["ops_implementation"] = deepcopy(ops_implementation)
-        if model_path:
-            model_block["model_path"] = model_path
+        diff = super().to_diff_dict()
+        for field in ("model_path", "ops_implementation", "model_config", "processor_config"):
+            if not diff.get(field):
+                diff.pop(field, None)
+        return diff
+
+    @staticmethod
+    def resolve_path(
+        checkpoint_root: str | os.PathLike | None,
+        name: str,
+        model_path: str | None = None,
+    ) -> str:
+        """On-disk directory to load module ``name`` from.
+
+        An absolute ``model_path`` wins over ``<root>/<name>``, present or not:
+        a module pointed at another checkpoint must keep loading from there
+        even when a same-named directory happens to exist under the root.
+        """
+        path = model_path or name
+        if os.path.isabs(path):
+            return path
+        if checkpoint_root is None:
+            return path
+        return os.path.join(str(checkpoint_root), path)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | os.PathLike,
+        cache_dir: str | os.PathLike | None = None,
+        force_download: bool = False,
+        local_files_only: bool = False,
+        token: str | bool | None = None,
+        revision: str = "main",
+        **kwargs: Any,
+    ) -> OmniModuleConfig:
+        """Load this module's ``config.json``, then apply composed-model overwrites.
+
+        Called on the base class, the concrete config comes from
+        ``OMNI_MODEL_REGISTRY`` (the same gate as every other omni load).
+
+        ``model_config`` and ``processor_config`` are the module entry's
+        overwrites. ``ops_implementation`` is that entry's kernels.
+        ``base_ops_implementation`` is the composed model's default, passed in
+        separately because an entry does not carry it. Per field, lowest to
+        highest: what this file loaded, then ``base_ops_implementation``, then
+        the entry's ``ops_implementation``.
+        """
+        model_config = kwargs.pop("model_config", None)
+        processor_config = kwargs.pop("processor_config", None)
+        entry_ops = kwargs.pop("ops_implementation", None)
+        base_ops = kwargs.pop("base_ops_implementation", None)
+
+        if cls is OmniModuleConfig:
+            from . import OMNI_MODEL_REGISTRY, read_model_type
+
+            cls = OMNI_MODEL_REGISTRY[read_model_type(str(pretrained_model_name_or_path))]().config_class
+
+        hf_config = super().from_pretrained(
+            pretrained_model_name_or_path,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            local_files_only=local_files_only,
+            token=token,
+            revision=revision,
+            **kwargs,
+        )
+        if not isinstance(hf_config, OmniModuleConfig):
+            raise TypeError(
+                f"Module config loaded from {pretrained_model_name_or_path} is a "
+                f"{type(hf_config).__name__}, not a OmniModuleConfig."
+            )
+        hf_config._apply_composed_overwrites(
+            model_config=model_config,
+            processor_config=processor_config,
+            ops_implementation=entry_ops,
+            base_ops_implementation=base_ops,
+        )
+        return hf_config
+
+    def _apply_composed_overwrites(
+        self,
+        *,
+        model_config: dict[str, Any] | None,
+        processor_config: dict[str, Any] | None,
+        ops_implementation: dict[str, Any] | None,
+        base_ops_implementation: dict[str, Any] | None,
+    ) -> None:
+        """Write a composed model's overwrites onto this module config."""
+
+        def as_dict(field: str, value: Any) -> dict[str, Any] | None:
+            if value is None:
+                return None
+            if not isinstance(value, dict):
+                raise ValueError(f"{field} must be a dict, got {type(value).__name__}.")
+            return value
+
+        model_config = as_dict("model_config", model_config)
+        processor_config = as_dict("processor_config", processor_config)
+        entry_ops = as_dict("ops_implementation", ops_implementation)
+        base_ops = as_dict("base_ops_implementation", base_ops_implementation)
         if model_config:
-            model_block["model_config"] = deepcopy(model_config)
-        entry: dict[str, Any] = {
-            "subfolder": name,
-            "processor_config": deepcopy(processor_config or {}),
-        }
-        if model_block:
-            entry["model"] = model_block
-        return entry
+            self.update(deepcopy(model_config))
+        if processor_config:
+            current = dict(getattr(self, "processor_config", None) or {})
+            self.processor_config = {**current, **deepcopy(processor_config)}
+        if base_ops or entry_ops:
+            own = dict(getattr(self, "ops_implementation", None) or {})
+            self.ops_implementation = {**own, **(base_ops or {}), **(entry_ops or {})}
+        attn_implementation = dict(self.ops_implementation or {}).get("attn_implementation")
+        if attn_implementation is not None:
+            # HF selects the attention class from this attribute, not from ``ops_implementation``.
+            self._attn_implementation = attn_implementation
 
 
-__all__ = ["HYDRATED_CONFIG_KEY", "OmniModuleConfig", "safe_checkpoint_subfolder"]
+__all__ = [
+    "OmniModuleConfig",
+]

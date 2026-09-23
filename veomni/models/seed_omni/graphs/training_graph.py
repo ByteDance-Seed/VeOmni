@@ -62,9 +62,10 @@ See also
 """
 
 from collections import defaultdict, deque
-from typing import Dict, Iterator, List, Optional
+from collections.abc import Mapping
+from typing import Any, Dict, Iterator, List, Optional
 
-from .base import EdgeDef, NodeDef, is_end
+from .base import EdgeDef, NodeDef, is_end, validate_graph_modules
 
 
 def _mermaid_id(name: str) -> str:
@@ -83,6 +84,7 @@ class TrainingGraph:
         training_graph: List[Dict],
         *,
         default_method: str = "forward",
+        modules: Optional[Mapping[str, Any]] = None,
     ):
         if not training_graph:
             raise ValueError(
@@ -116,6 +118,8 @@ class TrainingGraph:
 
         self._active_nodes: List[NodeDef] = [self._node_by_name[n] for n in active_node_names]
         self._active_edges: List[EdgeDef] = resolved_edges
+        if modules is not None:
+            validate_graph_modules(self._active_nodes, modules)
 
         # Sanity: every active node has *some* outgoing edge (forbidding orphans
         # is the whole point of the `to: end` keyword).  By construction every
@@ -352,15 +356,15 @@ class TrainingGraph:
 
         in_degree: Dict[str, int] = {n: len(deps[n]) for n in nodes}
         # Sort by user-declared order (active_nodes preserves first-appearance).
-        order_index = {n: i for i, n in enumerate(nodes)}
-        queue: deque = deque(sorted((n for n in nodes if in_degree[n] == 0), key=order_index.get))
+        order_index: Dict[str, int] = {n: i for i, n in enumerate(nodes)}
+        queue: deque = deque(sorted((n for n in nodes if in_degree[n] == 0), key=lambda n: order_index[n]))
         order: List[str] = []
 
         while queue:
             n = queue.popleft()
             order.append(n)
             # Process in declaration order for stability.
-            for other in sorted(nodes, key=order_index.get):
+            for other in sorted(nodes, key=lambda n: order_index[n]):
                 if n in deps[other]:
                     deps[other].discard(n)
                     in_degree[other] -= 1
