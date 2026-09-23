@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import lru_cache
 from types import SimpleNamespace
 from typing import Any
 
@@ -48,8 +49,18 @@ _VEOMNI_HF_PATCHES: tuple[tuple[str, Callable[..., Any], Callable[..., Any]], ..
         flash_attention_mask_builder,
     ),
     (
+        "veomni_flash_attention_2_hub",
+        bind_flash_attention_forward("veomni_flash_attention_2_hub"),
+        flash_attention_mask_builder,
+    ),
+    (
         "veomni_flash_attention_3",
         bind_flash_attention_forward("veomni_flash_attention_3"),
+        flash_attention_mask_builder,
+    ),
+    (
+        "veomni_flash_attention_3_hub",
+        bind_flash_attention_forward("veomni_flash_attention_3_hub"),
         flash_attention_mask_builder,
     ),
     (
@@ -65,20 +76,44 @@ _VEOMNI_HF_PATCHES: tuple[tuple[str, Callable[..., Any], Callable[..., Any]], ..
 
 VEOMNI_FLASH_ATTN_IMPL_MAPPING = {
     "veomni_flash_attention_2": "flash_attention_2",
+    "veomni_flash_attention_2_hub": "flash_attention_2_hub",
     "veomni_flash_attention_3": "flash_attention_3",
+    "veomni_flash_attention_3_hub": "flash_attention_3_hub",
     "veomni_flash_attention_4": "flash_attention_4",
+}
+
+_HUB_FLASH_REPOS = {
+    "flash_attention_2_hub": "kernels-community/flash-attn2",
+    "veomni_flash_attention_2_hub": "kernels-community/flash-attn2",
+    "flash_attention_3_hub": "kernels-community/flash-attn3",
+    "veomni_flash_attention_3_hub": "kernels-community/flash-attn3",
 }
 
 _original_load_and_register_attn_kernel: Callable | None = None
 _veomni_hub_kernel_loader_patch_applied = False
 
 
-def _load_veomni_local_flash_kernel(implementation: str) -> SimpleNamespace:
-    """Build a local kernel-like object for VeOmni flash attention names.
+@lru_cache(maxsize=None)
+def _load_hub_flash_kernel(repository: str):
+    """Load a pinned Hub FlashAttention artifact through ``kernels``."""
+    try:
+        from kernels import get_kernel
+    except ImportError as e:
+        raise ImportError("VeOmni Hub FlashAttention implementations require `kernels` to be installed.") from e
+
+    return get_kernel(repository, version=1)
+
+
+def _load_veomni_local_flash_kernel(implementation: str) -> SimpleNamespace | object:
+    """Build a local or Hub kernel-like object for VeOmni flash attention names.
 
     Mimics the minimal interface expected by Transformers ``_lazy_imports``:
     ``flash_attn_func`` and ``flash_attn_varlen_func``.
     """
+    hub_repo = _HUB_FLASH_REPOS.get(implementation)
+    if hub_repo is not None:
+        return _load_hub_flash_kernel(hub_repo)
+
     stock = VEOMNI_FLASH_ATTN_IMPL_MAPPING.get(implementation)
     if stock == "flash_attention_2":
         try:
@@ -114,9 +149,9 @@ def _load_veomni_local_flash_kernel(implementation: str) -> SimpleNamespace:
 def patch_transformers_hub_kernel_loader_for_veomni() -> None:
     """Intercept VeOmni flash names before Transformers treats them as hub ids.
 
-    FA2 and FA3 have explicit ``_lazy_imports`` branches. FA4 does not, so it
-    falls through to ``load_and_register_attn_kernel``; this patch loads
-    ``flash_attn.cute`` locally instead of fetching from the hub.
+    FA2 and FA3 have explicit ``_lazy_imports`` branches. Hub FA2/FA3 and FA4
+    keep their VeOmni names, so this patch loads a pinned Hub artifact or
+    ``flash_attn.cute`` locally instead of treating those names as hub ids.
     """
     global _veomni_hub_kernel_loader_patch_applied
     global _original_load_and_register_attn_kernel
@@ -140,8 +175,8 @@ def patch_transformers_hub_kernel_loader_for_veomni() -> None:
         attention_wrapper: Callable | None = None,
         allow_all_kernels: bool = False,
     ) -> SimpleNamespace | object:
-        """Load VeOmni FlashAttention locally and delegate every other name."""
-        if attn_implementation in VEOMNI_FLASH_ATTN_IMPL_MAPPING:
+        """Load VeOmni FlashAttention locally or from a pinned Hub artifact."""
+        if attn_implementation in VEOMNI_FLASH_ATTN_IMPL_MAPPING or attn_implementation in _HUB_FLASH_REPOS:
             return _load_veomni_local_flash_kernel(attn_implementation)
 
         if is_transformers_version_greater_or_equal_to("5.3.0"):

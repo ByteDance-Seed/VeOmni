@@ -40,7 +40,9 @@ same way:
 | Public value | VeOmni registry name |
 |---|---|
 | `flash_attention_2` | `veomni_flash_attention_2` |
+| `flash_attention_2_hub` | `veomni_flash_attention_2_hub` |
 | `flash_attention_3` | `veomni_flash_attention_3` |
+| `flash_attention_3_hub` | `veomni_flash_attention_3_hub` |
 | `flash_attention_4` | `veomni_flash_attention_4` |
 | `flex_attention` | `veomni_flex_attention` |
 | `magi_attention` | `veomni_magi_attention` |

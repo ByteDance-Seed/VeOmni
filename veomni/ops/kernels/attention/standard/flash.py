@@ -37,11 +37,14 @@ def flash_kernel_implementation(implementation: str) -> str:
     """Map a selected VeOmni or Transformers flash name to the vendor token.
 
     FA2 and FA3 have dedicated branches in Transformers' ``_lazy_imports``, so
-    the plain names resolve without the hub-kernel path. FA4 has no such
-    branch; keeping the VeOmni name lets the
-    ``load_and_register_attn_kernel`` monkey-patch load ``flash_attn.cute``
-    locally.
+    the plain names resolve without the hub-kernel path. Hub FA2/FA3 and FA4
+    keep their VeOmni names so the ``load_and_register_attn_kernel``
+    monkey-patch can load a pinned Hub artifact or ``flash_attn.cute``.
     """
+    if "flash_attention_2_hub" in implementation:
+        return "veomni_flash_attention_2_hub"
+    if "flash_attention_3_hub" in implementation:
+        return "veomni_flash_attention_3_hub"
     if "flash_attention_2" in implementation:
         return "flash_attention_2"
     if "flash_attention_3" in implementation:
@@ -127,10 +130,10 @@ def flash_attention_forward(
        * FA2/FA3 → plain name (``"flash_attention_2"`` / ``"flash_attention_3"``)
          because ``_lazy_imports`` has an explicit branch for each and resolves
          them without touching the hub-kernel path.
-       * FA4 → kept as ``"veomni_flash_attention_4"`` so that
-         Transformers v5's hub-kernel fallback is intercepted by VeOmni's
-         monkey-patch of ``load_and_register_attn_kernel``, which loads
-         ``flash_attn.cute`` locally instead of fetching from the hub.
+       * Hub FA2/FA3 and FA4 keep their VeOmni names so Transformers v5's
+         hub-kernel fallback is intercepted by VeOmni's monkey-patch of
+         ``load_and_register_attn_kernel``. Hub names load a pinned
+         ``kernels-community`` artifact; FA4 loads ``flash_attn.cute`` locally.
     """
     if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
         logger.warning_once(

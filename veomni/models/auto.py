@@ -48,7 +48,9 @@ _VEOMNI_SP_ATTN = (
     "veomni_flex_attention",
     "veomni_magi_attention",
     "veomni_flash_attention_2",
+    "veomni_flash_attention_2_hub",
     "veomni_flash_attention_3",
+    "veomni_flash_attention_3_hub",
     "veomni_flash_attention_4",
 )
 
@@ -139,12 +141,16 @@ def build_foundation_model(
             "eager",
             "sdpa",
             "flash_attention_2",
+            "flash_attention_2_hub",
             "flash_attention_3",
+            "flash_attention_3_hub",
             "flash_attention_4",
             "flex_attention",
             "magi_attention",
             "veomni_flash_attention_2",
+            "veomni_flash_attention_2_hub",
             "veomni_flash_attention_3",
+            "veomni_flash_attention_3_hub",
             "veomni_flash_attention_4",
             "veomni_flex_attention",
             "veomni_magi_attention",
@@ -177,6 +183,10 @@ def build_foundation_model(
             )
         if attn_implementation is None:
             attn_implementation = installed.attn_implementation
+        else:
+            from veomni.arguments.arguments_types import OpsImplementationConfig
+
+            attn_implementation = OpsImplementationConfig.normalize_hub_attention_backend(attn_implementation)
         _validate_attention_parallelism(attn_implementation)
 
     if config_kwargs is None:

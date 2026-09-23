@@ -47,6 +47,23 @@ MODEL_PROCESSOR_REGISTRY = Registry("ModelProcessor")
 logger = logging.get_logger(__name__)
 
 
+def _omni_registries():
+    """Import SeedOmni registries lazily.
+
+    SeedOmni modeling imports back into ``veomni.models``, so this stays
+    behind a function instead of a module-level import.
+
+    Returns ``(OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY, OMNI_PROCESSOR_REGISTRY)``.
+    """
+    from .seed_omni.modules import (
+        OMNI_CONFIG_REGISTRY,
+        OMNI_MODEL_REGISTRY,
+        OMNI_PROCESSOR_REGISTRY,
+    )
+
+    return OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY, OMNI_PROCESSOR_REGISTRY
+
+
 def raise_unsupported_veomni_modeling(model_name: str) -> None:
     """Raise a model-build error that names the available VeOmni model types."""
     supported = ", ".join(sorted(MODELING_REGISTRY.valid_keys())) or "none"
@@ -76,8 +93,12 @@ def get_model_config(config_path: str, **kwargs):
     except Exception:
         config_dict, _ = PretrainedConfig.get_config_dict(config_path, **kwargs)
         model_type = config_dict["model_type"] if "model_type" in config_dict else config_dict["_class_name"]
-        logger.info_rank0(f"[CONFIG] Loading {model_type} from custom config.")
         kwargs.pop("trust_remote_code", None)
+        omni_config_registry, _, _ = _omni_registries()
+        if model_type in set(omni_config_registry.valid_keys()):
+            logger.info_rank0(f"[CONFIG] Loading {model_type} from OMNI config registry.")
+            return omni_config_registry[model_type]().from_pretrained(config_path, **kwargs)
+        logger.info_rank0(f"[CONFIG] Loading {model_type} from custom config.")
         return MODEL_CONFIG_REGISTRY[model_type]().from_pretrained(config_path, **kwargs)
 
 
@@ -103,6 +124,25 @@ def get_model_processor(processor_path: str, **kwargs):
         )
         return processor
     except Exception:
+        # SeedOmni sub-module processors are keyed by ``model_type``
+        # (read from the module's ``config.json``), not by processor class
+        # name — consult the OMNI registry first.
+        try:
+            hub_kwargs = {
+                key: kwargs[key]
+                for key in ("token", "revision", "cache_dir", "subfolder", "local_files_only")
+                if key in kwargs
+            }
+            cfg_dict, _ = PretrainedConfig.get_config_dict(processor_path, **hub_kwargs)
+            omni_model_type = cfg_dict.get("model_type")
+        except Exception:
+            omni_model_type = None
+        _, _, omni_processor_registry = _omni_registries()
+        if omni_model_type is not None and omni_model_type in set(omni_processor_registry.valid_keys()):
+            kwargs.pop("trust_remote_code", None)
+            logger.info_rank0(f"[PROCESSOR] Loading {omni_model_type} from OMNI processor registry.")
+            return omni_processor_registry[omni_model_type]().from_pretrained(processor_path, **kwargs)
+
         from transformers.processing_utils import ProcessorMixin
         from transformers.utils import PROCESSOR_NAME, cached_file
 
@@ -128,6 +168,9 @@ def get_model_class(model_config: PretrainedConfig):
     model_type = model_config.model_type
     modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend != "hf":
+        _, omni_model_registry, _ = _omni_registries()
+        if model_type in set(omni_model_registry.valid_keys()):
+            return omni_model_registry[model_type]()
         if model_type not in MODELING_REGISTRY.valid_keys():
             raise_unsupported_veomni_modeling(model_type)
         return MODELING_REGISTRY[model_type](arch_name)

@@ -222,7 +222,7 @@ NPU validation runs at two times:
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation. Supported public values include `eager`, `sdpa`, `flash_attention_2/3/4`, `flex_attention`, `magi_attention`, `sage_attention`, and `native-sparse`. Under the VeOmni modeling backend, Flash, Flex, Magi, Sage, and SDPA values rewrite to the matching `veomni_*` registry names. FlexAttention requires a model-provided native `BlockMask`; Ulysses currently requires it to be head-broadcast. MagiAttention requires the optional `--extra magi` install (`uv sync --extra gpu --extra magi`), a model-provided `MagiAttentionMask`, physical batch size 1, `cp_size == 1`, and zero attention dropout; it does not support KV-cache offsets. It uses the CUTLASS overlay on SM90 and CUTE DSL/JIT on SM100+. SageAttention is inference-only and does not take a dense mask. |
+| attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation. Supported public values include `eager`, `sdpa`, `flash_attention_2/3/4`, `flash_attention_2_hub`, `flash_attention_3_hub`, `flex_attention`, `magi_attention`, `sage_attention`, and `native-sparse`. Under the VeOmni modeling backend, Flash, Flex, Magi, Sage, and SDPA values rewrite to the matching `veomni_*` registry names. The opt-in Hub backends require `MODELING_BACKEND=veomni`, `kernels==0.16.0`, and a compatible version-1 artifact from `kernels-community/flash-attn2` or `kernels-community/flash-attn3`. Both short and normalized Hub names are rejected on Ascend NPU before HF preloading; dependency/download errors do not fall back to local kernels. Local FA2/FA3 remain the defaults. FlexAttention requires a model-provided native `BlockMask`; Ulysses currently requires it to be head-broadcast. MagiAttention requires the optional `--extra magi` install (`uv sync --extra gpu --extra magi`), a model-provided `MagiAttentionMask`, physical batch size 1, `cp_size == 1`, and zero attention dropout; it does not support KV-cache offsets. It uses the CUTLASS overlay on SM90 and CUTE DSL/JIT on SM100+. SageAttention is inference-only and does not take a dense mask. |
 | moe_implementation | `str` | `"fused_triton"` | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+ or MLU); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel; `fused_mlu` uses Apex grouped-GEMM on MLU; `eager` is the reference loop. A value still equal to the GPU default auto-resolves to `fused_npu` on NPU; explicit incompatible non-default overrides raise. |
 | cross_entropy_loss_implementation | `str` | `"liger_kernel"` | Cross-entropy loss. `liger_kernel` (default, GPU only) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `npu` is a back-compat alias for `chunk_loss`. `eager` is `F.cross_entropy`. |
 | rms_norm_implementation | `str` | `"liger_kernel"` | RMSNorm. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
@@ -564,7 +564,7 @@ configured and never round-trip through a saved config.
 | ulysses_size | `int` | `1` | Ulysses sequence parallel size. |
 | enable_async | `bool` | `False` | Enable async Ulysses. |
 | cp_size | `int` | `1` | Ring-attention context parallel size. |
-| init_device | `Literal["cuda", "meta", "npu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2 and also works for multi-rank DDP; a run with no FSDP wrap (`fsdp_size == 1`) must name an accelerator. |
+| init_device | `Literal["cuda", "meta", "npu", "mlu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2 and also works for multi-rank DDP; a run with no FSDP wrap (`fsdp_size == 1`) must name an accelerator. |
 | fsdp_config | `FSDPConfig` | — | FSDP sharding configuration. |
 | offload_config | `OffloadConfig` | — | Activation offload settings. |
 | gradient_checkpointing | `GradientCheckpointingConfig` | — | Activation recomputation settings. |
@@ -582,8 +582,155 @@ configured and never round-trip through a saved config.
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |
 | offload | `bool` | `False` | Enable CPU offload. |
 | offload_pin_memory | `bool` | `True` | Pin the CPU offload buffers, matching torch's `CPUOffloadPolicy` default. Set `False` to keep offloaded shards pageable, so a large-MoE job is not charged non-reclaimable Shmem. |
+| low_precision_reduce_scatter_comm | `bool` | `False` | Use `mixed_precision.param_dtype` (BF16 or FP16) for node-local FSDP2 ReduceScatter communication while keeping FP32 accumulation. See the precision and topology tables below. |
 | max_load_broadcast_size | `float` | `20.0` | Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting. |
 | mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |
+
+Set `low_precision_reduce_scatter_comm: true` to communicate gradients in `mixed_precision.param_dtype`
+while keeping `mixed_precision.reduce_dtype: float32`. There is no separate communication-dtype setting;
+use a YAML boolean, not a quoted string or dtype name.
+
+```yaml
+model:
+  accelerator:
+    fsdp_config:
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+      low_precision_reduce_scatter_comm: true
+```
+
+#### Which training layouts use it?
+
+The following assumes a valid custom configuration on CUDA. A node means a physical machine, not a worker
+process. VeOmni checks the actual ReduceScatter (RS) group, not the FSDP/HSDP strategy name.
+
+| Training layout | RS behavior | Warning or error? |
+| --- | --- | --- |
+| Single-node FSDP with multiple GPUs | Communicate in `param_dtype`; sum in FP32 | No fallback warning |
+| Multi-node FSDP whose RS group spans machines | Keep native PyTorch RS | Warning; training continues |
+| HSDP with RS inside each node and AllReduce between nodes | Communicate RS in `param_dtype`; replica AllReduce stays FP32 | No fallback warning |
+| HSDP whose RS group spans machines | Keep native communication for all replica-linked shard groups | Warning; training continues |
+| Node identity cannot be determined | Keep native communication for all replica-linked shard groups | Warning; training continues |
+| RS group contains only one rank | Keep native communication and scaling | No fallback warning |
+| Option disabled, or supported parameter/reduction dtypes are equal | Keep native communication without topology checks | No fallback warning |
+
+Fallback warnings are emitted by each affected shard group's rank zero when its decision is first cached
+for a model initialization, not on every backward pass. Unsupported precision combinations still raise
+configuration errors; real communication failures are not hidden by fallback.
+
+#### How it works
+
+When the option is enabled with BF16/FP16 parameters, FP32 reduction and eligible topology,
+VeOmni converts the FP32 ReduceScatter input to `mixed_precision.param_dtype`, performs an all-to-all over
+the shard group, and accumulates directly into the FP32 output. HSDP replica AllReduce stays native FP32;
+parameter AllGather is unchanged.
+
+![Native FP32 ReduceScatter compared with node-local BF16 or FP16 all-to-all transport followed by local FP32 sum and scaling. Both paths retain FP32 ReduceScatter input and output. HSDP replica AllReduce remains native FP32, using SUM on the custom path because full-mesh scaling is applied in the ReduceScatter hook. Parameter AllGather is unchanged.](../assets/reduce_scatter_transport.png)
+
+PyTorch allocates and packs the full input in `reduce_dtype` before invoking the collective callback,
+so this implementation retains the initial FP32 buffer. A separately tested Direct16 allocator prototype
+avoids that FP32 staging, but is **not integrated**: the allocator API does not identify input versus output
+allocations, so the prototype depends on a pinned PyTorch caller, source fingerprint and allocation order.
+A supported role-aware allocation interface would be preferable to shipping that dependency.
+
+At model initialization, VeOmni checks each module's actual ReduceScatter process group, including the
+combined shard/sequence-parallel group and any expert-specific shard groups. Multi-rank groups are eligible
+only when every member reports the same valid Linux kernel boot ID (`/proc/sys/kernel/random/boot_id`).
+Container hostnames, local rank numbers and configured shard sizes are not used as evidence of node locality.
+Isolated container boot IDs may conservatively cause a fallback even on one physical node.
+
+HSDP replica-linked shard groups must all qualify, preventing replicas from mixing the custom force-SUM
+scaling contract with native reduction scaling. Unrelated module meshes may choose different paths.
+Decisions are cached by process group within one model initialization; no detection runs during backward.
+Only named 1D shard meshes and 2D replica/shard meshes are supported; other dimensionalities are rejected
+before process-group lookup rather than skipping replica consensus.
+
+This is a conservative performance guard, not a guarantee of acceleration on every node-local interconnect
+or bucket size. All-to-all can increase cross-node NIC traffic despite using a smaller dtype.
+
+Budget two additional full-size low-precision buffers per in-flight reduction: one for the converted
+input and one for the all-to-all receive data. For a 1 GiB BF16/FP16 gradient bucket, these add 2 GiB
+of live tensor storage alongside the native-sized FP32 input and output buffers. Allocator/workspace
+overhead and overlapping reductions can further affect peak device memory.
+
+Modules excluded via `modules_to_ignore_in_mixed_precision` deliberately retain native FP32 communication:
+their gradients are genuine FP32 values, so low-precision transport would discard the precision they preserve.
+
+Finite gradients computed in the matching 16-bit dtype round-trip through the FP32 reduction buffer exactly.
+The final reduction need not be bitwise identical to native FP32 ReduceScatter because addition order may differ.
+Exact conversion also does not guarantee the same overflow behavior as native AVG: this path sums
+before scaling, so extreme finite BF16 values can overflow an intermediate FP32 sum even when their
+average is representable. Leave the option disabled when native AVG overflow behavior is required.
+
+This exact-conversion argument does not cover externally modified FP32 gradients or delayed ReduceScatter
+via PyTorch's `set_requires_gradient_sync(False)`, which may accumulate gradients in FP32 before transport.
+VeOmni's gradient accumulation retains per-microbatch ReduceScatter and only defers HSDP AllReduce.
+
+FP16 still has its usual finite range: values above `65504` may overflow during gradient computation. The
+transport option does not make an overflowing FP16 workload safe.
+
+The supported combinations are intentionally narrow:
+
+| Option | `param_dtype` | `reduce_dtype` | Behavior |
+| --- | --- | --- | --- |
+| `false` | Any otherwise valid configuration | Any otherwise valid configuration | Native path; no topology checks |
+| `true` | Same supported dtype as reduction | Same supported dtype as parameters | Native path; no topology checks |
+| `true` | `bfloat16` | `float32` | BF16 communication and FP32 accumulation on eligible groups |
+| `true` | `float16` | `float32` | FP16 communication and FP32 accumulation on eligible groups |
+| `true` | Other combinations | Other combinations | Configuration error, not silent compression |
+
+The custom rows additionally require enabled mixed precision and CUDA FSDP2. Equal-dtype native bypass
+does not enable this custom path, even if mixed precision is disabled. Two unset dtypes are not a supported
+equal-dtype configuration for an enabled flag.
+
+#### Communication measurements
+
+Tests on 2026-09-18 used VeOmni `ab25e073`, two nodes with eight H100 80GB GPUs each,
+PyTorch 2.11.0+cu128 and NCCL 2.28.9. The node-local RS results below use eight-rank groups
+and BF16 input sizes per rank. Each entry is the mean maximum-rank wall time over seven
+shuffled paired rounds, with ten warmups and fifty timed operations per mode per round.
+Two fresh-process repetitions are shown separately. Timing includes the custom conversion,
+allocation and reduction, but excludes PyTorch's initial BF16-to-FP32 packing.
+
+The automatic baseline retained platform tuning, with algorithm, protocol and tuner overrides
+unset and `NCCL_NVLS_ENABLE=2`. Separate profiles confirmed that NCCL selected Ring.
+Ring is the observed choice on these nodes, not a fixed NCCL default; NCCL selects
+algorithms according to the collective, message size and available topology.
+
+| BF16 MiB/rank | Repeat 1: native FP32 AVG -> custom (ms) | Repeat 2: native FP32 AVG -> custom (ms) |
+| --- | --- | --- |
+| 4 | 0.0587 -> 0.0831 | 0.0592 -> 0.0829 |
+| 8 | 0.0850 -> 0.0914 | 0.0861 -> 0.0892 |
+| 16 | 0.1312 -> 0.1228 | 0.1317 -> 0.1235 |
+| 64 | 0.3930 -> 0.3461 | 0.3941 -> 0.3460 |
+| 1024 | 5.3700 -> 4.5739 | 5.3659 -> 4.5739 |
+
+Small buffers can regress: 4 MiB is slower here, and 8 MiB is near break-even. Across the
+64-1024 MiB sweep, local RS improved by 11.9-14.8% in both repetitions. Keep the option
+off for workloads where its overhead outweighs the benefit; there is no automatic size
+threshold, since the crossover depends on hardware and workload.
+
+NVLS was also tested explicitly. In this NCCL version, floating-point AVG becomes PreMulSum,
+which is not NVLS-eligible. The control therefore uses native SUM followed by a timed output
+division. Profiles confirmed actual NVLS selection with `NCCL_ALGO=reducescatter:NVLS`.
+At 1024 MiB, matched native/custom measurements from each independent sweep were:
+
+| Native FP32 configuration | Repeat 1: native -> custom (ms) | Repeat 2: native -> custom (ms) |
+| --- | --- | --- |
+| Auto-selected Ring, AVG | 5.3700 -> 4.5739 | 5.3659 -> 4.5739 |
+| Auto-selected Ring, SUM + division | 5.5362 -> 4.5752 | 5.5360 -> 4.5726 |
+| Forced NVLS, SUM + division | 6.1836 -> 4.5686 | 6.1828 -> 4.5703 |
+
+**Forced NVLS was slower than the automatic Ring baseline**, including the matched SUM control.
+The primary comparison remains the faster automatic AVG baseline: about 14.8% lower local RS
+latency at 1024 MiB, not the larger percentage against forced NVLS. This is not an exhaustive
+search of all NCCL tuning or buffer-registration settings.
+
+Native BF16 was faster (about 2.76 ms at 1024 MiB), but changes reduction precision; its entire
+gap cannot be attributed to conversion alone because the communication and accumulation
+implementations also differ. These timings measure collective latency, not model throughput.
 
 ### MixedPrecisionConfig
 

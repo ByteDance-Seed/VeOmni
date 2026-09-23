@@ -186,6 +186,11 @@ def optimized_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1)
     ...
 ```
 
+Decorators on the source function are preserved on the generated replacement.
+This keeps Transformers Hub kernel registrations such as
+`@use_kernel_forward_from_hub("rotary_pos_emb")` consistent with class-level
+`@use_kernelized_func(...)` references when `kernels` is installed.
+
 #### Method Override
 
 Replace a specific method within a class (keeps the rest of the class unchanged):
@@ -592,7 +597,7 @@ Inspired by HuggingFace's own `modular_model_converter.py`, we:
 
 - **Python 3.10+** required (matches the standalone `patchgen` package metadata)
 - Generated code may need manual adjustment for complex patches
-- Some HF decorators (e.g., `@use_kernel_forward_from_hub`) may need special handling
+- Function replacements retain source decorators, so replacement bodies must remain compatible with them
 - Does not handle dynamic/conditional patches (use config flags in patches instead)
 - Empty class bodies written as `class Foo(Bar): ...` (inline ellipsis) and
   `class Foo(Bar):\n    pass` are both supported by `override_method` since the

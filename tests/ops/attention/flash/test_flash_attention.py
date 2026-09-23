@@ -228,7 +228,9 @@ def test_registered_fa4_adapter_matches_attention_sink_reference_and_gradients()
     ("selected", "expected_backend"),
     (
         ("veomni_flash_attention_2", "flash_attention_2"),
+        ("veomni_flash_attention_2_hub", "veomni_flash_attention_2_hub"),
         ("veomni_flash_attention_3", "flash_attention_3"),
+        ("veomni_flash_attention_3_hub", "veomni_flash_attention_3_hub"),
         ("veomni_flash_attention_4", "veomni_flash_attention_4"),
     ),
 )
@@ -569,3 +571,56 @@ def test_gpt_oss_attention_passes_learnable_sinks_through_hf_dict():
     assert captured["module"] is attention
     assert captured["s_aux"] is attention.sinks
     assert captured["sliding_window"] == 8
+
+
+@pytest.mark.parametrize(
+    ("implementation", "repository"),
+    [
+        ("veomni_flash_attention_2_hub", "kernels-community/flash-attn2"),
+        ("veomni_flash_attention_3_hub", "kernels-community/flash-attn3"),
+    ],
+)
+def test_hub_flash_loader_uses_pinned_kernels_artifact(monkeypatch, implementation, repository):
+    import sys
+
+    from veomni.ops import install as install_backend
+
+    calls = []
+    kernel = SimpleNamespace(flash_attn_func=object(), flash_attn_varlen_func=object())
+
+    def get_kernel(requested_repository, *, version):
+        calls.append((requested_repository, version))
+        return kernel
+
+    monkeypatch.setitem(sys.modules, "kernels", SimpleNamespace(get_kernel=get_kernel))
+    install_backend._load_hub_flash_kernel.cache_clear()
+    try:
+        loaded = install_backend._load_veomni_local_flash_kernel(implementation)
+        assert loaded is kernel
+        assert install_backend._load_veomni_local_flash_kernel(implementation) is kernel
+        assert calls == [(repository, 1)]
+    finally:
+        install_backend._load_hub_flash_kernel.cache_clear()
+
+
+def test_hub_flash_loader_reports_missing_kernels_dependency(monkeypatch):
+    import builtins
+    import sys
+
+    from veomni.ops import install as install_backend
+
+    real_import = builtins.__import__
+
+    def reject_kernels(name, *args, **kwargs):
+        if name == "kernels":
+            raise ImportError("test-only missing kernels")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.delitem(sys.modules, "kernels", raising=False)
+    monkeypatch.setattr(builtins, "__import__", reject_kernels)
+    install_backend._load_hub_flash_kernel.cache_clear()
+    try:
+        with pytest.raises(ImportError, match="require `kernels`"):
+            install_backend._load_veomni_local_flash_kernel("veomni_flash_attention_2_hub")
+    finally:
+        install_backend._load_hub_flash_kernel.cache_clear()

@@ -107,8 +107,14 @@ _FA2_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
     (NpuKernelRequirement(), ()),
     (MluKernelRequirement(), ("flash_attn",)),
 )
+_FA2_HUB_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
+    (GpuKernelRequirement(platforms=(_NVIDIA_SM80_PLUS,)), ("kernels",)),
+)
 _FA3_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
     (GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,)), ("flash_attn_interface",)),
+)
+_FA3_HUB_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
+    (GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,)), ("kernels",)),
 )
 _FA4_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
     (GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,)), ("flash_attn.cute",)),
@@ -149,7 +155,19 @@ def _register_attention(
 _register_attention("eager", "Transformers model-local eager attention")
 _register_attention("sdpa", "PyTorch scaled dot-product attention through Transformers")
 _register_attention("flash_attention_2", "FlashAttention 2 through Transformers", rows=_FA2_ROWS)
+_register_attention(
+    "flash_attention_2_hub",
+    "FlashAttention 2 from kernels-community/flash-attn2",
+    rows=_FA2_HUB_ROWS,
+    interface="veomni_flash_attention_2_hub",
+)
 _register_attention("flash_attention_3", "FlashAttention 3 through Transformers", rows=_FA3_ROWS)
+_register_attention(
+    "flash_attention_3_hub",
+    "FlashAttention 3 from kernels-community/flash-attn3",
+    rows=_FA3_HUB_ROWS,
+    interface="veomni_flash_attention_3_hub",
+)
 _register_attention("flash_attention_4", "FlashAttention 4 through Transformers", rows=_FA4_ROWS)
 _register_attention("flex_attention", "PyTorch FlexAttention through Transformers")
 _register_attention(
@@ -164,9 +182,19 @@ _register_attention(
     rows=_FA2_ROWS,
 )
 _register_attention(
+    "veomni_flash_attention_2_hub",
+    "VeOmni FlashAttention 2 adapter from kernels-community/flash-attn2",
+    rows=_FA2_HUB_ROWS,
+)
+_register_attention(
     "veomni_flash_attention_3",
     "VeOmni FlashAttention 3 adapter through Transformers",
     rows=_FA3_ROWS,
+)
+_register_attention(
+    "veomni_flash_attention_3_hub",
+    "VeOmni FlashAttention 3 adapter from kernels-community/flash-attn3",
+    rows=_FA3_HUB_ROWS,
 )
 _register_attention(
     "veomni_flash_attention_4",

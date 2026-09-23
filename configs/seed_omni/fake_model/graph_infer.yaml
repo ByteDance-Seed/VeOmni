@@ -1,0 +1,10 @@
+# Convert-time generation FSMs, keyed by infer_type.
+infer_gen:
+  initial: run
+  states:
+    run:
+      body:
+        - {from: fake_module_a, to: fake_module_b}
+        - {from: fake_module_b, to: end}
+      transitions:
+        - {condition: {type: default}, next_state: done}

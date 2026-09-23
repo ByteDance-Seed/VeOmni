@@ -47,7 +47,9 @@ _BUILTIN_ENTRIES = (
     ("attention", "standard", "flash_attention_2", "cuda", _GPU_SM80, ("flash_attn",)),
     ("attention", "standard", "flash_attention_2", "npu", _NPU, ()),
     ("attention", "standard", "flash_attention_2", "mlu", _MLU, ("flash_attn",)),
+    ("attention", "standard", "flash_attention_2_hub", "cuda", _GPU_NVIDIA_SM80, ("kernels",)),
     ("attention", "standard", "flash_attention_3", "cuda", _GPU_NVIDIA_SM90, ("flash_attn_interface",)),
+    ("attention", "standard", "flash_attention_3_hub", "cuda", _GPU_NVIDIA_SM90, ("kernels",)),
     ("attention", "standard", "flash_attention_4", "cuda", _GPU_NVIDIA_SM90, ("flash_attn.cute",)),
     ("attention", "standard", "flex_attention", "any", _ANY, ()),
     (
@@ -61,6 +63,7 @@ _BUILTIN_ENTRIES = (
     ("attention", "standard", "veomni_flash_attention_2", "cuda", _GPU_SM80, ("flash_attn",)),
     ("attention", "standard", "veomni_flash_attention_2", "npu", _NPU, ()),
     ("attention", "standard", "veomni_flash_attention_2", "mlu", _MLU, ("flash_attn",)),
+    ("attention", "standard", "veomni_flash_attention_2_hub", "cuda", _GPU_NVIDIA_SM80, ("kernels",)),
     (
         "attention",
         "standard",
@@ -69,6 +72,7 @@ _BUILTIN_ENTRIES = (
         _GPU_NVIDIA_SM90,
         ("flash_attn_interface",),
     ),
+    ("attention", "standard", "veomni_flash_attention_3_hub", "cuda", _GPU_NVIDIA_SM90, ("kernels",)),
     ("attention", "standard", "veomni_flash_attention_4", "cuda", _GPU_NVIDIA_SM90, ("flash_attn.cute",)),
     ("attention", "standard", "veomni_flex_attention", "any", _ANY, ()),
     (
