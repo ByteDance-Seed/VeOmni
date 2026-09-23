@@ -120,11 +120,16 @@
 
      def extra_repr(self):
          return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-@@ -91,30 +111,22 @@
+@@ -91,30 +111,23 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
--@use_kernel_forward_from_hub("rotary_pos_emb")
++# ======================================================================
++# [PATCHED FUNCTION] apply_rotary_pos_emb
++# Reason: Use NPU fused rotary embedding
++# Source: veomni.models.transformers.seed_oss.seed_oss_npu_patch_gen_config
++# ======================================================================
+ @use_kernel_forward_from_hub("rotary_pos_emb")
 -def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 -    """Applies Rotary Position Embedding to the query and key tensors.
 -
@@ -148,11 +153,6 @@
 -    q_embed = (q * cos) + (rotate_half(q) * sin)
 -    k_embed = (k * cos) + (rotate_half(k) * sin)
 -    return q_embed, k_embed
-+# ======================================================================
-+# [PATCHED FUNCTION] apply_rotary_pos_emb
-+# Reason: Use NPU fused rotary embedding
-+# Source: veomni.models.transformers.seed_oss.seed_oss_npu_patch_gen_config
-+# ======================================================================
 +def apply_rotary_pos_emb(
 +    q: torch.Tensor,
 +    k: torch.Tensor,
@@ -167,7 +167,7 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -418,6 +430,12 @@
+@@ -418,6 +431,12 @@
          )
 
 
@@ -180,7 +180,7 @@
  @auto_docstring
  class SeedOssForCausalLM(SeedOssPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -434,6 +452,13 @@
+@@ -434,6 +453,13 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -194,7 +194,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -445,53 +470,64 @@
+@@ -445,53 +471,64 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
