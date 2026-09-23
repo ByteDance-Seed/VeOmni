@@ -7,6 +7,8 @@ checkpoint. Graphs come from ``configs/seed_omni/Janus/janus_1.3b/``.
 
 from __future__ import annotations
 
+import json
+import tempfile
 from typing import Any
 
 from transformers import AutoTokenizer, JanusForConditionalGeneration, JanusProcessor, LlamaConfig
@@ -26,7 +28,7 @@ def convert_janus_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
     """Split an upstream Janus checkpoint into four V2 modules.
 
     A DeepSeek-format source (path not ending in ``-hf``) is first converted to
-    the HF layout at ``<model_path>-hf``.
+    the HF layout in a temporary directory.
     """
     training_graphs, generation_graphs = load_family_graphs(
         "configs/seed_omni/Janus/janus_1.3b",
@@ -41,12 +43,13 @@ def convert_janus_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
     )
     del kwargs
     if model_path.endswith("-hf"):
-        hf_model_path = model_path
+        modules = _split_janus_hf(model_path)
     else:
-        hf_model_path = model_path + "-hf"
-        convert_janus_to_hf(local_dir=model_path, output_dir=hf_model_path)
+        with tempfile.TemporaryDirectory(prefix="janus-hf-") as hf_model_path:
+            convert_janus_to_hf(local_dir=model_path, output_dir=hf_model_path)
+            modules = _split_janus_hf(hf_model_path)
     return {
-        "modules": _split_janus_hf(hf_model_path),
+        "modules": modules,
         "training_graphs": training_graphs,
         "generation_graphs": generation_graphs,
         "infer_type": "infer_interleave",
@@ -72,6 +75,15 @@ def _split_janus_hf(model_path: str) -> dict[str, Any]:
     model = JanusForConditionalGeneration.from_pretrained(model_path, device_map="cpu")
     image_processor = JanusProcessor.from_pretrained(model_path).image_processor
     tokenizer = AutoTokenizer.from_pretrained(model_path)
+    # Janus's vocab is byte-level BPE. An HF export written before
+    # convert_janus_weight_to_hf bypassed the mislabelled ``LlamaTokenizer``
+    # class carries a rebuilt Metaspace pipeline that tokenizes differently.
+    pre_tokenizer = json.loads(tokenizer.backend_tokenizer.to_str()).get("pre_tokenizer") or {}
+    if pre_tokenizer.get("type") == "Metaspace":
+        raise ValueError(
+            f"{model_path} holds a Metaspace tokenizer; Janus needs the byte-level one. "
+            "Convert from the DeepSeek checkpoint (the directory without the -hf suffix) instead."
+        )
     model.eval()
     cfg = model.config
     inner = model.model
