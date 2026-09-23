@@ -1,31 +1,31 @@
-"""Split a BAGEL checkpoint into SeedOmni V2 module subfolders."""
+"""Split a BAGEL checkpoint into SeedOmni V2 modules.
+
+Registered under ``OMNI_CONVERT_REGISTRY["bagel"]``; :func:`convert_checkpoint`
+writes the omni checkpoint. Graphs come from ``configs/seed_omni/Bagel/bagel_7b_mot/``.
+"""
 
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 from typing import Any, Callable
 
 import torch
 from safetensors import safe_open
+from transformers import AutoTokenizer
 from transformers.initialization import no_init_weights
 
 from veomni.models.module_utils import init_empty_weights
-from veomni.models.seed_omni.utils.convert_registry import OMNI_CONVERT_REGISTRY
+from veomni.models.seed_omni.utils.convert_registry import (
+    OMNI_CONVERT_REGISTRY,
+    attach_module_assets,
+    load_family_graphs,
+)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def _prepare_output_dir(output_dir: Path, force: bool) -> None:
-    if output_dir.exists() and any(output_dir.iterdir()):
-        if not force:
-            raise FileExistsError(f"{output_dir} already exists and is not empty. Clear it before converting.")
-        shutil.rmtree(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _load_prefixed_safetensors(
@@ -82,16 +82,13 @@ def _materialize_allowed_missing_parameters(model: Any, missing: list[str]) -> N
         module._init_weights()
 
 
-def _save_module(
+def _build_module(
     model_type: str,
     config: Any,
     state_dict: dict[str, Any],
-    output_dir: Path,
     *,
     allowed_missing: set[str] | None = None,
-) -> None:
-    from veomni.models.seed_omni.modules import read_model_type
-
+) -> Any:
     model = _instantiate(model_type, config)
     allowed_missing = set() if allowed_missing is None else allowed_missing
     missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
@@ -101,43 +98,32 @@ def _save_module(
     if unexpected_missing or unexpected:
         raise RuntimeError(f"{model_type} load mismatch: missing={unexpected_missing}, unexpected={unexpected}")
     _materialize_allowed_missing_parameters(model, [key for key in missing if key in allowed_missing])
-    module_dir = output_dir / model_type
-    model.save_pretrained(module_dir, safe_serialization=True)
-    resolved_type = read_model_type(str(module_dir))
-    if resolved_type != model_type:
-        raise RuntimeError(f"{module_dir} resolved model_type {resolved_type!r}, expected {model_type!r}")
-    print(f"[bagel] saved {model_type} -> {module_dir}")
-
-
-def _copy_tokenizer_assets(model_root: Path, target_dir: Path) -> None:
-    asset_names = (
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "vocab.json",
-        "merges.txt",
-        "special_tokens_map.json",
-        "added_tokens.json",
-    )
-    for name in asset_names:
-        src = model_root / name
-        if src.exists():
-            shutil.copy2(src, target_dir / name)
+    print(f"[bagel] extracted {model_type}")
+    return model
 
 
 def convert_bagel_checkpoint(
     model_path: str,
-    output_dir: str,
     *,
-    force: bool = False,
     max_latent_size: int = 64,
-    **kwargs,
-) -> None:
-    """Split an upstream BAGEL checkpoint into five V2 module subfolders."""
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Split an upstream BAGEL checkpoint into five V2 modules."""
+    training_graphs, generation_graphs = load_family_graphs(
+        "configs/seed_omni/Bagel/bagel_7b_mot",
+        training="train/graph_train.yaml",
+        generation={
+            "infer_edit": "infer/graph_infer_edit.yaml",
+            "infer_gen": "infer/graph_infer_gen.yaml",
+            "infer_und": "infer/graph_infer_und.yaml",
+        },
+        training_graph=kwargs.pop("training_graph", None),
+        generation_graph=kwargs.pop("generation_graph", None),
+    )
     del kwargs
+    max_latent_size = int(max_latent_size)
 
     model_root = Path(model_path)
-    target_root = Path(output_dir)
-    _prepare_output_dir(target_root, force=force)
 
     ema_path = model_root / "ema.safetensors"
     ae_path = model_root / "ae.safetensors"
@@ -171,8 +157,8 @@ def convert_bagel_checkpoint(
         }.get(key),
         consumed_ema_keys,
     )
-    _save_module("bagel_text_encoder", text_cfg, text_state, target_root)
-    _copy_tokenizer_assets(model_root, target_root / "bagel_text_encoder")
+    text_encoder = _build_module("bagel_text_encoder", text_cfg, text_state)
+    attach_module_assets(text_encoder, tokenizer=AutoTokenizer.from_pretrained(model_path))
 
     qwen_cfg_cls = OMNI_CONFIG_REGISTRY["bagel_qwen2_mot"]()
     qwen_cfg = qwen_cfg_cls(
@@ -192,7 +178,7 @@ def convert_bagel_checkpoint(
         ),
         consumed_ema_keys,
     )
-    _save_module("bagel_qwen2_mot", qwen_cfg, qwen_state, target_root)
+    qwen2_mot = _build_module("bagel_qwen2_mot", qwen_cfg, qwen_state)
 
     siglip_cfg_cls = OMNI_CONFIG_REGISTRY["bagel_siglip_navit"]()
     siglip_cfg = siglip_cfg_cls(
@@ -219,16 +205,15 @@ def convert_bagel_checkpoint(
         ),
         consumed_ema_keys,
     )
-    _save_module(
+    siglip = _build_module(
         "bagel_siglip_navit",
         siglip_cfg,
         siglip_state,
-        target_root,
         allowed_missing={"vit_pos_embed.pos_embed"},
     )
     from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import BagelSiglipNavitProcessor
 
-    BagelSiglipNavitProcessor.from_config(siglip_cfg).save_pretrained(target_root / "bagel_siglip_navit")
+    attach_module_assets(siglip, image_processor=BagelSiglipNavitProcessor.from_config(siglip_cfg))
 
     flow_cfg_cls = OMNI_CONFIG_REGISTRY["bagel_flow_connector"]()
     patch_latent_dim = 2 * 2 * 16
@@ -244,28 +229,38 @@ def convert_bagel_checkpoint(
         lambda key: key if key.startswith(flow_prefixes) else None,
         consumed_ema_keys,
     )
-    _save_module(
+    flow_connector = _build_module(
         "bagel_flow_connector",
         flow_cfg,
         flow_state,
-        target_root,
         allowed_missing={"latent_pos_embed.pos_embed"},
     )
 
     vae_cfg_cls = OMNI_CONFIG_REGISTRY["bagel_vae"]()
     vae_cfg = vae_cfg_cls()
     vae_state = _load_prefixed_safetensors(ae_path, lambda key: key, consumed_ae_keys)
-    _save_module("bagel_vae", vae_cfg, vae_state, target_root)
+    vae = _build_module("bagel_vae", vae_cfg, vae_state)
     from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
 
-    BagelVAEProcessor.from_config(vae_cfg).save_pretrained(target_root / "bagel_vae")
+    attach_module_assets(vae, image_processor=BagelVAEProcessor.from_config(vae_cfg))
 
     # Position embeddings are deterministic sin-cos buffers regenerated from config.
     ignored_ema_keys = {"latent_pos_embed.pos_embed", "vit_pos_embed.pos_embed"}
     _assert_no_unhandled_keys(ema_path, consumed_ema_keys, ignored_ema_keys)
     _assert_no_unhandled_keys(ae_path, consumed_ae_keys, set())
 
-    print(f"[bagel] split complete -> {target_root}")
+    return {
+        "modules": {
+            "bagel_vae": vae,
+            "bagel_siglip_navit": siglip,
+            "bagel_text_encoder": text_encoder,
+            "bagel_flow_connector": flow_connector,
+            "bagel_qwen2_mot": qwen2_mot,
+        },
+        "training_graphs": training_graphs,
+        "generation_graphs": generation_graphs,
+        "infer_type": "infer_und",
+    }
 
 
 @OMNI_CONVERT_REGISTRY.register("bagel")

@@ -246,8 +246,15 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
   `_module_entries: {<name>: {model_path, ops_implementation, model_config, processor_config}}`
   instead of `modules: {<name>: {subfolder, ...}}`. `model_path` is the module's subfolder
   (relative to the root); there is no `subfolder` field and no hydrate / stash step. Re-run
-  `scripts/seed_omni/convert_model.py` (or the split + `export_omni_checkpoint.py` route) on
-  any checkpoint converted before this change.
+  `scripts/seed_omni/convert_model.py` on any checkpoint converted before this change.
+- **Family converters return modules; they no longer write files.** A converter registered
+  in `OMNI_CONVERT_REGISTRY` takes `(model_path, **kwargs)` and returns
+  `{"modules": {name: module}, "training_graphs", "generation_graphs", "infer_type"}`
+  (see `fake_model/convert_model.py`). `convert_checkpoint` saves that through
+  `OmniModel.save_pretrained`, so one convert run yields a complete omni root (config,
+  graph sidecars, module subfolders). Processors and tokenizers ride along on the module
+  via `attach_module_assets`; default graphs come from the family's `configs/seed_omni/`
+  YAML via `load_family_graphs`. `scripts/seed_omni/export_omni_checkpoint.py` is removed.
 - `OmniConfig.from_pretrained` loads every module config eagerly into `_module_configs`.
   A module config that is not an `OmniModuleConfig` raises at load time; conversion no
   longer validates the graph.

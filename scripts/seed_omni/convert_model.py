@@ -54,7 +54,7 @@ def main() -> None:
     parser.add_argument(
         "--output_dir",
         required=True,
-        help="Directory to write the split omni checkpoint (modules; graph YAML sidecars when supplied)",
+        help="Directory to write the omni checkpoint (root config, graph sidecars, module subfolders)",
     )
     parser.add_argument(
         "--training_graph",

@@ -555,8 +555,12 @@ boundary-token logic without the framework knowing about it.
 Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 
 1. **Split the checkpoint.** Register a converter in `modules/<family>/convert_model.py` (dispatched by `scripts/seed_omni/convert_model.py`)
-   to break the upstream HF checkpoint into one self-contained subfolder per
-   module (`config.json` + `model.safetensors` + any processor/tokenizer JSON).
+   that returns the upstream HF checkpoint as one module instance per module
+   (processors / tokenizers attached with `attach_module_assets`) plus the
+   family's default graphs. `convert_checkpoint` saves it through
+   `OmniModel.save_pretrained`: root `config.json`, graph sidecars and one
+   self-contained subfolder per module (`config.json` + `model.safetensors` +
+   any processor/tokenizer JSON).
 
 2. **Write each module** under
    `veomni/models/seed_omni/modules/<family>/<sub>/`:

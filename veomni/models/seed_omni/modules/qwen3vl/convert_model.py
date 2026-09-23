@@ -1,7 +1,8 @@
-"""Split a Qwen3-VL checkpoint into SeedOmni V2 module subfolders.
+"""Split a Qwen3-VL checkpoint into SeedOmni V2 modules.
 
 Registered under ``OMNI_CONVERT_REGISTRY["qwen3_vl"]`` and dispatched by
 ``scripts/seed_omni/convert_model.py`` (via :func:`convert_checkpoint`).
+Graphs come from ``configs/seed_omni/Qwen/qwen3vl_2b/``.
 
 Output layout::
 
@@ -13,7 +14,7 @@ Output layout::
 
 from __future__ import annotations
 
-import os
+from typing import Any
 
 from transformers import AutoProcessor, AutoTokenizer
 from transformers.initialization import no_init_weights
@@ -21,7 +22,7 @@ from transformers.initialization import no_init_weights
 from veomni.models.module_utils import init_empty_weights
 from veomni.utils.device import IS_NPU_AVAILABLE
 
-from ...utils.convert_registry import OMNI_CONVERT_REGISTRY
+from ...utils.convert_registry import OMNI_CONVERT_REGISTRY, attach_module_assets, load_family_graphs
 
 
 if IS_NPU_AVAILABLE:
@@ -34,8 +35,15 @@ else:
     )
 
 
-def convert_qwen3vl_checkpoint(model_path: str, output_dir: str, **kwargs) -> None:
-    """Split an upstream Qwen3-VL checkpoint into three V2 module subfolders."""
+def convert_qwen3vl_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
+    """Split an upstream Qwen3-VL checkpoint into three V2 modules."""
+    training_graphs, generation_graphs = load_family_graphs(
+        "configs/seed_omni/Qwen/qwen3vl_2b",
+        training="train/graph_train.yaml",
+        generation={"vision_understanding": "infer/graph_infer.yaml"},
+        training_graph=kwargs.pop("training_graph", None),
+        generation_graph=kwargs.pop("generation_graph", None),
+    )
     del kwargs
     print(f"Loading Qwen3-VL from: {model_path}")
     import veomni.models.seed_omni.modules  # noqa: F401
@@ -59,15 +67,11 @@ def convert_qwen3vl_checkpoint(model_path: str, output_dir: str, **kwargs) -> No
     with no_init_weights(), init_empty_weights():
         vision = Qwen3VLVisionEncoder._from_config(vision_cfg)
     vision.visual.load_state_dict(inner.visual.state_dict(), assign=True)
-    vision_dir = os.path.join(output_dir, "qwen3vl_vision")
-    vision.save_pretrained(vision_dir, safe_serialization=True)
     # Two distinct processors / configs, both loaded by the vision module:
     #   image -> preprocessor_config.json       (Qwen2VLImageProcessor)
     #   video -> video_preprocessor_config.json (Qwen3VLVideoProcessor)
     processor = AutoProcessor.from_pretrained(model_path)
-    processor.image_processor.save_pretrained(vision_dir)
-    processor.video_processor.save_pretrained(vision_dir)
-    print(f"  saved → {vision_dir}")
+    attach_module_assets(vision, image_processor=processor.image_processor, video_processor=processor.video_processor)
 
     print("Extracting qwen3vl_text_encoder ...")
     # Official Qwen3-VL puts `tie_word_embeddings` on the top-level config
@@ -85,11 +89,8 @@ def convert_qwen3vl_checkpoint(model_path: str, output_dir: str, **kwargs) -> No
     if not tie_word_embeddings and model.lm_head is not None:
         src_sd = {k: v.detach().clone() for k, v in model.lm_head.state_dict().items()}
         te.lm_head.load_state_dict(src_sd, assign=True)
-    te_dir = os.path.join(output_dir, "qwen3vl_text_encoder")
-    te.save_pretrained(te_dir, safe_serialization=True)
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    tokenizer.save_pretrained(te_dir)
-    print(f"  saved → {te_dir} (tie_word_embeddings={tie_word_embeddings})")
+    attach_module_assets(te, tokenizer=AutoTokenizer.from_pretrained(model_path))
+    print(f"  tie_word_embeddings={tie_word_embeddings}")
 
     print("Extracting qwen3vl_llm ...")
     llm_cfg = Qwen3VLLlmConfig(
@@ -101,11 +102,13 @@ def convert_qwen3vl_checkpoint(model_path: str, output_dir: str, **kwargs) -> No
         llm = Qwen3VLLlm._from_config(llm_cfg)
     src = {k: v for k, v in inner.language_model.state_dict().items() if not k.startswith("embed_tokens.")}
     llm.language_model.load_state_dict(src, assign=True, strict=False)
-    llm_dir = os.path.join(output_dir, "qwen3vl_llm")
-    llm.save_pretrained(llm_dir, safe_serialization=True)
-    print(f"  saved → {llm_dir} (no embed_tokens / no lm_head)")
 
-    print(f"\nDone.  Split checkpoint saved to: {output_dir}")
+    return {
+        "modules": {"qwen3vl_vision": vision, "qwen3vl_text_encoder": te, "qwen3vl_llm": llm},
+        "training_graphs": training_graphs,
+        "generation_graphs": generation_graphs,
+        "infer_type": "vision_understanding",
+    }
 
 
 @OMNI_CONVERT_REGISTRY.register("qwen3_vl")
