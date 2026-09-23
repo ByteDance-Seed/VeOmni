@@ -498,6 +498,29 @@ def test_resolve_model_reads_graphs_from_omni_checkpoint(tmp_path):
     assert cfg.infer_types == runtime_cfg.infer_types
 
 
+def test_a_launcher_infer_graph_does_not_inherit_the_checkpoint_infer_type(tmp_path):
+    """The checkpoint's ``infer_type`` names one of its own scenarios, not the launcher's."""
+    infer_dir = _cfg_dir() / "infer"
+    runtime_cfg = _model_runtime(
+        model_path=str(tmp_path),
+        infer_graph={"infer_und": str(infer_dir / "graph_infer_und.yaml")},
+        infer_type="infer_und",
+    )
+    export_root = tmp_path / "exported"
+    _with_module_configs(runtime_cfg.to_hf_config()).save_pretrained(export_root)
+    assert OmniConfig.from_pretrained(export_root).infer_type == "infer_und"
+
+    args = OmniArguments(
+        model=OmniModelRuntimeArguments(
+            model_path=str(export_root),
+            model_config={"infer_graph": {"understanding": str(infer_dir / "graph_infer_und.yaml")}},
+        ),
+        data=OmniDataArguments(train_path=""),
+        infer=OmniInferArguments(),
+    )
+    assert args.resolve_model(for_inference=True).infer_type == "understanding"
+
+
 def test_from_model_runtime_projects_onto_hf_config(tmp_path):
     """from_model_runtime builds OmniModel from ``to_hf_config()``; each ModuleRuntime
     gets the module config that OmniConfig loaded."""

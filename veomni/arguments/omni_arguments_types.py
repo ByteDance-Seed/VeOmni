@@ -138,7 +138,8 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
     train_modules = yaml_modules if yaml_modules is not None else {name: {} for name in ckpt_modules}
 
     train_graph = model_runtime.launcher_config("train_graph")
-    if train_graph is None and omni_cfg is not None:
+    train_graph_from_ckpt = train_graph is None and omni_cfg is not None
+    if train_graph_from_ckpt:
         train_graph = omni_cfg.training_graphs
     if train_graph is None:
         raise ValueError(
@@ -147,7 +148,8 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
         )
 
     infer_graph = model_runtime.launcher_config("infer_graph")
-    if not infer_graph and omni_cfg is not None:
+    infer_graph_from_ckpt = not infer_graph and omni_cfg is not None
+    if infer_graph_from_ckpt:
         infer_graph = omni_cfg.generation_graphs
     if not infer_graph:
         raise ValueError(
@@ -155,11 +157,14 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
             "`config.json` generation graphs."
         )
 
+    # A checkpoint's train_type / infer_type names one of *its* scenarios, so it
+    # only applies while the graphs are the checkpoint's too: a launcher graph
+    # override brings its own scenario names.
     train_type = model_runtime.launcher_config("train_type")
     infer_type = model_runtime.launcher_config("infer_type")
-    if train_type is None and omni_cfg is not None:
+    if train_type is None and train_graph_from_ckpt:
         train_type = omni_cfg.train_type
-    if infer_type is None and omni_cfg is not None:
+    if infer_type is None and infer_graph_from_ckpt:
         infer_type = omni_cfg.infer_type
 
     train_type = _resolve_graph_type(args, model_runtime, train_graph, "train_type", train_type)
