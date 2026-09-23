@@ -77,12 +77,12 @@ def _write_omni_checkpoint(root: Path) -> None:
     }
 
     yaml.safe_dump(
-        {"training_graph": training_graph},
+        training_graph,
         (root / DEFAULT_TRAINING_GRAPH_FILE).open("w", encoding="utf-8"),
         sort_keys=False,
     )
     yaml.safe_dump(
-        {"generation_graphs": generation_graphs},
+        generation_graphs,
         (root / DEFAULT_GENERATION_GRAPH_FILE).open("w", encoding="utf-8"),
         sort_keys=False,
     )
@@ -115,7 +115,7 @@ def _minimal_generation_graphs(*, module: str = FAKE_A) -> dict:
 def _build_omni_model() -> OmniModel:
     config = OmniConfig(
         modules=_chain_modules(),
-        training_graph=_chain_edges(),
+        training_graphs={"default": _chain_edges()},
         generation_graphs=_minimal_generation_graphs(),
     )
     return OmniModel(
@@ -176,7 +176,7 @@ def test_omni_config_repr_survives_required_init_args(tmp_path):
 def test_omni_config_generation_graph_is_read_only():
     config = OmniConfig(
         modules=_chain_modules(),
-        training_graph=_chain_edges(),
+        training_graphs={"default": _chain_edges()},
         generation_graphs=_minimal_generation_graphs(),
     )
     with pytest.raises(AttributeError, match="read-only"):
@@ -186,7 +186,7 @@ def test_omni_config_generation_graph_is_read_only():
 def test_omni_config_without_scenarios_reports_clearly():
     config = OmniConfig(
         modules=_chain_modules(),
-        training_graph=_chain_edges(),
+        training_graphs={"default": _chain_edges()},
         generation_graphs={},
     )
     with pytest.raises(ValueError, match="No graph scenarios"):
@@ -336,22 +336,22 @@ def test_from_pretrained_root_argument_wins_over_the_config_origin(tmp_path):
 def test_omni_config_save_pretrained_writes_graph_sidecars(tmp_path):
     config = OmniConfig(
         modules=_chain_modules(),
-        training_graph=_chain_edges(),
+        training_graphs={"default": _chain_edges()},
         generation_graphs=_minimal_generation_graphs(),
     )
 
     config.save_pretrained(tmp_path)
 
     saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
-    assert "training_graph" not in saved
+    assert "training_graphs" not in saved
     assert saved["modules"] == _chain_modules()
     assert "generation_graphs" not in saved
     assert (tmp_path / DEFAULT_GENERATION_GRAPH_FILE).exists()
-    assert yaml.safe_load((tmp_path / DEFAULT_TRAINING_GRAPH_FILE).read_text(encoding="utf-8"))["training_graph"] == (
-        _chain_edges()
-    )
+    assert yaml.safe_load((tmp_path / DEFAULT_TRAINING_GRAPH_FILE).read_text(encoding="utf-8")) == {
+        "default": _chain_edges()
+    }
     sidecar = yaml.safe_load((tmp_path / DEFAULT_GENERATION_GRAPH_FILE).read_text(encoding="utf-8"))
-    assert list(sidecar["generation_graphs"]) == ["infer_gen"]
+    assert list(sidecar) == ["infer_gen"]
     assert (tmp_path / "graphs" / "training.mmd").exists()
     assert (tmp_path / "graphs" / "generation_infer_gen.mmd").exists()
     training_mmd = (tmp_path / "graphs" / "training.mmd").read_text(encoding="utf-8")
@@ -403,7 +403,7 @@ def test_save_pretrained_roundtrips_every_generation_scenario(tmp_path):
     """An exported checkpoint stays multi-scenario — it is not locked to the active one."""
     config = OmniConfig(
         modules=_chain_modules(),
-        training_graph=_chain_edges(),
+        training_graphs={"default": _chain_edges()},
         generation_graphs={
             "infer_gen": _minimal_generation_graph(module=FAKE_A),
             "infer_und": {
@@ -458,7 +458,7 @@ def test_omni_model_post_init_unions_child_no_split_modules():
 def test_module_checkpoint_subfolder_rejects_path_escape():
     config = OmniConfig(
         modules={"../evil": {"subfolder": "../evil"}},
-        training_graph=[{"from": "../evil", "to": "end"}],
+        training_graphs={"default": [{"from": "../evil", "to": "end"}]},
         generation_graphs=_minimal_generation_graphs(module="../evil"),
     )
     with pytest.raises(ValueError, match="not a safe checkpoint subfolder"):

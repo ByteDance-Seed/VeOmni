@@ -6,8 +6,10 @@ the training DAG, and every generation FSM. Per-module subfolder / path /
 :class:`~veomni.models.seed_omni.modules.module_configuration_base.OmniModuleConfig`.
 This class does not know about VeOmni runtime (ops, FSDP, freeze, launcher YAML).
 
-A checkpoint stores every generation scenario under ``generation_graphs``, keyed
-by ``infer_type``. :attr:`OmniConfig.generation_graph` is the active one.
+A checkpoint stores every training DAG under ``training_graphs`` (keyed by
+``train_type``) and every generation FSM under ``generation_graphs`` (keyed by
+``infer_type``). :attr:`OmniConfig.training_graph` / :attr:`OmniConfig.generation_graph`
+are the active entries. A single-scenario file uses the name ``default``.
 
 VeOmni runtime fields live on
 :class:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_config.OmniModelRuntimeConfig`
@@ -26,6 +28,7 @@ from transformers import PretrainedConfig
 
 DEFAULT_TRAINING_GRAPH_FILE = "training_graph.yaml"
 DEFAULT_GENERATION_GRAPH_FILE = "generation_graph.yaml"
+DEFAULT_GRAPH_SCENARIO = "default"
 
 
 def select_graph(
@@ -54,7 +57,7 @@ class OmniConfig(PretrainedConfig):
     """
 
     model_type = "omni"
-    # ``modules`` / ``training_graph`` / ``generation_graphs`` are required, so
+    # ``modules`` / ``training_graphs`` / ``generation_graphs`` are required, so
     # transformers must not probe defaults via a bare ``OmniConfig()`` — it does
     # that in ``to_diff_dict`` (and therefore ``__repr__``) unless told otherwise.
     has_no_defaults_at_init = True
@@ -62,25 +65,51 @@ class OmniConfig(PretrainedConfig):
     def __init__(
         self,
         modules: Dict[str, Dict],
-        training_graph: List[Dict],
+        training_graphs: Dict[str, List[Dict]],
         generation_graphs: Dict[str, Dict],
         *,
+        train_type: Optional[str] = None,
         infer_type: Optional[str] = None,
         generation_kwargs: Optional[Dict] = None,
         **kwargs,
     ):
         self.modules = modules
-        self.training_graph = training_graph
+        self.training_graphs = training_graphs
         self.generation_graphs = generation_graphs
+        self.train_type = train_type
         self.infer_type = infer_type
         self.generation_kwargs = generation_kwargs
 
         super().__init__(**kwargs)
 
     @property
+    def train_types(self) -> List[str]:
+        """Declared training scenarios, in declaration order."""
+        return list(self.training_graphs)
+
+    @property
     def infer_types(self) -> List[str]:
         """Declared generation scenarios, in declaration order."""
         return list(self.generation_graphs)
+
+    @property
+    def training_graph(self) -> List[Dict]:
+        """The training DAG selected by :attr:`train_type` (first scenario if unset)."""
+        if not self.training_graphs:
+            return []
+        return select_graph(
+            self.training_graphs,
+            self.train_type,
+            empty_hint=f"Populate `training_graphs` (or load a checkpoint with `{DEFAULT_TRAINING_GRAPH_FILE}`).",
+            unknown_hint="train_type",
+        )
+
+    @training_graph.setter
+    def training_graph(self, value: List[Dict]) -> None:
+        raise AttributeError(
+            "`training_graph` is read-only — it is whichever entry of `training_graphs` "
+            "`train_type` names. Assign `training_graphs` / `train_type` instead."
+        )
 
     @property
     def generation_graph(self) -> Dict:
@@ -137,16 +166,19 @@ class OmniConfig(PretrainedConfig):
     def copy_for_hf_export(
         self,
         *,
-        training_graph: Optional[List[Dict]] = None,
+        training_graphs: Optional[Dict[str, List[Dict]]] = None,
         generation_graphs: Optional[Dict[str, Dict]] = None,
     ) -> "OmniConfig":
         """Return a checkpoint-serializable copy (no in-memory load paths)."""
         export_dict = self.to_dict()
         export_dict["modules"] = self.normalize_modules_for_hf_export()
-        export_dict["training_graph"] = list(training_graph if training_graph is not None else self.training_graph)
+        export_dict["training_graphs"] = deepcopy(
+            training_graphs if training_graphs is not None else self.training_graphs
+        )
         export_dict["generation_graphs"] = deepcopy(
             generation_graphs if generation_graphs is not None else self.generation_graphs
         )
+        export_dict["train_type"] = self.train_type
         export_dict["infer_type"] = self.infer_type
         accepted = {k: v for k, v in export_dict.items() if k in OmniConfig.__init__.__code__.co_varnames}
         return OmniConfig.from_dict(accepted)
@@ -249,32 +281,18 @@ class OmniConfig(PretrainedConfig):
         self.modules = {name: self.module(name).hydrate(checkpoint_root) for name in self.module_names}
 
     def _hydrate_graphs_from_checkpoint(self, checkpoint_root: Union[str, os.PathLike]) -> None:
-        """Load ``training_graph`` and ``generation_graphs`` from their YAML sidecars."""
+        """Load ``training_graphs`` and ``generation_graphs`` from their YAML sidecars."""
         root = str(checkpoint_root)
 
         training_path = os.path.join(root, DEFAULT_TRAINING_GRAPH_FILE)
         if not os.path.isfile(training_path):
             raise FileNotFoundError(f"Omni checkpoint missing required graph sidecar: {training_path}")
-        self.training_graph = self._read_graph_file(training_path, "training_graph")
+        self.training_graphs = self._read_graph_file(training_path, list)
 
         generation_path = os.path.join(root, DEFAULT_GENERATION_GRAPH_FILE)
         if not os.path.isfile(generation_path):
             raise FileNotFoundError(f"Omni checkpoint missing required graph sidecar: {generation_path}")
-        self.generation_graphs = self._read_generation_graphs(generation_path)
-
-    @staticmethod
-    def _read_generation_graphs(path: str) -> Dict[str, Dict]:
-        """Read the ``generation_graphs`` sidecar: ``{scenario_name: fsm_spec}``."""
-        with open(path, encoding="utf-8") as f:
-            payload = yaml.safe_load(f)
-        if not isinstance(payload, dict):
-            raise ValueError(f"Malformed generation-graph sidecar {path}: expected a mapping, got {type(payload)}.")
-        if "generation_graphs" not in payload:
-            raise ValueError(f"Malformed generation-graph sidecar {path}: missing top-level `generation_graphs:` key.")
-        graphs = payload["generation_graphs"]
-        if not isinstance(graphs, dict):
-            raise ValueError(f"Malformed generation-graph sidecar {path}: `generation_graphs` must be a mapping.")
-        return graphs
+        self.generation_graphs = self._read_graph_file(generation_path, dict)
 
     def save_pretrained(self, save_directory: Union[str, os.PathLike], push_to_hub: bool = False, **kwargs):
         """Write ``config.json`` plus graph YAML sidecars for HF-style reload."""
@@ -291,17 +309,15 @@ class OmniConfig(PretrainedConfig):
 
         self._write_graph_file(
             os.path.join(save_directory, DEFAULT_TRAINING_GRAPH_FILE),
-            "training_graph",
-            export_config.training_graph,
+            export_config.training_graphs,
         )
         self._write_graph_file(
             os.path.join(save_directory, DEFAULT_GENERATION_GRAPH_FILE),
-            "generation_graphs",
             export_config.generation_graphs,
         )
 
         config_dict = export_config.to_dict()
-        config_dict.pop("training_graph", None)
+        config_dict.pop("training_graphs", None)
         config_dict.pop("generation_graphs", None)
 
         config_path = os.path.join(save_directory, "config.json")
@@ -317,18 +333,37 @@ class OmniConfig(PretrainedConfig):
             raise NotImplementedError("OmniConfig push_to_hub is not implemented yet.")
 
     @staticmethod
-    def _write_graph_file(path: str, key: str, payload: Any) -> None:
+    def _write_graph_file(path: str, payload: Any) -> None:
+        """Dump ``payload`` as the YAML document. Filename identifies train vs generation."""
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            yaml.safe_dump({key: payload}, f, sort_keys=False, allow_unicode=True)
+            yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
 
     @staticmethod
-    def _read_graph_file(path: str, key: str):
-        """Read a graph sidecar written by :meth:`_write_graph_file`."""
+    def _read_graph_file(path: str, value_type: type) -> Dict[str, Any]:
+        """Load a graph sidecar: ``{scenario_name: graph}``.
+
+        ``value_type`` is the per-scenario payload: ``list`` (training DAG) or
+        ``dict`` (generation FSM). A bare payload (one DAG / one FSM) is stored
+        under :data:`DEFAULT_GRAPH_SCENARIO`.
+        """
         with open(path, encoding="utf-8") as f:
             payload = yaml.safe_load(f)
-        if isinstance(payload, dict) and key in payload:
-            return payload[key]
+        if isinstance(payload, list) and value_type is list:
+            payload = {DEFAULT_GRAPH_SCENARIO: payload}
+        elif isinstance(payload, dict) and value_type is dict and {"initial", "states"} <= set(payload):
+            payload = {DEFAULT_GRAPH_SCENARIO: payload}
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"Malformed graph sidecar {path}: expected a mapping of scenario name to graph, "
+                f"got {type(payload).__name__}."
+            )
+        for name, graph in payload.items():
+            if not isinstance(graph, value_type):
+                raise ValueError(
+                    f"Malformed graph sidecar {path}: scenario {name!r} expected "
+                    f"{value_type.__name__}, got {type(graph).__name__}."
+                )
         return payload
 
     @classmethod
@@ -342,11 +377,11 @@ class OmniConfig(PretrainedConfig):
         accepted = {k: v for k, v in config_dict.items() if k in cls.__init__.__code__.co_varnames}
         if "generation_graphs" not in accepted:
             accepted["generation_graphs"] = {}
-        if "training_graph" not in accepted:
-            accepted["training_graph"] = []
+        if "training_graphs" not in accepted:
+            accepted["training_graphs"] = {}
         if "modules" not in accepted:
             accepted["modules"] = {}
         return cls(**{**accepted, **kwargs})
 
 
-__all__ = ["OmniConfig", "select_graph"]
+__all__ = ["OmniConfig", "select_graph", "DEFAULT_GRAPH_SCENARIO"]

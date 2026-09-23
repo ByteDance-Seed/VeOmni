@@ -58,7 +58,7 @@ def main() -> None:
         "--training_graph",
         default=None,
         help=(
-            "YAML for the training DAG (a list, or `{training_graph: [...]}`). "
+            "YAML for training DAGs (`{train_type: edge list}`; a bare list is `default`). "
             "Overrides the family converter's default; written as training_graph.yaml."
         ),
     )
@@ -66,7 +66,7 @@ def main() -> None:
         "--generation_graph",
         default=None,
         help=(
-            "YAML for generation FSMs (`generation_graphs:` keyed by infer_type). "
+            "YAML for generation FSMs (`{infer_type: fsm}` mapping). "
             "Overrides the family converter's default; written as generation_graph.yaml."
         ),
     )

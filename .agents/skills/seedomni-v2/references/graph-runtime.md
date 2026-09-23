@@ -81,24 +81,29 @@ infer:
 `OmniConfig` stores **every** scenario, not just the active one, so an exported
 checkpoint is not locked to the scenario it was exported under:
 
-- `config.generation_graphs` — `{infer_type: fsm_spec}`, all scenarios.
-- `config.infer_type` — the active scenario (unset means the first declared).
-- `config.generation_graph` — read-only property returning the active FSM. This
-  is what `OmniModel` binds; switching scenario means setting `infer_type` and
-  rebuilding the model.
+- `config.training_graphs` — `{train_type: dag}`, all training DAGs.
+- `config.train_type` — the active training scenario (unset means the first declared).
+- `config.training_graph` — read-only property returning the active DAG.
+- `config.generation_graphs` — `{infer_type: fsm_spec}`, all generation FSMs.
+- `config.infer_type` — the active generation scenario (unset means the first declared).
+- `config.generation_graph` — read-only property returning the active FSM.
 
-The checkpoint sidecar `generation_graph.yaml` therefore wraps a **map**:
+The checkpoint sidecar `generation_graph.yaml` is that map (no wrapping key —
+the filename is the identity):
 
 ```yaml
-generation_graphs:
-  infer_gen: {initial: ..., states: {...}}
-  infer_und: {initial: ..., states: {...}}
+infer_gen: {initial: ..., states: {...}}
+infer_und: {initial: ..., states: {...}}
 ```
 
-The older single `generation_graph:` sidecar layout is rejected at load time —
-re-export with `scripts/seed_omni/export_omni_checkpoint.py`. The wrapper exists
-only in the checkpoint sidecar, which needs a key to hold a *map* of scenarios;
-a per-scenario **authoring** file is the bare FSM.
+`training_graph.yaml` is the same map idea, keyed by ``train_type`` (a lone DAG
+uses the name ``default``):
+
+```yaml
+default:
+- {from: fake_module_a, to: fake_module_b}
+- {from: fake_module_b, to: end}
+```
 
 ## Module Config
 

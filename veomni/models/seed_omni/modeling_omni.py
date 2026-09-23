@@ -76,9 +76,10 @@ _CONFIG_LOAD_KWARG_NAMES = frozenset(
 # Top-level :class:`OmniConfig` fields overridable at ``OmniModel.from_pretrained`` time.
 _OMNI_CONFIG_OVERRIDE_KEYS = frozenset(
     {
+        "train_type",
         "infer_type",
         "generation_kwargs",
-        "training_graph",
+        "training_graphs",
         "generation_graphs",
         "modules",
     }
@@ -102,7 +103,7 @@ class OmniModel(PreTrainedModel):
     Parameters
     ----------
     config:
-        :class:`OmniConfig` with ``modules`` / ``training_graph`` /
+        :class:`OmniConfig` with ``modules`` / ``training_graphs`` /
         ``generation_graphs`` populated. The FSM bound here is the one
         ``config.infer_type`` selects, so switching scenario means rebuilding.
     modules:

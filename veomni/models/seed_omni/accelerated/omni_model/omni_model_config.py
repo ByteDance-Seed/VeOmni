@@ -120,7 +120,8 @@ class OmniModelRuntimeConfig(ModelArguments):
         module_entries = {name: mod.to_hf_config(name) for name, mod in self.modules.items()}
         return OmniConfig.from_dict(
             {
-                "training_graph": deepcopy(self.training_graph),
+                "training_graphs": deepcopy(self.training_graphs),
+                "train_type": self.train_type,
                 "generation_graphs": deepcopy(self.generation_graphs),
                 "infer_type": self.infer_type,
                 "generation_kwargs": dict(self.generation_kwargs),

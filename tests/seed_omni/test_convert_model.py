@@ -46,15 +46,14 @@ def test_convert_checkpoint_uses_caller_graph_yaml(tmp_path):
         encoding="utf-8",
     )
     infer_yaml.write_text(
-        "generation_graphs:\n"
-        "  infer_und:\n"
-        "    initial: run\n"
-        "    states:\n"
-        "      run:\n"
-        "        body:\n"
-        "          - {from: fake_module_a, to: end}\n"
-        "        transitions:\n"
-        "          - {condition: {type: default}, next_state: done}\n",
+        "infer_und:\n"
+        "  initial: run\n"
+        "  states:\n"
+        "    run:\n"
+        "      body:\n"
+        "        - {from: fake_module_a, to: end}\n"
+        "      transitions:\n"
+        "        - {condition: {type: default}, next_state: done}\n",
         encoding="utf-8",
     )
 
@@ -96,14 +95,14 @@ def test_extra_pairs_reach_the_family_converter(tmp_path):
     source = tmp_path / "src"
     source.mkdir()
     (source / "config.json").write_text(json.dumps({"model_type": "extra_kwargs_test"}), encoding="utf-8")
-    training_graph, generation_graphs = load_family_graphs()
+    training_graphs, generation_graphs = load_family_graphs()
 
     def _record_extra(model_path: str, **kwargs) -> dict:
         del model_path
         seen.update(kwargs)
         return {
             "modules": {FAKE_A: FakeModuleA(FakeModuleAConfig()), FAKE_B: FakeModuleB(FakeModuleBConfig())},
-            "training_graph": training_graph,
+            "training_graphs": training_graphs,
             "generation_graphs": generation_graphs,
         }
 
@@ -117,14 +116,14 @@ def test_extra_pairs_reach_the_family_converter(tmp_path):
 def test_convert_fake_omni_writes_both_graphs_and_loads(tmp_path):
     source = _write_fake_omni_source(tmp_path / "src", hidden_size=8)
     output = tmp_path / "omni"
-    training_graph, generation_graphs = load_family_graphs()
+    training_graphs, generation_graphs = load_family_graphs()
 
     convert_checkpoint(str(source), str(output))
 
     assert (output / DEFAULT_TRAINING_GRAPH_FILE).is_file()
     assert (output / DEFAULT_GENERATION_GRAPH_FILE).is_file()
     config = OmniConfig.from_pretrained(output)
-    assert config.training_graph == training_graph
+    assert config.training_graphs == training_graphs
     assert config.generation_graphs == generation_graphs
 
     loaded = OmniModel.from_pretrained(output)
@@ -139,7 +138,7 @@ def test_convert_checkpoint_rejects_missing_generation_graph(tmp_path):
     source.mkdir()
     (source / "config.json").write_text(json.dumps({"model_type": "missing_graphs_test"}), encoding="utf-8")
     output = tmp_path / "omni"
-    training_graph, _ = load_family_graphs()
+    training_graphs, _ = load_family_graphs()
 
     def _omit_generation_graphs(model_path: str, **kwargs) -> dict:
         del model_path, kwargs
@@ -148,7 +147,7 @@ def test_convert_checkpoint_rejects_missing_generation_graph(tmp_path):
                 FAKE_A: FakeModuleA(FakeModuleAConfig()),
                 FAKE_B: FakeModuleB(FakeModuleBConfig()),
             },
-            "training_graph": training_graph,
+            "training_graphs": training_graphs,
             "generation_graphs": {},
         }
 
@@ -160,17 +159,17 @@ def test_convert_checkpoint_rejects_missing_generation_graph(tmp_path):
 
 
 def test_require_converted_graphs_rejects_empty_training_graph(tmp_path):
-    training_graph, generation_graphs = load_family_graphs()
+    training_graphs, generation_graphs = load_family_graphs()
     save_converted_omni(
         str(tmp_path),
         modules={
             FAKE_A: FakeModuleA(FakeModuleAConfig()),
             FAKE_B: FakeModuleB(FakeModuleBConfig()),
         },
-        training_graph=training_graph,
+        training_graphs=training_graphs,
         generation_graphs=generation_graphs,
     )
-    (tmp_path / DEFAULT_TRAINING_GRAPH_FILE).write_text("training_graph: []\n", encoding="utf-8")
+    (tmp_path / DEFAULT_TRAINING_GRAPH_FILE).write_text("[]\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="empty"):
         _require_converted_graphs(str(tmp_path))
@@ -200,7 +199,7 @@ def test_save_converted_omni_rejects_missing_endpoint_method(tmp_path):
                 FAKE_A: FakeModuleA(FakeModuleAConfig()),
                 FAKE_B: FakeModuleB(FakeModuleBConfig()),
             },
-            training_graph=[{"from": f"{FAKE_A}.encode", "to": "end"}],
+            training_graphs={"default": [{"from": f"{FAKE_A}.encode", "to": "end"}]},
             generation_graphs=_one_node_generation_graphs(FAKE_A),
         )
     assert not (output / DEFAULT_TRAINING_GRAPH_FILE).exists()
@@ -218,7 +217,7 @@ def test_save_converted_omni_rejects_missing_default_generate(tmp_path):
         save_converted_omni(
             str(output),
             modules={FAKE_A: NoGenerate(FakeModuleAConfig())},
-            training_graph=[{"from": FAKE_A, "to": "end"}],
+            training_graphs={"default": [{"from": FAKE_A, "to": "end"}]},
             generation_graphs=_one_node_generation_graphs(FAKE_A),
         )
     assert not (output / DEFAULT_TRAINING_GRAPH_FILE).exists()

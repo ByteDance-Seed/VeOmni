@@ -112,6 +112,8 @@ def test_to_hf_config_carries_graphs_and_scenario_selection():
     runtime_cfg = _janus_model_runtime()
     cfg = runtime_cfg.to_hf_config()
 
+    assert cfg.training_graphs == runtime_cfg.training_graphs
+    assert cfg.train_type == runtime_cfg.train_type
     assert cfg.training_graph == runtime_cfg.training_graph
     assert cfg.infer_types == runtime_cfg.infer_types
     assert cfg.generation_graph == runtime_cfg.generation_graph
@@ -161,7 +163,7 @@ def test_packed_modules_yaml_sets_text_encoder_processor_config():
     entry = encoder.to_hf_config("janus_text_encoder")
     cfg = OmniConfig(
         modules={"janus_text_encoder": entry},
-        training_graph=[{"from": "janus_text_encoder", "to": "end"}],
+        training_graphs={"default": [{"from": "janus_text_encoder", "to": "end"}]},
         generation_graphs={"infer_gen": {"initial": "run", "states": {}}},
     )
     assert cfg.module_processor_config("janus_text_encoder") == {"packed_preprocess": True}

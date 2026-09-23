@@ -91,7 +91,7 @@ def test_omni_processor_from_pretrained_collects_module_preprocessors(
     del mock_read_model_type
     mock_from_pretrained.return_value = OmniConfig(
         modules={"encoder": {"subfolder": "encoder"}},
-        training_graph=[{"from": "encoder", "to": "end"}],
+        training_graphs={"default": [{"from": "encoder", "to": "end"}]},
         generation_graphs={"infer_gen": {"initial": "run", "states": {}}},
     )
     fake_mod_cls = MagicMock()
@@ -122,7 +122,7 @@ def test_omni_processor_from_config_forwards_module_model_config_overrides(mock_
                 "model": {"model_config": {"enable_image": True}},
             }
         },
-        training_graph=[{"from": "encoder", "to": "end"}],
+        training_graphs={"default": [{"from": "encoder", "to": "end"}]},
         generation_graphs={"infer_gen": {"initial": "run", "states": {}}},
     )
 
@@ -147,7 +147,7 @@ def test_omni_processor_from_config_forwards_module_processor_config(mock_read_m
                 "processor_config": {"packed_preprocess": True},
             }
         },
-        training_graph=[{"from": "encoder", "to": "end"}],
+        training_graphs={"default": [{"from": "encoder", "to": "end"}]},
         generation_graphs={"infer_gen": {"initial": "run", "states": {}}},
     )
 

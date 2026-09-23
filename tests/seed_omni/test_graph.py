@@ -286,7 +286,7 @@ def test_omni_model_runtime_forward_matches_manual_executor():
     modules = _fake_modules(g)
     config = OmniConfig(
         modules={name: {"subfolder": name} for name in {g.module_of(n) for n in g.execution_order}},
-        training_graph=edges,
+        training_graphs={"default": edges},
         generation_graphs=_minimal_generation_graphs(),
     )
     model = OmniModel(config, modules)
@@ -311,7 +311,7 @@ def test_omni_model_runtime_forward_enters_composed_model_call(monkeypatch: pyte
     modules = _fake_modules(g)
     config = OmniConfig(
         modules={name: {"subfolder": name} for name in {g.module_of(n) for n in g.execution_order}},
-        training_graph=edges,
+        training_graphs={"default": edges},
         generation_graphs=_minimal_generation_graphs(),
     )
     model = OmniModel(config, modules)
@@ -337,7 +337,7 @@ def test_omni_model_forward_runs_graph_without_a_runner():
     modules = _fake_modules(g)
     config = OmniConfig(
         modules={name: {"subfolder": name} for name in {g.module_of(n) for n in g.execution_order}},
-        training_graph=edges,
+        training_graphs={"default": edges},
         generation_graphs=_minimal_generation_graphs(),
     )
     model = OmniModel(config, modules)
@@ -362,7 +362,7 @@ def test_omni_model_forward_runs_fake_module_chain():
     b = FakeModuleB(FakeModuleBConfig(hidden_size=hidden_size))
     config = OmniConfig(
         modules={"fake_module_a": {"subfolder": "fake_module_a"}, "fake_module_b": {"subfolder": "fake_module_b"}},
-        training_graph=edges,
+        training_graphs={"default": edges},
         generation_graphs=_minimal_generation_graphs(module="fake_module_a"),
     )
     model = OmniModel(config, {"fake_module_a": a, "fake_module_b": b})
@@ -453,7 +453,7 @@ def _make_graph_profile_callback(output_dir, *, global_rank=0, **profile_kwargs)
     modules = _fake_modules(g)
     config = OmniConfig(
         modules={name: {"subfolder": name} for name in {g.module_of(n) for n in g.execution_order}},
-        training_graph=edges,
+        training_graphs={"default": edges},
         generation_graphs=_minimal_generation_graphs(),
     )
     model = OmniModel(config, modules)
@@ -865,7 +865,7 @@ def test_named_omni_modules_yields_modules_as_attached():
     wrapped_modules = {name: _DdpStyleWrapper(mod) for name, mod in raw_modules.items()}
     config = OmniConfig(
         modules={name: {"subfolder": name} for name in raw_modules},
-        training_graph=edges,
+        training_graphs={"default": edges},
         generation_graphs=_minimal_generation_graphs(),
     )
     model = OmniModel(config, wrapped_modules)
@@ -885,7 +885,7 @@ def test_iter_named_omni_modules_unwraps_ddp_style_wrapper():
     wrapped_modules = {name: _DdpStyleWrapper(mod) for name, mod in raw_modules.items()}
     config = OmniConfig(
         modules={name: {"subfolder": name} for name in raw_modules},
-        training_graph=edges,
+        training_graphs={"default": edges},
         generation_graphs=_minimal_generation_graphs(),
     )
 
@@ -904,7 +904,7 @@ def test_named_omni_modules_yields_all_graph_participants():
     plain = _PlainModule()
     config = OmniConfig(
         modules={"plain": {"subfolder": "plain"}},
-        training_graph=[{"from": "plain", "to": "end"}],
+        training_graphs={"default": [{"from": "plain", "to": "end"}]},
         generation_graphs=_minimal_generation_graphs("plain"),
     )
     model = OmniModel(config, {"plain": plain})

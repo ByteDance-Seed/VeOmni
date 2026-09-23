@@ -27,8 +27,9 @@ def save_converted_omni(
     output_dir: str,
     *,
     modules: Mapping[str, nn.Module],
-    training_graph: list[dict[str, Any]],
+    training_graphs: dict[str, list[dict[str, Any]]],
     generation_graphs: dict[str, dict[str, Any]],
+    train_type: str | None = None,
     infer_type: str | None = None,
     generation_kwargs: dict[str, Any] | None = None,
 ) -> None:
@@ -42,7 +43,10 @@ def save_converted_omni(
     from ..graphs.training_graph import TrainingGraph
     from ..modeling_omni import OmniModel
 
-    TrainingGraph(training_graph)
+    if not training_graphs:
+        raise ValueError("Omni convert must produce at least one training-graph scenario under `training_graphs`.")
+    for spec in training_graphs.values():
+        TrainingGraph(spec)
     if not generation_graphs:
         raise ValueError("Omni convert must produce at least one generation-graph scenario under `generation_graphs`.")
     for spec in generation_graphs.values():
@@ -50,8 +54,9 @@ def save_converted_omni(
 
     config = OmniConfig(
         modules={name: {"subfolder": name} for name in modules},
-        training_graph=training_graph,
+        training_graphs=training_graphs,
         generation_graphs=generation_graphs,
+        train_type=train_type,
         infer_type=infer_type,
         generation_kwargs=generation_kwargs,
     )
@@ -75,7 +80,7 @@ def convert_checkpoint(
     the family hard-coding one DAG/FSM.
     """
     if training_graph is not None:
-        kwargs.setdefault("train_graph", training_graph)
+        kwargs.setdefault("training_graph", training_graph)
     if generation_graph is not None:
         kwargs.setdefault("generation_graph", generation_graph)
     converted = _run_converter(model_path, **kwargs)
@@ -94,9 +99,14 @@ def _apply_graph_files(
     from ..configuration_omni import OmniConfig
 
     if training_graph is not None:
-        converted["training_graph"] = OmniConfig._read_graph_file(str(training_graph), "training_graph")
+        converted.pop("training_graph", None)
+        converted["training_graphs"] = OmniConfig._read_graph_file(str(training_graph), list)
+        graphs = converted["training_graphs"]
+        train_type = converted.get("train_type")
+        if train_type is None or train_type not in graphs:
+            converted["train_type"] = next(iter(graphs)) if graphs else None
     if generation_graph is not None:
-        converted["generation_graphs"] = OmniConfig._read_generation_graphs(str(generation_graph))
+        converted["generation_graphs"] = OmniConfig._read_graph_file(str(generation_graph), dict)
         infer_type = converted.get("infer_type")
         graphs = converted["generation_graphs"]
         if infer_type is None or infer_type not in graphs:
@@ -189,8 +199,9 @@ def _assert_graph_modules(config: Any, modules: Mapping[str, nn.Module] | None =
 
 
 def _iter_graph_nodes(config: Any):
-    for spec in config.training_graph:
-        yield from _edge_nodes(spec, default_method="forward")
+    for dag in config.training_graphs.values():
+        for spec in dag:
+            yield from _edge_nodes(spec, default_method="forward")
     for fsm in config.generation_graphs.values():
         for state in (fsm.get("states") or {}).values():
             for spec in state.get("body") or []:

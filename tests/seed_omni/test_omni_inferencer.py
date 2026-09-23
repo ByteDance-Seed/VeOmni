@@ -230,7 +230,7 @@ def test_build_module_args_from_checkpoint_module_entry():
                     "accelerator": {"fsdp_config": {"fsdp_mode": "ddp"}},
                 }
             },
-            "training_graph": [{"from": "janus_siglip", "to": "end"}],
+            "training_graphs": {"default": [{"from": "janus_siglip", "to": "end"}]},
             "generation_graphs": {
                 "infer_gen": {
                     "initial": "run",
