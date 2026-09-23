@@ -24,12 +24,23 @@ from veomni.models.seed_omni.utils.convert_registry import (
 from .convert_janus_weight_to_hf import convert_model as convert_janus_to_hf
 
 
+JANUS_GENERATION_KWARGS = {
+    "max_new_tokens": 2048,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "do_sample": False,
+    "guidance_scale": 5.0,
+}
+
+
 def convert_janus_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
     """Split an upstream Janus checkpoint into four V2 modules.
 
-    A DeepSeek-format source (path not ending in ``-hf``) is first converted to
-    the HF layout in a temporary directory.
+    A DeepSeek-format source (``model_type: multi_modality``) is first converted
+    to the HF layout in a temporary directory.
     """
+    from veomni.models.seed_omni.modules import read_hf_model_type
+
     training_graphs, generation_graphs = load_family_graphs(
         "configs/seed_omni/Janus/janus_1.3b",
         training="train/graph_train.yaml",
@@ -42,17 +53,18 @@ def convert_janus_checkpoint(model_path: str, **kwargs: Any) -> dict[str, Any]:
         generation_graph=kwargs.pop("generation_graph", None),
     )
     del kwargs
-    if model_path.endswith("-hf"):
-        modules = _split_janus_hf(model_path)
-    else:
+    if read_hf_model_type(model_path) == "multi_modality":
         with tempfile.TemporaryDirectory(prefix="janus-hf-") as hf_model_path:
             convert_janus_to_hf(local_dir=model_path, output_dir=hf_model_path)
             modules = _split_janus_hf(hf_model_path)
+    else:
+        modules = _split_janus_hf(model_path)
     return {
         "modules": modules,
         "training_graphs": training_graphs,
         "generation_graphs": generation_graphs,
         "infer_type": "infer_interleave",
+        "generation_kwargs": dict(JANUS_GENERATION_KWARGS),
     }
 
 

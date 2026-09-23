@@ -7,6 +7,7 @@ writes the omni checkpoint. Graphs come from ``configs/seed_omni/Bagel/bagel_7b_
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
@@ -21,6 +22,25 @@ from veomni.models.seed_omni.utils.convert_registry import (
     attach_module_assets,
     load_family_graphs,
 )
+
+
+BAGEL_GENERATION_KWARGS = {
+    "max_new_tokens": 2048,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "do_sample": False,
+    "image_height": 1024,
+    "image_width": 1024,
+    "latent_downsample": 16,
+    "num_timesteps": 50,
+    "timestep_shift": 3.0,
+    "cfg_text_scale": 1.0,
+    "cfg_img_scale": 1.0,
+    "cfg_interval": [0.0, 1.0],
+    "cfg_renorm_min": 0.0,
+    "cfg_renorm_type": "global",
+    "enable_taylorseer": False,
+}
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -260,6 +280,7 @@ def convert_bagel_checkpoint(
         "training_graphs": training_graphs,
         "generation_graphs": generation_graphs,
         "infer_type": "infer_und",
+        "generation_kwargs": deepcopy(BAGEL_GENERATION_KWARGS),
     }
 
 
