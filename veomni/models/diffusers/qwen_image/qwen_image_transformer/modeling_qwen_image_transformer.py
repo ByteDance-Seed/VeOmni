@@ -9,13 +9,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import QwenImageTransformer2DModel as _QwenImageTransformer2DModel
-from diffusers.models.attention_dispatch import dispatch_attention_fn
+from diffusers.models.attention_dispatch import _AttentionBackendRegistry, dispatch_attention_fn
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.transformers.transformer_qwenimage import (
     apply_rotary_emb_qwen,
     compute_text_seq_len_from_mask,
 )
 from diffusers.utils import apply_lora_scale
+from packaging.version import Version
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
@@ -27,7 +28,11 @@ from .....distributed.sequence_parallel import (
     slice_input_tensor,
 )
 from .....utils import logging
-from .configuration_qwen_image_transformer import QWEN_IMAGE_INIT_SIGNATURE, QwenImageTransformer2DModelConfig
+from .configuration_qwen_image_transformer import (
+    QWEN_IMAGE_INIT_SIGNATURE,
+    QwenImageTransformer2DModelConfig,
+    diffusers_version,
+)
 
 
 logger = logging.get_logger(__name__)
@@ -325,6 +330,17 @@ def apply_veomni_qwen_image_transformer_patch() -> None:
     logger.info_rank0("Applied VeOmni SP patch to QwenImageTransformer2DModel.forward.")
 
 
+# Normalized attn_implementation -> diffusers attention backend. Only the Hub varlen backends are
+# mapped: from diffusers 0.40 they pack keys by the mask's nonzero indices, which keeps the padded
+# text in the middle of the [text, image] joint sequence masked. Earlier Hub varlen and all local
+# flash varlen backends keep a key prefix instead, and the non-varlen flash backends reject masks.
+_HUB_ATTENTION_BACKENDS = {
+    "veomni_flash_attention_2_hub_with_sp": "flash_varlen_hub",
+    "veomni_flash_attention_3_hub_with_sp": "_flash_3_varlen_hub",
+}
+_HUB_ATTENTION_MIN_DIFFUSERS = "0.40.0"
+
+
 @dataclass
 class QwenImageModelOutput(ModelOutput):
     loss: dict[str, torch.FloatTensor] | None = None
@@ -341,6 +357,7 @@ class _QwenImageTransformerInitShim(_QwenImageTransformer2DModel):
 class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim):
     config_class = QwenImageTransformer2DModelConfig
     supports_gradient_checkpointing = True
+    _supports_sdpa = True
     _no_split_modules = ["QwenImageTransformerBlock"]
 
     def __init__(self, config: QwenImageTransformer2DModelConfig, **kwargs):
@@ -358,6 +375,29 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
         sp_processor = QwenImageSPAttnProcessor()
         for block in self.transformer_blocks:
             block.attn.set_processor(sp_processor)
+        self._configure_attention(config._attn_implementation)
+
+    def _configure_attention(self, attn_implementation):
+        """Select the diffusers attention backend from ``attn_implementation``."""
+        backend = _HUB_ATTENTION_BACKENDS.get(attn_implementation)
+        if backend is None:
+            if attn_implementation not in (None, "eager", "sdpa"):
+                logger.warning_once(
+                    f"Qwen-Image has no masked kernel for attn_implementation={attn_implementation!r}; using "
+                    "native SDPA. Use flash_attention_2_hub or flash_attention_3_hub for FlashAttention."
+                )
+            # Bind native explicitly: None would follow diffusers' process-wide default backend.
+            backend = "native"
+        elif Version(diffusers_version) < Version(_HUB_ATTENTION_MIN_DIFFUSERS):
+            raise ImportError(
+                f"Qwen-Image attn_implementation={attn_implementation!r} requires "
+                f"diffusers>={_HUB_ATTENTION_MIN_DIFFUSERS} (found {diffusers_version}); earlier Hub varlen "
+                "backends mishandle Qwen-Image's padded text tokens."
+            )
+        # set_attention_backend also switches diffusers' process-wide default; keep it for other models.
+        active_backend = _AttentionBackendRegistry._active_backend
+        self.set_attention_backend(backend)
+        _AttentionBackendRegistry.set_active_backend(active_backend)
 
     @property
     def config(self):
@@ -530,4 +570,5 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
         sp_processor = QwenImageSPAttnProcessor()
         for block in diffusers_model.transformer_blocks:
             block.attn.set_processor(sp_processor)
+        diffusers_model._configure_attention(None)
         return diffusers_model
