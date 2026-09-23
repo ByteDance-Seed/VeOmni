@@ -37,7 +37,8 @@ def pack_samples(samples):
             raise ValueError("H3 packing requires explicit condition-row output cropping.")
         length = inp["x"].shape[1]
         text_len = inp["prompt_embeds"].shape[0]
-        if length <= 0 or text_len <= 0 or inp["packed_seq_params"]["cu_seqlens_q"].tolist() != [0, length]:
+        # Host check: a single valid segment spans the whole sample (a legacy tail makes it shorter).
+        if length <= 0 or text_len <= 0 or int(inp["packed_seq_params"]["max_seqlen_q"]) != length:
             raise ValueError("H3 samples must contain one valid segment without tail padding; rebuild cached layouts.")
         if inp["text_pos_info"]["position_ids"].numel() != text_len:
             raise ValueError("H3 text rows must match the sample's text positions.")
@@ -66,10 +67,12 @@ def pack_samples(samples):
         use_gradient_checkpointing=checkpointing,
         packed_seq_params={
             "cu_seqlens_q": torch.tensor(cu, dtype=torch.int32, device=device),
+            "cu_seqlens_host": tuple(cu),
             "max_seqlen_q": max(b - a for a, b in zip(cu, cu[1:])),
         },
         refiner_packed_seq_params={
             "cu_seqlens_q": torch.tensor(refiner_cu, dtype=torch.int32, device=device),
+            "cu_seqlens_host": tuple(refiner_cu),
             "max_seqlen_q": max(b - a for a, b in zip(refiner_cu, refiner_cu[1:])),
         },
     )

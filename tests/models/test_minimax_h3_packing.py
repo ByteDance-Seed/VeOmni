@@ -48,7 +48,7 @@ def condition_model():
     return MiniMaxH3ConditionModel(MiniMaxH3ConditionModelConfig(skip_encoder_load=True, num_train_timesteps=16))
 
 
-def raw_sample(text_len=3, task="fl2va", refs=None, latent_t=2, latent_h=4, latent_w=6, audio_t=3):
+def raw_sample(text_len=3, task="fl2va", refs=None, latent_t=2, latent_h=4, latent_w=6, audio_t=3, keyframes=(0,)):
     geometry = dict(
         text_len=text_len, latent_t=latent_t, latent_h=latent_h, latent_w=latent_w, audio_t=audio_t, audio_channel=2
     )
@@ -57,16 +57,32 @@ def raw_sample(text_len=3, task="fl2va", refs=None, latent_t=2, latent_h=4, late
         pk = packed_sequence.build_packed_ref2va(**geometry, ref_blocks=refs)
         anchor_key = "ref_visual_anchor"
     else:
-        pk = packed_sequence.build_packed_fl2va(**geometry, keyframe_indices=[0])
+        pk = packed_sequence.build_packed_fl2va(**geometry, keyframe_indices=list(keyframes))
         anchor_key = "keyframe_cond_anchor"
-    return dict(
+    row = dict(
         input_latents=torch.randn(1, 24, latent_t, latent_h, latent_w),
         audio_input_latents=torch.randn(2, 32, audio_t),
         prompt_embeds=torch.randn(text_len, 32),
         packed=pk,
-        **{anchor_key: torch.randn(pk["cond_rows"], 96)},
         use_gradient_checkpointing=False,
     )
+    if pk["cond_rows"]:
+        row[anchor_key] = torch.randn(pk["cond_rows"], 96)
+    return row
+
+
+def legacy_tail(sample):
+    """Append the pre-#1204 64-row sample tail to a prepared single sample."""
+    legacy = copy.deepcopy(sample)
+    length = sample["x"].shape[1]
+    pad = (-length) % 64
+    for key in ("x", "audio_x", "img_position_ids"):
+        legacy[key] = F.pad(legacy[key], (0, 0, 0, pad))
+    legacy["token_tags"] = F.pad(legacy["token_tags"], (0, pad), value=-1)
+    legacy["inverse_indices"] = F.pad(legacy["inverse_indices"], (0, pad))
+    legacy["packed_seq_params"]["cu_seqlens_q"] = torch.tensor([0, length, length + pad], dtype=torch.int32)
+    legacy["packed_seq_params"]["cu_seqlens_host"] = (0, length, length + pad)
+    return legacy
 
 
 def prepare(condition, raws):
@@ -200,6 +216,71 @@ def test_mixed_target_geometry_matches_serial(task):
         torch.testing.assert_close(p.grad, q.grad, rtol=2e-4, atol=2e-5, msg=name)
 
 
+def test_mixed_tasks_and_keyframes_match_serial():
+    torch.manual_seed(13)
+    base = tiny_model()
+    packed = copy.deepcopy(base)
+    raws = [raw_sample(3), raw_sample(5, "ref2va"), raw_sample(4, keyframes=())]
+    collated = DiTDataCollator()(raws)
+    assert [anchor is None for anchor in collated["keyframe_cond_anchor"]] == [False, True, True]
+    assert [anchor is None for anchor in collated["ref_visual_anchor"]] == [True, False, True]
+    samples = prepare(condition_model(), raws)
+    assert [sample["cond_rows"] for sample in samples][2] == 0
+    expected = serial(base, samples)
+    actual = packed(**batch(samples))
+    for i, ref in enumerate(expected):
+        for a, b in zip((actual.predictions[0][i], actual.predictions[1][i]), ref.predictions):
+            torch.testing.assert_close(a, b, rtol=2e-5, atol=2e-5)
+    for key in actual.loss:
+        torch.testing.assert_close(actual.loss[key], torch.stack([out.loss[key] for out in expected]).mean())
+    sum(sum(out.loss.values()) for out in expected).div(len(samples)).backward()
+    sum(actual.loss.values()).backward()
+    for (name, p), (_, q) in zip(base.named_parameters(), packed.named_parameters()):
+        torch.testing.assert_close(p.grad, q.grad, rtol=2e-4, atol=2e-5, msg=name)
+
+
+def test_get_condition_flags_silent_audio_placeholder(monkeypatch):
+    cond = MiniMaxH3ConditionModel(
+        MiniMaxH3ConditionModelConfig(skip_encoder_load=True, num_train_timesteps=16, use_keyframe_condition=False)
+    )
+    cond._video_vae = torch.nn.Linear(1, 1)
+    monkeypatch.setattr(cond, "_encode_text", lambda prompt, images, device: (torch.randn(3, 32), None))
+    monkeypatch.setattr(cond, "_encode_video", lambda video, device: torch.randn(1, 24, 2, 4, 6))
+    monkeypatch.setattr(cond, "_encode_audio", lambda audio, frames, device: torch.randn(2, 32, 3))
+    monkeypatch.setattr(cond, "_make_silent_audio_latent", lambda frames, device: torch.zeros(2, 32, 3))
+    frames = [torch.zeros(3, 8, 8)] * 22
+    out = cond.get_condition(inputs=["a", "b"], videos=[frames, frames], audios=[(torch.zeros(1, 8), 16000), None])
+    assert out["has_audio"] == [True, False]
+
+
+def test_audio_loss_skips_samples_without_audio():
+    torch.manual_seed(17)
+    base = tiny_model()
+    packed = copy.deepcopy(base)
+    raws = [raw_sample(3), raw_sample(5), raw_sample(4, "ref2va")]
+    raws[1]["has_audio"] = False
+    samples = prepare(condition_model(), raws)
+    assert [sample["has_audio"] for sample in samples] == [True, False, True]
+    expected = serial(base, samples)
+    assert expected[1].loss["mse_audio"] == 0
+    actual = packed(**batch(samples))
+    torch.testing.assert_close(actual.loss["mse_video"], torch.stack([o.loss["mse_video"] for o in expected]).mean())
+    torch.testing.assert_close(
+        actual.loss["mse_audio"], (expected[0].loss["mse_audio"] + expected[2].loss["mse_audio"]) / 2
+    )
+    (sum(o.loss["mse_video"] for o in expected) / 3 + sum(o.loss["mse_audio"] for o in expected) / 2).backward()
+    sum(actual.loss.values()).backward()
+    for (name, p), (_, q) in zip(base.named_parameters(), packed.named_parameters()):
+        torch.testing.assert_close(p.grad, q.grad, rtol=2e-4, atol=2e-5, msg=name)
+
+    silent = [raw_sample(3), raw_sample(5)]
+    for row in silent:
+        row["has_audio"] = False
+    silent_samples = prepare(condition_model(), silent)
+    for out in (base(**silent_samples[0]), base(**batch(silent_samples))):
+        assert out.loss["mse_audio"] == 0 and out.loss["mse_audio"].requires_grad
+
+
 def test_sample_isolation_boundaries_and_zero_valid_rows():
     model = tiny_model()
     samples = prepare(condition_model(), [raw_sample(3), raw_sample(9)])
@@ -237,12 +318,8 @@ def test_ref2va_variable_reference_layouts_and_target_only_loss():
     assert [p.shape for p in actual.predictions[1]] == [(2, 32, 3)] * 2
 
 
-def test_invalid_condition_columns_and_audio_refs_fail_closed():
+def test_audio_refs_fail_closed():
     cond = condition_model()
-    rows = DiTDataCollator()([raw_sample(), raw_sample()])
-    rows["prompt_embeds"] = rows["prompt_embeds"][:1]
-    with pytest.raises(ValueError, match="length"):
-        cond.process_condition(**rows)
     row = raw_sample(task="ref2va")
     row["ref_audio_anchor"] = torch.ones(2, 32)
     with pytest.raises(NotImplementedError, match="audio"):
@@ -272,6 +349,30 @@ def test_visual_ref_layout_matches_native_inference(audio_channel):
     assert actual["cu_seqlens"].tolist() == [0, actual["seq_len"]]
 
 
+def test_host_bounds_match_packed_layouts():
+    refs = [
+        {"kind": "video", "latent_t": 2, "latent_h": 4, "latent_w": 6},
+        {"kind": "image", "latent_t": 1, "latent_h": 2, "latent_w": 4},
+    ]
+    rows = [
+        raw_sample(3),
+        raw_sample(5, keyframes=(0, -1)),
+        raw_sample(4, keyframes=()),
+        raw_sample(6, "ref2va", refs),
+    ]
+    for row in rows:
+        pk = row["packed"]
+        assert packed_sequence.host_cu_seqlens(pk) == tuple(pk["cu_seqlens"].tolist())
+        sample = prepare(condition_model(), [row])[0]
+        assert sample["packed_seq_params"]["cu_seqlens_host"] == tuple(pk["cu_seqlens"].tolist())
+        assert sample["refiner_packed_seq_params"]["cu_seqlens_host"] == (0, pk["text_len"])
+        assert sample["refiner_packed_seq_params"]["cu_seqlens_q"].tolist() == [0, pk["text_len"]]
+    legacy = dict(rows[0]["packed"])
+    used = legacy["seq_len"]
+    legacy["seq_len"] = used + (-used) % 64
+    assert packed_sequence.host_cu_seqlens(legacy) == (0, used, legacy["seq_len"])
+
+
 @pytest.mark.parametrize("task", ["fl2va", "ref2va"])
 def test_single_sample_valid_outputs_match_legacy_64_tail(task):
     model = tiny_model()
@@ -279,14 +380,7 @@ def test_single_sample_valid_outputs_match_legacy_64_tail(task):
     length = sample["x"].shape[1]
     assert length % 64 != 0
     assert sample["packed_seq_params"]["cu_seqlens_q"].tolist() == [0, length]
-    legacy = copy.deepcopy(sample)
-    pad = (-length) % 64
-    for key in ("x", "audio_x", "img_position_ids"):
-        legacy[key] = F.pad(legacy[key], (0, 0, 0, pad))
-    legacy["token_tags"] = F.pad(legacy["token_tags"], (0, pad), value=-1)
-    legacy["inverse_indices"] = F.pad(legacy["inverse_indices"], (0, pad))
-    legacy["packed_seq_params"]["cu_seqlens_q"] = torch.tensor([0, length, length + pad], dtype=torch.int32)
-    actual, expected = model(**sample), model(**legacy)
+    actual, expected = model(**sample), model(**legacy_tail(sample))
     for a, b in zip(actual.predictions, expected.predictions):
         torch.testing.assert_close(a, b, rtol=2e-5, atol=2e-5)
     for key in actual.loss:
@@ -442,8 +536,14 @@ def test_packed_sdpa_slices_with_host_bounds(monkeypatch, checkpointing):
     raws = [raw_sample(3), raw_sample(7)]
     for row in raws:
         row["use_gradient_checkpointing"] = checkpointing
-    out = tiny_model()(**batch(prepare(condition_model(), raws)))
+    samples = prepare(condition_model(), raws)
+    model = tiny_model()
+    reads = []
+    tolist = torch.Tensor.tolist
+    monkeypatch.setattr(torch.Tensor, "tolist", lambda self: reads.append(self.shape) or tolist(self))
+    out = model(**batch(samples))
     sum(out.loss.values()).backward()
+    assert reads == []  # packing and the DiT use host bounds; no device read-back
 
     assert len(bounds) == 4 + 2 * checkpointing
     assert all(type(bound) is tuple and all(type(value) is int for value in bound) for bound in bounds)
@@ -486,6 +586,8 @@ def test_inference_forwards_checkpoint_offload_to_core(offload):
 
     def capture(module, args, kwargs):
         assert kwargs["use_gradient_checkpointing_offload"] is offload
+        assert kwargs["packed_seq_params"]["cu_seqlens_host"] == tuple(row["packed"]["cu_seqlens"].tolist())
+        assert kwargs["refiner_packed_seq_params"]["cu_seqlens_host"] == (0, 3)
         raise RuntimeError("inference offload forwarded")
 
     handle = model.dit.register_forward_pre_hook(capture, with_kwargs=True)
@@ -535,10 +637,8 @@ def test_invalid_precision_and_legacy_tail_fail_closed():
     changed[0]["unique_timesteps"] = changed[0]["unique_timesteps"].bfloat16()
     with pytest.raises(ValueError, match="cast_forward_inputs"):
         model(**batch(changed))
-    changed = copy.deepcopy(samples)
-    changed[0]["packed_seq_params"]["cu_seqlens_q"] = torch.tensor([0, 27, 27], dtype=torch.int32)
     with pytest.raises(ValueError, match="tail padding"):
-        model(**batch(changed))
+        model(**batch([legacy_tail(samples[0]), samples[1]]))
     row = raw_sample()
     row["keyframe_cond_anchor"] = None
     with pytest.raises(ValueError, match="anchor rows"):

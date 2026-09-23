@@ -105,11 +105,12 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         outputs = [self._finish_outputs(v, a, **sample) for sample, v, a in zip(samples, video_parts, audio_parts)]
         if any((out.loss is None) != (outputs[0].loss is None) for out in outputs):
             raise ValueError("All H3 samples must consistently supply or omit training targets.")
-        losses = (
-            None
-            if outputs[0].loss is None
-            else {key: torch.stack([out.loss[key] for out in outputs]).mean() for key in outputs[0].loss}
-        )
+        losses = None
+        if outputs[0].loss is not None:
+            losses = {key: torch.stack([out.loss[key] for out in outputs]).mean() for key in outputs[0].loss}
+            # Audio loss averages only over samples with real audio (others are zero-weighted).
+            audio_count = sum(sample.get("has_audio") is not False for sample in samples)
+            losses["mse_audio"] = torch.stack([out.loss["mse_audio"] for out in outputs]).sum() / max(audio_count, 1)
         # Per-sample lists: samples in one microbatch may differ in video/audio geometry.
         return MiniMaxH3DiTOutput(
             predictions=[[out.predictions[0] for out in outputs], [out.predictions[1] for out in outputs]],
@@ -237,6 +238,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         training_target_audio=None,
         scheduler_video=None,
         scheduler_audio=None,
+        has_audio=True,
         **kwargs,
     ):
         # Slice off condition rows (v_video_rows[cond_rows_count:])
@@ -270,16 +272,20 @@ class MiniMaxH3DiTModel(PreTrainedModel):
 
             if scheduler_video is not None and t_video_val is not None:
                 sigma_v = 1.0 - float(t_video_val)
-                ts_v = torch.tensor(sigma_v * scheduler_video.num_train_timesteps, device=video_pred.device)
+                # Host scalar: the scheduler looks the weight up on its own (CPU) timesteps.
+                ts_v = torch.tensor(sigma_v * scheduler_video.num_train_timesteps)
                 weight_v = scheduler_video.training_weight(ts_v)
                 loss_video = loss_video * weight_v
 
             if scheduler_audio is not None and t_audio_val is not None:
                 sigma_a = 1.0 - float(t_audio_val)
-                ts_a = torch.tensor(sigma_a * scheduler_audio.num_train_timesteps, device=audio_pred.device)
+                ts_a = torch.tensor(sigma_a * scheduler_audio.num_train_timesteps)
                 weight_a = scheduler_audio.training_weight(ts_a)
                 loss_audio = loss_audio * weight_a
 
+            if has_audio is False:
+                # Silent placeholder audio is not a target; keep the graph but drop the supervision.
+                loss_audio = loss_audio * 0.0
             loss = {"mse_video": loss_video, "mse_audio": loss_audio}
 
         return MiniMaxH3DiTOutput(

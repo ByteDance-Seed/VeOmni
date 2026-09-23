@@ -255,3 +255,14 @@ def build_packed_fl2va(
         "latent_w_patched": pw,
         "cond_rows": cond_rows,
     }
+
+
+def host_cu_seqlens(packed: dict) -> tuple[int, ...]:
+    """Segment bounds of a ``[text | cond | audio | video]`` layout from host metadata only.
+
+    ``packed["cu_seqlens"]`` may already live on the accelerator; reading it back would sync.
+    Returns ``(0, seq_len)``, or ``(0, used, seq_len)`` for legacy tail-padded layouts.
+    """
+    used = int(packed["text_pos"].numel() + packed["img_pos"].numel() + packed["audio_pos"].numel())
+    seq_len = int(packed["seq_len"])
+    return (0, seq_len) if used == seq_len else (0, used, seq_len)

@@ -47,7 +47,7 @@ from .minimax_h3_core.minimax_h3_text_encoder import (
     video_token_counts,
 )
 from .minimax_h3_core.minimax_h3_video_vae import MiniMaxH3VideoVAE
-from .minimax_h3_core.packed_sequence import build_packed_fl2va
+from .minimax_h3_core.packed_sequence import build_packed_fl2va, host_cu_seqlens
 from .minimax_h3_transformer.modeling_minimax_h3_transformer import MiniMaxH3DiTModel
 
 
@@ -1241,6 +1241,7 @@ def model_fn_minimax_h3(
     audio_pos = packed["audio_pos"]
     text_pos = packed["text_pos"]
     cu = packed["cu_seqlens"]
+    cu_host = host_cu_seqlens(packed)
     seq_len = packed["seq_len"]
     text_len = text_pos.shape[0]
     # Video Sequence
@@ -1287,8 +1288,12 @@ def model_fn_minimax_h3(
         audio_pos_info={"position_ids": audio_pos},
         text_pos_info={"position_ids": text_pos},
         img_pos_for_infer_output_info={"position_ids": img_pos},
-        packed_seq_params={"cu_seqlens_q": cu, "max_seqlen_q": int(cu[1])},
-        refiner_packed_seq_params={"cu_seqlens_q": refiner_cu, "max_seqlen_q": text_len},
+        packed_seq_params={"cu_seqlens_q": cu, "cu_seqlens_host": cu_host, "max_seqlen_q": cu_host[1]},
+        refiner_packed_seq_params={
+            "cu_seqlens_q": refiner_cu,
+            "cu_seqlens_host": (0, int(text_len)),
+            "max_seqlen_q": int(text_len),
+        },
         skip_mask_out_condition=True,
         cond_rows=cond_rows_count,
         video_latent_shape=(f, h // 2, w // 2),

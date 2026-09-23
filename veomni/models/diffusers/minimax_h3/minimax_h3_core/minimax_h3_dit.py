@@ -319,15 +319,17 @@ class MiniMaxH3TokenRefiner(nn.Module):
     def forward(self, x, *, cu_seqlens, max_seqlen, sample_local=False):
         if sample_local and isinstance(cu_seqlens, _PackedBounds) and len(cu_seqlens.host) > 2:
             bounds = cu_seqlens.host
-            segments = [(start, stop) for start, stop in zip(bounds, bounds[1:]) if stop > start]
+            segments = [(i, start, stop) for i, (start, stop) in enumerate(zip(bounds, bounds[1:])) if stop > start]
             if len(segments) > 1:
                 # Small BF16 refiner GEMMs can change rounding with the row count.
                 # Keep them sample-local: pretrained main-DiT blocks amplify those
                 # differences. The much larger main-DiT sequence stays packed.
                 outputs = []
-                for start, stop in segments:
+                for index, start, stop in segments:
                     length = stop - start
-                    local_cu = _PackedBounds(cu_seqlens.device.new_tensor([0, length]), (0, length))
+                    # Device bounds via slicing the packed tensor: no host-to-device copy per sample.
+                    device_cu = cu_seqlens.device[index : index + 2] - cu_seqlens.device[index]
+                    local_cu = _PackedBounds(device_cu, (0, length))
                     outputs.append(self.forward(x[start:stop], cu_seqlens=local_cu, max_seqlen=length))
                 return torch.cat(outputs, dim=0)
         for block in self.blocks:
@@ -587,9 +589,9 @@ class MiniMaxH3DiT(nn.Module):
         max_seqlen = int(packed_seq_params["max_seqlen_q"])
         refiner_cu = refiner_packed_seq_params["cu_seqlens_q"].to(torch.int32)
         refiner_max = int(refiner_packed_seq_params["max_seqlen_q"])
-        # Read segment bounds once per forward; SDPA loops then slice with host integers.
-        cu_host = tuple(cu_seqlens.tolist())
-        refiner_host = tuple(refiner_cu.tolist())
+        # Host bounds come from packing/conditioning; reading the device tensor is only a fallback.
+        cu_host = packed_seq_params.get("cu_seqlens_host") or tuple(cu_seqlens.tolist())
+        refiner_host = refiner_packed_seq_params.get("cu_seqlens_host") or tuple(refiner_cu.tolist())
 
         if x.dim() != 3 or x.shape[0] != 1:
             raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")

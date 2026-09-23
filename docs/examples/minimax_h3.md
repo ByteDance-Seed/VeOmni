@@ -207,10 +207,12 @@ bash train.sh tasks/train_dit.py configs/dit/minimax_h3_fl2va_offline.yaml \
 Keep `train.dyn_bsz=false`, `data.dataloader.drop_last=true`, and FSDP2
 `mixed_precision.cast_forward_inputs=false`. Timesteps stay FP32 and positions
 stay FP32/FP64; blanket BF16 input casting is rejected rather than silently
-changing their precision. Samples in one microbatch may differ in target
-video/audio geometry, prompt length, reference count and reference geometry;
-multi-sample outputs return per-sample prediction lists. Multi-sample packing rejects Ulysses SP and block/checkpoint offload inside
-modeling. Single-device/FSDP2 with SP/CP/TP/PP sizes one is the validation target;
+changing their precision. Samples in one microbatch may differ in task
+(FL2VA/visual Ref2VA, with or without keyframes), target video/audio geometry,
+prompt length, reference count and reference geometry; `DiTDataCollator` fills
+keys a sample lacks with `None`, and multi-sample outputs return per-sample
+prediction lists. Multi-sample packing rejects Ulysses SP and block/checkpoint
+offload inside modeling. Single-device/FSDP2 with SP/CP/TP/PP sizes one is the validation target;
 LoRA, compilation and additional parallel/offload combinations are not validated.
 
 FL2VA and Ref2VA layouts now contain exactly `[text | cond | audio | video]`, with
@@ -221,6 +223,12 @@ Legacy padded metadata is rejected for multi-sample packing. Any divisibility
 padding for single-sample Ulysses remains local to `MiniMaxH3DiT.forward`.
 Uncovered SP attention rows are zero-initialized so discarded outputs cannot
 introduce nonfinite parameter gradients.
+
+Samples encoded without an audio track keep the silent placeholder latent, so the
+layout is unchanged, but carry `has_audio=False` (also saved in offline
+embeddings). They contribute no audio loss, and a microbatch averages `mse_audio`
+only over samples with audio (zero when none have it). Caches written without
+`has_audio` keep supervising audio as before.
 
 ### Visual Ref2VA prepared data
 
