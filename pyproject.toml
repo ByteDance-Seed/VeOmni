@@ -60,6 +60,7 @@ gpu = [
   # x86_64/aarch64.
   "flash-attn; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn-3; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'x86_64')",
+  "kernels==0.16.0; sys_platform == 'linux'",
   "flash-mla; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'x86_64')",
   # 4.0.0b16 is available from PyPI; newer fa4-v4.0.0.beta17 is tag-only
   # and not yet published as a package release.
@@ -357,9 +358,6 @@ exclude = [
 ]
 
 [tool.setuptools.package-data]
-# LTX-2.3 reads its default Gemma system prompts from disk at import-adjacent
-# runtime (`veomni/models/diffusers/ltx2_3/.../encoders/prompts/*.txt`), so they
-# have to travel with the package instead of only living in the git checkout.
 veomni = ["**/*.txt"]
 
 [tool.patchgen]

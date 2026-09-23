@@ -114,11 +114,16 @@
 
 
  def rotate_half(x):
-@@ -55,25 +82,23 @@
+@@ -55,25 +82,24 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
--@use_kernel_forward_from_hub("rotary_pos_emb")
++# ======================================================================
++# [PATCHED FUNCTION] apply_rotary_pos_emb
++# Reason: OpSlot guard for Liger fused RoPE
++# Source: veomni.models.transformers.qwen3_moe.qwen3_moe_gpu_patch_gen_config
++# ======================================================================
+ @use_kernel_forward_from_hub("rotary_pos_emb")
 -def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 -    """Applies Rotary Position Embedding to the query and key tensors.
 -
@@ -137,11 +142,6 @@
 -    Returns:
 -        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
 -    """
-+# ======================================================================
-+# [PATCHED FUNCTION] apply_rotary_pos_emb
-+# Reason: OpSlot guard for Liger fused RoPE
-+# Source: veomni.models.transformers.qwen3_moe.qwen3_moe_gpu_patch_gen_config
-+# ======================================================================
 +def apply_rotary_pos_emb(
 +    q: torch.Tensor,
 +    k: torch.Tensor,
@@ -157,7 +157,7 @@
      cos = cos.unsqueeze(unsqueeze_dim)
      sin = sin.unsqueeze(unsqueeze_dim)
      q_embed = (q * cos) + (rotate_half(q) * sin)
-@@ -190,6 +215,12 @@
+@@ -190,6 +216,12 @@
          return attn_output, attn_weights
 
 
@@ -170,7 +170,7 @@
  class Qwen3MoeMLP(nn.Module):
      def __init__(self, config, intermediate_size=None):
          super().__init__()
-@@ -201,22 +232,32 @@
+@@ -201,22 +233,32 @@
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
          self.act_fn = ACT2FN[config.hidden_act]
 
@@ -209,7 +209,7 @@
          self.act_fn = ACT2FN[config.hidden_act]
 
      def forward(
-@@ -226,6 +267,9 @@
+@@ -226,6 +268,9 @@
          top_k_weights: torch.Tensor,
      ) -> torch.Tensor:
          final_hidden_states = torch.zeros_like(hidden_states)
@@ -219,7 +219,7 @@
          with torch.no_grad():
              expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
              expert_mask = expert_mask.permute(2, 1, 0)
-@@ -237,13 +281,20 @@
+@@ -237,13 +282,20 @@
                  continue
              top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
              current_state = hidden_states[token_idx]
@@ -242,7 +242,7 @@
 
 
  class Qwen3MoeTopKRouter(nn.Module):
-@@ -255,16 +306,31 @@
+@@ -255,16 +307,31 @@
          self.hidden_dim = config.hidden_size
          self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
 
@@ -280,7 +280,7 @@
 
 
  class Qwen3MoeSparseMoeBlock(nn.Module):
-@@ -273,12 +339,38 @@
+@@ -273,12 +340,38 @@
          self.experts = Qwen3MoeExperts(config)
          self.gate = Qwen3MoeTopKRouter(config)
 
@@ -321,7 +321,7 @@
 
 
  @use_kernel_forward_from_hub("RMSNorm")
-@@ -291,7 +383,12 @@
+@@ -291,7 +384,12 @@
          self.weight = nn.Parameter(torch.ones(hidden_size))
          self.variance_epsilon = eps
 
@@ -334,7 +334,7 @@
          input_dtype = hidden_states.dtype
          hidden_states = hidden_states.to(torch.float32)
          variance = hidden_states.pow(2).mean(-1, keepdim=True)
-@@ -435,6 +532,12 @@
+@@ -435,6 +533,12 @@
          return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -347,7 +347,7 @@
  @auto_docstring
  class Qwen3MoeModel(Qwen3MoePreTrainedModel):
      def __init__(self, config: Qwen3MoeConfig):
-@@ -464,8 +567,13 @@
+@@ -464,8 +568,13 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
@@ -361,7 +361,7 @@
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-@@ -475,12 +583,18 @@
+@@ -475,12 +584,18 @@
          if inputs_embeds is None:
              inputs_embeds = self.embed_tokens(input_ids)
 
@@ -383,7 +383,7 @@
          causal_mask = mask_function(
              config=self.config,
              inputs_embeds=inputs_embeds,
-@@ -499,6 +613,7 @@
+@@ -499,6 +614,7 @@
                  position_ids=position_ids,
                  past_key_values=past_key_values,
                  use_cache=use_cache,
@@ -391,7 +391,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -580,6 +695,12 @@
+@@ -580,6 +696,12 @@
      return overall_loss * num_experts
 
 
@@ -404,7 +404,7 @@
  @auto_docstring
  class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -611,37 +732,23 @@
+@@ -611,37 +733,23 @@
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
          output_router_logits: bool | None = None,
@@ -447,7 +447,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -650,30 +757,69 @@
+@@ -650,30 +758,69 @@
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
              output_router_logits=output_router_logits,
@@ -529,7 +529,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -681,7 +827,13 @@
+@@ -681,7 +828,13 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,

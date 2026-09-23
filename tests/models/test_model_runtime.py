@@ -34,6 +34,7 @@ import torch.nn as nn
 from veomni.arguments import (
     AcceleratorConfig,
     FSDPConfig,
+    MixedPrecisionConfig,
     ModelArguments,
 )
 from veomni.distributed.parallel_state import (
@@ -251,6 +252,34 @@ class TestHowATrainerHoldsItsModel:
         )
 
         assert runtime.skip_hf_weight_load is False
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("param_dtype", ["bfloat16", "float16", "float32"])
+def test_runtime_forwards_low_precision_reduce_scatter_config(monkeypatch, enabled, param_dtype):
+    from veomni.distributed import torch_parallelize
+
+    config = FSDPConfig(
+        mixed_precision=MixedPrecisionConfig(param_dtype=param_dtype, reduce_dtype="float32"),
+        low_precision_reduce_scatter_comm=enabled,
+    )
+    runtime = unbuilt_runtime(
+        ModelArguments(model_path="somewhere", accelerator=AcceleratorConfig(fsdp_config=config)),
+        train=train_args(),
+    )
+    runtime.model = nn.Linear(2, 2)
+    calls = []
+
+    def parallelize(model, **kwargs):
+        calls.append(kwargs)
+        return model
+
+    monkeypatch.setattr(torch_parallelize, "build_parallelize_model", parallelize)
+    runtime._build_parallelized_model()
+
+    assert len(calls) == 1
+    assert calls[0]["low_precision_reduce_scatter_comm"] is enabled
+    assert calls[0]["mixed_precision"] is config.mixed_precision
 
 
 class TestWhereTheLoaderReadsTheConfigFrom:

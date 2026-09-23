@@ -420,6 +420,7 @@ def rotate_half(x):
 # Patch: apply_rotary_pos_emb
 # 1. Use NPU fused rotary embedding kernel.
 # ================================================================
+@use_kernel_forward_from_hub("rotary_pos_emb")
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     from veomni.ops.kernels.rotary.npu import apply_rotary_pos_emb_npu as _apply_rotary_pos_emb_npu
 

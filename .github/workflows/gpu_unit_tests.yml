@@ -151,6 +151,9 @@ jobs:
           uv run --frozen pytest -s -x tests/models/test_model_forward_no_implicit_sync.py
           uv run --frozen pytest -s -x tests/models/test_checkpoint_tensor_converter.py
           uv run --frozen pytest -s -x tests/models/test_return_log_probs_e2e.py
+      - name: Run SeedOmni unit tests
+        run: |
+          uv run --frozen pytest -s -x tests/seed_omni
       - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests
         if: steps.changes.outputs.qwen3_5_ulysses == 'true'
         run: |
@@ -173,6 +176,7 @@ jobs:
         run: |
           uv run --frozen pytest -s -x tests/distributed/test_async_offload_unit.py
           uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
+          uv run --frozen pytest -s -x tests/distributed/test_reduce_scatter_fp32_accumulation.py
           uv run --frozen pytest -s -x tests/distributed/test_torch_compile.py
       - name: Run data tests
         run: |
