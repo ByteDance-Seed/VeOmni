@@ -72,7 +72,9 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             "eager",
             "sdpa",
             "veomni_flash_attention_2_with_sp",
+            "veomni_flash_attention_2_hub_with_sp",
             "veomni_flash_attention_3_with_sp",
+            "veomni_flash_attention_3_hub_with_sp",
         ):
             raise ValueError(f"Unsupported H3 packing backend: {attn_implementation}")
         self._packed_attn_implementation = attn_implementation
@@ -88,9 +90,9 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         attention_modules = [module for module in self.dit.modules() if isinstance(module, MiniMaxH3Attention)]
         if all(module.varlen_kernel is not None for module in attention_modules):
             return
-        from .....ops.kernels.attention.flash import _load_veomni_local_flash_kernel
+        from .....ops.kernels.attention.flash import _load_veomni_flash_kernel
 
-        kernel = _load_veomni_local_flash_kernel(implementation).flash_attn_varlen_func
+        kernel = _load_veomni_flash_kernel(implementation).flash_attn_varlen_func
         for module in attention_modules:
             module.varlen_kernel = kernel
 

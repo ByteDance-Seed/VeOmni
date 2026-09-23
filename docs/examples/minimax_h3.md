@@ -290,18 +290,21 @@ packing; ordinary single-sample attention dispatch is preserved.
 - `eager` / `sdpa`: explicit per-segment PyTorch SDPA reference path; main-DiT
   projections and MLPs still operate on compact cross-sample rows.
 - `flash_attention_2` / `flash_attention_3` in `model.ops_implementation` resolve
-  to VeOmni's local FA2/FA3 backends. Each main-DiT layer uses one non-causal
-  varlen call; refiner layers retain one call per sample. The matching local
-  kernel package and BF16/FP16 are required; unavailable kernels are not silently
-  replaced with SDPA.
+  to VeOmni's local FA2/FA3 backends, and `flash_attention_2_hub` /
+  `flash_attention_3_hub` to the Hugging Face Hub kernels
+  (`kernels-community/flash-attn2` / `flash-attn3`, version 1). Each main-DiT
+  layer uses one non-causal varlen call; refiner layers retain one call per
+  sample. The kernel is loaded on the first multi-sample forward and needs
+  BF16/FP16; unavailable kernels are not silently replaced with SDPA.
 
 `tests/models/test_minimax_h3_packing.py` uses a native tiny model on CPU to
 check packed-versus-serial outputs, losses and gradients (including mixed target
 geometry and checkpoint recomputation), sample isolation, Ref2VA variable
 references, forward-local SP padding and fail-closed inputs. SP collectives are
 mocked there, so it does not establish distributed SP parity. The FA2/FA3 call
-site is checked with a kernel stub that asserts the varlen layout; kernel
-correctness itself is covered by `tests/ops/test_flash_attn_varlen_padding.py`.
+site is checked for all four backends with a kernel stub that asserts the
+varlen layout; kernel correctness itself is covered by
+`tests/ops/test_flash_attn_varlen_padding.py`.
 No end-to-end speedup or convergence is claimed. Benchmark against an equivalent,
 tuned non-packed baseline before claiming a performance improvement.
 

@@ -22,6 +22,7 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_
     MiniMaxH3DiTOutput,
 )
 from veomni.trainer.dit_trainer import DiTDataCollator
+from veomni.utils.import_utils import is_torch_npu_available
 
 
 def tiny_model():
@@ -424,13 +425,24 @@ def test_sequence_parallel_padding_remains_forward_local(monkeypatch, task):
         model(**batch([sample, sample]))
 
 
-@pytest.mark.parametrize("backend", ["veomni_flash_attention_2_with_sp", "veomni_flash_attention_3_with_sp"])
+_NPU_REJECTS_HUB = pytest.mark.skipif(is_torch_npu_available(), reason="Hub attention is rejected on Ascend NPU.")
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "flash_attention_2",
+        pytest.param("flash_attention_2_hub", marks=_NPU_REJECTS_HUB),
+        "flash_attention_3",
+        pytest.param("flash_attention_3_hub", marks=_NPU_REJECTS_HUB),
+    ],
+)
 def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(monkeypatch, backend):
     from veomni.arguments import OpsImplementationConfig
     from veomni.models.auto import build_foundation_model
     from veomni.ops.kernels.attention import flash
 
-    calls = []
+    calls, loads = [], []
 
     config = tiny_model().config
 
@@ -443,9 +455,11 @@ def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(mon
         calls.append(cu_seqlens_q.tolist())
         return minimax_h3_dit._sdpa_varlen_attention(q, k, v, tuple(cu_seqlens_q.tolist()), softmax_scale, True)
 
-    monkeypatch.setattr(
-        flash, "_load_veomni_local_flash_kernel", lambda name: SimpleNamespace(flash_attn_varlen_func=kernel)
-    )
+    def loader(name):
+        loads.append(name)
+        return SimpleNamespace(flash_attn_varlen_func=kernel)
+
+    monkeypatch.setattr(flash, "_load_veomni_flash_kernel", loader)
     ops = OpsImplementationConfig(
         attn_implementation=backend,
         rms_norm_implementation="eager",
@@ -466,10 +480,12 @@ def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(mon
     samples = prepare(condition_model(), raws)
     serial(model, samples)
     assert calls == []
+    loads.clear()  # Transformers may already have resolved the backend at construction.
     out = model(**batch(samples))
     sum(out.loss.values()).backward()
     assert calls[:2] == [[0, 3], [0, 7]]
     assert len(calls) == 4 and calls[2] == calls[3] and len(calls[2]) == 3
+    assert loads == [f"veomni_{backend}_with_sp"]
 
 
 def test_flash_backend_defers_packed_kernel_until_multisample_forward(monkeypatch):
@@ -489,7 +505,7 @@ def test_flash_backend_defers_packed_kernel_until_multisample_forward(monkeypatc
         raise AssertionError("construction must not run NPU attention")
 
     # Mirror Ascend: Transformers resolves its native NPU FA before VeOmni's loader.
-    monkeypatch.setattr(flash, "_load_veomni_local_flash_kernel", unavailable)
+    monkeypatch.setattr(flash, "_load_veomni_flash_kernel", unavailable)
     monkeypatch.setattr(hf_flash, "is_flash_attn_2_available", lambda: False)
     monkeypatch.setattr(hf_flash, "is_torch_npu_available", lambda: True)
     for name in (
