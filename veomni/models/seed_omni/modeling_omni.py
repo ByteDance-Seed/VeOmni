@@ -31,7 +31,7 @@ walk.  Stop when ``is_done()`` or ``max_new_tokens`` is reached.
 from __future__ import annotations
 
 import os
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 import torch.distributed as dist
 import torch.nn as nn
@@ -462,6 +462,7 @@ class OmniModel(PreTrainedModel):
         self,
         batch: dict[str, Any],
         *args: Any,
+        node_runner: Callable[[PretrainedOmniModule, NodeDef, dict[str, Any]], None] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Run the training DAG; this is the FSDP2 root ``forward``.
@@ -471,8 +472,14 @@ class OmniModel(PreTrainedModel):
         units (decoder layers, ``Embedding``, …) unshard on their own
         ``__call__``; leftover params on this module unshard because training
         enters here.
+
+        ``node_runner`` replaces how one node runs; the graph walk, loss
+        collection and return value stay here. A runtime that wraps the modules
+        passes one to unwrap them and scope each node to its module's mesh;
+        without one each node runs as :meth:`_run_train_node`.
         """
         del args, kwargs
+        run_node = node_runner if node_runner is not None else self._run_train_node
         if self.training_graph is None:
             raise ValueError(
                 "OmniModel.forward: this model has no training graph. Pass `training_graphs` "
@@ -483,7 +490,7 @@ class OmniModel(PreTrainedModel):
         self._losses.clear()
 
         for node in self.training_graph.iter_nodes():
-            self._run_train_node(self.get_module(node.module), node, batch)
+            run_node(self.get_module(node.module), node, batch)
             loss = batch.pop(LOSS_KEY, None)
             if loss is not None:
                 self._losses[node.name] = loss

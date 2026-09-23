@@ -113,9 +113,10 @@ def execute_generation_node(
 ) -> Dict[str, Any]:
     """Run one generation node under VeOmni (unwrap + scope + profile).
 
-    Unlike training, inference has no ``pre_forward`` / ``post_forward`` and no
-    metric meter — the eager endpoint is called directly with the full ``ctx``
-    plus ``generation_kwargs``. ``state_name`` only labels the profiler node.
+    Same hooks as :meth:`OmniModel._run_generation_node` — optional
+    ``pre_generate`` → endpoint (with ``generation_kwargs``) → optional
+    ``post_generate`` — so eager and distributed inference run one module the
+    same way. No metric meter. ``state_name`` only labels the profiler node.
 
     Returns the (mutated) ``ctx``.
     """
@@ -134,15 +135,20 @@ def execute_generation_node(
         if profiler is not None
         else nullcontext()
     )
+    pre_generate = getattr(raw, "pre_generate", None)
+    post_generate = getattr(raw, "post_generate", None)
     with module_context, profile_context:
+        inputs = pre_generate(method=method, **ctx) if pre_generate is not None else ctx
         outputs = call_graph_endpoint(
             wrapped,
             raw,
             method=method,
-            kwargs={**ctx, "generation_kwargs": generation_kwargs},
+            kwargs={**inputs, "generation_kwargs": generation_kwargs},
         )
-    if not isinstance(outputs, dict):
-        raise TypeError(f"FSM node '{node.name}'.{method} must return a dict; got {type(outputs).__name__}.")
+        if not isinstance(outputs, dict):
+            raise TypeError(f"FSM node '{node.name}'.{method} must return a dict; got {type(outputs).__name__}.")
+        if post_generate is not None:
+            outputs = post_generate(method=method, **outputs)
     ctx.update(outputs)
     return ctx
 

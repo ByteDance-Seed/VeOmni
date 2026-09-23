@@ -375,11 +375,10 @@ class OmniModelRuntime:
                     profiler=profiler,
                     scope_fn=self.module_context,
                 )
+                # Per node, as in ``OmniModel.generate``: a later node emitting
+                # ``generated`` would overwrite this one's in the shared ``ctx``.
+                self._collect_generated(ctx, profiler, label="generated")
             total_steps += 1
-            generated = ctx.pop("generated", None)
-            model._append_generated(generated)
-            if profiler is not None and generated is not None:
-                profiler.record(f"generated:{generated['type']}")
             fired = model.generation_graph.maybe_transition(ctx)
             if fired is not None and profiler is not None:
                 profiler.record(f"transition: {fired.from_state} -> {fired.to_state} [{fired.condition}]")
@@ -391,12 +390,18 @@ class OmniModelRuntime:
                 out = raw.finalize(ctx=ctx)
                 if not isinstance(out, dict):
                     raise TypeError(f"{type(raw).__name__}.finalize must return a dict, got {type(out).__name__}.")
-                generated = out.pop("generated", None)
-                model._append_generated(generated)
-                if profiler is not None and generated is not None:
-                    profiler.record(f"finalize:{name} | generated:{generated['type']}")
+                ctx.update(out)
+                self._collect_generated(ctx, profiler, label=f"finalize:{name} | generated")
 
         return list(model._generated)
+
+    def _collect_generated(self, ctx: dict[str, Any], profiler: GraphProfiler | None, *, label: str) -> None:
+        """Drain ``ctx["generated"]`` via :meth:`OmniModel._collect_generated`, tracing what it kept."""
+        generated = self.model._generated
+        before = len(generated)
+        self.model._collect_generated(ctx)
+        if profiler is not None and len(generated) > before:
+            profiler.record(f"{label}:{generated[-1]['type']}")
 
     def named_omni_modules(self) -> Iterator[tuple[str, Any]]:
         """Yield ``(name, BaseMixin)`` for every graph participant (unwraps wrappers)."""
