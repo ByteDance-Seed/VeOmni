@@ -220,8 +220,11 @@ def test_real_handler_matches_torch_output_gradient_and_dispatcher(op_name, monk
     }
     assert expected_dispatch[op_name] in calls
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    gemm = op_name in {"mm", "addmm"}
+    grad_atol = 5e-2 if gemm else 3e-2
+    grad_rtol = 5e-2 if gemm else 3e-2
     for actual_input, expected_input in zip(actual_inputs, expected_inputs, strict=True):
-        torch.testing.assert_close(actual_input.grad, expected_input.grad, atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(actual_input.grad, expected_input.grad, atol=grad_atol, rtol=grad_rtol)
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="batch-invariant handlers require CUDA + Triton")

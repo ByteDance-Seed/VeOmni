@@ -24,7 +24,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.moe_experts.shared.dispatch import expert_histogram, moe_gather, moe_scatter
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 from veomni.utils.import_utils import is_fused_moe_available
 
@@ -250,6 +249,7 @@ def test_npu_matches_eager(variant):
 @pytest.mark.parametrize("variant", ["shared", "independent"])
 def test_triton_ep_class_matches_nonep_single_rank(variant):
     """EP autograd class output and LoRA grads match the non-EP class on one rank."""
+    from veomni.ops.kernels.moe_experts.shared.dispatch import expert_histogram, moe_gather, moe_scatter
     from veomni.ops.kernels.moe_experts_lora.independent.triton import (
         EPMergedFc1IndependentLoRAGroupGemm,
         MergedFc1IndependentTritonFusedLoRAMoeExpertFunction,
