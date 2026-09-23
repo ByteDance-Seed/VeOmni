@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import time
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Union
 
 from tqdm import trange
 
@@ -237,7 +237,7 @@ class EnvironMeterCallback(Callback):
         state: TrainerState,
         loss: float,
         loss_dict: Dict[str, float],
-        grad_norm: float,
+        grad_norm: Union[float, "torch.Tensor"],
         aux_metrics: Dict[str, float] = None,
         **kwargs,
     ) -> None:

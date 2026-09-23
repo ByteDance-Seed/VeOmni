@@ -1,30 +1,27 @@
 model:
-  model_path: Wan-AI/Wan2___2-TI2V-5B-Diffusers/transformer
-  condition_model_path: Wan-AI/Wan2___2-TI2V-5B-Diffusers
-  config_path: VeOmni/configs/model_configs/wan/wan2.2_i2v_5b.json
+  model_path: Wan2.2-I2V-A14B-Diffusers/transformer
+  condition_model_path: Wan2.2-I2V-A14B-Diffusers
+  config_path: VeOmni/configs/model_configs/wan/wan2.2_i2v_14b.json
   ops_implementation:
+    # Wan's RoPE has a non‑standard signature (rope_apply takes a single
+    # tensor plus freqs/head_dim kwargs) so the framework's default
+    # liger_kernel RoPE cannot drop in. Pin to eager explicitly until a
+    # Wan‑specific liger wrapper exists.
     rotary_pos_emb_implementation: eager
-    rms_norm_implementation: eager
-    swiglu_mlp_implementation: eager
-    cross_entropy_loss_implementation: eager
-    load_balancing_loss_implementation: eager
-    moe_implementation: eager
 
 data:
-  train_path: /Tom-and-Jerry-VideoGeneration-Dataset-parquet
+  train_path: Tom-and-Jerry-VideoGeneration-Dataset-parquet
   source_name: Tom-and-Jerry-VideoGeneration-Dataset
   mm_configs:
-    fps: 1
-    max_frames: 33
-
+    fps: 12
+    max_frames: 100
 train:
   global_batch_size: 8
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007
   dyn_bsz: false
   init_device: meta
-  empty_init: false
-  num_train_epochs: 10
+  num_train_epochs: 20
   training_task: online_training
   gradient_checkpointing:
     enable: true
@@ -34,7 +31,7 @@ train:
     fsdp_config:
       fsdp_mode: fsdp2
       reshard_after_forward: true
-      forward_prefetch: true
+      forward_prefetch: false
       mixed_precision:
         enable: true
         param_dtype: bfloat16
@@ -45,8 +42,8 @@ train:
       activation_gpu_limit: 0.0
       enable_async_activation_offload: true
   checkpoint:
-    output_dir: Wan2.2-I2V-5B
-    train.checkpoint.save_hf_weights: true
+    output_dir: Wan2.2-I2V-14B
+    save_hf_weights: false
   optimizer:
     type: adamw
     lr: 1.0e-4
@@ -58,4 +55,5 @@ train:
   wandb:
     enable: false
     project: veomni_dit
-    name: Wan2.2-I2V-5B
+    name: Wan2.2-I2V-14B
+ 

@@ -14,6 +14,8 @@ from diffusers.models.transformers.transformer_wan import (
     _get_added_kv_projections,
     _get_qkv_projections,
 )
+from diffusers.models.activations import GELU
+
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -26,6 +28,7 @@ from .....distributed.sequence_parallel import (
 from .....utils import logging
 from .configuration_wan_transformer import WanTransformer3DModelConfig
 
+import torch_npu
 
 logger = logging.get_logger(__name__)
 
@@ -51,6 +54,16 @@ def wan_eager_attention_forward(
     )
     return attn_output.transpose(1, 2), None
 
+# Patch diffusers GELU to use torch_npu.fast_gelu on NPU
+try:
+    def _gelu_npu(self, gate: torch.Tensor) -> torch.Tensor:
+        if gate.device.type == "privateuseone":
+            return torch_npu.fast_gelu(gate)
+        return torch.nn.functional.gelu(gate, approximate=self.approximate)
+
+    GELU.gelu = _gelu_npu
+except ImportError:
+    pass
 
 class WanAttentionKernelModule:
     def __init__(self, config: SimpleNamespace, attn: WanAttention):
@@ -91,14 +104,14 @@ def _get_wan_full_sequence_varlen_kwargs(
         0,
         (batch_size + 1) * query_length,
         query_length,
-        device=query.device,
+        device="cpu",
         dtype=torch.int32,
     )
     cu_seq_lens_k = torch.arange(
         0,
         (batch_size + 1) * key_length,
         key_length,
-        device=key.device,
+        device="cpu",
         dtype=torch.int32,
     )
     return {
@@ -166,8 +179,18 @@ class WanSPAttnProcessor(WanAttnProcessor):
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
         query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
 
-        query = attn.norm_q(query)
-        key = attn.norm_k(key)
+        try:
+            import torch_npu
+            _is_npu = True
+        except ImportError:
+            _is_npu = False
+
+        if _is_npu:
+            query = torch_npu.npu_rms_norm(query, attn.norm_q.weight, epsilon=attn.norm_q.eps)[0]
+            key = torch_npu.npu_rms_norm(key, attn.norm_k.weight, epsilon=attn.norm_k.eps)[0]
+        else:
+            query = attn.norm_q(query)
+            key = attn.norm_k(key)
 
         query = query.unflatten(2, (attn.heads, -1))
         key = key.unflatten(2, (attn.heads, -1))
@@ -189,8 +212,26 @@ class WanSPAttnProcessor(WanAttnProcessor):
                 out[..., 1::2] = x1 * sin + x2 * cos
                 return out.type_as(hidden_states)
 
-            query = apply_rotary_emb(query, *rotary_emb)
-            key = apply_rotary_emb(key, *rotary_emb)
+            def apply_rotary_emb_npu(
+                hidden_states: torch.Tensor,
+                freqs_cos: torch.Tensor,
+                freqs_sin: torch.Tensor,
+            ):
+                cos = freqs_cos[..., 0::2].repeat_interleave(2, dim=-1).contiguous()
+                sin = freqs_sin[..., 1::2].repeat_interleave(2, dim=-1).contiguous()
+                x_float = hidden_states.to(torch.float32)
+                x_out = torch_npu.npu_rotary_mul(x_float, cos, sin, rotary_mode="interleave")
+                return x_out.to(hidden_states.dtype)
+
+            try:
+                import torch_npu
+                _is_npu = True
+            except ImportError:
+                _is_npu = False
+
+            _apply_rope = apply_rotary_emb_npu if _is_npu else apply_rotary_emb
+            query = _apply_rope(query, *rotary_emb)
+            key = _apply_rope(key, *rotary_emb)
 
         attention_interface: Callable = wan_eager_attention_forward
         use_flash_attention = self.attn_implementation in {"flash_attention_2", "veomni_flash_attention_2_with_sp"}
@@ -359,8 +400,16 @@ def WanTransformer3DModel_forward(
     rotary_emb = self.rope(hidden_states)
     # 2. Patch embedding: (B, C, F, H, W) → (B, seq, inner_dim)
     hidden_states = self.patch_embedding(hidden_states)
-    hidden_states = hidden_states.flatten(2).transpose(1, 2)
-
+    try:
+        import torch_npu
+        B, C = hidden_states.shape[:2]
+        S = hidden_states.shape[2:].numel()
+        hidden_states = torch_npu.npu_confusion_transpose(
+            hidden_states, [0, 2, 1], [B, C, S], transpose_first=False
+        )
+    except (ImportError, ModuleNotFoundError):
+        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        
     # 3. Condition embedding
     if timestep.ndim == 2:
         ts_seq_len = timestep.shape[1]
