@@ -5,17 +5,17 @@
 - [Overview](#overview)
 - [Quick Start](#quick-start)
 - [How It Works](#how-it-works)
-  - [Motivation](#motivation)
-  - [Stream-Based D2H/H2D Overlap](#stream-based-d2hh2d-overlap)
-  - [Interaction with Gradient Checkpointing](#interaction-with-gradient-checkpointing)
-  - [Automatic Module Discovery](#automatic-module-discovery)
+  - [Motivation](#motivation)
+  - [Stream-Based D2H/H2D Overlap](#stream-based-d2hh2d-overlap)
+  - [Interaction with Gradient Checkpointing](#interaction-with-gradient-checkpointing)
+  - [Automatic Module Discovery](#automatic-module-discovery)
 - [Configuration Reference](#configuration-reference)
 - [Core API](#core-api)
 - [Implementation Details](#implementation-details)
-  - [SwapTensor Lifecycle](#swaptensor-lifecycle)
-  - [OffloadManager Singleton](#offloadmanager-singleton)
-  - [Class-Level **call** Patching](#class-level-__call__-patching)
-  - [Prefetch Mechanism](#prefetch-mechanism)
+  - [SwapTensor Lifecycle](#swaptensor-lifecycle)
+  - [OffloadManager Singleton](#offloadmanager-singleton)
+  - [Class-Level **call** Patching](#class-level-call-patching)
+  - [Prefetch Mechanism](#prefetch-mechanism)
 - [Limitations](#limitations)
 
 ## Overview
@@ -44,11 +44,11 @@ configuration file:
 
 ```yaml
 train:
-  gradient_checkpointing:
-    enable: true              # Required: must be enabled together
-  accelerator:
-    offload_config:
-      enable_async_activation_offload: true
+  gradient_checkpointing:
+    enable: true              # Required: must be enabled together
+  accelerator:
+    offload_config:
+      enable_async_activation_offload: true
 
 ```
 
@@ -57,8 +57,8 @@ Or via command-line:
 
 ```shell
 bash train.sh tasks/train_text.py configs/text/qwen3-moe.yaml \
-    --train.gradient_checkpointing.enable true \
-    --train.accelerator.offload_config.enable_async_activation_offload true
+    --train.gradient_checkpointing.enable true \
+    --train.accelerator.offload_config.enable_async_activation_offload true
 
 ```
 
@@ -77,11 +77,11 @@ models, these hidden states can consume significant GPU memory.
 
 Async activation offload addresses this by:
 1. **Forward pass:** Immediately offloading hidden states to CPU via a dedicated stream
-   (non-blocking D2H copy with pinned memory).
+   (non-blocking D2H copy with pinned memory).
 2. **Backward pass:** Prefetching hidden states back to GPU just before they are needed
-   (H2D copy overlapping with ongoing computation).
+   (H2D copy overlapping with ongoing computation).
 3. **Recomputation:** Intermediate activations within each block are recomputed by
-   gradient checkpointing, so they never persist on GPU.
+   gradient checkpointing, so they never persist on GPU.
 
 This combination yields zero persistent GPU memory for both hidden states (offloaded to
 CPU) and intermediate activations (recomputed).
@@ -91,10 +91,10 @@ CPU) and intermediate activations (recomputed).
 Unlike the synchronous `custom_save_on_cpu` (which blocks the default stream until
 the transfer completes), async activation offload uses a dedicated swap stream:
 
-```plaintext
-Default Stream:  [Compute Layer 0] [Compute Layer 1] [Compute Layer 2] ...
-Swap Stream:     [D2H Layer 0]     [D2H Layer 1]     [D2H Layer 2]    ...
-                                       ↑ overlapped with compute
+```text
+Default Stream:  [Compute Layer 0] [Compute Layer 1] [Compute Layer 2] ...
+Swap Stream:     [D2H Layer 0]     [D2H Layer 1]     [D2H Layer 2]    ...
+                                       ↑ overlapped with compute
 
 ```
 
@@ -110,19 +110,19 @@ The `saved_tensors_hooks` stack ordering is critical. Class-level `__call__` pat
 places `async_save_on_cpu` **outside** the `GradientCheckpointingLayer` checkpoint
 boundary:
 
-```plaintext
+```text
 Forward saved_tensors_hooks stack:
-  [async_save_on_cpu (outer)]   ← intercepts hidden_states
-  [_checkpoint_hook (inner)]    ← handles intermediate activations via recomputation
+  [async_save_on_cpu (outer)]   ← intercepts hidden_states
+  [_checkpoint_hook (inner)]    ← handles intermediate activations via recomputation
 
 ```
 
 With this ordering:
 - `_NoopSaveInputs.apply` (called by checkpoint before `_checkpoint_hook` is pushed)
-  saves input tensors through `async_save_on_cpu.pack`, allowing hidden states to be
-  offloaded to CPU.
+  saves input tensors through `async_save_on_cpu.pack`, allowing hidden states to be
+  offloaded to CPU.
 - Intermediate activations are handled by `_checkpoint_hook` (GC recomputation),
-  requiring zero persistent GPU memory.
+  requiring zero persistent GPU memory.
 
 ### Automatic Module Discovery
 
@@ -174,7 +174,7 @@ CPU. Applied per-module via class-level `__call__` patching.
 from veomni.distributed.async_offloading import async_save_on_cpu
 
 with async_save_on_cpu(block_idx=0, depth=12, prefetch=True):
-    output = module(*args, **kwargs)
+    output = module(*args, **kwargs)
 ```
 
 Args:
@@ -192,13 +192,13 @@ Each tensor that is offloaded is wrapped in a `SwapTensor` object that manages i
 lifecycle across GPU and CPU:
 
 1. **Creation:** A pinned CPU buffer (`tensor_cpu`) is allocated matching the tensor's
-   shape and dtype.
+   shape and dtype.
 2. **D2H (launch_d2h):** On the swap stream, copy GPU tensor to pinned CPU buffer
-   (non-blocking). Record a `d2h_event` for synchronization.
+   (non-blocking). Record a `d2h_event` for synchronization.
 3. **Wait D2H (wait_d2h_finished):** After the D2H transfer completes, free the GPU
-   storage by resizing to 0.
+   storage by resizing to 0.
 4. **H2D (launch_h2d):** On the swap stream, resize GPU storage back and copy from
-   pinned CPU buffer (non-blocking). Record an `h2d_event`.
+   pinned CPU buffer (non-blocking). Record an `h2d_event`.
 5. **Wait H2D:** The default stream waits on `h2d_event` before accessing the tensor.
 
 State transitions: `device` → (D2H) → `host` → (H2D) → `device`
@@ -239,14 +239,14 @@ activations to be available on GPU.
 ## Limitations
 
 - **Requires gradient checkpointing:** Async activation offload must be used together
-  with gradient checkpointing (`train.gradient_checkpointing.enable=True`). Without
-  recomputation, intermediate activations would consume GPU memory, negating the
-  benefit of offloading hidden states.
+  with gradient checkpointing (`train.gradient_checkpointing.enable=True`). Without
+  recomputation, intermediate activations would consume GPU memory, negating the
+  benefit of offloading hidden states.
 - **Pinned CPU memory:** Requires sufficient CPU pinned memory to hold all offloaded
-  activations. For very large models with many layers, this can be substantial.
+  activations. For very large models with many layers, this can be substantial.
 - **Single-stream architecture:** Currently uses a single swap stream for both D2H and
-  H2D. Bi-directional overlap (simultaneous D2H and H2D) is not yet supported.
+  H2D. Bi-directional overlap (simultaneous D2H and H2D) is not yet supported.
 - **VLM multiple forward passes:** VLM models may invoke the same visual-block
-  sequence twice per training step (image forward + video forward / FSDP dummy_forward).
-  `GetCnt` handles this by incrementing existing counts instead of resetting, ensuring
-  unique keys across passes.
+  sequence twice per training step (image forward + video forward / FSDP dummy_forward).
+  `GetCnt` handles this by incrementing existing counts instead of resetting, ensuring
+  unique keys across passes.
