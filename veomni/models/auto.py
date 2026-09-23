@@ -223,14 +223,18 @@ def build_foundation_model(
             "eager",
             "sdpa",
             "flash_attention_2",
+            "flash_attention_2_hub",
             "flash_attention_3",
+            "flash_attention_3_hub",
             "flash_attention_4",
             "flex_attention",
             "magi_attention",
             "veomni_flex_attention_with_sp",
             "veomni_magi_attention_with_sp",
             "veomni_flash_attention_2_with_sp",
+            "veomni_flash_attention_2_hub_with_sp",
             "veomni_flash_attention_3_with_sp",
+            "veomni_flash_attention_3_hub_with_sp",
             "veomni_flash_attention_4_with_sp",
             "native-sparse",
         ]
@@ -259,7 +263,9 @@ def build_foundation_model(
     from ..ops.config.singleton import get_ops_config
 
     if ops_implementation is not None:
-        attn_implementation = ops_implementation.attn_implementation
+        attn_implementation = OpsImplementationConfig.normalize_hub_attention_backend(
+            ops_implementation.attn_implementation
+        )
         _validate_attention_parallelism(attn_implementation)
         apply_ops_config(ops_implementation)
     else:
@@ -279,6 +285,7 @@ def build_foundation_model(
         # variant the user selected.
         if attn_implementation is None:
             attn_implementation = installed.attn_implementation
+        attn_implementation = OpsImplementationConfig.normalize_hub_attention_backend(attn_implementation)
         _validate_attention_parallelism(attn_implementation)
 
     if config_kwargs is None:
@@ -341,7 +348,9 @@ def build_foundation_model(
         "veomni_flex_attention_with_sp",
         "veomni_magi_attention_with_sp",
         "veomni_flash_attention_2_with_sp",
+        "veomni_flash_attention_2_hub_with_sp",
         "veomni_flash_attention_3_with_sp",
+        "veomni_flash_attention_3_hub_with_sp",
         "veomni_flash_attention_4_with_sp",
     ):
         logger.warning_rank0(

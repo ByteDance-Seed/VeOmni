@@ -1274,7 +1274,9 @@ class OpsImplementationConfig:
             "eager",
             "sdpa",
             "flash_attention_2",
+            "flash_attention_2_hub",
             "flash_attention_3",
+            "flash_attention_3_hub",
             "flash_attention_4",
             "flex_attention",
             "magi_attention",
@@ -1402,7 +1404,38 @@ class OpsImplementationConfig:
         },
     )
 
+    @staticmethod
+    def validate_hub_attention_backend(implementation: Optional[str]) -> None:
+        """Reject unsupported Hub attention requests before HF kernel preloading."""
+        if implementation not in (
+            "flash_attention_2_hub",
+            "flash_attention_3_hub",
+            "veomni_flash_attention_2_hub_with_sp",
+            "veomni_flash_attention_3_hub_with_sp",
+        ):
+            return
+
+        from ..utils.import_utils import is_torch_npu_available
+
+        if is_torch_npu_available():
+            raise ValueError(
+                f"{implementation} is not supported on Ascend NPU; "
+                "select a supported non-Hub attention backend instead."
+            )
+        if get_env("MODELING_BACKEND") != "veomni":
+            raise ValueError(f"{implementation} requires MODELING_BACKEND=veomni.")
+
+    @staticmethod
+    def normalize_hub_attention_backend(implementation: Optional[str]) -> Optional[str]:
+        """Validate Hub requests and resolve their registered VeOmni names."""
+        OpsImplementationConfig.validate_hub_attention_backend(implementation)
+        return {
+            "flash_attention_2_hub": "veomni_flash_attention_2_hub_with_sp",
+            "flash_attention_3_hub": "veomni_flash_attention_3_hub_with_sp",
+        }.get(implementation, implementation)
+
     def __post_init__(self):
+        self.attn_implementation = self.normalize_hub_attention_backend(self.attn_implementation)
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",

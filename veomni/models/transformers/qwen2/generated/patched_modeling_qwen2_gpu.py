@@ -157,6 +157,7 @@ def rotate_half(x):
 # Source: veomni.models.transformers.qwen2.qwen2_gpu_patch_gen_config
 # ======================================================================
 # ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
+@use_kernel_forward_from_hub("rotary_pos_emb")
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
