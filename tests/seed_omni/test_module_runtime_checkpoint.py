@@ -25,7 +25,7 @@ def _build_module_runtime(model: nn.Module, *, load_path: str | None = _RESUME_P
     runtime.model = model
     runtime.model_name = "test_module"
     runtime.args = SimpleNamespace(model_path="/tmp/hf-model", lora_config=None)
-    runtime.train = SimpleNamespace(checkpoint=SimpleNamespace(load_path=load_path))
+    runtime.train_args = SimpleNamespace(checkpoint=SimpleNamespace(load_path=load_path))
     runtime._has_trainable_parameters = None
     return runtime
 

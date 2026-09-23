@@ -19,6 +19,7 @@ base build sequence, and that the handful of places a *module* legitimately
 differs from a standalone model are the places that override it.
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -36,7 +37,7 @@ def _unbuilt(model: nn.Module | None = None, **args_fields) -> ModuleRuntime:
     runtime.model = model
     runtime.model_name = "vision_encoder"
     runtime.args = SimpleNamespace(model_path="/tmp/hf-model", lora_config=None, **args_fields)
-    runtime.train = None
+    runtime.train_args = None
     return runtime
 
 
@@ -180,6 +181,42 @@ def test_a_trainable_module_does_get_a_checkpoint_manager(monkeypatch):
 
     assert runtime.checkpoint == "manager"
     assert built == [runtime]
+
+
+def test_the_real_checkpoint_manager_reads_the_modules_train_args():
+    """The base manager reads ``runtime.train_args``; a module that stored its
+    training args under another name would resolve it on the wrapped model."""
+    from veomni.models.seed_omni.utils.checkpoint import OmniModuleCheckpointManager
+
+    runtime = _unbuilt(nn.Linear(2, 2), accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="fsdp2")))
+    checkpoint = SimpleNamespace(manager="dcp", load_path=None)
+    runtime.train_args = SimpleNamespace(checkpoint=checkpoint)
+
+    manager = OmniModuleCheckpointManager(runtime)
+
+    assert manager.config is checkpoint
+    assert manager.module_name == "vision_encoder"
+
+
+def test_the_constructor_stores_training_args_where_the_base_reads_them(monkeypatch):
+    for step in (
+        "setup",
+        "_build_model",
+        "_build_model_assets",
+        "_freeze_model_module",
+        "_build_parallelized_model",
+        "_scope_recompute_to_parallel_state",
+        "_build_optimizer",
+        "build_checkpoint",
+    ):
+        monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, **k: None)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+    train = SimpleNamespace(checkpoint=SimpleNamespace(load_path=None))
+    args = SimpleNamespace(accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope="module")))
+
+    runtime = ModuleRuntime(args, "vision_encoder", train=train)
+
+    assert vars(runtime)["train_args"] is train
 
 
 def test_a_module_the_lora_config_missed_stays_frozen_instead_of_failing():

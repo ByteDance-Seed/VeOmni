@@ -101,7 +101,7 @@ class ModuleRuntime(VeOmniModelRuntime):
     _global_accelerator: Optional["AcceleratorConfig"] = None
 
     args: "OmniModuleRuntimeArguments"
-    train: Optional["OmniTrainingArguments"] = None
+    train_args: Optional["OmniTrainingArguments"] = None
     _has_trainable_parameters: Optional[bool] = None
 
     def __init__(
@@ -115,7 +115,7 @@ class ModuleRuntime(VeOmniModelRuntime):
     ):
         self.args = args
         self.model_name = module_name
-        self.train = train
+        self.train_args = train
         self.optimizer = None
         self.lr_scheduler = None
         self._defer_parallelize = False
@@ -444,7 +444,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         :meth:`build_checkpoint` installs no checkpoint manager at all, so nothing
         would ever write its weights and it must load the released HF ones.
         """
-        load_path = self.train.checkpoint.load_path if self.train is not None else None
+        load_path = self.train_args.checkpoint.load_path if self.train_args is not None else None
         if not should_skip_hf_weight_load(load_path, self.args.lora_config):
             return False
 
