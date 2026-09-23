@@ -123,6 +123,16 @@ class ModelCheckpointManager:
     def trainable_only(self) -> bool:
         return bool(self.runtime.args.lora_config)
 
+    @property
+    def hf_export_assets(self) -> list:
+        """Sidecars an HF export writes beside the weights: config, tokenizer, processor.
+
+        The runtime's cached list. A SeedOmni V2 module overrides this to read
+        them off the live model instead, because there the assets are bound onto
+        the model rather than kept beside it.
+        """
+        return self.runtime.model_assets
+
     def step_dir(self, state: "TrainerState") -> str:
         """Root of this step's checkpoint, shared by every module of the job."""
         return layout.step_dir(self.config.save_path, state.global_step)
@@ -263,7 +273,7 @@ class ModelCheckpointManager:
 
         save_hf_safetensor(
             save_hf_safetensor_path=self.hf_export_dir(state),
-            model_assets=self.runtime.model_assets,
+            model_assets=self.hf_export_assets,
             ckpt_manager=self.config.manager,
             output_dir=self.config.output_dir,
             save_checkpoint_path=weights_path,
