@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU single-process tests for native MoE-LoRA via ``VeOmniLoraModel`` (Phase 2).
+"""CPU tests for native MoE-LoRA via ``VeOmniLoraModel`` (Phase 2).
 
 Exercises the injection + save/load contract *without* running the experts
 forward (which needs the fused kernel / distributed state), so the suite is
@@ -27,12 +27,15 @@ CPU-only and dependency-light:
   native weight load round-trips the adapter tensors bit-exact.
 * MoE mode is inferred from tensor shapes when the config lacks a
   ``veomni_lora`` block (stock-PEFT-style adapter).
+* A two-rank Gloo probe checks shared-LoRA FSDP2/EP gradient accumulation,
+  activation recomputation, and parameter updates without the fused GPU kernel.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -40,7 +43,12 @@ import torch
 import torch.nn as nn
 
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
-from veomni.lora.moe_layers import is_lora_independent_experts, is_lora_moe_experts, is_lora_shared_experts
+from veomni.lora.moe_layers import (
+    LoraSharedExperts,
+    is_lora_independent_experts,
+    is_lora_moe_experts,
+    is_lora_shared_experts,
+)
 from veomni.lora.state_dict import get_lora_state_dict, load_adapter_state_dict
 from veomni.lora.weight_loading import init_lora_parameter, load_lora_weights
 
@@ -113,6 +121,63 @@ def _randomize_lora_b(model: VeOmniLoraModel) -> None:
         for name, p in model.named_parameters():
             if ".lora_B." in name:
                 p.normal_(0.0, 0.02)
+
+
+class _SharedLoraAccumulationProbe(LoraSharedExperts):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self._forward_calls = getattr(self, "_forward_calls", 0) + 1
+        self._ensure_ep_grad_sync_hooks()
+        return self.gate_proj.lora_A["default"](x)
+
+
+def _shared_lora_ep_accumulation_worker(rank: int, rendezvous: str, checkpointed: bool, defer_reshard: bool) -> None:
+    import torch.distributed as dist
+    from torch.distributed._composable.fsdp import fully_shard
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard
+    from torch.utils.checkpoint import checkpoint
+
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        mesh = init_device_mesh("cpu", (2, 1), mesh_dim_names=("ep", "ep_fsdp"))
+        experts = _SharedLoraAccumulationProbe(ToyExperts(), r=RANK, lora_alpha=8)
+        fully_shard(experts, mesh=mesh["ep_fsdp"], shard_placement_fn=lambda param: Shard(1))
+        experts.set_gradient_divide_factor(2)
+        weight = experts.gate_proj.lora_A["default"].weight
+        initial = weight.to_local().clone()
+        optimizer = torch.optim.SGD([weight], lr=0.1)
+        state = SimpleNamespace(ep_enabled=True, ep_group=mesh["ep"].get_group())
+        with mock.patch("veomni.distributed.parallel_state.get_parallel_state", return_value=state):
+            # Two microbatches share one optimizer step. Each rank contributes
+            # (rank + 1) and 2 * (rank + 1), so the global gradient is 9.
+            for micro in (1, 2):
+                if defer_reshard:
+                    experts.set_reshard_after_backward(micro == 2)
+                x = torch.full((1, HIDDEN), float(micro * (rank + 1)))
+                output = checkpoint(experts, x, use_reentrant=False) if checkpointed else experts(x)
+                torch.testing.assert_close(output.sum(), (x @ initial.T).sum(), rtol=1e-6, atol=1e-6)
+                output.sum().backward()
+
+        assert experts._forward_calls == (4 if checkpointed else 2)
+        expected_grad = torch.full_like(initial, 4.5)  # FSDP divides the EP sum by world size.
+        torch.testing.assert_close(weight.grad.to_local(), expected_grad, rtol=0, atol=0)
+        optimizer.step()
+        torch.testing.assert_close(weight.to_local(), initial - 0.1 * expected_grad, rtol=1e-6, atol=1e-7)
+        replicas = [torch.empty_like(initial) for _ in range(2)]
+        dist.all_gather(replicas, weight.to_local(), group=state.ep_group)
+        torch.testing.assert_close(replicas[0], replicas[1], rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("checkpointed", [False, True])
+@pytest.mark.parametrize("defer_reshard", [False, True])
+def test_shared_lora_ep_gradient_accumulation(tmp_path, checkpointed, defer_reshard):
+    torch.multiprocessing.spawn(
+        _shared_lora_ep_accumulation_worker,
+        args=(str(tmp_path / "rendezvous"), checkpointed, defer_reshard),
+        nprocs=2,
+    )
 
 
 @pytest.mark.parametrize("mode", ["independent", "shared"])
