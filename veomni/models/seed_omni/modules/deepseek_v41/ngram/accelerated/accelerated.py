@@ -42,6 +42,7 @@ from torch.distributed._tensor import Shard
 
 from .......distributed.parallel_plan import ParallelPlan
 from .....mixins.base_mixin import BaseMixin
+from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem
 from ...quant_scheme import quantized_storage_dtype
@@ -94,7 +95,15 @@ class TrainingMixin(TrainingModuleMixin):
         }
 
 
-class VeOmniMixin(BaseMixin, TrainingMixin):
+class MeterMixin(MetricMeterMixin):
+    """Token count only: the gather has no FLOPs worth reporting against the backbone."""
+
+    def estimate_flops(self, seqlens: List[int]) -> float:
+        del seqlens
+        return 0.0
+
+
+class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
     """Family assembly plus the table-sharding plan."""
 
     def get_parallel_plan(self) -> ParallelPlan:
