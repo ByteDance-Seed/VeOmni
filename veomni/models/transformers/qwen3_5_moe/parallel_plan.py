@@ -7,6 +7,8 @@ def get_parallel_plan():
     ep_plan = {
         "model.language_model.layers.*.mlp.experts.gate_up_proj": Shard(0),
         "model.language_model.layers.*.mlp.experts.down_proj": Shard(0),
+        "mtp.layers.*.mlp.experts.gate_up_proj": Shard(0),
+        "mtp.layers.*.mlp.experts.down_proj": Shard(0),
     }
     parallel_plan = ParallelPlan(
         extra_parallel_plan={

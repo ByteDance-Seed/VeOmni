@@ -8,11 +8,11 @@ import torch.nn as nn
 from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import Qwen3Model
 
 from ...base.llm_packing import SimpleArGenerationMixin
-from ...module_modeling_base import OmniPreTrainedModel
+from ...module_modeling_base import PretrainedOmniModule
 from .configuration import Qwen3LlmConfig
 
 
-class Qwen3Llm(SimpleArGenerationMixin, OmniPreTrainedModel):
+class Qwen3Llm(SimpleArGenerationMixin, PretrainedOmniModule):
     """Qwen3 backbone (no wte, no lm_head).
 
     Multi-modal inputs are already embedded by the sibling text encoder and live

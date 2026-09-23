@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from transformers import PretrainedConfig
+from ...module_configuration_base import OmniModuleConfig
 
 
-class FakeModuleBConfig(PretrainedConfig):
+class FakeModuleBConfig(OmniModuleConfig):
     """Minimal OmniModule config used to exercise the composite save/load path."""
 
     model_type = "fake_module_b"

@@ -6,10 +6,10 @@ The ``model_type`` string is the lookup key used by
 ``TextEncoder.__init__``.
 """
 
-from transformers import PretrainedConfig
+from ...module_configuration_base import OmniModuleConfig
 
 
-class TextEncoderConfig(PretrainedConfig):
+class TextEncoderConfig(OmniModuleConfig):
     """Config for the generic word-token embedding + LM head module.
 
     Parameters

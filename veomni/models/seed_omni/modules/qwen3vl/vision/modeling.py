@@ -1,6 +1,6 @@
 """Qwen3-VL vision tower (ViT + patch merger + deepstack mergers).
 
-``Qwen3VLVisionEncoder(InferenceMixin, OmniPreTrainedModel)`` — HF
+``Qwen3VLVisionEncoder(InferenceMixin, PretrainedOmniModule)`` — HF
 vision stack in this file; graph hooks in ``accelerated.py``.
 
 The ``forward`` returns two payloads consumed by the backbone:
@@ -29,7 +29,7 @@ from veomni.utils.device import IS_NPU_AVAILABLE
 from ......distributed.parallel_state import get_parallel_state
 from ......models.checkpoint_tensor_loading import ConvertedCheckpointTensor
 from ....utils.conversation import ConversationItem
-from ...module_modeling_base import OmniPreTrainedModel
+from ...module_modeling_base import PretrainedOmniModule
 from .configuration import Qwen3VLVisionEncoderConfig
 from .processing import (
     _OMNI_GRID,
@@ -170,7 +170,7 @@ class _MergerProjectionConverter:
     match (standard Qwen3-VL load) nothing is dropped.
     """
 
-    def __init__(self, model: "OmniPreTrainedModel"):
+    def __init__(self, model: "PretrainedOmniModule"):
         self._model = model
 
     def can_handle(self, name: str) -> bool:
@@ -197,7 +197,7 @@ class InferenceMixin:
     """FSM ``generate`` — reads patchified image/video items, runs the ViT, scatters
     merged tokens + DeepStack features back onto the carrier.
 
-    Listed *before* :class:`~...module_modeling_base.OmniPreTrainedModel` in
+    Listed *before* :class:`~...module_modeling_base.PretrainedOmniModule` in
     :class:`Qwen3VLVisionEncoder`'s bases so MRO resolves this concrete
     ``generate`` (there are no inference-state resets to worry about shadowing
     here — this module is stateless across FSM steps).
@@ -231,7 +231,7 @@ class InferenceMixin:
         return {"conversation_list": conversation_list}
 
 
-class Qwen3VLVisionEncoder(InferenceMixin, OmniPreTrainedModel):
+class Qwen3VLVisionEncoder(InferenceMixin, PretrainedOmniModule):
     """Qwen3-VL vision tower for image understanding."""
 
     config_class = Qwen3VLVisionEncoderConfig
@@ -261,7 +261,7 @@ class Qwen3VLVisionEncoder(InferenceMixin, OmniPreTrainedModel):
         self.post_init()
 
     @staticmethod
-    def _create_checkpoint_tensor_converter(model: "OmniPreTrainedModel") -> _MergerProjectionConverter:
+    def _create_checkpoint_tensor_converter(model: "PretrainedOmniModule") -> _MergerProjectionConverter:
         return _MergerProjectionConverter(model)
 
     def freeze_model(self) -> None:

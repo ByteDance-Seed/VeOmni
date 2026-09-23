@@ -1,6 +1,6 @@
 """Janus LLaMA backbone (no wte / lm_head).
 
-``JanusLlama(InferenceMixin, OmniPreTrainedModel)`` — patched
+``JanusLlama(InferenceMixin, PretrainedOmniModule)`` — patched
 ``LlamaModel`` with ``embed_tokens = Identity``; ``inputs_embeds`` come from
 the text-encoder node.  Packing / FSDP dummy anchors live in ``accelerated.py``.
 
@@ -41,15 +41,15 @@ from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_posit
 
 from ....utils.conversation import ConversationItem
 from ...base.llm_packing import pack_llm_conversations_for_forward
-from ...module_modeling_base import OmniPreTrainedModel
+from ...module_modeling_base import PretrainedOmniModule
 from .configuration import JanusLlamaConfig
 
 
 class InferenceMixin:
     """FSM ``generate`` (with classifier-free guidance) — HF ``GenerationMixin`` analog.
 
-    Listed *before* :class:`~...module_modeling_base.OmniPreTrainedModel` in
-    :class:`JanusLlama`'s bases: ``OmniPreTrainedModel`` ships no-op
+    Listed *before* :class:`~...module_modeling_base.PretrainedOmniModule` in
+    :class:`JanusLlama`'s bases: ``PretrainedOmniModule`` ships no-op
     ``reset_local_inference_state`` / ``reset_global_inference_state`` defaults
     (kept as a safety net for modules that don't need real inference state),
     and MRO resolves left-to-right — put second, those no-ops would shadow the
@@ -167,7 +167,7 @@ class InferenceMixin:
         raise TypeError(f"Unexpected hidden_states shape: {tuple(hidden_states.shape)}")
 
 
-class JanusLlama(InferenceMixin, OmniPreTrainedModel):
+class JanusLlama(InferenceMixin, PretrainedOmniModule):
     """LLaMA backbone (no wte, no lm_head).
 
     Multi-modal inputs are already embedded by the sibling encoder modules

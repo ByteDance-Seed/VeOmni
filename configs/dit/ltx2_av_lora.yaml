@@ -146,7 +146,7 @@ data:
 # Training Configuration
 # -----------------------------------------------------------------------------
 # train.* maps to DiTTrainingArguments (extends TrainingArguments).
-# Note: DiTTrainer._setup() overrides dyn_bsz=False and micro_batch_size=1.
+# Note: DiTTrainer._setup() forces dyn_bsz=False but honors micro_batch_size.
 train:
   # LTX-2.3 only supports "offline_training" (pre-computed Gemma features + VAE latents).
   # Run preprocess_dataset.py first to generate latents, conditions, and optionally audio_latents.

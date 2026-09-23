@@ -52,8 +52,9 @@ See the :class:`~veomni.models.seed_omni.graphs.training_graph.TrainingGraph` an
 docstrings for the full schema.
 """
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 
 END: str = "end"
@@ -156,3 +157,22 @@ class EdgeDef:
     def is_sink(self) -> bool:
         """True iff this edge terminates at the virtual ``end`` sink."""
         return self.to == END
+
+
+def validate_graph_modules(nodes: Iterable[NodeDef], modules: Mapping[str, Any]) -> None:
+    """Every endpoint must name a provided module and an existing method."""
+    unknown = sorted({node.module for node in nodes} - set(modules))
+    if unknown:
+        raise ValueError(f"Omni graphs reference modules that are not loaded: {unknown}. Loaded: {sorted(modules)}.")
+    missing: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for node in nodes:
+        key = (node.module, node.method)
+        if key in seen:
+            continue
+        seen.add(key)
+        module = modules[node.module]
+        if getattr(module, node.method, None) is None:
+            missing.append(f"{type(module).__name__}.{node.method}")
+    if missing:
+        raise ValueError(f"Omni graphs reference methods that are not implemented on the loaded modules: {missing}.")

@@ -15,7 +15,7 @@ class InferenceMixin:
     """generate() + FSM inference state — analogous to HF's GenerationMixin."""
     ...
 
-class BagelFlowConnector(InferenceMixin, OmniPreTrainedModel):
+class BagelFlowConnector(InferenceMixin, PretrainedOmniModule):
     ...
 
 # accelerated/accelerated.py
@@ -39,8 +39,8 @@ class InferenceMixin:
     """generate() + FSM state — omit if the module isn't inference-capable."""
     def generate(self, conversation_list=None, **kwargs): ...
 
-class Xxx(InferenceMixin, OmniPreTrainedModel):
-    """InferenceMixin listed FIRST: OmniPreTrainedModel ships no-op
+class Xxx(InferenceMixin, PretrainedOmniModule):
+    """InferenceMixin listed FIRST: PretrainedOmniModule ships no-op
     reset_local_inference_state / reset_global_inference_state / finalize
     defaults, and MRO resolves left-to-right — second, those no-ops would
     shadow the real implementations above."""
@@ -64,7 +64,7 @@ class XxxAccelerated(VeOmniMixin, Xxx):
 
 A handful of backbones (`qwen3/llm`, `qwen3_moe/llm`) share a family-wide
 `SimpleArGenerationMixin` (`modules/base/llm_packing.py`) instead of a
-per-module `InferenceMixin` — same rule: listed before `OmniPreTrainedModel`.
+per-module `InferenceMixin` — same rule: listed before `PretrainedOmniModule`.
 
 Do **not** put modeling logic in the `TrainingMixin` stubs. Stubs are for
 static analysis and navigation only.

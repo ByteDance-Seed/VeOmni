@@ -55,6 +55,7 @@ by a `pytest.param` table, so a new case is a few lines:
 | `torch.compile` support | `tests/distributed/test_torch_compile.py` |
 | Ulysses SP behaviour | `tests/parallel/ulysses/test_ulysses.py` and siblings |
 | Checkpoint callback / DCP round-trip | `tests/checkpoints/test_checkpoint_callback.py`, `test_trainer_saveload.py` |
+| DiT resume / noise-stream equivalence | `tests/checkpoints/test_dit_resume_align.py` |
 | Weight loading / broadcast / EP shard | `tests/utils/test_rank0_load_and_broadcast_weights.py`, `test_moe_ep_sharded_load_matrix.py` |
 | Grad clipping with ExtraParallel | `tests/utils/test_extra_parallel_clip_grad_norm.py` |
 | FLOPs / MFU accounting | `tests/utils/test_count_flops.py` |

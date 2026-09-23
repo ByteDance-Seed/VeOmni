@@ -64,7 +64,7 @@ class InferenceMixin:
     def generate(self, conversation_list=None, generation_kwargs=None, **kwargs):
         ...  # one FSM inference step (sample / embed) — CFG cache, etc.
 
-class JanusLlama(InferenceMixin, OmniPreTrainedModel):
+class JanusLlama(InferenceMixin, PretrainedOmniModule):
     def forward(self, ...): ...
 
 # accelerated/accelerated.py — VeOmni-only. Owns training-graph hooks; no InferenceMixin.
@@ -99,19 +99,19 @@ Each module's ``modeling.py`` defines its own ``InferenceMixin`` holding
 ``generate()`` plus whatever FSM inference state / sampling helpers it needs
 (`reset_local_inference_state`, `reset_global_inference_state`, `finalize`,
 top-p / sampling utilities, …). The model class lists it **first**:
-``class JanusLlama(InferenceMixin, OmniPreTrainedModel)``. Order matters:
-``OmniPreTrainedModel`` ships dead-by-default `reset_local_inference_state` /
+``class JanusLlama(InferenceMixin, PretrainedOmniModule)``. Order matters:
+``PretrainedOmniModule`` ships dead-by-default `reset_local_inference_state` /
 `reset_global_inference_state` / `finalize` stubs (kept as a safety net for
 modules that don't need real inference state — e.g. the FSM runtime's
 unconditional `module.finalize(ctx=...)` call), and Python MRO resolves
-left-to-right, so listing `OmniPreTrainedModel` first would let those no-ops
+left-to-right, so listing `PretrainedOmniModule` first would let those no-ops
 silently shadow the real implementations in `InferenceMixin`.
 
 `accelerated/accelerated.py` needs **no `InferenceMixin`** of its own any more:
 `generate()` / `reset_*` / `finalize` reach the accelerated wrapper unshadowed
 through normal inheritance from the native class (`JanusLlamaAccelerated`
 inherits `JanusLlama`, which already has the real `InferenceMixin` ahead of
-`OmniPreTrainedModel` in its own MRO). Only add accelerated-only inference
+`PretrainedOmniModule` in its own MRO). Only add accelerated-only inference
 behavior by overriding the relevant method directly on the `Accelerated`
 class if it genuinely differs from native inference — do not reintroduce an
 empty `InferenceMixin` marker in `accelerated/accelerated.py`.
@@ -119,7 +119,7 @@ empty `InferenceMixin` marker in `accelerated/accelerated.py`.
 A few backbones (`qwen3/llm`, `qwen3_moe/llm`) share a family-wide
 `SimpleArGenerationMixin` (`modules/base/llm_packing.py`) instead of a
 per-module `InferenceMixin` — same MRO rule applies: it's listed before
-`OmniPreTrainedModel`.
+`PretrainedOmniModule`.
 
 #### IDE type stubs (static analysis only)
 
@@ -561,11 +561,11 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 2. **Write each module** under
    `veomni/models/seed_omni/modules/<family>/<sub>/`:
    - `configuration.py` — a `PretrainedConfig` with a unique `model_type`.
-   - `modeling.py` — `class X(InferenceMixin, OmniPreTrainedModel)` — pure
+   - `modeling.py` — `class X(InferenceMixin, PretrainedOmniModule)` — pure
      HF-native: `__init__`, submodule layout, `forward` on `X`, and (if
      inference-capable) an in-file `InferenceMixin` (§2.1) holding the FSM
      `generate()` plus its state/helpers, listed **before**
-     `OmniPreTrainedModel` in `X`'s bases. This class must load and run under
+     `PretrainedOmniModule` in `X`'s bases. This class must load and run under
      plain `from_pretrained` with no VeOmni import.
    - `accelerated/accelerated.py` — `TrainingMixin` / `VeOmniMixin` (no `InferenceMixin` —
      see §2.1) **and** IDE type stubs for native APIs those training hooks
@@ -632,7 +632,7 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 | `mixins/base_mixin.py` | shared assets, `_omni_hook_name` registry |
 | `mixins/training_module_mixin.py` | `pre_forward` / `post_forward` dispatch |
 | `mixins/inference_module_mixin.py` | live `reset_*` / `finalize` hooks, plus `pre_generate` / `post_generate` dispatchers that nothing invokes (both FSM drivers call endpoints directly — see §2.1) |
-| `modules/module_modeling_base.py` | `OmniPreTrainedModel` — base for every native `modeling.py` class; ships no-op `reset_local_inference_state` / `reset_global_inference_state` / `finalize` defaults, shadowed by each module's `InferenceMixin` (§2.1) |
+| `modules/module_modeling_base.py` | `PretrainedOmniModule` — base for every native `modeling.py` class; ships no-op `reset_local_inference_state` / `reset_global_inference_state` / `finalize` defaults, shadowed by each module's `InferenceMixin` (§2.1) |
 | `mixins/metric_meter_mixin.py` | `MetricMeterMixin` / `MetricMeterResult` (optional per-module FLOPs meter) |
 | `utils/conversation.py` | `ConversationItem` + carrier helpers |
 | `utils/convert_registry.py` | HF → split-checkpoint conversion registry |

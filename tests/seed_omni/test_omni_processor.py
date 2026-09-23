@@ -90,7 +90,7 @@ def test_omni_processor_from_pretrained_collects_module_preprocessors(
 ):
     del mock_read_model_type
     mock_from_pretrained.return_value = OmniConfig(
-        modules={"encoder": {"subfolder": "encoder"}},
+        _module_entries={"encoder": {"model_path": "encoder"}},
         training_graphs={"default": [{"from": "encoder", "to": "end"}]},
         generation_graphs={"infer_gen": {"initial": "run", "states": {}}},
     )
@@ -116,10 +116,10 @@ def test_omni_processor_from_config_forwards_module_model_config_overrides(mock_
     fake_mod_cls = MagicMock()
     mock_registry.__getitem__.return_value = MagicMock(return_value=fake_mod_cls)
     config = OmniConfig(
-        modules={
+        _module_entries={
             "encoder": {
-                "subfolder": "encoder",
-                "model": {"model_config": {"enable_image": True}},
+                "model_path": "encoder",
+                "model_config": {"enable_image": True},
             }
         },
         training_graphs={"default": [{"from": "encoder", "to": "end"}]},
@@ -141,9 +141,9 @@ def test_omni_processor_from_config_forwards_module_processor_config(mock_read_m
     fake_mod_cls = MagicMock()
     mock_registry.__getitem__.return_value = MagicMock(return_value=fake_mod_cls)
     config = OmniConfig(
-        modules={
+        _module_entries={
             "encoder": {
-                "subfolder": "encoder",
+                "model_path": "encoder",
                 "processor_config": {"packed_preprocess": True},
             }
         },

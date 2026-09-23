@@ -12,7 +12,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
 from transformers.utils import ModelOutput
 
 from ....utils.conversation import ConversationItem, get_tail_output_item
-from ...module_modeling_base import OmniPreTrainedModel
+from ...module_modeling_base import PretrainedOmniModule
 from ..sources import BAGEL_FLOW_HIDDEN, BAGEL_FLOW_QUERY, BAGEL_FLOW_VELOCITY, BAGEL_START_TOKEN
 from .configuration import BagelQwen2MoTConfig
 from .generation_state import MotGenerationState
@@ -44,7 +44,7 @@ class InferenceMixin:
     """FSM ``generate`` / serial denoise / velocity-collection — HF ``GenerationMixin`` analog.
 
     Listed *before* :class:`BagelQwen2MoTCore` (and therefore before
-    :class:`~...module_modeling_base.OmniPreTrainedModel`): the pretrained
+    :class:`~...module_modeling_base.PretrainedOmniModule`): the pretrained
     base ships a no-op ``reset_local_inference_state``, and MRO resolves
     left-to-right — put second, that no-op would shadow the real one below.
     """
@@ -428,7 +428,7 @@ class InferenceMixin:
         return NaiveCache(len(self.model.layers))
 
 
-class BagelQwen2MoTCore(OmniPreTrainedModel):
+class BagelQwen2MoTCore(PretrainedOmniModule):
     """Shared weights, packed train/infer forward, and generation-state shell.
 
     Public eager and accelerated classes mix their inference mixins onto this

@@ -1,9 +1,9 @@
 """Configuration for BAGEL's VAE/LLM flow connector."""
 
-from transformers import PretrainedConfig
+from ...module_configuration_base import OmniModuleConfig
 
 
-class BagelFlowConnectorConfig(PretrainedConfig):
+class BagelFlowConnectorConfig(OmniModuleConfig):
     """BAGEL latent-token connector config."""
 
     model_type = "bagel_flow_connector"

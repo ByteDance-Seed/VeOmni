@@ -237,7 +237,7 @@ Config split:
 | Layer | Config source | Owns |
 |-------|---------------|------|
 | **OmniModel** | `OmniConfig`, projected from `OmniModelRuntimeConfig.to_hf_config()` | graph topology, module wiring |
-| **OmniModuleConfig** | `OmniConfig.modules[name]` descriptor (`modules/module_configuration_base.py`) | subfolder / `model_path` / `model_config` / processor / hydrate / HF export slim |
+| **OmniModuleConfig** | `OmniConfig._module_configs[name]`, loaded from the module subfolder (`modules/module_configuration_base.py`); the root's `_module_entries[name]` keeps the overwrite fields | `model_path` / `ops_implementation` / `model_config` / `processor_config` |
 | **ModuleRuntime** | slim `OmniModuleRuntimeConfig` (`accelerated/omni_module/omni_module_config.py`; aliased as `OmniModuleRuntimeArguments`) + launcher `train` | FSDP (or deferred wrap when `fsdp_scope='model'`), optimizer, checkpoint per module |
 | **OmniModelRuntime** | `OmniModelRuntimeConfig` (`accelerated/omni_model/omni_model_config.py`; aliased as `OmniModelRuntimeArguments`) via `from_model_runtime()` | graph loops, module runtimes, graph trace, metering |
 | **OmniTrainer** | launcher YAML + `OmniArguments` | dist init, dataloader, train loop, multi-opt |
@@ -266,16 +266,20 @@ separate explicit step, `.to_hf_config()`, taken only where an HF artefact is ne
 Graph-only consumers such as `scripts/visualize_omni_graph.py` use the runtime config
 directly and never convert.
 
-`OmniConfig.from_pretrained()` hydrates each module entry into a `PretrainedConfig` by
-reading the module subfolder's `config.json`. Hydration destroys the descriptor's
-`model` block, so `_stash_module_load_options()` captures each entry's launcher-shaped
-fields first; `module_runtime_fields()` / `module_ops_implementation()` read that stash.
+`OmniConfig` keeps two views of every module. `_module_entries[name]` is the root
+`config.json` entry, holding only the overwrite fields (`model_path`,
+`ops_implementation`, `model_config`, `processor_config`). `_module_configs[name]` is
+the typed `OmniModuleConfig` loaded from the module subfolder with that entry applied.
+`OmniConfig.from_pretrained()` builds both; an entry that is not an `OmniModuleConfig`
+raises at load, not at convert time. `to_dict()` writes each entry's `model_path` as the
+module name, so a saved root always points at its own subfolders;
+`resolve_module_path(root, name)` turns it back into a path.
 
 **Per-module settings resolve in four layers**, widest first, in
 `build_module_runtime_args`:
 
 1. the launcher's global `model:` block (`_module_base`),
-2. what the checkpoint persisted for that module (`OmniConfig.module_runtime_fields`),
+2. what the checkpoint persisted for that module (`OmniConfig._module_entries[name]`, via `_checkpoint_module_fields`),
 3. the synthesized `fsdp_mode: eager` inference default (`for_inference=True` only),
 4. the launcher's per-module `modules:` YAML.
 
@@ -305,12 +309,12 @@ says it has nothing to say about a key (`accelerator: {}`, a bare module name un
 An `accelerator` block in layer 2 therefore only ever comes from a hand-written
 `config.json`, and only the VeOmni runtime consumes it: `OmniModel.from_pretrained` has no
 parallelism to configure and reads `ops_implementation` alone
-(`_build_module_load_kwargs`, which also hands it to HF as `attn_implementation`).
+(`OmniModel._load_modules` installs each module config's kernels around that module's load).
 
 `OmniConfig` itself (`configuration_omni.py`) is a plain `PretrainedConfig` and imports
 nothing from `veomni.arguments`: it only reads/writes a checkpoint root. Per-module
-descriptor conversion (subfolder, `model_path`, hydrate, export slim) lives on
-`OmniModuleConfig` in `modules/module_configuration_base.py`. The accelerated
+config loading and path resolution (`OmniModuleConfig.from_pretrained` / `resolve_path`)
+live on `OmniModuleConfig` in `modules/module_configuration_base.py`. The accelerated
 counterparts are `OmniModuleRuntimeConfig` / `OmniModelRuntimeConfig` in
 `accelerated/omni_module/` and `accelerated/omni_model/` (aliased as
 `OmniModuleRuntimeArguments` / `OmniModelRuntimeArguments`
@@ -399,6 +403,16 @@ build_omni_model_runtime() / resolve_omni_model()  build_module_runtime_args()  
 5. Apply VeOmni patches (flash attention, sequence parallel hooks)
 6. Load weights (`load_model_weights()` or `rank0_load_and_broadcast_weights()`)
 7. Apply parallelization (`build_parallelize_model()`)
+
+## DiT Fixed Microbatches
+
+`DiTTrainer` honors `train.micro_batch_size` and keeps `dyn_bsz=false`.
+`DiTDataCollator` produces dict-of-lists microbatches; the existing
+`get_condition` / `process_condition` / model-forward path is unchanged.
+Models return sample-mean scalar losses, and the trainer divides by the number
+of accumulation microbatches. Packing and SP/CP handling remain model-owned.
+Offline embedding allows multiple samples but keeps one microbatch per step.
+See `docs/usage/dit_microbatching.md`.
 
 ## Parallelization Flow
 

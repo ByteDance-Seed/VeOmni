@@ -1,6 +1,6 @@
 """Janus VQVAE codec + generation projection head.
 
-``JanusVqvae(InferenceMixin, OmniPreTrainedModel)`` — codec weights here;
+``JanusVqvae(InferenceMixin, PretrainedOmniModule)`` — codec weights here;
 encode/decode graph hooks in ``accelerated.py``.
 
 Call-site split
@@ -36,7 +36,7 @@ from veomni.utils import helper
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....utils.conversation import ConversationItem, maybe_merge_outputs, seal_outputs
-from ...module_modeling_base import OmniPreTrainedModel
+from ...module_modeling_base import PretrainedOmniModule
 from .configuration import JanusVqvaeConfig
 from .processing import JanusVqvaePreprocessor, JanusVqvaeProcessor
 
@@ -47,8 +47,8 @@ logger = helper.create_logger(__name__)
 class InferenceMixin:
     """FSM ``generate`` (VQ AR sampling + CFG) — HF ``GenerationMixin`` analog.
 
-    Listed *before* :class:`~...module_modeling_base.OmniPreTrainedModel` in
-    :class:`JanusVqvae`'s bases: ``OmniPreTrainedModel`` ships a no-op
+    Listed *before* :class:`~...module_modeling_base.PretrainedOmniModule` in
+    :class:`JanusVqvae`'s bases: ``PretrainedOmniModule`` ships a no-op
     ``finalize`` default (kept as a safety net for modules that don't need
     real inference state), and MRO resolves left-to-right — put second, that
     no-op would shadow the real one below.
@@ -217,7 +217,7 @@ class JanusVqvaeVectorQuantizer(JanusVQVAEVectorQuantizer):
         return quantized, loss, min_encoding_indices
 
 
-class JanusVqvae(InferenceMixin, OmniPreTrainedModel):
+class JanusVqvae(InferenceMixin, PretrainedOmniModule):
     """VQVAE + generation head for Janus VQ image generation.
 
     The VQVAE encoder/decoder is frozen by default (matching the Janus

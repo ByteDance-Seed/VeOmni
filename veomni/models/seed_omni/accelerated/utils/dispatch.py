@@ -8,7 +8,7 @@ from typing import Any
 import torch.nn as nn
 
 from ...mixins.base_mixin import BaseMixin
-from ...modules.module_modeling_base import OmniPreTrainedModel
+from ...modules.module_modeling_base import PretrainedOmniModule
 
 
 def unwrap_module_chain(wrapped: nn.Module) -> nn.Module:
@@ -56,8 +56,9 @@ def unwrap_graph_module(wrapped: nn.Module, *, module_name: str) -> nn.Module:
     common case is a :class:`BaseMixin`, which owns graph endpoint methods and
     the shared :meth:`~veomni.models.seed_omni.mixins.base_mixin.BaseMixin._omni_hook_name`
     registry.  Training call-sites dispatch ``pre_forward`` / ``post_forward``
-    through :class:`TrainingModuleMixin`; inference call-sites call the endpoint
-    directly, with no hooks (see :func:`.executor.execute_generation_node`).
+    through :class:`TrainingModuleMixin`; inference call-sites dispatch
+    ``pre_generate`` / ``post_generate`` through :class:`InferenceModuleMixin`
+    (see :func:`.executor.execute_generation_node`).
     FSDP2 is composable and leaves the module itself as the
     callable object; DDP-style wrappers expose the mixin through ``.module``.
 
@@ -75,18 +76,18 @@ def unwrap_graph_module(wrapped: nn.Module, *, module_name: str) -> nn.Module:
     need to return the inner :class:`BaseMixin` here.
 
     A ``fsdp_mode: eager`` module (``ModuleRuntime._init_eager_inference`` in
-    ``omni_module_runtime.py``) is a bare native :class:`OmniPreTrainedModel` from
+    ``omni_module_runtime.py``) is a bare native :class:`PretrainedOmniModule` from
     plain ``from_pretrained`` — no FSDP/DDP wrap, no ``BaseMixin``. It is only
     reachable from generation nodes (training always builds the wrapped
     ``BaseMixin`` path — eager is gated behind ``for_inference``), which need
     no ``pre_forward``/``post_forward``, so it dispatches straight through.
     """
     raw = unwrap_module_chain(wrapped)
-    if isinstance(raw, (BaseMixin, OmniPreTrainedModel)):
+    if isinstance(raw, (BaseMixin, PretrainedOmniModule)):
         return raw
     raise TypeError(
         f"Graph module '{module_name}' must be a BaseMixin (or eager "
-        f"OmniPreTrainedModel) or wrap one on `.module` / LoRA base; got "
+        f"PretrainedOmniModule) or wrap one on `.module` / LoRA base; got "
         f"{type(wrapped).__name__} (resolved {type(raw).__name__})."
     )
 

@@ -32,7 +32,8 @@ stays in ``arguments/`` to avoid an arguments ↔ accelerated import cycle.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass
 
 from .....arguments.arguments_types import ModelArguments
 
@@ -57,32 +58,39 @@ class OmniModuleRuntimeConfig(ModelArguments):
     is the projection onto an HF module descriptor.
     """
 
-    def to_hf_config(self, module_name: str) -> dict:
-        """Project onto this module's slim :class:`OmniModuleConfig` descriptor.
+    def to_hf_config(self) -> dict:
+        """Project onto this module's ``OmniConfig._module_entries`` entry.
 
-        ``model_path`` is carried through explicitly (not just ``subfolder:
-        module_name``): by the time this runs, ``build_module_runtime_args`` /
-        ``_resolve_model_path`` has already resolved it to an absolute path —
-        usually ``<checkpoint_root>/<module_name>``, but a launcher YAML module
-        override may point it at a wholly different checkpoint (e.g. Qwen3
-        visual-instruction-tuning composing ``qwen3_llm``/``qwen3_text_encoder``
-        from one HF model with ``qwen3vl_vision`` from another). Dropping it
-        and re-deriving ``checkpoint_root/module_name`` downstream (as
+        The module's name is the key that entry is filed under, so it is not
+        repeated inside it.
+
+        ``model_path`` is carried through explicitly: by the time this runs,
+        ``build_module_runtime_args`` / ``_resolve_model_path`` has already
+        resolved it to an absolute path — usually ``<checkpoint_root>/<name>``,
+        but a launcher YAML module override may point it at a wholly different
+        checkpoint (e.g. Qwen3 visual-instruction-tuning composing
+        ``qwen3_llm``/``qwen3_text_encoder`` from one HF model with
+        ``qwen3vl_vision`` from another). Dropping it and re-deriving
+        ``checkpoint_root/name`` downstream (as
         :meth:`~veomni.models.seed_omni.modules.module_configuration_base.OmniModuleConfig.resolve_path`
-        does for anything without an explicit ``model_path``) would silently
-        resolve to the wrong path for that module.
+        does for an entry without one) would silently resolve to the wrong path
+        for that module.
+
+        Kernels are projected too, so a checkpoint remembers what each module
+        was trained with: ``build_module_runtime_args`` layers the entry under
+        the launcher's per-module YAML, and a bare ``OmniModel.from_pretrained``
+        applies it to the module config.
         """
-        from dataclasses import asdict
-
-        from ...modules.module_configuration_base import OmniModuleConfig
-
-        return OmniModuleConfig.from_runtime(
-            module_name,
-            model_path=self.model_path,
-            model_config=hf_module_model_config(self.model_config),
-            processor_config=self.processor_config,
-            ops_implementation=asdict(self.ops_implementation),
-        )
+        entry: dict = {}
+        if self.model_path:
+            entry["model_path"] = self.model_path
+        if self.ops_implementation is not None:
+            entry["ops_implementation"] = asdict(self.ops_implementation)
+        if model_config := hf_module_model_config(self.model_config):
+            entry["model_config"] = deepcopy(model_config)
+        if self.processor_config:
+            entry["processor_config"] = deepcopy(self.processor_config)
+        return entry
 
 
 __all__ = [

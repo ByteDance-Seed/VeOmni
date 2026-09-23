@@ -20,7 +20,7 @@ from torch.nn.functional import scaled_dot_product_attention
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 from ....utils.conversation import ConversationItem, iter_desired_items
-from ...module_modeling_base import OmniPreTrainedModel
+from ...module_modeling_base import PretrainedOmniModule
 from ..sources import BAGEL_SIGLIP_CONTEXT
 
 
@@ -100,7 +100,7 @@ def scatter_siglip_image_embeds(
 class InferenceMixin:
     """FSM ``generate`` — HF ``GenerationMixin`` analog.
 
-    Listed *before* :class:`~...module_modeling_base.OmniPreTrainedModel` in
+    Listed *before* :class:`~...module_modeling_base.PretrainedOmniModule` in
     :class:`BagelSiglipNavit`'s bases for consistency with every other
     module's native / accelerated split (see ``janus/llama/modeling.py`` for
     the full MRO rationale where a competing no-op default exists).
@@ -130,7 +130,7 @@ class InferenceMixin:
         return {"conversation_list": batched[0]}
 
 
-class BagelSiglipNavit(InferenceMixin, OmniPreTrainedModel):
+class BagelSiglipNavit(InferenceMixin, PretrainedOmniModule):
     config_class = BagelSiglipNavitConfig
     image_processor_class = BagelSiglipNavitProcessor
     preprocessor_class = BagelSiglipNavitPreprocessor

@@ -141,6 +141,7 @@ class DataCollateInfo:
 DEFAULT_DATA_COLLATE_INFO: Dict[str, DataCollateInfo] = {
     "input_ids": DataCollateInfo(-1, True, 0, 1),
     "labels": DataCollateInfo(-1, True, IGNORE_INDEX, 1),
+    "mtp_labels": DataCollateInfo(-1, True, IGNORE_INDEX, 1),
     "attention_mask": DataCollateInfo(-1, False, 1, 1),
     "position_ids": DataCollateInfo(-1, False, 0, 1),
     "pixel_values": DataCollateInfo(0, True, 0, 4),
@@ -454,6 +455,7 @@ class MainCollator(DataCollator):
     """
 
     def __post_init__(self):
+        """Build the ordered collation pipeline and merge model-specific field rules."""
         self.preforward_pipeline = []
         self.collate_infos: Dict[str, DataCollateInfo] = {}
 
@@ -636,7 +638,7 @@ class SeedOmniCollator(DataCollator):
 
         # Worker-side CPU input-prep (tokenize / image normalize) over the grouped
         # batch. Mutates items in place; the modules' thin pre_forward then only
-        # moves to device. Order is FIXED and SERIAL: ``config.modules:``
+        # moves to device. Order is FIXED and SERIAL: ``config._module_entries``
         # declaration order (see :class:`OmniProcessor`).
         self.processor.preprocess_batch(batch, inference=False)
         return batch

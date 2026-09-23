@@ -68,11 +68,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     helper.set_seed(args.seed)
+    # Only forward `infer_type` when the flag was given: passing None overrides
+    # the scenario the checkpoint saved and falls back to the first one.
+    scenario = {"infer_type": args.infer_type} if args.infer_type is not None else {}
     model = OmniModel.from_pretrained(
         args.model_path,
         device_map="auto",
         torch_dtype="auto",
-        infer_type=args.infer_type,
+        **scenario,
     ).eval()
     processor = OmniProcessor.from_pretrained(args.model_path)
     model_input = processor(

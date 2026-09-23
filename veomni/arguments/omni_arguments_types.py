@@ -122,7 +122,7 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
     # `fsdp_mode: eager` default between the two — see its docstring for the
     # full order.
     ckpt_modules = (
-        {name: omni_cfg.module_runtime_fields(name) for name in omni_cfg.module_names}
+        {name: _checkpoint_module_fields(omni_cfg, model_path, name) for name in omni_cfg.module_names}
         if omni_cfg is not None
         else None
     )
@@ -265,10 +265,10 @@ def build_module_runtime_args(
     Layers, weakest first:
 
     1. ``global_args`` — the launcher's global ``model:`` block.
-    2. ``checkpoint_modules`` — what the checkpoint persisted per module. The only
-       layer that knows a module individually without the user restating it: the
-       kernels it was exported with, its ``model_config``, an ``accelerator``
-       overlay if the entry carries one.
+    2. ``checkpoint_modules`` — the checkpoint's ``_module_entries``. The only
+       layer that knows a module individually without the user restating it:
+       the kernels it was exported with, its ``model_config``, an
+       ``accelerator`` overlay if the entry carries one.
     3. the synthesized ``fsdp_mode: eager`` inference default (``for_inference``).
     4. ``modules`` — the launcher's per-module YAML.
 
@@ -306,15 +306,33 @@ def build_module_runtime_args(
     return runtime_modules
 
 
-def build_module_args(config, name: str) -> OmniModuleRuntimeArguments:
-    """Instantiate :class:`OmniModuleRuntimeArguments` from an ``OmniConfig.modules`` entry."""
-    from ..models.seed_omni.modules.module_configuration_base import OmniModuleConfig
+def _checkpoint_module_fields(omni_cfg, checkpoint_root: str, name: str) -> dict[str, Any]:
+    """What the checkpoint's entry for ``name`` contributes, keyed on launcher fields.
 
-    cfg = config.modules.get(name, None)
-    if cfg is None:
-        raise KeyError(f"Module '{name}' not found in OmniConfig.modules")
-    entry = OmniModuleConfig(name, cfg)
-    return _instantiate_recursive(OmniModuleRuntimeArguments, entry.as_runtime_fields())
+    An entry is already keyed on :class:`OmniModuleRuntimeArguments` names
+    (``model_path``, ``model_config``, ``processor_config``,
+    ``ops_implementation``). ``model_path`` goes through ``resolve_module_path``
+    so an entry pointing outside the root keeps its own path instead of being
+    re-derived as ``<root>/<name>``.
+    """
+    fields = deepcopy(omni_cfg._module_entries[name])
+    fields["model_path"] = omni_cfg.resolve_module_path(checkpoint_root, name)
+    return fields
+
+
+def build_module_args(config, name: str) -> OmniModuleRuntimeArguments:
+    """Instantiate :class:`OmniModuleRuntimeArguments` from an ``OmniConfig`` module entry.
+
+    A checkpoint entry is already keyed on launcher field names (``model_path``,
+    ``model_config``, ``processor_config``, ``ops_implementation``), so it needs
+    no flattening — only a copy, so instantiation cannot write through into the
+    config's own entry.
+    """
+    entry = config._module_entries.get(name)
+    if entry is None:
+        known = ", ".join(config.module_names) or "(none)"
+        raise KeyError(f"Module '{name}' not found in OmniConfig; known modules: {known}.")
+    return _instantiate_recursive(OmniModuleRuntimeArguments, deepcopy(entry))
 
 
 def _to_module_global_args(model_runtime: OmniModelRuntimeArguments) -> OmniModuleRuntimeArguments:

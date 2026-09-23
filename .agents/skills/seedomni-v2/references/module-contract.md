@@ -16,7 +16,7 @@ A SeedOmni V2 module is usually:
     HF's `GenerationMixin` — holding `generate()` and FSM inference state
     (`reset_local_inference_state`, `reset_global_inference_state`,
     `finalize`, sampling helpers). The model class lists it **first**:
-    `class Xxx(InferenceMixin, OmniPreTrainedModel)` (`OmniPreTrainedModel`
+    `class Xxx(InferenceMixin, PretrainedOmniModule)` (`PretrainedOmniModule`
     ships no-op defaults for those three methods; MRO resolves left-to-right,
     so `InferenceMixin` must come first or those no-ops shadow it).
 - An `accelerated/accelerated.py` with composable training-graph mixins:

@@ -4,26 +4,14 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Protocol
+from typing import TYPE_CHECKING
 
 from ..graphs.generation_graph import GenerationGraph
 from ..graphs.training_graph import TrainingGraph
 
 
-class GraphConfig(Protocol):
-    """The graph surface :func:`save_graph_mermaid_diagrams` needs.
-
-    Satisfied by both :class:`~veomni.models.seed_omni.configuration_omni.OmniConfig`
-    and the launcher-side
-    :class:`~veomni.arguments.omni_arguments_types.OmniModelRuntimeArguments`,
-    so diagrams can be drawn without projecting the runtime view onto a checkpoint.
-    """
-
-    training_graph: list[dict]
-    generation_graphs: dict
-
-    @property
-    def infer_types(self) -> list[str]: ...
+if TYPE_CHECKING:
+    from ..configuration_omni import OmniConfig
 
 
 _SAFE_INFER_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -40,7 +28,7 @@ def _write_mermaid(path: str, body: str) -> None:
 
 
 def save_graph_mermaid_diagrams(
-    config: GraphConfig,
+    config: OmniConfig,
     save_directory: str | os.PathLike,
     *,
     training_title: str = "Training graph",

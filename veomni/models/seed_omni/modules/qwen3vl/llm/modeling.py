@@ -9,7 +9,7 @@ from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.tensor_utils import naflatten
 
 from ....utils.conversation import ConversationItem, is_dummy
-from ...module_modeling_base import OmniPreTrainedModel
+from ...module_modeling_base import PretrainedOmniModule
 from .configuration import Qwen3VLLlmConfig
 
 
@@ -117,8 +117,8 @@ def pack_qwen3vl_conversations_for_forward(
 class InferenceMixin:
     """FSM ``generate`` (with M-RoPE + DeepStack) — HF ``GenerationMixin`` analog.
 
-    Listed *before* :class:`~...module_modeling_base.OmniPreTrainedModel` in
-    :class:`Qwen3VLLlm`'s bases: ``OmniPreTrainedModel`` ships no-op
+    Listed *before* :class:`~...module_modeling_base.PretrainedOmniModule` in
+    :class:`Qwen3VLLlm`'s bases: ``PretrainedOmniModule`` ships no-op
     ``reset_local_inference_state`` / ``reset_global_inference_state`` defaults
     (kept as a safety net for modules that don't need real inference state),
     and MRO resolves left-to-right — put second, those no-ops would shadow the
@@ -196,7 +196,7 @@ class InferenceMixin:
         return hidden_states[:, -1:, :].contiguous()
 
 
-class Qwen3VLLlm(InferenceMixin, OmniPreTrainedModel):
+class Qwen3VLLlm(InferenceMixin, PretrainedOmniModule):
     """Qwen3-VL text backbone (no wte, no lm_head).
 
     Token / image embeds are produced by the sibling ``qwen3vl_text_encoder`` /

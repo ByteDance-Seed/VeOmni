@@ -12,45 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""VeOmni-accelerated FakeModuleA — identity training / generation graph hooks."""
+"""VeOmni-side FakeModuleA — the head of the stand-in chain."""
 
 from typing import Any
 
+import torch
+
 from .....mixins.base_mixin import BaseMixin
-from .....mixins.inference_module_mixin import InferenceModuleMixin, post_generate, pre_generate
-from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
+from .....mixins.inference_module_mixin import InferenceModuleMixin
+from .....mixins.training_module_mixin import TrainingModuleMixin, pre_forward
 from ..modeling import FakeModuleA
 
 
 class TrainingMixin(TrainingModuleMixin):
-    """Passthrough ``pre_forward`` / ``post_forward`` for the training DAG."""
+    """Turn a collated batch into the ``hidden`` the chain carries.
+
+    The module has no preprocessor, so the batch reaches it as the collator
+    left it: one ``conversation_list`` per sample. One ``hidden`` row per sample
+    is all the chain needs to produce a loss that backpropagates through both
+    modules.
+    """
 
     @pre_forward("forward")
-    def forward_pre(self, **kwargs: Any) -> dict[str, Any]:
-        return kwargs
-
-    @post_forward("forward")
-    def forward_post(self, **outputs: Any) -> dict[str, Any]:
-        return outputs
-
-
-class InferenceMixin(InferenceModuleMixin):
-    """Passthrough generation hooks; ``generate`` reuses native ``forward``."""
-
-    @pre_generate("generate")
-    def generate_pre(self, **kwargs: Any) -> dict[str, Any]:
-        return kwargs
-
-    @post_generate("generate")
-    def generate_post(self, **outputs: Any) -> dict[str, Any]:
-        return outputs
-
-    def generate(self, **kwargs: Any) -> dict[str, Any]:
-        kwargs.pop("generation_kwargs", None)
-        return self.forward(**kwargs)
+    def forward_pre(self, conversation_list: list[Any], hidden: Any = None, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        if hidden is None:
+            weight = self.proj.weight
+            hidden = torch.ones(
+                len(conversation_list), self.config.hidden_size, device=weight.device, dtype=weight.dtype
+            )
+        return {"hidden": hidden}
 
 
-class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin):
+class VeOmniMixin(BaseMixin, TrainingMixin, InferenceModuleMixin):
     pass
 
 

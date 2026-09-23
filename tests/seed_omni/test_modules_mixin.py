@@ -240,13 +240,13 @@ def _accelerated_model_cls(model_type: str):
 
 
 def test_all_registered_classes_are_module_mixins():
-    from veomni.models.seed_omni.modules.module_modeling_base import OmniPreTrainedModel
+    from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
 
     accelerated_keys = set(OMNI_ACCELERATED_MODEL_REGISTRY.valid_keys())
     for name in OMNI_MODEL_REGISTRY.valid_keys():
         native_cls = OMNI_MODEL_REGISTRY[name]()
         assert name in accelerated_keys, f"{name} must register OMNI_ACCELERATED_MODEL_REGISTRY"
-        assert issubclass(native_cls, OmniPreTrainedModel), f"{name} native must inherit OmniPreTrainedModel"
+        assert issubclass(native_cls, PretrainedOmniModule), f"{name} native must inherit PretrainedOmniModule"
         assert not issubclass(native_cls, BaseMixin), f"{name} native must not inherit BaseMixin"
         accelerated_cls = OMNI_ACCELERATED_MODEL_REGISTRY[name]()
         assert issubclass(accelerated_cls, BaseMixin), f"{name} accelerated must inherit BaseMixin"
@@ -726,8 +726,8 @@ def test_janus_train_yaml_loads_with_v2_module_names():
         infer_graph_path=_janus_cfg_dir() / "infer/graph_infer_gen.yaml",
     )
 
-    assert set(cfg.modules) == {"janus_siglip", "janus_vqvae", "janus_llama", "janus_text_encoder"}
-    assert cfg.modules["janus_siglip"]["subfolder"] == "janus_siglip"
+    assert set(cfg._module_entries) == {"janus_siglip", "janus_vqvae", "janus_llama", "janus_text_encoder"}
+    assert cfg._module_entries["janus_siglip"]["model_path"].endswith("janus_siglip")
     # training_graph is a flat list of `{from, to}` edges; endpoints are
     # self-describing `module[.method]` strings.
     assert isinstance(cfg.training_graph, list) and cfg.training_graph
@@ -750,7 +750,7 @@ def test_janus_train_plus_infer_merges_generation_graph(infer_graph: str):
         infer_graph_path=_janus_cfg_dir() / infer_graph,
     )
     # Training vocabulary still present.
-    assert set(cfg.modules) == {"janus_siglip", "janus_vqvae", "janus_llama", "janus_text_encoder"}
+    assert set(cfg._module_entries) == {"janus_siglip", "janus_vqvae", "janus_llama", "janus_text_encoder"}
     # Generation graph painted on top.
     assert cfg.generation_graph is not None
     assert "states" in cfg.generation_graph
@@ -809,8 +809,8 @@ def test_init_resolves_relative_module_paths():
         infer_graph_path=_janus_cfg_dir() / "infer/graph_infer_gen.yaml",
     )
 
-    assert cfg.modules["janus_siglip"]["subfolder"] == "janus_siglip"
-    assert cfg.modules["janus_text_encoder"]["subfolder"] == "janus_text_encoder"
+    assert cfg._module_entries["janus_siglip"]["model_path"].endswith("janus_siglip")
+    assert cfg._module_entries["janus_text_encoder"]["model_path"].endswith("janus_text_encoder")
     assert cfg.generation_graph is not None
     assert cfg.generation_graph["initial"] == "prompt_encode"
 
@@ -837,8 +837,8 @@ def test_qwen3_train_yaml_loads_with_v2_module_names():
         infer_graph_path=_qwen3_cfg_dir() / "train/graph_infer.yaml",
     )
 
-    assert set(cfg.modules) == {"qwen3_text_encoder", "qwen3_llm"}
-    assert cfg.modules["qwen3_text_encoder"]["subfolder"] == "qwen3_text_encoder"
+    assert set(cfg._module_entries) == {"qwen3_text_encoder", "qwen3_llm"}
+    assert cfg._module_entries["qwen3_text_encoder"]["model_path"].endswith("qwen3_text_encoder")
     assert isinstance(cfg.training_graph, list) and cfg.training_graph
     endpoints = {e["from"] for e in cfg.training_graph} | {e["to"] for e in cfg.training_graph}
     assert "qwen3_text_encoder.encode" in endpoints and "qwen3_llm" in endpoints
@@ -850,7 +850,7 @@ def test_qwen3_train_plus_infer_merges_generation_graph():
         train_graph_path=_qwen3_cfg_dir() / "train/graph_train.yaml",
         infer_graph_path=_qwen3_cfg_dir() / "train/graph_infer.yaml",
     )
-    assert set(cfg.modules) == {"qwen3_text_encoder", "qwen3_llm"}
+    assert set(cfg._module_entries) == {"qwen3_text_encoder", "qwen3_llm"}
     assert cfg.generation_graph is not None
     assert cfg.generation_graph["initial"] == "text_ar"
     assert "done" not in cfg.generation_graph["states"]

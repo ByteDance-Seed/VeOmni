@@ -90,6 +90,7 @@ def test_parallelize_forwards_module_skip_decision(monkeypatch: pytest.MonkeyPat
                 forward_prefetch=False,
                 offload=False,
                 offload_pin_memory=False,
+                low_precision_reduce_scatter_comm=False,
                 max_load_broadcast_size=20.0,
             ),
             offload_config=SimpleNamespace(enable_async_activation=False),

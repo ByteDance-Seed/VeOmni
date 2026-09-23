@@ -78,7 +78,7 @@ def register_fake_omni_convert():
 
 
 def convert_fake_omni(model_path: str, **kwargs: Any) -> dict[str, Any]:
-    """Build the two-module stand-in chain; caller writes via ``save_converted_omni``."""
+    """Build the two-module stand-in chain; :func:`convert_checkpoint` writes the split directory."""
     training_graph = kwargs.pop("training_graph", None)
     generation_graph = kwargs.pop("generation_graph", None)
     del kwargs

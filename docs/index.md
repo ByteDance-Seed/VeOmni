@@ -29,6 +29,7 @@ usage/arguments.md
 usage/basic_modules.md
 usage/multimodal_data_processing.md
 usage/data_packing_and_dyn_bsz.md
+usage/dit_microbatching.md
 usage/support_new_models/guide_and_checklist.md
 usage/support_new_models/qwen3_vl_example.md
 usage/support_new_models/qwen3_omni_moe_example.md
@@ -87,6 +88,7 @@ key_features/ep_fsdp2.md
 key_features/extra_parallel.md
 key_features/ulysses.md
 key_features/lora.md
+key_features/mtp.md
 
 ```
 

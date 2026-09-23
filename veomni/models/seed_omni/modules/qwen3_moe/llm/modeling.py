@@ -27,11 +27,11 @@ from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_g
 )
 
 from ...base.llm_packing import SimpleArGenerationMixin
-from ...module_modeling_base import OmniPreTrainedModel
+from ...module_modeling_base import PretrainedOmniModule
 from .configuration import Qwen3MoeLlmConfig
 
 
-class Qwen3MoeLlm(SimpleArGenerationMixin, OmniPreTrainedModel):
+class Qwen3MoeLlm(SimpleArGenerationMixin, PretrainedOmniModule):
     """Qwen3-MoE backbone (no wte, no lm_head).
 
     Multi-modal inputs are already embedded by the sibling text encoder and live

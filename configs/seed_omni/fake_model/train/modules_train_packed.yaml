@@ -1,0 +1,7 @@
+# modules_train.yaml plus a module-owned `processor_config`, which rides along
+# to the exported OmniConfig while staying out of the model's own overrides.
+__inherit__: modules_train.yaml
+
+fake_module_a:
+  processor_config:
+    packed_preprocess: true

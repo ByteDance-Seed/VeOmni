@@ -11,11 +11,12 @@ unchanged.
 
 from typing import Any, Dict, Optional
 
-from transformers import PretrainedConfig
 from transformers.models.janus.configuration_janus import JanusVisionConfig
 
+from ...module_configuration_base import OmniModuleConfig
 
-class JanusSiglipConfig(PretrainedConfig):
+
+class JanusSiglipConfig(OmniModuleConfig):
     """Top-level config for the Janus SigLIP encoder + aligner."""
 
     model_type = "janus_siglip"

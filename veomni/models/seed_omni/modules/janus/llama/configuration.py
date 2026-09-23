@@ -21,10 +21,12 @@ The ``model_type`` literal here is the lookup key for
 
 from typing import Any, Dict, Optional
 
-from transformers import LlamaConfig, PretrainedConfig
+from transformers import LlamaConfig
+
+from ...module_configuration_base import OmniModuleConfig
 
 
-class JanusLlamaConfig(PretrainedConfig):
+class JanusLlamaConfig(OmniModuleConfig):
     """Top-level config for the Janus LLaMA backbone (no wte, no lm_head)."""
 
     model_type = "janus_llama"

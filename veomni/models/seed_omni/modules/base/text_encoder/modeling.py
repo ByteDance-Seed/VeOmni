@@ -1,7 +1,7 @@
 """Generic word-token embedding (``wte``) + LM head as a graph node.
 
-``TextEncoder(InferenceMixin, OmniPreTrainedModel)`` — mirrors HF's own
-``PreTrainedModel`` + ``GenerationMixin`` split: ``OmniPreTrainedModel``
+``TextEncoder(InferenceMixin, PretrainedOmniModule)`` — mirrors HF's own
+``PreTrainedModel`` + ``GenerationMixin`` split: ``PretrainedOmniModule``
 owns weights / ``forward`` (here, ``encode`` / ``decode``, which mirror a
 VQ codec pre/post stage so the backbone stays vocab-agnostic), while
 ``InferenceMixin`` owns the FSM ``generate`` sampling helpers shared by every
@@ -22,7 +22,7 @@ from transformers import PreTrainedTokenizerBase
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....utils.conversation import ConversationItem, seal_outputs
-from ...module_modeling_base import OmniPreTrainedModel
+from ...module_modeling_base import PretrainedOmniModule
 from .chat_template import TextEncoderChatTemplate
 from .configuration import TextEncoderConfig
 
@@ -55,8 +55,8 @@ class InferenceMixin:
     helpers below, plus the FSM inference state initialized in
     :meth:`TextEncoder.__init__`.
 
-    Listed *before* :class:`~...module_modeling_base.OmniPreTrainedModel` in
-    :class:`TextEncoder`'s bases: ``OmniPreTrainedModel`` ships no-op
+    Listed *before* :class:`~...module_modeling_base.PretrainedOmniModule` in
+    :class:`TextEncoder`'s bases: ``PretrainedOmniModule`` ships no-op
     ``reset_local_inference_state`` / ``finalize`` defaults (kept so
     inference-only modules that don't mix this in still satisfy the FSM
     runtime's unconditional ``module.finalize(ctx=...)`` call), and MRO
@@ -174,7 +174,7 @@ class InferenceMixin:
         return {"type": "text", "value": text, "meta": meta}
 
 
-class TextEncoder(InferenceMixin, OmniPreTrainedModel):
+class TextEncoder(InferenceMixin, PretrainedOmniModule):
     """Word-token embedding + LM head, plus shared FSM ``generate`` sampling helpers."""
 
     config_class = TextEncoderConfig

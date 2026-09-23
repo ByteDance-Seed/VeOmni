@@ -14,7 +14,7 @@ def test_bagel_train_yaml_loads_with_v2_module_names():
         infer_graph_path=bagel_cfg_dir() / "infer/graph_infer_gen.yaml",
     )
 
-    assert set(cfg.modules) == {
+    assert set(cfg._module_entries) == {
         "bagel_text_encoder",
         "bagel_siglip_navit",
         "bagel_qwen2_mot",
@@ -95,7 +95,7 @@ def test_bagel_train_plus_infer_merges_generation_graph(infer_graph: str):
         train_graph_path=bagel_cfg_dir() / "train/graph_train.yaml",
         infer_graph_path=bagel_cfg_dir() / infer_graph,
     )
-    assert set(cfg.modules) == {
+    assert set(cfg._module_entries) == {
         "bagel_text_encoder",
         "bagel_siglip_navit",
         "bagel_qwen2_mot",

@@ -26,6 +26,7 @@ from .....utils.logging import get_logger
 from ...mixins.metric_meter_mixin import MetricMeterResult
 from ...modeling_omni import OmniModel
 from ...utils.graph_profiler import GraphProfiler
+from ..utils.dispatch import unwrap_module_chain
 from ..utils.executor import TrainNodeRunner, execute_generation_node
 from ..utils.modules import iter_named_omni_modules, save_module_subdirectory
 
@@ -124,9 +125,15 @@ class OmniModelRuntime:
         module_runtimes: Mapping[str, ModuleRuntime] | None = None,
         module_parallel_state_names: Iterable[str] | None = None,
         omni_model_runtime_args: OmniModelRuntimeConfig | None = None,
+        wrapped_modules: Mapping[str, Any] | None = None,
     ) -> None:
         self.model = model
         self.module_runtimes = dict(module_runtimes or {})
+        # DDP / LoRA wrappers, keyed by module name. :class:`OmniModel` holds only
+        # the bare :class:`PretrainedOmniModule` it can validate, but a node must
+        # still be called through its wrapper (DDP syncs gradients from its own
+        # ``forward``).
+        self._wrapped_modules = dict(wrapped_modules or {})
         self._module_parallel_state_names = set(module_parallel_state_names or ())
         self.omni_model_runtime_args = omni_model_runtime_args
         self._step_profiler: GraphProfiler | None = None
@@ -159,7 +166,7 @@ class OmniModelRuntime:
                 for_inference=for_inference,
                 global_accelerator=omni_model_runtime_args.accelerator,
             )
-            module_runtime.checkpoint_subfolder = omni_config.module_checkpoint_subfolder(name)
+            module_runtime.checkpoint_subfolder = name
             module_runtimes[name] = module_runtime
             logger.info_rank0(f"OmniModelRuntime: built ModuleRuntime '{name}' from {module_args.model_path}")
 
@@ -168,11 +175,15 @@ class OmniModelRuntime:
         )
         if not for_inference:
             _reject_lora_that_matched_nothing(module_runtimes, train)
+        wrapped = {name: rt.model for name, rt in module_runtimes.items()}
         runtime = cls(
-            OmniModel(omni_config, {name: rt.model for name, rt in module_runtimes.items()}),
+            OmniModel(omni_config, {name: unwrap_module_chain(module) for name, module in wrapped.items()}),
             module_runtimes=module_runtimes,
             module_parallel_state_names=[name for name in module_runtimes if is_parallel_state_registered(name)],
             omni_model_runtime_args=omni_model_runtime_args,
+            wrapped_modules={
+                name: module for name, module in wrapped.items() if module is not unwrap_module_chain(module)
+            },
         )
         runtime._parallelize_composed_model(for_inference=for_inference)
         return runtime
@@ -338,7 +349,11 @@ class OmniModelRuntime:
         """
         profiler = profiler if profiler is not None else self._step_profiler
         runner = TrainNodeRunner(profiler=profiler, scope_fn=self.module_context)
-        return self.model(batch, node_runner=runner)
+
+        def run_node(module: Any, node: Any, batch: dict[str, Any]) -> None:
+            runner(self._wrapped_modules.get(node.module, module), node, batch)
+
+        return self.model(batch, node_runner=run_node)
 
     def generate(
         self,
@@ -358,7 +373,7 @@ class OmniModelRuntime:
         profiler = profiler if profiler is not None else self._step_profiler
         model = self.model
         ctx: dict[str, Any] = request
-        modules = model.modules_dict
+        modules = {name: self._runtime_module(name) for name in model._module_names}
         generation_kwargs = model.resolve_generation_kwargs(generation_kwargs)
         max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
         total_steps = 0
@@ -376,11 +391,10 @@ class OmniModelRuntime:
                     profiler=profiler,
                     scope_fn=self.module_context,
                 )
+                # Per node, as in ``OmniModel.generate``: a later node emitting
+                # ``generated`` would overwrite this one's in the shared ``ctx``.
+                self._collect_generated(ctx, profiler, label="generated")
             total_steps += 1
-            generated = ctx.pop("generated", None)
-            model._append_generated(generated)
-            if profiler is not None and generated is not None:
-                profiler.record(f"generated:{generated['type']}")
             fired = model.generation_graph.maybe_transition(ctx)
             if fired is not None and profiler is not None:
                 profiler.record(f"transition: {fired.from_state} -> {fired.to_state} [{fired.condition}]")
@@ -392,12 +406,22 @@ class OmniModelRuntime:
                 out = raw.finalize(ctx=ctx)
                 if not isinstance(out, dict):
                     raise TypeError(f"{type(raw).__name__}.finalize must return a dict, got {type(out).__name__}.")
-                generated = out.pop("generated", None)
-                model._append_generated(generated)
-                if profiler is not None and generated is not None:
-                    profiler.record(f"finalize:{name} | generated:{generated['type']}")
+                ctx.update(out)
+                self._collect_generated(ctx, profiler, label=f"finalize:{name} | generated")
 
         return list(model._generated)
+
+    def _collect_generated(self, ctx: dict[str, Any], profiler: GraphProfiler | None, *, label: str) -> None:
+        """Drain ``ctx["generated"]`` via :meth:`OmniModel._collect_generated`, tracing what it kept."""
+        generated = self.model._generated
+        before = len(generated)
+        self.model._collect_generated(ctx)
+        if profiler is not None and len(generated) > before:
+            profiler.record(f"{label}:{generated[-1]['type']}")
+
+    def _runtime_module(self, name: str) -> Any:
+        """Module ``name`` as its runtime built it: the wrapper when there is one."""
+        return self._wrapped_modules.get(name, self.model.modules_dict[name])
 
     def named_omni_modules(self) -> Iterator[tuple[str, Any]]:
         """Yield ``(name, BaseMixin)`` for every graph participant (unwraps wrappers)."""
@@ -439,9 +463,8 @@ class OmniModelRuntime:
             "max_shard_size": max_shard_size,
         }
         for name in model._module_names:
-            module = model.modules_dict[name]
+            module = self._runtime_module(name)
             save_module_subdirectory(
-                model.config,
                 name,
                 module,
                 save_directory,

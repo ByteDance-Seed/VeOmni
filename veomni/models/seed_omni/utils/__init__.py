@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SeedOmni utilities: conversation carrier + HF→split checkpoint conversion."""
+"""SeedOmni utilities: conversation carrier + HF → split-checkpoint conversion."""
 
 from .conversation import (
     ConversationItem,
@@ -23,7 +23,7 @@ from .conversation import (
     maybe_merge_outputs,
     seal_outputs,
 )
-from .convert_registry import OMNI_CONVERT_REGISTRY, convert_checkpoint, save_converted_omni
+from .convert_registry import OMNI_CONVERT_REGISTRY, convert_checkpoint
 
 
 __all__ = [
@@ -36,5 +36,4 @@ __all__ = [
     "collect_desired_values",
     "OMNI_CONVERT_REGISTRY",
     "convert_checkpoint",
-    "save_converted_omni",
 ]

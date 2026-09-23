@@ -12,45 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""VeOmni-accelerated FakeModuleB — identity training / generation graph hooks."""
+"""VeOmni-side FakeModuleB — the tail of the stand-in chain, where the loss is taken."""
 
 from typing import Any
 
 from .....mixins.base_mixin import BaseMixin
-from .....mixins.inference_module_mixin import InferenceModuleMixin, post_generate, pre_generate
+from .....mixins.inference_module_mixin import InferenceModuleMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
+from .....modeling_omni import LOSS_KEY
 from ..modeling import FakeModuleB
 
 
 class TrainingMixin(TrainingModuleMixin):
-    """Passthrough ``pre_forward`` / ``post_forward`` for the training DAG."""
+    """Take ``hidden`` off the batch and emit the chain's loss.
+
+    A squared-magnitude loss has a nonzero gradient for any nonzero ``hidden``,
+    so both modules' weights receive one on every step.
+    """
 
     @pre_forward("forward")
-    def forward_pre(self, **kwargs: Any) -> dict[str, Any]:
-        return kwargs
+    def forward_pre(self, hidden: Any, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        return {"hidden": hidden}
 
     @post_forward("forward")
-    def forward_post(self, **outputs: Any) -> dict[str, Any]:
+    def forward_post(self, hidden: Any = None, **outputs: Any) -> dict[str, Any]:
+        if hidden is not None:
+            outputs["hidden"] = hidden
+            outputs[LOSS_KEY] = hidden.float().pow(2).mean()
         return outputs
 
 
-class InferenceMixin(InferenceModuleMixin):
-    """Passthrough generation hooks; ``generate`` reuses native ``forward``."""
-
-    @pre_generate("generate")
-    def generate_pre(self, **kwargs: Any) -> dict[str, Any]:
-        return kwargs
-
-    @post_generate("generate")
-    def generate_post(self, **outputs: Any) -> dict[str, Any]:
-        return outputs
-
-    def generate(self, **kwargs: Any) -> dict[str, Any]:
-        kwargs.pop("generation_kwargs", None)
-        return self.forward(**kwargs)
-
-
-class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin):
+class VeOmniMixin(BaseMixin, TrainingMixin, InferenceModuleMixin):
     pass
 
 

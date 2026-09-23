@@ -2,10 +2,12 @@
 
 from typing import Any, Dict, Optional
 
-from transformers import PretrainedConfig, Qwen3VLTextConfig
+from transformers import Qwen3VLTextConfig
+
+from ...module_configuration_base import OmniModuleConfig
 
 
-class Qwen3VLLlmConfig(PretrainedConfig):
+class Qwen3VLLlmConfig(OmniModuleConfig):
     """Top-level config for the Qwen3-VL AR backbone (no wte, no lm_head).
 
     ``spatial_merge_size`` is copied from the vision config so the backbone can

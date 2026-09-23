@@ -241,6 +241,26 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
   guard is added for configs still on the old `train.*` schema — an un-migrated config
   is rejected by the relocated-key parser rather than silently falling back.
 
+### 3.7 Root `config.json`: `modules` → `_module_entries`; module configs subclass `OmniModuleConfig`
+- **Breaking, re-convert old checkpoints.** The split-checkpoint root now stores
+  `_module_entries: {<name>: {model_path, ops_implementation, model_config, processor_config}}`
+  instead of `modules: {<name>: {subfolder, ...}}`. `model_path` is the module's subfolder
+  (relative to the root); there is no `subfolder` field and no hydrate / stash step. Re-run
+  `scripts/seed_omni/convert_model.py` (or the split + `export_omni_checkpoint.py` route) on
+  any checkpoint converted before this change.
+- `OmniConfig.from_pretrained` loads every module config eagerly into `_module_configs`.
+  A module config that is not an `OmniModuleConfig` raises at load time; conversion no
+  longer validates the graph.
+- Every family `*Config` subclasses `OmniModuleConfig` (not bare `PretrainedConfig`), and
+  every module model subclasses `PretrainedOmniModule` (renamed from `OmniPreTrainedModel`).
+  Under transformers v5 a config class with no `__init__` of its own is wrapped into a
+  dataclass init that skips its parents' `__init__`. Such a class needs an explicit
+  `__init__(self, **kwargs): super().__init__(**kwargs)`. When mixing with an HF config
+  that has no custom init (e.g. `Qwen2Config`), list `OmniModuleConfig` first in the bases.
+- `OmniModel` only accepts bare `PretrainedOmniModule`s. `OmniModelRuntime` keeps
+  DDP / LoRA wrappers aside (`wrapped_modules`) and routes train nodes, generation and save
+  through them.
+
 ## 4. Mechanical merge recipe (for an agent)
 
 1. **Branch off / rebase target.** Bring `szl.omni_v2` (post-refactor) into your

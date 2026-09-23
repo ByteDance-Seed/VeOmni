@@ -4,8 +4,10 @@
 Reads ``model_type`` from the upstream HuggingFace ``config.json`` at
 ``--model_path``, runs the matching family converter, and writes the split
 checkpoint through
-:func:`~veomni.models.seed_omni.utils.convert_registry.save_converted_omni`
-(module subfolders plus ``training_graph.yaml`` / ``generation_graph.yaml``).
+:func:`~veomni.models.seed_omni.utils.convert_registry.convert_checkpoint`
+(module subfolders, plus ``training_graph.yaml`` / ``generation_graph.yaml``
+when the family converter or ``--training_graph`` / ``--generation_graph``
+supply them).
 
 Usage::
 
@@ -52,7 +54,7 @@ def main() -> None:
     parser.add_argument(
         "--output_dir",
         required=True,
-        help="Directory to write the split omni checkpoint (modules + graph YAML sidecars)",
+        help="Directory to write the split omni checkpoint (modules; graph YAML sidecars when supplied)",
     )
     parser.add_argument(
         "--training_graph",

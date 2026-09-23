@@ -118,11 +118,10 @@ class OmniProcessor:
         module, reads its ``preprocessor_class`` off the class registered for its
         ``model_type`` and calls :meth:`ModulePreprocessorBase.from_pretrained` directly on
         its checkpoint subfolder — no model instance is built at all (not even a
-        ``meta``-device one). ``config.module_model_config(name)`` (the module's
-        YAML ``model_config:`` block) is forwarded as ``config_overrides`` so a
-        preprocessor that reads a behavior-affecting model field (e.g.
-        ``enable_image``) agrees with the live model. ``config.module_processor_config(name)``
-        (YAML ``processor_config:``) is splatted as kwargs, matching
+        ``meta``-device one). The entry's ``model_config`` is forwarded as
+        ``config_overrides`` so a preprocessor that reads a behavior-affecting
+        model field (e.g. ``enable_image``) agrees with the live model. The
+        entry's ``processor_config`` is splatted as kwargs, matching
         ``build_processor(path, **processor_config)``.
         """
         root = checkpoint_root if checkpoint_root is not None else getattr(config, "_name_or_path", None)
@@ -135,10 +134,11 @@ class OmniProcessor:
             preprocessor_cls = getattr(mod_cls, "preprocessor_class", None)
             if preprocessor_cls is None:
                 continue
+            entry = config._module_entries[name]
             preprocessor = preprocessor_cls.from_pretrained(
                 module_path,
-                config_overrides=config.module_model_config(name),
-                **config.module_processor_config(name),
+                config_overrides=dict(entry.get("model_config") or {}),
+                **dict(entry.get("processor_config") or {}),
             )
             if preprocessor is not None:
                 preprocessors[name] = preprocessor

@@ -138,7 +138,7 @@ class OptimizerConfig:
                 "then report sqrt(sum n_i^2). "
                 "'global': measure each module unclipped, total=sqrt(sum n_i^2), then scale "
                 "all modules by one coefficient (single-model / seedream gradient_clip_val semantics)."
-            ),
+            )
         },
     )
     betas: Tuple[float, float] = field(
@@ -496,17 +496,48 @@ class MixedPrecisionConfig:
         _check_dtype(self.output_dtype)
 
 
+def validate_low_precision_reduce_scatter_comm(
+    enabled: bool,
+    mixed_precision: MixedPrecisionConfig,
+    *,
+    fsdp_mode: str = "fsdp2",
+) -> bool:
+    """Validate the opt-in flag and precision settings; return whether a custom path is needed."""
+    if not isinstance(enabled, bool):
+        raise ValueError("low_precision_reduce_scatter_comm must be a boolean (true or false).")
+    if not enabled:
+        return False
+    if (
+        mixed_precision.param_dtype in ("bfloat16", "float16", "float32")
+        and mixed_precision.param_dtype == mixed_precision.reduce_dtype
+    ):
+        return False
+    if fsdp_mode != "fsdp2":
+        raise ValueError("low_precision_reduce_scatter_comm requires fsdp_mode='fsdp2'.")
+    if (
+        not mixed_precision.enable
+        or mixed_precision.reduce_dtype != "float32"
+        or mixed_precision.param_dtype not in ("bfloat16", "float16")
+    ):
+        raise ValueError(
+            "low_precision_reduce_scatter_comm requires enabled mixed-precision FSDP2 with "
+            "param_dtype='bfloat16' or 'float16' and reduce_dtype='float32'. "
+            "Communication precision is inferred from param_dtype. Disable the option or use equal "
+            "parameter and reduction dtypes for the native path."
+        )
+    return True
+
+
 @dataclass
 class FSDPConfig:
     """model.accelerator.fsdp_config.* — FSDP sharding configuration."""
 
-    # eager mode use HF.from_pretrained(..., device_map='auto') for inference
     fsdp_mode: Literal["ddp", "fsdp2", "eager"] = field(
         default="fsdp2",
         metadata={
             "help": (
                 "Data parallel mode. 'eager' skips every wrapper for the single-process "
-                "inference path an OmniModule takes via _init_eager_inference."
+                "inference path an omni module takes via ModuleRuntime._init_eager_inference."
             )
         },
     )
@@ -514,18 +545,15 @@ class FSDPConfig:
         default="module",
         metadata={
             "help": (
-                "Where to apply FSDP2/DDP wrap for a SeedOmni composed model. "
-                "'module' (default) wraps each OmniModule independently. "
-                "'model' wraps the composed OmniModel once (one FSDP tree over every "
-                "sub-module, matching a monolithic train_janus-style wrap). "
+                "Where to apply the FSDP2/DDP wrap for a SeedOmni composed model. "
+                "'module' (default) wraps each omni module independently. 'model' wraps "
+                "the composed OmniModel once, so one FSDP tree spans every sub-module. "
                 "Wrap targets are each child's _no_split_modules scoped as "
                 "'{child}.{ClassName}'; leftover params unshard on OmniModel.forward. "
-                "When 'model', per-module fsdp_mode / extra_parallel / init_device "
-                "/ SP-CP-TP-PP overlays are left as written but unused for mesh, init, "
-                "and wrap: every module is initialized unwrapped using the top-level "
-                "accelerator topology, and the composer fully_shards the parent. "
-                "Inference fsdp_mode='eager' still takes the per-module eager path "
-                "and returns before the composed wrap."
+                "Under 'model', per-module fsdp_mode / extra_parallel / init_device and "
+                "SP-CP-TP-PP overlays stay as written but no longer decide mesh, init or "
+                "wrap — the top-level accelerator does. Inference fsdp_mode='eager' still "
+                "takes the per-module eager path and returns before the composed wrap."
             )
         },
     )
@@ -548,7 +576,25 @@ class FSDPConfig:
     offload_pin_memory: bool = field(
         default=True,
         metadata={
-            "help": "When FSDP2 CPU offload is enabled, pin (page-lock) the offloaded CPU param shards. Default True matches torch's CPUOffloadPolicy. Set False to keep shards in pageable memory — for very large models (e.g. MoE experts) pinning is charged as non-reclaimable Shmem and can OOM the memcg; False avoids that at the cost of slightly slower non-pinned H2D per layer."
+            "help": (
+                "Pin the CPU offload buffers, matching torch's CPUOffloadPolicy default. "
+                "Set False to keep offloaded shards pageable, so a large-MoE job is not "
+                "charged non-reclaimable Shmem."
+            )
+        },
+    )
+    low_precision_reduce_scatter_comm: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use mixed_precision.param_dtype for node-local FSDP2 ReduceScatter communication, while "
+                "keeping FP32 reduction buffers and accumulation. Disabled by default. Equal parameter and "
+                "reduction dtypes retain native communication. The custom path requires enabled mixed precision, "
+                "bfloat16 or float16 parameters, and float32 reduction. "
+                "Cross-node or unknown-placement shard groups fall back to native communication; "
+                "HSDP replica-linked groups make a consistent choice. FP32 modules excluded from mixed "
+                "precision keep native communication."
+            )
         },
     )
     max_load_broadcast_size: float = field(
@@ -568,6 +614,9 @@ class FSDPConfig:
             )
         if self.fsdp_scope not in ("module", "model"):
             raise ValueError(f"Unsupported fsdp_scope={self.fsdp_scope!r}; expected 'module' or 'model'.")
+        validate_low_precision_reduce_scatter_comm(
+            self.low_precision_reduce_scatter_comm, self.mixed_precision, fsdp_mode=self.fsdp_mode
+        )
 
 
 @dataclass
@@ -640,11 +689,7 @@ class OffloadConfig:
 
 @dataclass
 class AcceleratorConfig:
-    """model.accelerator.* — Parallelism and distributed-training topology.
-
-    Per-module: an omni model builds one of these for each module, so every knob
-    here is overridable per module.
-    """
+    """model.accelerator.* — Parallelism and distributed-training topology."""
 
     dp_replicate_size: int = field(
         default=-1,
@@ -1232,7 +1277,9 @@ class OpsImplementationConfig:
             "eager",
             "sdpa",
             "flash_attention_2",
+            "flash_attention_2_hub",
             "flash_attention_3",
+            "flash_attention_3_hub",
             "flash_attention_4",
             "flex_attention",
             "magi_attention",
@@ -1298,7 +1345,7 @@ class OpsImplementationConfig:
         default="fla",
         metadata={
             "help": "Gated RMSNorm implementation (Qwen3.5 GatedDeltaNet `self.norm`). "
-            "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU or MLU). "
+            "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'eager' uses the HuggingFace Qwen3_5RMSNormGated. "
             "'npu' uses the VeOmni NPUFusedRMSNormGated."
         },
@@ -1307,7 +1354,7 @@ class OpsImplementationConfig:
         default="fla",
         metadata={
             "help": "Varlen depthwise causal conv1d implementation (Qwen3.5 GatedDeltaNet pre-mixer). "
-            "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU or MLU). "
+            "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'eager' leaves causal_conv1d_fn unset; the varlen training path then raises "
             "because no torch fallback handles cu_seqlens. "
             "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
@@ -1319,7 +1366,7 @@ class OpsImplementationConfig:
         default="fla",
         metadata={
             "help": "Chunk gated delta-rule kernel for Qwen3.5 linear attention. "
-            "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU or MLU). "
+            "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'flash_qla' uses QwenLM FlashQLA (ships under the gpu extra, Hopper SM90 only — "
             "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
@@ -1360,7 +1407,38 @@ class OpsImplementationConfig:
         },
     )
 
+    @staticmethod
+    def validate_hub_attention_backend(implementation: Optional[str]) -> None:
+        """Reject unsupported Hub attention requests before HF kernel preloading."""
+        if implementation not in (
+            "flash_attention_2_hub",
+            "flash_attention_3_hub",
+            "veomni_flash_attention_2_hub_with_sp",
+            "veomni_flash_attention_3_hub_with_sp",
+        ):
+            return
+
+        from ..utils.import_utils import is_torch_npu_available
+
+        if is_torch_npu_available():
+            raise ValueError(
+                f"{implementation} is not supported on Ascend NPU; "
+                "select a supported non-Hub attention backend instead."
+            )
+        if get_env("MODELING_BACKEND") != "veomni":
+            raise ValueError(f"{implementation} requires MODELING_BACKEND=veomni.")
+
+    @staticmethod
+    def normalize_hub_attention_backend(implementation: Optional[str]) -> Optional[str]:
+        """Validate Hub requests and resolve their registered VeOmni names."""
+        OpsImplementationConfig.validate_hub_attention_backend(implementation)
+        return {
+            "flash_attention_2_hub": "veomni_flash_attention_2_hub_with_sp",
+            "flash_attention_3_hub": "veomni_flash_attention_3_hub_with_sp",
+        }.get(implementation, implementation)
+
     def __post_init__(self):
+        self.attn_implementation = self.normalize_hub_attention_backend(self.attn_implementation)
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",

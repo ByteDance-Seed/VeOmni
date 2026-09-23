@@ -22,7 +22,6 @@ from typing import Any
 
 import torch.nn as nn
 
-from ...configuration_omni import OmniConfig
 from ...mixins.base_mixin import BaseMixin
 from .dispatch import unwrap_module_chain
 
@@ -44,7 +43,6 @@ def save_module_assets(module: nn.Module, module_dir: str) -> None:
 
 
 def save_module_subdirectory(
-    config: OmniConfig,
     name: str,
     module: nn.Module,
     save_directory: str,
@@ -52,9 +50,14 @@ def save_module_subdirectory(
     save_module_weights: bool,
     **kwargs: Any,
 ) -> None:
-    """Write one module subfolder under an omni checkpoint root (runtime path)."""
-    subfolder = config.module_checkpoint_subfolder(name)
-    module_dir = os.path.join(save_directory, subfolder)
+    """Write one module subfolder under an omni checkpoint root (runtime path).
+
+    The subfolder is the module's name, matching
+    :meth:`OmniModel._save_module_subdirectory` — an entry's ``model_path`` says
+    where a module was *loaded* from, which may be another checkpoint entirely,
+    and must not decide where this one writes.
+    """
+    module_dir = os.path.join(save_directory, name)
     os.makedirs(module_dir, exist_ok=True)
     save_module_assets(module, module_dir)
     if save_module_weights:

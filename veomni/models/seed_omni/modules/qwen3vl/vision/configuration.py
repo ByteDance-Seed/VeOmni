@@ -8,10 +8,12 @@ key for ``OMNI_CONFIG_REGISTRY`` / ``OMNI_MODEL_REGISTRY``.
 
 from typing import Any, Dict, Optional
 
-from transformers import PretrainedConfig, Qwen3VLVisionConfig
+from transformers import Qwen3VLVisionConfig
+
+from ...module_configuration_base import OmniModuleConfig
 
 
-class Qwen3VLVisionEncoderConfig(PretrainedConfig):
+class Qwen3VLVisionEncoderConfig(OmniModuleConfig):
     """Top-level config for the Qwen3-VL vision tower (ViT + patch merger + deepstack).
 
     Three optional knobs adapt the tower to a different LLM backbone (e.g.

@@ -24,7 +24,7 @@ import torch.nn as nn
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....utils.conversation import ConversationItem, get_tail_output_item, is_dummy, iter_desired_items
-from ...module_modeling_base import OmniPreTrainedModel
+from ...module_modeling_base import PretrainedOmniModule
 from ..sources import (
     BAGEL_FLOW_HIDDEN,
     BAGEL_FLOW_QUERY,
@@ -84,8 +84,8 @@ class InferenceMixin:
     / ``decode_velocity_from_hidden`` / ``advance_denoise``) — HF ``GenerationMixin``
     analog.
 
-    Listed *before* :class:`~...module_modeling_base.OmniPreTrainedModel` in
-    :class:`BagelFlowConnector`'s bases: ``OmniPreTrainedModel`` ships a no-op
+    Listed *before* :class:`~...module_modeling_base.PretrainedOmniModule` in
+    :class:`BagelFlowConnector`'s bases: ``PretrainedOmniModule`` ships a no-op
     ``reset_local_inference_state`` default (kept as a safety net for modules
     that don't need real inference state), and MRO resolves left-to-right —
     put second, that no-op would shadow the real one below.
@@ -283,7 +283,7 @@ class InferenceMixin:
         return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: SIGNAL_IMAGE_COMPLETE}
 
 
-class BagelFlowConnector(InferenceMixin, OmniPreTrainedModel):
+class BagelFlowConnector(InferenceMixin, PretrainedOmniModule):
     config_class = BagelFlowConnectorConfig
     base_model_prefix = "bagel_flow_connector"
     main_input_name = "hidden_states"

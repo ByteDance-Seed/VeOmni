@@ -222,9 +222,8 @@ def test_build_module_args_from_checkpoint_module_entry():
 
     omni_config = OmniConfig.from_dict(
         {
-            "modules": {
+            "_module_entries": {
                 "janus_siglip": {
-                    "subfolder": "janus_siglip",
                     "model_path": "/tmp/global/janus_siglip",
                     "model_config": {"freeze": True},
                     "accelerator": {"fsdp_config": {"fsdp_mode": "ddp"}},

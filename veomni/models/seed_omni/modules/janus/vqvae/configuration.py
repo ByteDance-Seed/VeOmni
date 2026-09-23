@@ -15,11 +15,12 @@ after build); this config only carries the knob.
 
 from typing import Any, Dict, Optional
 
-from transformers import PretrainedConfig
 from transformers.models.janus.configuration_janus import JanusVQVAEConfig as _hfvqconfig
 
+from ...module_configuration_base import OmniModuleConfig
 
-class JanusVqvaeConfig(PretrainedConfig):
+
+class JanusVqvaeConfig(OmniModuleConfig):
     """Top-level config for the Janus VQVAE + generation head."""
 
     model_type = "janus_vqvae"

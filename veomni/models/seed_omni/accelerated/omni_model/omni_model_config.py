@@ -114,18 +114,25 @@ class OmniModelRuntimeConfig(ModelArguments):
         return name
 
     def to_hf_config(self):
-        """Project onto the checkpoint-shaped HF :class:`~veomni.models.seed_omni.configuration_omni.OmniConfig`."""
+        """Project onto the checkpoint-shaped HF :class:`~veomni.models.seed_omni.configuration_omni.OmniConfig`.
+
+        Both scenario maps are carried whole, with the keys that select them:
+        ``OmniConfig.training_graph`` / ``generation_graph`` are read-only views
+        of ``training_graphs[train_type]`` / ``generation_graphs[infer_type]``,
+        so handing over only the active graph would lose every other scenario a
+        launcher declared.
+        """
         from ...configuration_omni import OmniConfig
 
-        module_entries = {name: mod.to_hf_config(name) for name, mod in self.modules.items()}
+        module_entries = {name: mod.to_hf_config() for name, mod in self.modules.items()}
         return OmniConfig.from_dict(
             {
+                "_module_entries": module_entries,
                 "training_graphs": deepcopy(self.training_graphs),
-                "train_type": self.train_type,
                 "generation_graphs": deepcopy(self.generation_graphs),
+                "train_type": self.train_type,
                 "infer_type": self.infer_type,
                 "generation_kwargs": dict(self.generation_kwargs),
-                "modules": module_entries,
             }
         )
 
