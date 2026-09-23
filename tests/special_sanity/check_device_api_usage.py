@@ -34,6 +34,9 @@ from pathlib import Path
 CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/utils/import_utils.py",
     "veomni/utils/device.py",
+    # Muon scopes backend-specific TF32/HF32 matmul controls to the actual
+    # tensor device. These precision switches have no device-agnostic API.
+    "veomni/optim/qwen38_muon.py",
     "veomni/ops/kernels/moe/_kernels/utils/benchmark_utils.py",
     "veomni/utils/helper.py",
     "veomni/distributed/torch_parallelize.py",

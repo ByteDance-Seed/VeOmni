@@ -219,3 +219,7 @@ jobs:
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_trainer.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep2.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep_sharded_stream_load.py
+
+      - name: Test FP32 master and logical-slice Muon optimizers
+        run: |
+          uv run --frozen pytest -v -s -x tests/optim/test_master_fp32_adamw.py tests/optim/test_cpu_offload_adamw.py tests/optim/test_qwen38_muon.py
