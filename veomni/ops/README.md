@@ -20,9 +20,9 @@ veomni/ops/
 │   ├── deepseek_v4/        TileLang sparse attention/indexer + precision helpers
 │   ├── load_balancing_loss/  eager + triton fused kernel
 │   ├── mhc/                TileKernels mHC pre/post/head adapters
-│   ├── rms_norm/           Liger / NPU / triton batch-invariant
+│   ├── rms_norm/           Liger / NPU / triton batch-invariant / nabla
 │   ├── rotary/             Liger / NPU / deterministic / Wan Triton
-│   ├── swiglu/             Liger SwiGLU MLP
+│   ├── swiglu/             Liger SwiGLU MLP / nabla
 │   └── moe/                Fused MoE + _kernels/ (group_gemm, quack_gemm)
 ├── platform/               Platform-specific runtime patches
 │   └── npu/                HCCL pre-mul sum patch
@@ -50,9 +50,9 @@ depending on when and where the kernel is bound:
 | Attention | `attn_implementation` | import-time | `flash_attention_2` | `eager`, `sdpa`, `flash_attention_2/3/4`, `flex_attention`, `magi_attention`, `native-sparse` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | LOSS_MAPPING | `eager` | `eager`, `liger_kernel`, `npu` (chunked loss) |
 | Load-balancing loss | `load_balancing_loss_implementation` | GLOBAL | `eager` | `eager`, `triton` |
-| RMSNorm | `rms_norm_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
+| RMSNorm | `rms_norm_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\*, `nabla` |
 | Rotary pos emb | `rotary_pos_emb_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
-| SwiGLU MLP | `swiglu_mlp_implementation` | PER_MODEL | `eager` | `liger_kernel` |
+| SwiGLU MLP | `swiglu_mlp_implementation` | PER_MODEL | `eager` | `liger_kernel`, `nabla` |
 | mHC | `mhc_implementation` | build-time `OpSlot` | `eager` | `tilelang` (DeepSeek V4, SM90+; provided by `tile-kernels`) |
 | Fused MoE | `moe_implementation` | build-time | `eager` | `eager`, `fused_triton` (group-gemm, SM70+), `fused_quack` (CUTLASS/CuTe, SM90+), `fused_npu` (Ascend). Mismatches raise instead of falling back. |
 
