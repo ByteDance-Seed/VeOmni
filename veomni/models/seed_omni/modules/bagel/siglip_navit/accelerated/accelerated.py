@@ -1,4 +1,4 @@
-"""SeedOmni V2 training-graph hooks for BAGEL's SigLIP NaViT vision encoder.
+"""SeedOmni training-graph hooks for BAGEL's SigLIP NaViT vision encoder.
 
 ``generate()`` lives natively on :class:`~.modeling.BagelSiglipNavit` — this
 file only carries the SP-aware training pre/forward/post hooks.

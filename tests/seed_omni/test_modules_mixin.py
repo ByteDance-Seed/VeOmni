@@ -1,4 +1,4 @@
-"""Smoke tests for SeedOmni V2 ``*BaseMixin`` classes and checkpoint layout."""
+"""Smoke tests for SeedOmni ``*BaseMixin`` classes and checkpoint layout."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Split a Qwen3-MoE checkpoint into SeedOmni V2 modules.
+"""Split a Qwen3-MoE checkpoint into SeedOmni modules.
 
 Registered under ``OMNI_CONVERT_REGISTRY["qwen3_moe"]`` and dispatched by
 ``scripts/seed_omni/convert_model.py`` (via :func:`convert_checkpoint`).

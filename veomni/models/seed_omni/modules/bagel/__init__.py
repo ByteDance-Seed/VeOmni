@@ -1,4 +1,4 @@
-"""BAGEL SeedOmni V2 modules.
+"""BAGEL SeedOmni modules.
 
 The V2 graph keeps BAGEL modules split by producer/consumer boundaries:
 

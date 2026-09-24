@@ -1,6 +1,6 @@
-# BAGEL-7B-MoT (SeedOmni V2)
+# BAGEL-7B-MoT (SeedOmni)
 
-End-to-end recipe for training and inferring **BAGEL-7B-MoT** as a SeedOmni V2
+End-to-end recipe for training and inferring **BAGEL-7B-MoT** as a SeedOmni
 graph model. The upstream BAGEL checkpoint is split into five OmniModules: text
 embedding / LM head, SigLIP-NaViT understanding tower, VAE codec, flow connector,
 and Qwen2-MoT backbone.

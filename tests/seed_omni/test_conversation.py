@@ -1,4 +1,4 @@
-"""Unit tests for SeedOmni V2 conversation-list helpers."""
+"""Unit tests for SeedOmni conversation-list helpers."""
 
 from __future__ import annotations
 

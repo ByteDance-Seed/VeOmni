@@ -4,7 +4,7 @@ Read this before editing `veomni/models/seed_omni/modules/**`.
 
 ## Shape
 
-A SeedOmni V2 module is usually:
+A SeedOmni module is usually:
 
 - A `configuration.py` with a unique `model_type` (family `PretrainedConfig`;
   the omni composite stores each slot as an `OmniModuleConfig` descriptor in

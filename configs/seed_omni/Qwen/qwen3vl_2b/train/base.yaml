@@ -1,4 +1,4 @@
-# VeOmni training / inference config for OmniModel V2 — Qwen3-VL-2B-Instruct.
+# VeOmni training / inference config for OmniModel — Qwen3-VL-2B-Instruct.
 #
 # Launch training (text + image + video understanding SFT):
 #   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml

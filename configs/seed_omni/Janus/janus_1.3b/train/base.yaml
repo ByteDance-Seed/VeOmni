@@ -1,4 +1,4 @@
-# Janus-1.3B SeedOmni V2 training launcher.
+# Janus-1.3B SeedOmni training launcher.
 #
 # Launch:
 #   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml

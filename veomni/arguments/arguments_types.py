@@ -1940,7 +1940,7 @@ class DataArguments:
             elif self.data_type == "dpo":
                 self.text_keys = "chosen"
             elif self.data_type in {"seedomni", "seedomni_cached"}:
-                # SeedOmni V2 modules own their own tokenization; the transform
+                # SeedOmni modules own their own tokenization; the transform
                 # reads ``conversations`` / ``images`` columns directly and
                 # cached rows carry ``conversation_list`` directly. Leave it unset.
                 pass

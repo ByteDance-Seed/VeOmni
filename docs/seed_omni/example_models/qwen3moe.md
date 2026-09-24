@@ -1,7 +1,7 @@
-# Qwen3-30B-A3B (MoE) (SeedOmni V2)
+# Qwen3-30B-A3B (MoE) (SeedOmni)
 
 End-to-end recipe for training and inferring **Qwen3-30B-A3B** (a 30B-total /
-3B-active Mixture-of-Experts model: 128 experts, top-8) as a SeedOmni V2 graph
+3B-active Mixture-of-Experts model: 128 experts, top-8) as a SeedOmni graph
 model. It reuses the dense Qwen3 split skeleton, swapping the backbone for the
 MoE one and adding **Expert Parallel (EP)** on the experts.
 

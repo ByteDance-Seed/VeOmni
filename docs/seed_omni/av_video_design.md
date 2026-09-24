@@ -38,7 +38,7 @@
   embeds, AUDIO slots ← audio embeds). Because the placeholders were already laid
   out in time order, the scatter restores time alignment.
 
-## SeedOmni V2 target design (decided)
+## SeedOmni target design (decided)
 
 - **Carrier**: one `conversation_list` item with `type="video"` and
   `value = video_inputs`; `meta["audio_stream"]` is optional (present ⇒ the clip

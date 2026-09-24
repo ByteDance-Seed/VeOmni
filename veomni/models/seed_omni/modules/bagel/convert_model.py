@@ -1,4 +1,4 @@
-"""Split a BAGEL checkpoint into SeedOmni V2 modules.
+"""Split a BAGEL checkpoint into SeedOmni modules.
 
 Registered under ``OMNI_CONVERT_REGISTRY["bagel"]``; :func:`convert_checkpoint`
 writes the omni checkpoint. Graphs come from ``configs/seed_omni/Bagel/bagel_7b_mot/``.

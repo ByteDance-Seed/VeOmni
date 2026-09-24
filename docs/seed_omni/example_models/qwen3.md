@@ -1,6 +1,6 @@
-# Qwen3-0.6B (SeedOmni V2)
+# Qwen3-0.6B (SeedOmni)
 
-End-to-end recipe for training and inferring **Qwen3-0.6B** as a SeedOmni V2
+End-to-end recipe for training and inferring **Qwen3-0.6B** as a SeedOmni
 graph model. This is the minimal **text-only** omni model: the monolithic
 `Qwen3ForCausalLM` is split into two OmniModules wired as
 `token_encode → qwen3_llm → token_decode`.

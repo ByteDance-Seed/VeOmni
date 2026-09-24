@@ -163,7 +163,7 @@ def compute_device_memory_metrics() -> Dict[str, Any]:
     """Device + host memory metrics, reduced (max) across all ranks.
 
     Shared by :class:`EnvironMeter` (single model) and
-    :class:`veomni.utils.omni_helper.OmniEnvironMeter` (OmniModel V2) — these are
+    :class:`veomni.utils.omni_helper.OmniEnvironMeter` (OmniModel) — these are
     module-agnostic and depend only on the device, so both meters report them
     identically.
     """

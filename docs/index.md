@@ -94,9 +94,9 @@ key_features/mtp.md
 
 ```{toctree}
 :maxdepth: 1
-:caption: SeedOmni V2
+:caption: SeedOmni
 
-seed_omni/seed_omni_v2.md
+seed_omni/seed_omni.md
 seed_omni/data_format.md
 seed_omni/av_video_design.md
 seed_omni/example_models/janus.md

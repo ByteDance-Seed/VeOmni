@@ -1,6 +1,6 @@
-# SeedOmni V2 Data Format
+# SeedOmni Data Format
 
-This guide describes the **on-disk conversation schema** used by SeedOmni V2
+This guide describes the **on-disk conversation schema** used by SeedOmni
 (`data_type: seedomni`) and the multisource preprocessors under
 ``veomni/data/seed_omni/preprocess.py``. The design goal is a **flat chat JSON**
 — a small number of `user` / `assistant` messages, each with an ordered
@@ -200,7 +200,7 @@ e.g. assistant prefix ``0``, boi/eoi/eos ``1``). Module-specific keys live in
 
 Modules read this list directly — chat template, tokenize, normalize, and
 patchify happen inside each SeedOmni module at forward time (see
-`seed_omni_v2.md` § 3).
+`seed_omni.md` § 3).
 
 ## Janus multisource training
 

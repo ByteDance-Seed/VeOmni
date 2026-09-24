@@ -1,7 +1,7 @@
 """Janus-1.3B OmniModule mixins.
 
 Splits the monolithic ``JanusForConditionalGeneration`` into composable
-sub-modules that match the SeedOmni V2 graph runtime (:mod:`veomni.models.
+sub-modules that match the SeedOmni graph runtime (:mod:`veomni.models.
 seed_omni`).  Each sub-module lives in its own folder under
 ``janus/<sub_module>/`` and contains short-named files
 (``configuration.py``, ``modeling.py``, optional ``processing.py``) —

@@ -1,4 +1,4 @@
-"""SeedOmni V2 native eager inference — simple process, then generate.
+"""SeedOmni native eager inference — simple process, then generate.
 
 Loads a split checkpoint with ``OmniModel.from_pretrained`` and preprocesses
 requests through :class:`~veomni.models.seed_omni.processing_omni.OmniProcessor`
@@ -32,7 +32,7 @@ logger = helper.create_logger(__name__)
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="SeedOmni V2 native inference (split checkpoint, checkpoint-driven load).",
+        description="SeedOmni native inference (split checkpoint, checkpoint-driven load).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(

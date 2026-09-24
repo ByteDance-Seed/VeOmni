@@ -1,6 +1,6 @@
 """Worker-side CPU preprocessor hooks + naflatten/unflatten CPU-shape fix.
 
-Covers the SeedOmni V2 optimization that moves each module's heavy CPU input-prep
+Covers the SeedOmni optimization that moves each module's heavy CPU input-prep
 (chat-template + tokenize, image normalize) into the DataLoader worker via a
 picklable ``Preprocessor`` run inside ``SeedOmniCollator``:
 

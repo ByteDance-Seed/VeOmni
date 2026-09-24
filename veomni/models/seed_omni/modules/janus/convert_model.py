@@ -1,4 +1,4 @@
-"""Split a Janus checkpoint into SeedOmni V2 modules.
+"""Split a Janus checkpoint into SeedOmni modules.
 
 Registered under ``OMNI_CONVERT_REGISTRY["janus"]`` (HF) and
 ``["multi_modality"]`` (DeepSeek); :func:`convert_checkpoint` writes the omni

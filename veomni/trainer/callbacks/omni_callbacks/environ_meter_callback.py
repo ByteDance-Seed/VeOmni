@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 
 class OmniEnvironMeterCallback(Callback):
-    """Per-module metric metering for OmniModel V2.
+    """Per-module metric metering for OmniModel.
 
     The single-model :class:`EnvironMeterCallback` can't meter ``OmniModel``: it
     is a composition of sub-modules with no single ``model_type`` to estimate

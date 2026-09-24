@@ -1,6 +1,6 @@
 # Source Of Truth
 
-Use this reference to decide which files to trust before editing SeedOmni V2.
+Use this reference to decide which files to trust before editing SeedOmni.
 
 ## Highest Priority
 
@@ -37,7 +37,7 @@ Use this reference to decide which files to trust before editing SeedOmni V2.
 
 ## Docs
 
-- `docs/seed_omni/seed_omni_v2.md`
+- `docs/seed_omni/seed_omni.md`
   - Authoritative architecture and developer guide. Start here for intent, but
     verify schema details against current graph source.
 - `docs/seed_omni/av_video_design.md`

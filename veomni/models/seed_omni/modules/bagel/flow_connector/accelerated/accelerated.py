@@ -1,4 +1,4 @@
-"""SeedOmni V2 carrier hooks for BAGEL's flow connector — training-graph hooks only.
+"""SeedOmni carrier hooks for BAGEL's flow connector — training-graph hooks only.
 
 ``embed_context_latents()`` / ``prepare_denoise_query()`` / ``decode_velocity_from_hidden()``
 / ``advance_denoise()`` and the shared :class:`~.generation_state.FlowGenerationState`

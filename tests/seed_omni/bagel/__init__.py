@@ -1,1 +1,1 @@
-"""BAGEL SeedOmni V2 tests."""
+"""BAGEL SeedOmni tests."""

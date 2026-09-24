@@ -1,6 +1,6 @@
 # Module Workflow
 
-Use this workflow when adding or changing a SeedOmni V2 module.
+Use this workflow when adding or changing a SeedOmni module.
 
 ## 1. Pick The Closest Live Example
 
@@ -37,7 +37,7 @@ Follow the existing folder shape:
 - `modeling.py`: weights, `forward`, and — if inference-capable — an in-file
   `InferenceMixin` (`generate()` + FSM state, listed before
   `PretrainedOmniModule` in the model class's bases; see §2.1 of
-  `docs/seed_omni/seed_omni_v2.md`).
+  `docs/seed_omni/seed_omni.md`).
 - `accelerated/accelerated.py`: composable `TrainingMixin` / `VeOmniMixin` hooks (no
   `InferenceMixin` — that lives on `modeling.py` now), CPU preprocessor, and
   **IDE type stubs** for modeling APIs (see

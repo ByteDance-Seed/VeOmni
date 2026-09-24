@@ -1,16 +1,16 @@
 ---
 name: seedomni-v2
-description: "SeedOmni V2 development guidance for Open-VeOmni. Use when adding or modifying `veomni/models/seed_omni/`, Omni modules, module mixins, CPU preprocessors, conversation carrier handling, training or generation graph YAML, SeedOmni split-checkpoint scripts, per-module accelerators, distributed/eager Omni inference, or SeedOmni V2 validation. Triggers include: new OmniModule, modify SeedOmni module, wire graph, update `training_graph` or `generation_graph`, split SeedOmni checkpoint, add Preprocessor, change conversation_list flow, configure per-module FSDP2/DDP/emb/ep, or debug SeedOmni V2 train/infer graph behavior."
+description: "SeedOmni development guidance for Open-VeOmni. Use when adding or modifying `veomni/models/seed_omni/`, Omni modules, module mixins, CPU preprocessors, conversation carrier handling, training or generation graph YAML, SeedOmni split-checkpoint scripts, per-module accelerators, distributed/eager Omni inference, or SeedOmni validation. Triggers include: new OmniModule, modify SeedOmni module, wire graph, update `training_graph` or `generation_graph`, split SeedOmni checkpoint, add Preprocessor, change conversation_list flow, configure per-module FSDP2/DDP/emb/ep, or debug SeedOmni train/infer graph behavior."
 ---
 
-# SeedOmni V2 Skill
+# SeedOmni Skill
 
 Use this file as a routing entrypoint. Load only the references needed for the
 task at hand; do not read every reference by default.
 
 ## First Checks
 
-1. Confirm the task touches SeedOmni V2:
+1. Confirm the task touches SeedOmni:
    - Source code under `veomni/models/seed_omni/`.
    - Configs under `configs/seed_omni/`.
    - SeedOmni data collation or `conversation_list` preprocessing.
@@ -33,7 +33,7 @@ task at hand; do not read every reference by default.
 | Add a new model config layout | `references/graph-runtime.md`, `templates/base.template.yaml`, `templates/modules_train.template.yaml` |
 | Add distributed/eager inference module config | `references/per-module-parallel.md`, `templates/modules_infer_eager.template.yaml`, `templates/modules_infer_fsdp.template.yaml` |
 | Update split-checkpoint conversion | `references/checkpoint-splitting.md`, `references/janus-example-map.md` |
-| Validate a SeedOmni V2 change | `references/validation.md` |
+| Validate a SeedOmni change | `references/validation.md` |
 
 ## Current Baseline
 
@@ -64,6 +64,6 @@ in `references/janus-example-map.md`.
 
 - Use `veomni-new-model` first when adding a new HuggingFace model family under
   `veomni/models/transformers/`.
-- Use this skill after that model exists, when wrapping it as SeedOmni V2
+- Use this skill after that model exists, when wrapping it as SeedOmni
   modules or wiring it into Omni graphs.
-- Use `veomni-develop` for unrelated framework work outside SeedOmni V2.
+- Use `veomni-develop` for unrelated framework work outside SeedOmni.

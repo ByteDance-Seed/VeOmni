@@ -1,4 +1,4 @@
-# <Model> SeedOmni V2 launcher.
+# <Model> SeedOmni launcher.
 #
 # Replace all angle-bracket placeholders and compare with a live config such as
 # configs/seed_omni/Janus/janus_1.3b/train/base.yaml before committing.

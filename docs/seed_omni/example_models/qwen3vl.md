@@ -1,7 +1,7 @@
-# Qwen3-VL-2B-Instruct (SeedOmni V2)
+# Qwen3-VL-2B-Instruct (SeedOmni)
 
 End-to-end recipe for training and inferring **Qwen3-VL-2B-Instruct** as a
-SeedOmni V2 graph model. This is a **vision-language** omni model: the monolithic
+SeedOmni graph model. This is a **vision-language** omni model: the monolithic
 `Qwen3VLForConditionalGeneration` is split into three OmniModules wired as
 image-understanding (I2T):
 
@@ -157,7 +157,7 @@ bash train.sh tasks/omni/train_omni.py \
 
 ## 5. Inference
 
-SeedOmni V2 has **two inference entry points**:
+SeedOmni has **two inference entry points**:
 
 | Script | Checkpoint | Runtime | When to use |
 |--------|------------|---------|-------------|
@@ -196,7 +196,7 @@ done
 
 ### 5.2 Native eager (`infer_omni_native.py`)
 
-This is launch path 1 in [`seed_omni_v2.md` §4.1](../seed_omni_v2.md#two-launch-paths)
+This is launch path 1 in [`seed_omni.md` §4.1](../seed_omni.md#two-launch-paths)
 (`OmniModel.from_pretrained`, no VeOmni runtime). Path 2 is
 `tasks/omni/infer_omni.py` plus `base.yaml`.
 

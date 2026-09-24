@@ -2,7 +2,7 @@
 
 > **⚠️ 历史文档（2026-07-20 已废弃该实现）：本文记录的 looped per-module SP 是 Arch A，代码已删除并迁移到 Arch B（uniform outer SP + classic single-pass Ulysses，见 [module_level_sp.md](./module_level_sp.md)）。** 下面的显存/时间数字**仍作为「促成放弃 Arch A 的动因证据」保留**：它们量化了把 SP 税压在最贵 LLM 上的代价（尤其 §3.3 的同步拷贝 ≈49–60% 墙钟）。文中提到的 `run_sp_looped_endpoint` / `sp_activation_offload` / `fsdp2_ac_patch` 等均已不存在。
 >
-> 日期：2026-07-19 · 机型：8×A100-80GB · 框架：VeOmni SeedOmni V2 · 对照模型：Janus-1.3B  
+> 日期：2026-07-19 · 机型：8×A100-80GB · 框架：VeOmni SeedOmni · 对照模型：Janus-1.3B  
 > 目标（Arch A 语境）：outer SP=1、module `ulysses_size=4` 时，**forward 与 backward 峰值显存都降到约 1/4**（相对「每卡只跑自己那条满长 sample」）。  
 > 设计与图例：[module_level_sp.md](./module_level_sp.md)。
 

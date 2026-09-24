@@ -1,4 +1,4 @@
-"""``ConversationItem`` — the single carrier object of SeedOmni V2.
+"""``ConversationItem`` — the single carrier object of SeedOmni.
 
 The whole pipeline (training and inference) operates on one batched
 ``conversation_list`` (``list[list[ConversationItem]]`` for training, a flat

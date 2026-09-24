@@ -3,7 +3,7 @@
 `train.checkpoint.output_dir` is the run root. Every per-step artifact lives
 under `output_dir/checkpoints/global_step_{N}/` (`train.checkpoint.save_path`);
 the model assets are written once to `output_dir/model_assets/`
-(`output_dir/model_assets/<module>/` in a [multi-module job](#multi-module-jobs-seedomni-v2)).
+(`output_dir/model_assets/<module>/` in a [multi-module job](#multi-module-jobs-seedomni)).
 
 ```
 checkpoints/global_step_{N}/
@@ -21,7 +21,7 @@ checkpoints/global_step_{N}/
 A step directory is split by *who owns the state*. `model/`, `loader/` and
 `extra_state/` are the resume tree — everything needed to continue training and
 nothing else. The two exports are inference artifacts that resume never reads.
-`<module>/` appears only in a [multi-module job](#multi-module-jobs-seedomni-v2).
+`<module>/` appears only in a [multi-module job](#multi-module-jobs-seedomni).
 
 ## What each path holds
 
@@ -67,7 +67,7 @@ Three splits in the tree above are deliberate:
   is not what a LoRA run resumes from; see
   [LoRA checkpoints](../key_features/lora.md#4-checkpoint-saving).
 
-## Multi-module jobs (SeedOmni V2)
+## Multi-module jobs (SeedOmni)
 
 A V2 job trains several modules side by side, each with its own weights,
 optimizer, scheduler and accelerator config. Module names are the keys of
@@ -212,7 +212,7 @@ What those older shapes looked like:
 |-----|----------------|
 | 0.1.12 | Step root *was* the DCP directory (`.metadata` + fused `__{i}_{rank}.distcp`); `extra_state/extra_state_rank_{R}.pt` mixed the scheduler and the job cursor; the LoRA adapter went to `<output_dir>/global_step_{N}/`, a sibling of `checkpoints/` |
 | 0.2.x flat | The same, with the cursor split out into `trainer_state_rank_{R}.pt` and `extra_state_rank_{R}.pt` left holding the scheduler alone |
-| SeedOmni V2 modules | Nested per module, but one level too shallow: `global_step_{N}/<module>/` was the DCP directory *and* the HF export directory, so safetensors landed on top of the shards |
+| SeedOmni modules | Nested per module, but one level too shallow: `global_step_{N}/<module>/` was the DCP directory *and* the HF export directory, so safetensors landed on top of the shards |
 
 The same fallbacks resolve a V2 module checkpoint, because they are applied
 *within* a module's directory: a module whose `model/<name>/` is absent falls

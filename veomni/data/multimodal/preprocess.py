@@ -375,7 +375,7 @@ def tulu_3_sft_mixture_preprocess(conversations, **kwargs):
 
 @PREPROCESSOR_REGISTRY.register("veomni_omni_demo")
 def veomni_omni_demo_preprocess(conversations, **kwargs):
-    """Unified SeedOmni V2 demo schema — one shape for every UG scenario.
+    """Unified SeedOmni demo schema — one shape for every UG scenario.
 
     Flat chat JSON: each message is
     ``{"role": <system|user|assistant>, "content": [...]}`` with typed items::

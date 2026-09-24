@@ -176,7 +176,7 @@ class OmniProcessor:
             # builds video items yet — say so rather than return a text-only
             # request as if the videos had been read.
             raise NotImplementedError(
-                "`videos` is not supported yet by SeedOmni V2 request building. Pass video "
+                "`videos` is not supported yet by SeedOmni request building. Pass video "
                 "frames as `images`, or build the conversation items directly and call "
                 "`preprocess`."
             )

@@ -1,4 +1,4 @@
-# Module-Level Sequence Parallel (SeedOmni V2)
+# Module-Level Sequence Parallel (SeedOmni)
 
 > **架构决策（2026-07-20，已实现）：从 Arch A（per-module *looped* SP）迁移到 Arch B（uniform outer SP + classic single-pass Ulysses）。**
 >

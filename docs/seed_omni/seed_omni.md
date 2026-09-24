@@ -1,4 +1,4 @@
-# SeedOmni V2 — Architecture & Developer Guide
+# SeedOmni — Architecture & Developer Guide
 
 > A ~10-minute tour of the composable, graph-driven multi-modal model in
 > `veomni/models/seed_omni/`. By the end you will know how the modules fit
@@ -7,9 +7,9 @@
 
 ---
 
-## 1. What SeedOmni V2 is
+## 1. What SeedOmni is
 
-SeedOmni V2 is a **model-agnostic runtime** for multi-modal models. The
+SeedOmni is a **model-agnostic runtime** for multi-modal models. The
 framework (`OmniModel`) knows *nothing* about Janus, vision towers, VQ codecs,
 or boundary tokens. It only knows how to:
 
@@ -408,7 +408,7 @@ anchor term described in §2.2. Inference has no such constraint — modules may
 (two-launch-paths)=
 ### 4.1 Two launch paths (native HF vs VeOmni Inferencer)
 
-SeedOmni V2 exposes **two public inference launches**. Both walk the same
+SeedOmni exposes **two public inference launches**. Both walk the same
 generation FSM (`OmniModel.generate`); they differ in how the composed model is
 built.
 

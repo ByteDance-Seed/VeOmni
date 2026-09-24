@@ -1,4 +1,4 @@
-"""Smoke tests for Qwen3-VL SeedOmni V2 modules (registry + M-RoPE helper)."""
+"""Smoke tests for Qwen3-VL SeedOmni modules (registry + M-RoPE helper)."""
 
 from pathlib import Path
 from types import SimpleNamespace

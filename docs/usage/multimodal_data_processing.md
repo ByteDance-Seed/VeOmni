@@ -8,9 +8,9 @@ The multimodal data pipeline lives in `veomni/data/multimodal/` and handles:
 
 1. **Preprocessing** (`preprocess.py`) — converts raw data samples into a unified conversation format via the [Preprocessor Registry](../key_features/preprocessor_registry.md).
 
-> **SeedOmni V2 (Janus / Bagel):** uses `data_type: seedomni` and a flat
+> **SeedOmni (Janus / Bagel):** uses `data_type: seedomni` and a flat
 > chat JSON with `type="image"` routed by `role`. See
-> [SeedOmni V2 Data Format](../seed_omni/data_format.md) for the full schema and
+> [SeedOmni Data Format](../seed_omni/data_format.md) for the full schema and
 > I2T / T2I / interleave examples.
 2. **Image processing** (`image_utils.py`) — loads images, resizes them to fit pixel budgets while preserving aspect ratio and ViT patch alignment.
 3. **Video processing** (`video_utils.py`) — loads videos (via torchcodec), samples frames by FPS, resizes spatially, and optionally extracts audio.

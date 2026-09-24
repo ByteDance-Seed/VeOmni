@@ -51,7 +51,7 @@ backbone:
 
 ## Sequence Parallel (Ulysses)
 
-> **Architecture (2026-07-20, implemented — Arch B):** SeedOmni V2 uses classic
+> **Architecture (2026-07-20, implemented — Arch B):** SeedOmni uses classic
 > single-pass Ulysses at ONE **uniform** SP size shared by the outer trainer and
 > every module. The earlier looped per-module SP (Arch A: outer SP=1, distinct
 > per-rank samples, per-sample loop + gather-to-owner + activation offload/ckpt +

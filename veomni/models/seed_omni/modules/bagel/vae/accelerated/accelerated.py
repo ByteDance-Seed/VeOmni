@@ -1,4 +1,4 @@
-"""SeedOmni V2 carrier hooks for BAGEL's latent VAE module — training-graph hooks only.
+"""SeedOmni carrier hooks for BAGEL's latent VAE module — training-graph hooks only.
 
 ``encode_context()`` and ``decode_generated()`` (the FSM generation nodes) live
 natively on :class:`~.modeling.BagelVAE` — this file only carries the training

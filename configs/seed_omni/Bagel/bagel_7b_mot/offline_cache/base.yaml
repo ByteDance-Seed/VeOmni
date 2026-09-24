@@ -1,4 +1,4 @@
-# VeOmni offline VAE posterior cache config for OmniModel V2 - BAGEL-7B-MoT.
+# VeOmni offline VAE posterior cache config for OmniModel - BAGEL-7B-MoT.
 
 model:
   model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT-v2

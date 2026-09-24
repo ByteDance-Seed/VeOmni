@@ -1,4 +1,4 @@
-# SeedOmni V2 Refactor — Merge / Migration Guide
+# SeedOmni Refactor — Merge / Migration Guide
 
 > **⚠️ Historical document.** The `szl.refact_omni_v2` refactor described here is
 > long merged, and the layout has moved on since: `mixins/module_mixin.py`,
@@ -7,9 +7,9 @@
 > `ModuleRuntime`), and per-node execution lives in `accelerated/utils/executor.py`
 > rather than `TrainingGraph.step`. Read this only to understand *why* things
 > moved; for current structure use
-> [`seed_omni_v2.md`](./seed_omni_v2.md) § 7 (file map).
+> [`seed_omni.md`](./seed_omni.md) § 7 (file map).
 
-> **Audience:** an agent (or human) whose branch adds or modifies a SeedOmni V2
+> **Audience:** an agent (or human) whose branch adds or modifies a SeedOmni
 > model and now needs to merge the `szl.refact_omni_v2` refactor (target branch
 > `szl.omni_v2`). This document is self-contained: it lists every structural move,
 > the import rewrites, the behavioural/API changes, and a mechanical conflict-resolution recipe.

@@ -104,7 +104,7 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 | Code review (before opening a PR) | `/veomni-review` |
 | Add new model | `/veomni-new-model` |
 | Write or refresh a model's patchgen modeling | `/veomni-patchgen-model` |
-| Add / modify SeedOmni V2 module or graph | `/seedomni-v2` |
+| Add / modify SeedOmni module or graph | `/seedomni-v2` |
 | Add new op/kernel | `/veomni-new-op` |
 | Update dependencies (uv) | `/veomni-uv-update` |
 | Performance profiling | `/veomni-profile` |

@@ -1,6 +1,6 @@
-# Janus-1.3B (SeedOmni V2)
+# Janus-1.3B (SeedOmni)
 
-End-to-end recipe for training and inferring **Janus-1.3B** as a SeedOmni V2
+End-to-end recipe for training and inferring **Janus-1.3B** as a SeedOmni
 graph model: a unified understanding (image→text) + generation (text→image)
 model whose SigLIP / VQVAE / LLaMA backbone are wired as separate OmniModules.
 
@@ -188,7 +188,7 @@ Training continues from step 500 with the dataloader and RNG state restored.
 ## 5. Inference
 
 Two public launches are documented in
-[`seed_omni_v2.md` §4.1](../seed_omni_v2.md#two-launch-paths):
+[`seed_omni.md` §4.1](../seed_omni.md#two-launch-paths):
 
 * **Native HF** — `python tasks/omni/infer_omni_native.py --model_path <split-ckpt> …`
   (`OmniModel.from_pretrained`, `modeling.py`, no runtime).
