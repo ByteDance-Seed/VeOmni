@@ -214,7 +214,8 @@ See `docs/usage/dit_microbatching.md`.
 MiniMax H3 prepares samples independently in `process_condition` and concatenates
 multi-sample inputs inside its model forward. Its layouts contain no 64-row tail;
 DiT/refiner attention boundaries and timestep indices remain sample-local.
-Single-sample Ulysses padding stays inside the DiT forward. Packed batches return
+Single-sample Ulysses padding stays inside the DiT forward. DiT attention follows
+`attn_implementation` for single-sample and packed forwards. Packed batches return
 ordinary sample-mean scalar losses and per-sample prediction lists, without a
 Trainer packing API; samples may differ in target geometry. See
 `docs/examples/minimax_h3.md` for the model-specific support limits.

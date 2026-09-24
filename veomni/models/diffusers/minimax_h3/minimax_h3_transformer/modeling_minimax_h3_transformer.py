@@ -12,6 +12,7 @@ because VeOmni's DiTTrainer does not pop/process training targets externally.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -19,9 +20,14 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
+from .....utils import logging
+from .....utils.device import IS_NPU_AVAILABLE
 from ..minimax_h3_core.batch_packing import pack_samples
 from ..minimax_h3_core.minimax_h3_dit import MiniMaxH3Attention, MiniMaxH3DiT, unpack_audio, unpatchify_video
 from .configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
+
+
+logger = logging.get_logger(__name__)
 
 
 @dataclass
@@ -32,10 +38,10 @@ class MiniMaxH3DiTOutput(ModelOutput):
     predictions: list | None = None
 
 
-_PACKED_FLASH_BACKENDS = (
-    "veomni_flash_attention_2_with_sp",
+_SDPA_BACKENDS = (None, "eager", "sdpa")
+_LOCAL_FLASH_BACKENDS = ("veomni_flash_attention_2_with_sp", "veomni_flash_attention_3_with_sp")
+_FLASH_BACKENDS = _LOCAL_FLASH_BACKENDS + (
     "veomni_flash_attention_2_hub_with_sp",
-    "veomni_flash_attention_3_with_sp",
     "veomni_flash_attention_3_hub_with_sp",
 )
 
@@ -73,35 +79,51 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             final_norm_eps=config.final_norm_eps,
         )
 
-        self._configure_packed_attention(config._attn_implementation)
+        self._configure_attention(config._attn_implementation)
 
-    def _configure_packed_attention(self, attn_implementation):
-        """Record the packed backend; it is validated and loaded on the first packed forward."""
-        self._packed_attn_implementation = attn_implementation
-        for module in self.dit.modules():
-            if isinstance(module, MiniMaxH3Attention):
-                module.packed_sdpa = attn_implementation in (None, "eager", "sdpa")
-                module.varlen_kernel = None
+    def _attention_modules(self):
+        return [module for module in self.dit.modules() if isinstance(module, MiniMaxH3Attention)]
 
-    def _load_packed_attention_kernel(self):
-        implementation = self._packed_attn_implementation
-        if implementation in (None, "eager", "sdpa"):
+    def _configure_attention(self, attn_implementation):
+        """Record the DiT attention backend; it is validated and loaded on the first forward."""
+        if os.environ.get("MINIMAX_H3_ATTENTION_IMPLEMENTATION"):
+            logger.warning_once(
+                "MINIMAX_H3_ATTENTION_IMPLEMENTATION no longer selects the H3 DiT attention; "
+                "use model.ops_implementation.attn_implementation."
+            )
+        self._attn_backend = attn_implementation
+        for module in self._attention_modules():
+            module.requires_flash_kernel = attn_implementation not in _SDPA_BACKENDS
+            module.varlen_kernel = None
+
+    def _load_attention_kernel(self, packed):
+        implementation = self._attn_backend
+        if implementation in _SDPA_BACKENDS:
             return
-        if implementation not in _PACKED_FLASH_BACKENDS:
-            raise ValueError(f"Unsupported H3 packing backend: {implementation}")
-        attention_modules = [module for module in self.dit.modules() if isinstance(module, MiniMaxH3Attention)]
+        if implementation not in _FLASH_BACKENDS:
+            raise ValueError(f"Unsupported H3 attention backend: {implementation}")
+        attention_modules = self._attention_modules()
         if all(module.varlen_kernel is not None for module in attention_modules):
+            return
+        if IS_NPU_AVAILABLE and not packed and implementation in _LOCAL_FLASH_BACKENDS:
+            if any(module.requires_flash_kernel for module in attention_modules):
+                logger.warning_once(
+                    f"H3 has no {implementation} kernel on Ascend NPU; single-sample attention uses PyTorch SDPA."
+                )
+                for module in attention_modules:
+                    module.requires_flash_kernel = False
             return
         from .....ops.kernels.attention.flash import _load_veomni_flash_kernel
 
         kernel = _load_veomni_flash_kernel(implementation).flash_attn_varlen_func
         for module in attention_modules:
             module.varlen_kernel = kernel
+            module.requires_flash_kernel = True
 
     def _forward_batch(self, samples):
         if any(sample.get("use_gradient_checkpointing_offload", False) for sample in samples):
             raise ValueError("H3 multi-sample packing does not support checkpoint offload.")
-        self._load_packed_attention_kernel()
+        self._load_attention_kernel(packed=True)
         packed_inputs, row_counts = pack_samples(samples)
         video, audio = self.dit(**packed_inputs, packed_batch=True)
         video_parts = video.split([v for v, _ in row_counts])
@@ -195,6 +217,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         scheduler_video = kwargs.pop("scheduler_video", None)
         scheduler_audio = kwargs.pop("scheduler_audio", None)
 
+        self._load_attention_kernel(packed=False)
         # Run DiT — skip_mask_out_condition=True, update_mask=None
         video_tokens, audio_tokens = self.dit(
             x=x,

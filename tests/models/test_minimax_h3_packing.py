@@ -14,6 +14,7 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_condition.modeling_minimax_h3
     MiniMaxH3ConditionModel,
 )
 from veomni.models.diffusers.minimax_h3.minimax_h3_core import core, minimax_h3_dit, packed_sequence
+from veomni.models.diffusers.minimax_h3.minimax_h3_transformer import modeling_minimax_h3_transformer as h3_model
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.configuration_minimax_h3_transformer import (
     MiniMaxH3DiTModelConfig,
 )
@@ -105,6 +106,7 @@ def serial(model, samples):
 @pytest.fixture(autouse=True)
 def cpu_attention(monkeypatch):
     monkeypatch.setattr(minimax_h3_dit, "IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr(h3_model, "IS_NPU_AVAILABLE", False)
     monkeypatch.setattr(core, "ATTENTION_IMPLEMENTATION", "torch")
     monkeypatch.setattr(minimax_h3_dit, "get_ulysses_sequence_parallel_group", lambda: None)
 
@@ -292,13 +294,24 @@ def test_accumulated_microbatches_weight_each_sample_like_single_sample():
     torch.testing.assert_close(accumulated, reference)
 
 
-def test_unsupported_backend_fails_only_on_packed_forward():
+def test_unsupported_backend_fails_on_first_forward():
     model = tiny_model()
-    model._configure_packed_attention("veomni_flash_attention_4_with_sp")  # what __init__ runs; must not raise
+    model._configure_attention("veomni_flash_attention_4_with_sp")  # what __init__ runs; must not raise
     samples = prepare(condition_model(), [raw_sample(3), raw_sample(5)])
-    serial(model, samples)
-    with pytest.raises(ValueError, match="Unsupported H3 packing backend"):
+    with pytest.raises(ValueError, match="Unsupported H3 attention backend"):
+        serial(model, samples)
+    with pytest.raises(ValueError, match="Unsupported H3 attention backend"):
         model(**batch(samples))
+
+
+def test_sdpa_selection_ignores_process_wide_attention(monkeypatch):
+    """eager/sdpa pin PyTorch SDPA per model, whatever core auto-detected or the environment requests."""
+    monkeypatch.setattr(core, "ATTENTION_IMPLEMENTATION", "xformers")  # would fail if the DiT still used it
+    monkeypatch.setenv("MINIMAX_H3_ATTENTION_IMPLEMENTATION", "xformers")
+    model = tiny_model()
+    assert model.config._attn_implementation == "sdpa"
+    sample = prepare(condition_model(), [raw_sample(3)])[0]
+    sum(model(**sample).loss.values()).backward()
 
 
 def test_sample_isolation_boundaries_and_zero_valid_rows():
@@ -407,9 +420,17 @@ def test_single_sample_valid_outputs_match_legacy_64_tail(task):
         torch.testing.assert_close(actual.loss[key], expected.loss[key])
 
 
-def test_uncovered_sp_attention_tail_cannot_poison_gradients(monkeypatch):
-    attention = tiny_model().dit.blocks[0].attn
-    x = torch.randn(8, 32, requires_grad=True)
+@pytest.mark.parametrize("flash", [False, True])
+def test_uncovered_sp_attention_tail_cannot_poison_gradients(monkeypatch, flash):
+    model = tiny_model()
+    attention = model.dit.blocks[0].attn
+    dtype = torch.float32
+    if flash:
+        config = model.config
+        attention.varlen_kernel = recording_kernel(config, [])
+        dtype = torch.bfloat16
+        attention.bfloat16()
+    x = torch.randn(8, 32, dtype=dtype, requires_grad=True)
     monkeypatch.setattr(torch, "empty_like", lambda value: torch.full_like(value, float("nan")))
     output = attention(x, rope_cos=None, rope_sin=None, cu_seqlens=(0, 7), max_seqlen=7)
     output[:7].square().mean().backward()
@@ -430,7 +451,7 @@ def test_sequence_parallel_padding_remains_forward_local(monkeypatch, task):
     seen = []
 
     def block(hidden, **kwargs):
-        seen.append((hidden.shape[0], kwargs["rope_cos"].shape[0], kwargs["cu_seqlens"], kwargs["use_ulysses"]))
+        seen.append((hidden.shape[0], kwargs["rope_cos"].shape[0], kwargs["cu_seqlens"].host, kwargs["use_ulysses"]))
         return hidden
 
     for module in model.dit.blocks:
@@ -447,23 +468,8 @@ def test_sequence_parallel_padding_remains_forward_local(monkeypatch, task):
 _NPU_REJECTS_HUB = pytest.mark.skipif(is_torch_npu_available(), reason="Hub attention is rejected on Ascend NPU.")
 
 
-@pytest.mark.parametrize(
-    "backend",
-    [
-        "flash_attention_2",
-        pytest.param("flash_attention_2_hub", marks=_NPU_REJECTS_HUB),
-        "flash_attention_3",
-        pytest.param("flash_attention_3_hub", marks=_NPU_REJECTS_HUB),
-    ],
-)
-def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(monkeypatch, backend):
-    from veomni.arguments import OpsImplementationConfig
-    from veomni.models.auto import build_foundation_model
-    from veomni.ops.kernels.attention import flash
-
-    calls, loads = [], []
-
-    config = tiny_model().config
+def recording_kernel(config, calls):
+    """Varlen FA stub: checks the FA layout, records ``cu_seqlens`` and computes the SDPA reference."""
 
     def kernel(q, k, v, *, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, causal):
         assert q.ndim == 3 and q.shape[1:] == (config.num_attention_heads, config.attention_head_dim)
@@ -474,11 +480,13 @@ def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(mon
         calls.append(cu_seqlens_q.tolist())
         return minimax_h3_dit._sdpa_varlen_attention(q, k, v, tuple(cu_seqlens_q.tolist()), softmax_scale, True)
 
-    def loader(name):
-        loads.append(name)
-        return SimpleNamespace(flash_attn_varlen_func=kernel)
+    return kernel
 
-    monkeypatch.setattr(flash, "_load_veomni_flash_kernel", loader)
+
+def build_with_backend(backend):
+    from veomni.arguments import OpsImplementationConfig
+    from veomni.models.auto import build_foundation_model
+
     ops = OpsImplementationConfig(
         attn_implementation=backend,
         rms_norm_implementation="eager",
@@ -488,26 +496,79 @@ def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(mon
         moe_implementation="eager",
         load_balancing_loss_implementation="eager",
     )
-    model = build_foundation_model(
+    return build_foundation_model(
         tiny_model().config, init_device="cpu", torch_dtype="float32", ops_implementation=ops
     ).bfloat16()
-    raws = [raw_sample(3), raw_sample(7)]
+
+
+def bf16_samples(raws):
     for row in raws:
         for key, value in row.items():
             if torch.is_tensor(value) and value.is_floating_point():
                 row[key] = value.bfloat16()
-    samples = prepare(condition_model(), raws)
-    serial(model, samples)
-    assert calls == []
+    return prepare(condition_model(), raws)
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "flash_attention_2",
+        pytest.param("flash_attention_2_hub", marks=_NPU_REJECTS_HUB),
+        "flash_attention_3",
+        pytest.param("flash_attention_3_hub", marks=_NPU_REJECTS_HUB),
+    ],
+)
+def test_flash_backend_drives_single_and_packed_attention(monkeypatch, backend):
+    from veomni.ops.kernels.attention import flash
+
+    calls, loads = [], []
+    kernel = recording_kernel(tiny_model().config, calls)
+
+    def loader(name):
+        loads.append(name)
+        return SimpleNamespace(flash_attn_varlen_func=kernel)
+
+    monkeypatch.setattr(flash, "_load_veomni_flash_kernel", loader)
+    model = build_with_backend(backend)
+    reference = build_with_backend("eager")
+    reference.load_state_dict(model.state_dict())
+    samples = bf16_samples([raw_sample(3), raw_sample(7)])
+    lengths = [sample["packed_seq_params"]["cu_seqlens_host"][-1] for sample in samples]
     loads.clear()  # Transformers may already have resolved the backend at construction.
-    out = model(**batch(samples))
-    sum(out.loss.values()).backward()
-    assert calls[:2] == [[0, 3], [0, 7]]
-    assert len(calls) == 4 and calls[2] == calls[3] and len(calls[2]) == 3
+
+    # Single samples: refiner then both main-DiT layers, each one varlen call, interleaved with an
+    # SDPA-configured model that must stay on SDPA and match within the stub's SDPA arithmetic.
+    for sample, text_len, length in zip(samples, (3, 7), lengths):
+        calls.clear()
+        out = model(**sample)
+        assert calls == [[0, text_len], [0, length], [0, length]]
+        expected = reference(**sample)
+        assert len(calls) == 3  # the SDPA-configured model never reaches the kernel
+        sum(out.loss.values()).backward()
+        sum(expected.loss.values()).backward()
+        for actual, want in zip(out.predictions, expected.predictions):
+            torch.testing.assert_close(actual, want)
+    for (name, param), ref in zip(model.named_parameters(), reference.parameters()):
+        torch.testing.assert_close(param.grad, ref.grad, msg=name)
     assert loads == [f"veomni_{backend}_with_sp"]
 
+    calls.clear()
+    out = model(**batch(samples))
+    sum(out.loss.values()).backward()
+    assert calls[:2] == [[0, 3], [0, 7]]  # refiners stay sample-local
+    assert len(calls) == 4 and calls[2] == calls[3] == [0, lengths[0], sum(lengths)]
+    assert loads == [f"veomni_{backend}_with_sp"]  # loaded once, shared by single and packed forwards
 
-def test_flash_backend_defers_packed_kernel_until_multisample_forward(monkeypatch):
+
+@pytest.mark.parametrize("backend", ["flex_attention", "flash_attention_4", "magi_attention"])
+def test_unsupported_public_backends_never_run_silently(backend):
+    """Transformers rejects some names at construction; H3 rejects the rest on the first forward."""
+    with pytest.raises((ValueError, ImportError)):
+        model = build_with_backend(backend)
+        model(**bf16_samples([raw_sample(3)])[0])
+
+
+def test_flash_backend_loads_on_first_forward_and_never_falls_back_on_cuda(monkeypatch):
     import sys
 
     from transformers import modeling_flash_attention_utils as hf_flash
@@ -550,9 +611,34 @@ def test_flash_backend_defers_packed_kernel_until_multisample_forward(monkeypatc
     config._attn_implementation = "veomni_flash_attention_2_with_sp"
     model = MiniMaxH3DiTModel(config)
     samples = prepare(condition_model(), [raw_sample(3), raw_sample(7)])
+    assert loads == []  # construction imports no CUDA kernel
 
-    serial(model, samples[:1])
-    assert loads == []
+    with pytest.raises(ImportError, match="flash_attn unavailable"):
+        serial(model, samples[:1])  # CUDA: a missing kernel is an error, not a silent SDPA run
+    assert loads == ["veomni_flash_attention_2_with_sp"]
+
+
+def test_npu_single_sample_warns_and_uses_sdpa_but_packing_still_needs_the_kernel(monkeypatch):
+    from veomni.ops.kernels.attention import flash
+
+    loads, warnings = [], []
+
+    def unavailable(name):
+        loads.append(name)
+        raise ImportError("flash_attn unavailable")
+
+    monkeypatch.setattr(flash, "_load_veomni_flash_kernel", unavailable)
+    monkeypatch.setattr(h3_model, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(h3_model.logger, "warning_once", warnings.append)
+    model = tiny_model()
+    model._configure_attention("veomni_flash_attention_2_with_sp")  # what __init__ runs on Ascend
+    reference = tiny_model()
+    reference.load_state_dict(model.state_dict())
+    samples = prepare(condition_model(), [raw_sample(3), raw_sample(7)])
+
+    for actual, expected in zip(serial(model, samples), serial(reference, samples)):
+        torch.testing.assert_close(actual.predictions, expected.predictions)
+    assert loads == [] and len(warnings) == 1 and "Ascend NPU" in warnings[0]
     with pytest.raises(ImportError, match="flash_attn unavailable"):
         model(**batch(samples))
     assert loads == ["veomni_flash_attention_2_with_sp"]
