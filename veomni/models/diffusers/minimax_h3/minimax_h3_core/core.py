@@ -15,9 +15,9 @@ from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
 
 
-def bind_minimax_attention(module: nn.Module, *, is_causal: bool) -> None:
+def bind_minimax_attention(module: nn.Module, *, is_causal: bool, impl: str | None = None) -> None:
     """Attach the configured ``attention/standard`` handle and HF interface attrs."""
-    impl = resolve_op_impl("attn_implementation")
+    impl = impl or resolve_op_impl("attn_implementation")
     num_heads = module.num_heads
     module.veomni_attn = VeomniOp("attention", "standard", impl)
     module.is_causal = is_causal

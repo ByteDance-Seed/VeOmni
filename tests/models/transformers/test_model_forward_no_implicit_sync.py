@@ -883,3 +883,93 @@ def test_no_implicit_sync_in_packed_deepseek_v4_fast_path():
             dead_fmt = "\n".join(f"  {bn} :: {qn}" for bn, qn in dead)
             problems.append(f"{len(dead)} dead _ALLOWED_SYNCS entries for {_PACKED_DSV4_FAST_PATH_ID!r}:\n{dead_fmt}")
         raise AssertionError("\n\n".join(problems))
+
+
+# MiniMax H3 (native diffusion model, not generated/): gate a training step through the
+# ordinary condition/model interface, single-sample and packed, with inputs already on
+# device as ``DiTTrainer.preforward`` leaves them. Keyed by ``(basename, qualname)``.
+_H3_CONDITION_SYNC = (
+    "algorithm-essential: per-sample timestep draw (`randint(...).item()`) and device index writes "
+    "of the noised layout; segment bounds are built separately in `_packed_seq_params`."
+)
+_H3_ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
+    "single": {
+        ("modeling_minimax_h3_condition.py", "MiniMaxH3ConditionModel._process_single_condition"): _H3_CONDITION_SYNC,
+    },
+    "packed": {
+        ("modeling_minimax_h3_condition.py", "MiniMaxH3ConditionModel._process_single_condition"): _H3_CONDITION_SYNC,
+        ("batch_packing.py", "pack_samples"): (
+            "algorithm-essential: one H2D upload each of the host-built main/refiner cu_seqlens, "
+            "which varlen kernels read on device; the DiT itself slices with the host copies."
+        ),
+    },
+}
+
+
+def _to_device_recursive(value, device):
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {key: _to_device_recursive(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_device_recursive(item, device) for item in value]
+    return value
+
+
+def _is_minimax_h3_path(filename: str) -> bool:
+    return "veomni/models/diffusers/minimax_h3/" in filename.replace(os.sep, "/")
+
+
+@pytest.mark.parametrize("attention", ["sdpa", "veomni_flash_attention_2"])
+@pytest.mark.parametrize("mode", ["single", "packed"])
+def test_no_implicit_sync_in_minimax_h3_forward_backward(monkeypatch, mode, attention):
+    """No implicit CUDA sync from MiniMax H3 modeling during a training step."""
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("CUDA required.")
+    if attention != "sdpa" and importlib.util.find_spec("flash_attn") is None:
+        pytest.skip("flash_attn package not installed.")
+
+    from tests.models.test_minimax_h3_packing import condition_model, raw_sample, tiny_model
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core import core
+    from veomni.trainer.dit_trainer import DiTDataCollator
+
+    fused = attention != "sdpa"
+    monkeypatch.setattr(core, "ATTENTION_IMPLEMENTATION", "flash_attention_2" if fused else "torch", raising=False)
+    dtype = torch.bfloat16 if fused else torch.float32
+    device = get_device_type()
+    torch.manual_seed(0)
+    config = tiny_model().config
+    config._attn_implementation = attention
+    model = type(tiny_model())(config).to(device=device, dtype=dtype)
+    raws = [raw_sample(3), raw_sample(5, "ref2va")][: 1 if mode == "single" else 2]
+    for row in raws:
+        row["use_gradient_checkpointing"] = True
+        for key in ("input_latents", "audio_input_latents", "prompt_embeds"):
+            row[key] = row[key].to(dtype)
+    collated = _to_device_recursive(dict(DiTDataCollator()(raws)), device)
+    condition = condition_model().to(device)
+
+    def step():
+        sum(model(**condition.process_condition(**collated)).loss.values()).backward()
+
+    step()  # warm up lazy kernel loading
+    model.zero_grad(set_to_none=True)
+    synchronize()
+
+    prev_mode = torch.cuda.get_sync_debug_mode()
+    captured: list[tuple[str, int]] = []
+    try:
+        torch.cuda.set_sync_debug_mode("warn")
+        with warnings.catch_warnings(record=True) as wlist:
+            warnings.simplefilter("always")
+            step()
+        captured = [(w.filename, w.lineno) for w in wlist if _SYNC_RE.search(str(w.message))]
+    finally:
+        torch.cuda.set_sync_debug_mode(prev_mode)
+
+    observed = {(os.path.basename(f), _enclosing_qualname(f, ln)): ln for f, ln in captured if _is_minimax_h3_path(f)}
+    allowed = _H3_ALLOWED_SYNCS.get(mode, {})
+    offending = sorted(k for k in observed if k not in allowed)
+    dead = sorted(k for k in allowed if k not in observed)
+    assert not offending, f"New implicit CUDA sync(s) in MiniMax H3 {mode} ({attention}): {offending}"
+    assert not dead, f"Dead MiniMax H3 sync allowlist entries for {mode}: {dead}"

@@ -197,6 +197,14 @@ of accumulation microbatches. Packing and SP/CP handling remain model-owned.
 Offline embedding allows multiple samples but keeps one microbatch per step.
 See `docs/usage/dit_microbatching.md`.
 
+MiniMax H3 prepares samples independently in `process_condition` and concatenates
+multi-sample inputs inside its model forward. Its layouts contain no 64-row tail;
+DiT/refiner attention boundaries and timestep indices remain sample-local.
+Single-sample Ulysses padding stays inside the DiT forward. Packed batches return
+ordinary sample-mean scalar losses and per-sample prediction lists, without a
+Trainer packing API; samples may differ in target geometry. See
+`docs/examples/minimax_h3.md` for the model-specific support limits.
+
 ## Parallelization Flow
 
 VeOmni uses FSDP2 exclusively.

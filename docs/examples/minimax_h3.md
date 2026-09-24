@@ -187,6 +187,129 @@ train:
 
 ---
 
+## Packed Offline Training
+
+With `train.micro_batch_size > 1`, H3 packs samples inside its ordinary forward.
+Both **FL2VA** and **visual Ref2VA** (image/video references, without reference
+audio) use `process_condition(**batch) → model(**batch)` and return sample-mean
+scalar losses. There is no Trainer packing switch or alternate output protocol.
+The recipe defaults to one sample. This does not batch inference requests,
+enable dynamic batching, load new encoders, or implement an RL objective.
+
+Use the offline recipe with the updated packed metadata:
+
+```shell
+bash train.sh tasks/train_dit.py configs/dit/minimax_h3_fl2va_offline.yaml \
+  --train.micro_batch_size 2 \
+  --train.global_batch_size 16
+```
+
+Keep `train.dyn_bsz=false`, `data.dataloader.drop_last=true`, and FSDP2
+`mixed_precision.cast_forward_inputs=false`. Timesteps stay FP32 and positions
+stay FP32/FP64; blanket BF16 input casting is rejected rather than silently
+changing their precision. Samples in one microbatch may differ in task
+(FL2VA/visual Ref2VA, with or without keyframes), target video/audio geometry,
+prompt length, reference count and reference geometry; `DiTDataCollator` fills
+keys a sample lacks with `None`, and multi-sample outputs return per-sample
+prediction lists. Multi-sample packing rejects Ulysses SP and block/checkpoint
+offload inside modeling. Single-device/FSDP2 with SP/CP/TP/PP sizes one is the validation target;
+LoRA, compilation and additional parallel/offload combinations are not validated.
+
+FL2VA and Ref2VA layouts now contain exactly `[text | cond | audio | video]`, with
+`seq_len=used` and `cu_seqlens=[0, used]`. There is no 64-row tail to crop during
+batch packing. Regenerate old cached `packed` metadata with the current builders
+before multi-sample training; latent tensors and embeddings need not be re-encoded.
+Legacy padded metadata is rejected for multi-sample packing. Any divisibility
+padding for single-sample Ulysses remains local to `MiniMaxH3DiT.forward`.
+Uncovered SP attention rows are zero-initialized so discarded outputs cannot
+introduce nonfinite parameter gradients.
+
+Samples encoded without an audio track keep the silent placeholder latent, so the
+layout is unchanged, but carry `has_audio=False` (also saved in offline
+embeddings). Their `mse_audio` is zero-weighted, and a packed microbatch takes
+the plain sample mean, so after the trainer's division by the accumulation steps
+every sample keeps weight `1/G`, as with `micro_batch_size=1`. Normalizing by the
+global audio-sample count is not implemented. Caches written without `has_audio`
+keep supervising audio as before.
+
+### Visual Ref2VA prepared data
+
+Use matching Ref2VA model weights and **precomputed** Ref2VA prompt/condition
+embeddings. The existing FL2VA embedding recipe does not become a Ref2VA encoder.
+A decoded offline sample has the usual `input_latents`, `audio_input_latents`,
+`prompt_embeds` and `use_gradient_checkpointing`, plus:
+
+```python
+from veomni.models.diffusers.minimax_h3.minimax_h3_core.packed_sequence import build_packed_ref2va
+
+# Illustrative geometry; match it to the actual encoded tensors.
+ref_blocks = [
+    {"kind": "image", "latent_t": 1, "latent_h": 16, "latent_w": 24},
+    {"kind": "video", "latent_t": 6, "latent_h": 16, "latent_w": 24},
+]
+packed = build_packed_ref2va(
+    text_len=prompt_embeds.shape[0],
+    latent_t=video_latents.shape[2],
+    latent_h=video_latents.shape[3],
+    latent_w=video_latents.shape[4],
+    audio_t=audio_latents.shape[-1],
+    audio_channel=audio_latents.shape[0],
+    ref_blocks=ref_blocks,
+    text_token_tags=text_token_tags,
+)
+```
+
+Store this `packed` dictionary and `ref_visual_anchor` of shape
+`[packed["cond_rows"], 96]` in the existing offline-record format. Anchor rows must
+be concatenated in reference-block order and already use the same conditioning
+noise augmentation as `model.condition_model_cfg.imgvid_cond_noise_aug`, matching
+the native inference reference encoder. Preserve the Ref2VA presentation's text
+versus vision token tags. Do not substitute target-video keyframes or FL2VA prompt
+embeddings for Ref2VA references. Reference audio is rejected explicitly.
+
+Each sample samples its own timestep/noise through the existing condition path
+before packing. The transformer then executes once over compact rows with
+independent main-DiT and text-refiner cumulative boundaries. Its RoPE coordinates
+stay sample-local; timestep tables are remapped, not assumed shared. Reference
+rows are cropped separately for each output. Video/audio signs, unpatchification,
+scheduler weights and sample-mean losses retain their single-sample meanings.
+For multi-sample inputs, the small text token refiner runs separately for each sample. Its BF16 output
+projections can round differently when their GEMM row count changes; the deep
+pretrained DiT amplifies those differences. Keeping the refiner sample-local
+preserves its serial arithmetic without disabling packing in the main DiT.
+This is not a promise of bitwise equality for every packed operator or shape.
+
+AdaLN timestep gathers retain the upstream dtype and backward reduction on both
+paths. This feature does not introduce an FP32 gather correction into the shared
+H3 implementation. Low-precision repeated-index reductions can vary even between
+serial repeats, so packed-gradient comparisons must also measure that baseline
+variability; a separate accumulation-precision fix must not silently change the
+single-sample path. Sample-local refiner execution is restricted to cross-sample
+packing; ordinary single-sample attention dispatch is preserved.
+
+### Attention and validation
+
+- `eager` / `sdpa`: explicit per-segment PyTorch SDPA reference path; main-DiT
+  projections and MLPs still operate on compact cross-sample rows.
+- `flash_attention_2` / `flash_attention_3` in `model.ops_implementation` resolve
+  to VeOmni's local FA2/FA3 backends, and `flash_attention_2_hub` /
+  `flash_attention_3_hub` to the Hugging Face Hub kernels
+  (`kernels-community/flash-attn2` / `flash-attn3`, version 1). Each main-DiT
+  layer uses one non-causal varlen call; refiner layers retain one call per
+  sample. The kernel is loaded on the first multi-sample forward and needs
+  BF16/FP16; unavailable kernels are not silently replaced with SDPA.
+
+`tests/models/test_minimax_h3_packing.py` uses a native tiny model on CPU to
+check packed-versus-serial outputs, losses and gradients (including mixed target
+geometry and checkpoint recomputation), sample isolation, Ref2VA variable
+references, forward-local SP padding and fail-closed inputs. SP collectives are
+mocked there, so it does not establish distributed SP parity. The FA2/FA3 call
+site is checked for all four backends with a kernel stub that asserts the
+varlen layout; kernel correctness itself is covered by
+`tests/ops/test_flash_attn_varlen_padding.py`.
+No end-to-end speedup or convergence is claimed. Benchmark against an equivalent,
+tuned non-packed baseline before claiming a performance improvement.
+
 ## 5. Inference
 
 ```shell

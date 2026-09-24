@@ -18,6 +18,7 @@ import veomni.trainer.dit_trainer as dit_module
 from veomni.data.dataset import MappingDataset
 from veomni.trainer.dit_trainer import (
     DiTDataArguments,
+    DiTDataCollator,
     DiTModelArguments,
     DiTModelRuntime,
     DiTTrainer,
@@ -208,3 +209,10 @@ def test_embedding_tail_padding_saves_original_samples_exactly_once(monkeypatch,
         rows = Dataset.from_parquet(str(tmp_path / f"rank_{rank}_shard_0.parquet"))
         saved_ids.extend(int(pickle.loads(row["value"]).item()) - 1 for row in rows)
     assert sorted(saved_ids) == list(range(5))
+
+
+def test_collator_aligns_missing_keys_with_none():
+    single = DiTDataCollator()([{"a": 1, "b": 2}])
+    assert dict(single) == {"a": [1], "b": [2]}
+    mixed = DiTDataCollator()([{"a": 1, "x": "fl2va"}, {"a": 2, "y": "ref2va"}, {"a": 3}])
+    assert dict(mixed) == {"a": [1, 2, 3], "x": ["fl2va", None, None], "y": [None, "ref2va", None]}

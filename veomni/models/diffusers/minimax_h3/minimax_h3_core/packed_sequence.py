@@ -1,11 +1,11 @@
-"""FL2VA Packed Sequence Builder.
+"""FL2VA and visual Ref2VA packed sequence builders.
 
-Layout: [text | cond | audio | video | pad]
+Layout: [text | cond | audio | video]
 
 Output packed dict fields:
   seq_len, img_pos, audio_pos, text_pos, update_mask,
   img_position_ids [1, seq_len, 3] float64, token_tags [seq_len] int64,
-  cu_seqlens [3] int32,
+  cu_seqlens [2] int32,
   text_len, audio_channel, audio_t, latent_t, latent_h_patched, latent_w_patched, cond_rows
 """
 
@@ -28,7 +28,6 @@ _INTERP = 32
 _T_GROUP = 5
 _FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 _FRAME_RESCALE = 5.0 / 3.0
-_SEQ_ALIGN = 64
 _PATCH_H, _PATCH_W = 2, 2
 
 
@@ -56,6 +55,74 @@ def _temporal_position_span(temporal_length: int) -> float:
     for token_index in range(_T_GROUP):
         spans[token_index::_T_GROUP] *= _FRAME_PER_TOKEN[token_index]
     return float(spans.sum())
+
+
+def build_packed_ref2va(
+    text_len: int,
+    latent_t: int,
+    latent_h: int,
+    latent_w: int,
+    audio_t: int,
+    ref_blocks: list[dict],
+    audio_channel: int = 2,
+    text_token_tags: torch.Tensor | None = None,
+) -> dict:
+    """Build visual-reference training metadata using the native inference grids.
+
+    References describe pre-encoded image/video geometry; anchor rows are supplied
+    separately, in block order. Audio references require a different replay/loss
+    contract and are not supported here. No encoder or inference pipeline is loaded.
+    """
+    if not ref_blocks:
+        raise ValueError("Ref2VA requires at least one visual reference.")
+    pk = build_packed_fl2va(text_len, latent_t, latent_h, latent_w, audio_t, [], audio_channel, text_token_tags)
+    grids = []
+    t_cursor = float(text_len)
+    for block in ref_blocks:
+        kind = block["kind"]
+        if kind in ("audio", "video_audio") or block.get("ref_audio_t", 0):
+            raise NotImplementedError("Ref2VA audio references are not supported.")
+        if kind not in ("image", "video"):
+            raise ValueError(f"Unknown visual reference kind: {kind}")
+        t, h, w = (int(block[key]) for key in ("latent_t", "latent_h", "latent_w"))
+        if t < 1 or h < 2 or w < 2 or h % 2 or w % 2 or (kind == "image" and t != 1):
+            raise ValueError("Reference geometry requires positive T, even H/W, and T=1 for images.")
+        sqrt_area = np.sqrt(h * w)
+        hh, ww = torch.meshgrid(
+            _axis_from_sqrt_area(h, 2, sqrt_area), _axis_from_sqrt_area(w, 2, sqrt_area), indexing="ij"
+        )
+        grid = torch.empty(t, (h // 2) * (w // 2), 3, dtype=torch.float64)
+        grid[:, :, 0] = _video_t_grid(t, t_cursor)[:, None]
+        grid[:, :, 1:] = torch.stack([hh.flatten(), ww.flatten()], dim=-1)[None]
+        grids.append(grid.flatten(0, 1))
+        t_cursor += 1.0 if kind == "image" else _temporal_position_span(t)
+    ref_grid = torch.cat(grids)
+    cond_rows = ref_grid.shape[0]
+    old_used = int(pk["cu_seqlens"][1])
+    target_grid = pk["img_position_ids"][0, text_len:old_used].clone()
+    target_grid[:, 0] += t_cursor - text_len
+    used = old_used + cond_rows
+    seq_len = used
+    positions = torch.zeros(1, seq_len, 3, dtype=torch.float64)
+    positions[0, :text_len] = pk["img_position_ids"][0, :text_len]
+    positions[0, text_len : text_len + cond_rows] = ref_grid
+    positions[0, text_len + cond_rows : used] = target_grid
+    tags = torch.full((seq_len,), -1, dtype=torch.long)
+    tags[:text_len] = pk["token_tags"][:text_len]
+    tags[text_len : text_len + cond_rows] = 0
+    tags[text_len + cond_rows : used] = pk["token_tags"][text_len:old_used]
+    pk.update(
+        seq_len=seq_len,
+        img_position_ids=positions,
+        token_tags=tags,
+        img_pos=torch.cat([torch.arange(text_len, text_len + cond_rows), pk["img_pos"] + cond_rows]),
+        audio_pos=pk["audio_pos"] + cond_rows,
+        cond_rows=cond_rows,
+        update_mask=torch.cat([torch.zeros(cond_rows, dtype=torch.bool), pk["update_mask"]]),
+        cu_seqlens=torch.tensor([0, used], dtype=torch.int32),
+        task="ref2va",
+    )
+    return pk
 
 
 def build_packed_fl2va(
@@ -92,7 +159,7 @@ def build_packed_fl2va(
     num_keyframes = len(keyframe_indices)
     cond_rows = num_keyframes * frame_rows
     used = text_len + cond_rows + audio_rows + video_rows
-    seq_len = ((used + _SEQ_ALIGN - 1) // _SEQ_ALIGN) * _SEQ_ALIGN
+    seq_len = used
 
     # Slice ranges
     text_sl = slice(0, text_len)
@@ -169,7 +236,7 @@ def build_packed_fl2va(
     if text_token_tags is not None:
         token_tags[text_pos] = text_token_tags.long()
 
-    cu = torch.tensor([0, used, seq_len], dtype=torch.int32)
+    cu = torch.tensor([0, used], dtype=torch.int32)
 
     return {
         "seq_len": int(seq_len),
@@ -188,3 +255,14 @@ def build_packed_fl2va(
         "latent_w_patched": pw,
         "cond_rows": cond_rows,
     }
+
+
+def host_cu_seqlens(packed: dict) -> tuple[int, ...]:
+    """Segment bounds of a ``[text | cond | audio | video]`` layout from host metadata only.
+
+    ``packed["cu_seqlens"]`` may already live on the accelerator; reading it back would sync.
+    Returns ``(0, seq_len)``, or ``(0, used, seq_len)`` for legacy tail-padded layouts.
+    """
+    used = int(packed["text_pos"].numel() + packed["img_pos"].numel() + packed["audio_pos"].numel())
+    seq_len = int(packed["seq_len"])
+    return (0, seq_len) if used == seq_len else (0, used, seq_len)
