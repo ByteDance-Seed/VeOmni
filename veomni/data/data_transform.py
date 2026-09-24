@@ -412,6 +412,89 @@ def process_sample_qwen_vl(
     )
 
 
+@DATA_TRANSFORM_REGISTRY.register("gemma3")
+def process_sample_gemma3(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    position_id_func: "Callable",
+    max_seq_len: int = 8192,
+    **kwargs,
+):
+    """Build a Gemma 3 multimodal SFT sample with assistant-only labels."""
+    from .multimodal import conv_preprocess
+    from .multimodal.image_utils import fetch_images
+
+    source = kwargs.get("source_name") or sample.get("source") or sample.get("source_name")
+    conversations = conv_preprocess(source, sample.get("conversations", sample), **kwargs)
+
+    images = fetch_images(sample.get("images", []), **kwargs)
+    if images:
+        image_inputs = processor.image_processor(images=images, return_tensors="pt", do_pan_and_scan=False)
+        num_crops = image_inputs.pop("num_crops", torch.zeros(len(images), dtype=torch.long))
+    else:
+        image_inputs = {}
+        num_crops = torch.empty(0, dtype=torch.long)
+
+    messages = []
+    for conversation in conversations:
+        role = conversation[0]
+        content = []
+        for value_type, value in conversation[1:]:
+            if value_type == "image":
+                content.append({"type": "image"})
+            elif value_type == "text":
+                content.append({"type": "text", "text": value})
+            else:
+                raise ValueError(f"Unsupported Gemma 3 content type: {value_type}")
+        messages.append({"role": role, "content": content})
+
+    def tokenize_prefix(end: int) -> torch.Tensor:
+        prefix_messages = messages[:end]
+        text = processor.apply_chat_template(prefix_messages, tokenize=False, add_generation_prompt=False)
+        image_count = sum(item["type"] == "image" for msg in prefix_messages for item in msg["content"])
+        for image_idx in range(image_count):
+            replacement = processor.replace_image_token({"num_crops": num_crops}, image_idx)
+            text = text.replace(processor.boi_token, replacement, 1)
+        return processor.tokenizer(text, add_special_tokens=True, return_tensors="pt")["input_ids"][0]
+
+    input_ids = tokenize_prefix(len(messages))
+    labels = torch.full_like(input_ids, IGNORE_INDEX)
+    previous_length = 0
+    for end, message in enumerate(messages, start=1):
+        current_length = tokenize_prefix(end).numel()
+        if message["role"] == "assistant":
+            labels[previous_length:current_length] = input_ids[previous_length:current_length]
+        previous_length = current_length
+
+    if input_ids.numel() > max_seq_len:
+        input_ids = input_ids[:max_seq_len]
+        labels = labels[:max_seq_len]
+
+    image_token_id = processor.tokenizer.image_token_id
+    expected_image_tokens = len(images) * processor.image_seq_length
+    actual_image_tokens = int((input_ids == image_token_id).sum())
+    if actual_image_tokens != expected_image_tokens:
+        raise ValueError(
+            "Gemma 3 max_seq_len truncated an image placeholder: "
+            f"expected {expected_image_tokens} image tokens, found {actual_image_tokens}."
+        )
+
+    attention_mask = torch.ones_like(input_ids)
+    position_ids = position_id_func(input_ids=input_ids.unsqueeze(0), attention_mask=attention_mask.unsqueeze(0))[
+        "position_ids"
+    ].squeeze(0)
+
+    model_inputs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "token_type_ids": (input_ids == image_token_id).long(),
+        "labels": labels,
+    }
+    model_inputs.update(image_inputs)
+    return [model_inputs]
+
+
 @DATA_TRANSFORM_REGISTRY.register("qwen2_5_omni")
 @DATA_TRANSFORM_REGISTRY.register("qwen3_omni_moe")
 def process_sample_qwen_omni(
