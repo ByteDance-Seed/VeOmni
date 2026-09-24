@@ -69,6 +69,10 @@ def flash_calls(monkeypatch):
 
     def varlen_oracle(query, key, value, attention_mask, **kwargs):  # packed q/k/v: [1, T, H, D]
         calls.append({"mask": attention_mask, **kwargs})
+        if kwargs.get("cu_seq_lens_q") is None:
+            return F.scaled_dot_product_attention(
+                query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+            ).transpose(1, 2)
         q_bounds, k_bounds = kwargs["cu_seq_lens_q"].tolist(), kwargs["cu_seq_lens_k"].tolist()
         segments = [
             F.scaled_dot_product_attention(
@@ -110,6 +114,12 @@ def test_flash_path_rejects_additive_masks():
         qi_model._joint_varlen_metadata(torch.zeros(2, 11))  # 0 = attend in an additive mask
 
 
+@pytest.mark.parametrize("invalid_value", [-1, 2])
+def test_flash_path_rejects_nonbinary_integer_masks(invalid_value):
+    with pytest.raises(ValueError, match="boolean or 0/1 keep mask"):
+        qi_model._joint_varlen_metadata(torch.tensor([[1, invalid_value, 0, 1]]))
+
+
 def test_flash_path_accepts_integer_keep_masks():
     metadata = qi_model._joint_varlen_metadata(torch.tensor([[1, 1, 0, 1], [1, 0, 0, 0]]))
     assert metadata["indices"].tolist() == [0, 1, 3, 4]
@@ -123,50 +133,121 @@ def test_unsupported_attn_implementation_is_rejected(attn_implementation):
         qi_model.QwenImageSPAttnProcessor(attn_implementation)
 
 
-def run_attention(model, seed=0):
-    """Joint attention on a batch where sample 1 has padded text in the middle of the joint sequence."""
+def run_attention(model, seed=0, masked=True):
+    """Joint attention with optional text padding in the middle of the joint sequence."""
     generator = torch.Generator().manual_seed(seed)
     batch, text_len, image_len, dim = 2, 5, 6, 16
     image = torch.randn(batch, image_len, dim, generator=generator, requires_grad=True)
-    text = torch.randn(batch, text_len, dim, generator=generator)
+    text = torch.randn(batch, text_len, dim, generator=generator, requires_grad=True)
     text_mask = torch.ones(batch, text_len, dtype=torch.bool)
-    text_mask[1, 3:] = False
-    joint_mask = torch.cat([text_mask, torch.ones(batch, image_len, dtype=torch.bool)], dim=1)
+    if masked:
+        text_mask[1, 3:] = False
+    joint_mask = torch.cat([text_mask, torch.ones(batch, image_len, dtype=torch.bool)], dim=1) if masked else None
     attn = model.transformer_blocks[0].attn
     image_out, text_out = attn.processor(attn, image, encoder_hidden_states=text, attention_mask=joint_mask)
-    return image, image_out, text_out, text_mask
+    return image, text, image_out, text_out, text_mask
 
 
 @pytest.mark.parametrize("requested, resolved, kernel", FLASH_CASES)
-def test_flash_path_matches_sdpa_on_valid_tokens(flash_calls, requested, resolved, kernel):
+@pytest.mark.parametrize("masked", [False, True])
+def test_flash_path_matches_sdpa_on_valid_tokens(flash_calls, requested, resolved, kernel, masked):
     reference = build("eager")
     model = build(requested)
     model.load_state_dict(reference.state_dict())
 
-    ref_image, ref_image_out, ref_text_out, text_mask = run_attention(reference)
-    image, image_out, text_out, _ = run_attention(model)
+    ref_image, ref_text, ref_image_out, ref_text_out, text_mask = run_attention(reference, masked=masked)
+    image, text, image_out, text_out, _ = run_attention(model, masked=masked)
 
     (call,) = flash_calls
     assert call["attn_implementation"] == kernel
     assert call["mask"] is None  # explicit varlen metadata instead of per-layer unpadding from the mask
-    assert call["cu_seq_lens_q"].tolist() == [0, 11, 20]  # sample 1: 3 valid text + 6 image tokens
-    assert call["cu_seq_lens_k"].tolist() == [0, 11, 20]
-    assert call["max_length_q"] == call["max_length_k"] == 11
+    if masked:
+        assert call["cu_seq_lens_q"].tolist() == [0, 11, 20]  # sample 1: 3 valid text + 6 image tokens
+        assert call["cu_seq_lens_k"].tolist() == [0, 11, 20]
+        assert call["max_length_q"] == call["max_length_k"] == 11
+    else:
+        assert call.get("cu_seq_lens_q") is None
+        assert call.get("cu_seq_lens_k") is None
     torch.testing.assert_close(image_out, ref_image_out)
     torch.testing.assert_close(text_out[text_mask], ref_text_out[text_mask])
-    image_out.square().sum().backward()
-    ref_image_out.square().sum().backward()
+    (image_out.square().sum() + text_out[text_mask].square().sum()).backward()
+    (ref_image_out.square().sum() + ref_text_out[text_mask].square().sum()).backward()
     torch.testing.assert_close(image.grad, ref_image.grad)
+    torch.testing.assert_close(text.grad, ref_text.grad)
+    for parameter, ref_parameter in zip(model.parameters(), reference.parameters()):
+        assert (parameter.grad is None) == (ref_parameter.grad is None)
+        if parameter.grad is not None:
+            torch.testing.assert_close(parameter.grad, ref_parameter.grad)
 
 
-def run_forward(model):
-    """Full transformer forward on a batch where sample 1 has padded text."""
+def test_attention_selection_is_instance_local(flash_calls):
+    hub_model = build("flash_attention_3_hub")
+    local_model = build("flash_attention_2")
+    native_model = build("eager")
+    for model in (hub_model, native_model, local_model, hub_model):
+        run_attention(model)
+    assert [call["attn_implementation"] for call in flash_calls] == [
+        "veomni_flash_attention_3_hub_with_sp",
+        "flash_attention_2",
+        "veomni_flash_attention_3_hub_with_sp",
+    ]
+
+
+@pytest.mark.parametrize("error_type", [ImportError, RuntimeError])
+def test_flash_kernel_failure_does_not_fall_back(flash_calls, monkeypatch, error_type):
+    model = build("flash_attention_3_hub")
+
+    def unavailable(*args, **kwargs):
+        raise error_type("requested flash kernel is unavailable")
+
+    monkeypatch.setattr(flash, "_flash_attention_forward", unavailable)
+    with pytest.raises(error_type, match="requested flash kernel is unavailable"):
+        run_attention(model)
+
+
+@pytest.mark.parametrize("mask_shape", [(1, 11), (2, 10)])
+@pytest.mark.parametrize("precomputed", [False, True])
+def test_flash_path_rejects_mismatched_joint_mask_shape(flash_calls, mask_shape, precomputed):
+    model = build("flash_attention_3_hub")
+    attn = model.transformer_blocks[0].attn
+    mask = torch.ones(mask_shape, dtype=torch.bool)
+    metadata = qi_model._joint_varlen_metadata(mask) if precomputed else None
+    with pytest.raises(ValueError, match="joint mask shape"):
+        attn.processor(
+            attn,
+            torch.randn(2, 6, 16),
+            encoder_hidden_states=torch.randn(2, 5, 16),
+            attention_mask=mask,
+            joint_varlen_metadata=metadata,
+        )
+    assert not flash_calls
+
+
+@pytest.mark.parametrize("invalid_value", [-1, 2, float("-inf"), 1j])
+def test_model_rejects_invalid_text_mask_before_normalization(flash_calls, invalid_value):
+    model = build("flash_attention_3_hub")
+    text_mask = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, invalid_value, 0]])
+    with pytest.raises(ValueError, match="boolean or 0/1 keep mask"):
+        run_forward(model, text_mask)
+    assert not flash_calls
+
+
+@pytest.mark.parametrize("mask_shape", [(1, 5), (2, 4)])
+def test_model_rejects_mismatched_text_mask_shape(flash_calls, mask_shape):
+    model = build("flash_attention_3_hub")
+    with pytest.raises(ValueError, match="text mask shape"):
+        run_forward(model, torch.ones(mask_shape, dtype=torch.bool))
+    assert not flash_calls
+
+
+def run_forward(model, text_mask=None):
+    """Full transformer forward through the public model entry point."""
     generator = torch.Generator().manual_seed(0)
     batch, text_len = 2, 5
-    text_mask = torch.ones(batch, text_len, dtype=torch.long)
-    text_mask[1, 3:] = 0
-    return qi_model.QwenImageTransformer2DModel_forward(
-        model,
+    if text_mask is None:
+        text_mask = torch.ones(batch, text_len, dtype=torch.long)
+        text_mask[1, 3:] = 0
+    return model(
         hidden_states=torch.randn(batch, 6, 16, generator=generator),
         encoder_hidden_states=torch.randn(batch, text_len, 16, generator=generator),
         encoder_hidden_states_mask=text_mask,
@@ -176,14 +257,26 @@ def run_forward(model):
     )[0]
 
 
-def test_varlen_metadata_is_computed_once_per_forward(flash_calls, monkeypatch):
+@pytest.mark.parametrize("gradient_checkpointing", [False, True])
+def test_varlen_metadata_is_computed_once_per_forward(flash_calls, monkeypatch, gradient_checkpointing):
     reference = build("eager")
     model = build("flash_attention_3_hub")
     model.load_state_dict(reference.state_dict())
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        reference.gradient_checkpointing_enable()
     derivations = []
     derive = qi_model._joint_varlen_metadata
     monkeypatch.setattr(qi_model, "_joint_varlen_metadata", lambda mask: derivations.append(mask) or derive(mask))
 
-    torch.testing.assert_close(run_forward(model), run_forward(reference))
+    output, ref_output = run_forward(model), run_forward(reference)
+    torch.testing.assert_close(output, ref_output)
     assert len(flash_calls) == 2  # one per block
-    assert len(derivations) == 1  # each derivation syncs with the host, so not per layer
+    output.square().sum().backward()
+    ref_output.square().sum().backward()
+    for parameter, ref_parameter in zip(model.parameters(), reference.parameters()):
+        assert (parameter.grad is None) == (ref_parameter.grad is None)
+        if parameter.grad is not None:
+            torch.testing.assert_close(parameter.grad, ref_parameter.grad)
+    assert len(flash_calls) == (4 if gradient_checkpointing else 2)
+    assert len(derivations) == 1  # also reused during checkpoint recomputation

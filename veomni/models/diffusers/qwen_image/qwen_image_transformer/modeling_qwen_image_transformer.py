@@ -49,16 +49,24 @@ def _pad_seq(x: torch.Tensor, dim: int, pad_size: int, value: float = 0) -> torc
     return torch.cat([x, pad], dim=dim)
 
 
+def _validate_flash_keep_mask(attention_mask: torch.Tensor) -> None:
+    """Reject non-keep masks before normalization can discard their dtype or values."""
+    if attention_mask.ndim != 2 or attention_mask.is_floating_point() or attention_mask.is_complex():
+        raise ValueError(
+            "Qwen-Image flash attention needs a [B, S] boolean or 0/1 keep mask; got "
+            f"shape {tuple(attention_mask.shape)} dtype {attention_mask.dtype}. "
+            "The flash path does not support additive masks."
+        )
+    if attention_mask.dtype != torch.bool and not ((attention_mask == 0) | (attention_mask == 1)).all():
+        raise ValueError("Qwen-Image flash attention needs a boolean or 0/1 keep mask; integer values must be 0 or 1.")
+
+
 def _joint_varlen_metadata(attention_mask: torch.Tensor) -> dict[str, Any]:
     """Pack the tokens kept by a ``[B, S]`` joint mask for FlashAttention varlen, once per forward.
 
-    Deriving this per layer (as unpadding from the mask would) costs two host syncs per attention call.
+    Deriving this per layer (as unpadding from the mask would) adds host syncs to every attention call.
     """
-    if attention_mask.ndim != 2 or attention_mask.is_floating_point():
-        raise ValueError(
-            "Qwen-Image flash attention needs a [B, S] boolean or 0/1 keep mask; got "
-            f"shape {tuple(attention_mask.shape)} dtype {attention_mask.dtype}. Use sdpa for additive masks."
-        )
+    _validate_flash_keep_mask(attention_mask)
     attention_mask = attention_mask.bool()
     seqlens = attention_mask.sum(dim=-1, dtype=torch.int32)
     return {
@@ -172,9 +180,14 @@ class QwenImageSPAttnProcessor:
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
         if self.use_flash_attention:
+            batch_size, joint_len = joint_query.shape[:2]
+            if attention_mask is not None and attention_mask.shape != (batch_size, joint_len):
+                raise ValueError(
+                    f"Qwen-Image flash joint mask shape must be {(batch_size, joint_len)}, "
+                    f"got {tuple(attention_mask.shape)}. Broadcast masks are not supported."
+                )
             if attention_mask is not None and joint_varlen_metadata is None:
                 joint_varlen_metadata = _joint_varlen_metadata(attention_mask)
-            batch_size, joint_len = joint_query.shape[:2]
             varlen_kwargs = {}
             if joint_varlen_metadata is not None:
                 # Pack the kept tokens of all samples into one [1, T, H, D] sequence.
@@ -283,6 +296,16 @@ def QwenImageTransformer2DModel_forward(
     encoder_hidden_states = self.txt_norm(encoder_hidden_states)
     encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
+    # This forward is also patched onto the diffusers class, so consult its processor.
+    use_flash_attention = getattr(self.transformer_blocks[0].attn.processor, "use_flash_attention", False)
+    if use_flash_attention and encoder_hidden_states_mask is not None:
+        _validate_flash_keep_mask(encoder_hidden_states_mask)
+        if encoder_hidden_states_mask.shape != encoder_hidden_states.shape[:2]:
+            raise ValueError(
+                f"Qwen-Image flash text mask shape must be {tuple(encoder_hidden_states.shape[:2])}, "
+                f"got {tuple(encoder_hidden_states_mask.shape)}."
+            )
+
     text_seq_len, _, encoder_hidden_states_mask = compute_text_seq_len_from_mask(
         encoder_hidden_states, encoder_hidden_states_mask
     )
@@ -346,8 +369,6 @@ def QwenImageTransformer2DModel_forward(
         block_attention_kwargs["attention_mask"] = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
 
     joint_mask = block_attention_kwargs.get("attention_mask")
-    # This forward is patched onto the diffusers class, so ask the processor rather than a VeOmni-only config.
-    use_flash_attention = getattr(self.transformer_blocks[0].attn.processor, "use_flash_attention", False)
     if joint_mask is not None and use_flash_attention:
         block_attention_kwargs["joint_varlen_metadata"] = _joint_varlen_metadata(joint_mask)
 
@@ -440,8 +461,7 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
         self.config: QwenImageTransformer2DModelConfig = config
         self.config.tie_word_embeddings = False
 
-        # Install the Ulysses-SP joint-attention processor on every block. It is
-        # a no-op (plain diffusers joint attention) when SP is disabled.
+        # Bind this model's attention implementation on every block, independently of whether SP is enabled.
         sp_processor = QwenImageSPAttnProcessor(config._attn_implementation)
         for block in self.transformer_blocks:
             block.attn.set_processor(sp_processor)
