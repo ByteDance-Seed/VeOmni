@@ -127,7 +127,7 @@ class ModelCheckpointManager:
     def hf_export_assets(self) -> list:
         """Sidecars an HF export writes beside the weights: config, tokenizer, processor.
 
-        The runtime's cached list. A SeedOmni V2 module overrides this to read
+        The runtime's cached list. A SeedOmni module overrides this to read
         them off the live model instead, because there the assets are bound onto
         the model rather than kept beside it.
         """

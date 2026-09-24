@@ -1,6 +1,6 @@
 """Tests for the per-module accelerator training knobs moved off `OmniTrainingArguments`.
 
-Covers: `AcceleratorConfig` gaining the SeedOmni-V2-only fields, per-module
+Covers: `AcceleratorConfig` gaining the SeedOmni-only fields, per-module
 `accelerator.*` override survival through `build_module_runtime_args`, and
 `_validate_omni_accelerator` being invoked both for the top-level default
 (`OmniArguments.__post_init__`) and per resolved module (`resolve_omni_model`).
@@ -64,7 +64,7 @@ def _fake_args(*, modules_override: dict | None = None) -> OmniArguments:
     )
 
 
-def test_accelerator_config_has_seed_omni_v2_fields_with_expected_defaults():
+def test_accelerator_config_has_seed_omni_fields_with_expected_defaults():
     acc = AcceleratorConfig()
     assert acc.init_device == "meta"
     assert isinstance(acc.gradient_checkpointing, GradientCheckpointingConfig)

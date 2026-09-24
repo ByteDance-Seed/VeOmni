@@ -1,4 +1,4 @@
-# fake_module_a -> fake_module_b SeedOmni V2 launcher: the smallest config that
+# fake_module_a -> fake_module_b SeedOmni launcher: the smallest config that
 # drives OmniTrainer / OmniInferencer end to end. The modules are single linear
 # maps, so this exercises the launch path, not a model.
 #

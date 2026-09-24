@@ -92,7 +92,7 @@ veomni/
 │   ├── dit_trainer.py  DitTrainer: diffusion transformer training
 │   ├── text_dpo_trainer.py  DPO training for text models
 │   ├── base_rl_trainer.py   Base RL trainer for RLHF
-│   ├── omni/           SeedOmni V2 orchestrators (not BaseTrainer subclasses):
+│   ├── omni/           SeedOmni orchestrators (not BaseTrainer subclasses):
 │   │                   OmniTrainer drives OmniModelRuntime's per-module
 │   │                   ModuleRuntimes; OmniInferencer runs the infer graph
 │   │                   (eager, or FSDP/DDP via the runtime). Launched by

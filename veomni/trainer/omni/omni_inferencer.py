@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OmniInferencer — SeedOmni V2 inference driver.
+"""OmniInferencer — SeedOmni inference driver.
 
 Standalone from :class:`OmniTrainer`, and like it holds exactly one model
 handle: ``self.model``.  Which of the two SeedOmni build paths produces it
@@ -73,7 +73,7 @@ class InferenceRequest:
 
 
 class OmniInferencer:
-    """SeedOmni V2 inference driver over a single model handle."""
+    """SeedOmni inference driver over a single model handle."""
 
     model: OmniModel | OmniModelRuntime
     processor: OmniProcessor
@@ -146,7 +146,7 @@ class OmniInferencer:
     # ── Inference entry point ─────────────────────────────────────────────────
 
     def _runtime_generation_kwargs(self) -> dict[str, Any]:
-        """Return per-request generation kwargs with the resolved V2 scenario attached."""
+        """Return per-request generation kwargs with the resolved scenario attached."""
         infer_args = self.args.infer
         generation_kwargs = dict(infer_args.generation_kwargs)
         requested_infer_type = generation_kwargs.get("infer_type")

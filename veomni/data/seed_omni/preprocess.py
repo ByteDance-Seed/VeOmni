@@ -1,4 +1,4 @@
-"""SeedOmni V2 dataset preprocessors.
+"""SeedOmni dataset preprocessors.
 
 Maps each multisource ``names`` entry to a conversation layout understood by
 ``veomni.data.seed_omni.seedomni_transform``.

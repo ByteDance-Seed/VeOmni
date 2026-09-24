@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal audio IO for the SeedOmni V2 data layer.
+"""Minimal audio IO for the SeedOmni data layer.
 
 **Loads at the source's own rate and reports it.** That is the whole design, and
 it is the opposite of ``veomni/data/multimodal/audio_utils.py``, which resamples
@@ -100,7 +100,7 @@ def load_audio(audio: AudioInput, audio_sampling_rate: int | None = None) -> tup
         samples, rate = soundfile.read(source, dtype="float32", always_2d=False)
     except soundfile.LibsndfileError:
         # libsndfile covers wav / flac / ogg / mp3 but not the ffmpeg-only
-        # containers (m4a, aac, wma), which the v1 loader reached through
+        # containers (m4a, aac, wma), which ``veomni.data.multimodal`` reaches through
         # librosa's audioread backend. ``sr=None`` is what keeps the native
         # rate — librosa's own default would resample to 22.05 kHz and defeat
         # the point of this file.

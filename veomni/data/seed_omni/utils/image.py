@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal image IO for the SeedOmni V2 data layer.
+"""Minimal image IO for the SeedOmni data layer.
 
 This is intentionally tiny: **load** the image and, if it's huge, do a single
 **aspect-preserving downscale** so a giant source image doesn't blow up memory /
@@ -22,7 +22,7 @@ It deliberately does **not** do ``smart_resize`` (patch-aligned / min-max-pixel
 rounding) — that is a model-specific decision owned by the vision module's
 processor (e.g. ``Qwen2VLImageProcessor``), which receives the pixels and does
 its own resize + patchify + normalize. Keeping the data layer model-agnostic is
-the whole point of SeedOmni V2 (see ``docs/seed_omni/seed_omni_v2.md`` § 3).
+the whole point.
 """
 
 from __future__ import annotations

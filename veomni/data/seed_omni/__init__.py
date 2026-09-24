@@ -1,4 +1,4 @@
-"""SeedOmni V2 data helpers."""
+"""SeedOmni data helpers."""
 
 from .preprocess import SEED_OMNI_PREPROCESSOR_REGISTRY, conv_preprocess  # noqa: F401
 

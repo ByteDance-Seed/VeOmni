@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Launcher argument schema for SeedOmni V2 training + inference.
+"""Launcher argument schema for SeedOmni training + inference.
 
 A single ``base.yaml`` drives both
 :class:`~veomni.trainer.omni.omni_trainer.OmniTrainer` and
@@ -25,7 +25,7 @@ and
 subclass ``ModelArguments`` (aliased here as :class:`OmniModuleRuntimeArguments`
 / :class:`OmniModelRuntimeArguments`). The model fields, the ``accelerator`` /
 ``optimizer`` pair, HDFS localization and the cached ``fqn_to_index_mapping``
-are declared once and shared with the V1 ``ModelArguments``. Only ``data`` /
+are declared once and shared with ``ModelArguments``. Only ``data`` /
 ``train`` / ``infer`` are Omni's own.
 
 Omni-specific layout:
@@ -109,7 +109,7 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
     """Resolve ``args.model`` launcher fields into a fully populated :class:`OmniModelRuntimeArguments`."""
     model_runtime = args.model
     if not model_runtime.model_path:
-        raise ValueError("`model.model_path` (split-checkpoint root) is required for OmniModel V2.")
+        raise ValueError("`model.model_path` (split-checkpoint root) is required for OmniModel.")
 
     # ``model_path`` is already local: ``BaseModelArguments.__post_init__`` localizes
     # it, so per-module subfolders join against a path that exists on disk and
@@ -445,7 +445,7 @@ class OmniInferArguments:
 
 @dataclass
 class OmniDataArguments:
-    """``data.*`` for OmniModel V2."""
+    """``data.*`` for OmniModel."""
 
     train_path: str = field(
         metadata={"help": "Local path/HDFS path of the training data. Use comma to separate multiple datasets."},
@@ -539,7 +539,7 @@ class OmniDataArguments:
 
 @dataclass
 class OmniTrainingArguments:
-    """``train.*`` for OmniModel V2 — parallelism and optimizer live on ``model``."""
+    """``train.*`` for OmniModel — parallelism and optimizer live on ``model``."""
 
     dyn_bsz: bool = field(
         default=True,
@@ -643,7 +643,7 @@ class OmniTrainingArguments:
             )
         },
     )
-    train_type: str | None = field(default=None, metadata={"help": "SeedOmni V2 training workflow."})
+    train_type: str | None = field(default=None, metadata={"help": "SeedOmni training workflow."})
     offline_cache_dir: str | None = field(
         default=None,
         metadata={"help": "Output directory for train_type='offline_cache'."},
@@ -741,8 +741,8 @@ def _validate_omni_accelerator(accelerator: AcceleratorConfig) -> None:
     ``AcceleratorConfig.__post_init__``; the ``ep_sharded_stream_load`` /
     ``broadcast_model_weights_from_rank0`` exclusion runs in
     ``ModelArguments.__post_init__``. Neither is repeated here. What is left is the
-    V2-only ``torch_compile`` ban (V1 supports it, with its own validation in
-    ``VeOmniArguments``).
+    SeedOmni-only ``torch_compile`` ban (single-model trainers support it, with
+    their own validation in ``VeOmniArguments``).
 
     Called once for the top-level default (``model.accelerator``, at ``OmniArguments.__post_init__``
     time, before modules are resolved) and once per module (in :func:`resolve_omni_model`, after
@@ -750,12 +750,12 @@ def _validate_omni_accelerator(accelerator: AcceleratorConfig) -> None:
     validated too, not just the global default.
     """
     if accelerator.torch_compile.enable:
-        raise ValueError("accelerator.torch_compile.enable is not supported by SeedOmni V2 yet.")
+        raise ValueError("accelerator.torch_compile.enable is not supported by SeedOmni yet.")
 
 
 @dataclass
 class OmniArguments:
-    """Root launcher config for SeedOmni V2."""
+    """Root launcher config for SeedOmni."""
 
     model: OmniModelRuntimeArguments = field(default_factory=OmniModelRuntimeArguments)
     data: OmniDataArguments = field(default_factory=OmniDataArguments)

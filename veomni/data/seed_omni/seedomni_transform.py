@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SeedOmni V2 multimodal data transform — Feature D1.
+"""SeedOmni multimodal data transform.
 
 Reads a raw jsonl-style sample (already source-tagged conversations + media
 paths/bytes) and returns ``[{"conversation_list": [...]}]`` where each
@@ -41,8 +41,7 @@ This transform is intentionally minimal — it does **only**:
 Anything else (chat-template formatting, tokenization, boundary marker
 emission, ``input_ids`` / ``labels`` / ``attention_mask`` construction,
 position id calculation, image normalization, image patchification) is
-deliberately **not** done here — it belongs in model modules per the V2
-design contract (see ``docs/seed_omni/seed_omni_v2.md`` § 3).
+deliberately **not** done here — it belongs in model modules.
 
 Audio turns (``("audio", _)``) are paired with the per-sample ``audios`` list and
 loaded by ``utils/audio.fetch_audios`` **at the source's own rate**, which each
@@ -210,7 +209,7 @@ def process_seedomni_example(
     example: dict[str, Any],
     **kwargs,
 ) -> list[dict[str, Any]]:
-    """SeedOmni V2 transform — emit a single-key sample ``{"conversation_list": [...]}``.
+    """SeedOmni transform — emit a single-key sample ``{"conversation_list": [...]}``.
 
     Args:
         example: a dataset sample dict.  Required keys:
@@ -241,7 +240,7 @@ def process_seedomni_example(
             ignored rather than rejected.
             ``OmniTrainer`` injects ``tokenizer`` / ``max_seq_len`` /
             ``text_keys`` here (legacy contract); they are silently
-            ignored — V2 modules own their own tokenizer.
+            ignored — SeedOmni modules own their own tokenizer.
 
     Returns:
         A single-element list ``[{"conversation_list": items}]`` to match

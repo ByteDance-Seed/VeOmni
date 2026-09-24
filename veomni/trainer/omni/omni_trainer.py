@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OmniTrainer — orchestrator for OmniModel V2 (one runtime per sub-module).
+"""OmniTrainer — orchestrator for OmniModel (one runtime per sub-module).
 
 Unlike single-model trainers (BaseTrainer / VLMTrainer), OmniModel is a
 *composition* of several independent OmniModule sub-models (Janus: siglip /
@@ -197,7 +197,7 @@ def build_omni_model(
 
 
 class OmniTrainer:
-    """Orchestrator for OmniModel V2 — one :class:`ModuleRuntime` per module.
+    """Orchestrator for OmniModel — one :class:`ModuleRuntime` per module.
 
     Not a :class:`BaseTrainer` subclass: ``BaseTrainer`` assumes one model, one
     optimizer and one checkpoint, while every OmniModule here carries its own.

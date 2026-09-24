@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal video IO for the SeedOmni V2 data layer.
+"""Minimal video IO for the SeedOmni data layer.
 
 Intentionally tiny — just enough to avoid OOM when a clip is large:
 
@@ -51,7 +51,7 @@ VideoInput = Union[List["Image.Image"], List[bytes], bytes, str]
 
 @dataclass
 class VideoInputs:
-    """Decoded video carried as a SeedOmni V2 conversation item ``value``.
+    """Decoded video carried as a SeedOmni conversation item ``value``.
 
     A single clip is one media item whose ``value`` bundles both streams:
 

@@ -1,6 +1,6 @@
 """Per-module checkpoint path resolution in ``_resolve_model_path``.
 
-A SeedOmni V2 checkpoint is a root folder with one subfolder per OmniModule, so
+A SeedOmni checkpoint is a root folder with one subfolder per OmniModule, so
 a module's ``model_path`` is normally a bare name joined under that root. These
 tests pin down when the join must *not* happen.
 """

@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 
 class OmniStepMetricsCallback(Callback):
-    """Per-step training metrics (loss / per-node losses / grad norm / lr) for OmniModel V2.
+    """Per-step training metrics (loss / per-node losses / grad norm / lr) for OmniModel.
 
     The single-model :class:`EnvironMeterCallback` cannot run here: an
     ``OmniModel`` has no single ``model_type`` to estimate FLOPs on, and its

@@ -565,7 +565,7 @@ class PackingPostCollator(DataCollator):
 
 @dataclass
 class SeedOmniCollator(DataCollator):
-    """List-only collator for the SeedOmni V2 ``conversation_list`` schema.
+    """List-only collator for the SeedOmni ``conversation_list`` schema.
 
     Pairs with ``data_type: seedomni`` (see
     ``veomni/data/seed_omni/seedomni_transform.py``) which emits
@@ -574,7 +574,7 @@ class SeedOmniCollator(DataCollator):
     ``{"conversation_list": [[ConversationItem, ...], ...]}`` plus any extra
     keys present in the samples (passed through unchanged as a per-sample list).
 
-    No stacking, no padding, no sequence-parallel slicing — the V2 design
+    No stacking, no padding, no sequence-parallel slicing — the SeedOmni design
     contract puts all of that inside model modules' ``pre_forward``,
     where each module knows which fields it owns and how to slice them.
     The data layer's job stops at "list of per-sample dicts → dict of
