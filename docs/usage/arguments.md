@@ -743,6 +743,7 @@ implementations also differ. These timings measure collective latency, not model
 | reduce_dtype | `str` | `"float32"` | Dtype for gradient reduction (i.e. reduce-scatter or all-reduce). |
 | output_dtype | `str` | `None` | Dtype for casting floating-point forward outputs (FSDP2). |
 | cast_forward_inputs | `bool` | `True` | Enable mixed precision cast forward inputs (FSDP2). |
+| extra_parallel_param_dtype | `str` | `None` | Dtype for the unsharded parameters of ExtraParallel (e.g. expert) modules, overriding param_dtype for those modules only; float32 keeps their weight gradients in FP32 through the FSDP2 reduce-scatter. |
 
 
 ### OffloadConfig
