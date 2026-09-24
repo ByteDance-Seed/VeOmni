@@ -168,7 +168,6 @@ def test_a_frozen_module_gets_no_checkpoint_manager():
 
     assert runtime.checkpoint is None
     assert runtime.has_trainable_parameters is False
-    assert runtime.checkpoint_subfolder == "vision_encoder"
 
 
 def test_a_trainable_module_does_get_a_checkpoint_manager(monkeypatch):

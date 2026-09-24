@@ -563,17 +563,6 @@ class ModuleRuntime(VeOmniModelRuntime):
 
     # ── Checkpoint manager (I/O only; scheduling lives in trainer callbacks) ───
 
-    @property
-    def checkpoint_subfolder(self) -> str:
-        if self.checkpoint is None:
-            return self.module_name
-        return self.checkpoint.checkpoint_subfolder
-
-    @checkpoint_subfolder.setter
-    def checkpoint_subfolder(self, value: str) -> None:
-        if self.checkpoint is not None:
-            self.checkpoint.checkpoint_subfolder = value
-
     def build_checkpoint(self) -> None:
         """Build this module's DCP / HF / LoRA checkpoint manager.
 

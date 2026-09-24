@@ -163,7 +163,6 @@ class OmniModelRuntime:
                 for_inference=for_inference,
                 global_accelerator=omni_model_runtime_args.accelerator,
             )
-            module_runtime.checkpoint_subfolder = name
             module_runtimes[name] = module_runtime
             logger.info_rank0(f"OmniModelRuntime: built ModuleRuntime '{name}' from {module_args.model_path}")
 
