@@ -21,7 +21,7 @@ def generate_dataset(output_dir: Path, samples: int = 16, size: int = 64) -> Pat
         draw.rectangle((size // 4, size // 4, 3 * size // 4, 3 * size // 4), fill=color)
         image_name = f"sample_{index:04d}.png"
         image.save(image_dir / image_name)
-        records.append({"prompt": f"A {color} square on a white background.", "image_path": image_name})
+        records.append({"prompt": f"A {color} square on a white background.", "image_path": f"images/{image_name}"})
     data_path = output_dir / "train.jsonl"
     data_path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
     return data_path

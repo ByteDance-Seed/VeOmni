@@ -136,14 +136,10 @@ all `Qwen3MoeDecoderLayer` instances are automatically identified as offload tar
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `train.accelerator.offload_config.enable_async_activation_offload` | bool |
-`False` | Enable async activation offload |
-| `train.accelerator.offload_config.enable_activation` | bool | `False` | Enable 
-synchronous activation offload (legacy) |
-| `train.accelerator.offload_config.activation_gpu_limit` | float | `0.0` | GPU memory 
-limit (GB) for synchronous offload |
-| `train.gradient_checkpointing.enable` | bool | `True` | Must be `True` when using 
-async offload |
+| `train.accelerator.offload_config.enable_async_activation_offload` | bool | `False` | Enable async activation offload |
+| `train.accelerator.offload_config.enable_activation` | bool | `False` | Enable synchronous activation offload (legacy) |
+| `train.accelerator.offload_config.activation_gpu_limit` | float | `0.0` | GPU memory limit (GB) for synchronous offload |
+| `train.gradient_checkpointing.enable` | bool | `True` | Must be `True` when using async offload |
 
 When `enable_async_activation_offload` is `True`, it takes precedence over
 `enable_activation` (synchronous offload). The global forward/backward contexts

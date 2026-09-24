@@ -38,7 +38,7 @@ def qwen_image_preprocess(conversations, **kwargs):
         data_dir
         and isinstance(image, str)
         and not os.path.isabs(image)
-        and not image.startswith(("http://", "https://"))
+        and "://" not in image
     ):
         image = os.path.join(data_dir, image)
     return prompt, {}, [image], []
@@ -98,7 +98,7 @@ def qwen_image_edit_preprocess(conversations, **kwargs):
             data_dir
             and isinstance(path, str)
             and not os.path.isabs(path)
-            and not path.startswith(("http://", "https://"))
+            and "://" not in path
         ):
             return os.path.join(data_dir, path)
         return path

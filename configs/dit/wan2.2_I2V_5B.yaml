@@ -46,7 +46,7 @@ train:
       enable_async_activation_offload: true
   checkpoint:
     output_dir: Wan2.2-I2V-5B
-    train.checkpoint.save_hf_weights: true
+    save_hf_weights: true
   optimizer:
     type: adamw
     lr: 1.0e-4

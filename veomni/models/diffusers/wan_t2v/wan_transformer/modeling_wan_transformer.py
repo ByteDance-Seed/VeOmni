@@ -33,12 +33,7 @@ import torch_npu
 logger = logging.get_logger(__name__)
 
 
-# =================================================================
-# Eager attention forward for WanTransformer (SDPA fallback).
-# Inputs/output follow the ALL_ATTENTION_FUNCTIONS convention:
-#   input : (B, heads, seq, head_dim)
-#   output: (B, seq, heads, head_dim), None
-# =================================================================
+
 def wan_eager_attention_forward(
     module,
     query: torch.Tensor,
@@ -308,25 +303,19 @@ class WanSPAttnProcessor(WanAttnProcessor):
         return hidden_states_out
 
 
-# =================================================================
-# Gradient-checkpointing wrapper for WanTransformerBlock.
-# VeOmni's _gradient_checkpointing_func passes an `early_stop` kwarg
-# that diffusers' WanTransformerBlock.forward() does not accept.
-# This wrapper absorbs and ignores it.
-# =================================================================
 def _wan_block_ckpt_wrapper(block):
-    """Return a callable compatible with VeOmni's gradient checkpointing."""
+    """Return a callable compatible with VeOmni's gradient checkpointing.
+
+    VeOmni's ``_gradient_checkpointing_func`` passes an ``early_stop`` kwarg that
+    diffusers' ``WanTransformerBlock.forward()`` does not accept; this wrapper
+    absorbs and ignores it.
+    """
     def custom_forward(*args, early_stop=None, **kwargs):
         return block(*args, **kwargs)
     return custom_forward
 
 
-# =================================================================
-# Patch: WanTransformer3DModel.forward
-# 1. Slice the patchified sequence across Ulysses SP ranks before the
-#    transformer blocks, and gather it back before the output head.
-# 2. Handle I2V 36-channel concatenation (image_latents + mask).
-# =================================================================
+
 def WanTransformer3DModel_forward(
     self: _WanTransformer3DModel,
     hidden_states: torch.Tensor,
@@ -339,9 +328,8 @@ def WanTransformer3DModel_forward(
 ):
     batch_size, num_channels, num_frames, height, width = hidden_states.shape
 
-    # ================= I2V: channel concatenation =================
-    # in_channels=36: [noise(16), image_latent(16), mask(4)] -> 36 channels
-    # in_channels=48: [noise(16), image_latent(16), mask(16)] -> 48 channels
+        # in_channels=36: [noise(16), image_latent(16), mask(4)] -> 36 channels
+        # in_channels=48: [noise(16), image_latent(16), mask(16)] -> 48 channels
     is_i2v_36ch = self.config.in_channels == 36 and num_channels == 16
     is_i2v_48ch = self.config.in_channels == 48 and num_channels == 16
 
@@ -389,7 +377,7 @@ def WanTransformer3DModel_forward(
         # Concatenate: [noise_latent(16), image_latent(16), mask(mask_ch)] -> in_ch_label channels
         hidden_states = torch.cat([hidden_states, image_latents, mask], dim=1)
         num_channels = hidden_states.shape[1]
-    # ================================================================
+
 
     p_t, p_h, p_w = self.config.patch_size
     post_patch_num_frames = num_frames // p_t

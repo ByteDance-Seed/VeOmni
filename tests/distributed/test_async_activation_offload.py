@@ -14,9 +14,7 @@ from veomni.distributed.async_offloading import (
     get_offload_modules_from_class_names,
 )
 
-# ---------------------------------------------------------------------------
-# Toy models for testing
-# ---------------------------------------------------------------------------
+
 class ToyDecoderLayer(torch.nn.Module):
     def __init__(self, hidden_size=64):
         super().__init__()
@@ -51,9 +49,7 @@ class ToyModelNoNoSplitModules(torch.nn.Module):
         return self.linear(x).sum()
 
 
-# ---------------------------------------------------------------------------
-# async_offload_modules tests
-# ---------------------------------------------------------------------------
+
 class TestAsyncOffloadModules:
     def setup_method(self):
         _Singleton._instances.clear()
@@ -76,9 +72,6 @@ class TestAsyncOffloadModules:
         assert ToyDecoderLayer._veomni_async_offload_patched is True
 
 
-# ---------------------------------------------------------------------------
-# apply_async_activation_offload tests
-# ---------------------------------------------------------------------------
 class TestApplyAsyncActivationOffload:
     def setup_method(self):
         _Singleton._instances.clear()
