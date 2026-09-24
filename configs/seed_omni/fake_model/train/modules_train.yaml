@@ -1,0 +1,22 @@
+# Per-module training overlay for the fake_module_a -> fake_module_b chain.
+#
+# Deep-merged onto the launcher's top-level `model.*` block, so each entry only
+# states what differs. The two modules deliberately pick different wraps: this
+# is the smallest config that exercises per-module accelerator resolution.
+fake_module_a:
+  model_path: fake_module_a
+  broadcast_model_weights_from_rank0: false # only meaningful for fsdp2
+  ops_implementation:
+    attn_implementation: eager
+  accelerator:
+    init_device: cuda # ddp doesn't need meta-init's broadcast dance
+    fsdp_config:
+      fsdp_mode: ddp
+
+fake_module_b:
+  model_path: fake_module_b
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2

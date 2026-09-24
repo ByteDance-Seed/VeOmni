@@ -186,8 +186,14 @@ def get_model_class(model_config: PretrainedConfig):
     if not modeling_backend == "hf":
         # SeedOmni sub-modules resolve to their OmniModule class via the
         # OMNI registry (keyed by model_type; the factory takes no arch_name).
+        # A module built here is a graph participant, so prefer the subclass
+        # that carries the graph hooks; the HF-native class is the fallback.
         _, omni_model_registry, _ = _omni_registries()
         if model_type in set(omni_model_registry.valid_keys()):
+            from .seed_omni.modules import OMNI_ACCELERATED_MODEL_REGISTRY
+
+            if model_type in set(OMNI_ACCELERATED_MODEL_REGISTRY.valid_keys()):
+                return OMNI_ACCELERATED_MODEL_REGISTRY[model_type]()
             return omni_model_registry[model_type]()
         return MODELING_REGISTRY[model_type](arch_name)
     if type(model_config) in AutoModelForImageTextToText._model_mapping.keys():  # assume built-in models

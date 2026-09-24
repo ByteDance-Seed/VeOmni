@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from torch.optim.optimizer import Optimizer
 
     from ..arguments import ModelArguments, TrainingArguments
+    from ..arguments.arguments_types import AcceleratorConfig
     from ..data.chat_template import ChatTemplate
     from ..trainer.callbacks import TrainerState
     from .checkpoint_manager import ModelCheckpointManager
@@ -161,6 +162,17 @@ class VeOmniModelRuntime:
         """
         return self.model(*args, **kwargs)
 
+    @property
+    def mesh_accelerator(self) -> "AcceleratorConfig":
+        """The accelerator config that decides mesh, init device and wrap.
+
+        Its own by default. A composed runtime whose wrap happens one level up
+        overrides this so mesh and init follow the owner of the wrap rather than
+        the model's local overlay (see
+        :class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime`).
+        """
+        return self.args.accelerator
+
     def train(self, mode: bool = True):
         """Forward ``nn.Module.train()``. Job-wide knobs live on :attr:`train_args`."""
         model = self.model
@@ -173,12 +185,12 @@ class VeOmniModelRuntime:
 
         The process group itself is job-bound and must already be initialised by
         :meth:`BaseTrainer._setup`; this only derives the model's own
-        mesh from its accelerator config, which is why sibling models in one job
+        mesh from :attr:`mesh_accelerator`, which is why sibling models in one job
         can hold different ones.
         """
         from ..distributed.parallel_state import init_parallel_state_from_config
 
-        init_parallel_state_from_config(self.args.accelerator, self.model_name)
+        init_parallel_state_from_config(self.mesh_accelerator, self.model_name)
 
     @property
     def parallel_state(self):
@@ -329,6 +341,13 @@ class VeOmniModelRuntime:
         :meth:`_freeze_model_module` survives and is not re-asserted here.
         """
         args = self.args
+        if args.accelerator.fsdp_config.fsdp_mode == "eager":
+            # ``build_parallelize_model`` has no unwrapped branch, so an eager
+            # mode reaching it would be handed to DDP instead.
+            raise ValueError(
+                "model.accelerator.fsdp_config.fsdp_mode='eager' is only supported by SeedOmni "
+                "module inference (ModuleRuntime._init_eager_inference)."
+            )
 
         # Apply async activation offload BEFORE FSDP2 sharding.
         # Uses per-instance __call__ patching so that async_save_on_cpu is
@@ -441,9 +460,9 @@ class VeOmniModelRuntime:
             return
 
         # Customized LoRA model setup.
-        customized_setup_lora_function = getattr(self.model, "setup_lora", None)
-        if callable(customized_setup_lora_function):
-            customized_lora_model = customized_setup_lora_function(lora_config)
+        model_setup_lora = getattr(self.model, "setup_lora", None)
+        if callable(model_setup_lora):
+            customized_lora_model = model_setup_lora(lora_config)
             if customized_lora_model is not None:
                 self.model = customized_lora_model
                 logger.info_rank0("Setup customized LoRA model.")
@@ -469,9 +488,20 @@ class VeOmniModelRuntime:
             self.model = VeOmniLoraModel(self.model, cfg)
 
         if not _has_trainable_lora_parameters(self.model):
-            raise ValueError(
-                "LoRA configuration produced no trainable adapters. Select at least one Linear or MoE target."
-            )
+            self.on_lora_matched_nothing()
+
+    def on_lora_matched_nothing(self) -> None:
+        """React to a LoRA config that selected none of this model's parameters.
+
+        For a single-model job that is always a misconfiguration — the run would
+        train nothing — so it fails here rather than after the first
+        zero-gradient step. A runtime that is one model *among several* overrides
+        this, because there "no targets in this one" is how a config says which
+        model to adapt.
+        """
+        raise ValueError(
+            "LoRA configuration produced no trainable adapters. Select at least one Linear or MoE target."
+        )
 
     def _freeze_model_module(self) -> None:
         """Let the model freeze itself, apply LoRA, and report what is left trainable.
