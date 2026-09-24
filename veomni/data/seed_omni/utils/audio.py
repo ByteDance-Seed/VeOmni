@@ -29,8 +29,8 @@ here, and neither is about audio quality:
   seconds, so a clip whose declared duration is wrong drifts against the video
   track — 22.05 kHz read as 16 kHz makes a 4 s clip claim 5.54 s, a 38% error.
 
-So the samples travel with ``meta["sampling_rate"]`` and each module converts to
-what it needs (``Qwen3OmniAudioPreprocessor._to_encoder_rate``,
+So the samples travel with ``meta["audio_metadata"]`` and each module converts
+to what it needs (``Qwen3OmniAudioPreprocessor._to_encoder_rate``,
 ``Qwen3OmniCodecPreprocessor``). Resampling is a module decision because the
 target rate is a module property.
 """
@@ -39,19 +39,17 @@ from __future__ import annotations
 
 import os
 import tempfile
+from collections.abc import Mapping
 from io import BytesIO
-from typing import ByteString, Union
+from typing import Any, ByteString, Union
 
 import numpy as np
 import torch
 
+from .media_metadata import AUDIO_METADATA_KEY, AudioMetadata
+
 
 AudioInput = Union[np.ndarray, ByteString, str]
-
-# What an item declares its rate as, on ``ConversationItem.meta``. The same
-# spelling the audio tower reads, the codec requires, and ``OmniInferencer``
-# needs before writing a wav — one key for the whole graph.
-SAMPLING_RATE_KEY = "sampling_rate"
 
 
 def load_audio(audio: AudioInput, audio_sampling_rate: int | None = None) -> tuple[np.ndarray, int]:
@@ -172,8 +170,12 @@ def _to_mono_float32(samples: np.ndarray, channel_axis: int | None = None) -> np
     return array.mean(axis=axis).astype(np.float32, copy=False)
 
 
-def fetch_audios(audios: list[AudioInput], **kwargs) -> list[tuple[np.ndarray, int]]:
-    """Load a list of clips, each as ``(samples, rate)`` at its own native rate.
+def fetch_audios(audios: list[AudioInput], **kwargs) -> list[tuple[np.ndarray, dict[str, Any]]]:
+    """Load a list of clips, each as ``(samples, meta)`` at its own native rate.
+
+    ``meta`` is the entries the data layer states about the clip, ready to merge
+    into the item's ``ConversationItem.meta`` — the same shape ``fetch_videos``
+    returns, so ``_build_conversation_list`` handles every modality the same way.
 
     A repeated ref is decoded once and copied on reuse, as ``fetch_images``
     does. The copy is not redundant: the two rows holding one clip can be
@@ -183,20 +185,25 @@ def fetch_audios(audios: list[AudioInput], **kwargs) -> list[tuple[np.ndarray, i
     """
     audio_sampling_rate = kwargs.get("audio_sampling_rate")
     cache: dict = {}
-    out: list[tuple[np.ndarray, int]] = []
+    out: list[tuple[np.ndarray, dict[str, Any]]] = []
     for audio in audios:
         key = audio if isinstance(audio, (str, bytes)) else id(audio)
         if key in cache:
             samples, rate = cache[key]
-            out.append((samples.copy(), rate))
+            samples = samples.copy()
         else:
-            cache[key] = load_audio(audio, audio_sampling_rate=audio_sampling_rate)
-            out.append(cache[key])
+            samples, rate = cache[key] = load_audio(audio, audio_sampling_rate=audio_sampling_rate)
+        out.append((samples, {AUDIO_METADATA_KEY: AudioMetadata(sampling_rate=rate, num_samples=len(samples))}))
     return out
 
 
-def save_audio(path: str, waveform: torch.Tensor, sampling_rate: int | None) -> None:
+def save_audio(path: str, waveform: torch.Tensor, meta: Mapping[str, Any] | None = None) -> None:
     """Write one generated waveform, however the emitting module shaped it.
+
+    ``meta`` is the item's whole ``ConversationItem.meta``, not a rate pulled out
+    of it: every saver takes the same ``(path, value, meta)`` so the caller can
+    hand each item over without knowing what its modality reads, and this one
+    reads ``meta[AUDIO_METADATA_KEY].sampling_rate``.
 
     The inverse of :func:`load_audio`, and it keeps that function's contract on
     both counts. The rate must come from the module that produced the samples —
@@ -222,9 +229,10 @@ def save_audio(path: str, waveform: torch.Tensor, sampling_rate: int | None) -> 
     """
     import soundfile
 
+    sampling_rate = getattr((meta or {}).get(AUDIO_METADATA_KEY), "sampling_rate", None)
     if sampling_rate is None:
         raise ValueError(
-            f"save_audio: the audio item for {path} carries no meta[{SAMPLING_RATE_KEY!r}]; the emitting "
+            f"save_audio: the audio item for {path} carries no meta[{AUDIO_METADATA_KEY!r}] rate; the emitting "
             f"module must declare the rate it generated at."
         )
     if not torch.is_tensor(waveform):
@@ -248,4 +256,4 @@ def save_audio(path: str, waveform: torch.Tensor, sampling_rate: int | None) -> 
     soundfile.write(path, samples.numpy(), int(sampling_rate))
 
 
-__all__ = ["AudioInput", "SAMPLING_RATE_KEY", "fetch_audios", "load_audio", "save_audio"]
+__all__ = ["AUDIO_METADATA_KEY", "AudioInput", "AudioMetadata", "fetch_audios", "load_audio", "save_audio"]

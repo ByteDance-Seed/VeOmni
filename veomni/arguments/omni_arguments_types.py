@@ -439,6 +439,33 @@ class OmniInferArguments:
     )
     prompt: str = field(default="", metadata={"help": "User text prompt (required at generate time)."})
     images: list[str] = field(default_factory=list, metadata={"help": "Reference image paths / URLs."})
+    audios: list[str] = field(
+        default_factory=list,
+        metadata={"help": "Standalone audio clip paths / URLs. Sound belonging to a video goes in `videos`."},
+    )
+    videos: list[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Reference video paths / URLs. For a clip with sound, keep it here and set "
+                "`use_audio_in_video: true` under `mm_configs` rather than also listing it under `audios`."
+            )
+        },
+    )
+    mm_configs: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "Decode knobs forwarded to every media fetcher (e.g. fps / max_frames / frames_fps / "
+                "image_max_pixels / video_max_pixels / audio_sampling_rate / use_audio_in_video). Free-form, "
+                "and named to match "
+                "training's `data.mm_configs`: both bags reach the same fetchers, so a key means the same "
+                "thing on either side and each fetcher ignores the ones it does not read. Set a group in "
+                "the launcher YAML, override one key with `--infer.mm_configs.<key> <value>`. Not inherited "
+                "from `data.mm_configs` — an inference run states its own decode budget."
+            )
+        },
+    )
     output_dir: str = field(default="output", metadata={"help": "Root output directory."})
     seed: int = field(default=42, metadata={"help": "Random seed."})
 
@@ -508,7 +535,15 @@ class OmniDataArguments:
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
     mm_configs: dict | None = field(
         default_factory=dict,
-        metadata={"help": "Config for multimodal input (forwarded to the seedomni data transform)."},
+        metadata={
+            "help": (
+                "Config for multimodal input (forwarded to the seedomni data transform, which hands it to "
+                "both the source preprocessor and every media fetcher). `infer.mm_configs` is the same bag "
+                "for an inference run; the decode keys mean the same thing in both. A source that stores "
+                "videos as pre-decoded frame lists must set `frames_fps` to the rate the frames were taken "
+                "at — a list carries no timing, and is refused rather than given a default."
+            )
+        },
     )
 
     def __post_init__(self):

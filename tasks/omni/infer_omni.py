@@ -22,6 +22,31 @@ Single-process eager (``resolve_model(for_inference=True)`` forces eager unless 
         --model.model_config.modules configs/seed_omni/fake_model/infer/modules_infer_eager.yaml \\
         --infer.prompt "hi"
 
+Media is decoded by the same fetchers the training transform uses, so a request
+carries the same metadata a training sample does (a clip's sampling rate, a
+video's frame timeline)::
+
+    --infer.images /path/to/image.jpg           # an image
+    --infer.audios /path/to/speech.wav          # standalone sound
+    --infer.videos /path/to/clip.mp4            # a clip
+
+``infer.mm_configs`` holds the decode knobs — the same free-form bag training
+spells ``data.mm_configs``, reaching the same fetchers, so a key means the same
+thing on either side. It is not inherited from the training config: state the
+decode budget an inference run wants. Like ``infer.generation_kwargs``, set a
+group of them in the launcher YAML and override one on the command line with a
+dotted flag. A clip with sound is one entry in ``videos`` plus the flag, never
+also an entry in ``audios``, since the two streams share a timeline the backbone
+interleaves::
+
+    infer:
+      videos: [/path/to/clip.mp4]
+      mm_configs:
+        use_audio_in_video: true
+        fps: 2.0
+
+    --infer.mm_configs.fps 4.0                # overrides just that key
+
 Distributed inference (modules keep their DDP / FSDP2 wraps):
 
     bash train.sh tasks/omni/infer_omni.py configs/seed_omni/fake_model/train/base.yaml \\

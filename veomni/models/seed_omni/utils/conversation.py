@@ -18,17 +18,22 @@ Each item is ``{type, value, role, meta}``:
   input, which ``JanusSiglip.generate`` re-encodes and seals to ``"image"``.
   ``"audio"`` is a standalone sound item (speech in, or speech out once sealed).
   Sound carried *inside* a video clip is not an ``"audio"`` item — it rides on
-  the video item as ``meta["audio_stream"]`` so that one clip stays one item and
-  the backbone can interleave both streams on a shared timeline; see
-  ``docs/seed_omni/av_video_design.md``.
+  the video item's own ``value`` (``VideoInputs.audio``) so that one clip stays
+  one item and the backbone can interleave both streams on a shared timeline.
+  Either way its rate is stated the same way, in ``meta["audio_metadata"]``.
 * ``value`` — polymorphic: raw content (``str`` / PIL image / pixel tensor /
   ``(samples,)`` waveform) before encoding, an ``(L, D)`` / ``(1, L, D)``
   embedding tensor after.
 * ``role``  — ``"user"`` | ``"assistant"`` | ``"dummy"`` (``"dummy"`` rows are
   zero-tensor FSDP placeholders appended by encoders on text-only
   micro-batches; the backbone skips them and folds a zero-grad anchor).
-* ``meta``  — per-module baggage written during forward (``labels`` /
-  ``attention_mask`` / ``janus_vqvae_labels`` / ``source`` / …).
+* ``meta``  — the item's only durable channel. What the data layer loaded
+  (``video_metadata`` / ``audio_metadata``, see
+  ``veomni/data/seed_omni/utils/media_metadata.py``)
+  plus per-module baggage written during forward (``labels`` /
+  ``attention_mask`` / ``janus_vqvae_labels`` / ``source`` / …). Anything the
+  backbone still needs after an encoder has overwritten ``value`` has to be
+  here.
 
 Lifecycle
 ---------
@@ -43,6 +48,7 @@ Lifecycle
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Union
 
@@ -86,17 +92,19 @@ class ConversationItem:
             return f"[torch.Tensor]{tuple(value.shape)}"
         elif isinstance(value, Image.Image):
             return f"[PIL.Image]{value.size}"
-        elif hasattr(value, "video") and hasattr(value, "video_fps"):
-            # VideoInputs bundle — duck-typed so core conversation.py doesn't
+        elif hasattr(value, "video") and hasattr(value, "has_audio"):
+            # VideoInputs payload — duck-typed so core conversation.py doesn't
             # import the optional video/audio (ffmpeg/torchcodec/librosa) stack.
+            # Only the two streams are here; the timelines are on ``meta`` (see
+            # ``data/seed_omni/utils/media_metadata.py``) and print with the
+            # rest of it.
             v = value
             shape = tuple(v.video.shape) if isinstance(v.video, torch.Tensor) else type(v.video).__name__
-            parts = [f"video.shape={shape}", f"fps={v.video_fps}"]
+            parts = [f"video.shape={shape}"]
             audio = getattr(v, "audio", None)
             if audio is not None:
                 audio_shape = tuple(audio.shape) if isinstance(audio, torch.Tensor) else type(audio).__name__
                 parts.append(f"audio.shape={audio_shape}")
-                parts.append(f"audio_fps={getattr(v, 'audio_fps', None)}")
             return f"[VideoInputs | {', '.join(parts)}]"
         elif hasattr(value, "shape") and hasattr(value, "dtype"):
             # Raw audio waveforms arrive as numpy arrays. Duck-typed for the same
@@ -137,22 +145,45 @@ def seal_outputs(parts: list[ConversationItem], new_type: ItemType) -> None:
     parts[-1].type = new_type
 
 
+def _split_entry(entry: Any) -> tuple[Any, Mapping]:
+    """Read a media entry as ``(payload, meta)``, defaulting the meta to empty.
+
+    Pair-ness is decided on the second element being a mapping rather than on
+    tuple-ness alone, so a payload that happens to be a 2-tuple is not mistaken
+    for a pair.
+    """
+    if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], Mapping):
+        return entry[0], entry[1]
+    return entry, {}
+
+
 def build_conversation(
     *,
     prompt: str,
-    images: list[Any] | None = None,
-    audios: list[Any] | None = None,
+    media: Mapping[str, Sequence[Any]] | None = None,
 ) -> list[ConversationItem]:
     """Build the canonical conversation list for a single inference request.
 
-    ``audios`` are standalone waveforms. Sound belonging to a video clip does not
-    come through here — it rides on the video item's ``meta["audio_stream"]``.
+    ``media`` is ``{item_type: [payload | (payload, meta), ...]}`` — the shape
+    ``veomni.data.seed_omni.utils.media.fetch_media`` returns. Passing the
+    fetchers' output straight through is what makes a request carry the same
+    metadata a training sample does: a clip's sampling rate and a video's frame
+    timeline are facts only the decode knew, and a consumer cannot recover them
+    from the payload. Bare payloads are accepted for callers that already hold
+    decoded media and have nothing to state about it.
+
+    Items come out in the mapping's own order, prompt last. Adding a modality
+    needs no change here — any type keyed in that table flows through untouched.
+
+    Sound belonging to a video clip is not a separate ``"audio"`` entry: it rides
+    on the video payload's ``VideoInputs.audio``, so one clip stays one item
+    however many tracks it has.
     """
     parts: list[ConversationItem] = []
-    for img in images or []:
-        parts.append(ConversationItem(type="image", value=img, role="user"))
-    for wav in audios or []:
-        parts.append(ConversationItem(type="audio", value=wav, role="user"))
+    for item_type, entries in (media or {}).items():
+        for entry in entries:
+            value, meta = _split_entry(entry)
+            parts.append(ConversationItem(type=item_type, value=value, role="user", meta=dict(meta)))
     parts.append(ConversationItem(type="text", value=prompt, role="user"))
     return parts
 

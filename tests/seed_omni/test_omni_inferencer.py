@@ -34,6 +34,21 @@ def test_inference_request_defaults_are_empty():
     assert req.generation_kwargs == {}
 
 
+def test_inference_request_is_a_plain_dataclass():
+    # ``OmniInferencer.run_request`` accepts an InferenceRequest; we want it
+    # to be JSON-loggable for traceability so the dataclass MUST NOT carry
+    # private state (only the documented fields).
+    fields = InferenceRequest.__dataclass_fields__
+    assert set(fields) == {
+        "prompt",
+        "images",
+        "audios",
+        "videos",
+        "mm_configs",
+        "generation_kwargs",
+    }
+
+
 def test_runtime_generation_kwargs_attach_the_resolved_infer_type_without_mutating_args():
     inferencer = _inferencer_with("infer_gen", {"temperature": 0.5})
 

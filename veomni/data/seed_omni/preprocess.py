@@ -15,29 +15,43 @@ from ...utils.registry import Registry
 SEED_OMNI_PREPROCESSOR_REGISTRY = Registry("SeedOmniPreprocessor")
 
 
-def conv_preprocess(source: str, conversations, example, **kwargs):
+def conv_preprocess(source: str, conversations, example, **kwargs) -> tuple[list, dict[str, list]]:
     """Dispatch ``source`` to its registered preprocessor.
 
-    Returns a 4-tuple ``(constructed, image_refs, video_refs, audio_refs)``: the
-    ``[[role, (type, value) | (type, value, meta), ...], ...]`` layout plus the
-    per-sample media ref lists the transform decodes via ``fetch_images`` /
-    ``fetch_videos`` / ``fetch_audios``. The ref lists' lengths must match the
-    flattened entry counts per modality so ``_build_conversation_list`` can pair
-    them by pure sequential order — the preprocessor owns that alignment (the
-    multi-turn edit preprocessor duplicates copy-image refs to express reuse).
+    Returns ``(constructed, media_refs)``:
 
-    A preprocessor may return the older 3-tuple, which is read as "no audio".
-    This registry is an extension point — a preprocessor for a private corpus
-    lives outside this repo — so adding a modality widens the contract instead
-    of breaking every implementation of it.
+    * ``constructed`` — the ``[[role, (type, value) | (type, value, meta), ...],
+      ...]`` layout.
+    * ``media_refs`` — per-sample media refs **keyed by the item type they pair
+      with**: ``{"image": [...], "video": [...], "audio": [...]}``. An absent key
+      means the sample has none of that modality, so a text-only preprocessor
+      returns ``{}``.
+
+    Keyed rather than positional because this registry is an extension point —
+    a preprocessor for a private corpus lives outside this repo — and the
+    modality list is still growing (action, 3d, camera). A tuple makes every
+    new modality a change to every implementation and to every unpack site; a
+    dict makes it one new key, read by whoever knows that key.
+
+    Using the item ``type`` as the key is what keeps the pairing readable:
+    ``media_refs["image"]`` is consumed by the ``("image", None)`` turns, in
+    order. Lengths must match per modality — pairing is positional and the
+    preprocessor owns that alignment (the multi-turn edit preprocessor
+    duplicates copy-image refs to express reuse).
     """
     result = SEED_OMNI_PREPROCESSOR_REGISTRY[source](conversations, example, **kwargs)
-    if len(result) == 3:
-        return (*result, [])
-    if len(result) != 4:
+    if not (isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict)):
+        # Named rather than left to unpack sideways: the old contract was a
+        # 3- or 4-tuple of positional ref lists, and an out-of-repo
+        # preprocessor still on it would otherwise fail with a bare "too many
+        # values to unpack" naming neither the source nor the fix.
         raise ValueError(
-            f"conv_preprocess: preprocessor for source {source!r} returned {len(result)} values; expected "
-            f"(constructed, image_refs, video_refs) or (constructed, image_refs, video_refs, audio_refs)."
+            f"conv_preprocess: preprocessor for source {source!r} returned {type(result).__name__} "
+            f"{f'of length {len(result)}' if isinstance(result, tuple) else ''}; expected "
+            f"(constructed, media_refs) where media_refs is a dict keyed by item type. Migrate a legacy "
+            f"(constructed, image_refs, video_refs[, audio_refs]) return to "
+            f'(constructed, {{"image": image_refs, "video": video_refs, "audio": audio_refs}}) and drop the '
+            f"keys the source has no media for."
         )
     return result
 
@@ -51,7 +65,7 @@ def imagenet1k_preprocess(conversations, example, **kwargs):
         ["user", ("text", class_label)],
         ["assistant", ("image", None, {_IMG_TAG_KEY: "gen"})],
     ]
-    return constructed, list(example.get("images", []) or []), []
+    return constructed, {"image": list(example.get("images", []) or [])}
 
 
 @SEED_OMNI_PREPROCESSOR_REGISTRY.register("tulu-3-sft-mixture")
@@ -82,7 +96,8 @@ def tulu_3_sft_mixture_preprocess(conversations, example, **kwargs):
     constructed_conversation = []
     for conversation in text_example:
         constructed_conversation.append([conversation["role"], ("text", conversation["content"])])
-    return constructed_conversation, [], []
+    # Text-only, so no media keys at all.
+    return constructed_conversation, {}
 
 
 @SEED_OMNI_PREPROCESSOR_REGISTRY.register("voice_assistant")
@@ -126,7 +141,7 @@ def voice_assistant_preprocess(conversations, example, **kwargs):
             f"voice_assistant: sample has {spoken} spoken turn(s) but {len(audio_refs)} clip(s); "
             f"they are paired by position, so an unequal count would misattach them."
         )
-    return constructed, [], [], audio_refs
+    return constructed, {"audio": audio_refs}
 
 
 def _sharegpt4v_sft_layout(conversations):
@@ -151,7 +166,7 @@ def _sharegpt4v_sft_layout(conversations):
 @SEED_OMNI_PREPROCESSOR_REGISTRY.register("sharegpt4v_sft")
 def sharegpt4v_cap_preprocess(conversations, example, **kwargs):
     del kwargs
-    return _sharegpt4v_sft_layout(conversations), list(example.get("images", []) or []), []
+    return _sharegpt4v_sft_layout(conversations), {"image": list(example.get("images", []) or [])}
 
 
 @SEED_OMNI_PREPROCESSOR_REGISTRY.register("llava_video")
@@ -178,7 +193,7 @@ def llava_video_preprocess(conversations, example, **kwargs):
             constructed_conversation.append([role, ("video", None, {_IMG_TAG_KEY: "und"}), ("text", value)])
         else:
             constructed_conversation.append([role, ("text", value)])
-    return constructed_conversation, [], list(example.get("videos", []) or [])
+    return constructed_conversation, {"video": list(example.get("videos", []) or [])}
 
 
 @SEED_OMNI_PREPROCESSOR_REGISTRY.register("seed_edit_p23_multi_turn")
@@ -209,7 +224,7 @@ def seed_edit_p23_multi_turn_preprocess(conversations, example, **kwargs):
     Instruction text is emitted as a 2-tuple (no ``_img_tag``) with the turn's
     role.
 
-    Returns ``(constructed, image_refs, video_refs)``. ``image_refs`` is a NEW
+    Returns ``(constructed, {"image": image_refs})``. ``image_refs`` is a NEW
     list (``example["images"]`` is never mutated) whose length equals the
     flattened image entry count: each primary image appends
     ``example["images"][img_seq]`` (``img_seq`` counts primary ``<image>`` tokens
@@ -253,7 +268,7 @@ def seed_edit_p23_multi_turn_preprocess(conversations, example, **kwargs):
             text = value.strip()
             if text:
                 constructed_conversation.append([role, ("text", text)])
-    return constructed_conversation, image_refs, []
+    return constructed_conversation, {"image": image_refs}
 
 
 __all__ = ["SEED_OMNI_PREPROCESSOR_REGISTRY", "conv_preprocess"]

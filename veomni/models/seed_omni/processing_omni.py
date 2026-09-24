@@ -42,9 +42,6 @@ import os
 from collections.abc import Mapping, Sequence
 from typing import Any, Union
 
-from PIL import Image
-
-from ...data.multimodal.image_utils import load_image
 from ...utils import logging  # VeOmni shared logger (rank-0 helpers); not seed_omni-local.
 from .configuration_omni import OmniConfig
 from .modules import OMNI_MODEL_REGISTRY, read_model_type
@@ -54,20 +51,31 @@ from .utils.conversation import build_conversation
 
 logger = logging.get_logger(__name__)
 
-ImageInput = Union[str, Any]
-MediaInput = Union[ImageInput, Sequence[ImageInput]]
+# A ref a fetcher can decode: a path, a URL, or the raw bytes of a container.
+# What counts beyond that is the fetcher's business — the image one also takes a
+# PIL image, and the audio one a waveform array given its rate in ``mm_configs``.
+MediaRef = Union[str, bytes, Any]
+MediaInput = Union[MediaRef, Sequence[MediaRef]]
+
+# Ref types that are themselves sequences, and so would otherwise be iterated
+# into their elements: one bytes-backed clip becoming a few thousand integer
+# "refs". ``bytearray`` is what a parquet corpus storing media inline produces and
+# the loaders take it; ``memoryview`` is listed because they do *not*, and one ref
+# they reject by name beats a few thousand they reject by type.
+_ATOMIC_REFS = (str, bytes, bytearray, memoryview)
 
 
-def _normalize_images(images: MediaInput) -> list[Any]:
-    if isinstance(images, (str, bytes)) or isinstance(images, Image.Image):
-        images = [images]
-    normalized: list[Any] = []
-    for image in images:
-        if isinstance(image, Image.Image):
-            normalized.append(image)
-        else:
-            normalized.append(load_image(image))
-    return normalized
+def _as_list(media: MediaInput | None) -> list[Any]:
+    """One ref or a sequence of them, as a list — decoding is the fetchers' job.
+
+    Non-sequence media (PIL image, tensor, ndarray, ``VideoInputs``) is a single
+    item, as is any of :data:`_ATOMIC_REFS`.
+    """
+    if media is None:
+        return []
+    if isinstance(media, _ATOMIC_REFS) or not isinstance(media, Sequence):
+        return [media]
+    return list(media)
 
 
 class OmniProcessor:
@@ -161,28 +169,48 @@ class OmniProcessor:
         text: str = "",
         *,
         images: MediaInput | None = None,
+        audios: MediaInput | None = None,
         videos: MediaInput | None = None,
+        mm_configs: Mapping[str, Any] | None = None,
         inference: bool = True,
         **generation_kwargs: Any,
     ) -> dict[str, Any]:
         """Build and preprocess a single inference request.
 
+        Each modality takes one ref or a list of them — a path, a URL, or the raw
+        bytes of a container — decoded by the very fetchers the training transform
+        uses. That is what makes a request carry the same metadata a training
+        sample does: a clip's sampling rate and a video's frame timeline are
+        facts only the decode knew, and a module cannot recover them from the
+        payload. Whether a modality also accepts already-decoded media is its
+        fetcher's business, not this signature's: images take a PIL image,
+        waveform arrays need ``mm_configs={"audio_sampling_rate": ...}`` to say
+        what rate they are in, and pixel tensors are not accepted at all.
+
+        A clip with sound is **one** entry in ``videos`` with
+        ``mm_configs={"use_audio_in_video": True}``, not a video plus a
+        parallel entry in ``audios``: the two streams share a timeline the
+        backbone interleaves, and splitting them across two items throws away
+        the alignment. ``audios`` is for standalone sound.
+
+        ``mm_configs`` carries the decode knobs (``fps`` / ``max_frames`` /
+        ``image_max_pixels`` / ``video_max_pixels`` / ``audio_sampling_rate`` /
+        ``use_audio_in_video``) — a named dict rather than more ``**`` because
+        ``**generation_kwargs`` would otherwise swallow them. It shares its name
+        with training's ``data.mm_configs`` because it is the same bag reaching
+        the same fetchers: a key set here means what it means there.
+
         Returns a dict suitable for :meth:`OmniModel.generate` —
         ``{"conversation_list": [...]}`` (a single conversation).
         """
-        if videos:
-            # The parameter is here because video follows the same conversation
-            # path as images once callers pass PIL / VideoInputs, but nothing
-            # builds video items yet — say so rather than return a text-only
-            # request as if the videos had been read.
-            raise NotImplementedError(
-                "`videos` is not supported yet by SeedOmni V2 request building. Pass video "
-                "frames as `images`, or build the conversation items directly and call "
-                "`preprocess`."
-            )
+        # Imported in-function: ``veomni.data.seed_omni`` reaches back into
+        # ``veomni.models.seed_omni`` for the conversation carrier, so a
+        # module-scope import here would close that loop.
+        from ...data.seed_omni.utils.media import fetch_media
 
-        image_items = _normalize_images(images) if images is not None else []
-        conversation = build_conversation(prompt=text, images=image_items)
+        media_refs = {"image": _as_list(images), "audio": _as_list(audios), "video": _as_list(videos)}
+        media = fetch_media(media_refs, "OmniProcessor request", mm_configs)
+        conversation = build_conversation(prompt=text, media=media)
         return self.preprocess(conversation, inference=inference, **generation_kwargs)
 
     def preprocess(
