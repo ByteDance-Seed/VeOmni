@@ -11,6 +11,10 @@ from veomni.ops import kernel_registry
 from veomni.ops.kernel_registry import KERNEL_REGISTRY
 from veomni.ops.kernels.qsa.eager import qsa_indexer_forward_eager
 from veomni.ops.kernels.qsa.triton import qsa_indexer_forward_triton
+from veomni.utils.device import IS_CUDA_AVAILABLE
+
+
+pytestmark = pytest.mark.skipif(IS_CUDA_AVAILABLE, reason="QSA Triton indexer is currently NPU-only")
 
 
 class _RMSNorm:
