@@ -85,6 +85,7 @@ examples/seed_oss.md
 key_features/model_loader.md
 key_features/preprocessor_registry.md
 key_features/ep_fsdp2.md
+key_features/async_activate_offload.md
 key_features/extra_parallel.md
 key_features/ulysses.md
 key_features/lora.md

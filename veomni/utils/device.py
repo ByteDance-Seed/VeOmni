@@ -180,19 +180,12 @@ def is_sm90_or_above() -> bool:
     """Check if the current CUDA device has SM90+ capability."""
     return get_gpu_compute_capability() >= 90
 
-
-def create_stream(device: torch.device | None = None, priority: int = 0) -> Any:
+def create_stream(device=None, priority: int = 0) -> Any:
     """Create a device stream (CUDA/NPU-agnostic)."""
     device_type = get_device_type()
     device_api = get_torch_device()
-
-    # ``torch.cpu.Stream`` intentionally has a smaller constructor than the
-    # CUDA/NPU stream implementations.  Passing ``device`` or ``priority``
-    # through unconditionally makes CPU-only unit tests fail before they can
-    # exercise the device-agnostic caller.
     if device_type == "cpu":
         return device_api.Stream()
-
     kwargs = {}
     if device is not None:
         kwargs["device"] = device
@@ -205,19 +198,26 @@ def create_event(enable_timing: bool = False, blocking: bool = False) -> Any:
     """Create a device event (CUDA/NPU-agnostic)."""
     device_api = get_torch_device()
     if get_device_type() == "cpu":
-        # ``torch.cpu.Event`` is a no-argument synchronization marker.
         return device_api.Event()
     return device_api.Event(enable_timing=enable_timing, blocking=blocking)
 
 
-def get_current_stream() -> Any:
+def get_current_stream(device=None) -> Any:
     """Get the current device stream."""
-    return get_torch_device().current_stream()
+    if device is None:
+        return get_torch_device().current_stream()
+    return get_torch_device().current_stream(device=device)
+
+
+def switch_to_stream(stream: Any) -> Any:
+    """Set the given stream as the current compute stream; returns the previous stream."""
+    return get_torch_device().set_stream(stream)
 
 
 def switch_to_specified_stream(stream: Any) -> Any:
     """Context manager to switch to a specified device stream."""
     return get_torch_device().stream(stream)
+
 
 
 def get_compute_units():

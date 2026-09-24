@@ -3,16 +3,7 @@ model:
   ops_implementation:
     attn_implementation: flash_attention_2
     moe_implementation: fused_triton
-  optimizer:
-    type: adamw
-    lr: 1.0e-4
-    lr_warmup_ratio: 0.007
-    lr_decay_style: cosine
-    max_grad_norm: 1.0
   accelerator:
-    gradient_checkpointing:
-      enable: true
-    init_device: meta
     ulysses_size: 1
     fsdp_config:
       fsdp_mode: fsdp2
@@ -20,7 +11,12 @@ model:
         enable: true
     offload_config:
       enable_activation: false
-  chat_template: chatml
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: cosine
+    max_grad_norm: 1.0
 
 data:
   train_path: tulu-3-sft-mixture
@@ -31,10 +27,13 @@ data:
   dyn_bsz_buffer_size: 200
 
 train:
+  gradient_checkpointing:
+    enable: true
   global_batch_size: 8
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007
   num_train_epochs: 3
+  init_device: meta
   enable_full_determinism: false
   empty_cache_steps: 500
   checkpoint:
