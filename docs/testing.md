@@ -170,6 +170,47 @@ Registry binding plus mHC pre/post/head forward and backward parity are covered
 by `tests/ops/test_mhc_tile_kernels.py`, which requires TileKernels on an SM90+
 NVIDIA GPU for kernel execution.
 
+`tests/e2e/test_e2e_parallel.py::test_deepseek_v4_compiled_fsdp2_training_alignment` compares
+eager and fullgraph Inductor through four-rank packed FSDP2 training, with
+static 512-token shapes and EP/SP disabled. Loss and gradient norm are checked
+at `rtol=atol=1e-3`; this checks aggregate training metrics, not per-parameter
+update alignment, convergence or bitwise equivalence.
+It keeps DSA/mHC/norm/shared MLP/loss eager and routed experts fused. Enabled
+ExtraParallel with compilation remains rejected. Single-device decoder trace
+and gradient checks live in `tests/distributed/test_torch_compile.py`.
+Backend `eager` capture requires exact loss/all-gradient equality. The Inductor
+execution gate requires finite loss, identical used-parameter coverage, finite
+gradients and an actual AdamW update; it does not treat eager BF16 as an exact
+numerical oracle. A separate held-out fixed-route expert test compares output,
+input/routing gradients and both expert-weight gradients against FP32 PyTorch
+math with the same promoted BF16 inputs/weights/cotangent. Its per-tensor budget
+is relative L2 <= two BF16 epsilons and peak error <= four BF16 epsilons of the
+reference peak. These local gates do not qualify whole-model numerical training
+correctness or the SM90+ optimized kernels.
+
+Controlled two-step BF16 FSDP2 runs matched initial FP32 master weights,
+buffers, optimizer settings and every rank's micro-batches. Aggregate execution
+gates passed, but whole-model pre-clipping gradient relative L2 differed by
+about 5.81% for Inductor versus eager. First-step AdamW replay and clipping
+passed their scoped oracles; whole-model update parity and convergence remain
+unqualified. See the separate EP validation PR for expert transport validation.
+
+The eager/Inductor BF16 gap is rounding divergence, not an accuracy regression.
+`test_deepseek_v4_compiled_decoder_gradients_track_the_fp32_oracle` keeps the
+decoder-level bound under test: from one fixed set of BF16-rounded weights and the
+same input, both the eager and the fullgraph Inductor decoder stay within 5%
+relative L2 of an eager FP32 forward/backward over those same values. The
+reference runs the eager MoE implementation rather than the Triton grouped GEMM
+both BF16 modes use, so its distance also contains that implementation
+difference.
+
+Measurements taken for this document, none of which a test asserts: the harness
+reads 1.70% (eager) and 1.48% (Inductor), so Inductor is if anything closer to
+the reference, and the two BF16 modes are 2.08% apart. Their pre-clipping
+gradient norms agree to 1.5e-4 relative and the cosine between them is 0.9985.
+In the four-rank run `TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1` does not close the
+gap: 5.84% and 6.02% at steps 1 and 2, against 5.48% and 5.79% by default.
+
 ---
 
 ### 2. VLM Trainer Test (`tests/models/test_vlm_trainer.py`)
@@ -386,6 +427,19 @@ pytest → test_text_fsdp_equivalence(config, ...)
 ```
 
 ---
+
+## Batch-invariant FP32 GEMM precision
+
+`tests/ops/test_batch_invariant_matmul_precision.py` checks FP32, BF16 and FP16
+matrix products against FP64 arithmetic over the same operands, including bias,
+strided inputs, padded tiles and batch partitions. The GPU unit workflow runs
+the entire `tests/ops/` directory.
+
+The invariant Triton GEMM explicitly uses IEEE input precision. Triton's default
+TF32 dot precision truncates FP32 projection inputs even when PyTorch's matmul
+precision is `highest`; setting the PyTorch policy alone does not configure a
+Triton kernel. This fixes that operator's FP32 accuracy, but does not establish
+whole-model BF16 gradient, parameter-update or convergence parity.
 
 ## Architecture Notes
 
