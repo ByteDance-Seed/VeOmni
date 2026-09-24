@@ -15,6 +15,7 @@
 """SeedOmni V2 mixins: base lifecycle + training / inference graph hooks + metric meter."""
 
 from .base_mixin import BaseMixin
+from .data_balance_mixin import DataBalanceMixin, DataBalanceSpec, ItemTensorField, ModuleStructure
 from .inference_module_mixin import InferenceModuleMixin, post_generate, pre_generate
 from .metric_meter_mixin import MetricMeterMixin, MetricMeterResult
 from .offline_encoding_mixin import OfflineEncodingMixin
@@ -23,6 +24,10 @@ from .training_module_mixin import TrainingModuleMixin, post_forward, pre_forwar
 
 __all__ = [
     "BaseMixin",
+    "DataBalanceMixin",
+    "DataBalanceSpec",
+    "ItemTensorField",
+    "ModuleStructure",
     "InferenceModuleMixin",
     "TrainingModuleMixin",
     "pre_forward",

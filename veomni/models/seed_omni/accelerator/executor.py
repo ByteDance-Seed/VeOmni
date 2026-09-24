@@ -19,6 +19,7 @@ from contextlib import nullcontext
 from typing import Any, Callable, ContextManager, Dict, Optional
 
 from ..graphs.base import NodeDef
+from ..mixins.data_balance_mixin import DataBalanceMixin
 from ..modeling_omni import LOSS_KEY
 from ..utils.graph_profiler import GraphProfiler
 from .dispatch import call_graph_endpoint, unwrap_graph_module
@@ -54,7 +55,8 @@ def execute_train_node(
 
     module_context = scope_fn(node.module) if scope_fn is not None else nullcontext()
     profile_context = profiler.node(f"forward:{node.name}") if profiler is not None else nullcontext()
-    with module_context, profile_context:
+    balance_context = raw.data_balance_scope() if isinstance(raw, DataBalanceMixin) else nullcontext()
+    with module_context, profile_context, balance_context:
         inputs = raw.pre_forward(method=method, **batch)
 
         if hasattr(raw, "metric_meter_add"):
