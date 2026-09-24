@@ -381,7 +381,7 @@ def _resolve_model_path(
     for mod_cfg in modules_config.values():
         if not isinstance(mod_cfg, dict):
             continue
-        resolved = mod_cfg.get("model_path") or mod_cfg.get("weights_path")
+        resolved = mod_cfg.get("model_path")
         if resolved is None:
             continue
         if not os.path.isabs(resolved) and not is_non_local(resolved):
