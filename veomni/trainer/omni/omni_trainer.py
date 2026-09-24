@@ -97,6 +97,24 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+def batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+    """Move a graph batch's top-level tensors (and those one dict deep) onto ``device``.
+
+    Tensors a module keeps inside its conversation items stay where the
+    preprocessor built them; placing those is the module's own ``pre_forward`` /
+    ``pre_generate`` job.
+    """
+
+    def _to_device(v: Any) -> Any:
+        if isinstance(v, torch.Tensor):
+            return v.to(device, non_blocking=True)
+        if isinstance(v, dict):
+            return {k: _to_device(vv) for k, vv in v.items()}
+        return v
+
+    return {k: _to_device(v) for k, v in batch.items()}
+
+
 # ── Multi-optimizer / multi-scheduler proxies ──────────────────────────────────
 
 
@@ -560,14 +578,7 @@ class OmniTrainer:
         )
 
     def preforward(self, micro_batch: Dict[str, Any]) -> Dict[str, Any]:
-        def _to_device(v: Any) -> Any:
-            if isinstance(v, torch.Tensor):
-                return v.to(self.device, non_blocking=True)
-            if isinstance(v, dict):
-                return {k: _to_device(vv) for k, vv in v.items()}
-            return v
-
-        micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
+        micro_batch = batch_to_device(micro_batch, self.device)
         if getattr(self, "LOG_SAMPLE", True):
             helper.print_example(example=micro_batch, rank=self.args.train.local_rank)
             self.LOG_SAMPLE = False
@@ -683,6 +694,7 @@ __all__ = [
     "OmniTrainer",
     "MultiOptimizer",
     "MultiLRScheduler",
+    "batch_to_device",
     "build_omni_model",
     "cascade_module_reshard",
 ]

@@ -8,6 +8,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from veomni.arguments.omni_arguments_types import OmniModuleRuntimeArguments
 from veomni.arguments.parser import _instantiate_recursive
@@ -70,6 +71,28 @@ def test_module_needs_distributed_only_when_not_eager(fsdp_mode, expected):
         {"model_path": "fake_module_a", "accelerator": {"fsdp_config": {"fsdp_mode": fsdp_mode}}},
     )
     assert _module_needs_distributed(module_args) is expected
+
+
+@pytest.mark.parametrize(("distributed", "expected_device"), [(True, "meta"), (False, "cpu")])
+def test_run_places_request_tensors_like_training_when_distributed(distributed, expected_device):
+    """The processor builds CPU tensors. Distributed modules all sit on the rank's
+    device, so the request moves there as a training batch does; an eager
+    ``device_map="auto"`` load leaves placement to each module."""
+    seen = {}
+
+    def generate(request, generation_kwargs=None):
+        seen["input_ids"] = request["input_ids"]
+        return []
+
+    inferencer = _inferencer_with("infer_gen", {})
+    inferencer._distributed = distributed
+    inferencer.device = torch.device("meta")
+    inferencer.processor = lambda **kwargs: {"input_ids": torch.ones(2, dtype=torch.long)}
+    inferencer.model = SimpleNamespace(reset=lambda: None, generate=generate)
+
+    inferencer._run(InferenceRequest(prompt="hi"))
+
+    assert seen["input_ids"].device.type == expected_device
 
 
 def test_extract_generated_text_keeps_only_filled_text_items():

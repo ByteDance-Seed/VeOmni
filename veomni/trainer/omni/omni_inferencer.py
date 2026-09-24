@@ -44,7 +44,7 @@ from ...models.seed_omni.modeling_omni import OmniModel
 from ...models.seed_omni.processing_omni import OmniProcessor
 from ...models.seed_omni.utils.graph_profiler import GraphProfiler
 from ...utils import helper
-from .omni_trainer import OmniTrainer
+from .omni_trainer import OmniTrainer, batch_to_device
 
 
 logger = helper.create_logger(__name__)
@@ -240,6 +240,11 @@ class OmniInferencer:
             mm_configs=req.mm_configs or None,
             inference=True,
         )
+        if self._distributed:
+            # Every module sits on this rank's device, as in training. An eager
+            # ``device_map="auto"`` load may spread modules across devices, so
+            # there each module's ``pre_generate`` places its own inputs.
+            request_dict = batch_to_device(request_dict, self.device)
         self.model.reset()
         profiler = self._begin_graph_trace()
         with torch.no_grad():
