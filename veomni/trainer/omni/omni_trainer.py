@@ -115,9 +115,6 @@ def batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, An
     return {k: _to_device(v) for k, v in batch.items()}
 
 
-# ── Multi-optimizer / multi-scheduler proxies ──────────────────────────────────
-
-
 class MultiOptimizer:
     """Thin proxy over ``{module_name: torch.optim.Optimizer}``.
 
@@ -211,9 +208,6 @@ def build_omni_model(
     return OmniModelRuntime.from_model_runtime(model_runtime, train=global_args.train, for_inference=False)
 
 
-# ── OmniTrainer ────────────────────────────────────────────────────────────────
-
-
 class OmniTrainer:
     """Orchestrator for OmniModel — one :class:`ModuleRuntime` per module.
 
@@ -254,8 +248,6 @@ class OmniTrainer:
     data_iterator: Any | None = None
     optimizer: MultiOptimizer
     lr_scheduler: MultiLRScheduler
-
-    # ── Per-step trace state (written by omni_callbacks / shared callbacks) ───
 
     # OmniStepMetricsCallback.on_step_end: training metrics (loss, grad_norm, lr, …).
     # WandbTraceCallback.on_step_end: logs step_env_metrics.
@@ -401,12 +393,8 @@ class OmniTrainer:
             **dataloader_kwargs,
         )
 
-    # ── Build: per-module trainers + compose ───────────────────────────────────
-
     def _build_model(self):
         self.model = build_omni_model(global_args=self.args)
-
-    # ── Aggregate per-module optimizers / schedulers ───────────────────────────
 
     def _build_multi_optimizer(self) -> None:
         """Wrap per-module optimizers in :class:`MultiOptimizer`."""
@@ -433,8 +421,6 @@ class OmniTrainer:
             if module_runtime.lr_scheduler is not None
         }
         self.lr_scheduler = MultiLRScheduler(lr_schedulers)
-
-    # ── Step-level training contexts (explicit split, mirrors BaseTrainer) ───
 
     def _build_step_contexts(self) -> None:
         """Build reusable forward/backward context managers from ``args`` (once, at init).
@@ -466,8 +452,6 @@ class OmniTrainer:
 
     def _cascade_module_reshard(self, micro_step: int, num_micro_steps: int) -> None:
         cascade_module_reshard(self.model.module_runtimes, micro_step, num_micro_steps)
-
-    # ── Callbacks (orchestrator owns trace + per-module checkpoint scheduling) ─
 
     def _init_callbacks(self):
         """Build orchestrator trace callbacks + global / per-module checkpoint schedulers."""
@@ -506,7 +490,6 @@ class OmniTrainer:
         for callback in self._callback_handlers:
             getattr(callback, f"on_{stage}")(self.state, **kwargs)
 
-    # —— Callback helpers ──────────────────────────────────────────────────────
     def save_model_assets(self) -> None:
         """Export the omni-root HF layout (config + graphs + module sidecars, no weights)."""
         args: OmniArguments = self.args
@@ -557,8 +540,6 @@ class OmniTrainer:
             tag="model",
         )
 
-    # ── Grad-norm helpers ─────────────────────────────────────────────────────
-
     def _clip_grad_norm(self) -> float:
         """Clip grads across OmniModules according to ``grad_clip_scope``.
 
@@ -583,8 +564,6 @@ class OmniTrainer:
             helper.print_example(example=micro_batch, rank=self.args.train.local_rank)
             self.LOG_SAMPLE = False
         return micro_batch
-
-    # ── Main entrypoints: forward/backward → step → train loop ─────────────────
 
     def forward_backward_step(self, micro_batch: Dict[str, Any], *, micro_step: int = 0, num_micro_steps: int = 1):
         """One gradient-accumulation micro-batch over the training DAG.

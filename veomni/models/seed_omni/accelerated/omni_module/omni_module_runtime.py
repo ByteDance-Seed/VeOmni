@@ -240,8 +240,6 @@ class ModuleRuntime(VeOmniModelRuntime):
         self.model_config = self.model.config
         self._build_model_assets()
 
-    # ── Build (model, assets, parallelize) ────────────────────────────────────
-
     def _build_model(self) -> None:
         """Meta-init this module's sub-model from ``module_config``.
 
@@ -408,8 +406,6 @@ class ModuleRuntime(VeOmniModelRuntime):
                 self._build_optimizer()
                 self.build_checkpoint()
 
-    # ── Parallel state (per-module device mesh) ────────────────────────────────
-
     def _scoped(self):
         """Context manager making this module's ParallelState current.
 
@@ -453,8 +449,6 @@ class ModuleRuntime(VeOmniModelRuntime):
                     "context_fn": _recompute_context_fn,
                 }
             )
-
-    # ── Optimizer / lr-scheduler (optimizer in __init__; scheduler after train_steps) ─
 
     @property
     def has_trainable_parameters(self) -> bool:
@@ -560,8 +554,6 @@ class ModuleRuntime(VeOmniModelRuntime):
         model = self.model
         if isinstance(model, FSDPModule):
             model.set_reshard_after_backward(reshard)
-
-    # ── Checkpoint manager (I/O only; scheduling lives in trainer callbacks) ───
 
     def build_checkpoint(self) -> None:
         """Build this module's DCP / HF / LoRA checkpoint manager.

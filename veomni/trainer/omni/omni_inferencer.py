@@ -150,8 +150,6 @@ class OmniInferencer:
         self.processor = OmniProcessor.from_config(self.model.config, checkpoint_root=self.checkpoint_root)
         self.model_config = self.model.config
 
-    # ── Inference entry point ─────────────────────────────────────────────────
-
     def _runtime_generation_kwargs(self) -> dict[str, Any]:
         """Return per-request generation kwargs with the resolved scenario attached."""
         infer_args = self.args.infer
