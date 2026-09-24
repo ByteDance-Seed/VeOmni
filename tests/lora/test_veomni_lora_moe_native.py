@@ -147,6 +147,7 @@ def _shared_lora_ep_accumulation_worker(rank: int, rendezvous: str, checkpointed
         initial = weight.to_local().clone()
         optimizer = torch.optim.SGD([weight], lr=0.1)
         state = SimpleNamespace(ep_enabled=True, ep_group=mesh["ep"].get_group())
+        forward_checks = []
         with mock.patch("veomni.distributed.parallel_state.get_parallel_state", return_value=state):
             # Two microbatches share one optimizer step. Each rank contributes
             # (rank + 1) and 2 * (rank + 1), so the global gradient is 9.
@@ -155,16 +156,19 @@ def _shared_lora_ep_accumulation_worker(rank: int, rendezvous: str, checkpointed
                     experts.set_reshard_after_backward(micro == 2)
                 x = torch.full((1, HIDDEN), float(micro * (rank + 1)))
                 output = checkpoint(experts, x, use_reentrant=False) if checkpointed else experts(x)
-                torch.testing.assert_close(output.sum(), (x @ initial.T).sum(), rtol=1e-6, atol=1e-6)
+                forward_checks.append((output.sum().detach().clone(), (x @ initial.T).sum()))
                 output.sum().backward()
 
-        assert experts._forward_calls == (4 if checkpointed else 2)
         expected_grad = torch.full_like(initial, 4.5)  # FSDP divides the EP sum by world size.
-        torch.testing.assert_close(weight.grad.to_local(), expected_grad, rtol=0, atol=0)
+        actual_grad = weight.grad.to_local().detach().clone()
         optimizer.step()
-        torch.testing.assert_close(weight.to_local(), initial - 0.1 * expected_grad, rtol=1e-6, atol=1e-7)
         replicas = [torch.empty_like(initial) for _ in range(2)]
         dist.all_gather(replicas, weight.to_local(), group=state.ep_group)
+        for actual, expected in forward_checks:
+            torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+        assert experts._forward_calls == (4 if checkpointed else 2)
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+        torch.testing.assert_close(weight.to_local(), initial - 0.1 * expected_grad, rtol=1e-6, atol=1e-7)
         torch.testing.assert_close(replicas[0], replicas[1], rtol=0, atol=0)
     finally:
         dist.destroy_process_group()

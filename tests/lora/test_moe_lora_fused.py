@@ -623,14 +623,10 @@ def _distributed_ep_parity_worker(rank: int, rendezvous: str, mode: str) -> None
             )
         actual_grads = torch.autograd.grad(actual, [*local_lora, hidden_ep], grad_outputs=upstream)
 
-        assert _l2_rel(actual, reference) <= _FWD_L2REL_TOL, f"{mode}: distributed EP forward differs from non-EP"
-        assert _l2_rel(actual_grads[-1], reference_grads[-1]) <= _GRAD_L2REL_TOL, (
-            f"{mode}: distributed EP input gradient differs from non-EP"
-        )
-
         # Non-EP computes a full gradient from each rank's tokens. EP computes
         # one local expert shard from both ranks' tokens, or a shared-LoRA
         # partial from its local experts. Compare the logical full gradients.
+        gradient_checks = []
         for index, (local, full) in enumerate(zip(actual_grads[:-1], reference_grads[:-1])):
             expected = full.float().clone()
             dist.all_reduce(expected, op=dist.ReduceOp.SUM)
@@ -641,10 +637,18 @@ def _distributed_ep_parity_worker(rank: int, rendezvous: str, mode: str) -> None
             else:
                 observed = local.float().clone()
                 dist.all_reduce(observed, op=dist.ReduceOp.SUM)
+            gradient_checks.append((index, observed, expected))
+
+        assert _l2_rel(actual, reference) <= _FWD_L2REL_TOL, f"{mode}: distributed EP forward differs from non-EP"
+        assert _l2_rel(actual_grads[-1], reference_grads[-1]) <= _GRAD_L2REL_TOL, (
+            f"{mode}: distributed EP input gradient differs from non-EP"
+        )
+        for index, observed, expected in gradient_checks:
             assert expected.count_nonzero().item() > 0, f"{mode}: LoRA gradient {index} was zero"
-            assert _l2_rel(observed, expected) <= _GRAD_L2REL_TOL, (
+            relative_error = _l2_rel(observed, expected)
+            assert relative_error <= _GRAD_L2REL_TOL, (
                 f"{mode}: distributed EP LoRA gradient {index} differs from non-EP "
-                f"(relative L2 error {_l2_rel(observed, expected):.4%})"
+                f"(relative L2 error {relative_error:.4%})"
             )
     finally:
         dist.destroy_process_group()
