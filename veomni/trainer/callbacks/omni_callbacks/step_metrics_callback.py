@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Dict, List
+
+import torch.distributed as dist
 
 from ....utils.dist_utils import all_reduce
 from ..base import Callback, TrainerState
@@ -29,7 +31,8 @@ class OmniStepMetricsCallback(Callback):
     ``OmniModel`` has no single ``model_type`` to estimate FLOPs on, and its
     batch carries only ``conversation_list`` (no ``input_ids`` to count tokens
     from). This callback therefore publishes only what the train step itself
-    knows, averaged over the FSDP group.
+    knows: total loss and grad norm averaged over the FSDP group, and each
+    node's loss averaged over the ranks whose batch produced it.
 
     It writes :attr:`~OmniTrainer.step_train_metrics` (read by
     :class:`~veomni.trainer.callbacks.TqdmCallback`) and
@@ -43,10 +46,26 @@ class OmniStepMetricsCallback(Callback):
     def on_step_end(
         self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
     ) -> None:
-        step_train_metrics = {"total_loss": loss, **loss_dict, "grad_norm": grad_norm}
+        group = self.parallel_state.fsdp_group
+        # A node records a loss only when its batch produced one, and ranks see
+        # different modality mixes: reduce the union of keys in one order, or
+        # ranks issue different all_reduce sequences and hang or mis-pair.
+        rank_keys: List[List[str]] = [[] for _ in range(dist.get_world_size(group))]
+        dist.all_gather_object(rank_keys, sorted(loss_dict), group=group)
+        node_keys = sorted(set().union(*rank_keys))
+
         step_train_metrics = {
-            f"training/{k}": all_reduce(v, group=self.parallel_state.fsdp_group) for k, v in step_train_metrics.items()
+            "training/total_loss": all_reduce(loss, group=group),
+            "training/grad_norm": all_reduce(grad_norm, group=group),
         }
+        if node_keys:
+            # Average each node over the ranks that produced it: a rank without
+            # the node must not pull its logged loss toward zero.
+            values = [loss_dict.get(key, 0.0) for key in node_keys]
+            counts = [float(key in loss_dict) for key in node_keys]
+            sums = all_reduce(values + counts, op="sum", group=group)
+            for i, key in enumerate(node_keys):
+                step_train_metrics[f"training/{key}"] = sums[i] / sums[len(node_keys) + i]
         step_train_metrics["training/lr"] = max(self.trainer.lr_scheduler.get_last_lr())
 
         self.trainer.step_train_metrics = step_train_metrics
