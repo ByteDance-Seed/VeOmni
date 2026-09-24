@@ -1,17 +1,18 @@
 """Tests for async activation offload feature.
 Covers:
   1. Core components: SwapTensor, GetCnt, OffloadManager, async_save_on_cpu
-  2. Module patching: get_offload_modules_from_class_names, async_offload_modules
-  3. Argument validation: enable_async_activation_offload requires gradient_checkpointing
+  2. Module patching: _get_no_split_offload_modules, async_offload_modules
+  3. Argument validation: apply_async_activation_offload requires _no_split_modules
 Run (single GPU):
     pytest tests/distributed/test_async_activation_offload.py -v
 """
+import pytest
 import torch
-from veomni.distributed.async_offloading import (
-    _Singleton,
+from veomni.distributed.async_offload import (
+    PinnedBufferPool,
+    _get_no_split_offload_modules,
     apply_async_activation_offload,
     async_offload_modules,
-    get_offload_modules_from_class_names,
 )
 
 
@@ -49,15 +50,11 @@ class ToyModelNoNoSplitModules(torch.nn.Module):
         return self.linear(x).sum()
 
 
-
 class TestAsyncOffloadModules:
-    def setup_method(self):
-        _Singleton._instances.clear()
-
     def test_sets_per_instance_attributes(self):
         model = ToyModel(hidden_size=64, num_layers=4)
-        modules = get_offload_modules_from_class_names(model, ["ToyDecoderLayer"])
-        async_offload_modules(modules)
+        modules = _get_no_split_offload_modules(model)
+        async_offload_modules(modules, host_buffer_pool=PinnedBufferPool())
         for layer in model.layers:
             assert hasattr(layer, "_veomni_offload_layer_idx")
             assert hasattr(layer, "_veomni_offload_depth")
@@ -65,25 +62,21 @@ class TestAsyncOffloadModules:
 
     def test_class_patched_only_once(self):
         model = ToyModel(hidden_size=64, num_layers=4)
-        modules = get_offload_modules_from_class_names(model, ["ToyDecoderLayer"])
-        async_offload_modules(modules)
-        assert ToyDecoderLayer._veomni_async_offload_patched is True
-        async_offload_modules(modules)
-        assert ToyDecoderLayer._veomni_async_offload_patched is True
+        modules = _get_no_split_offload_modules(model)
+        async_offload_modules(modules, host_buffer_pool=PinnedBufferPool())
+        assert type(model.layers[0])._veomni_async_offload_instance_class is True
+        async_offload_modules(modules, host_buffer_pool=PinnedBufferPool())
+        assert type(model.layers[0])._veomni_async_offload_instance_class is True
 
 
 class TestApplyAsyncActivationOffload:
-    def setup_method(self):
-        _Singleton._instances.clear()
-        if hasattr(ToyDecoderLayer, "_veomni_async_offload_patched"):
-            delattr(ToyDecoderLayer, "_veomni_async_offload_patched")
-
     def test_applies_to_model_with_no_split_modules(self):
         model = ToyModel(hidden_size=64, num_layers=4)
-        apply_async_activation_offload(model)
+        apply_async_activation_offload(model, activation_offload_modules=[])
         for layer in model.layers:
             assert hasattr(layer, "_veomni_offload_layer_idx")
 
-    def test_warns_for_model_without_no_split_modules(self, capfd):
+    def test_raises_for_model_without_no_split_modules(self):
         model = ToyModelNoNoSplitModules(hidden_size=64)
-        apply_async_activation_offload(model)
+        with pytest.raises(ValueError):
+            apply_async_activation_offload(model, activation_offload_modules=[])

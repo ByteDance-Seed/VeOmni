@@ -153,8 +153,8 @@ Apply async activation offload to matched submodules. Called automatically by
 `build_parallelize_model` when `enable_async_activation_offload=True`.
 
 ```python
-from veomni.distributed.async_offloading import apply_async_activation_offload
-apply_async_activation_offload(model)
+from veomni.distributed.async_offload import apply_async_activation_offload
+apply_async_activation_offload(model, activation_offload_modules=[])
 
 ```
 
@@ -167,7 +167,7 @@ A `saved_tensors_hooks` context that intercepts saved tensors and offloads them 
 CPU. Applied per-module via class-level `__call__` patching.
 
 ```python
-from veomni.distributed.async_offloading import async_save_on_cpu
+from veomni.distributed.async_offload import async_save_on_cpu
 
 with async_save_on_cpu(block_idx=0, depth=12, prefetch=True):
     output = module(*args, **kwargs)
