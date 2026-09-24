@@ -46,6 +46,8 @@ Run:
 from __future__ import annotations
 
 import warnings
+from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -539,3 +541,127 @@ def test_ep_class_matches_nonep_class_single_rank(mode):
             f"[{mode}] {name}: EP-vs-non-EP backward parity broken — L2 rel {l2:.4%} > {_GRAD_L2REL_TOL:.2%} "
             f"(nonep_norm={g_nonep.float().norm().item():.3e}, max|Δ|={(g_nonep - g_ep).abs().max().item():.3e})"
         )
+
+
+def _distributed_ep_parity_worker(rank: int, rendezvous: str, mode: str) -> None:
+    """Compare the full EP dispatch against non-EP with identical inputs and upstream gradients."""
+    import torch.distributed as dist
+
+    from veomni.lora.ops.moe_group_gemm import (
+        group_gemm_fused_independent_lora_moe_forward,
+        group_gemm_fused_lora_moe_forward,
+    )
+
+    dist.init_process_group("nccl", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        torch.cuda.set_device(rank)
+        device = torch.device("cuda", rank)
+        dtype = torch.bfloat16
+        experts, hidden_size, intermediate_size, lora_rank, batch = 4, 64, 96, 8, 16
+        generator = torch.Generator().manual_seed(7123)
+
+        def random_tensor(shape: tuple[int, ...], scale: float) -> torch.Tensor:
+            return (torch.randn(shape, generator=generator) * scale).to(device=device, dtype=dtype)
+
+        hidden = random_tensor((2, batch, hidden_size), 0.5)[rank]
+        upstream = random_tensor((2, batch, hidden_size), 0.1)[rank]
+        gate_up = random_tensor((experts, 2 * intermediate_size, hidden_size), 0.05)
+        down = random_tensor((experts, hidden_size, intermediate_size), 0.05)
+        ids = torch.arange(batch, device=device)
+        selected = torch.stack(((ids + rank) % experts, (ids + rank + 1) % experts), dim=1)
+        routing = torch.tensor([0.75, 0.25], dtype=dtype, device=device).expand(batch, 2).contiguous()
+        if mode == "shared":
+            shapes = [
+                (lora_rank, hidden_size),
+                (intermediate_size, lora_rank),
+                (lora_rank, hidden_size),
+                (intermediate_size, lora_rank),
+                (lora_rank, intermediate_size),
+                (hidden_size, lora_rank),
+            ]
+            forward = group_gemm_fused_lora_moe_forward
+        else:
+            shapes = [
+                (experts, lora_rank, hidden_size),
+                (experts, intermediate_size, lora_rank),
+                (experts, lora_rank, hidden_size),
+                (experts, intermediate_size, lora_rank),
+                (experts, lora_rank, intermediate_size),
+                (experts, hidden_size, lora_rank),
+            ]
+            forward = group_gemm_fused_independent_lora_moe_forward
+        full_lora = [random_tensor(shape, 0.02).detach().requires_grad_(True) for shape in shapes]
+        hidden_reference = hidden.detach().requires_grad_(True)
+        non_ep_state = SimpleNamespace(ep_enabled=False)
+        ep_state = SimpleNamespace(ep_enabled=True, ep_group=dist.group.WORLD)
+
+        with mock.patch("veomni.lora.ops.moe_group_gemm.get_parallel_state", return_value=non_ep_state):
+            reference = forward(experts, routing, selected, hidden_reference, gate_up, down, *full_lora, 0.5, 0.5, 0.5)
+        reference_grads = torch.autograd.grad(reference, [*full_lora, hidden_reference], grad_outputs=upstream)
+
+        local_lora = []
+        for value in full_lora:
+            if mode == "independent":
+                value = value[rank * 2 : (rank + 1) * 2]
+            local_lora.append(value.detach().clone().requires_grad_(True))
+        hidden_ep = hidden.detach().requires_grad_(True)
+        with (
+            mock.patch("veomni.lora.ops.moe_group_gemm.get_parallel_state", return_value=ep_state),
+            mock.patch("veomni.distributed.moe.moe_layer.get_parallel_state", return_value=ep_state),
+        ):
+            actual = forward(
+                experts,
+                routing,
+                selected,
+                hidden_ep,
+                gate_up[rank * 2 : (rank + 1) * 2].contiguous(),
+                down[rank * 2 : (rank + 1) * 2].contiguous(),
+                *local_lora,
+                0.5,
+                0.5,
+                0.5,
+            )
+        actual_grads = torch.autograd.grad(actual, [*local_lora, hidden_ep], grad_outputs=upstream)
+
+        # Non-EP computes a full gradient from each rank's tokens. EP computes
+        # one local expert shard from both ranks' tokens, or a shared-LoRA
+        # partial from its local experts. Compare the logical full gradients.
+        gradient_checks = []
+        for index, (local, full) in enumerate(zip(actual_grads[:-1], reference_grads[:-1])):
+            expected = full.float().clone()
+            dist.all_reduce(expected, op=dist.ReduceOp.SUM)
+            if mode == "independent":
+                parts = [torch.empty_like(local) for _ in range(2)]
+                dist.all_gather(parts, local.contiguous())
+                observed = torch.cat(parts, dim=0).float()
+            else:
+                observed = local.float().clone()
+                dist.all_reduce(observed, op=dist.ReduceOp.SUM)
+            gradient_checks.append((index, observed, expected))
+
+        assert _l2_rel(actual, reference) <= _FWD_L2REL_TOL, f"{mode}: distributed EP forward differs from non-EP"
+        assert _l2_rel(actual_grads[-1], reference_grads[-1]) <= _GRAD_L2REL_TOL, (
+            f"{mode}: distributed EP input gradient differs from non-EP"
+        )
+        for index, observed, expected in gradient_checks:
+            assert expected.count_nonzero().item() > 0, f"{mode}: LoRA gradient {index} was zero"
+            relative_error = _l2_rel(observed, expected)
+            assert relative_error <= _GRAD_L2REL_TOL, (
+                f"{mode}: distributed EP LoRA gradient {index} differs from non-EP "
+                f"(relative L2 error {relative_error:.4%})"
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("mode", ["shared", "independent"])
+def test_distributed_ep_dispatch_matches_nonep_forward_and_gradients(tmp_path, mode):
+    """Two GPUs exercise real all-to-all dispatch and both LoRA gradient layouts."""
+    _require_cuda_with_triton()
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Distributed EP parity requires two CUDA devices.")
+    torch.multiprocessing.spawn(
+        _distributed_ep_parity_worker,
+        args=(str(tmp_path / "ep_rendezvous"), mode),
+        nprocs=2,
+    )
