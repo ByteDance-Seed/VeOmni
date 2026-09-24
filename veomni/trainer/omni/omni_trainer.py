@@ -62,6 +62,7 @@ from torch.utils.checkpoint import set_checkpoint_debug_enabled
 from ...arguments.omni_arguments_types import OmniArguments
 from ...arguments.parser import save_args
 from ...data import SeedOmniCollator, build_dataloader, build_dataset
+from ...data import seed_omni as _seed_omni_data  # noqa: F401  (import side effect: registers data_type="seedomni")
 from ...data.data_transform import build_data_transform
 from ...distributed.clip_grad_norm import omni_clip_grad_norm
 from ...distributed.offloading import build_activation_offloading_context
