@@ -21,6 +21,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
 
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel
 
 from ...modules.module_modeling_base import PretrainedOmniModule
 from .dispatch import unwrap_module_chain
@@ -60,6 +61,10 @@ def save_module_subdirectory(
     module_dir = os.path.join(save_directory, name)
     os.makedirs(module_dir, exist_ok=True)
     save_module_assets(module, module_dir)
+    if isinstance(module, DistributedDataParallel):
+        # DDP does not forward ``save_pretrained``. Strip only DDP: a LoRA
+        # wrapper's own ``save_pretrained`` is what writes the adapter.
+        module = module.module
     if save_module_weights:
         if not hasattr(module, "save_pretrained"):
             raise TypeError(

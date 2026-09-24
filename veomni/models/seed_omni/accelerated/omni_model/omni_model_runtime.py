@@ -437,8 +437,12 @@ class OmniModelRuntime:
     def save_pretrained(self, save_directory: str | os.PathLike, **kwargs: Any) -> None:
         """Save the omni-root HF layout (config + graphs + module sidecars).
 
-        Unwraps DDP / LoRA wrappers when writing per-module assets; weight export
-        still calls each wrapped module's ``save_pretrained`` so FSDP/DDP hooks run.
+        Unwraps DDP / LoRA wrappers when writing per-module assets. Weights are
+        written from the main process alone, so weight export only suits
+        unsharded modules (eager, DDP); it strips DDP but keeps a LoRA wrapper,
+        whose ``save_pretrained`` writes the adapter. Training exports sharded
+        weights per module via ``OmniTrainer.save_hf_or_lora`` and calls this
+        with ``save_module_weights=False``.
         """
         import torch.distributed as dist
 

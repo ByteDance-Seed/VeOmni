@@ -170,6 +170,35 @@ class _DdpStyleWrapper(torch.nn.Module):
         return self.module(*args, **kwargs)
 
 
+class _Exportable(torch.nn.Module):
+    """Records the directories its ``save_pretrained`` was asked to write."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(1, 1)
+        self.saved_to = []
+
+    def save_pretrained(self, save_directory, **kwargs):
+        self.saved_to.append(save_directory)
+
+
+def test_weight_export_reaches_a_ddp_wrapped_module(tmp_path):
+    """DDP does not forward ``save_pretrained``, so exporting a DDP module raised."""
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel
+
+    from veomni.models.seed_omni.accelerated.utils.modules import save_module_subdirectory
+
+    dist.init_process_group(backend="gloo", init_method=f"file://{tmp_path / 'rendezvous'}", world_size=1, rank=0)
+    try:
+        inner = _Exportable()
+        save_module_subdirectory("module_a", DistributedDataParallel(inner), str(tmp_path), save_module_weights=True)
+    finally:
+        dist.destroy_process_group()
+
+    assert inner.saved_to == [str(tmp_path / "module_a")]
+
+
 def test_runtime_calls_a_wrapped_module_through_its_runtime():
     """OmniModel holds the bare module; DDP syncs gradients only if its own forward runs."""
     model = _model()
