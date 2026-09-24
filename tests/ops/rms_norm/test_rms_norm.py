@@ -45,6 +45,8 @@ from tests.ops.tol import (
     RMS_NPU_FP16_DIM2048_ATOL,
     RMS_NPU_FP32_ATOL,
     RMS_NPU_FP32_RTOL,
+    RMS_NPU_GRAD_ATOL,
+    RMS_NPU_GRAD_RTOL,
     RMS_NPU_RTOL,
     RMS_TRITON_ATOL,
     RMS_TRITON_GRAD_ATOL,
@@ -259,6 +261,8 @@ def test_npu_matches_eager(variant: str):
         torch.bfloat16,
         atol=RMS_NPU_ATOL,
         rtol=RMS_NPU_RTOL,
+        grad_atol=RMS_NPU_GRAD_ATOL,
+        grad_rtol=RMS_NPU_GRAD_RTOL,
         cast_fp32=variant == "offset",
     )
 

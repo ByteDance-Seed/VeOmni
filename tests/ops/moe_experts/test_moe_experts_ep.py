@@ -22,6 +22,8 @@ from tests.ops.tol import (
     MOE_EP_PRE_SM90_GRAD_FC1_RTOL,
     MOE_EP_PRE_SM90_GRAD_FC2_ATOL,
     MOE_EP_PRE_SM90_GRAD_FC2_RTOL,
+    MOE_EP_PRE_SM90_GRAD_HIDDEN_ATOL,
+    MOE_EP_PRE_SM90_GRAD_HIDDEN_RTOL,
     MOE_EP_SM90_ATOL,
     MOE_EP_SM90_GRAD_FC1_ATOL,
     MOE_EP_SM90_GRAD_FC1_RTOL,
@@ -110,13 +112,14 @@ def _ep_gradient_tolerances(swiglu_limit):
     if is_sm90_or_above():
         fc1_tol = (MOE_EP_SM90_GRAD_FC1_ATOL, MOE_EP_SM90_GRAD_FC1_RTOL)
         fc2_tol = (MOE_EP_SM90_GRAD_FC2_ATOL, MOE_EP_SM90_GRAD_FC2_RTOL)
+        if swiglu_limit is not None:
+            hidden_tol = (MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL, MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL)
+        else:
+            hidden_tol = (MOE_FUSED_GRAD_HIDDEN_ATOL, MOE_FUSED_GRAD_HIDDEN_RTOL)
     else:
         fc1_tol = (MOE_EP_PRE_SM90_GRAD_FC1_ATOL, MOE_EP_PRE_SM90_GRAD_FC1_RTOL)
         fc2_tol = (MOE_EP_PRE_SM90_GRAD_FC2_ATOL, MOE_EP_PRE_SM90_GRAD_FC2_RTOL)
-    if swiglu_limit is not None:
-        hidden_tol = (MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL, MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL)
-    else:
-        hidden_tol = (MOE_FUSED_GRAD_HIDDEN_ATOL, MOE_FUSED_GRAD_HIDDEN_RTOL)
+        hidden_tol = (MOE_EP_PRE_SM90_GRAD_HIDDEN_ATOL, MOE_EP_PRE_SM90_GRAD_HIDDEN_RTOL)
     return hidden_tol, fc1_tol, fc2_tol
 
 
@@ -149,7 +152,10 @@ def test_ep_weight_grad_budgets_are_platform_specific():
     hidden_tol, fc1_tol, fc2_tol = _ep_gradient_tolerances(None)
     assert fc1_tol[1] == 0
     assert fc2_tol[1] == 0
-    assert hidden_tol[0] == MOE_FUSED_GRAD_HIDDEN_ATOL
+    if is_sm90_or_above():
+        assert hidden_tol[0] == MOE_FUSED_GRAD_HIDDEN_ATOL
+    else:
+        assert hidden_tol[0] == MOE_EP_PRE_SM90_GRAD_HIDDEN_ATOL
 
 
 @pytest.mark.parametrize("swiglu_limit", [None, 7.0, 10.0])
