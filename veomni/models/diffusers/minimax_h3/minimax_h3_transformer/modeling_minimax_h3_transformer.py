@@ -100,21 +100,22 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         self._configure_packed_attention(config._attn_implementation)
 
     def _configure_packed_attention(self, attn_implementation):
-        """Record the packed backend and rebind VeomniOp when a FlashAttention impl is selected."""
+        """Record the packed backend. Do not bind it yet: FA4/NPU/pre-SM90
+        cannot construct ``veomni_flash_attention_4``, and github/main only
+        validates the name on packed forward.
+        """
         self._packed_attn_implementation = _packed_attn_name(attn_implementation)
-        impl = _veomni_attn_impl(self._packed_attn_implementation)
-        if impl is None:
-            return
-        for module in self.dit.modules():
-            if isinstance(module, MiniMaxH3Attention):
-                bind_minimax_attention(module, is_causal=False, impl=impl)
 
     def _load_packed_attention_kernel(self):
         implementation = self._packed_attn_implementation
-        if _veomni_attn_impl(implementation) is None:
+        if implementation in (None, "eager", "sdpa", "veomni_sdpa"):
             return
-        if implementation not in _PACKED_FLASH_BACKENDS:
+        impl = _veomni_attn_impl(implementation)
+        if impl is None or implementation not in _PACKED_FLASH_BACKENDS:
             raise ValueError(f"Unsupported H3 packing backend: {implementation}")
+        for module in self.dit.modules():
+            if isinstance(module, MiniMaxH3Attention):
+                bind_minimax_attention(module, is_causal=False, impl=impl)
 
     def _forward_batch(self, samples):
         if any(sample.get("use_gradient_checkpointing_offload", False) for sample in samples):
