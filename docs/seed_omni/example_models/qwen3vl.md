@@ -143,7 +143,7 @@ NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
 
 ## 4. Resume
 
-Each save writes per-module DCP shards plus a `trainer_state.pt` (global step,
+Each save writes per-module DCP shards plus the per-rank job state (global step,
 dataloader position, RNG state) under `<output_dir>/checkpoints/global_step_N/`.
 Resume by pointing `load_path` at that directory:
 

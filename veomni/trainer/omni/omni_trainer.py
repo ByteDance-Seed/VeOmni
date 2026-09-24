@@ -79,6 +79,7 @@ from ..base import VeOmniIter
 from ..callbacks import (
     Callback,
     EvaluateCallback,
+    GlobalStateCallback,
     MoERouterMonitorCallback,
     ProfileTraceCallback,
     TqdmCallback,
@@ -88,7 +89,6 @@ from ..callbacks import (
 from ..callbacks.omni_callbacks import (
     GraphProfileCallback,
     OmniEnvironMeterCallback,
-    OmniGlobalStateCallback,
     OmniModuleDcpCallback,
     OmniModuleHfCallback,
     OmniRootAssetsCallback,
@@ -258,7 +258,7 @@ class OmniTrainer:
     # ── Per-step trace state (written by omni_callbacks / shared callbacks) ───
 
     # OmniEnvironMeterCallback.__init__: per-module MFU/token roll-up engine.
-    # OmniGlobalStateCallback: resume meter multisource cursor.
+    # GlobalStateCallback: resume meter multisource cursor.
     environ_meter: OmniEnvironMeter | None = None
     # OmniEnvironMeterCallback.on_step_end: env metrics (MFU, tokens, memory, …).
     # WandbTraceCallback.on_step_end: logged to wandb.
@@ -486,10 +486,10 @@ class OmniTrainer:
         self.profile_callback = ProfileTraceCallback(self)
         self.graph_profile_callback = GraphProfileCallback(self)
         self.omni_root_assets_callback = OmniRootAssetsCallback(self)
-        self.checkpointer_callback = OmniGlobalStateCallback(self)
         self.module_dcp_callback = OmniModuleDcpCallback(self)
         self.module_hf_ckpt_callback = OmniModuleHfCallback(self)
         self.hf_ckpt_callback = Callback(self)
+        self.global_state_callback = GlobalStateCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self.moe_monitor_callback = MoERouterMonitorCallback(self)
         self._callback_handlers = [
@@ -498,11 +498,13 @@ class OmniTrainer:
             self.wandb_callback,
             self.profile_callback,
             self.graph_profile_callback,
+            # Weights first, then the cursor — same order and reasons as
+            # ``BaseTrainer._init_callbacks``.
             self.omni_root_assets_callback,
-            self.checkpointer_callback,
             self.module_dcp_callback,
             self.module_hf_ckpt_callback,
             self.hf_ckpt_callback,
+            self.global_state_callback,
             self.evaluate_callback,
             self.moe_monitor_callback,
         ]

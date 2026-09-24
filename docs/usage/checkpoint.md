@@ -157,13 +157,10 @@ Checkpoints from older layouts have no manifest; discovery falls back to a
 only while the step is still entirely pre-split. See
 [Resuming older checkpoints](#resuming-older-checkpoints).
 
-SeedOmni V2 (`OmniTrainer`) writes the model half through the same
-`ModelCheckpointManager`, so its `model/<name>/` markers are the ones above, but
-its trainer half is `OmniGlobalStateCallback`, which keeps the orchestrator's
-step counter, dataloader and RNG in a single rank-0 `trainer_state.pt` and
-writes no manifest. Discovery accepts that file in the manifest's place — it is
-what the same callback reads back on resume — until the callback moves onto the
-manifest.
+SeedOmni (`OmniTrainer`) writes both halves the same way: the model half through
+`ModelCheckpointManager`, one `model/<name>/` per module, and the trainer half
+through the shared `GlobalStateCallback`, so its steps carry the same per-rank
+`loader/` and `extra_state/` files and the same manifest.
 
 ## Staged and asynchronous saves
 

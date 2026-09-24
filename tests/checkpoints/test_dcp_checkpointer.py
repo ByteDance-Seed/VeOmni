@@ -2533,16 +2533,6 @@ class TestResumeDiscovery:
 
         assert self._validate(step) == 10
 
-    def test_an_omni_step_is_accepted_by_its_trainer_state(self, tmp_path):
-        """``OmniGlobalStateCallback`` writes ``trainer_state.pt`` instead of a
-        manifest, and it is the file the same callback reads back on resume. A
-        step of an ``OmniTrainer`` run would be undiscoverable without it."""
-        step = tmp_path / "global_step_10"
-        self._write_dcp(step, module="vision")
-        Path(step, "trainer_state.pt").write_text("orchestrator state")
-
-        assert self._validate(step) == 10
-
     def test_a_legacy_step_is_accepted_by_its_own_marker(self, tmp_path):
         from veomni.checkpoint.legacy_v0_1_12 import marker_path
 

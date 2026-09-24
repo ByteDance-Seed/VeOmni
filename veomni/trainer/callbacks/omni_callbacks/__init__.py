@@ -15,15 +15,14 @@
 """SeedOmni V2 (OmniTrainer) callbacks — not shared with single-model trainers."""
 
 from .environ_meter_callback import OmniEnvironMeterCallback
-from .global_state_callback import OmniGlobalStateCallback, OmniRootAssetsCallback
 from .graph_profile_callback import GraphProfileCallback
 from .module_checkpoint_callback import OmniModuleDcpCallback, OmniModuleHfCallback
+from .root_assets_callback import OmniRootAssetsCallback
 
 
 __all__ = [
     "GraphProfileCallback",
     "OmniEnvironMeterCallback",
-    "OmniGlobalStateCallback",
     "OmniModuleDcpCallback",
     "OmniModuleHfCallback",
     "OmniRootAssetsCallback",
