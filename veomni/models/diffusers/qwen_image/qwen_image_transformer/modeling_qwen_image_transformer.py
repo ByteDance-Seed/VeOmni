@@ -186,8 +186,11 @@ class QwenImageSPAttnProcessor:
                     f"Qwen-Image flash joint mask shape must be {(batch_size, joint_len)}, "
                     f"got {tuple(attention_mask.shape)}. Broadcast masks are not supported."
                 )
-            if attention_mask is not None and joint_varlen_metadata is None:
-                joint_varlen_metadata = _joint_varlen_metadata(attention_mask)
+            if attention_mask is not None:
+                if joint_varlen_metadata is None:
+                    joint_varlen_metadata = _joint_varlen_metadata(attention_mask)
+                else:
+                    _validate_flash_keep_mask(attention_mask)
             varlen_kwargs = {}
             if joint_varlen_metadata is not None:
                 # Pack the kept tokens of all samples into one [1, T, H, D] sequence.
@@ -371,6 +374,8 @@ def QwenImageTransformer2DModel_forward(
     joint_mask = block_attention_kwargs.get("attention_mask")
     if joint_mask is not None and use_flash_attention:
         block_attention_kwargs["joint_varlen_metadata"] = _joint_varlen_metadata(joint_mask)
+        # Validate integer values once, then avoid value checks/host syncs in each block and recomputation.
+        block_attention_kwargs["attention_mask"] = joint_mask.bool()
 
     for index_block, block in enumerate(self.transformer_blocks):
         if torch.is_grad_enabled() and self.gradient_checkpointing:

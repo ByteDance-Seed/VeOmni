@@ -223,6 +223,23 @@ def test_flash_path_rejects_mismatched_joint_mask_shape(flash_calls, mask_shape,
     assert not flash_calls
 
 
+@pytest.mark.parametrize("invalid_value", [-1, 2, float("-inf")])
+def test_precomputed_metadata_does_not_bypass_mask_validation(flash_calls, invalid_value):
+    model = build("flash_attention_3_hub")
+    attn = model.transformer_blocks[0].attn
+    mask = torch.tensor([[1] * 11, [1] * 10 + [invalid_value]])
+    metadata = qi_model._joint_varlen_metadata(torch.ones(2, 11, dtype=torch.bool))
+    with pytest.raises(ValueError, match="boolean or 0/1 keep mask"):
+        attn.processor(
+            attn,
+            torch.randn(2, 6, 16),
+            encoder_hidden_states=torch.randn(2, 5, 16),
+            attention_mask=mask,
+            joint_varlen_metadata=metadata,
+        )
+    assert not flash_calls
+
+
 @pytest.mark.parametrize("invalid_value", [-1, 2, float("-inf"), 1j])
 def test_model_rejects_invalid_text_mask_before_normalization(flash_calls, invalid_value):
     model = build("flash_attention_3_hub")
