@@ -83,6 +83,37 @@ try:
 except ImportError:
     _FA_CE_AVAILABLE = False
 
+try:
+    import torch_npu as _torch_npu
+
+    _NPU_CE_AVAILABLE = hasattr(_torch_npu, "npu_cross_entropy_loss")
+except ImportError:
+    _NPU_CE_AVAILABLE = False
+
+
+def _per_token_log_probs_from_logits_npu(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    ignore_index: int,
+) -> torch.Tensor:
+    """Per-token log-probs through Ascend's fused cross-entropy kernel.
+
+    ``npu_cross_entropy_loss`` fuses log_softmax and NLL loss on NPU, avoiding
+    the explicit ``[chunk, vocab]`` log-prob tensor produced by the PyTorch
+    fallback. The custom autograd Function below still owns backward, so this
+    path is used only as an NPU-friendly forward primitive.
+    """
+    batch_shape = logits.shape[:-1]
+    logits_2d = logits.reshape(-1, logits.shape[-1])
+    labels_1d = labels.reshape(-1).to(torch.int64)
+    loss, _, _, _ = _torch_npu.npu_cross_entropy_loss(
+        logits_2d,
+        labels_1d,
+        reduction="none",
+        ignore_index=ignore_index,
+    )
+    return -loss.view(*batch_shape)
+
 
 def _per_token_log_probs_from_logits(
     logits: torch.Tensor,
@@ -100,6 +131,9 @@ def _per_token_log_probs_from_logits(
     positions internally, the negation is then ``-0.0`` which compares
     equal to ``0.0``).
     """
+    if _NPU_CE_AVAILABLE and logits.device.type == "npu":
+        return _per_token_log_probs_from_logits_npu(logits, labels, ignore_index)
+
     if _FA_CE_AVAILABLE:
         per_token_nll = _fa_cross_entropy_loss(logits, labels, ignore_index=ignore_index)[0]
         return -per_token_nll
