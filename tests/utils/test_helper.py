@@ -88,6 +88,30 @@ def test_environ_meter_passes_supported_lora_config(monkeypatch):
     warning.assert_called_once()
 
 
+def test_multisource_ds_idx_accepts_each_collator_shape():
+    """`SeedOmniCollator` hands back a per-sample list, unlike the packed tensor shape."""
+    assert helper._get_multisource_ds_idx({"ds_idx": torch.tensor([2, 5])}) == [2, 5]
+    assert helper._get_multisource_ds_idx({"ds_idx": [2, 5]}) == [2, 5]
+    assert helper._get_multisource_ds_idx({"ds_idx": 7}) == [7]
+
+
+def test_device_memory_metrics_are_shared_by_both_meters(monkeypatch):
+    """The keys `EnvironMeter` used to build inline now come from one helper."""
+    fake_device = SimpleNamespace(
+        max_memory_allocated=lambda: 2 * 1024**3,
+        max_memory_reserved=lambda: 4 * 1024**3,
+        memory_stats=lambda: {"num_alloc_retries": 3},
+    )
+    monkeypatch.setattr(helper, "get_torch_device", lambda: fake_device)
+    monkeypatch.setattr(helper, "all_reduce", lambda values, **kwargs: values)
+    monkeypatch.setattr(helper.psutil, "virtual_memory", lambda: SimpleNamespace(used=0, available=0, percent=0))
+
+    metrics = helper.compute_device_memory_metrics()
+    assert metrics["max_memory_allocated(GB)"] == 2.0
+    assert metrics["max_memory_reserved(GB)"] == 4.0
+    assert metrics["num_alloc_retries"] == 3
+
+
 @dataclass
 class Arguments(VeOmniArguments):
     model: "ModelArguments" = field(default_factory=ModelArguments)
