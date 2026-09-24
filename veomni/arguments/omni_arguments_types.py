@@ -170,6 +170,7 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
     )
     for module_args in modules.values():
         _validate_omni_accelerator(module_args.accelerator)
+    _validate_composed_wrap(model_runtime.accelerator, modules)
     training_graphs = _load_graph_map(train_graph)
     generation_graphs = _load_graph_map(infer_graph)
     if train_type is not None and train_type not in training_graphs:
@@ -788,6 +789,26 @@ def _validate_omni_accelerator(accelerator: AcceleratorConfig) -> None:
     """
     if accelerator.torch_compile.enable:
         raise ValueError("accelerator.torch_compile.enable is not supported by SeedOmni yet.")
+
+
+def _validate_composed_wrap(accelerator: AcceleratorConfig, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
+    """Reject an eager module under a top-level ``fsdp_scope='model'`` before any weights load.
+
+    ``OmniModelRuntime`` repeats the check at wrap time, by which point every
+    module has already loaded; this is the one that fails fast.
+    """
+    fsdp_config = accelerator.fsdp_config
+    if fsdp_config.fsdp_scope != "model" or fsdp_config.fsdp_mode == "eager":
+        return
+    eager = sorted(
+        name for name, module_args in modules.items() if module_args.accelerator.fsdp_config.fsdp_mode == "eager"
+    )
+    if eager:
+        raise ValueError(
+            "fsdp_scope='model' wraps the composed OmniModel once, so no module can be loaded "
+            f"unwrapped; these use fsdp_mode='eager': {eager}. Run with fsdp_scope='module', or "
+            "give them fsdp2 / ddp."
+        )
 
 
 @dataclass

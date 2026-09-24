@@ -284,6 +284,18 @@ def test_infer_module_overrides_apply_eager_defaults():
     assert infer_args[MODULE_B].accelerator.fsdp_config.fsdp_mode == "eager"
 
 
+def test_a_model_scope_wrap_rejects_eager_modules_before_loading_them():
+    """Inference defaults modules to eager but not the top level, so a
+    ``fsdp_scope='model'`` run would otherwise load all weights, then fail at wrap time."""
+    args = _omni_args()
+    args.model.accelerator.fsdp_config.fsdp_scope = "model"
+    assert args.resolve_model().modules[MODULE_B].accelerator.fsdp_config.fsdp_mode == "fsdp2"
+
+    args.model.model_config["modules"] = str(_cfg_dir() / "infer/modules_infer_eager.yaml")
+    with pytest.raises(ValueError, match=rf"fsdp_mode='eager': \['{MODULE_A}', '{MODULE_B}'\]"):
+        args.resolve_model(for_inference=True)
+
+
 def test_training_keeps_module_fsdp_modes():
     args = _omni_args()
     runtime_args = args.resolve_model().modules

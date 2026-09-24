@@ -195,12 +195,21 @@ class OmniModelRuntime:
         (aligner, final norm, anything not in a nested unit) unshard on
         :meth:`OmniModel.forward`.
         """
+        from ..omni_module.omni_module_runtime import composed_model_owns_wrap
+
         args = self.omni_model_runtime_args
         acc = args.accelerator
-        if acc.fsdp_config.fsdp_scope != "model" or acc.fsdp_config.fsdp_mode == "eager":
+        if not composed_model_owns_wrap(acc):
             return
 
         modules = self.module_runtimes
+        self_wrapped = sorted(name for name, runtime in modules.items() if not runtime._defer_parallelize)
+        if self_wrapped:
+            raise ValueError(
+                "fsdp_scope='model' wraps the composed OmniModel once, so every module must defer its "
+                f"own wrap; these did not: {self_wrapped}. A module on fsdp_mode='eager' is loaded "
+                "unwrapped — run it with fsdp_scope='module', or give it fsdp2 / ddp."
+            )
         wrap_units = _scoped_no_split_modules(modules)
         self.model._no_split_modules = wrap_units
 

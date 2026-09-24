@@ -222,6 +222,51 @@ def test_the_constructor_stores_training_args_where_the_base_reads_them(monkeypa
     assert vars(runtime)["train_args"] is train
 
 
+def _fsdp(scope: str, mode: str = "fsdp2") -> SimpleNamespace:
+    return SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope=scope, fsdp_mode=mode))
+
+
+@pytest.mark.parametrize(("top_level", "overlay", "defers"), [("model", "module", True), ("module", "model", False)])
+def test_only_the_top_level_scope_decides_whether_a_module_defers(monkeypatch, top_level, overlay, defers):
+    """The composed wrap reads the top-level scope, so a module reading its own
+    overlay would be wrapped twice, or left on meta with nothing to wrap it."""
+    for step in (
+        "setup",
+        "_build_model",
+        "_build_model_assets",
+        "_freeze_model_module",
+        "_build_parallelized_model",
+        "_scope_recompute_to_parallel_state",
+        "_build_optimizer",
+        "build_checkpoint",
+    ):
+        monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, **k: None)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+    args = SimpleNamespace(accelerator=_fsdp(overlay))
+
+    runtime = ModuleRuntime(
+        args, "vision_encoder", module_config=SimpleNamespace(), global_accelerator=_fsdp(top_level)
+    )
+
+    assert runtime._defer_parallelize is defers
+
+
+def test_the_composed_wrap_refuses_a_module_that_did_not_defer():
+    """An eager-inference module is loaded unwrapped; the parent's one FSDP tree
+    would re-wrap and re-load it."""
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
+
+    runtime = OmniModelRuntime.__new__(OmniModelRuntime)
+    runtime.omni_model_runtime_args = SimpleNamespace(accelerator=_fsdp("model"))
+    runtime.module_runtimes = {
+        "llm": SimpleNamespace(_defer_parallelize=True),
+        "vision_encoder": SimpleNamespace(_defer_parallelize=False),
+    }
+
+    with pytest.raises(ValueError, match=r"\['vision_encoder'\]"):
+        runtime._parallelize_composed_model(for_inference=True)
+
+
 def test_a_module_the_lora_config_missed_stays_frozen_instead_of_failing():
     """A composed ``lora_config`` reaches every module, so "no targets here" is
     how it says which model to adapt — only the composer can call it an error."""

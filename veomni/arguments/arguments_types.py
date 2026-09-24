@@ -559,8 +559,9 @@ class FSDPConfig:
                 "'{child}.{ClassName}'; leftover params unshard on OmniModel.forward. "
                 "Under 'model', per-module fsdp_mode / extra_parallel / init_device and "
                 "SP-CP-TP-PP overlays stay as written but no longer decide mesh, init or "
-                "wrap — the top-level accelerator does. Inference fsdp_mode='eager' still "
-                "takes the per-module eager path and returns before the composed wrap."
+                "wrap — the top-level accelerator does, and only its fsdp_scope counts. "
+                "Every module must defer to that one wrap, so a module on inference "
+                "fsdp_mode='eager' is rejected under 'model'."
             )
         },
     )

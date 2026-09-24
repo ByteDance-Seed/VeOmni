@@ -55,6 +55,19 @@ def unwrap_module(mod: nn.Module) -> nn.Module:
     return unwrap_module_chain(mod)
 
 
+def composed_model_owns_wrap(accelerator: "AcceleratorConfig") -> bool:
+    """Whether the top-level ``accelerator`` wraps the composed :class:`OmniModel` once.
+
+    The one rule both sides read: :class:`OmniModelRuntime` wraps the parent
+    exactly when this holds, and every :class:`ModuleRuntime` defers its own
+    wrap exactly when this holds. A module's own ``fsdp_scope`` overlay is not
+    consulted — letting it differ would wrap that module twice, or leave it on
+    meta with nothing left to wrap it.
+    """
+    fsdp_config = accelerator.fsdp_config
+    return fsdp_config.fsdp_scope == "model" and fsdp_config.fsdp_mode != "eager"
+
+
 class ModuleRuntime(VeOmniModelRuntime):
     """One OmniModule's training unit (model + optimizer + lr_scheduler + FSDP2).
 
@@ -125,6 +138,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         self.lr_scheduler = None
         self._defer_parallelize = False
         self._global_accelerator = global_accelerator
+        wrap_accelerator = global_accelerator if global_accelerator is not None else args.accelerator
 
         if for_inference:
             if args.accelerator.fsdp_config.fsdp_mode == "eager":
@@ -132,7 +146,7 @@ class ModuleRuntime(VeOmniModelRuntime):
                 self._init_eager_inference()
             else:
                 args.accelerator.fsdp_config.mixed_precision.enable = False
-                self._defer_parallelize = args.accelerator.fsdp_config.fsdp_scope == "model"
+                self._defer_parallelize = composed_model_owns_wrap(wrap_accelerator)
                 self.setup()
                 with self._scoped():
                     self._build_model()
@@ -140,7 +154,7 @@ class ModuleRuntime(VeOmniModelRuntime):
                     self._build_parallelized_model()
                 self.model.eval()
         else:
-            self._defer_parallelize = args.accelerator.fsdp_config.fsdp_scope == "model"
+            self._defer_parallelize = composed_model_owns_wrap(wrap_accelerator)
             self.setup()
             with self._scoped():
                 self._build_model()
@@ -645,4 +659,4 @@ class ModuleRuntime(VeOmniModelRuntime):
         return assets
 
 
-__all__ = ["ModuleRuntime"]
+__all__ = ["ModuleRuntime", "composed_model_owns_wrap"]
