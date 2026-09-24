@@ -26,9 +26,13 @@ from .....distributed.sequence_parallel import (
     slice_input_tensor,
 )
 from .....utils import logging
+from .....utils.device import IS_NPU_AVAILABLE, get_device_type
 from .configuration_wan_transformer import WanTransformer3DModelConfig
 
-import torch_npu
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
 
 logger = logging.get_logger(__name__)
 
@@ -49,16 +53,14 @@ def wan_eager_attention_forward(
     )
     return attn_output.transpose(1, 2), None
 
-# Patch diffusers GELU to use torch_npu.fast_gelu on NPU
-try:
+# Patch diffusers GELU to use torch_npu.fast_gelu on NPU.
+if IS_NPU_AVAILABLE and torch_npu is not None:
     def _gelu_npu(self, gate: torch.Tensor) -> torch.Tensor:
-        if gate.device.type == "privateuseone":
+        if gate.device.type == "npu":
             return torch_npu.fast_gelu(gate)
         return torch.nn.functional.gelu(gate, approximate=self.approximate)
 
     GELU.gelu = _gelu_npu
-except ImportError:
-    pass
 
 class WanAttentionKernelModule:
     def __init__(self, config: SimpleNamespace, attn: WanAttention):
@@ -95,18 +97,20 @@ def _get_wan_full_sequence_varlen_kwargs(
     batch_size = query.shape[0]
     query_length = query.shape[1] if query_length is None else query_length
     key_length = key.shape[1] if key_length is None else key_length
+    _q_device = "cpu" if get_device_type() == "npu" else query.device
+    _k_device = "cpu" if get_device_type() == "npu" else key.device
     cu_seq_lens_q = torch.arange(
         0,
         (batch_size + 1) * query_length,
         query_length,
-        device="cpu",
+        device=_q_device,
         dtype=torch.int32,
     )
     cu_seq_lens_k = torch.arange(
         0,
         (batch_size + 1) * key_length,
         key_length,
-        device="cpu",
+        device=_k_device,
         dtype=torch.int32,
     )
     return {
@@ -575,15 +579,7 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
                         )
                     img_lat = norm_lat[:, :, 0:1, :, :]  # [B, 16, 1, H, W]
                     img_lat_source = "from_norm_latents"
-                    if get_parallel_state().dp_rank == 0:
-                        logger.info(
-                            f"[I2V image_latents] source={img_lat_source}, "
-                            f"std={img_lat.std().item():.4f}, mean={img_lat.mean().item():.4f}"
-                        )
-                    if img_lat.std().item() == 0:
-                        logger.warning(
-                            "image_latents derived from norm_latents frame 0 has zero std, check input data"
-                        )
+
                 if msk is None:
                     B, _C, T, H, W = hs.shape
                     msk = torch.zeros(
