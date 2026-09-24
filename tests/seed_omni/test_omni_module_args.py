@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from veomni.arguments import (
+from veomni.arguments.omni_arguments_types import (
     OmniArguments,
     OmniDataArguments,
     OmniInferArguments,
@@ -389,7 +389,7 @@ def test_omni_module_config_owns_descriptor_conversion():
 
 
 def test_omni_module_runtime_config_is_the_arguments_alias():
-    from veomni.arguments import OmniModelRuntimeArguments, OmniModuleRuntimeArguments
+    from veomni.arguments.omni_arguments_types import OmniModelRuntimeArguments, OmniModuleRuntimeArguments
     from veomni.models.seed_omni.accelerated import OmniModelRuntimeConfig, OmniModuleRuntimeConfig
 
     assert OmniModuleRuntimeArguments is OmniModuleRuntimeConfig

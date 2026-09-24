@@ -59,7 +59,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.checkpoint import set_checkpoint_debug_enabled
 
-from ...arguments import OmniArguments
+from ...arguments.omni_arguments_types import OmniArguments
 from ...arguments.parser import save_args
 from ...data import SeedOmniCollator, build_dataloader, build_dataset
 from ...data.data_transform import build_data_transform

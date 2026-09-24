@@ -16,7 +16,6 @@ from pathlib import Path
 
 import pytest
 
-from veomni.arguments import OmniDataArguments, OmniInferArguments
 from veomni.arguments.arguments_types import (
     AcceleratorConfig,
     FSDPConfig,
@@ -25,6 +24,8 @@ from veomni.arguments.arguments_types import (
 )
 from veomni.arguments.omni_arguments_types import (
     OmniArguments,
+    OmniDataArguments,
+    OmniInferArguments,
     OmniModelRuntimeArguments,
     OmniModuleRuntimeArguments,
     _validate_omni_accelerator,

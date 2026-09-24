@@ -38,8 +38,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from ...arguments import OmniArguments
-from ...arguments.omni_arguments_types import OmniModuleRuntimeArguments
+from ...arguments.omni_arguments_types import OmniArguments, OmniModuleRuntimeArguments
 from ...models.seed_omni.accelerated import OmniModelRuntime
 from ...models.seed_omni.modeling_omni import OmniModel
 from ...models.seed_omni.processing_omni import OmniProcessor

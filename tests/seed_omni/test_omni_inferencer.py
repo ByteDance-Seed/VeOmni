@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from veomni.arguments import OmniModuleRuntimeArguments
+from veomni.arguments.omni_arguments_types import OmniModuleRuntimeArguments
 from veomni.arguments.parser import _instantiate_recursive
 from veomni.trainer.omni.omni_inferencer import (
     InferenceRequest,

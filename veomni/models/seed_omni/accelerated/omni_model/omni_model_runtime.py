@@ -30,8 +30,7 @@ from ..utils.modules import iter_named_omni_modules, save_module_subdirectory
 
 
 if TYPE_CHECKING:
-    from .....arguments import OmniGraphProfileArguments
-    from .....arguments.omni_arguments_types import OmniTrainingArguments
+    from .....arguments.omni_arguments_types import OmniGraphProfileArguments, OmniTrainingArguments
     from .....trainer.callbacks import TrainerState
     from ..omni_module.omni_module_runtime import ModuleRuntime
     from .omni_model_config import OmniModelRuntimeConfig
