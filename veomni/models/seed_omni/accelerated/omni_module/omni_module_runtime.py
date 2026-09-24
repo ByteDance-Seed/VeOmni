@@ -31,7 +31,7 @@ import torch.nn as nn
 from torch.distributed.fsdp import FSDPModule
 
 from .....distributed.clip_grad_norm import veomni_omni_module_clip_grad_norm
-from .....distributed.parallel_state import is_parallel_state_registered, use_parallel_state
+from .....distributed.parallel_state import use_parallel_state
 from .....utils import logging
 from .....utils.checkpoint_utils import should_skip_hf_weight_load
 from .....utils.device import get_device_type
@@ -100,6 +100,7 @@ class ModuleRuntime(VeOmniModelRuntime):
     # forwarding to the inner ``nn.Module`` never confuse this flag with a
     # missing model attribute.
     _defer_parallelize: bool = False
+    _eager: bool = False
     _global_accelerator: Optional["AcceleratorConfig"] = None
 
     args: "OmniModuleRuntimeArguments"
@@ -127,6 +128,7 @@ class ModuleRuntime(VeOmniModelRuntime):
 
         if for_inference:
             if args.accelerator.fsdp_config.fsdp_mode == "eager":
+                self._eager = True
                 self._init_eager_inference()
             else:
                 args.accelerator.fsdp_config.mixed_precision.enable = False
@@ -191,13 +193,8 @@ class ModuleRuntime(VeOmniModelRuntime):
         runtime directly has to scope it too: attention resolves its all-to-all
         group from the *current* state, so an unscoped forward under Ulysses SP
         would communicate over the orchestrator's ranks instead of this module's.
-
-        Gated on registration for the same reason ``module_context`` is: an
-        eager-inference module never runs :meth:`setup`, so it has no state to
-        enter and must not be refused a forward over one.
         """
-        scope = self._scoped() if is_parallel_state_registered(self.module_name) else nullcontext()
-        with scope:
+        with self._scoped():
             return super().__call__(*args, **kwargs)
 
     def _init_eager_inference(self) -> None:
@@ -403,7 +400,12 @@ class ModuleRuntime(VeOmniModelRuntime):
         ``get_parallel_state()`` (optimizer / lr-scheduler build, gradient clip)
         enters this itself, so the orchestrator can call them plainly without
         knowing (or wrapping) the module's private state.
+
+        An eager-inference module never runs :meth:`setup` (a mesh needs a
+        process group it may not have), so its scope is a no-op.
         """
+        if self._eager:
+            return nullcontext()
         return use_parallel_state(self.module_name)
 
     def _scope_recompute_to_parallel_state(self) -> None:

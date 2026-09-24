@@ -19,9 +19,9 @@ from __future__ import annotations
 import os
 from contextlib import nullcontext
 from dataclasses import fields
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Iterator, Mapping
 
-from .....distributed.parallel_state import is_parallel_state_registered, use_parallel_state
+from .....distributed.parallel_state import use_parallel_state
 from .....utils.logging import get_logger
 from ...modeling_omni import OmniModel
 from ...utils.graph_profiler import GraphProfiler
@@ -126,12 +126,10 @@ class OmniModelRuntime:
         model: OmniModel,
         *,
         module_runtimes: Mapping[str, ModuleRuntime] | None = None,
-        module_parallel_state_names: Iterable[str] | None = None,
         omni_model_runtime_args: OmniModelRuntimeConfig | None = None,
     ) -> None:
         self.model = model
         self.module_runtimes = dict(module_runtimes or {})
-        self._module_parallel_state_names = set(module_parallel_state_names or ())
         self.omni_model_runtime_args = omni_model_runtime_args
         self._step_profiler: GraphProfiler | None = None
 
@@ -177,7 +175,6 @@ class OmniModelRuntime:
         runtime = cls(
             OmniModel(omni_config, {name: rt.omni_module for name, rt in module_runtimes.items()}),
             module_runtimes=module_runtimes,
-            module_parallel_state_names=[name for name in module_runtimes if is_parallel_state_registered(name)],
             omni_model_runtime_args=omni_model_runtime_args,
         )
         runtime._parallelize_composed_model(for_inference=for_inference)
@@ -229,9 +226,8 @@ class OmniModelRuntime:
         weights_path = {name: runtime.args.model_path for name, runtime in modules.items()}
 
         logger.info_rank0(f"OmniModelRuntime: wrapping composed OmniModel (fsdp_scope='model') over {list(modules)}.")
-        # Trainer registered ``base`` from the same top-level accelerator.
-        scope = use_parallel_state("base") if is_parallel_state_registered("base") else nullcontext()
-        with scope:
+        # ``OmniTrainer.setup_distributed`` registered ``base`` from the same top-level accelerator.
+        with use_parallel_state("base"):
             self.model = build_parallelize_model(
                 self.model,
                 init_device=acc.init_device,
@@ -318,10 +314,9 @@ class OmniModelRuntime:
         self._step_profiler = None
 
     def module_context(self, module_name: str):
-        """Scope ``module_name``'s :class:`ParallelState` as current when registered."""
-        if module_name in self._module_parallel_state_names:
-            return use_parallel_state(module_name)
-        return nullcontext()
+        """Scope ``module_name``'s :class:`ParallelState` as current, as its runtime defines it."""
+        runtime = self.module_runtimes.get(module_name)
+        return runtime._scoped() if runtime is not None else nullcontext()
 
     def forward(
         self,
