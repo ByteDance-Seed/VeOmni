@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -31,6 +32,7 @@ from veomni.arguments.omni_arguments_types import (
     _validate_omni_accelerator,
     build_module_runtime_args,
 )
+from veomni.models.model_runtime import VeOmniModelRuntime
 
 
 MODULE_A = "fake_module_a"
@@ -77,6 +79,16 @@ def test_fsdp_scope_defaults_to_module_and_rejects_unknown_values():
     assert AcceleratorConfig().fsdp_config.fsdp_scope == "module"
     with pytest.raises(ValueError, match="fsdp_scope"):
         FSDPConfig(fsdp_scope="everything")
+
+
+def test_the_generic_runtime_refuses_eager_rather_than_falling_back_to_ddp():
+    """``eager`` is valid config (SeedOmni module inference returns before any
+    wrap), but ``build_parallelize_model`` has no unwrapped branch."""
+    runtime = VeOmniModelRuntime.__new__(VeOmniModelRuntime)
+    runtime.args = SimpleNamespace(accelerator=AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="eager")))
+
+    with pytest.raises(ValueError, match="eager"):
+        runtime._build_parallelized_model()
 
 
 def test_module_runtime_arguments_inherit_weight_load_knobs():

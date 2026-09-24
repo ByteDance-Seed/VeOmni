@@ -341,6 +341,13 @@ class VeOmniModelRuntime:
         :meth:`_freeze_model_module` survives and is not re-asserted here.
         """
         args = self.args
+        if args.accelerator.fsdp_config.fsdp_mode == "eager":
+            # ``build_parallelize_model`` has no unwrapped branch, so an eager
+            # mode reaching it would be handed to DDP instead.
+            raise ValueError(
+                "model.accelerator.fsdp_config.fsdp_mode='eager' is only supported by SeedOmni "
+                "module inference (ModuleRuntime._init_eager_inference)."
+            )
 
         # Apply async activation offload BEFORE FSDP2 sharding.
         # Uses per-instance __call__ patching so that async_save_on_cpu is

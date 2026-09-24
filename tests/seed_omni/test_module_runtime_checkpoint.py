@@ -85,6 +85,7 @@ def test_parallelize_forwards_module_skip_decision(monkeypatch: pytest.MonkeyPat
             torch_compile=CompileConfig(),
             gradient_checkpointing=SimpleNamespace(enable=False, enable_reentrant=False, early_stop=True),
             fsdp_config=SimpleNamespace(
+                fsdp_mode="fsdp2",
                 reshard_after_forward=True,
                 mixed_precision=SimpleNamespace(enable=False),
                 forward_prefetch=False,
