@@ -1,0 +1,79 @@
+model:
+  # Transformer from Qwen-Image-Edit-2511; text_encoder, VAE, tokenizer, scheduler
+  # from Qwen-Image; processor from Qwen-Image-Edit-2511.
+  model_path: /path/to/Qwen-Image-Edit-2511/transformer
+  condition_model_path: /path/to/Qwen-Image
+  config_path: /path/to/Qwen-Image-Edit-2511/transformer/config.json
+  model_config:
+    zero_cond_t: true
+  condition_model_cfg:
+    enable_edit: true
+    processor_path: /path/to/Qwen-Image-Edit-2511
+    text_encoder_attn_implementation: eager
+    max_sequence_length: 512
+    height: 1024
+    width: 1024
+    training_recipe: diffsynth
+    image_resize_mode: center_crop
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    load_balancing_loss_implementation: eager
+    moe_implementation: eager
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    dp_replicate_size: 1
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: false
+    offload_config:
+      enable_activation: false
+
+data:
+  train_path: /path/to/qwen_image_edit_train.jsonl
+  train_size: 1000000000000
+  dataloader:
+    type: native
+    drop_last: true
+  datasets_type: iterable
+  data_type: diffusion
+  max_seq_len: 4096
+  text_keys: text
+  dyn_bsz_buffer_size: 200
+  source_name: Qwen-Image-Edit
+  data_transform: dit_online
+  mm_configs:
+    data_dir: /path/to/images
+train:
+  training_task: online_training
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: qwen-image-edit-2511-sft
+    manager: dcp
+    save_epochs: 1
+    save_hf_weights: true
+  max_steps: 500
+  num_train_epochs: 2
+  wandb:
+    enable: false
+    project: Qwen-Image
+    name: sft_qwen_image_edit_2511

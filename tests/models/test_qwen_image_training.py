@@ -20,7 +20,7 @@ from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration, Q
 from veomni.arguments import parse_args
 from veomni.arguments.arguments_types import AcceleratorConfig, OpsImplementationConfig
 from veomni.data import build_data_transform, build_dataloader, build_dataset
-from veomni.data.multimodal.dit.preprocess import qwen_image_preprocess
+from veomni.data.multimodal.dit.preprocess import qwen_image_edit_preprocess, qwen_image_preprocess
 from veomni.distributed import parallel_state
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.models import build_foundation_model
@@ -69,6 +69,31 @@ def snapshot(tmp_path_factory):
     tokenizer = Qwen2Tokenizer(vocab=vocab, merges=[], pad_token=special[0], eos_token=special[2])
     tokenizer.add_special_tokens({"additional_special_tokens": special[1:]})
     tokenizer.save_pretrained(root / "tokenizer")
+    # Qwen2VLProcessor needs vision-related special tokens for edit mode.
+    vision_tokens = [
+        "<|vision_start|>",
+        "<|vision_end|>",
+        "<|image_pad|>",
+        "<|object_ref_start|>",
+        "<|object_ref_end|>",
+        "<|box_start|>",
+        "<|box_end|>",
+    ]
+    tokenizer.add_special_tokens({"additional_special_tokens": vision_tokens})
+    try:
+        from transformers import Qwen2VLImageProcessor, Qwen2VLProcessor
+
+        image_processor = Qwen2VLImageProcessor(
+            patch_size=2,
+            merge_size=1,
+            temporal_patch_size=1,
+            min_pixels=16,
+            max_pixels=1024,
+        )
+        processor = Qwen2VLProcessor(image_processor=image_processor, tokenizer=tokenizer)
+        processor.save_pretrained(root / "processor")
+    except Exception:
+        pass
     config = Qwen2_5_VLConfig(
         text_config={
             "vocab_size": len(tokenizer),
@@ -355,3 +380,100 @@ def test_backbone_reference_forward_and_gradients(snapshot, encoded):
         if reference_param.grad is not None:
             assert param.grad is not None
             torch.testing.assert_close(param.grad, reference_param.grad, atol=2e-6, rtol=1e-5)
+
+# ---------------------------------------------------------------------------
+# Qwen-Image-Edit tests
+# ---------------------------------------------------------------------------
+
+
+def edit_condition_model(snapshot, **kwargs):
+    processor_path = str(snapshot / "processor")
+    if not (Path(processor_path) / "tokenizer.json").exists():
+        pytest.skip("Qwen2VLProcessor could not be created in this environment.")
+    config = MODEL_CONFIG_REGISTRY["QwenImageConditionModel"]().from_pretrained(
+        str(snapshot),
+        height=16,
+        width=16,
+        max_sequence_length=256,
+        training_recipe="diffsynth",
+        image_resize_mode="center_crop",
+        seed=7,
+        enable_edit=True,
+        processor_path=processor_path,
+        **kwargs,
+    )
+    model = MODELING_REGISTRY["QwenImageConditionModel"]()._from_config(config)
+    return model.requires_grad_(False).eval()
+
+
+def edit_transformer(dtype="float32"):
+    return build_foundation_model(
+        str(ROOT / "tests/toy_config/qwen_image_edit_toy/config.json"),
+        init_device="cpu",
+        torch_dtype=dtype,
+        ops_implementation=eager_ops(),
+    )
+
+
+def test_edit_preprocessor_contract(tmp_path):
+    src = tmp_path / "src.png"
+    tgt = tmp_path / "tgt.png"
+    Image.new("RGB", (8, 8)).save(src)
+    Image.new("RGB", (8, 8)).save(tgt)
+    prompt, outputs, images, videos = qwen_image_edit_preprocess(
+        {"prompt": "make it red", "source_image": "src.png", "target_image": "tgt.png"},
+        data_dir=str(tmp_path),
+    )
+    assert prompt == "make it red"
+    assert outputs == {"edit_images": [str(src)]}
+    assert images == [str(tgt)]
+    assert videos == []
+    prompt, outputs, images, _ = qwen_image_edit_preprocess(
+        {"text": "edit", "edit_images": ["a.png", "b.png"], "image": "c.png"},
+    )
+    assert outputs == {"edit_images": ["a.png", "b.png"]}
+    assert images == ["c.png"]
+    with pytest.raises(ValueError, match="source"):
+        qwen_image_edit_preprocess({"prompt": "x", "image": "y.png"})
+    with pytest.raises(ValueError, match="target"):
+        qwen_image_edit_preprocess({"prompt": "x", "edit_image": "y.png"})
+
+
+def test_edit_yaml_config():
+    argv = ["train_dit.py", str(ROOT / "configs/dit/qwen_image_edit_2511.yaml")]
+    with __import__("contextlib").suppress(SystemExit):
+        pass
+    import sys
+
+    old = sys.argv
+    sys.argv = argv
+    try:
+        args = parse_args(VeOmniDiTArguments)
+    finally:
+        sys.argv = old
+    assert args.data.source_name == "Qwen-Image-Edit"
+    assert args.model.condition_model_cfg["enable_edit"] is True
+    assert args.model.model_config["zero_cond_t"] is True
+
+
+def test_edit_condition_and_zero_cond_t(snapshot):
+    condition = edit_condition_model(snapshot)
+    target_images = [Image.new("RGB", (16, 16), color="red")]
+    source_images = [Image.new("RGB", (16, 16), color="blue")]
+    outputs = [{"edit_images": source_images}]
+    encoded = condition.get_condition(
+        inputs=["make it red"], images=[target_images], outputs=outputs
+    )
+    assert "edit_latents" in encoded and "edit_img_shapes" in encoded
+    packed = condition.process_condition(**encoded)
+    # hidden_states includes target + source tokens; training_target only target.
+    hidden = packed["hidden_states"][0]
+    target = packed["training_target"][0]
+    assert hidden.shape[1] > target.shape[1]
+    combined_shapes = packed["img_shapes"][0]
+    assert len(combined_shapes) == 2
+    model = edit_transformer().eval()
+    with torch.no_grad():
+        out = model(**packed)
+    prediction = out.predictions[0]
+    assert prediction.shape == target.shape

@@ -28,6 +28,19 @@ class QwenImageConditionModelConfig(PretrainedConfig):
         prompt_template_encode_start_idx: int = 34,
         guidance_scale: Optional[float] = None,
         seed: Optional[int] = 42,
+        enable_edit: bool = False,
+        processor_path: str = "",
+        edit_prompt_template: str = (
+            "<|im_start|>system\n"
+            "Describe the key features of the input image (color, shape, size, texture, objects, background), "
+            "then explain how the user's text instruction should alter or modify the image. Generate a new "
+            "image that meets the user's requirements while maintaining consistency with the original input "
+            "where appropriate.<|im_end|>\n"
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+        ),
+        edit_prompt_template_start_idx: int = 64,
+        edit_img_prompt_template: str = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>",
+        text_encoder_attn_implementation: Optional[str] = None,
         **kwargs,
     ):
         if training_recipe not in ("veomni", "diffsynth"):
@@ -51,6 +64,12 @@ class QwenImageConditionModelConfig(PretrainedConfig):
         self.prompt_template_encode_start_idx = prompt_template_encode_start_idx
         self.guidance_scale = guidance_scale
         self.seed = seed
+        self.enable_edit = enable_edit
+        self.processor_path = processor_path
+        self.edit_prompt_template = edit_prompt_template
+        self.edit_prompt_template_start_idx = edit_prompt_template_start_idx
+        self.edit_img_prompt_template = edit_img_prompt_template
+        self.text_encoder_attn_implementation = text_encoder_attn_implementation
         super().__init__(**kwargs)
 
     @classmethod

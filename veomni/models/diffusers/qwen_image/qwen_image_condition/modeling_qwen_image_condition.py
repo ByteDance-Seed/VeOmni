@@ -6,7 +6,7 @@ import torch
 from diffusers import AutoencoderKLQwenImage, FlowMatchEulerDiscreteScheduler
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from torchvision.transforms import InterpolationMode, functional
-from transformers import PreTrainedModel, Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
+from transformers import PreTrainedModel, Qwen2Tokenizer, Qwen2VLProcessor, Qwen2_5_VLForConditionalGeneration
 
 from .....distributed.parallel_state import get_parallel_state
 from .....utils import logging
@@ -25,6 +25,7 @@ class QwenImageConditionModel(PreTrainedModel):
         super().__init__(config, **kwargs)
         self.config = config
         self.tokenizer = None
+        self.processor = None
         self.text_encoder = None
         self.vae = None
         self.scheduler = None
@@ -91,10 +92,18 @@ class QwenImageConditionModel(PreTrainedModel):
             return
 
         self.tokenizer = Qwen2Tokenizer.from_pretrained(base, subfolder=self.config.tokenizer_subfolder)
+        if self.config.enable_edit:
+            if not self.config.processor_path:
+                raise ValueError("Qwen-Image edit training requires `processor_path` for the multimodal processor.")
+            logger.info_rank0(f"Loading Qwen-Image edit processor from {self.config.processor_path}.")
+            self.processor = Qwen2VLProcessor.from_pretrained(self.config.processor_path)
+        text_encoder_kwargs = {"torch_dtype": torch.bfloat16}
+        if self.config.text_encoder_attn_implementation:
+            text_encoder_kwargs["attn_implementation"] = self.config.text_encoder_attn_implementation
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             base,
             subfolder=self.config.text_encoder_subfolder,
-            torch_dtype=torch.bfloat16,
+            **text_encoder_kwargs,
         )
         self.vae = AutoencoderKLQwenImage.from_pretrained(
             base,
@@ -198,6 +207,68 @@ class QwenImageConditionModel(PreTrainedModel):
         return prompt_embeds.to(dtype=dtype, device=device), encoder_attention_mask
 
     @torch.no_grad()
+    def _get_qwen_edit_prompt_embeds(
+        self,
+        prompt: str | list[str],
+        edit_images_per_sample: list[list[Any]],
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        """Encode text + source images into prompt embeddings via the multimodal processor.
+
+        ``edit_images_per_sample`` is one list of source PIL images per prompt. Each
+        prompt is encoded independently because the number of source images may vary
+        across samples; the per-sample embeddings are then padded and stacked. This
+        mirrors DiffSynth's ``encode_prompt_edit_multi`` (multi-image editing).
+        """
+        if self.processor is None:
+            raise ValueError("Qwen-Image edit training requires a multimodal processor.")
+        device = device or self._execution_device
+        dtype = dtype or self.text_encoder.dtype
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        if len(prompt) != len(edit_images_per_sample):
+            raise ValueError("Qwen-Image edit expects one source-image list per prompt.")
+
+        template = self.config.edit_prompt_template
+        drop_idx = self.config.edit_prompt_template_start_idx
+        img_prompt_template = self.config.edit_img_prompt_template
+
+        all_embeds: list[torch.Tensor] = []
+        all_masks: list[torch.Tensor] = []
+        for item, edit_images in zip(prompt, edit_images_per_sample):
+            edit_images = self._as_list(edit_images)
+            base_img_prompt = "".join(img_prompt_template.format(i + 1) for i in range(len(edit_images)))
+            txt = template.format(base_img_prompt + item)
+            model_inputs = self.processor(
+                text=txt,
+                images=edit_images,
+                padding=True,
+                return_tensors="pt",
+            ).to(device)
+            encoder_hidden_states = self.text_encoder(
+                input_ids=model_inputs.input_ids,
+                attention_mask=model_inputs.attention_mask,
+                pixel_values=model_inputs.pixel_values,
+                image_grid_thw=model_inputs.image_grid_thw,
+                output_hidden_states=True,
+            )
+            hidden_states = encoder_hidden_states.hidden_states[-1]
+            split_hidden_states = self._extract_masked_hidden(hidden_states, model_inputs.attention_mask)
+            split_hidden_states = [item[drop_idx:] for item in split_hidden_states]
+            single_embeds = split_hidden_states[0]
+            all_embeds.append(single_embeds)
+            all_masks.append(torch.ones(single_embeds.size(0), dtype=torch.long, device=single_embeds.device))
+
+        max_seq_len = max(item.size(0) for item in all_embeds)
+        prompt_embeds = torch.stack(
+            [torch.cat([item, item.new_zeros(max_seq_len - item.size(0), item.size(1))]) for item in all_embeds]
+        )
+        encoder_attention_mask = torch.stack(
+            [torch.cat([item, item.new_zeros(max_seq_len - item.size(0))]) for item in all_masks]
+        )
+        return prompt_embeds.to(dtype=dtype, device=device), encoder_attention_mask
+
+    @torch.no_grad()
     def encode_prompt(
         self,
         prompt: str | list[str],
@@ -239,14 +310,27 @@ class QwenImageConditionModel(PreTrainedModel):
         prompts = inputs if isinstance(inputs, list) else [inputs]
         if not prompts or len(prompts) != len(images) or not all(isinstance(prompt, str) for prompt in prompts):
             raise ValueError("Qwen-Image expects equally sized, nonempty lists of text prompts and target images.")
-        prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompt=prompts)
+
+        outputs_list = kwargs.get("outputs") or []
+        edit_images_per_sample = None
+        if self.config.enable_edit:
+            edit_images_per_sample = [
+                sample_outputs.get("edit_images", []) for sample_outputs in outputs_list
+            ]
+            if len(edit_images_per_sample) != len(prompts):
+                raise ValueError("Qwen-Image edit training requires one source-image list per sample.")
+            prompt_embeds, prompt_embeds_mask = self._get_qwen_edit_prompt_embeds(
+                prompts, edit_images_per_sample
+            )
+        else:
+            prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompt=prompts)
 
         latents_list = []
         img_shapes_list = []
         for sample_images in images:
             sample_images = self._as_list(sample_images)
             if len(sample_images) != 1:
-                raise ValueError("Qwen-Image text-to-image training expects exactly one target image per sample.")
+                raise ValueError("Qwen-Image training expects exactly one target image per sample.")
             sample_params, sample_img_shapes = self._encode_image_to_latents(sample_images[0])
             latents_list.append(sample_params)
             img_shapes_list.append(sample_img_shapes)
@@ -257,12 +341,30 @@ class QwenImageConditionModel(PreTrainedModel):
         else:
             encoder_hidden_states_mask = [prompt_embeds_mask[idx : idx + 1] for idx in range(len(prompts))]
 
-        return {
+        condition = {
             "latents": latents_list,
             "encoder_hidden_states": encoder_hidden_states,
             "encoder_hidden_states_mask": encoder_hidden_states_mask,
             "img_shapes": img_shapes_list,
         }
+
+        if self.config.enable_edit:
+            edit_latents_list = []
+            edit_img_shapes_list = []
+            for sample_edit_images in edit_images_per_sample:
+                sample_edit_images = self._as_list(sample_edit_images)
+                sample_edit_params = []
+                sample_edit_shapes = []
+                for edit_image in sample_edit_images:
+                    params, shapes = self._encode_image_to_latents(edit_image)
+                    sample_edit_params.append(params)
+                    sample_edit_shapes.append(shapes[0])
+                edit_latents_list.append(sample_edit_params)
+                edit_img_shapes_list.append(sample_edit_shapes)
+            condition["edit_latents"] = edit_latents_list
+            condition["edit_img_shapes"] = edit_img_shapes_list
+
+        return condition
 
     def rng_state_dict(self) -> dict[str, torch.Tensor]:
         """Snapshot the noise/timestep generator for the job-level checkpoint.
@@ -283,6 +385,8 @@ class QwenImageConditionModel(PreTrainedModel):
         encoder_hidden_states=None,
         encoder_hidden_states_mask=None,
         img_shapes=None,
+        edit_latents=None,
+        edit_img_shapes=None,
         **kwargs,
     ) -> dict[str, Any]:
         if "hidden_states" in kwargs and "training_target" in kwargs:
@@ -295,6 +399,10 @@ class QwenImageConditionModel(PreTrainedModel):
                 ready_inputs["encoder_hidden_states_mask"] = encoder_hidden_states_mask
             if img_shapes is not None:
                 ready_inputs["img_shapes"] = img_shapes
+            if edit_latents is not None:
+                ready_inputs["edit_latents"] = edit_latents
+            if edit_img_shapes is not None:
+                ready_inputs["edit_img_shapes"] = edit_img_shapes
             return ready_inputs
 
         if latents is None or encoder_hidden_states is None or img_shapes is None:
@@ -307,9 +415,17 @@ class QwenImageConditionModel(PreTrainedModel):
         encoder_hidden_states_list = self._as_list(encoder_hidden_states, len(latents_list))
         encoder_hidden_states_mask_list = self._as_list(encoder_hidden_states_mask, len(latents_list))
         img_shapes_list = self._as_list(img_shapes, len(latents_list))
+        edit_latents_list = self._as_list(edit_latents, len(latents_list))
+        edit_img_shapes_list = self._as_list(edit_img_shapes, len(latents_list))
         if not latents_list or any(
             len(items) != len(latents_list)
-            for items in (encoder_hidden_states_list, encoder_hidden_states_mask_list, img_shapes_list)
+            for items in (
+                encoder_hidden_states_list,
+                encoder_hidden_states_mask_list,
+                img_shapes_list,
+                edit_latents_list,
+                edit_img_shapes_list,
+            )
         ):
             raise ValueError("Qwen-Image condition fields must have the same nonzero sample count.")
 
@@ -371,8 +487,13 @@ class QwenImageConditionModel(PreTrainedModel):
         if self.config.training_recipe == "diffsynth":
             packed_conditions["loss_weights"] = []
 
-        for sample_params, sample_context, sample_context_mask, sample_img_shapes in zip(
-            latents_list, encoder_hidden_states_list, encoder_hidden_states_mask_list, img_shapes_list
+        for sample_params, sample_context, sample_context_mask, sample_img_shapes, sample_edit_latents, sample_edit_img_shapes in zip(
+            latents_list,
+            encoder_hidden_states_list,
+            encoder_hidden_states_mask_list,
+            img_shapes_list,
+            edit_latents_list,
+            edit_img_shapes_list,
         ):
             if sample_params.ndim != 5 or sample_params.shape[1] != 2 * self.vae_config["z_dim"]:
                 raise ValueError("Qwen-Image cache must contain raw VAE posterior parameters [B, 2*z_dim, 1, H, W].")
@@ -403,14 +524,39 @@ class QwenImageConditionModel(PreTrainedModel):
             noisy_latents = (1 - sigma) * sample_latents + sigma * noise
             training_target = noise - sample_latents
 
-            packed_conditions["hidden_states"].append(noisy_latents)
+            # Qwen-Image-Edit: concatenate clean source-image latents alongside the
+            # noisy target latent. ``zero_cond_t`` in the transformer modulates the
+            # source tokens with timestep 0 via ``modulate_index``.
+            if sample_edit_latents is not None:
+                sample_edit_latents = self._as_list(sample_edit_latents)
+                edit_packed = []
+                for edit_params, edit_shape in zip(sample_edit_latents, sample_edit_img_shapes):
+                    if edit_params.ndim != 5 or edit_params.shape[1] != 2 * self.vae_config["z_dim"]:
+                        raise ValueError(
+                            "Qwen-Image edit cache must contain raw VAE posterior parameters [B, 2*z_dim, 1, H, W]."
+                        )
+                    edit_raw = DiagonalGaussianDistribution(edit_params).mode()
+                    edit_norm = self._normalize_latents(edit_raw).to(self.generator.device)
+                    expected_edit_grid = (1, edit_params.shape[-2] // 2, edit_params.shape[-1] // 2)
+                    if tuple(edit_shape) != expected_edit_grid:
+                        raise ValueError(
+                            f"Qwen-Image edit img_shapes must match the packed latent grid {expected_edit_grid}."
+                        )
+                    edit_packed.append(self._pack_latents(edit_norm))
+                hidden_states = torch.cat([noisy_latents] + edit_packed, dim=1)
+                combined_shapes = sample_img_shapes + sample_edit_img_shapes
+            else:
+                hidden_states = noisy_latents
+                combined_shapes = sample_img_shapes
+
+            packed_conditions["hidden_states"].append(hidden_states)
             packed_conditions["timestep"].append(timestep / 1000)
             packed_conditions["encoder_hidden_states"].append(sample_context.to(sample_latents.device))
             if sample_context_mask is None:
                 packed_conditions["encoder_hidden_states_mask"].append(None)
             else:
                 packed_conditions["encoder_hidden_states_mask"].append(sample_context_mask.to(sample_latents.device))
-            packed_conditions["img_shapes"].append(sample_img_shapes)
+            packed_conditions["img_shapes"].append(combined_shapes)
             packed_conditions["training_target"].append(training_target)
             packed_conditions["latents"].append(sample_latents)
             if self.config.training_recipe == "diffsynth":

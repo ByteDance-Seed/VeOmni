@@ -217,8 +217,10 @@ def QwenImageTransformer2DModel_forward(
             device=timestep.device,
             dtype=torch.int,
         )
+        target_image_seq_len = prod(img_shapes[0][0])
     else:
         modulate_index = None
+        target_image_seq_len = None
 
     encoder_hidden_states = self.txt_norm(encoder_hidden_states)
     encoder_hidden_states = self.txt_in(encoder_hidden_states)
@@ -324,6 +326,10 @@ def QwenImageTransformer2DModel_forward(
         temb = temb.chunk(2, dim=0)[0]
     hidden_states = self.norm_out(hidden_states, temb)
     output = self.proj_out(hidden_states)
+    if self.zero_cond_t:
+        # The source-image tokens (modulated with timestep 0) only condition the
+        # target denoising; drop them so the prediction aligns with training_target.
+        output = output[:, :target_image_seq_len]
 
     if not return_dict:
         return (output,)
