@@ -151,6 +151,9 @@ class ModuleRuntime(VeOmniModelRuntime):
                 with self._scoped():
                     self._build_model()
                     self._build_model_assets()
+                    # The weight load maps keys onto the PEFT layout whenever
+                    # ``lora_config`` is set, so the model must already be wrapped.
+                    self._setup_lora()
                     self._build_parallelized_model()
                 self.model.eval()
         else:

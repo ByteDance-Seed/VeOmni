@@ -251,6 +251,22 @@ def test_only_the_top_level_scope_decides_whether_a_module_defers(monkeypatch, t
     assert runtime._defer_parallelize is defers
 
 
+def test_distributed_inference_wraps_lora_before_loading_weights(monkeypatch):
+    """With ``lora_config`` set the loader maps base keys onto ``base_model.model.*``;
+    an unwrapped model has no such names, so its base weights would never load."""
+    calls = []
+    for step in ("setup", "_build_model_assets", "_setup_lora", "_build_parallelized_model"):
+        monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, _step=step, **k: calls.append(_step))
+    monkeypatch.setattr(ModuleRuntime, "_build_model", lambda self: setattr(self, "model", nn.Linear(2, 2)))
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+    accelerator = _fsdp("module")
+    accelerator.fsdp_config.mixed_precision = SimpleNamespace(enable=True)
+
+    ModuleRuntime(SimpleNamespace(accelerator=accelerator), "llm", module_config=SimpleNamespace(), for_inference=True)
+
+    assert calls.index("_setup_lora") < calls.index("_build_parallelized_model")
+
+
 def test_the_composed_wrap_refuses_a_module_that_did_not_defer():
     """An eager-inference module is loaded unwrapped; the parent's one FSDP tree
     would re-wrap and re-load it."""
