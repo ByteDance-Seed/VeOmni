@@ -922,7 +922,7 @@ def _is_minimax_h3_path(filename: str) -> bool:
 
 @pytest.mark.parametrize("attention", ["sdpa", "veomni_flash_attention_2"])
 @pytest.mark.parametrize("mode", ["single", "packed"])
-def test_no_implicit_sync_in_minimax_h3_forward_backward(monkeypatch, mode, attention):
+def test_no_implicit_sync_in_minimax_h3_forward_backward(mode, attention):
     """No implicit CUDA sync from MiniMax H3 modeling during a training step."""
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
@@ -930,11 +930,9 @@ def test_no_implicit_sync_in_minimax_h3_forward_backward(monkeypatch, mode, atte
         pytest.skip("flash_attn package not installed.")
 
     from tests.models.test_minimax_h3_packing import condition_model, raw_sample, tiny_model
-    from veomni.models.diffusers.minimax_h3.minimax_h3_core import core
     from veomni.trainer.dit_trainer import DiTDataCollator
 
     fused = attention != "sdpa"
-    monkeypatch.setattr(core, "ATTENTION_IMPLEMENTATION", "flash_attention_2" if fused else "torch", raising=False)
     dtype = torch.bfloat16 if fused else torch.float32
     device = get_device_type()
     torch.manual_seed(0)

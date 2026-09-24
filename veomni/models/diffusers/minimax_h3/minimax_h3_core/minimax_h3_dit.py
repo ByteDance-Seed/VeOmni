@@ -181,7 +181,11 @@ class MiniMaxH3Attention(nn.Module):
         self.q_norm = _norm(attention_head_dim, eps=qk_norm_eps)
         self.k_norm = _norm(attention_head_dim, eps=qk_norm_eps)
         self.out_proj = nn.Linear(inner_dim, hidden_size, bias=False)
-        bind_minimax_attention(self, is_causal=False)
+        # Packed FA is bound later. FA3/FA4 cannot be constructed on NPU or pre-SM90.
+        impl = resolve_op_impl("attn_implementation")
+        if is_flash_attn_impl(impl):
+            impl = "sdpa"
+        bind_minimax_attention(self, is_causal=False, impl=impl)
 
     def _run_packed_attention(
         self,
