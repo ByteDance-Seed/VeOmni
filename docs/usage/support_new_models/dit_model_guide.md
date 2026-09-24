@@ -150,19 +150,19 @@ image streams across SP ranks and gathers the image stream back before the
 output head, mirroring the Wan/Flux pattern. `num_attention_heads` must be
 divisible by `ulysses_size`.
 
-`model.ops_implementation.attn_implementation` selects the diffusers attention
-backend used by `QwenImageSPAttnProcessor`:
+`model.ops_implementation.attn_implementation` selects the joint attention kernel used by
+`QwenImageSPAttnProcessor`:
 
 | `attn_implementation` | Joint attention |
 |:-----|:-----|
 | `eager` / `sdpa` | native SDPA |
-| `flash_attention_2_hub` / `flash_attention_3_hub` | diffusers `flash_varlen_hub` / `_flash_3_varlen_hub` (Hugging Face Hub kernels); requires `diffusers>=0.40.0` |
-| `flash_attention_2` / `flash_attention_3` | native SDPA, with a warning |
+| `flash_attention_2` / `flash_attention_3` / `flash_attention_4` | VeOmni flash-attention wrapper, local kernel |
+| `flash_attention_2_hub` / `flash_attention_3_hub` | VeOmni flash-attention wrapper, Hugging Face Hub kernel |
 
-Only the Hub varlen backends are used because from diffusers 0.40 they pack keys by
-the attention mask, which keeps padded text tokens in the middle of the
-`[text, image]` joint sequence masked. The local flash varlen backends keep a key
-prefix instead, and the non-varlen flash backends reject attention masks.
+Other values raise at model build. With a joint mask, the flash path packs the tokens the `[B, S]` mask
+keeps into one varlen call, using metadata computed once per forward, so padded text tokens in the
+middle of the `[text, image]` sequence stay masked. Padded query rows come out as zeros instead of
+attending; they are never attended to, so image and valid-text outputs match SDPA.
 
 ### Config Bridge — `to_diffuser_dict()` and `to_dict()`
 

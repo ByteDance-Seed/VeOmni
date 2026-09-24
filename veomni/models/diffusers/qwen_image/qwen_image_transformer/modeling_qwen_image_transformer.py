@@ -3,22 +3,23 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 from math import prod
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import QwenImageTransformer2DModel as _QwenImageTransformer2DModel
-from diffusers.models.attention_dispatch import _AttentionBackendRegistry, dispatch_attention_fn
+from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.transformers.transformer_qwenimage import (
     apply_rotary_emb_qwen,
     compute_text_seq_len_from_mask,
 )
 from diffusers.utils import apply_lora_scale
-from packaging.version import Version
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
@@ -27,12 +28,9 @@ from .....distributed.sequence_parallel import (
     gather_seq_scatter_heads,
     slice_input_tensor,
 )
+from .....ops.kernels.attention.flash import _is_veomni_custom_flash_attention
 from .....utils import logging
-from .configuration_qwen_image_transformer import (
-    QWEN_IMAGE_INIT_SIGNATURE,
-    QwenImageTransformer2DModelConfig,
-    diffusers_version,
-)
+from .configuration_qwen_image_transformer import QWEN_IMAGE_INIT_SIGNATURE, QwenImageTransformer2DModelConfig
 
 
 logger = logging.get_logger(__name__)
@@ -51,6 +49,25 @@ def _pad_seq(x: torch.Tensor, dim: int, pad_size: int, value: float = 0) -> torc
     return torch.cat([x, pad], dim=dim)
 
 
+def _joint_varlen_metadata(attention_mask: torch.Tensor) -> dict[str, Any]:
+    """Pack the tokens kept by a ``[B, S]`` joint mask for FlashAttention varlen, once per forward.
+
+    Deriving this per layer (as unpadding from the mask would) costs two host syncs per attention call.
+    """
+    if attention_mask.ndim != 2 or attention_mask.is_floating_point():
+        raise ValueError(
+            "Qwen-Image flash attention needs a [B, S] boolean or 0/1 keep mask; got "
+            f"shape {tuple(attention_mask.shape)} dtype {attention_mask.dtype}. Use sdpa for additive masks."
+        )
+    attention_mask = attention_mask.bool()
+    seqlens = attention_mask.sum(dim=-1, dtype=torch.int32)
+    return {
+        "indices": attention_mask.flatten().nonzero().flatten(),
+        "cu_seqlens": F.pad(seqlens.cumsum(0, dtype=torch.int32), (1, 0)),
+        "max_seqlen": int(seqlens.max()),
+    }
+
+
 class QwenImageSPAttnProcessor:
     """Joint dual-stream attention processor with Ulysses sequence parallelism.
 
@@ -60,16 +77,33 @@ class QwenImageSPAttnProcessor:
     all-to-all on the outputs. Because each stream is gathered independently and
     concatenated in the original ``[text, image]`` order, the full joint
     attention mask stays valid without any reordering.
+
+    ``attn_implementation`` selects the joint attention kernel: ``eager`` / ``sdpa`` run native SDPA, and
+    the VeOmni flash names run VeOmni's flash-attention wrapper. With a joint mask, the tokens it keeps
+    are packed into one varlen call (``joint_varlen_metadata``, precomputed by the model forward), which
+    handles the text padding in the middle of the joint sequence; padded query rows come out as zeros
+    instead of attending, and they are never attended to.
     """
 
     _attention_backend = None
     _parallel_config = None
 
-    def __init__(self):
+    def __init__(self, attn_implementation: str | None = "eager"):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError(
                 "QwenImageSPAttnProcessor requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0."
             )
+        if attn_implementation not in (None, "eager", "sdpa") and not _is_veomni_custom_flash_attention(
+            attn_implementation
+        ):
+            raise ValueError(
+                f"Qwen-Image does not support attn_implementation={attn_implementation!r}; use eager, sdpa, "
+                "flash_attention_2, flash_attention_3, flash_attention_4, flash_attention_2_hub or "
+                "flash_attention_3_hub."
+            )
+        self.use_flash_attention = _is_veomni_custom_flash_attention(attn_implementation)
+        # Minimal module view read by VeOmni's flash-attention wrapper.
+        self.kernel_config = SimpleNamespace(_attn_implementation=attn_implementation)
 
     def __call__(
         self,
@@ -79,6 +113,7 @@ class QwenImageSPAttnProcessor:
         encoder_hidden_states_mask: torch.Tensor = None,
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: torch.Tensor | None = None,
+        joint_varlen_metadata: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if encoder_hidden_states is None:
             raise ValueError("QwenImageSPAttnProcessor requires encoder_hidden_states (text stream)")
@@ -136,16 +171,55 @@ class QwenImageSPAttnProcessor:
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
-        joint_hidden_states = dispatch_attention_fn(
-            joint_query,
-            joint_key,
-            joint_value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
-        )
+        if self.use_flash_attention:
+            if attention_mask is not None and joint_varlen_metadata is None:
+                joint_varlen_metadata = _joint_varlen_metadata(attention_mask)
+            batch_size, joint_len = joint_query.shape[:2]
+            varlen_kwargs = {}
+            if joint_varlen_metadata is not None:
+                # Pack the kept tokens of all samples into one [1, T, H, D] sequence.
+                indices = joint_varlen_metadata["indices"]
+                joint_query, joint_key, joint_value = (
+                    x.flatten(0, 1).index_select(0, indices).unsqueeze(0)
+                    for x in (joint_query, joint_key, joint_value)
+                )
+                cu_seqlens, max_seqlen = joint_varlen_metadata["cu_seqlens"], joint_varlen_metadata["max_seqlen"]
+                varlen_kwargs = dict(
+                    cu_seq_lens_q=cu_seqlens,
+                    cu_seq_lens_k=cu_seqlens,
+                    max_length_q=max_seqlen,
+                    max_length_k=max_seqlen,
+                )
+            # Streams are already gathered above, so the wrapper must not run Ulysses again.
+            kernel_module = SimpleNamespace(config=self.kernel_config, is_causal=False, modules=attn.modules)
+            joint_hidden_states = ALL_ATTENTION_FUNCTIONS[self.kernel_config._attn_implementation](
+                kernel_module,
+                joint_query.transpose(1, 2),
+                joint_key.transpose(1, 2),
+                joint_value.transpose(1, 2),
+                attention_mask=None,
+                dropout=0.0,
+                is_causal=False,
+                skip_ulysses=True,
+                **varlen_kwargs,
+            )[0]
+            if joint_varlen_metadata is not None:
+                packed = joint_hidden_states[0]
+                joint_hidden_states = packed.new_zeros(batch_size * joint_len, *packed.shape[1:])
+                joint_hidden_states = joint_hidden_states.index_copy(0, indices, packed)
+                joint_hidden_states = joint_hidden_states.unflatten(0, (batch_size, joint_len))
+        else:
+            # Bind native explicitly: None would follow diffusers' process-wide default backend.
+            joint_hidden_states = dispatch_attention_fn(
+                joint_query,
+                joint_key,
+                joint_value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                backend="native",
+                parallel_config=self._parallel_config,
+            )
 
         # joint_hidden_states: (B, joint_seq, heads_local, head_dim)
         txt_attn_output = joint_hidden_states[:, :seq_txt]
@@ -271,6 +345,12 @@ def QwenImageTransformer2DModel_forward(
         image_mask = torch.ones((batch_size, image_seq_len), dtype=torch.bool, device=hidden_states.device)
         block_attention_kwargs["attention_mask"] = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
 
+    joint_mask = block_attention_kwargs.get("attention_mask")
+    # This forward is patched onto the diffusers class, so ask the processor rather than a VeOmni-only config.
+    use_flash_attention = getattr(self.transformer_blocks[0].attn.processor, "use_flash_attention", False)
+    if joint_mask is not None and use_flash_attention:
+        block_attention_kwargs["joint_varlen_metadata"] = _joint_varlen_metadata(joint_mask)
+
     for index_block, block in enumerate(self.transformer_blocks):
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
@@ -330,17 +410,6 @@ def apply_veomni_qwen_image_transformer_patch() -> None:
     logger.info_rank0("Applied VeOmni SP patch to QwenImageTransformer2DModel.forward.")
 
 
-# Normalized attn_implementation -> diffusers attention backend. Only the Hub varlen backends are
-# mapped: from diffusers 0.40 they pack keys by the mask's nonzero indices, which keeps the padded
-# text in the middle of the [text, image] joint sequence masked. Earlier Hub varlen and all local
-# flash varlen backends keep a key prefix instead, and the non-varlen flash backends reject masks.
-_HUB_ATTENTION_BACKENDS = {
-    "veomni_flash_attention_2_hub_with_sp": "flash_varlen_hub",
-    "veomni_flash_attention_3_hub_with_sp": "_flash_3_varlen_hub",
-}
-_HUB_ATTENTION_MIN_DIFFUSERS = "0.40.0"
-
-
 @dataclass
 class QwenImageModelOutput(ModelOutput):
     loss: dict[str, torch.FloatTensor] | None = None
@@ -358,6 +427,7 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
     config_class = QwenImageTransformer2DModelConfig
     supports_gradient_checkpointing = True
     _supports_sdpa = True
+    _supports_flash_attn = True
     _no_split_modules = ["QwenImageTransformerBlock"]
 
     def __init__(self, config: QwenImageTransformer2DModelConfig, **kwargs):
@@ -372,32 +442,9 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
 
         # Install the Ulysses-SP joint-attention processor on every block. It is
         # a no-op (plain diffusers joint attention) when SP is disabled.
-        sp_processor = QwenImageSPAttnProcessor()
+        sp_processor = QwenImageSPAttnProcessor(config._attn_implementation)
         for block in self.transformer_blocks:
             block.attn.set_processor(sp_processor)
-        self._configure_attention(config._attn_implementation)
-
-    def _configure_attention(self, attn_implementation):
-        """Select the diffusers attention backend from ``attn_implementation``."""
-        backend = _HUB_ATTENTION_BACKENDS.get(attn_implementation)
-        if backend is None:
-            if attn_implementation not in (None, "eager", "sdpa"):
-                logger.warning_once(
-                    f"Qwen-Image has no masked kernel for attn_implementation={attn_implementation!r}; using "
-                    "native SDPA. Use flash_attention_2_hub or flash_attention_3_hub for FlashAttention."
-                )
-            # Bind native explicitly: None would follow diffusers' process-wide default backend.
-            backend = "native"
-        elif Version(diffusers_version) < Version(_HUB_ATTENTION_MIN_DIFFUSERS):
-            raise ImportError(
-                f"Qwen-Image attn_implementation={attn_implementation!r} requires "
-                f"diffusers>={_HUB_ATTENTION_MIN_DIFFUSERS} (found {diffusers_version}); earlier Hub varlen "
-                "backends mishandle Qwen-Image's padded text tokens."
-            )
-        # set_attention_backend also switches diffusers' process-wide default; keep it for other models.
-        active_backend = _AttentionBackendRegistry._active_backend
-        self.set_attention_backend(backend)
-        _AttentionBackendRegistry.set_active_backend(active_backend)
 
     @property
     def config(self):
@@ -570,5 +617,4 @@ class QwenImageTransformer2DModel(PreTrainedModel, _QwenImageTransformerInitShim
         sp_processor = QwenImageSPAttnProcessor()
         for block in diffusers_model.transformer_blocks:
             block.attn.set_processor(sp_processor)
-        diffusers_model._configure_attention(None)
         return diffusers_model
