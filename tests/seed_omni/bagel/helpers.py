@@ -9,7 +9,7 @@ from typing import Any, Literal
 import torch
 import torch.nn.functional as F
 
-from veomni.arguments import (
+from veomni.arguments.omni_arguments_types import (
     OmniArguments,
     OmniDataArguments,
     OmniModelRuntimeArguments,

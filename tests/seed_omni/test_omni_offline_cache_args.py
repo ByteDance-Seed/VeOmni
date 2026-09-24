@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from veomni.arguments import OmniDataArguments, OmniTrainingArguments
+from veomni.arguments.omni_arguments_types import OmniDataArguments, OmniTrainingArguments
 
 
 def test_omni_training_args_defaults_to_train_workflow() -> None:

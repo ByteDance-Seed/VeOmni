@@ -1,4 +1,5 @@
-from veomni.arguments import OmniArguments, parse_omni_args
+from veomni.arguments.omni_arguments_types import OmniArguments
+from veomni.arguments.omni_parser import parse_omni_args
 from veomni.trainer.omni import OmniTrainer
 
 

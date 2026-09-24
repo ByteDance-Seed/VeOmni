@@ -46,7 +46,8 @@ def test_module_runtime_is_a_model_runtime():
 
 
 def test_omni_runtime_arguments_are_model_arguments():
-    from veomni.arguments import ModelArguments, OmniModelRuntimeArguments, OmniModuleRuntimeArguments
+    from veomni.arguments import ModelArguments
+    from veomni.arguments.omni_arguments_types import OmniModelRuntimeArguments, OmniModuleRuntimeArguments
     from veomni.models.seed_omni.accelerated import OmniModelRuntimeConfig, OmniModuleRuntimeConfig
 
     assert OmniModuleRuntimeArguments is OmniModuleRuntimeConfig
@@ -272,9 +273,15 @@ def test_a_direct_forward_runs_inside_the_modules_own_parallel_state(registered_
     assert parallel_state._PARALLEL_STATE is orchestrator_state, "the ambient state must be restored"
 
 
-def test_a_direct_forward_still_works_for_an_unregistered_eager_module():
+def test_an_eager_inference_module_forwards_without_a_parallel_state(monkeypatch):
     """An eager-inference module never runs ``setup``, so it has no state to
-    enter — the same carve-out ``OmniModelRuntime.module_context`` makes."""
-    assert not parallel_state.is_parallel_state_registered("vision_encoder")
+    enter; its scope is a no-op rather than a registry lookup that would fail."""
+    model = _RecordAmbientState()
+    monkeypatch.setattr(ModuleRuntime, "_init_eager_inference", lambda self: setattr(self, "model", model))
+    args = SimpleNamespace(accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="eager")))
 
-    assert _unbuilt(_RecordAmbientState())(7) == 7
+    runtime = ModuleRuntime(args, "vision_encoder", module_config=SimpleNamespace(), for_inference=True)
+
+    assert "vision_encoder" not in parallel_state._PARALLEL_STATE_REGISTRY
+    assert runtime(7) == 7
+    assert model.seen != "never called"

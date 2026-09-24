@@ -605,9 +605,8 @@ class SeedOmniCollator(DataCollator):
     via :meth:`~veomni.models.seed_omni.processing_omni.OmniProcessor.from_config` from the
     active graph modules' config (see ``OmniTrainer._build_train_dataloader``). Its preprocessor
     chain runs, in order, over the grouped batch (``conversation_list`` plus any extra
-    keys) so the heavy per-module CPU input-prep (tokenize / image normalize, and
-    for Janus packed training the packed-tensor write-back) executes inside the
-    DataLoader worker and overlaps with GPU compute via prefetch, instead of
+    keys) so the heavy per-module CPU input-prep (tokenize / image normalize)
+    executes inside the DataLoader worker and overlaps with GPU compute via prefetch, instead of
     blocking the main process inside each module's ``pre_forward``.
     """
 

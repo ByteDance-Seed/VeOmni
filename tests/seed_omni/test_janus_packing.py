@@ -243,6 +243,20 @@ def _omni_runtime_args(*, accelerator=None, optimizer=None):
     )
 
 
+@pytest.fixture
+def base_parallel_state():
+    """The composed wrap runs under ``base``, which ``OmniTrainer.setup_distributed`` registers."""
+    from veomni.distributed import parallel_state
+
+    parallel_state._PARALLEL_STATE_REGISTRY["base"] = parallel_state.ParallelState()
+    try:
+        yield
+    finally:
+        parallel_state._PARALLEL_STATE_REGISTRY.pop("base", None)
+        parallel_state.set_parallel_state(None)
+
+
+@pytest.mark.usefixtures("base_parallel_state")
 def test_composed_wrap_scopes_child_no_split_modules(monkeypatch: pytest.MonkeyPatch):
     """Each child's ``_no_split_modules`` is prefixed with that child's name."""
     from unittest.mock import MagicMock
@@ -281,6 +295,7 @@ def test_composed_wrap_scopes_child_no_split_modules(monkeypatch: pytest.MonkeyP
     assert "_ChildB" not in captured["basic_modules"]
 
 
+@pytest.mark.usefixtures("base_parallel_state")
 def test_composed_wrap_scopes_embedding_to_owning_child(monkeypatch: pytest.MonkeyPatch):
     """TextEncoder ``Embedding`` must not also match a sibling VQ codebook."""
     from unittest.mock import MagicMock
@@ -326,6 +341,7 @@ def test_composed_wrap_scopes_embedding_to_owning_child(monkeypatch: pytest.Monk
     assert "_Vqvae" not in captured["basic_modules"]
 
 
+@pytest.mark.usefixtures("base_parallel_state")
 def test_composed_wrap_does_not_inspect_module_level_sp():
     """Wrap uses the already-built runtimes; module SP overlays are not compared."""
     from unittest.mock import MagicMock, patch
@@ -346,6 +362,7 @@ def test_composed_wrap_does_not_inspect_module_level_sp():
         omni._parallelize_composed_model()
 
 
+@pytest.mark.usefixtures("base_parallel_state")
 def test_composed_wrap_uses_composer_accelerator_not_module_overlay(monkeypatch: pytest.MonkeyPatch):
     """Wrap knobs come from the OmniModel accelerator / optimizer, not a module overlay."""
     from types import SimpleNamespace

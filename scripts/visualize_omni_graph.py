@@ -35,7 +35,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Literal
 
-from veomni.arguments import OmniArguments, parse_omni_args
+from veomni.arguments.omni_arguments_types import OmniArguments
+from veomni.arguments.omni_parser import parse_omni_args
 from veomni.models.seed_omni.utils.visualize import (
     render_generation_mermaid,
     render_training_mermaid,

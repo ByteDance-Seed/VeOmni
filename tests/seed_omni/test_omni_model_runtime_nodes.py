@@ -8,6 +8,7 @@ once it is served under VeOmni.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -139,7 +140,8 @@ def test_runtime_calls_a_wrapped_module_through_its_runtime():
     """OmniModel holds the bare module; DDP syncs gradients only if its own forward runs."""
     model = _model()
     wrapped = _DdpStyleWrapper(model.modules_dict["module_a"])
-    runtime = OmniModelRuntime(model, module_runtimes={"module_a": SimpleNamespace(model=wrapped)})
+    module_runtime = SimpleNamespace(model=wrapped, _scoped=nullcontext)
+    runtime = OmniModelRuntime(model, module_runtimes={"module_a": module_runtime})
 
     runtime.forward({})
     assert wrapped.calls == 1

@@ -9,7 +9,12 @@ import pytest
 import torch
 
 from tests.seed_omni.helpers import load_from_omni, save_as_omni
-from veomni.arguments import OmniArguments, OmniDataArguments, OmniModelRuntimeArguments, build_omni_model_runtime
+from veomni.arguments.omni_arguments_types import (
+    OmniArguments,
+    OmniDataArguments,
+    OmniModelRuntimeArguments,
+    build_omni_model_runtime,
+)
 from veomni.models.seed_omni import (
     OMNI_ACCELERATED_MODEL_REGISTRY,
     OMNI_MODEL_REGISTRY,

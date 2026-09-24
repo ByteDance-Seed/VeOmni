@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch.nn as nn
 
-from veomni.arguments import OmniGraphProfileArguments
+from veomni.arguments.omni_arguments_types import OmniGraphProfileArguments
 from veomni.models.seed_omni.accelerated import OmniModelRuntime
 from veomni.models.seed_omni.accelerated.utils import iter_named_omni_modules
 from veomni.models.seed_omni.accelerated.utils.executor import (
@@ -217,7 +217,7 @@ def _make_graph_profile_callback(output_dir, *, global_rank=0, **profile_kwargs)
             checkpoint=SimpleNamespace(output_dir=str(output_dir)),
         ),
     )
-    trainer.model = OmniModelRuntime(model, module_runtimes={}, module_parallel_state_names=())
+    trainer.model = OmniModelRuntime(model, module_runtimes={})
     return GraphProfileCallback(trainer), trainer
 
 

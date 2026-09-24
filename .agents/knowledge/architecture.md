@@ -249,11 +249,11 @@ from veomni.trainer.omni import OmniTrainer, OmniInferencer
 from veomni.models.seed_omni.accelerated import OmniModelRuntime, OmniModelRuntimeConfig
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 from veomni.arguments.omni_arguments_types import (
+    OmniArguments,
     build_module_runtime_args,
     build_omni_model_runtime,
     resolve_omni_model,
 )
-from veomni.arguments import OmniArguments
 ```
 
 **Runtime config vs `OmniConfig`.** `resolve_omni_model()` returns an

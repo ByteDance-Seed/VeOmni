@@ -33,7 +33,8 @@ Distributed inference (override modules to FSDP2 / DDP in ``modules_infer_fsdp.y
         --infer.prompt "A cat on a windowsill"
 """
 
-from veomni.arguments import OmniArguments, parse_omni_args
+from veomni.arguments.omni_arguments_types import OmniArguments
+from veomni.arguments.omni_parser import parse_omni_args
 from veomni.trainer.omni import OmniInferencer
 
 

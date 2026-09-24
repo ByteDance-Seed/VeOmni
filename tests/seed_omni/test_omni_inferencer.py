@@ -128,7 +128,7 @@ def test_module_exports_inferencer_and_request():
 
 
 def test_module_needs_distributed_only_when_declared_non_eager():
-    from veomni.arguments import OmniModuleRuntimeArguments
+    from veomni.arguments.omni_arguments_types import OmniModuleRuntimeArguments
     from veomni.arguments.parser import _instantiate_recursive
     from veomni.trainer.omni.omni_inferencer import _module_needs_distributed
 
@@ -171,7 +171,7 @@ def test_eager_inference_keeps_the_launcher_kernels(tmp_path):
     through ``build_foundation_model``, so without this the two halves of one
     process disagree about which attention the launcher asked for.
     """
-    from veomni.arguments import OmniModuleRuntimeArguments
+    from veomni.arguments.omni_arguments_types import OmniModuleRuntimeArguments
     from veomni.arguments.parser import _instantiate_recursive
     from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
     from veomni.models.seed_omni.modules.fake_model.fake_module_a.modeling import FakeModuleA
