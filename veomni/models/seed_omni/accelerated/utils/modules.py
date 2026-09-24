@@ -22,7 +22,7 @@ from typing import Any
 
 import torch.nn as nn
 
-from ...mixins.base_mixin import BaseMixin
+from ...modules.module_modeling_base import PretrainedOmniModule
 from .dispatch import unwrap_module_chain
 
 
@@ -72,14 +72,19 @@ def save_module_subdirectory(
 def iter_named_omni_modules(
     module_names: Iterable[str],
     modules: Mapping[str, nn.Module],
-) -> Iterator[tuple[str, BaseMixin]]:
-    """Yield ``(name, raw BaseMixin)`` for every graph participant behind wrappers."""
+) -> Iterator[tuple[str, PretrainedOmniModule]]:
+    """Yield ``(name, raw module)`` for every graph participant behind wrappers.
+
+    Filters on :class:`PretrainedOmniModule` (which owns the ``reset`` /
+    ``finalize`` hooks) rather than a mixin, so a native module an eager
+    inference build loads is reset and finalized like an accelerated one.
+    """
     for name in module_names:
         wrapped = modules.get(name)
         if wrapped is None:
             continue
         raw = unwrap_module_chain(wrapped)
-        if isinstance(raw, BaseMixin):
+        if isinstance(raw, PretrainedOmniModule):
             yield name, raw
 
 

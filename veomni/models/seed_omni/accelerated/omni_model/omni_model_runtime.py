@@ -423,7 +423,7 @@ class OmniModelRuntime:
         return module_runtime.model if module_runtime is not None else self.model.modules_dict[name]
 
     def named_omni_modules(self) -> Iterator[tuple[str, Any]]:
-        """Yield ``(name, BaseMixin)`` for every graph participant (unwraps wrappers)."""
+        """Yield ``(name, module)`` for every graph participant (unwraps wrappers)."""
         yield from iter_named_omni_modules(self.model._module_names, self.model.modules_dict)
 
     def reset(self) -> None:

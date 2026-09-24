@@ -123,6 +123,40 @@ def test_runtime_generation_matches_eager_generation():
     assert [item["value"] for item in runtime_generated] == ["module_a", "module_b"]
 
 
+class _NativeModule(PretrainedOmniModule):
+    """A module with no graph mixins, as an unregistered ``model_type`` resolves to."""
+
+    config_class = _StubConfig
+
+    def __init__(self):
+        super().__init__(_StubConfig())
+        self.weight = torch.nn.Parameter(torch.ones(1))
+        self.resets = 0
+
+    def forward(self, **kwargs):
+        return {"native_out": self.weight * 3}
+
+    def reset_global_inference_state(self) -> None:
+        self.resets += 1
+
+
+def test_runtime_runs_and_resets_a_module_without_graph_mixins():
+    """The eager model treats ``pre_forward`` / ``post_forward`` as optional and
+    resets every participant; served under VeOmni the module must behave the same."""
+    model = _model()
+    native = _NativeModule()
+    model.module_b = native
+    runtime = OmniModelRuntime(model)
+    batch: dict = {}
+
+    runtime.forward(batch)
+    runtime.reset()
+
+    assert torch.equal(batch["native_out"], torch.tensor([3.0]))
+    assert dict(runtime.named_omni_modules())["module_b"] is native
+    assert native.resets == 1
+
+
 class _DdpStyleWrapper(torch.nn.Module):
     """DDP-shaped: the module lives on ``.module``; counts the calls it receives."""
 
