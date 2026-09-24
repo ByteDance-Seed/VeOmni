@@ -557,10 +557,6 @@ class OmniTrainingArguments:
         default=1,
         metadata={"help": "Epochs to train."},
     )
-    pad_to_length: bool = field(
-        default=False,
-        metadata={"help": "Pad packed sequences to a fixed length when using dynamic batch size."},
-    )
     bsz_warmup_ratio: float = field(
         default=0,
         metadata={"help": "Ratio of batch size warmup steps."},
@@ -778,17 +774,6 @@ class OmniArguments:
             )
 
         self.train._derive_batch_config(self.model.accelerator)
-
-        if self.train.pad_to_length:
-            if not self.train.dyn_bsz:
-                logger.warning_rank0(
-                    "pad_to_length is enabled without dyn_bsz, which is not supported. "
-                    "Please set pad_to_length to False or enable dyn_bsz."
-                )
-                self.train.pad_to_length = False
-            else:
-                self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
-                logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
 
         _validate_omni_accelerator(self.model.accelerator)
 

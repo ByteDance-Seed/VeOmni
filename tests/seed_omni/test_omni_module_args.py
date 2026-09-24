@@ -164,27 +164,6 @@ def test_build_module_runtime_args_resolves_relative_model_paths():
     assert modules[MODULE_A].model_path.startswith("/tmp/fake_omni")
 
 
-def test_packed_modules_yaml_sets_module_processor_config():
-    args = _omni_args(model_path="/tmp/fake_omni")
-    modules = build_module_runtime_args(
-        args._to_module_global_args(),
-        "/tmp/fake_omni",
-        str(_cfg_dir() / "train/modules_train_packed.yaml"),
-    )
-    module_a = modules[MODULE_A]
-    assert module_a.processor_config == {"packed_preprocess": True}
-    assert not module_a.model_config.get("packed_preprocess")
-
-    cfg = OmniConfig(
-        _module_entries={MODULE_A: module_a.to_hf_config()},
-        training_graphs={"default": [{"from": MODULE_A, "to": "end"}]},
-        generation_graphs={"infer_gen": {"initial": "run", "states": {}}},
-    )
-    assert cfg._module_entries[MODULE_A]["processor_config"] == {"packed_preprocess": True}
-    exported = cfg.copy_for_hf_export()
-    assert exported._module_entries[MODULE_A]["processor_config"] == {"packed_preprocess": True}
-
-
 def test_build_module_runtime_args_merges_module_optimizer():
     """Global ``model.optimizer`` is the base; per-module YAML can override."""
     from veomni.arguments import OptimizerConfig
@@ -394,17 +373,17 @@ def test_omni_module_config_owns_descriptor_conversion():
     cfg = FakeModuleAConfig()
     cfg._apply_composed_overwrites(
         model_config={"freeze": True},
-        processor_config={"packed_preprocess": True},
+        processor_config={"image_size": 224},
         ops_implementation=None,
         base_ops_implementation=None,
     )
     assert cfg.freeze is True
-    assert cfg.processor_config == {"packed_preprocess": True}
+    assert cfg.processor_config == {"image_size": 224}
 
     # A module's own config.json states what the module is, not where the
     # composed model loaded it from nor the blocks it never set.
     exported = cfg.to_diff_dict()
-    assert exported["processor_config"] == {"packed_preprocess": True}
+    assert exported["processor_config"] == {"image_size": 224}
     assert "model_path" not in exported
     assert "ops_implementation" not in exported
 

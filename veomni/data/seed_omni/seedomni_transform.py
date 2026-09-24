@@ -246,8 +246,7 @@ def process_seedomni_example(
     Returns:
         A single-element list ``[{"conversation_list": items}]`` to match
         the ``MappingDataset`` contract (one source sample → one or more
-        training samples).  We do not split by length here — packing is a
-        downstream collator concern (Feature D2).
+        training samples).  We do not split by length here.
     """
     # Non-destructive read — datasets often share dict references and a
     # subsequent ``__getitem__`` would otherwise see the key gone.
