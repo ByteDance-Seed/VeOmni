@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SeedOmni V2 training / inference orchestrators (independent from V1 ``BaseTrainer``).
+"""SeedOmni training / inference orchestrators (independent from ``BaseTrainer``).
 
 Only :class:`OmniTrainer` / :class:`OmniInferencer` are re-exported here — the entry
 points (``tasks/omni/train_omni.py`` / ``tasks/omni/infer_omni.py``) are the only real

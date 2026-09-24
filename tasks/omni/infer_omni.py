@@ -1,4 +1,4 @@
-"""SeedOmni V2 inference via the VeOmni runtime (split checkpoint + generation FSM).
+"""SeedOmni inference via the VeOmni runtime (split checkpoint + generation FSM).
 
 This is the **framework** inference path:
 

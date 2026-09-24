@@ -69,7 +69,7 @@ class OmniModelRuntimeConfig(ModelArguments):
     def resolved_model_path(self) -> str:
         path = self.model_path
         if not path:
-            raise ValueError("`model.model_path` (split-checkpoint root) is required for OmniModel V2.")
+            raise ValueError("`model.model_path` (split-checkpoint root) is required for OmniModel.")
         return path
 
     @property

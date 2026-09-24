@@ -115,8 +115,14 @@ veomni/
 │   ├── dit_trainer.py  DitTrainer: diffusion transformer training
 │   ├── text_dpo_trainer.py  DPO training for text models
 │   ├── base_rl_trainer.py   Base RL trainer for RLHF
-│   ├── omni/           SeedOmni V2 orchestrators (OmniTrainer, OmniInferencer)
-│   └── callbacks/      Training callbacks (checkpoint, evaluate, trace, etc.)
+│   ├── omni/           SeedOmni orchestrators (not BaseTrainer subclasses):
+│   │                   OmniTrainer drives OmniModelRuntime's per-module
+│   │                   ModuleRuntimes; OmniInferencer runs the infer graph
+│   │                   (eager, or FSDP/DDP via the runtime). Launched by
+│   │                   tasks/omni/{train,infer}_omni.py
+│   └── callbacks/      Training callbacks (checkpoint, evaluate, trace, etc.;
+│                       omni_callbacks/ holds the per-module DCP/HF, root
+│                       assets, environ meter and graph profile callbacks)
 └── utils/              Shared utilities (logging, device, constants, helpers)
 ```
 

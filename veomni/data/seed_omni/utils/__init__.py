@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-modality IO for the SeedOmni V2 data layer — one module per modality.
+"""Per-modality IO for the SeedOmni data layer — one module per modality.
 
 Each loads a source at whatever resolution it was authored in and reports what
 it found, leaving every model-specific decision — resampling, ``smart_resize``,
 patchify — to the module processor that owns it. That split is what keeps the
-data layer model-agnostic (``docs/seed_omni/seed_omni_v2.md`` § 3).
+data layer model-agnostic.
 
 Nothing is re-exported here, deliberately: importing one modality's module
 should not execute the other two. :mod:`video` is the case that matters — it
