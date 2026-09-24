@@ -178,6 +178,42 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
 - A module with no CPU preprocessing simply doesn't set `preprocessor_class` (defaults to
   `None`), so `from_pretrained` skips it — zero overhead, same as before.
 
+### 3.4b `build_conversation` takes one media mapping; requests decode through the data layer
+- **Breaking, no back-compat shim.** `build_conversation(prompt=..., images=[...],
+  audios=[...])` → `build_conversation(prompt=..., media={"image": [...],
+  "audio": [...], "video": [...]})`, where each entry is `payload` or
+  `(payload, meta)`. That is exactly what the fetchers return, so a caller hands
+  their output straight through. A parameter per modality is what let `video` be
+  silently unsupported here while the data layer already decoded it; a mapping
+  carries a modality this function was never taught.
+- `OmniProcessor.__call__` gains `audios=` and honours `videos=` (it used to
+  raise `NotImplementedError`), and decodes **all** modalities through
+  `MEDIA_FETCHERS` / `fetch_media` in `veomni/data/seed_omni/utils/media.py` —
+  the same table the training transform uses. Consequences to expect when porting:
+  - image items now hold `(C, H, W)` uint8 tensors, not PIL images, on the
+    inference path too (they always did on the training path);
+  - items carry the decode's metadata (`audio_metadata` / `video_metadata`).
+    Previously request building attached none, so an audio item built for
+    inference had no sampling rate — required by its consumers and unrecoverable
+    from the samples.
+- Decode knobs go in a named `mm_configs` dict (`fps` / `max_frames` /
+  `image_max_pixels` / `video_max_pixels` / `audio_sampling_rate` /
+  `use_audio_in_video`), because `**generation_kwargs` would otherwise swallow
+  them. `InferenceRequest` and `infer.*` gain `audios` / `videos` /
+  `mm_configs` to match. The name is training's `data.mm_configs` on purpose:
+  both bags end up at the same fetchers, so a key carries one meaning across
+  training and inference. It is not inherited, though — an inference run states
+  its own decode budget rather than picking up the training config's.
+- A clip with sound is **one** `videos` entry plus
+  `mm_configs={"use_audio_in_video": True}` — never a video plus a parallel
+  `audios` entry. See [`av_video_design.md`](av_video_design.md).
+- `VideoMetadata` subclasses `transformers.video_utils.VideoMetadata` and
+  always carries a real `fps`. A video given as a pre-decoded frame list used
+  to load with `fps=None`; it now needs `mm_configs.frames_fps` (the rate the
+  frames were taken at) and is refused without it. A container that states no
+  frame rate is refused too. The clip's span is `duration` (the HF field);
+  `duration_seconds` stays on `AudioMetadata` only.
+
 ### 3.5 Dummy handling unified on `item.source`
 - **Gone:** `worker_dummy_items` / `has_worker_dummy` (from `utils/conversation.py`).
 - Dummies are appended by the module's `Preprocessor` (training only), tagged

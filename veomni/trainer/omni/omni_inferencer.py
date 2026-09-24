@@ -69,6 +69,13 @@ class InferenceRequest:
 
     prompt: str
     images: list[Any] = field(default_factory=list)
+    audios: list[Any] = field(default_factory=list)
+    videos: list[Any] = field(default_factory=list)
+    # Decode knobs forwarded to the media fetchers (``fps`` / ``max_frames`` /
+    # ``use_audio_in_video`` / …). A clip with sound is one entry in ``videos``
+    # plus ``use_audio_in_video``, never a video paired with an entry in
+    # ``audios`` — see :meth:`OmniProcessor.__call__`.
+    mm_configs: dict[str, Any] = field(default_factory=dict)
     generation_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
@@ -166,6 +173,9 @@ class OmniInferencer:
         request = InferenceRequest(
             prompt=infer_args.prompt,
             images=list(infer_args.images),
+            audios=list(infer_args.audios),
+            videos=list(infer_args.videos),
+            mm_configs=dict(infer_args.mm_configs),
             generation_kwargs=self._runtime_generation_kwargs(),
         )
         ctx = self._run(request)
@@ -208,7 +218,7 @@ class OmniInferencer:
         written = _save_generated_media(ctx["generated"], output_dir)
 
         if not reply and not written:
-            logger.warning_rank0("finalize: FSM produced no reply, no images and no audio.")
+            logger.warning_rank0("finalize: FSM produced no reply and no media.")
 
     def _begin_graph_trace(self) -> GraphProfiler | None:
         """Open a per-request FSM trace on the VeOmni runtime handle.
@@ -225,6 +235,9 @@ class OmniInferencer:
         request_dict = self.processor(
             text=req.prompt,
             images=req.images or None,
+            audios=req.audios or None,
+            videos=req.videos or None,
+            mm_configs=req.mm_configs or None,
             inference=True,
         )
         self.model.reset()
@@ -254,42 +267,32 @@ def _save_generated_media(generated: list[dict[str, Any]], output_dir: str) -> d
     of inference that has to know how each modality is encoded on disk; keeping
     it here leaves ``finalize`` a readable list of what gets persisted.
 
-    The data-layer import sits in the body rather than at module scope — not to
-    defer load cost, since importing this module already pulls the data layer
-    transitively through :class:`OmniTrainer`, but to keep the boundary legible.
-    This function is the only place the trainer reaches into ``data/`` for IO,
-    and naming that dependency where it is used states the fact better than one
-    more line in the module header.
+    Each item goes to its modality's saver in ``MEDIA_SAVERS`` together with its
+    whole ``meta``; which facts a modality needs (an audio rate, a clip's fps and
+    sound rate) is the saver's business, not this loop's. Those facts come from
+    the item rather than a default here because only the emitting module knows
+    them — the audio tower, the codec and the talker do not even share a rate. A
+    clip with sound is one ``video`` item and one muxed file, not an ``.mp4``
+    plus a stray ``.wav``.
+
+    The data-layer import sits in the body to keep the boundary legible: this
+    function is the only place the trainer reaches into ``data/`` for IO.
 
     Returns the number of files written per modality, omitting modalities that
     produced none, so the caller can distinguish "generated nothing" from
     "generated something".
     """
-    from ...data.seed_omni.utils.audio import SAMPLING_RATE_KEY, save_audio
+    from ...data.seed_omni.utils.media import MEDIA_SAVERS
 
     written: dict[str, int] = {}
-
-    # Images arrive as PIL objects from the vision decoder, which serialises
-    # itself; there is nothing for the data layer to add.
-    images = _generated_items(generated, "image")
-    for idx, item in enumerate(images):
-        out_path = os.path.join(output_dir, f"generated_image_{idx}.png")
-        item["value"].save(out_path)
-        logger.info_rank0(f"finalize: image #{idx} → {out_path}")
-    if images:
-        written["image"] = len(images)
-
-    # Audio carries its rate on the item rather than taking a default here: the
-    # audio tower, the codec and the talker do not run at one rate, so only the
-    # module that emitted these samples knows which one they are in.
-    audios = _generated_items(generated, "audio")
-    for idx, item in enumerate(audios):
-        out_path = os.path.join(output_dir, f"generated_audio_{idx}.wav")
-        save_audio(out_path, item["value"], (item.get("meta") or {}).get(SAMPLING_RATE_KEY))
-        logger.info_rank0(f"finalize: audio #{idx} → {out_path}")
-    if audios:
-        written["audio"] = len(audios)
-
+    for item_type, saver in MEDIA_SAVERS.items():
+        items = _generated_items(generated, item_type)
+        for idx, item in enumerate(items):
+            out_path = os.path.join(output_dir, f"generated_{item_type}_{idx}{saver.suffix}")
+            saver.save(out_path, item["value"], item.get("meta"))
+            logger.info_rank0(f"finalize: {item_type} #{idx} → {out_path}")
+        if items:
+            written[item_type] = len(items)
     return written
 
 

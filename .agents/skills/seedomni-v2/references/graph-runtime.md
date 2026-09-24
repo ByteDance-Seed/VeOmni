@@ -88,8 +88,8 @@ checkpoint is not locked to the scenario it was exported under:
 - `config.infer_type` — the active generation scenario (unset means the first declared).
 - `config.generation_graph` — read-only property returning the active FSM.
 
-The checkpoint sidecar `generation_graph.yaml` is that map (no wrapping key —
-the filename is the identity):
+The checkpoint sidecar `<checkpoint>/generation_graph.yaml` is that map — no
+wrapping key, since the filename is the identity:
 
 ```yaml
 infer_gen: {initial: ..., states: {...}}

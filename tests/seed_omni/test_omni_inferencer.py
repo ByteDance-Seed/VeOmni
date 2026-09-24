@@ -55,6 +55,9 @@ def test_inference_request_is_a_plain_dataclass():
     assert set(fields) == {
         "prompt",
         "images",
+        "audios",
+        "videos",
+        "mm_configs",
         "generation_kwargs",
     }
 

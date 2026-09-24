@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from veomni.data.seed_omni.utils.media_metadata import AudioMetadata
 from veomni.models.seed_omni.utils.conversation import (
     ConversationItem,
     build_conversation,
@@ -22,7 +23,7 @@ def test_build_conversation_text_only_yields_user_part():
 
 def test_build_conversation_with_images_places_them_first():
     img_a, img_b = object(), object()
-    parts = build_conversation(prompt="describe", images=[img_a, img_b])
+    parts = build_conversation(prompt="describe", media={"image": [img_a, img_b]})
     assert [(p.type, p.role) for p in parts] == [
         ("image", "user"),
         ("image", "user"),
@@ -35,7 +36,7 @@ def test_build_conversation_with_images_places_them_first():
 
 def test_build_conversation_with_audios_places_them_before_the_prompt():
     wav_a, wav_b = object(), object()
-    parts = build_conversation(prompt="transcribe", audios=[wav_a, wav_b])
+    parts = build_conversation(prompt="transcribe", media={"audio": [wav_a, wav_b]})
     assert [(p.type, p.role) for p in parts] == [
         ("audio", "user"),
         ("audio", "user"),
@@ -45,10 +46,55 @@ def test_build_conversation_with_audios_places_them_before_the_prompt():
     assert parts[1].value is wav_b
 
 
-def test_build_conversation_orders_images_before_audios():
-    img, wav = object(), object()
-    parts = build_conversation(prompt="what is in these", images=[img], audios=[wav])
-    assert [p.type for p in parts] == ["image", "audio", "text"]
+def test_build_conversation_keeps_the_mapping_order_and_ends_on_the_prompt():
+    img, wav, clip = object(), object(), object()
+    parts = build_conversation(prompt="what is in these", media={"image": [img], "audio": [wav], "video": [clip]})
+    assert [p.type for p in parts] == ["image", "audio", "video", "text"]
+
+
+def test_build_conversation_carries_a_modality_it_was_never_taught():
+    """A new modality is an entry in the fetcher table, not an edit to this function.
+
+    Pinned because the alternative — a parameter per modality — is what made
+    ``video`` silently unsupported here while the data layer already decoded it.
+    """
+    payload = object()
+    parts = build_conversation(prompt="act", media={"action": [payload]})
+    assert [p.type for p in parts] == ["action", "text"]
+    assert parts[0].value is payload
+
+
+def test_build_conversation_merges_fetcher_meta_onto_the_item():
+    """The decode's facts (a clip's rate) have to survive into the item.
+
+    Without this the inference path builds an audio item with no sampling rate —
+    a fact its consumers require and cannot recover from the samples.
+    """
+    wav = object()
+    meta = {"audio_metadata": AudioMetadata(sampling_rate=24_000, num_samples=48_000)}
+    parts = build_conversation(prompt="transcribe", media={"audio": [(wav, meta)]})
+    assert parts[0].value is wav
+    assert parts[0].meta["audio_metadata"].sampling_rate == 24_000
+
+
+def test_build_conversation_copies_the_meta_it_is_handed():
+    """Two items decoded from one ref must not share a meta dict.
+
+    Modules write into ``item.meta`` during forward, so a shared dict lets the
+    first writer reach the other item.
+    """
+    meta = {"audio_metadata": AudioMetadata(sampling_rate=16_000, num_samples=1600)}
+    parts = build_conversation(prompt="hi", media={"audio": [(object(), meta), (object(), meta)]})
+    assert parts[0].meta is not parts[1].meta
+    parts[0].meta["written_by_a_module"] = True
+    assert "written_by_a_module" not in parts[1].meta
+
+
+def test_build_conversation_does_not_mistake_a_tuple_payload_for_a_pair():
+    payload = (1, 2)
+    parts = build_conversation(prompt="hi", media={"image": [payload]})
+    assert parts[0].value == payload
+    assert parts[0].meta == {}
 
 
 def test_audio_items_are_filterable_like_any_other_modality():
