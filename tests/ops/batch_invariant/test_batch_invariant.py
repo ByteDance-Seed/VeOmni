@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +25,9 @@ import torch
 from veomni.ops.batch_invariant import patch as batch_patch
 from veomni.ops.batch_invariant.support import addmm_can_fuse_bias, mean_keep_fp32_until_divide
 from veomni.utils.device import IS_CUDA_AVAILABLE
+
+
+_TRITON_AVAILABLE = importlib.util.find_spec("triton") is not None
 
 
 class _FakeLibrary:
@@ -289,6 +293,7 @@ def test_mean_keep_fp32_until_divide_avoids_fp16_overflow():
     torch.testing.assert_close(actual, torch.ones((), dtype=torch.float16))
 
 
+@pytest.mark.skipif(not _TRITON_AVAILABLE, reason="batch-invariant Triton kernels need triton")
 def test_mean_batch_invariant_single_dim_forwards_dtype(monkeypatch):
     """Single-dim mean must honor an explicit dtype, not only the multi-dim path."""
     from veomni.ops.batch_invariant import triton as module
@@ -334,6 +339,7 @@ def test_addmm_falls_back_for_alpha_and_broadcast_bias():
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.skipif(not _TRITON_AVAILABLE, reason="batch-invariant Triton kernels need triton")
 def test_addmm_beta_zero_skips_nan_bias(monkeypatch):
     """beta=0 must not read bias. Do not use a patched aten::addmm as the oracle."""
     from veomni.ops.batch_invariant import triton as module

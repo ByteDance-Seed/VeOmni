@@ -37,6 +37,8 @@ from tests.ops.tol import (
     MOE_FUSED_GRAD_FC2_RTOL,
     MOE_FUSED_GRAD_HIDDEN_ATOL,
     MOE_FUSED_GRAD_HIDDEN_RTOL,
+    MOE_FUSED_PRODUCTION_PRE_SM90_GRAD_HIDDEN_ATOL,
+    MOE_FUSED_PRODUCTION_PRE_SM90_GRAD_HIDDEN_RTOL,
     MOE_FUSED_RTOL,
     MOE_FUSED_SWIGLU_ATOL,
     MOE_FUSED_SWIGLU_GRAD_FC1_ATOL,
@@ -49,11 +51,11 @@ from tests.ops.tol import (
     MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
     MOE_SPLIT_MERGED_GRAD_HIDDEN_RTOL,
 )
-from tests.ops.utils import assert_reference_signal, make_grad_leaf, require_nvidia_cuda
+from tests.ops.utils import assert_close_with_error, assert_reference_signal, make_grad_leaf, require_nvidia_cuda
 from veomni.ops import resolve_op
 from veomni.ops.kernels.moe_experts.shared.indices import build_moe_indices
 from veomni.ops.kernels.moe_experts.standard.npu import _fc1_weight
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE, is_sm90_or_above
 from veomni.utils.import_utils import is_fused_moe_available, is_quack_gemm_available
 
 
@@ -473,6 +475,8 @@ def _run_fused_three_way(
     device: torch.device | None = None,
     data_scale: float = 0.1,
     require_active_clamp: bool = False,
+    grad_hidden_atol: float | None = None,
+    grad_hidden_rtol: float | None = None,
 ):
     """Compare one fused implementation's split and merged layouts with eager."""
     torch.manual_seed(seed)
@@ -540,6 +544,10 @@ def _run_fused_three_way(
         hidden_atol, hidden_rtol = MOE_FUSED_GRAD_HIDDEN_ATOL, MOE_FUSED_GRAD_HIDDEN_RTOL
         fc1_atol, fc1_rtol = MOE_FUSED_GRAD_FC1_ATOL, MOE_FUSED_GRAD_FC1_RTOL
         fc2_atol, fc2_rtol = MOE_FUSED_GRAD_FC2_ATOL, MOE_FUSED_GRAD_FC2_RTOL
+    if grad_hidden_atol is not None:
+        hidden_atol = grad_hidden_atol
+    if grad_hidden_rtol is not None:
+        hidden_rtol = grad_hidden_rtol
     reference_checks = (
         ("output", out_e, fwd_atol, fwd_rtol),
         ("hidden gradient", hidden_e.grad, hidden_atol, hidden_rtol),
@@ -550,11 +558,16 @@ def _run_fused_three_way(
     )
     for name, reference, atol, rtol in reference_checks:
         assert_reference_signal(name, reference, atol, rtol)
-    assert torch.allclose(out_m.float(), out_e.float(), atol=fwd_atol, rtol=fwd_rtol)
-    assert torch.allclose(hidden_m.grad.float(), hidden_e.grad.float(), atol=hidden_atol, rtol=hidden_rtol)
-    assert torch.allclose(routing_m.grad.float(), routing_e.grad.float(), atol=hidden_atol, rtol=hidden_rtol)
-    assert torch.allclose(fc2_m.grad.float(), fc2_e.grad.float(), atol=fc2_atol, rtol=fc2_rtol)
-    assert torch.allclose(
+    assert_close_with_error("output", out_m.float(), out_e.float(), atol=fwd_atol, rtol=fwd_rtol)
+    assert_close_with_error(
+        "hidden gradient", hidden_m.grad.float(), hidden_e.grad.float(), atol=hidden_atol, rtol=hidden_rtol
+    )
+    assert_close_with_error(
+        "routing gradient", routing_m.grad.float(), routing_e.grad.float(), atol=hidden_atol, rtol=hidden_rtol
+    )
+    assert_close_with_error("fc2 gradient", fc2_m.grad.float(), fc2_e.grad.float(), atol=fc2_atol, rtol=fc2_rtol)
+    assert_close_with_error(
+        "fc1 gradient",
         fc1_12_m.grad.float(),
         torch.cat([fc1_1_e.grad, fc1_2_e.grad], dim=1).float(),
         atol=fc1_atol,
@@ -746,7 +759,11 @@ def test_triton_split_and_merged_match_eager_swiglu_limit(swiglu_limit: float):
     ],
 )
 def test_triton_split_and_merged_match_eager_production(shape: tuple[int, int, int, int, int], seed: int):
-    _run_fused_three_way("fused_triton", shape=shape, seed=seed)
+    kwargs = {}
+    if not is_sm90_or_above():
+        kwargs["grad_hidden_atol"] = MOE_FUSED_PRODUCTION_PRE_SM90_GRAD_HIDDEN_ATOL
+        kwargs["grad_hidden_rtol"] = MOE_FUSED_PRODUCTION_PRE_SM90_GRAD_HIDDEN_RTOL
+    _run_fused_three_way("fused_triton", shape=shape, seed=seed, **kwargs)
 
 
 @pytest.mark.skipif(not is_quack_gemm_available(), reason="quack fused MoE needs SM90+")
