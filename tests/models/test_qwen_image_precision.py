@@ -17,6 +17,7 @@ from veomni.arguments.arguments_types import MixedPrecisionConfig
 from veomni.distributed.parallel_state import ParallelState, use_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models.diffusers.qwen_image.qwen_image_transformer import modeling_qwen_image_transformer as modeling
+from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -38,6 +39,34 @@ def test_real_rope_forward_and_gradients(dtype):
     actual.float().square().mean().backward()
     torch.testing.assert_close(
         y.grad, x.grad, atol=1e-6 if dtype == torch.float32 else 1e-4, rtol=1e-5 if dtype == torch.float32 else 1e-2
+    )
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU rotary parity requires torch_npu")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_npu_rope_parity_with_cpu(dtype):
+    generator = torch.Generator().manual_seed(23)
+    x_cpu = torch.randn(2, 7, 3, 16, generator=generator).to(dtype).requires_grad_(True)
+    angles = torch.randn(7, 8, generator=generator)
+    freqs = torch.polar(torch.ones_like(angles), angles)
+    freqs_real = torch.view_as_real(freqs)
+
+    expected = modeling.apply_qwen_rotary_emb(x_cpu, freqs_real)
+
+    x_npu = x_cpu.detach().clone().to("npu").requires_grad_(True)
+    freqs_npu = freqs_real.to("npu")
+    actual = modeling.apply_qwen_rotary_emb(x_npu, freqs_npu)
+
+    torch.testing.assert_close(
+        actual.to("cpu"), expected, atol=1e-5 if dtype == torch.float32 else 5e-3,
+        rtol=1e-5 if dtype == torch.float32 else 5e-3,
+    )
+
+    expected.float().square().mean().backward()
+    actual.float().square().mean().backward()
+    torch.testing.assert_close(
+        x_npu.grad.to("cpu"), x_cpu.grad, atol=1e-5 if dtype == torch.float32 else 1e-3,
+        rtol=1e-5 if dtype == torch.float32 else 1e-2,
     )
 
 

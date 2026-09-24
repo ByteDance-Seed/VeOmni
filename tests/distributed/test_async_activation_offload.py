@@ -3,6 +3,7 @@ Covers:
   1. Core components: SwapTensor, GetCnt, OffloadManager, async_save_on_cpu
   2. Module patching: _get_no_split_offload_modules, async_offload_modules
   3. Argument validation: apply_async_activation_offload requires _no_split_modules
+  4. Gradient parity: forward+backward with offload matches without offload
 Run (single GPU):
     pytest tests/distributed/test_async_activation_offload.py -v
 """
@@ -13,7 +14,11 @@ from veomni.distributed.async_offload import (
     _get_no_split_offload_modules,
     apply_async_activation_offload,
     async_offload_modules,
+    reset_async_activation_offload,
 )
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+
+_HAS_ACCEL = IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE
 
 
 class ToyDecoderLayer(torch.nn.Module):
@@ -80,3 +85,38 @@ class TestApplyAsyncActivationOffload:
         model = ToyModelNoNoSplitModules(hidden_size=64)
         with pytest.raises(ValueError):
             apply_async_activation_offload(model, activation_offload_modules=[])
+
+@pytest.mark.skipif(not _HAS_ACCEL, reason="requires CUDA or NPU for streams + pinned memory")
+class TestGradientParity:
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_gradient_parity_with_and_without_offload(self, dtype):
+        torch.manual_seed(42)
+        device = torch.device("cuda" if IS_CUDA_AVAILABLE else "npu")
+        hidden_size = 64
+        num_layers = 4
+        batch = 2
+        seq_len = 8
+
+        model = ToyModel(hidden_size=hidden_size, num_layers=num_layers).to(device=device, dtype=dtype)
+        x = torch.randn(batch, seq_len, hidden_size, device=device, dtype=dtype)
+
+        loss_ref = model(x)
+        loss_ref.backward()
+        grads_ref = {name: p.grad.clone() for name, p in model.named_parameters()}
+
+        for p in model.parameters():
+            p.grad = None
+
+        apply_async_activation_offload(model, activation_offload_modules=[])
+        loss_off = model(x)
+        loss_off.backward()
+        grads_off = {name: p.grad.clone() for name, p in model.named_parameters()}
+        reset_async_activation_offload(model)
+
+        assert torch.allclose(loss_ref, loss_off, rtol=1e-3, atol=1e-3), (
+            f"Loss mismatch: ref={loss_ref.item():.6f}, off={loss_off.item():.6f}"
+        )
+        for name in grads_ref:
+            assert torch.allclose(grads_ref[name], grads_off[name], rtol=1e-2, atol=1e-2), (
+                f"Gradient mismatch for {name}: max diff={torch.max(torch.abs(grads_ref[name] - grads_off[name])).item():.6e}"
+            )
