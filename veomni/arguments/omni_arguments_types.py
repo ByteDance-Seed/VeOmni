@@ -136,7 +136,7 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
 
     train_graph = model_runtime.launcher_config("train_graph")
     if train_graph is None and omni_cfg is not None:
-        train_graph = {DEFAULT_SCENARIO: omni_cfg.training_graph}
+        train_graph = omni_cfg.training_graphs or None
     if train_graph is None:
         raise ValueError(
             "`model.model_config.train_graph` is required when `model_path` has no omni "
@@ -153,6 +153,8 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
         )
 
     train_type = model_runtime.launcher_config("train_type")
+    if train_type is None and omni_cfg is not None:
+        train_type = omni_cfg.train_type
     infer_type = model_runtime.launcher_config("infer_type")
     if infer_type is None and omni_cfg is not None:
         infer_type = omni_cfg.infer_type

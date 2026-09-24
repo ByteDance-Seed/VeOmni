@@ -334,6 +334,26 @@ def test_resolve_model_reads_graphs_from_omni_checkpoint(tmp_path):
     assert cfg.infer_types == runtime_cfg.infer_types
 
 
+def test_resolve_model_keeps_every_training_scenario_from_omni_checkpoint(tmp_path):
+    """The checkpoint stores the whole ``training_graphs`` map and its ``train_type``;
+    reading back only the active graph would rename it ``default`` and drop the rest."""
+    graph = str(_cfg_dir() / "train/graph_train.yaml")
+    runtime_cfg = _model_runtime(
+        model_path=str(tmp_path), train_graph={"train": graph, "alt": graph}, train_type="alt"
+    )
+    export_root = tmp_path / "exported"
+    _with_module_configs(runtime_cfg.to_hf_config()).save_pretrained(export_root)
+
+    args = OmniArguments(
+        model=OmniModelRuntimeArguments(model_path=str(export_root)),
+        data=OmniDataArguments(train_path=""),
+        infer=OmniInferArguments(),
+    )
+    cfg = args.resolve_model()
+    assert list(cfg.training_graphs) == ["train", "alt"]
+    assert cfg.train_type == "alt"
+
+
 def test_from_model_runtime_projects_onto_hf_config(tmp_path):
     """from_model_runtime builds OmniModel from ``to_hf_config()``; each ModuleRuntime
     gets the module config that OmniConfig loaded, and OmniModel gets the bare module."""
