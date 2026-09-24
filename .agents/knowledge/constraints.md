@@ -246,6 +246,10 @@ Core files:
    - `TextDPOTrainer` and `DiTTrainer` compose a `BaseTrainer` and override `forward_backward_step()`; they do not inherit the base implementation.
    - Lifecycle work added only inside `BaseTrainer.forward_backward_step()` is skipped by these trainers. Update every supported override or reject the unsupported trainer explicitly.
 
+24a. **OmniTrainer's backward must match its mean-over-micro-batches step loss**
+   - Each graph forward returns a per-micro-batch loss, not a loss already weighted over the full accumulation step. Divide its backward scalar by `num_micro_steps`; retain the original scalar for the logging average in `train_step`. Otherwise changing DP/SP topology at fixed global batch changes accumulation count and multiplies the gradient and clipping norm by that count.
+   - Do not apply the same division to `BaseTrainer`: its `postforward` already uses `mean_global_loss` to weight each micro-batch by its share of the full step's supervised tokens.
+
 25. **Module-level OpSlots are shared by every model instance**
    - Modeling modules expose `OpSlot` objects such as `veomni_causal_lm_loss` as globals. Policy/reference models in DPO can therefore use the same slot.
    - Temporary interception must use forward-scoped ownership and reference-counted dispatch. A closure bound to one model or callback can observe another model's forward and corrupt side-channel state.
