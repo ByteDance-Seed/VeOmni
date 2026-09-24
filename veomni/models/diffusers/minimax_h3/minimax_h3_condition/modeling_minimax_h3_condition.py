@@ -31,6 +31,27 @@ _MINIMAX_H3_TIME_DIVISION_FACTOR = 17
 _MINIMAX_H3_TIME_DIVISION_REMAINDER = 5
 
 
+def _packed_seq_params(pk: dict, device) -> dict[str, dict]:
+    """DiT/refiner segment params with host bounds, without reading device tensors back."""
+    from ..minimax_h3_core.packed_sequence import host_cu_seqlens
+
+    cu_host = host_cu_seqlens(pk)
+    text_len = int(pk["text_len"])
+    return {
+        "packed_seq_params": {
+            "cu_seqlens_q": pk["cu_seqlens"].to(device),
+            "cu_seqlens_host": cu_host,
+            "max_seqlen_q": cu_host[1],
+        },
+        "refiner_packed_seq_params": {
+            # [0, text_len] built on device, avoiding a host-to-device copy.
+            "cu_seqlens_q": torch.arange(2, dtype=torch.int32, device=device) * text_len,
+            "cu_seqlens_host": (0, text_len),
+            "max_seqlen_q": text_len,
+        },
+    }
+
+
 class MiniMaxH3ConditionModel(PreTrainedModel):
     config_class = MiniMaxH3ConditionModelConfig
 
@@ -237,6 +258,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
           imgvid_cond_noise_aug: list[float]
           audio_cond_noise_aug: list[float]
           use_gradient_checkpointing: list[bool]
+          has_audio: list[bool]               — False when the silent placeholder latent is used
         """
         device = next(self._video_vae.parameters()).device
         cfg = self.config
@@ -250,6 +272,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             "imgvid_cond_noise_aug": [],
             "audio_cond_noise_aug": [],
             "use_gradient_checkpointing": [],
+            "has_audio": [],
         }
 
         num_samples = len(inputs)
@@ -289,7 +312,8 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             input_latent = self._encode_video(video_tensor, device)
 
             # 5. Encode audio (VAE)
-            if audios is not None and i < len(audios) and audios[i] is not None:
+            has_audio = audios is not None and i < len(audios) and audios[i] is not None
+            if has_audio:
                 audio_latent = self._encode_audio(audios[i], num_frames, device)
             else:
                 # Placeholder: silent audio latent
@@ -345,6 +369,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             results["imgvid_cond_noise_aug"].append(cfg.imgvid_cond_noise_aug)
             results["audio_cond_noise_aug"].append(cfg.audio_cond_noise_aug)
             results["use_gradient_checkpointing"].append(True)
+            results["has_audio"].append(has_audio)
 
         return results
 
@@ -471,7 +496,28 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
     # ── process_condition (add noise + pack) ──────────────────────────
 
     @torch.no_grad()
-    def process_condition(
+    def process_condition(self, **collated_inputs) -> dict[str, Any]:
+        """Prepare each sample independently, preserving its conditioning RNG order."""
+        count = len(collated_inputs["input_latents"])
+        if count == 0:
+            raise ValueError("H3 requires a nonempty sample list.")
+        samples = []
+        for i in range(count):
+            single = {key: [value[i]] if isinstance(value, list) else value for key, value in collated_inputs.items()}
+            pk = single["packed"][0]
+            anchors = [
+                single[key][0]
+                for key in ("keyframe_cond_anchor", "ref_visual_anchor")
+                if single.get(key) is not None and single[key][0] is not None
+            ]
+            if pk["cond_rows"] and (len(anchors) != 1 or anchors[0].shape != (pk["cond_rows"], 96)):
+                raise ValueError("H3 condition anchor rows must match the packed layout.")
+            samples.append(self._process_single_condition(**single))
+        if count == 1:
+            return samples[0]
+        return {key: [sample[key] for sample in samples] for key in samples[0]}
+
+    def _process_single_condition(
         self,
         input_latents: list[torch.Tensor],
         audio_input_latents: list[torch.Tensor],
@@ -481,11 +527,15 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         imgvid_cond_noise_aug: float = 0.999,
         audio_cond_noise_aug: float = 1.0,
         use_gradient_checkpointing: bool = True,
+        use_gradient_checkpointing_offload: bool = False,
+        ref_visual_anchor: list[torch.Tensor | None] | None = None,
+        ref_audio_anchor: list[torch.Tensor | None] | None = None,
+        has_audio: list[bool | None] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         """Add noise + pack latents into model.forward() inputs.
 
-        Per-sample (batch is list of samples, this processes sample 0):
+        Called by ``process_condition`` with one sample wrapped in single-element lists:
 
         1. Sample shared timestep_id ~ Uniform(0, 999)
         2. Compute sigma_video, sigma_audio from respective schedulers
@@ -505,29 +555,27 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             audio_cond_noise_aug = audio_cond_noise_aug[0]
         if isinstance(use_gradient_checkpointing, list):
             use_gradient_checkpointing = use_gradient_checkpointing[0]
+        if isinstance(use_gradient_checkpointing_offload, list):
+            use_gradient_checkpointing_offload = use_gradient_checkpointing_offload[0]
+        # Caches written before has_audio existed supervise audio as before.
+        has_audio = True if not has_audio or has_audio[0] is None else bool(has_audio[0])
 
-        # Process first sample (batch=1 per micro_batch); reject any other
-        # size for every supplied collection so a mismatched length cannot
-        # silently truncate to index 0.
-        supplied = {
-            "input_latents": input_latents,
-            "audio_input_latents": audio_input_latents,
-            "prompt_embeds": prompt_embeds,
-            "packed": packed,
-        }
-        if keyframe_cond_anchor is not None:
-            supplied["keyframe_cond_anchor"] = keyframe_cond_anchor
-        for name, coll in supplied.items():
-            if len(coll) != 1:
-                raise ValueError(
-                    f"MiniMaxH3ConditionModel.process_condition supports micro_batch_size=1 only, "
-                    f"got {len(coll)} samples in {name}."
-                )
+        if ref_audio_anchor is not None and any(anchor is not None for anchor in ref_audio_anchor):
+            raise NotImplementedError("Ref2VA audio references are not supported.")
         clean_video = input_latents[0]
         clean_audio = audio_input_latents[0]
         prompt = prompt_embeds[0]
         pk = packed[0]
         cond_anchor = keyframe_cond_anchor[0] if keyframe_cond_anchor else None
+        if ref_visual_anchor and ref_visual_anchor[0] is not None:
+            if cond_anchor is not None:
+                raise ValueError("Specify either keyframe or reference visual anchors, not both.")
+            cond_anchor = ref_visual_anchor[0]
+        if pk.get("task") == "ref2va":
+            if cond_anchor is None or cond_anchor.shape != (pk["cond_rows"], clean_video.shape[1] * 4):
+                raise ValueError("Ref2VA visual anchor rows must match the packed reference layout.")
+            if len(pk["audio_pos"]) != clean_audio.shape[0] * clean_audio.shape[-1]:
+                raise NotImplementedError("Ref2VA audio reference rows are not supported.")
 
         device = clean_video.device
         dtype = clean_video.dtype
@@ -588,10 +636,6 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             timesteps[img_pos[:cond_rows]] = max(float(t_video), float(cfg.imgvid_cond_noise_aug))
         unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
 
-        # 5. Refiner cu_seqlens (text-only, no padding for refiner)
-        text_len = pk["text_len"]
-        refiner_cu = torch.tensor([0, text_len, text_len], dtype=torch.int32)
-
         # 6. Shape info for unpatchify (use keys NOT popped by trainer)
         T_v = pk["latent_t"]
         T_a = pk["audio_t"]
@@ -612,17 +656,11 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             "audio_pos_info": {"position_ids": pk["audio_pos"].to(device)},
             "text_pos_info": {"position_ids": pk["text_pos"].to(device)},
             "img_pos_for_infer_output_info": {"position_ids": pk["img_pos"].to(device)},
-            "packed_seq_params": {
-                "cu_seqlens_q": pk["cu_seqlens"].to(device),
-                "max_seqlen_q": int(pk["cu_seqlens"][1]),
-            },
-            "refiner_packed_seq_params": {
-                "cu_seqlens_q": refiner_cu.to(device),
-                "max_seqlen_q": text_len,
-            },
+            **_packed_seq_params(pk, device),
             "skip_mask_out_condition": True,
             "cond_rows": cond_rows,
             "use_gradient_checkpointing": use_gradient_checkpointing,
+            "use_gradient_checkpointing_offload": use_gradient_checkpointing_offload,
             "video_latent_shape": video_latent_shape,
             "audio_latent_shape": audio_latent_shape,
             "training_target": training_target,
@@ -632,4 +670,5 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             "scheduler_audio": self._scheduler_audio,
             "t_video": t_video,
             "t_audio": t_audio,
+            "has_audio": has_audio,
         }
