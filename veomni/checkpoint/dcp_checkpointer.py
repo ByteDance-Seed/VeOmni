@@ -67,14 +67,50 @@ _EXTRA_STATE_DIRNAME = "extra_state"
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 
 
+def _requires_exact_optimizer_state_dtypes(optimizer):
+    """Opt in only precision-sensitive optimizers, including MultiOptimizer."""
+    if getattr(optimizer, "requires_exact_state_dtypes", False):
+        return True
+    children = optimizer if isinstance(optimizer, dict) else getattr(optimizer, "optimizers_dict", {})
+    return any(_requires_exact_optimizer_state_dtypes(child) for child in children.values())
+
+
 class _ModelStrictLoadPlanner(DefaultLoadPlanner):
     """Allow partial optimizer state while requiring a complete full-model DCP."""
 
-    def __init__(self, strict_model: bool):
+    def __init__(self, strict_model: bool, strict_optimizer_dtype: bool = False):
         super().__init__(allow_partial_load=True)
         self.strict_model = strict_model
+        self.strict_optimizer_dtype = strict_optimizer_dtype
 
     def create_local_plan(self):
+        if self.strict_optimizer_dtype:
+            # DCP otherwise casts saved tensors to the target placeholders before
+            # optimizer.load_state_dict sees them. Validate original metadata
+            # before any read can erase evidence of a precision-policy change.
+            assert self.metadata is not None
+            for key, path in self.mappings.items():
+                if (
+                    not path
+                    or path[0] != "optimizer"
+                    or not key.endswith((".master_weight", ".exp_avg", ".exp_avg_sq", ".step"))
+                ):
+                    continue
+                source = self.metadata.state_dict_metadata.get(key)
+                target = self.state_dict.get(key)
+                if source is None:
+                    raise RuntimeError(
+                        f"DCP is missing precision-sensitive optimizer state {key}; "
+                        "explicit checkpoint migration is required"
+                    )
+                if not torch.is_tensor(target):
+                    continue
+                source_dtype = getattr(getattr(source, "properties", None), "dtype", None)
+                if source_dtype != target.dtype:
+                    raise RuntimeError(
+                        f"DCP optimizer dtype mismatch for {key}: saved={source_dtype}, configured={target.dtype}; "
+                        "explicit precision migration is required"
+                    )
         plan = super().create_local_plan()
         if not self.strict_model:
             return plan
@@ -301,6 +337,10 @@ class OptimizerState(Stateful):
             sparse and skips sub-optimizers that have never been stepped,
             avoiding synthetic zero state for unused parameters (e.g. unused
             MoE experts) in the checkpoint.
+
+    Precision-sensitive optimizers opt out of partial state restoration: missing
+    master, moment, or step fields require explicit migration. This also rejects
+    checkpoints with entirely absent lazy states for unused parameters.
     """
 
     def __init__(self, model, optimizer, parallel_state=None, *, load: bool = False):
@@ -379,6 +419,21 @@ class OptimizerState(Stateful):
         )
 
 
+def _from_local_preserve_device(local_tensor, device_mesh, placements):
+    """Wrap optimizer CPU state without moving it onto its accelerator mesh.
+
+    DTensor.from_local implicitly copies CPU input to device_mesh.device_type.
+    A metadata-only construction computes the same global shape/stride/spec;
+    attaching the actual local shard then preserves CPU storage and the original
+    mesh identity. DTensor's spec constructor is intentionally isolated here.
+    No collectives or accelerator allocations are needed (run_check=False).
+    """
+    if local_tensor.device.type == "cpu" and device_mesh.device_type != "cpu":
+        metadata = DTensor.from_local(local_tensor.to("meta"), device_mesh=device_mesh, placements=placements)
+        return DTensor(local_tensor, metadata._spec, requires_grad=local_tensor.requires_grad)
+    return DTensor.from_local(local_tensor, device_mesh=device_mesh, placements=placements)
+
+
 def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh, fsdp_shard_dim: int = 1):
     """
     Drop ExtraParallel dims after loading from DCP so that ExtraParallel-FSDP would not be confused.
@@ -400,11 +455,11 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
     if num_placements == 1:
         tensor_to_put = loaded_tensor.to_local()
     elif num_placements == 2:
-        tensor_to_put = DTensor.from_local(
+        tensor_to_put = _from_local_preserve_device(
             loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(fsdp_shard_dim)]
         )
     elif num_placements == 3:
-        tensor_to_put = DTensor.from_local(
+        tensor_to_put = _from_local_preserve_device(
             loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Replicate(), Shard(fsdp_shard_dim)]
         )
     else:
@@ -462,10 +517,12 @@ def restore_extra_parallel_dim(
             placements = [Replicate(), Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
         else:
             placements = [Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
-        dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
+        dtensor = _from_local_preserve_device(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
     elif torch.is_tensor(orgin_tensor):
         # If there is no FSDP but only ExtraParallel
-        dtensor = DTensor.from_local(orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=[Shard(0)])
+        dtensor = _from_local_preserve_device(
+            orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=[Shard(0)]
+        )
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 
@@ -1026,7 +1083,10 @@ class DistributedCheckpointer(CheckpointerBase):
                 state_dict=load_state,
                 storage_reader=cls._create_storage_reader(fused_dir),
                 process_group=process_group,
-                planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
+                planner=_ModelStrictLoadPlanner(
+                    strict_model=not trainable_only,
+                    strict_optimizer_dtype=_requires_exact_optimizer_state_dtypes(state.get("optimizer")),
+                ),
             )
             cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
             logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
@@ -1037,7 +1097,10 @@ class DistributedCheckpointer(CheckpointerBase):
             state_dict={"model": _model_state()},
             storage_reader=cls._create_storage_reader(weights_dir(path, module)),
             process_group=process_group,
-            planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
+            planner=_ModelStrictLoadPlanner(
+                strict_model=not trainable_only,
+                strict_optimizer_dtype=_requires_exact_optimizer_state_dtypes(state.get("optimizer")),
+            ),
         )
         if wants_optimizer:
             dcp.load(
@@ -1046,7 +1109,10 @@ class DistributedCheckpointer(CheckpointerBase):
                 process_group=process_group,
                 # The strict check looks for missing ``model`` keys; there are none
                 # in an optimizer-only load, so strictness has nothing to say here.
-                planner=_ModelStrictLoadPlanner(strict_model=False),
+                planner=_ModelStrictLoadPlanner(
+                    strict_model=False,
+                    strict_optimizer_dtype=_requires_exact_optimizer_state_dtypes(state.get("optimizer")),
+                ),
             )
 
         cls._load_extra_state(checkpoint_dir=model_root, state=state)
