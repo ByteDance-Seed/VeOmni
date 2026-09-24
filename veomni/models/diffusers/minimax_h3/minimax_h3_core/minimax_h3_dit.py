@@ -17,7 +17,6 @@ from veomni.distributed.sequence_parallel.ulysses import (
 )
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 from .core import (
     bind_minimax_attention,
@@ -26,10 +25,6 @@ from .core import (
     minimax_attention,
     packed_block_diag_mask,
 )
-
-
-if IS_NPU_AVAILABLE:
-    from torch_npu import npu_rotary_mul
 
 
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
@@ -76,26 +71,6 @@ class VeomniRMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the interned ``rms_norm`` handle."""
         return self.veomni_rms_norm(x, self.weight, eps=self.eps)
-
-
-def _norm(size: int, *, eps: float) -> VeomniRMSNorm:
-    return VeomniRMSNorm(size, eps=eps)
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = torch.chunk(x, 2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    # cos/sin are precomputed once per forward and shared across all blocks.
-    rot_dim = cos.shape[-1]
-    x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
-    if IS_NPU_AVAILABLE and x_rot.device.type == "npu":
-        x_rot = npu_rotary_mul(x_rot, cos, sin, rotary_mode="half")
-    else:
-        x_rot = (x_rot * cos) + (_rotate_half(x_rot) * sin)
-    return torch.cat((x_rot, x_pass), dim=-1)
 
 
 def _modulate_scale_shift(x, shift, scale, indices):
@@ -178,14 +153,16 @@ class MiniMaxH3Attention(nn.Module):
         inner_dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
         self.qkv_proj = nn.Linear(hidden_size, inner_dim * 3, bias=False)
-        self.q_norm = _norm(attention_head_dim, eps=qk_norm_eps)
-        self.k_norm = _norm(attention_head_dim, eps=qk_norm_eps)
+        self.q_norm = VeomniRMSNorm(attention_head_dim, eps=qk_norm_eps)
+        self.k_norm = VeomniRMSNorm(attention_head_dim, eps=qk_norm_eps)
         self.out_proj = nn.Linear(inner_dim, hidden_size, bias=False)
         # Packed FA is bound later. FA3/FA4 cannot be constructed on NPU or pre-SM90.
         impl = resolve_op_impl("attn_implementation")
         if is_flash_attn_impl(impl):
             impl = "sdpa"
         bind_minimax_attention(self, is_causal=False, impl=impl)
+        # 3-axis rope is shorter than head_dim (96 vs 128 in production). q/k are [S, H, D].
+        self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
 
     def _run_packed_attention(
         self,
@@ -269,8 +246,7 @@ class MiniMaxH3Attention(nn.Module):
                 q = self.q_norm(full[:, :, 0])
                 k = self.k_norm(full[:, :, 1])
                 if rope_cos is not None:
-                    q = _apply_rope(q, rope_cos, rope_sin)
-                    k = _apply_rope(k, rope_cos, rope_sin)
+                    q, k = self.veomni_rope(q, k, rope_cos, rope_sin)
                 o = self._run_packed_attention(
                     q,
                     k,
@@ -293,8 +269,7 @@ class MiniMaxH3Attention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
             if rope_cos is not None:
-                q = _apply_rope(q, rope_cos, rope_sin)
-                k = _apply_rope(k, rope_cos, rope_sin)
+                q, k = self.veomni_rope(q, k, rope_cos, rope_sin)
             packed_attention = isinstance(cu_seqlens, _PackedBounds)
             if packed_attention and is_flash_attn_impl(self.config._attn_implementation):
                 out = self._run_packed_attention(
@@ -349,8 +324,8 @@ class MiniMaxH3AdalnProj(nn.Module):
 class MiniMaxH3TokenRefinerBlock(nn.Module):
     def __init__(self, hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size, norm_eps, qk_norm_eps):
         super().__init__()
-        self.norm1 = _norm(hidden_size, eps=norm_eps)
-        self.norm2 = _norm(hidden_size, eps=norm_eps)
+        self.norm1 = VeomniRMSNorm(hidden_size, eps=norm_eps)
+        self.norm2 = VeomniRMSNorm(hidden_size, eps=norm_eps)
         self.attn = MiniMaxH3Attention(hidden_size, num_attention_heads, attention_head_dim, qk_norm_eps)
         self.mlp = MiniMaxH3MLP(hidden_size, ffn_hidden_size)
 
@@ -388,7 +363,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.final_norm = _norm(hidden_size, eps=final_norm_eps)
+        self.final_norm = VeomniRMSNorm(hidden_size, eps=final_norm_eps)
 
     def forward(self, x, *, cu_seqlens, max_seqlen, valid_seqlen=None, sample_local=False):
         if sample_local and isinstance(cu_seqlens, _PackedBounds) and len(cu_seqlens.host) > 2:
@@ -428,8 +403,8 @@ class MiniMaxH3DiTBlock(nn.Module):
         qk_norm_eps,
     ):
         super().__init__()
-        self.norm1 = _norm(hidden_size, eps=norm_eps)
-        self.norm2 = _norm(hidden_size, eps=norm_eps)
+        self.norm1 = VeomniRMSNorm(hidden_size, eps=norm_eps)
+        self.norm2 = VeomniRMSNorm(hidden_size, eps=norm_eps)
         self.attn = MiniMaxH3Attention(hidden_size, num_attention_heads, attention_head_dim, qk_norm_eps)
         self.mlp = MiniMaxH3MLP(hidden_size, ffn_hidden_size)
         self.adaln_proj = MiniMaxH3AdalnProj(
@@ -484,7 +459,7 @@ class MiniMaxH3FinalLayer(nn.Module):
     ):
         super().__init__()
         video_patch_dim = latents_dim * patch_size[0] * patch_size[1] * patch_size[2]
-        self.norm = _norm(hidden_size, eps=final_norm_eps)
+        self.norm = VeomniRMSNorm(hidden_size, eps=final_norm_eps)
         self.adaln_proj = MiniMaxH3AdalnProj(
             hidden_size, time_embed_dim, final_adaln_out_features, expand_ratio=2, modality_num=1
         )
@@ -728,10 +703,9 @@ class MiniMaxH3DiT(nn.Module):
         combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
         inverse_indices = inverse_indices.to(device)
 
-        # cos/sin are shared across all blocks; compute once instead of per q/k
-        # in _apply_rope. Same fp32 inputs, same ops: bit-identical results.
-        rope_cos = torch.cos(rope_freqs).to(decoder_input.dtype).unsqueeze(1)
-        rope_sin = torch.sin(rope_freqs).to(decoder_input.dtype).unsqueeze(1)
+        # Shared [S, rotary_dim] tables. Attention's partial RoPE unsqueezes the head axis.
+        rope_cos = torch.cos(rope_freqs).to(decoder_input.dtype)
+        rope_sin = torch.sin(rope_freqs).to(decoder_input.dtype)
 
         if sp_world > 1:
             decoder_input = decoder_input.narrow(0, unit * sp_rank, unit)

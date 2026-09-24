@@ -542,7 +542,11 @@ _MODEL_CASES = (
         has_registered_config=True,
         registered_config_aliases=("MiniMaxH3ConditionModel",),
         registered_model_aliases=("MiniMaxH3ConditionModel",),
-        eager_ops=(("dit.blocks.0.attn.veomni_attn", "attention"),),
+        eager_ops=(
+            ("dit.blocks.0.attn.q_norm.veomni_rms_norm", "rms_norm"),
+            ("dit.blocks.0.attn.veomni_attn", "attention"),
+            ("dit.blocks.0.attn.veomni_rope", "rope"),
+        ),
         isolation_op_path="dit.blocks.0.attn.veomni_attn",
         stamps_hf_attn=False,
     ),

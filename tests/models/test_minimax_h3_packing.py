@@ -106,7 +106,6 @@ def serial(model, samples):
 def cpu_attention(monkeypatch):
     from veomni.ops.config import get_ops_config, set_ops_config
 
-    monkeypatch.setattr(minimax_h3_dit, "IS_NPU_AVAILABLE", False)
     monkeypatch.setattr(minimax_h3_dit, "get_ulysses_sequence_parallel_group", lambda: None)
     # build_foundation_model installs process-global ops. Do not leak FA3 into later tests.
     previous = get_ops_config()

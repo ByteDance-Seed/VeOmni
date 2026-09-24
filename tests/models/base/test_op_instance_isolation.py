@@ -280,6 +280,7 @@ def test_minimax_h3_forward_keeps_construction_impls():
             audio_latent_shape=(2, 2),
         ).predictions[0],
         attn_paths=("dit.blocks.0.attn.veomni_attn",),
+        sticky_paths=("dit.blocks.0.attn.veomni_rope",),
         eager_cfg=_attn_cfg("sdpa"),
         alt_cfg=_attn_cfg("veomni_sdpa"),
         poison_cfg=_poison_cfg(),

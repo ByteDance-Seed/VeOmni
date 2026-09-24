@@ -27,7 +27,11 @@ from tests.models.compare import assert_outputs_and_grads_match, eager_ops_confi
 from tests.models.tiny_configs import tiny_minimax_h3_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_minimax_h3_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
-from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3Attention, VeomniRMSNorm
+from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import (
+    MiniMaxH3Attention,
+    VeomniRMSNorm,
+    _PackedBounds,
+)
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
     MiniMaxH3DiTModel,
 )
@@ -207,16 +211,24 @@ def test_minimax_h3_packed_sdpa_matches_independent_segments():
     torch.testing.assert_close(out_packed, torch.cat((out_a, out_b), dim=0), atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
 
-def test_minimax_h3_sdpa_packed_uses_block_diag_mask_not_varlen_kwargs():
+def test_minimax_h3_sdpa_packed_uses_host_slices_not_varlen_kwargs(monkeypatch):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_dit
+
     attn = _tiny_attention()
     captured: dict = {}
+    orig = minimax_h3_dit._sdpa_varlen_attention
 
-    def record(_module, query, _key, _value, attention_mask=None, **kwargs):
-        captured["attention_mask"] = attention_mask
-        captured.update(kwargs)
-        return query.transpose(1, 2), None
+    def record(q, k, v, cu_seqlens, softmax_scale, compatibility_mode=False):
+        captured["cu_seqlens"] = cu_seqlens
+        captured["compatibility_mode"] = compatibility_mode
+        return orig(q, k, v, cu_seqlens, softmax_scale, compatibility_mode)
 
-    attn.veomni_attn = record
+    monkeypatch.setattr(minimax_h3_dit, "_sdpa_varlen_attention", record)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("SDPA packed must not dispatch through veomni_attn")
+
+    attn.veomni_attn = boom
     hidden = torch.randn(6, 16)
     attn(
         hidden,
@@ -226,18 +238,19 @@ def test_minimax_h3_sdpa_packed_uses_block_diag_mask_not_varlen_kwargs():
         max_seqlen=4,
         valid_seqlen=6,
     )
-    assert captured["attention_mask"] is not None
-    assert captured["attention_mask"].shape == (1, 1, 6, 6)
-    assert "cu_seq_lens_q" not in captured
-    assert "cu_seq_lens_k" not in captured
+    assert captured["cu_seqlens"].tolist() == [0, 2, 6]
+    assert captured["compatibility_mode"] is False
 
 
-def test_minimax_h3_flash2_bind_passes_varlen_kwargs():
+def test_minimax_h3_flash2_bind_defers_until_packed_bounds():
     ops = eager_ops_config()
     ops.attn_implementation = "flash_attention_2"
     with ops_config_scope(ops):
         attn = MiniMaxH3Attention(hidden_size=16, num_attention_heads=2, attention_head_dim=8, qk_norm_eps=1e-5)
-    assert attn.veomni_attn.impl == "flash_attention_2"
+    assert attn.veomni_attn.impl == "sdpa"
+    assert attn.veomni_rope.op == "rope"
+    assert attn.veomni_rope.variant == "partial"
+
     captured: dict = {}
 
     def record(_module, query, _key, _value, attention_mask=None, **kwargs):
@@ -246,12 +259,13 @@ def test_minimax_h3_flash2_bind_passes_varlen_kwargs():
         return query.transpose(1, 2), None
 
     attn.veomni_attn = record
+    attn.config._attn_implementation = "veomni_flash_attention_2"
     hidden = torch.randn(6, 16)
     attn(
         hidden,
         rope_cos=None,
         rope_sin=None,
-        cu_seqlens=torch.tensor([0, 2, 6], dtype=torch.int32),
+        cu_seqlens=_PackedBounds(torch.tensor([0, 2, 6], dtype=torch.int32), (0, 2, 6)),
         max_seqlen=4,
         valid_seqlen=6,
     )
@@ -260,6 +274,35 @@ def test_minimax_h3_flash2_bind_passes_varlen_kwargs():
     assert captured["max_length_k"] == 4
     assert captured["cu_seq_lens_q"].tolist() == [0, 2, 6]
     assert captured["cu_seq_lens_k"].tolist() == [0, 2, 6]
+
+
+def test_minimax_h3_video_vae_attention_uses_partial_rope():
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_video_vae import Attention
+
+    with ops_config_scope(_sdpa_ops_config()):
+        attn = Attention(heads=2, dim_head=8, qk_norm_type=None)
+    assert attn.veomni_rope.op == "rope"
+    assert attn.veomni_rope.variant == "partial"
+
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 4, 16)
+    cos = torch.randn(2, 4, 6)
+    sin = torch.randn(2, 4, 6)
+    captured: dict = {}
+    orig = attn.veomni_rope
+
+    def record(query, key, rope_cos, rope_sin, unsqueeze_dim=1):
+        captured["unsqueeze_dim"] = unsqueeze_dim
+        captured["q_shape"] = tuple(query.shape)
+        captured["cos_shape"] = tuple(rope_cos.shape)
+        return orig(query, key, rope_cos, rope_sin, unsqueeze_dim=unsqueeze_dim)
+
+    attn.veomni_rope = record
+    out = attn(hidden, rotary_pos_emb=(cos, sin))
+    assert out.shape == hidden.shape
+    assert captured["unsqueeze_dim"] == 2
+    assert captured["q_shape"] == (2, 4, 2, 8)
+    assert captured["cos_shape"] == (2, 4, 6)
 
 
 def test_minimax_h3_pipeline_constructs_without_weights():
