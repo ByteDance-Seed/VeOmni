@@ -94,6 +94,12 @@ and patch construction. Qwen3-VL/Qwen3.5 chat templates compute frame times as
 patch. This uses the source's average FPS; exact timing for variable-frame-rate
 containers would require retaining decoder presentation timestamps separately.
 
+The Qwen-Omni transform also forwards this metadata with `do_sample_frames=False`.
+Its processors use Hugging Face `VideoMetadata.sampled_fps` to calculate
+`video_second_per_grid = temporal_patch_size / sampled_fps` for audio/video token
+interleaving and position precomputation. This accounts for frame-count limits
+without adding fields to VeOmni metadata.
+
 ### Spatial Resize Parameters
 
 | Parameter | Description |
