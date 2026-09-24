@@ -94,6 +94,18 @@ def test_gradient_accumulation_averages_micro_batch_gradients():
     torch.testing.assert_close(_accumulate_grads(2), _accumulate_grads(1))
 
 
+def test_an_exhausted_iterator_does_not_count_a_step():
+    """``train`` catches the ``StopIteration`` and runs ``epoch_end``, whose
+    checkpoints (and a later resume) read ``global_step``."""
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.state = TrainerState(global_step=3)
+
+    with pytest.raises(StopIteration):
+        trainer.train_step(iter(()))
+
+    assert trainer.state.global_step == 3
+
+
 def test_multi_lr_scheduler_without_schedulers_reports_zero_lr():
     assert MultiLRScheduler({}).get_last_lr() == [0.0]
 

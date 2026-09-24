@@ -616,9 +616,10 @@ class OmniTrainer:
         return total_loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> None:
-        self.state.global_step += 1
-
+        # Fetch first: an iterator that runs dry before ``train_steps`` raises
+        # here, and must not leave a step counted that never ran.
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        self.state.global_step += 1
         self._callbacks(stage="step_begin", micro_batches=micro_batches)
         if self.args.train.sync_each_train_step:
             synchronize()
