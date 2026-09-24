@@ -1,10 +1,12 @@
 """Qwen-Image joint attention follows ``attn_implementation`` instead of always running SDPA."""
 
+from functools import wraps
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import modeling_flash_attention_utils as hf_flash_utils
 
 from veomni.arguments import OpsImplementationConfig
@@ -14,6 +16,7 @@ from veomni.models.diffusers.qwen_image.qwen_image_transformer.configuration_qwe
     QwenImageTransformer2DModelConfig,
 )
 from veomni.ops.kernels.attention import flash
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 FLASH_CASES = [
@@ -37,7 +40,7 @@ def tiny_config():
     )
 
 
-def build(attn_implementation):
+def build(attn_implementation, *, device="cpu", dtype="float32"):
     ops = OpsImplementationConfig(
         attn_implementation=attn_implementation,
         rms_norm_implementation="eager",
@@ -47,7 +50,7 @@ def build(attn_implementation):
         moe_implementation="eager",
         load_balancing_loss_implementation="eager",
     )
-    return build_foundation_model(tiny_config(), init_device="cpu", torch_dtype="float32", ops_implementation=ops)
+    return build_foundation_model(tiny_config(), init_device=device, torch_dtype=dtype, ops_implementation=ops)
 
 
 def processor(model):
@@ -135,14 +138,17 @@ def test_unsupported_attn_implementation_is_rejected(attn_implementation):
 
 def run_attention(model, seed=0, masked=True):
     """Joint attention with optional text padding in the middle of the joint sequence."""
-    generator = torch.Generator().manual_seed(seed)
+    parameter = next(model.parameters())
+    generator = torch.Generator(device=parameter.device).manual_seed(seed)
+    tensor_kwargs = {"device": parameter.device, "dtype": parameter.dtype}
     batch, text_len, image_len, dim = 2, 5, 6, 16
-    image = torch.randn(batch, image_len, dim, generator=generator, requires_grad=True)
-    text = torch.randn(batch, text_len, dim, generator=generator, requires_grad=True)
-    text_mask = torch.ones(batch, text_len, dtype=torch.bool)
+    image = torch.randn(batch, image_len, dim, generator=generator, requires_grad=True, **tensor_kwargs)
+    text = torch.randn(batch, text_len, dim, generator=generator, requires_grad=True, **tensor_kwargs)
+    text_mask = torch.ones(batch, text_len, dtype=torch.bool, device=parameter.device)
     if masked:
         text_mask[1, 3:] = False
-    joint_mask = torch.cat([text_mask, torch.ones(batch, image_len, dtype=torch.bool)], dim=1) if masked else None
+    image_mask = torch.ones(batch, image_len, dtype=torch.bool, device=parameter.device)
+    joint_mask = torch.cat([text_mask, image_mask], dim=1) if masked else None
     attn = model.transformer_blocks[0].attn
     image_out, text_out = attn.processor(attn, image, encoder_hidden_states=text, attention_mask=joint_mask)
     return image, text, image_out, text_out, text_mask
@@ -178,6 +184,59 @@ def test_flash_path_matches_sdpa_on_valid_tokens(flash_calls, requested, resolve
         assert (parameter.grad is None) == (ref_parameter.grad is None)
         if parameter.grad is not None:
             torch.testing.assert_close(parameter.grad, ref_parameter.grad)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Real FA2 varlen execution requires CUDA")
+def test_real_fa2_varlen_matches_sdpa_on_valid_tokens(monkeypatch):
+    """Run real FA2 forward/backward with mid-sequence padding, independently of the CPU oracle."""
+    import flash_attn
+
+    # Force real kernel loading and restore Transformers' process-wide cache after this test.
+    for name in (
+        "_loaded_implementation",
+        "_flash_fn",
+        "_flash_varlen_fn",
+        "_flash_with_kvcache_fn",
+        "_pad_fn",
+        "_unpad_fn",
+        "_process_flash_kwargs_fn",
+    ):
+        monkeypatch.setattr(hf_flash_utils, name, None)
+    calls = []
+    real_varlen = flash_attn.flash_attn_varlen_func
+    device = get_device_type()
+
+    @wraps(real_varlen)
+    def record_varlen(q, k, v, **kwargs):
+        calls.append(kwargs)
+        assert q.device.type == device
+        assert q.dtype == torch.bfloat16
+        assert q.shape == (20, 2, 8)  # 11 + 9 kept tokens, not a dense batch or a valid-key prefix
+        return real_varlen(q, k, v, **kwargs)
+
+    monkeypatch.setattr(flash_attn, "flash_attn_varlen_func", record_varlen)
+    torch.manual_seed(0)
+    reference = build("eager", device=device, dtype="bfloat16")
+    model = build("flash_attention_2", device=device, dtype="bfloat16")
+    model.load_state_dict(reference.state_dict())
+
+    # Do not let native SDPA choose a fused kernel as the reference.
+    with sdpa_kernel(backends=[SDPBackend.MATH]):
+        ref_image, ref_text, ref_image_out, ref_text_out, text_mask = run_attention(reference)
+    image, text, image_out, text_out, _ = run_attention(model)
+    (call,) = calls
+    assert call["cu_seqlens_q"].tolist() == call["cu_seqlens_k"].tolist() == [0, 11, 20]
+    assert call["max_seqlen_q"] == call["max_seqlen_k"] == 11
+    torch.testing.assert_close(image_out, ref_image_out, rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(text_out[text_mask], ref_text_out[text_mask], rtol=2e-2, atol=2e-3)
+    (image_out.float().square().sum() + text_out[text_mask].float().square().sum()).backward()
+    (ref_image_out.float().square().sum() + ref_text_out[text_mask].float().square().sum()).backward()
+    torch.testing.assert_close(image.grad, ref_image.grad, rtol=3e-2, atol=5e-3)
+    torch.testing.assert_close(text.grad, ref_text.grad, rtol=3e-2, atol=5e-3)
+    for parameter, ref_parameter in zip(model.parameters(), reference.parameters()):
+        assert (parameter.grad is None) == (ref_parameter.grad is None)
+        if parameter.grad is not None:
+            torch.testing.assert_close(parameter.grad, ref_parameter.grad, rtol=3e-2, atol=5e-3)
 
 
 def test_attention_selection_is_instance_local(flash_calls):
