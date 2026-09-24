@@ -62,10 +62,11 @@ bash train.sh tasks/train_text.py configs/text/qwen3-moe.yaml \
 
 ```
 
-**Requirement:** `gradient_checkpointing.enable` must be `True` when using async
+**Recommendation:** `gradient_checkpointing.enable` should be `True` when using async
 activation offload. The feature relies on recomputation to avoid storing intermediate
-activations on GPU. If gradient checkpointing is disabled, a `ValueError` will be
-raised at config validation time.
+activations on GPU. Without gradient checkpointing, hidden states are still offloaded
+but intermediate activations within each block persist on GPU, reducing the memory
+savings. No runtime error is raised if checkpointing is disabled.
 
 ## How It Works
 
