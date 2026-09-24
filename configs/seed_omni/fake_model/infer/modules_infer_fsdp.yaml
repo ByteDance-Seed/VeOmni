@@ -7,8 +7,6 @@ fake_module_a:
     init_device: cuda # ddp doesn't need meta-init's broadcast dance
     fsdp_config:
       fsdp_mode: ddp
-    gradient_checkpointing:
-      enable: false
 
 fake_module_b:
   model_path: fake_module_b
