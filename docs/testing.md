@@ -424,3 +424,9 @@ The following redundancies have been addressed:
 - **`tests/e2e/test_e2e_training.py`** uses real model weights and `exec_scripts.py`,
   while `test_e2e_parallel.py` uses toy configs and `prepare_exec_cmd`. These serve
   different purposes (smoke test vs equivalence) but the naming doesn't reflect this.
+
+## Encoder balance reverse test
+
+`tests/parallel/encoder_data_balance/test_balance_reverse.py` defaults to eight
+ranks, as in CI. Set `VEOMNI_BALANCE_WORLD_SIZE=4` for a smaller test machine;
+the worker derives its DP topology from the torchrun world size.
