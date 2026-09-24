@@ -22,6 +22,9 @@ logger = logging.get_logger(__name__)
 
 ENV_DEFAULTS = {
     "MODELING_BACKEND": "veomni",
+    # Kill-switch for external ops-backend plugins (veomni.ops_backends entry
+    # points). "0" restores built-in-backends-only behavior exactly.
+    "VEOMNI_OPS_PLUGINS": "1",
 }
 
 
