@@ -434,6 +434,72 @@ class GradientCheckpointingConfig:
             )
         },
     )
+    recompute_last_n_layers: int = field(
+        default=-1,
+        metadata={
+            "help": (
+                "How many layers recompute, counted from the last block: -1 = "
+                "all layers (default), 0 = none, N = the last N layers. Values "
+                "above the model depth mean all layers. Applies to every model: "
+                "the framework finds the block stack itself (_no_split_modules / "
+                "basic_modules) and folds sibling stacks into one sequence. A "
+                "model with several stacks (a VLM tower beside the decoder) "
+                "counts the trainable one, the one with more blocks if both "
+                "train; list a class in model.basic_modules to count that one "
+                "instead."
+            )
+        },
+    )
+    selective_n_layers: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Selective activation checkpointing (SAC): how many of the "
+                "recomputed layers run SAC instead of full recompute, counted "
+                "from the front of the recompute range. 0 = off (default), N = "
+                "the first N recomputed layers, a value at or above the model "
+                "depth = every recomputed layer. Requires enable=True and "
+                "enable_reentrant=False; on a 20-layer model with "
+                "recompute_last_n_layers=-1, 10 = layers 0-9 SAC, 10-19 full "
+                "recompute. Applies to every model that checkpoints through HF "
+                "layers or through self._gradient_checkpointing_func; a model "
+                "calling torch.utils.checkpoint directly is reported and skipped."
+            )
+        },
+    )
+    selective_ops: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Extra operator strings to keep (MUST_SAVE) under selective mode, "
+                "e.g. ['aten._scaled_dot_product_attention.default']. Empty = auto default set."
+            )
+        },
+    )
+
+    def __post_init__(self) -> None:
+        # YAML values reach the dataclass untyped (the parser casts CLI args only),
+        # so a quoted "10" would otherwise fail much later, comparing against an
+        # int in the policy builder.
+        for name in ("recompute_last_n_layers", "selective_n_layers"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    f"model.accelerator.gradient_checkpointing.{name} must be an integer, "
+                    f"got {value!r} ({type(value).__name__})"
+                )
+        # Same reason: a bare operator string would be iterated character by
+        # character by the op resolver (one warning per letter), so normalise it
+        # and reject anything that is not a sequence of names.
+        if self.selective_ops is None:
+            self.selective_ops = []
+        elif isinstance(self.selective_ops, str):
+            self.selective_ops = [self.selective_ops]
+        elif not isinstance(self.selective_ops, list):
+            raise ValueError(
+                "model.accelerator.gradient_checkpointing.selective_ops must be a list of operator names, "
+                f"got {self.selective_ops!r} ({type(self.selective_ops).__name__})"
+            )
 
 
 @dataclass
