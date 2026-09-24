@@ -438,7 +438,7 @@ def _chunk_loss_dispatch(
         )
         return None, None, FusedLinearAuxOutput(log_probs=log_probs, entropy=entropy)
 
-    loss, logits_out = chunk_loss_function(*args, **kwargs)
+    loss, logits_out = chunk_loss_function(*args, chunk_size=chunk_size, **kwargs)
     return loss, logits_out, None
 
 
