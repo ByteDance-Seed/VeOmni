@@ -1321,6 +1321,15 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
+    qsa_indexer_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "Qwen4-Exp QSA token-selection indexer. 'eager' (default) uses "
+            "the exact HuggingFace reference. 'triton' uses the fused NPU-only kernel "
+            "and splits packed varlen batches at cu_seq_lens_q boundaries. A non-eager "
+            "value on hardware without a matching backend raises at OpSlot bind time."
+        },
+    )
     dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = field(
         default="eager",
         metadata={"help": "DeepSeek sparse attention top-k indexer implementation: 'eager', 'cudnn', or 'tilelang'."},
