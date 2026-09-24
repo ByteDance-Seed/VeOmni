@@ -423,9 +423,9 @@ def parallelize_model_fsdp2(
             if parallel_state.dp_replicate_enabled:
                 raise NotImplementedError("Persistent ExtraParallel parameters do not support HSDP replicas yet.")
             if parallel_state.sp_enabled:
-                raise NotImplementedError(
-                    "Persistent ExtraParallel parameters do not support sequence parallelism yet."
-                )
+                allowed = parallel_plan.sequence_parallel_persistent_names
+                if not persistent_para_names.issubset(allowed):
+                    raise NotImplementedError("Persistent ExtraParallel SP requires model capability opt-in.")
             for para in persistent_para_names:
                 para_mesh = parallel_state.extra_parallel_fsdp_device_mesh[para]
                 flat_mesh = parallel_state.extra_parallel_flat_device_mesh[para]
