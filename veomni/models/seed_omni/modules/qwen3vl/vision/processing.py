@@ -29,6 +29,7 @@ import torch
 from transformers import Qwen2VLImageProcessor
 from transformers.models.qwen3_vl.video_processing_qwen3_vl import Qwen3VLVideoProcessor
 
+from ......data.seed_omni.utils.media_metadata import VIDEO_METADATA_KEY
 from ....utils.conversation import ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
 from .configuration import Qwen3VLVisionEncoderConfig
@@ -47,17 +48,44 @@ _OMNI_GRID = "_omni_grid"
 _SOURCE = "qwen3vl_vision"
 
 
-def _video_metadata(items: list, frames: list) -> list[dict]:
+def _video_metadata(items: list) -> list[dict]:
     """HF ``video_metadata`` for the handed-over (already decoded) frames.
 
-    The data layer (``seed_omni/utils/video.load_video``) pre-trims each clip to
-    ``mm_configs.fps`` purely as a memory bound, so the frames passed here are a
-    self-contained clip whose *source* fps **is** ``VideoInputs.video_fps``. We
-    forward that as the metadata fps; the HF ``Qwen3VLVideoProcessor`` then
-    sub-samples to its own authoritative ``self.fps`` (the model's target rate).
-    Without metadata it would default to ``fps=24`` and mangle the clip.
+    Forwards the source-axis timeline from the item's ``meta`` verbatim. The
+    data layer (``seed_omni/utils/video.load_video``) already sampled the
+    frames, and this is paired with ``do_sample_frames=False`` at the call
+    site: a second sampling pass would re-pick frames, after which
+    ``frames_indices`` describes a frame set the vision tower never saw and
+    every timestamp derived from it is wrong. That is the second half of the
+    bug PR #1165 fixed on the BaseTrainer path
+    (``veomni/data/data_transform.py``), and it bites even when the rates look
+    equal — a 25 fps source trimmed to "2 fps" lands at 2.083 fps, enough for
+    the processor to drop a frame.
+
+    The processor still does its spatial preprocessing and patch construction,
+    and pads the frame count up to a whole ``temporal_patch_size``.
+    :meth:`VideoMetadata.frame_timestamps` pads the indices the same way, so
+    the two stay in step.
     """
-    return [{"total_num_frames": f.shape[0], "fps": it.value.video_fps} for it, f in zip(items, frames)]
+    declared = []
+    for it in items:
+        video_metadata = (it.meta or {}).get(VIDEO_METADATA_KEY)
+        if video_metadata is None:
+            # Named here rather than surfacing as a bare KeyError from inside a
+            # DataLoader worker: every producer of a video item owes this key.
+            raise ValueError(
+                f"qwen3vl_vision: a video item carries no meta[{VIDEO_METADATA_KEY!r}], so the frames "
+                "cannot be placed on the source clip's timeline. Video items must come from "
+                "veomni/data/seed_omni/utils/video.load_video (or state the same metadata themselves)."
+            )
+        declared.append(
+            {
+                "total_num_frames": video_metadata.total_num_frames,
+                "fps": video_metadata.fps,
+                "frames_indices": video_metadata.frames_indices,
+            }
+        )
+    return declared
 
 
 def _store_patches(items: list, pixel_values: torch.Tensor, grid_thw: torch.Tensor, dtype: Any) -> None:
@@ -135,9 +163,16 @@ class Qwen3VLVisionPreprocessor(ModulePreprocessorBase):
                     out = self._image_processor(images=[it.value for it in sample_image_items], return_tensors="pt")
                     self._store(sample_image_items, out["pixel_values"], out["image_grid_thw"])
                 if sample_video_items:
+                    # Frames only: Qwen3-VL has no audio modality, so a clip's
+                    # ``VideoInputs.audio`` is not for this tower and is skipped.
+                    # ``_store`` then replaces ``value`` with patches, so a
+                    # module that does want the waveform has to run before this.
                     frames = [it.value.video for it in sample_video_items]
                     out = self._video_processor(
-                        videos=frames, video_metadata=_video_metadata(sample_video_items, frames), return_tensors="pt"
+                        videos=frames,
+                        video_metadata=_video_metadata(sample_video_items),
+                        do_sample_frames=False,
+                        return_tensors="pt",
                     )
                     self._store(sample_video_items, out["pixel_values_videos"], out["video_grid_thw"])
                 saw_real_media = True

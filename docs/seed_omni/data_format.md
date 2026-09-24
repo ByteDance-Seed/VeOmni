@@ -43,14 +43,33 @@ placeholder; `seedomni_transform` pairs them with `images[0]`, `images[1]`, …
 in order, and likewise per modality.
 
 Audio is decoded **at the clip's own sampling rate**, which the resulting item
-declares in `meta["sampling_rate"]`. Do not resample in your source: the
+states in `meta["audio_metadata"].sampling_rate` — the same spelling whether
+the sound arrives as its own item or inside a video. Do not resample in your
+source: the
 modules that read a clip disagree on what rate they want (a Qwen3-Omni audio
 tower runs at 16 kHz, the codec that turns assistant speech into talker targets
 at 24 kHz) and each converts for itself. The rate is also what places a clip on
 a shared wall clock against video under TMRoPE, so a wrong one is a silent
 alignment error rather than an audio-quality one. wav / flac / ogg / mp3 decode
 directly; m4a / aac / wma fall back to `audioread` (ffmpeg or gstreamer,
-whichever the machine has).
+whichever the machine has). A module that converts for itself must leave
+`meta["audio_metadata"]` on the decode axis — the clip is the same number of
+seconds long at any rate, and seconds are what the shared timeline is in.
+
+Video is decoded and frame-sampled once, in the data layer, and the item states
+the *source* clip's timeline in `meta["video_metadata"]`: its `fps`, its frame
+count, and the source-frame index of every frame kept. Ask it for times
+(`frame_timestamps()`, `duration`) rather than dividing those indices
+yourself — see `docs/seed_omni/av_video_design.md` for why that division is the
+one thing worth centralising.
+
+A video stored as a list of pre-decoded frames (PIL images or encoded image
+bytes) has no container to read a rate from, so the source must declare the
+rate the frames were taken at via `data.mm_configs.frames_fps`. It is the
+list's *source* rate — `fps` still picks which of those frames are kept — and
+there is no default: an undeclared list is refused, because any guess puts
+every frame on a clock that reads as fact. A container that states no frame
+rate is refused for the same reason.
 
 An encoder's window caps clip length — 30 s for the Qwen3-Omni tower — and a
 longer clip is **refused** rather than truncated, because a cut encoder input
@@ -217,8 +236,8 @@ for the full convert → train → resume → infer pipeline.
 ## Custom datasets
 
 Implement a preprocessor in `veomni/data/seed_omni/preprocess.py` returning
-`(constructed, image_refs, video_refs, audio_refs)`, where `constructed` is the
-internal tuple form:
+`(constructed, media_refs)`, where `constructed` is the internal tuple form and
+`media_refs` keys the sample's media refs **by the item type they pair with**:
 
 ```python
 (
@@ -226,14 +245,28 @@ internal tuple form:
         ["user", ("text", "..."), ("image", None), ("text", "...")],
         ["assistant", ("image", None), ("text", "...")],
     ],
-    image_refs,   # one per ("image", None), in order
-    [],           # video_refs
-    [],           # audio_refs
+    {"image": image_refs},   # one ref per ("image", None) entry, in order
 )
 ```
 
-A 3-tuple without `audio_refs` is still accepted and read as "this source has
-no audio", so a preprocessor written before audio existed keeps working.
+An absent key means the sample has none of that modality, so a text-only
+preprocessor returns `{}` rather than naming empty lists. Keyed rather than
+positional because the modality list keeps growing: adding one is a new key
+plus a fetcher in `MEDIA_FETCHERS` (`veomni/data/seed_omni/utils/media.py`), not
+a wider tuple in every preprocessor and every unpack site. A key with no
+registered fetcher is refused by name rather than silently dropped.
+
+That table is the single decode path, shared with inference request building
+(`OmniProcessor.__call__` → `fetch_media` → `build_conversation`), which is what
+makes the same clip mean the same thing on both sides: same payload type, same
+metadata on `item.meta`. Adding a modality there serves training and inference
+at once. Request building used to load media its own way and attach nothing, so
+an audio item built for inference carried no sampling rate — a fact its
+consumers require and cannot recover from the samples.
+
+A preprocessor still returning the old
+`(constructed, image_refs, video_refs[, audio_refs])` raises a `ValueError`
+naming the source and the migration.
 
 Register with `@SEED_OMNI_PREPROCESSOR_REGISTRY.register("your_source")` and set
 `source_name: your_source` in the dataset config. Keep the same rules: route by

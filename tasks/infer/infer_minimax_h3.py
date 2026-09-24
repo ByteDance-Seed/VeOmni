@@ -44,8 +44,8 @@ write_video_audio(
     video=video,
     audio=audio,
     output_path="t2va.mp4",
-    fps=24,
-    audio_sample_rate=32000,
+    fps=pipe.frame_rate,
+    audio_sample_rate=pipe.audio_vae.sample_rate,
 )
 
 # Text + First Frame + Last Frame -> Video + Audio
@@ -67,6 +67,6 @@ write_video_audio(
     video=video,
     audio=audio,
     output_path="fl2va.mp4",
-    fps=24,
-    audio_sample_rate=32000,
+    fps=pipe.frame_rate,
+    audio_sample_rate=pipe.audio_vae.sample_rate,
 )

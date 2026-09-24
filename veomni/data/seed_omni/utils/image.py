@@ -28,8 +28,9 @@ the whole point.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from io import BytesIO
-from typing import ByteString, Union
+from typing import Any, ByteString, Union
 
 import numpy as np
 import requests
@@ -117,4 +118,36 @@ def pil_to_uint8_tensor(image: Image.Image) -> torch.Tensor:
     return tensor
 
 
-__all__ = ["ImageInput", "load_image", "resize_to_max_pixels", "fetch_images", "pil_to_uint8_tensor"]
+def save_image(path: str, image: Image.Image | torch.Tensor, meta: Mapping[str, Any] | None = None) -> None:
+    """Write one generated image.
+
+    Takes a PIL image (what a vision decoder emits) or the ``(C, H, W) uint8``
+    tensor :func:`pil_to_uint8_tensor` produces on the way in. ``meta`` is the
+    item's whole ``ConversationItem.meta``, accepted so every saver has one call
+    shape; an image states nothing there that changes how it is written.
+
+    A non-uint8 tensor is refused rather than cast, for the reason
+    :func:`~.video.save_video` refuses one: a decoder's ``[0, 1]`` floats all
+    truncate to 0, and a black image looks like a bad generation.
+    """
+    del meta
+    if isinstance(image, Image.Image):
+        image.save(path)
+        return
+    if not torch.is_tensor(image):
+        raise TypeError(f"save_image: the image item for {path} is a {type(image).__name__}, expected a PIL image.")
+    if image.ndim != 3 or image.shape[0] not in (1, 3, 4):
+        raise ValueError(
+            f"save_image: the image item for {path} has shape {tuple(image.shape)}, which is not one "
+            f"(C, H, W) image. Emit one item per image."
+        )
+    if image.dtype != torch.uint8:
+        raise ValueError(
+            f"save_image: the image item for {path} holds {image.dtype} pixels, expected uint8. Convert to "
+            f"8-bit pixels first (a [0, 1] float image needs scaling by 255, not a cast)."
+        )
+    array = image.detach().cpu().permute(1, 2, 0).numpy()
+    Image.fromarray(array[..., 0] if array.shape[-1] == 1 else array).save(path)
+
+
+__all__ = ["ImageInput", "load_image", "resize_to_max_pixels", "fetch_images", "pil_to_uint8_tensor", "save_image"]

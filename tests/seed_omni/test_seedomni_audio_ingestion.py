@@ -26,7 +26,7 @@ import torch
 from veomni.data.seed_omni.preprocess import SEED_OMNI_PREPROCESSOR_REGISTRY, conv_preprocess
 from veomni.data.seed_omni.seedomni_transform import process_seedomni_example
 from veomni.data.seed_omni.utils import audio as audio_utils
-from veomni.data.seed_omni.utils.audio import SAMPLING_RATE_KEY, load_audio
+from veomni.data.seed_omni.utils.audio import AUDIO_METADATA_KEY, AudioMetadata, load_audio
 
 
 def _wav_bytes(seconds: float, rate: int, channels: int = 1) -> bytes:
@@ -60,7 +60,7 @@ def test_a_clip_arrives_at_its_own_rate_not_a_normalised_one():
     ]
     audio = next(item for item in items if item.type == "audio")
 
-    assert audio.meta[SAMPLING_RATE_KEY] == 22050
+    assert audio.meta[AUDIO_METADATA_KEY].sampling_rate == 22050
     assert audio.value.dtype == np.float32
     assert audio.value.shape == (33075,)
 
@@ -72,7 +72,11 @@ def test_the_declared_rate_and_the_sample_count_agree_on_the_duration():
     ]
     audio = next(item for item in items if item.type == "audio")
 
-    assert audio.value.size / audio.meta[SAMPLING_RATE_KEY] == pytest.approx(2.0, abs=1e-3)
+    metadata = audio.meta[AUDIO_METADATA_KEY]
+    assert audio.value.size / metadata.sampling_rate == pytest.approx(2.0, abs=1e-3)
+    # The item states the duration itself, so a consumer reading the clock does
+    # not have to still be holding the waveform to work it out.
+    assert metadata.duration_seconds == pytest.approx(2.0, abs=1e-3)
 
 
 def test_a_stereo_file_is_downmixed_where_its_layout_is_known():
@@ -191,6 +195,12 @@ def test_a_repeated_ref_is_decoded_once_but_not_shared():
     assert decodes == 1
     assert loaded[0][0] is not loaded[1][0]
     assert np.array_equal(loaded[0][0], loaded[1][0])
+    assert loaded[0][1][AUDIO_METADATA_KEY] == loaded[1][1][AUDIO_METADATA_KEY]
+
+
+def _rate_meta(rate: int) -> dict:
+    """An emitted audio item's meta, which is what ``save_audio`` is handed."""
+    return {AUDIO_METADATA_KEY: AudioMetadata(sampling_rate=rate)}
 
 
 def test_a_generated_waveform_is_written_however_the_vocoder_shaped_it(tmp_path):
@@ -205,7 +215,7 @@ def test_a_generated_waveform_is_written_however_the_vocoder_shaped_it(tmp_path)
     tone = np.sin(2 * np.pi * 220 * np.arange(frames) / rate).astype(np.float32)
     path = tmp_path / "generated_audio_0.wav"
 
-    audio_utils.save_audio(str(path), torch.from_numpy(tone).to(torch.bfloat16)[None, None, :], rate)
+    audio_utils.save_audio(str(path), torch.from_numpy(tone).to(torch.bfloat16)[None, None, :], _rate_meta(rate))
 
     written, written_rate = load_audio(str(path))
     assert written_rate == rate
@@ -218,8 +228,8 @@ def test_a_generated_waveform_is_written_however_the_vocoder_shaped_it(tmp_path)
 def test_a_generated_clip_with_no_rate_is_refused_rather_than_written_at_a_guess(tmp_path):
     """A default rate writes a file that plays at the wrong speed, and nothing
     downstream can tell that apart from a model that generated it wrong."""
-    with pytest.raises(ValueError, match=SAMPLING_RATE_KEY):
-        audio_utils.save_audio(str(tmp_path / "generated_audio_0.wav"), torch.zeros(2400), None)
+    with pytest.raises(ValueError, match=AUDIO_METADATA_KEY):
+        audio_utils.save_audio(str(tmp_path / "generated_audio_0.wav"), torch.zeros(2400), {})
 
 
 def test_a_multi_channel_waveform_is_refused_by_name(tmp_path):
@@ -231,7 +241,7 @@ def test_a_multi_channel_waveform_is_refused_by_name(tmp_path):
     its shape, which is the whole diagnostic.
     """
     with pytest.raises(ValueError, match="not a single"):
-        audio_utils.save_audio(str(tmp_path / "generated_audio_0.wav"), torch.zeros(2, 2400), 24000)
+        audio_utils.save_audio(str(tmp_path / "generated_audio_0.wav"), torch.zeros(2, 2400), _rate_meta(24000))
 
 
 def test_an_empty_generated_clip_is_refused_rather_than_written_as_a_bare_header(tmp_path):
@@ -243,7 +253,7 @@ def test_an_empty_generated_clip_is_refused_rather_than_written_as_a_bare_header
     """
     path = tmp_path / "generated_audio_0.wav"
     with pytest.raises(ValueError, match="no samples"):
-        audio_utils.save_audio(str(path), torch.zeros(1, 1, 0), 24000)
+        audio_utils.save_audio(str(path), torch.zeros(1, 1, 0), _rate_meta(24000))
     assert not path.exists()
 
 
@@ -254,7 +264,7 @@ def test_a_one_sample_clip_is_mono_not_a_batching_mistake(tmp_path):
     per utterance" would send the reader looking for a batching bug.
     """
     path = tmp_path / "generated_audio_0.wav"
-    audio_utils.save_audio(str(path), torch.ones(1, 1, 1), 24000)
+    audio_utils.save_audio(str(path), torch.ones(1, 1, 1), _rate_meta(24000))
 
     samples, rate = load_audio(str(path))
     assert (samples.size, rate) == (1, 24000)
@@ -288,49 +298,78 @@ def test_fewer_clips_than_spoken_turns_is_refused_too():
 def _declared_rate_source():
     """A source that asserts a rate on the item meta, contradicting the file."""
     SEED_OMNI_PREPROCESSOR_REGISTRY["_declared_rate"] = lambda conversations, example, **kwargs: (
-        [["user", ("audio", None, {SAMPLING_RATE_KEY: 16000})]],
-        [],
-        [],
-        list(example["audios"]),
+        [["user", ("audio", None, {AUDIO_METADATA_KEY: AudioMetadata(sampling_rate=16000)})]],
+        {"audio": list(example["audios"])},
     )
     yield "_declared_rate"
     del SEED_OMNI_PREPROCESSOR_REGISTRY["_declared_rate"]
 
 
 @pytest.fixture
-def _three_tuple_source():
-    """A source registered for one test, and removed even if it fails.
+def _legacy_tuple_source():
+    """A source still on the positional-tuple contract, registered for one test.
 
     Via the local-override path rather than ``register``, which raises on a
     duplicate key and would make this file fail on a second collection while
     leaving the key visible to every later test in the process.
     """
-    SEED_OMNI_PREPROCESSOR_REGISTRY["_legacy_three_tuple"] = lambda conversations, example, **kwargs: (
+    SEED_OMNI_PREPROCESSOR_REGISTRY["_legacy_tuple"] = lambda conversations, example, **kwargs: (
         [["user", ("text", "hi")]],
         [],
         [],
     )
-    yield "_legacy_three_tuple"
-    del SEED_OMNI_PREPROCESSOR_REGISTRY["_legacy_three_tuple"]
+    yield "_legacy_tuple"
+    del SEED_OMNI_PREPROCESSOR_REGISTRY["_legacy_tuple"]
+
+
+@pytest.fixture
+def _unknown_modality_source():
+    """A source declaring refs for a modality that has no fetcher yet."""
+    SEED_OMNI_PREPROCESSOR_REGISTRY["_unknown_modality"] = lambda conversations, example, **kwargs: (
+        [["user", ("text", "hi")]],
+        {"action": [object()]},
+    )
+    yield "_unknown_modality"
+    del SEED_OMNI_PREPROCESSOR_REGISTRY["_unknown_modality"]
 
 
 def test_a_declared_rate_that_contradicts_the_file_is_refused(_declared_rate_source):
-    """The header wins any argument, so a disagreement is a false claim.
+    """The header is the only authority on the rate, so a preprocessor does not
+    get to declare one.
 
     Preferring the declared value would be a silent misplacement on TMRoPE's
-    clock rather than a clip that sounds wrong, which is why it stops the run.
+    clock rather than a clip that sounds wrong, and letting the decoded one
+    overwrite it silently would hide the preprocessor's false belief.
     """
-    with pytest.raises(ValueError, match="but the clip decodes at"):
+    with pytest.raises(ValueError, match=f"declares meta key\\(s\\) \\['{AUDIO_METADATA_KEY}'\\]"):
         process_seedomni_example({"source_name": _declared_rate_source, "audios": [_wav_bytes(0.5, 22050)]})
 
 
-def test_a_preprocessor_written_before_audio_existed_still_works(_three_tuple_source):
-    """The registry is an extension point, so widening it must not break it.
+def test_a_preprocessor_on_the_old_positional_contract_is_told_how_to_migrate(_legacy_tuple_source):
+    """The registry is an extension point — a preprocessor for a private corpus
+    lives outside this repo — so the break has to name itself.
 
-    A preprocessor for a private corpus lives outside this repo and returns the
-    older 3-tuple; that is read as "this source has no audio".
+    Left to unpack, a legacy 3-tuple would fail with a bare "too many values to
+    unpack" naming neither the source nor the new shape.
     """
-    assert conv_preprocess(_three_tuple_source, None, {}) == ([["user", ("text", "hi")]], [], [], [])
+    with pytest.raises(ValueError, match="expected \\(constructed, media_refs\\)") as excinfo:
+        conv_preprocess(_legacy_tuple_source, None, {})
+
+    message = str(excinfo.value)
+    assert _legacy_tuple_source in message
+    assert '{"image": image_refs' in message  # the migration it should do
+
+
+def test_refs_for_a_modality_with_no_fetcher_are_refused_by_name(_unknown_modality_source):
+    """A modality key the transform cannot decode would leave its turns
+    unpaired, surfacing much later as a count mismatch blaming the wrong thing.
+
+    This is the seam a new modality (action / 3d / camera) lands on: registering
+    a fetcher in ``MEDIA_FETCHERS`` is what makes the key decodable, and until
+    then the refs are refused rather than dropped.
+    """
+    with pytest.raises(ValueError, match="'action'.*has no fetcher"):
+        process_seedomni_example({"source_name": _unknown_modality_source, "conversations": [], "audios": []})
 
 
 def test_the_voice_assistant_layout_is_speech_in_text_out():

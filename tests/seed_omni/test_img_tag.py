@@ -9,8 +9,9 @@ Covers the model-agnostic data-layer work only:
   sequential image/video pairing; the preprocessor owns the ref-list layout.
 * Existing preprocessors tag their image entries (imagenet1k=gen,
   sharegpt4v=und, llava_video=und); text-only tulu stays untagged. Each
-  preprocessor returns ``(constructed, image_refs, video_refs)`` whose media
-  ref lengths match the flattened image/video entry counts.
+  preprocessor returns ``(constructed, media_refs)`` where ``media_refs`` is
+  keyed by item type and each list's length matches that modality's flattened
+  entry count.
 * The ``seed_edit_p23_multi_turn`` preprocessor emits the source/target/copy
   edit chain with correct roles and tags, and returns an expanded
   ``image_refs`` list (copy-image refs duplicated) so
@@ -54,6 +55,17 @@ def _fake_images(n: int) -> list[torch.Tensor]:
     return [torch.full((3, 2, 2), i, dtype=torch.uint8) for i in range(n)]
 
 
+def _media(**by_type) -> dict[str, list]:
+    """Decoded media in the shape ``_build_conversation_list`` takes.
+
+    Keyed by item type, each entry a ``(payload, meta)`` pair — what the
+    fetchers in ``MEDIA_FETCHERS`` return. Payloads are passed bare here and
+    paired with an empty meta, since these tests are about the layout rather
+    than about what any modality states.
+    """
+    return {type_: [(payload, {}) for payload in payloads] for type_, payloads in by_type.items()}
+
+
 def _fake_tensors_for_refs(refs) -> list[torch.Tensor]:
     # One distinct uint8 tensor per unique ref (by identity), so duplicate refs
     # (edit copy-images) decode to the same content — mirroring ``fetch_images``
@@ -73,15 +85,20 @@ def _build(source: str, conversations, example: dict):
 
     ``example`` carries raw image/video refs (opaque objects are fine — they are
     not decoded here); the helper builds distinct fake tensors keyed on ref
-    identity (one per unique ref) of the lengths the preprocessor reports via
-    ``image_refs`` / ``video_refs``, so the sequential pairing in
+    identity (one per unique ref) of the lengths the preprocessor reports in its
+    ``media_refs`` dict, so the sequential pairing in
     ``_build_conversation_list`` is exercised and duplicate copy-image refs
     resolve to identical content.
     """
-    constructed, image_refs, video_refs, _ = conv_preprocess(source, conversations, example)
-    images = _fake_tensors_for_refs(image_refs)
-    videos = [object() for _ in range(len(video_refs))]  # opaque VideoInputs stand-ins
-    items = _build_conversation_list(constructed, images, videos)
+    constructed, media_refs = conv_preprocess(source, conversations, example)
+    image_refs = media_refs.get("image", [])
+    video_refs = media_refs.get("video", [])
+    media = _media(
+        image=_fake_tensors_for_refs(image_refs),
+        # Videos are opaque payload stand-ins — nothing here reads a frame.
+        video=[object() for _ in video_refs],
+    )
+    items = _build_conversation_list(constructed, media)
     return constructed, image_refs, video_refs, items
 
 
@@ -181,41 +198,61 @@ def test_iter_desired_items_missing_meta_key_is_excluded_when_filter_set():
 
 def test_two_tuple_still_builds_with_empty_meta():
     constructed = [["user", ("text", "hi")], ["assistant", ("image", None)]]
-    items = _build_conversation_list(constructed, _fake_images(1), [])
+    items = _build_conversation_list(constructed, _media(image=_fake_images(1)))
     assert items[0].type == "text" and items[0].value == "hi"
     assert items[1].type == "image" and items[1].meta == {}
     # Fill value 0 — sequential pairing of the first (only) image tensor.
     assert int(items[1].value.float().mean()) == 0
 
 
+def test_a_text_only_sample_needs_no_media_argument():
+    """What a text-only preprocessor's ``{}`` refs dict turns into: a build with
+    no media at all, rather than three empty lists it had to name."""
+    items = _build_conversation_list([["user", ("text", "hi")]])
+    assert [item.type for item in items] == ["text"]
+
+
 def test_three_tuple_meta_merges_into_item_meta():
     constructed = [["assistant", ("image", None, {_IMG_TAG_KEY: "gen", "extra": 7})]]
-    items = _build_conversation_list(constructed, _fake_images(1), [])
+    items = _build_conversation_list(constructed, _media(image=_fake_images(1)))
     assert items[0].meta == {_IMG_TAG_KEY: "gen", "extra": 7}
 
 
 def test_three_tuple_meta_does_not_alias_preprocessor_dict():
     src_meta = {_IMG_TAG_KEY: "edit"}
     constructed = [["assistant", ("image", None, src_meta)]]
-    items = _build_conversation_list(constructed, _fake_images(1), [])
+    items = _build_conversation_list(constructed, _media(image=[_fake_images(1)[0]]))
     items[0].meta["mutated"] = True
     assert "mutated" not in src_meta  # item meta is a copy, not the source dict
 
 
-def test_leftover_assert_fires_when_image_turns_underconsume():
-    # Pure sequential: 1 image turn but 2 tensors supplied → the leftover-image
-    # assert must catch the count mismatch.
+@pytest.mark.parametrize("type_", ["audio", "video"])
+def test_a_preprocessor_cannot_declare_a_key_the_fetcher_writes(type_):
+    """The decoded file is the only authority on its own timeline, for every
+    modality alike. Letting ``update`` silently overwrite the declaration would
+    hide a preprocessor that believes something the file contradicts."""
+    key = f"{type_}_metadata"
+    constructed = [["user", (type_, None, {key: "declared"})]]
+    media = {type_: [(object(), {key: "decoded"})]}
+
+    with pytest.raises(ValueError, match=f"declares meta key\\(s\\) \\['{key}'\\]"):
+        _build_conversation_list(constructed, media)
+
+
+def test_unused_media_is_refused_by_modality_and_count():
+    # Pure sequential: 1 image turn but 2 tensors supplied → the leftover check
+    # must catch the count mismatch and name which modality drifted.
     constructed = [["user", ("image", None)]]
-    with pytest.raises(AssertionError):
-        _build_conversation_list(constructed, _fake_images(2), [])
+    with pytest.raises(ValueError, match="1 unused image media"):
+        _build_conversation_list(constructed, _media(image=_fake_images(2)))
 
 
-def test_leftover_assert_fires_when_image_turns_overconsume():
-    # 2 image turns but only 1 tensor → next() raises StopIteration (the build
-    # itself must fail loudly rather than silently misaligning).
+def test_a_media_turn_with_nothing_left_to_pair_is_refused_by_modality():
+    """2 image turns but only 1 tensor. Named ValueError rather than a leaked
+    StopIteration, which dataset iteration would read as a finished epoch."""
     constructed = [["user", ("image", None)], ["assistant", ("image", None)]]
-    with pytest.raises((AssertionError, StopIteration, RuntimeError)):
-        _build_conversation_list(constructed, _fake_images(1), [])
+    with pytest.raises(ValueError, match="more image turn"):
+        _build_conversation_list(constructed, _media(image=_fake_images(1)))
 
 
 # ── existing preprocessors tag image entries ───────────────────────────────────
@@ -325,25 +362,27 @@ def test_tulu_rejects_system_message_without_user():
 
 
 def test_preprocessors_return_matching_refs():
-    # Non-edit preprocessors echo the sample's media refs unchanged so the
-    # transform's fetch_images/fetch_videos see a ref list whose length matches
-    # the flattened image/video entry count (no expansion needed).
+    # Non-edit preprocessors echo the sample's media refs unchanged so each
+    # fetcher sees a ref list whose length matches that modality's flattened
+    # entry count (no expansion needed). A modality the source has none of is
+    # an absent key, not an empty list — that is what lets a new modality be
+    # one new key rather than a wider tuple everywhere.
     img_ref = object()
     vid_ref = object()
 
-    _, image_refs, video_refs, _ = conv_preprocess("imagenet1k", "cat", {"images": [img_ref]})
-    assert image_refs == [img_ref] and video_refs == []
+    _, refs = conv_preprocess("imagenet1k", "cat", {"images": [img_ref]})
+    assert refs == {"image": [img_ref]}
 
     conv = [{"from": "human", "value": "<image>describe"}, {"from": "gpt", "value": "a cat"}]
-    _, image_refs, video_refs, _ = conv_preprocess("sharegpt4v_sft", conv, {"images": [img_ref]})
-    assert image_refs == [img_ref] and video_refs == []
+    _, refs = conv_preprocess("sharegpt4v_sft", conv, {"images": [img_ref]})
+    assert refs == {"image": [img_ref]}
 
-    _, image_refs, video_refs, _ = conv_preprocess("llava_video", conv, {"videos": [vid_ref]})
-    assert image_refs == [] and video_refs == [vid_ref]
+    _, refs = conv_preprocess("llava_video", conv, {"videos": [vid_ref]})
+    assert refs == {"video": [vid_ref]}
 
     tulu = {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]}
-    _, image_refs, video_refs, _ = conv_preprocess("tulu-3-sft-mixture", tulu, {})
-    assert image_refs == [] and video_refs == []
+    _, refs = conv_preprocess("tulu-3-sft-mixture", tulu, {})
+    assert refs == {}
 
 
 # ── seed_edit_p23_multi_turn preprocessor ──────────────────────────────────────
@@ -365,7 +404,8 @@ def test_seed_edit_multi_turn_chain_structure_three_targets():
     conv = _edit_conv(n_targets)
     refs = [f"img{i}" for i in range(1 + n_targets)]  # 4 distinct string refs
     example = {"images": refs}
-    constructed, image_refs, video_refs, _ = conv_preprocess("seed_edit_p23_multi_turn", conv, example)
+    constructed, refs_by_type = conv_preprocess("seed_edit_p23_multi_turn", conv, example)
+    image_refs = refs_by_type["image"]
 
     # Expected flattened chain: S0, instr1, T1, S1(copy), instr2, T2, S2(copy),
     # instr3, T3 (final, no copy).
@@ -390,7 +430,8 @@ def test_seed_edit_multi_turn_chain_structure_three_targets():
     n_image_entries = sum(1 for turn in constructed for e in turn[1:] if e[0] == "image")
     assert len(image_refs) == n_image_entries == 6
     assert image_refs == [refs[0], refs[1], refs[1], refs[2], refs[2], refs[3]]
-    assert video_refs == []
+    # An image-only source declares no other modality at all.
+    assert set(refs_by_type) == {"image"}
 
 
 def test_seed_edit_multi_turn_image_refs_expansion_matches_primaries_and_copies():
@@ -401,7 +442,8 @@ def test_seed_edit_multi_turn_image_refs_expansion_matches_primaries_and_copies(
     conv = _edit_conv(n_targets)
     refs = [object() for _ in range(1 + n_targets)]  # 4 distinct opaque refs
     example = {"images": refs}
-    _, image_refs, _, _ = conv_preprocess("seed_edit_p23_multi_turn", conv, example)
+    _, refs_by_type = conv_preprocess("seed_edit_p23_multi_turn", conv, example)
+    image_refs = refs_by_type["image"]
 
     assert image_refs == [refs[0], refs[1], refs[1], refs[2], refs[2], refs[3]]
     # Copies are the very same object as the preceding target's ref.
@@ -446,7 +488,8 @@ def test_seed_edit_multi_turn_last_target_has_no_copy_single_target():
         {"from": "gpt", "value": "<image>"},
     ]
     example = {"images": [object(), object()]}
-    constructed, image_refs, video_refs, _ = conv_preprocess("seed_edit_p23_multi_turn", conv, example)
+    constructed, refs_by_type = conv_preprocess("seed_edit_p23_multi_turn", conv, example)
+    image_refs = refs_by_type["image"]
     flat = [(e[0], turn[0], e[2].get(_IMG_TAG_KEY) if len(e) == 3 else None) for turn in constructed for e in turn[1:]]
     assert flat == [
         ("image", "user", "edit"),
@@ -456,7 +499,7 @@ def test_seed_edit_multi_turn_last_target_has_no_copy_single_target():
     # No copy emitted for the final (only) target → image_refs == the two primaries.
     assert len(image_refs) == 2
     assert image_refs == [example["images"][0], example["images"][1]]
-    assert video_refs == []
+    assert set(refs_by_type) == {"image"}
 
     _, _, _, items = _build("seed_edit_p23_multi_turn", conv, example)
     img_items = [it for it in items if it.type == "image"]
@@ -552,11 +595,17 @@ def test_fetch_videos_decodes_repeated_ref_once_and_returns_independent_copies(m
         nonlocal calls
         calls += 1
         assert ref == "same-video"
-        return video_utils.VideoInputs(
-            video=torch.full((2, 3, 2, 2), 13, dtype=torch.uint8),
-            video_fps=kwargs["fps"],
-            audio=np.ones((4,), dtype=np.float32),
-            audio_fps=16000.0,
+        return (
+            video_utils.VideoInputs(
+                video=torch.full((2, 3, 2, 2), 13, dtype=torch.uint8),
+                audio=np.ones((4,), dtype=np.float32),
+            ),
+            {
+                video_utils.VIDEO_METADATA_KEY: video_utils.VideoMetadata(
+                    fps=30.0, total_num_frames=31, frames_indices=[0, 15], requested_fps=kwargs["fps"]
+                ),
+                video_utils.AUDIO_METADATA_KEY: video_utils.AudioMetadata(sampling_rate=16000, num_samples=4),
+            },
         )
 
     monkeypatch.setattr(video_utils, "load_video", fake_load_video)
@@ -565,11 +614,16 @@ def test_fetch_videos_decodes_repeated_ref_once_and_returns_independent_copies(m
 
     assert calls == 1
     assert len(out) == 2
-    assert out[0] is not out[1]
-    assert torch.equal(out[0].video, out[1].video)
-    assert out[0].audio is not out[1].audio
+    (first, first_meta), (second, second_meta) = out
+    assert first is not second
+    assert torch.equal(first.video, second.video)
+    assert first.audio is not second.audio
+    # The metadata is copied too: it lands on a per-item meta dict that modules
+    # write into, so a shared instance would let the first writer reach the other.
+    assert first_meta[video_utils.VIDEO_METADATA_KEY] is not second_meta[video_utils.VIDEO_METADATA_KEY]
+    assert first_meta[video_utils.VIDEO_METADATA_KEY] == second_meta[video_utils.VIDEO_METADATA_KEY]
 
-    out[0].video[0, 0, 0, 0] = 255
-    out[0].audio[0] = 7.0
-    assert int(out[1].video[0, 0, 0, 0]) == 13
-    assert float(out[1].audio[0]) == 1.0
+    first.video[0, 0, 0, 0] = 255
+    first.audio[0] = 7.0
+    assert int(second.video[0, 0, 0, 0]) == 13
+    assert float(second.audio[0]) == 1.0

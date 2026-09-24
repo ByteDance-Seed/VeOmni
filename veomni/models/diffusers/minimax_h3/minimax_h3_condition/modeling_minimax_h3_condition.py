@@ -26,7 +26,10 @@ from .configuration_minimax_h3_condition import MiniMaxH3ConditionModelConfig
 logger = logging.get_logger(__name__)
 
 # VAE constraints
-_MINIMAX_H3_FRAME_RATE = 24
+# Public because it is not only an internal shape constraint: the rate the model
+# generates at is what a caller has to write the container at, and what a
+# SeedOmni ``VideoMetadata`` states for a generated clip.
+MINIMAX_H3_FRAME_RATE = 24
 _MINIMAX_H3_TIME_DIVISION_FACTOR = 17
 _MINIMAX_H3_TIME_DIVISION_REMAINDER = 5
 
@@ -416,7 +419,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
     @staticmethod
     def _make_silent_audio_latent(num_frames: int, device: torch.device) -> torch.Tensor:
         """Create a zero-filled audio latent tensor as placeholder."""
-        T_a = round(num_frames / _MINIMAX_H3_FRAME_RATE * 40)
+        T_a = round(num_frames / MINIMAX_H3_FRAME_RATE * 40)
         return torch.zeros(2, 32, T_a, device=device, dtype=torch.bfloat16)
 
     def _encode_keyframe_cond(self, keyframe_images, device: torch.device, video_latent_t: int) -> torch.Tensor:
