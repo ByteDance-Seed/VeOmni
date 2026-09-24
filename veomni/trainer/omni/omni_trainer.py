@@ -265,8 +265,13 @@ class OmniTrainer:
         self._init_callbacks()
 
     @staticmethod
-    def setup_distributed(args: OmniArguments) -> torch.device:
-        """Init process group, device, seed, and register orchestrator ParallelState."""
+    def setup_distributed(args: OmniArguments, *, save_launch_args: bool = True) -> torch.device:
+        """Init process group, device, seed, and register orchestrator ParallelState.
+
+        ``save_launch_args`` writes the resolved launcher args into
+        ``train.checkpoint.output_dir``; inference turns it off because it
+        produces no training artefacts.
+        """
         logger.info_rank0(json.dumps(asdict(args), indent=2))
 
         device_str = f"{get_device_type()}:{args.train.local_rank}"
@@ -286,7 +291,7 @@ class OmniTrainer:
         if args.train.local_rank == 0:
             helper.enable_third_party_logging()
 
-        if args.train.global_rank == 0:
+        if save_launch_args and args.train.global_rank == 0:
             save_args(args, args.train.checkpoint.output_dir)
 
         set_checkpoint_debug_enabled(args.model.accelerator.gradient_checkpointing.debug)

@@ -96,7 +96,7 @@ class OmniInferencer:
             for name in self.omni_model_runtime.module_names
         )
         if self._distributed:
-            self.device = OmniTrainer.setup_distributed(args)
+            self.device = OmniTrainer.setup_distributed(args, save_launch_args=False)
         helper.set_seed(args.infer.seed)
         self._build_model()
 
