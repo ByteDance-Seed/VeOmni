@@ -285,19 +285,35 @@ H3 implementation. Low-precision repeated-index reductions can vary even between
 serial repeats, so packed-gradient comparisons must also measure that baseline
 variability; a separate accumulation-precision fix must not silently change the
 single-sample path. Sample-local refiner execution is restricted to cross-sample
-packing; ordinary single-sample attention dispatch is preserved.
+packing.
 
 ### Attention and validation
 
-- `eager` / `sdpa`: explicit per-segment PyTorch SDPA reference path; main-DiT
-  projections and MLPs still operate on compact cross-sample rows.
-- `flash_attention_2` / `flash_attention_3` in `model.ops_implementation` resolve
-  to VeOmni's local FA2/FA3 backends, and `flash_attention_2_hub` /
-  `flash_attention_3_hub` to the Hugging Face Hub kernels
-  (`kernels-community/flash-attn2` / `flash-attn3`, version 1). Each main-DiT
-  layer uses one non-causal varlen call; refiner layers retain one call per
-  sample. The kernel is loaded on the first multi-sample forward and needs
-  BF16/FP16; unavailable kernels are not silently replaced with SDPA.
+`model.ops_implementation.attn_implementation` selects the DiT and token-refiner
+attention for single-sample (`M=1`, inference) and packed forwards alike:
+
+- `eager` / `sdpa`: explicit per-segment PyTorch SDPA reference path; in packed
+  batches, main-DiT projections and MLPs still operate on compact cross-sample rows.
+- `flash_attention_2` / `flash_attention_3` resolve to VeOmni's local FA2/FA3
+  backends, and `flash_attention_2_hub` / `flash_attention_3_hub` to the Hugging
+  Face Hub kernels (`kernels-community/flash-attn2` / `flash-attn3`, version 1).
+  All four load through `_load_veomni_flash_kernel` on the first forward, so a
+  local backend never imports `kernels` and a Hub backend never needs a local FA
+  package. Each attention layer makes one non-causal varlen call (packed
+  refiners keep one call per sample). FA needs BF16/FP16, and on CUDA an
+  unavailable kernel raises instead of falling back to SDPA.
+- On Ascend NPU, single-sample local FA2/FA3 warns and uses PyTorch SDPA; packed
+  batches still require the FlashAttention kernel. Hub backends are rejected on NPU.
+- Other values are rejected: Transformers refuses some (for example `flex_attention`)
+  at construction, and H3 rejects the rest on the first forward.
+
+`MINIMAX_H3_ATTENTION_IMPLEMENTATION` and the import-time auto-detection in
+`minimax_h3_core/core.py` no longer select the DiT attention; they still apply to
+the video/audio VAEs. Before this change the DiT ignored `attn_implementation`
+and auto-detected FA3 > FA2 > torch at `M=1`, so recipes that set `eager` (such as
+`configs/dit/minimax_h3_fl2va_offline.yaml` and `tasks/infer/infer_minimax_h3.py`)
+now run PyTorch SDPA. Set `flash_attention_3` to keep FA3; in a TinyRandom BF16
+check its single-sample outputs were bitwise equal to the old auto-selected FA3.
 
 `tests/models/test_minimax_h3_packing.py` uses a native tiny model on CPU to
 check packed-versus-serial outputs, losses and gradients (including mixed target
