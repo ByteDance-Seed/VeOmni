@@ -220,3 +220,14 @@ jobs:
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_trainer.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep2.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep_sharded_stream_load.py
+      - name: Run Qwen-Image-2.1 tests with upstream Diffusers support
+        env:
+          VEOMNI_REQUIRE_QWEN_IMAGE21: "1"
+        run: |
+          uv pip install --python .venv/bin/python --no-deps --reinstall \
+            "huggingface-hub==1.33.0" \
+            "git+https://github.com/huggingface/diffusers.git@bdc2bea37a36038c44452811610489ea30ede229"
+          .venv/bin/python -c \
+            "from diffusers import AutoencoderKLQwenImage21, QwenImage21Pipeline, QwenImage21Transformer2DModel; from huggingface_hub import resolve_revision"
+          .venv/bin/python -m pytest -s -x \
+            tests/models/test_qwen_image21.py tests/models/test_model_registry.py

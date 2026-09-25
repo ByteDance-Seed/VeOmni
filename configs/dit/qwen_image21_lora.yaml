@@ -1,0 +1,67 @@
+model:
+  model_path: Qwen/Qwen-Image-2.1/transformer
+  condition_model_path: Qwen/Qwen-Image-2.1
+  config_path: ./configs/model_configs/qwen_image21/qwen_image21_7b.json
+  condition_model_cfg:
+    height: 512
+    width: 512
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: eager
+  lora_config:
+    rank: 32
+    alpha: 32
+    lora_modules:
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_warmup_ratio: 0.01
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: cuda
+    dp_replicate_size: 1
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: ddp
+      mixed_precision:
+        enable: false
+    offload_config:
+      enable_activation: false
+data:
+  train_path: qwen_image_train
+  train_size: 1000000000000
+  dataloader:
+    type: native
+    drop_last: true
+  datasets_type: iterable
+  data_type: diffusion
+  max_seq_len: 4096
+  text_keys: text
+  dyn_bsz_buffer_size: 200
+  source_name: Qwen-Image
+train:
+  global_batch_size: 1
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.01
+  enable_full_determinism: false
+  empty_cache_steps: 100
+  checkpoint:
+    output_dir: qwen-image21-lora
+    manager: dcp
+    save_epochs: 1
+    save_hf_weights: true
+  max_steps: 500
+  num_train_epochs: 3
+  wandb:
+    enable: false
+    project: Qwen-Image-2.1
+    name: lora_qwen_image21

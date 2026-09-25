@@ -1,3 +1,4 @@
+import diffusers
 import pytest
 import torch
 
@@ -22,6 +23,9 @@ local_test_cases = [
     pytest.param("./tests/toy_config/movqgan_toy", False, True, [], ["config", "model", "processor"]),
     pytest.param("./tests/toy_config/gpt_oss_toy", True, False, ["config", "model"], ["model"]),
 ]
+
+if hasattr(diffusers, "QwenImage21Transformer2DModel"):
+    local_test_cases.append(pytest.param("./tests/toy_config/qwen_image21_toy", False, False, [], ["config", "model"]))
 
 
 @pytest.mark.parametrize(
