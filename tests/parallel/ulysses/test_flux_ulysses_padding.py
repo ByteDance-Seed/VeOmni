@@ -102,6 +102,14 @@ class FluxUlyssesPaddingTest(SequenceParallelTest):
                     continue
                 out_err = ((out - ref_out).norm() / ref_out.norm()).item()
 
+                sp_grad_names = [None] * self.world_size
+                c10d.all_gather_object(sp_grad_names, set(grads), group=group)
+                ref_grad_names = set(ref_grads)
+                assert all(names == ref_grad_names for names in sp_grad_names), (
+                    f"{name}: gradient-name mismatch; "
+                    f"missing per rank: {[sorted(ref_grad_names - names) for names in sp_grad_names]}"
+                )
+
                 # Each rank's param grads cover only its own tokens, and the loss is replicated on
                 # every SP rank, so sum over SP and divide by its size (FSDP's mean over the SP mesh).
                 diff_sq = ref_sq = 0.0
