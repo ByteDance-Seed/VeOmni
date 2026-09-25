@@ -20,7 +20,9 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
+    gather_heads_scatter_seq,
     gather_outputs,
+    gather_seq_scatter_heads,
     slice_input_tensor,
 )
 from .....utils import logging
@@ -44,11 +46,19 @@ def wan_eager_attention_forward(
     attention_mask=None,
     scaling: float | None = None,
     dropout: float = 0.0,
+    skip_ulysses: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
+    use_ulysses = get_parallel_state().ulysses_enabled and not skip_ulysses
+    if use_ulysses:
+        query = gather_seq_scatter_heads(query, seq_dim=2, head_dim=1)
+        key = gather_seq_scatter_heads(key, seq_dim=2, head_dim=1)
+        value = gather_seq_scatter_heads(value, seq_dim=2, head_dim=1)
     attn_output = F.scaled_dot_product_attention(
         query, key, value, attn_mask=attention_mask, dropout_p=dropout, scale=scaling, is_causal=False
     )
+    if use_ulysses:
+        attn_output = gather_heads_scatter_seq(attn_output, seq_dim=2, head_dim=1)
     return attn_output.transpose(1, 2), None
 
 
@@ -143,7 +153,14 @@ class WanSPAttnProcessor(WanAttnProcessor):
         self.attn_implementation = attn_implementation
         # build config for veomni_flash_attention_forward
         self.config = SimpleNamespace(_attn_implementation=attn_implementation)
+        # Unpadded self-attention length under Ulysses SP, set by WanTransformer3DModel_forward.
+        self.sp_valid_length = None
         super().__init__()
+
+    @staticmethod
+    def sp_padded_length(length: int) -> int:
+        ulysses_size = get_parallel_state().ulysses_size
+        return length + (ulysses_size - length % ulysses_size) % ulysses_size
 
     def __call__(
         self,
@@ -234,13 +251,26 @@ class WanSPAttnProcessor(WanAttnProcessor):
 
         query_length = query.shape[1]
         key_length = key.shape[1]
+        skip_ulysses = is_cross_attention
+        valid_length = None
         if use_sp:
-            # Wan forward slices hidden_states/rotary_emb before the blocks.
-            # The shared VeOmni FA wrapper gathers those local slices back to
-            # the full sequence before calling FA2, so cu_seqlens must describe
-            # the post-gather length rather than this rank's local length.
-            query_length *= get_parallel_state().ulysses_size
-            key_length *= get_parallel_state().ulysses_size
+            ulysses_size = get_parallel_state().ulysses_size
+            if self.sp_valid_length is not None and self.sp_valid_length < query_length * ulysses_size:
+                # Ulysses tail padding: gather here, drop the pad rows so no backend attends to
+                # them, and scatter back below. Kernels then see the plain full sequence.
+                valid_length = self.sp_valid_length
+                query, key, value = (
+                    gather_seq_scatter_heads(x, seq_dim=1, head_dim=2)[:, :valid_length] for x in (query, key, value)
+                )
+                query_length = key_length = valid_length
+                skip_ulysses = True
+            else:
+                # Wan forward slices hidden_states/rotary_emb before the blocks.
+                # The shared VeOmni FA wrapper gathers those local slices back to
+                # the full sequence before calling FA2, so cu_seqlens must describe
+                # the post-gather length rather than this rank's local length.
+                query_length *= ulysses_size
+                key_length *= ulysses_size
         attention_kwargs = (
             _get_wan_full_sequence_varlen_kwargs(query, key, value, query_length=query_length, key_length=key_length)
             if use_flash_attention
@@ -254,9 +284,13 @@ class WanSPAttnProcessor(WanAttnProcessor):
             attention_mask=attention_mask,
             dropout=0.0,
             is_causal=False,
-            skip_ulysses=is_cross_attention,
+            skip_ulysses=skip_ulysses,
             **attention_kwargs,
         )[0]
+        if valid_length is not None:
+            pad = self.sp_padded_length(valid_length) - valid_length
+            hidden_states_out = F.pad(hidden_states_out, (0, 0, 0, 0, 0, pad))
+            hidden_states_out = gather_heads_scatter_seq(hidden_states_out, seq_dim=1, head_dim=2)
 
         hidden_states_out = hidden_states_out.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
@@ -313,18 +347,21 @@ def WanTransformer3DModel_forward(
     if encoder_hidden_states_image is not None:
         encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
-    if get_parallel_state().sp_enabled:
-        hidden_states = slice_input_tensor(hidden_states, dim=1, group=get_parallel_state().sp_group)
+    use_sp = get_parallel_state().sp_enabled
+    seq_len = hidden_states.shape[1]
+    # Set on every call (not reset afterwards) so gradient-checkpointing recompute sees it too.
+    for processor in {block.attn1.processor for block in self.blocks}:
+        if isinstance(processor, WanSPAttnProcessor):
+            processor.sp_valid_length = seq_len if use_sp else None
 
-        # Slice rotary embeddings to the local rank's positions (no gradient).
-        freqs_cos, freqs_sin = rotary_emb
-        ulysses_size = get_parallel_state().ulysses_size
-        ulysses_rank = get_parallel_state().ulysses_rank
-        seq_len = freqs_cos.shape[1]
-        chunk = seq_len // ulysses_size
-        freqs_cos = freqs_cos[:, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
-        freqs_sin = freqs_sin[:, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
-        rotary_emb = (freqs_cos, freqs_sin)
+    if use_sp:
+        # slice_input_tensor pads to a multiple of the SP size; slice RoPE and per-token
+        # timesteps the same way so every rank's positions line up with its tokens.
+        sp_group = get_parallel_state().sp_group
+        hidden_states = slice_input_tensor(hidden_states, dim=1, group=sp_group)
+        rotary_emb = tuple(slice_input_tensor(freqs, dim=1, group=sp_group) for freqs in rotary_emb)
+        if ts_seq_len is not None:
+            timestep_proj = slice_input_tensor(timestep_proj, dim=1, group=sp_group)
     # 4. Transformer blocks
     if torch.is_grad_enabled() and self.gradient_checkpointing:
         for block in self.blocks:
@@ -337,8 +374,8 @@ def WanTransformer3DModel_forward(
 
     # SP: gather before output head – every rank holds the full sequence so
     # that the loss is identical across SP ranks.
-    if get_parallel_state().sp_enabled:
-        hidden_states = gather_outputs(hidden_states, gather_dim=1)
+    if use_sp:
+        hidden_states = gather_outputs(hidden_states, gather_dim=1, padding_dim=1, unpad_dim_size=seq_len)
 
     # 5. Output: norm → projection → unpatchify
     if temb.ndim == 3:
