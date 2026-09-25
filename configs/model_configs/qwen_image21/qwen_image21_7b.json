@@ -1,0 +1,19 @@
+{
+  "_class_name": "QwenImage21Transformer2DModel",
+  "_diffusers_version": "0.41.0.dev0",
+  "attention_head_dim": 128,
+  "axes_dims_rope": [
+    16,
+    56,
+    56
+  ],
+  "causal_condition": true,
+  "context_in_dim": 4096,
+  "eps": 1e-06,
+  "in_channels": 64,
+  "mlp_ratio": 3,
+  "num_attention_heads": 32,
+  "num_layers": 32,
+  "out_channels": 64,
+  "patch_size": 1
+}
