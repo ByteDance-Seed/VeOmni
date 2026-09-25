@@ -24,7 +24,13 @@ local_test_cases = [
     pytest.param("./tests/toy_config/gpt_oss_toy", True, False, ["config", "model"], ["model"]),
 ]
 
-if hasattr(diffusers, "QwenImage21Transformer2DModel"):
+_QWEN_IMAGE21_COMPONENTS = (
+    "AutoencoderKLQwenImage21",
+    "QwenImage21Pipeline",
+    "QwenImage21Transformer2DModel",
+)
+
+if all(hasattr(diffusers, component) for component in _QWEN_IMAGE21_COMPONENTS):
     local_test_cases.append(pytest.param("./tests/toy_config/qwen_image21_toy", False, False, [], ["config", "model"]))
 
 

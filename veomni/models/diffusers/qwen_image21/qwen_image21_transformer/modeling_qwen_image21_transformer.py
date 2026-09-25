@@ -163,8 +163,10 @@ class QwenImage21Transformer2DModel(PreTrainedModel, _QwenImage21TransformerInit
     def save_pretrained(self, path, **kwargs):
         veomni_config = copy.deepcopy(self.config)
         self.config = self.config.to_diffuser_dict()
-        _QwenImage21Transformer2DModel.save_pretrained(self, path, **kwargs)
-        self.config = veomni_config
+        try:
+            return _QwenImage21Transformer2DModel.save_pretrained(self, path, **kwargs)
+        finally:
+            self.config = veomni_config
 
     @classmethod
     def from_pretrained(cls, path, **kwargs):

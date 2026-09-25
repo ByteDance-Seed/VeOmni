@@ -32,8 +32,8 @@ image. For example, a JSONL row can use `text` and `image_path`:
 
 The prompt key may be `prompt`, `text`, or `caption`. The image key may be
 `image`, `image_bytes`, `image_path`, or `target_image`. Images are resized to
-the configured resolution and converted to opaque RGBA because the
-Qwen-Image-2.1 VAE has four input channels.
+the configured resolution, composited onto a white background, and converted
+to opaque RGBA because the Qwen-Image-2.1 VAE has four input channels.
 
 ## Start a single-GPU run
 

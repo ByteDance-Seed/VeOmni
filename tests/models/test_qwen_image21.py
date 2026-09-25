@@ -107,6 +107,84 @@ def test_qwen_image21_transformer_save_reload(tmp_path):
         torch.testing.assert_close(actual[key], expected[key])
 
 
+def test_qwen_image21_transformer_restores_config_after_failed_save(monkeypatch, tmp_path):
+    model = _toy_model()
+
+    def fail_save(*args, **kwargs):
+        raise OSError("simulated save failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(DiffusersQwenImage21Transformer2DModel, "save_pretrained", fail_save)
+        with pytest.raises(OSError, match="simulated save failure"):
+            model.save_pretrained(str(tmp_path / "failed"))
+
+    assert isinstance(model.config, QwenImage21Transformer2DModelConfig)
+    model.save_pretrained(str(tmp_path / "retry"))
+
+
+def test_qwen_image21_condition_config_propagates_malformed_json(tmp_path):
+    (tmp_path / "config.json").write_text("{", encoding="utf-8")
+
+    with pytest.raises(OSError):
+        QwenImage21ConditionModelConfig.from_pretrained(str(tmp_path))
+
+
+def test_qwen_image21_condition_config_accepts_direct_file(tmp_path):
+    config_path = tmp_path / "condition-config.json"
+    config_path.write_text('{"height": 640, "width": 768}', encoding="utf-8")
+
+    config = QwenImage21ConditionModelConfig.from_pretrained(str(config_path))
+
+    assert config.base_model_path == str(config_path)
+    assert config.height == 640
+    assert config.width == 768
+
+
+def test_qwen_image21_condition_config_accepts_diffusers_root(tmp_path):
+    config = QwenImage21ConditionModelConfig.from_pretrained(str(tmp_path), height=768, width=768)
+
+    assert config.base_model_path == str(tmp_path)
+    assert config.height == 768
+    assert config.width == 768
+
+
+def test_qwen_image21_condition_config_accepts_remote_root_without_config(monkeypatch):
+    cached_file_calls = []
+
+    def missing_config(repo_id, filename, **kwargs):
+        cached_file_calls.append((repo_id, filename, kwargs))
+        return None
+
+    monkeypatch.setattr(
+        "veomni.models.diffusers.qwen_image21.qwen_image21_condition.configuration_qwen_image21_condition.cached_file",
+        missing_config,
+    )
+    config = QwenImage21ConditionModelConfig.from_pretrained(
+        "Qwen/Qwen-Image-2.1",
+        height=768,
+        cache_dir="/tmp/qwen-image21-cache",
+    )
+
+    assert config.base_model_path == "Qwen/Qwen-Image-2.1"
+    assert config.height == 768
+    assert not hasattr(config, "cache_dir")
+    assert len(cached_file_calls) == 1
+    assert cached_file_calls[0][1] == "config.json"
+    assert cached_file_calls[0][2]["_raise_exceptions_for_missing_entries"] is False
+
+
+def test_qwen_image21_image_preprocessing_composites_transparency():
+    model = QwenImage21ConditionModel.__new__(QwenImage21ConditionModel)
+    torch.nn.Module.__init__(model)
+    model.config = QwenImage21ConditionModelConfig(height=4, width=4, background_color=(255, 255, 255))
+
+    transparent_red = Image.new("RGBA", (4, 4), (255, 0, 0, 0))
+    image_tensor = model._image_to_tensor(transparent_red)
+
+    assert image_tensor.shape == (1, 4, 1, 4, 4)
+    torch.testing.assert_close(image_tensor, torch.ones_like(image_tensor))
+
+
 class _FakePosterior:
     def __init__(self, parameters):
         self.parameters = parameters
@@ -133,6 +211,7 @@ class _FakeVAE(torch.nn.Module):
     def encode(self, image):
         assert image.shape[:3] == (1, 4, 1)
         assert image.shape[-2] == image.shape[-1]
+        torch.testing.assert_close(image[:, :3], torch.ones_like(image[:, :3]))
         torch.testing.assert_close(image[:, 3], torch.ones_like(image[:, 3]))
         latent_size = image.shape[-1] // 16
         parameters = image.new_zeros((1, 128, 1, latent_size, latent_size))
@@ -184,7 +263,8 @@ def test_qwen_image21_condition_uses_resolution_shifted_schedule(monkeypatch, re
         ),
     )
 
-    condition = model.get_condition(["a red seed"], [[Image.new("RGB", (resolution, resolution), "red")]])
+    transparent_red = Image.new("RGBA", (resolution, resolution), (255, 0, 0, 0))
+    condition = model.get_condition(["a red seed"], [[transparent_red]])
     assert condition["latents"][0].shape == (1, 128, 1, latent_size, latent_size)
     assert condition["img_shapes"] == [[(1, latent_size, latent_size)]]
 

@@ -5,6 +5,7 @@ from typing import Any
 import torch
 from diffusers import AutoencoderKLQwenImage21, FlowMatchEulerDiscreteScheduler, QwenImage21Pipeline
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+from PIL import Image
 from torchvision.transforms import InterpolationMode, functional
 from transformers import PreTrainedModel, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
@@ -91,6 +92,8 @@ class QwenImage21ConditionModel(PreTrainedModel):
             [self.config.height, self.config.width],
             interpolation=InterpolationMode.BICUBIC,
         )
+        background = Image.new("RGBA", image.size, (*self.config.background_color, 255))
+        image = Image.alpha_composite(background, image)
         return functional.to_tensor(image).unsqueeze(0).unsqueeze(2).mul(2.0).sub(1.0)
 
     @staticmethod
