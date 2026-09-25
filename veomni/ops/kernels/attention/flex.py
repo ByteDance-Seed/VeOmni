@@ -127,6 +127,12 @@ def flex_attention_forward(
     # fail during Inductor kernel selection. Use the standard Triton FlexAttention
     # kernel by default while preserving an explicit caller override.
     kernel_options.setdefault("BACKEND", "TRITON")
+    # PyTorch's default multi-stage Triton config can exceed the per-SM shared
+    # memory limit on Ampere for 256-wide heads (for example Gemma 4 on A100).
+    # A single pipeline stage keeps the same attention semantics and compiles on
+    # those devices. Preserve explicit tuning supplied by callers.
+    if query.shape[-1] >= 256:
+        kernel_options.setdefault("num_stages", 1)
 
     parallel_state = get_parallel_state()
     ulysses_enabled = parallel_state.ulysses_enabled and not skip_ulysses
