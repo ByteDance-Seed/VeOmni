@@ -60,14 +60,24 @@ def _all_gather(
 def _all_gather_into_tensor(
     x: Tensor,
     group: dist.ProcessGroup,
+    dim: int = 0,
 ):
     dim_size = list(x.size())
 
     group = get_ulysses_sequence_parallel_group() if group is None else group
     sp_world_size = dist.get_world_size(group)
-    dim_size[0] = dim_size[0] * sp_world_size
+    dim = dim % len(dim_size)
+    dim_size[dim] = dim_size[dim] * sp_world_size
     output = torch.empty(dim_size, dtype=x.dtype, device=get_device_id())
-    dist.all_gather_into_tensor(output, x, group=group)
+    if dim == 0:
+        dist.all_gather_into_tensor(output, x.contiguous(), group=group)
+    else:
+        x_contig = x.movedim(dim, 0).contiguous()
+        out_shape = list(x_contig.shape)
+        out_shape[0] = out_shape[0] * sp_world_size
+        out_contig = torch.empty(out_shape, dtype=x.dtype, device=get_device_id())
+        dist.all_gather_into_tensor(out_contig, x_contig, group=group)
+        output = out_contig.movedim(0, dim).contiguous()
     return output
 
 
@@ -186,13 +196,11 @@ class _Slice(torch.autograd.Function):
         return local_input.split(dim_size // seq_world_size, dim=dim)[ctx.rank].contiguous()
 
     @staticmethod
-    def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor, None]:
-        dim_size = list(grad_output.size())
-        split_size = dim_size[0]
-        output = _all_gather_into_tensor(grad_output, group=ctx.group)
+    def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor, None, None]:
+        output = _all_gather_into_tensor(grad_output, group=ctx.group, dim=ctx.dim)
         if ctx.scale_grad:
             output = output / ctx.seq_world_size
-        return (None, torch.cat(output.split(split_size), dim=ctx.dim), None, None)
+        return (None, output, None, None)
 
 
 class _Gather(torch.autograd.Function):
