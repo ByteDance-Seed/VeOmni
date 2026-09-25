@@ -53,6 +53,8 @@ def LTXSPAttention_forward(
     mask: torch.Tensor | None = None,
     pe: torch.Tensor | None = None,
     k_pe: torch.Tensor | None = None,
+    sp_valid_length: int | None = None,
+    sp_context_length: int | None = None,
     perturbation_mask: torch.Tensor | None = None,
     all_perturbed: bool = False,
 ) -> torch.Tensor:
@@ -60,7 +62,7 @@ def LTXSPAttention_forward(
 
     # Audio<->video cross-attention attends to the other modality, which is sliced across SP
     # ranks like x. Gather it (and its key RoPE) back to the full, unpadded sequence.
-    context_length = getattr(self, "sp_context_length", None)
+    context_length = sp_context_length
     if is_cross_attention and context_length is not None and get_parallel_state().sp_enabled:
         context = gather_outputs(context, gather_dim=1, padding_dim=1, unpad_dim_size=context_length)
         if k_pe is not None:
@@ -95,7 +97,7 @@ def LTXSPAttention_forward(
 
             # Drop the Ulysses tail padding so no backend attends to it; restored below.
             padded_length = q.shape[1]
-            valid_length = getattr(self, "sp_valid_length", None) or padded_length
+            valid_length = sp_valid_length or padded_length
             q, k, v_sp = q[:, :valid_length], k[:, :valid_length], v_sp[:, :valid_length]
 
             sp_heads = heads // ulysses_size
@@ -161,19 +163,6 @@ def LTXVideoModel_forward(
     use_sp = get_parallel_state().sp_enabled
     video_len = video_args.x.shape[1] if video_args is not None else None
     audio_len = audio_args.x.shape[1] if audio_args is not None else None
-    # Set on every call (not reset afterwards) so gradient-checkpointing recompute sees it too.
-    for block in self.transformer_blocks:
-        for name, valid, context in (
-            ("attn1", video_len, None),
-            ("audio_attn1", audio_len, None),
-            ("audio_to_video_attn", None, audio_len),
-            ("video_to_audio_attn", None, video_len),
-        ):
-            attn = getattr(block, name, None)
-            if attn is not None:
-                attn.sp_valid_length = valid if use_sp else None
-                attn.sp_context_length = context if use_sp else None
-
     if use_sp:
         sp_group = get_parallel_state().sp_group
         if video_args is not None:
@@ -185,6 +174,8 @@ def LTXVideoModel_forward(
         video=video_args,
         audio=audio_args,
         perturbations=perturbations,
+        sp_video_length=video_len if use_sp else None,
+        sp_audio_length=audio_len if use_sp else None,
     )
 
     if use_sp and video_out is not None:

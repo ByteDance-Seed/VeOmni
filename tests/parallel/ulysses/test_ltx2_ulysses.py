@@ -19,7 +19,7 @@ import torch.distributed as c10d
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
-if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backend()):
+if get_device_type() == "cpu" or not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backend()):
     pytest.skip("c10d NCCL not available, skipping tests", allow_module_level=True)
 
 from torch.testing._internal.common_utils import run_tests
@@ -133,6 +133,13 @@ class LTX2UlyssesTest(SequenceParallelTest):
                             continue
                         ref_preds, ref_grads = refs[name]
                         pred_err = max(((p - r).norm() / r.norm()).item() for p, r in zip(preds, ref_preds))
+                        sp_grad_names = [None] * self.world_size
+                        c10d.all_gather_object(sp_grad_names, set(grads), group=group)
+                        ref_grad_names = set(ref_grads)
+                        assert all(names == ref_grad_names for names in sp_grad_names), (
+                            f"{tag}: gradient-name mismatch; "
+                            f"missing per rank: {[sorted(ref_grad_names - names) for names in sp_grad_names]}"
+                        )
                         # Param grads cover only this rank's tokens and the loss is replicated on every
                         # SP rank, so sum over SP and divide by its size (FSDP's mean over the SP mesh).
                         diff_sq = ref_sq = 0.0
