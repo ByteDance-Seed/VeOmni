@@ -103,15 +103,16 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         if implementation not in _FLASH_BACKENDS:
             raise ValueError(f"Unsupported H3 attention backend: {implementation}")
         attention_modules = self._attention_modules()
-        if all(module.varlen_kernel is not None for module in attention_modules):
-            return
         if IS_NPU_AVAILABLE and not packed and implementation in _LOCAL_FLASH_BACKENDS:
             if any(module.requires_flash_kernel for module in attention_modules):
                 logger.warning_once(
                     f"H3 has no {implementation} kernel on Ascend NPU; single-sample attention uses PyTorch SDPA."
                 )
-                for module in attention_modules:
-                    module.requires_flash_kernel = False
+            for module in attention_modules:
+                module.varlen_kernel = None
+                module.requires_flash_kernel = False
+            return
+        if all(module.varlen_kernel is not None for module in attention_modules):
             return
         from .....ops.kernels.attention.flash import _load_veomni_flash_kernel
 

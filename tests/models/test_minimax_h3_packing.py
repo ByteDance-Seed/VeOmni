@@ -644,6 +644,29 @@ def test_npu_single_sample_warns_and_uses_sdpa_but_packing_still_needs_the_kerne
     assert loads == ["veomni_flash_attention_2_with_sp"]
 
 
+def test_npu_single_sample_uses_sdpa_after_a_packed_forward_loaded_the_kernel(monkeypatch):
+    from veomni.ops.kernels.attention import flash
+
+    calls = []
+    model = tiny_model().bfloat16()
+    kernel = recording_kernel(model.config, calls)
+    monkeypatch.setattr(
+        flash, "_load_veomni_flash_kernel", lambda name: SimpleNamespace(flash_attn_varlen_func=kernel)
+    )
+    monkeypatch.setattr(h3_model, "IS_NPU_AVAILABLE", True)
+    model._configure_attention("veomni_flash_attention_2_with_sp")
+    samples = bf16_samples([raw_sample(3), raw_sample(7)])
+
+    model(**batch(samples))
+    assert calls
+    calls.clear()
+    model(**samples[0])
+    assert calls == []
+    assert all(module.varlen_kernel is None for module in model._attention_modules())
+    model(**batch(samples))
+    assert calls
+
+
 @pytest.mark.parametrize("checkpointing", [False, True])
 def test_packed_sdpa_slices_with_host_bounds(monkeypatch, checkpointing):
     sdpa = minimax_h3_dit._sdpa_varlen_attention
