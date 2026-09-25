@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from types import SimpleNamespace
 
 import torch
@@ -153,8 +154,6 @@ class WanSPAttnProcessor(WanAttnProcessor):
         self.attn_implementation = attn_implementation
         # build config for veomni_flash_attention_forward
         self.config = SimpleNamespace(_attn_implementation=attn_implementation)
-        # Unpadded self-attention length under Ulysses SP, set by WanTransformer3DModel_forward.
-        self.sp_valid_length = None
         super().__init__()
 
     @staticmethod
@@ -169,6 +168,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
         encoder_hidden_states: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        sp_valid_length: int | None = None,
         **kwargs,
     ) -> torch.Tensor:
         is_cross_attention = encoder_hidden_states is not None
@@ -255,10 +255,10 @@ class WanSPAttnProcessor(WanAttnProcessor):
         valid_length = None
         if use_sp:
             ulysses_size = get_parallel_state().ulysses_size
-            if self.sp_valid_length is not None and self.sp_valid_length < query_length * ulysses_size:
+            if sp_valid_length is not None and sp_valid_length < query_length * ulysses_size:
                 # Ulysses tail padding: gather here, drop the pad rows so no backend attends to
                 # them, and scatter back below. Kernels then see the plain full sequence.
-                valid_length = self.sp_valid_length
+                valid_length = sp_valid_length
                 query, key, value = (
                     gather_seq_scatter_heads(x, seq_dim=1, head_dim=2)[:, :valid_length] for x in (query, key, value)
                 )
@@ -302,6 +302,42 @@ class WanSPAttnProcessor(WanAttnProcessor):
         hidden_states_out = attn.to_out[0](hidden_states_out)
         hidden_states_out = attn.to_out[1](hidden_states_out)
         return hidden_states_out
+
+
+def wan_transformer_block_forward(
+    block,
+    sp_valid_length: int | None,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    temb: torch.Tensor,
+    rotary_emb: torch.Tensor,
+) -> torch.Tensor:
+    if temb.ndim == 4:
+        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+            block.scale_shift_table.unsqueeze(0) + temb.float()
+        ).chunk(6, dim=2)
+        shift_msa = shift_msa.squeeze(2)
+        scale_msa = scale_msa.squeeze(2)
+        gate_msa = gate_msa.squeeze(2)
+        c_shift_msa = c_shift_msa.squeeze(2)
+        c_scale_msa = c_scale_msa.squeeze(2)
+        c_gate_msa = c_gate_msa.squeeze(2)
+    else:
+        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+            block.scale_shift_table + temb.float()
+        ).chunk(6, dim=1)
+
+    norm_hidden_states = (block.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
+    attn_output = block.attn1(norm_hidden_states, None, None, rotary_emb, sp_valid_length=sp_valid_length)
+    hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
+
+    norm_hidden_states = block.norm2(hidden_states.float()).type_as(hidden_states)
+    attn_output = block.attn2(norm_hidden_states, encoder_hidden_states, None, None)
+    hidden_states = hidden_states + attn_output
+
+    norm_hidden_states = (block.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(hidden_states)
+    ff_output = block.ffn(norm_hidden_states)
+    return (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
 
 
 # ================================================================
@@ -349,10 +385,6 @@ def WanTransformer3DModel_forward(
 
     use_sp = get_parallel_state().sp_enabled
     seq_len = hidden_states.shape[1]
-    # Set on every call (not reset afterwards) so gradient-checkpointing recompute sees it too.
-    for processor in {block.attn1.processor for block in self.blocks}:
-        if isinstance(processor, WanSPAttnProcessor):
-            processor.sp_valid_length = seq_len if use_sp else None
 
     if use_sp:
         # slice_input_tensor pads to a multiple of the SP size; slice RoPE and per-token
@@ -363,14 +395,15 @@ def WanTransformer3DModel_forward(
         if ts_seq_len is not None:
             timestep_proj = slice_input_tensor(timestep_proj, dim=1, group=sp_group)
     # 4. Transformer blocks
+    block_forward = partial(wan_transformer_block_forward, sp_valid_length=seq_len if use_sp else None)
     if torch.is_grad_enabled() and self.gradient_checkpointing:
         for block in self.blocks:
             hidden_states = self._gradient_checkpointing_func(
-                block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
+                partial(block_forward, block), hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
             )
     else:
         for block in self.blocks:
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+            hidden_states = block_forward(block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
 
     # SP: gather before output head – every rank holds the full sequence so
     # that the loss is identical across SP ranks.
