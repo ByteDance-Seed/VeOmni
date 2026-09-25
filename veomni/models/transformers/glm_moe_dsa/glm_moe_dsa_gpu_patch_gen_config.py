@@ -1,44 +1,169 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing limitations
+# under the License.
+"""
+Patch configuration for GLM-MoE-DSA GPU VeomniOp replacements.
+
+Regen command:
+patchgen veomni.models.transformers.glm_moe_dsa.glm_moe_dsa_gpu_patch_gen_config -o veomni/models/transformers/glm_moe_dsa/generated --diff
+
+Indexer and attention always call ``dsa_indexer`` / ``dsa_attention``
+``glm``. CausalLM uses ``ForCausalLMLoss``.
+"""
+
+from functools import partial
+
 import torch
+from torch import nn
+from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
+from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
+from veomni.ops.kernels.dsa.mask import copy_dsa_mask_provenance, translate_fused_dsa_mask
 from veomni.patchgen.patch_spec import PatchConfig
+from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
+    CausalLMOutputWithLogProbs,
+    FusedLinearAuxOutput,
+    FusedLinearAuxOutputMixin,
+)
 
 
 config = PatchConfig(
     source_module="transformers.models.glm_moe_dsa.modeling_glm_moe_dsa",
     target_file="patched_modeling_glm_moe_dsa_gpu.py",
-    description="GLM-5 with GPU replacements",
+    description="GLM-MoE-DSA with VeomniOp DSA indexer / attention and fused loss",
 )
 
-# Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` can
-# return per-token log-probs in the unified output dataclass.
+config.add_import("functools", names=["partial"])
 config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
-
-# The NPU sibling config is much smaller than this one — it only patches
-# `GlmMoeDsaForCausalLM.forward` and shares no patch bodies with this module, so
-# the indexer / attention ports here do not propagate to it.
-config.add_post_import_block(
-    """
-    # ── OpSlot declarations ──────────────────────────────────────────────────
-    # Bound at model-build time by _bind_veomni_ops() in auto.py.
-    from veomni.ops.dispatch import OpSlot, OpsConfigSlot
-    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-    veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
-    veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
-    """
+config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import(
+    "veomni.ops.config",
+    names=["resolve_op_impl"],
 )
+config.add_import(
+    "veomni.models.loss_utils",
+    names=["ForCausalLMLoss"],
+)
+config.add_import(
+    "veomni.ops.kernels.dsa.mask",
+    names=["copy_dsa_mask_provenance", "create_standard_causal_mask", "translate_fused_dsa_mask"],
+)
+# Model.forward still calls create_causal_mask; bind it to the provenance
+# wrapper so a no-padding HF causal mask can be dropped without a host scan.
+config.drop_import_names("create_causal_mask")
+config.add_post_import_block("create_causal_mask = create_standard_causal_mask")
+config.exclude_from_output("apply_rotary_pos_emb_interleave", "use_kernel_forward_from_hub")
+config.drop_import_names("use_kernel_forward_from_hub")
+yarn_apply_mscale = None
+GlmMoeDsaRMSNorm = None
+
+
+@config.override_method(
+    "GlmMoeDsaRMSNorm.__init__",
+    description="Construct a local rms_norm VeomniOp",
+)
+def glm_moe_dsa_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+    nn.Module.__init__(self)
+    self.weight = nn.Parameter(torch.ones(hidden_size))
+    self.variance_epsilon = eps
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+
+
+@config.override_method(
+    "GlmMoeDsaRMSNorm.forward",
+    description="Always call the local rms_norm VeomniOp",
+)
+def glm_moe_dsa_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
+
+
+@config.override_method(
+    "GlmMoeDsaMLP.__init__",
+    description="Construct a local swiglu_mlp VeomniOp",
+)
+def glm_moe_dsa_mlp_init_patched(self, config, intermediate_size=None):
+    nn.Module.__init__(self)
+    self.config = config
+    self.hidden_size = config.hidden_size
+    self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
+    self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+    self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+    self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+    self.act_fn = ACT2FN[config.hidden_act]
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+
+
+@config.override_method(
+    "GlmMoeDsaMLP.forward",
+    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
+)
+def glm_moe_dsa_mlp_forward_patched(self, x):
+    if self.config.hidden_act in {"silu", "swish"}:
+        return self.veomni_swiglu_mlp(
+            x,
+            self.gate_proj.weight,
+            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+            self.up_proj.weight,
+            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+            self.down_proj.weight,
+            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+        )
+    return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+@config.override_method(
+    "GlmMoeDsaIndexer.__init__",
+    description="Construct a local dsa_indexer glm VeomniOp",
+)
+def glm_moe_dsa_indexer_init_patched(self, config: "GlmMoeDsaConfig", layer_idx: int):
+    nn.Module.__init__(self)
+    self.config = config
+    self.layer_idx = layer_idx
+
+    self.hidden_size: int = config.hidden_size
+    self.n_heads: int = config.index_n_heads
+    self.head_dim: int = config.index_head_dim
+    self.qk_rope_head_dim: int = config.qk_rope_head_dim
+    self.index_topk: int = config.index_topk
+    self.q_lora_rank: int = config.q_lora_rank
+
+    self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
+    self.wk = nn.Linear(self.hidden_size, self.head_dim, bias=False)
+    self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
+    self.weights_proj = nn.Linear(self.hidden_size, self.n_heads, bias=False)
+    self.softmax_scale = self.head_dim**-0.5
+    self.veomni_rope = VeomniOp("rope", "interleave", "eager")
+    self.veomni_dsa_indexer = VeomniOp(
+        "dsa_indexer",
+        "glm",
+        resolve_op_impl("dsa_indexer_implementation"),
+    )
 
 
 @config.override_method(
     "GlmMoeDsaIndexer.forward",
-    description="Use cuDNN Frontend DSA indexer kernels when supported",
+    description="Always call the local dsa_indexer glm VeomniOp",
 )
 def glm_moe_dsa_indexer_forward_patched(
     self,
@@ -53,108 +178,110 @@ def glm_moe_dsa_indexer_forward_patched(
     cos, sin = position_embeddings
 
     q = self.wq_b(q_resid)
-    q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)  # [B, S, H, D]
+    q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)
     q_rot, q_pass = torch.split(q, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
 
-    k = self.k_norm(self.wk(hidden_states)).unsqueeze(2)  # [B, S, 1, D]
+    k = self.k_norm(self.wk(hidden_states)).unsqueeze(2)
     k_rot, k_pass = torch.split(k, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
 
-    # GLM-MoE-DSA uses interleaved RoPE in the indexer. transformers 5.16 replaced
-    # the per-tensor `apply_rotary_pos_emb` helper with a fused q/k
-    # `apply_rotary_pos_emb_interleave`.
-    q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin, unsqueeze_dim=2)
-    q = torch.cat([q_rot, q_pass], dim=-1)  # [B, S, H, D]
-    k = torch.cat([k_rot, k_pass], dim=-1).squeeze(2)  # [B, S, D]
+    q_rot, k_rot = self.veomni_rope(q_rot, k_rot, cos, sin, unsqueeze_dim=2)
+    q = torch.cat([q_rot, q_pass], dim=-1)
+    k = torch.cat([k_rot, k_pass], dim=-1).squeeze(2)
 
-    # transformers 5.16 moved the indexer key cache off a per-module
-    # `_cached_keys` buffer and onto the shared cache object.
     if past_key_values is not None:
         k = past_key_values.update_indexer(k, self.layer_idx)
 
     weights = self.weights_proj(hidden_states.to(self.weights_proj.weight.dtype)).float() * (self.n_heads**-0.5)
+    kv_len = k.shape[1]
+    attention_mask = translate_fused_dsa_mask(
+        attention_mask,
+        q_len=seq_len,
+        kv_len=kv_len,
+        fused=self.veomni_dsa_indexer.impl != "eager",
+        what="cuDNN GLM sparse-attention indexer",
+    )
+    return self.veomni_dsa_indexer(
+        q,
+        k,
+        weights.to(q.dtype),
+        self.index_topk,
+        ratio=1,
+        qhead_per_kv_head=self.n_heads,
+        sm_scale=self.softmax_scale,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        use_cache=past_key_values is not None,
+    ).to(torch.int32)
 
-    # --- Patch.1 ---
-    # The cuDNN indexer kernel bakes in the standard causal mask, so it can only
-    # run when the incoming mask *is* that mask. Detect it explicitly; anything
-    # else (custom / padded masks) has to take the eager path.
-    use_cache = past_key_values is not None
-    # In the model path, create_causal_mask may return None for the no-padding
-    # causal case and let the attention backend use is_causal internally.
-    if attention_mask is None and not use_cache:
-        has_standard_causal_mask = True
-    elif (
-        attention_mask is not None
-        and attention_mask.dim() == 3
-        and not use_cache
-        and attention_mask.shape[-2:]
-        == (
-            seq_len,
-            k.shape[1],
-        )
-    ):
-        q_positions = torch.arange(seq_len, device=attention_mask.device)[:, None]
-        k_positions = torch.arange(k.shape[1], device=attention_mask.device)[None, :]
-        expected_masked = k_positions > q_positions + k.shape[1] - seq_len
-        has_standard_causal_mask = bool(
-            torch.equal(attention_mask < 0, expected_masked.unsqueeze(0).expand_as(attention_mask))
-        )
-    else:
-        has_standard_causal_mask = False
 
-    indexer_implementation = veomni_dsa_indexer_implementation.value
-    if indexer_implementation not in ("eager", "cudnn"):
-        raise ValueError(f"Unknown dsa_indexer_implementation={indexer_implementation!r}; expected 'eager' or 'cudnn'")
-    if indexer_implementation == "cudnn":
-        from veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn import indexer_select_topk
+@config.override_method(
+    "GlmMoeDsaAttention.__init__",
+    description="Construct a local dsa_attention glm VeomniOp",
+)
+def glm_moe_dsa_attention_init_patched(self, config: GlmMoeDsaConfig, layer_idx: int):
+    nn.Module.__init__(self)
+    self.config = config
+    self.layer_idx = layer_idx
+    self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+    self.attention_dropout = config.attention_dropout
+    self.num_heads = config.num_attention_heads
 
-        qhead_per_kv_head = self.n_heads
-        unsupported_reasons = []
-        if not hidden_states.is_cuda:
-            unsupported_reasons.append("hidden_states must be CUDA")
-        if q.dtype not in (torch.bfloat16, torch.float16):
-            unsupported_reasons.append(f"q dtype must be bf16/fp16, got {q.dtype}")
-        if k.dtype not in (torch.bfloat16, torch.float16):
-            unsupported_reasons.append(f"k dtype must be bf16/fp16, got {k.dtype}")
-        if weights.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-            unsupported_reasons.append(f"weights dtype must be bf16/fp16/fp32, got {weights.dtype}")
-        if not has_standard_causal_mask:
-            unsupported_reasons.append("only the standard causal mask is supported")
-        if qhead_per_kv_head not in (32, 64):
-            unsupported_reasons.append(f"qhead_per_kv_head must be 32 or 64, got {qhead_per_kv_head}")
-        if unsupported_reasons:
-            raise ValueError("dsa_indexer_implementation='cudnn' is not supported: " + "; ".join(unsupported_reasons))
-        return indexer_select_topk(
-            q,
-            k,
-            weights.to(q.dtype),
-            self.index_topk,
-            ratio=1,
-            qhead_per_kv_head=qhead_per_kv_head,
-            sm_scale=self.softmax_scale,
-        ).to(torch.int32)
-    # --- Patch.1 ---
+    self.q_lora_rank = config.q_lora_rank
+    self.qk_rope_head_dim = config.qk_rope_head_dim
+    self.kv_lora_rank = config.kv_lora_rank
+    self.v_head_dim = config.v_head_dim
+    self.qk_nope_head_dim = config.qk_nope_head_dim
+    self.qk_head_dim = config.qk_head_dim
 
-    scores = torch.matmul(q.float(), k.transpose(-1, -2).float().unsqueeze(1)) * self.softmax_scale
-    scores = F.relu(scores)
+    self.is_causal = True
 
-    # Weight per head and sum across heads: [B, S, 1, H] @ [B, S, H, T] → [B, S, T]
-    index_scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)
+    self.q_proj = (
+        nn.Linear(config.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
+        if self.q_lora_rank is None
+        else None
+    )
+    self.q_a_proj = (
+        nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
+        if self.q_lora_rank is not None
+        else None
+    )
+    self.q_a_layernorm = GlmMoeDsaRMSNorm(config.q_lora_rank) if self.q_lora_rank is not None else None
+    self.q_b_proj = (
+        nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
+        if self.q_lora_rank is not None
+        else None
+    )
 
-    # Causality needs to be taken into account when computing scores so padding tokens don't affect computation
-    if attention_mask is not None:
-        index_scores = index_scores + attention_mask
-    else:
-        key_positions = torch.arange(index_scores.shape[-1], device=index_scores.device)
-        causal = key_positions[None, None, :] > position_ids[:, :, None]  # [B, S, T]
-        index_scores = index_scores.masked_fill(causal, float("-inf"))
-
-    topk = min(self.index_topk, index_scores.shape[-1])
-    return index_scores.topk(topk, dim=-1).indices.to(torch.int32)
+    self.kv_a_proj_with_mqa = nn.Linear(
+        config.hidden_size,
+        self.kv_lora_rank + self.qk_rope_head_dim,
+        bias=config.attention_bias,
+    )
+    self.kv_a_layernorm = GlmMoeDsaRMSNorm(self.kv_lora_rank)
+    self.kv_b_proj = nn.Linear(
+        self.kv_lora_rank,
+        self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+        bias=False,
+    )
+    self.o_proj = nn.Linear(
+        self.num_heads * self.v_head_dim,
+        config.hidden_size,
+        bias=config.attention_bias,
+    )
+    self.scaling = yarn_apply_mscale(config.rope_parameters, self.qk_head_dim ** (-0.5))
+    self.skip_topk = config.indexer_types[layer_idx] == "shared"
+    self.indexer = None if self.skip_topk else GlmMoeDsaIndexer(config, layer_idx)
+    self.veomni_rope = VeomniOp("rope", "interleave", "eager")
+    self.veomni_dsa_attention = VeomniOp(
+        "dsa_attention",
+        "glm",
+        resolve_op_impl("dsa_attention_implementation"),
+    )
 
 
 @config.override_method(
     "GlmMoeDsaAttention.forward",
-    description="Use FlashMLA sparse prefill forward with cuDNN FE DSA backward when supported",
+    description="DSA consumes compressed K/V from past_key_values.update(), not module buffers",
 )
 def glm_moe_dsa_attention_forward_patched(
     self,
@@ -169,50 +296,30 @@ def glm_moe_dsa_attention_forward_patched(
     batch_size, seq_length = hidden_states.shape[:-1]
     cos, sin = position_embeddings
 
-    # ===== Query path =====
     if self.q_lora_rank is None:
         query_states = self.q_proj(hidden_states)
         q_resid = None
     else:
-        q_resid = self.q_a_layernorm(self.q_a_proj(hidden_states))  # [B, S, q_lora_rank]
+        q_resid = self.q_a_layernorm(self.q_a_proj(hidden_states))
         query_states = self.q_b_proj(q_resid)
     query_states = query_states.view(batch_size, seq_length, -1, self.qk_head_dim).transpose(1, 2)
-    # Split nope/rope — layout: [B, H, S, D]
     q_nope, q_pe = torch.split(query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-    # ===== KV path =====
-    compressed_kv = self.kv_a_proj_with_mqa(hidden_states)  # [B, S, kv_rank + rope_D]
+    compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
     k_compressed, k_pe = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-    k_compressed = self.kv_a_layernorm(k_compressed)  # [B, S, kv_rank]
-    k_pe = k_pe.view(batch_size, 1, seq_length, self.qk_rope_head_dim)  # [B, 1, S, rope_D]
+    k_compressed = self.kv_a_layernorm(k_compressed)
+    k_pe = k_pe.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
 
-    # transformers 5.16 replaced the per-tensor `apply_rotary_pos_emb` helper with
-    # a fused q/k `apply_rotary_pos_emb_interleave`, so both rope streams are
-    # rotated in one call (BHSD ⇒ default unsqueeze_dim=1).
-    q_pe, k_pe = apply_rotary_pos_emb_interleave(q_pe, k_pe, cos, sin)
+    q_pe, k_pe = self.veomni_rope(q_pe, k_pe, cos, sin)
 
-    # Expand KV through kv_b_proj
-    kv_expanded = self.kv_b_proj(k_compressed)  # [B, S, H * (nope_D + v_D)]
-    kv_expanded = kv_expanded.view(batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
-    k_nope, value_states = torch.split(kv_expanded, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-    k_nope = k_nope.transpose(1, 2)  # [B, H, S, nope_D]
-    value_states = value_states.transpose(1, 2)  # [B, H, S, v_D]
-
-    k_pe_mqa = k_pe
-    k_pe = k_pe.expand(-1, k_nope.shape[1], -1, -1)  # [B, H, S, rope_D]
-
-    # Assemble full Q and K
-    query_states = torch.cat([q_nope, q_pe], dim=-1)  # [B, H, S, qk_head_dim]
-    key_states = torch.cat([k_nope, k_pe], dim=-1)  # [B, H, S, qk_head_dim]
-
-    # Cache update
+    # DSA consumes MQA compressed latents. Keep them on the shared Cache object
+    # (BHSD, concat on seq) instead of module buffers so chunked prefill,
+    # independent requests, and reorder_cache share one lifecycle.
+    k_pe_states = k_pe
+    kv_states = k_compressed.unsqueeze(1)
     if past_key_values is not None:
-        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+        k_pe_states, kv_states = past_key_values.update(k_pe_states, kv_states, self.layer_idx)
 
-    # ===== Indexer (DSA sparse mask) =====
-    # attention_mask is [B, 1, S, T] (4D) for eager and (2D) otherwise but indexer works with [B, S, T] (3D)
-    # transformers 5.16 sets `self.indexer = None` on "shared" indexer layers
-    # instead of gating on `self.skip_topk` inside the forward.
     if self.indexer is not None:
         indexer_mask = (
             attention_mask[:, 0, :, :]
@@ -221,6 +328,7 @@ def glm_moe_dsa_attention_forward_patched(
             if attention_mask is not None
             else None
         )
+        indexer_mask = copy_dsa_mask_provenance(attention_mask, indexer_mask)
         topk_indices = self.indexer(
             hidden_states,
             q_resid,
@@ -228,131 +336,81 @@ def glm_moe_dsa_attention_forward_patched(
             indexer_mask,
             position_ids,
             past_key_values=past_key_values,
-        )  # [B, S, topk]
+        )
     else:
         if prev_topk_indices is None:
             raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")
-        topk_indices = prev_topk_indices  # [B, S, topk]
+        topk_indices = prev_topk_indices
 
-    attention_implementation = veomni_dsa_attention_implementation.value
-    if attention_implementation not in ("eager", "flashmla_cudnn"):
+    kv_b_weight = self.kv_b_proj.weight.contiguous().view(
+        self.num_heads,
+        self.qk_nope_head_dim + self.v_head_dim,
+        self.kv_lora_rank,
+    )
+    k_nope_weight = kv_b_weight[:, : self.qk_nope_head_dim, :]
+    value_weight = kv_b_weight[:, self.qk_nope_head_dim :, :]
+    q_nope_absorbed = torch.einsum("bhsd,hdr->bshr", q_nope, k_nope_weight).contiguous()
+    k_pe_kernel = k_pe_states.transpose(1, 2).contiguous()
+    kv_cache = kv_states.transpose(1, 2).contiguous()
+    output_attentions = bool(kwargs.get("output_attentions", False)) or bool(
+        getattr(self.config, "output_attentions", False)
+    )
+    fused_attention = self.veomni_dsa_attention.impl != "eager"
+    if fused_attention and output_attentions:
         raise ValueError(
-            f"Unknown dsa_attention_implementation={attention_implementation!r}; expected 'eager' or 'flashmla_cudnn'"
+            "flashmla_cudnn GLM sparse attention does not support output_attentions=True; "
+            "use the eager implementation."
         )
-    if attention_implementation == "flashmla_cudnn":
-        from veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn import (
-            check_flash_mla_sparse_forward_compatible,
-            flash_mla_sparse_attention_with_cudnn_backward,
-        )
-
-        if not hidden_states.is_cuda:
-            raise ValueError("dsa_attention_implementation='flashmla_cudnn' requires CUDA hidden_states")
-        if past_key_values is not None:
-            raise ValueError("dsa_attention_implementation='flashmla_cudnn' does not support KV cache")
-        if self.training and self.attention_dropout != 0:
-            raise ValueError("dsa_attention_implementation='flashmla_cudnn' requires attention_dropout=0")
-
-        if not self.kv_b_proj.weight.is_contiguous():
-            raise ValueError("dsa_attention_implementation='flashmla_cudnn' requires contiguous kv_b_proj.weight")
-        kv_b_weight = self.kv_b_proj.weight.view(
-            self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-            self.kv_lora_rank,
-        )
-        k_nope_weight = kv_b_weight[:, : self.qk_nope_head_dim, :]
-        value_weight = kv_b_weight[:, self.qk_nope_head_dim :, :]
-        q_nope_absorbed = torch.einsum("bhsd,hdr->bshr", q_nope, k_nope_weight)
-        compatible, reason = check_flash_mla_sparse_forward_compatible(
-            q_pe.transpose(1, 2),
-            k_pe_mqa.transpose(1, 2),
-            k_compressed.unsqueeze(2),
-            q_nope_absorbed,
-            topk_indices,
-        )
-        if not compatible:
-            raise ValueError("dsa_attention_implementation='flashmla_cudnn' is not supported: " + reason)
-        compressed_attn_output = flash_mla_sparse_attention_with_cudnn_backward(
-            q_pe.transpose(1, 2).contiguous(),
-            k_pe_mqa.transpose(1, 2).contiguous(),
-            k_compressed.unsqueeze(2).contiguous(),
-            q_nope_absorbed.contiguous(),
-            topk_indices,
-            softmax_scale=self.scaling,
-        )
-        attn_output = torch.einsum("bshr,hvr->bshv", compressed_attn_output, value_weight)
-        attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, None, topk_indices
-
-    # Build the combined DSA + causal mask. Mirrors upstream 5.16: a boolean
-    # "not selected" mask is scattered from topk_indices and folded into the
-    # additive attention mask (materialising a zero mask when the model path
-    # passed None and relied on `is_causal`). The `qk_head_dim != v_head_dim`
-    # flash-attention value padding upstream carried in 5.9 is gone: the class
-    # sets `_supports_flash_attn = False`, so that branch was unreachable.
-    sparse_indices = None
-    if self.config._attn_implementation in ("eager", "sdpa"):
-        index_mask = (
-            topk_indices.new_ones((batch_size, seq_length, key_states.shape[2]), dtype=torch.bool)
-            .scatter(-1, topk_indices.long(), False)
-            .unsqueeze(1)
-        )
-        if attention_mask is None:
-            key_positions = torch.arange(key_states.shape[2], device=hidden_states.device)
-            index_mask = index_mask | (key_positions[None, None, None, :] > position_ids[:, None, :, None])
-            attention_mask = hidden_states.new_zeros((batch_size, 1, seq_length, key_states.shape[2]))
-        attention_mask = attention_mask.masked_fill(index_mask, torch.finfo(hidden_states.dtype).min)
-    else:
-        # Modification: upstream reaches this branch only with a flash-mla kernel
-        # that consumes `indices`. VeOmni also registers `veomni_flash_attention_*`
-        # names in ALL_ATTENTION_FUNCTIONS, and those swallow `indices` into
-        # `**kwargs` — which would silently run *dense* attention with the DSA
-        # top-k selection discarded. Upstream's `_supports_flash_attn = False`
-        # does not gate VeOmni's custom names, so reject them explicitly here
-        # rather than training on a silently wrong attention pattern.
-        # The consuming kernel is the flash-mla hub kernel, requested as
-        # ``kernels-community/flash-mla``, so match the family by name. Upstream's
-        # ``PreTrainedModel._compatible_flash_implementations`` is where such a
-        # kernel would be declared, but no 5.16 model populates it (glm_moe_dsa and
-        # deepseek_v32 both leave it empty), so this accepted-name set is a
-        # forward-looking guess and the positive branch is currently unreachable.
-        # The guard fails closed, which is the safe direction. VeOmni's
-        # `flash_attention_forward` carries the same rejection for models whose
-        # attention forward is not patched here (e.g. the glm_moe_dsa NPU build).
-        _impl = self.config._attn_implementation
-        if "flash-mla" not in _impl and "flash_mla" not in _impl:
-            raise ValueError(
-                "GLM-MoE-DSA sparse attention requires an attention implementation that consumes the "
-                "top-k `indices` (a flash-mla kernel), or 'eager'/'sdpa' which fold the selection into "
-                f"the mask. Got _attn_implementation={_impl!r}, which would "
-                "discard the DSA top-k selection and run dense attention."
-            )
-        sparse_indices = topk_indices
-
-    attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-        self.config._attn_implementation, eager_attention_forward
-    )
-
-    attn_output, attn_weights = attention_interface(
-        self,
-        query_states,
-        key_states,
-        value_states,
+    attention_mask = translate_fused_dsa_mask(
         attention_mask,
-        dropout=0.0 if not self.training else self.attention_dropout,
-        scaling=self.scaling,
-        indices=sparse_indices,  # consumed by flash_mla_with_kvcache; ignored by eager / SDPA
-        **kwargs,
+        q_len=seq_length,
+        kv_len=k_pe_kernel.shape[1],
+        fused=fused_attention,
+        what="flashmla_cudnn GLM sparse attention",
     )
-
+    attention_dropout = 0.0 if not self.training else self.attention_dropout
+    attn_result = self.veomni_dsa_attention(
+        q_pe.transpose(1, 2).contiguous(),
+        k_pe_kernel,
+        kv_cache,
+        q_nope_absorbed,
+        topk_indices,
+        softmax_scale=self.scaling,
+        attention_mask=attention_mask,
+        use_cache=past_key_values is not None,
+        training=self.training,
+        attention_dropout=attention_dropout,
+        return_attn_weights=output_attentions,
+    )
+    if output_attentions:
+        compressed_attn_output, attn_weights = attn_result
+    else:
+        compressed_attn_output = attn_result
+        attn_weights = None
+    attn_output = torch.einsum("bshr,hvr->bshv", compressed_attn_output, value_weight)
     attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
     attn_output = self.o_proj(attn_output)
     return attn_output, attn_weights, topk_indices
 
 
 @config.override_method(
+    "GlmMoeDsaForCausalLM.__init__",
+    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp",
+)
+def glm_moe_dsa_forcausallm_init_patched(self, config):
+    super().__init__(config)
+    self.model = GlmMoeDsaModel(config)
+    self.vocab_size = config.vocab_size
+    self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+    self.post_init()
+
+
+@config.override_method(
     "GlmMoeDsaForCausalLM.forward",
-    description="Support fused cross entropy path in GlmMoeDsaForCausalLM.forward",
+    description="Always call self.loss_function (ForCausalLMLoss + VeomniOp)",
 )
 def glm_moe_dsa_forcausallm_forward_patched(
     self,
@@ -369,8 +427,8 @@ def glm_moe_dsa_forcausallm_forward_patched(
 ) -> CausalLMOutputWithPast:
     r"""
     cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-        Indices depicting the position of the input sequence tokens in the sequence. Retained in the
-        signature for callers that pass it positionally; transformers 5.16 moved it into `**kwargs`.
+        Indices depicting the position of input tokens in the sequence. This is
+        retained explicitly for callers that pass it positionally.
     """
     outputs = self.model(
         input_ids=input_ids,
@@ -390,30 +448,14 @@ def glm_moe_dsa_forcausallm_forward_patched(
     logits = None
     fused_linear_aux = None
     if labels is not None:
-        # Modification: OpSlot guard for cross-entropy loss.
-        if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-        else:
-            logits = self.lm_head(hidden_states)
-            loss, _, fused_linear_aux = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-            if fused_linear_aux is not None:
-                # fused_linear_aux path empties loss/logits slots; clear the local 3D
-                # logits so output mirrors the OpSlot branch's contract.
-                logits = None
+        loss, logits, fused_linear_aux = self.loss_function(
+            logits=None,
+            labels=labels,
+            vocab_size=self.config.vocab_size,
+            hidden_states=hidden_states,
+            weights=self.lm_head.weight,
+            **kwargs,
+        )
     else:
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
@@ -425,3 +467,13 @@ def glm_moe_dsa_forcausallm_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
     )
+
+
+@config.override_method(
+    "GlmMoeDsaForCausalLM.get_parallel_plan",
+    description="Register GLM-MoE-DSA expert parallel plan for v5 generated modeling",
+)
+def glm_moe_dsa_get_parallel_plan_patched(self):
+    from ..parallel_plan import get_parallel_plan as _get_parallel_plan
+
+    return _get_parallel_plan()

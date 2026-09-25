@@ -40,7 +40,6 @@ The `patchgen` console script reads `[tool.patchgen]` from the nearest `pyprojec
 [tool.patchgen]
 search_root = "veomni/models/transformers"
 package_prefix = "veomni.models.transformers"
-legacy_patches_prefix = "veomni.models.transformers.qwen3.patches"
 ```
 
 ## Project Structure
@@ -57,11 +56,9 @@ Open-VeOmni/
 │       ├── _normalize.py            # Shared ruff fix+format pipeline
 │       └── cli.py                   # `patchgen` console-script entry
 ├── veomni/
-│   ├── patchgen.py                  # back-compat shim: from patchgen import *
+│   ├── patchgen/                    # package-level forwarding modules
 │   └── models/transformers/qwen3/
 │       ├── qwen3_gpu_patch_gen_config.py      # Qwen3 GPU patch config
-│       ├── patches/
-│       │   └── qwen3_gpu_patches.py            # Qwen3 GPU patch implementations
 │       └── generated/
 │           ├── patched_modeling_qwen3_gpu.py   # Generated output
 │           └── patched_modeling_qwen3_gpu.diff # Unified diff vs original
@@ -84,8 +81,8 @@ When adapting HuggingFace models for training frameworks (VeOmni, veRL, etc.), w
 Current approaches have significant drawbacks:
 
 ```python
-# BAD: Runtime monkey patching - hard to debug, order-dependent
-apply_ops_patch()
+# Runtime mutation is hard to debug and order-dependent
+apply_runtime_patches()
 apply_logprobs_patch()
 apply_xpu_patch()
 
@@ -371,13 +368,14 @@ output = generator.generate(
 
 ### Init Modification
 
-Modify `__init__` methods without replacing the entire class:
+Modify `__init__` methods without replacing the entire class. Extra statements
+after `original_init(...)` are inlined into the upstream body:
 
 ```python
-@config.modify_init("Qwen3Attention")
-def modified_init(original_init, self, config, layer_idx):
-    original_init(self, config, layer_idx)
-    self.custom_attr = some_value
+@config.modify_init("Qwen2Attention")
+def bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 ```
 
 ## CLI Reference
@@ -423,7 +421,7 @@ make patchgen
 
 The `check_patchgen.yml` workflow runs on PRs that touch `patchgen-pkg/**`,
 `veomni/patchgen/**`, `veomni/models/transformers/**`, `pyproject.toml`, or
-`uv.lock`. It:
+`uv.lock`. It checks the complete discovered config set. The workflow:
 
 1. Discovers all `*_patch_gen_config.py` files via the `[tool.patchgen]` section
 2. Regenerates each config to a temp file
@@ -481,7 +479,7 @@ patchgen --list
 > helpers, and pass `cu_seq_lens_q` into mask construction. The wrappers add
 > packed-sample boundaries to the native mask so tokens from different samples
 > cannot attend to each other. See the
-> [FlexAttention integration guide](../transformers_v5/veomni_fused_attention.md#integrating-a-new-patchgen-model).
+> [FlexAttention integration guide](../transformers_v5/veomni_attention_interface.md#integrating-a-new-patchgen-model).
 
 ## Using patchgen from a dependent project
 
@@ -511,9 +509,6 @@ ruff_extra_ignore = ["E501"]
 # Run ruff with --isolated so normalization is deterministic regardless
 # of which pyproject.toml ruff happens to discover. Recommended.
 ruff_isolated = true
-# Legacy patches.<name> shorthand expansion (rarely needed; VeOmni uses
-# this for its qwen3 tree).
-# legacy_patches_prefix = "<your_project>.models.qwen3.patches"
 ```
 
 The `patchgen` console script walks up from CWD looking for the nearest `pyproject.toml` with a `[tool.patchgen]` section and builds its `DiscoveryConfig` from that. CLI flags are unchanged.

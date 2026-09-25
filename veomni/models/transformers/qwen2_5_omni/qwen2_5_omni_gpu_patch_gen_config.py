@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen2.5-Omni transformers>=5.16.1 code generation.
+Patch configuration for Qwen2.5-Omni transformers>=5.9.0 code generation.
 
 Covers the thinker training path (text + vision + audio, dense — no MoE):
   - PreTrained.get_rope_index with per-video use_audio_in_video derived from
@@ -33,7 +33,7 @@ Covers the thinker training path (text + vision + audio, dense — no MoE):
     preprocessing time
   - Thinker.forward: pre-computed image/video/audio masks (popped from
     kwargs), SP-aware embed gather+scatter, FSDP dummy ViT/audio forward on
-    ranks without modality, fused loss via OpSlot + self.loss_function,
+    ranks without modality, fused loss via ForCausalLMLoss,
     precomputed multimodal position-ids transposed from (bs, 3, L) to
     (3, bs, L), filtered zero-length audio_feature_lengths
   - ForConditionalGeneration.__init__: force has_talker=False, pin
@@ -46,22 +46,25 @@ Covers the thinker training path (text + vision + audio, dense — no MoE):
 
 Regen command:
 patchgen veomni.models.transformers.qwen2_5_omni.qwen2_5_omni_gpu_patch_gen_config -o veomni/models/transformers/qwen2_5_omni/generated --diff
+
+Thinker CausalLM uses ``ForCausalLMLoss``. Talker and token2wav stay excluded.
 """
 
 import copy
 from functools import partial
 from types import SimpleNamespace
-from typing import Callable
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPooling
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.modeling_utils import is_flash_attention_requested
 from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
     Qwen2_5OmniThinkerForConditionalGeneration,
-    apply_rotary_pos_emb_vision,
-    eager_attention_forward,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
@@ -73,7 +76,10 @@ from veomni.distributed.sequence_parallel import (
     slice_input_tensor,
     unpad_tensor,
 )
-from veomni.models.transformers.attention_utils import VARLEN_ATTENTION_TYPES
+from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.models.utils.attention_utils import VARLEN_ATTENTION_TYPES
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import (
     AUDIO_INPUT_INDEX,
@@ -89,6 +95,8 @@ config = PatchConfig(
     target_file="patched_modeling_qwen2_5_omni_gpu.py",
     description="Qwen2.5-Omni thinker with VeOmni v5 compatibility (SP + FSDP + fused loss)",
 )
+
+config.add_import("typing", names=["Optional"])
 
 
 # ================================================================
@@ -108,7 +116,16 @@ config.add_import(
         "unpad_tensor",
     ],
 )
-config.add_import("veomni.models.transformers.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
+config.add_import("veomni.models.utils.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
+config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import(
+    "veomni.ops.config",
+    names=["resolve_op_impl"],
+)
+config.add_import(
+    "veomni.models.loss_utils",
+    names=["ForCausalLMLoss"],
+)
 # Surface ``Qwen2_5OmniThinkerCausalLMOutputWithLogProbs`` so the patched
 # ``Qwen2_5OmniThinkerForConditionalGeneration.forward`` can return per-token
 # log-probs / entropy as constructor fields while preserving ``rope_deltas``.
@@ -122,15 +139,6 @@ config.add_import(
 )
 config.drop_import_names("Qwen2_5OmniThinkerCausalLMOutputWithPast")
 
-config.add_post_import_block(
-    """
-    # ── OpSlot declarations ──────────────────────────────────────────────────
-    # Only the Thinker forward is in VeOmni's training path (Talker / Token2Wav
-    # are inference-only speech paths excluded from the generated file).
-    from veomni.ops.dispatch import OpSlot
-    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-    """
-)
 config.add_import(
     "veomni.utils.constants",
     names=["AUDIO_INPUT_INDEX", "IGNORE_INDEX", "IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"],
@@ -188,7 +196,100 @@ config.exclude_from_output(
     "TimeDelayNetBlock",
     "TorchActivation1d",
     "SnakeBeta",
+    "apply_rotary_pos_emb",
+    "apply_rotary_pos_emb_vision",
+    "apply_multimodal_rotary_pos_emb",
+    "rotate_half",
+    "use_kernel_forward_from_hub",
 )
+config.drop_import_names("use_kernel_forward_from_hub")
+
+
+@config.override_method(
+    "Qwen2_5OmniRMSNorm.__init__",
+    description="Construct a local rms_norm VeomniOp",
+)
+def qwen2_5_omni_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+    nn.Module.__init__(self)
+    self.weight = nn.Parameter(torch.ones(hidden_size))
+    self.variance_epsilon = eps
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+
+
+@config.override_method(
+    "Qwen2_5OmniRMSNorm.forward",
+    description="Always call the local rms_norm VeomniOp",
+)
+def qwen2_5_omni_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
+
+
+@config.override_method(
+    "Qwen2_5OmniMLP.__init__",
+    description="Construct a local swiglu_mlp VeomniOp",
+)
+def qwen2_5_omni_vision_mlp_init_patched(self, config, bias: bool = False):
+    nn.Module.__init__(self)
+    self.config = config
+    self.hidden_size = config.hidden_size
+    self.intermediate_size = config.intermediate_size
+    self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
+    self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
+    self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=bias)
+    self.act_fn = ACT2FN[config.hidden_act]
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+
+
+@config.override_method(
+    "Qwen2_5OmniMLP.forward",
+    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
+)
+def qwen2_5_omni_vision_mlp_forward_patched(self, hidden_state):
+    if self.config.hidden_act in {"silu", "swish"}:
+        return self.veomni_swiglu_mlp(
+            hidden_state,
+            self.gate_proj.weight,
+            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+            self.up_proj.weight,
+            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+            self.down_proj.weight,
+            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+        )
+    return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+
+
+@config.override_method(
+    "Qwen2MLP.__init__",
+    description="Construct a local swiglu_mlp VeomniOp",
+)
+def qwen2_5_omni_text_mlp_init_patched(self, config, bias: bool = False):
+    nn.Module.__init__(self)
+    self.config = config
+    self.hidden_size = config.hidden_size
+    self.intermediate_size = config.intermediate_size
+    self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
+    self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
+    self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=bias)
+    self.act_fn = ACT2FN[config.hidden_act]
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+
+
+@config.override_method(
+    "Qwen2MLP.forward",
+    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
+)
+def qwen2_5_omni_text_mlp_forward_patched(self, hidden_state):
+    if self.config.hidden_act in {"silu", "swish"}:
+        return self.veomni_swiglu_mlp(
+            hidden_state,
+            self.gate_proj.weight,
+            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+            self.up_proj.weight,
+            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+            self.down_proj.weight,
+            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+        )
+    return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
 
 # ================================================================
@@ -228,13 +329,13 @@ def get_position_id(main_func, self, **kwargs):
 )
 def qwen2_5_omni_get_rope_index_patched(
     self,
-    input_ids: torch.LongTensor | None = None,
-    image_grid_thw: torch.LongTensor | None = None,
-    video_grid_thw: torch.LongTensor | None = None,
-    attention_mask: torch.Tensor | None = None,
+    input_ids: Optional[torch.LongTensor] = None,
+    image_grid_thw: Optional[torch.LongTensor] = None,
+    video_grid_thw: Optional[torch.LongTensor] = None,
+    attention_mask: Optional[torch.Tensor] = None,
     use_audio_in_video: bool | None = None,
-    audio_seqlens: torch.LongTensor | None = None,
-    second_per_grids: torch.Tensor | None = None,
+    audio_seqlens: Optional[torch.LongTensor] = None,
+    second_per_grids: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     spatial_merge_size = self.spatial_merge_size
     image_token_id = self.config.image_token_id
@@ -352,7 +453,7 @@ def qwen2_5_omni_get_rope_index_patched(
 
                 elif min_ed == ed_video:
                     # --- Patch.1 ---
-                    # None selects VeOmni's per-video placeholder convention;
+                    # ``None`` selects VeOmni's per-video placeholder convention;
                     # explicit booleans retain HF generation's global contract.
                     video_has_audio = use_audio_in_video
                     if video_has_audio is None:
@@ -693,6 +794,13 @@ def qwen2_5_omni_audio_dummy_forward_patched(self):
 #    the SP-appended cu_seqlens padding entry would run through the
 #    non-varlen split branch and size-mismatch.
 # ================================================================
+@config.modify_init("Qwen2_5OmniVisionAttention", description="Bind instance-local rope and attention VeomniOps")
+def qwen2_5_omni_vision_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+
+
 @config.override_method(
     "Qwen2_5OmniVisionAttention.forward",
     description="Route through VARLEN_ATTENTION_TYPES so veomni_flash_attention_* with cu_seqlens works",
@@ -709,24 +817,18 @@ def qwen2_5_omni_vision_attention_forward_patched(
     query_states = self.q(hidden_states).reshape(seq_length, self.num_heads, -1)
     key_states = self.k(hidden_states).reshape(seq_length, self.num_heads, -1)
     value_states = self.v(hidden_states).reshape(seq_length, self.num_heads, -1)
-    query_states = apply_rotary_pos_emb_vision(query_states.unsqueeze(0), position_embeddings).squeeze(0)
-    key_states = apply_rotary_pos_emb_vision(key_states.unsqueeze(0), position_embeddings).squeeze(0)
+    cos = torch.cat((position_embeddings.cos(), position_embeddings.cos()), dim=-1)
+    sin = torch.cat((position_embeddings.sin(), position_embeddings.sin()), dim=-1)
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
     query_states = query_states.transpose(0, 1).unsqueeze(0)
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface: Callable = eager_attention_forward
-    if self.config._attn_implementation != "eager":
-        attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+    attention_interface = self.veomni_attn
 
     # --- Patch.1 ---
     if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
-        # Upstream calls `get_max_seqlen(...)` here, which returns None for
-        # VeOmni's custom `veomni_flash_attention_*` names because it gates on
-        # HF's built-in `is_flash_attention_requested`. Honour a caller-supplied
-        # value (upstream threads one down from the encoder, avoiding a host
-        # sync) and otherwise reduce locally.
         if max_seqlen is None:
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
         attn_output, _ = attention_interface(
@@ -1001,11 +1103,8 @@ def qwen2_5_omni_vision_dummy_forward_patched(self):
 
 # ================================================================
 # Patch: Qwen2_5OmniThinkerForConditionalGeneration.get_image_features
-# 1. skip the upstream `torch.split(pooler_output, split_sizes)` that
-#    transformers 5.16 added — VeOmni needs the flat tensor for the SP
-#    all-to-all, and the downstream masked_scatter is indexed by a single
-#    n_image_tokens slice rather than a per-image list. Mirrors the same patch
-#    on qwen3_vl / qwen3_5.
+# Keep the visual output flat for VeOmni's SP gather/scatter path instead of
+# the per-image list introduced by transformers 5.16.
 # ================================================================
 @config.override_method(
     "Qwen2_5OmniThinkerForConditionalGeneration.get_image_features",
@@ -1024,18 +1123,12 @@ def qwen2_5_omni_thinker_get_image_features_patched(
         The temporal, height and width of feature shape of each image in LLM.
     """
     pixel_values = pixel_values.type(self.visual.dtype)
-    # --- Patch.1 ---
-    # vision_outputs = self.visual(pixel_values, grid_thw=image_grid_thw, **kwargs)
-    # split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
-    # vision_outputs.pooler_output = list(torch.split(vision_outputs.pooler_output, split_sizes))
-    # return vision_outputs
-    # --- Patch.1 ---
     return self.visual(pixel_values, grid_thw=image_grid_thw, **kwargs)
 
 
 # ================================================================
 # Patch: Qwen2_5OmniThinkerForConditionalGeneration.get_video_features
-# 1. same as get_image_features above — keep pooler_output flat.
+# Keep the visual output flat for the same reason as get_image_features.
 # ================================================================
 @config.override_method(
     "Qwen2_5OmniThinkerForConditionalGeneration.get_video_features",
@@ -1054,9 +1147,6 @@ def qwen2_5_omni_thinker_get_video_features_patched(
         The temporal, height and width of feature shape of each video in LLM.
     """
     pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
-    # --- Patch.1 ---
-    # See get_image_features: upstream 5.16 splits pooler_output per video.
-    # --- Patch.1 ---
     return self.visual(pixel_values_videos, grid_thw=video_grid_thw, **kwargs)
 
 
@@ -1135,9 +1225,7 @@ def qwen2_5_omni_thinker_get_position_id_func_patched(self):
 # 4. [PosIDs] Transpose precomputed position_ids from (bs, 3, L) to
 #    (3, bs, L) so the model layer's mrope handler sees the canonical axis
 #    order.
-# 5. [Loss] Delegate loss to OpSlot-guarded `veomni_causal_lm_loss` first,
-#    then fall back to `self.loss_function` (VeOmni's patched LOSS_MAPPING
-#    returns `(loss, logits, fused_linear_aux)`).
+# 5. [Loss] Always call `self.loss_function` (ForCausalLMLoss + VeomniOp).
 # 6. [Data] Filter zero-length audio_feature_lengths (placeholder entries
 #    for videos without audio) before forwarding the audio tower.
 # 7. [LogProbs] Return Qwen2_5OmniThinkerCausalLMOutputWithLogProbs so
@@ -1146,35 +1234,54 @@ def qwen2_5_omni_thinker_get_position_id_func_patched(self):
 #    on backward.
 # ================================================================
 @config.override_method(
+    "Qwen2_5OmniThinkerForConditionalGeneration.__init__",
+    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp",
+)
+def qwen2_5_omni_thinker_init_patched(self, config):
+    super().__init__(config)
+    self.audio_tower = Qwen2_5OmniAudioEncoder._from_config(config.audio_config)
+    self.visual = Qwen2_5OmniVisionEncoder._from_config(config.vision_config)
+    self.vocab_size = config.text_config.vocab_size
+    self.model = Qwen2_5OmniThinkerTextModel._from_config(config.text_config)
+    self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+    self.spatial_merge_size = config.vision_config.spatial_merge_size
+    self.rope_deltas = None
+    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+    self.post_init()
+
+
+@config.override_method(
     "Qwen2_5OmniThinkerForConditionalGeneration.forward",
-    description="VeOmni SP + FSDP + precomputed masks + fused loss + log-probs / entropy",
+    description="VeOmni SP + FSDP + precomputed masks + always-call ForCausalLMLoss",
 )
 def qwen2_5_omni_thinker_forward_patched(
     self,
-    input_ids: torch.LongTensor | None = None,
-    input_features: torch.FloatTensor | None = None,
-    pixel_values: torch.FloatTensor | None = None,
-    pixel_values_videos: torch.FloatTensor | None = None,
-    image_grid_thw: torch.LongTensor | None = None,
-    video_grid_thw: torch.LongTensor | None = None,
-    attention_mask: torch.Tensor | None = None,
+    input_ids: Optional[torch.LongTensor] = None,
+    input_features: Optional[torch.FloatTensor] = None,
+    pixel_values: Optional[torch.FloatTensor] = None,
+    pixel_values_videos: Optional[torch.FloatTensor] = None,
+    image_grid_thw: Optional[torch.LongTensor] = None,
+    video_grid_thw: Optional[torch.LongTensor] = None,
+    attention_mask: Optional[torch.Tensor] = None,
     # --- Patch.1 ---
     # feature_attention_mask removed: VeOmni's collator already produces flat
     # audio_feature_lengths so this signature drops the redundant mask.
     # --- Patch.1 ---
-    audio_feature_lengths: torch.LongTensor | None = None,
-    position_ids: torch.LongTensor | None = None,
+    audio_feature_lengths: Optional[torch.LongTensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
     past_key_values=None,
-    inputs_embeds: torch.FloatTensor | None = None,
-    rope_deltas: torch.LongTensor | None = None,
-    labels: torch.LongTensor | None = None,
-    use_cache: bool | None = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    rope_deltas: Optional[torch.LongTensor] = None,
+    labels: Optional[torch.LongTensor] = None,
+    use_cache: Optional[bool] = None,
     # --- Patch.1 ---
     # use_audio_in_video removed: handled per-video in get_rope_index via
     # the audio_seqlens[audio_idx] == 0 convention.
     # --- Patch.1 ---
-    cache_position: torch.LongTensor | None = None,
-    video_second_per_grid: torch.LongTensor | None = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    video_second_per_grid: Optional[torch.LongTensor] = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen2_5OmniThinkerCausalLMOutputWithLogProbs:
     r"""
@@ -1318,7 +1425,6 @@ def qwen2_5_omni_thinker_forward_patched(
             or self.rope_deltas is None
         ):
             delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
-            # Keep the per-video audio lengths separate from HF's global flag.
             position_ids, rope_deltas = self.get_rope_index(
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,
@@ -1358,36 +1464,15 @@ def qwen2_5_omni_thinker_forward_patched(
     logits = None
     fused_linear_aux = None
     if labels is not None:
-        # Modification: OpSlot guard for cross-entropy loss (chunked fused CE
-        # when bound, falls back to ``self.loss_function`` otherwise).
-        if veomni_causal_lm_loss.use_non_eager_impl:  # noqa: F821 — declared via add_post_import_block
-            loss, logits, fused_linear_aux = veomni_causal_lm_loss(  # noqa: F821
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.get_text_config().vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                ignore_index=IGNORE_INDEX,
-                **kwargs,
-            )
-        else:
-            logits = self.lm_head(hidden_states)
-            # Modification: VeOmni's patched ``loss_function`` (via
-            # LOSS_MAPPING) returns ``(loss, logits, fused_linear_aux)``;
-            # unpack to match the OpSlot branch above.
-            loss, _, fused_linear_aux = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.get_text_config().vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                ignore_index=IGNORE_INDEX,
-                **kwargs,
-            )
-            if fused_linear_aux is not None:
-                # fused_linear_aux path empties loss/logits slots; clear the local 3D
-                # logits so output mirrors the OpSlot branch's contract.
-                logits = None
+        loss, logits, fused_linear_aux = self.loss_function(
+            logits=logits,
+            labels=labels,
+            vocab_size=self.config.get_text_config().vocab_size,
+            hidden_states=hidden_states,
+            weights=self.lm_head.weight,
+            ignore_index=IGNORE_INDEX,
+            **kwargs,
+        )
     else:
         logits = self.lm_head(hidden_states)
     # --- Patch.5 ---
@@ -1724,3 +1809,135 @@ def qwen2_5_omni_thinker_get_metadata_collate_func_patched(self):
 )
 def qwen2_5_omni_top_get_metadata_collate_func_patched(self):
     return self.thinker.get_metadata_collate_func()
+
+
+@config.modify_init("Qwen2_5OmniAudioAttention", description="Bind instance-local attention VeomniOp")
+def qwen2_5_omni_audio_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+
+
+@config.override_method(
+    "Qwen2_5OmniAudioAttention.forward",
+    description="Always call the local attention VeomniOp",
+)
+def qwen2_5_omni_audio_attention_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    **kwargs,
+) -> torch.Tensor:
+    seq_length, _ = hidden_states.size()
+
+    query_states = self.q_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
+    key_states = self.k_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
+    value_states = self.v_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
+
+    query_states = query_states.transpose(0, 1).unsqueeze(0)
+    key_states = key_states.transpose(0, 1).unsqueeze(0)
+    value_states = value_states.transpose(0, 1).unsqueeze(0)
+
+    attention_interface = self.veomni_attn
+
+    if is_flash_attention_requested(self.config):
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+        attn_output, _ = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask=None,
+            scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+            is_causal=False,
+            **kwargs,
+        )
+    else:
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
+        attn_outputs = [
+            attention_interface(
+                self,
+                q,
+                k,
+                v,
+                attention_mask=None,
+                scaling=self.scaling,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                is_causal=False,
+                **kwargs,
+            )[0]
+            for q, k, v in zip(*splits)
+        ]
+        attn_output = torch.cat(attn_outputs, dim=1)
+
+    attn_output = attn_output.reshape(seq_length, -1).contiguous()
+    attn_output = self.out_proj(attn_output)
+    return attn_output
+
+
+@config.modify_init("Qwen2_5OmniAttention", description="Bind instance-local rope and attention VeomniOps")
+def qwen2_5_omni_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "mrope", "eager")
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+
+
+@config.override_method(
+    "Qwen2_5OmniAttention.forward",
+    description="Always call the local attention VeomniOp",
+)
+def qwen2_5_omni_attention_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
+    del output_attentions, use_cache
+    bsz, q_len, _ = hidden_states.size()
+
+    query_states = self.q_proj(hidden_states)
+    key_states = self.k_proj(hidden_states)
+    value_states = self.v_proj(hidden_states)
+
+    query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = self.veomni_rope(
+        query_states,
+        key_states,
+        cos,
+        sin,
+        mrope_section=self.config.rope_parameters["mrope_section"],
+    )
+
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+    attn_output, attn_weights = self.veomni_attn(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        sliding_window=self.sliding_window,
+        position_ids=position_ids,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights

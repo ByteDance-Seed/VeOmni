@@ -9,19 +9,21 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# See the License for the specific language governing limitations
+# under the License.
+
+"""DeepSeek-V4 modeling that calls local VeomniOp handles."""
 
 from functools import partial
 
-from ....utils.device import IS_NPU_AVAILABLE
-from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from veomni.utils.device import IS_NPU_AVAILABLE
+
+from .configuration_deepseek_v4 import DeepseekV4Config
 
 
 @MODEL_CONFIG_REGISTRY.register("deepseek_v4")
 def register_deepseek_v4_config():
-    from .configuration_deepseek_v4 import DeepseekV4Config
-
     return DeepseekV4Config
 
 
@@ -31,14 +33,11 @@ def register_deepseek_v4_modeling(architecture: str):
         convert_deepseek_v4_fqn_to_index_mapping,
         create_deepseek_v4_checkpoint_tensor_converter,
     )
-    from .device_patch import apply_veomni_deepseek_v4_device_patch
 
     if IS_NPU_AVAILABLE:
         from .generated import patched_modeling_deepseek_v4_npu as gen
     else:
         from .generated import patched_modeling_deepseek_v4_gpu as gen
-
-    apply_veomni_deepseek_v4_device_patch(gen)
 
     DeepseekV4ForCausalLM = gen.DeepseekV4ForCausalLM
     DeepseekV4Model = gen.DeepseekV4Model
@@ -61,3 +60,6 @@ def register_deepseek_v4_modeling(architecture: str):
         return DeepseekV4Model
     else:
         return DeepseekV4ForCausalLM
+
+
+__all__ = ["DeepseekV4Config"]

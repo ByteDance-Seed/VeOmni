@@ -29,8 +29,8 @@ from typing import Dict, List, Optional
 
 import torch
 
-from ....utils import logging
-from ...checkpoint_tensor_loading import ConvertedCheckpointTensor
+from veomni.models.checkpoint.convert import ConvertedCheckpointTensor
+from veomni.utils import logging
 
 
 logger = logging.get_logger(__name__)

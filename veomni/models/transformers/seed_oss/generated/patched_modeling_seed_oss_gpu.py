@@ -9,21 +9,32 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
-#    - class_replacement: SeedOssRMSNorm
-#      Use LigerKernel RMSNorm
-#    - class_replacement: SeedOssMLP
-#      Use LigerKernel SwiGLU MLP
-#    - function_replacement: apply_rotary_pos_emb
-#      Use LigerKernel rotary embedding
+#    - method_override: SeedOssRMSNorm.__init__
+#      Construct a local rms_norm VeomniOp
+#    - method_override: SeedOssRMSNorm.forward
+#      Always call the local rms_norm VeomniOp
+#    - method_override: SeedOssMLP.__init__
+#      Construct a local swiglu_mlp VeomniOp
+#    - method_override: SeedOssMLP.forward
+#      Call swiglu_mlp for silu/swish, otherwise self.act_fn, then residual dropout
+#    - method_override: SeedOssForCausalLM.__init__
+#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: SeedOssForCausalLM.forward
-#      OpSlot guard for fused cross entropy in SeedOssForCausalLM.forward
+#      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
+#    - init_modification: SeedOssAttention
+#      Bind instance-local rope and attention VeomniOps
+#    - method_override: SeedOssAttention.forward
+#      Always call the local rope and attention VeomniOps
 #
 # ==============================================================================
 
 from collections.abc import Callable
+from functools import partial
 
+# Additional imports for patches
 import torch
 import torch.nn as nn
+from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
@@ -36,7 +47,7 @@ from transformers.modeling_layers import (
 )
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.seed_oss.configuration_seed_oss import SeedOssConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
@@ -44,68 +55,66 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
-# Additional import blocks for patches
-# ── OpSlot declarations ──────────────────────────────────────────────────
-# Bound at model-build time by _bind_veomni_ops() in auto.py.
-from veomni.ops.dispatch import OpSlot
-
-# Additional imports for patches
+from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
-veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+# ======================================================================
+# [MODIFIED CLASS] SeedOssRMSNorm
+# Methods patched: __init__, forward
+# ======================================================================
+
+
+@use_kernel_forward_from_hub("RMSNorm")
+class SeedOssRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+        nn.Module.__init__(self)
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
 # ======================================================================
-# [PATCHED CLASS] SeedOssRMSNorm
-# Original class replaced with: external
-# Reason: Use LigerKernel RMSNorm
-# Source: liger_kernel.transformers.rms_norm
+# [MODIFIED CLASS] SeedOssMLP
+# Methods patched: __init__, forward
 # ======================================================================
-# Import from: liger_kernel.transformers.rms_norm.LigerRMSNorm
-from liger_kernel.transformers.rms_norm import LigerRMSNorm as SeedOssRMSNorm
-
-# ======================================================================
-# [PATCHED CLASS] SeedOssMLP
-# Original class replaced with: external
-# Reason: Use LigerKernel SwiGLU MLP
-# Source: liger_kernel.transformers.swiglu
-# ======================================================================
-# Import from: liger_kernel.transformers.swiglu.LigerSwiGLUMLP
-from liger_kernel.transformers.swiglu import LigerSwiGLUMLP as SeedOssMLP
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+class SeedOssMLP(nn.Module):
+    def __init__(self, config):
+        nn.Module.__init__(self)
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        self.act_fn = ACT2FN[config.hidden_act]
+        self.residual_dropout = config.residual_dropout
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
-
-# ======================================================================
-# [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: Use LigerKernel rotary embedding
-# Source: veomni.models.transformers.seed_oss.seed_oss_gpu_patch_gen_config
-# ======================================================================
-@use_kernel_forward_from_hub("rotary_pos_emb")
-def apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    position_ids: torch.Tensor | None = None,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    from liger_kernel.transformers.rope import liger_rotary_pos_emb
-
-    return liger_rotary_pos_emb(
-        q,
-        k,
-        cos,
-        sin,
-        position_ids=position_ids,
-        unsqueeze_dim=unsqueeze_dim,
-    )
+    def forward(self, x):
+        if self.config.hidden_act in {"silu", "swish"}:
+            down_proj = self.veomni_swiglu_mlp(
+                x,
+                self.gate_proj.weight,
+                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+                self.up_proj.weight,
+                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+                self.down_proj.weight,
+                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+            )
+        else:
+            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return nn.functional.dropout(down_proj, p=self.residual_dropout, training=self.training)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -145,7 +154,14 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] SeedOssAttention
+# Methods patched: forward, __init__
+# ======================================================================
+
+
 class SeedOssAttention(nn.Module):
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: SeedOssConfig, layer_idx: int):
         super().__init__()
         self.config = config
@@ -172,6 +188,9 @@ class SeedOssAttention(nn.Module):
         )
 
         self.residual_dropout = config.residual_dropout
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,
@@ -189,16 +208,12 @@ class SeedOssAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
             key_states,
@@ -411,7 +426,7 @@ class SeedOssModel(SeedOssPreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] SeedOssForCausalLM
-# Methods patched: forward
+# Methods patched: __init__, forward
 # ======================================================================
 
 
@@ -427,17 +442,11 @@ class SeedOssForCausalLM(SeedOssPreTrainedModel, GenerationMixin):
         self.model = SeedOssModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Initialize weights and apply final processing
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
 
-    # ================================================================
-    # Patch: SeedOssForCausalLM.forward
-    # 1. OpSlot guard for fused cross-entropy loss; falls back to the eager
-    #    HF loss path when no fused kernel is bound. Returns the unified
-    #    ``CausalLMOutputWithLogProbs`` so callers can read per-token
-    #    log-probs / entropy alongside the loss.
-    # ================================================================
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -453,11 +462,6 @@ class SeedOssForCausalLM(SeedOssPreTrainedModel, GenerationMixin):
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
-        r"""
-        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-            Indices depicting the position of the input sequence tokens in the sequence. Retained in the
-            signature for callers that pass it positionally; transformers 5.16 moved it into `**kwargs`.
-        """
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -476,30 +480,14 @@ class SeedOssForCausalLM(SeedOssPreTrainedModel, GenerationMixin):
         logits = None
         fused_linear_aux = None
         if labels is not None:
-            # Modification: OpSlot guard for cross-entropy loss.
-            if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.config.vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
-                    **kwargs,
-                )
-            else:
-                logits = self.lm_head(hidden_states)
-                loss, _, fused_linear_aux = self.loss_function(
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.config.vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
-                    **kwargs,
-                )
-                if fused_linear_aux is not None:
-                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
-                    # logits so output mirrors the OpSlot branch's contract.
-                    logits = None
+            loss, logits, fused_linear_aux = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
+            )
         else:
             logits = self.lm_head(hidden_states[:, slice_indices, :])
 

@@ -33,11 +33,9 @@ from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmni
 from ..data import build_data_transform, build_dataloader
 from ..data.data_collator import DataCollator
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
-from ..models import build_foundation_model
-from ..models.auto import build_config
-from ..models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from ..models import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY, build_config, build_foundation_model
 from ..models.model_runtime import VeOmniModelRuntime
-from ..ops import apply_ops_config
+from ..ops.config import set_ops_config
 from ..utils import helper
 from ..utils.device import (
     get_device_type,
@@ -198,7 +196,7 @@ class DiTModelRuntime(VeOmniModelRuntime):
         # ``model_class._from_config``, not ``build_foundation_model``) sees a
         # populated ops singleton / LOSS_MAPPING. ``build_foundation_model``
         # below will re-apply the same config — that call is idempotent.
-        apply_ops_config(args.ops_implementation)
+        set_ops_config(args.ops_implementation)
         dit_config = build_config(args.config_path, **args.model_config)
         self.model_config = dit_config
         logger.info_rank0(f"Detected DiT model type: {dit_config.model_type}.")

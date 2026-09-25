@@ -11,23 +11,60 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ....lora.target_mapping import convert_fused_moe_lora_targets
-from ....utils.device import IS_NPU_AVAILABLE
-from ...loader import MODELING_REGISTRY
+
+"""Qwen3.5-MoE modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.lora.target_mapping import convert_fused_moe_lora_targets
+from veomni.models.registry import MODELING_REGISTRY
+from veomni.utils.device import IS_NPU_AVAILABLE
 
 
-def _convert_qwen3_5_moe_conditional_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
-    """Map semantic expert LoRA targets for the conditional-generation wrapper."""
+_LANGUAGE_GATE_UP = "model.language_model.layers.*.mlp.experts.gate_up_proj"
+_LANGUAGE_DOWN = "model.language_model.layers.*.mlp.experts.down_proj"
+_MTP_GATE_UP = "mtp.layers.*.mlp.experts.gate_up_proj"
+_MTP_DOWN = "mtp.layers.*.mlp.experts.down_proj"
+
+
+def _has_mtp_experts(model) -> bool:
+    """Return whether MTP fused-expert globs should be included.
+
+    Architecture-level mapping (``model is None``) includes MTP. Instance
+    mapping only adds those globs when the live model actually has MTP experts,
+    so ``resolve_fused_moe_lora_targets`` does not assert unmatched patterns.
+    """
+    if model is None:
+        return True
+    mtp = getattr(model, "mtp", None)
+    if mtp is None:
+        return False
+    return any(".mlp.experts." in name for name, _ in mtp.named_parameters())
+
+
+def _convert_qwen3_5_moe_wrapped_lora_targets_to_parameters(model, lora_modules, target_parameter_patterns):
+    target_modules, patterns = convert_fused_moe_lora_targets(
+        lora_modules,
+        target_parameter_patterns,
+        _LANGUAGE_GATE_UP,
+        _LANGUAGE_DOWN,
+    )
+    if _has_mtp_experts(model):
+        if _LANGUAGE_GATE_UP in patterns:
+            patterns.append(_MTP_GATE_UP)
+        if _LANGUAGE_DOWN in patterns:
+            patterns.append(_MTP_DOWN)
+    return target_modules, patterns
+
+
+def _convert_qwen3_5_moe_model_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
     return convert_fused_moe_lora_targets(
         lora_modules,
         target_parameter_patterns,
-        "model.language_model.layers.*.mlp.experts.gate_up_proj",
-        "model.language_model.layers.*.mlp.experts.down_proj",
+        "language_model.layers.*.mlp.experts.gate_up_proj",
+        "language_model.layers.*.mlp.experts.down_proj",
     )
 
 
 def _convert_qwen3_5_moe_causal_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
-    """Map semantic expert LoRA targets for the causal language-model wrapper."""
     return convert_fused_moe_lora_targets(
         lora_modules,
         target_parameter_patterns,
@@ -36,18 +73,20 @@ def _convert_qwen3_5_moe_causal_lora_targets_to_parameters(_model, lora_modules,
     )
 
 
+def _convert_qwen3_5_moe_text_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
+    return convert_fused_moe_lora_targets(
+        lora_modules,
+        target_parameter_patterns,
+        "layers.*.mlp.experts.gate_up_proj",
+        "layers.*.mlp.experts.down_proj",
+    )
+
+
 def _create_qwen3_5_moe_checkpoint_tensor_converter(model):
     from ..qwen3_moe.checkpoint_tensor_converter import Qwen3MoeCheckpointTensorConverter
 
     text_config = getattr(model.config, "text_config", model.config)
     return Qwen3MoeCheckpointTensorConverter(num_experts=text_config.num_experts)
-
-
-#
-# NPU branch is opt-in; everything else (CUDA, CPU-only) falls back to the GPU
-# generated file. The GPU generated module imports cleanly without an active
-# CUDA device, so a CPU-only environment (e.g. CI lint, doc build) can still
-# register the class.
 
 
 @MODELING_REGISTRY.register("qwen3_5_moe")
@@ -59,45 +98,54 @@ def register_qwen3_5_moe_modeling(architecture: str):
         from .generated.patched_modeling_qwen3_5_moe_npu import (
             Qwen3_5MoeForCausalLM,
             Qwen3_5MoeForConditionalGeneration,
+            Qwen3_5MoeModel,
         )
     else:
         from .generated.patched_modeling_qwen3_5_moe_gpu import (
             Qwen3_5MoeForCausalLM,
             Qwen3_5MoeForConditionalGeneration,
+            Qwen3_5MoeModel,
         )
 
     Qwen3_5MoeForConditionalGeneration._convert_lora_targets_to_parameters = staticmethod(
-        _convert_qwen3_5_moe_conditional_lora_targets_to_parameters
+        _convert_qwen3_5_moe_wrapped_lora_targets_to_parameters
     )
-    Qwen3_5MoeForCausalLM._convert_lora_targets_to_parameters = staticmethod(
-        _convert_qwen3_5_moe_causal_lora_targets_to_parameters
+    Qwen3_5MoeModel._convert_lora_targets_to_parameters = staticmethod(
+        _convert_qwen3_5_moe_model_lora_targets_to_parameters
     )
     for model_cls in (Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration):
         model_cls._create_checkpoint_tensor_converter = staticmethod(_create_qwen3_5_moe_checkpoint_tensor_converter)
         model_cls._convert_fqn_to_index_mapping = staticmethod(convert_qwen3_moe_fqn_to_index_mapping)
     if "ForCausalLM" in architecture:
         return Qwen3_5MoeForCausalLM
-    elif "ForConditionalGeneration" in architecture:
+    if "ForConditionalGeneration" in architecture:
         return Qwen3_5MoeForConditionalGeneration
-    else:
-        return Qwen3_5MoeForCausalLM
+    if "Model" in architecture:
+        return Qwen3_5MoeModel
+    return Qwen3_5MoeForConditionalGeneration
 
 
 @MODELING_REGISTRY.register("qwen3_5_moe_text")
 def register_qwen3_5_moe_text_modeling(architecture: str):
-    """Register and return the device-specific text-only Qwen3.5-MoE class."""
     if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_qwen3_5_moe_npu import Qwen3_5MoeForCausalLM
+        from .generated.patched_modeling_qwen3_5_moe_npu import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextModel
     else:
-        from .generated.patched_modeling_qwen3_5_moe_gpu import Qwen3_5MoeForCausalLM
+        from .generated.patched_modeling_qwen3_5_moe_gpu import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextModel
 
     from ..qwen3_moe.checkpoint_tensor_converter import convert_qwen3_moe_fqn_to_index_mapping
 
     Qwen3_5MoeForCausalLM._convert_lora_targets_to_parameters = staticmethod(
         _convert_qwen3_5_moe_causal_lora_targets_to_parameters
     )
+    Qwen3_5MoeTextModel._convert_lora_targets_to_parameters = staticmethod(
+        _convert_qwen3_5_moe_text_lora_targets_to_parameters
+    )
     Qwen3_5MoeForCausalLM._create_checkpoint_tensor_converter = staticmethod(
         _create_qwen3_5_moe_checkpoint_tensor_converter
     )
     Qwen3_5MoeForCausalLM._convert_fqn_to_index_mapping = staticmethod(convert_qwen3_moe_fqn_to_index_mapping)
+    if "ForCausalLM" in architecture:
+        return Qwen3_5MoeForCausalLM
+    if "TextModel" in architecture:
+        return Qwen3_5MoeTextModel
     return Qwen3_5MoeForCausalLM

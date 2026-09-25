@@ -29,10 +29,10 @@ per-expert stacking is needed (unlike `qwen3_moe`).
         model.language_model.layers.{i}.mlp.experts.down_proj     [E, H, I]
 
 Because VeOmni's training save path can also emit the v5 layout directly (e.g.
-`save_pretrained(save_original_format=False)`), the converter uses the dim-1
-and dim-2 shapes to distinguish HF layout from v5 layout and only transposes
-when needed; v5-layout tensors pass through untouched. Shapes matching both
-layouts or neither layout raise rather than silently corrupting weights.
+`save_pretrained(save_original_format=False)`), the converter uses both trailing
+dimensions to distinguish HF layout from v5 layout and only transposes when
+needed; v5-layout tensors pass through untouched. Shapes matching both layouts
+or neither layout raise rather than silently corrupting weights.
 """
 
 import re
@@ -40,7 +40,7 @@ from typing import List, Optional
 
 import torch
 
-from ...checkpoint_tensor_loading import ConvertedCheckpointTensor
+from veomni.models.checkpoint.convert import ConvertedCheckpointTensor
 
 
 # Matches fused-expert keys like: ...mlp.experts.{gate_up_proj|down_proj}

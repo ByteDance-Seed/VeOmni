@@ -1,6 +1,20 @@
+from contextlib import contextmanager
+
+import torch
 import torch.distributed as dist
 
 from veomni.utils.device import get_device_type, get_torch_device
+
+
+@contextmanager
+def ieee_fp32_matmul():
+    """Disable TF32 so fp32 Linear/SDPA compare at IEEE precision on CUDA."""
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
 
 
 def get_world_size():

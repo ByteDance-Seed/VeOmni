@@ -23,7 +23,9 @@ from ltx_core.model.transformer.ops import (
 )
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.transformer_args import TransformerArgs
-from ltx_core.utils import rms_norm
+
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 
 
 @dataclass
@@ -78,8 +80,9 @@ class TransformerOpsConfig:
         )
 
 
-# Frozen, so safe to share as a default argument across callers that want the
-# stock PyTorch ops without explicit construction.
+# Import-time snapshot of stock PyTorch callables. Do not pass this object
+# into a model that should follow the active ops config; construct a fresh
+# ``TransformerOpsConfig()`` at model ``__init__`` instead.
 DEFAULT_TRANSFORMER_OPS = TransformerOpsConfig()
 
 
@@ -96,6 +99,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         if ops is None:
             ops = TransformerOpsConfig()
+        impl = resolve_op_impl("rms_norm_implementation")
+        self.veomni_rms_norm_unweighted = VeomniOp("rms_norm", "unweighted", impl)
         self.ada_zero_function = ops.ada_zero_function
         self.post_sa_function = ops.post_sa_function
         if video is not None:
@@ -245,8 +250,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 prompt_timestep,
                 context_mask,
                 self.norm_eps,
+                self.veomni_rms_norm_unweighted,
             )
-        return attn(rms_norm(x, eps=self.norm_eps), context=context, mask=context_mask)
+        return attn(self.veomni_rms_norm_unweighted(x, eps=self.norm_eps), context=context, mask=context_mask)
 
     def forward(  # noqa: PLR0915
         self,
@@ -431,12 +437,15 @@ def apply_cross_attention_adaln(
     prompt_timestep: torch.Tensor,
     context_mask: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
+    rms_norm_op: VeomniOp | None = None,
 ) -> torch.Tensor:
     batch_size = x.shape[0]
     shift_kv, scale_kv = (
         prompt_scale_shift_table[None, None].to(device=x.device, dtype=x.dtype)
         + prompt_timestep.reshape(batch_size, prompt_timestep.shape[1], 2, -1)
     ).unbind(dim=2)
-    attn_input = rms_norm(x, eps=norm_eps) * (1 + q_scale) + q_shift
+    if rms_norm_op is None:
+        raise TypeError("apply_cross_attention_adaln requires an instance-local rms_norm handle")
+    attn_input = rms_norm_op(x, eps=norm_eps) * (1 + q_scale) + q_shift
     encoder_hidden_states = context * (1 + scale_kv) + shift_kv
     return attn(attn_input, context=encoder_hidden_states, mask=context_mask) * q_gate

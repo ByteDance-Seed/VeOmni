@@ -9,6 +9,7 @@ Validates:
 import os
 import random
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,7 +20,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_dist_comm_backend, get_torch_device
 
 
 # Only run in CI when ulysses SP or Qwen3.5 model code is touched.
@@ -38,35 +39,60 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 _PATCHED_MODULE = "veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu"
 
 
+def _install_fla_kernel_config() -> None:
+    from veomni.ops.config import set_ops_config
+
+    set_ops_config(
+        SimpleNamespace(
+            rms_norm_gated_implementation="fla",
+            causal_conv1d_implementation="fla",
+            chunk_gated_delta_rule_implementation="fla",
+        )
+    )
+
+
 @pytest.fixture(scope="module", autouse=True)
-def _bind_qwen3_5_op_slots():
-    """Bind the patched module's OpSlots to FLA before any test runs.
+def _configured_qwen3_5_kernels():
+    """Install the FLA selections used by directly constructed test layers."""
+    from veomni.ops.config import get_ops_config, set_ops_config
 
-    ``build_foundation_model`` is what normally calls ``_bind_veomni_ops`` to
-    resolve each ``OpSlot`` to a concrete kernel. These tests skip that path —
-    they construct ``Qwen3_5GatedDeltaNet`` directly to isolate the SP layer —
-    so without this fixture every slot stays unbound, ``bound_kernel()``
-    returns ``None`` in ``__init__``, and the varlen guard in ``forward``
-    raises ``RuntimeError``.
+    previous = get_ops_config()
+    _install_fla_kernel_config()
+    try:
+        yield
+    finally:
+        set_ops_config(previous)
 
-    These tests already require FLA (see the ``causal_conv1d_fn is None`` skip
-    inside each test), so binding to the FLA defaults matches existing intent.
-    """
-    if causal_conv1d_fn is None:
-        # No FLA installed → individual tests will skip; nothing to bind.
+
+@contextmanager
+def _deterministic_backend_flags():
+    """Scope deterministic CUDA flags without assigning global cudnn state."""
+    previous_deterministic = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    with torch.backends.cudnn.flags(
+        enabled=torch.backends.cudnn.enabled,
+        benchmark=False,
+        benchmark_limit=torch.backends.cudnn.benchmark_limit,
+        deterministic=True,
+        allow_tf32=False,
+    ):
+        torch.use_deterministic_algorithms(True)
+        try:
+            yield
+        finally:
+            torch.use_deterministic_algorithms(previous_deterministic, warn_only=previous_warn_only)
+
+
+@pytest.fixture(autouse=True)
+def _scope_deterministic_backend_flags():
+    if not IS_CUDA_AVAILABLE:
+        yield
         return
-    import importlib
-
-    from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.models.auto import _bind_veomni_ops
-
-    _bind_veomni_ops(importlib.import_module(_PATCHED_MODULE), OpsImplementationConfig())
+    with _deterministic_backend_flags():
+        yield
 
 
 def _set_deterministic(seed=42):
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(True)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -160,7 +186,9 @@ def test_lasp_depthwise_conv1d_slicing_matches_full(
     if causal_conv1d_fn is None or not get_torch_device().is_available():
         pytest.skip("FLA causal_conv1d or accelerator not available")
 
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import Qwen3_5GatedDeltaNet
+    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+        Qwen3_5GatedDeltaNet,
+    )
 
     _set_deterministic(42)
     key_dim = num_k_heads * head_k_dim
@@ -214,99 +242,93 @@ def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str, bsz
         world_size=world_size,
     )
 
-    import importlib
-
-    from veomni.arguments.arguments_types import OpsImplementationConfig
     from veomni.distributed.parallel_state import _init_parallel_state
-    from veomni.models.auto import _bind_veomni_ops
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import Qwen3_5GatedDeltaNet
+    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+        Qwen3_5GatedDeltaNet,
+    )
 
     _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
+    # Spawned workers do not inherit the process-global config installed by the
+    # parent fixture, so install the same FLA selections in each child.
+    _install_fla_kernel_config()
 
-    # The module-level ``_bind_qwen3_5_op_slots`` fixture only binds OpSlots
-    # in the parent test process; ``mp.spawn(start_method="spawn")`` here
-    # creates fresh interpreters that re-import the patched module with
-    # OpSlots unbound. Re-bind in each child so ``self.causal_conv1d_fn`` /
-    # ``self.chunk_gated_delta_rule`` are non-``None`` when
-    # ``Qwen3_5GatedDeltaNet.__init__`` reads them.
-    _bind_veomni_ops(importlib.import_module(_PATCHED_MODULE), OpsImplementationConfig())
+    with _deterministic_backend_flags():
+        _set_deterministic(42)
+        config = _TinyQwen3_5Config()
+        layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(device_type)
+        layer.train()
 
-    _set_deterministic(42)
-    config = _TinyQwen3_5Config()
-    layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(device_type)
-    layer.train()
+        hidden = config.hidden_size
 
-    hidden = config.hidden_size
+        if rank == 0:
+            full_input = torch.randn(bsz, seq_len, hidden, device=device_type)
+        else:
+            full_input = torch.empty(bsz, seq_len, hidden, device=device_type)
+        dist.broadcast(full_input, src=0)
 
-    if rank == 0:
-        full_input = torch.randn(bsz, seq_len, hidden, device=device_type)
-    else:
-        full_input = torch.empty(bsz, seq_len, hidden, device=device_type)
-    dist.broadcast(full_input, src=0)
+        shard_len = seq_len // world_size
+        local_input = full_input[:, rank * shard_len : (rank + 1) * shard_len].contiguous()
 
-    shard_len = seq_len // world_size
-    local_input = full_input[:, rank * shard_len : (rank + 1) * shard_len].contiguous()
+        # Baseline forward/backward on rank 0 with SP disabled
+        baseline_out = None
+        baseline_param_grads = None
+        if rank == 0:
+            no_sp_state = SimpleNamespace(ulysses_enabled=False)
+            with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+                baseline_out = layer(full_input, attention_mask=None, cu_seq_lens_q=None)
+                baseline_loss = baseline_out.mean()
+                baseline_loss.backward()
+                baseline_param_grads = {
+                    name: param.grad.detach().clone() if param.grad is not None else None
+                    for name, param in layer.named_parameters()
+                }
+                layer.zero_grad(set_to_none=True)
+                baseline_out = baseline_out.detach()
 
-    # Baseline forward/backward on rank 0 with SP disabled
-    baseline_out = None
-    baseline_param_grads = None
-    if rank == 0:
-        no_sp_state = SimpleNamespace(ulysses_enabled=False)
-        with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
-            baseline_out = layer(full_input, attention_mask=None, cu_seq_lens_q=None)
-            baseline_loss = baseline_out.mean()
-            baseline_loss.backward()
-            baseline_param_grads = {
-                name: param.grad.detach().clone() if param.grad is not None else None
-                for name, param in layer.named_parameters()
-            }
-            layer.zero_grad(set_to_none=True)
-            baseline_out = baseline_out.detach()
+        dist.barrier()
 
-    dist.barrier()
+        # SP forward/backward
+        sp_out_local = layer(local_input, attention_mask=None, cu_seq_lens_q=None)
+        total_numel = bsz * seq_len * sp_out_local.shape[-1]
+        sp_loss = sp_out_local.sum() / total_numel
+        sp_loss.backward()
 
-    # SP forward/backward
-    sp_out_local = layer(local_input, attention_mask=None, cu_seq_lens_q=None)
-    total_numel = bsz * seq_len * sp_out_local.shape[-1]
-    sp_loss = sp_out_local.sum() / total_numel
-    sp_loss.backward()
+        for param in layer.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
 
-    for param in layer.parameters():
-        if param.grad is not None:
-            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+        out_list = [torch.empty_like(sp_out_local) for _ in range(world_size)]
+        dist.all_gather(out_list, sp_out_local.detach())
+        sp_out_full = torch.cat(out_list, dim=1)
 
-    out_list = [torch.empty_like(sp_out_local) for _ in range(world_size)]
-    dist.all_gather(out_list, sp_out_local.detach())
-    sp_out_full = torch.cat(out_list, dim=1)
+        if rank == 0:
+            for name, param in layer.named_parameters():
+                baseline_grad = baseline_param_grads.get(name)
+                if baseline_grad is None and param.grad is None:
+                    continue
+                assert baseline_grad is not None and param.grad is not None, f"Missing grad for {name}"
+                # 1e-5 absolute tolerance: bfloat16-level grad noise can land
+                # just above the previous 3e-6 floor (observed 3.8e-6 on
+                # norm.weight, ~0.5% relative). The SP-vs-baseline check is
+                # really validating that the partition mechanics are sound,
+                # not bit-exact reproducibility under reduced precision.
+                torch.testing.assert_close(
+                    param.grad,
+                    baseline_grad,
+                    rtol=0,
+                    atol=1e-5,
+                    msg=lambda msg, n=name: f"{msg}\nGradient mismatch for {n}",
+                )
 
-    if rank == 0:
-        for name, param in layer.named_parameters():
-            baseline_grad = baseline_param_grads.get(name)
-            if baseline_grad is None and param.grad is None:
-                continue
-            assert baseline_grad is not None and param.grad is not None, f"Missing grad for {name}"
-            # 1e-5 absolute tolerance: bfloat16-level grad noise can land
-            # just above the previous 3e-6 floor (observed 3.8e-6 on
-            # norm.weight, ~0.5% relative). The SP-vs-baseline check is
-            # really validating that the partition mechanics are sound,
-            # not bit-exact reproducibility under reduced precision.
-            torch.testing.assert_close(
-                param.grad,
-                baseline_grad,
-                rtol=0,
-                atol=1e-5,
-                msg=lambda msg, n=name: f"{msg}\nGradient mismatch for {n}",
-            )
+        if rank == 0:
+            # 5e-3 abs tol: SP forward in bfloat16 with all-to-all reductions
+            # accumulates noise scaling with both batch size and seq length;
+            # observed ~1.2e-3 on the [seq=2048, bsz=8] case. Still small vs
+            # per-element output magnitudes.
+            torch.testing.assert_close(sp_out_full, baseline_out, rtol=0, atol=5e-3)
 
-    if rank == 0:
-        # 5e-3 abs tol: SP forward in bfloat16 with all-to-all reductions
-        # accumulates noise scaling with both batch size and seq length;
-        # observed ~1.2e-3 on the [seq=2048, bsz=8] case. Still small vs
-        # per-element output magnitudes.
-        torch.testing.assert_close(sp_out_full, baseline_out, rtol=0, atol=5e-3)
-
-    dist.barrier()
-    dist.destroy_process_group()
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("world_size", [2])
@@ -346,43 +368,35 @@ def _run_gated_deltanet_sp_determinism(rank: int, world_size: int, init_file: st
         world_size=world_size,
     )
 
-    import importlib
-
-    from veomni.arguments.arguments_types import OpsImplementationConfig
     from veomni.distributed.parallel_state import _init_parallel_state
-    from veomni.models.auto import _bind_veomni_ops
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import Qwen3_5GatedDeltaNet
+    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+        Qwen3_5GatedDeltaNet,
+    )
 
     _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
+    _install_fla_kernel_config()
 
-    # The module-level ``_bind_qwen3_5_op_slots`` fixture only binds OpSlots
-    # in the parent test process; ``mp.spawn(start_method="spawn")`` here
-    # creates fresh interpreters that re-import the patched module with
-    # OpSlots unbound. Re-bind in each child so ``self.causal_conv1d_fn`` /
-    # ``self.chunk_gated_delta_rule`` are non-``None`` when
-    # ``Qwen3_5GatedDeltaNet.__init__`` reads them.
-    _bind_veomni_ops(importlib.import_module(_PATCHED_MODULE), OpsImplementationConfig())
+    with _deterministic_backend_flags():
+        _set_deterministic(42)
+        config = _TinyQwen3_5Config()
+        layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(device_type)
+        layer.train()
 
-    _set_deterministic(42)
-    config = _TinyQwen3_5Config()
-    layer = Qwen3_5GatedDeltaNet(config, layer_idx=0).to(device_type)
-    layer.train()
+        hidden = config.hidden_size
 
-    hidden = config.hidden_size
+        if rank == 0:
+            full_input = torch.randn(bsz, seq_len, hidden, device=device_type)
+        else:
+            full_input = torch.empty(bsz, seq_len, hidden, device=device_type)
+        dist.broadcast(full_input, src=0)
 
-    if rank == 0:
-        full_input = torch.randn(bsz, seq_len, hidden, device=device_type)
-    else:
-        full_input = torch.empty(bsz, seq_len, hidden, device=device_type)
-    dist.broadcast(full_input, src=0)
+        shard_len = seq_len // world_size
+        local_input = full_input[:, rank * shard_len : (rank + 1) * shard_len].contiguous()
 
-    shard_len = seq_len // world_size
-    local_input = full_input[:, rank * shard_len : (rank + 1) * shard_len].contiguous()
+        _assert_forward_deterministic(layer, local_input, repeats=100)
 
-    _assert_forward_deterministic(layer, local_input, repeats=100)
-
-    dist.barrier()
-    dist.destroy_process_group()
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("world_size", [2])
@@ -424,7 +438,9 @@ def test_qwen3_5_gated_deltanet_forward_deterministic_no_sp(bsz, seq_len):
     if causal_conv1d_fn is None or not get_torch_device().is_available():
         pytest.skip("FLA causal_conv1d or accelerator not available")
 
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import Qwen3_5GatedDeltaNet
+    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+        Qwen3_5GatedDeltaNet,
+    )
 
     device_type = get_device_type()
 

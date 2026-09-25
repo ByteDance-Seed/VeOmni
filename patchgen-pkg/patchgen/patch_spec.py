@@ -261,31 +261,49 @@ class PatchConfig:
 
         return decorator
 
-    def modify_init(self, target_class: str, description: Optional[str] = None):
+    def modify_init(
+        self,
+        target_class: str,
+        replacement: Any = None,
+        description: Optional[str] = None,
+    ):
         """
-        Decorator to register an __init__ modification.
+        Register an ``__init__`` modification that keeps the upstream body.
 
-        The decorated function should take (original_init, self, *args, **kwargs)
-        and call original_init as needed.
+        The function takes ``(original_init, self, *args, **kwargs)``, must call
+        ``original_init(...)``, and may then bind extra attributes. Codegen
+        inlines those extra statements into the original ``__init__``.
 
-        Usage:
-            @config.modify_init("Qwen3Attention")
-            def modified_init(original_init, self, config, layer_idx):
+        Decorator usage:
+            @config.modify_init("Qwen2Attention")
+            def bind_ops(original_init, self, config, layer_idx):
                 original_init(self, config, layer_idx)
-                self.custom_attr = some_value
+                self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+
+        Direct usage (NPU configs reusing a GPU function):
+            config.modify_init("Qwen2Attention", replacement=bind_ops)
         """
 
-        def decorator(func: Callable) -> Callable:
+        def register(func: Callable) -> Callable:
             patch = Patch(
                 patch_type=PatchType.INIT_MODIFICATION,
                 target=target_class,
                 replacement=func,
+                source_module=func.__module__ if hasattr(func, "__module__") else None,
                 description=description or f"Modify {target_class}.__init__",
             )
             self.patches.append(patch)
             return func
 
-        return decorator
+        if replacement is not None:
+            return register(replacement)
+        return register
+
+    def adopt_init_modifications(self, other: "PatchConfig") -> None:
+        """Copy ``modify_init`` patches from another config (GPU → NPU)."""
+        for patch in other.patches:
+            if patch.patch_type == PatchType.INIT_MODIFICATION:
+                self.patches.append(patch)
 
     def add_import(
         self, module: str, names: Optional[list[str]] = None, alias: Optional[str] = None, is_from_import: bool = True
@@ -379,6 +397,10 @@ class PatchConfig:
         """
         Exclude specific classes/functions from the generated output.
 
+        Decorators that reference an excluded name are stripped as well, so a
+        leftover ``@use_kernelized_func(apply_rotary_pos_emb)`` does not
+        NameError after the helper is dropped.
+
         Usage:
             config.exclude_from_output("Qwen3ForTokenClassification")
         """
@@ -399,6 +421,10 @@ class PatchConfig:
     def get_function_replacements(self) -> dict[str, Patch]:
         """Get all function replacement patches as a dict."""
         return {p.target: p for p in self.patches if p.patch_type == PatchType.FUNCTION_REPLACEMENT}
+
+    def get_init_modifications(self) -> dict[str, Patch]:
+        """Get ``modify_init`` patches keyed by class name."""
+        return {p.target: p for p in self.patches if p.patch_type == PatchType.INIT_MODIFICATION}
 
 
 def get_source_code(obj: Any) -> str:

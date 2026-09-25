@@ -1,0 +1,79 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing limitations
+# under the License.
+
+"""GLM-DSA indexer eager.
+
+Adapted from HuggingFace ``GlmMoeDsaIndexer.forward`` score / top-k:
+
+    scores = ReLU(q @ k) * softmax_scale
+    index_scores = (scores * weights).sum(heads)
+    return index_scores.topk(...)
+
+https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+
+from ...topk import mask_unselectable_topk_indices
+
+
+def wrapper(
+    q: Tensor,
+    k: Tensor,
+    w: Tensor,
+    top_k: int,
+    *,
+    ratio: int = 1,
+    qhead_per_kv_head: int | None = None,
+    sm_scale: float = 1.0,
+    attention_mask: Tensor | None = None,
+    position_ids: Tensor | None = None,
+    use_cache: bool = False,
+) -> Tensor:
+    """Compute GLM DSA scores and causal top-k compressed-KV indices.
+
+    ``q`` is ``[B, S, H, D]``. ``k`` is ``[B, T, D]`` or ``[B, T, 1, D]``.
+    ``w`` is ``[B, S, H]``. Returns ``[B, S, K]`` ``torch.int32`` indices
+    where ``K = min(top_k, T)``. Invisible keys, including future positions
+    after the causal fill, are ``-1``. The ReLU / weighted-sum scores follow
+    HuggingFace ``GlmMoeDsaIndexer.forward``. Causal masking through
+    ``attention_mask`` or ``position_ids`` is VeOmni, not a copy of that
+    module. HuggingFace still returns future indices when fewer than ``K``
+    keys remain visible; fused attention here requires the ``-1`` sentinel.
+    ``ratio`` is accepted for API parity with cuDNN. The eager
+    path applies causality through ``attention_mask``, not ``ratio``.
+    ``qhead_per_kv_head`` is unused.
+    """
+    del ratio, qhead_per_kv_head, use_cache
+    if k.dim() == 4:
+        k = k.squeeze(2)
+    # Copied from GlmMoeDsaIndexer.forward (transformers glm_moe_dsa).
+    scores = torch.matmul(q.float(), k.transpose(-1, -2).float().unsqueeze(1)) * sm_scale
+    scores = F.relu(scores)
+    index_scores = torch.matmul(w.float().unsqueeze(-2), scores).squeeze(-2)
+    if attention_mask is not None:
+        index_scores = index_scores + attention_mask
+    else:
+        if position_ids is None:
+            raise ValueError("position_ids is required when attention_mask is None.")
+        key_positions = torch.arange(index_scores.shape[-1], device=index_scores.device)
+        causal = key_positions[None, None, :] > position_ids[:, :, None]
+        index_scores = index_scores.masked_fill(causal, float("-inf"))
+    top_k = min(int(top_k), index_scores.shape[-1])
+    topk_out = index_scores.topk(top_k, dim=-1)
+    return mask_unselectable_topk_indices(topk_out.values, topk_out.indices).to(torch.int32)

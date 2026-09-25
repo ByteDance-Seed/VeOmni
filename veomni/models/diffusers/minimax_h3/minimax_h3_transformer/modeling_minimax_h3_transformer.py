@@ -20,6 +20,7 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from ..minimax_h3_core.batch_packing import pack_samples
+from ..minimax_h3_core.core import bind_minimax_attention
 from ..minimax_h3_core.minimax_h3_dit import MiniMaxH3Attention, MiniMaxH3DiT, unpack_audio, unpatchify_video
 from .configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
 
@@ -33,11 +34,34 @@ class MiniMaxH3DiTOutput(ModelOutput):
 
 
 _PACKED_FLASH_BACKENDS = (
-    "veomni_flash_attention_2_with_sp",
-    "veomni_flash_attention_2_hub_with_sp",
-    "veomni_flash_attention_3_with_sp",
-    "veomni_flash_attention_3_hub_with_sp",
+    "veomni_flash_attention_2",
+    "veomni_flash_attention_2_hub",
+    "veomni_flash_attention_3",
+    "veomni_flash_attention_3_hub",
+    "flash_attention_2",
+    "flash_attention_2_hub",
+    "flash_attention_3",
+    "flash_attention_3_hub",
 )
+
+
+def _packed_attn_name(attn_implementation: str | None) -> str | None:
+    if attn_implementation is None:
+        return None
+    if attn_implementation.endswith("_with_sp"):
+        return attn_implementation[: -len("_with_sp")]
+    return attn_implementation
+
+
+def _veomni_attn_impl(attn_implementation: str | None) -> str | None:
+    name = _packed_attn_name(attn_implementation)
+    if name in (None, "eager", "sdpa", "veomni_sdpa"):
+        return None
+    if name.startswith("flash_attention_"):
+        return f"veomni_{name}"
+    if name.startswith("veomni_flash_attention_"):
+        return name
+    return None
 
 
 class MiniMaxH3DiTModel(PreTrainedModel):
@@ -76,27 +100,22 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         self._configure_packed_attention(config._attn_implementation)
 
     def _configure_packed_attention(self, attn_implementation):
-        """Record the packed backend; it is validated and loaded on the first packed forward."""
-        self._packed_attn_implementation = attn_implementation
-        for module in self.dit.modules():
-            if isinstance(module, MiniMaxH3Attention):
-                module.packed_sdpa = attn_implementation in (None, "eager", "sdpa")
-                module.varlen_kernel = None
+        """Record the packed backend. Do not bind it yet: FA4/NPU/pre-SM90
+        cannot construct ``veomni_flash_attention_4``, and github/main only
+        validates the name on packed forward.
+        """
+        self._packed_attn_implementation = _packed_attn_name(attn_implementation)
 
     def _load_packed_attention_kernel(self):
         implementation = self._packed_attn_implementation
-        if implementation in (None, "eager", "sdpa"):
+        if implementation in (None, "eager", "sdpa", "veomni_sdpa"):
             return
-        if implementation not in _PACKED_FLASH_BACKENDS:
+        impl = _veomni_attn_impl(implementation)
+        if impl is None or implementation not in _PACKED_FLASH_BACKENDS:
             raise ValueError(f"Unsupported H3 packing backend: {implementation}")
-        attention_modules = [module for module in self.dit.modules() if isinstance(module, MiniMaxH3Attention)]
-        if all(module.varlen_kernel is not None for module in attention_modules):
-            return
-        from .....ops.kernels.attention.flash import _load_veomni_flash_kernel
-
-        kernel = _load_veomni_flash_kernel(implementation).flash_attn_varlen_func
-        for module in attention_modules:
-            module.varlen_kernel = kernel
+        for module in self.dit.modules():
+            if isinstance(module, MiniMaxH3Attention):
+                bind_minimax_attention(module, is_causal=False, impl=impl)
 
     def _forward_batch(self, samples):
         if any(sample.get("use_gradient_checkpointing_offload", False) for sample in samples):

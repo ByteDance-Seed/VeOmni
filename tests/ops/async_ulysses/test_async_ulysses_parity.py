@@ -1,0 +1,203 @@
+"""Two-GPU dense async Ulysses parity against the sync attention path."""
+
+import sys
+
+import pytest
+import torch
+import torch.distributed as c10d
+import torch.distributed as dist
+
+from tests.parallel.ulysses.attention import Attention
+from tests.parallel.ulysses.utils import SequenceParallelTest, sync_tensor
+from veomni.distributed.sequence_parallel.comm import (
+    get_ulysses_sequence_parallel_group,
+    set_ulysses_sequence_parallel_group,
+)
+from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
+from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
+from veomni.utils.import_utils import is_torch_npu_available
+
+
+try:
+    _DIST_BACKEND = get_dist_comm_backend()
+except RuntimeError:
+    _NCCL_AVAILABLE = False
+else:
+    _NCCL_AVAILABLE = c10d.is_available() and c10d.is_backend_available(_DIST_BACKEND)
+if not _NCCL_AVAILABLE:
+    if __name__ == "__main__":
+        sys.exit(0)
+    pytest.skip("c10d NCCL not available", allow_module_level=True)
+
+
+_PARAMETER_GRAD_TOLERANCES = {
+    "proj_o.weight": (1e-4, 1e-4),
+    "q_proj.weight": (2e-3, 1e-4),
+    "k_proj.weight": (1e-4, 1e-4),
+    "v_proj.weight": (3e-3, 1e-4),
+    "q_norm.weight": (2e-3, 1e-4),
+    "q_norm.bias": (2e-3, 1e-4),
+    "k_norm.weight": (2e-3, 1e-4),
+    "k_norm.bias": (2e-3, 1e-4),
+}
+
+
+def _parameter_gradients(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Clone every trainable parameter gradient covered by the parity test."""
+    parameters = dict(module.named_parameters())
+    return {name: parameters[name].grad.detach().clone() for name in _PARAMETER_GRAD_TOLERANCES}
+
+
+def _assert_parameter_gradients_close(expected: dict[str, torch.Tensor], actual: dict[str, torch.Tensor]) -> None:
+    """Compare distributed parameter gradients with per-parameter tolerances."""
+    for name, (atol, rtol) in _PARAMETER_GRAD_TOLERANCES.items():
+        torch.testing.assert_close(expected[name], actual[name], atol=atol, rtol=rtol, msg=f"{name} gradient")
+
+
+class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
+    def _configure_repro(self) -> None:
+        """Seed the worker and disable TF32. Do not set cuDNN flags: pytest freezes them."""
+        set_seed(seed=0, full_determinism=False)
+        try:
+            enable_high_precision_for_bf16()
+        except RuntimeError:
+            pass
+
+    @staticmethod
+    def _get_input_data():
+        heads = 16
+        hidden_dim = 64 * heads
+        batch_size = 2
+        seq_len = 8192
+        input_ = torch.randn(batch_size, seq_len, hidden_dim).to(get_device_type())
+        dist.broadcast(input_, src=0)
+
+        return input_
+
+    @staticmethod
+    def _get_input_data_for_padding():
+        heads = 16
+        hidden_dim = 64 * heads
+        batch_size = 2
+        seq_len = 8191
+        input_ = torch.randn(batch_size, seq_len, hidden_dim).to(get_device_type())
+        dist.broadcast(input_, src=0)
+
+        return input_
+
+    @staticmethod
+    def _overlapping_grad(output) -> torch.Tensor:
+        return output.sum() * 2
+
+    @staticmethod
+    def _non_overlapping_grad(output) -> torch.Tensor:
+        t = torch.ones_like(output)
+        return torch.sum(output * t)
+
+    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
+    @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses")
+    def test_self_attn(self):
+        self._get_process_group()
+        self._configure_repro()
+        sp_group = get_ulysses_sequence_parallel_group()
+        full_input = self._get_input_data()
+        unpad_size = full_input.size(1)
+        part_input = slice_input_tensor(full_input, dim=1, group=sp_group)
+        full_input.requires_grad = True
+        part_input.requires_grad = True
+
+        attn_dp = Attention(
+            dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
+        ).to(get_device_type())
+        attn_sp = Attention(
+            dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=True
+        ).to(get_device_type())
+        attn_sp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
+        attn_dp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
+
+        loss_func = self._overlapping_grad
+
+        sp_rst = attn_sp(part_input, unpad_size)
+        sp_full_rst = gather_outputs(
+            sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
+        )
+        loss_sp = loss_func(sp_rst)
+        loss_sp.backward()
+        attn_sp_grads = _parameter_gradients(attn_sp)
+        part_input_grad = part_input.grad.detach().clone()
+        for gradient in attn_sp_grads.values():
+            dist.all_reduce(gradient)
+        part_input_grad = sync_tensor(part_input_grad, 1)
+        part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
+
+        set_ulysses_sequence_parallel_group(None)
+        dp_rst = attn_dp(full_input, unpad_size)
+        loss_dp = loss_func(dp_rst)
+        loss_dp.backward()
+        attn_dp_grads = _parameter_gradients(attn_dp)
+        full_input_grad = full_input.grad.detach().clone()
+
+        torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
+        _assert_parameter_gradients_close(attn_dp_grads, attn_sp_grads)
+        torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
+
+    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
+    @pytest.mark.skipif(is_torch_npu_available(), reason="npu skip async ulysses")
+    def test_self_attn_padding(self):
+        self._get_process_group()
+        self._configure_repro()
+        sp_group = get_ulysses_sequence_parallel_group()
+        full_input = self._get_input_data_for_padding()
+        unpad_size = full_input.size(1)
+        part_input = slice_input_tensor(full_input, dim=1, group=sp_group)
+        full_input.requires_grad = True
+        part_input.requires_grad = True
+
+        attn_dp = Attention(
+            dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
+        ).to(get_device_type())
+        attn_sp = Attention(
+            dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=True
+        ).to(get_device_type())
+        attn_sp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
+        attn_dp.load_state_dict(self._sync_model(attn_sp.state_dict(), self.rank))
+
+        loss_func = self._non_overlapping_grad
+
+        sp_rst = attn_sp(part_input, unpad_size)
+        sp_full_rst = gather_outputs(
+            sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
+        )
+        loss_sp = loss_func(sp_rst)
+        loss_sp.backward()
+        attn_sp_grads = _parameter_gradients(attn_sp)
+        part_input_grad = part_input.grad.detach().clone()
+        for gradient in attn_sp_grads.values():
+            dist.all_reduce(gradient)
+        part_input_grad = sync_tensor(part_input_grad, 1)
+        part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
+
+        set_ulysses_sequence_parallel_group(None)
+        dp_rst = attn_dp(full_input, unpad_size)
+        loss_dp = loss_func(dp_rst)
+        loss_dp.backward()
+        attn_dp_grads = _parameter_gradients(attn_dp)
+        full_input_grad = full_input.grad.detach().clone()
+
+        torch.testing.assert_close(dp_rst, sp_full_rst, atol=1e-6, rtol=1e-5)
+        _assert_parameter_gradients_close(attn_dp_grads, attn_sp_grads)
+        torch.testing.assert_close(full_input_grad, part_input_grad, atol=1e-5, rtol=1e-5)
+
+
+if __name__ == "__main__":
+    assert not get_torch_device()._initialized, (
+        "test_distributed must not have initialized CUDA context on main process"
+    )
+
+    set_seed(seed=0, full_determinism=True)
+    enable_high_precision_for_bf16()
+    from torch.testing._internal.common_utils import run_tests
+
+    run_tests()
