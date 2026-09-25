@@ -53,10 +53,11 @@ def LTXSPAttention_forward(
     mask: torch.Tensor | None = None,
     pe: torch.Tensor | None = None,
     k_pe: torch.Tensor | None = None,
-    sp_valid_length: int | None = None,
-    sp_context_length: int | None = None,
     perturbation_mask: torch.Tensor | None = None,
     all_perturbed: bool = False,
+    *,
+    sp_valid_length: int | None = None,
+    sp_context_length: int | None = None,
 ) -> torch.Tensor:
     is_cross_attention = context is not None
 
