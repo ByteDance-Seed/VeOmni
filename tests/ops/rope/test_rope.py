@@ -908,8 +908,9 @@ def test_wan_npu_matches_eager():
     torch.manual_seed(0)
     head_dim = 64
     x = torch.randn(2, 16, 4 * head_dim, device="npu", dtype=torch.bfloat16)
-    angle = torch.randn(16, 1, head_dim // 2, device="npu", dtype=torch.float64)
-    freqs = torch.polar(torch.ones_like(angle), angle)
+    # NPU polar rejects float64. Production Wan tables use CPU polar then .to(device).
+    angle = torch.randn(16, 1, head_dim // 2, dtype=torch.float64)
+    freqs = torch.polar(torch.ones_like(angle), angle).to("npu")
 
     x_e = x.detach().requires_grad_(True)
     x_o = x.detach().requires_grad_(True)
