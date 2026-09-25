@@ -1,0 +1,115 @@
+{
+  "architectures": [
+    "Gemma4ForConditionalGeneration"
+  ],
+  "audio_config": {
+    "attention_chunk_size": 4,
+    "attention_context_left": 2,
+    "attention_context_right": 0,
+    "attention_invalid_logits_value": -1000000000.0,
+    "attention_logit_cap": 50.0,
+    "conv_kernel_size": 3,
+    "gradient_clipping": 10000000000.0,
+    "hidden_act": "silu",
+    "hidden_size": 32,
+    "initializer_range": 0.02,
+    "model_type": "gemma4_audio",
+    "num_attention_heads": 4,
+    "num_hidden_layers": 2,
+    "output_proj_dims": 32,
+    "residual_weight": 0.5,
+    "rms_norm_eps": 1e-06,
+    "subsampling_conv_channels": [
+      8,
+      8
+    ],
+    "use_clipped_linears": false
+  },
+  "audio_token_id": 123,
+  "boa_token_id": 120,
+  "boi_token_id": 119,
+  "dtype": "float32",
+  "eoa_token_id": 124,
+  "eoa_token_index": 124,
+  "eoi_token_id": 122,
+  "image_token_id": 121,
+  "initializer_range": 0.02,
+  "model_type": "gemma4",
+  "text_config": {
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "attention_k_eq_v": false,
+    "bos_token_id": 2,
+    "dtype": "float32",
+    "enable_moe_block": false,
+    "eos_token_id": 1,
+    "final_logit_softcapping": null,
+    "global_head_dim": 16,
+    "head_dim": 16,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "hidden_size": 64,
+    "hidden_size_per_layer_input": 8,
+    "initializer_range": 0.02,
+    "intermediate_size": 128,
+    "layer_types": [
+      "sliding_attention",
+      "full_attention"
+    ],
+    "max_position_embeddings": 64,
+    "model_type": "gemma4_text",
+    "num_attention_heads": 4,
+    "num_experts": null,
+    "num_global_key_value_heads": null,
+    "num_hidden_layers": 2,
+    "num_key_value_heads": 2,
+    "num_kv_shared_layers": 0,
+    "pad_token_id": 0,
+    "rms_norm_eps": 1e-06,
+    "rope_parameters": {
+      "full_attention": {
+        "partial_rotary_factor": 0.25,
+        "rope_theta": 1000000.0,
+        "rope_type": "proportional"
+      },
+      "sliding_attention": {
+        "rope_theta": 10000.0,
+        "rope_type": "default"
+      }
+    },
+    "sliding_window": 4,
+    "tie_word_embeddings": true,
+    "top_k_experts": null,
+    "use_bidirectional_attention": null,
+    "use_cache": true,
+    "use_double_wide_mlp": true,
+    "vocab_size": 128,
+    "vocab_size_per_layer_input": 128
+  },
+  "tie_word_embeddings": true,
+  "video_token_id": 125,
+  "vision_config": {
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "dtype": "float32",
+    "head_dim": 8,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "hidden_size": 32,
+    "initializer_range": 0.02,
+    "intermediate_size": 64,
+    "max_position_embeddings": 64,
+    "model_type": "gemma4_vision",
+    "num_attention_heads": 4,
+    "num_hidden_layers": 2,
+    "num_key_value_heads": 4,
+    "patch_size": 4,
+    "pooling_kernel_size": 2,
+    "position_embedding_size": 16,
+    "rms_norm_eps": 1e-06,
+    "rope_parameters": {
+      "rope_theta": 100.0,
+      "rope_type": "default"
+    },
+    "standardize": false,
+    "use_clipped_linears": false
+  }
+}
