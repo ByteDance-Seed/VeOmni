@@ -92,7 +92,7 @@ model:
 
   # LTX-2.3 has non-standard RoPE, pin to eager until a dedicated kernel exists
   ops_implementation:
-    attn_implementation: eager
+    attn_implementation: eager  # PyTorch SDPA; flash_attention_3 selects FA3 (docs/examples/ltx-2.3.md)
     rotary_pos_emb_implementation: eager
     rms_norm_implementation: eager
     swiglu_mlp_implementation: eager
