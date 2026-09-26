@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 import torch
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier, get_pixel_coords
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig
-from ltx_core.model.transformer.attention import Attention
+from ltx_core.model.transformer.attention import Attention, PytorchAttention
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.model import LTXModel, LTXModelType
 from ltx_core.model.transformer.rope import LTXRopeType
@@ -44,6 +44,59 @@ _VEOMNI_SP_ATTN_IMPLS = frozenset(
         "veomni_flash_attention_4_with_sp",
     }
 )
+
+
+_LTX_SDPA_BACKENDS = frozenset({None, "eager", "sdpa"})
+
+
+class _VeOmniFlashAttention:
+    """Unmasked LTX attention through VeOmni's local/Hub FlashAttention varlen kernel, loaded on first call."""
+
+    def __init__(self, implementation: str):
+        self.implementation = implementation
+        self.label = implementation
+        self._varlen_func = None
+
+    def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int) -> torch.Tensor:
+        if v.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(f"LTX-2.3 {self.implementation} needs FP16/BF16 attention inputs, got {v.dtype}.")
+        if self._varlen_func is None:
+            from .....ops.kernels.attention.flash import _load_veomni_flash_kernel
+
+            self._varlen_func = _load_veomni_flash_kernel(self.implementation).flash_attn_varlen_func
+        b, q_len, inner_dim = q.shape
+        k_len = k.shape[1]
+        dim_head = inner_dim // heads
+        q, k, v = (t.reshape(-1, heads, dim_head) for t in (q.to(v.dtype), k.to(v.dtype), v))
+        cu_q = torch.arange(0, (b + 1) * q_len, q_len, device=q.device, dtype=torch.int32)
+        cu_k = torch.arange(0, (b + 1) * k_len, k_len, device=q.device, dtype=torch.int32)
+        out = self._varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=q_len,
+            max_seqlen_k=k_len,
+            softmax_scale=dim_head**-0.5,
+            causal=False,
+        )
+        if isinstance(out, tuple):
+            out = out[0]
+        return out.reshape(b, q_len, heads * dim_head)
+
+
+class _NoMaskedFlashAttention:
+    """Masked calls under a flash backend: LTX masks are additive/soft biases FlashAttention cannot apply."""
+
+    def __init__(self, implementation: str):
+        self.implementation = implementation
+
+    def __call__(self, q, k, v, heads, mask):
+        raise NotImplementedError(
+            f"LTX-2.3 {self.implementation} supports only all-valid text context masks; this call has a "
+            "partial context or self-attention mask. Use attn_implementation=sdpa."
+        )
 
 
 def LTXSPAttention_forward(
@@ -213,6 +266,8 @@ class _LTXModelInitShim(LTXModel):
 class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
     config_class = LTXVideoTransformerModelConfig
     supports_gradient_checkpointing = True
+    _supports_flash_attn = True
+    _supports_sdpa = True
     _no_split_modules = ["BasicAVTransformerBlock"]
     _checkpoint_conversion_mapping = {
         "^model\\.diffusion_model\\.": "",
@@ -273,6 +328,30 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
         self.config: LTXVideoTransformerModelConfig = config
         self.config.tie_word_embeddings = False
         self.gradient_checkpointing = False
+        self._configure_attention(config._attn_implementation)
+
+    def _configure_attention(self, implementation: str | None) -> None:
+        """Bind every DiT attention module to ``attn_implementation`` for this model instance."""
+        from .....ops.kernels.attention.flash import _is_veomni_custom_flash_attention
+
+        if implementation in _LTX_SDPA_BACKENDS:
+            attention = masked_attention = PytorchAttention()
+        elif _is_veomni_custom_flash_attention(implementation):
+            attention, masked_attention = (
+                _VeOmniFlashAttention(implementation),
+                _NoMaskedFlashAttention(implementation),
+            )
+        else:
+            raise ValueError(
+                f"Unsupported LTX-2.3 attention backend: {implementation}. Use eager, sdpa, flash_attention_2, "
+                "flash_attention_3, flash_attention_2_hub, flash_attention_3_hub or flash_attention_4 through "
+                "build_foundation_model."
+            )
+        self._uses_flash_attention = implementation not in _LTX_SDPA_BACKENDS
+        for module in self.modules():
+            if isinstance(module, Attention):
+                module.attention_function = attention
+                module.masked_attention_function = masked_attention
 
     def _init_weights(self, module: torch.nn.Module) -> None:
         for attr in (
@@ -385,6 +464,14 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
             sample_ctx_mask = context_mask[sample_idx] if context_mask is not None else None
             if sample_ctx_mask is not None:
                 sample_ctx_mask = sample_ctx_mask.to(device=model_device)
+                # LTX-2.3 connectors turn padding into learned registers, so the mask is usually all-valid;
+                # dropping it is exact and lets flash backends take the unmasked path.
+                if (
+                    self._uses_flash_attention
+                    and not torch.is_floating_point(sample_ctx_mask)
+                    and sample_ctx_mask.all()
+                ):
+                    sample_ctx_mask = None
 
             video_modality = Modality(
                 latent=latent_tokens,
