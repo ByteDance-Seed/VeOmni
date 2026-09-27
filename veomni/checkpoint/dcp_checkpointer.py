@@ -314,7 +314,23 @@ class OptimizerState(Stateful):
         )
         self._load = load
 
+    @staticmethod
+    def _reject_swap_optimizer(optimizer) -> None:
+        """Refuse to persist ``adamw_swap``, whose device state is intentionally absent.
+
+        The swap optimizer frees its device-side state storage between steps and
+        keeps the values on host, so a DCP read would write zero-filled shards.
+        Failing here makes that loud instead of producing an unrestorable
+        checkpoint.
+        """
+        if getattr(optimizer, "_is_swap_optimizer", False):
+            raise RuntimeError(
+                "optimizer.type='adamw_swap' does not support checkpoint save/load yet. "
+                "Disable checkpointing/HF export for this run, or use optimizer.type='adamw'."
+            )
+
     def state_dict(self):
+        self._reject_swap_optimizer(self.optimizer)
         if self.should_extra_parallel_aware:
             logger.info_rank0(
                 "Getting optimizer state_dict from OptimizerState wrapper, would restore ExtraParallel dim for Experts module"
@@ -336,6 +352,7 @@ class OptimizerState(Stateful):
         return get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
 
     def load_state_dict(self, state_dict):
+        self._reject_swap_optimizer(self.optimizer)
         optim_state_from_dcp_load = state_dict
         if self.should_extra_parallel_aware:
             # we need to drop ExtraParallel dim before loading them into optimizers

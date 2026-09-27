@@ -506,6 +506,19 @@ class VeOmniModelRuntime:
         opt = self.args.optimizer
         from ..optim import build_optimizer
 
+        if opt.type == "adamw_swap":
+            if self.args.accelerator.fsdp_config.offload:
+                raise ValueError(
+                    "optimizer.type='adamw_swap' cannot be combined with "
+                    "model.accelerator.fsdp_config.offload; both move training state to host."
+                )
+            checkpoint = self.train_args.checkpoint
+            if checkpoint.save_steps or checkpoint.save_epochs or checkpoint.save_hf_weights or checkpoint.load_path:
+                raise ValueError(
+                    "optimizer.type='adamw_swap' does not support checkpointing yet. Disable it with "
+                    "train.checkpoint.save_steps=0, save_epochs=0, save_hf_weights=false and no load_path."
+                )
+
         self.optimizer = build_optimizer(
             self.model,
             lr=opt.lr,
