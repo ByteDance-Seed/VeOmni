@@ -173,3 +173,41 @@ def test_direct_loading_with_a_public_flash_name_fails_closed(backend):
 def test_unsupported_backends_are_rejected_at_construction(backend):
     with pytest.raises(ValueError):
         build(backend)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Real FlashAttention kernels need CUDA.")
+@pytest.mark.parametrize(
+    "backend, package, min_major",
+    [("flash_attention_2", "flash_attn", 8), ("flash_attention_3", "flash_attn_interface", 9)],
+)
+def test_real_local_flash_kernel_matches_sdpa(monkeypatch, backend, package, min_major):
+    pytest.importorskip(package)
+    if torch.cuda.get_device_capability()[0] < min_major:
+        pytest.skip(f"{backend} needs SM{min_major}0+.")
+    for key, value in dict(
+        num_attention_heads=4,
+        attention_head_dim=32,
+        cross_attention_dim=128,
+        audio_num_attention_heads=4,
+        audio_attention_head_dim=16,
+        audio_cross_attention_dim=64,
+    ).items():
+        monkeypatch.setitem(_TINY, key, value)
+    device = torch.device("cuda")
+    sample = {key: [value.to(device) for value in values] for key, values in inputs().items()}
+    models = [build(name).to(device, torch.bfloat16) for name in ("eager", backend)]
+    for model in models:  # sharpen attention so layout or scale mistakes show up in the output
+        for module in model.modules():
+            if isinstance(module, ltx_model.Attention):
+                for proj in (module.q_norm, module.k_norm, module.to_out[0]):
+                    proj.weight.data.mul_(4.0)
+    (ref_out, ref_grads), (out, grads) = (run(model, sample) for model in models)
+
+    kernels = {m.attention_function._varlen_func for m in models[1].modules() if isinstance(m, ltx_model.Attention)}
+    assert len(kernels) == 1 and next(iter(kernels)).__module__.split(".")[0] == package
+    flat = lambda o: torch.cat([x.float().flatten() for x in o.predictions + o.audio_predictions])  # noqa: E731
+    rel = lambda a, b: ((a - b).norm() / b.norm()).item()  # noqa: E731
+    assert rel(flat(out), flat(ref_out)) < 3e-3
+    assert grads.keys() == ref_grads.keys() and all(torch.isfinite(g).all() for g in grads.values())
+    grad, ref_grad = (torch.cat([g[k].float().flatten() for k in sorted(g)]) for g in (grads, ref_grads))
+    assert rel(grad, ref_grad) < 1e-2

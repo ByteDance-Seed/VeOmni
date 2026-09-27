@@ -463,15 +463,17 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
 
             sample_ctx_mask = context_mask[sample_idx] if context_mask is not None else None
             if sample_ctx_mask is not None:
-                sample_ctx_mask = sample_ctx_mask.to(device=model_device)
                 # LTX-2.3 connectors turn padding into learned registers, so the mask is usually all-valid;
-                # dropping it is exact and lets flash backends take the unmasked path.
+                # dropping it is exact and lets flash backends take the unmasked path. Checked before the
+                # device move so a host mask costs no device sync.
                 if (
                     self._uses_flash_attention
                     and not torch.is_floating_point(sample_ctx_mask)
                     and sample_ctx_mask.all()
                 ):
                     sample_ctx_mask = None
+                else:
+                    sample_ctx_mask = sample_ctx_mask.to(device=model_device)
 
             video_modality = Modality(
                 latent=latent_tokens,
