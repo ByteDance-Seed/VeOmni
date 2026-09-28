@@ -34,14 +34,14 @@ Omni-specific layout:
   ``model_path``, ``model_config``, ``ops_implementation``, ``accelerator`` and
   ``optimizer``, plus the modules it composes.
 * Per-module overrides live in ``model.model_config.modules`` YAML;
-  :meth:`OmniArguments.resolve_model` merges them into
+  :func:`build_omni_model_runtime_args` merges them into
   :attr:`OmniModelRuntimeArguments.modules` (each entry is
   :class:`OmniModuleRuntimeArguments`: same flat fields).
 * ``data`` / ``train`` / ``infer`` remain launcher-wide.
 
 The runtime *classes* live next to :class:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.OmniModelRuntime`
 / :class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime`.
-Resolution helpers (``resolve_omni_model``, ``build_module_runtime_args``, …)
+Resolution helpers (``build_omni_model_runtime_args``, ``build_omni_module_runtime_args``, …)
 stay in this module so :class:`OmniArguments` can call them without an
 arguments ↔ accelerated import cycle.
 """
@@ -103,8 +103,12 @@ def _try_load_omni_checkpoint_config(path: Optional[str]):
 DEFAULT_SCENARIO = "default"
 
 
-def resolve_omni_model(args: "OmniArguments", *, for_inference: bool = False) -> OmniModelRuntimeArguments:
-    """Resolve ``args.model`` launcher fields into a fully populated :class:`OmniModelRuntimeArguments`."""
+def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool = False) -> OmniModelRuntimeArguments:
+    """Resolve ``args.model`` launcher fields into a fully populated :class:`OmniModelRuntimeArguments`.
+
+    Set ``for_inference=True`` to apply the all-eager inference accelerator
+    default on top of ``model.model_config.modules``.
+    """
     model_runtime = args.model
     if not model_runtime.model_path:
         raise ValueError("`model.model_path` (split-checkpoint root) is required for OmniModel.")
@@ -160,7 +164,7 @@ def resolve_omni_model(args: "OmniArguments", *, for_inference: bool = False) ->
     train_type = _resolve_graph_type(args, model_runtime, train_graph, "train_type", train_type)
     infer_type = _resolve_graph_type(args, model_runtime, infer_graph, "infer_type", infer_type)
 
-    modules = build_module_runtime_args(
+    modules = build_omni_module_runtime_args(
         _to_module_global_args(model_runtime),
         model_path,
         train_modules,
@@ -191,7 +195,7 @@ def resolve_omni_model(args: "OmniArguments", *, for_inference: bool = False) ->
     )
 
 
-def build_module_runtime_args(
+def build_omni_module_runtime_args(
     global_args: OmniModuleRuntimeArguments,
     model_path: Union[str, os.PathLike],
     modules: Union[str, os.PathLike, dict[str, Any]],
@@ -664,7 +668,7 @@ def _validate_omni_accelerator(accelerator: AcceleratorConfig) -> None:
     their own validation in ``VeOmniArguments``).
 
     Called once for the top-level default (``model.accelerator``, at ``OmniArguments.__post_init__``
-    time, before modules are resolved) and once per module (in :func:`resolve_omni_model`, after
+    time, before modules are resolved) and once per module (in :func:`build_omni_model_runtime_args`, after
     ``modules`` merges each module's own ``accelerator:`` YAML override) so a per-module override is
     validated too, not just the global default.
     """
@@ -716,14 +720,6 @@ class OmniArguments:
 
         _validate_omni_accelerator(self.model.accelerator)
 
-    def resolve_model(self, *, for_inference: bool = False) -> OmniModelRuntimeArguments:
-        """Build a resolved :class:`OmniModelRuntimeArguments`.
-
-        Set ``for_inference=True`` to apply the all-eager inference accelerator
-        default on top of ``model.model_config.modules``.
-        """
-        return resolve_omni_model(self, for_inference=for_inference)
-
     def _to_module_global_args(self) -> OmniModuleRuntimeArguments:
         """Project ``model`` defaults onto :class:`OmniModuleRuntimeArguments` for per-module merging."""
         return _to_module_global_args(self.model)
@@ -767,6 +763,6 @@ __all__ = [
     "OmniTrainingArguments",
     "_hf_module_model_config",
     "_is_omni_checkpoint_root",
-    "build_module_runtime_args",
-    "resolve_omni_model",
+    "build_omni_module_runtime_args",
+    "build_omni_model_runtime_args",
 ]

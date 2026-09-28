@@ -26,7 +26,7 @@ view; :meth:`to_hf_config` is the one-way projection.
 
 ``OmniModuleRuntimeArguments`` is the public alias kept in
 :mod:`veomni.arguments.omni_arguments_types` so existing launcher imports keep
-working. YAML resolution (``resolve_omni_model``, ``build_module_runtime_args``)
+working. YAML resolution (``build_omni_model_runtime_args``, ``build_omni_module_runtime_args``)
 stays in ``arguments/`` to avoid an arguments ↔ accelerated import cycle.
 """
 
@@ -65,7 +65,7 @@ class OmniModuleRuntimeConfig(ModelArguments):
         repeated inside it.
 
         ``model_path`` is carried through explicitly: by the time this runs,
-        ``build_module_runtime_args`` / ``_resolve_model_path`` has already
+        ``build_omni_module_runtime_args`` / ``_resolve_model_path`` has already
         resolved it to an absolute path — usually ``<checkpoint_root>/<name>``,
         but a launcher YAML module override may point it at a wholly different
         checkpoint (e.g. Qwen3 visual-instruction-tuning composing

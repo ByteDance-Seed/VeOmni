@@ -17,7 +17,8 @@ from veomni.arguments.omni_arguments_types import (
     OmniDataArguments,
     OmniInferArguments,
     OmniModelRuntimeArguments,
-    build_module_runtime_args,
+    build_omni_model_runtime_args,
+    build_omni_module_runtime_args,
 )
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 
@@ -66,7 +67,7 @@ def _with_module_configs(cfg: OmniConfig) -> OmniConfig:
 
 
 def _model_runtime(**kwargs) -> OmniModelRuntimeArguments:
-    return _omni_args(**kwargs).resolve_model()
+    return build_omni_model_runtime_args(_omni_args(**kwargs))
 
 
 def test_runtime_config_keeps_the_full_launcher_view():
@@ -144,9 +145,9 @@ def test_to_hf_config_does_not_alias_nested_model_config():
     assert runtime_cfg.modules[MODULE_B].model_config.get("freeze") is not False
 
 
-def test_build_module_runtime_args_resolves_relative_model_paths():
+def test_build_omni_module_runtime_args_resolves_relative_model_paths():
     args = _omni_args(model_path="/tmp/fake_omni")
-    modules = build_module_runtime_args(
+    modules = build_omni_module_runtime_args(
         args._to_module_global_args(),
         "/tmp/fake_omni",
         str(_cfg_dir() / "train/modules_train.yaml"),
@@ -154,7 +155,7 @@ def test_build_module_runtime_args_resolves_relative_model_paths():
     assert modules[MODULE_A].model_path.startswith("/tmp/fake_omni")
 
 
-def test_build_module_runtime_args_merges_module_optimizer():
+def test_build_omni_module_runtime_args_merges_module_optimizer():
     """Global ``model.optimizer`` is the base; per-module YAML can override."""
     from veomni.arguments import OptimizerConfig
     from veomni.arguments.omni_arguments_types import OmniModuleRuntimeArguments
@@ -163,7 +164,7 @@ def test_build_module_runtime_args_merges_module_optimizer():
         model_path="/tmp/fake_omni",
         optimizer=OptimizerConfig(lr=1e-4, weight_decay=0.01),
     )
-    modules = build_module_runtime_args(
+    modules = build_omni_module_runtime_args(
         global_args,
         "/tmp/fake_omni",
         {
@@ -177,12 +178,12 @@ def test_build_module_runtime_args_merges_module_optimizer():
     assert modules[MODULE_A].optimizer.weight_decay == 0.01
 
 
-def test_omni_arguments_resolve_model_modules_match_builder():
+def test_omni_arguments_build_model_runtime_args_modules_match_builder():
     args = _omni_args()
     modules_yaml = str(_cfg_dir() / "infer/modules_infer_fsdp.yaml")
     args.model.model_config["modules"] = modules_yaml
-    built = args.resolve_model(for_inference=True).modules
-    direct = build_module_runtime_args(
+    built = build_omni_model_runtime_args(args, for_inference=True).modules
+    direct = build_omni_module_runtime_args(
         args._to_module_global_args(),
         args.model.model_path,
         modules_yaml,
@@ -192,14 +193,14 @@ def test_omni_arguments_resolve_model_modules_match_builder():
     assert built[MODULE_A].accelerator.fsdp_config.fsdp_mode == direct[MODULE_A].accelerator.fsdp_config.fsdp_mode
 
 
-def test_omni_arguments_resolve_model_returns_the_runtime_view():
+def test_omni_arguments_build_model_runtime_args_returns_the_runtime_view():
     args = _omni_args()
-    runtime_cfg = args.resolve_model()
+    runtime_cfg = build_omni_model_runtime_args(args)
     assert isinstance(runtime_cfg, OmniModelRuntimeArguments)
     assert runtime_cfg.modules[MODULE_B].model_path.startswith("/tmp/fake_omni")
 
 
-def test_resolve_model_carries_every_infer_graph_scenario():
+def test_build_model_runtime_args_carries_every_infer_graph_scenario():
     args = _omni_args()
     cfg_dir = _cfg_dir()
     args.model.model_config["infer_graph"] = {
@@ -208,13 +209,13 @@ def test_resolve_model_carries_every_infer_graph_scenario():
     }
     args.model.set_launcher_config("infer_type", "infer_und")
 
-    cfg = args.resolve_model()
+    cfg = build_omni_model_runtime_args(args)
     assert set(cfg.infer_types) == {"infer_gen", "infer_und"}
     assert cfg.infer_type == "infer_und"
     assert cfg.generation_graphs["infer_und"] is not None
 
 
-def test_resolve_model_defaults_infer_type_to_first_scenario():
+def test_build_model_runtime_args_defaults_infer_type_to_first_scenario():
     args = _omni_args()
     cfg_dir = _cfg_dir()
     args.model.model_config["infer_graph"] = {
@@ -223,54 +224,54 @@ def test_resolve_model_defaults_infer_type_to_first_scenario():
     }
     args.model.model_config.pop("infer_type", None)
 
-    cfg = args.resolve_model()
+    cfg = build_omni_model_runtime_args(args)
     assert cfg.infer_type == "infer_gen"
     assert args.model.launcher_config("infer_type") == "infer_gen"
 
 
-def test_resolve_model_rejects_unknown_infer_type():
+def test_build_model_runtime_args_rejects_unknown_infer_type():
     args = _omni_args()
     args.model.set_launcher_config("infer_type", "does_not_exist")
     with pytest.raises(KeyError, match="infer_type"):
-        args.resolve_model()
+        build_omni_model_runtime_args(args)
 
 
-def test_resolve_model_carries_every_train_graph_scenario():
+def test_build_model_runtime_args_carries_every_train_graph_scenario():
     args = _omni_args()
     train_graph = str(_cfg_dir() / "train/graph_train.yaml")
     args.model.model_config["train_graph"] = {"train": train_graph, "alt": train_graph}
     args.model.set_launcher_config("train_type", "train")
 
-    cfg = args.resolve_model()
+    cfg = build_omni_model_runtime_args(args)
     assert set(cfg.train_types) == {"train", "alt"}
     assert cfg.train_type == "train"
 
 
-def test_resolve_model_defaults_train_type_for_single_path():
+def test_build_model_runtime_args_defaults_train_type_for_single_path():
     args = _omni_args()
     args.model.model_config.pop("train_type", None)
 
-    cfg = args.resolve_model()
+    cfg = build_omni_model_runtime_args(args)
     assert cfg.train_type == "default"
     assert args.model.launcher_config("train_type") == "default"
 
 
-def test_resolve_model_rejects_unknown_train_type():
+def test_build_model_runtime_args_rejects_unknown_train_type():
     args = _omni_args()
     train_graph = str(_cfg_dir() / "train/graph_train.yaml")
     args.model.model_config["train_graph"] = {"train": train_graph, "alt": train_graph}
     args.model.set_launcher_config("train_type", "does_not_exist")
     with pytest.raises(KeyError, match="train_type"):
-        args.resolve_model()
+        build_omni_model_runtime_args(args)
 
 
 def test_infer_module_overrides_apply_eager_defaults():
     args = _omni_args()
-    train_args = args.resolve_model().modules
+    train_args = build_omni_model_runtime_args(args).modules
     assert train_args[MODULE_B].accelerator.fsdp_config.fsdp_mode == "fsdp2"
 
     args.model.model_config["modules"] = str(_cfg_dir() / "infer/modules_infer_eager.yaml")
-    infer_args = args.resolve_model(for_inference=True).modules
+    infer_args = build_omni_model_runtime_args(args, for_inference=True).modules
     assert infer_args[MODULE_B].accelerator.fsdp_config.fsdp_mode == "eager"
 
 
@@ -279,16 +280,16 @@ def test_a_model_scope_wrap_rejects_eager_modules_before_loading_them():
     ``fsdp_scope='model'`` run would otherwise load all weights, then fail at wrap time."""
     args = _omni_args()
     args.model.accelerator.fsdp_config.fsdp_scope = "model"
-    assert args.resolve_model().modules[MODULE_B].accelerator.fsdp_config.fsdp_mode == "fsdp2"
+    assert build_omni_model_runtime_args(args).modules[MODULE_B].accelerator.fsdp_config.fsdp_mode == "fsdp2"
 
     args.model.model_config["modules"] = str(_cfg_dir() / "infer/modules_infer_eager.yaml")
     with pytest.raises(ValueError, match=rf"fsdp_mode='eager': \['{MODULE_A}', '{MODULE_B}'\]"):
-        args.resolve_model(for_inference=True)
+        build_omni_model_runtime_args(args, for_inference=True)
 
 
 def test_training_keeps_module_fsdp_modes():
     args = _omni_args()
-    runtime_args = args.resolve_model().modules
+    runtime_args = build_omni_model_runtime_args(args).modules
     assert runtime_args[MODULE_A].accelerator.fsdp_config.fsdp_mode == "ddp"
     assert runtime_args[MODULE_B].accelerator.fsdp_config.fsdp_mode == "fsdp2"
 
@@ -320,7 +321,7 @@ def test_runtime_to_hf_config_roundtrips_through_checkpoint(tmp_path):
         assert not reloaded._module_entries[name].get("ops_implementation")
 
 
-def test_resolve_model_reads_graphs_from_omni_checkpoint(tmp_path):
+def test_build_model_runtime_args_reads_graphs_from_omni_checkpoint(tmp_path):
     """A self-contained omni checkpoint supplies graphs — no launcher YAML refs needed."""
     runtime_cfg = _model_runtime(model_path=str(tmp_path))
     export_root = tmp_path / "exported"
@@ -331,12 +332,12 @@ def test_resolve_model_reads_graphs_from_omni_checkpoint(tmp_path):
         data=OmniDataArguments(train_path=""),
         infer=OmniInferArguments(),
     )
-    cfg = args.resolve_model()
+    cfg = build_omni_model_runtime_args(args)
     assert cfg.training_graph == runtime_cfg.training_graph
     assert cfg.infer_types == runtime_cfg.infer_types
 
 
-def test_resolve_model_keeps_every_training_scenario_from_omni_checkpoint(tmp_path):
+def test_build_model_runtime_args_keeps_every_training_scenario_from_omni_checkpoint(tmp_path):
     """The checkpoint stores the whole ``training_graphs`` map and its ``train_type``;
     reading back only the active graph would rename it ``default`` and drop the rest."""
     graph = str(_cfg_dir() / "train/graph_train.yaml")
@@ -351,7 +352,7 @@ def test_resolve_model_keeps_every_training_scenario_from_omni_checkpoint(tmp_pa
         data=OmniDataArguments(train_path=""),
         infer=OmniInferArguments(),
     )
-    cfg = args.resolve_model()
+    cfg = build_omni_model_runtime_args(args)
     assert list(cfg.training_graphs) == ["train", "alt"]
     assert cfg.train_type == "alt"
 

@@ -59,7 +59,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.checkpoint import set_checkpoint_debug_enabled
 
-from ...arguments.omni_arguments_types import OmniArguments
+from ...arguments.omni_arguments_types import OmniArguments, build_omni_model_runtime_args
 from ...arguments.parser import save_args
 from ...data import SeedOmniCollator, build_dataloader, build_dataset
 from ...data import seed_omni as _seed_omni_data  # noqa: F401  (import side effect: registers data_type="seedomni")
@@ -201,7 +201,7 @@ def build_omni_model(
     global_args: OmniArguments,
 ) -> OmniModelRuntime:
     """Build one VeOmni-managed composed model — the trainer's ``self.model``."""
-    model_runtime = global_args.resolve_model()
+    model_runtime = build_omni_model_runtime_args(global_args)
     return OmniModelRuntime.from_model_runtime(model_runtime, train=global_args.train, for_inference=False)
 
 

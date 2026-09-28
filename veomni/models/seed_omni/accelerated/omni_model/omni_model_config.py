@@ -25,7 +25,7 @@ view; :meth:`to_hf_config` is the one-way projection.
 
 ``OmniModelRuntimeArguments`` is the public alias kept in
 :mod:`veomni.arguments.omni_arguments_types` so existing launcher imports keep
-working. YAML resolution (``resolve_omni_model``, ``build_module_runtime_args``)
+working. YAML resolution (``build_omni_model_runtime_args``, ``build_omni_module_runtime_args``)
 stays in ``arguments/`` to avoid an arguments ↔ accelerated import cycle.
 """
 
@@ -43,7 +43,7 @@ class OmniModelRuntimeConfig(ModelArguments):
 
     YAML supplies the inherited ``model_path``, ``model_config``,
     ``ops_implementation``, ``accelerator`` and ``optimizer``, which double as the
-    defaults each module's own block is merged over. :func:`~veomni.arguments.omni_arguments_types.resolve_omni_model`
+    defaults each module's own block is merged over. :func:`~veomni.arguments.omni_arguments_types.build_omni_model_runtime_args`
     fills ``modules``, the graph scenario maps, and the scenario keys.
     """
 

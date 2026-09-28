@@ -1,9 +1,9 @@
 """Tests for the per-module accelerator training knobs moved off `OmniTrainingArguments`.
 
 Covers: `AcceleratorConfig` gaining the SeedOmni-only fields, per-module
-`accelerator.*` override survival through `build_module_runtime_args`, and
+`accelerator.*` override survival through `build_omni_module_runtime_args`, and
 `_validate_omni_accelerator` being invoked both for the top-level default
-(`OmniArguments.__post_init__`) and per resolved module (`resolve_omni_model`).
+(`OmniArguments.__post_init__`) and per resolved module (`build_omni_model_runtime_args`).
 
 The resolution tests run on the in-tree ``fake_module_a -> fake_module_b``
 chain (``configs/seed_omni/fake_model/``), so they need no real model config.
@@ -31,7 +31,8 @@ from veomni.arguments.omni_arguments_types import (
     OmniModelRuntimeArguments,
     OmniModuleRuntimeArguments,
     _validate_omni_accelerator,
-    build_module_runtime_args,
+    build_omni_model_runtime_args,
+    build_omni_module_runtime_args,
 )
 from veomni.models.model_runtime import VeOmniModelRuntime
 
@@ -143,13 +144,13 @@ def test_omni_arguments_post_init_validates_the_top_level_default():
         )
 
 
-def test_build_module_runtime_args_merges_per_module_gradient_checkpointing_override():
+def test_build_omni_module_runtime_args_merges_per_module_gradient_checkpointing_override():
     """Global `model.accelerator.gradient_checkpointing` is the base; per-module YAML can override."""
     global_args = OmniModuleRuntimeArguments(
         model_path="/tmp/model",
         accelerator=AcceleratorConfig(gradient_checkpointing=GradientCheckpointingConfig(enable=True)),
     )
-    modules = build_module_runtime_args(
+    modules = build_omni_module_runtime_args(
         global_args,
         "/tmp/model",
         {
@@ -161,13 +162,13 @@ def test_build_module_runtime_args_merges_per_module_gradient_checkpointing_over
     assert modules["module_b"].accelerator.gradient_checkpointing.enable is True
 
 
-def test_build_module_runtime_args_merges_per_module_weight_load_override():
+def test_build_omni_module_runtime_args_merges_per_module_weight_load_override():
     """Global `model.broadcast_*` is the base; a per-module overlay can override it."""
     global_args = OmniModuleRuntimeArguments(
         model_path="/tmp/model",
         broadcast_model_weights_from_rank0=True,
     )
-    modules = build_module_runtime_args(
+    modules = build_omni_module_runtime_args(
         global_args,
         "/tmp/model",
         {
@@ -179,10 +180,10 @@ def test_build_module_runtime_args_merges_per_module_weight_load_override():
     assert modules["module_b"].broadcast_model_weights_from_rank0 is True
 
 
-def test_resolve_omni_model_accepts_valid_per_module_accelerator_override():
+def test_build_omni_model_runtime_args_accepts_valid_per_module_accelerator_override():
     """A per-module `accelerator.*` override that passes validation resolves cleanly."""
     args = _fake_args(modules_override={MODULE_B: {"accelerator": {"gradient_checkpointing": {"enable": False}}}})
-    modules = args.resolve_model().modules
+    modules = build_omni_model_runtime_args(args).modules
     assert modules[MODULE_B].accelerator.gradient_checkpointing.enable is False
     # Untouched modules keep the top-level default.
     assert modules[MODULE_A].accelerator.gradient_checkpointing.enable is True
@@ -204,7 +205,7 @@ def veomni_caplog(caplog):
         logger.removeHandler(caplog.handler)
 
 
-def test_resolve_omni_model_for_inference_forces_eager_without_broadcast_warning(veomni_caplog):
+def test_build_omni_model_runtime_args_for_inference_forces_eager_without_broadcast_warning(veomni_caplog):
     """`for_inference=True` forces `fsdp_mode=eager` for a module that does not pin its own.
 
     The override replaces `MODULE_B`'s whole `accelerator` block, so the module
@@ -216,21 +217,21 @@ def test_resolve_omni_model_for_inference_forces_eager_without_broadcast_warning
     """
     args = _fake_args(modules_override={MODULE_B: {"accelerator": {"gradient_checkpointing": {"enable": False}}}})
     with veomni_caplog.at_level("WARNING"):
-        modules = args.resolve_model(for_inference=True).modules
+        modules = build_omni_model_runtime_args(args, for_inference=True).modules
     assert modules[MODULE_B].accelerator.fsdp_config.fsdp_mode == "eager"
     assert modules[MODULE_B].broadcast_model_weights_from_rank0 is False
     assert modules[MODULE_A].accelerator.fsdp_config.fsdp_mode == "ddp"
     assert "broadcast_model_weights_from_rank0" not in veomni_caplog.text
 
 
-def test_resolve_omni_model_validates_each_module_accelerator():
+def test_build_omni_model_runtime_args_validates_each_module_accelerator():
     """A per-module override that fails `_validate_omni_accelerator` must raise at resolve time.
 
     The top-level `model.accelerator` default passes validation on its own (no
     `torch_compile.enable`); only the module override sets it, so this only
-    fails because `resolve_omni_model` validates every resolved module's own
+    fails because `build_omni_model_runtime_args` validates every resolved module's own
     `accelerator`, not just the top-level default.
     """
     args = _fake_args(modules_override={MODULE_B: {"accelerator": {"torch_compile": {"enable": True}}}})
     with pytest.raises(ValueError, match="torch_compile"):
-        args.resolve_model()
+        build_omni_model_runtime_args(args)

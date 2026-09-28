@@ -38,7 +38,11 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from ...arguments.omni_arguments_types import OmniArguments, OmniModuleRuntimeArguments
+from ...arguments.omni_arguments_types import (
+    OmniArguments,
+    OmniModuleRuntimeArguments,
+    build_omni_model_runtime_args,
+)
 from ...models.seed_omni.accelerated import OmniModelRuntime
 from ...models.seed_omni.modeling_omni import OmniModel
 from ...models.seed_omni.processing_omni import OmniProcessor
@@ -57,7 +61,7 @@ def _module_needs_distributed(module_args: OmniModuleRuntimeArguments) -> bool:
     whenever it is **not** a single-process ``eager`` load — i.e. ``fsdp2``
     (incl. expert-parallel ``ep`` / vocab-parallel ``emb``) or ``ddp`` (a replicated backbone alongside
     the sharded modules). ``eager`` is the inference default
-    (``build_module_runtime_args``) and loads via ``device_map`` without collectives.
+    (``build_omni_module_runtime_args``) and loads via ``device_map`` without collectives.
     """
     fsdp_mode = module_args.accelerator.fsdp_config.fsdp_mode
     return bool(fsdp_mode and str(fsdp_mode).lower() not in ("eager",))
@@ -89,7 +93,7 @@ class OmniInferencer:
         self.args = args
 
         self.checkpoint_root = args.model.model_path
-        self.omni_model_runtime = args.resolve_model(for_inference=True)
+        self.omni_model_runtime = build_omni_model_runtime_args(args, for_inference=True)
 
         self._distributed = any(
             _module_needs_distributed(self.omni_model_runtime.modules[name])
@@ -101,7 +105,7 @@ class OmniInferencer:
         self._build_model()
 
         # Nest artefacts under <output_dir>/<infer_type>/ (infer_type is resolved
-        # during resolve_model(for_inference=True) when left unset).
+        # during build_omni_model_runtime_args(for_inference=True) when left unset).
         infer_type = args.model.launcher_config("infer_type")
         args.infer.output_dir = os.path.join(args.infer.output_dir, infer_type)
         logger.info_rank0(f"OmniInferencer: model_path = {self.checkpoint_root}")

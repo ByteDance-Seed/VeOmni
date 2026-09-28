@@ -15,8 +15,8 @@ VeOmni runtime / YAML launcher), use ``tasks/omni/infer_omni_native.py`` instead
 
 Examples
 --------
-Single-process eager (``resolve_model(for_inference=True)`` forces eager unless the
-``modules:`` overlay pins another ``fsdp_mode``):
+Single-process eager (``build_omni_model_runtime_args(args, for_inference=True)``
+forces eager unless the ``modules:`` overlay pins another ``fsdp_mode``):
 
     python tasks/omni/infer_omni.py configs/seed_omni/fake_model/train/base.yaml \\
         --model.model_config.modules configs/seed_omni/fake_model/infer/modules_infer_eager.yaml \\
