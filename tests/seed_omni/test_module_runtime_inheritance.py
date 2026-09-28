@@ -39,6 +39,7 @@ def _unbuilt(model: nn.Module | None = None, **args_fields) -> ModuleRuntime:
     """A ModuleRuntime with its fields set but no build run."""
     args_fields.setdefault("accelerator", _fsdp("module"))
     runtime = ModuleRuntime.__new__(ModuleRuntime)
+    runtime._global_accelerator = _fsdp("module")
     runtime.model = model
     runtime.model_name = "vision_encoder"
     runtime.args = SimpleNamespace(model_path="/tmp/hf-model", lora_config=None, **args_fields)
@@ -220,7 +221,9 @@ def test_the_constructor_stores_training_args_where_the_base_reads_them(monkeypa
     train = SimpleNamespace(checkpoint=SimpleNamespace(load_path=None))
     args = SimpleNamespace(accelerator=_fsdp("module"))
 
-    runtime = ModuleRuntime(args, "vision_encoder", module_config=SimpleNamespace(), train=train)
+    runtime = ModuleRuntime(
+        args, "vision_encoder", module_config=SimpleNamespace(), global_accelerator=_fsdp("module"), train=train
+    )
 
     assert vars(runtime)["train_args"] is train
 
@@ -274,7 +277,13 @@ def test_distributed_inference_wraps_lora_before_loading_weights(monkeypatch):
     accelerator = _fsdp("module")
     accelerator.fsdp_config.mixed_precision = SimpleNamespace(enable=True)
 
-    ModuleRuntime(SimpleNamespace(accelerator=accelerator), "llm", module_config=SimpleNamespace(), for_inference=True)
+    ModuleRuntime(
+        SimpleNamespace(accelerator=accelerator),
+        "llm",
+        module_config=SimpleNamespace(),
+        global_accelerator=_fsdp("module"),
+        for_inference=True,
+    )
 
     assert calls.index("_setup_lora") < calls.index("_build_parallelized_model")
 
@@ -337,7 +346,9 @@ def test_an_eager_inference_module_forwards_without_a_parallel_state(monkeypatch
     monkeypatch.setattr(ModuleRuntime, "_init_eager_inference", lambda self: setattr(self, "model", model))
     args = SimpleNamespace(accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="eager")))
 
-    runtime = ModuleRuntime(args, "vision_encoder", module_config=SimpleNamespace(), for_inference=True)
+    runtime = ModuleRuntime(
+        args, "vision_encoder", module_config=SimpleNamespace(), global_accelerator=_fsdp("module"), for_inference=True
+    )
 
     assert "vision_encoder" not in parallel_state._PARALLEL_STATE_REGISTRY
     assert runtime(7) == 7

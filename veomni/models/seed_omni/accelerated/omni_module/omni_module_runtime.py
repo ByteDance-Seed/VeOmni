@@ -104,8 +104,6 @@ class ModuleRuntime(VeOmniModelRuntime):
     mistyped runtime attribute silently reads the model rather than raising.
     """
 
-    _global_accelerator: Optional["AcceleratorConfig"] = None
-
     args: "OmniModuleRuntimeArguments"
     train_args: Optional["OmniTrainingArguments"] = None
     _has_trainable_parameters: Optional[bool] = None
@@ -116,9 +114,9 @@ class ModuleRuntime(VeOmniModelRuntime):
         module_name: str,
         *,
         module_config: "OmniModuleConfig",
+        global_accelerator: "AcceleratorConfig",
         train: Optional["OmniTrainingArguments"] = None,
         for_inference: bool = False,
-        global_accelerator: Optional["AcceleratorConfig"] = None,
     ):
         self.args = args
         self.model_name = module_name
@@ -173,8 +171,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         once. ``_validate_composed_wrap`` rejects an eager module under that
         scope when the launcher args are resolved.
         """
-        accelerator = self._global_accelerator if self._global_accelerator is not None else self.args.accelerator
-        return composed_model_owns_wrap(accelerator)
+        return composed_model_owns_wrap(self._global_accelerator)
 
     @property
     def mesh_accelerator(self) -> "AcceleratorConfig":
@@ -185,7 +182,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         emb-parallel block) must not decide them — a module meta-initialized on
         a different mesh than the one it is later sharded over would not load.
         """
-        if self.wrap_omni_model and self._global_accelerator is not None:
+        if self.wrap_omni_model:
             return self._global_accelerator
         return self.args.accelerator
 
@@ -663,18 +660,18 @@ def build_omni_module_runtime(
     module_name: str,
     *,
     module_config: "OmniModuleConfig",
+    global_accelerator: "AcceleratorConfig",
     train: Optional["OmniTrainingArguments"] = None,
     for_inference: bool = False,
-    global_accelerator: Optional["AcceleratorConfig"] = None,
 ) -> ModuleRuntime:
     """Build the :class:`ModuleRuntime` for one module of a composed model."""
     return ModuleRuntime(
         args,
         module_name=module_name,
         module_config=module_config,
+        global_accelerator=global_accelerator,
         train=train,
         for_inference=for_inference,
-        global_accelerator=global_accelerator,
     )
 
 
