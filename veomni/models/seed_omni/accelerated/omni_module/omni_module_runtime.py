@@ -344,33 +344,8 @@ class ModuleRuntime(VeOmniModelRuntime):
             "training this module frozen."
         )
 
-    def customized_build_parallelize_model(
-        self, *, weights_path: Optional[str], args: "OmniModuleRuntimeArguments", **kwargs: Any
-    ) -> Optional[Any]:
-        """Optional override on a **custom runtime** for bespoke parallelize + load.
-
-        When this returns a module, that module is used verbatim — the override
-        owns FSDP/DDP wrap, weight load, param offload, gradient checkpointing,
-        and mixed precision. When it returns ``None`` (the default here), the
-        generic :meth:`VeOmniModelRuntime._build_parallelized_model` path runs.
-
-        This is the *runtime's* hook, which is why it carries the ``customized_``
-        prefix: a **model** that wants to own its own wrap declares
-        ``build_parallelize_model`` instead, and the base honours that too.
-
-        Called inside this module's ``use_parallel_state`` scope after meta-init,
-        so ``get_parallel_state()`` returns this module's device mesh.
-        """
-        del weights_path, args, kwargs
-        return None
-
     def _build_parallelized_model(self) -> None:
-        """FSDP2/DDP-wrap this module and load its weights, unless a runtime owns it.
-
-        A **custom runtime subclass** may fully own parallelize + weight-load by
-        overriding :meth:`customized_build_parallelize_model` — e.g. a huge MoE
-        backbone that streams EP-sharded experts to CPU, which the generic
-        GPU-materializing loader has no hook for.
+        """FSDP2/DDP-wrap this module and load its weights.
 
         When ``fsdp_scope='model'``, only async activation offload is applied
         here, since it must precede the wrap: the module stays on meta (freeze
@@ -384,13 +359,6 @@ class ModuleRuntime(VeOmniModelRuntime):
                 f"ModuleRuntime '{self.module_name}': deferring FSDP wrap to the composed "
                 "OmniModel (accelerator.fsdp_config.fsdp_scope='model')."
             )
-            return
-        customized_model = self.customized_build_parallelize_model(
-            weights_path=self.args.model_path,
-            args=self.args,
-        )
-        if customized_model is not None:
-            self.model = customized_model
             return
         super()._build_parallelized_model()
 
@@ -554,10 +522,10 @@ class ModuleRuntime(VeOmniModelRuntime):
             return
         # ``set_reshard_after_backward`` recurses into every nested FSDP unit by
         # default, so one call on the root-sharded model covers them all (the
-        # generic ``parallelize_model_fsdp2`` ``fully_shard``s the root). A module
-        # that owns its parallelize via a custom runtime's
-        # ``customized_build_parallelize_model`` (contract: "FSDP-or-not") may leave the root un-sharded — it then owns
-        # its own reshard policy, so skip rather than assume a root FSDP unit.
+        # generic ``parallelize_model_fsdp2`` ``fully_shard``s the root). A model
+        # that declares its own ``build_parallelize_model`` may leave the root
+        # un-sharded — it then owns its reshard policy, so skip rather than
+        # assume a root FSDP unit.
         model = self.model
         if isinstance(model, FSDPModule):
             model.set_reshard_after_backward(reshard)

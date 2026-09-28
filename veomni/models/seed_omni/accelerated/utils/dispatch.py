@@ -62,7 +62,7 @@ def unwrap_graph_module(wrapped: nn.Module, *, module_name: str) -> nn.Module:
     FSDP2 is composable and leaves the module itself as the
     callable object; DDP-style wrappers expose the mixin through ``.module``.
 
-    Parallel/acceleration hooks (``customized_build_parallelize_model``,
+    Parallel/acceleration hooks (``build_parallelize_model``,
     ``get_parallel_plan``, …) are **not** part of :class:`BaseMixin`; they
     live on :class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime`
     or optional family mixins on the wrapped model.
