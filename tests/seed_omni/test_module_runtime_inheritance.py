@@ -228,8 +228,10 @@ def test_the_constructor_stores_training_args_where_the_base_reads_them(monkeypa
     assert vars(runtime)["train_args"] is train
 
 
-@pytest.mark.parametrize(("top_level", "overlay", "defers"), [("model", "module", True), ("module", "model", False)])
-def test_only_the_top_level_scope_decides_whether_a_module_defers(monkeypatch, top_level, overlay, defers):
+@pytest.mark.parametrize(
+    ("top_level", "overlay", "wraps_omni_model"), [("model", "module", True), ("module", "model", False)]
+)
+def test_only_the_top_level_scope_decides_wrap_omni_model(monkeypatch, top_level, overlay, wraps_omni_model):
     """The composed wrap reads the top-level scope, so a module reading its own
     overlay would be wrapped twice, or left on meta with nothing to wrap it."""
     for step in (
@@ -250,10 +252,10 @@ def test_only_the_top_level_scope_decides_whether_a_module_defers(monkeypatch, t
         args, "vision_encoder", module_config=SimpleNamespace(), global_accelerator=_fsdp(top_level)
     )
 
-    assert runtime.wrap_omni_model is defers
+    assert runtime.wrap_omni_model is wraps_omni_model
 
 
-def test_a_deferred_module_applies_async_activation_offload_before_the_composed_wrap(monkeypatch):
+def test_a_module_under_the_omni_model_wrap_applies_async_activation_offload_first(monkeypatch):
     """The patching must precede ``fully_shard``, which under ``fsdp_scope='model'`` the
     composed OmniModel runs later; the module's own parallelize step is the last chance."""
     applied = []

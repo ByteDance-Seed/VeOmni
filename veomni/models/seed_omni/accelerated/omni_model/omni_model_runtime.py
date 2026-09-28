@@ -291,8 +291,9 @@ class OmniModelRuntime:
                 **kwargs,
             )
 
-        for runtime in modules.values():
-            runtime.finish_deferred_parallelize(for_inference=for_inference)
+        if not for_inference:
+            for runtime in modules.values():
+                runtime.build_after_omni_model_wrap()
 
     def __getattr__(self, name: str) -> Any:
         """Forward undshadowed :class:`OmniModel` APIs."""

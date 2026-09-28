@@ -54,7 +54,7 @@ def composed_model_owns_wrap(accelerator: "AcceleratorConfig") -> bool:
     """Whether the top-level ``accelerator`` wraps the composed :class:`OmniModel` once.
 
     The one rule both sides read: :class:`OmniModelRuntime` wraps the parent
-    exactly when this holds, and every :class:`ModuleRuntime` defers its own
+    exactly when this holds, and every :class:`ModuleRuntime` skips its own
     wrap exactly when this holds. A module's own ``fsdp_scope`` overlay is not
     consulted — letting it differ would wrap that module twice, or leave it on
     meta with nothing left to wrap it.
@@ -350,35 +350,31 @@ class ModuleRuntime(VeOmniModelRuntime):
         When ``fsdp_scope='model'``, only async activation offload is applied
         here, since it must precede the wrap: the module stays on meta (freeze
         already applied) so :class:`OmniModelRuntime` can wrap the composed
-        parent once, then :meth:`finish_deferred_parallelize` builds the
+        parent once, then :meth:`build_after_omni_model_wrap` builds the
         optimizer on the now-DTensor parameters.
         """
         if self.wrap_omni_model:
             self._apply_async_activation_offload()
             logger.info_rank0(
-                f"ModuleRuntime '{self.module_name}': deferring FSDP wrap to the composed "
+                f"ModuleRuntime '{self.module_name}': leaving the FSDP wrap to the composed "
                 "OmniModel (accelerator.fsdp_config.fsdp_scope='model')."
             )
             return
         super()._build_parallelized_model()
 
-    def finish_deferred_parallelize(self, *, for_inference: bool = False) -> None:
-        """Optimizer / checkpoint / GC recompute after the parent OmniModel wrap.
+    def build_after_omni_model_wrap(self) -> None:
+        """Training steps that need the wrapped parameters, once the composed OmniModel is wrapped.
 
-        No-op when this module wrapped itself, or when this is an eager-inference
-        module that never entered :meth:`setup`.
+        Under ``fsdp_scope='model'`` :meth:`__init__` stops after building this
+        module on meta; the optimizer, the checkpoint manager and the recompute
+        scope all bind to the DTensor parameters ``fully_shard`` creates, so
+        :class:`OmniModelRuntime` calls this after its wrap. Inference needs
+        none of them.
         """
-        if not self.wrap_omni_model:
-            return
-        if for_inference:
-            with self._scoped():
-                self._scope_recompute_to_parallel_state()
-                self.model.eval()
-        else:
-            with self._scoped():
-                self._scope_recompute_to_parallel_state()
-                self._build_optimizer()
-                self.build_checkpoint()
+        with self._scoped():
+            self._scope_recompute_to_parallel_state()
+            self._build_optimizer()
+            self.build_checkpoint()
 
     def _scoped(self):
         """Context manager making this module's ParallelState current.
