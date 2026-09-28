@@ -47,7 +47,7 @@ from .minimax_h3_core.minimax_h3_text_encoder import (
     video_token_counts,
 )
 from .minimax_h3_core.minimax_h3_video_vae import MiniMaxH3VideoVAE
-from .minimax_h3_core.packed_sequence import build_packed_fl2va
+from .minimax_h3_core.packed_sequence import build_packed_fl2va, host_cu_seqlens
 from .minimax_h3_transformer.modeling_minimax_h3_transformer import MiniMaxH3DiTModel
 
 
@@ -975,7 +975,6 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
     _T_GROUP = 5
     _FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
     _FRAME_RESCALE = 5.0 / 3.0
-    _SEQ_ALIGN = 64
 
     def __init__(self):
         super().__init__(
@@ -989,9 +988,6 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
     @staticmethod
     def _to_device(packed: dict, device) -> dict:
         return {k: v.to(device) if torch.is_tensor(v) else v for k, v in packed.items()}
-
-    def _aligned_seq_len(self, used: int) -> int:
-        return ((used + self._SEQ_ALIGN - 1) // self._SEQ_ALIGN) * self._SEQ_ALIGN
 
     def _axis_from_sqrt_area(self, dim: int, patch: int, sqrt_area: float) -> torch.Tensor:
         ratio = dim / sqrt_area
@@ -1078,7 +1074,7 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
             block_dims.append(info)
 
         used = text_len + total_ref_visual_rows + total_ref_audio_rows + target_audio_rows + target_video_rows
-        seq_len = self._aligned_seq_len(used)
+        seq_len = used
 
         g = torch.zeros(seq_len, 3, dtype=torch.float64)
         g[0:text_len, 0] = torch.arange(text_len, dtype=torch.float64)
@@ -1172,7 +1168,7 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
         token_tags[target_audio_sl] = 2
 
         text_pos = torch.arange(0, text_len)
-        cu = torch.tensor([0, used, seq_len], dtype=torch.int32)
+        cu = torch.tensor([0, used], dtype=torch.int32)
 
         return {
             "img_pos": img_pos,
@@ -1245,6 +1241,7 @@ def model_fn_minimax_h3(
     audio_pos = packed["audio_pos"]
     text_pos = packed["text_pos"]
     cu = packed["cu_seqlens"]
+    cu_host = host_cu_seqlens(packed)
     seq_len = packed["seq_len"]
     text_len = text_pos.shape[0]
     # Video Sequence
@@ -1267,7 +1264,7 @@ def model_fn_minimax_h3(
     timesteps[audio_pos[:ref_audio_rows_count]] = max(float(t_audio), audio_cond_noise_aug)
     unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
 
-    refiner_cu = torch.tensor([0, text_len, text_len], dtype=torch.int32, device=device)
+    refiner_cu = torch.tensor([0, text_len], dtype=torch.int32, device=device)
 
     # VeOmni DiT is the HF wrapper MiniMaxH3DiTModel: it runs the
     # same raw DiT forward (skip_mask_out_condition=True, update_mask=None),
@@ -1291,13 +1288,18 @@ def model_fn_minimax_h3(
         audio_pos_info={"position_ids": audio_pos},
         text_pos_info={"position_ids": text_pos},
         img_pos_for_infer_output_info={"position_ids": img_pos},
-        packed_seq_params={"cu_seqlens_q": cu, "max_seqlen_q": int(cu[1])},
-        refiner_packed_seq_params={"cu_seqlens_q": refiner_cu, "max_seqlen_q": text_len},
+        packed_seq_params={"cu_seqlens_q": cu, "cu_seqlens_host": cu_host, "max_seqlen_q": cu_host[1]},
+        refiner_packed_seq_params={
+            "cu_seqlens_q": refiner_cu,
+            "cu_seqlens_host": (0, int(text_len)),
+            "max_seqlen_q": int(text_len),
+        },
         skip_mask_out_condition=True,
         cond_rows=cond_rows_count,
         video_latent_shape=(f, h // 2, w // 2),
         audio_latent_shape=(audio_channel, audio_t),
         use_gradient_checkpointing=use_gradient_checkpointing,
+        use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
     )
 
     video_pred, audio_pred = outputs.predictions
