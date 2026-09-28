@@ -119,6 +119,17 @@ class DeepseekV41Ngram(DeepseekV41NgramInferenceMixin, OmniPreTrainedModel):
         if self.config.freeze:
             self.tables.requires_grad_(False)
 
+    def float(self):
+        """Keep released fp8 tables in fp8.
+
+        ``build_parallelize_model`` upcasts to float32 when mixed precision is
+        on, so optimizer masters are fp32. These tables are frozen and 196.6 B;
+        that upcast is 393 GB and is the allocation that does not fit eight H20s.
+        """
+        if quantized_storage_dtype(self.config) is None:
+            return super().float()
+        return self
+
     @property
     def compressed_pad_id(self) -> torch.Tensor:
         """The pad token in the *compressed* id space -- what a blocked lookback slot becomes."""

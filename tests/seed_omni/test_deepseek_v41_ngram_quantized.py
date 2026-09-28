@@ -134,6 +134,18 @@ class TestLookup:
         assert error.max() < 0.07
 
 
+class TestMixedPrecisionDoesNotUpcastTheTables:
+    def test_float_is_a_no_op_when_the_tables_are_fp8(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.ngram.modeling import DeepseekV41Ngram
+
+        config = DeepseekV41NgramConfig(weight_quantization=RELEASED_QUANTIZATION)
+        with torch.device("meta"):
+            model = DeepseekV41Ngram(config)
+        assert model.tables[0].weight.dtype is torch.float8_e4m3fn
+        model.float()
+        assert model.tables[0].weight.dtype is torch.float8_e4m3fn
+
+
 class TestTheConfigSwitch:
     def test_a_bf16_ngram_config_asks_for_nothing(self):
         assert quantized_storage_dtype(DeepseekV41NgramConfig()) is None
