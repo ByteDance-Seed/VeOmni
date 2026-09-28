@@ -478,10 +478,6 @@ class OmniDataArguments:
     train_path: str = field(
         metadata={"help": "Local path/HDFS path of the training data. Use comma to separate multiple datasets."},
     )
-    eval_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "path of the evaluation data. If None, use a subset of train_path."},
-    )
     train_size: int = field(
         default=10_000_000,
         metadata={"help": "Number of tokens for training to compute training steps for dynamic batch dataloader."},
@@ -492,14 +488,7 @@ class OmniDataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal[
-        "plaintext",
-        "conversation",
-        "diffusion",
-        "classification",
-        "dpo",
-        "seedomni",
-    ] = field(default="conversation", metadata={"help": "Type of the training data."})
+    data_type: Literal["seedomni"] = field(default="seedomni", metadata={"help": "Type of the training data."})
     datasets_type: str = field(
         default="mapping",
         metadata={"help": "Type of the datasets."},
@@ -508,29 +497,22 @@ class OmniDataArguments:
         default="interleave",
         metadata={"help": "Type of the datasets for multisource training."},
     )
-    source_name: str = field(
+    source_name: Optional[str] = field(
         default=None,
-        metadata={"help": "Dataset name for training. If multisource, dataset name will be loaded from yaml config."},
+        metadata={
+            "help": (
+                "Preprocessor for samples that carry no `source_name` of their own. If multisource, "
+                "dataset names are loaded from the yaml config."
+            )
+        },
     )
     dyn_bsz_buffer_size: int = field(
         default=200,
         metadata={"help": "Buffer size for dynamic batch size."},
     )
-    text_keys: str = field(
-        default=None,
-        metadata={"help": "Key to get text from the training data."},
-    )
-    chat_template: str = field(
-        default="default",
-        metadata={"help": "Chat template to use."},
-    )
     max_seq_len: int = field(
         default=2048,
         metadata={"help": "Maximum sequence length in training."},
-    )
-    silent_exception: bool = field(
-        default=False,
-        metadata={"help": "Whether to ignore exceptions when loading data. Defaults to ``False``"},
     )
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
     mm_configs: Optional[dict] = field(
@@ -547,26 +529,14 @@ class OmniDataArguments:
     )
 
     def __post_init__(self):
+        if self.data_type != "seedomni":
+            raise ValueError(f"OmniTrainer only builds the seedomni transform; got data.data_type={self.data_type!r}.")
         self.enable_multisource = self.train_path.endswith(".yaml")
 
         if self.enable_multisource:
             self.dataset_name = self.multisource_datasets_type
         else:
             self.dataset_name = self.datasets_type
-
-        if self.text_keys is None:
-            if self.data_type == "plaintext":
-                self.text_keys = "content_split"
-            elif self.data_type == "conversation":
-                self.text_keys = "messages"
-            elif self.data_type == "classification":
-                self.text_keys = "text"
-            elif self.data_type == "dpo":
-                self.text_keys = "chosen"
-            elif self.data_type == "seedomni":
-                pass
-            else:
-                raise ValueError(f"Unknown data type: {self.data_type}")
 
         if self.dataloader.num_workers == 0:
             self.dataloader.prefetch_factor = None

@@ -212,9 +212,8 @@ def process_seedomni_example(
             ``utils/image.resize_to_max_pixels``).  The fetchers drop every
             other keyword, so a knob named here that they do not read is
             ignored rather than rejected.
-            ``OmniTrainer`` injects ``tokenizer`` / ``max_seq_len`` /
-            ``text_keys`` here (legacy contract); they are silently
-            ignored — SeedOmni modules own their own tokenizer.
+            ``OmniTrainer`` passes ``data.mm_configs`` here; SeedOmni
+            modules own their own tokenizer.
 
     Returns:
         A single-element list ``[{"conversation_list": items}]`` to match

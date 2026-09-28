@@ -13,8 +13,9 @@ import typing
 
 import pytest
 
-from veomni.arguments.omni_arguments_types import OmniArguments, OmniModuleRuntimeArguments
+from veomni.arguments.omni_arguments_types import OmniArguments, OmniDataArguments, OmniModuleRuntimeArguments
 from veomni.arguments.omni_parser import parse_omni_args
+from veomni.arguments.parser import _instantiate_recursive
 
 
 def _contains_pep604_union(annotation) -> bool:
@@ -57,3 +58,9 @@ def test_an_optional_field_parses_from_the_cli(monkeypatch):
     )
 
     assert parse_omni_args(OmniArguments).train.max_steps == 5
+
+
+def test_a_non_seedomni_data_type_in_yaml_is_refused_at_parse_time():
+    """``Literal`` only constrains the CLI flag; a YAML value reaches the dataclass unchecked."""
+    with pytest.raises(ValueError, match="data_type='conversation'"):
+        _instantiate_recursive(OmniDataArguments, {"train_path": "t.jsonl", "data_type": "conversation"}, "data")
