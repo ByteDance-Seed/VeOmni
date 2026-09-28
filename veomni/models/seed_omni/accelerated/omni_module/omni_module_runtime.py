@@ -608,6 +608,11 @@ class ModuleRuntime(VeOmniModelRuntime):
             return
         ckpt.save_hf_or_lora(state)
 
+    def wait_for_pending_save(self) -> None:
+        """Block until this module's in-flight async save is on disk, if any."""
+        if self.checkpoint is not None:
+            self.checkpoint.wait_for_pending_save()
+
     def save_model_assets(self) -> None:
         """Not a module's job — the composed model writes the shared sidecars.
 

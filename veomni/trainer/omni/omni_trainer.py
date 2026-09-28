@@ -514,6 +514,10 @@ class OmniTrainer:
         """Export every composed model's HF weights / LoRA adapter."""
         self.model.save_hf_or_lora(state)
 
+    def wait_for_pending_save(self) -> None:
+        """Drain every composed model's in-flight async checkpoint writes."""
+        self.model.wait_for_pending_save()
+
     def init_graph_profile(self) -> None:
         """Open a graph profiler on every composed model handle for this step.
 

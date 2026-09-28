@@ -58,6 +58,11 @@ class OmniModuleDcpCallback(Callback):
             return
         self.trainer.save_dcp(state)
 
+    def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        # Under ``save_async`` the last DCP may still be writing; the process
+        # group is torn down right after train_end.
+        self.trainer.wait_for_pending_save()
+
 
 class OmniModuleHfCallback(Callback):
     """Schedule HF / LoRA export via :meth:`OmniTrainer.save_hf_or_lora`.

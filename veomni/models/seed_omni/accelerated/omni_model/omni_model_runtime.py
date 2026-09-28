@@ -459,6 +459,11 @@ class OmniModelRuntime:
         for module_runtime in self.module_runtimes.values():
             module_runtime.save_hf_or_lora(state)
 
+    def wait_for_pending_save(self) -> None:
+        """Drain every module's in-flight async checkpoint writes."""
+        for module_runtime in self.module_runtimes.values():
+            module_runtime.wait_for_pending_save()
+
 
 def build_omni_model_runtime(
     omni_model_runtime_args: OmniModelRuntimeConfig,

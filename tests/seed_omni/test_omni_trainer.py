@@ -9,8 +9,9 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 from veomni.trainer.callbacks.base import TrainerState
-from veomni.trainer.callbacks.omni_callbacks import OmniModuleHfCallback
+from veomni.trainer.callbacks.omni_callbacks import OmniModuleDcpCallback, OmniModuleHfCallback
 from veomni.trainer.omni.omni_trainer import MultiLRScheduler, OmniTrainer, cascade_module_reshard
 
 
@@ -104,6 +105,23 @@ def test_an_exhausted_iterator_does_not_count_a_step():
         trainer.train_step(iter(()))
 
     assert trainer.state.global_step == 3
+
+
+def test_train_end_drains_in_flight_async_dcp_saves():
+    checkpoint = SimpleNamespace(save_steps=0, save_epochs=0)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(checkpoint=checkpoint)))
+    trainer.wait_for_pending_save = MagicMock()
+
+    OmniModuleDcpCallback(trainer).on_train_end(TrainerState(global_step=2, stage="train_end"))
+
+    trainer.wait_for_pending_save.assert_called_once_with()
+
+
+def test_a_frozen_module_has_no_async_save_to_drain():
+    runtime = ModuleRuntime.__new__(ModuleRuntime)
+    runtime.checkpoint = None
+
+    runtime.wait_for_pending_save()
 
 
 def test_async_activation_offload_is_reset_only_on_modules_that_enable_it(monkeypatch):
