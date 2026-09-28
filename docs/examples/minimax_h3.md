@@ -389,16 +389,19 @@ It does **not** add raw-reference encoding, audio-reference support or a
 Training Adapter downloader. A training/de-distillation adapter is separate from
 the trainable LoRA; this recipe does not load one implicitly.
 
-```mermaid
-flowchart LR
-    A[Prepared video/audio latents + paired conditions] --> B[Sample one timestep and one noise realization]
-    B --> C[Negative layout: same noisy targets and visual anchors]
-    B --> D[Positive layout]
-    C --> E[Current DiT: no gradient]
-    D --> F[Current DiT: gradient enabled]
-    E --> G[CFG-aware FM objective]
-    F --> G
-    G --> H[Existing trainer: accumulation and optimizer]
+```text
+Prepared video/audio latents + paired conditions
+                         |
+            Shared timestep and noise
+                /                 \
+Negative layout                   Positive layout
+(same targets and visual anchors)       |
+        |                               |
+Current DiT (no gradient)       Current DiT (gradient enabled)
+                \                 /
+                CFG-aware FM objective
+                         |
+          Existing trainer and optimizer
 ```
 
 ### Cache contract
