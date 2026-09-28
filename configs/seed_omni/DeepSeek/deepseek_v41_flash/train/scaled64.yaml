@@ -51,6 +51,7 @@ model:
 data:
   data_type: seedomni
   # Same as full.yaml, so this run's peak memory bounds that one's.
+  # Not enforced on the SeedOmni V2 path; the tulu data is pre-filtered to it.
   max_seq_len: 1024
   train_path: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/scaled64_data.yaml
   datasets_type: iterable

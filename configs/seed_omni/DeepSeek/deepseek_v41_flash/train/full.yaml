@@ -54,6 +54,7 @@ model:
 data:
   data_type: seedomni
   # Raise only once scaled64.yaml, at the same length, shows the headroom.
+  # Not enforced on the SeedOmni V2 path; the tulu data is pre-filtered to it.
   max_seq_len: 1024
   train_path: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/data.yaml
   datasets_type: iterable

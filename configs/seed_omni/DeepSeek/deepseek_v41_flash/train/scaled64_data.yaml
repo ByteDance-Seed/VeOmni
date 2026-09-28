@@ -1,6 +1,9 @@
 # Text-only tulu-3: its 64 parquet shards give each of the 64 ranks its own.
+# The -le1024 copy keeps the 78.8% of samples at or under 1000 tokens: the
+# SeedOmni V2 path ignores data.max_seq_len, and the longest raw samples
+# (~150k tokens) OOM a rank on their fp32 logits grad alone.
 sources:
-  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/data
+  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture-le1024/data
 names:
   - tulu-3-sft-mixture
 schedule:

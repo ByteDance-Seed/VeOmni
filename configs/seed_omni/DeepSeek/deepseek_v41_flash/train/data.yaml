@@ -2,7 +2,7 @@
 # configs use, so a first run compares against a known baseline rather than
 # against a dataset nobody has trained on here.
 sources:
-  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/data
+  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture-le1024/data
   - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k
 names:
   - tulu-3-sft-mixture
