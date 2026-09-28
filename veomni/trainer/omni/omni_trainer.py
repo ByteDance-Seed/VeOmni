@@ -202,10 +202,6 @@ def build_omni_model(
 ) -> OmniModelRuntime:
     """Build one VeOmni-managed composed model — the trainer's ``self.model``."""
     model_runtime = global_args.resolve_model()
-    for name in model_runtime.module_names:
-        module_args = model_runtime.modules[name]
-        module_args.model_config = dict(module_args.model_config or {})
-        module_args.model_config["train_type"] = global_args.train.train_type
     return OmniModelRuntime.from_model_runtime(model_runtime, train=global_args.train, for_inference=False)
 
 
@@ -263,8 +259,6 @@ class OmniTrainer:
         return self.model.config
 
     def __init__(self, args: OmniArguments):
-        if args.train.train_type == "offline_cache":
-            raise NotImplementedError("`train.train_type: offline_cache` is not supported by OmniTrainer yet.")
         self.args = args
         self.device = self.setup_distributed(args)
 

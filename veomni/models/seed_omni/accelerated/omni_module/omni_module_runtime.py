@@ -560,7 +560,7 @@ class ModuleRuntime(VeOmniModelRuntime):
 
         Fully-frozen modules (no ``requires_grad`` params) get **no** manager:
         there is nothing to train, no optimizer to snapshot, and weights stay at
-        the released checkpoint (e.g. offline_cache OE/ViT/VAE). That is why
+        the released checkpoint (e.g. a frozen encoder). That is why
         every save/load below tolerates a missing manager, where the base can
         assume one.
         """

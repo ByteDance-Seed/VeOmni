@@ -108,10 +108,3 @@ def test_an_exhausted_iterator_does_not_count_a_step():
 
 def test_multi_lr_scheduler_without_schedulers_reports_zero_lr():
     assert MultiLRScheduler({}).get_last_lr() == [0.0]
-
-
-def test_offline_cache_is_rejected_before_any_setup():
-    args = SimpleNamespace(train=SimpleNamespace(train_type="offline_cache"))
-
-    with pytest.raises(NotImplementedError, match="offline_cache"):
-        OmniTrainer(args)

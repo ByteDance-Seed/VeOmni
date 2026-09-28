@@ -79,7 +79,6 @@ OmniModelRuntimeArguments = OmniModelRuntimeConfig
 
 logger = logging.get_logger(__name__)
 
-OMNI_TRAIN_WORKFLOWS = {"train", "offline_cache", "train_with_cache", "train_and_cache"}
 LAUNCHER_CONFIG_KEYS = frozenset({"modules", "train_graph", "train_type", "infer_graph", "infer_type"})
 
 
@@ -500,7 +499,6 @@ class OmniDataArguments:
         "classification",
         "dpo",
         "seedomni",
-        "seedomni_cached",
     ] = field(default="conversation", metadata={"help": "Type of the training data."})
     datasets_type: str = field(
         default="mapping",
@@ -565,7 +563,7 @@ class OmniDataArguments:
                 self.text_keys = "text"
             elif self.data_type == "dpo":
                 self.text_keys = "chosen"
-            elif self.data_type in {"seedomni", "seedomni_cached"}:
+            elif self.data_type == "seedomni":
                 pass
             else:
                 raise ValueError(f"Unknown data type: {self.data_type}")
@@ -680,11 +678,6 @@ class OmniTrainingArguments:
             )
         },
     )
-    train_type: Optional[str] = field(default=None, metadata={"help": "SeedOmni training workflow."})
-    offline_cache_dir: Optional[str] = field(
-        default=None,
-        metadata={"help": "Output directory for train_type='offline_cache'."},
-    )
     graph_profile: OmniGraphProfileArguments = field(default_factory=OmniGraphProfileArguments)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
@@ -692,15 +685,6 @@ class OmniTrainingArguments:
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
-        self.train_type = self.train_type or "train"
-        if self.train_type not in OMNI_TRAIN_WORKFLOWS:
-            known = ", ".join(sorted(OMNI_TRAIN_WORKFLOWS))
-            raise ValueError(f"Unknown train.train_type {self.train_type!r}; expected one of: {known}.")
-        if self.train_type == "train_and_cache":
-            raise NotImplementedError("`train.train_type: train_and_cache` is reserved and is not implemented yet.")
-        if self.train_type == "offline_cache" and not self.offline_cache_dir:
-            raise ValueError("`train.offline_cache_dir` is required when `train.train_type` is 'offline_cache'.")
-
         if self.dyn_bsz_physical_overflow_ratio < 1.0:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
@@ -874,7 +858,6 @@ class OmniArguments:
 __all__ = [
     "DEFAULT_SCENARIO",
     "LAUNCHER_CONFIG_KEYS",
-    "OMNI_TRAIN_WORKFLOWS",
     "OmniArguments",
     "OmniDataArguments",
     "OmniGraphProfileArguments",

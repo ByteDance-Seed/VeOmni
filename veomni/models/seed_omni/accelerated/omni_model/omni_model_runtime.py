@@ -63,20 +63,14 @@ def _scoped_no_split_modules(module_runtimes: Mapping[str, ModuleRuntime]) -> li
     return list(dict.fromkeys(scoped))
 
 
-def _reject_lora_that_matched_nothing(module_runtimes: Mapping[str, ModuleRuntime], train: Any = None) -> None:
+def _reject_lora_that_matched_nothing(module_runtimes: Mapping[str, ModuleRuntime]) -> None:
     """Fail a LoRA run that left the composed model with nothing to train.
 
     A single module whose targets missed is normal — ``ModuleRuntime`` already
     logs and stays frozen. A sibling doing full-parameter SFT still trains.
     Raise only when LoRA was requested and **every** module is frozen, which
     would look like a healthy run whose loss never moves.
-
-    ``offline_cache`` is exempt: it freezes every module by design (and is
-    usually the training YAML with only ``--train.train_type`` overridden).
     """
-    if getattr(train, "train_type", None) == "offline_cache":
-        return
-
     requested = [name for name, runtime in module_runtimes.items() if bool(runtime.args.lora_config)]
     if not requested:
         return
@@ -170,7 +164,7 @@ class OmniModelRuntime:
             f"OmniModelRuntime: composed OmniModel with {len(module_runtimes)} module(s) ({list(module_runtimes)})."
         )
         if not for_inference:
-            _reject_lora_that_matched_nothing(module_runtimes, train)
+            _reject_lora_that_matched_nothing(module_runtimes)
         runtime = cls(
             OmniModel(omni_config, {name: rt.omni_module for name, rt in module_runtimes.items()}),
             module_runtimes=module_runtimes,
