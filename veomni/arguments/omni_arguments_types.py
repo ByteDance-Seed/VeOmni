@@ -733,7 +733,6 @@ class OmniArguments:
 
 
 __all__ = [
-    "DEFAULT_SCENARIO",
     "OmniArguments",
     "OmniDataArguments",
     "OmniGraphProfileArguments",
@@ -741,7 +740,6 @@ __all__ = [
     "OmniModelRuntimeArguments",
     "OmniModuleRuntimeArguments",
     "OmniTrainingArguments",
-    "_is_omni_checkpoint_root",
     "build_omni_module_runtime_args",
     "build_omni_model_runtime_args",
 ]
