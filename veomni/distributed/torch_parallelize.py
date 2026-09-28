@@ -486,7 +486,7 @@ def _divide_extra_parallel_grads_like_fsdp(model: "nn.Module", parallel_state, f
     """
     for fqn, param in model.named_parameters():
         spec_info = (fqn2spec_info or {}).get(fqn)
-        if spec_info is None or not isinstance(spec_info.placement, Shard):
+        if not param.requires_grad or spec_info is None or not isinstance(spec_info.placement, Shard):
             continue
         para = spec_info.para_name
         if not parallel_state.extra_parallel_enabled(para):
