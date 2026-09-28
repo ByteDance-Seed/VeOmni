@@ -38,7 +38,7 @@ from .attention import (
 )
 from .configuration import DeepseekV41LlmConfig
 from .decode import dense_sparse_attn
-from .mhc import DeepseekV41HyperConnection, mhc_collapse, mhc_expand
+from .mhc import DeepseekV41HyperConnection, mhc_collapse, mhc_expand, require_fp32_pre_mix
 from .moe import DeepseekV41SparseMoeBlock
 from .quantization import fake_quant_linear, round_window_kv
 from .quantized import DeepseekV41Linear, linear_quant_dtype
@@ -133,6 +133,7 @@ class DeepseekV41DSparkBlock(nn.Module):
         ``main_x`` after it. Returns the streams, the carried ``pre`` mix,
         ``main_x``, and the LM-head input on the last stage (else ``None``).
         """
+        require_fp32_pre_mix(pre_mix)
         main_x = self.project_main(main) if self.stage_id == 0 else main
         hidden_streams, pre_mix = self.forward_draft_packed(hidden_streams, pre_mix, position_ids, rotary_emb, main_x)
         draft = self.collapse_draft(hidden_streams, pre_mix) if hasattr(self, "norm") else None

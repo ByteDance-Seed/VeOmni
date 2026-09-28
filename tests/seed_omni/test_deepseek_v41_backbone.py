@@ -481,6 +481,17 @@ class TestRefusals:
         with pytest.raises(NotImplementedError, match="deepseek_v41_text_encoder"):
             model.set_input_embeddings(torch.nn.Embedding(4, HIDDEN))
 
+    def test_a_narrowed_pre_mix_is_refused_at_every_block(self):
+        """The FSDP2 input cast; see ``require_fp32_pre_mix``."""
+        backbone = DeepseekV41Backbone(make_config(dspark_block_size=2, num_nextn_predict_layers=3))
+        streams = torch.randn(1, 12, HC, HIDDEN, dtype=torch.bfloat16)
+        pre_mix = torch.full((1, 12, HC), 0.25, dtype=torch.bfloat16)
+        positions = torch.arange(12).unsqueeze(0)
+        with pytest.raises(RuntimeError, match="cast_forward_inputs: false"):
+            backbone.layers[0](streams, pre_mix, positions, backbone.rotary_emb, None, {})
+        with pytest.raises(RuntimeError, match="cast_forward_inputs: false"):
+            backbone.mtp[0](streams, pre_mix, positions, backbone.rotary_emb, [])
+
 
 class TestModuleShape:
     def test_engram_connections_only_at_declared_layers(self):

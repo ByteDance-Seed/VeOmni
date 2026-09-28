@@ -158,6 +158,24 @@ def mhc_expand(
     )
 
 
+def require_fp32_pre_mix(pre_mix: torch.Tensor) -> None:
+    """Refuse a ``pre`` that something outside the model narrowed.
+
+    Every ``pre`` the model builds is fp32, so a bf16 one at a block boundary
+    is the FSDP2 mixed-precision input cast. That cast also hands each block a
+    copy of the ``SharedAttentionState`` it publishes into, so the layers after
+    a source never see its KV; and FSDP2 skips it when gradient checkpointing
+    replays the block, so the replay collapses with a different ``pre``,
+    routes differently and fails the checkpoint's shape check.
+    """
+    if pre_mix.dtype != torch.float32:
+        raise RuntimeError(
+            f"the hyper-connection pre mix reached a block as {pre_mix.dtype}, not float32. Under FSDP2 mixed "
+            "precision set `accelerator.fsdp_config.mixed_precision.cast_forward_inputs: false` for the "
+            "DeepSeek-V4.1 llm."
+        )
+
+
 def identity_pre_mix(hidden_streams: torch.Tensor, hc_mult: int) -> torch.Tensor:
     """The ``pre`` the first block collapses with: all weight on copy 0.
 
@@ -182,4 +200,5 @@ __all__ = [
     "identity_pre_mix",
     "mhc_collapse",
     "mhc_expand",
+    "require_fp32_pre_mix",
 ]

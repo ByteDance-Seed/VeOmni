@@ -46,7 +46,7 @@ from .attention import (
     SharedAttentionState,
 )
 from .configuration import DeepseekV41LlmConfig
-from .mhc import DeepseekV41HyperConnection, mhc_collapse, mhc_expand
+from .mhc import DeepseekV41HyperConnection, mhc_collapse, mhc_expand, require_fp32_pre_mix
 from .moe import DeepseekV41SparseMoeBlock
 from .reuse import DeepseekV4RMSNorm
 
@@ -89,6 +89,7 @@ class DeepseekV41DecoderLayer(GradientCheckpointingLayer):
         backward is built from the recomputed forward's tensors. The indexer
         would get no gradient at all while the logged KL fell.
         """
+        require_fp32_pre_mix(pre_mix)
         residual = hidden_streams
         attn_pre, attn_post, attn_comb = self.attn_hc(hidden_streams)
         collapsed = mhc_collapse(hidden_streams, pre_mix)

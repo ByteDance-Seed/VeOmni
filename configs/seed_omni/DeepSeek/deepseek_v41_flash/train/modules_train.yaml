@@ -96,8 +96,6 @@ deepseek_v41_llm:
   accelerator:
     ep_size: 8
     ep_outside: false
-    # 2-layer overfit: checkpoint recompute promoted a bf16 activation to
-    # fp32 (QAT / mixed-precision) and autograd refused the mismatch.
     gradient_checkpointing:
       enable: false
       enable_reentrant: false
@@ -106,3 +104,7 @@ deepseek_v41_llm:
     # EP-sliced by the plan before wrap (ep_fsdp=1 at ep=8).
     fsdp_config:
       fsdp_mode: fsdp2
+      mixed_precision:
+        # FSDP2 would cast the fp32 hyper-connection mix to bf16 and hand each
+        # layer a copy of the shared KV state; see require_fp32_pre_mix.
+        cast_forward_inputs: false
