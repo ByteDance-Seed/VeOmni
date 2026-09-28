@@ -72,6 +72,7 @@ from .configuration import DeepseekV41LlmConfig
 from .quantization import fake_quant_linear, round_compress_kv, round_index_act, round_window_kv
 from .quantized import DeepseekV41GroupedLinear, DeepseekV41Linear, linear_quant_dtype
 from .reuse import DeepseekV4RMSNorm
+from .sequence_shard import SequenceShard
 
 
 #: Query rows scored per chunk by the eager indexer. Its ``[B, S, H, C]``
@@ -516,8 +517,19 @@ class DeepseekV41Compressor(nn.Module):
         self.wkv = nn.Linear(config.hidden_size, config.head_dim, bias=False)
         self.wgate = nn.Linear(config.hidden_size, config.head_dim, bias=False) if self.compress_ratio > 1 else None
 
-    def forward(self, hidden_states: torch.Tensor, plan: CompressionPlan) -> torch.Tensor:
-        """``[B, S, hidden]`` -> ``[B, n_groups, head_dim]``, unrotated."""
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        plan: CompressionPlan,
+        shard: Optional[SequenceShard] = None,
+    ) -> torch.Tensor:
+        """``[B, S, hidden]`` -> ``[B, n_groups, head_dim]``, unrotated.
+
+        Under ``shard`` the hidden states are this rank's rows and ``plan``
+        indexes the full row: the projections run on the local rows and are
+        gathered before the groups are pooled, so the pooling arithmetic is the
+        unsharded one and a group may straddle two ranks.
+        """
         if plan.ratio != self.compress_ratio:
             raise ValueError(
                 f"Compression plan is for ratio {plan.ratio}, this layer compresses by {self.compress_ratio}"
@@ -529,11 +541,16 @@ class DeepseekV41Compressor(nn.Module):
             # One token per group, so there is nothing to pool: take each group's
             # single token and project it. The gather is not a no-op even at ratio
             # 1 -- a packed sample shorter than the ratio contributes no group.
-            return self.norm(self.wkv(hidden_states[:, plan.window_indices[:, 0]]))
+            if shard is None:
+                return self.norm(self.wkv(hidden_states[:, plan.window_indices[:, 0]]))
+            return self.norm(shard.gather(self.wkv(hidden_states))[:, plan.window_indices[:, 0]])
 
         x = hidden_states.float()
-        kv = torch.nn.functional.linear(x, self.wkv.weight.float())[:, plan.window_indices]
-        gate = torch.nn.functional.linear(x, self.wgate.weight.float())[:, plan.window_indices]
+        kv = torch.nn.functional.linear(x, self.wkv.weight.float())
+        gate = torch.nn.functional.linear(x, self.wgate.weight.float())
+        if shard is not None:
+            kv, gate = shard.gather(kv), shard.gather(gate)
+        kv, gate = kv[:, plan.window_indices], gate[:, plan.window_indices]
         pooled = (kv * gate.softmax(dim=2)).sum(dim=2)
         return self.norm(pooled.to(hidden_states.dtype))
 
@@ -796,6 +813,7 @@ class DeepseekV41Attention(nn.Module):
         capture_seq_len: Optional[int] = None,
         compress_hidden: Optional[torch.Tensor] = None,
         compress_position_ids: Optional[torch.Tensor] = None,
+        shard: Optional[SequenceShard] = None,
     ) -> Tuple[torch.Tensor, Optional[IndexerLossTerms]]:
         """``[B, S, hidden]``, and this layer's indexer KL when it builds one.
 
@@ -811,7 +829,15 @@ class DeepseekV41Attention(nn.Module):
         threaded like :class:`SharedAttentionState` rather than held as a global:
         under activation checkpointing a global would hold the wrong source
         layer's publication.
+
+        ``shard`` is sequence parallelism: ``hidden_states`` and ``position_ids``
+        are this rank's rows, ``plans`` cover the full row, and the queries
+        attend over the gathered KV. See :mod:`.sequence_shard`.
         """
+        if shard is not None and (capture is not None or compress_hidden is not None):
+            raise NotImplementedError(
+                "prefill capture is an inference path and does not run under sequence parallelism"
+            )
         batch, seq_len, _ = hidden_states.shape
         cos, sin = rotary_emb(position_ids, compressed=self.rope_is_compressed)
 
@@ -837,7 +863,11 @@ class DeepseekV41Attention(nn.Module):
             capture.window = kv[:, valid - width : valid].detach().clone()
 
         student = None
-        topk_idxs = self._window_indices(position_ids, seq_len)
+        if shard is None:
+            topk_idxs = self._window_indices(position_ids, seq_len)
+        else:
+            kv = shard.gather(kv)
+            topk_idxs = shard.local_rows(self._window_indices(shard.position_ids, shard.full_len))
         if self.compress_ratio:
             compress_kv, compress_idxs, student = self._compressed_kv(
                 hidden_states,
@@ -846,11 +876,12 @@ class DeepseekV41Attention(nn.Module):
                 rotary_emb,
                 shared,
                 plans,
-                offset=seq_len,
+                offset=kv.shape[1],
                 capture=capture,
                 capture_seq_len=capture_seq_len,
                 compress_hidden=compress_hidden,
                 compress_position_ids=compress_position_ids,
+                shard=shard,
             )
             kv = torch.cat([kv, compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
@@ -876,7 +907,8 @@ class DeepseekV41Attention(nn.Module):
             output = attn_impl(query, kv, sink, topk_idxs, self.softmax_scale)
         else:
             output, lse = attn_impl(query, kv, sink, topk_idxs, self.softmax_scale, return_lse=True)
-            indexer_loss = self._indexer_loss(query, kv, topk_idxs, lse, student)
+            valid_rows = None if shard is None else shard.valid_rows(query.device)
+            indexer_loss = self._indexer_loss(query, kv, topk_idxs, lse, student, valid_rows)
 
         # The KV is cached in one shared rotated form, so the query's rotation is
         # removed from the output rather than never applied.
@@ -891,6 +923,7 @@ class DeepseekV41Attention(nn.Module):
         topk_idxs: torch.Tensor,
         lse: torch.Tensor,
         student: torch.Tensor,
+        valid_rows: Optional[torch.Tensor] = None,
     ) -> IndexerLossTerms:
         """Score the indexer against the attention it feeds.
 
@@ -912,6 +945,10 @@ class DeepseekV41Attention(nn.Module):
         In V4.1 the indexer is shared, so this trains it on the *source* layer's
         attention; the layers reusing the selection have their own distributions
         and no say. That is inherent to one indexer serving several layers.
+
+        ``valid_rows`` drops sequence-parallel padding rows: the pad is its own
+        packed sample and has compressed groups to attend to, so it would
+        otherwise contribute a KL of its own.
         """
         width = student.shape[-1]
         if width > topk_idxs.shape[-1]:
@@ -929,6 +966,9 @@ class DeepseekV41Attention(nn.Module):
         tiny = torch.finfo(torch.float32).tiny
         target = torch.where(mass > tiny, target / mass.clamp_min(tiny), 0.0)
         kl, uniform = indexer_kl_terms(student, target)
+        if valid_rows is not None:
+            kl = torch.where(valid_rows, kl, 0.0)
+            uniform = torch.where(valid_rows, uniform, 0.0)
         return IndexerLossTerms(kl=kl.sum(), uniform=uniform.sum())
 
     def _window_indices(self, position_ids: torch.Tensor, seq_len: int) -> torch.Tensor:
@@ -959,6 +999,7 @@ class DeepseekV41Attention(nn.Module):
         capture_seq_len: Optional[int] = None,
         compress_hidden: Optional[torch.Tensor] = None,
         compress_position_ids: Optional[torch.Tensor] = None,
+        shard: Optional[SequenceShard] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """The shared compressed KV and this layer's selection into it.
 
@@ -968,6 +1009,11 @@ class DeepseekV41Attention(nn.Module):
         gets this by writing both out of the same buffer in a fixed order; doing
         it out of order would train the indexer against keys the deployed model
         never produces.
+
+        Under ``shard`` the compressed KV and index keys cover the full row and
+        are identical on every rank, while the top-k selection and the
+        candidate mask stay on this rank's query rows: only this rank's
+        queries ever read them.
         """
         plan = plans[self.compress_ratio]
 
@@ -976,7 +1022,7 @@ class DeepseekV41Attention(nn.Module):
             # (``hidden_states``) are already the sliding-window replay.
             source_h = hidden_states if compress_hidden is None else compress_hidden
             source_pos = position_ids if compress_position_ids is None else compress_position_ids
-            latent = self.compressor(source_h, plan)
+            latent = self.compressor(source_h, plan, shard)
             group_cos, group_sin = rotary_emb(plan.window_positions, compressed=True)
             if self.indexer is not None:
                 shared.index_k = self.indexer.build_keys(latent, group_cos, group_sin)
@@ -1019,7 +1065,7 @@ class DeepseekV41Attention(nn.Module):
                 hidden_states,
                 q_residual,
                 shared.index_k,
-                plan,
+                plan if shard is None else plan.narrow_queries(shard.start, shard.end),
                 shared,
                 cos,
                 sin,

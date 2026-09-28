@@ -293,19 +293,35 @@ class TestIndexerKlFoldIn:
         assert fold_indexer_kl_loss({"indexer_kl_total": torch.tensor(1.0)}, 0.0) is None
 
 
-class TestSequenceParallelRefusal:
-    def test_ulysses_sp_is_refused_rather_than_silently_wrong(self, monkeypatch):
-        """The compression plan is built in Python over the whole sequence, before
-        any kernel sees it, so a sequence-sharded rank would pool across shards."""
+class TestSequenceParallelSlice:
+    def test_forward_pre_hands_the_backbone_its_rows_and_the_full_positions(self, monkeypatch):
+        """Rows of every per-token input, and a shard whose positions cover the
+        padded row: the pad restarts at zero so it is a sample of its own."""
         import veomni.models.seed_omni.modules.deepseek_v41.llm.accelerated.accelerated as module
 
         class FakeState:
             sp_size = 4
+            sp_rank = 3
+            sp_group = None
 
         monkeypatch.setattr(module, "get_parallel_state", lambda: FakeState())
-        model = DeepseekV41LlmAccelerated(make_config())
-        with pytest.raises(NotImplementedError, match="does not support Ulysses sequence parallelism"):
-            model.forward_pre(conversation_list=[[text(4)]])
+        config = make_config()
+        model = DeepseekV41LlmAccelerated(config)
+        conversation = [[text(5), image(3)], [text(6)]]
+        cols = (config.engram_max_ngram_size - 1) * config.engram_n_heads
+        ngram = [torch.randn(1, 14, cols, config.engram_head_dim) for _ in config.engram_layer_ids]
+        packed = torch.cat([part.value for sample in conversation for part in sample])
+
+        out = model.forward_pre(conversation_list=conversation, ngram_embeds=ngram)
+
+        shard = out["sequence_shard"]
+        assert (shard.valid_len, shard.full_len, shard.start, shard.end) == (14, 16, 12, 16)
+        assert shard.position_ids[0].tolist() == [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 0, 1]
+        assert out["position_ids"][0].tolist() == [4, 5, 0, 1]
+        torch.testing.assert_close(out["inputs_embeds"][0, :2], packed[12:])
+        assert out["inputs_embeds"][0, 2:].abs().sum() == 0
+        torch.testing.assert_close(out["ngram_embeds"][0][:, :2], ngram[0][:, 12:])
+        assert out["image_mask"].shape == (1, 4) and not out["image_mask"].any()
 
 
 class TestRegistration:

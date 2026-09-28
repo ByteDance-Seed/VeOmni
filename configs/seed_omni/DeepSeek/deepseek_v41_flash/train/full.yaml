@@ -17,7 +17,7 @@ model:
 
   accelerator:
     init_device: meta
-    # `deepseek_v41_llm` raises on sp_size > 1.
+    # Raise for sequences longer than one card's activations hold; see base.yaml.
     ulysses_size: 1
     gradient_checkpointing:
       enable: false

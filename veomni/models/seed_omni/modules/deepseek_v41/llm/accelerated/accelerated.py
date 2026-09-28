@@ -29,17 +29,15 @@ because they must be derived from the *same* segmentation the embeddings were:
   sequence, so a stale or differently-packed tensor would pair every token with
   another token's memory.
 
-**Ulysses SP is refused rather than supported.** The shared path slices the
-sequence across SP ranks and lets the attention's all-to-all rebuild it inside
-the kernel. V4.1's attention cannot: the compression groups, the candidate
-blocks and the compressed-history visibility are all built from the whole
-sequence in Python, *before* any kernel is called, so a rank holding 1/sp_size
-of the tokens would build a plan for a sequence that does not exist and pool
-across shard boundaries. Supporting it means sharding the plan too, which is its
-own change; accepting it silently means wrong numbers.
+**Sequence parallelism** does not use the shared path's attention all-to-all.
+The compression groups, the candidate blocks and the compressed-history
+visibility are built from the whole row in Python before any kernel runs, so
+``forward_pre`` hands the backbone a :class:`SequenceShard` carrying the full
+positions alongside this rank's rows, and the attention gathers its one KV
+head instead of scattering query heads (see :mod:`..sequence_shard`).
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch.distributed._tensor import Shard
@@ -60,6 +58,7 @@ from ..modeling import DeepseekV41Llm
 from ..quantization import veomni_qat_implementation
 from ..reuse import veomni_moe_experts_forward
 from ..reuse import veomni_qat_implementation as veomni_v4_expert_qat_implementation
+from ..sequence_shard import SequenceShard
 
 
 def build_packed_image_mask(
@@ -108,6 +107,44 @@ def fold_indexer_kl_loss(outputs: Dict[str, Any], coef: float) -> Optional[torch
     return coef * (total / denom)
 
 
+def shard_packed_row(
+    inputs_embeds: torch.Tensor,
+    position_ids: torch.Tensor,
+    ngram_embeds: Optional[List[torch.Tensor]],
+    image_mask: Optional[torch.Tensor],
+    group: Any,
+    rank: int,
+    size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[List[torch.Tensor]], Optional[torch.Tensor], SequenceShard]:
+    """Pad the packed row to a multiple of ``size`` and keep this rank's rows.
+
+    Every SP rank holds the same packed row. The pad is appended as one more
+    packed sample, positions restarting at zero: sample boundaries are read off
+    the positions, so no real token can attend to it. Zeros at every pad
+    position would instead make each pad token its own sample.
+    """
+
+    def pad_rows(x: torch.Tensor) -> torch.Tensor:
+        return torch.cat([x, x.new_zeros((x.shape[0], pad, *x.shape[2:]))], dim=1)
+
+    valid_len = inputs_embeds.shape[1]
+    pad = -valid_len % size
+    if pad:
+        tail = torch.arange(pad, device=position_ids.device, dtype=position_ids.dtype)
+        position_ids = torch.cat([position_ids, tail.expand(position_ids.shape[0], -1)], dim=1)
+        inputs_embeds = pad_rows(inputs_embeds)
+        ngram_embeds = None if ngram_embeds is None else [pad_rows(rows) for rows in ngram_embeds]
+        image_mask = None if image_mask is None else pad_rows(image_mask)
+    shard = SequenceShard(group=group, rank=rank, size=size, position_ids=position_ids, valid_len=valid_len)
+    return (
+        shard.local_rows(inputs_embeds),
+        shard.local_rows(position_ids),
+        None if ngram_embeds is None else [shard.local_rows(rows) for rows in ngram_embeds],
+        None if image_mask is None else shard.local_rows(image_mask),
+        shard,
+    )
+
+
 class TrainingMixin(TrainingModuleMixin):
     """Training-graph hooks: pack in, scatter out, thread the n-gram rows."""
 
@@ -119,6 +156,7 @@ class TrainingMixin(TrainingModuleMixin):
         super().__init__(*args, **kwargs)
         self._conversation_carrier: Optional[List[List[ConversationItem]]] = None
         self._pack_inputs_embeds_shape: Optional[torch.Tensor] = None
+        self._sequence_shard: Optional[SequenceShard] = None
 
     @pre_forward("forward")
     def forward_pre(
@@ -127,14 +165,6 @@ class TrainingMixin(TrainingModuleMixin):
         ngram_embeds: Optional[List[torch.Tensor]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        if get_parallel_state().sp_size > 1:
-            raise NotImplementedError(
-                "deepseek_v41_llm does not support Ulysses sequence parallelism: the compression groups, "
-                "candidate blocks and compressed-history visibility are built from the whole sequence in "
-                "Python before the attention kernel runs, so a sequence-sharded rank would pool across "
-                "shard boundaries. Run this module with sp_size=1."
-            )
-
         inputs_embeds, _, position_ids, inputs_embeds_shape = pack_llm_conversations_for_forward(
             conversation_list, self.device
         )
@@ -152,6 +182,13 @@ class TrainingMixin(TrainingModuleMixin):
         self.metric_meter_set_seqlens(
             "forward", [int(s) for s in valid_seqlens_from_cu_seqlens(cu_seq_lens_q).tolist()]
         )
+
+        ps = get_parallel_state()
+        if ps.sp_size > 1:
+            inputs_embeds, position_ids, ngram_embeds, image_mask, self._sequence_shard = shard_packed_row(
+                inputs_embeds, position_ids, ngram_embeds, image_mask, ps.sp_group, ps.sp_rank, ps.sp_size
+            )
+            kwargs["sequence_shard"] = self._sequence_shard
 
         return dict(
             inputs_embeds=inputs_embeds,
@@ -193,14 +230,24 @@ class TrainingMixin(TrainingModuleMixin):
         hidden_states = outputs["hidden_states"]
         conversation = self._conversation_carrier
         pack_shape = self._pack_inputs_embeds_shape
+        shard = self._sequence_shard
         self._conversation_carrier = None
         self._pack_inputs_embeds_shape = None
+        self._sequence_shard = None
+
+        dspark_hidden = outputs.get("dspark_hidden_states")
+        if shard is not None:
+            # Every SP rank scores the full row downstream, so each one needs
+            # all of it back. The gather's summed backward is the size-times
+            # convention FSDP's division by dp * sp undoes.
+            hidden_states = shard.gather(hidden_states).narrow(1, 0, shard.valid_len)
+            if dspark_hidden is not None:
+                dspark_hidden = shard.gather(dspark_hidden).narrow(1, 0, shard.valid_len)
 
         if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
             hidden_states = hidden_states.squeeze(0)
         scatter_llm_hidden_states(conversation, unflatten(hidden_states, pack_shape))
 
-        dspark_hidden = outputs.get("dspark_hidden_states")
         if dspark_hidden is not None:
             if dspark_hidden.dim() == 3 and dspark_hidden.size(0) == 1:
                 dspark_hidden = dspark_hidden.squeeze(0)

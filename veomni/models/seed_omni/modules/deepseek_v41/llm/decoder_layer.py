@@ -49,6 +49,7 @@ from .configuration import DeepseekV41LlmConfig
 from .mhc import DeepseekV41HyperConnection, mhc_collapse, mhc_expand, require_fp32_pre_mix
 from .moe import DeepseekV41SparseMoeBlock
 from .reuse import DeepseekV4RMSNorm
+from .sequence_shard import SequenceShard
 
 
 class DeepseekV41DecoderLayer(GradientCheckpointingLayer):
@@ -78,6 +79,7 @@ class DeepseekV41DecoderLayer(GradientCheckpointingLayer):
         capture_seq_len: Optional[int] = None,
         compress_hidden: Optional[torch.Tensor] = None,
         compress_position_ids: Optional[torch.Tensor] = None,
+        shard: Optional[SequenceShard] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[IndexerLossTerms]]:
         """``[B, S, hc, D]`` in and out, plus the next ``pre``, router logits and indexer KL.
 
@@ -103,6 +105,7 @@ class DeepseekV41DecoderLayer(GradientCheckpointingLayer):
             capture_seq_len=capture_seq_len,
             compress_hidden=compress_hidden,
             compress_position_ids=compress_position_ids,
+            shard=shard,
         )
         hidden_streams = mhc_expand(attn_out, residual, attn_post, attn_comb)
 

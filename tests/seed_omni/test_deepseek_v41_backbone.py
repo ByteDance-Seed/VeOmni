@@ -123,6 +123,7 @@ def stub_backbone(config, indexer_layers=()):
             capture_seq_len=None,
             compress_hidden=None,
             compress_position_ids=None,
+            shard=None,
         ):
             backbone.seen[layer_idx] = {
                 "streams": hidden_streams.detach().clone(),

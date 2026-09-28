@@ -43,6 +43,7 @@ from .moe import DeepseekV41SparseMoeBlock
 from .quantization import fake_quant_linear, round_window_kv
 from .quantized import DeepseekV41Linear, linear_quant_dtype
 from .reuse import DeepseekV4RMSNorm
+from .sequence_shard import SequenceShard
 
 
 class DSparkMarkovHead(nn.Module):
@@ -121,6 +122,7 @@ class DeepseekV41DSparkBlock(nn.Module):
         position_ids: torch.Tensor,
         rotary_emb: DeepseekV41RotaryEmbedding,
         main: Union[List[torch.Tensor], torch.Tensor],
+        shard: Optional[SequenceShard] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """One teacher-forced packed stage: the only way training enters a stage.
 
@@ -135,7 +137,9 @@ class DeepseekV41DSparkBlock(nn.Module):
         """
         require_fp32_pre_mix(pre_mix)
         main_x = self.project_main(main) if self.stage_id == 0 else main
-        hidden_streams, pre_mix = self.forward_draft_packed(hidden_streams, pre_mix, position_ids, rotary_emb, main_x)
+        hidden_streams, pre_mix = self.forward_draft_packed(
+            hidden_streams, pre_mix, position_ids, rotary_emb, main_x, shard
+        )
         draft = self.collapse_draft(hidden_streams, pre_mix) if hasattr(self, "norm") else None
         return hidden_streams, pre_mix, main_x, draft
 
@@ -263,6 +267,7 @@ class DeepseekV41DSparkBlock(nn.Module):
         position_ids: torch.Tensor,
         rotary_emb: DeepseekV41RotaryEmbedding,
         main_x: torch.Tensor,
+        shard: Optional[SequenceShard] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Teacher-forced DSpark on a packed row.
 
@@ -276,7 +281,9 @@ class DeepseekV41DSparkBlock(nn.Module):
         residual = hidden_streams
         attn_pre, attn_post, attn_comb = self.attn_hc(hidden_streams)
         collapsed = mhc_collapse(hidden_streams, pre_mix)
-        attn_out = self._packed_draft_attention(self.input_layernorm(collapsed), position_ids, rotary_emb, main_x)
+        attn_out = self._packed_draft_attention(
+            self.input_layernorm(collapsed), position_ids, rotary_emb, main_x, shard
+        )
         hidden_streams = mhc_expand(attn_out, residual, attn_post, attn_comb)
 
         residual = hidden_streams
@@ -292,8 +299,13 @@ class DeepseekV41DSparkBlock(nn.Module):
         position_ids: torch.Tensor,
         rotary_emb: DeepseekV41RotaryEmbedding,
         main_x: torch.Tensor,
+        shard: Optional[SequenceShard] = None,
     ) -> torch.Tensor:
-        """Causal window attention over backbone KV plus packed draft keys."""
+        """Causal window attention over backbone KV plus packed draft keys.
+
+        Under ``shard`` the queries are this rank's rows and both KV halves are
+        gathered to the full row, so a window may reach into the previous rank.
+        """
         if main_x.shape[:2] != hidden_states.shape[:2]:
             raise ValueError(
                 f"packed DSpark expected main_x shape {tuple(hidden_states.shape[:2])}, got {tuple(main_x.shape[:2])}"
@@ -308,9 +320,13 @@ class DeepseekV41DSparkBlock(nn.Module):
 
         kv = self._window_kv(hidden_states, position_ids, rotary_emb)
         main_kv = self._window_kv(main_x, position_ids, rotary_emb)
+        if shard is None:
+            window_idxs = attn._window_indices(position_ids, seq_len)
+        else:
+            kv, main_kv = shard.gather(kv), shard.gather(main_kv)
+            window_idxs = shard.local_rows(attn._window_indices(shard.position_ids, shard.full_len))
         pool = torch.cat([main_kv, kv], dim=1)
-        window_idxs = attn._window_indices(position_ids, seq_len)
-        draft_idxs = torch.where(window_idxs >= 0, window_idxs + seq_len, window_idxs)
+        draft_idxs = torch.where(window_idxs >= 0, window_idxs + main_kv.shape[1], window_idxs)
         topk_idxs = torch.cat([window_idxs, draft_idxs], dim=-1)
 
         output = dense_sparse_attn(query, pool, attn.attn_sink, topk_idxs, attn.softmax_scale)

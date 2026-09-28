@@ -70,6 +70,7 @@ from .moe import DeepseekV41TopKRouter
 from .quantization import veomni_qat_implementation
 from .reuse import DeepseekV4Experts, DeepseekV4RMSNorm, veomni_moe_experts_forward
 from .reuse import veomni_qat_implementation as veomni_v4_expert_qat_implementation
+from .sequence_shard import SequenceShard
 
 
 class DeepseekV41Backbone(nn.Module):
@@ -103,7 +104,15 @@ class DeepseekV41Backbone(nn.Module):
         capture: Optional[List[DeepseekV41AttentionCache]] = None,
         capture_seq_len: Optional[int] = None,
         return_draft_hiddens: bool = False,
+        shard: Optional[SequenceShard] = None,
     ) -> Dict[str, Any]:
+        """``shard`` runs this rank's rows of a sequence-parallel row.
+
+        Every per-token input -- embeddings, positions, n-gram rows, image mask
+        -- is then this rank's rows, and the outputs are too.
+        """
+        if shard is not None and capture is not None:
+            raise NotImplementedError("prefill capture does not run under sequence parallelism")
         if ngram_embeds is None and self.engram:
             raise ValueError(
                 f"this backbone has Engram connections at layers {list(self.config.engram_layer_ids)} but no "
@@ -129,7 +138,10 @@ class DeepseekV41Backbone(nn.Module):
         # consumers skip their select entirely.
         token_mask = None if image_mask is None else ~image_mask
 
-        plans = build_compression_plans(self.config, position_ids, sequence_slices_from_positions(position_ids))
+        row_position_ids = position_ids if shard is None else shard.position_ids
+        plans = build_compression_plans(
+            self.config, row_position_ids, sequence_slices_from_positions(row_position_ids)
+        )
         shared = SharedAttentionState()
 
         hidden_streams = expand_to_streams(inputs_embeds, self.config.hc_mult)
@@ -170,6 +182,7 @@ class DeepseekV41Backbone(nn.Module):
                 image_mask,
                 capture=None if capture is None else capture[layer_idx],
                 capture_seq_len=capture_seq_len,
+                shard=shard,
             )
             router_logits.append(layer_logits)
             if indexer_loss is not None:
@@ -197,14 +210,26 @@ class DeepseekV41Backbone(nn.Module):
             "router_logits": router_logits,
         }
         if indexer_terms:
-            outputs["indexer_kl_total"] = torch.stack([term.kl for term in indexer_terms]).sum()
-            outputs["indexer_uniform_total"] = torch.stack([term.uniform for term in indexer_terms]).sum()
+            kl_total = torch.stack([term.kl for term in indexer_terms]).sum()
+            uniform_total = torch.stack([term.uniform for term in indexer_terms]).sum()
+            query_tokens = hidden_states.shape[0] * hidden_states.shape[1]
+            if shard is not None:
+                # Each rank sums only its own rows. Scaled by the group size,
+                # the ranks' gradients add up to size times the full-row one --
+                # what FSDP's division by dp * sp expects, and what the output
+                # gather already gives every other parameter -- and the
+                # fsdp-group mean of the logged value is the full-row KL.
+                kl_total = kl_total * shard.size
+                uniform_total = uniform_total * shard.size
+                query_tokens = hidden_states.shape[0] * shard.valid_len
+            outputs["indexer_kl_total"] = kl_total
+            outputs["indexer_uniform_total"] = uniform_total
             # The count travels so the *metric* can be a per-layer mean while the
             # objective stays a sum: dividing the sum by the layer count here would
             # make the gradient each indexer receives depend on how many other
             # layers happened to carry one.
             outputs["indexer_kl_layers"] = len(indexer_terms)
-            outputs["indexer_query_tokens"] = hidden_states.shape[0] * hidden_states.shape[1]
+            outputs["indexer_query_tokens"] = query_tokens
         if return_draft_hiddens or self.mtp:
             outputs["draft_hiddens"] = [draft_inputs[idx] for idx in self.config.dspark_target_layer_ids]
         return outputs
@@ -371,6 +396,7 @@ class DeepseekV41Backbone(nn.Module):
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
         draft_hiddens: List[torch.Tensor],
+        shard: Optional[SequenceShard] = None,
     ) -> torch.Tensor:
         """Teacher-forced DSpark on the packed row. Returns ``[B, S, hidden]``.
 
@@ -391,7 +417,9 @@ class DeepseekV41Backbone(nn.Module):
         main: Any = draft_hiddens
         draft = None
         for stage in self.mtp:
-            hidden_streams, pre_mix, main, draft = stage(hidden_streams, pre_mix, position_ids, self.rotary_emb, main)
+            hidden_streams, pre_mix, main, draft = stage(
+                hidden_streams, pre_mix, position_ids, self.rotary_emb, main, shard
+            )
         return draft
 
     def forward_spec(
@@ -543,6 +571,7 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
         capture: Optional[List[DeepseekV41AttentionCache]] = None,
         capture_seq_len: Optional[int] = None,
         return_draft_hiddens: bool = False,
+        sequence_shard: Optional[SequenceShard] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """``[B, S, hidden]`` embeddings -> ``[B, S, hidden]`` hidden states.
@@ -560,6 +589,9 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
         Gradient checkpointing wraps the layers, and a tensor that reaches the
         loss by any route other than the flattened output carries no graph: the
         indexer would receive no gradient at all while the logged KL fell.
+
+        ``sequence_shard`` is set by the training hook under sequence
+        parallelism; every per-token input and output is then this rank's rows.
         """
         del kwargs
         if inputs_embeds is None:
@@ -577,6 +609,7 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
             capture=capture,
             capture_seq_len=capture_seq_len,
             return_draft_hiddens=return_draft_hiddens,
+            shard=sequence_shard,
         )
         mtp_trainable = bool(self.model.mtp) and any(p.requires_grad for p in self.model.mtp.parameters())
         if self.training and mtp_trainable:
@@ -587,7 +620,7 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
                     "dspark_target_layer_ids must name live backbone layers."
                 )
             outputs["dspark_hidden_states"] = self.model.forward_dspark_train(
-                inputs_embeds, position_ids, draft_hiddens
+                inputs_embeds, position_ids, draft_hiddens, sequence_shard
             )
         return outputs
 
