@@ -279,22 +279,6 @@ def test_distributed_inference_wraps_lora_before_loading_weights(monkeypatch):
     assert calls.index("_setup_lora") < calls.index("_build_parallelized_model")
 
 
-def test_the_composed_wrap_refuses_a_module_that_did_not_defer():
-    """An eager-inference module is loaded unwrapped; the parent's one FSDP tree
-    would re-wrap and re-load it."""
-    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
-
-    runtime = OmniModelRuntime.__new__(OmniModelRuntime)
-    runtime.omni_model_runtime_args = SimpleNamespace(accelerator=_fsdp("model"))
-    runtime.module_runtimes = {
-        "llm": SimpleNamespace(wrap_omni_model=True),
-        "vision_encoder": SimpleNamespace(wrap_omni_model=False),
-    }
-
-    with pytest.raises(ValueError, match=r"\['vision_encoder'\]"):
-        runtime._parallelize_composed_model(for_inference=True)
-
-
 def test_a_module_the_lora_config_missed_stays_frozen_instead_of_failing():
     """A composed ``lora_config`` reaches every module, so "no targets here" is
     how it says which model to adapt — only the composer can call it an error."""

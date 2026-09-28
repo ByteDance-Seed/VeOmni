@@ -242,13 +242,6 @@ class OmniModelRuntime:
             return
 
         modules = self.module_runtimes
-        self_wrapped = sorted(name for name, runtime in modules.items() if not runtime.wrap_omni_model)
-        if self_wrapped:
-            raise ValueError(
-                "fsdp_scope='model' wraps the composed OmniModel once, so every module must defer its "
-                f"own wrap; these did not: {self_wrapped}. A module on fsdp_mode='eager' is loaded "
-                "unwrapped — run it with fsdp_scope='module', or give it fsdp2 / ddp."
-            )
         wrap_units = _scoped_no_split_modules(modules)
         self.model._no_split_modules = wrap_units
 

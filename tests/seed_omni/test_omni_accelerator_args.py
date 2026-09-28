@@ -246,3 +246,12 @@ def test_build_omni_model_runtime_args_validates_each_module_accelerator():
     args = _fake_args(modules_override={MODULE_B: {"accelerator": {"torch_compile": {"enable": True}}}})
     with pytest.raises(ValueError, match="torch_compile"):
         build_omni_model_runtime_args(args)
+
+
+def test_build_omni_model_runtime_args_rejects_an_eager_module_under_the_composed_wrap():
+    """``fsdp_scope='model'`` wraps the composed OmniModel once; an eager module is
+    loaded unwrapped, so nothing would shard it."""
+    args = _fake_args(modules_override={MODULE_B: {"accelerator": {"fsdp_config": {"fsdp_mode": "eager"}}}})
+    args.model.accelerator.fsdp_config.fsdp_scope = "model"
+    with pytest.raises(ValueError, match=rf"fsdp_mode='eager': \['{MODULE_B}'\]"):
+        build_omni_model_runtime_args(args)

@@ -170,10 +170,9 @@ class ModuleRuntime(VeOmniModelRuntime):
 
         True under a top-level ``fsdp_scope='model'``: the module is built on
         meta and left unwrapped, and :class:`OmniModelRuntime` wraps the parent
-        once. An eager-inference module is never wrapped by anyone.
+        once. ``_validate_composed_wrap`` rejects an eager module under that
+        scope when the launcher args are resolved.
         """
-        if self.is_eager:
-            return False
         accelerator = self._global_accelerator if self._global_accelerator is not None else self.args.accelerator
         return composed_model_owns_wrap(accelerator)
 

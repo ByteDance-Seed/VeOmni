@@ -660,11 +660,7 @@ def _validate_omni_accelerator(accelerator: AcceleratorConfig) -> None:
 
 
 def _validate_composed_wrap(accelerator: AcceleratorConfig, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
-    """Reject an eager module under a top-level ``fsdp_scope='model'`` before any weights load.
-
-    ``OmniModelRuntime`` repeats the check at wrap time, by which point every
-    module has already loaded; this is the one that fails fast.
-    """
+    """Reject an eager module under a top-level ``fsdp_scope='model'`` before any weights load."""
     fsdp_config = accelerator.fsdp_config
     if fsdp_config.fsdp_scope != "model" or fsdp_config.fsdp_mode == "eager":
         return
