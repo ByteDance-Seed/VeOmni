@@ -247,7 +247,7 @@ def test_a_missing_decode_stack_is_named_rather_than_dropping_the_clip():
     import_utils.is_video_audio_available = lambda: False
     try:
         importlib.reload(module)
-        with pytest.raises(RuntimeError, match="torchcodec"):
+        with pytest.raises(RuntimeError, match=r"av, librosa and soundfile \(plus ffmpeg \+ torchcodec\)"):
             module.fetch_media({"video": ["clip.mp4"]}, "t")
     finally:
         import_utils.is_video_audio_available = original

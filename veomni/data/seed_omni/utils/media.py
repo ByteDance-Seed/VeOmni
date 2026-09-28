@@ -53,13 +53,13 @@ else:
         # video (inference).
         raise RuntimeError(
             "video refs were passed but the video/audio decode stack is unavailable. "
-            "Install the optional dependencies (ffmpeg + torchcodec) to decode clips."
+            "Install av, librosa and soundfile (plus ffmpeg + torchcodec) to decode clips."
         )
 
     def save_video(path: str, *args, **kwargs):
         raise RuntimeError(
             f"save_video: a generated clip is to be written to {path}, but the video/audio stack is "
-            "unavailable. Install the optional dependencies (ffmpeg + torchcodec) to write clips."
+            "unavailable. Install av, librosa and soundfile to write clips."
         )
 
 
