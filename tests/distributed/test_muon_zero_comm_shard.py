@@ -16,11 +16,16 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 from torch.distributed._tensor import Shard
 
-from veomni.distributed.parallel_plan import ParallelPlan
+from veomni.distributed.parallel_plan import (
+    ParallelPlan,
+    local_extra_parallel_parameter,
+    meta_local_parameter,
+)
 from veomni.distributed.torch_parallelize import _can_shard_extra_parallel_dim0
 
 
@@ -115,6 +120,32 @@ def test_rejects_plan_that_slices_a_non_zero_dim():
 def test_rejects_plan_whose_patterns_match_nothing():
     plan = ParallelPlan(extra_parallel_plan={"ep": {"decoder.*.experts.w1": Shard(0)}})
     assert _can_shard_extra_parallel_dim0(_ToyMoe(), plan, "ep", 2) is False
+
+
+def test_meta_local_parameter_shrinks_fp8_table_rows():
+    # DeepSeek-V4.1 n-gram tables are fp8 meta Parameters. DTensor redistribute
+    # leaves their numel global, so to_empty would allocate the full 91 GiB row
+    # slab. The ExtraParallel apply path must size the meta tensor itself.
+    param = nn.Parameter(torch.empty(64, 32, dtype=torch.float8_e4m3fn, device="meta"))
+    local = meta_local_parameter(param, Shard(0), para_size=8)
+    assert tuple(local.shape) == (8, 32)
+    assert local.is_meta
+    assert local.dtype == torch.float8_e4m3fn
+    assert local.requires_grad is True
+
+
+def test_meta_local_parameter_rejects_indivisible_rows():
+    param = nn.Parameter(torch.empty(10, 4, device="meta"))
+    with pytest.raises(ValueError, match="not divisible by 8"):
+        meta_local_parameter(param, Shard(0), para_size=8)
+
+
+def test_local_extra_parallel_parameter_slices_cpu_rows():
+    param = nn.Parameter(torch.arange(32, dtype=torch.float32).reshape(8, 4))
+    local = local_extra_parallel_parameter(param, Shard(0), para_size=4, para_rank=1)
+    assert tuple(local.shape) == (2, 4)
+    torch.testing.assert_close(local, param[2:4])
+    assert local.device.type == "cpu"
 
 
 def test_rejects_para_absent_from_the_plan():

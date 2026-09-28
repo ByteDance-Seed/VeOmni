@@ -27,6 +27,48 @@ from .utils import check_fqn_match, get_module_from_path, set_module_from_path
 logger = logging.get_logger(__name__)
 
 
+def meta_local_parameter(param: nn.Parameter, shard: Shard, para_size: int) -> nn.Parameter:
+    """Allocate a meta Parameter whose shape is this rank's ExtraParallel shard.
+
+    ``DTensor.from_local`` + ``redistribute`` does not change the storage of a
+    meta tensor -- ``to_local()`` still reports the global numel. ``Module.to_empty``
+    then materializes that global tensor. For DeepSeek-V4.1's fp8 n-gram tables
+    that is a 91 GiB allocation on a rank that already holds the other table.
+    """
+    local_shape = list(param.shape)
+    dim = shard.dim
+    size = param.size(dim)
+    if size % para_size != 0:
+        raise ValueError(
+            f"ExtraParallel shard dim {dim} of shape {tuple(param.shape)} is not divisible by {para_size}."
+        )
+    local_shape[dim] = size // para_size
+    return nn.Parameter(param.data.new_empty(local_shape), requires_grad=param.requires_grad)
+
+
+def local_extra_parallel_parameter(param: nn.Parameter, shard: Shard, para_size: int, para_rank: int) -> nn.Parameter:
+    """Return this rank's ExtraParallel shard without going through DTensor.
+
+    ``DTensor.from_local`` on a CUDA mesh materializes onto CUDA even when the
+    source still lives on CPU, so ``apply`` would place a 45 GiB n-gram table
+    on the card before ``to_empty`` ran. Slice (or allocate meta) in place and
+    leave device placement to the loader.
+    """
+    if param.is_meta:
+        return meta_local_parameter(param, shard, para_size)
+    dim = shard.dim
+    size = param.size(dim)
+    if size % para_size != 0:
+        raise ValueError(
+            f"ExtraParallel shard dim {dim} of shape {tuple(param.shape)} is not divisible by {para_size}."
+        )
+    if not (0 <= para_rank < para_size):
+        raise ValueError(f"ExtraParallel rank {para_rank} is outside [0, {para_size}).")
+    local_size = size // para_size
+    local_data = param.data.narrow(dim, para_rank * local_size, local_size).contiguous()
+    return nn.Parameter(local_data, requires_grad=param.requires_grad)
+
+
 @dataclass
 class SpecInfo:
     para_name: str  # name of the ExtraParallel this fqn belongs to
@@ -130,10 +172,6 @@ class ParallelPlan:
                             logger.info_rank0(
                                 f"{para} sharding: slicing param {fqn} along {para}_mesh with placement {para_placement}"
                             )
-                            dtensor = DTensor.from_local(
-                                local_tensor=param.data, device_mesh=target_mesh, placements=source_placement
-                            )
-                            dtensor = dtensor.redistribute(device_mesh=target_mesh, placements=para_placement)
                             spec_info = SpecInfo(
                                 para_name=para,
                                 para_fsdp_mesh=para_fsdp_mesh,
@@ -142,9 +180,21 @@ class ParallelPlan:
                                 persistent_fsdp_shard_dim=persistent_fsdp_shard_dim,
                             )
                             if persistent_fsdp_shard_dim is not None:
+                                dtensor = DTensor.from_local(
+                                    local_tensor=param.data, device_mesh=target_mesh, placements=source_placement
+                                )
+                                dtensor = dtensor.redistribute(device_mesh=target_mesh, placements=para_placement)
                                 local_chunk = torch.nn.Parameter(dtensor, requires_grad=param.requires_grad)
                             else:
-                                local_chunk = torch.nn.Parameter(dtensor.to_local(), requires_grad=param.requires_grad)
+                                from .parallel_state import get_parallel_state
+
+                                para_rank = get_parallel_state().extra_parallel_rank(para)
+                                local_chunk = local_extra_parallel_parameter(param, shard, para_size, para_rank)
+                                logger.info_rank0(
+                                    f"{para} sharding: {fqn} {tuple(param.shape)} {param.dtype} "
+                                    f"is_meta={param.is_meta} -> local {tuple(local_chunk.shape)} "
+                                    f"(rank {para_rank}/{para_size})"
+                                )
                             local_chunk.spec_info = spec_info
                             set_module_from_path(model, fqn, local_chunk)
                             fqn2spec_info[fqn] = spec_info
