@@ -65,6 +65,7 @@ from ...data import build_dataloader, build_dataset
 from ...data import seed_omni as _seed_omni_data  # noqa: F401  (registers data_type="seedomni" and its preprocessors)
 from ...data.data_transform import build_data_transform
 from ...data.seed_omni.collator import SeedOmniCollator
+from ...distributed.async_offload import reset_async_activation_offload
 from ...distributed.offloading import build_activation_offloading_context
 from ...distributed.parallel_state import init_parallel_state_from_config, use_parallel_state
 from ...models.seed_omni.accelerated import OmniModelRuntime, build_omni_model_runtime
@@ -440,6 +441,12 @@ class OmniTrainer:
     def _cascade_module_reshard(self, micro_step: int, num_micro_steps: int) -> None:
         cascade_module_reshard(self.model.module_runtimes, micro_step, num_micro_steps)
 
+    def _reset_async_activation_offload_if_enabled(self) -> None:
+        """Async offload is applied per module from its own accelerator, so reset per module."""
+        for module_runtime in self.model.module_runtimes.values():
+            if module_runtime.args.accelerator.offload_config.enable_async_activation:
+                reset_async_activation_offload(module_runtime.model)
+
     def _init_callbacks(self):
         """Build orchestrator trace callbacks + global / per-module checkpoint schedulers."""
         self.step_metrics_callback = OmniStepMetricsCallback(self)
@@ -568,6 +575,7 @@ class OmniTrainer:
         # here, and must not leave a step counted that never ran.
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self.state.global_step += 1
+        self._reset_async_activation_offload_if_enabled()
         self._callbacks(stage="step_begin", micro_batches=micro_batches)
         if self.args.train.sync_each_train_step:
             synchronize()

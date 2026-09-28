@@ -106,5 +106,24 @@ def test_an_exhausted_iterator_does_not_count_a_step():
     assert trainer.state.global_step == 3
 
 
+def test_async_activation_offload_is_reset_only_on_modules_that_enable_it(monkeypatch):
+    def _module(enable_async: bool) -> SimpleNamespace:
+        offload_config = SimpleNamespace(enable_async_activation=enable_async)
+        return SimpleNamespace(
+            args=SimpleNamespace(accelerator=SimpleNamespace(offload_config=offload_config)),
+            model=MagicMock(),
+        )
+
+    runtimes = {"offloaded": _module(True), "plain": _module(False)}
+    reset = MagicMock()
+    monkeypatch.setattr("veomni.trainer.omni.omni_trainer.reset_async_activation_offload", reset)
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.model = SimpleNamespace(module_runtimes=runtimes)
+
+    trainer._reset_async_activation_offload_if_enabled()
+
+    reset.assert_called_once_with(runtimes["offloaded"].model)
+
+
 def test_multi_lr_scheduler_without_schedulers_reports_zero_lr():
     assert MultiLRScheduler({}).get_last_lr() == [0.0]
