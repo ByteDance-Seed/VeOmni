@@ -503,6 +503,38 @@ class MixedPrecisionConfig:
         _check_dtype(self.output_dtype)
 
 
+def validate_low_precision_reduce_scatter_comm(
+    enabled: bool,
+    mixed_precision: MixedPrecisionConfig,
+    *,
+    fsdp_mode: str = "fsdp2",
+) -> bool:
+    """Validate the opt-in flag and precision settings; return whether a custom path is needed."""
+    if not isinstance(enabled, bool):
+        raise ValueError("low_precision_reduce_scatter_comm must be a boolean (true or false).")
+    if not enabled:
+        return False
+    if (
+        mixed_precision.param_dtype in ("bfloat16", "float16", "float32")
+        and mixed_precision.param_dtype == mixed_precision.reduce_dtype
+    ):
+        return False
+    if fsdp_mode != "fsdp2":
+        raise ValueError("low_precision_reduce_scatter_comm requires fsdp_mode='fsdp2'.")
+    if (
+        not mixed_precision.enable
+        or mixed_precision.reduce_dtype != "float32"
+        or mixed_precision.param_dtype not in ("bfloat16", "float16")
+    ):
+        raise ValueError(
+            "low_precision_reduce_scatter_comm requires enabled mixed-precision FSDP2 with "
+            "param_dtype='bfloat16' or 'float16' and reduce_dtype='float32'. "
+            "Communication precision is inferred from param_dtype. Disable the option or use equal "
+            "parameter and reduction dtypes for the native path."
+        )
+    return True
+
+
 @dataclass
 class FSDPConfig:
     """model.accelerator.fsdp_config.* — FSDP sharding configuration."""
@@ -543,6 +575,20 @@ class FSDPConfig:
             )
         },
     )
+    low_precision_reduce_scatter_comm: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use mixed_precision.param_dtype for node-local FSDP2 ReduceScatter communication, while "
+                "keeping FP32 reduction buffers and accumulation. Disabled by default. Equal parameter and "
+                "reduction dtypes retain native communication. The custom path requires enabled mixed precision, "
+                "bfloat16 or float16 parameters, and float32 reduction. "
+                "Cross-node or unknown-placement shard groups fall back to native communication; "
+                "HSDP replica-linked groups make a consistent choice. FP32 modules excluded from mixed "
+                "precision keep native communication."
+            )
+        },
+    )
     max_load_broadcast_size: float = field(
         default=20.0,
         metadata={
@@ -565,6 +611,9 @@ class FSDPConfig:
                 "model.accelerator.fsdp_config.fsdp_mode='eager' is reserved for the "
                 "single-process inference path and is not wired up yet."
             )
+        validate_low_precision_reduce_scatter_comm(
+            self.low_precision_reduce_scatter_comm, self.mixed_precision, fsdp_mode=self.fsdp_mode
+        )
 
 
 @dataclass
@@ -1225,7 +1274,9 @@ class OpsImplementationConfig:
             "eager",
             "sdpa",
             "flash_attention_2",
+            "flash_attention_2_hub",
             "flash_attention_3",
+            "flash_attention_3_hub",
             "flash_attention_4",
             "flex_attention",
             "aiter",
@@ -1292,7 +1343,7 @@ class OpsImplementationConfig:
         default="fla",
         metadata={
             "help": "Gated RMSNorm implementation (Qwen3.5 GatedDeltaNet `self.norm`). "
-            "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU or MLU). "
+            "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'eager' uses the HuggingFace Qwen3_5RMSNormGated. "
             "'npu' uses the VeOmni NPUFusedRMSNormGated."
         },
@@ -1301,7 +1352,7 @@ class OpsImplementationConfig:
         default="fla",
         metadata={
             "help": "Varlen depthwise causal conv1d implementation (Qwen3.5 GatedDeltaNet pre-mixer). "
-            "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU or MLU). "
+            "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'eager' leaves causal_conv1d_fn unset; the varlen training path then raises "
             "because no torch fallback handles cu_seqlens. "
             "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
@@ -1313,7 +1364,7 @@ class OpsImplementationConfig:
         default="fla",
         metadata={
             "help": "Chunk gated delta-rule kernel for Qwen3.5 linear attention. "
-            "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU or MLU). "
+            "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU, MLU, or NPU). "
             "'flash_qla' uses QwenLM FlashQLA (ships under the gpu extra, Hopper SM90 only — "
             "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
@@ -1354,7 +1405,38 @@ class OpsImplementationConfig:
         },
     )
 
+    @staticmethod
+    def validate_hub_attention_backend(implementation: Optional[str]) -> None:
+        """Reject unsupported Hub attention requests before HF kernel preloading."""
+        if implementation not in (
+            "flash_attention_2_hub",
+            "flash_attention_3_hub",
+            "veomni_flash_attention_2_hub_with_sp",
+            "veomni_flash_attention_3_hub_with_sp",
+        ):
+            return
+
+        from ..utils.import_utils import is_torch_npu_available
+
+        if is_torch_npu_available():
+            raise ValueError(
+                f"{implementation} is not supported on Ascend NPU; "
+                "select a supported non-Hub attention backend instead."
+            )
+        if get_env("MODELING_BACKEND") != "veomni":
+            raise ValueError(f"{implementation} requires MODELING_BACKEND=veomni.")
+
+    @staticmethod
+    def normalize_hub_attention_backend(implementation: Optional[str]) -> Optional[str]:
+        """Validate Hub requests and resolve their registered VeOmni names."""
+        OpsImplementationConfig.validate_hub_attention_backend(implementation)
+        return {
+            "flash_attention_2_hub": "veomni_flash_attention_2_hub_with_sp",
+            "flash_attention_3_hub": "veomni_flash_attention_3_hub_with_sp",
+        }.get(implementation, implementation)
+
     def __post_init__(self):
+        self.attn_implementation = self.normalize_hub_attention_backend(self.attn_implementation)
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",

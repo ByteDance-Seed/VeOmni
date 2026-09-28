@@ -1,7 +1,7 @@
 """Unit tests for distributed checkpoint and resume behavior.
 
 Covers: OptimizerState (no placeholder synthesis), key normalization,
-lr_scheduler sidecar persistence, allow_partial_load planner, skip-HF resume, and
+per-rank extra_state persistence, allow_partial_load planner, skip-HF resume, and
 trainer step-counting correctness. Tests marked ``xfail`` document known
 in-tree bugs — they become regression guards once the fix lands.
 """
@@ -285,14 +285,14 @@ class TestCheckpointLayoutRoundTrip:
 
         DistributedCheckpointer.save(
             path=str(tmp_path),
-            state={"model": model, "optimizer": optimizer, "lr_scheduler": scheduler},
+            state={"model": model, "optimizer": optimizer, "extra_state": {"lr_scheduler": scheduler.state_dict()}},
             global_steps=7,
         )
 
         model_root = tmp_path / "global_step_7" / "model"
         assert (model_root / "ckpt" / ".metadata").is_file()
         assert (model_root / "optimizer" / ".metadata").is_file()
-        assert (model_root / "lr_scheduler.pt").is_file()
+        assert (model_root / "extra_state" / "extra_state_rank_0.pt").is_file()
         # The pre-split marker at the step root is gone; only the manifest, which
         # GlobalStateCallback writes, marks a step complete now.
         assert not (tmp_path / "global_step_7" / ".metadata").exists()
@@ -312,7 +312,7 @@ class TestCheckpointLayoutRoundTrip:
 
         DistributedCheckpointer.save(
             path=str(tmp_path),
-            state={"model": model, "optimizer": optimizer, "lr_scheduler": scheduler},
+            state={"model": model, "optimizer": optimizer, "extra_state": {"lr_scheduler": scheduler.state_dict()}},
             global_steps=7,
         )
 
@@ -320,10 +320,9 @@ class TestCheckpointLayoutRoundTrip:
         resumed, resumed_optimizer, resumed_scheduler = self._build(seed=1)
         assert not torch.equal(resumed.weight, model.weight)
 
-        DistributedCheckpointer.load(
-            path=str(tmp_path / "global_step_7"),
-            state={"model": resumed, "optimizer": resumed_optimizer, "lr_scheduler": resumed_scheduler},
-        )
+        state = {"model": resumed, "optimizer": resumed_optimizer, "extra_state": {}}
+        DistributedCheckpointer.load(path=str(tmp_path / "global_step_7"), state=state)
+        resumed_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
 
         torch.testing.assert_close(resumed.weight, model.weight, atol=0.0, rtol=0.0)
         expected_exp_avg = optimizer.state_dict()["state"][0]["exp_avg"]
@@ -341,7 +340,11 @@ class TestCheckpointLayoutRoundTrip:
             model, optimizer, scheduler = self._build(seed=index)
             DistributedCheckpointer.save(
                 path=str(tmp_path),
-                state={"model": model, "optimizer": optimizer, "lr_scheduler": scheduler},
+                state={
+                    "model": model,
+                    "optimizer": optimizer,
+                    "extra_state": {"lr_scheduler": scheduler.state_dict()},
+                },
                 global_steps=7,
                 module=module,
             )
@@ -351,6 +354,7 @@ class TestCheckpointLayoutRoundTrip:
         for module in ("vision", "llm"):
             assert (model_root / module / "ckpt" / ".metadata").is_file()
             assert (model_root / module / "optimizer" / ".metadata").is_file()
+            assert (model_root / module / "extra_state" / "extra_state_rank_0.pt").is_file()
 
     def test_resume_reads_a_pre_split_checkpoint(self, mock_gps, tmp_path):
         """A checkpoint written before the split keeps both in one directory.
@@ -358,7 +362,6 @@ class TestCheckpointLayoutRoundTrip:
         Delete this along with ``veomni/checkpoint/legacy_v0_1_12.py``.
         """
         from veomni.checkpoint.dcp_checkpointer import (
-            _LR_SCHEDULER_FILENAME,
             DistributedCheckpointer,
             ModelState,
             OptimizerState,
@@ -377,16 +380,18 @@ class TestCheckpointLayoutRoundTrip:
             },
             checkpoint_id=step,
         )
-        torch.save(scheduler.state_dict(), step / _LR_SCHEDULER_FILENAME)
 
-        resumed, resumed_optimizer, resumed_scheduler = self._build(seed=1)
+        resumed, resumed_optimizer, _ = self._build(seed=1)
         DistributedCheckpointer.load(
             path=str(step),
-            state={"model": resumed, "optimizer": resumed_optimizer, "lr_scheduler": resumed_scheduler},
+            state={"model": resumed, "optimizer": resumed_optimizer, "extra_state": {}},
         )
 
         torch.testing.assert_close(resumed.weight, model.weight, atol=0.0, rtol=0.0)
-        assert resumed_scheduler.state_dict()["last_epoch"] == scheduler.state_dict()["last_epoch"]
+        expected_exp_avg = optimizer.state_dict()["state"][0]["exp_avg"]
+        torch.testing.assert_close(
+            resumed_optimizer.state_dict()["state"][0]["exp_avg"], expected_exp_avg, atol=0.0, rtol=0.0
+        )
 
 
 class TestAllowPartialLoad:
@@ -408,11 +413,11 @@ class TestAllowPartialLoad:
         model._fqn2spec_info = None
         optimizer = MagicMock()
 
-        state = {"model": model, "optimizer": optimizer, "lr_scheduler": MagicMock()}
+        state = {"model": model, "optimizer": optimizer, "extra_state": {}}
 
         mock_dcp.load = MagicMock()
 
-        with patch.object(DistributedCheckpointer, "_load_lr_scheduler"):
+        with patch.object(DistributedCheckpointer, "_load_extra_state"):
             with patch.object(DistributedCheckpointer, "_create_storage_reader") as mock_reader:
                 mock_reader.return_value = MagicMock()
                 DistributedCheckpointer.load(path="/fake", state=state)
@@ -1387,119 +1392,44 @@ class TestNormalizeKey:
 
 
 @patch("veomni.checkpoint.dcp_checkpointer.dist")
-class TestLrSchedulerSaveLoad:
+class TestExtraStateSaveLoad:
     def test_roundtrip(self, mock_dist, tmp_path):
         mock_dist.is_initialized.return_value = False
-        mock_dist.get_rank.return_value = 0
-        from veomni.checkpoint.dcp_checkpointer import (
-            _LR_SCHEDULER_FILENAME,
-            DistributedCheckpointer,
-        )
-
-        saved_scheduler = MagicMock()
-        saved_scheduler.state_dict.return_value = {"last_epoch": 10, "base_lrs": [1e-4]}
-        DistributedCheckpointer._save_lr_scheduler(str(tmp_path), {"lr_scheduler": saved_scheduler})
-
-        assert (tmp_path / _LR_SCHEDULER_FILENAME).is_file()
-        assert {p.name for p in tmp_path.iterdir()} == {_LR_SCHEDULER_FILENAME}
-
-        loaded_scheduler = MagicMock()
-        DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": loaded_scheduler})
-
-        loaded_scheduler.load_state_dict.assert_called_once_with({"last_epoch": 10, "base_lrs": [1e-4]})
-
-    def test_only_rank_zero_writes(self, mock_dist, tmp_path):
-        mock_dist.is_initialized.return_value = True
-        mock_dist.get_rank.return_value = 3
-        from veomni.checkpoint.dcp_checkpointer import (
-            _LR_SCHEDULER_FILENAME,
-            DistributedCheckpointer,
-        )
-
-        saved_scheduler = MagicMock()
-        saved_scheduler.state_dict.return_value = {"last_epoch": 10}
-        with patch(
-            "veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed, group=None: failed
-        ):
-            DistributedCheckpointer._save_lr_scheduler(str(tmp_path), {"lr_scheduler": saved_scheduler})
-
-        saved_scheduler.state_dict.assert_not_called()
-        assert not (tmp_path / _LR_SCHEDULER_FILENAME).exists()
-
-    def test_missing_lr_scheduler_key_save(self, mock_dist, tmp_path):
-        mock_dist.is_initialized.return_value = False
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
-        state = {"model": MagicMock()}
-        DistributedCheckpointer._save_lr_scheduler(str(tmp_path), state)
+        payload = {"lr_scheduler": {"last_epoch": 10}, "condition_model_rng_state": {"generator": "state"}}
+        DistributedCheckpointer._save_extra_state(str(tmp_path), {"extra_state": payload})
 
-    def test_missing_lr_scheduler_key_load(self, mock_dist, tmp_path):
-        mock_dist.is_initialized.return_value = False
-        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+        assert (tmp_path / "extra_state" / "extra_state_rank_0.pt").is_file()
+        assert {p.name for p in tmp_path.iterdir()} == {"extra_state"}
 
-        state = {"model": MagicMock()}
-        DistributedCheckpointer._load_lr_scheduler(str(tmp_path), state)
+        state = {"extra_state": {}}
+        DistributedCheckpointer._load_extra_state(str(tmp_path), state)
+        assert state["extra_state"] == payload
 
-    def test_none_scheduler_is_a_no_op(self, mock_dist, tmp_path):
-        mock_dist.is_initialized.return_value = False
-        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
-
-        DistributedCheckpointer._save_lr_scheduler(str(tmp_path), {"lr_scheduler": None})
-        DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": None})
-
-    def test_missing_sidecar_raises_when_scheduler_is_expected(self, mock_dist, tmp_path):
-        mock_dist.is_initialized.return_value = False
-        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
-
-        loaded = MagicMock()
-        with pytest.raises(FileNotFoundError, match="lr_scheduler sidecar"):
-            DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": loaded})
-        loaded.load_state_dict.assert_not_called()
-
-    def test_load_falls_back_to_extra_state_scheduler(self, mock_dist, tmp_path):
-        mock_dist.is_initialized.return_value = False
-        mock_dist.get_rank.return_value = 0
-        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
-        from veomni.checkpoint.legacy_v0_1_12 import extra_state_path
-
-        extra = tmp_path / "extra_state"
-        extra.mkdir()
-        torch.save({"lr_scheduler": {"last_epoch": 4}}, extra_state_path(str(tmp_path), 0))
-
-        loaded = MagicMock()
-        DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": loaded})
-        loaded.load_state_dict.assert_called_once_with({"last_epoch": 4})
-
-    def test_sidecar_wins_over_extra_state(self, mock_dist, tmp_path):
-        mock_dist.is_initialized.return_value = False
-        from veomni.checkpoint.dcp_checkpointer import (
-            _LR_SCHEDULER_FILENAME,
-            DistributedCheckpointer,
-        )
-        from veomni.checkpoint.legacy_v0_1_12 import extra_state_path
-
-        torch.save({"last_epoch": 1}, tmp_path / _LR_SCHEDULER_FILENAME)
-        extra = tmp_path / "extra_state"
-        extra.mkdir()
-        torch.save({"lr_scheduler": {"last_epoch": 99}}, extra_state_path(str(tmp_path), 0))
-
-        loaded = MagicMock()
-        DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": loaded})
-        loaded.load_state_dict.assert_called_once_with({"last_epoch": 1})
-
-    def test_rank_nonzero_reads_rank0_extra_state_for_scheduler(self, mock_dist, tmp_path):
+    def test_each_rank_writes_its_own_file(self, mock_dist, tmp_path):
         mock_dist.is_initialized.return_value = True
         mock_dist.get_rank.return_value = 3
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
-        from veomni.checkpoint.legacy_v0_1_12 import extra_state_path
 
-        extra = tmp_path / "extra_state"
-        extra.mkdir()
-        torch.save({"lr_scheduler": {"last_epoch": 8}}, extra_state_path(str(tmp_path), 0))
+        DistributedCheckpointer._save_extra_state(str(tmp_path), {"extra_state": {"rng": "state"}})
 
-        loaded = MagicMock()
-        DistributedCheckpointer._load_lr_scheduler(str(tmp_path), {"lr_scheduler": loaded})
-        loaded.load_state_dict.assert_called_once_with({"last_epoch": 8})
+        assert (tmp_path / "extra_state" / "extra_state_rank_3.pt").is_file()
+
+    def test_missing_extra_state_key_skips(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        DistributedCheckpointer._save_extra_state(str(tmp_path), {"model": MagicMock()})
+        DistributedCheckpointer._load_extra_state(str(tmp_path), {"model": MagicMock()})
+
+    def test_load_missing_file_keeps_state_empty(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        state = {"extra_state": {}}
+        DistributedCheckpointer._load_extra_state(str(tmp_path), state)
+        assert state["extra_state"] == {}
 
 
 class TestPromoteStagedCheckpoint:
@@ -1582,7 +1512,7 @@ class TestPromoteStagedCheckpoint:
         """A nested file is copied with the shards, before any ``.metadata`` is."""
         import shutil as _shutil
 
-        from veomni.checkpoint.dcp_checkpointer import _LR_SCHEDULER_FILENAME, _promote_staged_checkpoint
+        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
 
         stage_path = tmp_path / "stage"
         final_path = tmp_path / "final"
@@ -1590,7 +1520,7 @@ class TestPromoteStagedCheckpoint:
         nested.mkdir(parents=True)
         (stage_path / "__0_0.distcp").write_text("weights")
         (stage_path / ".metadata").write_text("meta")
-        (stage_path / _LR_SCHEDULER_FILENAME).write_text("scheduler-v2")
+        (stage_path / "extra_state.pt").write_text("extra-state")
         (nested / "sidecar.pt").write_text("nested")
 
         order = []
@@ -1606,12 +1536,12 @@ class TestPromoteStagedCheckpoint:
                 _promote_staged_checkpoint(str(stage_path), str(final_path))
 
         nested_rel = os.path.join("nested", "sidecar.pt")
-        assert _LR_SCHEDULER_FILENAME in order
+        assert "extra_state.pt" in order
         assert nested_rel in order
         assert order[-1] == ".metadata"
-        assert order.index(_LR_SCHEDULER_FILENAME) < order.index(".metadata")
+        assert order.index("extra_state.pt") < order.index(".metadata")
         assert order.index(nested_rel) < order.index(".metadata")
-        assert (final_path / _LR_SCHEDULER_FILENAME).read_text() == "scheduler-v2"
+        assert (final_path / "extra_state.pt").read_text() == "extra-state"
         assert (final_path / nested_rel).read_text() == "nested"
 
     def test_stale_metadata_is_gone_before_any_data_is_copied(self, staged):
@@ -2081,16 +2011,16 @@ class TestStageDirValidation:
                 with pytest.raises(OSError, match="No space left"):
                     _prepare_stage_dir(str(tmp_path), "/remote/ckpt")
 
-    def test_failed_staged_overwrite_does_not_change_previous_scheduler(self, tmp_path):
-        """A failed staged save must not mutate the live checkpoint's scheduler.
+    def test_failed_staged_overwrite_does_not_change_previous_extra_state(self, tmp_path):
+        """A failed staged save must not mutate the live checkpoint's extra state.
 
         ``.metadata`` still advertises the previous checkpoint until promotion.
-        Writing the new ``lr_scheduler.pt`` into the destination first would let
-        a resume load the old model and optimizer with the new scheduler; a
+        Writing the new ``extra_state`` into the destination first would let a
+        resume load the old model and optimizer with the new scheduler/rng; a
         failed ``dcp.save`` would leave the same mix. The sidecar has to live
         under ``stage_path`` until promotion copies it with the shards.
         """
-        from veomni.checkpoint.dcp_checkpointer import _LR_SCHEDULER_FILENAME, DistributedCheckpointer
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
         final = tmp_path / "ckpt"
         model_root = final / "global_step_10" / "model"
@@ -2098,12 +2028,11 @@ class TestStageDirValidation:
         weights.mkdir(parents=True)
         (weights / ".metadata").write_text("previous")
         (weights / "__0_0.distcp").write_text("old-weights")
-        sidecar = model_root / _LR_SCHEDULER_FILENAME
-        previous = {"last_epoch": 10, "base_lrs": [1e-4]}
+        extra_state_dir = model_root / "extra_state"
+        extra_state_dir.mkdir(parents=True)
+        sidecar = extra_state_dir / "extra_state_rank_0.pt"
+        previous = {"lr_scheduler": {"last_epoch": 10, "base_lrs": [1e-4]}}
         torch.save(previous, sidecar)
-
-        new_scheduler = MagicMock()
-        new_scheduler.state_dict.return_value = {"last_epoch": 99, "base_lrs": [1e-3]}
 
         with (
             patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
@@ -2117,7 +2046,10 @@ class TestStageDirValidation:
             with pytest.raises(OSError, match="dcp write failed"):
                 DistributedCheckpointer.save(
                     path=str(final),
-                    state={"model": MagicMock(), "lr_scheduler": new_scheduler},
+                    state={
+                        "model": MagicMock(),
+                        "extra_state": {"lr_scheduler": {"last_epoch": 99, "base_lrs": [1e-3]}},
+                    },
                     save_async=False,
                     global_steps=10,
                     stage_dir=str(tmp_path / "stage"),
@@ -2149,7 +2081,7 @@ class TestStageDirValidation:
             patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed, group=None: failed),
             patch.object(DistributedCheckpointer, "execute_save", side_effect=OSError("dcp write failed")),
             patch.object(DistributedCheckpointer, "_create_storage_writer"),
-            patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
+            patch.object(DistributedCheckpointer, "_save_extra_state"),
             patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
         ):
             with pytest.raises(OSError, match="dcp write failed"):
@@ -2251,7 +2183,7 @@ class TestStageDirValidation:
         with (
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,
             patch.object(DistributedCheckpointer, "_create_storage_writer") as create_writer,
-            patch.object(DistributedCheckpointer, "_save_lr_scheduler") as save_sched,
+            patch.object(DistributedCheckpointer, "_save_extra_state") as save_sched,
             patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
             patch("veomni.checkpoint.dcp_checkpointer.OptimizerState"),
             patch("veomni.checkpoint.dcp_checkpointer._prepare_stage_dir") as prepare,
@@ -2298,7 +2230,7 @@ class TestStageDirValidation:
         with (
             patch.object(DistributedCheckpointer, "execute_save"),
             patch.object(DistributedCheckpointer, "_create_storage_writer"),
-            patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
+            patch.object(DistributedCheckpointer, "_save_extra_state"),
             patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
         ):
             DistributedCheckpointer.save(
@@ -2328,7 +2260,7 @@ class TestStageDirValidation:
         with (
             patch.object(DistributedCheckpointer, "execute_save"),
             patch.object(DistributedCheckpointer, "_create_storage_writer"),
-            patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
+            patch.object(DistributedCheckpointer, "_save_extra_state"),
             patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
         ):
             DistributedCheckpointer.save(
@@ -2363,7 +2295,7 @@ class TestStageDirValidation:
                 side_effect=lambda **kw: seen.append([(d / layout.DCP_MARKER_FILENAME).exists() for d in markers]),
             ),
             patch.object(DistributedCheckpointer, "_create_storage_writer"),
-            patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
+            patch.object(DistributedCheckpointer, "_save_extra_state"),
             patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
             patch("veomni.checkpoint.dcp_checkpointer.OptimizerState"),
         ):
@@ -2392,7 +2324,7 @@ class TestStageDirValidation:
         with (
             patch.object(DistributedCheckpointer, "execute_save"),
             patch.object(DistributedCheckpointer, "_create_storage_writer"),
-            patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
+            patch.object(DistributedCheckpointer, "_save_extra_state"),
             patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
         ):
             DistributedCheckpointer.save(
@@ -2438,7 +2370,7 @@ class TestStageDirValidation:
         with (
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,
             patch.object(DistributedCheckpointer, "_create_storage_writer"),
-            patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
+            patch.object(DistributedCheckpointer, "_save_extra_state"),
             patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
         ):
             DistributedCheckpointer.save(
@@ -2468,7 +2400,7 @@ class TestStageDirValidation:
         with (
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,
             patch.object(DistributedCheckpointer, "_create_storage_writer"),
-            patch.object(DistributedCheckpointer, "_save_lr_scheduler"),
+            patch.object(DistributedCheckpointer, "_save_extra_state"),
             patch.object(DistributedCheckpointer, "_get_stage_process_group", return_value=group) as get_group,
             patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
             patch(

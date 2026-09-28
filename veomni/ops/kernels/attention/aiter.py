@@ -17,7 +17,7 @@
 Unlike the flex backend, aiter does not need its own SP-aware forward: it reuses
 the FlashAttention adapter in ``flash.py`` and only swaps the underlying kernels.
 This module therefore exposes a kernel-like object rather than an attention
-forward, and ``flash._load_veomni_local_flash_kernel`` picks it up for the
+forward, and ``flash._load_veomni_flash_kernel`` picks it up for the
 ``veomni_flash_attention_aiter_with_sp`` implementation name.
 """
 

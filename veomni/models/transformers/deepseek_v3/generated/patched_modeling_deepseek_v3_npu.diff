@@ -252,11 +252,20 @@
          hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
          hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)
          hidden_states = hidden_states + self.shared_experts(residuals)
-@@ -293,30 +411,19 @@
+@@ -293,30 +411,20 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
--@use_kernel_forward_from_hub("rotary_pos_emb")
++# ======================================================================
++# [PATCHED FUNCTION] apply_rotary_pos_emb
++# Reason: Use NPU fused rotary embedding kernel
++# Source: veomni.models.transformers.deepseek_v3.deepseek_v3_npu_patch_gen_config
++# ======================================================================
++# ================================================================
++# Patch: apply_rotary_pos_emb
++# 1. Use NPU fused rotary embedding kernel.
++# ================================================================
+ @use_kernel_forward_from_hub("rotary_pos_emb")
 -def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 -    """Applies Rotary Position Embedding to the query and key tensors.
 -
@@ -280,15 +289,6 @@
 -    q_embed = (q * cos) + (rotate_half(q) * sin)
 -    k_embed = (k * cos) + (rotate_half(k) * sin)
 -    return q_embed, k_embed
-+# ======================================================================
-+# [PATCHED FUNCTION] apply_rotary_pos_emb
-+# Reason: Use NPU fused rotary embedding kernel
-+# Source: veomni.models.transformers.deepseek_v3.deepseek_v3_npu_patch_gen_config
-+# ======================================================================
-+# ================================================================
-+# Patch: apply_rotary_pos_emb
-+# 1. Use NPU fused rotary embedding kernel.
-+# ================================================================
 +def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 +    from veomni.ops.kernels.rotary.npu import apply_rotary_pos_emb_npu as _apply_rotary_pos_emb_npu
 +
@@ -296,7 +296,7 @@
 
 
  def apply_rotary_pos_emb_interleave(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-@@ -646,6 +753,12 @@
+@@ -646,6 +754,12 @@
          )
 
 
@@ -309,7 +309,7 @@
  @auto_docstring
  class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -662,6 +775,13 @@
+@@ -662,6 +776,13 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -323,7 +323,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -673,26 +793,15 @@
+@@ -673,26 +794,15 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -355,7 +355,7 @@
          outputs: BaseModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -700,25 +809,70 @@
+@@ -700,25 +810,70 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,

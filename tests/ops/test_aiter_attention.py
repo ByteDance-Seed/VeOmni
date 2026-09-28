@@ -105,7 +105,7 @@ def test_unexpected_window_size_width_is_rejected(window_size):
 def test_dense_path_requests_lse_and_translates_window(monkeypatch):
     """aiter's forward asserts return_lse whenever autograd is enabled."""
     calls = _install_fake_aiter(monkeypatch)
-    kernels = veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
+    kernels = veomni_flash._load_veomni_flash_kernel(AITER_IMPL)
 
     q = torch.randn(1, 3, 2, 4)
     kernels.flash_attn_func(q, q, q, causal=True, window_size=(8, 0), softmax_scale=0.5)
@@ -121,7 +121,7 @@ def test_lse_is_not_requested_without_autograd(monkeypatch, path):
     """Under no_grad aiter needs no log-sum-exp, and asking for it makes the kernel
     write a buffer Transformers immediately discards."""
     calls = _install_fake_aiter(monkeypatch)
-    kernels = veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
+    kernels = veomni_flash._load_veomni_flash_kernel(AITER_IMPL)
 
     q = torch.randn(6, 2, 4)
     cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
@@ -140,7 +140,7 @@ def test_dense_path_rejects_softcap_instead_of_ignoring_it(monkeypatch):
     """aiter.flash_attn_func has no softcap argument; silently dropping it would
     change the model's maths, so the shim must fail loudly."""
     _install_fake_aiter(monkeypatch)
-    kernels = veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
+    kernels = veomni_flash._load_veomni_flash_kernel(AITER_IMPL)
 
     q = torch.randn(1, 3, 2, 4)
     with pytest.raises(ValueError, match="softcap"):
@@ -154,7 +154,7 @@ def test_attention_sinks_are_rejected_instead_of_dropped(monkeypatch, path, sink
     drops them silently. Declaring both and raising is what makes a sink model fail
     loudly rather than train with different maths (DeepSeek-V4 always passes s_aux)."""
     _install_fake_aiter(monkeypatch)
-    kernels = veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
+    kernels = veomni_flash._load_veomni_flash_kernel(AITER_IMPL)
 
     q = torch.randn(6, 2, 4)
     cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
@@ -176,7 +176,7 @@ def test_transformers_kwarg_selection_matches_the_shim_signature(monkeypatch):
     from transformers.modeling_flash_attention_utils import _lazy_define_process_function
 
     _install_fake_aiter(monkeypatch)
-    kernels = veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
+    kernels = veomni_flash._load_veomni_flash_kernel(AITER_IMPL)
 
     supports_mapping = _lazy_define_process_function(kernels.flash_attn_varlen_func).keywords["supports_mapping"]
 
@@ -190,7 +190,7 @@ def test_transformers_kwarg_selection_matches_the_shim_signature(monkeypatch):
 def test_varlen_path_maps_softcap_to_logits_soft_cap(monkeypatch):
     """Inference only: under autograd the cap is refused, see the test below."""
     calls = _install_fake_aiter(monkeypatch)
-    kernels = veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
+    kernels = veomni_flash._load_veomni_flash_kernel(AITER_IMPL)
 
     q = torch.randn(6, 2, 4)
     cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
@@ -221,7 +221,7 @@ def test_varlen_softcap_is_refused_under_autograd(monkeypatch):
     forward matches an eager reference at every cap, while the gradient error reaches
     4.6 / 14.4 / 18.8 for caps of 2.0 / 0.5 / 0.125 against a 0.0195 softcap=0 control."""
     _install_fake_aiter(monkeypatch)
-    kernels = veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
+    kernels = veomni_flash._load_veomni_flash_kernel(AITER_IMPL)
 
     q = torch.randn(6, 2, 4)
     cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
@@ -238,7 +238,7 @@ def test_sink_rejection_does_not_recommend_flash_attention_2(monkeypatch):
     """FA2 drops sinks silently (flash-attn 2.8.3 has no sink argument), so pointing a
     sink model at it would trade a loud failure for wrong maths."""
     _install_fake_aiter(monkeypatch)
-    kernels = veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
+    kernels = veomni_flash._load_veomni_flash_kernel(AITER_IMPL)
 
     q = torch.randn(1, 3, 2, 4)
     with pytest.raises(ValueError) as excinfo:
@@ -304,7 +304,7 @@ def test_attention_forward_dispatches_under_the_aiter_implementation(monkeypatch
 def test_missing_aiter_raises_actionable_import_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "aiter", None)
     with pytest.raises(ImportError, match="aiter"):
-        veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
+        veomni_flash._load_veomni_flash_kernel(AITER_IMPL)
 
 
 def test_aiter_without_ck_kernels_fails_at_load_not_at_forward(monkeypatch):
@@ -314,4 +314,4 @@ def test_aiter_without_ck_kernels_fails_at_load_not_at_forward(monkeypatch):
     monkeypatch.setitem(sys.modules, "aiter", SimpleNamespace())
 
     with pytest.raises(RuntimeError, match="does not expose"):
-        veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
+        veomni_flash._load_veomni_flash_kernel(AITER_IMPL)

@@ -81,6 +81,8 @@ def _make_mock_runtime(save_path="/tmp/test_ckpt", save_async=False):
         parallel_state=SimpleNamespace(global_rank=trainer.args.train.global_rank),
         args=trainer.args.model,
         train_args=trainer.args.train,
+        extra_state=MagicMock(return_value={}),
+        load_extra_state=MagicMock(),
     )
 
 
@@ -340,7 +342,7 @@ class TestModelCheckpointManagerSaveContract:
         named = Named(runtime)
         assert named.assets_dir() == f"{runtime.train_args.checkpoint.model_assets_dir}/vision_encoder"
 
-    def test_save_forwards_lr_scheduler_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
+    def test_save_forwards_extra_state_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
         runtime = _make_mock_runtime()
         mock_build_ckpt.return_value = MagicMock()
         manager = ModelCheckpointManager(runtime)
@@ -348,11 +350,10 @@ class TestModelCheckpointManagerSaveContract:
         manager.save_dcp(TrainerState(global_step=10))
 
         saved = manager.checkpointer.save.call_args.args[1]
-        assert saved["lr_scheduler"] is runtime.lr_scheduler
+        assert set(saved["extra_state"]) == {"lr_scheduler"}
         assert saved["optimizer"] is runtime.optimizer
-        assert "extra_state" not in saved
 
-    def test_load_forwards_lr_scheduler_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
+    def test_load_forwards_extra_state_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
         runtime = _make_mock_runtime()
         runtime.train_args.checkpoint.load_path = "/tmp/ckpt"
         mock_checkpointer = MagicMock()
@@ -362,7 +363,7 @@ class TestModelCheckpointManagerSaveContract:
         manager.load()
 
         loaded = mock_checkpointer.load.call_args.args[1]
-        assert loaded["lr_scheduler"] is runtime.lr_scheduler
+        assert loaded["extra_state"] == {}
         assert loaded["optimizer"] is runtime.optimizer
         assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is runtime.parallel_state
 
