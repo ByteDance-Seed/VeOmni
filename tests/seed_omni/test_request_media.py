@@ -43,9 +43,10 @@ from veomni.data.seed_omni.utils.media_metadata import (
     AudioMetadata,
     VideoMetadata,
 )
-from veomni.data.seed_omni.utils.video import VideoInputs, save_video
 from veomni.models.seed_omni.processing_omni import OmniProcessor, _as_list
 from veomni.models.seed_omni.utils.conversation import build_conversation
+
+from .utils import require_video_stack
 
 
 _RATE = 24_000
@@ -85,18 +86,20 @@ def wav_path(tmp_path):
 
 @pytest.fixture
 def silent_clip_path(tmp_path):
+    video = require_video_stack()
     path = tmp_path / "silent.mp4"
-    save_video(str(path), _frames(), _clip_meta())
+    video.save_video(str(path), _frames(), _clip_meta())
     return str(path)
 
 
 @pytest.fixture
 def sounding_clip_path(tmp_path):
+    video = require_video_stack()
     path = tmp_path / "sounding.mp4"
     seconds = _FRAMES / _FPS
-    save_video(
+    video.save_video(
         str(path),
-        VideoInputs(video=_frames(), audio=_tone(seconds)),
+        video.VideoInputs(video=_frames(), audio=_tone(seconds)),
         {**_clip_meta(), AUDIO_METADATA_KEY: AudioMetadata(sampling_rate=_RATE)},
     )
     return str(path)
@@ -124,6 +127,8 @@ def test_an_audio_request_states_the_rate_it_decoded(wav_path):
 
 
 def test_a_silent_video_request_states_its_frame_timeline(silent_clip_path):
+    from veomni.data.seed_omni.utils.video import VideoInputs
+
     ((payload, meta),) = fetch_media({"video": [silent_clip_path]}, "t", {"fps": _FPS})["video"]
 
     assert isinstance(payload, VideoInputs)
@@ -313,9 +318,6 @@ def test_a_pixel_tensor_is_refused_rather_than_silently_reinterpreted():
     images only. Pinned so the docstring's claim stays true."""
     with pytest.raises(NotImplementedError, match="Unsupported image input type"):
         fetch_media({"image": [torch.zeros(3, 4, 4)]}, "t")
-
-
-# --- The write side: one saver per fetcher, each handed the item's whole meta ---
 
 
 def test_every_modality_that_can_be_read_can_be_written():

@@ -35,6 +35,8 @@ wall clock as its frames, and the two spans have to stay comparable.
 """
 
 import contextlib
+import sys
+from types import ModuleType
 
 import numpy as np
 import pytest
@@ -89,10 +91,16 @@ def _stub_decoder(average_fps: float | None, num_frames: int, duration_seconds: 
         def get_frames_at(self, indices):
             return type("F", (), {"data": torch.zeros(len(indices), 3, 2, 2, dtype=torch.uint8)})()
 
-    import torchcodec.decoders
+    # A stand-in package rather than a patched real one: nothing is decoded, so
+    # these run where torchcodec is absent or its shared libraries cannot load.
+    decoders = ModuleType("torchcodec.decoders")
+    decoders.VideoDecoder = _Decoder
+    torchcodec = ModuleType("torchcodec")
+    torchcodec.decoders = decoders
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(torchcodec.decoders, "VideoDecoder", _Decoder)
+        patch.setitem(sys.modules, "torchcodec", torchcodec)
+        patch.setitem(sys.modules, "torchcodec.decoders", decoders)
         patch.setattr(_video_module, "is_ffmpeg_available", lambda: True)
         yield patch
 
@@ -342,9 +350,6 @@ def test_a_nonsense_patch_size_is_refused_rather_than_raising_from_the_arithmeti
 
     with pytest.raises(ValueError, match="temporal_patch_size"):
         meta.frame_timestamps(temporal_patch_size=bad)
-
-
-# --- The generated side: one clip, one file, sound included --------------------
 
 
 def _generated_clip(num_frames: int = 6, fps: float = 24.0) -> tuple[torch.Tensor, VideoMetadata]:
