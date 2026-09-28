@@ -40,12 +40,8 @@ class OmniModuleCheckpointManager(ModelCheckpointManager):
     :mod:`veomni.checkpoint.layout` takes a ``module`` argument, so this class
     builds no paths of its own.
 
-    Two things do differ from a single-model job:
-
-    * **Export assets.** A module's config/tokenizer/processor are bound onto
-      the model, not cached beside it, so they are read off the live model.
-    * **Stage.** The orchestrator puts the save stage on ``state``, where the
-      base takes it as an argument.
+    One thing does differ from a single-model job: the orchestrator puts the
+    save stage on ``state``, where the base takes it as an argument.
     """
 
     def __init__(self, runtime: ModuleRuntime) -> None:
@@ -55,12 +51,6 @@ class OmniModuleCheckpointManager(ModelCheckpointManager):
     @property
     def args(self) -> OmniModuleRuntimeArguments:
         return self.runtime.args
-
-    @property
-    def hf_export_assets(self) -> list:
-        """Read off the live model — ``ModuleRuntime._build_model_assets`` binds
-        this module's sidecars onto it instead of caching them on the runtime."""
-        return self.runtime.collect_hf_export_assets()
 
     def save_hf_or_lora(self, state: TrainerState, stage: str = "step_end") -> None:
         """Route by LoRA, with the stage taken from ``state``.

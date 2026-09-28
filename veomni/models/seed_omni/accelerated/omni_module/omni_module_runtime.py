@@ -271,9 +271,9 @@ class ModuleRuntime(VeOmniModelRuntime):
         A standalone runtime keeps the tokenizer/processor beside the model
         because the trainer's data pipeline reads through it. A module's caller
         is the graph, which addresses the *module* — so the assets are attached
-        to the model (``bind_module_assets``) and travel with it, and HF export
-        collects them back off the live model in
-        :meth:`collect_hf_export_assets` rather than from a cached list.
+        to the model (``bind_module_assets``) and travel with it, and
+        :attr:`model_assets` reads them back off the live model rather than
+        from a cached list.
 
         Meta-init skips ``from_pretrained``, so vision modules and text encoders
         that need a processor or tokenizer at train time get one here from this
@@ -281,11 +281,6 @@ class ModuleRuntime(VeOmniModelRuntime):
         ``preprocessor_class``, or when an earlier eager ``from_pretrained``
         already bound one.
         """
-        # The base caches its sidecars here for a whole-model export. A module's
-        # are read off the live model at save time instead, so this stays empty
-        # rather than aliasing the class-level default.
-        self.model_assets = []
-
         model = self.model
         label = type(model).__name__
         if getattr(type(model), "preprocessor_class", None) is None:
@@ -587,25 +582,25 @@ class ModuleRuntime(VeOmniModelRuntime):
     def save_model_assets(self) -> None:
         """Not a module's job — the composed model writes the shared sidecars.
 
-        The base writes ``model_assets`` beside a whole model's weights. A module
-        has none to cache (its processor/tokenizer live on the model itself and
-        are exported per-module by :meth:`collect_hf_export_assets`), and the
-        job-level sidecars belong to the composed checkpoint root, which
-        :meth:`OmniModelRuntime.save_model_assets` owns.
+        The base writes ``model_assets`` into ``model_assets_dir``. For a composed
+        model that directory is the omni root's, which
+        :meth:`OmniModelRuntime.save_model_assets` writes; a module's own
+        sidecars only go into its per-module HF export.
         """
         raise NotImplementedError(
             f"ModuleRuntime '{self.module_name}' does not write model assets; "
-            "per-module sidecars go through collect_hf_export_assets(), and the composed "
-            "checkpoint root's assets through OmniModelRuntime.save_model_assets()."
+            "the composed checkpoint root's assets go through OmniModelRuntime.save_model_assets()."
         )
 
-    def collect_hf_export_assets(self) -> List[Any]:
-        """Return this module's config + processor/tokenizer sidecars for HF export.
+    @property
+    def model_assets(self) -> List[Any]:
+        """This module's config + processor/tokenizer sidecars, read off the live model.
 
-        ``self.model`` may still be DDP-wrapped here (FSDP2 composes in place and
-        exposes the raw model's attributes, but ``DistributedDataParallel`` does
-        not forward unknown attribute lookups to ``.module``) — unwrap first so
-        ``config`` / processor / tokenizer resolve regardless of ``dp_mode``.
+        :meth:`_build_model_assets` binds them onto the model rather than caching
+        a list. ``self.model`` may still be DDP-wrapped here (FSDP2 composes in
+        place and exposes the raw model's attributes, but
+        ``DistributedDataParallel`` does not forward unknown attribute lookups to
+        ``.module``) — unwrap first so they resolve regardless of ``dp_mode``.
         """
         model = unwrap_module_chain(self.model)
         assets: List[Any] = []

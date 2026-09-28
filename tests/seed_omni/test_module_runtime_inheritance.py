@@ -299,8 +299,19 @@ def test_a_module_the_lora_config_missed_stays_frozen_instead_of_failing():
 
 
 def test_a_module_does_not_write_the_jobs_model_assets():
-    with pytest.raises(NotImplementedError, match="collect_hf_export_assets"):
+    with pytest.raises(NotImplementedError, match="OmniModelRuntime.save_model_assets"):
         _unbuilt(nn.Linear(2, 2)).save_model_assets()
+
+
+def test_model_assets_are_read_off_the_live_model():
+    """A module's sidecars are bound onto the model, so an asset bound after the
+    build still reaches the HF export."""
+    model = nn.Linear(2, 2)
+    model.config = SimpleNamespace()
+    runtime = _unbuilt(model)
+    model._tokenizer = SimpleNamespace()
+
+    assert runtime.model_assets == [model.config, model._tokenizer]
 
 
 class _RecordAmbientState(nn.Module):
