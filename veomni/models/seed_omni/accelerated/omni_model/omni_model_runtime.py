@@ -273,7 +273,7 @@ class OmniModelRuntime:
         weights_path = {name: runtime.args.model_path for name, runtime in modules.items()}
 
         logger.info_rank0(f"OmniModelRuntime: wrapping composed OmniModel (fsdp_scope='model') over {list(modules)}.")
-        # ``OmniTrainer.setup_distributed`` registered ``base`` from the same top-level accelerator.
+        # ``OmniTrainer._setup`` registered ``base`` from the same top-level accelerator.
         with use_parallel_state("base"):
             self.model = build_parallelize_model(
                 self.model,

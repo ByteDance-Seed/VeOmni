@@ -68,13 +68,19 @@ from ...data.data_transform import build_data_transform
 from ...data.seed_omni.collator import SeedOmniCollator
 from ...distributed.async_offload import reset_async_activation_offload
 from ...distributed.offloading import build_activation_offloading_context
-from ...distributed.parallel_state import init_parallel_state_from_config, use_parallel_state
+from ...distributed.parallel_state import clear_parallel_state, init_parallel_state_from_config, use_parallel_state
 from ...models.seed_omni.accelerated import OmniModelRuntime, build_omni_model_runtime
 from ...models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 from ...models.seed_omni.processing_omni import OmniProcessor
 from ...ops.batch_invariant_ops import set_batch_invariant_mode
 from ...utils import helper, logging
-from ...utils.device import get_device_type, get_dist_comm_backend, get_torch_device, synchronize
+from ...utils.device import (
+    get_device_type,
+    get_dist_comm_backend,
+    get_torch_device,
+    is_nccl_backend,
+    synchronize,
+)
 from ..base import VeOmniIter
 from ..callbacks import (
     EvaluateCallback,
@@ -177,6 +183,11 @@ class OmniTrainer:
     collate_fn: Any
     train_dataloader: Any
     data_iterator: Any | None = None
+    train_steps: int = 0
+
+    # Training context
+    model_fwd_context: Any
+    model_bwd_context: Any
 
     # OmniStepMetricsCallback.on_step_end: training metrics (loss, grad_norm, lr, …).
     # WandbTraceCallback.on_step_end: logs step_env_metrics.
@@ -187,16 +198,21 @@ class OmniTrainer:
 
     def __init__(self, args: OmniArguments):
         self.args = args
-        self.device = self.setup_distributed(args)
-
-        self._build_model()
-        self._build_step_contexts()
-        self._build_data()
+        self.device = self._setup(args)
+        self.model = self._build_model_runtime()
+        # The collator and dataset builders read the orchestrator's ParallelState.
+        with use_parallel_state("base"):
+            self._build_data_transform()
+            self._build_dataset()
+            self._build_collate_fn()
+            self._build_dataloader()
+        # The dataset fixes train_steps, which the schedule needs.
         self._build_lr_scheduler()
+        self._build_training_context()
         self._init_callbacks()
 
     @staticmethod
-    def setup_distributed(args: OmniArguments, *, save_launch_args: bool = True) -> torch.device:
+    def _setup(args: OmniArguments, *, save_launch_args: bool = True) -> torch.device:
         """Init process group, device, seed, and register orchestrator ParallelState.
 
         ``save_launch_args`` writes the resolved launcher args into
@@ -230,9 +246,6 @@ class OmniTrainer:
 
     def destroy_distributed(self) -> None:
         """Tear down the process group."""
-        from ...distributed.parallel_state import clear_parallel_state
-        from ...utils.device import is_nccl_backend
-
         if not dist.is_available() or not dist.is_initialized():
             return
 
@@ -251,35 +264,36 @@ class OmniTrainer:
         dist.destroy_process_group()
         clear_parallel_state()
 
-    def _build_data(self) -> None:
-        """Build transform → dataset (fixes ``train_steps``) → dataloader."""
-        with use_parallel_state("base"):
-            self._build_data_transform()
-            self._build_train_dataset()
-            self._build_train_dataloader()
+    def _build_model_runtime(self) -> OmniModelRuntime:
+        """Build the composed model — every module built, wrapped and given its optimizer."""
+        return build_omni_model_runtime(build_omni_model_runtime_args(self.args), train=self.args.train)
+
+    def _build_lr_scheduler(self) -> None:
+        """Size the run, then let the model schedule over it."""
+        self.model._build_lr_scheduler(self.args.train_steps * self.args.train.num_train_epochs)
 
     def _build_data_transform(self) -> None:
         self.data_transform = build_data_transform(self.args.data.data_type, **self.args.data.mm_configs)
 
-    def _build_train_dataset(self) -> None:
+    def _build_dataset(self) -> None:
         args: OmniArguments = self.args
-        train_dataset = build_dataset(
+        self.train_dataset = build_dataset(
             dataset_name=args.data.dataset_name,
             transform=self.data_transform,
             seed=args.train.seed,
             **asdict(args.data),
         )
-        dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
+        dataset_length = None if not hasattr(self.train_dataset, "__len__") else len(self.train_dataset)
         if args.data.datasets_type == "mapping":
             dataset_length = dataset_length / args.model.accelerator.dp_size
         args.compute_train_steps(dataset_length)
-        self.train_dataset = train_dataset
+        self.train_steps = args.train_steps
 
-    def _build_train_dataloader(self) -> None:
+    def _build_collate_fn(self) -> None:
         args: OmniArguments = self.args
         processor = OmniProcessor.from_config(self.model.config, checkpoint_root=args.model.model_path)
         # FSDP-anchor dummy tensors are only exercised by the training (inference=False)
-        # branch. `_build_model` already ran (see `setup`), so every module's own
+        # branch. The model runtime is already built, so every module's own
         # resolved `ModuleRuntime.model_config` is sitting in memory — hand that
         # straight to the processor instead of re-reading each module's config.json
         # from disk. Mirrors the per-module load dtype resolved in
@@ -290,6 +304,9 @@ class OmniTrainer:
         processor.bind_dummy_inputs(module_configs, dtype=dummy_dtype)
         logger.info_rank0(f"SeedOmniCollator with {len(processor)} worker-side CPU preprocessor(s).")
         self.collate_fn = SeedOmniCollator(processor=processor)
+
+    def _build_dataloader(self) -> None:
+        args: OmniArguments = self.args
         dataloader_kwargs = asdict(args.data.dataloader)
         dataloader_type = dataloader_kwargs.pop("type")
         dataloader_kwargs.pop("use_background_prefetcher", None)
@@ -314,49 +331,23 @@ class OmniTrainer:
             **dataloader_kwargs,
         )
 
-    def _build_model(self):
-        self.model = build_omni_model_runtime(build_omni_model_runtime_args(self.args), train=self.args.train)
+    def _build_training_context(self) -> None:
+        """Build the sync activation-offload fwd/bwd contexts from the global accelerator.
 
-    def _build_lr_scheduler(self) -> None:
-        """Size the run, then let the model schedule over it."""
-        self.model._build_lr_scheduler(self.args.train_steps * self.args.train.num_train_epochs)
-
-    def _build_step_contexts(self) -> None:
-        """Build reusable forward/backward context managers from ``args`` (once, at init).
-
-        Each context is entered explicitly in :meth:`forward_backward_step` so
-        the train loop reads as a recipe. Grad-accum
-        FSDP reshard is handled imperatively via :func:`cascade_module_reshard`.
-
-        The activation-offload contexts are genuinely reusable (``nullcontext`` /
-        ``saved_tensors_hooks`` don't consume state on ``__enter__``), so they are
-        built once here and entered repeatedly. ``set_batch_invariant_mode`` is a
-        ``@contextmanager`` generator CM — single-use by construction (Python
-        deletes its ``args``/``kwds``/``func`` on first ``__enter__``) — so it is
-        *not* cached here; every call site builds a fresh one per step instead.
+        Async offload needs no trainer-level context: its hooks are attached in a
+        module's own parallelize step (so not under ``fsdp_scope='model'``), and
+        ``enable_activation`` is then off, leaving both contexts ``nullcontext``.
+        ``set_batch_invariant_mode`` is a single-use generator CM, so it is built
+        per step instead of cached here.
         """
         args = self.args
         offload = args.model.accelerator.offload_config
         enable_activation = bool(offload and offload.enable_activation)
-        self.fwd_activation_offload_ctx, self.bwd_activation_offload_ctx = build_activation_offloading_context(
+        self.model_fwd_context, self.model_bwd_context = build_activation_offloading_context(
             enable_activation=enable_activation,
             enable_gradient_checkpointing=args.model.accelerator.gradient_checkpointing.enable,
             activation_gpu_limit=offload.activation_gpu_limit if offload else 0.0,
         )
-        logger.info_rank0(
-            "OmniTrainer: step contexts — "
-            f"activation_offload={enable_activation}, "
-            f"batch_invariant={args.train.enable_batch_invariant_mode}"
-        )
-
-    def _cascade_module_reshard(self, micro_step: int, num_micro_steps: int) -> None:
-        cascade_module_reshard(self.model.module_runtimes, micro_step, num_micro_steps)
-
-    def _reset_async_activation_offload_if_enabled(self) -> None:
-        """Async offload is applied per module from its own accelerator, so reset per module."""
-        for module_runtime in self.model.module_runtimes.values():
-            if module_runtime.args.accelerator.offload_config.enable_async_activation:
-                reset_async_activation_offload(module_runtime.model)
 
     def _init_callbacks(self):
         """Build orchestrator trace callbacks + global / per-module checkpoint schedulers."""
@@ -371,7 +362,7 @@ class OmniTrainer:
         self.global_state_callback = GlobalStateCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self.moe_monitor_callback = MoERouterMonitorCallback(self)
-        self._callback_handlers = [
+        self._callbacks = [
             self.step_metrics_callback,
             self.tqdm_callback,
             self.wandb_callback,
@@ -387,13 +378,6 @@ class OmniTrainer:
             self.moe_monitor_callback,
         ]
         self.state = TrainerState()
-
-    def _callbacks(self, stage: str, **kwargs) -> None:
-        # Publish the stage on the state so save paths can branch on it without a
-        # ``stage`` argument threaded through every layer.
-        self.state.stage = stage
-        for callback in self._callback_handlers:
-            getattr(callback, f"on_{stage}")(self.state, **kwargs)
 
     def save_model_assets(self) -> None:
         """Write every composed model's omni-root sidecars."""
@@ -443,6 +427,31 @@ class OmniTrainer:
             tag="model",
         )
 
+    def _run_callbacks(self, stage: str, **kwargs) -> None:
+        # Publish the stage on the state so save paths can branch on it without a
+        # ``stage`` argument threaded through every layer.
+        self.state.stage = stage
+        for callback in self._callbacks:
+            getattr(callback, f"on_{stage}")(self.state, **kwargs)
+
+    def on_train_begin(self):
+        self._run_callbacks("train_begin")
+
+    def on_train_end(self):
+        self._run_callbacks("train_end")
+
+    def on_epoch_begin(self):
+        self._run_callbacks("epoch_begin")
+
+    def on_epoch_end(self):
+        self._run_callbacks("epoch_end")
+
+    def on_step_begin(self, micro_batches=None, **kwargs):
+        self._run_callbacks("step_begin", micro_batches=micro_batches, **kwargs)
+
+    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
+        self._run_callbacks("step_end", loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+
     def preforward(self, micro_batch: Dict[str, Any]) -> Dict[str, Any]:
         micro_batch = batch_to_device(micro_batch, self.device)
         if getattr(self, "LOG_SAMPLE", True):
@@ -450,7 +459,7 @@ class OmniTrainer:
             self.LOG_SAMPLE = False
         return micro_batch
 
-    def forward_backward_step(self, micro_batch: Dict[str, Any], *, micro_step: int = 0, num_micro_steps: int = 1):
+    def forward_backward_step(self, micro_batch: Dict[str, Any], *, num_micro_steps: int = 1):
         """One gradient-accumulation micro-batch over the training DAG.
 
         ``OmniModelRuntime.forward`` returns ``{"loss", "losses"}`` where ``loss``
@@ -463,40 +472,52 @@ class OmniTrainer:
         returned loss stays unscaled for logging.
         """
         micro_batch = self.preforward(micro_batch)
-        self._cascade_module_reshard(micro_step, num_micro_steps)
 
         # Forward: spill activations to CPU (if enabled) + batch-invariant ops.
-        with self.fwd_activation_offload_ctx, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
+        with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
             result: Dict[str, Any] = self.model.forward(micro_batch)
 
         total_loss: torch.Tensor = result["loss"]
         loss_dict: Dict[str, torch.Tensor] = result.get("losses", {})
 
         # Backward: separate offload hook stack (may differ from forward when GC is on).
-        with self.bwd_activation_offload_ctx, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
+        with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
             (total_loss / num_micro_steps).backward()
 
         del micro_batch
         return total_loss, loss_dict
+
+    def model_reshard(self, micro_step: int, num_micro_steps: int) -> None:
+        """Keep every module's params gathered across the grad-accumulation window."""
+        cascade_module_reshard(self.model.module_runtimes, micro_step, num_micro_steps)
+
+    def _reset_async_activation_offload_if_enabled(self) -> None:
+        """Reset each module's async-offload managers; its own accelerator decides whether it has any."""
+        for module_runtime in self.model.module_runtimes.values():
+            if module_runtime.args.accelerator.offload_config.enable_async_activation:
+                reset_async_activation_offload(module_runtime.model)
+
+    def sync_before_train_step(self):
+        if self.args.train.sync_each_train_step:
+            synchronize()
 
     def train_step(self, data_iterator: Any) -> None:
         # Fetch first: an iterator that runs dry before ``train_steps`` raises
         # here, and must not leave a step counted that never ran.
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self.state.global_step += 1
+
         self._reset_async_activation_offload_if_enabled()
-        self._callbacks(stage="step_begin", micro_batches=micro_batches)
-        if self.args.train.sync_each_train_step:
-            synchronize()
+        self.on_step_begin(micro_batches=micro_batches)
+        self.sync_before_train_step()
 
         total_loss = 0.0
         total_loss_dict: Dict[str, float] = defaultdict(float)
         num_micro_steps = len(micro_batches)
 
         for micro_step, micro_batch in enumerate(micro_batches):
-            loss, loss_dict = self.forward_backward_step(
-                micro_batch, micro_step=micro_step, num_micro_steps=num_micro_steps
-            )
+            self.model_reshard(micro_step, num_micro_steps)
+            loss, loss_dict = self.forward_backward_step(micro_batch, num_micro_steps=num_micro_steps)
             total_loss += loss.item() / num_micro_steps
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item() / num_micro_steps
@@ -506,11 +527,11 @@ class OmniTrainer:
         self.model.lr_scheduler.step()
         self.model.optimizer.zero_grad()
 
-        self._callbacks(stage="step_end", loss=total_loss, loss_dict=dict(total_loss_dict), grad_norm=grad_norm)
+        self.on_step_end(loss=total_loss, loss_dict=dict(total_loss_dict), grad_norm=grad_norm)
 
     def train(self):
         args: OmniArguments = self.args
-        self._callbacks(stage="train_begin")
+        self.on_train_begin()
         logger.info(
             f"Rank{args.train.local_rank} Start training. "
             f"Start step: {self.start_step}. "
@@ -524,7 +545,7 @@ class OmniTrainer:
                 self.train_dataloader.set_epoch(epoch)
             self.state.epoch = epoch
 
-            self._callbacks(stage="epoch_begin")
+            self.on_epoch_begin()
 
             self.data_iterator = VeOmniIter(
                 self.train_dataloader,
@@ -538,7 +559,7 @@ class OmniTrainer:
                     logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break
 
-            self._callbacks(stage="epoch_end")
+            self.on_epoch_end()
 
             self.start_step = 0
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
@@ -546,7 +567,7 @@ class OmniTrainer:
             if args.data.dataloader.use_background_prefetcher:
                 self.data_iterator.stop()
 
-        self._callbacks(stage="train_end")
+        self.on_train_end()
 
         if self.data_iterator is not None and args.data.dataloader.use_background_prefetcher:
             self.data_iterator.stop()

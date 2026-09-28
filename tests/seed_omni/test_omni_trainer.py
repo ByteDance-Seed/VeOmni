@@ -81,19 +81,33 @@ def _accumulate_grads(num_micro_steps: int) -> torch.Tensor:
     trainer = OmniTrainer.__new__(OmniTrainer)
     trainer.model = SimpleNamespace(forward=forward, module_runtimes={})
     trainer.args = SimpleNamespace(train=SimpleNamespace(enable_batch_invariant_mode=False))
-    trainer.fwd_activation_offload_ctx = nullcontext()
-    trainer.bwd_activation_offload_ctx = nullcontext()
+    trainer.model_fwd_context = nullcontext()
+    trainer.model_bwd_context = nullcontext()
     trainer.preforward = lambda micro_batch: micro_batch
 
     micro_batch = {"x": torch.tensor([3.0, -1.0])}
-    for micro_step in range(num_micro_steps):
-        trainer.forward_backward_step(micro_batch, micro_step=micro_step, num_micro_steps=num_micro_steps)
+    for _ in range(num_micro_steps):
+        trainer.forward_backward_step(micro_batch, num_micro_steps=num_micro_steps)
     return weight.grad
 
 
 def test_gradient_accumulation_averages_micro_batch_gradients():
     """Accumulating N copies of one micro-batch must match a single step on it."""
     torch.testing.assert_close(_accumulate_grads(2), _accumulate_grads(1))
+
+
+def test_callback_hooks_publish_the_stage_before_dispatch():
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.state = TrainerState()
+    callback = MagicMock()
+    callback.on_step_end.side_effect = lambda state, **kwargs: seen.append(state.stage)
+    trainer._callbacks = [callback]
+    seen = []
+
+    trainer.on_step_end(loss=1.0, loss_dict={"lm": 1.0}, grad_norm=0.5)
+
+    assert seen == ["step_end"]
+    callback.on_step_end.assert_called_once_with(trainer.state, loss=1.0, loss_dict={"lm": 1.0}, grad_norm=0.5)
 
 
 def test_an_exhausted_iterator_does_not_count_a_step():

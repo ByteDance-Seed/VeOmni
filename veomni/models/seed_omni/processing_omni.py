@@ -99,8 +99,8 @@ class OmniProcessor:
         self.model.module_runtimes.items()}``), so it is already the exact
         config the live model was built with, overrides included. Call once,
         right after the training model finishes building
-        (:meth:`~veomni.trainer.omni.omni_trainer.OmniTrainer._build_train_dataloader`
-        runs after ``_build_model``). Unnecessary for pure inference
+        (:meth:`~veomni.trainer.omni.omni_trainer.OmniTrainer._build_collate_fn`
+        runs after ``_build_model_runtime``). Unnecessary for pure inference
         (``OmniInferencer``): the dummy branch is never exercised there.
         """
         for name, preprocessor in self._preprocessors.items():

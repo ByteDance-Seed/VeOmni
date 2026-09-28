@@ -62,7 +62,7 @@ class SeedOmniCollator(DataCollator):
 
     ``processor`` is an :class:`~veomni.models.seed_omni.processing_omni.OmniProcessor` built
     via :meth:`~veomni.models.seed_omni.processing_omni.OmniProcessor.from_config` from the
-    active graph modules' config (see ``OmniTrainer._build_train_dataloader``). Its preprocessor
+    active graph modules' config (see ``OmniTrainer._build_collate_fn``). Its preprocessor
     chain runs, in order, over the grouped batch (``conversation_list`` plus any extra
     keys) so the heavy per-module CPU input-prep (tokenize / image normalize)
     executes inside the DataLoader worker and overlaps with GPU compute via prefetch, instead of
