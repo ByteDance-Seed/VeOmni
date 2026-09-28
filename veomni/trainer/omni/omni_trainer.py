@@ -53,7 +53,7 @@ import json
 import os
 from collections import defaultdict
 from dataclasses import asdict
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping
 
 import torch
 import torch.distributed as dist
@@ -92,9 +92,6 @@ from ..callbacks.omni_callbacks import (
     OmniStepMetricsCallback,
 )
 
-
-if TYPE_CHECKING:
-    from ...models.seed_omni.configuration_omni import OmniConfig
 
 logger = logging.get_logger(__name__)
 
@@ -245,11 +242,6 @@ class OmniTrainer:
     step_env_metrics: Dict[str, Any] | None = None
     step_train_metrics: Dict[str, Any] | None = None
     LOG_SAMPLE: bool = True
-
-    @property
-    def model_config(self) -> "OmniConfig":
-        """Shared trace callbacks read ``trainer.model_config`` — alias of ``model.config``."""
-        return self.model.config
 
     def __init__(self, args: OmniArguments):
         self.args = args
