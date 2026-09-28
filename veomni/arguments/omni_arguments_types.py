@@ -54,6 +54,8 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Literal, Optional, Union
 
+import yaml
+
 from ..models.seed_omni.accelerated.omni_model.omni_model_config import OmniModelRuntimeConfig
 from ..models.seed_omni.accelerated.omni_module.omni_module_config import OmniModuleRuntimeConfig
 from ..utils import logging
@@ -358,9 +360,8 @@ def _load_launcher_yaml(spec: Optional[Union[str, os.PathLike, dict, list]]):
     if spec is None:
         return {}
     if isinstance(spec, (str, os.PathLike)):
-        from .omni_parser import load_yaml_with_inherit
-
-        return load_yaml_with_inherit(str(spec))
+        with open(spec) as f:
+            return yaml.safe_load(f)
     return deepcopy(spec)
 
 

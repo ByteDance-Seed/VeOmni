@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from veomni.arguments.arguments_types import (
     AcceleratorConfig,
@@ -52,9 +53,8 @@ def _fake_args(*, modules_override: dict | None = None) -> OmniArguments:
         "infer_graph": {"infer_gen": str(cfg_dir / "infer/graph_infer_gen.yaml")},
     }
     if modules_override is not None:
-        from veomni.arguments.omni_parser import load_yaml_with_inherit
-
-        loaded = load_yaml_with_inherit(modules_yaml)
+        with open(modules_yaml) as f:
+            loaded = yaml.safe_load(f)
         for name, override in modules_override.items():
             loaded.setdefault(name, {})
             loaded[name] = {**loaded[name], **override}
