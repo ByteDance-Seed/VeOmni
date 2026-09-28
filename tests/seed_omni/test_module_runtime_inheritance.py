@@ -31,8 +31,13 @@ from veomni.models.model_runtime import VeOmniModelRuntime
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 
 
+def _fsdp(scope: str, mode: str = "fsdp2") -> SimpleNamespace:
+    return SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope=scope, fsdp_mode=mode))
+
+
 def _unbuilt(model: nn.Module | None = None, **args_fields) -> ModuleRuntime:
     """A ModuleRuntime with its fields set but no build run."""
+    args_fields.setdefault("accelerator", _fsdp("module"))
     runtime = ModuleRuntime.__new__(ModuleRuntime)
     runtime.model = model
     runtime.model_name = "vision_encoder"
@@ -123,7 +128,9 @@ def test_build_model_uses_the_config_the_omni_config_loaded(monkeypatch):
         ops_implementation=None,
         accelerator=SimpleNamespace(
             init_device="meta",
-            fsdp_config=SimpleNamespace(fsdp_scope="module", mixed_precision=SimpleNamespace(enable=False)),
+            fsdp_config=SimpleNamespace(
+                fsdp_mode="fsdp2", fsdp_scope="module", mixed_precision=SimpleNamespace(enable=False)
+            ),
         ),
     )
     runtime.module_config = SimpleNamespace(model_type="fake")
@@ -187,7 +194,7 @@ def test_the_real_checkpoint_manager_reads_the_modules_train_args():
     training args under another name would resolve it on the wrapped model."""
     from veomni.models.seed_omni.utils.checkpoint import OmniModuleCheckpointManager
 
-    runtime = _unbuilt(nn.Linear(2, 2), accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="fsdp2")))
+    runtime = _unbuilt(nn.Linear(2, 2), accelerator=_fsdp("module"))
     checkpoint = SimpleNamespace(manager="dcp", load_path=None)
     runtime.train_args = SimpleNamespace(checkpoint=checkpoint)
 
@@ -211,15 +218,11 @@ def test_the_constructor_stores_training_args_where_the_base_reads_them(monkeypa
         monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, **k: None)
     monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
     train = SimpleNamespace(checkpoint=SimpleNamespace(load_path=None))
-    args = SimpleNamespace(accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope="module")))
+    args = SimpleNamespace(accelerator=_fsdp("module"))
 
     runtime = ModuleRuntime(args, "vision_encoder", module_config=SimpleNamespace(), train=train)
 
     assert vars(runtime)["train_args"] is train
-
-
-def _fsdp(scope: str, mode: str = "fsdp2") -> SimpleNamespace:
-    return SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope=scope, fsdp_mode=mode))
 
 
 @pytest.mark.parametrize(("top_level", "overlay", "defers"), [("model", "module", True), ("module", "model", False)])

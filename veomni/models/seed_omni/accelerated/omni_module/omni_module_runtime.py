@@ -104,7 +104,6 @@ class ModuleRuntime(VeOmniModelRuntime):
     mistyped runtime attribute silently reads the model rather than raising.
     """
 
-    _eager: bool = False
     _global_accelerator: Optional["AcceleratorConfig"] = None
 
     args: "OmniModuleRuntimeArguments"
@@ -130,8 +129,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         self._global_accelerator = global_accelerator
 
         if for_inference:
-            if args.accelerator.fsdp_config.fsdp_mode == "eager":
-                self._eager = True
+            if self.is_eager:
                 self._init_eager_inference()
             else:
                 args.accelerator.fsdp_config.mixed_precision.enable = False
@@ -157,6 +155,16 @@ class ModuleRuntime(VeOmniModelRuntime):
                     self.build_checkpoint()
 
     @property
+    def is_eager(self) -> bool:
+        """Whether this module is loaded unwrapped in one process (``fsdp_mode='eager'``).
+
+        Inference only: it skips :meth:`setup`, so it has no mesh, no
+        :class:`ParallelState` and no wrap. The generic parallelize step rejects
+        ``eager`` for training.
+        """
+        return self.args.accelerator.fsdp_config.fsdp_mode == "eager"
+
+    @property
     def wrap_omni_model(self) -> bool:
         """Whether the composed :class:`OmniModel` owns this module's FSDP wrap.
 
@@ -164,7 +172,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         meta and left unwrapped, and :class:`OmniModelRuntime` wraps the parent
         once. An eager-inference module is never wrapped by anyone.
         """
-        if self._eager:
+        if self.is_eager:
             return False
         accelerator = self._global_accelerator if self._global_accelerator is not None else self.args.accelerator
         return composed_model_owns_wrap(accelerator)
@@ -217,7 +225,7 @@ class ModuleRuntime(VeOmniModelRuntime):
     def _init_eager_inference(self) -> None:
         """Single-process eager load via ``from_pretrained`` + ``device_map``."""
         args = self.args
-        assert args.accelerator.fsdp_config.fsdp_mode == "eager"
+        assert self.is_eager
         from ... import OMNI_MODEL_REGISTRY
 
         model_path = args.model_path
@@ -419,7 +427,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         An eager-inference module never runs :meth:`setup` (a mesh needs a
         process group it may not have), so its scope is a no-op.
         """
-        if self._eager:
+        if self.is_eager:
             return nullcontext()
         return use_parallel_state(self.module_name)
 
