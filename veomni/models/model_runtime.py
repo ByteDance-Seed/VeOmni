@@ -333,6 +333,26 @@ class VeOmniModelRuntime:
 
         self.chat_template = build_chat_template(self.args.chat_template, preprocessor)
 
+    def _apply_async_activation_offload(self) -> None:
+        """Patch this model's offload targets for async activation offload, if enabled.
+
+        Must run BEFORE FSDP2 sharding. Uses per-instance __call__ patching so
+        that async_save_on_cpu is OUTER to the checkpoint boundary pushed by
+        GradientCheckpointingLayer, matching MindSpeed-MM's GC+async offload
+        behavior: hidden_states inputs are offloaded to CPU (via
+        _NoopSaveInputs), while intermediate activations are handled by GC
+        recomputation (via _checkpoint_hook).
+        """
+        offload_config = self.args.accelerator.offload_config
+        if offload_config.enable_async_activation:
+            from ..distributed.async_offload import apply_async_activation_offload
+
+            apply_async_activation_offload(
+                self.model,
+                offload_config.activation_offload_modules,
+                host_cache_limit_bytes=int(offload_config.activation_offload_host_cache_limit_gb * 1024**3),
+            )
+
     def _build_parallelized_model(self) -> None:
         """FSDP2/DDP-wrap the model and load its weights.
 
@@ -349,21 +369,7 @@ class VeOmniModelRuntime:
                 "module inference (ModuleRuntime._init_eager_inference)."
             )
 
-        # Apply async activation offload BEFORE FSDP2 sharding.
-        # Uses per-instance __call__ patching so that async_save_on_cpu is
-        # OUTER to the checkpoint boundary pushed by GradientCheckpointingLayer,
-        # matching MindSpeed-MM's GC+async offload behavior: hidden_states
-        # inputs are offloaded to CPU (via _NoopSaveInputs), while intermediate
-        # activations are handled by GC recomputation (via _checkpoint_hook).
-        offload_config = args.accelerator.offload_config
-        if offload_config.enable_async_activation:
-            from ..distributed.async_offload import apply_async_activation_offload
-
-            apply_async_activation_offload(
-                self.model,
-                offload_config.activation_offload_modules,
-                host_cache_limit_bytes=int(offload_config.activation_offload_host_cache_limit_gb * 1024**3),
-            )
+        self._apply_async_activation_offload()
 
         # Customized parallelize model.
         customized_parallelize_model_function = getattr(self.model, "build_parallelize_model", None)

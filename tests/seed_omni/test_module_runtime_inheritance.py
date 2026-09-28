@@ -250,6 +250,19 @@ def test_only_the_top_level_scope_decides_whether_a_module_defers(monkeypatch, t
     assert runtime._defer_parallelize is defers
 
 
+def test_a_deferred_module_applies_async_activation_offload_before_the_composed_wrap(monkeypatch):
+    """The patching must precede ``fully_shard``, which under ``fsdp_scope='model'`` the
+    composed OmniModel runs later; the module's own parallelize step is the last chance."""
+    applied = []
+    monkeypatch.setattr(ModuleRuntime, "_apply_async_activation_offload", lambda self: applied.append(self))
+    runtime = _unbuilt(nn.Linear(2, 2))
+    runtime._defer_parallelize = True
+
+    runtime._build_parallelized_model()
+
+    assert applied == [runtime]
+
+
 def test_distributed_inference_wraps_lora_before_loading_weights(monkeypatch):
     """With ``lora_config`` set the loader maps base keys onto ``base_model.model.*``;
     an unwrapped model has no such names, so its base weights would never load."""

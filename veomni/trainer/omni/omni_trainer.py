@@ -339,9 +339,9 @@ class OmniTrainer:
     def _build_training_context(self) -> None:
         """Build the sync activation-offload fwd/bwd contexts from the global accelerator.
 
-        Async offload needs no trainer-level context: its hooks are attached in a
-        module's own parallelize step (so not under ``fsdp_scope='model'``), and
-        ``enable_activation`` is then off, leaving both contexts ``nullcontext``.
+        Async offload needs no trainer-level context: its hooks are attached in
+        each module's own parallelize step, and ``enable_activation`` is then
+        off, leaving both contexts ``nullcontext``.
         ``set_batch_invariant_mode`` is a single-use generator CM, so it is built
         per step instead of cached here.
         """

@@ -368,12 +368,14 @@ class ModuleRuntime(VeOmniModelRuntime):
         backbone that streams EP-sharded experts to CPU, which the generic
         GPU-materializing loader has no hook for.
 
-        When ``fsdp_scope='model'``, this is a no-op: the module stays on meta
-        (freeze already applied) so :class:`OmniModelRuntime` can wrap the
-        composed parent once, then :meth:`finish_deferred_parallelize` builds
-        the optimizer on the now-DTensor parameters.
+        When ``fsdp_scope='model'``, only async activation offload is applied
+        here, since it must precede the wrap: the module stays on meta (freeze
+        already applied) so :class:`OmniModelRuntime` can wrap the composed
+        parent once, then :meth:`finish_deferred_parallelize` builds the
+        optimizer on the now-DTensor parameters.
         """
         if self._defer_parallelize:
+            self._apply_async_activation_offload()
             logger.info_rank0(
                 f"ModuleRuntime '{self.module_name}': deferring FSDP wrap to the composed "
                 "OmniModel (accelerator.fsdp_config.fsdp_scope='model')."
