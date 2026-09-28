@@ -196,6 +196,82 @@ class TestTrainGraph:
         assert llm["candidate_source_layer_id"] == 1
         assert train["deepseek_v41_llm"]["ops_implementation"]["qat_implementation"] == "fp8_blockwise"
 
+    @pytest.mark.parametrize(
+        "modules_file, cards", [("modules_train_full.yaml", 256), ("modules_train_scaled64.yaml", 64)]
+    )
+    def test_multi_node_layouts_divide_the_card_count(self, modules_file, cards):
+        """The counts that decide which card counts can run at all.
+
+        ``extra_parallel_only`` needs emb to span every rank, so the vocabulary
+        and the padded table rows must split that many ways, and EP must split
+        both the backbone's and the MTP stages' routed experts.
+        """
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig
+        from veomni.models.seed_omni.modules.deepseek_v41.ngram.configuration import DeepseekV41NgramConfig
+
+        train = yaml.safe_load((CONFIG_ROOT / "train" / modules_file).read_text())
+        llm_config = DeepseekV41LlmConfig()
+        for module in ("deepseek_v41_text_encoder", "deepseek_v41_ngram"):
+            accelerator = train[module]["accelerator"]
+            assert accelerator["fsdp_config"]["extra_parallel_only"] is True, module
+            assert accelerator["extra_parallel_sizes"] == [cards], module
+        assert llm_config.vocab_size % cards == 0
+        for rows in DeepseekV41NgramConfig().padded_num_embeddings:
+            assert rows % cards == 0
+
+        ep_size = train["deepseek_v41_llm"]["accelerator"]["ep_size"]
+        assert cards % ep_size == 0
+        assert llm_config.n_routed_experts % ep_size == 0
+        assert llm_config.dspark_n_routed_experts % ep_size == 0
+
+    @pytest.mark.parametrize("modules_file", ["modules_train_full.yaml", "modules_train_scaled64.yaml"])
+    def test_multi_node_runs_train_the_ngram_tables_and_mtp(self, modules_file):
+        """Trainable tables must be bf16 and streamed: fp8 takes no gradient, and
+        reading them whole on every rank is 393 GB."""
+        train = yaml.safe_load((CONFIG_ROOT / "train" / modules_file).read_text())
+        ngram = train["deepseek_v41_ngram"]
+        assert ngram["model_config"]["freeze"] is False
+        assert ngram["model_config"]["weight_quantization"] is None
+        assert ngram["ep_sharded_stream_load"] is True
+        assert ngram["broadcast_model_weights_from_rank0"] is False
+        llm = train["deepseek_v41_llm"]["model_config"]
+        assert llm["dspark_block_size"] > 0
+        assert llm["num_nextn_predict_layers"] == 3
+        assert llm.get("freeze_mtp") is not True
+
+    @pytest.mark.parametrize("modules_file", ["modules_train_full.yaml", "modules_train_scaled64.yaml"])
+    def test_multi_node_llm_checkpoints_and_keeps_mixed_precision(self, modules_file):
+        """43 layers of activations do not fit an H20 uncheckpointed, and with
+        mixed precision off the fp32 mHC and bf16 weights cannot share a shard."""
+        accelerator = yaml.safe_load((CONFIG_ROOT / "train" / modules_file).read_text())["deepseek_v41_llm"][
+            "accelerator"
+        ]
+        assert accelerator["gradient_checkpointing"]["enable"] is True
+        assert accelerator["fsdp_config"].get("mixed_precision", {}).get("enable", True) is True
+
+    @pytest.mark.parametrize(
+        "modules_file",
+        [
+            "modules_train.yaml",
+            "modules_train_mtp.yaml",
+            "modules_train_full.yaml",
+            "modules_train_scaled64.yaml",
+        ],
+    )
+    def test_llm_training_keeps_fsdp_off_the_layer_inputs(self, modules_file):
+        """See ``require_fp32_pre_mix``: the cast is refused at the first layer."""
+        fsdp_config = yaml.safe_load((CONFIG_ROOT / "train" / modules_file).read_text())["deepseek_v41_llm"][
+            "accelerator"
+        ]["fsdp_config"]
+        assert fsdp_config["mixed_precision"]["cast_forward_inputs"] is False
+
+    def test_full_training_freezes_nothing_in_the_llm(self):
+        llm = yaml.safe_load((CONFIG_ROOT / "train/modules_train_full.yaml").read_text())["deepseek_v41_llm"][
+            "model_config"
+        ]
+        for key in ("n_trainable_layers", "trainable_layer_ids", "freeze_mtp", "num_hidden_layers"):
+            assert key not in llm, key
+
     def test_mtp_training_constructs_and_trains_dspark(self):
         train = yaml.safe_load((CONFIG_ROOT / "train/modules_train_mtp.yaml").read_text())
         llm = train["deepseek_v41_llm"]["model_config"]

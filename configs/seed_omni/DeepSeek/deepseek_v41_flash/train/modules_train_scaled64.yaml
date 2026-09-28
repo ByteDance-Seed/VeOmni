@@ -1,0 +1,94 @@
+# 64 x H20 (8 nodes) rehearsal of modules_train_full.yaml. The structure is
+# the full one -- all 40 layers, the three MTP stages, EP over 8 nodes and the
+# trainable n-gram tables row-sharded 64 ways -- but in the llm only layer 0
+# and the MTP stages train. What it checks is the multi-node path: the
+# streamed fp8 -> bf16 table load, the emb/ep collectives, the MTP CE, and
+# the gradient reduction of the unwrapped modules.
+#
+# State per card at the step peak (bytes per parameter in brackets):
+#
+#   llm, all 564.78 B fp32 masters [4]              35.3 GB
+#   llm, layer 0 + MTP (~28 B) grads + moments [10]  5.3 GB
+#   ngram, 196.61 B bf16 trainable [8]              24.6 GB
+#   text_encoder lm_head, replicated [8]             5.3 GB
+#   vision + wte                                     0.1 GB
+#                                                   -------
+#                                                   ~70 GB
+#
+# The llm keeps mixed precision on: the FSDP2 wrap casts every parameter to
+# fp32, and without a param_dtype the bf16 weights and the fp32 mHC
+# parameters cannot share one flat shard. Gradient checkpointing is what
+# leaves room on a 96 GB card: without it each layer holds ~3 GB of QAT
+# fake-quant expert copies plus ~0.8 MB per token, for all 43 layers, since
+# the n-gram gradient enters at layer 1 and every layer runs a backward.
+
+deepseek_v41_vision:
+  model_path: deepseek_v41_vision
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+deepseek_v41_text_encoder:
+  model_path: deepseek_v41_text_encoder
+  accelerator:
+    extra_parallel_sizes: [64]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      extra_parallel_only: true
+      mixed_precision:
+        enable: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_ngram:
+  model_path: deepseek_v41_ngram
+  model_config:
+    freeze: false
+    weight_quantization: null
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+  accelerator:
+    extra_parallel_sizes: [64]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      extra_parallel_only: true
+      reshard_after_forward: false
+      mixed_precision:
+        enable: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_llm:
+  model_path: deepseek_v41_llm
+  model_config:
+    weight_quantization: null
+    dsa_indexer_loss: true
+    dspark_block_size: 5
+    num_nextn_predict_layers: 3
+    # DSpark reads the inputs of layers 37-39, so the MTP CE reaches through
+    # the frozen stack to layer 0.
+    trainable_layer_ids: [0]
+    freeze_mtp: false
+  ops_implementation:
+    qat_implementation: fp8_blockwise
+  accelerator:
+    # 6 experts a rank, ep_fsdp=1.
+    ep_size: 64
+    ep_outside: false
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        # FSDP2 would cast the fp32 hyper-connection mix to bf16 and hand each
+        # layer a copy of the shared KV state; see require_fp32_pre_mix.
+        cast_forward_inputs: false
