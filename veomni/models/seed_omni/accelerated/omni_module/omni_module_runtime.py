@@ -621,12 +621,12 @@ class ModuleRuntime(VeOmniModelRuntime):
         has none to cache (its processor/tokenizer live on the model itself and
         are exported per-module by :meth:`collect_hf_export_assets`), and the
         job-level sidecars belong to the composed checkpoint root, which
-        :meth:`OmniTrainer.save_model_assets` owns.
+        :meth:`OmniModelRuntime.save_model_assets` owns.
         """
         raise NotImplementedError(
             f"ModuleRuntime '{self.module_name}' does not write model assets; "
             "per-module sidecars go through collect_hf_export_assets(), and the composed "
-            "checkpoint root's assets through OmniTrainer.save_model_assets()."
+            "checkpoint root's assets through OmniModelRuntime.save_model_assets()."
         )
 
     def collect_hf_export_assets(self) -> List[Any]:

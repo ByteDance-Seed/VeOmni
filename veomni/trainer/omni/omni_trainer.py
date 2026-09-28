@@ -396,14 +396,8 @@ class OmniTrainer:
             getattr(callback, f"on_{stage}")(self.state, **kwargs)
 
     def save_model_assets(self) -> None:
-        """Export the omni-root HF layout (config + graphs + module sidecars, no weights)."""
-        args: OmniArguments = self.args
-        if args.train.global_rank == 0:
-            save_directory = args.train.checkpoint.model_assets_dir
-            self.model.save_pretrained(save_directory, save_module_weights=False)
-            logger.info_rank0(f"OmniTrainer: saved OmniModel assets to {save_directory}.")
-        if dist.is_initialized():
-            dist.barrier()
+        """Write every composed model's omni-root sidecars."""
+        self.model.save_model_assets()
 
     def load(self) -> None:
         """Resume every composed model's module checkpoints.

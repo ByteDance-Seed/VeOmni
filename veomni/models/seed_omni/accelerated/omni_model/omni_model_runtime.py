@@ -183,10 +183,12 @@ class OmniModelRuntime:
         *,
         module_runtimes: Mapping[str, ModuleRuntime] | None = None,
         omni_model_runtime_args: OmniModelRuntimeConfig | None = None,
+        train_args: OmniTrainingArguments | None = None,
     ) -> None:
         self.model = model
         self.module_runtimes = dict(module_runtimes or {})
         self.omni_model_runtime_args = omni_model_runtime_args
+        self.train_args = train_args
         self.optimizer: MultiOptimizer | None = None
         self.lr_scheduler: MultiLRScheduler | None = None
         self._step_profiler: GraphProfiler | None = None
@@ -532,6 +534,19 @@ class OmniModelRuntime:
 
         model.config.save_pretrained(save_directory)
 
+    def save_model_assets(self) -> None:
+        """Write the omni-root HF layout (config + graphs + module sidecars, no weights)."""
+        import torch.distributed as dist
+
+        if self.train_args is None:
+            raise ValueError("OmniModelRuntime.save_model_assets needs a training runtime (built with train=...).")
+        if self.train_args.global_rank == 0:
+            save_directory = self.train_args.checkpoint.model_assets_dir
+            self.save_pretrained(save_directory, save_module_weights=False)
+            logger.info_rank0(f"OmniModelRuntime: saved OmniModel assets to {save_directory}.")
+        if dist.is_initialized():
+            dist.barrier()
+
     def load(self) -> None:
         """Resume every module's DCP checkpoint (no-op for frozen / unconfigured modules)."""
         for module_runtime in self.module_runtimes.values():
@@ -593,6 +608,7 @@ def build_omni_model_runtime(
         OmniModel(omni_config, {name: rt.omni_module for name, rt in module_runtimes.items()}),
         module_runtimes=module_runtimes,
         omni_model_runtime_args=omni_model_runtime_args,
+        train_args=train,
     )
     runtime._parallelize_composed_model(for_inference=for_inference)
     if not for_inference:

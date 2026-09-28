@@ -148,6 +148,20 @@ def test_multi_lr_scheduler_without_schedulers_reports_zero_lr():
     assert MultiLRScheduler({}).get_last_lr() == [0.0]
 
 
+@pytest.mark.parametrize(("global_rank", "writes"), [(0, True), (1, False)])
+def test_model_runtime_writes_root_assets_without_weights_on_rank_zero(global_rank, writes):
+    train_args = SimpleNamespace(global_rank=global_rank, checkpoint=SimpleNamespace(model_assets_dir="/out/assets"))
+    runtime = OmniModelRuntime(MagicMock(), train_args=train_args)
+    runtime.save_pretrained = MagicMock()
+
+    runtime.save_model_assets()
+
+    if writes:
+        runtime.save_pretrained.assert_called_once_with("/out/assets", save_module_weights=False)
+    else:
+        runtime.save_pretrained.assert_not_called()
+
+
 def test_model_runtime_steps_only_the_trainable_modules():
     trainable = SimpleNamespace(optimizer=MagicMock(), lr_scheduler=None)
     trainable._build_lr_scheduler = lambda total_steps: setattr(trainable, "lr_scheduler", MagicMock())
