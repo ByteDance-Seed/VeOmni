@@ -81,6 +81,13 @@ def veomni_clip_grad_norm(
     return grad_norm
 
 
+# The two clippers below serve an OmniModel, where every module runs under its own
+# ParallelState. `ModuleRuntime.clip_grad_norm` (omni_module_runtime.py) calls
+# `veomni_omni_module_clip_grad_norm` to clip one module and return its norm;
+# `OmniModelRuntime.clip_grad_norm` (omni_model_runtime.py) calls
+# `veomni_omni_model_clip_grad_norm` to combine those per-module norms.
+
+
 def veomni_omni_module_clip_grad_norm(
     model,
     max_norm: float,
@@ -164,7 +171,7 @@ def veomni_omni_module_clip_grad_norm(
     return total_norm.item()
 
 
-def omni_clip_grad_norm(
+def veomni_omni_model_clip_grad_norm(
     module_runtimes: dict,
     max_grad_norm: float,
     grad_clip_scope: str = "per_module",
@@ -176,8 +183,9 @@ def omni_clip_grad_norm(
       optimizer config, so *max_grad_norm* here is only the model-level value
       they inherit from. Returns ``sqrt(sum n_i^2)`` of the per-module (pre-clip)
       norms for logging.
-    * ``global``: measure each module with ``max_norm=inf`` (no scale),
-      ``total = sqrt(sum n_i^2)``, then if ``total > max_grad_norm`` scale **all**
+    * ``global`` (not enabled yet: ``OptimizerConfig`` rejects it): measure
+      each module with ``max_norm=inf`` (no scale), ``total = sqrt(sum n_i^2)``,
+      then if ``total > max_grad_norm`` scale **all**
       module grads by one coefficient — single-model / seedream
       ``gradient_clip_val`` semantics. A single threshold is inherent to this
       scope, so the per-module values do not apply.

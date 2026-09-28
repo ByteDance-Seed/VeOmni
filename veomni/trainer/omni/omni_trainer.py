@@ -65,7 +65,6 @@ from ...data import build_dataloader, build_dataset
 from ...data import seed_omni as _seed_omni_data  # noqa: F401  (registers data_type="seedomni" and its preprocessors)
 from ...data.data_transform import build_data_transform
 from ...data.seed_omni.collator import SeedOmniCollator
-from ...distributed.clip_grad_norm import omni_clip_grad_norm
 from ...distributed.offloading import build_activation_offloading_context
 from ...distributed.parallel_state import init_parallel_state_from_config, use_parallel_state
 from ...models.seed_omni.accelerated import OmniModelRuntime, build_omni_model_runtime
@@ -528,24 +527,6 @@ class OmniTrainer:
             tag="model",
         )
 
-    def _clip_grad_norm(self) -> float:
-        """Clip grads across OmniModules according to ``grad_clip_scope``.
-
-        * ``per_module`` (default): each :class:`ModuleRuntime` clips the params of
-          its own FSDP unit against **its own** ``optimizer.max_grad_norm`` (every
-          OmniModule carries its own optimizer config); the whole-model norm is
-          their L2 combination. Empty (no module runtimes) → 0.0.
-        * ``global``: measure unclipped, ``total=sqrt(sum n_i^2)``, then one scale
-          coeff for all modules (seedream ``gradient_clip_val`` semantics), against
-          the model-level ``max_grad_norm`` the modules inherit from.
-        """
-        opt_cfg = self.args.model.optimizer
-        return omni_clip_grad_norm(
-            self.model.module_runtimes,
-            opt_cfg.max_grad_norm,
-            grad_clip_scope=opt_cfg.grad_clip_scope,
-        )
-
     def preforward(self, micro_batch: Dict[str, Any]) -> Dict[str, Any]:
         micro_batch = batch_to_device(micro_batch, self.device)
         if getattr(self, "LOG_SAMPLE", True):
@@ -603,7 +584,7 @@ class OmniTrainer:
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item() / num_micro_steps
 
-        grad_norm = self._clip_grad_norm()
+        grad_norm = self.model.clip_grad_norm()
         self.optimizer.step()
         self.lr_scheduler.step()
         self.optimizer.zero_grad()

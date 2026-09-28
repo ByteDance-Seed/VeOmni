@@ -215,3 +215,28 @@ def test_runtime_calls_a_wrapped_module_through_its_runtime():
     assert wrapped.calls == 2
     assert ctx["trace"][:3] == ["module_a:pre", "module_a:generate", "module_a:post"]
     assert dict(runtime.named_omni_modules())["module_a"] is model.modules_dict["module_a"]
+
+
+class _ClippingRuntime:
+    def __init__(self, norm: float, max_grad_norm: float):
+        self.norm = norm
+        self.args = SimpleNamespace(optimizer=SimpleNamespace(max_grad_norm=max_grad_norm))
+        self.clipped_at: list[float] = []
+
+    def clip_grad_norm(self, max_norm: float) -> float:
+        self.clipped_at.append(max_norm)
+        return self.norm
+
+
+def test_each_module_clips_at_its_own_threshold_and_the_norms_combine():
+    runtimes = {"module_a": _ClippingRuntime(3.0, max_grad_norm=1.0), "module_b": _ClippingRuntime(4.0, 2.0)}
+    args = SimpleNamespace(optimizer=SimpleNamespace(max_grad_norm=9.0, grad_clip_scope="per_module"))
+    runtime = OmniModelRuntime(_model(), module_runtimes=runtimes, omni_model_runtime_args=args)
+
+    assert runtime.clip_grad_norm() == 5.0
+    assert runtimes["module_a"].clipped_at == [1.0]
+    assert runtimes["module_b"].clipped_at == [2.0]
+
+
+def test_a_runtime_without_modules_reports_a_zero_norm():
+    assert OmniModelRuntime(_model()).clip_grad_norm() == 0.0

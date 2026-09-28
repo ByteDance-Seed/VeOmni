@@ -21,6 +21,7 @@ from contextlib import nullcontext
 from dataclasses import fields
 from typing import TYPE_CHECKING, Any, Iterator, Mapping
 
+from .....distributed.clip_grad_norm import veomni_omni_model_clip_grad_norm
 from .....distributed.parallel_state import use_parallel_state
 from .....utils.logging import get_logger
 from ...modeling_omni import OmniModel
@@ -111,8 +112,8 @@ class OmniModelRuntime:
     :meth:`__getattr__` (``config``, ``modules_dict``, …).
     :meth:`forward` enters the (possibly FSDP-wrapped) :class:`OmniModel` so
     root leftover params unshard, then :meth:`OmniModel.forward` runs the
-    training graph. :meth:`generate`, :meth:`save_pretrained`, :meth:`reset`,
-    and :meth:`named_omni_modules` stay on this wrapper.
+    training graph. :meth:`clip_grad_norm`, :meth:`generate`, :meth:`save_pretrained`,
+    :meth:`reset`, and :meth:`named_omni_modules` stay on this wrapper.
     """
 
     def __init__(
@@ -300,6 +301,24 @@ class OmniModelRuntime:
             runner(self._module_to_call(node.module), node, batch)
 
         return self.model(batch, node_runner=run_node)
+
+    def clip_grad_norm(self) -> float:
+        """Clip every module's grads and return the whole-model norm.
+
+        Each :class:`ModuleRuntime` clips its own params against **its own**
+        ``optimizer.max_grad_norm`` (every OmniModule carries its own optimizer
+        config); the returned norm is the L2 combination of the pre-clip module
+        norms. Takes no threshold, since no single one applies. With no module
+        runtimes the norm is 0.0.
+        """
+        if not self.module_runtimes:
+            return 0.0
+        optimizer = self.omni_model_runtime_args.optimizer
+        return veomni_omni_model_clip_grad_norm(
+            self.module_runtimes,
+            optimizer.max_grad_norm,
+            grad_clip_scope=optimizer.grad_clip_scope,
+        )
 
     def generate(
         self,

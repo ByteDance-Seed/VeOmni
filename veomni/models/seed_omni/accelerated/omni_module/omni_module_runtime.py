@@ -515,8 +515,8 @@ class ModuleRuntime(VeOmniModelRuntime):
 
         Uses the omni-module clipper rather than the base's whole-model one: the
         orchestrator combines the per-module norms itself (see
-        :func:`~veomni.distributed.clip_grad_norm.omni_clip_grad_norm`), so this
-        must return *this* module's norm without reducing across modules.
+        :meth:`OmniModelRuntime.clip_grad_norm`), so this must return *this*
+        module's norm without reducing across modules.
         """
         if max_norm is None:
             max_norm = self.args.optimizer.max_grad_norm
