@@ -123,7 +123,7 @@ def test_build_model_uses_the_config_the_omni_config_loaded(monkeypatch):
         ops_implementation=None,
         accelerator=SimpleNamespace(
             init_device="meta",
-            fsdp_config=SimpleNamespace(mixed_precision=SimpleNamespace(enable=False)),
+            fsdp_config=SimpleNamespace(fsdp_scope="module", mixed_precision=SimpleNamespace(enable=False)),
         ),
     )
     runtime.module_config = SimpleNamespace(model_type="fake")
@@ -244,7 +244,7 @@ def test_only_the_top_level_scope_decides_whether_a_module_defers(monkeypatch, t
         args, "vision_encoder", module_config=SimpleNamespace(), global_accelerator=_fsdp(top_level)
     )
 
-    assert runtime._defer_parallelize is defers
+    assert runtime.wrap_omni_model is defers
 
 
 def test_a_deferred_module_applies_async_activation_offload_before_the_composed_wrap(monkeypatch):
@@ -253,7 +253,7 @@ def test_a_deferred_module_applies_async_activation_offload_before_the_composed_
     applied = []
     monkeypatch.setattr(ModuleRuntime, "_apply_async_activation_offload", lambda self: applied.append(self))
     runtime = _unbuilt(nn.Linear(2, 2))
-    runtime._defer_parallelize = True
+    runtime._global_accelerator = _fsdp("model")
 
     runtime._build_parallelized_model()
 
@@ -284,8 +284,8 @@ def test_the_composed_wrap_refuses_a_module_that_did_not_defer():
     runtime = OmniModelRuntime.__new__(OmniModelRuntime)
     runtime.omni_model_runtime_args = SimpleNamespace(accelerator=_fsdp("model"))
     runtime.module_runtimes = {
-        "llm": SimpleNamespace(_defer_parallelize=True),
-        "vision_encoder": SimpleNamespace(_defer_parallelize=False),
+        "llm": SimpleNamespace(wrap_omni_model=True),
+        "vision_encoder": SimpleNamespace(wrap_omni_model=False),
     }
 
     with pytest.raises(ValueError, match=r"\['vision_encoder'\]"):

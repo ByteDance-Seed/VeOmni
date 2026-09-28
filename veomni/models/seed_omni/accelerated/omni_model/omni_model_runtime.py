@@ -242,7 +242,7 @@ class OmniModelRuntime:
             return
 
         modules = self.module_runtimes
-        self_wrapped = sorted(name for name, runtime in modules.items() if not runtime._defer_parallelize)
+        self_wrapped = sorted(name for name, runtime in modules.items() if not runtime.wrap_omni_model)
         if self_wrapped:
             raise ValueError(
                 "fsdp_scope='model' wraps the composed OmniModel once, so every module must defer its "

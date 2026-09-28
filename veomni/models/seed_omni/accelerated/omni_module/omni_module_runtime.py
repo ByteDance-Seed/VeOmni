@@ -109,10 +109,6 @@ class ModuleRuntime(VeOmniModelRuntime):
     mistyped runtime attribute silently reads the model rather than raising.
     """
 
-    # Class default so ``__new__``-constructed tests and ``__getattr__``
-    # forwarding to the inner ``nn.Module`` never confuse this flag with a
-    # missing model attribute.
-    _defer_parallelize: bool = False
     _eager: bool = False
     _global_accelerator: Optional["AcceleratorConfig"] = None
 
@@ -136,9 +132,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         self.train_args = train
         self.optimizer = None
         self.lr_scheduler = None
-        self._defer_parallelize = False
         self._global_accelerator = global_accelerator
-        wrap_accelerator = global_accelerator if global_accelerator is not None else args.accelerator
 
         if for_inference:
             if args.accelerator.fsdp_config.fsdp_mode == "eager":
@@ -146,7 +140,6 @@ class ModuleRuntime(VeOmniModelRuntime):
                 self._init_eager_inference()
             else:
                 args.accelerator.fsdp_config.mixed_precision.enable = False
-                self._defer_parallelize = composed_model_owns_wrap(wrap_accelerator)
                 self.setup()
                 with self._scoped():
                     self._build_model()
@@ -157,17 +150,29 @@ class ModuleRuntime(VeOmniModelRuntime):
                     self._build_parallelized_model()
                 self.model.eval()
         else:
-            self._defer_parallelize = composed_model_owns_wrap(wrap_accelerator)
             self.setup()
             with self._scoped():
                 self._build_model()
                 self._build_model_assets()
                 self._freeze_model_module()
                 self._build_parallelized_model()
-                if not self._defer_parallelize:
+                if not self.wrap_omni_model:
                     self._scope_recompute_to_parallel_state()
                     self._build_optimizer()
                     self.build_checkpoint()
+
+    @property
+    def wrap_omni_model(self) -> bool:
+        """Whether the composed :class:`OmniModel` owns this module's FSDP wrap.
+
+        True under a top-level ``fsdp_scope='model'``: the module is built on
+        meta and left unwrapped, and :class:`OmniModelRuntime` wraps the parent
+        once. An eager-inference module is never wrapped by anyone.
+        """
+        if self._eager:
+            return False
+        accelerator = self._global_accelerator if self._global_accelerator is not None else self.args.accelerator
+        return composed_model_owns_wrap(accelerator)
 
     @property
     def mesh_accelerator(self) -> "AcceleratorConfig":
@@ -178,7 +183,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         emb-parallel block) must not decide them — a module meta-initialized on
         a different mesh than the one it is later sharded over would not load.
         """
-        if self._defer_parallelize and self._global_accelerator is not None:
+        if self.wrap_omni_model and self._global_accelerator is not None:
             return self._global_accelerator
         return self.args.accelerator
 
@@ -374,7 +379,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         parent once, then :meth:`finish_deferred_parallelize` builds the
         optimizer on the now-DTensor parameters.
         """
-        if self._defer_parallelize:
+        if self.wrap_omni_model:
             self._apply_async_activation_offload()
             logger.info_rank0(
                 f"ModuleRuntime '{self.module_name}': deferring FSDP wrap to the composed "
@@ -396,7 +401,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         No-op when this module wrapped itself, or when this is an eager-inference
         module that never entered :meth:`setup`.
         """
-        if not self._defer_parallelize:
+        if not self.wrap_omni_model:
             return
         if for_inference:
             with self._scoped():
