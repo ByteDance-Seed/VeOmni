@@ -25,7 +25,7 @@ def _rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
     dist_utils.get_device_type = lambda: "cpu"
     dist.init_process_group(backend="gloo", init_method=f"file://{rendezvous}", world_size=2, rank=rank)
     try:
-        trainer = SimpleNamespace(lr_scheduler=SimpleNamespace(get_last_lr=lambda: [1e-4]))
+        trainer = SimpleNamespace(model=SimpleNamespace(lr_scheduler=SimpleNamespace(get_last_lr=lambda: [1e-4])))
         callback = OmniStepMetricsCallback.__new__(OmniStepMetricsCallback)
         callback.trainer = trainer
         callback.parallel_state = SimpleNamespace(fsdp_group=None)

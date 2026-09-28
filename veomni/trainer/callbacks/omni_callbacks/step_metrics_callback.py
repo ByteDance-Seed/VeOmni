@@ -66,7 +66,7 @@ class OmniStepMetricsCallback(Callback):
             sums = all_reduce(values + counts, op="sum", group=group)
             for i, key in enumerate(node_keys):
                 step_train_metrics[f"training/{key}"] = sums[i] / sums[len(node_keys) + i]
-        step_train_metrics["training/lr"] = max(self.trainer.lr_scheduler.get_last_lr())
+        step_train_metrics["training/lr"] = max(self.trainer.model.lr_scheduler.get_last_lr())
 
         self.trainer.step_train_metrics = step_train_metrics
         self.trainer.step_env_metrics = dict(step_train_metrics)

@@ -34,16 +34,17 @@ Division of labour
   module): ``_build_model`` → ``_build_model_assets`` → ``_freeze_model_module``
   (freeze + LoRA) → ``_build_parallelized_model`` (FSDP2 wrap + weight load) →
   ``_build_optimizer`` → ``build_checkpoint`` (its own per-module DCP manager).
-  The lr-scheduler is built in :meth:`OmniTrainer._build_multi_lr_scheduler`
+  The lr-scheduler is built by :meth:`OmniModelRuntime._build_lr_scheduler`
   once ``train_steps`` is known from the dataset.
 * :class:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.OmniModelRuntime`
   (``self.model``): composes the module runtimes into one :class:`OmniModel`,
-  owns the graph loops, ParallelState scoping and graph tracing, and fans
-  checkpoint load / save out to every module runtime.
+  owns the graph loops, ParallelState scoping and graph tracing, aggregates the
+  per-module optimizers / schedulers behind ``MultiOptimizer`` /
+  ``MultiLRScheduler``, and fans clipping and checkpoint load / save out to
+  every module runtime.
 * :class:`OmniTrainer` (orchestrator): distributed setup + data pipeline +
-  callbacks + train loop; builds the model handle, aggregates the per-module
-  optimizers / schedulers behind :class:`MultiOptimizer` /
-  :class:`MultiLRScheduler`, and owns the forward/backward + the optimizer step.
+  callbacks + train loop; builds the model handle and owns the
+  forward/backward + the optimizer step.
   Checkpoint *cadence* lives in the omni callbacks
   (:class:`OmniModuleDcpCallback` / :class:`OmniModuleHfCallback`) and the
   shared :class:`GlobalStateCallback` (step, dataloader cursor, RNG).
@@ -114,64 +115,6 @@ def batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, An
     return {k: _to_device(v) for k, v in batch.items()}
 
 
-class MultiOptimizer:
-    """Thin proxy over ``{module_name: torch.optim.Optimizer}``.
-
-    Exposes the minimal :class:`torch.optim.Optimizer` surface the logging
-    callbacks read (``param_groups``) and the train loop drives
-    (``step`` / ``zero_grad``).  Optimizer state is checkpointed per module by
-    each :class:`ModuleRuntime`'s own DCP manager, so no ``state_dict`` is needed
-    here.
-    """
-
-    def __init__(self, optimizers: Dict[str, torch.optim.Optimizer]):
-        if not optimizers:
-            raise ValueError("OmniTrainer found no trainable module optimizers to build.")
-        self.optimizers = optimizers
-
-    @property
-    def param_groups(self) -> List[Dict[str, Any]]:
-        groups: List[Dict[str, Any]] = []
-        for opt in self.optimizers.values():
-            groups.extend(opt.param_groups)
-        return groups
-
-    def step(self) -> None:
-        for opt in self.optimizers.values():
-            opt.step()
-
-    def zero_grad(self, set_to_none: bool = True) -> None:
-        # veomni.optim.MultiOptimizer (FSDP2 +ExtraParallel) has ``zero_grad()`` with no args
-        # plain torch optimizers default to ``set_to_none=True``.
-        for opt in self.optimizers.values():
-            opt.zero_grad()
-
-
-class MultiLRScheduler:
-    """Thin proxy over ``{module_name: LRScheduler}`` (step-all / lr-read)."""
-
-    def __init__(self, schedulers: Dict[str, Any]):
-        self.schedulers = schedulers
-
-    def step(self) -> None:
-        for sched in self.schedulers.values():
-            sched.step()
-
-    def get_last_lr(self) -> List[float]:
-        lrs: List[float] = []
-        for sched in self.schedulers.values():
-            lrs.extend(sched.get_last_lr())
-        return lrs or [0.0]
-
-    def state_dict(self) -> Dict[str, Any]:
-        return {name: sched.state_dict() for name, sched in self.schedulers.items()}
-
-    def load_state_dict(self, state: Dict[str, Any]) -> None:
-        for name, sched in self.schedulers.items():
-            if name in state:
-                sched.load_state_dict(state[name])
-
-
 def cascade_module_reshard(
     module_runtimes: Mapping[str, ModuleRuntime],
     micro_step: int,
@@ -211,8 +154,9 @@ class OmniTrainer:
     is forwarded, so shared callbacks read ``self.model``
     unchanged.  Training requires the runtime — only it exposes the graph loops.
 
-    Canonical training state (``model`` / ``optimizer`` / ``lr_scheduler`` /
-    ``state`` / dataloaders / per-step trace metrics) lives on ``self``.  A
+    Job state (``model`` / ``state`` / dataloaders / per-step trace metrics)
+    lives on ``self``; the optimizer and lr-scheduler live on ``self.model``,
+    as they do on a :class:`BaseTrainer`'s runtime.  A
     future student+teacher trainer holds two handles by calling
     :func:`build_omni_model_runtime` twice.
 
@@ -233,8 +177,6 @@ class OmniTrainer:
     collate_fn: Any
     train_dataloader: Any
     data_iterator: Any | None = None
-    optimizer: MultiOptimizer
-    lr_scheduler: MultiLRScheduler
 
     # OmniStepMetricsCallback.on_step_end: training metrics (loss, grad_norm, lr, …).
     # WandbTraceCallback.on_step_end: logs step_env_metrics.
@@ -250,8 +192,7 @@ class OmniTrainer:
         self._build_model()
         self._build_step_contexts()
         self._build_data()
-        self._build_multi_optimizer()
-        self._build_multi_lr_scheduler()
+        self._build_lr_scheduler()
         self._init_callbacks()
 
     @staticmethod
@@ -376,31 +317,9 @@ class OmniTrainer:
     def _build_model(self):
         self.model = build_omni_model_runtime(build_omni_model_runtime_args(self.args), train=self.args.train)
 
-    def _build_multi_optimizer(self) -> None:
-        """Wrap per-module optimizers in :class:`MultiOptimizer`."""
-        optimizers = {
-            name: module_runtime.optimizer
-            for name, module_runtime in self.model.module_runtimes.items()
-            if module_runtime.optimizer is not None
-        }
-        self.optimizer = MultiOptimizer(optimizers)
-        logger.info_rank0(f"OmniTrainer: wired {len(optimizers)} optimizer(s): {list(optimizers)}.")
-
-    def _build_multi_lr_scheduler(self) -> None:
-        """Build per-module lr-schedulers and wrap them in :class:`MultiLRScheduler`.
-
-        ``_build_lr_scheduler`` no-ops for a fully-frozen module, so such modules
-        contribute no entry to the wrapper.
-        """
-        total_steps = self.args.train_steps * self.args.train.num_train_epochs
-        for module_runtime in self.model.module_runtimes.values():
-            module_runtime._build_lr_scheduler(total_steps)
-        lr_schedulers = {
-            name: module_runtime.lr_scheduler
-            for name, module_runtime in self.model.module_runtimes.items()
-            if module_runtime.lr_scheduler is not None
-        }
-        self.lr_scheduler = MultiLRScheduler(lr_schedulers)
+    def _build_lr_scheduler(self) -> None:
+        """Size the run, then let the model schedule over it."""
+        self.model._build_lr_scheduler(self.args.train_steps * self.args.train.num_train_epochs)
 
     def _build_step_contexts(self) -> None:
         """Build reusable forward/backward context managers from ``args`` (once, at init).
@@ -589,9 +508,9 @@ class OmniTrainer:
                 total_loss_dict[k] += v.item() / num_micro_steps
 
         grad_norm = self.model.clip_grad_norm()
-        self.optimizer.step()
-        self.lr_scheduler.step()
-        self.optimizer.zero_grad()
+        self.model.optimizer.step()
+        self.model.lr_scheduler.step()
+        self.model.optimizer.zero_grad()
 
         self._callbacks(stage="step_end", loss=total_loss, loss_dict=dict(total_loss_dict), grad_norm=grad_norm)
 
@@ -645,8 +564,6 @@ class OmniTrainer:
 
 __all__ = [
     "OmniTrainer",
-    "MultiOptimizer",
-    "MultiLRScheduler",
     "batch_to_device",
     "cascade_module_reshard",
 ]

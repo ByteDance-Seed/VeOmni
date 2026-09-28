@@ -21,6 +21,8 @@ from contextlib import nullcontext
 from dataclasses import fields
 from typing import TYPE_CHECKING, Any, Iterator, Mapping
 
+import torch
+
 from .....distributed.clip_grad_norm import veomni_omni_model_clip_grad_norm
 from .....distributed.parallel_state import use_parallel_state
 from .....utils.logging import get_logger
@@ -38,6 +40,64 @@ if TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
+
+
+class MultiOptimizer:
+    """Thin proxy over ``{module_name: torch.optim.Optimizer}``.
+
+    Exposes the minimal :class:`torch.optim.Optimizer` surface the logging
+    callbacks read (``param_groups``) and the train loop drives
+    (``step`` / ``zero_grad``).  Optimizer state is checkpointed per module by
+    each :class:`ModuleRuntime`'s own DCP manager, so no ``state_dict`` is needed
+    here.
+    """
+
+    def __init__(self, optimizers: dict[str, torch.optim.Optimizer]):
+        if not optimizers:
+            raise ValueError("OmniModelRuntime found no trainable module optimizers to build.")
+        self.optimizers = optimizers
+
+    @property
+    def param_groups(self) -> list[dict[str, Any]]:
+        groups: list[dict[str, Any]] = []
+        for opt in self.optimizers.values():
+            groups.extend(opt.param_groups)
+        return groups
+
+    def step(self) -> None:
+        for opt in self.optimizers.values():
+            opt.step()
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        # veomni.optim.MultiOptimizer (FSDP2 +ExtraParallel) has ``zero_grad()`` with no args
+        # plain torch optimizers default to ``set_to_none=True``.
+        for opt in self.optimizers.values():
+            opt.zero_grad()
+
+
+class MultiLRScheduler:
+    """Thin proxy over ``{module_name: LRScheduler}`` (step-all / lr-read)."""
+
+    def __init__(self, schedulers: dict[str, Any]):
+        self.schedulers = schedulers
+
+    def step(self) -> None:
+        for sched in self.schedulers.values():
+            sched.step()
+
+    def get_last_lr(self) -> list[float]:
+        lrs: list[float] = []
+        for sched in self.schedulers.values():
+            lrs.extend(sched.get_last_lr())
+        return lrs or [0.0]
+
+    def state_dict(self) -> dict[str, Any]:
+        return {name: sched.state_dict() for name, sched in self.schedulers.items()}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        for name, sched in self.schedulers.items():
+            if name in state:
+                sched.load_state_dict(state[name])
 
 
 def _scoped_no_split_modules(module_runtimes: Mapping[str, ModuleRuntime]) -> list[str]:
@@ -113,7 +173,8 @@ class OmniModelRuntime:
     :meth:`forward` enters the (possibly FSDP-wrapped) :class:`OmniModel` so
     root leftover params unshard, then :meth:`OmniModel.forward` runs the
     training graph. :meth:`clip_grad_norm`, :meth:`generate`, :meth:`save_pretrained`,
-    :meth:`reset`, and :meth:`named_omni_modules` stay on this wrapper.
+    :meth:`reset`, and :meth:`named_omni_modules` stay on this wrapper, and so do
+    :attr:`optimizer` / :attr:`lr_scheduler`, which step every module's own.
     """
 
     def __init__(
@@ -126,7 +187,34 @@ class OmniModelRuntime:
         self.model = model
         self.module_runtimes = dict(module_runtimes or {})
         self.omni_model_runtime_args = omni_model_runtime_args
+        self.optimizer: MultiOptimizer | None = None
+        self.lr_scheduler: MultiLRScheduler | None = None
         self._step_profiler: GraphProfiler | None = None
+
+    def _build_optimizer(self) -> None:
+        """Wrap the trainable modules' optimizers in one :class:`MultiOptimizer`."""
+        optimizers = {
+            name: module_runtime.optimizer
+            for name, module_runtime in self.module_runtimes.items()
+            if module_runtime.optimizer is not None
+        }
+        self.optimizer = MultiOptimizer(optimizers)
+        logger.info_rank0(f"OmniModelRuntime: wired {len(optimizers)} optimizer(s): {list(optimizers)}.")
+
+    def _build_lr_scheduler(self, total_steps: int) -> None:
+        """Build every module's lr-scheduler over ``total_steps`` and wrap them.
+
+        A fully-frozen module builds none, so it contributes no entry.
+        """
+        for module_runtime in self.module_runtimes.values():
+            module_runtime._build_lr_scheduler(total_steps)
+        self.lr_scheduler = MultiLRScheduler(
+            {
+                name: module_runtime.lr_scheduler
+                for name, module_runtime in self.module_runtimes.items()
+                if module_runtime.lr_scheduler is not None
+            }
+        )
 
     def _parallelize_composed_model(self, *, for_inference: bool = False) -> None:
         """``fully_shard`` the composed :class:`OmniModel` when ``fsdp_scope='model'``.
@@ -507,7 +595,9 @@ def build_omni_model_runtime(
         omni_model_runtime_args=omni_model_runtime_args,
     )
     runtime._parallelize_composed_model(for_inference=for_inference)
+    if not for_inference:
+        runtime._build_optimizer()
     return runtime
 
 
-__all__ = ["OmniModelRuntime", "build_omni_model_runtime"]
+__all__ = ["MultiLRScheduler", "MultiOptimizer", "OmniModelRuntime", "build_omni_model_runtime"]

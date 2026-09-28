@@ -9,10 +9,11 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import MultiLRScheduler, OmniModelRuntime
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.omni_callbacks import OmniModuleDcpCallback, OmniModuleHfCallback
-from veomni.trainer.omni.omni_trainer import MultiLRScheduler, OmniTrainer, cascade_module_reshard
+from veomni.trainer.omni.omni_trainer import OmniTrainer, cascade_module_reshard
 
 
 def _hf_callback(*, hf_save_steps: int = 0, hf_save_epochs: int = 0) -> OmniModuleHfCallback:
@@ -145,3 +146,18 @@ def test_async_activation_offload_is_reset_only_on_modules_that_enable_it(monkey
 
 def test_multi_lr_scheduler_without_schedulers_reports_zero_lr():
     assert MultiLRScheduler({}).get_last_lr() == [0.0]
+
+
+def test_model_runtime_steps_only_the_trainable_modules():
+    trainable = SimpleNamespace(optimizer=MagicMock(), lr_scheduler=None)
+    trainable._build_lr_scheduler = lambda total_steps: setattr(trainable, "lr_scheduler", MagicMock())
+    frozen = SimpleNamespace(optimizer=None, lr_scheduler=None, _build_lr_scheduler=MagicMock())
+    runtime = OmniModelRuntime(MagicMock(), module_runtimes={"trainable": trainable, "frozen": frozen})
+    assert runtime.optimizer is None and runtime.lr_scheduler is None
+
+    runtime._build_optimizer()
+    runtime._build_lr_scheduler(total_steps=10)
+
+    assert list(runtime.optimizer.optimizers) == ["trainable"]
+    assert list(runtime.lr_scheduler.schedulers) == ["trainable"]
+    frozen._build_lr_scheduler.assert_called_once_with(10)

@@ -500,10 +500,11 @@ class ModuleRuntime(VeOmniModelRuntime):
     def _build_lr_scheduler(self, total_steps: int) -> None:
         """Build this module's lr-scheduler over ``total_steps``.
 
-        The orchestrator (:meth:`~veomni.trainer.omni.omni_trainer.OmniTrainer._build_multi_lr_scheduler`)
-        computes ``total_steps`` once the dataset-derived ``train_steps`` (already
-        clamped by the global ``train.max_steps`` debug cap) is known. A no-op for
-        a fully-frozen module: there is no optimizer to schedule.
+        :meth:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.OmniModelRuntime._build_lr_scheduler`
+        calls this with the ``total_steps`` the trainer computes once the
+        dataset-derived ``train_steps`` (already clamped by the global
+        ``train.max_steps`` debug cap) is known. A no-op for a fully-frozen
+        module: there is no optimizer to schedule.
         """
         if not self.has_trainable_parameters:
             return
