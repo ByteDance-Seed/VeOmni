@@ -1,4 +1,6 @@
 import math
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -7,6 +9,10 @@ from torch.distributed._tensor import DTensor
 from .fsdp2 import clip_grad_norm as fsdp2_clip_grad_norm
 from .fsdp2.clip_grad_norm import _finalize_total_norm, _fsdp2_reduce_group
 from .parallel_state import ParallelState, get_parallel_state
+
+
+if TYPE_CHECKING:
+    from ..models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 
 
 @torch.no_grad()
@@ -89,7 +95,7 @@ def veomni_clip_grad_norm(
 
 
 def veomni_omni_module_clip_grad_norm(
-    model,
+    model: torch.nn.Module,
     max_norm: float,
     norm_type: float = 2.0,
 ) -> float:
@@ -172,7 +178,7 @@ def veomni_omni_module_clip_grad_norm(
 
 
 def veomni_omni_model_clip_grad_norm(
-    module_runtimes: dict,
+    module_runtimes: Mapping[str, "ModuleRuntime"],
     max_grad_norm: float,
     grad_clip_scope: str = "per_module",
 ) -> float:
@@ -193,7 +199,7 @@ def veomni_omni_model_clip_grad_norm(
     Each ``clip_grad_norm`` enters the module's own ``ParallelState``; the
     ``global`` rescale re-enters it via ``_scoped()`` for the same reason.
     """
-    runtimes = list(module_runtimes.values()) if isinstance(module_runtimes, dict) else list(module_runtimes)
+    runtimes = list(module_runtimes.values())
     if not runtimes:
         return 0.0
 
