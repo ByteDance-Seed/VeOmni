@@ -53,8 +53,6 @@ class MultiOptimizer:
     """
 
     def __init__(self, optimizers: dict[str, torch.optim.Optimizer]):
-        if not optimizers:
-            raise ValueError("OmniModelRuntime found no trainable module optimizers to build.")
         self.optimizers = optimizers
 
     @property
@@ -194,29 +192,32 @@ class OmniModelRuntime:
         self._step_profiler: GraphProfiler | None = None
 
     def _build_optimizer(self) -> None:
-        """Wrap the trainable modules' optimizers in one :class:`MultiOptimizer`."""
+        """Wrap the trainable modules' optimizers in one :class:`MultiOptimizer`.
+
+        Stays ``None`` when every module is frozen, like a frozen module's own.
+        """
         optimizers = {
             name: module_runtime.optimizer
             for name, module_runtime in self.module_runtimes.items()
             if module_runtime.optimizer is not None
         }
-        self.optimizer = MultiOptimizer(optimizers)
+        self.optimizer = MultiOptimizer(optimizers) if optimizers else None
         logger.info_rank0(f"OmniModelRuntime: wired {len(optimizers)} optimizer(s): {list(optimizers)}.")
 
     def _build_lr_scheduler(self, total_steps: int) -> None:
         """Build every module's lr-scheduler over ``total_steps`` and wrap them.
 
-        A fully-frozen module builds none, so it contributes no entry.
+        A fully-frozen module builds none, so it contributes no entry; with no
+        entry at all the wrapper stays ``None``.
         """
         for module_runtime in self.module_runtimes.values():
             module_runtime._build_lr_scheduler(total_steps)
-        self.lr_scheduler = MultiLRScheduler(
-            {
-                name: module_runtime.lr_scheduler
-                for name, module_runtime in self.module_runtimes.items()
-                if module_runtime.lr_scheduler is not None
-            }
-        )
+        lr_schedulers = {
+            name: module_runtime.lr_scheduler
+            for name, module_runtime in self.module_runtimes.items()
+            if module_runtime.lr_scheduler is not None
+        }
+        self.lr_scheduler = MultiLRScheduler(lr_schedulers) if lr_schedulers else None
 
     def _parallelize_composed_model(self, *, for_inference: bool = False) -> None:
         """``fully_shard`` the composed :class:`OmniModel` when ``fsdp_scope='model'``.

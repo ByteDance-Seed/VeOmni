@@ -169,6 +169,29 @@ def test_multi_lr_scheduler_without_schedulers_reports_zero_lr():
     assert MultiLRScheduler({}).get_last_lr() == [0.0]
 
 
+def test_an_all_frozen_model_runtime_has_no_optimizer_or_lr_scheduler():
+    frozen = SimpleNamespace(optimizer=None, lr_scheduler=None, _build_lr_scheduler=MagicMock())
+    runtime = OmniModelRuntime(MagicMock(), module_runtimes={"frozen": frozen})
+
+    runtime._build_optimizer()
+    runtime._build_lr_scheduler(total_steps=10)
+
+    assert runtime.optimizer is None and runtime.lr_scheduler is None
+
+
+def test_the_trainer_refuses_a_model_with_nothing_to_train(monkeypatch):
+    monkeypatch.setattr("veomni.trainer.omni.omni_trainer.build_omni_model_runtime_args", MagicMock())
+    monkeypatch.setattr(
+        "veomni.trainer.omni.omni_trainer.build_omni_model_runtime",
+        MagicMock(return_value=SimpleNamespace(optimizer=None)),
+    )
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.args = SimpleNamespace(train=SimpleNamespace())
+
+    with pytest.raises(ValueError, match="every module is frozen"):
+        trainer._build_model_runtime()
+
+
 @pytest.mark.parametrize(("global_rank", "writes"), [(0, True), (1, False)])
 def test_model_runtime_writes_root_assets_without_weights_on_rank_zero(global_rank, writes):
     train_args = SimpleNamespace(global_rank=global_rank, checkpoint=SimpleNamespace(model_assets_dir="/out/assets"))

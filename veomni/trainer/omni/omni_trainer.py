@@ -268,7 +268,10 @@ class OmniTrainer:
 
     def _build_model_runtime(self) -> OmniModelRuntime:
         """Build the composed model — every module built, wrapped and given its optimizer."""
-        return build_omni_model_runtime(build_omni_model_runtime_args(self.args), train=self.args.train)
+        model = build_omni_model_runtime(build_omni_model_runtime_args(self.args), train=self.args.train)
+        if model.optimizer is None:
+            raise ValueError("OmniTrainer has nothing to train: every module is frozen.")
+        return model
 
     def _build_lr_scheduler(self) -> None:
         """Size the run, then let the model schedule over it."""
