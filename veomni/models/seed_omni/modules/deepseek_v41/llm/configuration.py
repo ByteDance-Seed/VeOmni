@@ -131,8 +131,14 @@ class DeepseekV41LlmConfig(PretrainedConfig):
         enable_vision_routing_bias: bool = True,
         # Training-only. None trains every backbone layer; an int freezes
         # ``layers[n:]`` so an 8xH20 SFT can keep the first two. Absent from the
-        # released config, same as ``dsa_indexer_loss``.
+        # released config, same as ``dsa_indexer_loss``. Mutually exclusive
+        # with ``trainable_layer_ids``.
         n_trainable_layers: Optional[int] = None,
+        trainable_layer_ids: Optional[List[int]] = None,
+        # None: freeze DSpark whenever the backbone is partially frozen (the
+        # 8xH20 default). False keeps ``model.mtp`` trainable so the extra CE
+        # can reach it even if only the MTP-target layers are unfrozen.
+        freeze_mtp: Optional[bool] = None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -232,6 +238,8 @@ class DeepseekV41LlmConfig(PretrainedConfig):
         self.image_token_id = image_token_id
         self.enable_vision_routing_bias = enable_vision_routing_bias
         self.n_trainable_layers = n_trainable_layers
+        self.trainable_layer_ids = list(trainable_layer_ids) if trainable_layer_ids is not None else None
+        self.freeze_mtp = freeze_mtp
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
         self.validate_layer_schedule()
 
@@ -330,11 +338,25 @@ class DeepseekV41LlmConfig(PretrainedConfig):
                 f"num_attention_heads={self.num_attention_heads} must be divisible by o_groups={self.o_groups}: "
                 "the output projection is block-diagonal over head groups."
             )
+        if self.n_trainable_layers is not None and self.trainable_layer_ids is not None:
+            raise ValueError("set only one of n_trainable_layers and trainable_layer_ids")
         if self.n_trainable_layers is not None and not 0 <= self.n_trainable_layers <= self.num_hidden_layers:
             raise ValueError(
                 f"n_trainable_layers={self.n_trainable_layers} is outside [0, {self.num_hidden_layers}]. "
                 "None trains the whole stack; 0 freezes it."
             )
+        if self.trainable_layer_ids is not None:
+            seen = set()
+            for layer_idx in self.trainable_layer_ids:
+                if not 0 <= layer_idx < self.num_hidden_layers:
+                    raise ValueError(
+                        f"trainable_layer_ids contains {layer_idx}, outside [0, {self.num_hidden_layers})."
+                    )
+                if layer_idx in seen:
+                    raise ValueError(f"trainable_layer_ids repeats layer {layer_idx}")
+                seen.add(layer_idx)
+        if self.freeze_mtp is not None and not isinstance(self.freeze_mtp, bool):
+            raise ValueError(f"freeze_mtp must be True, False, or None, got {self.freeze_mtp!r}")
 
 
 RELEASED_NUM_HIDDEN_LAYERS = 40
@@ -431,6 +453,12 @@ def shrink_layer_schedule(n_layers: int, n_draft: int = 3) -> Dict[str, Any]:
 
     n_dspark = min(3, n_layers)
     dspark_ids = list(range(n_layers - n_dspark, n_layers))
+    # Stage 0's main_proj concatenates one hidden per target. The released
+    # weight is 3 * hidden; a 2-layer CED only has two live indices, so pad
+    # with the last decoder layer rather than shrinking the projection.
+    if n_draft == len(RELEASED_DSPARK_TARGET_LAYER_IDS) and dspark_ids:
+        while len(dspark_ids) < n_draft:
+            dspark_ids.append(dspark_ids[-1])
     return {
         "num_hidden_layers": n_layers,
         "num_nextn_predict_layers": n_draft,

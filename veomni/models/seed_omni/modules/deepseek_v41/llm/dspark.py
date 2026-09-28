@@ -25,7 +25,7 @@ the shared LM head plus the Markov residual.
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -114,29 +114,70 @@ class DeepseekV41DSparkBlock(nn.Module):
             raise RuntimeError("only the first DSpark stage owns main_proj")
         return self.main_norm(self.main_proj(torch.cat(draft_hiddens, dim=-1)))
 
+    def forward(
+        self,
+        hidden_streams: torch.Tensor,
+        pre_mix: torch.Tensor,
+        position_ids: torch.Tensor,
+        rotary_emb: DeepseekV41RotaryEmbedding,
+        main: Union[List[torch.Tensor], torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """One teacher-forced packed stage: the only way training enters a stage.
+
+        Each stage is an FSDP2 unit, and FSDP gathers its parameters in the
+        pre-forward hook. Calling ``project_main`` / ``forward_draft_packed`` /
+        ``collapse_draft`` from outside would hand sharded DTensors to the
+        matmuls, so all three run in here.
+
+        ``main`` is the target-layer hidden list at stage 0 and the projected
+        ``main_x`` after it. Returns the streams, the carried ``pre`` mix,
+        ``main_x``, and the LM-head input on the last stage (else ``None``).
+        """
+        main_x = self.project_main(main) if self.stage_id == 0 else main
+        hidden_streams, pre_mix = self.forward_draft_packed(hidden_streams, pre_mix, position_ids, rotary_emb, main_x)
+        draft = self.collapse_draft(hidden_streams, pre_mix) if hasattr(self, "norm") else None
+        return hidden_streams, pre_mix, main_x, draft
+
     def seed_window(
         self,
         main_x: torch.Tensor,
         position_ids: torch.Tensor,
         rotary_emb: DeepseekV41RotaryEmbedding,
         cache: DeepseekV41AttentionCache,
+        *,
+        detach: bool = True,
     ) -> None:
         """Write the backbone token's window KV, matching ``DSparkAttention`` at any start_pos.
 
         Prefill (``S > 1``) replaces the cache with the last ``sliding_window`` rows.
         Decode (``S == 1``) appends into the ring the same way the backbone window does.
+
+        ``detach`` is the decode path: the window is a cache, not a residual.
+        Packed training does not use this cache; it rebuilds causal window
+        indices over the full row in ``_packed_draft_attention``.
         """
         attn = self.self_attn
         seq_len = main_x.shape[1]
-        cos, sin = rotary_emb(position_ids, compressed=False)
-        kv = attn.kv_norm(fake_quant_linear(attn.wkv, main_x))
-        kv = apply_interleaved_rope(kv, cos, sin)
-        kv = round_window_kv(kv, training=attn.training)
+        kv = self._window_kv(main_x, position_ids, rotary_emb)
         if seq_len == 1 and cache.window is not None:
             cache.append_window(kv)
             return
         width = min(attn.sliding_window, seq_len)
-        cache.window = kv[:, seq_len - width : seq_len].detach()
+        window = kv[:, seq_len - width : seq_len]
+        cache.window = window.detach() if detach else window
+
+    def _window_kv(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        rotary_emb: DeepseekV41RotaryEmbedding,
+    ) -> torch.Tensor:
+        """Rotated window KV for ``hidden_states``, matching ``seed_window``."""
+        attn = self.self_attn
+        cos, sin = rotary_emb(position_ids, compressed=False)
+        kv = attn.kv_norm(fake_quant_linear(attn.wkv, hidden_states))
+        kv = apply_interleaved_rope(kv, cos, sin)
+        return round_window_kv(kv, training=attn.training)
 
     def forward_draft(
         self,
@@ -212,6 +253,68 @@ class DeepseekV41DSparkBlock(nn.Module):
         output = dense_sparse_attn(query, pool, attn.attn_sink, topk_idxs, attn.softmax_scale)
         output = apply_interleaved_rope(output, cos.unsqueeze(-2), -sin.unsqueeze(-2))
         grouped = attn.wo_a(output.reshape(batch, block_size, attn.n_groups, -1))
+        return attn.wo_b(grouped.flatten(2))
+
+    def forward_draft_packed(
+        self,
+        hidden_streams: torch.Tensor,
+        pre_mix: torch.Tensor,
+        position_ids: torch.Tensor,
+        rotary_emb: DeepseekV41RotaryEmbedding,
+        main_x: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Teacher-forced DSpark on a packed row.
+
+        Decode's ``forward_draft`` rebuilds draft positions as ``p+1 .. p+block``
+        and attends densely inside that block. Training already has the packed
+        ``position_ids``; using the decode formula would put every token at the
+        wrong RoPE phase, and seeding only the last window would let position 0
+        read the end of the row. Packed attention is causal over the same
+        sliding window the backbone uses, once, over the full sequence.
+        """
+        residual = hidden_streams
+        attn_pre, attn_post, attn_comb = self.attn_hc(hidden_streams)
+        collapsed = mhc_collapse(hidden_streams, pre_mix)
+        attn_out = self._packed_draft_attention(self.input_layernorm(collapsed), position_ids, rotary_emb, main_x)
+        hidden_streams = mhc_expand(attn_out, residual, attn_post, attn_comb)
+
+        residual = hidden_streams
+        ffn_pre, ffn_post, ffn_comb = self.ffn_hc(hidden_streams)
+        collapsed = mhc_collapse(hidden_streams, attn_pre)
+        mlp_out, _ = self.mlp(self.post_attention_layernorm(collapsed), image_mask=None)
+        hidden_streams = mhc_expand(mlp_out, residual, ffn_post, ffn_comb)
+        return hidden_streams, ffn_pre
+
+    def _packed_draft_attention(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        rotary_emb: DeepseekV41RotaryEmbedding,
+        main_x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Causal window attention over backbone KV plus packed draft keys."""
+        if main_x.shape[:2] != hidden_states.shape[:2]:
+            raise ValueError(
+                f"packed DSpark expected main_x shape {tuple(hidden_states.shape[:2])}, got {tuple(main_x.shape[:2])}"
+            )
+        attn = self.self_attn
+        batch, seq_len, _ = hidden_states.shape
+        cos, sin = rotary_emb(position_ids, compressed=False)
+
+        q_residual = attn.q_norm(fake_quant_linear(attn.wq_a, hidden_states))
+        query = fake_quant_linear(attn.wq_b, q_residual).unflatten(-1, (attn.n_heads, attn.head_dim))
+        query = apply_interleaved_rope(query, cos.unsqueeze(-2), sin.unsqueeze(-2))
+
+        kv = self._window_kv(hidden_states, position_ids, rotary_emb)
+        main_kv = self._window_kv(main_x, position_ids, rotary_emb)
+        pool = torch.cat([main_kv, kv], dim=1)
+        window_idxs = attn._window_indices(position_ids, seq_len)
+        draft_idxs = torch.where(window_idxs >= 0, window_idxs + seq_len, window_idxs)
+        topk_idxs = torch.cat([window_idxs, draft_idxs], dim=-1)
+
+        output = dense_sparse_attn(query, pool, attn.attn_sink, topk_idxs, attn.softmax_scale)
+        output = apply_interleaved_rope(output, cos.unsqueeze(-2), -sin.unsqueeze(-2))
+        grouped = attn.wo_a(output.reshape(batch, seq_len, attn.n_groups, -1))
         return attn.wo_b(grouped.flatten(2))
 
     def collapse_draft(self, hidden_streams: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:

@@ -49,6 +49,7 @@ from veomni.models.seed_omni.modules.deepseek_v41.vision.configuration import De
 from veomni.models.seed_omni.modules.deepseek_v41.vision.processing import _SOURCE, image_token_types
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 from veomni.ops.kernels.cross_entropy import ForCausalLMLoss
+from veomni.utils.constants import IGNORE_INDEX
 
 
 CONFIG_ROOT = Path("configs/seed_omni/DeepSeek/deepseek_v41_flash")
@@ -121,6 +122,7 @@ def _patch_cpu_attention(monkeypatch) -> None:
 
 def tiny_llm_config(**overrides) -> DeepseekV41LlmConfig:
     schedule = shrink_layer_schedule(N_LAYERS, n_draft=0)
+    schedule.pop("kept_layer_ids", None)
     kwargs = dict(
         vocab_size=VOCAB,
         hidden_size=HIDDEN,
@@ -206,10 +208,35 @@ def tiny_text_config() -> DeepseekV41TextEncoderConfig:
     )
 
 
-def build_toy_modules(*, n_trainable_layers=None):
-    llm_config = tiny_llm_config(n_trainable_layers=n_trainable_layers)
-    ngram = DeepseekV41NgramAccelerated(tiny_ngram_config(llm_config.engram_layer_ids))
+def build_toy_modules(
+    *,
+    n_trainable_layers=None,
+    dspark: bool = False,
+    n_layers: int = N_LAYERS,
+    trainable_layer_ids=None,
+    freeze_mtp=None,
+):
+    overrides: dict = {}
+    n_draft = 1 if dspark else 0
+    if dspark or n_layers != N_LAYERS:
+        schedule = shrink_layer_schedule(n_layers, n_draft=n_draft)
+        schedule.pop("kept_layer_ids", None)
+        overrides.update(schedule)
+    if dspark:
+        overrides.update(
+            dspark_block_size=5,
+            dspark_n_routed_experts=4,
+            dspark_num_experts_per_tok=2,
+        )
+    if n_trainable_layers is not None:
+        overrides["n_trainable_layers"] = n_trainable_layers
+    if trainable_layer_ids is not None:
+        overrides["trainable_layer_ids"] = list(trainable_layer_ids)
+    if freeze_mtp is not None:
+        overrides["freeze_mtp"] = freeze_mtp
+    llm_config = tiny_llm_config(**overrides) if overrides else tiny_llm_config()
     torch.manual_seed(0)
+    ngram = DeepseekV41NgramAccelerated(tiny_ngram_config(llm_config.engram_layer_ids))
     ngram.token_map.copy_(torch.arange(VOCAB) % ngram.config.compressed_vocab_size)
     ngram.freeze_model()
 
@@ -311,8 +338,8 @@ class TestToyTrainStep:
         modules = build_toy_modules()
         llm_names = {name for name, _ in modules[LLM].named_parameters()}
         for pattern in modules[LLM].get_parallel_plan().extra_parallel_plan["ep"]:
-            # Draft stages are off (``dspark_block_size=0``), so ``mtp.*`` is empty.
-            if pattern.startswith("model.mtp."):
+            mtp_on = any(name.startswith("model.mtp.") for name in llm_names)
+            if pattern.startswith("model.mtp.") and not mtp_on:
                 continue
             concrete = pattern.replace("*", "0")
             assert concrete in llm_names, f"{pattern} matches nothing on the toy backbone"
@@ -358,6 +385,251 @@ class TestFirstNLayersFreeze:
         trained = [p for n, p in modules[LLM].named_parameters() if n.startswith("model.layers.0.")]
         assert frozen and all(p.grad is None for p in frozen)
         assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in trained)
+
+
+class TestDsparkTrainStep:
+    def test_shrunk_stack_freezes_mtp(self):
+        llm = DeepseekV41LlmAccelerated(
+            tiny_llm_config(
+                **{
+                    **{k: v for k, v in shrink_layer_schedule(N_LAYERS, n_draft=1).items() if k != "kept_layer_ids"},
+                    "dspark_block_size": 5,
+                    "dspark_n_routed_experts": 4,
+                    "n_trainable_layers": 1,
+                }
+            )
+        )
+        llm.freeze_model()
+        mtp = [p for n, p in llm.named_parameters() if n.startswith("model.mtp.")]
+        assert mtp and all(not p.requires_grad for p in mtp)
+
+    def test_full_parameter_trains_mtp(self, monkeypatch):
+        _patch_cpu_attention(monkeypatch)
+        modules = build_toy_modules(dspark=True)
+        mtp = [p for n, p in modules[LLM].named_parameters() if n.startswith("model.mtp.")]
+        assert mtp and all(p.requires_grad for p in mtp)
+        model = build_toy_omni(modules)
+        model.train()
+        out = model({"conversation_list": toy_conversation()})
+        assert torch.isfinite(out["loss"])
+        out["loss"].backward()
+        assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in mtp)
+
+    def test_mtp_ep_plan_resolves(self):
+        modules = build_toy_modules(dspark=True)
+        llm_names = {name for name, _ in modules[LLM].named_parameters()}
+        assert "model.mtp.0.mlp.experts.gate_up_proj" in llm_names
+        assert "model.mtp.0.mlp.experts.down_proj" in llm_names
+
+    def test_frozen_mtp_skips_the_train_forward(self, monkeypatch):
+        _patch_cpu_attention(monkeypatch)
+        modules = build_toy_modules(dspark=True, n_trainable_layers=1)
+        called = []
+        orig = modules[LLM].model.forward_dspark_train
+
+        def _wrapped(*args, **kwargs):
+            called.append(True)
+            return orig(*args, **kwargs)
+
+        modules[LLM].model.forward_dspark_train = _wrapped
+        model = build_toy_omni(modules)
+        model.train()
+        out = model({"conversation_list": toy_conversation()})
+        assert torch.isfinite(out["loss"])
+        assert called == []
+
+    def test_packed_dspark_does_not_read_the_future(self):
+        schedule = shrink_layer_schedule(N_LAYERS, n_draft=1)
+        schedule.pop("kept_layer_ids", None)
+        torch.manual_seed(0)
+        llm = DeepseekV41LlmAccelerated(
+            tiny_llm_config(
+                **schedule,
+                dspark_block_size=5,
+                dspark_n_routed_experts=4,
+                dspark_num_experts_per_tok=2,
+            )
+        )
+        llm.train()
+        batch, seq_len = 1, 6
+        embeds = torch.randn(batch, seq_len, HIDDEN)
+        drafts = [torch.randn(batch, seq_len, HIDDEN) for _ in llm.config.dspark_target_layer_ids]
+        positions = torch.arange(seq_len).unsqueeze(0)
+        clean = llm.model.forward_dspark_train(embeds, positions, drafts)
+        dirty_embeds = embeds.clone()
+        dirty_embeds[:, -1] = 1.0e3
+        dirty_drafts = [hidden.clone() for hidden in drafts]
+        for hidden in dirty_drafts:
+            hidden[:, -1] = 1.0e3
+        dirty = llm.model.forward_dspark_train(dirty_embeds, positions, dirty_drafts)
+        torch.testing.assert_close(clean[:, :1], dirty[:, :1], atol=1e-4, rtol=1e-4)
+
+    def test_packed_dspark_enters_every_stage_through_call(self):
+        """FSDP2 unshards a stage in its pre-forward hook; a bypassed ``__call__`` sees DTensor shards."""
+        schedule = shrink_layer_schedule(N_LAYERS)
+        schedule.pop("kept_layer_ids", None)
+        llm = DeepseekV41LlmAccelerated(
+            tiny_llm_config(**schedule, dspark_block_size=5, dspark_n_routed_experts=4, dspark_num_experts_per_tok=2)
+        )
+        llm.train()
+        entered = []
+        for stage in llm.model.mtp:
+            stage.register_forward_pre_hook(lambda module, _args: entered.append(module.stage_id))
+        batch, seq_len = 1, 6
+        drafts = [torch.randn(batch, seq_len, HIDDEN) for _ in llm.config.dspark_target_layer_ids]
+        out = llm.model.forward_dspark_train(
+            torch.randn(batch, seq_len, HIDDEN), torch.arange(seq_len).unsqueeze(0), drafts
+        )
+        assert entered == list(range(len(llm.model.mtp)))
+        assert out.shape == (batch, seq_len, HIDDEN)
+
+    def test_decode_pre_extra_shifts_mtp_labels(self):
+        """Qwen3.5 MTP: decode_pre extra-shifts t+1 labels into t+2 mtp_labels."""
+        te = DeepseekV41TextEncoderAccelerated(tiny_text_config())
+
+        def _text(labels: list[int], *, dspark: bool = True) -> ConversationItem:
+            item = ConversationItem(
+                type="text",
+                value=torch.randn(len(labels), HIDDEN),
+                role="assistant",
+                meta={"labels": torch.tensor(labels)},
+            )
+            if dspark:
+                item.meta["dspark_hidden"] = torch.randn(len(labels), HIDDEN)
+            return item
+
+        packed = te.decode_pre(conversation_list=[[_text([1, 2, 3])], [_text([4, 5])]])
+        assert packed["shift_labels"].tolist() == [2, 3, IGNORE_INDEX, 5, IGNORE_INDEX]
+        assert packed["mtp_labels"].tolist() == [3, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX]
+        assert packed["dspark_hidden_states"].shape == (5, HIDDEN)
+
+        no_draft = te.decode_pre(conversation_list=[[_text([1, 2, 3], dspark=False)]])
+        assert "mtp_labels" not in no_draft
+        assert "dspark_hidden_states" not in no_draft
+
+    def test_decode_mtp_ce_uses_extra_shifted_labels(self, monkeypatch):
+        """Draft CE must score mtp_labels, not the main head's t+1 shift_labels."""
+        from veomni.models.seed_omni.modules.base.text_encoder.accelerated.accelerated import (
+            TrainingMixin as BaseTrainingMixin,
+        )
+
+        captured: list[torch.Tensor | None] = []
+
+        def _fake_decode(self, hidden_states=None, labels=None, shift_labels=None, **kwargs):
+            del self, hidden_states, labels, kwargs
+            captured.append(None if shift_labels is None else shift_labels.detach().clone())
+            return {"loss": torch.tensor(1.0), "logits": None}
+
+        monkeypatch.setattr(BaseTrainingMixin, "decode", _fake_decode)
+        te = DeepseekV41TextEncoderAccelerated(tiny_text_config())
+        shift_labels = torch.tensor([2, 3, IGNORE_INDEX, 5, IGNORE_INDEX])
+        mtp_labels = torch.tensor([3, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX])
+        out = te.decode(
+            hidden_states=torch.randn(5, HIDDEN),
+            shift_labels=shift_labels,
+            dspark_hidden_states=torch.randn(5, HIDDEN),
+            mtp_labels=mtp_labels,
+        )
+        assert float(out["loss"]) == 2.0
+        assert torch.equal(captured[0], shift_labels)
+        assert torch.equal(captured[1], mtp_labels)
+
+
+def _has_grad(module, prefix: str) -> bool:
+    params = [p for n, p in module.named_parameters() if n.startswith(prefix)]
+    return any(p.grad is not None and p.grad.abs().sum() > 0 for p in params)
+
+
+def _all_frozen(module, prefix: str) -> bool:
+    params = [p for n, p in module.named_parameters() if n.startswith(prefix)]
+    return bool(params) and all(not p.requires_grad for p in params)
+
+
+class TestTrainableLayerMatrix:
+    """Partial freeze must work for prefix layers, MTP-target layers, and MTP itself."""
+
+    def test_cannot_set_both_selectors(self):
+        with pytest.raises(ValueError, match="n_trainable_layers and trainable_layer_ids"):
+            tiny_llm_config(n_trainable_layers=1, trainable_layer_ids=[0])
+
+    def test_mtp_target_ids_stay_unfrozen_when_named(self):
+        llm = DeepseekV41LlmAccelerated(
+            tiny_llm_config(
+                **{
+                    **{k: v for k, v in shrink_layer_schedule(N_LAYERS, n_draft=1).items() if k != "kept_layer_ids"},
+                    "dspark_block_size": 5,
+                    "dspark_n_routed_experts": 4,
+                    "trainable_layer_ids": [1],
+                    "freeze_mtp": False,
+                }
+            )
+        )
+        llm.freeze_model()
+        assert _all_frozen(llm, "model.layers.0.")
+        assert all(p.requires_grad for n, p in llm.named_parameters() if n.startswith("model.layers.1."))
+        assert all(p.requires_grad for n, p in llm.named_parameters() if n.startswith("model.mtp."))
+
+    @pytest.mark.parametrize(
+        "label, kwargs, train_layers, train_mtp",
+        [
+            ("first_two_freeze_mtp", {"n_trainable_layers": 2}, {0, 1}, False),
+            ("both_layers_and_mtp", {"trainable_layer_ids": [0, 1], "freeze_mtp": False}, {0, 1}, True),
+            ("encoder_only", {"trainable_layer_ids": [0]}, {0}, False),
+            ("decoder_mtp_layer", {"trainable_layer_ids": [1]}, {1}, False),
+            ("decoder_and_mtp", {"trainable_layer_ids": [1], "freeze_mtp": False}, {1}, True),
+            ("mtp_only", {"trainable_layer_ids": [], "freeze_mtp": False}, set(), True),
+        ],
+    )
+    def test_two_layer_dspark_train_step(self, monkeypatch, label, kwargs, train_layers, train_mtp):
+        del label
+        _patch_cpu_attention(monkeypatch)
+        modules = build_toy_modules(dspark=True, **kwargs)
+        model = build_toy_omni(modules)
+        model.train()
+        out = model({"conversation_list": toy_conversation()})
+        assert torch.isfinite(out["loss"]), out
+        out["loss"].backward()
+        llm = modules[LLM]
+        for layer_idx in range(N_LAYERS):
+            prefix = f"model.layers.{layer_idx}."
+            if layer_idx in train_layers:
+                assert _has_grad(llm, prefix), f"layer {layer_idx} should train"
+            else:
+                assert _all_frozen(llm, prefix), f"layer {layer_idx} should be frozen"
+                frozen = [p for n, p in llm.named_parameters() if n.startswith(prefix)]
+                assert all(p.grad is None for p in frozen)
+        if train_mtp:
+            assert _has_grad(llm, "model.mtp.")
+        else:
+            assert _all_frozen(llm, "model.mtp.")
+
+    def test_four_layer_last_two_are_the_mtp_targets(self, monkeypatch):
+        """4-layer CED: first two are encoder-ish; last two are DSpark targets.
+
+        ``shrink_layer_schedule(4, n_draft=1)`` sets ``dspark_target_layer_ids``
+        to ``[1, 2, 3]``, so training ``[2, 3]`` plus MTP is the 'keep the MTP
+        layers' counterpart of ``n_trainable_layers: 2``.
+        """
+        _patch_cpu_attention(monkeypatch)
+        schedule = shrink_layer_schedule(4, n_draft=1)
+        assert schedule["dspark_target_layer_ids"] == [1, 2, 3]
+        modules = build_toy_modules(
+            dspark=True,
+            n_layers=4,
+            trainable_layer_ids=[2, 3],
+            freeze_mtp=False,
+        )
+        model = build_toy_omni(modules)
+        model.train()
+        out = model({"conversation_list": toy_conversation()})
+        assert torch.isfinite(out["loss"])
+        out["loss"].backward()
+        llm = modules[LLM]
+        assert _all_frozen(llm, "model.layers.0.")
+        assert _all_frozen(llm, "model.layers.1.")
+        assert _has_grad(llm, "model.layers.2.")
+        assert _has_grad(llm, "model.layers.3.")
+        assert _has_grad(llm, "model.mtp.")
 
 
 class TestQatOpsSlotBinding:

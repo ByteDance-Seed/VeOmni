@@ -216,11 +216,29 @@ class TestLoopOrdering:
         for draft, layer_idx in zip(drafts, DRAFT_TARGETS):
             torch.testing.assert_close(draft, backbone.seen[layer_idx]["streams"].mean(dim=2))
 
-    def test_draft_hiddens_are_off_by_default(self):
-        config = make_config()
+    def test_duplicate_draft_targets_repeat_the_same_stream(self):
+        """A 3-wide ``main_proj`` on a short stack pads the last decoder twice."""
+        config = make_config(dspark_target_layer_ids=[5, 7, 7])
+        backbone = stub_backbone(config)
+        embeds, positions, rows = self._inputs(config)
+        drafts = backbone(embeds, positions, rows, return_draft_hiddens=True)["draft_hiddens"]
+        assert len(drafts) == 3
+        torch.testing.assert_close(drafts[0], backbone.seen[5]["streams"].mean(dim=2))
+        torch.testing.assert_close(drafts[1], backbone.seen[7]["streams"].mean(dim=2))
+        torch.testing.assert_close(drafts[1], drafts[2])
+
+    def test_draft_hiddens_are_off_without_dspark_stages(self):
+        config = make_config(num_nextn_predict_layers=0, dspark_block_size=0, compress_ratios=[2] * N_LAYERS)
         backbone = stub_backbone(config)
         embeds, positions, rows = self._inputs(config)
         assert "draft_hiddens" not in backbone(embeds, positions, rows)
+
+    def test_train_collects_draft_hiddens_when_dspark_stages_exist(self):
+        config = make_config()
+        backbone = stub_backbone(config).train()
+        embeds, positions, rows = self._inputs(config)
+        drafts = backbone(embeds, positions, rows)["draft_hiddens"]
+        assert len(drafts) == len(DRAFT_TARGETS)
 
     def test_eval_collects_draft_hiddens_when_dspark_stages_exist(self):
         config = make_config()
@@ -363,7 +381,7 @@ class TestShrinkSchedule:
         assert any(idx < 1 for idx in config.kv_source_layer_ids)
         assert any(idx < 1 for idx in config.engram_layer_ids)
         assert any(idx >= 1 for idx in config.engram_layer_ids)
-        assert config.dspark_target_layer_ids == [0, 1]
+        assert config.dspark_target_layer_ids == [0, 1, 1]
         assert config.compress_ratios[1] != 0
 
     def test_forty_layers_is_the_released_schedule(self):

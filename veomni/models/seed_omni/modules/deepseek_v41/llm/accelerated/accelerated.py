@@ -200,6 +200,19 @@ class TrainingMixin(TrainingModuleMixin):
             hidden_states = hidden_states.squeeze(0)
         scatter_llm_hidden_states(conversation, unflatten(hidden_states, pack_shape))
 
+        dspark_hidden = outputs.get("dspark_hidden_states")
+        if dspark_hidden is not None:
+            if dspark_hidden.dim() == 3 and dspark_hidden.size(0) == 1:
+                dspark_hidden = dspark_hidden.squeeze(0)
+            hidden_iter = iter(unflatten(dspark_hidden, pack_shape))
+            for sample in conversation:
+                for part in sample:
+                    if is_dummy(part):
+                        continue
+                    part.meta["dspark_hidden"] = next(hidden_iter)
+            if next(hidden_iter, None) is not None:
+                raise RuntimeError("dspark_hidden segment count exceeds non-dummy conversation items.")
+
         forwarded: Dict[str, Any] = {"conversation_list": conversation}
         # OmniModel only collects ``_loss``. Leaving the KL tensors on the batch
         # would hand them to ``text_encoder.decode`` as unexpected kwargs; folding

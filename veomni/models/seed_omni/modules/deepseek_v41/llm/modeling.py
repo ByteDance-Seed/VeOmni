@@ -134,10 +134,10 @@ class DeepseekV41Backbone(nn.Module):
         hidden_streams = expand_to_streams(inputs_embeds, self.config.hc_mult)
         pre_mix = identity_pre_mix(hidden_streams, self.config.hc_mult)
 
-        draft_hiddens: List[torch.Tensor] = []
         router_logits: List[torch.Tensor] = []
         indexer_terms: List[IndexerLossTerms] = []
         draft_targets = set(self.config.dspark_target_layer_ids)
+        draft_inputs: Dict[int, torch.Tensor] = {}
 
         for layer_idx, layer in enumerate(self.layers):
             if str(layer_idx) in self.engram:
@@ -148,12 +148,12 @@ class DeepseekV41Backbone(nn.Module):
                 # the trained weights never produced.
                 connection = self.engram[str(layer_idx)]
                 hidden_streams = connection(hidden_streams, ngram_embeds[connection.layer_hash_index], token_mask)
-            if (return_draft_hiddens or (self.mtp and not self.training)) and layer_idx in draft_targets:
+            if (return_draft_hiddens or self.mtp) and layer_idx in draft_targets:
                 # The MTP head reads its target layer's *input*, not its output --
                 # `main_hiddens.append(h.mean(dim=2))` sits above `layer(...)` in
-                # the reference. Collected at inference whenever DSpark stages
-                # exist, so the draft window can be seeded from the same tensor.
-                draft_hiddens.append(hidden_streams.mean(dim=2))
+                # the reference. Stored by layer id so a padded 3-wide ``main_proj``
+                # can reuse the last decoder stream twice.
+                draft_inputs[layer_idx] = hidden_streams.mean(dim=2)
 
             hidden_streams, pre_mix, layer_logits, indexer_loss = layer(
                 hidden_streams,
@@ -200,8 +200,8 @@ class DeepseekV41Backbone(nn.Module):
             # layers happened to carry one.
             outputs["indexer_kl_layers"] = len(indexer_terms)
             outputs["indexer_query_tokens"] = hidden_states.shape[0] * hidden_states.shape[1]
-        if draft_hiddens:
-            outputs["draft_hiddens"] = draft_hiddens
+        if return_draft_hiddens or self.mtp:
+            outputs["draft_hiddens"] = [draft_inputs[idx] for idx in self.config.dspark_target_layer_ids]
         return outputs
 
     def forward_ced_prefill(
@@ -247,7 +247,7 @@ class DeepseekV41Backbone(nn.Module):
         shared = SharedAttentionState()
         hidden_streams = expand_to_streams(inputs_embeds, self.config.hc_mult)
         pre_mix = identity_pre_mix(hidden_streams, self.config.hc_mult)
-        draft_hiddens: List[torch.Tensor] = []
+        draft_inputs: Dict[int, torch.Tensor] = {}
         router_logits: List[torch.Tensor] = []
         indexer_terms: List[IndexerLossTerms] = []
         draft_targets = set(self.config.dspark_target_layer_ids)
@@ -270,7 +270,7 @@ class DeepseekV41Backbone(nn.Module):
                 connection = self.engram[str(layer_idx)]
                 hidden_streams = connection(hidden_streams, layer_ngram[connection.layer_hash_index], layer_token_mask)
             if self.mtp and layer_idx in draft_targets:
-                draft_hiddens.append(hidden_streams.mean(dim=2))
+                draft_inputs[layer_idx] = hidden_streams.mean(dim=2)
             hidden_streams, pre_mix, layer_logits, indexer_loss = layer(
                 hidden_streams,
                 pre_mix,
@@ -321,9 +321,10 @@ class DeepseekV41Backbone(nn.Module):
                 compress_hidden=compress_hidden if layer_idx == split else None,
                 compress_position_ids=full_position_ids if layer_idx == split else None,
             )
+        draft_hiddens = [draft_inputs[idx] for idx in self.config.dspark_target_layer_ids] if self.mtp else []
         if draft_hiddens:
             width = hidden_streams.shape[1]
-            draft_hiddens[:] = [hidden[:, -width:] for hidden in draft_hiddens]
+            draft_hiddens = [hidden[:, -width:] for hidden in draft_hiddens]
 
         hidden_states = self.norm(mhc_collapse(hidden_streams, pre_mix))
         outputs: Dict[str, Any] = {
@@ -359,6 +360,34 @@ class DeepseekV41Backbone(nn.Module):
         for stage, cache in zip(self.mtp, caches):
             stage.seed_window(main_x, position_ids, self.rotary_emb, cache)
         return main_x
+
+    def forward_dspark_train(
+        self,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        draft_hiddens: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """Teacher-forced DSpark on the packed row. Returns ``[B, S, hidden]``.
+
+        Decode runs one 5-token block after a verified token. Training cannot
+        afford that loop, so the three stages run once over the packed sequence
+        with causal sliding-window attention. Same modules as ``forward_spec``;
+        different position arithmetic (see ``forward_draft_packed``).
+        """
+        if not self.mtp:
+            raise RuntimeError("forward_dspark_train was called but this backbone has no DSpark stages")
+        if len(draft_hiddens) != len(self.config.dspark_target_layer_ids):
+            raise ValueError(
+                f"DSpark expected {len(self.config.dspark_target_layer_ids)} target-layer hiddens, "
+                f"got {len(draft_hiddens)}"
+            )
+        hidden_streams = expand_to_streams(inputs_embeds, self.config.hc_mult)
+        pre_mix = identity_pre_mix(hidden_streams, self.config.hc_mult)
+        main: Any = draft_hiddens
+        draft = None
+        for stage in self.mtp:
+            hidden_streams, pre_mix, main, draft = stage(hidden_streams, pre_mix, position_ids, self.rotary_emb, main)
+        return draft
 
     def forward_spec(
         self,
@@ -462,26 +491,43 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
         )
 
     def freeze_model(self) -> None:
-        """Keep the first ``n_trainable_layers`` trainable; freeze the rest.
+        """Freeze backbone layers that are not selected for training.
 
-        ``None`` is a no-op (full-parameter). Engram connections follow their
-        layer index, not the decoder-layer wrap, so a connection at layer 14 is
-        frozen when N=2 even though it is not a child of ``layers.14``. The final
-        RMSNorm rides the frozen tail. DSpark stages are serving-only and freeze
-        whenever they exist.
+        ``n_trainable_layers=N`` keeps ``layers[:N]`` (the 8xH20 default).
+        ``trainable_layer_ids`` names an explicit set — use it to keep the
+        DSpark target layers instead of the prefix. ``None`` on both trains
+        the whole stack, DSpark included.
+
+        Engram connections follow their layer index, not the decoder-layer
+        wrap, so a connection at layer 14 is frozen when that id is not
+        selected even though it is not a child of ``layers.14``. The final
+        RMSNorm rides the frozen tail. Partial backbone freeze freezes
+        DSpark unless ``freeze_mtp=False``: three draft stages are ~14 B,
+        and AdamW on them does not fit 8×H20 next to a 2-layer backbone.
         """
-        n = self.config.n_trainable_layers
-        if n is None:
+        trainable = self._trainable_backbone_layer_ids()
+        if trainable is None:
             return
         for layer_idx, layer in enumerate(self.model.layers):
-            if layer_idx >= n:
+            if layer_idx not in trainable:
                 layer.requires_grad_(False)
         for key, connection in self.model.engram.items():
-            if int(key) >= n:
+            if int(key) not in trainable:
                 connection.requires_grad_(False)
-        self.model.mtp.requires_grad_(False)
-        if n < self.config.num_hidden_layers:
+        freeze_mtp = True if self.config.freeze_mtp is None else self.config.freeze_mtp
+        if freeze_mtp:
+            self.model.mtp.requires_grad_(False)
+        last = self.config.num_hidden_layers - 1
+        if last not in trainable:
             self.model.norm.requires_grad_(False)
+
+    def _trainable_backbone_layer_ids(self) -> Optional[set]:
+        if self.config.trainable_layer_ids is not None:
+            return set(self.config.trainable_layer_ids)
+        n = self.config.n_trainable_layers
+        if n is None:
+            return None
+        return set(range(n))
 
     def forward(  # type: ignore[override]
         self,
@@ -518,7 +564,7 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
                 "deepseek_v41_llm requires position_ids: they carry the packed sample boundaries, and "
                 "assuming a single arange here would compress across them."
             )
-        return self.model(
+        outputs = self.model(
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
             ngram_embeds=ngram_embeds,
@@ -527,6 +573,18 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
             capture_seq_len=capture_seq_len,
             return_draft_hiddens=return_draft_hiddens,
         )
+        mtp_trainable = bool(self.model.mtp) and any(p.requires_grad for p in self.model.mtp.parameters())
+        if self.training and mtp_trainable:
+            draft_hiddens = outputs.get("draft_hiddens")
+            if not draft_hiddens:
+                raise RuntimeError(
+                    "DSpark is trainable but the backbone did not collect draft_hiddens. "
+                    "dspark_target_layer_ids must name live backbone layers."
+                )
+            outputs["dspark_hidden_states"] = self.model.forward_dspark_train(
+                inputs_embeds, position_ids, draft_hiddens
+            )
+        return outputs
 
 
 __all__ = [
