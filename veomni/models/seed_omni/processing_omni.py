@@ -14,7 +14,7 @@ the class registered for its ``model_type`` and is the single code path backing
 both :meth:`OmniProcessor.from_pretrained` (checkpoint on disk) and callers that
 already hold a resolved config in memory (e.g. ``OmniTrainer`` builds its
 dataloader's collator this way, decoupled from ``self.model``). Callers that
-need a :class:`~veomni.data.data_collator.SeedOmniCollator` (e.g. ``OmniTrainer``)
+need a :class:`~veomni.data.seed_omni.collator.SeedOmniCollator` (e.g. ``OmniTrainer``)
 build one directly from a processor — that composition is theirs to own, not
 this module's.
 
