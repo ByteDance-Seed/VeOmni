@@ -96,6 +96,13 @@ def test_gradient_accumulation_averages_micro_batch_gradients():
     torch.testing.assert_close(_accumulate_grads(2), _accumulate_grads(1))
 
 
+def test_the_moe_router_monitor_is_refused_before_anything_is_built():
+    args = SimpleNamespace(train=SimpleNamespace(moe_load_balance_monitor_interval=10))
+
+    with pytest.raises(AssertionError, match="moe_load_balance_monitor_interval"):
+        OmniTrainer(args)
+
+
 def test_callback_hooks_publish_the_stage_before_dispatch():
     trainer = OmniTrainer.__new__(OmniTrainer)
     trainer.state = TrainerState()

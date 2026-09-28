@@ -85,7 +85,6 @@ from ..base import VeOmniIter
 from ..callbacks import (
     EvaluateCallback,
     GlobalStateCallback,
-    MoERouterMonitorCallback,
     ProfileTraceCallback,
     TqdmCallback,
     TrainerState,
@@ -197,6 +196,9 @@ class OmniTrainer:
     LOG_SAMPLE: bool = True
 
     def __init__(self, args: OmniArguments):
+        assert args.train.moe_load_balance_monitor_interval <= 0, (
+            "OmniTrainer does not support the MoE router monitor; set train.moe_load_balance_monitor_interval=0."
+        )
         self.args = args
         self.device = self._setup(args)
         self.model = self._build_model_runtime()
@@ -361,7 +363,6 @@ class OmniTrainer:
         self.module_hf_ckpt_callback = OmniModuleHfCallback(self)
         self.global_state_callback = GlobalStateCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
-        self.moe_monitor_callback = MoERouterMonitorCallback(self)
         self._callbacks = [
             self.step_metrics_callback,
             self.tqdm_callback,
@@ -375,7 +376,6 @@ class OmniTrainer:
             self.module_hf_ckpt_callback,
             self.global_state_callback,
             self.evaluate_callback,
-            self.moe_monitor_callback,
         ]
         self.state = TrainerState()
 
