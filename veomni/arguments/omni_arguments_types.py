@@ -699,6 +699,10 @@ class OmniArguments:
                 "Otherwise, each node will save checkpoints to its local directory, which may cause inconsistencies or job failures."
             )
 
+        assert self.train.moe_load_balance_monitor_interval <= 0, (
+            "OmniTrainer does not support the MoE router monitor; set train.moe_load_balance_monitor_interval=0."
+        )
+
         self.train._derive_batch_config(self.model.accelerator)
 
         _validate_omni_accelerator(self.model.accelerator)

@@ -30,6 +30,7 @@ from veomni.arguments.omni_arguments_types import (
     OmniInferArguments,
     OmniModelRuntimeArguments,
     OmniModuleRuntimeArguments,
+    OmniTrainingArguments,
     _validate_omni_accelerator,
     build_omni_model_runtime_args,
     build_omni_module_runtime_args,
@@ -140,6 +141,16 @@ def test_omni_arguments_post_init_validates_the_top_level_default():
                 accelerator=AcceleratorConfig(torch_compile=TorchCompileConfig(enable=True)),
             ),
             data=OmniDataArguments(train_path=""),
+            infer=OmniInferArguments(),
+        )
+
+
+def test_omni_arguments_post_init_refuses_the_moe_router_monitor():
+    with pytest.raises(AssertionError, match="moe_load_balance_monitor_interval"):
+        OmniArguments(
+            model=OmniModelRuntimeArguments(model_path="/tmp/fake_omni"),
+            data=OmniDataArguments(train_path=""),
+            train=OmniTrainingArguments(moe_load_balance_monitor_interval=10),
             infer=OmniInferArguments(),
         )
 

@@ -196,9 +196,6 @@ class OmniTrainer:
     LOG_SAMPLE: bool = True
 
     def __init__(self, args: OmniArguments):
-        assert args.train.moe_load_balance_monitor_interval <= 0, (
-            "OmniTrainer does not support the MoE router monitor; set train.moe_load_balance_monitor_interval=0."
-        )
         self.args = args
         self.device = self._setup(args)
         self.model = self._build_model_runtime()
