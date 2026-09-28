@@ -14,14 +14,14 @@
 
 """Composite accelerated config + runtime.
 
-``OmniModelRuntimeConfig`` is the lightweight launcher dataclass.
+``OmniModelRuntimeArguments`` is the lightweight launcher dataclass.
 :class:`OmniModelRuntime` is heavier — import it from
 :mod:`.omni_model_runtime` when needed so config-only imports stay cheap.
 """
 
-from .omni_model_config import OmniModelRuntimeConfig
+from .omni_model_config import OmniModelRuntimeArguments
 
 
 __all__ = [
-    "OmniModelRuntimeConfig",
+    "OmniModelRuntimeArguments",
 ]

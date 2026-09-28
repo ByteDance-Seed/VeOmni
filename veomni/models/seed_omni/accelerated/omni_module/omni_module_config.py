@@ -14,7 +14,7 @@
 
 """VeOmni per-module runtime config — the accelerated counterpart of ``OmniModuleConfig``.
 
-:class:`OmniModuleRuntimeConfig` is one module's slice of a composed Omni model:
+:class:`OmniModuleRuntimeArguments` is one module's slice of a composed Omni model:
 the inherited :class:`~veomni.arguments.arguments_types.ModelArguments` fields
 (``model_path``, ``ops_implementation``, ``accelerator``, ``optimizer``, freeze,
 LoRA) plus the projection onto an HF :class:`OmniModuleConfig` descriptor.
@@ -24,9 +24,7 @@ or :class:`~veomni.models.seed_omni.modules.module_configuration_base.OmniModule
 those are HuggingFace checkpoint shapes. This dataclass is the launcher/runtime
 view; :meth:`to_hf_config` is the one-way projection.
 
-``OmniModuleRuntimeArguments`` is the public alias kept in
-:mod:`veomni.arguments.omni_arguments_types` so existing launcher imports keep
-working. YAML resolution (``build_omni_model_runtime_args``, ``build_omni_module_runtime_args``)
+It is re-exported from :mod:`veomni.arguments.omni_arguments_types`. YAML resolution (``build_omni_model_runtime_args``, ``build_omni_module_runtime_args``)
 stays in ``arguments/`` to avoid an arguments ↔ accelerated import cycle.
 """
 
@@ -48,7 +46,7 @@ def hf_module_model_config(model_config: dict | None) -> dict:
 
 
 @dataclass
-class OmniModuleRuntimeConfig(ModelArguments):
+class OmniModuleRuntimeArguments(ModelArguments):
     """Per-module runtime — one module's slice of a composed Omni model.
 
     ``ModelArguments`` already is a complete training unit: the model
@@ -91,6 +89,6 @@ class OmniModuleRuntimeConfig(ModelArguments):
 
 
 __all__ = [
-    "OmniModuleRuntimeConfig",
+    "OmniModuleRuntimeArguments",
     "hf_module_model_config",
 ]

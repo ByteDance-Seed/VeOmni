@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from .....arguments.omni_arguments_types import OmniGraphProfileArguments, OmniTrainingArguments
     from .....trainer.callbacks import TrainerState
     from ..omni_module.omni_module_runtime import ModuleRuntime
-    from .omni_model_config import OmniModelRuntimeConfig
+    from .omni_model_config import OmniModelRuntimeArguments
 
 
 logger = get_logger(__name__)
@@ -180,7 +180,7 @@ class OmniModelRuntime:
         model: OmniModel,
         *,
         module_runtimes: Mapping[str, ModuleRuntime] | None = None,
-        omni_model_runtime_args: OmniModelRuntimeConfig | None = None,
+        omni_model_runtime_args: OmniModelRuntimeArguments | None = None,
         train_args: OmniTrainingArguments | None = None,
     ) -> None:
         self.model = model
@@ -570,12 +570,12 @@ class OmniModelRuntime:
 
 
 def build_omni_model_runtime(
-    omni_model_runtime_args: OmniModelRuntimeConfig,
+    omni_model_runtime_args: OmniModelRuntimeArguments,
     *,
     train: OmniTrainingArguments | None = None,
     for_inference: bool = False,
 ) -> OmniModelRuntime:
-    """Compose a VeOmni-managed model from a resolved :class:`OmniModelRuntimeConfig`.
+    """Compose a VeOmni-managed model from a resolved :class:`OmniModelRuntimeArguments`.
 
     ``train`` is the global :class:`~....arguments.omni_arguments_types.OmniTrainingArguments`
     (unset for inference) — forwarded to every :class:`ModuleRuntime` so its

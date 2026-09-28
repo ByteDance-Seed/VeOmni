@@ -409,11 +409,3 @@ def test_omni_module_config_owns_descriptor_conversion():
     assert exported["processor_config"] == {"image_size": 224}
     assert "model_path" not in exported
     assert "ops_implementation" not in exported
-
-
-def test_omni_module_runtime_config_is_the_arguments_alias():
-    from veomni.arguments.omni_arguments_types import OmniModelRuntimeArguments, OmniModuleRuntimeArguments
-    from veomni.models.seed_omni.accelerated import OmniModelRuntimeConfig, OmniModuleRuntimeConfig
-
-    assert OmniModuleRuntimeArguments is OmniModuleRuntimeConfig
-    assert OmniModelRuntimeArguments is OmniModelRuntimeConfig

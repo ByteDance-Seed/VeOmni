@@ -19,11 +19,10 @@ A single ``base.yaml`` drives both
 :class:`~veomni.trainer.omni.omni_inferencer.OmniInferencer`.
 
 The model blocks extend :mod:`veomni.arguments.arguments_types`. Both
-:class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_config.OmniModuleRuntimeConfig`
+:class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_config.OmniModuleRuntimeArguments`
 and
-:class:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_config.OmniModelRuntimeConfig`
-subclass ``ModelArguments`` (aliased here as :class:`OmniModuleRuntimeArguments`
-/ :class:`OmniModelRuntimeArguments`). The model fields, the ``accelerator`` /
+:class:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_config.OmniModelRuntimeArguments`
+subclass ``ModelArguments``. The model fields, the ``accelerator`` /
 ``optimizer`` pair, HDFS localization and the cached ``fqn_to_index_mapping``
 are declared once and shared with ``ModelArguments``. Only ``data`` /
 ``train`` / ``infer`` are Omni's own.
@@ -56,8 +55,8 @@ from typing import Any, Literal, Optional, Union
 
 import yaml
 
-from ..models.seed_omni.accelerated.omni_model.omni_model_config import OmniModelRuntimeConfig
-from ..models.seed_omni.accelerated.omni_module.omni_module_config import OmniModuleRuntimeConfig
+from ..models.seed_omni.accelerated.omni_model.omni_model_config import OmniModelRuntimeArguments
+from ..models.seed_omni.accelerated.omni_module.omni_module_config import OmniModuleRuntimeArguments
 from ..utils import logging
 from ..utils.fs import is_non_local
 from .arguments_types import (
@@ -70,10 +69,6 @@ from .arguments_types import (
     WandbConfig,
 )
 from .parser import _deep_update, _instantiate_recursive
-
-
-OmniModuleRuntimeArguments = OmniModuleRuntimeConfig
-OmniModelRuntimeArguments = OmniModelRuntimeConfig
 
 
 logger = logging.get_logger(__name__)
@@ -751,9 +746,7 @@ __all__ = [
     "OmniGraphProfileArguments",
     "OmniInferArguments",
     "OmniModelRuntimeArguments",
-    "OmniModelRuntimeConfig",
     "OmniModuleRuntimeArguments",
-    "OmniModuleRuntimeConfig",
     "OmniTrainingArguments",
     "_hf_module_model_config",
     "_is_omni_checkpoint_root",

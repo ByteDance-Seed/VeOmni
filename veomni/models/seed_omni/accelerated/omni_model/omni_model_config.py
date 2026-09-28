@@ -14,7 +14,7 @@
 
 """VeOmni composite runtime config — the accelerated counterpart of ``OmniConfig``.
 
-:class:`OmniModelRuntimeConfig` is one composed Omni model: the inherited
+:class:`OmniModelRuntimeArguments` is one composed Omni model: the inherited
 :class:`~veomni.arguments.arguments_types.ModelArguments` fields (which double as
 the defaults each module is merged over) plus the modules it decomposes into
 and every training / generation graph scenario.
@@ -23,9 +23,7 @@ It does **not** inherit :class:`~veomni.models.seed_omni.configuration_omni.Omni
 that is the HuggingFace checkpoint shape. This dataclass is the launcher/runtime
 view; :meth:`to_hf_config` is the one-way projection.
 
-``OmniModelRuntimeArguments`` is the public alias kept in
-:mod:`veomni.arguments.omni_arguments_types` so existing launcher imports keep
-working. YAML resolution (``build_omni_model_runtime_args``, ``build_omni_module_runtime_args``)
+It is re-exported from :mod:`veomni.arguments.omni_arguments_types`. YAML resolution (``build_omni_model_runtime_args``, ``build_omni_module_runtime_args``)
 stays in ``arguments/`` to avoid an arguments ↔ accelerated import cycle.
 """
 
@@ -34,11 +32,11 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .....arguments.arguments_types import ModelArguments
-from ..omni_module.omni_module_config import OmniModuleRuntimeConfig
+from ..omni_module.omni_module_config import OmniModuleRuntimeArguments
 
 
 @dataclass
-class OmniModelRuntimeConfig(ModelArguments):
+class OmniModelRuntimeArguments(ModelArguments):
     """One composed Omni model — a training unit plus the modules it decomposes into.
 
     YAML supplies the inherited ``model_path``, ``model_config``,
@@ -47,7 +45,7 @@ class OmniModelRuntimeConfig(ModelArguments):
     fills ``modules``, the graph scenario maps, and the scenario keys.
     """
 
-    modules: dict[str, OmniModuleRuntimeConfig] = field(default_factory=dict)
+    modules: dict[str, OmniModuleRuntimeArguments] = field(default_factory=dict)
     training_graphs: dict[str, Any] = field(default_factory=dict)
     generation_graphs: dict[str, Any] = field(default_factory=dict)
     train_type: Optional[str] = None
@@ -135,4 +133,4 @@ class OmniModelRuntimeConfig(ModelArguments):
         )
 
 
-__all__ = ["OmniModelRuntimeConfig"]
+__all__ = ["OmniModelRuntimeArguments"]

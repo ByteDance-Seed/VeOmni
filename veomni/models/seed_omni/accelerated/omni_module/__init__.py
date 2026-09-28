@@ -14,15 +14,15 @@
 
 """Per-module accelerated config + runtime.
 
-``OmniModuleRuntimeConfig`` is the lightweight launcher dataclass.
+``OmniModuleRuntimeArguments`` is the lightweight launcher dataclass.
 :class:`ModuleRuntime` is heavier — import it from
 :mod:`.omni_module_runtime` when needed so config-only imports stay cheap.
 """
 
-from .omni_module_config import OmniModuleRuntimeConfig, hf_module_model_config
+from .omni_module_config import OmniModuleRuntimeArguments, hf_module_model_config
 
 
 __all__ = [
-    "OmniModuleRuntimeConfig",
+    "OmniModuleRuntimeArguments",
     "hf_module_model_config",
 ]

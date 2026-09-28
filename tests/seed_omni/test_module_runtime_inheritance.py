@@ -48,10 +48,7 @@ def test_module_runtime_is_a_model_runtime():
 def test_omni_runtime_arguments_are_model_arguments():
     from veomni.arguments import ModelArguments
     from veomni.arguments.omni_arguments_types import OmniModelRuntimeArguments, OmniModuleRuntimeArguments
-    from veomni.models.seed_omni.accelerated import OmniModelRuntimeConfig, OmniModuleRuntimeConfig
 
-    assert OmniModuleRuntimeArguments is OmniModuleRuntimeConfig
-    assert OmniModelRuntimeArguments is OmniModelRuntimeConfig
     assert issubclass(OmniModuleRuntimeArguments, ModelArguments)
     assert issubclass(OmniModelRuntimeArguments, ModelArguments)
 
