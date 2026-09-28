@@ -41,7 +41,7 @@ Omni-specific layout:
 
 The runtime *classes* live next to :class:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.OmniModelRuntime`
 / :class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime`.
-Resolution helpers (``resolve_omni_model``, ``build_omni_model_runtime``, …)
+Resolution helpers (``resolve_omni_model``, ``build_module_runtime_args``, …)
 stay in this module so :class:`OmniArguments` can call them without an
 arguments ↔ accelerated import cycle.
 """
@@ -68,7 +68,6 @@ from .arguments_types import (
     ModelArguments,
     ProfileConfig,
     WandbConfig,
-    _resolve_hdfs_path,
 )
 from .parser import _deep_update, _instantiate_recursive
 
@@ -192,62 +191,6 @@ def resolve_omni_model(args: "OmniArguments", *, for_inference: bool = False) ->
     )
 
 
-def build_omni_model_runtime(
-    global_args: OmniModuleRuntimeArguments,
-    model_path: Union[str, os.PathLike],
-    train_graph: Union[str, os.PathLike, Mapping[str, Any], list, dict],
-    infer_graph: Union[str, os.PathLike, Mapping[str, Any], list, dict],
-    train_modules: Union[str, os.PathLike, dict[str, Any]],
-    train_type: Optional[str] = None,
-    infer_type: Optional[str] = None,
-    generation_kwargs: Optional[dict[str, Any]] = None,
-    *,
-    for_inference: bool = False,
-    accelerator: Any = None,
-    optimizer: Any = None,
-) -> OmniModelRuntimeArguments:
-    """Build a resolved :class:`OmniModelRuntimeArguments` from launcher YAML paths (tests / export)."""
-    # Localize before splitting into modules, the order `resolve_omni_model` gets for
-    # free from `BaseModelArguments.__post_init__`. Joining subfolders onto a remote
-    # root instead would let each module localize `<remote_root>/<module>` separately:
-    # the local cache dir is keyed on a hash of the source path, so the root and its
-    # modules would land in unrelated directories and the root would no longer be a
-    # prefix of them -- which anything re-deriving `<root>/<module>` relies on.
-    model_path = _resolve_hdfs_path(str(model_path))
-
-    modules = build_module_runtime_args(
-        global_args,
-        model_path,
-        train_modules,
-        for_inference=for_inference,
-    )
-    training_graphs = _load_graph_map(train_graph)
-    generation_graphs = _load_graph_map(infer_graph)
-    if train_type is not None and train_type not in training_graphs:
-        known = ", ".join(training_graphs)
-        raise KeyError(f"Unknown train_type {train_type!r}; expected one of: {known}.")
-    if infer_type is not None and infer_type not in generation_graphs:
-        known = ", ".join(generation_graphs)
-        raise KeyError(f"Unknown infer_type {infer_type!r}; expected one of: {known}.")
-
-    shared_fields = {f.name for f in fields(ModelArguments)}
-    model_kwargs = {name: getattr(global_args, name) for name in shared_fields if name != "model_path"}
-    if accelerator is not None:
-        model_kwargs["accelerator"] = accelerator
-    if optimizer is not None:
-        model_kwargs["optimizer"] = optimizer
-    return OmniModelRuntimeArguments(
-        model_path=str(model_path),
-        **model_kwargs,
-        modules=modules,
-        training_graphs=training_graphs,
-        generation_graphs=generation_graphs,
-        train_type=train_type,
-        infer_type=infer_type,
-        generation_kwargs=dict(generation_kwargs or {}),
-    )
-
-
 def build_module_runtime_args(
     global_args: OmniModuleRuntimeArguments,
     model_path: Union[str, os.PathLike],
@@ -274,21 +217,6 @@ def build_module_runtime_args(
         )
         runtime_modules[name] = module_args
     return runtime_modules
-
-
-def build_module_args(config, name: str) -> OmniModuleRuntimeArguments:
-    """Instantiate :class:`OmniModuleRuntimeArguments` from an ``OmniConfig`` module entry.
-
-    A checkpoint entry is already keyed on launcher field names (``model_path``,
-    ``model_config``, ``processor_config``, ``ops_implementation``), so it needs
-    no flattening — only a copy, so instantiation cannot write through into the
-    config's own entry.
-    """
-    entry = config._module_entries.get(name)
-    if entry is None:
-        known = ", ".join(config.module_names) or "(none)"
-        raise KeyError(f"Module '{name}' not found in OmniConfig; known modules: {known}.")
-    return _instantiate_recursive(OmniModuleRuntimeArguments, deepcopy(entry))
 
 
 def _to_module_global_args(model_runtime: OmniModelRuntimeArguments) -> OmniModuleRuntimeArguments:
@@ -839,8 +767,6 @@ __all__ = [
     "OmniTrainingArguments",
     "_hf_module_model_config",
     "_is_omni_checkpoint_root",
-    "build_module_args",
     "build_module_runtime_args",
-    "build_omni_model_runtime",
     "resolve_omni_model",
 ]

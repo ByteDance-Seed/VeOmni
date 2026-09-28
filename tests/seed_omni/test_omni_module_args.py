@@ -18,7 +18,6 @@ from veomni.arguments.omni_arguments_types import (
     OmniInferArguments,
     OmniModelRuntimeArguments,
     build_module_runtime_args,
-    build_omni_model_runtime,
 )
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 
@@ -31,7 +30,7 @@ def _cfg_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "fake_model"
 
 
-def _omni_args(*, model_path: str = "/tmp/fake_omni") -> OmniArguments:
+def _omni_args(*, model_path: str = "/tmp/fake_omni", **launcher_config) -> OmniArguments:
     cfg_dir = _cfg_dir()
     return OmniArguments(
         model=OmniModelRuntimeArguments(
@@ -40,6 +39,7 @@ def _omni_args(*, model_path: str = "/tmp/fake_omni") -> OmniArguments:
                 "modules": str(cfg_dir / "train/modules_train.yaml"),
                 "train_graph": str(cfg_dir / "train/graph_train.yaml"),
                 "infer_graph": {"infer_gen": str(cfg_dir / "infer/graph_infer_gen.yaml")},
+                **launcher_config,
             },
         ),
         data=OmniDataArguments(train_path=""),
@@ -66,17 +66,7 @@ def _with_module_configs(cfg: OmniConfig) -> OmniConfig:
 
 
 def _model_runtime(**kwargs) -> OmniModelRuntimeArguments:
-    model_path = kwargs.pop("model_path", "/tmp/fake_omni")
-    args = _omni_args(model_path=model_path)
-    cfg_dir = _cfg_dir()
-    return build_omni_model_runtime(
-        global_args=args._to_module_global_args(),
-        model_path=model_path,
-        train_modules=str(cfg_dir / "train/modules_train.yaml"),
-        train_graph=kwargs.pop("train_graph", str(cfg_dir / "train/graph_train.yaml")),
-        infer_graph=kwargs.pop("infer_graph", str(cfg_dir / "infer/graph_infer_gen.yaml")),
-        **kwargs,
-    )
+    return _omni_args(**kwargs).resolve_model()
 
 
 def test_runtime_config_keeps_the_full_launcher_view():
