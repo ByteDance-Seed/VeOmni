@@ -58,7 +58,6 @@ def cta_threads(block_H, block_size):
 @tilelang.jit(out_idx=[-1])
 def preprocess(
     B,
-    S,
     H,
     D,
     block_ND=32,
@@ -68,6 +67,7 @@ def preprocess(
 ):
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
+    S = T.dynamic("seq_len")
     shape = [B, S, H, D]
 
     @T.prim_func
@@ -131,7 +131,6 @@ def postprocess(
 )
 def bwd(
     B,
-    S,
     S_kv,
     H,
     D,
@@ -152,6 +151,12 @@ def bwd(
         sm_scale = D ** (-0.5)
     sm_scale_mul_reciprocal_log2 = sm_scale * 1.44269504  # log2(e)
 
+    # The query length changes with every unpacked sample, and under sequence
+    # parallelism it is the local shard's length, so a constant here compiles a new
+    # kernel (~20 s) per length. Symbolic S costs <=1% of kernel time; a symbolic
+    # batch as well cost up to 5% (measured on H20 at H=64, D=512), and B is always 1
+    # in training, so it stays a constant.
+    S = T.dynamic("seq_len")
     q_shape = [B, S, H, D]
     kv_shape = [B, S_kv, D]
     o_shape = [B, S, H, D]
@@ -373,8 +378,8 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
         kv = torch.cat([kv, kv.new_zeros(B, kv_pad, D)], dim=1).contiguous()
     S_kv = unpadded_S_kv + kv_pad
 
-    preprocess_kernel = preprocess(B, S, padded_H, D)
-    bwd_kernel = bwd(B, S, S_kv, padded_H, D, topk, sm_scale)
+    preprocess_kernel = preprocess(B, padded_H, D)
+    bwd_kernel = bwd(B, S_kv, padded_H, D, topk, sm_scale)
     postprocess_kernel = postprocess(B, S_kv, D)
 
     delta = preprocess_kernel(o, do)

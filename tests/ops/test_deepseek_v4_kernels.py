@@ -424,9 +424,9 @@ def test_tilelang_sparse_attention_backward_shares_kernel_across_kv_lengths(monk
     requested_kv_lengths = []
     original_bwd = sparse_mla_bwd.bwd
 
-    def tracking_bwd(B, S, S_kv, *args, **kwargs):
+    def tracking_bwd(B, S_kv, *args, **kwargs):
         requested_kv_lengths.append(S_kv)
-        return original_bwd(B, S, S_kv, *args, **kwargs)
+        return original_bwd(B, S_kv, *args, **kwargs)
 
     monkeypatch.setattr(sparse_mla_bwd, "bwd", tracking_bwd)
 
@@ -454,6 +454,41 @@ def test_tilelang_sparse_attention_backward_shares_kernel_across_kv_lengths(monk
 
     # One specialization key for all three lengths, so TileLang compiles once.
     assert set(requested_kv_lengths) == {kv_block}
+
+
+def test_tilelang_sparse_attention_backward_shares_kernel_across_query_lengths():
+    """Unpacked samples, and sequence-parallel shards of them, vary the query length
+    every step. A backward specialized on it stalls each new length for tens of
+    seconds of compilation."""
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang
+    from veomni.ops.kernels.deepseek_v4 import tilelang_sparse_mla_bwd as sparse_mla_bwd
+
+    # tilelang.jit caches on the call arguments, so a query length that is not an
+    # argument is one that cannot key a recompile.
+    for entry in (sparse_mla_bwd.preprocess, sparse_mla_bwd.bwd, sparse_mla_bwd.postprocess):
+        params = inspect.signature(getattr(entry, "func", entry)).parameters
+        assert "S" not in params
+
+    batch, heads, dim, kv_len, topk = 1, 8, 512, 96, 64
+    scale = dim**-0.5
+    # 45 and 77 leave a partial preprocess tile, so the dynamic tail must be guarded.
+    for seqlen in (32, 45, 77):
+        torch.manual_seed(seqlen)
+        q = torch.randn(batch, seqlen, heads, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        kv = torch.randn(batch, kv_len, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        sinks = torch.randn(heads, device=DEVICE, requires_grad=True)
+        indices = torch.randint(kv_len, (batch, seqlen, topk), device=DEVICE, dtype=torch.int32)
+        indices[..., -1] = -1
+
+        actual = sparse_attn_tilelang(q, kv, sinks, indices, scale)
+        expected = _sparse_attention_reference(q, kv, sinks, indices, scale)
+        grad = torch.randn_like(actual)
+        expected_grads = torch.autograd.grad((expected * grad.float()).sum(), (q, kv, sinks))
+        actual.backward(grad)
+        for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
+            assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+        torch.testing.assert_close(sinks.grad, expected_grads[2], rtol=2e-2, atol=2e-2)
 
 
 def test_deepseek_v4_generated_attention_dispatch_matches_eager():
