@@ -427,6 +427,17 @@ class TestModuleShape:
         backbone = DeepseekV41Backbone(make_config())
         assert sorted(int(key) for key in backbone.engram.keys()) == ENGRAM_LAYERS
 
+    def test_hyperconnection_parameters_are_initialized(self):
+        """Raw ``fn`` / ``base`` / ``scale`` are not ``nn.Linear``; empty would NaN Sinkhorn."""
+        backbone = DeepseekV41Backbone(make_config())
+        for name, param in backbone.named_parameters():
+            if name.endswith(".fn") or name.endswith(".base") or name.endswith(".scale"):
+                assert torch.isfinite(param).all(), name
+                if name.endswith(".scale"):
+                    torch.testing.assert_close(param, torch.ones_like(param))
+                if name.endswith(".base"):
+                    torch.testing.assert_close(param, torch.zeros_like(param))
+
     def test_registered_under_its_model_type(self):
         from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
 

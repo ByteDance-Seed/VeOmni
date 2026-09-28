@@ -64,9 +64,10 @@ from .decoder_layer import DeepseekV41DecoderLayer
 from .dspark import build_dspark_blocks
 from .engram_connection import build_engram_connections
 from .inference import DeepseekV41LlmInferenceMixin
-from .mhc import expand_to_streams, identity_pre_mix, mhc_collapse
+from .mhc import DeepseekV41HyperConnection, expand_to_streams, identity_pre_mix, mhc_collapse
+from .moe import DeepseekV41TopKRouter
 from .quantization import veomni_qat_implementation
-from .reuse import DeepseekV4RMSNorm
+from .reuse import DeepseekV4Experts, DeepseekV4RMSNorm
 from .reuse import veomni_qat_implementation as veomni_v4_expert_qat_implementation
 
 
@@ -421,6 +422,26 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
         self._decode_cache = None
         self._next_position = 0
         self.post_init()
+
+    def _init_weights(self, module: nn.Module) -> None:
+        """Fill the raw ``Parameter``s HF's Linear/Embedding init does not see.
+
+        mHC ``fn``/``base``/``scale``, the router, and stacked expert slabs are
+        ``torch.empty`` until this runs. V4 does the same in its generated
+        ``_init_weights``; without it a random-init toy Sinkhorn/MoE is a lottery.
+        Checkpoint load overwrites these.
+        """
+        super()._init_weights(module)
+        std = self.config.initializer_range
+        if isinstance(module, DeepseekV41HyperConnection):
+            nn.init.normal_(module.fn, mean=0.0, std=std)
+            nn.init.zeros_(module.base)
+            nn.init.ones_(module.scale)
+        elif isinstance(module, DeepseekV41TopKRouter):
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+        elif isinstance(module, DeepseekV4Experts) and not getattr(module, "experts_are_quantized", False):
+            nn.init.normal_(module.gate_up_proj, mean=0.0, std=std)
+            nn.init.normal_(module.down_proj, mean=0.0, std=std)
 
     def get_input_embeddings(self) -> nn.Module:
         """There is none -- the text encoder owns it.

@@ -88,6 +88,19 @@ class DeepseekV41HyperConnection(nn.Module):
         self.base = nn.Parameter(torch.empty(mix))
         # One learned scale per output: pre, post, comb.
         self.scale = nn.Parameter(torch.empty(3))
+        self._initializer_range = config.initializer_range
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Match V4's HyperConnection init: ``fn ~ N(0, std)``, ``base = 0``, ``scale = 1``.
+
+        These are raw ``Parameter``s, not ``nn.Linear``, so HF's default
+        ``_init_weights`` would leave ``torch.empty`` garbage. Sinkhorn on nan
+        ``comb`` is how a random-init toy forward sporadically explodes.
+        """
+        nn.init.normal_(self.fn, mean=0.0, std=self._initializer_range)
+        nn.init.zeros_(self.base)
+        nn.init.ones_(self.scale)
 
     def forward(self, hidden_streams: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``[B, S, hc, D]`` -> ``pre[B, S, hc]``, ``post[B, S, hc]``, ``comb[B, S, hc, hc]``."""

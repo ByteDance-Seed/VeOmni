@@ -105,10 +105,15 @@ class DeepseekV41TopKRouter(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.score_fn = ACT2FN[config.scoring_func]
         self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim))
+        self._initializer_range = config.initializer_range
         self.e_score_correction_bias = nn.Buffer(torch.zeros(self.num_experts))
         self.e_score_correction_bias_vl = (
             nn.Buffer(torch.zeros(self.num_experts)) if config.enable_vision_routing_bias else None
         )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.weight, mean=0.0, std=self._initializer_range)
 
     def forward(
         self,
