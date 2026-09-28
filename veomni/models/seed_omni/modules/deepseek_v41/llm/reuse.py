@@ -69,6 +69,12 @@ DeepseekV4MLP = _generated.DeepseekV4MLP
 #: ``llm/accelerated/accelerated.py``).
 veomni_qat_implementation = _generated.veomni_qat_implementation
 
+#: The fused-MoE guard in :class:`DeepseekV4Experts`, re-exported for the same
+#: reason. Unbound, the experts run V4's eager loop, which indexes the stacked
+#: slabs with global expert ids and so cannot run on an EP shard; it also skips
+#: the fp4 expert QAT, which is wired on the fused path only.
+veomni_moe_experts_forward = _generated.veomni_moe_experts_forward
+
 
 __all__ = [
     "DeepseekV4Experts",
@@ -76,5 +82,6 @@ __all__ = [
     "DeepseekV4MLP",
     "DeepseekV4RMSNorm",
     "DeepseekV4UnweightedRMSNorm",
+    "veomni_moe_experts_forward",
     "veomni_qat_implementation",
 ]

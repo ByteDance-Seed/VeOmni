@@ -64,10 +64,10 @@ from .decoder_layer import DeepseekV41DecoderLayer
 from .dspark import build_dspark_blocks
 from .engram_connection import build_engram_connections
 from .inference import DeepseekV41LlmInferenceMixin
-from .mhc import DeepseekV41HyperConnection, expand_to_streams, identity_pre_mix, mhc_collapse
+from .mhc import DeepseekV41HyperConnection, expand_to_streams, identity_pre_mix, mhc_collapse, veomni_mhc_post
 from .moe import DeepseekV41TopKRouter
 from .quantization import veomni_qat_implementation
-from .reuse import DeepseekV4Experts, DeepseekV4RMSNorm
+from .reuse import DeepseekV4Experts, DeepseekV4RMSNorm, veomni_moe_experts_forward
 from .reuse import veomni_qat_implementation as veomni_v4_expert_qat_implementation
 
 
@@ -532,6 +532,8 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
 __all__ = [
     "DeepseekV41Backbone",
     "DeepseekV41Llm",
+    "veomni_mhc_post",
+    "veomni_moe_experts_forward",
     "veomni_qat_implementation",
     "veomni_v4_expert_qat_implementation",
 ]
