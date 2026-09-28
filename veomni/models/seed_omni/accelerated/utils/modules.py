@@ -17,14 +17,11 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
-
-from ...modules.module_modeling_base import PretrainedOmniModule
-from .dispatch import unwrap_module_chain
 
 
 def save_module_subdirectory(
@@ -64,26 +61,6 @@ def save_module_subdirectory(
         module.save_pretrained(module_dir, **kwargs)
 
 
-def iter_named_omni_modules(
-    module_names: Iterable[str],
-    modules: Mapping[str, nn.Module],
-) -> Iterator[tuple[str, PretrainedOmniModule]]:
-    """Yield ``(name, raw module)`` for every graph participant behind wrappers.
-
-    Filters on :class:`PretrainedOmniModule` (which owns the ``reset`` /
-    ``finalize`` hooks) rather than a mixin, so a native module an eager
-    inference build loads is reset and finalized like an accelerated one.
-    """
-    for name in module_names:
-        wrapped = modules.get(name)
-        if wrapped is None:
-            continue
-        raw = unwrap_module_chain(wrapped)
-        if isinstance(raw, PretrainedOmniModule):
-            yield name, raw
-
-
 __all__ = [
-    "iter_named_omni_modules",
     "save_module_subdirectory",
 ]

@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 from contextlib import nullcontext
 from dataclasses import fields
-from typing import TYPE_CHECKING, Any, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 import torch
 
@@ -29,7 +29,7 @@ from .....utils.logging import get_logger
 from ...modeling_omni import OmniModel
 from ...utils.graph_profiler import GraphProfiler
 from ..utils.executor import TrainNodeRunner, execute_generation_node
-from ..utils.modules import iter_named_omni_modules, save_module_subdirectory
+from ..utils.modules import save_module_subdirectory
 
 
 if TYPE_CHECKING:
@@ -161,17 +161,18 @@ class OmniModelRuntime:
 
     The two lines stay apart: :class:`OmniModel` holds each runtime's bare
     module (:attr:`ModuleRuntime.omni_module`), and whatever a runtime wrapped
-    it in (DDP, LoRA) stays on the runtime. Nodes, generation and export call
-    the module through its runtime (:meth:`_module_to_call`), so a DDP
-    module still syncs its gradients.
+    it in (DDP, LoRA) stays on the runtime. Nodes and generation call the
+    module through its runtime (:meth:`get_module`), so a DDP module still
+    syncs its gradients.
 
     Both are used through the single ``self.model`` handle on the trainer /
     inferencer. APIs that need no wrapper handling are forwarded via
-    :meth:`__getattr__` (``config``, ``modules_dict``, …).
+    :meth:`__getattr__` (``config``, ``modules_dict``, :meth:`OmniModel.reset`,
+    :meth:`OmniModel.named_omni_modules`, …).
     :meth:`forward` enters the (possibly FSDP-wrapped) :class:`OmniModel` so
     root leftover params unshard, then :meth:`OmniModel.forward` runs the
-    training graph. :meth:`clip_grad_norm`, :meth:`generate`, :meth:`save_pretrained`,
-    :meth:`reset`, and :meth:`named_omni_modules` stay on this wrapper, and so do
+    training graph. :meth:`get_module`, :meth:`clip_grad_norm`, :meth:`generate` and
+    :meth:`save_pretrained` stay on this wrapper, and so do
     :attr:`optimizer` / :attr:`lr_scheduler`, which step every module's own.
     """
 
@@ -383,7 +384,7 @@ class OmniModelRuntime:
         runner = TrainNodeRunner(profiler=profiler, scope_fn=self.module_context)
 
         def run_node(module: Any, node: Any, batch: dict[str, Any]) -> None:
-            runner(self._module_to_call(node.module), node, batch)
+            runner(self.get_module(node.module), node, batch)
 
         return self.model(batch, node_runner=run_node)
 
@@ -423,7 +424,7 @@ class OmniModelRuntime:
         profiler = profiler if profiler is not None else self._step_profiler
         model = self.model
         ctx: dict[str, Any] = request
-        modules = {name: self._module_to_call(name) for name in model._module_names}
+        modules = {name: self.get_module(name) for name in model._module_names}
         generation_kwargs = model.resolve_generation_kwargs(generation_kwargs)
         max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
         total_steps = 0
@@ -469,22 +470,14 @@ class OmniModelRuntime:
         if profiler is not None and len(generated) > before:
             profiler.record(f"{label}:{generated[-1]['type']}")
 
-    def _module_to_call(self, name: str) -> Any:
-        """Module ``name`` as its runtime wrapped it, else the bare module :class:`OmniModel` holds."""
+    def get_module(self, name: str) -> Any:
+        """Module ``name`` as the graph runs it: wrapped as its runtime wrapped it.
+
+        :meth:`OmniModel.get_module` returns the bare module the composed model
+        holds; a DDP / LoRA wrapper lives on the module's runtime instead.
+        """
         module_runtime = self.module_runtimes.get(name)
-        return module_runtime.model if module_runtime is not None else self.model.modules_dict[name]
-
-    def named_omni_modules(self) -> Iterator[tuple[str, Any]]:
-        """Yield ``(name, module)`` for every graph participant (unwraps wrappers)."""
-        yield from iter_named_omni_modules(self.model._module_names, self.model.modules_dict)
-
-    def reset(self) -> None:
-        """Clear per-conversation inference runtime state (unwraps wrapped modules)."""
-        model = self.model
-        model.generation_graph.reset()
-        model._generated.clear()
-        for _, module in self.named_omni_modules():
-            module.reset_global_inference_state()
+        return module_runtime.model if module_runtime is not None else self.model.get_module(name)
 
     def save_pretrained(self, save_directory: str | os.PathLike, **kwargs: Any) -> None:
         """Save the omni-root HF layout (config + graphs + module sidecars).
