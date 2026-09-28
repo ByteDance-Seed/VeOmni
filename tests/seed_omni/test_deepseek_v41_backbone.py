@@ -354,6 +354,8 @@ class TestIndexerKLAggregation:
 class TestShrinkSchedule:
     def test_a_two_layer_toy_keeps_the_ced_split(self):
         schedule = shrink_layer_schedule(2)
+        assert schedule["kept_layer_ids"] == [2, 20]
+        schedule.pop("kept_layer_ids")
         config = make_config(**schedule, n_routed_experts=8, num_experts_per_tok=2)
         assert config.num_hidden_layers == 2
         assert config.candidate_source_layer_id == 1
@@ -370,6 +372,8 @@ class TestShrinkSchedule:
         assert schedule["candidate_source_layer_id"] == 20
         assert schedule["engram_layer_ids"] == [1, 14]
         assert schedule["dspark_target_layer_ids"] == [37, 38, 39]
+        assert schedule["kept_layer_ids"] == list(range(40))
+        schedule.pop("kept_layer_ids")
         DeepseekV41LlmConfig(**schedule)
 
     def test_candidate_source_must_move_with_the_layer_count(self):

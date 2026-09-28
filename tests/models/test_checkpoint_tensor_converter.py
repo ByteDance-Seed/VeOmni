@@ -1468,3 +1468,68 @@ class TestDeepseekV41DequantConverter:
         model._create_checkpoint_tensor_converter = staticmethod(DeepseekV41Llm._create_checkpoint_tensor_converter)
         converter = get_checkpoint_tensor_converter(model)
         assert isinstance(converter, DeepseekV41DequantConverter)
+
+    def test_two_layer_stack_loads_released_layers_2_and_20(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.checkpoint_tensor_converter import (
+            remap_shrunk_checkpoint_key,
+        )
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import shrink_layer_schedule
+
+        schedule = shrink_layer_schedule(2, n_draft=0)
+        layer_map = {orig: new for new, orig in enumerate(schedule["kept_layer_ids"])}
+        engram_map = {1: 0, 14: 1}
+        assert layer_map == {2: 0, 20: 1}
+        assert (
+            remap_shrunk_checkpoint_key("model.layers.2.self_attn.wq_a.weight", layer_map, engram_map, drop_mtp=True)
+            == "model.layers.0.self_attn.wq_a.weight"
+        )
+        assert (
+            remap_shrunk_checkpoint_key("model.layers.20.mlp.experts.down_proj", layer_map, engram_map, drop_mtp=True)
+            == "model.layers.1.mlp.experts.down_proj"
+        )
+        assert (
+            remap_shrunk_checkpoint_key("model.layers.0.self_attn.wq_a.weight", layer_map, engram_map, drop_mtp=True)
+            is None
+        )
+        assert (
+            remap_shrunk_checkpoint_key("model.engram.1.wkv.weight", layer_map, engram_map, drop_mtp=True)
+            == "model.engram.0.wkv.weight"
+        )
+        assert (
+            remap_shrunk_checkpoint_key("model.engram.14.gate.weight", layer_map, engram_map, drop_mtp=True)
+            == "model.engram.1.gate.weight"
+        )
+        assert remap_shrunk_checkpoint_key("model.mtp.0.norm.weight", layer_map, engram_map, drop_mtp=True) is None
+        assert (
+            remap_shrunk_checkpoint_key("model.norm.weight", layer_map, engram_map, drop_mtp=True)
+            == "model.norm.weight"
+        )
+
+        config = SimpleNamespace(weight_quantization=None, num_hidden_layers=2, num_nextn_predict_layers=0)
+        converter = DeepseekV41DequantConverter(config)
+        assert converter.should_skip_without_loading("model.layers.7.mlp.experts.down_proj")
+        weight = torch.randn(64, 64).to(torch.float8_e4m3fn)
+        scale = _v41_e8m0(2, 2)
+        name = "model.layers.2.self_attn.wq_a.weight"
+        assert maybe_convert_checkpoint_tensor(name, weight, converter) is None
+        result = maybe_convert_checkpoint_tensor(f"{name}_scale", scale, converter)
+        assert result is not None
+        assert result.name == "model.layers.0.self_attn.wq_a.weight"
+
+    def test_two_layer_stack_keeps_mtp_when_draft_stages_exist(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.checkpoint_tensor_converter import (
+            remap_shrunk_checkpoint_key,
+        )
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import shrink_layer_schedule
+
+        schedule = shrink_layer_schedule(2, n_draft=3)
+        layer_map = {orig: new for new, orig in enumerate(schedule["kept_layer_ids"])}
+        engram_map = {1: 0, 14: 1}
+        assert (
+            remap_shrunk_checkpoint_key("model.mtp.0.norm.weight", layer_map, engram_map, drop_mtp=False)
+            == "model.mtp.0.norm.weight"
+        )
+        config = SimpleNamespace(weight_quantization=None, num_hidden_layers=2, num_nextn_predict_layers=3)
+        converter = DeepseekV41DequantConverter(config)
+        assert not converter.should_skip_without_loading("model.mtp.0.norm.weight")
+        assert converter.should_skip_without_loading("model.layers.7.mlp.experts.down_proj")

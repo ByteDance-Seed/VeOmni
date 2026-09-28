@@ -392,6 +392,7 @@ def shrink_layer_schedule(n_layers: int, n_draft: int = 3) -> Dict[str, Any]:
             "candidate_source_layer_id": RELEASED_CANDIDATE_SOURCE_LAYER_ID,
             "engram_layer_ids": list(RELEASED_ENGRAM_LAYER_IDS),
             "dspark_target_layer_ids": list(RELEASED_DSPARK_TARGET_LAYER_IDS),
+            "kept_layer_ids": list(range(RELEASED_NUM_HIDDEN_LAYERS)),
         }
 
     n_enc = n_layers // 2
@@ -439,6 +440,7 @@ def shrink_layer_schedule(n_layers: int, n_draft: int = 3) -> Dict[str, Any]:
         "candidate_source_layer_id": n_enc,
         "engram_layer_ids": engram_ids,
         "dspark_target_layer_ids": dspark_ids,
+        "kept_layer_ids": kept,
     }
 
 
