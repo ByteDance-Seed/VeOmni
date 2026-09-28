@@ -172,7 +172,6 @@ def parse_omni_args(
     root_class: Type[T],
     *,
     preload_path_fields: tuple = (),
-    return_config_path: bool = False,
 ):
     """Like :func:`veomni.arguments.parser.parse_args`, but tolerant of
     **arbitrary** CLI overrides.
@@ -223,10 +222,7 @@ def parse_omni_args(
 
     final_config = _deep_update(final_config, cli_config)
 
-    instance = _instantiate_recursive(root_class, final_config)
-    if return_config_path:
-        return instance, config_path
-    return instance
+    return _instantiate_recursive(root_class, final_config)
 
 
 __all__ = ["load_yaml_with_inherit", "parse_omni_args"]

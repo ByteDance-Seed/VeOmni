@@ -29,11 +29,9 @@ working. YAML resolution (``resolve_omni_model``, ``build_omni_model_runtime``)
 stays in ``arguments/`` to avoid an arguments ↔ accelerated import cycle.
 """
 
-from __future__ import annotations
-
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 from .....arguments.arguments_types import ModelArguments
 from ..omni_module.omni_module_config import OmniModuleRuntimeConfig
@@ -52,8 +50,8 @@ class OmniModelRuntimeConfig(ModelArguments):
     modules: dict[str, OmniModuleRuntimeConfig] = field(default_factory=dict)
     training_graphs: dict[str, Any] = field(default_factory=dict)
     generation_graphs: dict[str, Any] = field(default_factory=dict)
-    train_type: str | None = None
-    infer_type: str | None = None
+    train_type: Optional[str] = None
+    infer_type: Optional[str] = None
     generation_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def launcher_config(self, key: str, default: Any = None) -> Any:

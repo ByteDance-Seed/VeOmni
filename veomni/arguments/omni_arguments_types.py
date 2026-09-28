@@ -46,15 +46,13 @@ stay in this module so :class:`OmniArguments` can call them without an
 arguments ↔ accelerated import cycle.
 """
 
-from __future__ import annotations
-
 import math
 import os
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional, Union
 
 from ..models.seed_omni.accelerated.omni_model.omni_model_config import OmniModelRuntimeConfig
 from ..models.seed_omni.accelerated.omni_module.omni_module_config import OmniModuleRuntimeConfig
@@ -83,18 +81,18 @@ OMNI_TRAIN_WORKFLOWS = {"train", "offline_cache", "train_with_cache", "train_and
 LAUNCHER_CONFIG_KEYS = frozenset({"modules", "train_graph", "train_type", "infer_graph", "infer_type"})
 
 
-def _hf_module_model_config(model_config: dict | None) -> dict:
+def _hf_module_model_config(model_config: Optional[dict]) -> dict:
     """Drop launcher layout keys before merging or exporting per-module ``model_config``."""
     from ..models.seed_omni.accelerated.omni_module.omni_module_config import hf_module_model_config
 
     return hf_module_model_config(model_config)
 
 
-def _is_omni_checkpoint_root(path: str | None) -> bool:
+def _is_omni_checkpoint_root(path: Optional[str]) -> bool:
     return bool(path) and os.path.isfile(os.path.join(str(path), "config.json"))
 
 
-def _try_load_omni_checkpoint_config(path: str | None):
+def _try_load_omni_checkpoint_config(path: Optional[str]):
     if not _is_omni_checkpoint_root(path):
         return None
     from ..models.seed_omni.configuration_omni import OmniConfig
@@ -105,7 +103,7 @@ def _try_load_omni_checkpoint_config(path: str | None):
 DEFAULT_SCENARIO = "default"
 
 
-def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> OmniModelRuntimeArguments:
+def resolve_omni_model(args: "OmniArguments", *, for_inference: bool = False) -> OmniModelRuntimeArguments:
     """Resolve ``args.model`` launcher fields into a fully populated :class:`OmniModelRuntimeArguments`."""
     model_runtime = args.model
     if not model_runtime.model_path:
@@ -195,13 +193,13 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
 
 def build_omni_model_runtime(
     global_args: OmniModuleRuntimeArguments,
-    model_path: str | os.PathLike,
-    train_graph: str | os.PathLike | Mapping[str, Any] | list | dict,
-    infer_graph: str | os.PathLike | Mapping[str, Any] | list | dict,
-    train_modules: str | os.PathLike | dict[str, Any],
-    train_type: str | None = None,
-    infer_type: str | None = None,
-    generation_kwargs: dict[str, Any] | None = None,
+    model_path: Union[str, os.PathLike],
+    train_graph: Union[str, os.PathLike, Mapping[str, Any], list, dict],
+    infer_graph: Union[str, os.PathLike, Mapping[str, Any], list, dict],
+    train_modules: Union[str, os.PathLike, dict[str, Any]],
+    train_type: Optional[str] = None,
+    infer_type: Optional[str] = None,
+    generation_kwargs: Optional[dict[str, Any]] = None,
     *,
     for_inference: bool = False,
     accelerator: Any = None,
@@ -251,8 +249,8 @@ def build_omni_model_runtime(
 
 def build_module_runtime_args(
     global_args: OmniModuleRuntimeArguments,
-    model_path: str | os.PathLike,
-    modules: str | os.PathLike | dict[str, Any],
+    model_path: Union[str, os.PathLike],
+    modules: Union[str, os.PathLike, dict[str, Any]],
     *,
     for_inference: bool = False,
 ) -> dict[str, OmniModuleRuntimeArguments]:
@@ -301,11 +299,11 @@ def _to_module_global_args(model_runtime: OmniModelRuntimeArguments) -> OmniModu
 
 
 def _resolve_graph_type(
-    args: OmniArguments,
+    args: "OmniArguments",
     model_runtime: OmniModelRuntimeArguments,
-    graph: str | dict[str, str],
+    graph: Union[str, dict[str, str]],
     config_key: str,
-    selected: str | None = None,
+    selected: Optional[str] = None,
 ) -> str:
     graph_field = "train_graph" if config_key == "train_type" else "infer_graph"
 
@@ -342,7 +340,7 @@ def _graph_scenario_specs(spec: Any) -> dict[str, Any]:
 
 
 def _load_graph_map(
-    spec: str | os.PathLike | Mapping[str, Any] | list | None,
+    spec: Optional[Union[str, os.PathLike, Mapping[str, Any], list]],
 ) -> dict[str, Any]:
     specs = _graph_scenario_specs(spec)
     if not specs:
@@ -356,7 +354,7 @@ def _load_graph_map(
     return graphs
 
 
-def _load_launcher_yaml(spec: str | os.PathLike | dict | list | None):
+def _load_launcher_yaml(spec: Optional[Union[str, os.PathLike, dict, list]]):
     if spec is None:
         return {}
     if isinstance(spec, (str, os.PathLike)):
@@ -367,8 +365,8 @@ def _load_launcher_yaml(spec: str | os.PathLike | dict | list | None):
 
 
 def _resolve_model_path(
-    model_path: str | os.PathLike,
-    modules_config: dict[str, Any] | None,
+    model_path: Union[str, os.PathLike],
+    modules_config: Optional[dict[str, Any]],
 ) -> dict[str, Any]:
     """Join a relative per-module ``model_path`` under the checkpoint root.
 
@@ -393,7 +391,7 @@ def _resolve_model_path(
 
 def _resolve_default_accelerator(
     train_modules_config: dict[str, Any],
-    infer_modules_overrides: dict[str, Any] | None,
+    infer_modules_overrides: Optional[dict[str, Any]],
 ) -> dict[str, Any]:
     # `broadcast_model_weights_from_rank0` is only meaningful for `fsdp2`; forcing it off here
     # alongside `fsdp_mode: eager` keeps the common single-process eager-inference default
@@ -480,7 +478,7 @@ class OmniDataArguments:
     train_path: str = field(
         metadata={"help": "Local path/HDFS path of the training data. Use comma to separate multiple datasets."},
     )
-    eval_path: str | None = field(
+    eval_path: Optional[str] = field(
         default=None,
         metadata={"help": "path of the evaluation data. If None, use a subset of train_path."},
     )
@@ -536,7 +534,7 @@ class OmniDataArguments:
         metadata={"help": "Whether to ignore exceptions when loading data. Defaults to ``False``"},
     )
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
-    mm_configs: dict | None = field(
+    mm_configs: Optional[dict] = field(
         default_factory=dict,
         metadata={
             "help": (
@@ -587,7 +585,7 @@ class OmniTrainingArguments:
         default=1,
         metadata={"help": "Micro batch size. The number of samples per iteration on each device."},
     )
-    global_batch_size: int | None = field(
+    global_batch_size: Optional[int] = field(
         default=None,
         metadata={"help": "Global batch size. If None, use `micro_batch_size` * `data_parallel_size`."},
     )
@@ -667,7 +665,7 @@ class OmniTrainingArguments:
         default=42,
         metadata={"help": "Random seed."},
     )
-    max_steps: int | None = field(
+    max_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
     )
@@ -681,8 +679,8 @@ class OmniTrainingArguments:
             )
         },
     )
-    train_type: str | None = field(default=None, metadata={"help": "SeedOmni training workflow."})
-    offline_cache_dir: str | None = field(
+    train_type: Optional[str] = field(default=None, metadata={"help": "SeedOmni training workflow."})
+    offline_cache_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Output directory for train_type='offline_cache'."},
     )
@@ -847,7 +845,7 @@ class OmniArguments:
         """Project ``model`` defaults onto :class:`OmniModuleRuntimeArguments` for per-module merging."""
         return _to_module_global_args(self.model)
 
-    def compute_train_steps(self, dataset_length: int | None = None):
+    def compute_train_steps(self, dataset_length: Optional[int] = None):
         if self.train.dyn_bsz:
             assert self.data.max_seq_len is not None and self.data.train_size is not None, (
                 "data.max_seq_len and data.train_size are required."
