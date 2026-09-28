@@ -41,9 +41,11 @@ _PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_mode
 def _cuda_device_count() -> int:
     """Devices this suite can run on, which are CUDA devices and nothing else.
 
-    Context parallelism is GPU-only -- ``check_context_parallel_supported``
-    refuses it on Ascend -- but these workers build the GPU patched module
-    directly instead of going through that gate, so a plain device count would
+    Not because context parallelism refuses other backends -- it does not;
+    ``check_context_parallel_supported`` admits DeepSeek-V4 on Ascend/NPU, and
+    the NPU patched module carries the same CP branches. This suite is CUDA-only
+    because it builds the *GPU* patched module (``_PATCHED_MODULE``) and several
+    of its cases pin the SM90 TileLang kernels, so a plain device count would
     let a multi-NPU host start a suite that cannot run there.
     """
     return get_torch_device().device_count() if IS_CUDA_AVAILABLE else 0

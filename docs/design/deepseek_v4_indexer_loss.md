@@ -368,13 +368,14 @@ the whole matrix, so the paper-faithful routing is the dimensionality-based one
 `configs/text/deepseek_v4_indexer_loss.yaml` leaves `muon_head_split_modules`
 unset.
 
-**Context parallelism, which the gate refuses today.** DeepSeek-V4's forward has
-no context-parallel path on `main`: no rank exchanges compressor halos or gathers
-compressed rows, so at `cp_size > 1` each rank treats its sequence shard as a
-whole sequence. Attention is already wrong there, and this objective would build
-its teacher out of that attention and report a plausible captured fraction over
-it, so `_indexer_loss_enabled` refuses `cp_size > 1` alongside Ulysses rather than
-inheriting a silent one.
+**Context parallelism, which the gate refuses today.** Not because the forward
+lacks a context-parallel path — #1131 landed one, and each rank's attention is
+correct over that rank's own query shard. It is refused for the two reasons the
+paragraphs below spell out: the reduction the objective needs across query shards
+is not wired up, and the indexer's own collectives, which this objective is what
+makes reachable from the loss, have no backward. `_indexer_loss_enabled` therefore
+refuses `cp_size > 1` alongside Ulysses rather than inheriting a silent wrong
+number.
 
 The reduction it would need is nonetheless written and sits behind
 `sp_enabled` — unreachable under that refusal, and left in place because CP query

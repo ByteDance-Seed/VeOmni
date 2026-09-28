@@ -265,7 +265,7 @@ DeepSeek-V4-only by construction: no other model's config declares them.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| dsa_indexer_loss | `bool` | `False` | Train the DeepSeek sparse attention Lightning Indexer with the DeepSeek-V3.2 eq. (4) sparse KL objective. Requires `dsa_indexer_implementation: tilelang` and `dsa_attention_implementation: tilelang`, both refused at model build before any weight is read, and `ulysses_size: 1` with `cp_size: 1`, refused on the first forward. GPU-only; NPU refuses it. No unsupported combination is silently downgraded. |
+| dsa_indexer_loss | `bool` | `False` | Train the DeepSeek sparse attention Lightning Indexer with the DeepSeek-V3.2 eq. (4) sparse KL objective. Requires `dsa_indexer_implementation: tilelang` and `dsa_attention_implementation: tilelang`, both refused at model build before any weight is read, and `ulysses_size: 1` with `cp_size: 1`, refused on the first forward. CUDA-only, because those two backends are SM90+ NVIDIA kernels: NPU refuses them. Context parallelism is not the constraint — DeepSeek-V4 supports CP on NPU; this objective is what does not. No unsupported combination is silently downgraded. |
 | dsa_indexer_loss_coef | `float` | `1.0` | Weight on the indexer KL when it is folded into the total loss. `0.0` switches the objective off entirely: no teacher is recomputed, no gradient reaches the indexer and no metric is reported, so it costs exactly what `dsa_indexer_loss: false` costs. Negative and non-finite values are refused. It is not a learning-rate knob for the indexer — see below before tuning it. |
 
 Both fields are serialised into the checkpoint's `config.json`, so a checkpoint

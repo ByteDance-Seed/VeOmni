@@ -1,4 +1,26 @@
 model:
+  model_config:
+    num_hidden_layers: 4
+    # DeepseekV4Config derives `layer_types` / `mlp_layer_types` from the
+    # checkpoint's `compress_ratios` / `num_hash_layers` inside __post_init__,
+    # then truncates them to `[:num_hidden_layers]`. That truncation only runs
+    # when `num_hidden_layers` is already 4 at construction time; the
+    # `model_config` override above is applied *after* construction, so the
+    # derived lists stay at 43 entries and `save_pretrained`'s
+    # validate_layer_type() rejects the config
+    # ("`num_hidden_layers` (4) must equal `len(layer_types)` (43)").
+    # List the first 4 entries explicitly to keep the config self-consistent.
+    # NOTE: these must be extended if `num_hidden_layers` is raised.
+    layer_types:
+      - sliding_attention
+      - sliding_attention
+      - compressed_sparse_attention
+      - heavily_compressed_attention
+    mlp_layer_types:
+      - hash_moe
+      - hash_moe
+      - hash_moe
+      - moe
   # Set this to the target DeepSeek-V4 checkpoint (HF format, v5 fused expert layout).
   # model_path: <path-or-id-to-DeepSeek-V4-checkpoint>
   ops_implementation:
@@ -47,11 +69,19 @@ model:
     gradient_checkpointing:
       enable: true
     init_device: meta
-    # DeepSeek-V4's Ulysses SP path (Q head all-to-all + sequence all-gather
-    # around compressors / sparse attention) is backend-agnostic but has not
-    # been validated on NPU with this model yet — keep ulysses_size at 1
-    # until it has been.
+    # DeepSeek-V4 sequence parallelism. Ulysses (Q head all-to-all + sequence
+    # all-gather around compressors / sparse attention) is backend-agnostic but
+    # has not been validated on NPU with this model yet — keep ulysses_size at 1
+    # until it has been. Context parallelism, the model's other
+    # sequence-parallel mode, *is* supported on NPU: its full-resolution KV,
+    # compressed rows and compressor halos are all-gathered through plain
+    # torch.distributed collectives, which reach HCCL unchanged, and the NPU
+    # compressor patches carry the same CP branches as the GPU ones. The two
+    # modes are mutually exclusive. The widest compression rate caps cp_size —
+    # the packed sequence length has to be at least cp_size * max(compress_rates)
+    # — see docs/design/deepseek_v4_context_parallel.md.
     ulysses_size: 1
+    cp_size: 2
     ep_size: 8
     fsdp_config:
       fsdp_mode: fsdp2
