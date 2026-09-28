@@ -584,8 +584,8 @@ class ModuleRuntime(VeOmniModelRuntime):
 
         The base writes ``model_assets`` into ``model_assets_dir``. For a composed
         model that directory is the omni root's, which
-        :meth:`OmniModelRuntime.save_model_assets` writes; a module's own
-        sidecars only go into its per-module HF export.
+        :meth:`OmniModelRuntime.save_model_assets` writes, putting each module's
+        :attr:`model_assets` under ``<root>/<module>/`` beside the root config.
         """
         raise NotImplementedError(
             f"ModuleRuntime '{self.module_name}' does not write model assets; "

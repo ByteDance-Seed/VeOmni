@@ -14,11 +14,10 @@
 
 """Accelerator helpers: dispatch, node executors, and module save/iter utilities."""
 
-from .modules import iter_named_omni_modules, save_module_assets, save_module_subdirectory
+from .modules import iter_named_omni_modules, save_module_subdirectory
 
 
 __all__ = [
     "iter_named_omni_modules",
-    "save_module_assets",
     "save_module_subdirectory",
 ]

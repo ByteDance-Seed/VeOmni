@@ -192,11 +192,38 @@ def test_weight_export_reaches_a_ddp_wrapped_module(tmp_path):
     dist.init_process_group(backend="gloo", init_method=f"file://{tmp_path / 'rendezvous'}", world_size=1, rank=0)
     try:
         inner = _Exportable()
-        save_module_subdirectory("module_a", DistributedDataParallel(inner), str(tmp_path), save_module_weights=True)
+        save_module_subdirectory(
+            "module_a", DistributedDataParallel(inner), str(tmp_path), assets=[], save_module_weights=True
+        )
     finally:
         dist.destroy_process_group()
 
     assert inner.saved_to == [str(tmp_path / "module_a")]
+
+
+class _Asset:
+    """A sidecar that records where it was written."""
+
+    def __init__(self):
+        self.saved_to = []
+
+    def save_pretrained(self, save_directory):
+        self.saved_to.append(save_directory)
+
+
+def test_save_pretrained_writes_each_modules_runtime_assets_into_its_subfolder(tmp_path):
+    model = _model()
+    assets = {name: _Asset() for name in ("module_a", "module_b")}
+    runtimes = {
+        name: SimpleNamespace(model=model.modules_dict[name], model_assets=[asset]) for name, asset in assets.items()
+    }
+
+    OmniModelRuntime(model, module_runtimes=runtimes).save_pretrained(tmp_path, save_module_weights=False)
+
+    assert {name: asset.saved_to for name, asset in assets.items()} == {
+        "module_a": [str(tmp_path / "module_a")],
+        "module_b": [str(tmp_path / "module_b")],
+    }
 
 
 def test_runtime_calls_a_wrapped_module_through_its_runtime():

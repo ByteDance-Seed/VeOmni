@@ -489,7 +489,7 @@ class OmniModelRuntime:
     def save_pretrained(self, save_directory: str | os.PathLike, **kwargs: Any) -> None:
         """Save the omni-root HF layout (config + graphs + module sidecars).
 
-        Unwraps DDP / LoRA wrappers when writing per-module assets. Weights are
+        Each module's sidecars are its runtime's :attr:`ModuleRuntime.model_assets`. Weights are
         written from the main process alone, so weight export only suits
         unsharded modules (eager, DDP); it strips DDP but keeps a LoRA wrapper,
         whose ``save_pretrained`` writes the adapter. Training exports sharded
@@ -518,11 +518,12 @@ class OmniModelRuntime:
             "max_shard_size": max_shard_size,
         }
         for name in model._module_names:
-            module = self._module_to_call(name)
+            module_runtime = self.module_runtimes[name]
             save_module_subdirectory(
                 name,
-                module,
+                module_runtime.model,
                 save_directory,
+                assets=module_runtime.model_assets,
                 save_module_weights=save_module_weights,
                 **module_save_kwargs,
             )
