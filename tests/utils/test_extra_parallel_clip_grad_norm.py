@@ -141,9 +141,11 @@ def main():
         dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
     )
 
+    extra_parallel_only = args.model.accelerator.fsdp_config.extra_parallel_only
     model = ToyMoeAndEmbedModel()
     model = build_parallelize_model(
         model,
+        extra_parallel_only=extra_parallel_only,
         init_device=args.model.accelerator.init_device,
         weights_path=None,
         mixed_precision=args.model.accelerator.fsdp_config.mixed_precision,
@@ -255,6 +257,12 @@ def main():
         check_model_param_grad_one_by_one(
             expected_grad=expected, ep_expected_grad=ep_expected, emb_expected_grad=emb_expected, msg="Before clipping"
         )
+        if extra_parallel_only:
+            # Nothing has reduced the replicated params yet: give each rank a
+            # different grad whose mean is still 1, so the checks after clipping
+            # only pass if the clipper averaged them.
+            world_size = dist.get_world_size()
+            model.bias.grad.mul_(2.0 * dist.get_rank() / (world_size - 1))
 
         # Every local param grad is 1.0 / ps.ep_size, model total norm should be sqrt(1 * non_ep_param_num + 1/ep_size^2 * ep_param_num)
         expected_total_grad_norm = math.sqrt(
@@ -288,7 +296,11 @@ def main():
 
 
 def _run_clip_grad_norm_fsdp2_test(
-    ep_size: int, emb_size: int, cpu_offload: bool, dp_replicate_size: int | None = None
+    ep_size: int,
+    emb_size: int,
+    cpu_offload: bool,
+    dp_replicate_size: int | None = None,
+    extra_parallel_only: bool = False,
 ) -> None:
     command = [
         "torchrun",
@@ -314,6 +326,8 @@ def _run_clip_grad_norm_fsdp2_test(
         command.append(f"--model.accelerator.dp_replicate_size={dp_replicate_size}")
     if cpu_offload:
         command.append("--model.accelerator.fsdp_config.offload=True")
+    if extra_parallel_only:
+        command.append("--model.accelerator.fsdp_config.extra_parallel_only=True")
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
 
@@ -341,6 +355,15 @@ def test_clip_grad_norm_fsdp2_emb8(cpu_offload: bool):
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_clip_grad_norm_fsdp2_ep2_emb4(cpu_offload: bool):
     _run_clip_grad_norm_fsdp2_test(ep_size=2, emb_size=4, cpu_offload=cpu_offload)
+
+
+def test_clip_grad_norm_extra_parallel_only_emb8():
+    """Without the FSDP2 wrap, grads and norm must match the wrapped emb8 case.
+
+    The table grads are divided by the world size as FSDP would, the replicated
+    params are averaged, and the replicated norm is counted once, not per rank.
+    """
+    _run_clip_grad_norm_fsdp2_test(ep_size=1, emb_size=8, cpu_offload=False, extra_parallel_only=True)
 
 
 # ---------------------------------------------------------------------------

@@ -468,7 +468,32 @@ def _finish_without_fsdp_wrap(
     if materialize_device == "cpu":
         _move_buffers_to_device(model, get_device_type())
 
+    _divide_extra_parallel_grads_like_fsdp(model, parallel_state, fqn2spec_info)
+    # Read by the grad clipper, which averages the replicated parameters' grads.
+    model._extra_parallel_only = True
     return model
+
+
+def _divide_extra_parallel_grads_like_fsdp(model: "nn.Module", parallel_state, fqn2spec_info) -> None:
+    """Scale plan-sharded grads the way the skipped FSDP2 wrap would have.
+
+    A row-sharded table's gradient is complete after ``AllToAllEmbedding``'s
+    backward, but as the *sum* of every rank's contribution. The wrapped path
+    divides ExtraParallel grads by ``extra_parallel_gradient_divide_factor``
+    (the world size), so without this an unwrapped module would take steps
+    ``world_size`` times larger than the same module under FSDP2. A tensor hook
+    runs before accumulation, so gradient accumulation stays correct.
+    """
+    for fqn, param in model.named_parameters():
+        spec_info = (fqn2spec_info or {}).get(fqn)
+        if spec_info is None or not isinstance(spec_info.placement, Shard):
+            continue
+        para = spec_info.para_name
+        if not parallel_state.extra_parallel_enabled(para):
+            continue
+        factor = parallel_state.extra_parallel_gradient_divide_factor(para)
+        if factor > 1:
+            param.register_hook(lambda grad, factor=factor: grad / factor)
 
 
 def parallelize_model_fsdp2(

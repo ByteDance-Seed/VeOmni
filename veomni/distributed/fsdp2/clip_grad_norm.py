@@ -18,6 +18,8 @@ def clip_grad_norm(
     model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
 ) -> torch.Tensor:
     if hasattr(model, "_extra_parallel_param_groups"):
+        if getattr(model, "_extra_parallel_only", False):
+            _average_extra_parallel_only_replicated_grads(model)
         return extra_parallel_fsdp2_clip_grad_norm(
             model,
             max_norm,
@@ -45,6 +47,31 @@ def clip_grad_norm(
     if isinstance(grad_norm, DTensor):
         grad_norm = grad_norm.full_tensor()
     return grad_norm
+
+
+@torch.no_grad()
+def _average_extra_parallel_only_replicated_grads(model) -> None:
+    """Average the grads of parameters an unwrapped ExtraParallel-only module replicates.
+
+    Without the FSDP2 wrap nothing reduces a parameter the plan does not name, so
+    every rank would step its full replica with its own micro-batch's gradient
+    and the replicas would drift apart. Averaging over the FSDP group is what the
+    wrap's reduce-scatter computes, and repeating it is harmless.
+
+    Every rank all-reduces every trainable replicated parameter in the same
+    order, so a parameter that got no gradient on one rank takes a zero one
+    instead of leaving the collectives misaligned.
+    """
+    ps = get_parallel_state()
+    group = ps.fsdp_group
+    group_size = dist.get_world_size(group) if group is not None else 1
+    if group_size == 1:
+        return
+    for param in model._extra_parallel_param_groups.get("non_extra_parallel", []):
+        if param.grad is None:
+            param.grad = torch.zeros_like(param)
+        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=group)
+        param.grad.div_(group_size)
 
 
 def _fsdp_grad_norm_reduce_groups(ps) -> List[tuple[str, dist.ProcessGroup | None]]:
@@ -152,11 +179,13 @@ def extra_parallel_fsdp2_clip_grad_norm(
         p for p in model._extra_parallel_param_groups.get("non_extra_parallel", []) if p.grad is not None
     ]
 
-    # Compute and reduce non-ExtraParallel
+    # Compute and reduce non-ExtraParallel. Without the FSDP2 wrap these are whole
+    # replicas holding identical averaged grads, so summing over the FSDP group
+    # would count each one once per rank.
     non_extra_parallel_total = _fsdp2_reduce_group(
         params=non_extra_parallel_params,
         norm_type=norm_type,
-        reduce_groups=_fsdp_grad_norm_reduce_groups(ps),
+        reduce_groups=[] if getattr(model, "_extra_parallel_only", False) else _fsdp_grad_norm_reduce_groups(ps),
     )
     logger.debug_rank0(f"non_extra_parallel total grad norm: {non_extra_parallel_total}")
 

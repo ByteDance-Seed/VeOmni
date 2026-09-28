@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence,
 
 import torch
 import torch.nn as nn
-from torch.distributed._tensor import DTensor
+from torch.distributed._tensor import DTensor, Shard
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_optimizer_state_dict,
@@ -552,8 +552,17 @@ def build_optimizer(
 
 
 def _is_extra_parallel_param(p: torch.nn.Parameter, extra_parallel_names: Sequence[str]) -> Optional[str]:
-    """Return the ExtraParallel name for a DTensor param, or ``None``."""
+    """Return the ExtraParallel name for a plan-sharded param, or ``None``.
+
+    Under FSDP2 a plan shard is a DTensor on the ``{para}_fsdp`` mesh. Without the
+    wrap (``extra_parallel_only``) it stays a plain local tensor, and only the
+    ``spec_info`` the plan attached says it holds distinct rows on every rank.
+    """
     if DTensor is None or not isinstance(p, DTensor):
+        spec_info = getattr(p, "spec_info", None)
+        if spec_info is not None and isinstance(spec_info.placement, Shard):
+            if spec_info.para_name in extra_parallel_names:
+                return spec_info.para_name
         return None
     mesh = getattr(p, "device_mesh", None)
     names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
@@ -828,18 +837,10 @@ def build_extra_parallel_fsdp2_optimizer(
                 if not p.requires_grad:
                     continue
 
-                # Check if this parameter is part of ExtraParallel
-                is_extra_parallel_params = False
-                if DTensor is not None and isinstance(p, DTensor):
-                    mesh = getattr(p, "device_mesh", None)
-                    names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
-                    for para in parallel_state.extra_parallel_names:
-                        if f"{para}_fsdp" in names:
-                            group_extra_parallel_params[para].append(p)
-                            is_extra_parallel_params = True
-                            break
-
-                if not is_extra_parallel_params:
+                para = _is_extra_parallel_param(p, parallel_state.extra_parallel_names)
+                if para is not None:
+                    group_extra_parallel_params[para].append(p)
+                else:
                     group_non_extra_parallel_params.append(p)
 
             # Create subgroups with weight decay handling
@@ -879,21 +880,11 @@ def build_extra_parallel_fsdp2_optimizer(
             if not p.requires_grad:
                 continue
 
-            # Check if this parameter is part of ExtraParallel
-            is_extra_parallel_params = False
-            if DTensor is not None and isinstance(p, DTensor):
-                mesh = getattr(p, "device_mesh", None)
-                names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
-                logger.debug_rank0(f"param {name} has device_mesh {mesh} with mesh dim names {names}")
-
-                for para in parallel_state.extra_parallel_names:
-                    if f"{para}_fsdp" in names:
-                        logger.debug_rank0(f"Adding {name} to {para}_params in extra_parallel+fsdp2 optimizer")
-                        extra_parallel_params[para].append(p)
-                        is_extra_parallel_params = True
-                        break
-
-            if not is_extra_parallel_params:
+            para = _is_extra_parallel_param(p, parallel_state.extra_parallel_names)
+            if para is not None:
+                logger.debug_rank0(f"Adding {name} to {para}_params in extra_parallel+fsdp2 optimizer")
+                extra_parallel_params[para].append(p)
+            else:
                 logger.debug_rank0(f"Adding {name} to non_extra_parallel_params in extra_parallel+fsdp2 optimizer")
                 non_extra_parallel_params.append(p)
 
