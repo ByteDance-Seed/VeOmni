@@ -357,12 +357,12 @@ def test_build_model_runtime_args_keeps_every_training_scenario_from_omni_checkp
     assert cfg.train_type == "alt"
 
 
-def test_from_model_runtime_projects_onto_hf_config(tmp_path):
-    """from_model_runtime builds OmniModel from ``to_hf_config()``; each ModuleRuntime
+def test_build_omni_model_runtime_projects_onto_hf_config(tmp_path):
+    """build_omni_model_runtime builds OmniModel from ``to_hf_config()``; each ModuleRuntime
     gets the module config that OmniConfig loaded, and OmniModel gets the bare module."""
     from unittest.mock import MagicMock, patch
 
-    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import build_omni_model_runtime
 
     for name, config in _with_module_configs(_model_runtime().to_hf_config())._module_configs.items():
         config.save_pretrained(tmp_path / name)
@@ -370,7 +370,7 @@ def test_from_model_runtime_projects_onto_hf_config(tmp_path):
     with patch("veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime") as mock_rt_cls:
         mock_rt_cls.side_effect = lambda *a, **k: MagicMock(model=MagicMock(), omni_module=MagicMock())
         with patch("veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.OmniModel") as mock_omni_model:
-            runtime = OmniModelRuntime.from_model_runtime(runtime_cfg)
+            runtime = build_omni_model_runtime(runtime_cfg)
             omni_config, modules = mock_omni_model.call_args[0]
             assert isinstance(omni_config, OmniConfig)
             assert set(omni_config.module_names) == set(runtime_cfg.module_names)

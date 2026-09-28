@@ -43,7 +43,7 @@ from ...arguments.omni_arguments_types import (
     OmniModuleRuntimeArguments,
     build_omni_model_runtime_args,
 )
-from ...models.seed_omni.accelerated import OmniModelRuntime
+from ...models.seed_omni.accelerated import OmniModelRuntime, build_omni_model_runtime
 from ...models.seed_omni.modeling_omni import OmniModel
 from ...models.seed_omni.processing_omni import OmniProcessor
 from ...models.seed_omni.utils.graph_profiler import GraphProfiler
@@ -134,7 +134,7 @@ class OmniInferencer:
         """
         self.module_names = self.omni_model_runtime.module_names
         if self._distributed:
-            self.model = OmniModelRuntime.from_model_runtime(
+            self.model = build_omni_model_runtime(
                 self.omni_model_runtime,
                 for_inference=True,
             )

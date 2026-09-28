@@ -333,7 +333,7 @@ class ModuleRuntime(VeOmniModelRuntime):
 
         A config that targets *nothing anywhere* **and** leaves the composed
         model with no trainable parameters is still an error; only the composer
-        can see that. It is raised in :meth:`OmniModelRuntime.from_model_runtime`.
+        can see that. It is raised in :func:`build_omni_model_runtime`.
         """
         logger.info_rank0(
             f"ModuleRuntime '{self.module_name}': the LoRA config matched no parameters here; "
@@ -643,4 +643,24 @@ class ModuleRuntime(VeOmniModelRuntime):
         return assets
 
 
-__all__ = ["ModuleRuntime", "composed_model_owns_wrap"]
+def build_omni_module_runtime(
+    args: "OmniModuleRuntimeArguments",
+    module_name: str,
+    *,
+    module_config: "OmniModuleConfig",
+    train: Optional["OmniTrainingArguments"] = None,
+    for_inference: bool = False,
+    global_accelerator: Optional["AcceleratorConfig"] = None,
+) -> ModuleRuntime:
+    """Build the :class:`ModuleRuntime` for one module of a composed model."""
+    return ModuleRuntime(
+        args,
+        module_name=module_name,
+        module_config=module_config,
+        train=train,
+        for_inference=for_inference,
+        global_accelerator=global_accelerator,
+    )
+
+
+__all__ = ["ModuleRuntime", "build_omni_module_runtime", "composed_model_owns_wrap"]

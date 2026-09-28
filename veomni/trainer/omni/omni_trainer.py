@@ -67,7 +67,7 @@ from ...data.data_transform import build_data_transform
 from ...distributed.clip_grad_norm import omni_clip_grad_norm
 from ...distributed.offloading import build_activation_offloading_context
 from ...distributed.parallel_state import init_parallel_state_from_config, use_parallel_state
-from ...models.seed_omni.accelerated import OmniModelRuntime
+from ...models.seed_omni.accelerated import OmniModelRuntime, build_omni_model_runtime
 from ...models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 from ...models.seed_omni.processing_omni import OmniProcessor
 from ...ops.batch_invariant_ops import set_batch_invariant_mode
@@ -197,14 +197,6 @@ def cascade_module_reshard(
         module_runtime._model_reshard(reshard)
 
 
-def build_omni_model(
-    global_args: OmniArguments,
-) -> OmniModelRuntime:
-    """Build one VeOmni-managed composed model — the trainer's ``self.model``."""
-    model_runtime = build_omni_model_runtime_args(global_args)
-    return OmniModelRuntime.from_model_runtime(model_runtime, train=global_args.train, for_inference=False)
-
-
 class OmniTrainer:
     """Orchestrator for OmniModel — one :class:`ModuleRuntime` per module.
 
@@ -224,7 +216,7 @@ class OmniTrainer:
     Canonical training state (``model`` / ``optimizer`` / ``lr_scheduler`` /
     ``state`` / dataloaders / per-step trace metrics) lives on ``self``.  A
     future student+teacher trainer holds two handles by calling
-    :func:`build_omni_model` twice.
+    :func:`build_omni_model_runtime` twice.
 
     Checkpoint I/O is **not** owned here: each :class:`ModuleRuntime` owns its
     DCP manager and :class:`OmniModelRuntime` fans ``load`` / ``save_dcp`` /
@@ -389,7 +381,7 @@ class OmniTrainer:
         )
 
     def _build_model(self):
-        self.model = build_omni_model(global_args=self.args)
+        self.model = build_omni_model_runtime(build_omni_model_runtime_args(self.args), train=self.args.train)
 
     def _build_multi_optimizer(self) -> None:
         """Wrap per-module optimizers in :class:`MultiOptimizer`."""
@@ -670,6 +662,5 @@ __all__ = [
     "MultiOptimizer",
     "MultiLRScheduler",
     "batch_to_device",
-    "build_omni_model",
     "cascade_module_reshard",
 ]

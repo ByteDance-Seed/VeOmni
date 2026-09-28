@@ -92,7 +92,7 @@ class OmniModelRuntime:
       over a checkpoint root holding ``config.json``. Every sub-module is a plain
       ``PreTrainedModel`` and the composed model is a plain ``PreTrainedModel``;
       no VeOmni infrastructure is involved (eager single-process inference).
-    * **VeOmni** — :meth:`from_model_runtime`. Every sub-module is owned by a
+    * **VeOmni** — :func:`build_omni_model_runtime`. Every sub-module is owned by a
       :class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime`
       (FSDP2/DDP wrap, weight load, optimizer, checkpoint manager) and the
       composed model is *this* class. ``OmniTrainer.model`` /
@@ -126,52 +126,6 @@ class OmniModelRuntime:
         self.module_runtimes = dict(module_runtimes or {})
         self.omni_model_runtime_args = omni_model_runtime_args
         self._step_profiler: GraphProfiler | None = None
-
-    @classmethod
-    def from_model_runtime(
-        cls,
-        omni_model_runtime_args: OmniModelRuntimeConfig,
-        *,
-        train: OmniTrainingArguments = None,
-        for_inference: bool = False,
-    ) -> OmniModelRuntime:
-        """Compose a VeOmni-managed model from a resolved :class:`OmniModelRuntimeConfig`.
-
-        ``train`` is the global :class:`~....arguments.omni_arguments_types.OmniTrainingArguments`
-        (unset for inference) — forwarded to every :class:`ModuleRuntime` so its
-        checkpoint manager can resolve the shared ``save_path``/``output_dir``/``load_path``.
-        """
-        from ..omni_module.omni_module_runtime import ModuleRuntime
-
-        omni_config = omni_model_runtime_args.to_hf_config()
-        omni_config.load_checkpoint_sidecars(omni_model_runtime_args.resolved_model_path)
-        module_runtime_args = omni_model_runtime_args.modules
-        module_runtimes: dict[str, ModuleRuntime] = {}
-        for name in omni_config.module_names:
-            module_args = module_runtime_args[name]
-            module_runtime = ModuleRuntime(
-                module_args,
-                module_name=name,
-                module_config=omni_config._module_configs[name],
-                train=train,
-                for_inference=for_inference,
-                global_accelerator=omni_model_runtime_args.accelerator,
-            )
-            module_runtimes[name] = module_runtime
-            logger.info_rank0(f"OmniModelRuntime: built ModuleRuntime '{name}' from {module_args.model_path}")
-
-        logger.info_rank0(
-            f"OmniModelRuntime: composed OmniModel with {len(module_runtimes)} module(s) ({list(module_runtimes)})."
-        )
-        if not for_inference:
-            _reject_lora_that_matched_nothing(module_runtimes)
-        runtime = cls(
-            OmniModel(omni_config, {name: rt.omni_module for name, rt in module_runtimes.items()}),
-            module_runtimes=module_runtimes,
-            omni_model_runtime_args=omni_model_runtime_args,
-        )
-        runtime._parallelize_composed_model(for_inference=for_inference)
-        return runtime
 
     def _parallelize_composed_model(self, *, for_inference: bool = False) -> None:
         """``fully_shard`` the composed :class:`OmniModel` when ``fsdp_scope='model'``.
@@ -487,4 +441,49 @@ class OmniModelRuntime:
             module_runtime.save_hf_or_lora(state)
 
 
-__all__ = ["OmniModelRuntime"]
+def build_omni_model_runtime(
+    omni_model_runtime_args: OmniModelRuntimeConfig,
+    *,
+    train: OmniTrainingArguments | None = None,
+    for_inference: bool = False,
+) -> OmniModelRuntime:
+    """Compose a VeOmni-managed model from a resolved :class:`OmniModelRuntimeConfig`.
+
+    ``train`` is the global :class:`~....arguments.omni_arguments_types.OmniTrainingArguments`
+    (unset for inference) — forwarded to every :class:`ModuleRuntime` so its
+    checkpoint manager can resolve the shared ``save_path``/``output_dir``/``load_path``.
+    """
+    from ..omni_module.omni_module_runtime import build_omni_module_runtime
+
+    omni_config = omni_model_runtime_args.to_hf_config()
+    omni_config.load_checkpoint_sidecars(omni_model_runtime_args.resolved_model_path)
+    module_runtime_args = omni_model_runtime_args.modules
+    module_runtimes: dict[str, ModuleRuntime] = {}
+    for name in omni_config.module_names:
+        module_args = module_runtime_args[name]
+        module_runtime = build_omni_module_runtime(
+            module_args,
+            module_name=name,
+            module_config=omni_config._module_configs[name],
+            train=train,
+            for_inference=for_inference,
+            global_accelerator=omni_model_runtime_args.accelerator,
+        )
+        module_runtimes[name] = module_runtime
+        logger.info_rank0(f"OmniModelRuntime: built ModuleRuntime '{name}' from {module_args.model_path}")
+
+    logger.info_rank0(
+        f"OmniModelRuntime: composed OmniModel with {len(module_runtimes)} module(s) ({list(module_runtimes)})."
+    )
+    if not for_inference:
+        _reject_lora_that_matched_nothing(module_runtimes)
+    runtime = OmniModelRuntime(
+        OmniModel(omni_config, {name: rt.omni_module for name, rt in module_runtimes.items()}),
+        module_runtimes=module_runtimes,
+        omni_model_runtime_args=omni_model_runtime_args,
+    )
+    runtime._parallelize_composed_model(for_inference=for_inference)
+    return runtime
+
+
+__all__ = ["OmniModelRuntime", "build_omni_model_runtime"]

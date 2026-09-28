@@ -29,7 +29,7 @@ Per-module checkpoint I/O lives in ``veomni.models.seed_omni.utils.checkpoint``.
 """
 
 from .omni_model.omni_model_config import OmniModelRuntimeConfig
-from .omni_model.omni_model_runtime import OmniModelRuntime
+from .omni_model.omni_model_runtime import OmniModelRuntime, build_omni_model_runtime
 from .omni_module.omni_module_config import OmniModuleRuntimeConfig
 from .utils.executor import TrainNodeRunner, execute_generation_node
 
@@ -39,5 +39,6 @@ __all__ = [
     "OmniModelRuntimeConfig",
     "OmniModuleRuntimeConfig",
     "TrainNodeRunner",
+    "build_omni_model_runtime",
     "execute_generation_node",
 ]
