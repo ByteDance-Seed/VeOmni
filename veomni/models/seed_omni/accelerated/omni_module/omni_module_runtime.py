@@ -50,11 +50,6 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
-def unwrap_module(mod: nn.Module) -> nn.Module:
-    """Strip DDP/LoRA/FSDP wrappers so callers reach the inner :class:`BaseMixin`."""
-    return unwrap_module_chain(mod)
-
-
 def composed_model_owns_wrap(accelerator: "AcceleratorConfig") -> bool:
     """Whether the top-level ``accelerator`` wraps the composed :class:`OmniModel` once.
 
@@ -205,7 +200,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         ``self.model`` may be a DDP / LoRA wrapper around it; that wrapper stays
         on the runtime side and is what :class:`OmniModelRuntime` calls.
         """
-        return unwrap_module(self.model)
+        return unwrap_module_chain(self.model)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Run this module's forward inside its own ``ParallelState``.
@@ -450,7 +445,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         # ``gradient_checkpointing_enable``; FSDP2 wraps in place. Unwrap so the
         # call reaches the raw HF model regardless of dp_mode.
         if gc.enable:
-            unwrap_module(self.model).gradient_checkpointing_enable(
+            unwrap_module_chain(self.model).gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={
                     "use_reentrant": gc.enable_reentrant,
                     "context_fn": _recompute_context_fn,
@@ -644,7 +639,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         not forward unknown attribute lookups to ``.module``) — unwrap first so
         ``config`` / processor / tokenizer resolve regardless of ``dp_mode``.
         """
-        model = unwrap_module(self.model)
+        model = unwrap_module_chain(self.model)
         assets: List[Any] = []
         cfg = getattr(model, "config", None)
         if cfg is not None:
