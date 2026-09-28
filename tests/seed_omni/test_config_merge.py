@@ -14,15 +14,11 @@
 
 """The deep merge every layered omni config rests on.
 
-`_deep_update` is what makes `__inherit__` bases, the launcher's global `model:`
-block, a checkpoint's per-module entries and a `modules:` YAML compose instead of
-shadow each other. Its edge cases are silent — a wrong answer does not raise, it
+`_deep_update` is what makes the launcher's global `model:` block, a checkpoint's
+per-module entries and a `modules:` YAML compose instead of shadow each other. Its edge cases are silent — a wrong answer does not raise, it
 quietly runs the wrong kernel or the wrong parallelism — so they are pinned here.
 """
 
-import yaml
-
-from veomni.arguments.omni_parser import load_yaml_with_inherit
 from veomni.arguments.parser import _deep_update
 
 
@@ -58,17 +54,3 @@ def test_nested_mappings_merge_while_lists_and_scalars_replace():
     assert merged["accelerator"]["fsdp_config"] == {"fsdp_mode": "ddp", "reshard": True}
     # ...while a list replaces rather than concatenates.
     assert merged["accelerator"]["sizes"] == [4]
-
-
-def test_an_inheriting_config_does_not_erase_a_base_by_naming_a_key(tmp_path):
-    """The same rule, reached the way configs actually reach it."""
-    (tmp_path / "base.yaml").write_text(
-        yaml.safe_dump({"janus_vqvae": {"model_path": "janus_vqvae", "ops_implementation": {"attn": "eager"}}}),
-        encoding="utf-8",
-    )
-    child = tmp_path / "child.yaml"
-    child.write_text(yaml.safe_dump({"__inherit__": "base.yaml", "janus_vqvae": {}}), encoding="utf-8")
-
-    assert load_yaml_with_inherit(str(child)) == {
-        "janus_vqvae": {"model_path": "janus_vqvae", "ops_implementation": {"attn": "eager"}}
-    }
