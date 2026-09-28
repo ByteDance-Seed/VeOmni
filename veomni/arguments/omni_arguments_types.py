@@ -56,7 +56,10 @@ from typing import Any, Literal, Optional, Union
 import yaml
 
 from ..models.seed_omni.accelerated.omni_model.omni_model_config import OmniModelRuntimeArguments
-from ..models.seed_omni.accelerated.omni_module.omni_module_config import OmniModuleRuntimeArguments
+from ..models.seed_omni.accelerated.omni_module.omni_module_config import (
+    OmniModuleRuntimeArguments,
+    hf_module_model_config,
+)
 from ..utils import logging
 from ..utils.fs import is_non_local
 from .arguments_types import (
@@ -72,15 +75,6 @@ from .parser import _deep_update, _instantiate_recursive
 
 
 logger = logging.get_logger(__name__)
-
-LAUNCHER_CONFIG_KEYS = frozenset({"modules", "train_graph", "train_type", "infer_graph", "infer_type"})
-
-
-def _hf_module_model_config(model_config: Optional[dict]) -> dict:
-    """Drop launcher layout keys before merging or exporting per-module ``model_config``."""
-    from ..models.seed_omni.accelerated.omni_module.omni_module_config import hf_module_model_config
-
-    return hf_module_model_config(model_config)
 
 
 def _is_omni_checkpoint_root(path: Optional[str]) -> bool:
@@ -222,7 +216,7 @@ def _to_module_global_args(model_runtime: OmniModelRuntimeArguments) -> OmniModu
     """Project omni-model defaults onto :class:`OmniModuleRuntimeArguments` for per-module merging."""
     shared_fields = {f.name for f in fields(ModelArguments)}
     model_kwargs = {name: getattr(model_runtime, name) for name in shared_fields}
-    model_kwargs["model_config"] = _hf_module_model_config(model_kwargs.get("model_config"))
+    model_kwargs["model_config"] = hf_module_model_config(model_kwargs.get("model_config"))
     return OmniModuleRuntimeArguments(**model_kwargs)
 
 
@@ -740,7 +734,6 @@ class OmniArguments:
 
 __all__ = [
     "DEFAULT_SCENARIO",
-    "LAUNCHER_CONFIG_KEYS",
     "OmniArguments",
     "OmniDataArguments",
     "OmniGraphProfileArguments",
@@ -748,7 +741,6 @@ __all__ = [
     "OmniModelRuntimeArguments",
     "OmniModuleRuntimeArguments",
     "OmniTrainingArguments",
-    "_hf_module_model_config",
     "_is_omni_checkpoint_root",
     "build_omni_module_runtime_args",
     "build_omni_model_runtime_args",

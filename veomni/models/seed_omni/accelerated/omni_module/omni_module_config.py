@@ -36,10 +36,11 @@ from dataclasses import dataclass
 from .....arguments.arguments_types import ModelArguments
 
 
+LAUNCHER_CONFIG_KEYS = frozenset({"modules", "train_graph", "train_type", "infer_graph", "infer_type"})
+
+
 def hf_module_model_config(model_config: dict | None) -> dict:
     """Drop launcher layout keys before merging or exporting per-module ``model_config``."""
-    from .....arguments.omni_arguments_types import LAUNCHER_CONFIG_KEYS
-
     if not model_config:
         return {}
     return {key: value for key, value in model_config.items() if key not in LAUNCHER_CONFIG_KEYS}
