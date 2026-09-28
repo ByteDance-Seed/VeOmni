@@ -186,6 +186,23 @@ class TestTrainGraph:
         llm = train["deepseek_v41_llm"]["model_config"]
         assert llm["dsa_indexer_loss"] is True
         assert llm["dspark_block_size"] == 0
+        assert llm["num_nextn_predict_layers"] == 0
+        assert llm["dspark_target_layer_ids"] == []
+        assert llm["compress_ratios"] == [2, 1]
         assert llm["weight_quantization"] is None
         assert llm["n_trainable_layers"] == 2
+        assert llm["num_hidden_layers"] == 2
+        assert llm["engram_layer_ids"] == [0, 1]
+        assert llm["candidate_source_layer_id"] == 1
         assert train["deepseek_v41_llm"]["ops_implementation"]["qat_implementation"] == "fp8_blockwise"
+
+    def test_mtp_training_constructs_and_trains_dspark(self):
+        train = yaml.safe_load((CONFIG_ROOT / "train/modules_train_mtp.yaml").read_text())
+        llm = train["deepseek_v41_llm"]["model_config"]
+        assert llm["dspark_block_size"] > 0
+        assert llm["num_nextn_predict_layers"] == 3
+        assert llm["dspark_target_layer_ids"] == [0, 1, 1]
+        assert llm["compress_ratios"] == [2, 1, 0, 0, 0]
+        assert llm["trainable_layer_ids"] == [0]
+        assert llm["freeze_mtp"] is False
+        assert "n_trainable_layers" not in llm

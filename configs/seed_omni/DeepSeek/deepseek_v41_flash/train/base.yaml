@@ -29,8 +29,10 @@ model:
     # whole sequence in Python before any kernel runs. Raising `ulysses_size`
     # fails at the first forward rather than producing wrong numbers.
     ulysses_size: 1
+    # Per-module in modules_train.yaml. The ViT does not declare
+    # `gradient_checkpointing`, so a top-level enable would trip HF's check.
     gradient_checkpointing:
-      enable: true
+      enable: false
       enable_reentrant: false
     fsdp_config:
       fsdp_mode: fsdp2
