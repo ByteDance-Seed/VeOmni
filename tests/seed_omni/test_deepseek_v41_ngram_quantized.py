@@ -27,8 +27,9 @@ import torch
 
 from veomni.models.seed_omni.modules.deepseek_v41.dequant import dequant_fp8_blockwise
 from veomni.models.seed_omni.modules.deepseek_v41.ngram.checkpoint import (
+    NgramTableDequant,
     NgramTablePadding,
-    create_ngram_table_padding,
+    create_ngram_table_converter,
 )
 from veomni.models.seed_omni.modules.deepseek_v41.ngram.configuration import DeepseekV41NgramConfig
 from veomni.models.seed_omni.modules.deepseek_v41.ngram.quantized import DeepseekV41NgramTable
@@ -220,6 +221,92 @@ class TestRowPadding:
             converter.convert("tables.0.weight", torch.ones(128, 4))
 
     def test_no_converter_when_nothing_needs_padding(self):
-        config = DeepseekV41NgramConfig(num_embeddings=[384006400, 384016896])
+        config = DeepseekV41NgramConfig(
+            num_embeddings=[384006400, 384016896], weight_quantization=RELEASED_QUANTIZATION
+        )
         model = SimpleNamespace(config=config)
-        assert create_ngram_table_padding(model) is None
+        assert create_ngram_table_converter(model) is None
+
+
+class TestTrainableTablesDequantizeAtLoad:
+    """A trainable module allocates bf16 tables, so the released fp8 rows are widened at load.
+
+    Streaming is not optional here: every rank reading the whole table and
+    dequantizing it would need 393 GB, so a rank must read only its rows of the
+    fp8 table and of the scales, and dequantize just those.
+    """
+
+    def _released_rows(self, rows: int = 10):
+        torch.manual_seed(0)
+        return quantize_rows(torch.randn(rows, DIM, dtype=torch.bfloat16))
+
+    def test_bf16_tables_get_the_dequantizing_converter(self):
+        model = SimpleNamespace(config=DeepseekV41NgramConfig())
+        assert isinstance(create_ngram_table_converter(model), NgramTableDequant)
+
+    def test_the_scale_is_read_with_its_rows_not_on_its_own(self):
+        converter = NgramTableDequant([16, 16])
+        assert converter.dim0_rowwise_companion("tables.1.weight") == "tables.1.weight_scale"
+        assert converter.dim0_rowwise_companion("tables.1.weight_scale") is None
+        assert converter.should_skip_without_loading("tables.1.weight_scale")
+        assert not converter.should_skip_without_loading("tables.1.weight")
+
+    def test_whole_tensors_pair_up_in_either_order(self):
+        packed, scale = self._released_rows()
+        expected = dequant_fp8_blockwise(packed, scale)
+        for order in (("weight", "weight_scale"), ("weight_scale", "weight")):
+            converter = NgramTableDequant([16, 16])
+            tensors = {"weight": packed, "weight_scale": scale}
+            assert converter.convert(f"tables.0.{order[0]}", tensors[order[0]]) is None
+            converted = converter.convert(f"tables.0.{order[1]}", tensors[order[1]])
+            assert converted.name == "tables.0.weight"
+            assert converted.tensor.dtype is torch.bfloat16
+            torch.testing.assert_close(converted.tensor[:10], expected, rtol=0, atol=0)
+            assert (converted.tensor[10:] == 0).all()
+            assert converter.finalize() == []
+
+    def test_a_table_without_its_scale_is_refused(self):
+        packed, _ = self._released_rows()
+        converter = NgramTableDequant([16, 16])
+        converter.convert("tables.0.weight", packed)
+        with pytest.raises(ValueError, match="missing"):
+            converter.finalize()
+
+    def test_a_bf16_checkpoint_table_is_only_padded(self):
+        converter = NgramTableDequant([16, 16])
+        converted = converter.convert("tables.0.weight", torch.ones(10, DIM, dtype=torch.bfloat16))
+        assert converted.tensor.shape[0] == 16
+        assert converter.is_dim0_zero_pad("tables.0.weight")
+
+    def test_each_rank_streams_and_dequantizes_only_its_rows(self, tmp_path):
+        """10 real rows padded to 16 over 2 ranks: rank 1 straddles the padding."""
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+
+        from veomni.models.module_utils import _companion_row_transform, _read_ep_dim0_slice
+
+        packed, scale = self._released_rows()
+        path = str(tmp_path / "ngram.safetensors")
+        save_file({"tables.0.weight": packed, "tables.0.weight_scale": scale}, path)
+        converter = NgramTableDequant([16, 16])
+        row_transform = _companion_row_transform(converter, "tables.0.weight", path, "tables.0.weight_scale")
+
+        shards = []
+        with safe_open(path, framework="pt", device="cpu") as f:
+            for rank in range(2):
+                shards.append(
+                    _read_ep_dim0_slice(
+                        f.get_slice("tables.0.weight"),
+                        name="tables.0.weight",
+                        target0=8,
+                        para_rank=rank,
+                        expected_full0=16,
+                        zero_pad=True,
+                        row_transform=row_transform,
+                    )
+                )
+
+        full = torch.cat(shards)
+        assert full.dtype is torch.bfloat16
+        torch.testing.assert_close(full[:10], dequant_fp8_blockwise(packed, scale), rtol=0, atol=0)
+        assert (full[10:] == 0).all()

@@ -36,7 +36,7 @@ import torch.nn as nn
 
 from ....omni_pretrained_model import OmniPreTrainedModel
 from ..quant_scheme import quantized_storage_dtype
-from .checkpoint import create_ngram_table_padding
+from .checkpoint import create_ngram_table_converter
 from .configuration import DeepseekV41NgramConfig
 from .hashing import (
     DEAD,
@@ -72,8 +72,8 @@ class DeepseekV41Ngram(DeepseekV41NgramInferenceMixin, OmniPreTrainedModel):
 
     @staticmethod
     def _create_checkpoint_tensor_converter(model: "DeepseekV41Ngram"):
-        """Zero-pad the checkpoint's table rows up to the allocated counts."""
-        return create_ngram_table_padding(model)
+        """Zero-pad the checkpoint's table rows up to the allocated counts; dequantize for bf16 tables."""
+        return create_ngram_table_converter(model)
 
     def __init__(self, config: DeepseekV41NgramConfig):
         super().__init__(config)

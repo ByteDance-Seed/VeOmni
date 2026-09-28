@@ -111,6 +111,28 @@ class CheckpointTensorConverter(Protocol):
         """
         ...
 
+    def dim0_rowwise_companion(self, name: str) -> Optional[str]:
+        """Optional streaming capability: the checkpoint key ``name`` is converted
+        together with, row by row -- or ``None``.
+
+        Returning a key declares that row ``i`` of the converted ``name`` depends
+        only on row ``i`` of ``name`` and of that companion (e.g. fp8 table rows
+        and their per-row block scales, dequantized to bf16). Such a transform
+        commutes with a ``Shard(0)`` split, so a per-rank streaming loader reads
+        the same real-row slice of both keys, hands them to :meth:`convert_rows`,
+        and zero-fills any rows past the checkpoint's. The companion itself
+        should be declared in :meth:`should_skip_without_loading`.
+
+        The loader only uses the companion when the checkpoint holds it; without
+        it the key falls back to :meth:`is_dim0_zero_pad`. Implementing this
+        method is optional and a missing method means ``None``.
+        """
+        ...
+
+    def convert_rows(self, name: str, rows: "torch.Tensor", companion_rows: "torch.Tensor") -> "torch.Tensor":
+        """Convert matching row slices of ``name`` and its :meth:`dim0_rowwise_companion`."""
+        ...
+
     def should_skip_without_loading(self, name: str) -> bool:
         """Optional streaming capability: whether ``name`` can be discarded
         without materializing its checkpoint tensor.
@@ -147,6 +169,17 @@ def checkpoint_converter_is_dim0_zero_pad(
         return False
     fn = getattr(converter, "is_dim0_zero_pad", None)
     return bool(fn(name)) if callable(fn) else False
+
+
+def checkpoint_converter_dim0_rowwise_companion(
+    converter: Optional["CheckpointTensorConverter"],
+    name: str,
+) -> Optional[str]:
+    """Safely query the optional :meth:`CheckpointTensorConverter.dim0_rowwise_companion`."""
+    if converter is None or not converter.can_handle(name):
+        return None
+    fn = getattr(converter, "dim0_rowwise_companion", None)
+    return fn(name) if callable(fn) else None
 
 
 def checkpoint_converter_should_skip_without_loading(

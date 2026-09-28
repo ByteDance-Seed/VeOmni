@@ -28,11 +28,13 @@ slice of the real rows and zero-fills whatever tail falls past them.
 
 import math
 import re
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 
 from .....checkpoint_tensor_loading import ConvertedCheckpointTensor
+from ..quant_scheme import quantized_storage_dtype
+from .quantized import dequantize_rows
 
 
 #: ``tables.0.weight``, ``tables.1.weight_scale`` -- the row-sharded tensors and
@@ -89,9 +91,70 @@ class NgramTablePadding:
         return []
 
 
-def create_ngram_table_padding(model) -> Optional[NgramTablePadding]:
+class NgramTableDequant(NgramTablePadding):
+    """Released fp8 rows and their scales -> the padded bf16 tables training allocates.
+
+    A trainable module cannot hold fp8 tables, so ``weight_quantization: null``
+    allocates bf16 ones and the scales are spent here. Dequantizing a row reads
+    only that row and its own scales, which is what ``dim0_rowwise_companion``
+    declares: the streaming loader then reads a rank's slice of both and never
+    holds the 196.6 B tables whole -- in bf16 that would be 393 GB per rank.
+
+    A bf16 checkpoint carries no ``weight_scale``; its tables are only padded.
+    """
+
+    def __init__(self, padded_num_embeddings: List[int]) -> None:
+        super().__init__(padded_num_embeddings)
+        self._pending: Dict[int, Dict[str, torch.Tensor]] = {}
+
+    def dim0_rowwise_companion(self, name: str) -> Optional[str]:
+        match = _TABLE_TENSOR.match(name)
+        if match is None or match.group(2) != "weight":
+            return None
+        return f"tables.{match.group('index')}.weight_scale"
+
+    def convert_rows(self, name: str, rows: torch.Tensor, companion_rows: torch.Tensor) -> torch.Tensor:
+        if rows.shape[0] == 0:
+            return torch.empty(rows.shape, dtype=torch.bfloat16)
+        return dequantize_rows(rows, companion_rows)
+
+    def should_skip_without_loading(self, name: str) -> bool:
+        return self.can_handle(name) and name.endswith(".weight_scale")
+
+    def record_skip_without_loading(self, name: str) -> None:
+        pass
+
+    def is_dim0_zero_pad(self, name: str) -> bool:
+        """Only a bf16 checkpoint's table, which has no scale to pair with."""
+        return self.can_handle(name) and name.endswith(".weight")
+
+    def convert(self, name: str, tensor: torch.Tensor) -> Optional[ConvertedCheckpointTensor]:
+        match = _TABLE_TENSOR.match(name)
+        if match is None:
+            return None
+        index, part = int(match.group("index")), match.group(2)
+        if part == "weight" and tensor.dtype != torch.float8_e4m3fn:
+            return super().convert(name, tensor)
+        pending = self._pending.setdefault(index, {})
+        pending[part] = tensor
+        if len(pending) < 2:
+            return None
+        del self._pending[index]
+        weight = self.convert_rows(f"tables.{index}.weight", pending["weight"], pending["weight_scale"])
+        return super().convert(f"tables.{index}.weight", weight)
+
+    def finalize(self) -> List[ConvertedCheckpointTensor]:
+        if self._pending:
+            unpaired = {index: sorted(parts) for index, parts in self._pending.items()}
+            raise ValueError(f"n-gram tables missing their weight or weight_scale: {unpaired}")
+        return []
+
+
+def create_ngram_table_converter(model) -> Optional[NgramTablePadding]:
     """The converter for a :class:`DeepseekV41Ngram`, or ``None`` if it needs none."""
     config = model.config
+    if quantized_storage_dtype(config) is None:
+        return NgramTableDequant(config.padded_num_embeddings)
     if list(config.padded_num_embeddings) == list(config.num_embeddings):
         return None
     return NgramTablePadding(config.padded_num_embeddings)
@@ -102,4 +165,4 @@ def padded_rows(rows: int, divisor: int) -> int:
     return math.ceil(rows / divisor) * divisor
 
 
-__all__ = ["NgramTablePadding", "create_ngram_table_padding", "padded_rows"]
+__all__ = ["NgramTableDequant", "NgramTablePadding", "create_ngram_table_converter", "padded_rows"]
