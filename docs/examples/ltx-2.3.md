@@ -129,6 +129,27 @@ data:
 The Gemma path is used by the preprocessing command; the shipped offline
 training configs consume the precomputed embeddings and do not reload Gemma.
 
+## Attention backend
+
+`model.ops_implementation.attn_implementation` selects the DiT self-, cross- and
+audio-video attention:
+
+- `eager` / `sdpa`: PyTorch SDPA, including masked calls.
+- `flash_attention_2` / `flash_attention_3`: the local FA2/FA3 packages;
+  `flash_attention_2_hub` / `flash_attention_3_hub`: the Hugging Face Hub kernels.
+  They need BF16/FP16 weights. The text context mask is dropped when it is all-valid
+  (the usual case, because the connectors replace padding with learned registers);
+  a partial context mask or a self-attention mask raises instead of falling back.
+- `flash_attention_4`: the local FA4 package through the same call; not validated here.
+- Other values are rejected at model construction. Names are resolved by the standard
+  model builder (`build_foundation_model`); loading the transformer directly with a
+  flash name is rejected rather than silently using SDPA.
+
+Before this change the DiT ignored the setting and picked a backend from the
+installed packages (FA3, xFormers or FA4 on supported GPUs). The shipped configs
+keep `eager`, which now really runs PyTorch SDPA; set `flash_attention_3` on
+Hopper to keep FA3.
+
 ## Start training on GPU/NPU
 
 ### Audio-Video LoRA (default)
