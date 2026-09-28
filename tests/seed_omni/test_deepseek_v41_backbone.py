@@ -299,6 +299,44 @@ class TestLoopOrdering:
             assert backbone.seen[layer_idx]["streams"].shape[1] == window, layer_idx
         assert backbone.seen[4]["streams"].shape[1] == window
 
+    def test_a_later_source_does_not_rewrite_an_earlier_layers_shared_state(self):
+        """What gradient checkpointing replays a layer against during backward.
+
+        Backward recomputes layer 3 after layer 4 has republished the compressed
+        KV. If every layer held the same state object, the replay would attend
+        over layer 4's KV instead of layer 0's.
+        """
+        sources = (0, 4)
+        config = make_config(kv_source_layer_ids=list(sources), candidate_source_layer_id=4)
+        backbone = stub_backbone(config)
+        received = {}
+        for layer_idx, layer in enumerate(backbone.layers):
+            inner = layer.forward
+
+            def publishing(
+                hidden_streams,
+                pre_mix,
+                position_ids,
+                rotary_emb,
+                shared,
+                *args,
+                _idx=layer_idx,
+                _inner=inner,
+                **kwargs,
+            ):
+                received[_idx] = shared
+                if _idx in sources:
+                    shared.compress_kv = torch.tensor(float(_idx))
+                return _inner(hidden_streams, pre_mix, position_ids, rotary_emb, shared, *args, **kwargs)
+
+            layer.forward = publishing
+        embeds, positions, rows = self._inputs(config)
+        backbone(embeds, positions, rows)
+
+        for layer_idx in range(N_LAYERS):
+            publisher = max(src for src in sources if src <= layer_idx)
+            assert received[layer_idx].compress_kv.item() == publisher, layer_idx
+
 
 class TestMasks:
     def _inputs(self, config, seq_len=12):

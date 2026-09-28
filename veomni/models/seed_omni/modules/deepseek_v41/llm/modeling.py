@@ -45,6 +45,7 @@ There is no HF ``past_key_values``.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -155,6 +156,10 @@ class DeepseekV41Backbone(nn.Module):
                 # can reuse the last decoder stream twice.
                 draft_inputs[layer_idx] = hidden_streams.mean(dim=2)
 
+            # A copy per layer: gradient checkpointing replays each layer during
+            # backward, after every later source layer has republished. On one
+            # shared object the replay would read a later layer's KV and top-k.
+            shared = dataclasses.replace(shared)
             hidden_streams, pre_mix, layer_logits, indexer_loss = layer(
                 hidden_streams,
                 pre_mix,
