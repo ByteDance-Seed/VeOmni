@@ -1,10 +1,10 @@
 # H3 Ref2VA / CFG-aware Implementation Plan
 
 > Execution: inline with executing-plans and test-driven-development; final review
-> with veomni-review. No commits, pushes, deployment or training submission.
+> with veomni-review. No deployment or training submission.
 
 **Goal:** Extend current public H3 training with a usable Ref2VA recipe and
-model-local CFG-aware objectives without copying internal infrastructure.
+one model-local CFG-calibrated FM objective without copying internal infrastructure.
 
 **Architecture:** Condition preparation owns both layouts and noise sampling.
 The transformer owns both forwards and the objective. The existing trainer and
@@ -17,7 +17,7 @@ runtime retain optimizer, LoRA, parallelism and checkpoint ownership.
 ## Global constraints
 
 - Base: GitHub ByteDance-Seed/VeOmni main, `3a9f736f2263479744fa0166ab6e1db7e1c76efc`.
-- Branch: `feat/h3-ref2va-cfg-aware-20260927`; no git commits or pushes.
+- Branch: `feat/h3-ref2va-cfg-aware-20260927`, published to the author's fork.
 - Preserve default FL2VA outputs and RNG use; no shared trainer or distributed edits.
 - New behavior is opt-in via `model.condition_model_cfg`.
 - Comments/docs in English; no internal service paths or dependencies.
@@ -53,8 +53,8 @@ runtime retain optimizer, LoRA, parallelism and checkpoint ownership.
 - [x] Add Ref2VA offline recipe and document exact cache contracts and equations.
 - [x] Extend H3 tests already enumerated in both GPU and NPU unit workflows.
 - [x] Run H3 suite, native LoRA, checkpoint tensor converter and lint; diagnose CPU limits.
-- [x] Review uncommitted diff with veomni-review, resolve correctness findings and rerun tests.
-- [x] Verify HEAD still equals the upstream base; leave all changes uncommitted.
+- [x] Review the complete branch diff with veomni-review and resolve findings.
+- [x] Verify the branch is based on the upstream main commit and excludes unrelated changes.
 
 ## Progress / rulings
 
@@ -88,7 +88,7 @@ runtime retain optimizer, LoRA, parallelism and checkpoint ownership.
   Restore upstream index sampling; remove the sampler option, recipe and tests.
   Keep CFG schedules and video sigma-bin loss weights unchanged.
 - Post-removal verification: 238 tests passed (75 H3 cases), `make quality` and
-  `git diff --check` passed. HEAD remains the upstream base; no commit or push.
+  `git diff --check` passed before the initial commit.
 - Interface consolidation: expose one CFG-calibrated FM objective, with
   `training_cfg_curvature_power` in [0, 2] instead of a loss-mode selector.
   Default 2 preserves the inverse-CFG formula; 0 removes curvature attenuation.
@@ -97,3 +97,6 @@ runtime retain optimizer, LoRA, parallelism and checkpoint ownership.
   245 focused tests now pass (82 H3 cases and 163 LoRA/converter cases).
   The full suite stops at E2E collection with `ModuleNotFoundError: exec_scripts`;
   this does not establish a full-suite pass or accelerator validation.
+- Pre-PR review found one stale plan-status statement, corrected here. No
+  confirmed implementation defect was found. The branch is published to the
+  author's fork for an upstream pull request.

@@ -5,7 +5,7 @@
 Extend the public H3 implementation rather than porting an internal trainer.
 The baseline already supports prepared visual Ref2VA samples, model-owned packing,
 FSDP2, checkpointing and sequence parallelism. Those implementations remain intact.
-This change adds a Ref2VA offline recipe and opt-in CFG-aware objectives with two
+This change adds a Ref2VA offline recipe and one opt-in CFG-calibrated FM objective with two
 unconditional data contracts. Upstream noise sampling is unchanged.
 
 ## Ownership
