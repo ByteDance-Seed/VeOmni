@@ -113,6 +113,7 @@ from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 from veomni.utils.seqlen_pos_transform_utils import culen2pos, pos2culen
+from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
 
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
@@ -1070,7 +1071,26 @@ class Qwen4ExpTextSparseMoeBlock(nn.Module):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
         shared_expert_output = self.shared_expert(hidden_states_reshaped)
-        _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+        router_logits, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+        # MoE router replay: when an RL framework has installed a manager via
+        # ``set_active_replay``, the manager may substitute ``selected_experts``
+        # with previously recorded target indices. The manager's sole
+        # responsibility is choosing indices; all model-specific post-topk
+        # weight math (softmax recompute, gather, renorm, dtype cast) is
+        # replicated here so the cross-framework controller stays
+        # model-agnostic. transformers v5.8 fixed Qwen3.5-MoE's ``TopKRouter``
+        # the same way as Qwen3-MoE (#715): it now returns pre-softmax
+        # ``router_logits`` and discards its internal post-softmax matrix after
+        # top-k, so we recompute ``softmax`` here to feed the RR contract.
+        # Qwen4-Exp's native router always renormalizes the top-k probs, so
+        # the gathered weights are renormalized unconditionally.
+        if get_active_replay() is not None:
+            target_dtype = routing_weights.dtype
+            routing_scores = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+            selected_experts = maybe_replay_indices(self.gate, routing_scores, selected_experts)
+            routing_weights = routing_scores.gather(1, selected_experts)
+            routing_weights = routing_weights / routing_weights.sum(-1, keepdim=True)
+            routing_weights = routing_weights.to(target_dtype)
         expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
 
         shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
