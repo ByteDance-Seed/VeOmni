@@ -7,9 +7,9 @@ import torch
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
-from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items, maybe_merge_outputs
+from ....utils.conversation import ConversationItem, iter_desired_items, maybe_merge_outputs
 from ...base.text_encoder.modeling import TextEncoder
-from ..sources import BAGEL_FLOW_QUERY, BAGEL_START_TOKEN
+from ..sources import BAGEL_FLOW_QUERY, BAGEL_PHASE_KEY, BAGEL_START_TOKEN
 from .configuration import BagelTextEncoderConfig
 from .processing import BagelTextEncoderPreprocessor, apply_image_marker
 
@@ -34,7 +34,7 @@ def prepare_bagel_encode_input_ids(
 
     input_ids: List[torch.Tensor] = []
     for item in iter_desired_items(conversation_list, types=["text"]):
-        if is_dummy(item):
+        if item.is_dummy:
             continue
         if not item.meta.get(_OMNI_TOKENIZED):
             raise ValueError("BAGEL text encoder expects CPU-preprocessed text items.")
@@ -58,7 +58,7 @@ def scatter_bagel_text_embeds(
     """Write BAGEL text embeds back onto conversation text items."""
     segment_embeds_iterator = iter(segment_embeds)
     for item in iter_desired_items(conversation_list, types=["text"]):
-        if is_dummy(item):
+        if item.is_dummy:
             continue
         item.value = next(segment_embeds_iterator).to(device=device, dtype=dtype)
     if next(segment_embeds_iterator, None) is not None:
@@ -108,8 +108,7 @@ class BagelTextEncoder(TextEncoder):
                         type="output",
                         value=start_embed,
                         role="assistant",
-                        source=BAGEL_START_TOKEN,
-                        meta={"input_ids": input_ids.reshape(-1).detach()},
+                        meta={"input_ids": input_ids.reshape(-1).detach(), BAGEL_PHASE_KEY: BAGEL_START_TOKEN},
                     )
                 )
                 self._bos_injected = True
@@ -156,9 +155,9 @@ class BagelTextEncoder(TextEncoder):
         for item in iter_desired_items(
             [conversation_list],
             types=["output"],
-            sources=[BAGEL_FLOW_QUERY],
+            meta={BAGEL_PHASE_KEY: [BAGEL_FLOW_QUERY]},
         ):
-            if is_dummy(item):
+            if item.is_dummy:
                 continue
 
             if marker_embeds is None:

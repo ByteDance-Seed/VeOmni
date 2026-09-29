@@ -72,9 +72,9 @@ class ModulePreprocessorBase:
       single ``.to(device)``.
     * **In-place mutation.** ``__call__`` receives the collator ``batch`` dict
       (must contain ``conversation_list`` as ``list[list[ConversationItem]]``).
-      The default path mutates those items' ``value`` / ``meta`` in place and
-      tags the module ``source`` so the thin ``pre_forward`` / ``generate``
-      reads the heavy work back uniformly. A packed preprocessor may override
+      The default path mutates those items' ``value`` / ``meta`` in place, and
+      the thin ``pre_forward`` / ``generate`` re-selects them with the same
+      ``type`` / ``role`` / ``meta`` filter to read the heavy work back. A packed preprocessor may override
       ``__call__`` and write tensors onto the same dict instead of walking
       items.
     * **Shared by training + inference.** Training runs it inside a collator
@@ -131,7 +131,7 @@ class ModulePreprocessorBase:
         The anchor exists so a module whose real inputs are absent this step still
         runs forward and backward, keeping its FSDP2 collectives in step with the
         other ranks. One row does that: the module's graph hooks batch every row
-        tagged with their ``source`` and flag the batch all-dummy, and every
+        their filter selects and flag the batch all-dummy, and every
         downstream consumer filters dummies out. Appending one per *sample*
         instead would put a full-size dummy image per sample through the tower —
         on a batch with no real images for this module that was the single largest

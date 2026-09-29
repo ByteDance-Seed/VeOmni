@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 
 from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
-from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT, bagel_context
 from .masking import build_mot_attention_metadata
 
 
@@ -109,13 +109,15 @@ def preprocess_mot_inputs(
 
         # Dummy carrier items are handled separately as zero-gradient anchors;
         # only real user/assistant embeddings participate in packed attention.
-        items = list(
-            iter_desired_items(
+        items = [
+            item
+            for item in iter_desired_items(
                 [sample],
                 types=["text", "image", "output"],
                 roles=["user", "assistant"],
             )
-        )
+            if not item.is_dummy
+        ]
         item_index = 0
         while item_index < len(items):
             if _is_vision_marker_triplet_at(items, item_index):
@@ -245,7 +247,7 @@ def _mot_attn_mode_for_item(item: ConversationItem) -> str:
     if item.type == "output":
         return "noise"
     if item.type == "image":
-        if item.source != BAGEL_VAE_CONTEXT:
+        if bagel_context(item) != BAGEL_VAE_CONTEXT:
             # SigLIP context (and any non-VAE image) is clean/full-attention
             # regardless of ``_img_tag``; the tag only disambiguates VAE roles.
             return "full"
@@ -270,7 +272,7 @@ def _mot_gen_token_indexes_for_span(span: PackedSpan, indexes: torch.Tensor) -> 
     item = span.item
     if item.type == "output":
         return indexes
-    if item.type != "image" or item.source != BAGEL_VAE_CONTEXT:
+    if item.type != "image" or bagel_context(item) != BAGEL_VAE_CONTEXT:
         return indexes.new_empty(0)
 
     tag = item.meta.get(_IMG_TAG_KEY)
@@ -290,23 +292,19 @@ def _mot_gen_token_indexes_for_span(span: PackedSpan, indexes: torch.Tensor) -> 
 
 
 def _is_vision_marker_triplet_at(items: list[ConversationItem], index: int) -> bool:
-    # Source equality prevents unrelated one-token text items around an image
-    # from being mistaken for BAGEL's encoder-specific marker pair.
+    # Context-tag equality prevents unrelated one-token text items around an
+    # image from being mistaken for BAGEL's encoder-specific marker pair.
     if index + 2 >= len(items):
         return False
     start, image, end = items[index], items[index + 1], items[index + 2]
-    if image.type != "image" or image.source not in {BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT}:
+    context = bagel_context(image)
+    if image.type != "image" or context not in {BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT}:
         return False
-    return (
-        start.source == image.source
-        and end.source == image.source
-        and _is_bagel_vision_marker(start, source=image.source)
-        and _is_bagel_vision_marker(end, source=image.source)
-    )
+    return _is_bagel_vision_marker(start, context=context) and _is_bagel_vision_marker(end, context=context)
 
 
-def _is_bagel_vision_marker(item: ConversationItem, *, source: str) -> bool:
-    return item.type == "text" and item.source == source and _text_item_length(item) == 1
+def _is_bagel_vision_marker(item: ConversationItem, *, context: str) -> bool:
+    return item.type == "text" and bagel_context(item) == context and _text_item_length(item) == 1
 
 
 def _text_item_length(item: ConversationItem) -> int | None:

@@ -14,7 +14,7 @@ from tests.seed_omni.bagel.helpers import (
 )
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated.accelerated import TrainingMixin
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
-from veomni.models.seed_omni.modules.bagel.sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+from veomni.models.seed_omni.modules.bagel.sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
 from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
 
@@ -35,8 +35,7 @@ def test_bagel_mot_packing_rejects_incompatible_vae_img_tag():
         type="image",
         value=torch.ones(2, 4),
         role="assistant",
-        source=BAGEL_VAE_CONTEXT,
-        meta={_IMG_TAG_KEY: "und"},
+        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "und"},
     )
 
     with pytest.raises(ValueError, match="_img_tag"):
@@ -48,22 +47,19 @@ def test_bagel_mot_packing_routes_tagged_edit_vae_through_generation_expert():
         type="image",
         value=torch.ones(2, 4),
         role="assistant",
-        source=BAGEL_VAE_CONTEXT,
-        meta={_IMG_TAG_KEY: "edit"},
+        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "edit"},
     )
     gen_target = ConversationItem(
         type="image",
         value=torch.full((2, 4), 2),
         role="assistant",
-        source=BAGEL_VAE_CONTEXT,
-        meta={_IMG_TAG_KEY: "gen"},
+        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "gen"},
     )
     siglip_context = ConversationItem(
         type="image",
         value=torch.full((1, 4), 3),
         role="user",
-        source=BAGEL_SIGLIP_CONTEXT,
-        meta={_IMG_TAG_KEY: "edit"},
+        meta={BAGEL_CONTEXT_KEY: BAGEL_SIGLIP_CONTEXT, _IMG_TAG_KEY: "edit"},
     )
 
     packed = preprocess_mot_inputs(
@@ -88,8 +84,7 @@ def test_bagel_mot_forward_pre_returns_sample_local_tensor_contract():
         type="image",
         value=torch.ones(3, hidden_size),
         role="assistant",
-        source=BAGEL_VAE_CONTEXT,
-        meta={_IMG_TAG_KEY: "gen"},
+        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "gen"},
     )
 
     inputs = model.forward_pre(conversation_list=[[text, gen_target]])
@@ -139,8 +134,7 @@ def test_bagel_mot_forward_pre_keeps_metadata_full_and_marks_sequence_padding(mo
         type="image",
         value=torch.ones(3, hidden_size),
         role="assistant",
-        source=BAGEL_VAE_CONTEXT,
-        meta={_IMG_TAG_KEY: "gen"},
+        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "gen"},
     )
 
     inputs = model.forward_pre(conversation_list=[[text, image]])
@@ -177,15 +171,13 @@ def test_bagel_flow_training_embed_treats_edit_context_as_clean_and_gen_as_targe
         type="image",
         value=torch.ones(1, 1, 2),
         role="assistant",
-        source=BAGEL_VAE_CONTEXT,
-        meta={_IMG_TAG_KEY: "edit"},
+        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "edit"},
     )
     gen_target = ConversationItem(
         type="image",
         value=torch.full((1, 1, 2), 2.0),
         role="assistant",
-        source=BAGEL_VAE_CONTEXT,
-        meta={_IMG_TAG_KEY: "gen"},
+        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "gen"},
     )
 
     inputs = model.embed_latent_pre(conversation_list=[[edit_context, gen_target]])
@@ -204,26 +196,25 @@ def test_mot_forward_post_scatters_virtual_marker_triplet_hidden_states() -> Non
     hidden_size = 4
     markers = torch.tensor([[101.0, 102.0, 103.0, 104.0], [201.0, 202.0, 203.0, 204.0]])
 
-    def marker(row: int, source: str) -> ConversationItem:
+    def marker(row: int, context: str) -> ConversationItem:
         return ConversationItem(
             type="text",
             value=markers[row : row + 1],
             role="user",
-            source=source,
-            meta={"labels": torch.full((1,), -100)},
+            meta={"labels": torch.full((1,), -100), BAGEL_CONTEXT_KEY: context},
         )
 
     latent_item = ConversationItem(
         type="image",
         value=torch.arange(8, dtype=torch.float32).reshape(2, hidden_size) + 20,
         role="assistant",
-        source=BAGEL_VAE_CONTEXT,
+        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT},
     )
     siglip_item = ConversationItem(
         type="image",
         value=torch.arange(12, dtype=torch.float32).reshape(3, hidden_size),
         role="user",
-        source=BAGEL_SIGLIP_CONTEXT,
+        meta={BAGEL_CONTEXT_KEY: BAGEL_SIGLIP_CONTEXT},
     )
     text_item = ConversationItem(
         type="text",
@@ -304,13 +295,13 @@ def test_bagel_vae_online_process_consumes_variable_size_cache_items_without_pad
         type="image",
         value=torch.zeros(2, 2, 2, 1),
         role="assistant",
-        source=BAGEL_VAE_CONTEXT,
+        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT},
     )
     second = ConversationItem(
         type="image",
         value=torch.zeros(2, 2, 2, 2),
         role="assistant",
-        source=BAGEL_VAE_CONTEXT,
+        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT},
     )
     conversation = [[first], [second]]
 

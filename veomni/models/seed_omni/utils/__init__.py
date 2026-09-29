@@ -18,7 +18,6 @@ from .conversation import (
     ConversationItem,
     build_conversation,
     collect_desired_values,
-    is_dummy,
     iter_desired_items,
     maybe_merge_outputs,
     seal_outputs,
@@ -29,7 +28,6 @@ from .convert_registry import OMNI_CONVERT_REGISTRY, convert_checkpoint
 __all__ = [
     "ConversationItem",
     "build_conversation",
-    "is_dummy",
     "maybe_merge_outputs",
     "seal_outputs",
     "iter_desired_items",

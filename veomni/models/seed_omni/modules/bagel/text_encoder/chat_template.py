@@ -8,8 +8,9 @@ from typing import Any
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from ....utils.conversation import ConversationItem, is_dummy
+from ....utils.conversation import ConversationItem
 from ...base.text_encoder.chat_template import ChatMarkers, TextEncoderChatTemplate
+from ..sources import BAGEL_CONTEXT_KEY, bagel_context
 from .processing import is_bagel_vision_marker
 
 
@@ -98,7 +99,7 @@ class BagelChatTemplate(TextEncoderChatTemplate):
 
     def tokenize(self, parts: list[ConversationItem]) -> None:
         for item in parts:
-            if item.type != "text" or is_dummy(item) or item.meta.get(_OMNI_TOKENIZED):
+            if item.type != "text" or item.is_dummy or item.meta.get(_OMNI_TOKENIZED):
                 continue
 
             token_ids = self._token_ids_for_text_item(item)
@@ -139,20 +140,22 @@ class BagelChatTemplate(TextEncoderChatTemplate):
         while index < len(sample):
             item = sample[index]
 
-            if item.type != "image" or is_dummy(item):
+            if item.type != "image" or item.is_dummy:
                 out.append(item)
                 index += 1
                 continue
 
             # Add vision marker for image items: <vision_start> + image + <vision_end>.
-            if not (out and out[-1].source == item.source and is_bagel_vision_marker(out[-1], source=item.source)):
+            # Markers carry the image's context tag so MoT can regroup the triplet.
+            context = bagel_context(item)
+            marker_meta = {"loss_mask": 0} if context is None else {"loss_mask": 0, BAGEL_CONTEXT_KEY: context}
+            if not (out and bagel_context(out[-1]) == context and is_bagel_vision_marker(out[-1], context=context)):
                 out.append(
                     ConversationItem(
                         type="text",
                         value=self.chat_markers.vision_start_token,
                         role=item.role,
-                        source=item.source,
-                        meta={"loss_mask": 0},
+                        meta=dict(marker_meta),
                     )
                 )
 
@@ -160,8 +163,8 @@ class BagelChatTemplate(TextEncoderChatTemplate):
 
             if (
                 index + 1 < len(sample)
-                and sample[index + 1].source == item.source
-                and is_bagel_vision_marker(sample[index + 1], source=item.source)
+                and bagel_context(sample[index + 1]) == context
+                and is_bagel_vision_marker(sample[index + 1], context=context)
             ):
                 out.append(sample[index + 1])
                 index += 2
@@ -171,8 +174,7 @@ class BagelChatTemplate(TextEncoderChatTemplate):
                         type="text",
                         value=self.chat_markers.vision_end_token,
                         role=item.role,
-                        source=item.source,
-                        meta={"loss_mask": 0},
+                        meta=dict(marker_meta),
                     )
                 )
                 index += 1

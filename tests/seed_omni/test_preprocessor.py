@@ -30,7 +30,7 @@ from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import (
     BagelSiglipNavitPreprocessor,
     BagelSiglipNavitProcessor,
 )
-from veomni.models.seed_omni.modules.bagel.sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+from veomni.models.seed_omni.modules.bagel.sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.modules.bagel.text_encoder.chat_template import BagelChatTemplate
 from veomni.models.seed_omni.modules.bagel.text_encoder.modeling import (
     _OMNI_TOKENIZED as BAGEL_TOK,
@@ -65,9 +65,9 @@ from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, Conversatio
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 
-def _worker_dummies(conversation_list, source):
-    """Test helper: worker-appended ``role="dummy"`` placeholders for ``source``."""
-    return list(iter_desired_items(conversation_list, roles=["dummy"], sources=[source]))
+def _worker_dummies(conversation_list, role):
+    """Test helper: worker-appended ``is_dummy`` image placeholders standing in for ``role`` images."""
+    return [it for it in iter_desired_items(conversation_list, types=["image"], roles=[role]) if it.is_dummy]
 
 
 class _DummyBagelVAE(VeOmniMixin):
@@ -251,7 +251,9 @@ def test_bagel_text_preprocessor_tokenizes_plain_items_and_is_idempotent():
     batch = [
         [
             ConversationItem(type="text", value="hi", role="user"),
-            ConversationItem(type="image", value=torch.zeros(3, 4, 4), role="user", source=BAGEL_SIGLIP_CONTEXT),
+            ConversationItem(
+                type="image", value=torch.zeros(3, 4, 4), role="user", meta={BAGEL_CONTEXT_KEY: BAGEL_SIGLIP_CONTEXT}
+            ),
             ConversationItem(type="text", value="ok", role="assistant"),
         ]
     ]
@@ -260,12 +262,12 @@ def test_bagel_text_preprocessor_tokenizes_plain_items_and_is_idempotent():
     user_text, image_start, image, image_end, assistant_text = batch[0]
 
     assert image.type == "image"
-    assert image.source == BAGEL_SIGLIP_CONTEXT
+    assert image.meta.get(BAGEL_CONTEXT_KEY) == BAGEL_SIGLIP_CONTEXT
     assert image_start.type == "text"
-    assert image_start.source == BAGEL_SIGLIP_CONTEXT
+    assert image_start.meta.get(BAGEL_CONTEXT_KEY) == BAGEL_SIGLIP_CONTEXT
     assert torch.equal(image_start.value, torch.tensor([7]))
     assert image_end.type == "text"
-    assert image_end.source == BAGEL_SIGLIP_CONTEXT
+    assert image_end.meta.get(BAGEL_CONTEXT_KEY) == BAGEL_SIGLIP_CONTEXT
     assert torch.equal(image_end.value, torch.tensor([8]))
     assert torch.equal(user_text.value, torch.tensor([5, ord("h"), ord("i"), 2]))
     assert user_text.value.device.type == "cpu"
@@ -303,14 +305,14 @@ def test_bagel_siglip_preprocessor_patchifies_and_tags_context():
                 type="image",
                 value=torch.full((3, 4, 4), 7, dtype=torch.uint8),
                 role="user",
-                source=BAGEL_SIGLIP_CONTEXT,
+                meta={BAGEL_CONTEXT_KEY: BAGEL_SIGLIP_CONTEXT},
             )
         ]
     ]
 
     pre(_b(batch))
     item = batch[0][0]
-    assert item.source == BAGEL_SIGLIP_CONTEXT
+    assert item.meta.get(BAGEL_CONTEXT_KEY) == BAGEL_SIGLIP_CONTEXT
     assert item.meta[BAGEL_SIGLIP_TOKEN_LEN] == 4
     assert item.meta[BAGEL_SIGLIP_POSITION_IDS].tolist() == [0, 1, 2, 3]
     assert item.value.shape == (4, 2 * 2 * 3)
@@ -335,7 +337,7 @@ def test_bagel_siglip_preprocessor_appends_per_sample_dummy_for_missing_context(
                 type="image",
                 value=torch.full((3, 4, 4), 7, dtype=torch.uint8),
                 role="user",
-                source=BAGEL_SIGLIP_CONTEXT,
+                meta={BAGEL_CONTEXT_KEY: BAGEL_SIGLIP_CONTEXT},
             )
         ],
         [ConversationItem(type="text", value="text-only", role="user")],
@@ -343,12 +345,13 @@ def test_bagel_siglip_preprocessor_appends_per_sample_dummy_for_missing_context(
 
     pre(_b(batch))
 
-    assert len(_worker_dummies(batch, BAGEL_SIGLIP_CONTEXT)) == 1
+    assert len(_worker_dummies(batch, "user")) == 1
     assert len(batch[0]) == 1
     dummy = batch[1][-1]
     assert dummy.type == "image"
-    assert dummy.role == "dummy"
-    assert dummy.source == BAGEL_SIGLIP_CONTEXT
+    assert dummy.role == "user" and dummy.is_dummy
+    assert dummy.meta[_IMG_TAG_KEY] == "und"
+    assert dummy.meta[BAGEL_CONTEXT_KEY] == BAGEL_SIGLIP_CONTEXT
     assert dummy.meta[BAGEL_SIGLIP_TOKEN_LEN] == 1
     assert dummy.meta[BAGEL_SIGLIP_POSITION_IDS].tolist() == [0]
     assert dummy.value.shape == (1, 2 * 2 * 3)
@@ -378,7 +381,7 @@ def test_bagel_siglip_preprocessor_keeps_bs4_sample_aligned_for_0_2_4_images():
                             type="image",
                             value=torch.full((3, 4, 4), 7, dtype=torch.uint8),
                             role="user",
-                            source=BAGEL_SIGLIP_CONTEXT,
+                            meta={BAGEL_CONTEXT_KEY: BAGEL_SIGLIP_CONTEXT},
                         )
                     ]
                 )
@@ -387,9 +390,13 @@ def test_bagel_siglip_preprocessor_keeps_bs4_sample_aligned_for_0_2_4_images():
 
         pre(_b(batch))
 
-        assert len(_worker_dummies(batch, BAGEL_SIGLIP_CONTEXT)) == 4 - real_count
+        assert len(_worker_dummies(batch, "user")) == 4 - real_count
         for sample in batch:
-            context_items = [item for item in sample if item.type == "image" and item.source == BAGEL_SIGLIP_CONTEXT]
+            context_items = [
+                item
+                for item in sample
+                if item.type == "image" and item.meta.get(BAGEL_CONTEXT_KEY) == BAGEL_SIGLIP_CONTEXT
+            ]
             assert len(context_items) == 1
 
 
@@ -480,9 +487,9 @@ def test_bagel_preprocessors_route_inference_edit_prompt_context():
         "text",
     ]
     assert torch.equal(sample[0].value, torch.tensor([5, ord("h"), ord("i"), 2]))
-    assert sample[2].source == BAGEL_VAE_CONTEXT
-    assert sample[5].source == BAGEL_SIGLIP_CONTEXT
-    assert sample[8].source == BAGEL_VAE_CONTEXT
+    assert sample[2].meta.get(BAGEL_CONTEXT_KEY) == BAGEL_VAE_CONTEXT
+    assert sample[5].meta.get(BAGEL_CONTEXT_KEY) == BAGEL_SIGLIP_CONTEXT
+    assert sample[8].meta.get(BAGEL_CONTEXT_KEY) == BAGEL_VAE_CONTEXT
     assert sample[2].value.shape == (3, 4, 4)
     assert sample[2].value.dtype == torch.bfloat16
     assert sample[5].value.shape == (4, 2 * 2 * 3)
@@ -490,7 +497,7 @@ def test_bagel_preprocessors_route_inference_edit_prompt_context():
     assert sample[5].meta[BAGEL_SIGLIP_TOKEN_LEN] == 4
     assert sample[8].value.shape == (3, 4, 4)
     assert sample[8].value.dtype == torch.bfloat16
-    assert [sample[i].source for i in [1, 3, 4, 6, 7, 9]] == [
+    assert [sample[i].meta.get(BAGEL_CONTEXT_KEY) for i in [1, 3, 4, 6, 7, 9]] == [
         BAGEL_VAE_CONTEXT,
         BAGEL_VAE_CONTEXT,
         BAGEL_SIGLIP_CONTEXT,
@@ -530,7 +537,7 @@ def test_bagel_preprocessors_route_tagged_edit_without_infer_type():
         preprocessor(_b(batch))
 
     sample = batch[0]
-    assert [item.source for item in sample if item.type == "image"] == [
+    assert [item.meta.get(BAGEL_CONTEXT_KEY) for item in sample if item.type == "image"] == [
         BAGEL_VAE_CONTEXT,
         BAGEL_SIGLIP_CONTEXT,
         BAGEL_VAE_CONTEXT,
@@ -560,7 +567,7 @@ def test_bagel_preprocessors_route_inference_und_user_image_to_siglip_only():
     text_pre(_b(batch), inference=True, generation_kwargs={"infer_type": "infer_und"})
 
     assert [item.type for item in batch[0]] == ["text", "image", "text"]
-    assert batch[0][1].source == BAGEL_SIGLIP_CONTEXT
+    assert batch[0][1].meta.get(BAGEL_CONTEXT_KEY) == BAGEL_SIGLIP_CONTEXT
     assert torch.equal(batch[0][1].value, image)
 
 
@@ -586,16 +593,17 @@ def test_bagel_vae_preprocessor_appends_per_sample_dummy_for_missing_context():
     pre(_b(batch))
 
     real = batch[0][0]
-    assert real.source == BAGEL_VAE_CONTEXT
+    assert real.meta.get(BAGEL_CONTEXT_KEY) == BAGEL_VAE_CONTEXT
     assert real.value.shape == (3, 4, 4)
     assert real.value.dtype == torch.bfloat16
     assert real.meta[BAGEL_VAE_PIXEL_SHAPE].tolist() == [4, 4]
 
-    assert len(_worker_dummies(batch, BAGEL_VAE_CONTEXT)) == 1
+    assert len(_worker_dummies(batch, "assistant")) == 1
     dummy = batch[1][-1]
     assert dummy.type == "image"
-    assert dummy.role == "dummy"
-    assert dummy.source == BAGEL_VAE_CONTEXT
+    assert dummy.role == "assistant" and dummy.is_dummy
+    assert dummy.meta[_IMG_TAG_KEY] == "gen"
+    assert dummy.meta[BAGEL_CONTEXT_KEY] == BAGEL_VAE_CONTEXT
     assert dummy.meta[BAGEL_VAE_PIXEL_SHAPE].tolist() == [4, 4]
     assert dummy.value.shape == real.value.shape
     assert dummy.value.dtype == torch.bfloat16
@@ -629,9 +637,13 @@ def test_bagel_vae_preprocessor_keeps_bs4_sample_aligned_for_0_2_4_images():
 
         pre(_b(batch))
 
-        assert len(_worker_dummies(batch, BAGEL_VAE_CONTEXT)) == 4 - real_count
+        assert len(_worker_dummies(batch, "assistant")) == 4 - real_count
         for sample in batch:
-            context_items = [item for item in sample if item.type == "image" and item.source == BAGEL_VAE_CONTEXT]
+            context_items = [
+                item
+                for item in sample
+                if item.type == "image" and item.meta.get(BAGEL_CONTEXT_KEY) == BAGEL_VAE_CONTEXT
+            ]
             assert len(context_items) == 1
         shapes = [tuple(sample[-1].value.shape) for sample in batch]
         assert len(set(shapes)) == 1
@@ -882,13 +894,13 @@ def test_siglip_appends_one_batch_anchor_when_no_user_image():
     )
     batch = _text_only_batch()
     pre(_b(batch))
-    dummies = _worker_dummies(batch, "janus_siglip")
+    dummies = _worker_dummies(batch, "user")
     assert len(dummies) == 1
     assert dummies[0] is batch[0][-1]
     d = dummies[0]
-    assert d.type == "image" and d.role == "dummy"
+    assert d.type == "image" and d.role == "user" and d.is_dummy
     assert d.value.shape == (3, 4, 4) and d.value.dtype == torch.bfloat16
-    assert d.source == "janus_siglip"
+    assert d.meta[_IMG_TAG_KEY] == "und"
 
 
 def test_siglip_no_dummy_when_user_image_present():
@@ -897,7 +909,7 @@ def test_siglip_no_dummy_when_user_image_present():
     )
     batch = [[ConversationItem(type="image", value=torch.zeros(3, 4, 4, dtype=torch.uint8), role="user")]]
     pre(_b(batch))
-    assert _worker_dummies(batch, "janus_siglip") == []
+    assert _worker_dummies(batch, "user") == []
     assert batch[0][0].value.dtype == torch.bfloat16  # real image normalized instead
 
 
@@ -912,7 +924,7 @@ def test_siglip_no_dummy_when_any_sample_in_batch_has_a_user_image():
     pre(_b(batch))
 
     # The real image already anchors the tower for the whole micro-batch.
-    assert _worker_dummies(batch, "janus_siglip") == []
+    assert _worker_dummies(batch, "user") == []
     assert len(batch[0]) == 1 and len(batch[1]) == 1
 
 
@@ -922,10 +934,10 @@ def test_vqvae_appends_one_batch_anchor_when_no_assistant_image():
     )
     batch = _text_only_batch()
     pre(_b(batch))
-    dummies = _worker_dummies(batch, "janus_vqvae")
+    dummies = _worker_dummies(batch, "assistant")
     assert len(dummies) == 1
     assert dummies[0] is batch[0][-1]
-    assert dummies[0].source == "janus_vqvae" and dummies[0].value.shape == (3, 4, 4)
+    assert dummies[0].meta[_IMG_TAG_KEY] == "gen" and dummies[0].value.shape == (3, 4, 4)
 
 
 def test_vqvae_no_dummy_when_any_sample_in_batch_has_a_gen_image():
@@ -938,7 +950,7 @@ def test_vqvae_no_dummy_when_any_sample_in_batch_has_a_gen_image():
     ]
     pre(_b(batch))
 
-    assert _worker_dummies(batch, "janus_vqvae") == []
+    assert _worker_dummies(batch, "assistant") == []
     assert len(batch[0]) == 1 and len(batch[1]) == 1
 
 
@@ -953,12 +965,12 @@ def test_qwen3vl_vision_appends_one_batch_anchor_with_grid_when_no_visual():
     )
     batch = _text_only_batch()
     pre(_b(batch))
-    dummies = _worker_dummies(batch, "qwen3vl_vision")
+    dummies = _worker_dummies(batch, "user")
     assert len(dummies) == 1
     assert dummies[0] is batch[0][-1]
     d = dummies[0]
     assert d.value.shape == (4, 8) and d.value.dtype == torch.bfloat16
-    assert d.meta[_OMNI_GRID] == [1, 2, 2] and d.source == "qwen3vl_vision"
+    assert d.meta[_OMNI_GRID] == [1, 2, 2] and d.meta[_IMG_TAG_KEY] == "und"
 
 
 def test_qwen3vl_vision_no_dummy_when_any_sample_in_batch_has_a_visual():
@@ -975,12 +987,12 @@ def test_qwen3vl_vision_no_dummy_when_any_sample_in_batch_has_a_visual():
     ]
     pre(_b(batch))
 
-    assert _worker_dummies(batch, "qwen3vl_vision") == []
+    assert _worker_dummies(batch, "user") == []
     assert len(batch[0]) == 1 and len(batch[1]) == 1
 
 
 def test_worker_dummy_routes_to_dummy_parts_in_text_template():
-    # A worker-appended role="dummy" image item must survive Janus chat-template
+    # A worker-appended is_dummy image item must survive Janus chat-template
     # (routed to dummy_parts at the end, no markers, value untouched).
     batch = _text_only_batch()
     JanusSiglipPreprocessor(
@@ -988,10 +1000,10 @@ def test_worker_dummy_routes_to_dummy_parts_in_text_template():
     )(_b(batch))
     sample = batch[0]
     templated = _janus_template().apply_chat_template(sample)
-    dummies = [p for p in templated if p.role == "dummy"]
+    dummies = [p for p in templated if p.is_dummy]
     assert len(dummies) == 1
     assert dummies[-1] is templated[-1]  # dummy parts kept at the very end
-    assert dummies[0].source == "janus_siglip"
+    assert dummies[0].role == "user" and dummies[0].meta[_IMG_TAG_KEY] == "und"
 
 
 # ── Inference flag (no dummies + generation prompt) ─────────────────────────────
@@ -1005,14 +1017,14 @@ def test_image_preprocessors_skip_dummy_in_inference():
     )
     batch = _text_only_batch()
     siglip(_b(batch), inference=True)
-    assert _worker_dummies(batch, "janus_siglip") == []
+    assert _worker_dummies(batch, "user") == []
 
     vqvae = JanusVqvaePreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = _text_only_batch()
     vqvae(_b(batch), inference=True)
-    assert _worker_dummies(batch, "janus_vqvae") == []
+    assert _worker_dummies(batch, "assistant") == []
 
     vision = Qwen3VLVisionPreprocessor(
         FakeQwen3VLImageProcessor(),
@@ -1023,7 +1035,7 @@ def test_image_preprocessors_skip_dummy_in_inference():
     )
     batch = _text_only_batch()
     vision(_b(batch), inference=True)
-    assert _worker_dummies(batch, "qwen3vl_vision") == []
+    assert _worker_dummies(batch, "user") == []
 
 
 def test_text_preprocessor_appends_generation_prompt_in_inference():

@@ -656,7 +656,7 @@ def test_item_repr_prints_both_streams_and_both_timelines():
     )
 
     assert repr(item) == (
-        "\nConversationItem(type=video, role=user, source=None)\n"
+        "\nConversationItem(type=video, role=user, is_dummy=False)\n"
         "  value: [VideoInputs] video=[torch.Tensor](20, 3, 4, 4), audio=[ndarray](160000,)\n"
         "  meta:\n"
         "    video_metadata: [VideoMetadata] total_num_frames=300, fps=30, duration=10, "

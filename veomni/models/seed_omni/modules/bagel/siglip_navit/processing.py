@@ -20,9 +20,9 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 
-from ....utils.conversation import ConversationItem, iter_desired_items
+from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
-from ..sources import BAGEL_SIGLIP_CONTEXT
+from ..sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT
 from .configuration import BagelSiglipNavitConfig
 
 
@@ -375,9 +375,11 @@ class BagelSiglipNavitPreprocessor(ModulePreprocessorBase):
 
         image_items: list[ConversationItem] = []
         for sample in conversation_list:
-            sample_image_items = list(iter_desired_items([sample], types=["image"], sources=[BAGEL_SIGLIP_CONTEXT]))
+            sample_image_items = list(
+                iter_desired_items([sample], types=["image"], meta={BAGEL_CONTEXT_KEY: [BAGEL_SIGLIP_CONTEXT]})
+            )
             if sample_image_items:
-                image_items.extend(sample_image_items)
+                image_items.extend(item for item in sample_image_items if not item.is_dummy)
             elif not inference:
                 if self._dummy_pixel_values is None:
                     raise RuntimeError(
@@ -388,9 +390,11 @@ class BagelSiglipNavitPreprocessor(ModulePreprocessorBase):
                     ConversationItem(
                         type="image",
                         value=self._dummy_pixel_values.to(dtype=self._dtype).clone(),
-                        role="dummy",
-                        source=BAGEL_SIGLIP_CONTEXT,
+                        role="user",
+                        is_dummy=True,
                         meta={
+                            _IMG_TAG_KEY: "und",
+                            BAGEL_CONTEXT_KEY: BAGEL_SIGLIP_CONTEXT,
                             _OMNI_POSITION_IDS: torch.zeros(1, dtype=torch.long),
                             _OMNI_TOKEN_LEN: 1,
                         },
@@ -410,7 +414,7 @@ class BagelSiglipNavitPreprocessor(ModulePreprocessorBase):
             image_items, pixel_chunks, position_chunks, lengths, strict=True
         ):
             item.value = pixels.to(dtype=self._dtype)
-            item.source = BAGEL_SIGLIP_CONTEXT
+            item.meta[BAGEL_CONTEXT_KEY] = BAGEL_SIGLIP_CONTEXT
             item.meta[_OMNI_POSITION_IDS] = position_ids.to(dtype=torch.long)
             item.meta[_OMNI_TOKEN_LEN] = int(length)
 

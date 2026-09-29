@@ -26,7 +26,7 @@ and `veomni/trainer/` — **no model capability was added or removed**. It:
 3. **Removes the executor indirection**: per-node execution now lives in
    `TrainingGraph.step`, making the training loop symmetric with the inference FSM.
 4. **Unifies CPU input preprocessing** across training and inference, and unifies
-   dummy handling around `item.source`.
+   dummy handling (now the `item.is_dummy` field, see §3.5).
 
 `szl.refact_omni_v2` is a **clean fast-forward** over `szl.omni_v2` (no divergent
 commits on the target). Conflicts only arise for **other branches that forked the
@@ -78,7 +78,7 @@ from ....module import ModuleMixin, pre_forward, post_forward
 from ....metric_meter_mixin import MetricMeterMixin
     → from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....conversation import ConversationItem, iter_desired_items, ...
-    → from ....utils.conversation import ConversationItem, iter_desired_items, is_dummy, ...
+    → from ....utils.conversation import ConversationItem, iter_desired_items, ...
 from ....generation_graph import FSM_SIGNAL_KEY
     → from ....graphs.generation_graph import FSM_SIGNAL_KEY
 ```
@@ -88,7 +88,7 @@ Prefer the re-export hubs where possible (stable across future moves):
 ```python
 from veomni.models.seed_omni import OmniModel, OmniConfig, ModuleMixin, build_conversation
 from veomni.models.seed_omni.mixins import ModuleMixin, Preprocessor, pre_forward, post_forward, MetricMeterMixin
-from veomni.models.seed_omni.utils import ConversationItem, iter_desired_items, is_dummy
+from veomni.models.seed_omni.utils import ConversationItem, iter_desired_items
 from veomni.models.seed_omni.graphs import TrainingGraph, GenerationGraph, NodeDef, EdgeDef, END
 from veomni.trainer.omni import OmniTrainer, OmniInferencer, OmniModuleTrainer, OmniModuleInferencer
 ```
@@ -214,16 +214,17 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
   frame rate is refused too. The clip's span is `duration` (the HF field);
   `duration_seconds` stays on `AudioMetadata` only.
 
-### 3.5 Dummy handling unified on `item.source`
-- **Gone:** `worker_dummy_items` / `has_worker_dummy` (from `utils/conversation.py`).
-- Dummies are appended by the module's `Preprocessor` (training only), tagged
-  with `item.source == _SOURCE` and real-shaped zero `value`; real items are tagged
-  the same way. Hooks filter with a single `iter_desired_items(sources=[_SOURCE])`
-  — **no `None` / role branching**.
+### 3.5 Dummy handling unified on `item.is_dummy`
+- **Gone:** `worker_dummy_items` / `has_worker_dummy` (from `utils/conversation.py`),
+  and later `ConversationItem.source`, the `sources=` filter, `role="dummy"` and the
+  `is_dummy(item)` helper.
+- Dummies are appended by the module's `Preprocessor` (training only) with
+  `is_dummy=True` and a real-shaped zero `value`; they keep the `role` and `meta`
+  tags of the real items they stand in for, so hooks select both with a single
+  `iter_desired_items(types=, roles=, meta=)` filter and branch on `item.is_dummy`.
 - FSDP gating lives in `modeling`: it runs the real forward only when
   `self.training and fsdp_enabled`, otherwise fabricates **real-shaped zeros**
-  (never `None`). Use the `is_dummy(item)` helper.
-- Source lives on `item.source`, **not** `meta["source"]`.
+  (never `None`).
 
 ### 3.6 `init_device` / `gradient_checkpointing` / `torch_compile` moved to `model.accelerator.*`; weight-load knobs to `model.*`
 - **Breaking, no back-compat shim.** Mesh knobs (`init_device`, `gradient_checkpointing`,

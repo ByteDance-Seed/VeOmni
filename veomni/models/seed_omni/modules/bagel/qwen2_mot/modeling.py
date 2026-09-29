@@ -11,9 +11,17 @@ from torch.nn.functional import scaled_dot_product_attention
 from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
 from transformers.utils import ModelOutput
 
-from ....utils.conversation import ConversationItem, get_tail_output_item
+from ....utils.conversation import ConversationItem
 from ...module_modeling_base import PretrainedOmniModule
-from ..sources import BAGEL_FLOW_HIDDEN, BAGEL_FLOW_QUERY, BAGEL_FLOW_VELOCITY, BAGEL_START_TOKEN
+from ..sources import (
+    BAGEL_FLOW_HIDDEN,
+    BAGEL_FLOW_QUERY,
+    BAGEL_FLOW_VELOCITY,
+    BAGEL_PHASE_KEY,
+    BAGEL_START_TOKEN,
+    bagel_phase,
+    get_tail_phase_item,
+)
 from .configuration import BagelQwen2MoTConfig
 from .generation_state import MotGenerationState
 from .masking import build_mot_sdpa_mask
@@ -114,7 +122,7 @@ class InferenceMixin:
             hidden_states = self._prefill_prompt(conversation_list, generation_kwargs)
         elif self._generation_state.main.cache is None:
             tail = conversation_list[-1]
-            if tail.type != "output" or tail.source != BAGEL_START_TOKEN:
+            if tail.type != "output" or bagel_phase(tail) != BAGEL_START_TOKEN:
                 raise ValueError("BAGEL understanding prefill requires a tail assistant BOS embedding.")
             self._prefill_prompt(conversation_list[:-1], generation_kwargs)
             hidden_states = self._decode_next_token(conversation_list)
@@ -130,7 +138,7 @@ class InferenceMixin:
             if tail.type != "output":
                 raise ValueError(f"BAGEL understanding decode expects tail output item, got {tail.type!r}.")
             tail.value = hidden_states[-1:].contiguous()
-            tail.source = None
+            tail.meta.pop(BAGEL_PHASE_KEY, None)
         return {"conversation_list": conversation_list}
 
     def _prepare_denoise_query(
@@ -143,9 +151,9 @@ class InferenceMixin:
 
         self._generation_state.validate_cfg_request(generation_kwargs or {})
         self._generation_state.main.require_ready()
-        tail = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_QUERY])
+        tail = get_tail_phase_item(conversation_list, BAGEL_FLOW_QUERY)
         if tail is None or not torch.is_tensor(tail.value):
-            raise ValueError("BAGEL Qwen2-MoT denoise branch requires source='bagel_flow_query'.")
+            raise ValueError(f"BAGEL Qwen2-MoT denoise branch requires an output in phase {BAGEL_FLOW_QUERY!r}.")
 
         query = tail.value
         if query.dim() == 3 and query.shape[0] == 1:
@@ -189,7 +197,7 @@ class InferenceMixin:
         if not hiddens:
             raise RuntimeError("BAGEL Qwen2-MoT denoise branch produced no branch hidden states.")
 
-        tail.source = BAGEL_FLOW_HIDDEN
+        tail.meta[BAGEL_PHASE_KEY] = BAGEL_FLOW_HIDDEN
         tail.value = torch.cat(hiddens, dim=0).to(device=self.device, dtype=self.dtype)
         return {"conversation_list": conversation_list}
 
@@ -204,9 +212,11 @@ class InferenceMixin:
             raise ValueError("BAGEL Qwen2-MoT collect_velocity requires conversation_list.")
 
         self._generation_state.validate_cfg_request(generation_kwargs or {})
-        tail = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_VELOCITY])
+        tail = get_tail_phase_item(conversation_list, BAGEL_FLOW_VELOCITY)
         if tail is None or not torch.is_tensor(tail.value):
-            raise ValueError("BAGEL Qwen2-MoT velocity collection requires source='bagel_flow_velocity'.")
+            raise ValueError(
+                f"BAGEL Qwen2-MoT velocity collection requires an output in phase {BAGEL_FLOW_VELOCITY!r}."
+            )
 
         velocity = tail.value
         if velocity.dim() == 3 and velocity.shape[0] == 1:

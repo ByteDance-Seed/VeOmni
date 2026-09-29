@@ -92,14 +92,14 @@ def test_pack_janus_conversations_expands_images_and_skips_dummies():
             role="user",
             meta={"labels": torch.tensor([-100, -100, -100])},
         ),
-        ConversationItem(type="image", value=und, role="user", source="janus_siglip"),
+        ConversationItem(type="image", value=und, role="user"),
         ConversationItem(
             type="text",
             value=torch.tensor([4, 5]),
             role="assistant",
             meta={"labels": torch.tensor([4, 5])},
         ),
-        ConversationItem(type="image", value=dummy, role="dummy", source="janus_vqvae"),
+        ConversationItem(type="image", value=dummy, role="assistant", is_dummy=True),
     ]
     packed = pack_janus_conversations([sample], pad_token_id=0, num_image_tokens=4)
     # 3 text + 4 image + 2 text = 9 (dummy image is not in the sequence)
@@ -148,9 +148,9 @@ def test_janus_packed_preprocessor_writes_batch_keys():
     conversation = [
         [
             ConversationItem(type="text", value="hi", role="user"),
-            ConversationItem(type="image", value=pixels, role="user", source="janus_siglip"),
+            ConversationItem(type="image", value=pixels, role="user"),
             ConversationItem(type="text", value="ok", role="assistant"),
-            ConversationItem(type="image", value=torch.zeros(3, 4, 4), role="dummy", source="janus_vqvae"),
+            ConversationItem(type="image", value=torch.zeros(3, 4, 4), role="assistant", is_dummy=True),
         ]
     ]
     batch = {"conversation_list": conversation}

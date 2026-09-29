@@ -16,7 +16,7 @@ from .....mixins.base_mixin import BaseMixin
 from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem, iter_desired_items
-from ...sources import BAGEL_SIGLIP_CONTEXT
+from ...sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT
 from ..configuration import BagelSiglipNavitConfig
 from ..modeling import (
     BagelSiglipNavit,
@@ -146,7 +146,9 @@ class TrainingMixin(TrainingModuleMixin):
             sample_len = 0
             # SigLIP encodes per image, including dummy carriers, but
             # multi-source metering needs one aggregated length per sample.
-            for item in iter_desired_items([sample], types=["image"], sources=[BAGEL_SIGLIP_CONTEXT]):
+            for item in iter_desired_items(
+                [sample], types=["image"], meta={BAGEL_CONTEXT_KEY: [BAGEL_SIGLIP_CONTEXT]}
+            ):
                 sample_len += int(item.meta[_OMNI_TOKEN_LEN])
             sample_lens.append(sample_len)
         return sample_lens

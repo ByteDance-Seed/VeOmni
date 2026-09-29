@@ -91,8 +91,8 @@ class TextEncoderChatTemplate:
 
         Only used for template-generated **text** marker rows. Media rows (image /
         video) are passed through verbatim by the per-model ``apply_chat_template``
-        so they keep their ``value`` / ``source`` / ``meta`` (the per-module
-        encoders filter them by ``item.source``).
+        so they keep their ``value`` / ``role`` / ``meta`` (the per-module
+        encoders select them by ``type`` / ``role`` / ``meta`` tags).
         """
         part_meta = dict(meta or {})
         if type == "text":

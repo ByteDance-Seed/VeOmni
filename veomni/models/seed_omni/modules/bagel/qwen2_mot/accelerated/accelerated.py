@@ -28,7 +28,14 @@ from .....mixins.base_mixin import BaseMixin
 from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem, iter_desired_items
-from ...sources import BAGEL_FLOW_HIDDEN, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+from ...sources import (
+    BAGEL_CONTEXT_KEY,
+    BAGEL_FLOW_HIDDEN,
+    BAGEL_PHASE_KEY,
+    BAGEL_SIGLIP_CONTEXT,
+    BAGEL_VAE_CONTEXT,
+    bagel_context,
+)
 from ..checkpoint_conversion import (
     BagelQwen2MoTCheckpointTensorConverter,
     combine_qkv_state_dict_pre_hook,
@@ -202,16 +209,20 @@ class TrainingMixin(TrainingModuleMixin):
         has_anchor = False
         include_siglip_dummy, include_flow_dummy = self._has_valid_upstream_embeddings(conversation_list)
 
-        for item in iter_desired_items(conversation_list or [], roles=["dummy"]):
-            if not torch.is_tensor(item.value):
+        for item in iter_desired_items(conversation_list or []):
+            if not item.is_dummy or not torch.is_tensor(item.value):
                 continue
 
-            source = item.source
-            if source not in ["bagel_flow_connector", BAGEL_SIGLIP_CONTEXT]:
+            # The flow connector hands its embedded VAE placeholder on as an
+            # ``output`` row; a VAE placeholder still of type ``image`` never
+            # reached the flow connector and holds no MoT-width embedding.
+            context = bagel_context(item)
+            is_flow_dummy = item.type == "output" and context == BAGEL_VAE_CONTEXT
+            if not is_flow_dummy and context != BAGEL_SIGLIP_CONTEXT:
                 continue
-            if source == "bagel_flow_connector" and not include_flow_dummy:
+            if is_flow_dummy and not include_flow_dummy:
                 continue
-            if source == BAGEL_SIGLIP_CONTEXT and not include_siglip_dummy:
+            if context == BAGEL_SIGLIP_CONTEXT and not include_siglip_dummy:
                 continue
 
             has_anchor = True
@@ -237,7 +248,7 @@ class TrainingMixin(TrainingModuleMixin):
                 conversation_list,
                 label="SigLIP",
                 types=["image"],
-                sources=[BAGEL_SIGLIP_CONTEXT],
+                meta={BAGEL_CONTEXT_KEY: [BAGEL_SIGLIP_CONTEXT]},
             )
         )
         has_flow = int(
@@ -245,7 +256,7 @@ class TrainingMixin(TrainingModuleMixin):
                 conversation_list,
                 label="flow",
                 types=["image"],
-                sources=[BAGEL_VAE_CONTEXT],
+                meta={BAGEL_CONTEXT_KEY: [BAGEL_VAE_CONTEXT]},
                 meta_keys=["flow_velocity_target"],
             )
         )
@@ -262,16 +273,18 @@ class TrainingMixin(TrainingModuleMixin):
         *,
         label: str,
         types: list[str],
-        sources: list[str] | None = None,
+        meta: dict[str, list[Any]] | None = None,
         meta_keys: list[str] | None = None,
     ) -> bool:
         for item in iter_desired_items(
             conversation_list or [],
             types=types,
             roles=["user", "assistant"],
-            sources=sources,
             meta_keys=meta_keys,
+            meta=meta,
         ):
+            if item.is_dummy:
+                continue
             value = item.value
             if not torch.is_tensor(value):
                 continue
@@ -611,7 +624,7 @@ class InferenceMixinAccelerated(InferenceMixin):
             mode="gen",
             attention_implementation=_FLASH_ATTENTION_2,
         )
-        tail.source = BAGEL_FLOW_HIDDEN
+        tail.meta[BAGEL_PHASE_KEY] = BAGEL_FLOW_HIDDEN
         tail.value = outputs["hidden_states"].to(device=self.device, dtype=self.dtype)
         return {"conversation_list": conversation_list}
 

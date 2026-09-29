@@ -1,7 +1,7 @@
 """Unit tests for the Qwen3-VL ChatML template (text + image + video, class-based)."""
 
 from veomni.models.seed_omni.modules.qwen3vl.text_encoder.chat_template import Qwen3VLChatTemplate
-from veomni.models.seed_omni.utils.conversation import ConversationItem
+from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
 
 
 class FakeTokenizer:
@@ -86,28 +86,26 @@ def test_generation_prompt_appends_assistant_prefix():
     assert parts[-2].value == "<|im_end|>\n"
 
 
-def test_chat_template_preserves_media_source():
-    """Rebuilt image/video rows must keep ``item.source`` (regression).
+def test_chat_template_passes_media_rows_through():
+    """Rebuilt image/video rows must be the original items (regression).
 
-    ``tokenize_conversation`` re-materialises every sample; dropping ``source``
-    here would make the vision encoder's ``sources=[...]`` filter return an empty
-    batch and crash ``torch.stack`` on the next forward.
+    ``tokenize_conversation`` re-materialises every sample; rebuilding a media row
+    without its ``role`` / ``meta`` here would make the vision encoder's
+    user-image filter return an empty batch and crash on the next forward.
     """
-    sample = [
-        ConversationItem(type="image", value="<pixels>", role="user", source="qwen3vl_vision"),
-        ConversationItem(type="video", value="<frames>", role="user", source="qwen3vl_vision"),
+    media = [
+        ConversationItem(type="image", value="<pixels>", role="user", meta={_IMG_TAG_KEY: "und"}),
+        ConversationItem(type="video", value="<frames>", role="user", meta={_IMG_TAG_KEY: "und"}),
     ]
-    parts = _template().apply_chat_template(sample)
+    parts = _template().apply_chat_template(media)
     media_rows = [p for p in parts if p.type in ("image", "video")]
     assert len(media_rows) == 2
-    assert all(p.source == "qwen3vl_vision" for p in media_rows)
+    assert all(row is item for row, item in zip(media_rows, media))
 
 
 def test_dummy_rows_are_moved_to_tail():
-    sample = [
-        ConversationItem(type="text", value="hi", role="user"),
-        ConversationItem(type="image", value="<dummy>", role="dummy"),
-    ]
+    dummy = ConversationItem(type="image", value="<dummy>", role="user", is_dummy=True, meta={_IMG_TAG_KEY: "und"})
+    sample = [ConversationItem(type="text", value="hi", role="user"), dummy]
     parts = _template().apply_chat_template(sample)
-    assert parts[-1].role == "dummy"
-    assert parts[-1].type == "image"
+    assert parts[-1] is dummy
+    assert [p for p in parts if p.is_dummy] == [dummy]

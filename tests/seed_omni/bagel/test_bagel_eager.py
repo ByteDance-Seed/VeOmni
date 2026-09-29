@@ -12,7 +12,12 @@ from tests.seed_omni.bagel.helpers import (
     run_eager_mot,
     tiny_bagel_qwen2_cfg,
 )
-from veomni.models.seed_omni.modules.bagel.sources import BAGEL_FLOW_HIDDEN, BAGEL_FLOW_QUERY, BAGEL_START_TOKEN
+from veomni.models.seed_omni.modules.bagel.sources import (
+    BAGEL_FLOW_HIDDEN,
+    BAGEL_FLOW_QUERY,
+    BAGEL_PHASE_KEY,
+    BAGEL_START_TOKEN,
+)
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
@@ -62,7 +67,7 @@ def test_eager_und_generate_runs() -> None:
         type="output",
         value=torch.randn(1, int(model.config.hidden_size), device=model.device, dtype=model.dtype),
         role="assistant",
-        source=BAGEL_START_TOKEN,
+        meta={BAGEL_PHASE_KEY: BAGEL_START_TOKEN},
     )
 
     outputs = model.generate([prompt, bos], generation_kwargs={"infer_type": "infer_und"})
@@ -90,15 +95,14 @@ def test_eager_gen_denoise_runs() -> None:
         type="output",
         value=torch.randn(5, hidden_size, device=model.device, dtype=model.dtype),
         role="assistant",
-        source=BAGEL_FLOW_QUERY,
-        meta={"timestep": 0.5},
+        meta={BAGEL_PHASE_KEY: BAGEL_FLOW_QUERY, "timestep": 0.5},
     )
     outputs = model.denoise_branch(
         [query],
         generation_kwargs={"infer_type": "infer_gen", "cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
     )
     tail = outputs["conversation_list"][-1]
-    assert tail.source == BAGEL_FLOW_HIDDEN
+    assert tail.meta.get(BAGEL_PHASE_KEY) == BAGEL_FLOW_HIDDEN
     assert torch.is_tensor(tail.value)
     assert tail.value.shape[0] == 5
     assert tail.value.shape[-1] == hidden_size

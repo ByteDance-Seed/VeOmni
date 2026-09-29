@@ -21,7 +21,7 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 from ....utils.conversation import ConversationItem, iter_desired_items
 from ...module_modeling_base import PretrainedOmniModule
-from ..sources import BAGEL_SIGLIP_CONTEXT
+from ..sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT
 
 
 if IS_CUDA_AVAILABLE:
@@ -46,7 +46,7 @@ def select_siglip_image_items(
         iter_desired_items(
             conversation_list,
             types=["image"],
-            sources=[BAGEL_SIGLIP_CONTEXT],
+            meta={BAGEL_CONTEXT_KEY: [BAGEL_SIGLIP_CONTEXT]},
         )
     )
 
@@ -90,7 +90,7 @@ def scatter_siglip_image_embeds(
     lengths = token_lens.detach().cpu().reshape(-1).tolist()
     for item, length in zip(image_items, lengths, strict=True):
         item.value = image_embeds[offset : offset + int(length)].to(device=device, dtype=dtype)
-        item.source = BAGEL_SIGLIP_CONTEXT
+        item.meta[BAGEL_CONTEXT_KEY] = BAGEL_SIGLIP_CONTEXT
         offset += int(length)
 
     if offset != int(image_embeds.shape[0]):

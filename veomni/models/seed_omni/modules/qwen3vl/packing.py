@@ -25,7 +25,7 @@ import torch
 
 from veomni.utils.constants import IGNORE_INDEX
 
-from ...utils.conversation import ConversationItem, is_dummy
+from ...utils.conversation import ConversationItem
 from ..base.packing import (
     PACKED_ATTENTION_MASK,
     PACKED_CU_SEQLENS,
@@ -44,8 +44,6 @@ from ..base.packing import (
 from .llm.modeling import qwen3vl_vision_position_ids
 from .vision.processing import _OMNI_GRID
 
-
-VISION_SOURCE = "qwen3vl_vision"
 
 VISUAL_POS_MASK = "visual_pos_mask"
 PIXEL_VALUES = "pixel_values"
@@ -116,7 +114,7 @@ def pack_qwen3vl_conversations(
         sample_pos: list[torch.Tensor] = []
         current_pos = 0
         for part in sample:
-            if is_dummy(part):
+            if part.is_dummy:
                 if isinstance(part.value, torch.Tensor):
                     dummy_pixels.append(_patches_2d(part.value))
                     dummy_grids.append(_grid_from_item(part))
@@ -222,7 +220,6 @@ def visual_token_count(grid_thw: torch.Tensor, spatial_merge_size: int, num_real
 
 
 __all__ = [
-    "VISION_SOURCE",
     "PACKED_INPUT_IDS",
     "PACKED_LABELS",
     "PACKED_ATTENTION_MASK",

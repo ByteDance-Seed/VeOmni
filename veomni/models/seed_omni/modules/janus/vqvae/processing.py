@@ -26,7 +26,7 @@ import torch
 from PIL import Image
 from transformers.models.janus.image_processing_janus import JanusImageProcessor
 
-from ....utils.conversation import ConversationItem, iter_desired_items
+from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
 from .configuration import JanusVqvaeConfig
 
@@ -80,17 +80,14 @@ def _to_pil(img: torch.Tensor) -> Image.Image:
     return Image.fromarray(arr)
 
 
-_SOURCE = "janus_vqvae"
-
-
 class JanusVqvaePreprocessor(ModulePreprocessorBase):
     """Worker-side image normalize for the VQVAE (generation) codec.
 
     Holds only the (picklable) VQVAE image processor + a CPU zero-pixel template
     — never the model. Runs the HF image processor on **CPU** (bf16, to halve
     IPC); writes the pixel tensor back into each ``assistant``-image item.
-    When a whole micro-batch has no assistant image, appends one ``role="dummy"``
-    placeholder carrying the zero pixels (the codec + generation heads still run
+    When a whole micro-batch has no assistant image, appends one ``is_dummy``
+    assistant-image placeholder carrying the zero pixels (the codec + generation heads still run
     on it in the GPU forward for the FSDP gradient anchor).
     """
 
@@ -126,17 +123,18 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
         del kwargs  # generation_kwargs unused: prep is kwarg-independent
         saw_real_image = False
         for sample in conversation_list:
-            sample_image_items = list(iter_desired_items([sample], types=["image"], roles=["assistant"]))
+            sample_image_items = [
+                it for it in iter_desired_items([sample], types=["image"], roles=["assistant"]) if not it.is_dummy
+            ]
             if sample_image_items:
                 # Real assistant images present → normalize them; no dummy needed.
-                # Tag with the module source so the decode path can pick up real gen
-                # images and dummies uniformly (single ``source == _SOURCE`` filter).
+                # The encode/decode hooks re-select them, and the dummy, by the same
+                # image + assistant filter.
                 pixel_values = self._image_processor(
                     images=[it.value for it in sample_image_items], return_tensors="pt"
                 )["pixel_values"]
                 for it, px in zip(sample_image_items, pixel_values, strict=True):
                     it.value = px.to(dtype=self._dtype)
-                    it.source = _SOURCE
                 saw_real_image = True
 
         if inference or saw_real_image:
@@ -151,8 +149,9 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
             ConversationItem(
                 type="image",
                 value=self._dummy_pixel_values,
-                role="dummy",
-                source=_SOURCE,
+                role="assistant",
+                is_dummy=True,
+                meta={_IMG_TAG_KEY: "gen"},
             ),
         )
 

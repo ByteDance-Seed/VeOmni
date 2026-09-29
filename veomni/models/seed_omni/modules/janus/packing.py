@@ -21,7 +21,7 @@ import torch
 
 from veomni.utils.constants import IGNORE_INDEX
 
-from ...utils.conversation import ConversationItem, is_dummy
+from ...utils.conversation import ConversationItem
 from ..base.packing import (
     PACKED_ATTENTION_MASK,
     PACKED_FEATURES,
@@ -38,8 +38,6 @@ from ..base.packing import (
 
 
 JANUS_NUM_IMAGE_TOKENS = 576
-SIGLIP_SOURCE = "janus_siglip"
-VQVAE_SOURCE = "janus_vqvae"
 
 # Keys written onto the training batch by :class:`JanusTextEncoderPreprocessor`
 # when ``packed_preprocess`` is set.
@@ -90,12 +88,12 @@ def pack_janus_conversations(
         sample_und: list[torch.Tensor] = []
         sample_gen: list[torch.Tensor] = []
         for part in sample:
-            if is_dummy(part):
+            if part.is_dummy:
                 if not isinstance(part.value, torch.Tensor):
                     continue
-                if part.source == SIGLIP_SOURCE:
+                if part.type == "image" and part.role == "user":
                     und_dummy_pixels.append(part.value)
-                elif part.source == VQVAE_SOURCE:
+                elif part.type == "image" and part.role == "assistant":
                     gen_dummy_pixels.append(part.value)
                 continue
             if part.type == "text":
@@ -115,7 +113,7 @@ def pack_janus_conversations(
                 )
             sample_ids.append(pad_ids.clone())
             sample_labels.append(ignore.clone())
-            if part.source == SIGLIP_SOURCE or (part.source is None and part.role == "user"):
+            if part.role == "user":
                 sample_und.append(ones_img)
                 sample_gen.append(zeros_img)
                 und_pixels.append(part.value)
@@ -197,8 +195,6 @@ def teacher_force_vq_hidden(packed_hidden: torch.Tensor, gen_image_mask: torch.T
 
 __all__ = [
     "JANUS_NUM_IMAGE_TOKENS",
-    "SIGLIP_SOURCE",
-    "VQVAE_SOURCE",
     "PACKED_INPUT_IDS",
     "PACKED_LABELS",
     "PACKED_ATTENTION_MASK",

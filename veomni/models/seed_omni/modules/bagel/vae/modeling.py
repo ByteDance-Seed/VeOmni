@@ -24,9 +24,9 @@ from einops import rearrange
 from torch import Tensor
 
 from ....mixins.offline_encoding_mixin import OfflineEncodingMixin
-from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
+from ....utils.conversation import ConversationItem, iter_desired_items
 from ...module_modeling_base import PretrainedOmniModule
-from ..sources import BAGEL_GENERATED_LATENT, BAGEL_VAE_CONTEXT
+from ..sources import BAGEL_CONTEXT_KEY, BAGEL_GENERATED_LATENT, BAGEL_PHASE_KEY, BAGEL_VAE_CONTEXT
 from .configuration import BagelVAEConfig
 from .processing import BAGEL_VAE_PIXEL_SHAPE, BagelVAEPreprocessor, BagelVAEProcessor, crop_latent_to_image_shape
 
@@ -40,9 +40,9 @@ def select_bagel_vae_context_items(
     if conversation_list is None:
         raise ValueError("BagelVAE requires conversation_list to select VAE context items.")
 
-    items = list(iter_desired_items(conversation_list, types=["image"], sources=[BAGEL_VAE_CONTEXT]))
+    items = list(iter_desired_items(conversation_list, types=["image"], meta={BAGEL_CONTEXT_KEY: [BAGEL_VAE_CONTEXT]}))
     if exclude_dummy:
-        return [item for item in items if not is_dummy(item)]
+        return [item for item in items if not item.is_dummy]
     return items
 
 
@@ -84,7 +84,7 @@ class InferenceMixin:
                 downsample=int(self.config.downsample),
             )
             image_item.value = latent.to(device=self.device, dtype=self.dtype)
-            image_item.source = BAGEL_VAE_CONTEXT
+            image_item.meta[BAGEL_CONTEXT_KEY] = BAGEL_VAE_CONTEXT
         return {"conversation_list": conversation_list}
 
     def decode_generated(
@@ -135,8 +135,10 @@ class InferenceMixin:
 
         # Final image decode consumes the completed latent emitted by the flow connector.
         decode_items: list[ConversationItem] = []
-        for item in iter_desired_items(conversation_list, types=["output"], sources=[BAGEL_GENERATED_LATENT]):
-            if not is_dummy(item):
+        for item in iter_desired_items(
+            conversation_list, types=["output"], meta={BAGEL_PHASE_KEY: [BAGEL_GENERATED_LATENT]}
+        ):
+            if not item.is_dummy:
                 decode_items.append(item)
         return decode_items
 

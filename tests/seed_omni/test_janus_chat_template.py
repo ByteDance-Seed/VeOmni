@@ -4,7 +4,7 @@ from veomni.models.seed_omni.modules.janus.text_encoder.chat_template import (
     IMAGE_PLACEHOLDER,
     JanusChatTemplate,
 )
-from veomni.models.seed_omni.utils.conversation import ConversationItem
+from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
 
 
 # A distinctive substring of the fixed Janus default system prompt.
@@ -57,35 +57,35 @@ def test_expand_user_text_image_text_uses_boi_eoi_spans():
     assert not any(p.meta.get("image_slot") for p in parts)
 
 
-def test_apply_chat_template_preserves_media_source():
-    """Rebuilt image rows must keep ``item.source`` (regression).
+def test_apply_chat_template_passes_media_rows_through():
+    """Rebuilt image rows must be the original items (regression).
 
     The text encoder's ``tokenize_conversation`` re-materialises every sample, so
-    if ``apply_chat_template`` drops ``source`` from the rebuilt image row, the
-    VQVAE encoder's ``sources=[janus_vqvae]`` filter sees an empty batch and
-    ``torch.stack`` crashes on the next forward.
+    if ``apply_chat_template`` rebuilt the image row without its ``role`` /
+    ``meta``, the VQVAE encoder's assistant-image filter would see an empty batch
+    and ``torch.stack`` would crash on the next forward.
     """
-    sample = [
-        ConversationItem(type="text", value="draw a cat", role="user"),
-        ConversationItem(type="image", value=None, role="assistant", source="janus_vqvae"),
-    ]
+    image = ConversationItem(type="image", value=None, role="assistant", meta={_IMG_TAG_KEY: "gen"})
+    sample = [ConversationItem(type="text", value="draw a cat", role="user"), image]
     parts = _template().apply_chat_template(sample)
     image_rows = [p for p in parts if p.type == "image"]
-    assert len(image_rows) == 1
-    assert image_rows[0].source == "janus_vqvae"
+    assert image_rows == [image]
+    assert image_rows[0] is image
 
 
-def test_apply_chat_template_preserves_dummy_source():
-    """Worker-appended dummy rows are passed through verbatim (source kept)."""
+def test_apply_chat_template_moves_dummy_rows_to_the_tail():
+    """A worker-appended dummy is passed through verbatim after the templated
+    sample, and does not cost the sample its closing eos."""
+    dummy = ConversationItem(type="image", value=None, role="assistant", is_dummy=True, meta={_IMG_TAG_KEY: "gen"})
     sample = [
         ConversationItem(type="text", value="hello", role="user"),
         ConversationItem(type="text", value="hi", role="assistant"),
-        ConversationItem(type="image", value=None, role="dummy", source="janus_vqvae"),
+        dummy,
     ]
     parts = _template().apply_chat_template(sample)
-    dummy_rows = [p for p in parts if p.role == "dummy"]
-    assert len(dummy_rows) == 1
-    assert dummy_rows[0].source == "janus_vqvae"
+    assert parts[-1] is dummy
+    assert parts[-2].value == "</s>"
+    assert [p for p in parts if p.is_dummy] == [dummy]
 
 
 def _supervised_text(tmpl: JanusChatTemplate, parts: list[ConversationItem]) -> str:
@@ -105,7 +105,7 @@ def test_t2i_supervises_only_eoi():
     """
     sample = [
         ConversationItem(type="text", value="a cat on the moon", role="user"),
-        ConversationItem(type="image", value=None, role="assistant", source="janus_vqvae"),
+        ConversationItem(type="image", value=None, role="assistant", meta={_IMG_TAG_KEY: "gen"}),
     ]
     tmpl = _template()
     assert _supervised_text(tmpl, tmpl.apply_chat_template(sample)) == "<eoi>"

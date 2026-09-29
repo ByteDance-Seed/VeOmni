@@ -16,7 +16,7 @@ import torch
 from .....auto import build_tokenizer
 from ....utils.conversation import ConversationItem
 from ...base.text_encoder.processing import TextEncoderPreprocessor
-from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT, bagel_context
 
 
 if TYPE_CHECKING:
@@ -25,12 +25,12 @@ if TYPE_CHECKING:
     from .chat_template import BagelChatTemplate
 
 
-def is_bagel_vision_marker(item: ConversationItem, *, source: str | None = None) -> bool:
+def is_bagel_vision_marker(item: ConversationItem, *, context: str | None = None) -> bool:
     if item.type != "text":
         return False
-    if source is not None and item.source != source:
+    if context is not None and bagel_context(item) != context:
         return False
-    if item.source not in {BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT}:
+    if bagel_context(item) not in {BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT}:
         return False
     return _text_item_length(item) == 1
 

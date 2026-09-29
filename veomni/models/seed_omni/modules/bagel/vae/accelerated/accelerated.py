@@ -21,7 +21,7 @@ from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.offline_encoding_mixin import OfflineEncodingMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem
-from ...sources import BAGEL_VAE_CONTEXT
+from ...sources import BAGEL_CONTEXT_KEY, BAGEL_VAE_CONTEXT
 from ..configuration import BagelVAEConfig
 from ..modeling import BagelVAE, select_bagel_vae_context_items
 from ..processing import BAGEL_VAE_PIXEL_SHAPE, crop_latent_to_image_shape
@@ -105,8 +105,7 @@ class BagelVAEOfflineMixin:
             if cache_tensor.dim() == 3 and int(cache_tensor.shape[0]) == 2 * z_channels:
                 cache_tensor = cache_tensor.reshape(2, z_channels, *cache_tensor.shape[-2:])
             item.value = cache_tensor.detach().to(device=self.device, dtype=self.dtype)
-            item.source = BAGEL_VAE_CONTEXT
-            item.meta = {}
+            item.meta = {BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT}
         return {"conversation_list": conversation}
 
     @pre_forward("online_process")
@@ -211,7 +210,7 @@ class TrainingMixin(TrainingModuleMixin):
             for item, latent in zip(encode_items, latents, strict=True):
                 item.type = "image"
                 item.value = latent
-                item.source = BAGEL_VAE_CONTEXT
+                item.meta[BAGEL_CONTEXT_KEY] = BAGEL_VAE_CONTEXT
         else:
             for item, latent in zip(encode_items, latents, strict=True):
                 item.type = "image"
@@ -221,7 +220,7 @@ class TrainingMixin(TrainingModuleMixin):
                     downsample=int(self.config.downsample),
                 )
                 item.value = latent
-                item.source = BAGEL_VAE_CONTEXT
+                item.meta[BAGEL_CONTEXT_KEY] = BAGEL_VAE_CONTEXT
         return {"conversation_list": conversation}
 
     def _gather_encode_output(self, output: torch.Tensor) -> torch.Tensor:

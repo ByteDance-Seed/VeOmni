@@ -8,7 +8,7 @@ import torch.nn as nn
 from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.tensor_utils import naflatten
 
-from ....utils.conversation import ConversationItem, is_dummy
+from ....utils.conversation import ConversationItem
 from ...module_modeling_base import PretrainedOmniModule
 from .configuration import Qwen3VLLlmConfig
 
@@ -44,7 +44,7 @@ def collect_qwen3vl_dummy_deepstack(
 ) -> Optional[List[torch.Tensor]]:
     for sample in conversations:
         for item in sample:
-            if is_dummy(item) and item.type == "image" and "deepstack" in item.meta:
+            if item.is_dummy and item.type == "image" and "deepstack" in item.meta:
                 return [d.to(device) for d in item.meta["deepstack"]]
     return None
 
@@ -65,7 +65,7 @@ def pack_qwen3vl_conversations_for_forward(
         sample_len = 0
         current_pos = 0
         for item in sample:
-            if is_dummy(item):
+            if item.is_dummy:
                 continue
             embeds = item.value.to(device)
             length = embeds.size(0)

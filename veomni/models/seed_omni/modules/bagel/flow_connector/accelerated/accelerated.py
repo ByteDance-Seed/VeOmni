@@ -18,8 +18,8 @@ from .......distributed.sequence_parallel import gather_outputs, slice_input_ten
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
-from .....utils.conversation import _IMG_TAG_KEY, ConversationItem, is_dummy, iter_desired_items
-from ...sources import BAGEL_FLOW_HIDDEN, BAGEL_FLOW_VELOCITY
+from .....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
+from ...sources import BAGEL_FLOW_HIDDEN, BAGEL_FLOW_VELOCITY, BAGEL_PHASE_KEY, bagel_phase
 from ..configuration import BagelFlowConnectorConfig
 from ..modeling import BagelFlowConnector, scatter_flow_latent_embeds, select_vae_context_latent_items
 from ..processing import preprocess_context_latent_embed, preprocess_decode_velocity, preprocess_latent_embed
@@ -92,7 +92,7 @@ class TrainingMixin(TrainingModuleMixin):
         parts: list[dict[str, torch.Tensor]] = []
         meter_lengths: list[int] = []
         for item in self._embed_items:
-            if is_dummy(item):
+            if item.is_dummy:
                 inputs, lengths = preprocess_context_latent_embed(
                     [item],
                     config=self.config,
@@ -262,6 +262,8 @@ class TrainingMixin(TrainingModuleMixin):
             types=["text", "image", "output"],
             roles=["user", "assistant"],
         ):
+            if item.is_dummy:
+                continue
             value = item.value
             if not torch.is_tensor(value):
                 continue
@@ -289,7 +291,7 @@ class TrainingMixin(TrainingModuleMixin):
             # MoT hidden states.
             sample_target_items: list[ConversationItem] = []
             for item in iter_desired_items([sample], types=["image"]):
-                if not is_dummy(item) and torch.is_tensor(item.meta.get("flow_velocity_target")):
+                if not item.is_dummy and torch.is_tensor(item.meta.get("flow_velocity_target")):
                     sample_target_items.append(item)
             target_groups.append(sample_target_items)
         return target_groups
@@ -313,8 +315,8 @@ class TrainingMixin(TrainingModuleMixin):
                 span = velocity[offset : offset + length]
                 offset += length
                 item.value = span.to(device=self.device, dtype=self.dtype)
-                if item.source == BAGEL_FLOW_HIDDEN:
-                    item.source = BAGEL_FLOW_VELOCITY
+                if bagel_phase(item) == BAGEL_FLOW_HIDDEN:
+                    item.meta[BAGEL_PHASE_KEY] = BAGEL_FLOW_VELOCITY
                 real_velocity_parts.append(span)
         if offset != int(velocity.shape[0]):
             raise RuntimeError("BAGEL flow connector token count mismatch during velocity scatter.")

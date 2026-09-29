@@ -23,14 +23,17 @@ import torch
 import torch.nn as nn
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
-from ....utils.conversation import ConversationItem, get_tail_output_item, is_dummy, iter_desired_items
+from ....utils.conversation import ConversationItem, iter_desired_items
 from ...module_modeling_base import PretrainedOmniModule
 from ..sources import (
+    BAGEL_CONTEXT_KEY,
     BAGEL_FLOW_HIDDEN,
     BAGEL_FLOW_QUERY,
     BAGEL_FLOW_VELOCITY,
     BAGEL_GENERATED_LATENT,
+    BAGEL_PHASE_KEY,
     BAGEL_VAE_CONTEXT,
+    get_tail_phase_item,
 )
 from .configuration import BagelFlowConnectorConfig
 from .generation_state import FlowGenerationState
@@ -50,7 +53,7 @@ def select_vae_context_latent_items(
     # VAE preprocessing already makes BAGEL_VAE_CONTEXT per-sample by
     # appending a dummy carrier only for samples without real VAE context.
     # Reuse those existing carriers here; do not append another dummy.
-    return list(iter_desired_items(conversation_list, types=["image"], sources=[BAGEL_VAE_CONTEXT]))
+    return list(iter_desired_items(conversation_list, types=["image"], meta={BAGEL_CONTEXT_KEY: [BAGEL_VAE_CONTEXT]}))
 
 
 def scatter_flow_latent_embeds(
@@ -68,12 +71,11 @@ def scatter_flow_latent_embeds(
         offset += length
 
         # Hand the upstream VAE dummy carrier off as a flow dummy anchor;
-        # downstream MoT should not treat it as another VAE image span.
-        if is_dummy(item):
+        # downstream MoT should not treat it as another VAE image span. Only
+        # the context tag survives: it is how MoT recognizes the flow anchor.
+        if item.is_dummy:
             item.type = "output"
-            item.role = "dummy"
-            item.source = "bagel_flow_connector"
-            item.meta = {}
+            item.meta = {BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT}
 
     if offset != int(latent_embeds.shape[0]):
         raise RuntimeError("BAGEL flow connector latent count mismatch during embed scatter.")
@@ -105,7 +107,7 @@ class InferenceMixin:
             return {"conversation_list": conversation_list}
 
         batched = [conversation_list]
-        embed_items = [item for item in select_vae_context_latent_items(batched) if not is_dummy(item)]
+        embed_items = [item for item in select_vae_context_latent_items(batched) if not item.is_dummy]
         if not embed_items:
             return {"conversation_list": conversation_list}
 
@@ -160,23 +162,21 @@ class InferenceMixin:
         query = outputs["latent_embeds"].to(device=self.device, dtype=self.dtype)
         timestep_meta = timestep.detach().to(device=query.device, dtype=torch.float32)
 
-        item = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_VELOCITY])
+        item = get_tail_phase_item(conversation_list, BAGEL_FLOW_VELOCITY)
         if item is None:
             conversation_list.append(
                 ConversationItem(
                     type="output",
                     value=query,
                     role="assistant",
-                    source=BAGEL_FLOW_QUERY,
-                    meta={"timestep": timestep_meta},
+                    meta={"timestep": timestep_meta, BAGEL_PHASE_KEY: BAGEL_FLOW_QUERY},
                 )
             )
         else:
             item.type = "output"
             item.role = "assistant"
-            item.source = BAGEL_FLOW_QUERY
             item.value = query
-            item.meta = {"timestep": timestep_meta}
+            item.meta = {"timestep": timestep_meta, BAGEL_PHASE_KEY: BAGEL_FLOW_QUERY}
         return {"conversation_list": conversation_list}
 
     def decode_velocity_from_hidden(
@@ -189,9 +189,9 @@ class InferenceMixin:
         if conversation_list is None:
             raise ValueError("BAGEL flow inference requires conversation_list.")
 
-        item = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_HIDDEN])
+        item = get_tail_phase_item(conversation_list, BAGEL_FLOW_HIDDEN)
         if item is None or not torch.is_tensor(item.value):
-            raise ValueError("BAGEL flow decode_velocity requires source='bagel_flow_hidden'.")
+            raise ValueError(f"BAGEL flow decode_velocity requires an output in phase {BAGEL_FLOW_HIDDEN!r}.")
 
         hidden = item.value
         if hidden.dim() == 3 and hidden.shape[0] == 1:
@@ -222,7 +222,7 @@ class InferenceMixin:
             velocity = self.decode_velocity(hidden_states=hidden)["velocity"]
         item.type = "output"
         item.role = "assistant"
-        item.source = BAGEL_FLOW_VELOCITY
+        item.meta[BAGEL_PHASE_KEY] = BAGEL_FLOW_VELOCITY
         item.value = velocity.to(device=self.device, dtype=self.dtype)
         return {"conversation_list": conversation_list}
 
@@ -236,9 +236,9 @@ class InferenceMixin:
         if conversation_list is None:
             raise ValueError("BAGEL flow inference requires conversation_list.")
 
-        item = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_VELOCITY])
+        item = get_tail_phase_item(conversation_list, BAGEL_FLOW_VELOCITY)
         if item is None or not torch.is_tensor(item.value):
-            raise ValueError("BAGEL flow advance requires source='bagel_flow_velocity'.")
+            raise ValueError(f"BAGEL flow advance requires an output in phase {BAGEL_FLOW_VELOCITY!r}.")
 
         velocity = item.value
         if velocity.dim() == 3 and velocity.shape[0] == 1:
@@ -255,7 +255,7 @@ class InferenceMixin:
         conversation_list: list[ConversationItem],
     ) -> dict[str, Any]:
         x_t = self._generation_state.latents
-        item = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_VELOCITY])
+        item = get_tail_phase_item(conversation_list, BAGEL_FLOW_VELOCITY)
         latent = unpatchify_latent_tokens(
             x_t,
             self._generation_state.grid_shape,
@@ -268,16 +268,14 @@ class InferenceMixin:
                     type="output",
                     value=latent,
                     role="assistant",
-                    source=BAGEL_GENERATED_LATENT,
-                    meta={},
+                    meta={BAGEL_PHASE_KEY: BAGEL_GENERATED_LATENT},
                 )
             )
         else:
             item.type = "output"
             item.role = "assistant"
-            item.source = BAGEL_GENERATED_LATENT
             item.value = latent.to(device=self.device, dtype=self.dtype)
-            item.meta = {}
+            item.meta = {BAGEL_PHASE_KEY: BAGEL_GENERATED_LATENT}
 
         self._generation_state.reset()
         return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: SIGNAL_IMAGE_COMPLETE}

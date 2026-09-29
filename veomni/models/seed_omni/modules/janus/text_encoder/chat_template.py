@@ -97,6 +97,9 @@ class JanusChatTemplate(TextEncoderChatTemplate):
             False  # True after a user image; prepend \n to the next user text (HF Jinja same-turn layout).
         )
         for item in sample:
+            if item.is_dummy:
+                dummy_parts.append(item)
+                continue
             role = item.role
             if role != prev_role:
                 if role == "user":
@@ -119,18 +122,16 @@ class JanusChatTemplate(TextEncoderChatTemplate):
                     text = "\n" + text
                 out.append(self._build_conversation_item("text", text, role))
                 prev_was_user_image = False
-            elif item.type == "image" and role != "dummy":
+            elif item.type == "image":
                 # ``<boi>`` stays out of the text CE: Janus was never trained to emit
                 # it (upstream VeOmni masks ``image_start_id`` for the same reason), so
                 # supervising it costs tens of nats and swamps the real text loss.
                 # ``<eoi>`` is supervised — after a fixed-length image span the model
                 # predicts it near-perfectly, and the reference stack scores it too.
                 out.append(self._build_conversation_item("text", self.chat_markers.boi_token, role, loss_mask=0))
-                out.append(item)  # media row passed through verbatim (keeps value/source/meta)
+                out.append(item)  # media row passed through verbatim (keeps value/role/meta)
                 out.append(self._build_conversation_item("text", self.chat_markers.eoi_token, role))
                 prev_was_user_image = role == "user"
-            elif role == "dummy":
-                dummy_parts.append(item)
             else:
                 raise ValueError(f"Unsupported part type: {item.type}")
         if prev_role == "assistant":
@@ -171,13 +172,13 @@ class JanusChatTemplate(TextEncoderChatTemplate):
     @staticmethod
     def _sample_has_user_image(sample: list[ConversationItem]) -> bool:
         """Return True when the raw conversation includes a user ``image`` row."""
-        return any(item.type == "image" and item.role == "user" for item in sample)
+        return any(item.type == "image" and item.role == "user" and not item.is_dummy for item in sample)
 
     @staticmethod
     def _ends_on_generated_image(sample: list[ConversationItem]) -> bool:
         """Return True when the assistant's last row is an ``image`` (a T2I turn)."""
         for item in reversed(sample):
-            if item.role == "dummy":
+            if item.is_dummy:
                 continue
             return item.type == "image" and item.role == "assistant"
         return False

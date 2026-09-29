@@ -21,7 +21,7 @@ from veomni.models.seed_omni import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_MODEL_
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import PackedConversation, preprocess_mot_inputs
-from veomni.models.seed_omni.modules.bagel.sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+from veomni.models.seed_omni.modules.bagel.sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
 
 
@@ -139,7 +139,7 @@ def clone_conversation(conversation: list[list[ConversationItem]]) -> list[list[
                     type=item.type,
                     value=value,
                     role=item.role,
-                    source=item.source,
+                    is_dummy=item.is_dummy,
                     meta=_clone_meta(item.meta),
                 )
             )
@@ -182,8 +182,7 @@ def build_toy_conversation(
                 type="image",
                 value=_embed(generator, 4, hidden_size, device=device, dtype=dtype),
                 role="user",
-                source=BAGEL_SIGLIP_CONTEXT,
-                meta={_IMG_TAG_KEY: "und"},
+                meta={BAGEL_CONTEXT_KEY: BAGEL_SIGLIP_CONTEXT, _IMG_TAG_KEY: "und"},
             )
         )
 
@@ -204,8 +203,8 @@ def build_toy_conversation(
                 type="image",
                 value=_embed(generator, 6, hidden_size, device=device, dtype=dtype),
                 role="assistant",
-                source=BAGEL_VAE_CONTEXT,
                 meta={
+                    BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT,
                     _IMG_TAG_KEY: "gen",
                     "flow_velocity_target": torch.randn(
                         6,

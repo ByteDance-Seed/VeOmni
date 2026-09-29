@@ -33,7 +33,6 @@ from ...module_modeling_base import PretrainedOmniModule
 from .configuration import Qwen3VLVisionEncoderConfig
 from .processing import (
     _OMNI_GRID,
-    _SOURCE,
     Qwen3VLVisionImageProcessor,
     Qwen3VLVisionPreprocessor,
     Qwen3VLVisionVideoProcessor,
@@ -146,7 +145,6 @@ def scatter_qwen3vl_visual_embeds(
     deepstack_split = [torch.split(layer, sizes, dim=0) for layer in deepstack_features]
     for idx, slot in enumerate(output_slots):
         slot.item.value = embeds_split[idx]
-        slot.item.source = _SOURCE
         slot.item.meta["grid_thw"] = slot.grid
         slot.item.meta["deepstack"] = [layer[idx] for layer in deepstack_split]
 

@@ -11,7 +11,7 @@ import torch
 from transformers import PreTrainedTokenizerBase
 
 from .....mixins.training_module_mixin import post_forward, pre_forward
-from .....utils.conversation import ConversationItem, is_dummy, iter_desired_items
+from .....utils.conversation import ConversationItem, iter_desired_items
 from ....base.text_encoder.accelerated import (
     TrainingMixin as BaseTrainingMixin,
 )
@@ -78,6 +78,8 @@ class TrainingMixin(BaseTrainingMixin):
         for item in iter_desired_items(
             conversation_list, types=["text", "image", "output"], roles=["user", "assistant"]
         ):
+            if item.is_dummy:
+                continue
             value = item.value
             if not torch.is_tensor(value):
                 continue
@@ -118,7 +120,7 @@ class TrainingMixin(BaseTrainingMixin):
         hidden_parts: List[torch.Tensor] = []
         shift_label_parts: List[torch.Tensor] = []
         for item in iter_desired_items(conversation_list, types=["text"]):
-            if is_dummy(item):
+            if item.is_dummy:
                 continue
 
             hidden_states = item.value

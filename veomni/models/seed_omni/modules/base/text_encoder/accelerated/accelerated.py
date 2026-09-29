@@ -26,7 +26,7 @@ from .....mixins.base_mixin import BaseMixin
 from .....mixins.emb_parallel_mixin import EmbParallelMixin
 from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
-from .....utils.conversation import ConversationItem, is_dummy
+from .....utils.conversation import ConversationItem
 from ..chat_template import TextEncoderChatTemplate
 from ..configuration import TextEncoderConfig
 from ..modeling import TextEncoder, scatter_text_encoder_embeds
@@ -142,7 +142,7 @@ class TrainingMixin(TrainingModuleMixin):
         for sample in conversation_list:
             sample_start = decode_len
             for part in sample:
-                if is_dummy(part):
+                if part.is_dummy:
                     continue
                 hidden_states = part.value
                 if hidden_states.dim() == 3:

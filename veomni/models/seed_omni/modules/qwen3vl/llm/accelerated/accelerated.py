@@ -15,7 +15,7 @@ from veomni.utils.tensor_utils import unflatten
 
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
-from .....utils.conversation import ConversationItem, is_dummy
+from .....utils.conversation import ConversationItem
 from ....base.llm_packing import scatter_llm_hidden_states
 from ..configuration import Qwen3VLLlmConfig
 from ..modeling import Qwen3VLLlm, pack_qwen3vl_conversations_for_forward
@@ -197,7 +197,7 @@ def _fold_fsdp_dummy_anchors(
 ) -> torch.Tensor:
     for sample in conversations:
         for part in sample:
-            if not is_dummy(part):
+            if not part.is_dummy:
                 continue
             if isinstance(part.value, torch.Tensor):
                 inputs_embeds = (

@@ -1,4 +1,4 @@
-"""Unit tests for SeedOmni conversation-list helpers."""
+"""Unit tests for SeedOmni conversation-list helpers; items are selected by data tags, never by module."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import torch
 
 from veomni.data.seed_omni.utils.media_metadata import AudioMetadata
 from veomni.models.seed_omni.utils.conversation import (
+    _IMG_TAG_KEY,
     ConversationItem,
     build_conversation,
     collect_desired_values,
@@ -171,13 +172,32 @@ def test_iter_desired_items_filters_meta_keys():
 
 
 def test_get_tail_output_item_returns_latest_matching_output():
-    first = ConversationItem(type="output", value=torch.zeros(1), role="assistant", source="a")
+    first = ConversationItem(type="output", value=torch.zeros(1), role="assistant", meta={"a": 1})
     middle = ConversationItem(type="text", value="done", role="assistant")
-    second = ConversationItem(type="output", value=torch.ones(1), role="assistant", source="b")
-    third = ConversationItem(type="output", value=torch.full((1,), 2.0), role="assistant", source="a")
+    second = ConversationItem(type="output", value=torch.ones(1), role="user", meta={"b": 1})
+    third = ConversationItem(type="output", value=torch.full((1,), 2.0), role="assistant", meta={"a": 1})
     conversation = [first, middle, second, third]
 
     assert get_tail_output_item(conversation) is third
-    assert get_tail_output_item(conversation, sources=["a"]) is third
-    assert get_tail_output_item(conversation, sources=["b"]) is second
-    assert get_tail_output_item(conversation, sources=["missing"]) is None
+    assert get_tail_output_item(conversation, meta_keys=["a"]) is third
+    assert get_tail_output_item(conversation, meta_keys=["b"]) is second
+    assert get_tail_output_item(conversation, roles=["user"]) is second
+    assert get_tail_output_item(conversation, meta_keys=["missing"]) is None
+
+
+def test_a_dummy_is_selected_by_the_same_filter_as_the_items_it_stands_in_for():
+    """An encoder reads real and placeholder rows with one filter and tells them
+    apart by ``is_dummy``; a placeholder tagged for another encoder is not taken."""
+    und = ConversationItem(type="image", value=torch.zeros(1), role="user", meta={_IMG_TAG_KEY: "und"})
+    und_dummy = ConversationItem(
+        type="image", value=torch.zeros(1), role="user", is_dummy=True, meta={_IMG_TAG_KEY: "und"}
+    )
+    gen_dummy = ConversationItem(
+        type="image", value=torch.zeros(1), role="assistant", is_dummy=True, meta={_IMG_TAG_KEY: "gen"}
+    )
+    conversation_list = [[und], [und_dummy, gen_dummy]]
+
+    picked = list(iter_desired_items(conversation_list, types=["image"], roles=["user"], meta={_IMG_TAG_KEY: ["und"]}))
+
+    assert picked == [und, und_dummy]
+    assert [item.is_dummy for item in picked] == [False, True]

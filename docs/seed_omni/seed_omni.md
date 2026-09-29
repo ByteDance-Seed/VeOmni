@@ -290,10 +290,11 @@ mutable list is threaded through every call. One element:
 ```python
 @dataclass
 class ConversationItem:
-    type: str    # "text" | "image" | "output"
-    value: Any   # raw content → embedding tensor → hidden state (mutated in place)
-    role: str    # "user" | "assistant" | "dummy"
-    meta: dict   # per-module baggage: labels, attention_mask, janus_vqvae_labels, ...
+    type: str       # "text" | "image" | "output"
+    value: Any      # raw content → embedding tensor → hidden state (mutated in place)
+    role: str       # "user" | "assistant"
+    is_dummy: bool  # FSDP placeholder, see below
+    meta: dict      # data tags (``_img_tag``) + per-module baggage: labels, attention_mask, ...
 ```
 
 - Training carries a **batch**: `list[list[ConversationItem]]`.
@@ -308,10 +309,17 @@ flowchart LR
     C -->|decode head| D["loss / sampled token"]
 ```
 
-A `role="dummy"` item is a zero-tensor placeholder an encoder appends on a
-micro-batch that lacks its modality (e.g. a text-only sample has no image). The
-backbone skips dummy rows when packing but folds a `+ value.mean()*0.0` anchor
-so FSDP gradient-sync stays aligned across ranks.
+Items carry no module ownership: which module takes an item is decided by its
+`type` / `role` / `meta` tags alone (e.g. the data layer's `_img_tag` =
+`"und"` / `"gen"` / `"edit"`), so the same data works under any combination of
+modules.
+
+An `is_dummy=True` item is a zero-tensor placeholder an encoder appends on a
+micro-batch that lacks its modality (e.g. a text-only sample has no image). It
+keeps the `role` and tags of the items it stands in for, so the encoder selects
+real and placeholder rows with one filter and tells them apart by `is_dummy`.
+The backbone skips dummy rows when packing but folds a `+ value.mean()*0.0`
+anchor so FSDP gradient-sync stays aligned across ranks.
 
 ### 2.3 Two graph views (`graphs/base.py`, `graphs/training_graph.py`, `graphs/generation_graph.py`)
 
@@ -397,7 +405,7 @@ total_loss = sum(self._losses.values())
 
 **Dummy forward (training only):** every active node must run on every
 micro-batch or FSDP all-reduce hangs. Missing a modality? The encoder runs its
-`dummy_inputs()` zeros and appends a `role="dummy"` item; the backbone folds the
+`dummy_inputs()` zeros and appends an `is_dummy=True` item; the backbone folds the
 anchor term described in §2.2. Inference has no such constraint — modules may
 `return {}` and the FSM skips the edge.
 

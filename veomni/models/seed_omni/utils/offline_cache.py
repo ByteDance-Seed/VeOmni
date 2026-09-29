@@ -76,7 +76,7 @@ class SeedOmniOfflineCacheWriter:
                 type=value.type,
                 value=SeedOmniOfflineCacheWriter._cpu_recursive(value.value),
                 role=value.role,
-                source=value.source,
+                is_dummy=value.is_dummy,
                 meta=SeedOmniOfflineCacheWriter._cpu_recursive(value.meta),
             )
         if isinstance(value, dict):

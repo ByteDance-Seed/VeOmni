@@ -22,16 +22,13 @@ from typing import Any, Optional
 import torch
 from transformers.models.janus.image_processing_janus import JanusImageProcessor
 
-from ....utils.conversation import ConversationItem, iter_desired_items
+from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
 from .configuration import JanusSiglipConfig
 
 
 class JanusSiglipProcessor(JanusImageProcessor):
     """Alias — keeps the per-module asset name explicit in the V2 docs."""
-
-
-_SOURCE = "janus_siglip"
 
 
 class JanusSiglipPreprocessor(ModulePreprocessorBase):
@@ -41,7 +38,7 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
     never the model. Runs the same normalize as ``JanusSiglip._pixels_from_raw_images``
     but on **CPU** (bf16, to halve worker→main IPC); writes the pixel tensor back into
     each ``user``-image item. When a whole micro-batch has no user image, appends one
-    ``role="dummy"`` placeholder carrying the zero pixels, so the GPU forward never
+    ``is_dummy`` user-image placeholder carrying the zero pixels, so the GPU forward never
     builds dummy inputs (the FSDP gradient anchor still runs there).
     """
 
@@ -73,17 +70,18 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
         del kwargs  # generation_kwargs unused: prep is kwarg-independent
         saw_real_image = False
         for sample in conversation_list:
-            sample_image_items = list(iter_desired_items([sample], types=["image"], roles=["user"]))
+            sample_image_items = [
+                it for it in iter_desired_items([sample], types=["image"], roles=["user"]) if not it.is_dummy
+            ]
             if sample_image_items:
-                # Real user images present → normalize them; no dummy needed. Tag with
-                # the module source so forward_pre/post can pick up real images and
-                # dummies uniformly (single ``source == _SOURCE`` filter).
+                # Real user images present → normalize them; no dummy needed.
+                # forward_pre/post re-select them, and the dummy, by the same
+                # image + user filter.
                 pixel_values = self._image_processor(
                     images=[it.value for it in sample_image_items], return_tensors="pt"
                 )["pixel_values"]
                 for it, px in zip(sample_image_items, pixel_values, strict=True):
                     it.value = px.to(dtype=self._dtype)
-                    it.source = _SOURCE
                 saw_real_image = True
 
         if inference or saw_real_image:
@@ -98,8 +96,9 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
             ConversationItem(
                 type="image",
                 value=self._dummy_pixel_values,
-                role="dummy",
-                source=_SOURCE,
+                role="user",
+                is_dummy=True,
+                meta={_IMG_TAG_KEY: "und"},
             ),
         )
 

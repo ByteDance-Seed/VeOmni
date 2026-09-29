@@ -30,7 +30,7 @@ from transformers import Qwen2VLImageProcessor
 from transformers.models.qwen3_vl.video_processing_qwen3_vl import Qwen3VLVideoProcessor
 
 from ......data.seed_omni.utils.media_metadata import VIDEO_METADATA_KEY
-from ....utils.conversation import ConversationItem, iter_desired_items
+from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
 from .configuration import Qwen3VLVisionEncoderConfig
 
@@ -45,7 +45,6 @@ Qwen3VLVisionVideoProcessor = Qwen3VLVideoProcessor
 # CPU preprocessor (DataLoader worker for training, pre-FSM pass for inference).
 # ``_pixels_and_grid`` pops it on the main process.
 _OMNI_GRID = "_omni_grid"
-_SOURCE = "qwen3vl_vision"
 
 
 def _video_metadata(items: list) -> list[dict]:
@@ -109,7 +108,7 @@ class Qwen3VLVisionPreprocessor(ModulePreprocessorBase):
     template — never the model. Runs them on **CPU** (bf16, to halve IPC), writes
     the per-item normalized patches onto ``item.value`` and stashes ``grid_thw`` on
     ``meta``. When a whole micro-batch has no user image/video, appends one
-    ``role="dummy"`` placeholder carrying the zero patches + grid (the merger still
+    ``is_dummy`` user-image placeholder carrying the zero patches + grid (the merger still
     runs on it in the GPU forward for the FSDP gradient anchor).
     """
 
@@ -156,7 +155,9 @@ class Qwen3VLVisionPreprocessor(ModulePreprocessorBase):
         del kwargs  # generation_kwargs unused: prep is kwarg-independent
         saw_real_media = False
         for sample in conversation_list:
-            sample_image_items = list(iter_desired_items([sample], types=["image"], roles=["user"]))
+            sample_image_items = [
+                it for it in iter_desired_items([sample], types=["image"], roles=["user"]) if not it.is_dummy
+            ]
             sample_video_items = list(iter_desired_items([sample], types=["video"], roles=["user"]))
             if sample_image_items or sample_video_items:
                 if sample_image_items:
@@ -189,9 +190,9 @@ class Qwen3VLVisionPreprocessor(ModulePreprocessorBase):
             ConversationItem(
                 type="image",
                 value=self._dummy_pixel_values,
-                role="dummy",
-                source=_SOURCE,
-                meta={_OMNI_GRID: self._dummy_grid},
+                role="user",
+                is_dummy=True,
+                meta={_OMNI_GRID: self._dummy_grid, _IMG_TAG_KEY: "und"},
             ),
         )
 

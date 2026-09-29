@@ -35,13 +35,13 @@ from veomni.models.seed_omni.utils.conversation import (
 # ── helpers ────────────────────────────────────────────────────────────────────
 
 
-def _img(tag: str | None, role: str = "user", source: str | None = None) -> ConversationItem:
+def _img(tag: str | None, role: str = "user", is_dummy: bool = False) -> ConversationItem:
     meta = {} if tag is None else {_IMG_TAG_KEY: tag}
     return ConversationItem(
         type="image",
         value=torch.zeros(3, 2, 2, dtype=torch.uint8),
         role=role,
-        source=source,
+        is_dummy=is_dummy,
         meta=meta,
     )
 
@@ -140,28 +140,27 @@ def test_iter_desired_items_type_filter_excludes_text_items():
     assert items[0].type == "image"
 
 
-def test_iter_desired_items_meta_composes_with_roles_and_sources():
+def test_iter_desired_items_meta_composes_with_roles():
     batch = [
         [
-            _img("und", role="user", source="siglip"),
-            _img("gen", role="assistant", source="vqvae"),
-            _img("edit", role="user", source="siglip"),
+            _img("und", role="user"),
+            _img("gen", role="assistant"),
+            _img("edit", role="user"),
+            _img("gen", role="assistant", is_dummy=True),
         ]
     ]
     by_role = [it.meta.get(_IMG_TAG_KEY) for it in iter_desired_items(batch, types=["image"], roles=["user"])]
     assert by_role == ["und", "edit"]
-    by_source = [it.meta.get(_IMG_TAG_KEY) for it in iter_desired_items(batch, types=["image"], sources=["siglip"])]
-    assert by_source == ["und", "edit"]
     by_both = [
-        it.meta.get(_IMG_TAG_KEY)
+        (it.meta.get(_IMG_TAG_KEY), it.is_dummy)
         for it in iter_desired_items(
             batch,
             types=["image"],
             roles=["assistant"],
-            sources=["vqvae"],
+            meta={_IMG_TAG_KEY: ["gen"]},
         )
     ]
-    assert by_both == ["gen"]
+    assert by_both == [("gen", False), ("gen", True)]
     with_tag_and_role = [
         it.meta.get(_IMG_TAG_KEY)
         for it in iter_desired_items(

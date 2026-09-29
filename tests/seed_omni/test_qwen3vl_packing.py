@@ -97,8 +97,8 @@ def test_pack_qwen3vl_conversations_expands_variable_vision_and_skips_dummies():
         ConversationItem(
             type="image",
             value=dummy,
-            role="dummy",
-            source="qwen3vl_vision",
+            role="user",
+            is_dummy=True,
             meta={_OMNI_GRID: grid},
         ),
     ]
@@ -156,8 +156,8 @@ def test_pack_qwen3vl_masks_sample_boundary_labels():
             ConversationItem(
                 type="image",
                 value=torch.zeros(16, 8),
-                role="dummy",
-                source="qwen3vl_vision",
+                role="user",
+                is_dummy=True,
                 meta={_OMNI_GRID: [1, 4, 4]},
             ),
         ],
@@ -218,8 +218,8 @@ def test_qwen3vl_packed_preprocessor_writes_batch_keys():
             ConversationItem(
                 type="image",
                 value=torch.zeros(16, 8),
-                role="dummy",
-                source="qwen3vl_vision",
+                role="user",
+                is_dummy=True,
                 meta={_OMNI_GRID: [1, 4, 4]},
             ),
         ]

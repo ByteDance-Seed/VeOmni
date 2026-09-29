@@ -55,7 +55,7 @@ class Qwen3ChatTemplate(TextEncoderChatTemplate):
 
         for item in sample:
             role = item.role
-            if role == "dummy":
+            if item.is_dummy:
                 dummy_parts.append(item)
                 continue
             if item.type != "text":

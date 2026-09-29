@@ -16,9 +16,9 @@ raw data transforms, or request preprocessing.
 3. `SeedOmniCollator` always runs the bound `OmniProcessor`:
    - Built from active graph modules (`OmniProcessor.from_config`).
    - Preprocessors run serially in module declaration order.
-   - They mutate `ConversationItem.value`, `source`, and `meta` in place.
+   - They mutate `ConversationItem.value` and `meta` in place.
 4. Module `pre_forward` becomes thin:
-   - Select items by `type`, `role`, and usually `source`.
+   - Select items by `type`, `role`, and `meta` tags.
    - Stack/move prepared CPU tensors to the module device.
 5. Module forward/modeling runs GPU work and returns a dict.
 6. `post_forward` scatters outputs back to carrier items and returns
@@ -53,14 +53,20 @@ Rules:
   - Vision modules skip FSDP dummy injection.
   - Text encoders append generation prompts when needed.
 
-## Source Tagging
+## Item Routing
 
-Prefer `ConversationItem.source` as branch identity.
+Items carry no module ownership. Which module takes an item is decided by
+`type` / `role` / `meta` tags alone, so the same data works under any
+combination of modules.
 
-- CPU preprocessors should tag real and dummy items with their module source.
-- GPU hooks should filter with helpers such as `iter_desired_items(..., sources=[...])`.
-- Avoid mixing `meta["source"]`, `role == "dummy"`, and `None` fallbacks unless
-  the source producer is not yet available in a specific path.
+- Route by the data layer's tags first (`role`, `meta[_IMG_TAG_KEY]` =
+  `"und"` / `"gen"` / `"edit"`); the CPU preprocessor and the GPU hooks of one
+  module use the same `iter_desired_items(..., types=, roles=, meta=)` filter.
+- A model family that splits one item into internal copies or phases (BAGEL's
+  SigLIP / VAE context copies, flow phases) tags them with its own `meta` key.
+- A dummy placeholder is `is_dummy=True` and keeps the `role` and tags of the
+  items it stands in for; read `item.is_dummy`, never a sentinel role.
+- Preprocessors that select *real* inputs skip `is_dummy` items.
 
 ## Training vs Inference
 

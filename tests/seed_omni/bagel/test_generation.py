@@ -21,11 +21,14 @@ from veomni.models.seed_omni.mixins.base_mixin import BaseMixin
 from veomni.models.seed_omni.mixins.inference_module_mixin import InferenceModuleMixin
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.bagel.sources import (
+    BAGEL_CONTEXT_KEY,
     BAGEL_FLOW_HIDDEN,
     BAGEL_FLOW_QUERY,
     BAGEL_FLOW_VELOCITY,
     BAGEL_GENERATED_LATENT,
+    BAGEL_PHASE_KEY,
     BAGEL_SIGLIP_CONTEXT,
+    BAGEL_START_TOKEN,
     BAGEL_VAE_CONTEXT,
 )
 from veomni.models.seed_omni.modules.module_configuration_base import OmniModuleConfig
@@ -59,7 +62,7 @@ def test_bagel_text_encoder_injects_raw_bos_for_understanding() -> None:
 
     assert len(conversation) == 2
     assert conversation[-1].type == "output"
-    assert conversation[-1].source == "bagel_start_token"
+    assert conversation[-1].meta[BAGEL_PHASE_KEY] == BAGEL_START_TOKEN
     assert conversation[-1].meta["input_ids"].tolist() == [3]
     torch.testing.assert_close(conversation[-1].value, model.embed_tokens.weight[3].reshape(1, 4))
 
@@ -74,7 +77,7 @@ def test_bagel_qwen_first_understanding_step_prefills_prompt_then_decodes_bos(mo
         type="output",
         value=torch.full((1, hidden_size), 2.0),
         role="assistant",
-        source="bagel_start_token",
+        meta={BAGEL_PHASE_KEY: BAGEL_START_TOKEN},
     )
     calls: list[tuple[str, list[ConversationItem]]] = []
 
@@ -98,7 +101,7 @@ def test_bagel_qwen_first_understanding_step_prefills_prompt_then_decodes_bos(mo
 
     assert calls == [("prefill", [prompt]), ("decode", [prompt, bos])]
     assert conversation == [prompt, bos]
-    assert bos.source is None
+    assert BAGEL_PHASE_KEY not in bos.meta
     torch.testing.assert_close(bos.value, torch.full((1, hidden_size), 4.0))
 
 
@@ -163,7 +166,7 @@ def test_bagel_infer_gen_user_image_runs_siglip_context_only():
                 type="image",
                 value=Image.new("RGB", (1, 1)),
                 role="user",
-                source=BAGEL_SIGLIP_CONTEXT,
+                meta={BAGEL_CONTEXT_KEY: BAGEL_SIGLIP_CONTEXT},
             ),
             ConversationItem(type="text", value="prompt", role="user"),
         ]
@@ -179,7 +182,7 @@ def test_bagel_infer_gen_user_image_runs_siglip_context_only():
     )
 
     assert siglip.calls == 1
-    assert all(item.source != BAGEL_VAE_CONTEXT for item in request["conversation_list"])
+    assert all(item.meta.get(BAGEL_CONTEXT_KEY) != BAGEL_VAE_CONTEXT for item in request["conversation_list"])
     assert torch.equal(request["conversation_list"][0].value[0], torch.zeros(8))
     assert torch.equal(request["conversation_list"][0].value[1:], torch.ones(3, 8))
     assert any(item["type"] == "image" for item in generated)
@@ -208,13 +211,13 @@ def test_bagel_infer_edit_defaults_to_denoise_signal_smoke():
                 type="image",
                 value=Image.new("RGB", (1, 1)),
                 role="user",
-                source=BAGEL_VAE_CONTEXT,
+                meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT},
             ),
             ConversationItem(
                 type="image",
                 value=Image.new("RGB", (1, 1)),
                 role="user",
-                source=BAGEL_SIGLIP_CONTEXT,
+                meta={BAGEL_CONTEXT_KEY: BAGEL_SIGLIP_CONTEXT},
             ),
             ConversationItem(type="text", value="prompt", role="user"),
         ]
@@ -285,13 +288,12 @@ def test_bagel_qwen2_mot_eager_denoise_branch_runs_serial_forward_inference(monk
         type="output",
         value=query,
         role="assistant",
-        source=BAGEL_FLOW_QUERY,
-        meta={"timestep": 0.5},
+        meta={BAGEL_PHASE_KEY: BAGEL_FLOW_QUERY, "timestep": 0.5},
     )
     model.denoise_branch([tail], generation_kwargs={"cfg_text_scale": 2.0, "cfg_img_scale": 1.5})
 
     assert len(calls) == 3
-    assert tail.source == BAGEL_FLOW_HIDDEN
+    assert tail.meta.get(BAGEL_PHASE_KEY) == BAGEL_FLOW_HIDDEN
     assert int(tail.value.shape[0]) == 15
     assert calls[0]["query_lens"].tolist() == [5]
     assert calls[1]["query_lens"].tolist() == [5]
@@ -317,14 +319,13 @@ def test_bagel_qwen2_mot_accelerated_denoise_branch_packs_cfg_branches(monkeypat
         type="output",
         value=query,
         role="assistant",
-        source=BAGEL_FLOW_QUERY,
-        meta={"timestep": 0.5},
+        meta={BAGEL_PHASE_KEY: BAGEL_FLOW_QUERY, "timestep": 0.5},
     )
     model.denoise_branch([tail], generation_kwargs={"cfg_text_scale": 2.0, "cfg_img_scale": 1.5})
 
     assert captured["query_lens"].tolist() == [5, 5, 5]
     assert int(captured["packed_query_sequence"].shape[0]) == 15
-    assert tail.source == BAGEL_FLOW_HIDDEN
+    assert tail.meta.get(BAGEL_PHASE_KEY) == BAGEL_FLOW_HIDDEN
     assert int(tail.value.shape[0]) == 15
 
 
@@ -368,9 +369,12 @@ class _CountingInferGenBagelSiglip(_StubModule):
         del kwargs
         assert conversation_list is not None
         self.calls += 1
-        assert not any(item.type == "image" and item.source == BAGEL_VAE_CONTEXT for item in conversation_list)
+        assert not any(
+            item.type == "image" and item.meta.get(BAGEL_CONTEXT_KEY) == BAGEL_VAE_CONTEXT
+            for item in conversation_list
+        )
         for item in conversation_list:
-            if item.type == "image" and item.source == BAGEL_SIGLIP_CONTEXT:
+            if item.type == "image" and item.meta.get(BAGEL_CONTEXT_KEY) == BAGEL_SIGLIP_CONTEXT:
                 item.value = torch.ones(2, 8)
         return {"conversation_list": conversation_list}
 
@@ -402,11 +406,11 @@ class _InferGenBagelQwen(_StubModule):
         if not conversation_list or conversation_list[-1].type != "output":
             return {"conversation_list": conversation_list}
         tail = conversation_list[-1]
-        if tail.source == BAGEL_FLOW_QUERY:
-            tail.source = BAGEL_FLOW_HIDDEN
+        if tail.meta.get(BAGEL_PHASE_KEY) == BAGEL_FLOW_QUERY:
+            tail.meta[BAGEL_PHASE_KEY] = BAGEL_FLOW_HIDDEN
             tail.value = tail.value.repeat(_fake_cfg_branch_count(generation_kwargs), 1)
             return {"conversation_list": conversation_list}
-        if tail.source == BAGEL_FLOW_VELOCITY:
+        if tail.meta.get(BAGEL_PHASE_KEY) == BAGEL_FLOW_VELOCITY:
             tail.value = torch.zeros(16, 4)
             return {"conversation_list": conversation_list}
         return {"conversation_list": conversation_list}
@@ -420,8 +424,8 @@ class _InferGenBagelQwen(_StubModule):
         del kwargs
         assert conversation_list is not None
         tail = conversation_list[-1]
-        assert tail.source == BAGEL_FLOW_QUERY
-        tail.source = BAGEL_FLOW_HIDDEN
+        assert tail.meta.get(BAGEL_PHASE_KEY) == BAGEL_FLOW_QUERY
+        tail.meta[BAGEL_PHASE_KEY] = BAGEL_FLOW_HIDDEN
         tail.value = tail.value.repeat(_fake_cfg_branch_count(generation_kwargs), 1)
         return {"conversation_list": conversation_list}
 
@@ -434,7 +438,7 @@ class _InferGenBagelQwen(_StubModule):
         del kwargs
         assert conversation_list is not None
         tail = conversation_list[-1]
-        assert tail.source == BAGEL_FLOW_VELOCITY
+        assert tail.meta.get(BAGEL_PHASE_KEY) == BAGEL_FLOW_VELOCITY
         assert tail.value.shape[0] == 18 * _fake_cfg_branch_count(generation_kwargs)
         tail.value = torch.zeros(16, 4)
         return {"conversation_list": conversation_list}
@@ -458,24 +462,22 @@ class _InferGenBagelFlow(_StubModule):
                     type="output",
                     value=torch.zeros(16, 8),
                     role="assistant",
-                    source=BAGEL_FLOW_QUERY,
-                    meta={"timestep": torch.tensor(0.5)},
+                    meta={BAGEL_PHASE_KEY: BAGEL_FLOW_QUERY, "timestep": torch.tensor(0.5)},
                 )
             )
         else:
             item.value = torch.zeros(16, 8)
-            item.source = BAGEL_FLOW_QUERY
-            item.meta = {"timestep": torch.tensor(0.5)}
+            item.meta = {BAGEL_PHASE_KEY: BAGEL_FLOW_QUERY, "timestep": torch.tensor(0.5)}
         return {"conversation_list": conversation_list}
 
     def decode_velocity_from_hidden(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         assert conversation_list is not None
         item = conversation_list[-1]
-        assert item.source == BAGEL_FLOW_HIDDEN
+        assert item.meta.get(BAGEL_PHASE_KEY) == BAGEL_FLOW_HIDDEN
         assert item.value.shape[0] % 18 == 0
         item.value = torch.zeros(item.value.shape[0], 4)
-        item.source = BAGEL_FLOW_VELOCITY
+        item.meta[BAGEL_PHASE_KEY] = BAGEL_FLOW_VELOCITY
         return {"conversation_list": conversation_list}
 
     def advance_denoise(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
@@ -483,7 +485,7 @@ class _InferGenBagelFlow(_StubModule):
         assert conversation_list is not None
         item = conversation_list[-1]
         item.value = torch.zeros(1, 4, 4)
-        item.source = BAGEL_GENERATED_LATENT
+        item.meta[BAGEL_PHASE_KEY] = BAGEL_GENERATED_LATENT
         item.meta.pop("timestep", None)
         return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: "image_complete"}
 
@@ -504,7 +506,7 @@ class _InferEditBagelVAE(_InferGenBagelVAE):
         del kwargs
         assert conversation_list is not None
         for item in conversation_list:
-            if item.type == "image" and item.source == BAGEL_VAE_CONTEXT:
+            if item.type == "image" and item.meta.get(BAGEL_CONTEXT_KEY) == BAGEL_VAE_CONTEXT:
                 item.value = torch.zeros(4, 4, 4)
         return {"conversation_list": conversation_list}
 
@@ -514,7 +516,11 @@ class _InferEditBagelFlow(_InferGenBagelFlow):
         del kwargs
         assert conversation_list is not None
         for item in conversation_list:
-            if item.type == "image" and item.source == BAGEL_VAE_CONTEXT and torch.is_tensor(item.value):
+            if (
+                item.type == "image"
+                and item.meta.get(BAGEL_CONTEXT_KEY) == BAGEL_VAE_CONTEXT
+                and torch.is_tensor(item.value)
+            ):
                 item.value = torch.zeros(16, 8)
-                item.meta.clear()
+                item.meta = {BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT}
         return {"conversation_list": conversation_list}

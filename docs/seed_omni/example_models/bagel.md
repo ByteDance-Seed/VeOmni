@@ -91,14 +91,32 @@ schedule:
   - { schedule_type: const, weights: [0.4, 0.2, 0.2, 0.2] }
 ```
 
-The Bagel CPU preprocessor routes images by role:
+`ConversationItem`s carry no module ownership: each Bagel module selects its
+rows by `type` / `role` / `meta` tags. Bagel defines two private meta keys in
+`veomni/models/seed_omni/modules/bagel/sources.py`:
 
-- user images become `BAGEL_SIGLIP_CONTEXT` for SigLIP-NaViT.
-- assistant images become `BAGEL_VAE_CONTEXT` for VAE latent targets.
+| Key | Values | Meaning |
+|---|---|---|
+| `BAGEL_CONTEXT_KEY` (`"bagel_context"`) | `BAGEL_SIGLIP_CONTEXT` (`"siglip"`), `BAGEL_VAE_CONTEXT` (`"vae"`) | Which image copy a row is: SigLIP-NaViT understanding features, or VAE latent context/target. The vision start/end marker rows around each copy carry the same tag. |
+| `BAGEL_PHASE_KEY` (`"bagel_phase"`) | `start_token`, `flow_query`, `flow_hidden`, `flow_velocity`, `generated_latent` | Inference-only step of a `type="output"` row (see §4). |
 
-`ConversationItem.source` is the real producer/consumer branch identity.
-`meta["source"]` is only an alignment hint for dummy/worker paths and should not
-drive real routing.
+The VAE CPU preprocessor (`route_image_contexts`) expands each raw training
+image by its data-layer `_img_tag` into context copies:
+
+- `und` → one `BAGEL_SIGLIP_CONTEXT` copy for SigLIP-NaViT.
+- `gen` → one `BAGEL_VAE_CONTEXT` copy, the flow-matching target.
+- `edit` → a `BAGEL_VAE_CONTEXT` copy followed by a `BAGEL_SIGLIP_CONTEXT`
+  copy of the same image. `_img_tag` alone cannot tell these two apart, which
+  is why the context tag exists.
+
+At inference, raw user images have no `_img_tag`; they become SigLIP context,
+plus a VAE context copy when `infer_type` is `infer_edit`.
+
+A sample with no image for SigLIP-NaViT or the VAE gets an FSDP placeholder
+flagged `is_dummy=True`. It keeps the context tag (and a representative
+`role` / `_img_tag`: `user`/`und` for SigLIP, `assistant`/`gen` for the VAE),
+so the encoder selects it with the same filter as real rows; packing and loss
+code skip it via `item.is_dummy`.
 
 ---
 
@@ -277,8 +295,10 @@ flow_connector.prepare_denoise_query
   -> flow_connector.advance_denoise
 ```
 
-When the denoise state emits `image_complete`, `bagel_vae.decode_generated`
-decodes the final `BAGEL_GENERATED_LATENT`.
+Each step moves the tail `output` row through `BAGEL_PHASE_KEY` values
+`flow_query` → `flow_hidden` → `flow_velocity`. When the denoise state emits
+`image_complete`, the row is re-tagged `generated_latent` and
+`bagel_vae.decode_generated` decodes it.
 
 ### 4.3 Image edit
 
@@ -293,8 +313,9 @@ python tasks/omni/infer_omni.py \
   --infer.output_dir bagel_out
 ```
 
-Edit first builds context from both image branches: VAE encodes the edit image
-as `BAGEL_VAE_CONTEXT`, SigLIP-NaViT keeps the raw prompt image as visual
+Edit first builds context from both image branches: VAE encodes the
+`BAGEL_VAE_CONTEXT` copy of the edit image, SigLIP-NaViT encodes the
+`BAGEL_SIGLIP_CONTEXT` copy as visual
 context, and `flow_connector.embed_context_latents` projects the VAE context into
 the denoise prompt. The downstream denoise loop is shared with `infer_gen`.
 
@@ -316,7 +337,7 @@ YAML.
 
 ## 6. Contract checks
 
-The Bagel module and graph contracts cover carrier/source routing, generation
+The Bagel module and graph contracts cover carrier context-tag routing, generation
 state transitions, packing/cache behavior, and graph config structure. Packed
 MoT also compares Flex and Magi against eager SDPA on toy CE / MSE / gradients
 in `tests/seed_omni/bagel/test_bagel_accel_align.py`. Magi cases skip unless the

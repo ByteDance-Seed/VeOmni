@@ -10,14 +10,11 @@ from veomni.distributed.sequence_parallel import gather_outputs, slice_input_ten
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
-from .....utils.conversation import ConversationItem, is_dummy, iter_desired_items
+from .....utils.conversation import ConversationItem, iter_desired_items
 from ..configuration import JanusSiglipConfig
 from ..modeling import JanusSiglip
 from ..processing import JanusSiglipProcessor
 from .packed import PackedTrainingMixin
-
-
-_SOURCE = "janus_siglip"
 
 
 class TrainingMixin(TrainingModuleMixin):
@@ -38,11 +35,11 @@ class TrainingMixin(TrainingModuleMixin):
         conversation_list: Optional[list[list[ConversationItem]]] = None,
     ) -> Dict[str, Any]:
         self._conversation_carrier = conversation_list
-        items = list(iter_desired_items(conversation_list, types=["image"], sources=[_SOURCE]))
+        items = list(iter_desired_items(conversation_list, types=["image"], roles=["user"]))
         pixel_values = torch.stack([it.value for it in items], dim=0).to(
             device=self.device, dtype=self.dtype, non_blocking=True
         )
-        is_dummy_flag = all(is_dummy(it) for it in items)
+        is_dummy_flag = all(it.is_dummy for it in items)
         self._metric_meter_stash_tokens(int(pixel_values.shape[0]))
 
         if get_parallel_state().sp_size > 1:
@@ -63,7 +60,7 @@ class TrainingMixin(TrainingModuleMixin):
             image_embeds = image_embeds.narrow(0, 0, self._sp_own_len)
         conversation = self._conversation_carrier
         self._conversation_carrier = None
-        items = list(iter_desired_items(conversation, types=["image"], sources=[_SOURCE]))
+        items = list(iter_desired_items(conversation, types=["image"], roles=["user"]))
         for item, emb in zip(items, image_embeds, strict=True):
             item.value = emb
         return {"conversation_list": conversation}

@@ -20,7 +20,7 @@ Do not start from a synthetic placeholder module unless no live shape exists.
 Answer these before editing:
 
 - Which module owns the tokenizer or processor asset?
-- Which module creates or consumes each `ConversationItem.source`?
+- Which `type` / `role` / `meta` tags select this module's items, and who writes them?
 - Which module injects dummy items for training?
 - Which graph call-sites use this module?
 - Does the module need a CPU preprocessor?
