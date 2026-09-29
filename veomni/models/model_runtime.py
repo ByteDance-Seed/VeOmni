@@ -466,9 +466,9 @@ class VeOmniModelRuntime:
             return
 
         # Customized LoRA model setup.
-        model_setup_lora = getattr(self.model, "setup_lora", None)
-        if callable(model_setup_lora):
-            customized_lora_model = model_setup_lora(lora_config)
+        customized_setup_lora_function = getattr(self.model, "setup_lora", None)
+        if callable(customized_setup_lora_function):
+            customized_lora_model = customized_setup_lora_function(lora_config)
             if customized_lora_model is not None:
                 self.model = customized_lora_model
                 logger.info_rank0("Setup customized LoRA model.")
