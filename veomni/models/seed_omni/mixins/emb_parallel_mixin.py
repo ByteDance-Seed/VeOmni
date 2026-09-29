@@ -21,7 +21,7 @@ over-encoding table (hundreds of GB) both take this shape.
 
 The table lives in a :class:`VocabParallelEmbedding`, which the parallel plan
 wraps as its own FSDP2 unit. Every read of its weight goes through that unit's
-unshard hooks, so the kernels always see the plain ``[vocab/emb, hidden]`` rows
+unshard hooks, so the vocab-parallel ops always see the plain ``[vocab/emb, hidden]`` rows
 in the mixed-precision param dtype, and FSDP2 reduce-scatters and scales the
 weight gradient like any other parameter's. Reading ``embedding.weight`` from
 outside those hooks would instead see the sharded DTensor and bypass the
@@ -40,8 +40,8 @@ import torch.nn.functional as F
 from torch.distributed.fsdp import FSDPModule, register_fsdp_forward_method
 from torch.distributed.tensor import DTensor
 
+from ....distributed.emb_parallel import AllToAllEmbedding, VocabParallelLinear
 from ....distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
-from ....ops.kernels.embed import AllToAllEmbedding, VocabParallelLinear
 
 
 class EmbParallelMixin:
