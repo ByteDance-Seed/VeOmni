@@ -9,7 +9,7 @@ The whole pipeline (training and inference) operates on one batched
 
 Item shape
 ----------
-Each item is ``{type, value, role, meta}``:
+Each item is ``{type, value, role, is_dummy, meta}``:
 
 * ``type``  — ``"text"`` | ``"image"`` | ``"video"`` | ``"audio"`` | ``"output"``.
   ``"output"`` is the transient row a backbone appends while generating;
@@ -24,14 +24,19 @@ Each item is ``{type, value, role, meta}``:
 * ``value`` — polymorphic: raw content (``str`` / PIL image / pixel tensor /
   ``(samples,)`` waveform) before encoding, an ``(L, D)`` / ``(1, L, D)``
   embedding tensor after.
-* ``role``  — ``"user"`` | ``"assistant"`` | ``"dummy"`` (``"dummy"`` rows are
-  zero-tensor FSDP placeholders appended by encoders on text-only
-  micro-batches; the backbone skips them and folds a zero-grad anchor).
+* ``role``  — ``"user"`` | ``"assistant"``.
+* ``is_dummy`` — a zero-tensor FSDP placeholder an encoder appends on a
+  micro-batch with nothing for it to encode; the backbone skips it and folds a
+  zero-grad anchor. It keeps the ``role`` / ``meta`` tags of the items it
+  stands in for, so the encoder selects it with the same filter as real ones.
+  Items carry no module ownership: which encoder takes an item is decided by
+  ``type`` / ``role`` / ``meta`` tags (e.g. ``_IMG_TAG_KEY``) alone, so the
+  same data works under any combination of modules.
 * ``meta``  — the item's only durable channel. What the data layer loaded
   (``video_metadata`` / ``audio_metadata``, see
   ``veomni/data/seed_omni/utils/media_metadata.py``)
   plus per-module baggage written during forward (``labels`` /
-  ``attention_mask`` / ``janus_vqvae_labels`` / ``source`` / …). Anything the
+  ``attention_mask`` / ``janus_vqvae_labels`` / …). Anything the
   backbone still needs after an encoder has overwritten ``value`` has to be
   here.
 
@@ -57,7 +62,7 @@ from PIL import Image
 
 
 ItemType = str  # "text" | "image" | "video" | "audio" | "output" (+ legacy "image_output")
-ItemRole = str  # "user" | "assistant" | "dummy"
+ItemRole = str  # "user" | "assistant"
 ItemValue = Union[str, torch.Tensor, Image.Image]
 
 # Per-image data-tag key written on ``meta`` by the data layer (preprocessors).
@@ -70,19 +75,19 @@ _IMG_TAG_KEY = "_img_tag"
 
 @dataclass
 class ConversationItem:
-    """One element of a conversation list — ``{type, value, role, meta}``."""
+    """One element of a conversation list — ``{type, value, role, is_dummy, meta}``."""
 
     type: ItemType
     value: ItemValue
     role: ItemRole = "user"
-    source: str | None = None
+    is_dummy: bool = False
     meta: dict = field(default_factory=dict)
 
     def __repr__(self) -> str:
         # Multi-line with a blank line on each side, so ``print(conversation_list)``
         # shows one block per item.
         lines = [
-            f"ConversationItem(type={self.type}, role={self.role}, source={self.source})",
+            f"ConversationItem(type={self.type}, role={self.role}, is_dummy={self.is_dummy})",
             f"  value: {_format_value(self.value)}",
         ]
         if self.meta:
@@ -140,10 +145,6 @@ def _format_value(value: Any) -> str:
     if isinstance(value, Mapping):
         return "{" + ", ".join(f"{k}: {_format_value(v)}" for k, v in value.items()) + "}"
     return f"[UnknownType]{type(value).__name__}"
-
-
-def is_dummy(item: ConversationItem) -> bool:
-    return item.role == "dummy"
 
 
 def maybe_merge_outputs(parts: list[ConversationItem]) -> bool:
@@ -216,7 +217,6 @@ def iter_desired_items(
     conversation_list: list[list[ConversationItem]],
     types: list[str] | None = None,
     roles: list[str] | None = None,
-    sources: list[str] | None = None,
     reverse_item: bool = False,
     *,
     meta_keys: list[str] | None = None,
@@ -235,8 +235,6 @@ def iter_desired_items(
                 continue
             if roles is not None and item.role not in roles:
                 continue
-            if sources is not None and item.source not in sources:
-                continue
             if meta_keys is not None and any(key not in item.meta for key in meta_keys):
                 continue
             if meta is not None and any(
@@ -249,7 +247,6 @@ def iter_desired_items(
 def get_tail_output_item(
     conversation_list: list[ConversationItem],
     *,
-    sources: list[str] | None = None,
     roles: list[str] | None = None,
     meta_keys: list[str] | None = None,
 ) -> ConversationItem | None:
@@ -259,7 +256,6 @@ def get_tail_output_item(
             [conversation_list],
             types=["output"],
             roles=roles,
-            sources=sources,
             reverse_item=True,
             meta_keys=meta_keys,
         ),
@@ -271,7 +267,6 @@ def collect_desired_values(
     conversation_list: list[list[ConversationItem]],
     types: list[str] | None = None,
     roles: list[str] | None = None,
-    sources: list[str] | None = None,
     *,
     meta_keys: list[str] | None = None,
 ) -> list[Any]:
@@ -282,7 +277,6 @@ def collect_desired_values(
             conversation_list,
             types,
             roles,
-            sources,
             meta_keys=meta_keys,
         )
     ]
@@ -291,7 +285,6 @@ def collect_desired_values(
 __all__ = [
     "ConversationItem",
     "build_conversation",
-    "is_dummy",
     "maybe_merge_outputs",
     "seal_outputs",
     "get_tail_output_item",
