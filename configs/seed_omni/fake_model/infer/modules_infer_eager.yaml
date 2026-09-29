@@ -1,0 +1,12 @@
+# Single-process eager inference: no wrapper on any module.
+fake_module_a:
+  model_path: fake_module_a
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+
+fake_module_b:
+  model_path: fake_module_b
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
