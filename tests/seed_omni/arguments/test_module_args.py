@@ -28,7 +28,7 @@ MODULE_B = "fake_module_b"
 
 
 def _cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "fake_model"
+    return Path(__file__).resolve().parents[3] / "configs" / "seed_omni" / "fake_model"
 
 
 def _omni_args(*, model_path: str = "/tmp/fake_omni", **launcher_config) -> OmniArguments:

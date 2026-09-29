@@ -1,6 +1,6 @@
 """Unit tests for :mod:`veomni.trainer.omni.omni_inferencer` helpers (no model, no GPU).
 
-The end-to-end launches through ``tasks/omni/*.py`` live in ``test_omni_launch.py``.
+The end-to-end launches through ``tasks/omni/*.py`` live in ``tests/seed_omni/e2e/test_omni_launch.py``.
 """
 
 from __future__ import annotations

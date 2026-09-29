@@ -10,10 +10,12 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import pytest
 import torch
 
-from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
+from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import MultiLRScheduler, OmniModelRuntime
 from veomni.models.seed_omni.accelerated.utils import executor
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.mixins.base_mixin import BaseMixin
@@ -267,3 +269,46 @@ def test_each_module_clips_at_its_own_threshold_and_the_norms_combine():
 
 def test_a_runtime_without_modules_reports_a_zero_norm():
     assert OmniModelRuntime(_model()).clip_grad_norm() == 0.0
+
+
+def test_multi_lr_scheduler_without_schedulers_reports_zero_lr():
+    assert MultiLRScheduler({}).get_last_lr() == [0.0]
+
+
+def test_an_all_frozen_model_runtime_has_no_optimizer_or_lr_scheduler():
+    frozen = SimpleNamespace(optimizer=None, lr_scheduler=None, _build_lr_scheduler=MagicMock())
+    runtime = OmniModelRuntime(MagicMock(), module_runtimes={"frozen": frozen})
+
+    runtime._build_optimizer()
+    runtime._build_lr_scheduler(total_steps=10)
+
+    assert runtime.optimizer is None and runtime.lr_scheduler is None
+
+
+@pytest.mark.parametrize(("global_rank", "writes"), [(0, True), (1, False)])
+def test_model_runtime_writes_root_assets_without_weights_on_rank_zero(global_rank, writes):
+    train_args = SimpleNamespace(global_rank=global_rank, checkpoint=SimpleNamespace(model_assets_dir="/out/assets"))
+    runtime = OmniModelRuntime(MagicMock(), train_args=train_args)
+    runtime.save_pretrained = MagicMock()
+
+    runtime.save_model_assets()
+
+    if writes:
+        runtime.save_pretrained.assert_called_once_with("/out/assets", save_module_weights=False)
+    else:
+        runtime.save_pretrained.assert_not_called()
+
+
+def test_model_runtime_steps_only_the_trainable_modules():
+    trainable = SimpleNamespace(optimizer=MagicMock(), lr_scheduler=None)
+    trainable._build_lr_scheduler = lambda total_steps: setattr(trainable, "lr_scheduler", MagicMock())
+    frozen = SimpleNamespace(optimizer=None, lr_scheduler=None, _build_lr_scheduler=MagicMock())
+    runtime = OmniModelRuntime(MagicMock(), module_runtimes={"trainable": trainable, "frozen": frozen})
+    assert runtime.optimizer is None and runtime.lr_scheduler is None
+
+    runtime._build_optimizer()
+    runtime._build_lr_scheduler(total_steps=10)
+
+    assert list(runtime.optimizer.optimizers) == ["trainable"]
+    assert list(runtime.lr_scheduler.schedulers) == ["trainable"]
+    frozen._build_lr_scheduler.assert_called_once_with(10)

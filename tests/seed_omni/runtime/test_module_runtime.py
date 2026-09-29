@@ -392,3 +392,10 @@ def test_an_eager_inference_module_forwards_without_a_parallel_state(monkeypatch
     assert "vision_encoder" not in parallel_state._PARALLEL_STATE_REGISTRY
     assert runtime(7) == 7
     assert model.seen != "never called"
+
+
+def test_a_frozen_module_has_no_async_save_to_drain():
+    runtime = ModuleRuntime.__new__(ModuleRuntime)
+    runtime.checkpoint = None
+
+    runtime.wait_for_pending_save()

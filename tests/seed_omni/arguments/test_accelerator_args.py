@@ -43,7 +43,7 @@ MODULE_B = "fake_module_b"
 
 
 def _cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "fake_model"
+    return Path(__file__).resolve().parents[3] / "configs" / "seed_omni" / "fake_model"
 
 
 def _fake_args(*, modules_override: dict | None = None) -> OmniArguments:

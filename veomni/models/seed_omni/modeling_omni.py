@@ -7,7 +7,7 @@ checkpoint compose/load/save.  It must import nothing from VeOmni's runtime
 (``accelerator`` / ``distributed`` / trainer), at module scope or inside a
 function, so this modeling can be lifted into another framework as-is and so
 HF ``from_pretrained`` / ``from_config`` keeps working for eager
-single-process inference. ``tests/seed_omni/test_graph.py`` asserts this.
+single-process inference. ``tests/seed_omni/model/test_graph.py`` asserts this.
 
 ``forward`` is the FSDP2 root entry: leftover params unshard on ``__call__``,
 then the training graph runs each child eagerly, which is correct for an
