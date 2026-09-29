@@ -309,6 +309,7 @@ NVIDIA GPU for kernel execution.
 | `test_slice_input_tensor.py` | SP input slicing utilities | CPU |
 | `test_all_gather.py` | All-gather collective ops | multi |
 | `test_balance_reverse.py` | Encoder data balance recovery | 8 |
+| `test_balance_sorting_algo.py` | Post-MBS sorting algorithm | CPU |
 
 ---
 
@@ -328,7 +329,6 @@ CPU, and multi-rank cases spawn CPU gloo ranks with `torch.multiprocessing`;
 | `trainer/` | `OmniTrainer`, `OmniInferencer`, step-metrics callback (identical metrics across ranks) |
 | `mixins/` | Opt-in module mixins, e.g. `EmbParallelMixin` / `VocabParallelEmbedding` gradient parity through FSDP2 |
 | `e2e/` | `train_omni.py` / `infer_omni.py` under torchrun on the fake model (2 CUDA devices) |
-| `test_balance_sorting_algo.py` | Post-MBS sorting algorithm | CPU |
 
 ---
 
