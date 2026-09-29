@@ -133,6 +133,10 @@ def test_a_sliced_table_is_rejected_when_emb_is_off(emb_off):
     with pytest.raises(RuntimeError, match="holds 4 of 8 vocab rows"):
         EmbParallelMixin.emb_parallel_project(torch.randn(1, 4), embedding)
 
+    embedding = _sliced(VocabParallelEmbedding(8, 4, padding_idx=5), rows=4)
+    with pytest.raises(RuntimeError, match="holds 4 of 8 vocab rows"):
+        _ = embedding.padding_idx
+
 
 def test_an_unsliced_table_is_rejected_when_emb_is_on(monkeypatch):
     """The kernels would treat the whole table as one rank's shard of a ``vocab * emb`` vocabulary."""
@@ -152,6 +156,7 @@ def test_padding_idx_indexes_the_rows_this_rank_holds(monkeypatch, emb_rank, loc
     monkeypatch.setattr(emb_parallel_mixin, "get_parallel_state", lambda: _emb_state(size=2, rank=emb_rank))
     embedding = VocabParallelEmbedding(8, 4, padding_idx=5)
     assert embedding.padding_idx == 5
+    assert repr(embedding) == "VocabParallelEmbedding(8, 4, padding_idx=5)"
 
     _sliced(embedding, rows=4).reset_parameters()
     assert embedding.padding_idx == local_padding_idx
