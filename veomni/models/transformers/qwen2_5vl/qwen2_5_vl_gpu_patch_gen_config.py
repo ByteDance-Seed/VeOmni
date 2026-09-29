@@ -12,31 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen2.5-VL transformers>=5.16.1 code generation.
+Patch configuration for Qwen2.5-VL transformers>=5.9.0 code generation.
 
 Regen command:
 patchgen veomni.models.transformers.qwen2_5vl.qwen2_5_vl_gpu_patch_gen_config -o veomni/models/transformers/qwen2_5vl/generated --diff
+
+CausalLM uses ``ForCausalLMLoss``. Vision and sequence-parallel patches stay.
 """
 
 import copy
 from functools import partial
 from types import SimpleNamespace
-from typing import Callable
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch import nn
+from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.modeling_utils import (
-    ALL_ATTENTION_FUNCTIONS,
     is_flash_attention_requested,
 )
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLModel,
     Qwen2_5_VLModelOutputWithPast,
-    apply_rotary_pos_emb_vision,
-    eager_attention_forward,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
@@ -49,6 +50,9 @@ from veomni.distributed.sequence_parallel import (
     sp_pad_and_slice,
     unpad_tensor,
 )
+from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import Qwen2_5_VLCausalLMOutputWithLogProbs
@@ -85,16 +89,110 @@ config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "Qwen2_5_VLCausalLMOutputWithLogProbs"],
 )
-config.drop_import_names("Qwen2_5_VLCausalLMOutputWithPast")
-
-config.add_post_import_block(
-    """
-    # ── OpSlot declarations ──────────────────────────────────────────────────
-    # Bound at model-build time by _bind_veomni_ops() in auto.py.
-    from veomni.ops.dispatch import OpSlot
-    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-    """
+config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import(
+    "veomni.ops.config",
+    names=["resolve_op_impl"],
 )
+config.add_import(
+    "veomni.models.loss_utils",
+    names=["ForCausalLMLoss"],
+)
+config.drop_import_names("Qwen2_5_VLCausalLMOutputWithPast")
+config.exclude_from_output(
+    "apply_rotary_pos_emb_vision",
+    "apply_multimodal_rotary_pos_emb",
+    "rotate_half",
+    "use_kernel_forward_from_hub",
+)
+config.drop_import_names("use_kernel_forward_from_hub")
+
+
+@config.override_method(
+    "Qwen2_5_VLRMSNorm.__init__",
+    description="Construct a local rms_norm VeomniOp",
+)
+def qwen2_5_vl_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+    nn.Module.__init__(self)
+    self.weight = nn.Parameter(torch.ones(hidden_size))
+    self.variance_epsilon = eps
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+
+
+@config.override_method(
+    "Qwen2_5_VLRMSNorm.forward",
+    description="Always call the local rms_norm VeomniOp",
+)
+def qwen2_5_vl_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
+
+
+@config.override_method(
+    "Qwen2_5_VLMLP.__init__",
+    description="Construct a local swiglu_mlp VeomniOp",
+)
+def qwen2_5_vl_vision_mlp_init_patched(self, config, bias: bool = False):
+    nn.Module.__init__(self)
+    self.config = config
+    self.hidden_size = config.hidden_size
+    self.intermediate_size = config.intermediate_size
+    self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
+    self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
+    self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=bias)
+    self.act_fn = ACT2FN[config.hidden_act]
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+
+
+@config.override_method(
+    "Qwen2_5_VLMLP.forward",
+    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
+)
+def qwen2_5_vl_vision_mlp_forward_patched(self, hidden_state):
+    if self.config.hidden_act in {"silu", "swish"}:
+        return self.veomni_swiglu_mlp(
+            hidden_state,
+            self.gate_proj.weight,
+            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+            self.up_proj.weight,
+            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+            self.down_proj.weight,
+            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+        )
+    return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+
+
+@config.override_method(
+    "Qwen2MLP.__init__",
+    description="Construct a local swiglu_mlp VeomniOp",
+)
+def qwen2_5_vl_text_mlp_init_patched(self, config):
+    nn.Module.__init__(self)
+    self.config = config
+    self.hidden_size = config.hidden_size
+    self.intermediate_size = config.intermediate_size
+    self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+    self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+    self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+    self.act_fn = ACT2FN[config.hidden_act]
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+
+
+@config.override_method(
+    "Qwen2MLP.forward",
+    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
+)
+def qwen2_5_vl_text_mlp_forward_patched(self, x):
+    if self.config.hidden_act in {"silu", "swish"}:
+        return self.veomni_swiglu_mlp(
+            x,
+            self.gate_proj.weight,
+            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+            self.up_proj.weight,
+            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+            self.down_proj.weight,
+            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+        )
+    return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 # ================================================================
@@ -102,6 +200,13 @@ config.add_post_import_block(
 # 1. accept precomputed max_seqlen from outer forward to avoid
 #    per-layer `(cu_seqlens[1:] - cu_seqlens[:-1]).max()` CPU-GPU sync
 # ================================================================
+@config.modify_init("Qwen2_5_VLVisionAttention", description="Bind instance-local rope and attention VeomniOps")
+def qwen2_5_vl_vision_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+
+
 @config.override_method(
     "Qwen2_5_VLVisionAttention.forward",
     description="Use precomputed max_seqlen passed from outer forward to avoid per-layer CPU-GPU sync",
@@ -122,15 +227,13 @@ def qwen2_5_vl_vision_attention_forward_patched(
         self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
     )
     cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
     query_states = query_states.transpose(0, 1).unsqueeze(0)
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-        self.config._attn_implementation, eager_attention_forward
-    )
+    attention_interface = self.veomni_attn
 
     if is_flash_attention_requested(self.config):
         # --- Patch.1 ---
@@ -861,18 +964,27 @@ def qwen2_5_vl_get_position_id_func_patched(self):
 
 
 # ================================================================
-# Patch: Qwen2_5_VLForConditionalGeneration.forward
-# 1. use the unified VeOmni fused loss_function (handles Ulysses
-#    internally, takes hidden_states + lm_head weights instead of
-#    pre-computed logits) — avoids materializing full-vocab logits
-#    when labels are provided
-# 2. drop the HF v5 logits-first path — only compute logits when
-#    labels is None (inference); otherwise let loss_function fuse
-#    matmul + cross-entropy
+# Patch: Qwen2_5_VLForConditionalGeneration.__init__ + forward
+# Bind ForCausalLMLoss to a local VeomniOp. Always call
+# self.loss_function when labels are present.
 # ================================================================
 @config.override_method(
+    "Qwen2_5_VLForConditionalGeneration.__init__",
+    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp",
+)
+def qwen2_5_vl_for_conditional_generation_init_patched(self, config):
+    super().__init__(config)
+    self.model = Qwen2_5_VLModel(config)
+    self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+    self.post_init()
+
+
+@config.override_method(
     "Qwen2_5_VLForConditionalGeneration.forward",
-    description="Use VeOmni unified fused loss_function path",
+    description="Always call self.loss_function (ForCausalLMLoss + VeomniOp)",
 )
 def qwen2_5_vl_for_conditional_generation_forward_patched(
     self,
@@ -940,30 +1052,14 @@ def qwen2_5_vl_for_conditional_generation_forward_patched(
     logits = None
     fused_linear_aux = None
     if labels is not None:
-        # Modification: OpSlot guard for cross-entropy loss.
-        if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.text_config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-        else:
-            logits = self.lm_head(hidden_states)
-            loss, _, fused_linear_aux = self.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.config.text_config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-            if fused_linear_aux is not None:
-                # fused_linear_aux path empties loss/logits slots; clear the local 3D
-                # logits so output mirrors the OpSlot branch's contract.
-                logits = None
+        loss, logits, fused_linear_aux = self.loss_function(
+            logits=logits,
+            labels=labels,
+            vocab_size=self.config.text_config.vocab_size,
+            hidden_states=hidden_states,
+            weights=self.lm_head.weight,
+            **kwargs,
+        )
     else:
         logits = self.lm_head(hidden_states)
     # --- Patch.1 ---
@@ -1134,3 +1230,66 @@ def qwen2_5_vl_get_metadata_collate_func_patched(self):
         spatial_merge_size=vc.spatial_merge_size,
         patch_size=vc.patch_size,
     )
+
+
+@config.modify_init("Qwen2_5_VLAttention", description="Bind instance-local rope and attention VeomniOps")
+def qwen2_5_vl_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "mrope", "eager")
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+
+
+@config.override_method(
+    "Qwen2_5_VLAttention.forward",
+    description="Always call the local attention VeomniOp",
+)
+def qwen2_5_vl_attention_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
+    del output_attentions, use_cache
+    bsz, q_len, _ = hidden_states.size()
+
+    query_states = self.q_proj(hidden_states)
+    key_states = self.k_proj(hidden_states)
+    value_states = self.v_proj(hidden_states)
+
+    query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = self.veomni_rope(
+        query_states,
+        key_states,
+        cos,
+        sin,
+        mrope_section=self.config.rope_parameters["mrope_section"],
+    )
+
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+    attn_output, attn_weights = self.veomni_attn(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        sliding_window=self.sliding_window,
+        position_ids=position_ids,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights

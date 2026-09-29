@@ -62,7 +62,7 @@ def read_hf_model_type(model_path: str) -> str:
     declare custom ``model_type`` values (``module_A`` / ``module_B`` / …)
     that are NOT in HF's :data:`CONFIG_MAPPING`.  ``AutoConfig`` would raise
     on those families before we even get a chance to consult the registries;
-    reading the raw dict sidesteps that.  See :mod:`veomni.models.loader`
+    reading the raw dict sidesteps that.  See :mod:`veomni.models.registry`
     for the same pattern in the foundation-model loader.
     """
     config_dict, _ = PretrainedConfig.get_config_dict(model_path)

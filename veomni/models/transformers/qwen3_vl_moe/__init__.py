@@ -9,11 +9,14 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-from ....lora.target_mapping import convert_fused_moe_lora_targets
-from ....utils.device import IS_NPU_AVAILABLE
-from ...loader import MODELING_REGISTRY
+# See the License for the specific language governing limitations
+# under the License.
+
+"""Qwen3-VL-MoE modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.lora.target_mapping import convert_fused_moe_lora_targets
+from veomni.models.registry import MODELING_REGISTRY
+from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 def _convert_qwen3_vl_moe_wrapped_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
@@ -74,6 +77,8 @@ def register_qwen3_vl_moe_modeling(architecture: str):
 
     if "ForConditionalGeneration" in architecture:
         return Qwen3VLMoeForConditionalGeneration
+    elif "TextModel" in architecture:
+        return Qwen3VLMoeTextModel
     elif "Model" in architecture:
         return Qwen3VLMoeModel
     else:

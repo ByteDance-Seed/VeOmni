@@ -6,7 +6,6 @@ import torch
 import yaml
 
 from veomni.lora import LoraLinear, is_veomni_lora_model
-from veomni.models import build_foundation_model
 from veomni.trainer.vlm_trainer import (
     VeOmniVLMArguments,
     VLMMDataArguments,
@@ -16,6 +15,7 @@ from veomni.trainer.vlm_trainer import (
 )
 
 from ..tools.training_utils import make_eager_ops_config, unbuilt_runtime
+from .utils import build_lora_test_model
 
 
 _PRODUCTION_CONFIGS = [
@@ -60,7 +60,7 @@ def _make_runtime(model, args, model_config=None):
 
 def _build_meta_runtime(config_path, lora_config, **freeze_kwargs):
     args = _make_args(config_path, lora_config, **freeze_kwargs)
-    model = build_foundation_model(
+    model = build_lora_test_model(
         config_path=config_path,
         weights_path=None,
         torch_dtype="float32",

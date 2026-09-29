@@ -7,9 +7,11 @@ import torch.nn.functional as F
 from einops import rearrange
 from torchvision.transforms import Normalize
 
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.utils.device import get_device_type
 
-from .core import attention_forward
+from .core import bind_minimax_attention, minimax_attention
 
 
 class WarpedTensor(torch.nn.Module):
@@ -32,21 +34,6 @@ def create_token_ids(patch_dims, device, dtype):
     return (
         torch.stack(torch.meshgrid(*coords_list, indexing="ij"), dim=-1).flatten(0, len(patch_dims) - 1).unsqueeze(0)
     )
-
-
-def _rotate_half(x):
-    x1, x2 = torch.chunk(x, 2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(t, rotary_pos_emb):
-    cos, sin = rotary_pos_emb
-    cos, sin = cos.to(t.dtype), sin.to(t.dtype)
-    rot_dim = cos.shape[-1]
-    if rot_dim < t.shape[-1]:
-        t_rot, t_pass = t[..., :rot_dim], t[..., rot_dim:]
-        return torch.cat(((t_rot * cos) + (_rotate_half(t_rot) * sin), t_pass), dim=-1)
-    return (t * cos) + (_rotate_half(t) * sin)
 
 
 class BaseConv3d(nn.Conv3d):
@@ -121,10 +108,11 @@ def _group_norm(ch, t_isolated=False):
 
 
 class Attention(nn.Module):
-    """Multi-head attention with backend dispatch via attention_forward."""
+    """Multi-head attention through the interned ``attention/standard`` handle."""
 
     def __init__(self, heads, dim_head, embed_dim=None, qk_norm_type=None, qk_norm_affine=False, bias=True, eps=1e-5):
         super().__init__()
+        self.num_heads = heads
         self.dim_head = dim_head
         inner_dim = dim_head * heads
         dim = embed_dim or inner_dim
@@ -133,6 +121,9 @@ class Attention(nn.Module):
         self.norm_k = norm_cls(dim_head, eps=eps, elementwise_affine=qk_norm_affine) if norm_cls else None
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=bias)
         self.to_out = nn.Linear(inner_dim, dim, bias=bias)
+        bind_minimax_attention(self, is_causal=False)
+        # q/k are [B, S, H, D]. Production rotary width is dim_head * 0.75.
+        self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
 
     def forward(self, x, rotary_pos_emb=None):
         B, S, _ = x.shape
@@ -142,12 +133,10 @@ class Attention(nn.Module):
         if self.norm_k is not None:
             k = self.norm_k(k)
         if rotary_pos_emb is not None:
-            q, k = apply_rotary_pos_emb(q, rotary_pos_emb), apply_rotary_pos_emb(k, rotary_pos_emb)
-        return self.to_out(
-            attention_forward(
-                q, k, v, q_pattern="b s n d", k_pattern="b s n d", v_pattern="b s n d", out_pattern="b s n d"
-            ).reshape(B, S, -1)
-        )
+            cos, sin = rotary_pos_emb
+            q, k = self.veomni_rope(q, k, cos.to(dtype=q.dtype), sin.to(dtype=q.dtype), unsqueeze_dim=2)
+        out = minimax_attention(self, q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+        return self.to_out(out.transpose(1, 2).reshape(B, S, -1))
 
 
 class FeedForward(nn.Module):
@@ -175,12 +164,7 @@ class RotaryEmbeddingND(nn.Module):
             inv_freq = 1 / self.rotary_base ** torch.arange(
                 0, 1, 2 * self.n_dim / self.dim, dtype=torch.float32, device=img_ids.device
             )
-            angles = (
-                (self.angle_scale * img_ids[:, :, :, None] * inv_freq[None, None, None, :])
-                .flatten(2, 3)
-                .tile(2)
-                .unsqueeze(2)
-            )
+            angles = (self.angle_scale * img_ids[:, :, :, None] * inv_freq[None, None, None, :]).flatten(2, 3).tile(2)
             return torch.cos(angles), torch.sin(angles)
 
 

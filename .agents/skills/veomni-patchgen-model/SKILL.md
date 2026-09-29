@@ -15,7 +15,7 @@ supported transformers-family model. The non-transformers architectures
 
 - `docs/design/patchgen.md` — patchgen DSL, CLI, CI drift check
 - `docs/transformers_v5/transformers_v5_moe_weight_loading.md` — MoE fused-expert layout + runtime converter
-- `docs/transformers_v5/veomni_flash_attention_kernel_adapter.md` — FA custom-name adapter
+- `docs/transformers_v5/veomni_flash_attention_op_adapter.md` — FA custom-name adapter
 - `docs/transformers_v5/testing_new_model.md` — test case SOP for a new model
 
 ## What to read for your model
@@ -295,19 +295,20 @@ duplicating ~hundreds of lines per sibling model.
   through (see qwen3_5_moe), and import cu-free FLA impls via
   `add_post_import_block` with a try/except fallback.
 
-**MoE models** add three more patches here — expert replacement, `_moe_implementation`
-propagation and the expert parallel plan. See `references/moe.md`, "Phase 2 additions".
+**MoE models** add the expert `VeomniOp` replacement and the expert parallel
+plan. See `references/moe.md`, "Phase 2 additions".
 
 **VLM / Omni models** add the SP-aware multimodal forward and the metadata
 precompute contract, and Omni models also prune the speech subtree. See
 `references/multimodal.md`.
 
 **Flash attention**: VeOmni custom names
-(`veomni_flash_attention_{2,3,4}_with_sp`) are handled globally by
+(`veomni_flash_attention_2/3/4`) are handled globally by
 `transformers.integrations.hub_kernels.load_and_register_attn_kernel` adapter —
-**no per-model patching needed**. Just keep `attn_implementation` names unchanged
-in configs. See
-`docs/transformers_v5/veomni_flash_attention_kernel_adapter.md`.
+**no per-model patching needed**. Public short names
+(`flash_attention_2/3/4`, plus flex/magi/sage/sdpa) rewrite to the matching
+`veomni_*` adapter when `MODELING_BACKEND=veomni`. See
+`docs/transformers_v5/veomni_flash_attention_op_adapter.md`.
 
 **Patch comment style:**
 
@@ -490,23 +491,22 @@ Follow `docs/transformers_v5/testing_new_model.md`. Every file below is already
 enumerated in a CI workflow — the unit-test ones, or `gpu_e2e_test.yml` /
 `npu_e2e_test.yml` for the e2e tables — so appending a case needs no workflow
 change. That is exactly why this phase extends tables instead of adding files.
-`tests/models/test_model_registry.py` and
-`tests/models/test_models_logits_equal_v5.py` are part of the minimum too:
-the first proves the registry returns the generated class, the second that it
-is numerically equal to upstream.
+`tests/models/base/test_auto_registry.py` and the matching family test under
+`tests/models/transformers/` or `tests/models/diffusers/` are part of the
+minimum too: the first proves the registry constructs the registered class; the
+second owns model-specific eager forward/backward parity and integration gates.
 If you think you need a new test file, read `.agents/knowledge/testing.md` first.
 Minimum coverage:
 
 1. **Toy config**: create `tests/toy_config/<m>_toy/config.json` (few layers,
    small hidden/intermediate, tiny vocab). Add a `README.md` next to it noting
    source config + changes.
-2. **`tests/models/test_models_patch.py`**: append an entry to the test cases
-   list with `id="<m>"` and `is_moe=<bool>`. If the model lacks certain
-   attention/MoE backends, add a `case_id == "<m>"` filter block in
-   `test_models_patch_fwd_bwd`.
+2. **Registry/build coverage**: append one `_ModelCase` to
+   `tests/models/base/test_auto_registry.py`, using the canonical tiny-config
+   factory from `tests/models/tiny_configs.py`.
 3. **`tests/e2e/test_e2e_parallel.py`**: append a `pytest.param(...)`. Use
    `max_sp_size=1` if SP not yet supported, else `None`.
-4. **VLM only** — `tests/models/test_vlm_trainer.py`: add to the freeze-ViT
+4. **VLM only** — `tests/trainer/test_vlm_trainer.py`: add to the freeze-ViT
    VLM cases list.
 5. **VLM / Omni only** — `tests/distributed/test_dummy_forward.py`: add a
    `pytest.param(...)` in `_vlm_cases` (or `_omni_cases`). Required because
@@ -518,7 +518,7 @@ Minimum coverage:
    covers single-GPU vs FSDP2 `grad_norm` for *text* models only. If the model
    is text-only, append to the text test cases list. VLM/Omni models are out
    of scope for this suite (no VLM scaffolding exists).
-7. **MoE with a converter** — `tests/models/test_checkpoint_tensor_converter.py`: add a
+7. **MoE with a converter** — `tests/models/base/test_checkpoint_tensor_converter.py`: add a
    test group mirroring the existing `qwen3_moe` / `qwen3_vl_moe` blocks.
    Minimum coverage:
    - `can_handle` — matches the expected key regex, rejects non-expert keys.
@@ -552,16 +552,15 @@ source .venv/bin/activate
 Run:
 
 ```bash
-pytest tests/models/test_model_registry.py -v
-pytest tests/models/test_models_logits_equal_v5.py -k <m> -v
-pytest tests/models/test_models_patch.py -k <m> -v
+pytest tests/models/base/test_auto_registry.py -k <m> -v
+pytest tests/models/<family-test>.py -k <m> -v
 pytest tests/e2e/test_e2e_parallel.py::<test_fn> -k <model_name> -v   # see note below; needs multi-GPU worker
 # MoE with a converter:
-pytest tests/models/test_checkpoint_tensor_converter.py -v
+pytest tests/models/base/test_checkpoint_tensor_converter.py -v
 # VLM / Omni (requires multiple GPUs):
 pytest tests/distributed/test_dummy_forward.py -k <m> -v
 # VLM only:
-pytest tests/models/test_vlm_trainer.py -k <m> -v
+pytest tests/trainer/test_vlm_trainer.py -k <m> -v
 ```
 
 Run every applicable minimum-coverage suite from Phase 6 on a worker with the
@@ -573,9 +572,9 @@ getting this wrong silently produces `0 selected / N deselected`:**
 
 | Suite | id source | keyword to pass to `-k` |
 |---|---|---|
-| `test_models_patch.py` | explicit `pytest.param(..., id="<m>")` | model id as registered (e.g. `qwen2_5_vl`, `qwen3_5_moe`) |
+| `test_auto_registry.py` | `model_type` from `_MODEL_CASES` | model id as registered (e.g. `qwen2_5_vl`, `qwen3_5_moe`) |
+| family model test | file-local parametrization/cases | matching model keyword from `--collect-only` |
 | `test_vlm_trainer.py` | explicit `id="<m>"` | same as above |
-| `test_models_logits_equal_v5.py` | `case_id` from `CASES` / `_LOADER_CASES` | matching model keyword from `--collect-only` |
 | `test_dummy_forward.py` | explicit ids in `_vlm_cases` / `_omni_cases` | model id as registered |
 | `test_e2e_parallel.py` | **first positional arg (`model_name`)**, *no explicit id* | the HF-style short name (e.g. `qwen25vl`, `qwen2vl`, `qwen3vl`, `qwen3vlmoe`) — **no underscores for VL series** |
 
@@ -594,9 +593,8 @@ Extra e2e gotchas:
 
 **Acceptance:**
 
-- `test_models_patch` passes for every `(hf_mode, veomni_mode, moe_backend)`
-  combo the filter allows — loss and grad norm match within `(_DEFAULT_RTOL,
-  _DEFAULT_ATOL)`.
+- `test_models_transformers` family parity under `tests/models/transformers/`
+  matches Hugging Face on the eager path for the new architecture.
 - `test_e2e_parallel` passes across all `(sp_size, ep_size)` combos.
 - `make quality` is clean.
 
@@ -704,13 +702,13 @@ category too, since most of the expensive, silent failures live there.
   via `override_method` on a synthetic class (e.g.
   `LlamaForSequenceClassification`), verify the generated file imports cleanly
   before declaring victory.
-- **Text/MoE models silently fail on NPU CI with `KeyError: "Unknown kernel
-  'npu' for op='rotary_pos_emb'/'rms_norm'"`** — the `KERNEL_REGISTRY` (used
-  by the OpSlot path in patchgen-generated modeling) currently registers only
-  the `liger_kernel` GPU backend for `rotary_pos_emb/full` and
-  `rms_norm/standard`. Until matching NPU `KernelSpec`s are added, every
-  patchgen-generated text/MoE model that runs on NPU CI must be pinned to
-  eager via `_NPU_PER_MODEL_OVERRIDES` in `tests/tools/training_utils.py`:
+- **A model selects an op implementation that its variant does not expose on NPU** —
+  each generated module constructs a local `VeomniOp(op, variant, impl)`, and
+  resolution validates both the device-specific registry row and its optional
+  package requirements. Generic `rms_norm/standard` and `rope/full` have NPU
+  rows; specialized variants such as DeepSeek-V4 RoPE and unweighted RMSNorm
+  intentionally remain eager. Pin only those unsupported variants via
+  `_NPU_PER_MODEL_OVERRIDES` in `tests/tools/training_utils.py`:
   ```python
   "<model_name>": {
       "rms_norm_implementation": "eager",
@@ -719,10 +717,8 @@ category too, since most of the expensive, silent failures live there.
   ```
   Match the `model_name` exactly to the key used in `test_e2e_parallel.py`'s
   parametrize (e.g. `"qwen2"`, `"qwen3_moe"`, `"llama3.1"`, `"qwen2_5_omni"`).
-  Skipping this step is the canonical "GPU CI is green but NPU CI explodes at
-  model build" symptom. Multimodal/Omni models often need the override on
-  **both** `rms_norm_implementation` and `rotary_pos_emb_implementation`
-  because the audio/vision encoders pull the same OpSlots as the text tower.
+  Match overrides to the variants actually constructed by the model; do not
+  blanket-disable NPU implementations that are registered and tested.
 - **`pytest -k` mismatch on e2e** — `test_e2e_parallel.py` uses the first
   positional arg (`model_name`) as id, not the registry `<m>` id. For VL
   models that's the HF short name (`qwen25vl`, `qwen3vl`, `qwen3vlmoe`, …),

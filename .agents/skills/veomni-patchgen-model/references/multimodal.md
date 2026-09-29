@@ -112,7 +112,7 @@ generated file, and the TTS path is excluded anyway.
      build) for callers that bypass `MainCollator`.
   6. `dummy_forward` (FSDP path): build the `vit_metadata` sub-dict host-side.
   7. Add the model to `_MM_METADATA_WIRED_CASES` in
-     `tests/models/test_model_forward_no_implicit_sync.py`.
+     `tests/models/transformers/test_model_forward_no_implicit_sync.py`.
   When SP is enabled and you need to all-gather `input_ids` (or any tensor that
   went through `MainCollator`'s `pack_dim=-1` path) back to full seq on each
   rank, use `torch.cat(list, dim=1)` — the collator's `PackingCollator.__call__`

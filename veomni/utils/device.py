@@ -26,7 +26,10 @@ logger = logging.get_logger(__name__)
 
 
 IS_CUDA_AVAILABLE = torch.cuda.is_available()
-IS_NPU_AVAILABLE = is_torch_npu_available()
+# ``is_torch_npu_available`` is a package-install check. Tests that disable
+# ``TORCH_DEVICE_BACKEND_AUTOLOAD`` still have the package, but ``torch.npu`` is
+# not registered, so treat that as NPU-unavailable rather than crashing on import.
+IS_NPU_AVAILABLE = is_torch_npu_available() and hasattr(torch, "npu")
 IS_MLU_AVAILABLE = is_torch_mlu_available()
 
 if IS_NPU_AVAILABLE:

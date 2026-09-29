@@ -12,15 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3_5 NPU/SP patched modeling generation.
+Patch configuration for Qwen3_5 NPU VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config -o veomni/models/transformers/qwen3_5/generated --diff
-
-Language-model focused patches from qwen3_next example:
-1. Device-agnostic GatedDeltaNet init and varlen FLA forward.
-2. DecoderLayer forward with cu_seq_lens_q passthrough.
-3. Use VeOmni fused loss path in Qwen3_5ForConditionalGeneration.forward.
 """
 
 from dataclasses import dataclass
@@ -47,22 +42,32 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     compute_mtp_loss,
     get_position_id,
     mm_token_type_ids_from_input_ids,
+    qwen3_5_attention_forward_patched,
     qwen3_5_forcausallm_forward_patched,
+    qwen3_5_forcausallm_init_patched,
     qwen3_5_forconditional_generation_forward_patched,
     qwen3_5_forconditional_generation_get_metadata_collate_func,
     qwen3_5_forconditional_generation_get_position_id_func,
     qwen3_5_forconditional_generation_init_patched,
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
+    qwen3_5_mlp_forward_patched,
+    qwen3_5_mlp_init_patched,
     qwen3_5_model_forward,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
     qwen3_5_model_init_patched,
     qwen3_5_rmsnorm_forward_patched,
+    qwen3_5_rmsnorm_init_patched,
+    qwen3_5_vision_attention_forward_patched,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_rot_pos_emb,
 )
+from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
+    config as gpu_config,
+)
+from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  consumed by in-config dataclass + emitted forward
     FusedLinearAuxOutput,
@@ -75,12 +80,7 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_5_npu.py",
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
 )
-
-config.override_method(
-    "Qwen3_5Model.__init__",
-    replacement=qwen3_5_model_init_patched,
-    description="Construct generated vision and text towers instead of upstream AutoModel classes",
-)
+config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
 
 config.add_import("copy", names=["copy"])
 config.add_import("functools", names=["partial"])
@@ -106,31 +106,25 @@ config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )  # noqa: F401
+config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import(
+    "veomni.ops.config",
+    names=["resolve_op_impl"],
+)
+config.add_import(
+    "veomni.models.utils.attention_utils",
+    names=["prepare_dense_attention_inputs"],
+)
+config.add_import(
+    "veomni.models.loss_utils",
+    names=["ForCausalLMLoss"],
+)
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
-    "causal_conv1d_update",
     "chunk_gated_delta_rule",
     "fused_recurrent_gated_delta_rule",
 )
-
-config.add_post_import_block(
-    """
-    # ── OpSlot declarations ──────────────────────────────────────────────────
-    # Bound at model-build time by _bind_veomni_ops() in auto.py.
-    from veomni.ops.dispatch import OpSlot
-    veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
-    veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "partial")
-    veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
-    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-    veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
-    veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
-    veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
-    veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
-    """
-)
-
-
 # Dummy definitions for names that exist in the generated file's scope but not here.
 # The patchgen only extracts the function body; these are resolved at codegen time.
 torch_chunk_gated_delta_rule = None  # noqa: F811 — also imported above for the forward patch
@@ -139,22 +133,22 @@ gather_heads_scatter_seq = None
 gather_outputs = None
 slice_input_tensor = None
 sp_pad_and_slice = None
-veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
-veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
-veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
 # Names referenced by the patched Qwen3_5TextModel.forward; resolved at
 # codegen time from the imports already present in the generated modeling file.
 DynamicCache = None
 create_causal_mask = None
-create_recurrent_attention_mask = None
 Qwen3_5ModelOutputWithPast = None
 
-# This NPU config reuses qwen3_5_vision_model_forward (Patch.5) from the GPU
-# config but does NOT register the Qwen3_5VisionAttention.forward consumer —
-# NPU vision attention runs the upstream HF body which recomputes max_seqlen
-# itself. Setting the sentinel to False suppresses Patch.5's host sync /
-# kwarg leak into `attention_interface(**kwargs)` on NPU.
-config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = False")
+# Same GPU VisionAttention.forward consumer: bind ``self.veomni_attn`` via
+# ``adopt_init_modifications`` and call it from the patched forward. The
+# sentinel must stay True so Patch.5 can pass ``vision_max_seqlen``.
+config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = True")
+
+config.override_method(
+    "Qwen3_5Model.__init__",
+    replacement=qwen3_5_model_init_patched,
+    description="Construct generated vision and text towers instead of upstream AutoModel classes",
+)
 
 
 # Register the multimodal helpers used by the reused get_position_id_func /
@@ -179,54 +173,25 @@ config.add_helper_after("Qwen3_5ModelOutputWithPast", Qwen3_5MTPContextOutput)
 
 
 config.override_method(
+    "Qwen3_5RMSNorm.__init__",
+    replacement=qwen3_5_rmsnorm_init_patched,
+    description="Construct a local rms_norm offset VeomniOp",
+)
+config.override_method(
     "Qwen3_5RMSNorm.forward",
     replacement=qwen3_5_rmsnorm_forward_patched,
-    description="Use fused rmsnorm to impl zero-centered rmsnorm (1+weight centered formulation)",
+    description="Always call the local rms_norm offset VeomniOp",
 )
-
-
-@config.replace_function(
-    "apply_rotary_pos_emb",
-    description="Use fused rope to impl partial rotary postion embedding",
+config.override_method(
+    "Qwen3_5MLP.__init__",
+    replacement=qwen3_5_mlp_init_patched,
+    description="Construct a local swiglu_mlp VeomniOp",
 )
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
-        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-
-    # Keep half or full tensor for later concatenation
-    rotary_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-
-    # Apply rotary embeddings on the first half or full tensor
-    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
-
-    # Concatenate back to full shape
-    q_embed = torch.cat([q_embed, q_pass], dim=-1)
-    k_embed = torch.cat([k_embed, k_pass], dim=-1)
-    return q_embed, k_embed
-
-
-@config.replace_function(
-    "apply_rotary_pos_emb_vision", description="Use fused rope to impl rotary postion embedding in vit"
+config.override_method(
+    "Qwen3_5MLP.forward",
+    replacement=qwen3_5_mlp_forward_patched,
+    description="Call swiglu_mlp for silu/swish, otherwise self.act_fn",
 )
-def apply_rotary_pos_emb_vision(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if veomni_apply_rotary_pos_emb_vision.use_non_eager_impl:
-        return veomni_apply_rotary_pos_emb_vision(q, k, cos, sin)
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.float(), k.float()
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    q_embed = q_embed.to(orig_q_dtype)
-    k_embed = k_embed.to(orig_k_dtype)
-    return q_embed, k_embed
 
 
 config.override_method(
@@ -325,6 +290,11 @@ def qwen3_5_gated_deltanet_forward_patched(
         local_key_dim = self.key_dim
         local_value_dim = self.value_dim
 
+    # Host-gated NPU kernels must follow the activation device. Unconditional
+    # `.npu()` breaks CPU unit tests on Ascend hosts.
+    if cu_seq_lens_q is not None and mixed_qkv.device.type == "npu":
+        cu_seq_lens_q = cu_seq_lens_q.npu()
+
     if use_precomputed_states:
         # Modification: keep this disabled until FLA causal_conv1d_update decode path is validated.
         raise NotImplementedError("use_precomputed_states=True is not supported yet for causal_conv1d_update now.")
@@ -333,28 +303,24 @@ def qwen3_5_gated_deltanet_forward_patched(
             mixed_qkv_t = mixed_qkv.transpose(1, 2)
             conv_state = F.pad(mixed_qkv_t, (self.conv_kernel_size - mixed_qkv_t.shape[-1], 0))
             cache_params.conv_states[self.layer_idx] = conv_state
-        if self.causal_conv1d_fn is not None:
-            # Modification: shard conv1d weights per Ulysses rank to match head-sharded channels.
-            if ulysses_enabled:
-                conv_weight = self._get_local_conv1d_weight(
-                    ulysses_rank=ulysses_rank,
-                    local_key_dim=local_key_dim,
-                    local_value_dim=local_value_dim,
-                )
-            else:
-                conv_weight = self.conv1d.weight.squeeze(1)
-            # mixed_qkv is [B, S, D] — FLA causal_conv1d expects [B, S, D].
-            mixed_qkv = self.causal_conv1d_fn(
-                x=mixed_qkv,
-                weight=conv_weight,
-                bias=self.conv1d.bias,
-                activation=self.activation,
-                seq_idx=None,
-                backend="triton",
-                cu_seqlens=cu_seq_lens_q.npu(),
-            )[0]
+        # Modification: shard conv1d weights per Ulysses rank to match head-sharded channels.
+        if ulysses_enabled:
+            conv_weight = self._get_local_conv1d_weight(
+                ulysses_rank=ulysses_rank,
+                local_key_dim=local_key_dim,
+                local_value_dim=local_value_dim,
+            )
         else:
-            raise NotImplementedError("This path is not supported yet because it can't process varlen now.")
+            conv_weight = self.conv1d.weight.squeeze(1)
+        mixed_qkv = self.veomni_causal_conv1d(
+            mixed_qkv,
+            conv_weight,
+            self.conv1d.bias,
+            cu_seq_lens_q,
+            activation=self.activation,
+            seq_idx=None,
+            backend="triton",
+        )
 
     query, key, value = torch.split(
         mixed_qkv,
@@ -385,29 +351,20 @@ def qwen3_5_gated_deltanet_forward_patched(
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
     if not use_precomputed_states:
-        # Modification: instance-local guard (see GPU patch comment).
-        if self.chunk_gated_delta_rule is torch_chunk_gated_delta_rule:
-            raise RuntimeError(
-                "Varlen Qwen3.5 GatedDeltaNet training requires a non-eager "
-                "chunk_gated_delta_rule backend. On GPU, set the implementation to 'fla' or "
-                "'flash_qla'; on NPU, set it to 'fla' or 'npu'."
-            )
-        else:
-            # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
-            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=cache_params is not None,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seq_lens_q.npu(),
-                cu_seqlens_list=cu_seqlens_list,
-                chunk_indices=chunk_indices,
-                chunk_indices_list=chunk_indices_list,
-            )
+        core_attn_out, last_recurrent_state = self.veomni_chunk_gated_delta_rule(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            None,
+            cu_seq_lens_q,
+            output_final_state=cache_params is not None,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens_list=cu_seqlens_list,
+            chunk_indices=chunk_indices,
+            chunk_indices_list=chunk_indices_list,
+        )
     else:
         core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
             query,
@@ -433,7 +390,13 @@ def qwen3_5_gated_deltanet_forward_patched(
     # reshape input data into 2D tensor
     core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
     z = z.reshape(-1, self.head_v_dim)
-    core_attn_out = self.norm(core_attn_out, z)
+    core_attn_out = self.veomni_rms_norm_gated(
+        core_attn_out,
+        z,
+        self.norm.weight,
+        eps=self.layer_norm_epsilon,
+        activation=self.activation,
+    )
     core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
     output = self.out_proj(core_attn_out)
@@ -486,7 +449,14 @@ def qwen3_5_decoder_layer_forward_patched(
             chunk_indices_list=linear_attn_chunk_indices_list,
         )
     elif self.block_type == "full_attention":
-        # Self Attention
+        # Self Attention. SDPA/eager reject GDN cu_seq_lens metadata.
+        attn_impl = getattr(getattr(self, "self_attn", None), "veomni_attn", None)
+        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
+            kwargs,
+            impl=attn_impl.impl if attn_impl is not None else "eager",
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+        )
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -494,7 +464,7 @@ def qwen3_5_decoder_layer_forward_patched(
             past_key_values=past_key_values,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
-            **kwargs,
+            **attn_kwargs,
         )
 
     hidden_states = residual + hidden_states
@@ -554,7 +524,6 @@ def qwen3_5_text_model_forward_patched(
         text_position_ids = None
 
     if not isinstance(causal_mask_mapping := attention_mask, dict):
-        # Prepare mask arguments
         mask_kwargs = {
             "config": self.config,
             "inputs_embeds": inputs_embeds,
@@ -562,7 +531,6 @@ def qwen3_5_text_model_forward_patched(
             "past_key_values": past_key_values,
             "position_ids": text_position_ids,
         }
-        # Create the masks
         causal_mask_mapping = {
             "full_attention": create_causal_mask(**mask_kwargs),
             "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
@@ -571,11 +539,13 @@ def qwen3_5_text_model_forward_patched(
     # Modification: precompute varlen metadata once for all GDN layers to avoid per-layer tolist overhead.
     cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
     if cu_seq_lens_q is not None and "cu_seqlens_list_q" not in kwargs:
-        from veomni.ops.kernels.gated_delta_rule._ascend.flash_gated_delta_rule import precompute_varlen_metadata
+        from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.npu_ascendc import (
+            precompute_varlen_metadata,
+        )
 
-        # Use the Ulysses-local head count so that the precomputed cumsum-block
-        # key matches the per-layer _ensure_varlen_metadata computation (which
-        # derives h from g.shape[-1], i.e. the local head count after SP split).
+        # Use the Ulysses-local head count so the precomputed cumsum-block key
+        # matches per-layer metadata (h comes from g.shape[-1], i.e. the local
+        # head count after SP split).
         num_v_heads = self.config.linear_num_value_heads
         if get_parallel_state().sp_enabled:
             num_v_heads //= get_parallel_state().sp_size
@@ -795,10 +765,8 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
     # recompute when the key is absent (so non-VeOmni callers keep working).
     # Gate is two-pronged:
     #   (a) `_VEOMNI_VISION_ATTENTION_PATCHED` — set per generated file. True
-    #       only in GPU generated files where the consumer override is
-    #       registered. NPU configs inject False because they reuse upstream
-    #       HF Qwen3_5VisionAttention.forward, which recomputes max_seqlen and
-    #       would leak the unused kwarg into `attention_interface(**kwargs)`.
+    #       when Qwen3_5VisionAttention.forward is patched to consume
+    #       ``vision_max_seqlen``. GPU and NPU both register that consumer.
     #   (b) `is_flash_attention_requested(self.config)` — only FA's
     #       `flash_attn_varlen_func` benefits from the int hand-off; eager
     #       and sdpa paths in the consumer pop+discard the kwarg, so the
@@ -851,9 +819,14 @@ config.override_method(
 
 
 config.override_method(
+    "Qwen3_5ForCausalLM.__init__",
+    replacement=qwen3_5_forcausallm_init_patched,
+    description="Bind ForCausalLMLoss VeomniOp on Qwen3_5ForCausalLM",
+)
+config.override_method(
     "Qwen3_5ForCausalLM.forward",
     replacement=qwen3_5_forcausallm_forward_patched,
-    description="Support fused cross entropy path in Qwen3_5ForCausalLM.forward",
+    description="Always call ForCausalLMLoss VeomniOp",
 )
 
 
@@ -874,14 +847,12 @@ config.override_method(
 config.override_method(
     "Qwen3_5ForConditionalGeneration.__init__",
     replacement=qwen3_5_forconditional_generation_init_patched,
-    description="Build the MTP head when text_config.mtp_loss_weight is set",
+    description="Bind ForCausalLMLoss VeomniOp and build the MTP head when text_config.mtp_loss_weight is set",
 )
-
-
 config.override_method(
     "Qwen3_5ForConditionalGeneration.forward",
     replacement=qwen3_5_forconditional_generation_forward_patched,
-    description="Support fused cross entropy path in Qwen3_5ForConditionalGeneration.forward",
+    description="Always call ForCausalLMLoss VeomniOp",
 )
 
 
@@ -890,21 +861,32 @@ config.override_method(
 @config.add_helper_after("Qwen3_5CausalLMOutputWithPast")
 @dataclass
 class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5CausalLMOutputWithPast):
-    r"""
-    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
-        Language modeling loss (for next-token prediction).
-    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
-        Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
-        The rope index difference between sequence length and multimodal rope.
-    fused_linear_aux (`FusedLinearAuxOutput`, *optional*):
-        Per-token tensors produced by the fused-linear loss path
-        (``log_probs`` / ``entropy``; plus ``distillation_losses`` /
-        ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
-        ``None`` on the plain loss path; populated when ``return_log_probs=True``.
+    """``Qwen3_5CausalLMOutputWithPast`` + ``fused_linear_aux`` payload.
+
+    Args:
+        fused_linear_aux (`FusedLinearAuxOutput`, *optional*):
+            Per-token tensors produced by the fused-linear loss path
+            (``log_probs`` / ``entropy``; plus ``distillation_losses`` /
+            ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
+            ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """
 
 
+config.adopt_init_modifications(gpu_config)
+config.override_method(
+    "Qwen3_5VisionAttention.forward",
+    replacement=qwen3_5_vision_attention_forward_patched,
+    description=(
+        "Read pre-computed `vision_max_seqlen` (Python int) from kwargs to avoid "
+        "the per-block host sync that flash_attn_varlen_func incurs when "
+        "`max_length_q/k` are 0-D device tensors."
+    ),
+)
+config.override_method(
+    "Qwen3_5Attention.forward",
+    replacement=qwen3_5_attention_forward_patched,
+    description="Always call the local rope and attention VeomniOps",
+)
 config.add_import("transformers.utils", names=["logging"])
 config.add_post_import_block("""
 from transformers.utils import logging

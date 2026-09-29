@@ -9,32 +9,19 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# See the License for the specific language governing limitations
+# under the License.
 """
-Patch configuration for GPT-OSS GPU patched modeling generation.
+Patch configuration for GPT-OSS GPU VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models.transformers.gpt_oss.gpt_oss_gpu_patch_gen_config -o veomni/models/transformers/gpt_oss/generated --diff
 
-Patches:
-1. ``GptOssPreTrainedModel`` — extends HF's compatible flash-attention list
-   with VeOmni's FA4+SP implementation name, preventing the Transformers init
-   check from falling back to hub kernels.
-2. ``GptOssExperts`` — drops the upstream hub expert decorator so VeOmni owns
-   the MoE dispatch point. The exact eager GPT-OSS math is preserved, and a
-   GPT-OSS-specific fused grouped-GEMM path is exposed through OpSlot.
-3. ``GptOssMLP`` — drops the upstream ``MegaBlocksMoeMLP`` hub decorator so
-   the patched ``GptOssExperts`` module is always the MoE implementation.
-4. ``GptOssForCausalLM.get_parallel_plan`` — exposes the expert-parallel plan
-   for GPT-OSS expert weights and biases.
-5. ``GptOssForCausalLM.forward`` — OpSlot guard for fused cross entropy and
-   VeOmni's ``MoeCausalLMOutputWithLogProbs`` output contract.
-
-GPT-OSS attention already passes ``sliding_window`` and learnable sink
-(``s_aux=self.sinks``) through Transformers' attention interface, so FA4 support
-is provided by VeOmni's global attention registry patch.
+FA4 allowlist, hub-decorator drop, and EP plan stay. MoE, CE, and
+load-balancing loss call local VeomniOp.
 """
+
+from functools import partial
 
 import torch
 from torch import nn
@@ -47,12 +34,14 @@ from transformers.models.gpt_oss.modeling_gpt_oss import (
     GptOssAttention,
     GptOssDecoderLayer,
     GptOssTopKRouter,
-    load_balancing_loss_func,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring
 from transformers.utils.output_capturing import OutputRecorder
 
+from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
@@ -60,25 +49,46 @@ from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 config = PatchConfig(
     source_module="transformers.models.gpt_oss.modeling_gpt_oss",
     target_file="patched_modeling_gpt_oss_gpu.py",
-    description="GPT-OSS with VeOmni FA4-compatible attention dispatch and fused-loss contract",
+    description="GPT-OSS with VeOmni FA4-compatible attention dispatch and VeomniOp replacements",
 )
 
+config.add_import("functools", names=["partial"])
 config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "MoeCausalLMOutputWithLogProbs"],
 )
+config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import(
+    "veomni.ops.config",
+    names=["resolve_op_impl"],
+)
+config.add_import(
+    "veomni.models.loss_utils",
+    names=["ForCausalLMLoss", "load_balancing_loss"],
+)
+config.exclude_from_output("apply_rotary_pos_emb", "rotate_half", "_apply_rotary_emb", "use_kernel_forward_from_hub")
+config.drop_import_names("use_kernelized_func")
+config.drop_import_names("use_kernel_forward_from_hub")
 config.drop_import_names("MoeCausalLMOutputWithPast")
 
-config.add_post_import_block(
-    """
-    # ── OpSlot declarations ──────────────────────────────────────────────────
-    # Bound at model-build time by _bind_veomni_ops() in auto.py.
-    from veomni.ops.dispatch import OpSlot
-    veomni_moe_experts_forward = OpSlot("moe_experts", "gpt_oss")
-    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-    veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
-    """
+
+@config.override_method(
+    "GptOssRMSNorm.__init__",
+    description="Construct a local rms_norm VeomniOp",
 )
+def gpt_oss_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+    nn.Module.__init__(self)
+    self.weight = nn.Parameter(torch.ones(hidden_size))
+    self.variance_epsilon = eps
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+
+
+@config.override_method(
+    "GptOssRMSNorm.forward",
+    description="Always call the local rms_norm VeomniOp",
+)
+def gpt_oss_rmsnorm_forward_patched(self, hidden_states) -> torch.Tensor:
+    return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 
 
 @config.replace_class(
@@ -107,7 +117,7 @@ class PatchedGptOssPreTrainedModel(PreTrainedModel):
     _compatible_flash_implementations = [
         "kernels-community/vllm-flash-attn3",
         "flash_attention_4",
-        "veomni_flash_attention_4_with_sp",
+        "veomni_flash_attention_4",
     ]
 
     @torch.no_grad()
@@ -128,7 +138,7 @@ class PatchedGptOssPreTrainedModel(PreTrainedModel):
 
 @config.replace_class(
     "GptOssExperts",
-    description="Drop upstream expert hub decorator and expose VeOmni MoE dispatch guard",
+    description="Always call moe_experts gpt_oss VeomniOp",
 )
 class PatchedGptOssExperts(nn.Module):
     def __init__(self, config):
@@ -142,44 +152,21 @@ class PatchedGptOssExperts(nn.Module):
         self.down_proj_bias = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
         self.alpha = 1.702
         self.limit = 7.0
-
-    def _apply_gate(self, gate_up: torch.Tensor) -> torch.Tensor:
-        gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-        gate = gate.clamp(min=None, max=self.limit)
-        up = up.clamp(min=-self.limit, max=self.limit)
-        glu = gate * torch.sigmoid(gate * self.alpha)
-        gated_output = (up + 1) * glu
-        return gated_output
+        self.veomni_moe = VeomniOp("moe_experts", "gpt_oss", resolve_op_impl("moe_implementation"))
 
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
-        next_states = torch.zeros_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)
-
-        if veomni_moe_experts_forward.use_non_eager_impl:
-            return veomni_moe_experts_forward(self, hidden_states, router_indices, routing_weights)
-        if not veomni_moe_experts_forward.use_eager_impl:
-            raise RuntimeError(
-                "GPT-OSS MoE experts have no implementation bound. "
-                "Set moe_implementation='eager' to use the HuggingFace reference path, "
-                "or set moe_implementation to a supported fused backend such as 'fused_triton' or 'fused_quack'."
-            )
-
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            gate_up = current_state @ self.gate_up_proj[expert_idx] + self.gate_up_proj_bias[expert_idx]
-            gated_output = self._apply_gate(gate_up)
-            out = gated_output @ self.down_proj[expert_idx] + self.down_proj_bias[expert_idx]
-            weighted_output = out * routing_weights[token_idx, top_k_pos, None]
-            next_states.index_add_(0, token_idx, weighted_output.to(hidden_states.dtype))
-
-        return next_states
+        return self.veomni_moe(
+            hidden_states,
+            routing_weights,
+            router_indices,
+            self.gate_up_proj,
+            self.gate_up_proj_bias,
+            self.down_proj,
+            self.down_proj_bias,
+            num_experts=self.num_experts,
+            alpha=self.alpha,
+            limit=self.limit,
+        )
 
 
 @config.replace_class(
@@ -212,8 +199,32 @@ def gpt_oss_get_parallel_plan_patched(self):
 
 
 @config.override_method(
+    "GptOssForCausalLM.__init__",
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
+)
+def gpt_oss_forcausallm_init_patched(self, config):
+    super().__init__(config)
+    self.model = GptOssModel(config)
+    self.vocab_size = config.vocab_size
+    self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    self.router_aux_loss_coef = config.router_aux_loss_coef
+    self.num_experts = config.num_local_experts
+    self.num_experts_per_tok = config.num_experts_per_tok
+    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+    self.veomni_lb = VeomniOp(
+        "load_balancing_loss",
+        "standard",
+        resolve_op_impl("load_balancing_loss_implementation"),
+    )
+    self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
+    self.post_init()
+
+
+@config.override_method(
     "GptOssForCausalLM.forward",
-    description="Support VeOmni fused cross entropy contract in GptOssForCausalLM.forward",
+    description="Always call ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 def gpt_oss_forcausallm_forward_patched(
     self,
@@ -251,44 +262,26 @@ def gpt_oss_forcausallm_forward_patched(
     logits = None
     fused_linear_aux = None
     if labels is not None:
-        if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
-        else:
-            loss, _, fused_linear_aux = self.loss_function(
-                logits=None,
-                labels=labels,
-                vocab_size=self.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                **kwargs,
-            )
+        loss, logits, fused_linear_aux = self.loss_function(
+            logits=logits,
+            labels=labels,
+            vocab_size=self.vocab_size,
+            hidden_states=hidden_states,
+            weights=self.lm_head.weight,
+            **kwargs,
+        )
     else:
         logits = self.lm_head(hidden_states)
 
     aux_loss = None
     if output_router_logits:
-        if veomni_load_balancing_loss.use_non_eager_impl:
-            aux_loss = veomni_load_balancing_loss(
-                outputs.router_logits,
-                self.num_experts,
-                self.num_experts_per_tok,
-                attention_mask,
-            )
-        else:
-            aux_loss = load_balancing_loss_func(
-                outputs.router_logits,
-                self.num_experts,
-                self.num_experts_per_tok,
-                attention_mask,
-            )
-        if labels is not None and loss is not None:
+        aux_loss = self.load_balancing_loss(
+            outputs.router_logits,
+            self.num_experts,
+            self.num_experts_per_tok,
+            attention_mask,
+        )
+        if isinstance(loss, torch.Tensor) and isinstance(aux_loss, torch.Tensor):
             loss += self.router_aux_loss_coef * aux_loss.to(loss.device)
 
     return MoeCausalLMOutputWithLogProbs(
@@ -301,3 +294,56 @@ def gpt_oss_forcausallm_forward_patched(
         attentions=outputs.attentions,
         router_logits=outputs.router_logits,
     )
+
+
+@config.modify_init("GptOssAttention", description="Bind instance-local rope and attention VeomniOps")
+def gpt_oss_attention_bind_ops(original_init, self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
+    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+
+
+@config.override_method(
+    "GptOssAttention.forward",
+    description="Always call the local rope and attention VeomniOps",
+)
+def gpt_oss_attention_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None,
+    past_key_values: Cache | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    # HF GPT-OSS tables are half-width. Duplicate them so rope/full sees last-dim == head_dim.
+    cos = torch.cat((cos, cos), dim=-1)
+    sin = torch.cat((sin, sin), dim=-1)
+    query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
+
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+    attn_output, attn_weights = self.veomni_attn(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        sliding_window=self.sliding_window,
+        s_aux=self.sinks,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights

@@ -113,6 +113,7 @@ def _dsv4_csa_attention_model() -> nn.Module:
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
     config = AutoConfig.from_pretrained(str(_TOY_CONFIG_ROOT / "deepseek_v4_toy"))
+    config._attn_implementation = "eager"
     config.index_n_heads = 64
     config.index_head_dim = 128
     torch.manual_seed(0)

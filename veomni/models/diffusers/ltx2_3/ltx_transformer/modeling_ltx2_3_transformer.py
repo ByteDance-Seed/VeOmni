@@ -1,3 +1,5 @@
+"""Adapted from https://github.com/Lightricks/LTX-2/tree/main/packages/ltx-core"""
+
 from __future__ import annotations
 
 import copy
@@ -6,6 +8,13 @@ import os
 from dataclasses import dataclass, replace
 
 import torch
+from transformers import PreTrainedModel
+from transformers.modeling_outputs import ModelOutput
+
+
+# isort: off
+# Bind this tree before any ``import ltx_core``.
+import veomni.models.diffusers.ltx2_3.ltx_core  # noqa: F401
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier, get_pixel_coords
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig
 from ltx_core.model.transformer.attention import Attention
@@ -14,10 +23,7 @@ from ltx_core.model.transformer.model import LTXModel, LTXModelType
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.text_projection import PixArtAlphaTextProjection
 from ltx_core.types import AudioLatentShape, SpatioTemporalScaleFactors, VideoLatentShape
-from transformers import PreTrainedModel
-from transformers.modeling_outputs import ModelOutput
-
-import veomni.models.diffusers.ltx2_3.ltx_core  # noqa: F401
+# isort: on
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
@@ -36,14 +42,6 @@ VIDEO_SCALE_FACTORS = SpatioTemporalScaleFactors(time=8, height=32, width=32)
 AUDIO_MEL_BINS = 16
 AUDIO_CHANNELS = 8
 DEFAULT_FPS = 24
-
-_VEOMNI_SP_ATTN_IMPLS = frozenset(
-    {
-        "veomni_flash_attention_2_with_sp",
-        "veomni_flash_attention_3_with_sp",
-        "veomni_flash_attention_4_with_sp",
-    }
-)
 
 
 def LTXSPAttention_forward(
@@ -119,6 +117,11 @@ def LTXVideoModel_forward(
     audio: Modality | None,
     perturbations: BatchedPerturbationConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if not self.model_type.is_video_enabled() and video is not None:
+        raise ValueError("Video is not enabled for this model")
+    if not self.model_type.is_audio_enabled() and audio is not None:
+        raise ValueError("Audio is not enabled for this model")
+
     video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
     audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
 
@@ -474,12 +477,7 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
 
     @classmethod
     def from_pretrained(cls, path, **kwargs):
-        from ....loader import get_model_config
-
-        kwargs.pop("trust_remote_code", None)
-        config = get_model_config(path, **kwargs)
-        model = cls._from_config(config)
-        return model
+        raise NotImplementedError("LTXVideoTransformerModel.from_pretrained is not supported on this wrapper.")
 
 
 def compute_ltx2_loss(

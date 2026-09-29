@@ -61,7 +61,7 @@ source $CANN_path/ascend-toolkit/set_env.sh
 ```
 
 To enable the NPU chunked cross-entropy loss, set
-`model.ops_implementation.cross_entropy_loss_implementation: npu` in your training YAML
+`model.ops_implementation.cross_entropy_loss_implementation: chunk_loss` in your training YAML
 (replaces the legacy `VEOMNI_ENABLE_CHUNK_LOSS` environment variable).
 
 > **Note:** The NPU chunked cross-entropy backs both `ForCausalLM` and

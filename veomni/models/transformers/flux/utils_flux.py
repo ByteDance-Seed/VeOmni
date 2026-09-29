@@ -16,10 +16,14 @@
 
 import math
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import torch
 from einops import rearrange, repeat
 from transformers import T5EncoderModel
+
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 
 
 def get_timestep_embedding(
@@ -263,14 +267,44 @@ def init_weights_on_device(device=None, include_buffers: bool = False):
             setattr(torch, torch_function_name, old_torch_function)
 
 
-def low_version_attention(query, key, value, attn_bias=None):
-    scale = 1 / query.shape[-1] ** 0.5
-    query = query * scale
-    attn = torch.matmul(query, key.transpose(-2, -1))
-    if attn_bias is not None:
-        attn = attn + attn_bias
-    attn = attn.softmax(-1)
-    return attn @ value
+_SDPA_ATTN_IMPLS = frozenset({"sdpa", "veomni_sdpa"})
+
+
+def bind_flux_attention(module: torch.nn.Module, impl: str | None = None) -> None:
+    """Attach configured ``attention/standard`` plus a one-time SDPA mask fallback."""
+    impl = resolve_op_impl("attn_implementation") if impl is None else impl
+    module.veomni_attn = VeomniOp("attention", "standard", impl)
+    module.veomni_attn_masked = (
+        module.veomni_attn if impl in _SDPA_ATTN_IMPLS else VeomniOp("attention", "standard", "sdpa")
+    )
+    module.is_causal = False
+    module.layer_idx = getattr(module, "layer_idx", None)
+    module.num_key_value_groups = getattr(module, "num_key_value_groups", 1)
+    module.config = SimpleNamespace(_attn_implementation=impl)
+
+
+def flux_attention(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run interned attention and return ``(B, H, S, D)`` to match Flux consume."""
+    handle = module.veomni_attn_masked if attention_mask is not None else module.veomni_attn
+    if attention_mask is not None and attention_mask.ndim == 2:
+        attention_mask = attention_mask.view(1, 1, *attention_mask.shape)
+    output, _ = handle(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        dropout=0.0,
+        is_causal=False,
+        skip_ulysses=True,
+    )
+    return output.transpose(1, 2)
 
 
 class FluxTextEncoder2(T5EncoderModel):
@@ -312,16 +346,17 @@ class Attention(torch.nn.Module):
         self.to_k = torch.nn.Linear(kv_dim, dim_inner, bias=bias_kv)
         self.to_v = torch.nn.Linear(kv_dim, dim_inner, bias=bias_kv)
         self.to_out = torch.nn.Linear(dim_inner, q_dim, bias=bias_out)
+        bind_flux_attention(self)
 
     def interact_with_ipadapter(self, hidden_states, q, ip_k, ip_v, scale=1.0):
         batch_size = q.shape[0]
         ip_k = ip_k.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
         ip_v = ip_v.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        ip_hidden_states = torch.nn.functional.scaled_dot_product_attention(q, ip_k, ip_v)
+        ip_hidden_states = flux_attention(self, q, ip_k, ip_v)
         hidden_states = hidden_states + scale * ip_hidden_states
         return hidden_states
 
-    def torch_forward(
+    def forward(
         self, hidden_states, encoder_hidden_states=None, attn_mask=None, ipadapter_kwargs=None, qkv_preprocessor=None
     ):
         if encoder_hidden_states is None:
@@ -340,7 +375,7 @@ class Attention(torch.nn.Module):
         if qkv_preprocessor is not None:
             q, k, v = qkv_preprocessor(q, k, v)
 
-        hidden_states = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        hidden_states = flux_attention(self, q, k, v, attn_mask)
         if ipadapter_kwargs is not None:
             hidden_states = self.interact_with_ipadapter(hidden_states, q, **ipadapter_kwargs)
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
@@ -349,42 +384,6 @@ class Attention(torch.nn.Module):
         hidden_states = self.to_out(hidden_states)
 
         return hidden_states
-
-    def xformers_forward(self, hidden_states, encoder_hidden_states=None, attn_mask=None):
-        if encoder_hidden_states is None:
-            encoder_hidden_states = hidden_states
-
-        q = self.to_q(hidden_states)
-        k = self.to_k(encoder_hidden_states)
-        v = self.to_v(encoder_hidden_states)
-
-        q = rearrange(q, "b f (n d) -> (b n) f d", n=self.num_heads)
-        k = rearrange(k, "b f (n d) -> (b n) f d", n=self.num_heads)
-        v = rearrange(v, "b f (n d) -> (b n) f d", n=self.num_heads)
-
-        if attn_mask is not None:
-            hidden_states = low_version_attention(q, k, v, attn_bias=attn_mask)
-        else:
-            import xformers.ops as xops
-
-            hidden_states = xops.memory_efficient_attention(q, k, v)
-        hidden_states = rearrange(hidden_states, "(b n) f d -> b f (n d)", n=self.num_heads)
-
-        hidden_states = hidden_states.to(q.dtype)
-        hidden_states = self.to_out(hidden_states)
-
-        return hidden_states
-
-    def forward(
-        self, hidden_states, encoder_hidden_states=None, attn_mask=None, ipadapter_kwargs=None, qkv_preprocessor=None
-    ):
-        return self.torch_forward(
-            hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-            attn_mask=attn_mask,
-            ipadapter_kwargs=ipadapter_kwargs,
-            qkv_preprocessor=qkv_preprocessor,
-        )
 
 
 class CLIPEncoderLayer(torch.nn.Module):

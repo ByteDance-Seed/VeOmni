@@ -76,7 +76,13 @@ checkpoint round-trip tests; do not hide mismatches with `strict=False`.
    through `device_patch.py` or direct modeling. Copy the closest existing one
    and skip to Phase 3.
 
-Come back here once the model loads and its registry / patch tests pass.
+4. Reference existing parallel plans for guidance (e.g., `veomni/models/transformers/qwen3_moe/parallel_plan.py`). Come back here once the model loads and its registry and patch tests pass.
+
+5. **Patch patterns** — follow existing models:
+   - Sequence parallel: construct an instance-local attention `VeomniOp` and override `forward` via patchgen.
+   - MoE: stack per-expert weights (`gate_up_proj [E, 2*I, H]` / `down_proj [E, H, I]`) and store a `moe_experts` `VeomniOp` on the expert module.
+   - Cross-entropy: bind a `cross_entropy_loss` `VeomniOp` on the model instance and return `CausalLMOutputWithLogProbs`.
+   - Register the model class in the model package `__init__.py`; transformers models register through their per-model `MODELING_REGISTRY` decorators.
 
 ## Phase 3: Write Training Config
 
@@ -118,13 +124,11 @@ Come back here once the model loads and its registry / patch tests pass.
 
 1. **Create toy config**: Add `tests/toy_config/<model_name>_toy/config.json` with minimal parameters for fast testing.
 
-2. **Unit tests**: add cases to the existing enumerated tables rather than new
-   files — `tests/models/test_model_registry.py` and
-   `tests/models/test_models_patch.py` (`TEST_CASES`) already cover loading via
-   `veomni.models.auto`, forward output shape, and patch application. See
-   `.agents/knowledge/testing.md` for the full landing-spot table and for why a
-   new file outside `tests/ops/` / `tests/data/` will not run in CI unless it is
-   wired into the unit-test workflows.
+2. **Unit tests**: Add tests in `tests/models/` to verify:
+   - Model loads correctly via `veomni.models.auto`
+   - Forward pass produces correct output shape
+   - Model patch applies without errors
+   Check `.agents/knowledge/testing.md` and the owning workflow so a new test is actually collected in CI.
 
 3. **E2e tests** (if feasible): add a `pytest.param` to
    `tests/e2e/test_e2e_parallel.py` using the toy config, rather than a new

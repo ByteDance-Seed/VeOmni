@@ -1,7 +1,7 @@
 """Native H3 model-owned packing, without pretrained weights or encoders."""
 
 import copy
-from types import SimpleNamespace
+import importlib.util
 
 import pytest
 import torch
@@ -13,7 +13,7 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_condition.configuration_minim
 from veomni.models.diffusers.minimax_h3.minimax_h3_condition.modeling_minimax_h3_condition import (
     MiniMaxH3ConditionModel,
 )
-from veomni.models.diffusers.minimax_h3.minimax_h3_core import core, minimax_h3_dit, packed_sequence
+from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_dit, packed_sequence
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.configuration_minimax_h3_transformer import (
     MiniMaxH3DiTModelConfig,
 )
@@ -104,9 +104,16 @@ def serial(model, samples):
 
 @pytest.fixture(autouse=True)
 def cpu_attention(monkeypatch):
-    monkeypatch.setattr(minimax_h3_dit, "IS_NPU_AVAILABLE", False)
-    monkeypatch.setattr(core, "ATTENTION_IMPLEMENTATION", "torch")
+    from veomni.ops.config import get_ops_config, set_ops_config
+
     monkeypatch.setattr(minimax_h3_dit, "get_ulysses_sequence_parallel_group", lambda: None)
+    # build_foundation_model installs process-global ops. Do not leak FA3 into later tests.
+    previous = get_ops_config()
+    set_ops_config(None)
+    try:
+        yield
+    finally:
+        set_ops_config(previous)
 
 
 @pytest.mark.parametrize("backend", ["eager", "sdpa"])
@@ -444,41 +451,45 @@ def test_sequence_parallel_padding_remains_forward_local(monkeypatch, task):
         model(**batch([sample, sample]))
 
 
-_NPU_REJECTS_HUB = pytest.mark.skipif(is_torch_npu_available(), reason="Hub attention is rejected on Ascend NPU.")
+_HUB_UNAVAILABLE = pytest.mark.skipif(
+    is_torch_npu_available() or importlib.util.find_spec("kernels") is None,
+    reason="Hub FlashAttention needs the kernels package and is rejected on Ascend NPU.",
+)
 
 
 @pytest.mark.parametrize(
     "backend",
     [
         "flash_attention_2",
-        pytest.param("flash_attention_2_hub", marks=_NPU_REJECTS_HUB),
+        pytest.param("flash_attention_2_hub", marks=_HUB_UNAVAILABLE),
         "flash_attention_3",
-        pytest.param("flash_attention_3_hub", marks=_NPU_REJECTS_HUB),
+        pytest.param("flash_attention_3_hub", marks=_HUB_UNAVAILABLE),
     ],
 )
 def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(monkeypatch, backend):
     from veomni.arguments import OpsImplementationConfig
     from veomni.models.auto import build_foundation_model
-    from veomni.ops.kernels.attention import flash
+    from veomni.models.diffusers.minimax_h3.minimax_h3_transformer import (
+        modeling_minimax_h3_transformer as h3_modeling,
+    )
 
-    calls, loads = [], []
+    calls = []
 
-    config = tiny_model().config
+    def wrapped(self, q, k, v, *, cu_seqlens, max_seqlen, valid_seqlen):
+        bounds = cu_seqlens.device if isinstance(cu_seqlens, minimax_h3_dit._PackedBounds) else cu_seqlens
+        if not torch.is_tensor(bounds):
+            bounds = torch.tensor(bounds, dtype=torch.int32)
+        calls.append(bounds.tolist())
+        return minimax_h3_dit._sdpa_varlen_attention(q, k, v, tuple(bounds.tolist()), self.softmax_scale, True)
 
-    def kernel(q, k, v, *, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, causal):
-        assert q.ndim == 3 and q.shape[1:] == (config.num_attention_heads, config.attention_head_dim)
-        assert q.is_contiguous() and k.shape == v.shape == q.shape
-        assert cu_seqlens_q.dtype == torch.int32 and cu_seqlens_k is cu_seqlens_q
-        assert cu_seqlens_q[-1] == q.shape[0] and max_seqlen_q == max_seqlen_k
-        assert not causal
-        calls.append(cu_seqlens_q.tolist())
-        return minimax_h3_dit._sdpa_varlen_attention(q, k, v, tuple(cu_seqlens_q.tolist()), softmax_scale, True)
+    def bind_packed_name(module, *, is_causal, impl=None):
+        # github/main mocks `_load_veomni_flash_kernel` so this case never
+        # constructs a real FA backend. FA3 is CUDA SM90-only.
+        module.is_causal = is_causal
+        module.config._attn_implementation = impl
 
-    def loader(name):
-        loads.append(name)
-        return SimpleNamespace(flash_attn_varlen_func=kernel)
-
-    monkeypatch.setattr(flash, "_load_veomni_flash_kernel", loader)
+    monkeypatch.setattr(minimax_h3_dit.MiniMaxH3Attention, "_run_packed_attention", wrapped)
+    monkeypatch.setattr(h3_modeling, "bind_minimax_attention", bind_packed_name)
     ops = OpsImplementationConfig(
         attn_implementation=backend,
         rms_norm_implementation="eager",
@@ -499,55 +510,27 @@ def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(mon
     samples = prepare(condition_model(), raws)
     serial(model, samples)
     assert calls == []
-    loads.clear()  # Transformers may already have resolved the backend at construction.
     out = model(**batch(samples))
     sum(out.loss.values()).backward()
     assert calls[:2] == [[0, 3], [0, 7]]
     assert len(calls) == 4 and calls[2] == calls[3] and len(calls[2]) == 3
-    assert loads == [f"veomni_{backend}_with_sp"]
 
 
 def test_flash_backend_defers_packed_kernel_until_multisample_forward(monkeypatch):
-    import sys
-
-    from transformers import modeling_flash_attention_utils as hf_flash
-
-    from veomni.ops.kernels.attention import flash
+    from veomni.models.diffusers.minimax_h3.minimax_h3_transformer import (
+        modeling_minimax_h3_transformer as h3_modeling,
+    )
 
     loads = []
 
-    def unavailable(name):
-        loads.append(name)
+    def unavailable(module, *, is_causal, impl=None):
+        loads.append(impl)
         raise ImportError("flash_attn unavailable")
 
-    def npu_attention(q, k, v, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None, max_seqlen_k=None):
-        raise AssertionError("construction must not run NPU attention")
-
-    # Mirror Ascend: Transformers resolves its native NPU FA before VeOmni's loader.
-    monkeypatch.setattr(flash, "_load_veomni_flash_kernel", unavailable)
-    monkeypatch.setattr(hf_flash, "is_flash_attn_2_available", lambda: False)
-    monkeypatch.setattr(hf_flash, "is_torch_npu_available", lambda: True)
-    for name in (
-        "_loaded_implementation",
-        "_flash_fn",
-        "_flash_varlen_fn",
-        "_flash_with_kvcache_fn",
-        "_pad_fn",
-        "_unpad_fn",
-        "_process_flash_kwargs_fn",
-    ):
-        monkeypatch.setattr(hf_flash, name, None if name == "_loaded_implementation" else getattr(hf_flash, name))
-    monkeypatch.setitem(
-        sys.modules,
-        "transformers.integrations.npu_flash_attention",
-        SimpleNamespace(
-            npu_flash_attn_func=npu_attention,
-            npu_flash_attn_varlen_func=npu_attention,
-            npu_flash_attn_with_kvcache=npu_attention,
-        ),
-    )
+    # github/main mocks `_load_veomni_flash_kernel`. Packed load is the bind.
+    monkeypatch.setattr(h3_modeling, "bind_minimax_attention", unavailable)
     config = tiny_model().config
-    config._attn_implementation = "veomni_flash_attention_2_with_sp"
+    config._attn_implementation = "veomni_flash_attention_2"
     model = MiniMaxH3DiTModel(config)
     samples = prepare(condition_model(), [raw_sample(3), raw_sample(7)])
 
@@ -555,7 +538,7 @@ def test_flash_backend_defers_packed_kernel_until_multisample_forward(monkeypatc
     assert loads == []
     with pytest.raises(ImportError, match="flash_attn unavailable"):
         model(**batch(samples))
-    assert loads == ["veomni_flash_attention_2_with_sp"]
+    assert loads == ["veomni_flash_attention_2"]
 
 
 @pytest.mark.parametrize("checkpointing", [False, True])

@@ -290,9 +290,7 @@ class OmniModel(PreTrainedModel):
         """
 
         from ...arguments import OpsImplementationConfig
-        from ...ops import apply_ops_config
-        from ...ops.config.singleton import get_ops_config
-        from ..auto import bind_ops_to_modeling
+        from ...ops.config import get_ops_config, set_ops_config
 
         base_ops = get_ops_config()
         modules: dict[str, PretrainedOmniModule] = {}
@@ -309,10 +307,7 @@ class OmniModel(PreTrainedModel):
             # Install this module's kernels for the duration of its own load, so
             # a module's kernels do not depend on its position in
             # ``config.module_names``.
-            apply_ops_config(module_ops)
-
-            # After the ops config above was installed.
-            bind_ops_to_modeling(mod_cls)
+            set_ops_config(module_ops)
             if load_weights:
                 modules[name] = mod_cls.from_pretrained(module_path, config=module_config, **module_kwargs)
             else:
@@ -320,7 +315,7 @@ class OmniModel(PreTrainedModel):
 
         # Don't leave the caller's config holding the last module's override.
         if base_ops is not None:
-            apply_ops_config(base_ops)
+            set_ops_config(base_ops)
         return modules
 
     def _save_module_subdirectory(

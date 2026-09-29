@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from ..arguments import ModelArguments, TrainingArguments
     from ..data.chat_template import ChatTemplate
     from ..trainer.callbacks import TrainerState
-    from .checkpoint_manager import ModelCheckpointManager
+    from .checkpoint import ModelCheckpointManager
 
 logger = logging.get_logger(__name__)
 
@@ -76,7 +76,7 @@ class VeOmniModelRuntime:
     ``isinstance`` check, so the runtime owns every such boundary itself. Reading
     and writing checkpoints is one: :meth:`load`, :meth:`save_dcp` and
     :meth:`save_hf_or_lora` say *what* this model persists, the
-    :class:`~veomni.models.checkpoint_manager.ModelCheckpointManager` at
+    :class:`~veomni.models.checkpoint.ModelCheckpointManager` at
     :attr:`checkpoint` says *how*, and *when* stays in the trainer callbacks.
 
     Constructing one *builds* it — ``VeOmniModelRuntime(args)`` comes back with a
@@ -553,7 +553,7 @@ class VeOmniModelRuntime:
         Part of the build like every other step: a model that came back from
         construction unable to save itself would be half-built.
         """
-        from .checkpoint_manager import ModelCheckpointManager
+        from .checkpoint import ModelCheckpointManager
 
         self.checkpoint = ModelCheckpointManager(self)
 
@@ -600,7 +600,7 @@ class VeOmniModelRuntime:
         """Write the tokenizer/processor/config sidecars that an export needs."""
         import torch.distributed as dist
 
-        from .module_utils import save_model_assets as write_model_assets
+        from .checkpoint.weights import save_model_assets as write_model_assets
 
         if self.train_args.global_rank == 0:
             write_model_assets(self.checkpoint.assets_dir(), self.model_assets)

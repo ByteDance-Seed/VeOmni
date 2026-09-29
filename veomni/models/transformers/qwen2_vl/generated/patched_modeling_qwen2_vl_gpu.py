@@ -9,6 +9,16 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Qwen2VLRMSNorm.__init__
+#      Construct a local rms_norm VeomniOp
+#    - method_override: Qwen2VLRMSNorm.forward
+#      Always call the local rms_norm VeomniOp
+#    - method_override: Qwen2MLP.__init__
+#      Construct a local swiglu_mlp VeomniOp
+#    - method_override: Qwen2MLP.forward
+#      Call swiglu_mlp for silu/swish, otherwise self.act_fn
+#    - init_modification: VisionAttention
+#      Bind instance-local rope and attention VeomniOps
 #    - method_override: VisionAttention.forward
 #      Use VeOmni varlen attention types and precomputed max_seqlen to avoid per-layer cpu-gpu sync
 #    - method_override: Qwen2VisionTransformerPretrainedModel.forward
@@ -25,8 +35,14 @@
 #      Use VeOmni precomputed position-id function and unified multimodal token ids
 #    - method_override: Qwen2VLForConditionalGeneration.get_metadata_collate_func
 #      Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator
+#    - method_override: Qwen2VLForConditionalGeneration.__init__
+#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: Qwen2VLForConditionalGeneration.forward
-#      Use VeOmni unified loss path for Qwen2VLForConditionalGeneration.forward
+#      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
+#    - init_modification: Qwen2VLAttention
+#      Bind instance-local rope and attention VeomniOps
+#    - method_override: Qwen2VLAttention.forward
+#      Always call the local attention VeomniOp
 #
 # ==============================================================================
 
@@ -48,13 +64,12 @@ from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging, torch_compilable_check
@@ -70,18 +85,13 @@ from transformers.vision_utils import get_vision_position_ids
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, pad_tensor, slice_input_tensor, sp_pad_and_slice
-
-# Additional import blocks for patches
-# ── OpSlot declarations ──────────────────────────────────────────────────
-# Bound at model-build time by _bind_veomni_ops() in auto.py.
-from veomni.ops.dispatch import OpSlot
+from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.ops import VeomniOp
+from veomni.ops.config import resolve_op_impl
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import (
     Qwen2VLCausalLMOutputWithLogProbs,
 )
-
-
-veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 
 
 # ======================================================================
@@ -212,23 +222,22 @@ class Qwen2VLCausalLMOutputWithPast(CausalLMOutputWithPast):
     rope_deltas: torch.LongTensor | None = None
 
 
-@use_kernel_forward_from_hub("RMSNorm")
+# ======================================================================
+# [MODIFIED CLASS] Qwen2VLRMSNorm
+# Methods patched: __init__, forward
+# ======================================================================
+
+
 # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Qwen2VL
 class Qwen2VLRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
-        """
-        Qwen2VLRMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
+        nn.Module.__init__(self)
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -288,73 +297,6 @@ class Qwen2VLRotaryEmbedding(nn.Module):
             sin = emb.sin() * self.attention_scaling
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
-
-# Copied from transformers.models.llama.modeling_llama.rotate_half
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors (https://qwenlm.github.io/blog/qwen2-vl/).
-
-    Explanation:
-        Multimodal 3D rotary position embedding is an extension to 1D rotary position embedding. The input embedding
-        sequence contains vision (images / videos) embedding and text embedding or just contains text embedding. For
-        vision embedding part, we apply rotary position embedding on temporal, height and width dimension separately.
-        Here we split the channel dimension to 3 chunks for the temporal, height and width rotary position embedding.
-        For text embedding part, we just apply 1D rotary position embedding. The three rotary position index (temporal,
-        height and width) of text embedding is always the same, so the text embedding rotary position embedding has no
-        difference with modern LLMs.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        mrope_section(`List(int)`):
-            Multimodal rope section is for channel dimension of temporal, height and width in rope calculation.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    mrope_section = mrope_section * 2
-    cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1).unsqueeze(
-        unsqueeze_dim
-    )
-    sin = torch.cat([m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1).unsqueeze(
-        unsqueeze_dim
-    )
-
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-def apply_rotary_pos_emb_vision(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.float(), k.float()
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    q_embed = q_embed.to(orig_q_dtype)
-    k_embed = k_embed.to(orig_k_dtype)
-    return q_embed, k_embed
 
 
 class VisionRotaryEmbedding(nn.Module):
@@ -462,11 +404,12 @@ def eager_attention_forward(
 
 # ======================================================================
 # [MODIFIED CLASS] VisionAttention
-# Methods patched: forward
+# Methods patched: forward, __init__
 # ======================================================================
 
 
 class VisionAttention(nn.Module):
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: Qwen2VLVisionConfig) -> None:
         super().__init__()
         self.dim = config.embed_dim
@@ -479,6 +422,9 @@ class VisionAttention(nn.Module):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,
@@ -494,15 +440,13 @@ class VisionAttention(nn.Module):
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
 
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
+        attention_interface = self.veomni_attn
 
         if is_flash_attention_requested(self.config):
             # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
@@ -574,10 +518,16 @@ class Qwen2VLVisionBlock(GradientCheckpointingLayer):
         return hidden_states
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen2MLP
+# Methods patched: __init__, forward
+# ======================================================================
+
+
 # Copied from transformers.models.qwen2.modeling_qwen2.Qwen2MLP
 class Qwen2MLP(nn.Module):
     def __init__(self, config):
-        super().__init__()
+        nn.Module.__init__(self)
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -585,10 +535,26 @@ class Qwen2MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        if self.config.hidden_act in {"silu", "swish"}:
+            return self.veomni_swiglu_mlp(
+                x,
+                self.gate_proj.weight,
+                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+                self.up_proj.weight,
+                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+                self.down_proj.weight,
+                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+            )
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen2VLAttention
+# Methods patched: forward, __init__
+# ======================================================================
 
 
 class Qwen2VLAttention(nn.Module):
@@ -597,6 +563,7 @@ class Qwen2VLAttention(nn.Module):
     and "Generating Long Sequences with Sparse Transformers".
     """
 
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
     def __init__(self, config: Qwen2VLTextConfig, layer_idx: int | None = None):
         super().__init__()
         self.config = config
@@ -629,6 +596,9 @@ class Qwen2VLAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "mrope", "eager")
+        self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
 
     def forward(
         self,
@@ -641,6 +611,7 @@ class Qwen2VLAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
+        del output_attentions, use_cache
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -652,18 +623,18 @@ class Qwen2VLAttention(nn.Module):
         value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_multimodal_rotary_pos_emb(
-            query_states, key_states, cos, sin, self.config.rope_parameters["mrope_section"]
+        query_states, key_states = self.veomni_rope(
+            query_states,
+            key_states,
+            cos,
+            sin,
+            mrope_section=self.config.rope_parameters["mrope_section"],
         )
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
             key_states,
@@ -672,7 +643,7 @@ class Qwen2VLAttention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
-            position_ids=position_ids,  # pass positions for FA2
+            position_ids=position_ids,
             **kwargs,
         )
 
@@ -1562,7 +1533,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen2VLForConditionalGeneration
-# Methods patched: get_position_id_func, get_metadata_collate_func, forward
+# Methods patched: get_position_id_func, get_metadata_collate_func, __init__, forward
 # ======================================================================
 
 
@@ -1573,7 +1544,9 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Qwen2VLModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
 
     @auto_docstring
@@ -1668,30 +1641,14 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
         logits = None
         fused_linear_aux = None
         if labels is not None:
-            # Modification: OpSlot guard for cross-entropy loss.
-            if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits, fused_linear_aux = veomni_causal_lm_loss(
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.config.text_config.vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
-                    **kwargs,
-                )
-            else:
-                logits = self.lm_head(hidden_states)
-                loss, _, fused_linear_aux = self.loss_function(
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.config.text_config.vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
-                    **kwargs,
-                )
-                if fused_linear_aux is not None:
-                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
-                    # logits so output mirrors the OpSlot branch's contract.
-                    logits = None
+            loss, logits, fused_linear_aux = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.text_config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
+            )
         else:
             # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1926,4 +1883,9 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
         return collate_multimodal_metadata  # noqa: F821 defined via add_helper
 
 
-__all__ = ["Qwen2VLForConditionalGeneration", "Qwen2VLModel", "Qwen2VLPreTrainedModel", "Qwen2VLTextModel"]
+__all__ = [
+    "Qwen2VLForConditionalGeneration",
+    "Qwen2VLModel",
+    "Qwen2VLPreTrainedModel",
+    "Qwen2VLTextModel",
+]

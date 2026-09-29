@@ -49,10 +49,8 @@ import torch
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 from transformers.core_model_loading import WeightRenaming, rename_source_key
 
-from veomni.ops.kernels.deepseek_v4 import fp4_act_quant, fp8_weight_quant
-
-from ....utils import logging
-from ...checkpoint_tensor_loading import ConvertedCheckpointTensor, export_weights
+from veomni.models.checkpoint.convert import ConvertedCheckpointTensor, export_weights
+from veomni.utils import logging
 
 
 logger = logging.get_logger(__name__)
@@ -168,8 +166,8 @@ def convert_deepseek_v4_checkpoint_key(name: str, *, target_model_prefix: str = 
         return name
     has_model_prefix = name.startswith("model.")
     source_name = name.removeprefix("model.") if has_model_prefix else name
-    # Upgrade old VeOmni keys before HF's broad inference-name rewrite can
-    # add a second compressor prefix. The model always uses the current HF key.
+    # Upgrade legacy VeOmni scorer keys before HF's broad inference-name
+    # rewrite can add a second compressor prefix.
     if re.match(r"^layers\.\d+\.self_attn\.compressor\.indexer\.weights_proj\.", source_name):
         source_name = source_name.replace(".indexer.weights_proj.", ".indexer.scorer.weights_proj.")
         return f"{target_model_prefix}{source_name}"
@@ -391,8 +389,6 @@ class DeepseekV4CheckpointTensorConverter:
         config = model.config
         fqn_to_index_mapping = model._veomni_fqn_to_index_mapping
         expert_dtype = config.expert_dtype
-        scale_fmt = "ue8m0"
-        scale_dtype = torch.float8_e8m0fnu if expert_dtype == "fp4" else torch.float32
         export_weight_names = set()
         for name, param in export_weights(model):
             # 1. replace mlp.experts.0.(gate_proj|up_proj|down_proj).weight to mlp.experts.0.(w1|w2|w3).weight
@@ -419,9 +415,14 @@ class DeepseekV4CheckpointTensorConverter:
 
             # 4. quantize the weight
             fp4_quantize = "ffn.experts." in origin and expert_dtype == "fp4"
+            scale_fmt, scale_dtype = (
+                ("ue8m0", torch.float8_e8m0fnu) if expert_dtype == "fp4" else (None, torch.float32)
+            )
+            from veomni.models.transformers.deepseek_v4.export_quant import fp4_act_quant, fp8_weight_quant
+
             param = param.to(torch.bfloat16)
             if fp4_quantize:
-                weight, scale = fp4_act_quant(param, block_size=32)
+                weight, scale = fp4_act_quant(param, block_size=32, inplace=False)
                 weight = weight.view(torch.int8)
             else:
                 weight, scale = fp8_weight_quant(param, block_size=128, scale_fmt=scale_fmt, scale_dtype=scale_dtype)

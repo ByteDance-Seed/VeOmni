@@ -96,12 +96,12 @@ key_features/mtp.md
 :maxdepth: 1
 :caption: Design
 
-design/kernel_selection.md
-design/fused_moe_kernels.md
+design/op_selection.md
+design/opslot_to_veomniop.md
+design/fused_moe_ops.md
 design/local_parallel_state.md
 design/patchgen.md
 design/qwen4_exp_ple_2d_parallelism.md
-design/unified_kernel_registry.md
 design/verl_topk_distill_integration.md
 design/deepseek_v4_context_parallel.md
 design/deepseek_v4_indexer_loss.md

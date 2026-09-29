@@ -9,11 +9,14 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-from ....lora.target_mapping import convert_fused_moe_lora_targets
-from ....utils.device import IS_NPU_AVAILABLE
-from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
+# See the License for the specific language governing limitations
+# under the License.
+
+"""Qwen3-Omni-MoE modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.lora.target_mapping import convert_fused_moe_lora_targets
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
+from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 def _convert_qwen3_omni_moe_wrapped_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
@@ -45,32 +48,12 @@ def _convert_qwen3_omni_moe_text_lora_targets_to_parameters(_model, lora_modules
 
 @MODEL_CONFIG_REGISTRY.register("qwen3_omni_moe")
 def register_qwen3_omni_moe_config():
-    # The veomni subclass forces tie_word_embeddings=False to match reality: the
-    # top-level Qwen3OmniMoeForConditionalGeneration is a container over
-    # `thinker`/`talker` with no container-level `embed_tokens` or `lm_head`, so
-    # post-load embedding tying must be a no-op. Upstream HF keeps the default
-    # True, which would drive post_process_after_weight_loading into an
-    # unresolvable get_input_embeddings fallback. See
-    # configuration_qwen3_omni_moe.py for the rationale.
     from .configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
 
     return Qwen3OmniMoeConfig
 
 
-@MODELING_REGISTRY.register("qwen3_omni_moe")
-def register_qwen3_omni_moe_modeling(architecture: str):
-    # Talker classes are not subclassed locally; they live only in upstream
-    # transformers and are not trained via VeOmni's training path.
-    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-        Qwen3OmniMoeTalkerForConditionalGeneration,
-        Qwen3OmniMoeTalkerModel,
-    )
-
-    from .checkpoint_tensor_converter import (
-        convert_qwen3_omni_moe_fqn_to_index_mapping,
-        create_qwen3_omni_moe_checkpoint_tensor_converter,
-    )
-
+def _get_qwen3_omni_moe_modeling_classes():
     if IS_NPU_AVAILABLE:
         from .generated.patched_modeling_qwen3_omni_moe_npu import (
             Qwen3OmniMoeForConditionalGeneration,
@@ -84,9 +67,11 @@ def register_qwen3_omni_moe_modeling(architecture: str):
             Qwen3OmniMoeThinkerTextModel,
         )
 
-    # The thinker text submodel is also loadable standalone (e.g. when the
-    # registry dispatches on architecture == "...ThinkerTextModel"), so the
-    # converter must be attached to each class that may be the load entry.
+    from .checkpoint_tensor_converter import (
+        convert_qwen3_omni_moe_fqn_to_index_mapping,
+        create_qwen3_omni_moe_checkpoint_tensor_converter,
+    )
+
     for model_cls in (
         Qwen3OmniMoeForConditionalGeneration,
         Qwen3OmniMoeThinkerForConditionalGeneration,
@@ -94,6 +79,7 @@ def register_qwen3_omni_moe_modeling(architecture: str):
     ):
         model_cls._create_checkpoint_tensor_converter = staticmethod(create_qwen3_omni_moe_checkpoint_tensor_converter)
         model_cls._convert_fqn_to_index_mapping = staticmethod(convert_qwen3_omni_moe_fqn_to_index_mapping)
+
     Qwen3OmniMoeForConditionalGeneration._convert_lora_targets_to_parameters = staticmethod(
         _convert_qwen3_omni_moe_wrapped_lora_targets_to_parameters
     )
@@ -104,26 +90,49 @@ def register_qwen3_omni_moe_modeling(architecture: str):
         _convert_qwen3_omni_moe_text_lora_targets_to_parameters
     )
 
+    return (
+        Qwen3OmniMoeForConditionalGeneration,
+        Qwen3OmniMoeThinkerForConditionalGeneration,
+        Qwen3OmniMoeThinkerTextModel,
+    )
+
+
+@MODELING_REGISTRY.register("qwen3_omni_moe")
+def register_qwen3_omni_moe_modeling(architecture: str | None):
+    top_cls, thinker_cls, text_cls = _get_qwen3_omni_moe_modeling_classes()
+    architecture = architecture or ""
+
     if "ThinkerTextModel" in architecture:
-        return Qwen3OmniMoeThinkerTextModel
+        return text_cls
     if "ThinkerForConditionalGeneration" in architecture:
-        return Qwen3OmniMoeThinkerForConditionalGeneration
-    if "TalkerModel" in architecture:
-        return Qwen3OmniMoeTalkerModel
+        return thinker_cls
     if "TalkerForConditionalGeneration" in architecture:
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+            Qwen3OmniMoeTalkerForConditionalGeneration,
+        )
+
         return Qwen3OmniMoeTalkerForConditionalGeneration
-    if "ForConditionalGeneration" in architecture:
-        return Qwen3OmniMoeForConditionalGeneration
-    return Qwen3OmniMoeForConditionalGeneration
+    if "TalkerModel" in architecture:
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeTalkerModel
+
+        return Qwen3OmniMoeTalkerModel
+    return top_cls
+
+
+@MODELING_REGISTRY.register("qwen3_omni_moe_thinker")
+def register_qwen3_omni_moe_thinker_modeling(_architecture: str | None):
+    _, thinker_cls, _ = _get_qwen3_omni_moe_modeling_classes()
+    return thinker_cls
+
+
+@MODELING_REGISTRY.register("qwen3_omni_moe_text")
+def register_qwen3_omni_moe_text_modeling(_architecture: str | None):
+    _, _, text_cls = _get_qwen3_omni_moe_modeling_classes()
+    return text_cls
 
 
 @MODEL_PROCESSOR_REGISTRY.register("Qwen3OmniMoeProcessor")
 def register_qwen3_omni_moe_processor():
-    # The veomni subclass is required because VeOmni's data pipeline calls the
-    # processor with `audios=` (plural) and passes empty lists for missing
-    # modalities, while upstream's signature is `audio=` (singular) with
-    # `if audio is not None` checks. These are data-format patches, independent
-    # of transformers version.
     from .processing_qwen3_omni_moe import Qwen3OmniMoeProcessor
 
     return Qwen3OmniMoeProcessor

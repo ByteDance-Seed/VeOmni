@@ -1,5 +1,4 @@
-# Copyright 2024-2025 The Black-forest-labs Authors. All rights reserved.
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -10,9 +9,12 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+# See the License for the specific language governing limitations
+# under the License.
+
+"""Flux modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 
 @MODEL_CONFIG_REGISTRY.register("flux")
@@ -23,7 +25,7 @@ def register_flux_config():
 
 
 @MODELING_REGISTRY.register("flux")
-def register_flux_modeling(architecture: str):
+def register_flux_modeling(_architecture: str):
     from .modeling_flux import FluxModel
 
     return FluxModel
