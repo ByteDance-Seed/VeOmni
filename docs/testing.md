@@ -65,7 +65,17 @@ tests/
 ├── distributed/                    # Distributed training and runtime correctness
 │   ├── test_fsdp_equivalence.py         # Single-GPU vs FSDP2 grad equivalence
 │   ├── test_gradient_checkpointing.py   # Checkpoint kwargs and recomputed-input grad cleanup
+│   ├── test_emb_parallel.py             # Vocab-parallel (emb) lookup / tied projection vs dense (CPU gloo)
 │   └── test_dummy_forward.py            # Asymmetric multimodal forward (NCCL hang prevention)
+│
+├── seed_omni/                      # SeedOmni multi-module models, runtime and trainer
+│   ├── model/                           # OmniModel graphs, conversation, processor, save/load, conversion
+│   ├── media/                           # Request media and video metadata
+│   ├── arguments/                       # Launcher parser, module / accelerator args, module paths
+│   ├── runtime/                         # Module and OmniModel runtimes, per-module weight load
+│   ├── trainer/                         # OmniTrainer, inferencer, step-metrics callback
+│   ├── mixins/                          # Opt-in module mixins (e.g. EmbParallelMixin)
+│   └── e2e/                             # torchrun launch of the fake model (2 CUDA devices)
 │
 ├── e2e/                            # End-to-end training integration
 │   ├── test_e2e_parallel.py             # SP/EP parallel alignment across models
@@ -108,7 +118,8 @@ tests/
 | **Ops / kernels** | `tests/ops/` | 0-1 GPU (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Fused kernel guards, dispatch, correctness, and performance |
 | **Data pipeline** | `tests/data/` | 0-1 GPU | pytest | Data loading, collation, preprocessing |
 | **Parallelism** | `tests/parallel/` | 4-8 GPUs | torchrun / pytest | SP, EP, data-balance primitives |
-| **Distributed runtime** | `tests/distributed/` | 0-2+ GPUs | pytest + torchrun | FSDP equivalence, dummy forward, gradient checkpointing |
+| **Distributed runtime** | `tests/distributed/` | 0-2+ GPUs | pytest + torchrun | FSDP equivalence, dummy forward, gradient checkpointing, vocab-parallel embedding |
+| **SeedOmni** | `tests/seed_omni/` | 0; 2 for `e2e/` | pytest (+ torchrun for `e2e/`) | Multi-module OmniModel, runtimes, trainer, launcher, module mixins |
 | **E2E parallel** | `tests/e2e/` | 4+ GPUs | torchrun (subprocess) | SP/EP alignment across full training runs |
 | **Checkpoints** | `tests/checkpoints/` | 0-8 GPUs | pytest + torchrun | Save/load, DCP→HF conversion |
 | **Utilities** | `tests/utils/` | 0-8 GPUs | pytest + torchrun | FLOPs, grad clipping, weight broadcast |
@@ -298,6 +309,25 @@ NVIDIA GPU for kernel execution.
 | `test_slice_input_tensor.py` | SP input slicing utilities | CPU |
 | `test_all_gather.py` | All-gather collective ops | multi |
 | `test_balance_reverse.py` | Encoder data balance recovery | 8 |
+
+---
+
+### 13. SeedOmni Tests (`tests/seed_omni/`)
+
+Both unit-test workflows run the whole tree recursively (`pytest tests/seed_omni`),
+so a new file under it needs no workflow edit. Everything except `e2e/` runs on
+CPU, and multi-rank cases spawn CPU gloo ranks with `torch.multiprocessing`;
+`e2e/` needs two CUDA devices and is skipped otherwise.
+
+| Subdirectory | Purpose |
+|---|---|
+| `model/` | Training / generation graphs, conversation items, processor, save/load round-trips, checkpoint conversion |
+| `media/` | Request media loading and video metadata |
+| `arguments/` | Launcher parser, per-module and accelerator arguments, module path resolution |
+| `runtime/` | `ModuleRuntime` / `OmniModelRuntime`: build, frozen modules, per-module grad clipping and weight load |
+| `trainer/` | `OmniTrainer`, `OmniInferencer`, step-metrics callback (identical metrics across ranks) |
+| `mixins/` | Opt-in module mixins, e.g. `EmbParallelMixin` / `VocabParallelEmbedding` gradient parity through FSDP2 |
+| `e2e/` | `train_omni.py` / `infer_omni.py` under torchrun on the fake model (2 CUDA devices) |
 | `test_balance_sorting_algo.py` | Post-MBS sorting algorithm | CPU |
 
 ---
