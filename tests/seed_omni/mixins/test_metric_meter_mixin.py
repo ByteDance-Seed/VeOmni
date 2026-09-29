@@ -9,10 +9,13 @@ math is checked in-process, with no distributed init.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from veomni.models.seed_omni import MetricMeterMixin
 from veomni.utils import helper, omni_helper
@@ -146,19 +149,20 @@ def test_step_resets_the_per_step_sample_accumulator(single_process_meter):
     assert metrics["consumed_chunk_num"] == 2  # unchanged: no samples added this step
 
 
-def test_multisource_seqlens_come_from_the_module_that_covers_the_whole_sample():
+def test_multisource_source_is_the_aligned_module_with_the_most_tokens():
     """Several modules can be per-sample aligned; the backbone's tokens are the superset."""
-    module_metrics = {
-        "text_encoder": (1.0, [10, 10]),
-        "backbone": (1.0, [40, 60]),
-        "vision": (1.0, [16]),
-    }
-    assert OmniEnvironMeter._per_sample_seqlens(module_metrics, num_samples=2) == [40, 60]
+    tokens = {"text_encoder": 40.0, "backbone": 200.0, "vision": 500.0}
+    aligned = {"text_encoder": 2.0, "backbone": 2.0, "vision": 1.0}  # vision aligned on one rank only
+    assert OmniEnvironMeter._multisource_module(tokens, aligned, num_ranks=2) == "backbone"
 
 
-def test_multisource_seqlens_are_absent_when_no_module_aligns_with_the_samples():
-    assert OmniEnvironMeter._per_sample_seqlens({"vision": (1.0, [16])}, num_samples=2) is None
-    assert OmniEnvironMeter._per_sample_seqlens({"backbone": (1.0, [4])}, num_samples=0) is None
+def test_multisource_source_is_absent_unless_some_module_aligns_on_every_rank():
+    assert OmniEnvironMeter._multisource_module({"vision": 16.0}, {"vision": 1.0}, num_ranks=2) is None
+    assert OmniEnvironMeter._multisource_module({}, {}, num_ranks=2) is None
+
+
+def test_multisource_source_ties_resolve_by_name():
+    assert OmniEnvironMeter._multisource_module({"b": 4.0, "a": 4.0}, {"b": 1.0, "a": 1.0}, num_ranks=1) == "a"
 
 
 def test_step_omits_flops_when_no_module_is_metered(single_process_meter):
@@ -236,3 +240,59 @@ def test_multisource_tracker_steps_even_when_no_module_aligns(single_process_met
     meter.step(delta_time=1.0, global_step=1, module_metrics={"vision": (1.0, [16])})
 
     assert calls == [([0, 1], [0, 0])]
+
+
+def _two_rank_step_main(rank: int, rendezvous: str, out_dir: str) -> None:
+    """Rank 1 lists its modules in another order, and only rank 0's vision happens to align."""
+    import veomni.utils.dist_utils as dist_utils
+
+    dist_utils.get_device_type = lambda: "cpu"
+    omni_helper.get_device_flops = lambda: 100.0
+    omni_helper.compute_device_memory_metrics = dict
+    tracker_calls = []
+
+    class _Tracker:
+        def __init__(self, **kwargs):
+            pass
+
+        def step(self, ds_idx, seqlens):
+            tracker_calls.append(list(seqlens))
+            return {}
+
+    omni_helper.MultiSourceInfoTracker = _Tracker
+    dist.init_process_group(backend="gloo", init_method=f"file://{rendezvous}", world_size=2, rank=rank)
+    try:
+        meter = OmniEnvironMeter(
+            global_batch_size=4,
+            enable_multisource=True,
+            dataloader=object(),
+            empty_cache_steps=0,
+            parallel_state=SimpleNamespace(dp_group=None),
+        )
+        meter.add({"conversation_list": [[], []], "ds_idx": [rank, rank]})
+        if rank == 0:
+            module_metrics = {"backbone": (10.0, [30, 50]), "vision": (1.0, [8, 8])}
+        else:
+            module_metrics = {"vision": (2.0, [4]), "backbone": (20.0, [70, 90])}
+        metrics = meter.step(delta_time=1.0, global_step=1, module_metrics=module_metrics)
+        result = {
+            "backbone_tokens": metrics["trace/backbone/consume_tokens(M)"] * 1e6,
+            "vision_tokens": metrics["trace/vision/consume_tokens(M)"] * 1e6,
+            "flops": metrics["flops_achieved(T)"],
+            "tracker_seqlens": tracker_calls,
+        }
+        with open(f"{out_dir}/rank{rank}.json", "w") as f:
+            json.dump(result, f)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_step_reduces_by_module_name_and_agrees_on_the_multisource_module(tmp_path):
+    mp.spawn(_two_rank_step_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=2, join=True)
+
+    results = [json.loads((tmp_path / f"rank{rank}.json").read_text()) for rank in range(2)]
+    for rank, result in enumerate(results):
+        assert result["backbone_tokens"] == pytest.approx(240.0), rank
+        assert result["vision_tokens"] == pytest.approx(20.0), rank
+        assert result["flops"] == pytest.approx(33.0), rank
+    assert [result["tracker_seqlens"] for result in results] == [[[30, 50]], [[70, 90]]]
