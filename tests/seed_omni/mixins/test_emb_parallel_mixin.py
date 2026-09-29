@@ -19,8 +19,8 @@ path. With it on, lookup and tied projection must go through the embedding's
 own FSDP2 unshard hooks, so the weight gradient is reduce-scattered and scaled
 like any other parameter's: the multi-rank tests wrap the table with
 ``fully_shard`` on CPU gloo ranks and compare it with a dense reference over
-every rank's tokens. The kernels themselves are covered in
-``tests/ops/test_vocab_parallel_embed.py``.
+every rank's tokens. The ops themselves are covered in
+``tests/distributed/test_emb_parallel.py``.
 """
 
 import json
@@ -60,7 +60,7 @@ def emb_off(monkeypatch):
 
 @pytest.fixture
 def emb_on_single_shard(monkeypatch):
-    """``emb`` reported on over one whole-vocab shard: the kernels run their one-shard path."""
+    """``emb`` reported on over one whole-vocab shard: the ops run their one-shard path."""
     monkeypatch.setattr(emb_parallel_mixin, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(emb_parallel_mixin, "get_parallel_state", lambda: _emb_state(group=None, size=1))
 
@@ -139,7 +139,7 @@ def test_a_sliced_table_is_rejected_when_emb_is_off(emb_off):
 
 
 def test_an_unsliced_table_is_rejected_when_emb_is_on(monkeypatch):
-    """The kernels would treat the whole table as one rank's shard of a ``vocab * emb`` vocabulary."""
+    """The ops would treat the whole table as one rank's shard of a ``vocab * emb`` vocabulary."""
     monkeypatch.setattr(emb_parallel_mixin, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(emb_parallel_mixin, "get_parallel_state", lambda: _emb_state(size=2))
     embedding = VocabParallelEmbedding(8, 4)

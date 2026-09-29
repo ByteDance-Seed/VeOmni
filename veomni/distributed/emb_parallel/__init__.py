@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Vocab-parallel (``emb``) embedding ops."""
+"""Vocab-parallel (``emb`` extra-parallel) embedding lookup and tied projection."""
 
 from .vocab_parallel import AllToAllEmbedding, VocabParallelLinear
 

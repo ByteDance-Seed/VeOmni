@@ -33,7 +33,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-from veomni.ops.kernels.embed import AllToAllEmbedding, VocabParallelLinear
+from veomni.distributed.emb_parallel import AllToAllEmbedding, VocabParallelLinear
 from veomni.utils.device import get_device_type
 
 
