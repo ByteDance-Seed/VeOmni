@@ -105,12 +105,35 @@ class VocabParallelEmbedding(nn.Embedding):
         rows = self.weight.shape[0]
         if idx is None or rows == self.num_embeddings:
             return idx
+        if not EmbParallelMixin.emb_parallel_active():
+            raise self._layout_error(rows, emb_size=1)
         local = idx - get_parallel_state().extra_parallel_rank("emb") * rows
         return local if 0 <= local < rows else None
 
     @padding_idx.setter
     def padding_idx(self, idx: Optional[int]) -> None:
         self._global_padding_idx = idx
+
+    def extra_repr(self) -> str:
+        # nn.Embedding formats from ``__dict__``, which has no ``padding_idx`` now that it is a property.
+        s = f"{self.num_embeddings}, {self.embedding_dim}"
+        if self._global_padding_idx is not None:
+            s += f", padding_idx={self._global_padding_idx}"
+        if self.max_norm is not None:
+            s += f", max_norm={self.max_norm}"
+        if self.norm_type != 2:
+            s += f", norm_type={self.norm_type}"
+        if self.scale_grad_by_freq:
+            s += ", scale_grad_by_freq=True"
+        if self.sparse:
+            s += ", sparse=True"
+        return s
+
+    def _layout_error(self, rows: int, emb_size: int) -> RuntimeError:
+        return RuntimeError(
+            f"{type(self).__name__} holds {rows} of {self.num_embeddings} vocab rows, but the emb group here has "
+            f"{emb_size} rank(s): the table was not split for the parallel state it runs under."
+        )
 
     def _check_emb_layout(self) -> bool:
         """Whether ``emb`` is on, after checking the weight holds the rows that implies."""
@@ -124,10 +147,7 @@ class VocabParallelEmbedding(nn.Embedding):
         emb_size = get_parallel_state().extra_parallel_sizes["emb"] if active else 1
         rows = self.weight.shape[0]
         if rows * emb_size != self.num_embeddings:
-            raise RuntimeError(
-                f"{name} holds {rows} of {self.num_embeddings} vocab rows, but the emb group here has "
-                f"{emb_size} rank(s): the table was not split for the parallel state it runs under."
-            )
+            raise self._layout_error(rows, emb_size)
         return active
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
