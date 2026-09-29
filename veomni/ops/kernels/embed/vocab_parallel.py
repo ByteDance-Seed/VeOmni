@@ -171,7 +171,8 @@ class AllToAllEmbedding(torch.autograd.Function):
         if grad_recv_buf.numel() > 0:
             # Accumulate in fp32 (frequent tokens sum many rows into one), but only
             # over touched rows: a full-table fp32 buffer would triple the peak.
-            rows, inverse = torch.unique(local_indices, return_inverse=True)
+            # ``unique`` costs one host sync; ``index_copy_`` needs long indices.
+            rows, inverse = torch.unique(local_indices.long(), return_inverse=True)
             row_grads = torch.zeros(rows.numel(), embedding_dim, device=grad_output.device, dtype=torch.float32)
             row_grads.index_add_(0, inverse, grad_recv_buf.float())
             grad_embedding_table.index_copy_(0, rows, row_grads.to(ctx.embedding_table_dtype))
