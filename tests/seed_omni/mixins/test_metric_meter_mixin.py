@@ -192,6 +192,31 @@ def test_device_memory_metrics_are_shared_by_both_meters(monkeypatch):
     assert metrics["num_alloc_retries"] == 3
 
 
+def test_host_memory_metrics_report_the_worst_rank(monkeypatch):
+    """Rank 0 logs for every host: most used, highest usage, least available."""
+    fake_device = SimpleNamespace(
+        max_memory_allocated=lambda: 0, max_memory_reserved=lambda: 0, memory_stats=lambda: {"num_alloc_retries": 0}
+    )
+    other_rank = (0, 0, 0, 6 * 1024**3, 75.0, -2 * 1024**3)  # the busier host
+
+    def _max_with_other_rank(values, op):
+        assert op == "max"
+        return [max(mine, theirs) for mine, theirs in zip(values, other_rank)]
+
+    monkeypatch.setattr(helper, "get_torch_device", lambda: fake_device)
+    monkeypatch.setattr(helper, "all_reduce", _max_with_other_rank)
+    monkeypatch.setattr(
+        helper.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(used=1 * 1024**3, available=7 * 1024**3, percent=12.5),
+    )
+
+    metrics = helper.compute_device_memory_metrics()
+    assert metrics["cpu_used_memory(GB)"] == 6.0
+    assert metrics["cpu_memory_usage(%)"] == 75.0
+    assert metrics["cpu_available_memory(GB)"] == 2.0
+
+
 def test_multisource_tracker_steps_even_when_no_module_aligns(single_process_meter, monkeypatch):
     """The tracker step is a DP collective: a rank must not skip it on local data."""
     calls = []
