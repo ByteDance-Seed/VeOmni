@@ -95,6 +95,15 @@ def test_embedding_backward_sums_repeats_in_fp32_and_returns_the_table_dtype():
     assert torch.count_nonzero(table.grad[torch.arange(VOCAB) != 3]) == 0
 
 
+def test_embedding_accepts_int32_ids(table):
+    ids = torch.tensor([0, 3, 1, 3], dtype=torch.int32)
+    weight = table.clone().requires_grad_(True)
+    out = AllToAllEmbedding.apply(None, ids, weight)
+    out.sum().backward()
+    assert torch.equal(out, F.embedding(ids, table))
+    assert torch.equal(weight.grad[3], torch.full((HIDDEN,), 2.0, dtype=table.dtype))
+
+
 def test_embedding_gradcheck(table):
     ids = torch.tensor([0, 3, 1, 3])
     weight = table.clone().requires_grad_(True)
