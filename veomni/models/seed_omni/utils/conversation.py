@@ -49,7 +49,7 @@ Lifecycle
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any, Iterator, Union
 
 import torch
@@ -59,10 +59,6 @@ from PIL import Image
 ItemType = str  # "text" | "image" | "video" | "audio" | "output" (+ legacy "image_output")
 ItemRole = str  # "user" | "assistant" | "dummy"
 ItemValue = Union[str, torch.Tensor, Image.Image]
-
-# Sentinel so ``__value_repr__`` can distinguish "repr self.value" (no arg) from
-# "repr this explicit meta value" (which may legitimately be ``None``).
-_UNSET = object()
 
 # Per-image data-tag key written on ``meta`` by the data layer (preprocessors).
 # Image-only: text items do NOT carry it. Values: ``"und"`` | ``"gen"`` | ``"edit"``
@@ -82,43 +78,68 @@ class ConversationItem:
     source: str | None = None
     meta: dict = field(default_factory=dict)
 
-    def __value_repr__(self, value: Any = _UNSET) -> str:
-        # Repr ``self.value`` by default; ``__meta_repr__`` passes meta values.
-        if value is _UNSET:
-            value = self.value
-        if isinstance(value, str):
-            return f"[str]{repr(value)}"
-        elif isinstance(value, torch.Tensor):
-            return f"[torch.Tensor]{tuple(value.shape)}"
-        elif isinstance(value, Image.Image):
-            return f"[PIL.Image]{value.size}"
-        elif hasattr(value, "video") and hasattr(value, "has_audio"):
-            # VideoInputs payload — duck-typed so core conversation.py doesn't
-            # import the optional video/audio (ffmpeg/torchcodec/librosa) stack.
-            # Only the two streams are here; the timelines are on ``meta`` (see
-            # ``data/seed_omni/utils/media_metadata.py``) and print with the
-            # rest of it.
-            v = value
-            shape = tuple(v.video.shape) if isinstance(v.video, torch.Tensor) else type(v.video).__name__
-            parts = [f"video.shape={shape}"]
-            audio = getattr(v, "audio", None)
-            if audio is not None:
-                audio_shape = tuple(audio.shape) if isinstance(audio, torch.Tensor) else type(audio).__name__
-                parts.append(f"audio.shape={audio_shape}")
-            return f"[VideoInputs | {', '.join(parts)}]"
-        elif hasattr(value, "shape") and hasattr(value, "dtype"):
-            # Raw audio waveforms arrive as numpy arrays. Duck-typed for the same
-            # reason as VideoInputs above: keep this core module import-free.
-            return f"[{type(value).__name__}]{tuple(value.shape)}"
-        else:
-            return f"[UnknownType]{type(value).__name__}"
-
-    def __meta_repr__(self) -> str:
-        meta_items = [f"{key}={self.__value_repr__(value)}" for key, value in self.meta.items()]
-        return f"{{{','.join(meta_items)}}}"
-
     def __repr__(self) -> str:
-        return f"ConversationItem(type={self.type}, value={self.__value_repr__()}, role={self.role}, source={self.source}, meta={self.__meta_repr__()})"
+        # Multi-line with a blank line on each side, so ``print(conversation_list)``
+        # shows one block per item.
+        lines = [
+            f"ConversationItem(type={self.type}, role={self.role}, source={self.source})",
+            f"  value: {_format_value(self.value)}",
+        ]
+        if self.meta:
+            lines.append("  meta:")
+            lines.extend(f"    {key}: {_format_value(value)}" for key, value in self.meta.items())
+        else:
+            lines.append("  meta: {}")
+        return "\n" + "\n".join(lines) + "\n"
+
+
+# Longer sequences print their head and tail only (``frames_indices``, id lists).
+_MAX_SEQ_ITEMS = 6
+
+
+def _format_value(value: Any) -> str:
+    """One-line summary of an item ``value`` or a ``meta`` entry.
+
+    The media payload and metadata types are duck-typed so this core module does
+    not import the optional video/audio (ffmpeg/torchcodec/librosa) stack.
+    """
+    if value is None or isinstance(value, (bool, int)):
+        return repr(value)
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    if isinstance(value, str):
+        return f"[str]{value!r}"
+    if isinstance(value, torch.Tensor):
+        return f"[torch.Tensor]{tuple(value.shape)}"
+    if isinstance(value, Image.Image):
+        return f"[PIL.Image]{value.size}"
+    if hasattr(value, "video") and hasattr(value, "has_audio"):
+        # VideoInputs: both streams of one clip; their timelines are on ``meta``.
+        parts = [f"video={_format_value(value.video)}"]
+        if value.audio is not None:
+            parts.append(f"audio={_format_value(value.audio)}")
+        return f"[VideoInputs] {', '.join(parts)}"
+    if is_dataclass(value) and not isinstance(value, type):
+        # VideoMetadata / AudioMetadata; unset fields are left out.
+        parts = [
+            f"{f.name}={_format_value(getattr(value, f.name))}"
+            for f in fields(value)
+            if getattr(value, f.name) is not None
+        ]
+        return f"[{type(value).__name__}] {', '.join(parts)}"
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        # Raw audio waveforms arrive as numpy arrays.
+        return f"[{type(value).__name__}]{tuple(value.shape)}"
+    if isinstance(value, (list, tuple)):
+        items = [_format_value(v) for v in value]
+        if len(items) > _MAX_SEQ_ITEMS:
+            half = _MAX_SEQ_ITEMS // 2
+            items = [*items[:half], "...", *items[-half:]]
+            return f"[{', '.join(items)}](len={len(value)})"
+        return f"[{', '.join(items)}]"
+    if isinstance(value, Mapping):
+        return "{" + ", ".join(f"{k}: {_format_value(v)}" for k, v in value.items()) + "}"
+    return f"[UnknownType]{type(value).__name__}"
 
 
 def is_dummy(item: ConversationItem) -> bool:

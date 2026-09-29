@@ -560,3 +560,23 @@ def test_the_inferencer_writes_a_generated_clip_from_the_items_own_meta(tmp_path
     with av.open(str(tmp_path / "generated_video_0.mp4")) as container:
         assert container.streams.audio[0].sample_rate == rate
         assert container.streams.video[0].codec_context.framerate == meta.fps
+
+
+def test_item_repr_prints_both_streams_and_both_timelines():
+    """``print(conversation_list)`` shows the payload and the timelines on ``meta``,
+    one multi-line block per item."""
+    item = _video_item(
+        VideoMetadata(total_num_frames=300, fps=30.0, frames_indices=list(range(0, 300, 15))),
+        torch.zeros(20, 3, 4, 4, dtype=torch.uint8),
+        waveform=np.zeros(160000, dtype=np.float32),
+        audio_metadata=AudioMetadata(sampling_rate=16000, num_samples=160000),
+    )
+
+    assert repr(item) == (
+        "\nConversationItem(type=video, role=user, source=None)\n"
+        "  value: [VideoInputs] video=[torch.Tensor](20, 3, 4, 4), audio=[ndarray](160000,)\n"
+        "  meta:\n"
+        "    video_metadata: [VideoMetadata] total_num_frames=300, fps=30, duration=10, "
+        "frames_indices=[0, 15, 30, ..., 255, 270, 285](len=20)\n"
+        "    audio_metadata: [AudioMetadata] sampling_rate=16000, num_samples=160000\n"
+    )
