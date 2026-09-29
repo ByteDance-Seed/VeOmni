@@ -12,20 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Single-shard equivalence for the vocab-parallel (``emb``) embedding ops.
+"""Vocab-parallel (``emb``) embedding ops against the dense ops they shard.
 
-One shard owns the whole vocabulary, so both ops must reduce exactly to the
-dense op they shard — :func:`F.embedding` and :func:`F.linear`. That is worth
-pinning because the sharded path reaches its result through three collectives
-writing into freshly ``empty`` buffers: an unsharded path that skips a
-collective without aliasing its buffer returns uninitialized memory forward and
-an all-zero weight gradient back, neither of which raises.
+One shard owns the whole vocabulary, so both ops must reduce exactly to
+:func:`F.embedding` and :func:`F.linear`. That is worth pinning because the
+sharded path reaches its result through collectives writing into freshly
+``empty`` buffers: an unsharded path that skips a collective without aliasing
+its buffer returns uninitialized memory forward and an all-zero weight gradient
+back, neither of which raises.
 
-The multi-rank paths need a process group and live with the distributed tests.
+The sharded paths run on two CPU gloo ranks with uneven token counts (one rank
+holds none) and are compared with a dense reference over every rank's tokens.
 """
+
+import json
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from veomni.ops.kernels.embed import AllToAllEmbedding, VocabParallelLinear
@@ -144,5 +149,93 @@ def test_embedding_rejects_out_of_range_ids_instead_of_returning_garbage(table):
     before the local-range check below could see it, leaving its row of the
     ``empty`` output at whatever the buffer held.
     """
-    with pytest.raises(RuntimeError, match="local index out of range"):
+    with pytest.raises(RuntimeError, match="token ids must lie in"):
         AllToAllEmbedding.apply(None, torch.tensor([0, -1]), table)
+    with pytest.raises(RuntimeError, match="token ids must lie in"):
+        AllToAllEmbedding.apply(None, torch.tensor([0, VOCAB]), table)
+
+
+_WORLD = 2
+_MR_VOCAB, _MR_HIDDEN = 6, 3
+_RANK_IDS = [[0, 5, 3, 3, 1], []]  # rank 0 hits both shards and repeats an id; rank 1 holds none
+_RANK_HIDDEN_ROWS = [3, 0]
+
+
+def _mr_table() -> torch.Tensor:
+    return torch.randn(_MR_VOCAB, _MR_HIDDEN, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
+
+
+def _mr_randn(rank: int, salt: int, *shape: int) -> torch.Tensor:
+    return torch.randn(*shape, generator=torch.Generator().manual_seed(100 * salt + rank), dtype=torch.float64)
+
+
+def _parity_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", world_size=_WORLD, rank=rank)
+    try:
+        table = _mr_table()
+        rows = _MR_VOCAB // _WORLD
+        chunk = slice(rank * rows, (rank + 1) * rows)
+
+        ids = torch.tensor(_RANK_IDS[rank], dtype=torch.long)
+        hidden = _mr_randn(rank, 1, _RANK_HIDDEN_ROWS[rank], _MR_HIDDEN).requires_grad_(True)
+        emb_shard = table[chunk].clone().requires_grad_(True)
+        lin_shard = table[chunk].clone().requires_grad_(True)
+        embs = AllToAllEmbedding.apply(dist.group.WORLD, ids, emb_shard)
+        logits = VocabParallelLinear.apply(dist.group.WORLD, hidden, lin_shard)
+        (embs * _mr_randn(rank, 2, len(ids), _MR_HIDDEN)).sum().backward()
+        (logits * _mr_randn(rank, 3, _RANK_HIDDEN_ROWS[rank], _MR_VOCAB)).sum().backward()
+
+        # Dense reference over every rank's tokens: the shard grad sums the whole emb group.
+        emb_dense = table.clone().requires_grad_(True)
+        lin_dense = table.clone().requires_grad_(True)
+        hidden_dense = None
+        for r in range(_WORLD):
+            ids_r = torch.tensor(_RANK_IDS[r], dtype=torch.long)
+            hidden_r = _mr_randn(r, 1, _RANK_HIDDEN_ROWS[r], _MR_HIDDEN).requires_grad_(True)
+            (F.embedding(ids_r, emb_dense) * _mr_randn(r, 2, len(ids_r), _MR_HIDDEN)).sum().backward()
+            (F.linear(hidden_r, lin_dense) * _mr_randn(r, 3, _RANK_HIDDEN_ROWS[r], _MR_VOCAB)).sum().backward()
+            if r == rank:
+                hidden_dense = hidden_r
+
+        result = {
+            "embedding_forward": torch.equal(embs, F.embedding(ids, table)),
+            "embedding_grad": torch.allclose(emb_shard.grad, emb_dense.grad[chunk]),
+            "linear_forward": torch.allclose(logits, F.linear(hidden.detach(), table)),
+            "linear_hidden_grad": torch.allclose(hidden.grad, hidden_dense.grad),
+            "linear_weight_grad": torch.allclose(lin_shard.grad, lin_dense.grad[chunk]),
+        }
+        with open(f"{out_dir}/rank{rank}.json", "w") as f:
+            json.dump(result, f)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_sharded_ops_match_dense_over_all_ranks(tmp_path):
+    mp.spawn(_parity_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=_WORLD, join=True)
+
+    for rank in range(_WORLD):
+        result = json.loads((tmp_path / f"rank{rank}.json").read_text())
+        assert all(result.values()), (rank, result)
+
+
+def _out_of_range_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", world_size=_WORLD, rank=rank)
+    try:
+        ids = torch.tensor([0, _MR_VOCAB] if rank == 0 else [1], dtype=torch.long)
+        shard = torch.zeros(_MR_VOCAB // _WORLD, _MR_HIDDEN)
+        try:
+            AllToAllEmbedding.apply(dist.group.WORLD, ids, shard)
+            raised = False
+        except RuntimeError as e:
+            raised = "token ids must lie in" in str(e)
+        with open(f"{out_dir}/rank{rank}.json", "w") as f:
+            json.dump(raised, f)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_an_out_of_range_id_on_one_rank_fails_every_rank(tmp_path):
+    """The rank without a bad id must raise too, not block in the next collective."""
+    mp.spawn(_out_of_range_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=_WORLD, join=True)
+
+    assert [json.loads((tmp_path / f"rank{rank}.json").read_text()) for rank in range(_WORLD)] == [True, True]
