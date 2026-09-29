@@ -478,10 +478,21 @@ it cannot in general be replaced by a single learning-rate change. Loss values
 are not directly comparable across curvature settings, and this objective does
 not guarantee preservation of generation quality.
 
+`sigma = 1 - t` is the effective noise level from the existing scheduler. With
+`training_cfg_schedule: sigma`, video and audio use their respective sigmas:
+`s = 1 + (training_cfg_scale - 1) * sigma`. For a configured scale of `4`,
+`sigma=0.1` gives `s=1.3`, while `sigma=0.9` gives `s=3.7`. This concentrates
+stronger CFG calibration at high noise and leaves low-noise examples closer to
+ordinary FM, giving them more room to learn from new data. `constant` instead
+applies the configured scale at every noise level. The choice is a tradeoff
+between guidance protection and learning capacity, not a quality guarantee.
+Neither schedule changes the noise sampling distribution; the separate
+`video_sigma_bucket_weights` option controls video-loss weighting.
+
 | Condition config key | Default | Meaning |
 | --- | --- | --- |
 | `training_cfg_scale` | `1.0` | Scale one disables the extra branch and preserves upstream RNG/loss behavior |
-| `training_cfg_schedule` | `constant` | `constant` or `sigma`: `s=1+(scale-1)*sigma`, separately for video/audio |
+| `training_cfg_schedule` | `constant` | `constant` uses the configured scale everywhere; `sigma` varies it with each modality's effective noise level |
 | `training_cfg_curvature_power` | `2.0` | Curvature exponent `k` in `[0,2]`; relative curvature `1/s**k` |
 | `cfg_unconditional_mode` | `per_sample` | `per_sample` or `shared_empty` |
 | `cfg_unconditional_path` | unset | Local shared-empty safetensors, required only when enabled in that mode |
