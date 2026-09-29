@@ -16,15 +16,14 @@
 
 Shared by any module whose embedding table is ``Shard(0)``-split on dim-0 (vocab)
 over the ``emb`` extra-parallel group AND additionally FSDP-sharded on dim-1
-(hidden) over the ``emb_fsdp`` sub-mesh -- the base ``TextEncoder``'s
-``embed_tokens`` and Seedream 5.0's 258 GB over-encoding table both take this
-shape. The lookup / projection kernels (``AllToAllEmbedding`` /
+(hidden) over the ``emb_fsdp`` sub-mesh -- a text encoder's ``embed_tokens``
+and a very large over-encoding table (hundreds of GB) both take this shape. The lookup / projection kernels (``AllToAllEmbedding`` /
 ``VocabParallelLinear``) need this rank's *whole* emb chunk (all hidden), so the
 FSDP hidden shards are gathered back first (see :meth:`emb_local_weight`).
 
-All methods are ``@staticmethod`` so a top-level model (``TextEncoder``) or an
-inner ``nn.Module`` (Seedream's ``SHMOverEncodingEmbedding``) can call them
-regardless of ``self``; mix the class in for method-style access.
+All methods are ``@staticmethod`` so a top-level model (a text encoder) or an
+inner ``nn.Module`` (an over-encoding embedding) can call them regardless of
+``self``; mix the class in for method-style access.
 """
 
 import torch
