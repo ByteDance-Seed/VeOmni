@@ -97,33 +97,5 @@ class OfflineEncodingMixin(ABC):
                 f"current cache_mode is {mode!r}."
             )
 
-    def load_partial_dcp_checkpoint(self, load_dir: str, *, trainer: Any) -> None:
-        """Load runtime DCP state for a non-``full`` offline-cache module.
-
-        The default is a no-op for modules such as a VAE ``process_only`` stage
-        that has no online runtime state. Modules with trainable online
-        components can override this to restore a partial model/optimizer state.
-        """
-        del load_dir, trainer
-
-    def save_partial_dcp_checkpoint(self, save_dir: str, *, trainer: Any, state: Any) -> None:
-        """Save runtime DCP state for a non-``full`` offline-cache module.
-
-        The default is a no-op for modules with no online runtime state.
-        Modules with trainable online components can override this to persist a
-        partial model/optimizer state.
-        """
-        del save_dir, trainer, state
-
-    def save_full_hf_checkpoint(self, output_dir: str, *, source_path: str, trainer: Any, state: Any) -> None:
-        """Save a full HuggingFace artifact for a non-``full`` offline-cache module.
-
-        Concrete modules own the merge policy: a no-parameter process-only
-        module may copy the frozen source split, while a partial online module
-        may combine frozen source weights with trainable runtime weights.
-        """
-        del output_dir, source_path, trainer, state
-        raise NotImplementedError(f"{type(self).__name__}.save_full_hf_checkpoint is not implemented.")
-
 
 __all__ = ["OfflineEncodingMixin"]

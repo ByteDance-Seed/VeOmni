@@ -108,20 +108,6 @@ def test_pre_forward_rejects_encode_only_for_online_process() -> None:
         module.pre_forward("online_process", conversation_list=[])
 
 
-def test_default_partial_dcp_hooks_are_noop() -> None:
-    module = DummyOfflineModule(cache_mode="process_only")
-
-    assert module.load_partial_dcp_checkpoint("/tmp/load", trainer=object()) is None
-    assert module.save_partial_dcp_checkpoint("/tmp/save", trainer=object(), state=object()) is None
-
-
-def test_default_full_hf_checkpoint_hook_requires_module_implementation() -> None:
-    module = DummyOfflineModule(cache_mode="process_only")
-
-    with pytest.raises(NotImplementedError, match="save_full_hf_checkpoint"):
-        module.save_full_hf_checkpoint("/tmp/out", source_path="/tmp/source", trainer=object(), state=object())
-
-
 def test_offline_encoding_mixin_requires_tensor_endpoints() -> None:
     source = inspect.getsource(OfflineEncodingMixin)
     assert "@abstractmethod" in source
