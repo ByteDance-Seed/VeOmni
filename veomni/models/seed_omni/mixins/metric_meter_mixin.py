@@ -28,7 +28,7 @@ What a module computes vs. what the trainer computes
 A module only ever produces **time-independent** quantities:
 
 * :meth:`metric_meter_add` accumulates this module's token lengths — the per-module
-  analogue of ``EnvironMeter.add``.  The distributed module runtime calls it right
+  analogue of ``EnvironMeter.add``.  The training node executor calls it right
   after ``pre_forward`` (when the real input tensors are in hand), passing the
   node's ``method`` + the forward ``data``.  A module reports its tokens by calling
   :meth:`MetricMeterMixin.metric_meter_set_seqlens` inside its ``pre_forward``
@@ -44,11 +44,10 @@ A module only ever produces **time-independent** quantities:
   lengths.  **No timing, no MFU, no cross-rank reduction here.**
 
 MFU / achieved-FLOPs / tokens-per-second are computed once, globally, by the
-orchestrator: a per-module wall-clock is meaningless because a module's
-``on_step_end`` only fires after the *whole* graph's forward+backward finishes,
-so the elapsed time it would see is the whole-step time, not its own. The trainer
-therefore times the whole graph once and divides the summed theoretical FLOPs by
-that single delta (see :class:`veomni.utils.omni_helper.OmniEnvironMeter`).
+orchestrator: a per-module wall-clock is meaningless because modules share one
+backward and their compute interleaves within the step. The trainer therefore
+times the whole graph once and divides the summed theoretical FLOPs by that
+single delta (see :class:`veomni.utils.omni_helper.OmniEnvironMeter`).
 
 A module has exactly **one** notion of sequence length — a token is a token,
 whatever its modality. Each module implements its own :meth:`estimate_flops`
@@ -61,10 +60,10 @@ does *not* inherit ``MetricMeterMixin``). A module that wants metering defines i
 lengths come from :meth:`metric_meter_set_seqlens` via the default
 ``metric_meter_token_lengths``), and its concrete model multi-inherits it, e.g.::
 
-    class TextEncoder(VeOmniMixin, PreTrainedModel): ...
+    class XxxModel(XxxMetricMeterMixin, TrainingModuleMixin, BaseMixin, PreTrainedModel): ...
 
-The orchestrator decides whether a module contributes metrics with
-``isinstance(model, MetricMeterMixin)``. Modules without a metric meter contribute
+:meth:`OmniModelRuntime.metric_meter_collect` decides whether a module contributes
+metrics with ``isinstance(model, MetricMeterMixin)``. Modules without a metric meter contribute
 nothing.
 """
 
@@ -100,7 +99,7 @@ class MetricMeterMixin:
 
     def _metric_meter_seqlen_buffer(self) -> List[int]:
         # Lazily initialised so an implementing module never has to touch its own
-        # ``TrainingMixin.__init__`` / ``pre_forward``.
+        # ``__init__`` / ``pre_forward``.
         if not hasattr(self, "_metric_meter_seqlens"):
             self._metric_meter_seqlens: List[int] = []
         return self._metric_meter_seqlens
@@ -143,7 +142,7 @@ class MetricMeterMixin:
     def metric_meter_add(self, method: str, data: Dict[str, Any]) -> None:
         """Accumulate this micro-batch's token lengths (per-module ``meter.add``).
 
-        Called once per micro-batch by the module-trainer right after
+        Called once per micro-batch by the training node executor right after
         ``pre_forward`` (so ``data`` holds the real input tensors), with the
         node's ``method``.  Sums correctly over a whole gradient-accumulation
         step (a call that returns ``[]`` adds nothing).
