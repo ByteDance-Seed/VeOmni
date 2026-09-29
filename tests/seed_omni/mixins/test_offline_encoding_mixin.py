@@ -1,8 +1,8 @@
+"""``OfflineEncodingMixin``: per-run ``cache_mode``, the endpoint gate and its MRO contract."""
+
 from __future__ import annotations
 
-import inspect
 import json
-from collections.abc import Collection
 
 import pytest
 import torch
@@ -109,10 +109,7 @@ def test_pre_forward_rejects_encode_only_for_online_process() -> None:
 
 
 def test_offline_encoding_mixin_requires_tensor_endpoints() -> None:
-    source = inspect.getsource(OfflineEncodingMixin)
-    assert "@abstractmethod" in source
-    assert "def offline_encode" in source
-    assert "def online_process" in source
+    assert OfflineEncodingMixin.__abstractmethods__ == {"offline_encode", "online_process"}
 
 
 def test_offline_encoding_mixin_is_not_module_mixin_subclass() -> None:
@@ -174,9 +171,20 @@ def test_sibling_offline_mixin_wins_mro_over_the_abstract_stubs() -> None:
 
 
 def test_offline_encoding_mixin_does_not_implement_decorated_hooks() -> None:
-    source = inspect.getsource(OfflineEncodingMixin)
-    assert "@pre_forward" not in source
-    assert "@post_forward" not in source
+    markers = ("_omni_pre_context", "_omni_post_context")
+    assert not [name for name, attr in vars(OfflineEncodingMixin).items() for m in markers if hasattr(attr, m)]
+
+
+def test_mixin_after_training_module_mixin_is_rejected_at_class_creation() -> None:
+    """``TrainingModuleMixin.pre_forward`` does not chain to ``super()``, so the gate would be skipped."""
+    with pytest.raises(TypeError, match="OfflineEncodingMixin must come before TrainingModuleMixin"):
+
+        class _WrongOrder(BaseMixin, TrainingModuleMixin, OfflineEncodingMixin):
+            def offline_encode(self, **kwargs: torch.Tensor) -> dict[str, torch.Tensor]:
+                return {}
+
+            def online_process(self, **kwargs: torch.Tensor) -> dict[str, torch.Tensor]:
+                return {}
 
 
 def test_decorated_hook_slots_can_bind_multiple_contexts() -> None:
@@ -211,24 +219,3 @@ def test_decorated_hook_slots_are_dispatched_by_module_mixin() -> None:
         "online_process_pre",
         "online_process_post",
     ]
-
-
-def test_cache_mode_is_checked_once_per_offline_method() -> None:
-    module = DummyOfflineModule(support_cache=False)
-    conversation = [[ConversationItem(type="image", value=torch.ones(1), role="assistant")]]
-    calls: list[str] = []
-
-    original = module._check_cache_mode
-
-    def wrapped_check_cache_mode(*, method: str, allowed: Collection[str]) -> None:
-        calls.append(method)
-        return original(method=method, allowed=allowed)
-
-    module._check_cache_mode = wrapped_check_cache_mode  # type: ignore[method-assign]
-
-    module.pre_forward("offline_encode", conversation_list=conversation)
-    module.pre_forward("offline_encode", conversation_list=conversation)
-    module.pre_forward("online_process", conversation_list=conversation)
-    module.pre_forward("online_process", conversation_list=conversation)
-
-    assert calls == ["offline_encode", "online_process"]

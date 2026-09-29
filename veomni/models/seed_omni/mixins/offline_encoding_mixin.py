@@ -17,8 +17,15 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Collection
 from typing import Any
+
+from .training_module_mixin import TrainingModuleMixin
+
+
+_ALLOWED_CACHE_MODES = {
+    "offline_encode": frozenset({"full", "encode_only"}),
+    "online_process": frozenset({"full", "process_only"}),
+}
 
 
 class OfflineEncodingMixin(ABC):
@@ -39,7 +46,9 @@ class OfflineEncodingMixin(ABC):
     Modules that expose offline-cache graph endpoints must implement
     :meth:`offline_encode` and :meth:`online_process` on a sibling ``*OfflineMixin``
     placed **before** this mixin in ``VeOmniMixin`` bases so the concrete tensor
-    call-sites win MRO lookup.
+    call-sites win MRO lookup. This mixin itself must sit before
+    :class:`TrainingModuleMixin`, whose ``pre_forward`` does not chain to
+    ``super()`` and would otherwise skip the cache-mode gate.
     """
 
     DEFAULT_CACHE_MODE = "full"
@@ -48,12 +57,24 @@ class OfflineEncodingMixin(ABC):
     config: Any
     cache_mode: str
 
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        mro = cls.__mro__
+        if TrainingModuleMixin in mro and mro.index(TrainingModuleMixin) < mro.index(OfflineEncodingMixin):
+            raise TypeError(
+                f"{cls.__name__}: OfflineEncodingMixin must come before TrainingModuleMixin in the bases, "
+                "otherwise its cache-mode gate in pre_forward never runs."
+            )
+
     @classmethod
-    def validate_cache_mode(cls, cache_mode: str, config: Any) -> str:
+    def validate_cache_mode(cls, cache_mode: str, config: Any | None = None) -> str:
+        """Check ``cache_mode`` is known and, when ``config`` is given, that it supports caching."""
         if cache_mode not in cls.VALID_CACHE_MODES:
             valid = ", ".join(sorted(cls.VALID_CACHE_MODES))
             raise ValueError(f"{cls.__name__}.cache_mode must be one of {{{valid}}}; got {cache_mode!r}.")
-        if cache_mode != cls.DEFAULT_CACHE_MODE and not getattr(config, "support_cache", False):
+        if config is None or cache_mode == cls.DEFAULT_CACHE_MODE:
+            return cache_mode
+        if not getattr(config, "support_cache", False):
             raise ValueError(
                 f"{cls.__name__}.cache_mode={cache_mode!r} requires {type(config).__name__}.support_cache=True."
             )
@@ -63,12 +84,16 @@ class OfflineEncodingMixin(ABC):
         config = kwargs.get("config")
         if config is None and args and hasattr(args[0], "model_type"):
             config = args[0]
-        if config is not None:
-            self.validate_cache_mode(cache_mode, config)
+        self.validate_cache_mode(cache_mode, config)
         self.cache_mode = cache_mode
         super().__init__(*args, **kwargs)
-        if config is None:
-            self.validate_cache_mode(cache_mode, getattr(self, "config", None))
+        if config is None and cache_mode != self.DEFAULT_CACHE_MODE:
+            config = getattr(self, "config", None)
+            if config is None:
+                raise ValueError(
+                    f"{type(self).__name__}: cache_mode={cache_mode!r} needs a config with support_cache."
+                )
+            self.validate_cache_mode(cache_mode, config)
 
     @abstractmethod
     def offline_encode(self, **kwargs: Any) -> dict[str, Any]:
@@ -80,22 +105,14 @@ class OfflineEncodingMixin(ABC):
 
     def pre_forward(self, method: str, **kwargs: Any) -> dict[str, Any]:
         """Gate offline-cache call-sites before dispatching module hooks."""
-        if method == "offline_encode" and not getattr(self, f"_{method}_checked", False):
-            self._check_cache_mode(method=method, allowed={"full", "encode_only"})
-            setattr(self, f"_{method}_checked", True)
-        elif method == "online_process" and not getattr(self, f"_{method}_checked", False):
-            self._check_cache_mode(method=method, allowed={"full", "process_only"})
-            setattr(self, f"_{method}_checked", True)
-        return super().pre_forward(method=method, **kwargs)
-
-    def _check_cache_mode(self, *, method: str, allowed: Collection[str]) -> None:
-        mode = self.cache_mode
-        if mode not in allowed:
+        allowed = _ALLOWED_CACHE_MODES.get(method)
+        if allowed is not None and self.cache_mode not in allowed:
             allowed_text = ", ".join(sorted(allowed))
             raise ValueError(
                 f"{type(self).__name__}.{method} requires cache_mode in {{{allowed_text}}}; "
-                f"current cache_mode is {mode!r}."
+                f"current cache_mode is {self.cache_mode!r}."
             )
+        return super().pre_forward(method=method, **kwargs)
 
 
 __all__ = ["OfflineEncodingMixin"]
