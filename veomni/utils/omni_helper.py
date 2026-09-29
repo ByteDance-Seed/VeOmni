@@ -203,9 +203,11 @@ class OmniEnvironMeter:
             # source module is chosen from reduced values so every rank picks the same one.
             source = self._multisource_module(global_tokens, ranks_aligned, num_ranks)
             if source is None:
+                aligned_text = ", ".join(f"{name}={int(ranks_aligned[name])}" for name in names)
                 logger.warning_once(
                     "OmniEnvironMeter: no metered module reports per-sample seqlens aligned with ds_idx "
-                    "on every DP rank; multi-source token counts are reported as zero."
+                    f"on every DP rank (ranks aligned per module out of {num_ranks}: {aligned_text or 'none'}); "
+                    "multi-source token counts are reported as zero."
                 )
                 per_sample_seqlens = [0] * num_samples
             else:
@@ -234,8 +236,10 @@ class OmniEnvironMeter:
         sequence is the union of all modalities: text + image + boundary tokens).
         Candidates are modules with one length per sample on **every** DP rank;
         several can qualify (e.g. the text encoder and the backbone), so we take
-        the one with the most global tokens, which is the backbone (a superset of
-        the rest). Ties resolve to the first name in sorted order.
+        the one with the most global tokens. This is a heuristic: it assumes no
+        aligned module stashes more tokens than the backbone (e.g. a ViT reporting
+        pre-merge patch counts with one image per sample would outnumber it).
+        Ties resolve to the first name in sorted order.
         """
         candidates = [name for name in sorted(global_tokens) if ranks_aligned[name] == num_ranks]
         return max(candidates, key=lambda name: global_tokens[name], default=None)
