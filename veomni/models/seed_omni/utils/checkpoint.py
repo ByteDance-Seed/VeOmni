@@ -20,15 +20,11 @@ from typing import TYPE_CHECKING, Any
 
 from ....checkpoint import layout
 from ....models.checkpoint_manager import ModelCheckpointManager
-from ....utils import logging
 
 
 if TYPE_CHECKING:
     from ....arguments.omni_arguments_types import OmniModuleRuntimeArguments
     from ....trainer.callbacks import TrainerState
-
-
-logger = logging.get_logger(__name__)
 
 
 class OmniModuleCheckpointManager(ModelCheckpointManager):
@@ -38,9 +34,6 @@ class OmniModuleCheckpointManager(ModelCheckpointManager):
     level deeper under :attr:`module_name` — ``model/<module>/`` for the resume
     tree, ``hf_ckpt/<module>/`` for the export, ``model_assets/<module>/`` for
     the sidecars, so two modules cannot overwrite each other's ``config.json``.
-
-    The save stage also differs from a single-model job: the orchestrator puts
-    it on ``state``, where the base takes it as an argument.
     """
 
     @property
@@ -69,16 +62,6 @@ class OmniModuleCheckpointManager(ModelCheckpointManager):
     def _checkpointer_kwargs(self) -> dict[str, Any]:
         """The checkpointer resolves ``model/<module>/`` under the step itself."""
         return {**super()._checkpointer_kwargs(), "module": self.module_name}
-
-    def save_hf_or_lora(self, state: TrainerState, stage: str = "step_end") -> None:
-        """Route by LoRA, with the stage taken from ``state``.
-
-        ``ModuleRuntime.save_hf_or_lora`` drops the keyword, so the base's
-        default would report a train-end export as ``step_end`` and keep the
-        optimizer alive through it.
-        """
-        del stage
-        super().save_hf_or_lora(state, stage=state.stage or "step_end")
 
 
 __all__ = ["OmniModuleCheckpointManager"]

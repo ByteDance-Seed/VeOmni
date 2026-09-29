@@ -546,10 +546,10 @@ class OmniModelRuntime:
         for module_runtime in self.module_runtimes.values():
             module_runtime.save_dcp(state)
 
-    def save_hf_or_lora(self, state: TrainerState) -> None:
+    def save_hf_or_lora(self, state: TrainerState, stage: str = "step_end") -> None:
         """Export every module's HF weights / LoRA adapter."""
         for module_runtime in self.module_runtimes.values():
-            module_runtime.save_hf_or_lora(state)
+            module_runtime.save_hf_or_lora(state, stage=stage)
 
     def wait_for_pending_save(self) -> None:
         """Drain every module's in-flight async checkpoint writes."""

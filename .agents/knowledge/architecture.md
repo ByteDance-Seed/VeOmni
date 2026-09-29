@@ -98,8 +98,8 @@ veomni/
 │   │                   (eager, or FSDP/DDP via the runtime). Launched by
 │   │                   tasks/omni/{train,infer}_omni.py
 │   └── callbacks/      Training callbacks (checkpoint, evaluate, trace, etc.;
-│                       omni_callbacks/ holds the per-module DCP/HF, root
-│                       assets, step metrics and graph profile callbacks)
+│                       omni_callbacks/ holds the step metrics and graph
+│                       profile callbacks)
 └── utils/              Shared utilities (logging, device, constants, helpers)
 ```
 
@@ -155,7 +155,7 @@ So `self.model = self._build_model_runtime()` *is* the model build — a trainer
 
 It is usable on its own, with no trainer at all (see `tests/models/test_model_runtime.py`). Construction takes this model's *own* arguments (`ModelArguments`), the `ParallelState` name to register under, and the job-wide `TrainingArguments` it still needs for checkpoint paths and the resume decision. Nothing has to find itself inside a larger config: a job composing several models hands each one its own slice, so a single-model trainer and a multi-module omni model share one build sequence.
 
-Checkpointing is split three ways, mirroring SeedOmni V2's `OmniModuleDcpCallback` -> `OmniTrainer.save_dcp` -> `OmniModelRuntime`:
+Checkpointing is split three ways; `OmniTrainer` uses the same `CheckpointCallback`, with `OmniModelRuntime` fanning each call out to its module runtimes:
 
 - **When** — `CheckpointCallback` (`veomni/trainer/callbacks/checkpoint_callback.py`). It owns the every-N-steps/epochs cadence for DCP, HF/LoRA, and the one-shot tokenizer/config sidecars, and calls nothing but the trainer / model handles.
 - **What** — `BaseTrainer.load()` / `save_dcp()` / `save_hf_or_lora()` / `save_model_assets()`, one line each, fanning out to `self.model.<same name>()`. A trainer holding a second model (a DPO reference, a distillation teacher) extends the fan-out here without the callbacks learning about it.

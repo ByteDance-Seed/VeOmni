@@ -12,47 +12,27 @@ import torch
 from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import MultiLRScheduler, OmniModelRuntime
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 from veomni.trainer.callbacks.base import TrainerState
-from veomni.trainer.callbacks.omni_callbacks import OmniModuleDcpCallback, OmniModuleHfCallback
 from veomni.trainer.omni.omni_trainer import OmniTrainer, cascade_module_reshard
 
 
-def _hf_callback(*, hf_save_steps: int = 0, hf_save_epochs: int = 0) -> OmniModuleHfCallback:
-    checkpoint = SimpleNamespace(save_hf_weights=True, hf_save_steps=hf_save_steps, hf_save_epochs=hf_save_epochs)
-    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(checkpoint=checkpoint)))
-    trainer.save_hf_or_lora = MagicMock()
-    return OmniModuleHfCallback(trainer)
+def test_the_export_stage_reaches_every_module_checkpoint_manager():
+    """``train_end`` is what lets a manager drop the optimizer before the final
+    export, so the stage ``CheckpointCallback`` passes must survive the fan-out."""
+    managers = {name: MagicMock() for name in ("a", "b")}
+    module_runtimes = {}
+    for name, manager in managers.items():
+        runtime = ModuleRuntime.__new__(ModuleRuntime)
+        runtime.checkpoint = manager
+        module_runtimes[name] = runtime
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.model = OmniModelRuntime.__new__(OmniModelRuntime)
+    trainer.model.module_runtimes = module_runtimes
+    state = TrainerState(global_step=2)
 
+    trainer.save_hf_or_lora(state, stage="train_end")
 
-def test_hf_export_at_train_end_is_not_skipped_by_a_dcp_save_at_the_same_step():
-    """The module managers' ``last_saved_step`` counts DCP saves; HF export must not read it."""
-    callback = _hf_callback()
-    state = TrainerState(global_step=2, stage="train_end")
-
-    callback.on_train_end(state)
-
-    callback.trainer.save_hf_or_lora.assert_called_once_with(state)
-
-
-def test_hf_export_is_written_once_per_step():
-    callback = _hf_callback(hf_save_steps=2)
-    state = TrainerState(global_step=2, stage="step_end")
-    callback.on_step_end(state)
-    state.stage = "train_end"
-    callback.on_train_end(state)
-
-    assert callback.trainer.save_hf_or_lora.call_count == 1
-
-
-def test_failed_hf_export_is_retried_at_train_end():
-    callback = _hf_callback(hf_save_steps=2)
-    callback.trainer.save_hf_or_lora.side_effect = [RuntimeError("disk full"), None]
-    state = TrainerState(global_step=2, stage="step_end")
-    with pytest.raises(RuntimeError):
-        callback.on_step_end(state)
-    state.stage = "train_end"
-    callback.on_train_end(state)
-
-    assert callback.trainer.save_hf_or_lora.call_count == 2
+    for manager in managers.values():
+        manager.save_hf_or_lora.assert_called_once_with(state, stage="train_end")
 
 
 @pytest.mark.parametrize(
@@ -96,20 +76,6 @@ def test_gradient_accumulation_averages_micro_batch_gradients():
     torch.testing.assert_close(_accumulate_grads(2), _accumulate_grads(1))
 
 
-def test_callback_hooks_publish_the_stage_before_dispatch():
-    trainer = OmniTrainer.__new__(OmniTrainer)
-    trainer.state = TrainerState()
-    callback = MagicMock()
-    callback.on_step_end.side_effect = lambda state, **kwargs: seen.append(state.stage)
-    trainer._callbacks = [callback]
-    seen = []
-
-    trainer.on_step_end(loss=1.0, loss_dict={"lm": 1.0}, grad_norm=0.5)
-
-    assert seen == ["step_end"]
-    callback.on_step_end.assert_called_once_with(trainer.state, loss=1.0, loss_dict={"lm": 1.0}, grad_norm=0.5)
-
-
 def test_an_exhausted_iterator_does_not_count_a_step():
     """``train`` catches the ``StopIteration`` and runs ``epoch_end``, whose
     checkpoints (and a later resume) read ``global_step``."""
@@ -120,16 +86,6 @@ def test_an_exhausted_iterator_does_not_count_a_step():
         trainer.train_step(iter(()))
 
     assert trainer.state.global_step == 3
-
-
-def test_train_end_drains_in_flight_async_dcp_saves():
-    checkpoint = SimpleNamespace(save_steps=0, save_epochs=0)
-    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(checkpoint=checkpoint)))
-    trainer.wait_for_pending_save = MagicMock()
-
-    OmniModuleDcpCallback(trainer).on_train_end(TrainerState(global_step=2, stage="train_end"))
-
-    trainer.wait_for_pending_save.assert_called_once_with()
 
 
 def test_a_frozen_module_has_no_async_save_to_drain():

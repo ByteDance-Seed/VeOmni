@@ -15,15 +15,10 @@
 """SeedOmni (OmniTrainer) callbacks — not shared with single-model trainers."""
 
 from .graph_profile_callback import GraphProfileCallback
-from .module_checkpoint_callback import OmniModuleDcpCallback, OmniModuleHfCallback
-from .root_assets_callback import OmniRootAssetsCallback
 from .step_metrics_callback import OmniStepMetricsCallback
 
 
 __all__ = [
     "GraphProfileCallback",
-    "OmniModuleDcpCallback",
-    "OmniModuleHfCallback",
-    "OmniRootAssetsCallback",
     "OmniStepMetricsCallback",
 ]

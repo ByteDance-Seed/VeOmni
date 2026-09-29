@@ -45,9 +45,8 @@ Division of labour
 * :class:`OmniTrainer` (orchestrator): distributed setup + data pipeline +
   callbacks + train loop; builds the model handle and owns the
   forward/backward + the optimizer step.
-  Checkpoint *cadence* lives in the omni callbacks
-  (:class:`OmniModuleDcpCallback` / :class:`OmniModuleHfCallback`) and the
-  shared :class:`GlobalStateCallback` (step, dataloader cursor, RNG).
+  Checkpoint *cadence* lives in the shared :class:`CheckpointCallback` and
+  :class:`GlobalStateCallback` (step, dataloader cursor, RNG).
 """
 
 import json
@@ -83,6 +82,7 @@ from ...utils.device import (
 )
 from ..base import VeOmniIter
 from ..callbacks import (
+    CheckpointCallback,
     EvaluateCallback,
     GlobalStateCallback,
     ProfileTraceCallback,
@@ -92,9 +92,6 @@ from ..callbacks import (
 )
 from ..callbacks.omni_callbacks import (
     GraphProfileCallback,
-    OmniModuleDcpCallback,
-    OmniModuleHfCallback,
-    OmniRootAssetsCallback,
     OmniStepMetricsCallback,
 )
 
@@ -167,7 +164,7 @@ class OmniTrainer:
 
     Checkpoint I/O is **not** owned here: each :class:`ModuleRuntime` owns its
     DCP manager and :class:`OmniModelRuntime` fans ``load`` / ``save_dcp`` /
-    ``save_hf_or_lora`` out to them; the omni callbacks only schedule those calls.
+    ``save_hf_or_lora`` out to them; :class:`CheckpointCallback` only schedules those calls.
     """
 
     args: OmniArguments
@@ -358,9 +355,7 @@ class OmniTrainer:
         self.wandb_callback = WandbTraceCallback(self)
         self.profile_callback = ProfileTraceCallback(self)
         self.graph_profile_callback = GraphProfileCallback(self)
-        self.omni_root_assets_callback = OmniRootAssetsCallback(self)
-        self.module_dcp_callback = OmniModuleDcpCallback(self)
-        self.module_hf_ckpt_callback = OmniModuleHfCallback(self)
+        self.checkpoint_callback = CheckpointCallback(self)
         self.global_state_callback = GlobalStateCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self._callbacks = [
@@ -371,9 +366,7 @@ class OmniTrainer:
             self.graph_profile_callback,
             # Weights first, then the cursor — same order and reasons as
             # ``BaseTrainer._init_callbacks``.
-            self.omni_root_assets_callback,
-            self.module_dcp_callback,
-            self.module_hf_ckpt_callback,
+            self.checkpoint_callback,
             self.global_state_callback,
             self.evaluate_callback,
         ]
@@ -399,9 +392,9 @@ class OmniTrainer:
         """
         self.model.save_dcp(state)
 
-    def save_hf_or_lora(self, state: TrainerState) -> None:
+    def save_hf_or_lora(self, state: TrainerState, stage: str = "step_end") -> None:
         """Export every composed model's HF weights / LoRA adapter."""
-        self.model.save_hf_or_lora(state)
+        self.model.save_hf_or_lora(state, stage=stage)
 
     def wait_for_pending_save(self) -> None:
         """Drain every composed model's in-flight async checkpoint writes."""
@@ -428,9 +421,6 @@ class OmniTrainer:
         )
 
     def _run_callbacks(self, stage: str, **kwargs) -> None:
-        # Publish the stage on the state so save paths can branch on it without a
-        # ``stage`` argument threaded through every layer.
-        self.state.stage = stage
         for callback in self._callbacks:
             getattr(callback, f"on_{stage}")(self.state, **kwargs)
 
