@@ -67,6 +67,7 @@ veomni/
 │   │   ├── deepseek_v4/  TileLang sparse attention/indexer + precision helpers
 │   │   ├── attention/  Flash attention v2/3/4 + SP-aware variants
 │   │   ├── cross_entropy/  eager/liger/npu-chunk loss variants
+│   │   ├── embed/      Vocab-parallel (emb) lookup + tied projection
 │   │   ├── gated_delta_rule/  Qwen3.5 linear-attention kernels
 │   │   ├── load_balancing_loss/  eager + triton variants
 │   │   ├── mhc/        TileKernels DeepSeek V4 pre/post/head adapters
