@@ -12,17 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-module accelerated config + runtime.
+"""Per-module accelerated config + runtime."""
 
-``OmniModuleRuntimeArguments`` is the lightweight launcher dataclass.
-:class:`ModuleRuntime` is heavier — import it from
-:mod:`.omni_module_runtime` when needed so config-only imports stay cheap.
-"""
-
-from .omni_module_config import OmniModuleRuntimeArguments, hf_module_model_config
+from .omni_module_config import OmniModuleRuntimeArguments
+from .omni_module_runtime import ModuleRuntime, build_omni_module_runtime
 
 
 __all__ = [
+    "ModuleRuntime",
     "OmniModuleRuntimeArguments",
-    "hf_module_model_config",
+    "build_omni_module_runtime",
 ]

@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Accelerator helpers: dispatch, node executors, and module save/iter utilities."""
+"""Accelerator helpers: dispatch, node executors, and the per-module save helper."""
 
+from .executor import TrainNodeRunner, execute_generation_node
 from .modules import save_module_subdirectory
 
 
 __all__ = [
+    "TrainNodeRunner",
+    "execute_generation_node",
     "save_module_subdirectory",
 ]
