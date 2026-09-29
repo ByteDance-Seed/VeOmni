@@ -92,7 +92,14 @@ veomni/
 │   ├── dit_trainer.py  DitTrainer: diffusion transformer training
 │   ├── text_dpo_trainer.py  DPO training for text models
 │   ├── base_rl_trainer.py   Base RL trainer for RLHF
-│   └── callbacks/      Training callbacks (checkpoint, evaluate, trace, etc.)
+│   ├── omni/           SeedOmni orchestrators (not BaseTrainer subclasses):
+│   │                   OmniTrainer drives OmniModelRuntime's per-module
+│   │                   ModuleRuntimes; OmniInferencer runs the infer graph
+│   │                   (eager, or FSDP/DDP via the runtime). Launched by
+│   │                   tasks/omni/{train,infer}_omni.py
+│   └── callbacks/      Training callbacks (checkpoint, evaluate, trace, etc.;
+│                       omni_callbacks/ holds the step metrics and graph
+│                       profile callbacks)
 └── utils/              Shared utilities (logging, device, constants, helpers)
 ```
 
@@ -148,11 +155,11 @@ So `self.model = self._build_model_runtime()` *is* the model build — a trainer
 
 It is usable on its own, with no trainer at all (see `tests/models/test_model_runtime.py`). Construction takes this model's *own* arguments (`ModelArguments`), the `ParallelState` name to register under, and the job-wide `TrainingArguments` it still needs for checkpoint paths and the resume decision. Nothing has to find itself inside a larger config: a job composing several models hands each one its own slice, so a single-model trainer and a multi-module omni model share one build sequence.
 
-Checkpointing is split three ways, mirroring SeedOmni V2's `OmniModuleDcpCallback` -> `OmniTrainer.save_dcp` -> `OmniModelRuntime`:
+Checkpointing is split three ways; `OmniTrainer` uses the same `CheckpointCallback`, with `OmniModelRuntime` fanning each call out to its module runtimes:
 
 - **When** — `CheckpointCallback` (`veomni/trainer/callbacks/checkpoint_callback.py`). It owns the every-N-steps/epochs cadence for DCP, HF/LoRA, and the one-shot tokenizer/config sidecars, and calls nothing but the trainer / model handles.
 - **What** — `BaseTrainer.load()` / `save_dcp()` / `save_hf_or_lora()` / `save_model_assets()`, one line each, fanning out to `self.model.<same name>()`. A trainer holding a second model (a DPO reference, a distillation teacher) extends the fan-out here without the callbacks learning about it.
-- **How** — `VeOmniModelRuntime` forwards to its `ModelCheckpointManager`, which owns the *ordering* (drain async saves, `empty_cache` around the DCP write, barrier, then export) — the part previously duplicated between the V1 callbacks and V2's per-module manager. A multi-module model subclasses it and sets `module_name`; every path then nests one level deeper via `veomni/checkpoint/layout.py`.
+- **How** — `VeOmniModelRuntime` forwards to its `ModelCheckpointManager`, which owns the *ordering* (drain async saves, `empty_cache` around the DCP write, barrier, then export) — the part previously duplicated between the V1 callbacks and V2's per-module manager. The base's paths stop at the step directory; a multi-module model's subclass (`OmniModuleCheckpointManager`) overrides the path methods and `_checkpointer_kwargs()` to nest every artifact one level deeper under its module name via `veomni/checkpoint/layout.py`.
 
 Only this model's lr_scheduler travels with the DCP write (the checkpointer pickles `state_dict` into a single `model/lr_scheduler.pt`; rank 0 writes, every rank reads). Weights and optimizer are two DCP directories (`model/ckpt/`, `model/optimizer/`). Job-level state — the dataloader cursor, the rng, the meters — belongs to `GlobalStateCallback` (`veomni/trainer/callbacks/global_state_callback.py`) as `loader/rank_{N}.pt` and `extra_state/rank_{N}.pt`, because with several models in one job there is one such record but N model checkpoints. That callback also writes the step's `checkpoint_manifest.json`. VeOmni 0.1.12 `extra_state/` resume is `veomni/checkpoint/legacy_v0_1_12.py` (delete that file to drop it). On-disk layout: `docs/usage/checkpoint.md`.
 

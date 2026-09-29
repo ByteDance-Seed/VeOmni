@@ -1,0 +1,5 @@
+# Launcher-style training DAG: a top-level edge list (bare module → .forward).
+# The convert-time form of the same graph lives in ../graph_train.yaml, keyed by
+# scenario; a launcher names the scenario in `model.model_config.train_type`.
+- {from: fake_module_a, to: fake_module_b}
+- {from: fake_module_b, to: end}
