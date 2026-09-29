@@ -42,6 +42,8 @@ from .helper import (
 if TYPE_CHECKING:
     from torch.utils.data import DataLoader
 
+    from ..distributed.parallel_state import ParallelState
+
 logger = logging.get_logger(__name__)
 
 
@@ -77,8 +79,10 @@ class OmniEnvironMeter:
         data_path: str = "",
         empty_cache_steps: int = 500,
         gc_steps: int = 0,
+        parallel_state: Optional["ParallelState"] = None,
     ) -> None:
         self.global_batch_size = global_batch_size
+        self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
         self.enable_multisource = enable_multisource
         self.empty_cache_steps = empty_cache_steps
         self.gc_steps = gc_steps
@@ -158,7 +162,7 @@ class OmniEnvironMeter:
         for name in names:
             _flops, seqlens = module_metrics[name]
             packed.append(float(sum(seqlens)))  # tokens for this module
-        reduced = all_reduce(tuple(packed), op="sum", group=get_parallel_state().dp_group)
+        reduced = all_reduce(tuple(packed), op="sum", group=self.parallel_state.dp_group)
         if not isinstance(reduced, list):  # single-element edge case
             reduced = [reduced]
 
