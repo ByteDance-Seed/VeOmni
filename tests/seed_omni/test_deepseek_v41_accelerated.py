@@ -91,7 +91,12 @@ def make_config(**overrides) -> DeepseekV41LlmConfig:
 
 
 def text(length, role="user"):
-    return ConversationItem(type="text", value=torch.randn(length, HIDDEN), role=role)
+    return ConversationItem(
+        type="text",
+        value=torch.randn(length, HIDDEN),
+        role=role,
+        meta={"input_ids": torch.randint(1, 100, (length,))},
+    )
 
 
 def image(length):
@@ -322,6 +327,9 @@ class TestSequenceParallelSlice:
         assert out["inputs_embeds"][0, 2:].abs().sum() == 0
         torch.testing.assert_close(out["ngram_embeds"][0][:, :2], ngram[0][:, 12:])
         assert out["image_mask"].shape == (1, 4) and not out["image_mask"].any()
+        # DSpark's slot ids stay the unpadded full row; forward_dspark_train pads and slices them.
+        ids = conversation[0][0].meta["input_ids"].tolist() + [0] * 3 + conversation[1][0].meta["input_ids"].tolist()
+        assert out["dspark_input_ids"][0].tolist() == ids
 
 
 class TestRegistration:

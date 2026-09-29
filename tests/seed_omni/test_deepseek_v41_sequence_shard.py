@@ -136,13 +136,19 @@ def _inputs(config):
     image_mask = torch.zeros(1, total, dtype=torch.bool)
     image_mask[:, 18:23] = True
     weights = torch.randn(1, total, HIDDEN, generator=generator)
-    return embeds, positions, ngram, image_mask, weights
+    input_ids = torch.randint(0, config.vocab_size, (1, total), generator=generator)
+    return embeds, positions, ngram, image_mask, weights, input_ids
 
 
-def _loss(outputs, hidden, dspark, weights):
+def _loss(outputs, hidden, dspark, markov, weights):
     from veomni.models.seed_omni.modules.deepseek_v41.llm.accelerated.accelerated import fold_indexer_kl_loss
 
-    return (hidden * weights).sum() + (dspark * weights.flip(1)).sum() + fold_indexer_kl_loss(outputs, INDEXER_COEF)
+    return (
+        (hidden * weights).sum()
+        + (dspark * weights.flip(1)).sum()
+        + (markov * markov.detach().sin()).sum()
+        + fold_indexer_kl_loss(outputs, INDEXER_COEF)
+    )
 
 
 def _worker(rank: int, world_size: int, init_file: str) -> None:
@@ -160,13 +166,23 @@ def _worker(rank: int, world_size: int, init_file: str) -> None:
         torch.manual_seed(0)
         model = DeepseekV41Llm(config).float().train()
         assert len(model.model.mtp) == 2
-        embeds, positions, ngram, image_mask, weights = _inputs(config)
+        embeds, positions, ngram, image_mask, weights, input_ids = _inputs(config)
 
         reference_embeds = embeds.clone().requires_grad_(True)
         reference = model(
-            inputs_embeds=reference_embeds, position_ids=positions, ngram_embeds=ngram, image_mask=image_mask
+            inputs_embeds=reference_embeds,
+            position_ids=positions,
+            ngram_embeds=ngram,
+            image_mask=image_mask,
+            dspark_input_ids=input_ids,
         )
-        reference_loss = _loss(reference, reference["hidden_states"], reference["dspark_hidden_states"], weights)
+        reference_loss = _loss(
+            reference,
+            reference["hidden_states"],
+            reference["dspark_hidden_states"],
+            reference["dspark_markov_bias"],
+            weights,
+        )
         reference_loss.backward()
         reference_grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
         model.zero_grad(set_to_none=True)
@@ -182,14 +198,17 @@ def _worker(rank: int, world_size: int, init_file: str) -> None:
             ngram_embeds=local_ngram,
             image_mask=local_mask,
             sequence_shard=shard,
+            dspark_input_ids=input_ids,
         )
         hidden = shard.gather(outputs["hidden_states"]).narrow(1, 0, shard.valid_len)
         dspark = shard.gather(outputs["dspark_hidden_states"]).narrow(1, 0, shard.valid_len)
-        loss = _loss(outputs, hidden, dspark, weights)
+        markov = shard.gather(outputs["dspark_markov_bias"]).narrow(1, 0, shard.valid_len)
+        loss = _loss(outputs, hidden, dspark, markov, weights)
         loss.backward()
 
         torch.testing.assert_close(hidden, reference["hidden_states"], rtol=1e-4, atol=1e-5)
         torch.testing.assert_close(dspark, reference["dspark_hidden_states"], rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(markov, reference["dspark_markov_bias"], rtol=1e-4, atol=1e-5)
 
         mean_loss = loss.detach().clone()
         dist.all_reduce(mean_loss)

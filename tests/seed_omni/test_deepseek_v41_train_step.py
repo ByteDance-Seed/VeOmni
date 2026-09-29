@@ -462,7 +462,54 @@ class TestDsparkTrainStep:
         for hidden in dirty_drafts:
             hidden[:, -1] = 1.0e3
         dirty = llm.model.forward_dspark_train(dirty_embeds, positions, dirty_drafts)
-        torch.testing.assert_close(clean[:, :1], dirty[:, :1], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(clean[0][:, :-1], dirty[0][:, :-1], atol=1e-4, rtol=1e-4)
+
+    def test_packed_dspark_matches_decode_slot_zero(self):
+        """Packed row ``j`` is decode's slot 0 after verified token ``j-1``, Markov residual included.
+
+        One-slot blocks make the comparison exact: with more slots, decode's
+        slot 0 also attends the block's noise tokens, which teacher forcing
+        does not have.
+        """
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.decode import DeepseekV41DecodeCache
+
+        schedule = shrink_layer_schedule(N_LAYERS)
+        schedule.pop("kept_layer_ids", None)
+        torch.manual_seed(0)
+        llm = DeepseekV41LlmAccelerated(
+            tiny_llm_config(**schedule, dspark_block_size=1, dspark_n_routed_experts=4, dspark_num_experts_per_tok=2)
+        ).eval()
+        backbone = llm.model
+        lengths = [9, 4]
+        seq_len = sum(lengths)
+        embeds = torch.randn(1, seq_len, HIDDEN)
+        drafts = [torch.randn(1, seq_len, HIDDEN) for _ in llm.config.dspark_target_layer_ids]
+        positions = torch.cat([torch.arange(n) for n in lengths]).unsqueeze(0)
+        input_ids = torch.randint(0, VOCAB, (1, seq_len))
+        with torch.no_grad():
+            packed, markov_bias = backbone.forward_dspark_train(embeds, positions, drafts, input_ids=input_ids)
+            markov = backbone.mtp[-1].markov_head
+            expected_bias = torch.nn.functional.linear(
+                torch.nn.functional.embedding(input_ids, markov.embed.weight), markov.head.weight
+            )
+            torch.testing.assert_close(markov_bias, expected_bias)
+
+            start = 0
+            for length in lengths:
+                for j in range(1, length):
+                    cache = DeepseekV41DecodeCache.empty(llm.config)
+                    if j > 1:
+                        backbone.seed_dspark_windows(
+                            [d[:, start : start + j - 1] for d in drafts],
+                            torch.arange(j - 1).unsqueeze(0),
+                            cache.dspark,
+                        )
+                    verified = backbone.mtp[0].project_main([d[:, start + j - 1 : start + j] for d in drafts])
+                    spec = backbone.forward_spec(
+                        embeds[:, start + j : start + j + 1], position=j - 1, caches=cache.dspark, main_x=verified
+                    )
+                    torch.testing.assert_close(packed[:, start + j], spec[:, 0], atol=1e-5, rtol=1e-5)
+                start += length
 
     def test_packed_dspark_enters_every_stage_through_call(self):
         """FSDP2 unshards a stage in its pre-forward hook; a bypassed ``__call__`` sees DTensor shards."""
@@ -477,62 +524,78 @@ class TestDsparkTrainStep:
             stage.register_forward_pre_hook(lambda module, _args: entered.append(module.stage_id))
         batch, seq_len = 1, 6
         drafts = [torch.randn(batch, seq_len, HIDDEN) for _ in llm.config.dspark_target_layer_ids]
-        out = llm.model.forward_dspark_train(
-            torch.randn(batch, seq_len, HIDDEN), torch.arange(seq_len).unsqueeze(0), drafts
+        draft, markov_bias = llm.model.forward_dspark_train(
+            torch.randn(batch, seq_len, HIDDEN),
+            torch.arange(seq_len).unsqueeze(0),
+            drafts,
+            input_ids=torch.randint(0, VOCAB, (batch, seq_len)),
         )
         assert entered == list(range(len(llm.model.mtp)))
-        assert out.shape == (batch, seq_len, HIDDEN)
+        assert draft.shape == (batch, seq_len, HIDDEN)
+        assert markov_bias.shape == (batch, seq_len, VOCAB)
 
-    def test_decode_pre_extra_shifts_mtp_labels(self):
-        """Qwen3.5 MTP: decode_pre extra-shifts t+1 labels into t+2 mtp_labels."""
+    def test_decode_pre_masks_rows_decode_never_drafts_from(self):
+        """DSpark labels are the causal t+1 labels minus sample starts and vision rows."""
         te = DeepseekV41TextEncoderAccelerated(tiny_text_config())
 
-        def _text(labels: list[int], *, dspark: bool = True) -> ConversationItem:
-            item = ConversationItem(
-                type="text",
-                value=torch.randn(len(labels), HIDDEN),
-                role="assistant",
-                meta={"labels": torch.tensor(labels)},
-            )
+        def _part(kind: str, length: int, labels: list[int] | None = None, *, dspark: bool = True):
+            meta = {} if labels is None else {"labels": torch.tensor(labels)}
             if dspark:
-                item.meta["dspark_hidden"] = torch.randn(len(labels), HIDDEN)
-            return item
+                meta["dspark_hidden"] = torch.randn(length, HIDDEN)
+                meta["dspark_markov_bias"] = torch.randn(length, VOCAB)
+            return ConversationItem(type=kind, value=torch.randn(length, HIDDEN), role="assistant", meta=meta)
 
-        packed = te.decode_pre(conversation_list=[[_text([1, 2, 3])], [_text([4, 5])]])
-        assert packed["shift_labels"].tolist() == [2, 3, IGNORE_INDEX, 5, IGNORE_INDEX]
-        assert packed["mtp_labels"].tolist() == [3, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX]
-        assert packed["dspark_hidden_states"].shape == (5, HIDDEN)
+        packed = te.decode_pre(
+            conversation_list=[
+                [_part("text", 3, [1, 2, 3])],
+                [_part("image", 4), _part("text", 2, [4, 5])],
+            ]
+        )
+        assert packed["shift_labels"].tolist() == [2, 3, IGNORE_INDEX, 4, 5, IGNORE_INDEX]
+        assert packed["mtp_labels"].tolist() == [IGNORE_INDEX, 3, IGNORE_INDEX, IGNORE_INDEX, 5, IGNORE_INDEX]
+        assert packed["dspark_hidden_states"].shape == (6, HIDDEN)
+        assert packed["dspark_markov_bias"].shape == (6, VOCAB)
 
-        no_draft = te.decode_pre(conversation_list=[[_text([1, 2, 3], dspark=False)]])
+        no_draft = te.decode_pre(conversation_list=[[_part("text", 3, [1, 2, 3], dspark=False)]])
         assert "mtp_labels" not in no_draft
         assert "dspark_hidden_states" not in no_draft
 
-    def test_decode_mtp_ce_uses_extra_shifted_labels(self, monkeypatch):
-        """Draft CE must score mtp_labels, not the main head's t+1 shift_labels."""
+    def test_decode_dspark_ce_adds_the_markov_residual(self, monkeypatch):
+        """Draft CE scores ``lm_head(h) + markov`` on the DSpark labels, on top of the main loss."""
         from veomni.models.seed_omni.modules.base.text_encoder.accelerated.accelerated import (
             TrainingMixin as BaseTrainingMixin,
         )
 
-        captured: list[torch.Tensor | None] = []
-
         def _fake_decode(self, hidden_states=None, labels=None, shift_labels=None, **kwargs):
-            del self, hidden_states, labels, kwargs
-            captured.append(None if shift_labels is None else shift_labels.detach().clone())
+            del self, hidden_states, labels, shift_labels, kwargs
             return {"loss": torch.tensor(1.0), "logits": None}
 
         monkeypatch.setattr(BaseTrainingMixin, "decode", _fake_decode)
         te = DeepseekV41TextEncoderAccelerated(tiny_text_config())
-        shift_labels = torch.tensor([2, 3, IGNORE_INDEX, 5, IGNORE_INDEX])
-        mtp_labels = torch.tensor([3, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX])
+        torch.manual_seed(0)
+        draft = torch.randn(5, HIDDEN)
+        markov_bias = torch.randn(5, VOCAB)
+        mtp_labels = torch.tensor([IGNORE_INDEX, 3, 7, IGNORE_INDEX, 5])
         out = te.decode(
             hidden_states=torch.randn(5, HIDDEN),
-            shift_labels=shift_labels,
-            dspark_hidden_states=torch.randn(5, HIDDEN),
+            shift_labels=torch.tensor([2, 3, 7, 4, 5]),
+            dspark_hidden_states=draft,
+            dspark_markov_bias=markov_bias,
             mtp_labels=mtp_labels,
         )
-        assert float(out["loss"]) == 2.0
-        assert torch.equal(captured[0], shift_labels)
-        assert torch.equal(captured[1], mtp_labels)
+        keep = mtp_labels != IGNORE_INDEX
+        expected = torch.nn.functional.cross_entropy(
+            (te._project(draft) + markov_bias)[keep].float(), mtp_labels[keep]
+        )
+        torch.testing.assert_close(out["loss"], 1.0 + expected)
+
+        with pytest.raises(RuntimeError, match="dspark_markov_bias"):
+            te.decode(
+                hidden_states=torch.randn(5, HIDDEN),
+                shift_labels=torch.tensor([2, 3, 7, 4, 5]),
+                dspark_hidden_states=draft,
+                mtp_labels=mtp_labels,
+            )
 
 
 def _has_grad(module, prefix: str) -> bool:

@@ -123,25 +123,32 @@ class DeepseekV41DSparkBlock(nn.Module):
         rotary_emb: DeepseekV41RotaryEmbedding,
         main: Union[List[torch.Tensor], torch.Tensor],
         shard: Optional[SequenceShard] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        input_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """One teacher-forced packed stage: the only way training enters a stage.
 
         Each stage is an FSDP2 unit, and FSDP gathers its parameters in the
         pre-forward hook. Calling ``project_main`` / ``forward_draft_packed`` /
-        ``collapse_draft`` from outside would hand sharded DTensors to the
-        matmuls, so all three run in here.
+        ``collapse_draft`` / ``markov_head`` from outside would hand sharded
+        DTensors to the matmuls, so all of them run in here.
 
         ``main`` is the target-layer hidden list at stage 0 and the projected
         ``main_x`` after it. Returns the streams, the carried ``pre`` mix,
-        ``main_x``, and the LM-head input on the last stage (else ``None``).
+        ``main_x``, and on the last stage the LM-head input and -- given the
+        slot token ids -- the Markov residual ``forward_head`` adds to its
+        logits (else ``None`` for both).
         """
         require_fp32_pre_mix(pre_mix)
         main_x = self.project_main(main) if self.stage_id == 0 else main
         hidden_streams, pre_mix = self.forward_draft_packed(
             hidden_streams, pre_mix, position_ids, rotary_emb, main_x, shard
         )
-        draft = self.collapse_draft(hidden_streams, pre_mix) if hasattr(self, "norm") else None
-        return hidden_streams, pre_mix, main_x, draft
+        draft = markov_bias = None
+        if hasattr(self, "norm"):
+            draft = self.collapse_draft(hidden_streams, pre_mix)
+            if input_ids is not None:
+                markov_bias, _ = self.markov_head(input_ids)
+        return hidden_streams, pre_mix, main_x, draft, markov_bias
 
     def seed_window(
         self,
@@ -275,8 +282,9 @@ class DeepseekV41DSparkBlock(nn.Module):
         and attends densely inside that block. Training already has the packed
         ``position_ids``; using the decode formula would put every token at the
         wrong RoPE phase, and seeding only the last window would let position 0
-        read the end of the row. Packed attention is causal over the same
-        sliding window the backbone uses, once, over the full sequence.
+        read the end of the row. Every row runs as block slot 0 once, over the
+        full sequence (see ``_packed_draft_attention``); slots past 0 -- the
+        noise tokens -- are not trained.
         """
         residual = hidden_streams
         attn_pre, attn_post, attn_comb = self.attn_hc(hidden_streams)
@@ -301,9 +309,18 @@ class DeepseekV41DSparkBlock(nn.Module):
         main_x: torch.Tensor,
         shard: Optional[SequenceShard] = None,
     ) -> torch.Tensor:
-        """Causal window attention over backbone KV plus packed draft keys.
+        """Slot-0 ``DSparkAttention`` at every packed position.
 
-        Under ``shard`` the queries are this rank's rows and both KV halves are
+        Decode at verified token ``p`` puts slot token ``x[p+1]`` at position
+        ``p+1`` and attends the main-KV ring (``main_x`` of ``.. p``, each at its
+        own RoPE position) plus the block's own keys. Teacher forcing the slot
+        at every row ``j`` therefore reads main rows ``j-width .. j-1`` of the
+        same sample and its own draft key -- never ``main_x[j]`` (that token's
+        backbone state is what the slot is predicting past) and never earlier
+        draft rows (decode's ring only holds main KV). Rows at a sample start
+        see no main KV; the text encoder masks their labels.
+
+        Under ``shard`` the queries are this rank's rows and the main KV is
         gathered to the full row, so a window may reach into the previous rank.
         """
         if main_x.shape[:2] != hidden_states.shape[:2]:
@@ -321,18 +338,32 @@ class DeepseekV41DSparkBlock(nn.Module):
         kv = self._window_kv(hidden_states, position_ids, rotary_emb)
         main_kv = self._window_kv(main_x, position_ids, rotary_emb)
         if shard is None:
-            window_idxs = attn._window_indices(position_ids, seq_len)
+            main_idxs = self._main_window_indices(position_ids)
         else:
-            kv, main_kv = shard.gather(kv), shard.gather(main_kv)
-            window_idxs = shard.local_rows(attn._window_indices(shard.position_ids, shard.full_len))
+            main_kv = shard.gather(main_kv)
+            main_idxs = shard.local_rows(self._main_window_indices(shard.position_ids))
         pool = torch.cat([main_kv, kv], dim=1)
-        draft_idxs = torch.where(window_idxs >= 0, window_idxs + main_kv.shape[1], window_idxs)
-        topk_idxs = torch.cat([window_idxs, draft_idxs], dim=-1)
+        own_idxs = main_kv.shape[1] + torch.arange(seq_len, device=hidden_states.device, dtype=torch.int32)
+        topk_idxs = torch.cat([main_idxs, own_idxs.view(1, -1, 1).expand(batch, -1, -1)], dim=-1)
 
         output = dense_sparse_attn(query, pool, attn.attn_sink, topk_idxs, attn.softmax_scale)
         output = apply_interleaved_rope(output, cos.unsqueeze(-2), -sin.unsqueeze(-2))
         grouped = attn.wo_a(output.reshape(batch, seq_len, attn.n_groups, -1))
         return attn.wo_b(grouped.flatten(2))
+
+    def _main_window_indices(self, position_ids: torch.Tensor) -> torch.Tensor:
+        """``[B, S, min(window, S)]`` int32: main rows ``q-width .. q-1`` of the query's own sample.
+
+        ``offset > position_ids[q]`` would reach before the sample start, so
+        packed ``position_ids`` restarting at zero doubles as the boundary mask.
+        """
+        seq_len = position_ids.shape[1]
+        device = position_ids.device
+        width = min(self.self_attn.sliding_window, seq_len)
+        queries = torch.arange(seq_len, device=device, dtype=torch.int32)
+        offsets = torch.arange(width, 0, -1, device=device, dtype=torch.int32)
+        indices = (queries[None, :, None] - offsets[None, None, :]).expand(position_ids.shape[0], -1, -1)
+        return indices.masked_fill(offsets[None, None, :] > position_ids.to(torch.int32)[:, :, None], -1)
 
     def collapse_draft(self, hidden_streams: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
         """Last-stage ``norm(hc_pre(stream))`` -- the tensor the shared LM head reads."""

@@ -51,6 +51,7 @@ from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem, is_dummy
 from ....base.llm_packing import pack_llm_conversations_for_forward, scatter_llm_hidden_states
+from ...ngram.packing import pack_ngram_inputs
 from ...quant_scheme import quantized_storage_dtype
 from ..configuration import DeepseekV41LlmConfig
 from ..mhc import veomni_mhc_post
@@ -174,6 +175,9 @@ class TrainingMixin(TrainingModuleMixin):
         self._pack_inputs_embeds_shape = inputs_embeds_shape
 
         ngram_embeds = self._align_ngram_embeds(ngram_embeds, inputs_embeds.shape[1])
+        if self.dspark_trains:
+            # Image rows never carry a DSpark label, so the id they pack to is arbitrary.
+            kwargs["dspark_input_ids"], _ = pack_ngram_inputs(conversation_list, self.device, pad_token_id=0)
 
         # This rank's own per-sample lengths, read off the packed position ids --
         # the same tensor the backbone derives its sample boundaries from, so the
@@ -235,30 +239,36 @@ class TrainingMixin(TrainingModuleMixin):
         self._pack_inputs_embeds_shape = None
         self._sequence_shard = None
 
-        dspark_hidden = outputs.get("dspark_hidden_states")
+        dspark_rows = {
+            meta_key: outputs[key]
+            for key, meta_key in (
+                ("dspark_hidden_states", "dspark_hidden"),
+                ("dspark_markov_bias", "dspark_markov_bias"),
+            )
+            if outputs.get(key) is not None
+        }
         if shard is not None:
             # Every SP rank scores the full row downstream, so each one needs
             # all of it back. The gather's summed backward is the size-times
             # convention FSDP's division by dp * sp undoes.
             hidden_states = shard.gather(hidden_states).narrow(1, 0, shard.valid_len)
-            if dspark_hidden is not None:
-                dspark_hidden = shard.gather(dspark_hidden).narrow(1, 0, shard.valid_len)
+            dspark_rows = {key: shard.gather(rows).narrow(1, 0, shard.valid_len) for key, rows in dspark_rows.items()}
 
         if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
             hidden_states = hidden_states.squeeze(0)
         scatter_llm_hidden_states(conversation, unflatten(hidden_states, pack_shape))
 
-        if dspark_hidden is not None:
-            if dspark_hidden.dim() == 3 and dspark_hidden.size(0) == 1:
-                dspark_hidden = dspark_hidden.squeeze(0)
-            hidden_iter = iter(unflatten(dspark_hidden, pack_shape))
+        for meta_key, rows in dspark_rows.items():
+            if rows.dim() == 3 and rows.size(0) == 1:
+                rows = rows.squeeze(0)
+            row_iter = iter(unflatten(rows, pack_shape))
             for sample in conversation:
                 for part in sample:
                     if is_dummy(part):
                         continue
-                    part.meta["dspark_hidden"] = next(hidden_iter)
-            if next(hidden_iter, None) is not None:
-                raise RuntimeError("dspark_hidden segment count exceeds non-dummy conversation items.")
+                    part.meta[meta_key] = next(row_iter)
+            if next(row_iter, None) is not None:
+                raise RuntimeError(f"{meta_key} segment count exceeds non-dummy conversation items.")
 
         forwarded: Dict[str, Any] = {"conversation_list": conversation}
         # OmniModel only collects ``_loss``. Leaving the KL tensors on the batch

@@ -46,10 +46,11 @@ There is no HF ``past_key_values``.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ....omni_pretrained_model import OmniPreTrainedModel
 from .attention import (
@@ -397,13 +398,19 @@ class DeepseekV41Backbone(nn.Module):
         position_ids: torch.Tensor,
         draft_hiddens: List[torch.Tensor],
         shard: Optional[SequenceShard] = None,
-    ) -> torch.Tensor:
-        """Teacher-forced DSpark on the packed row. Returns ``[B, S, hidden]``.
+        input_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Teacher-forced DSpark on the packed row.
+
+        Returns the ``[B, S, hidden]`` LM-head input and, given the packed
+        ``[B, S]`` slot token ids, the ``[B, S, vocab]`` Markov residual.
+        Under ``shard`` both are this rank's rows; ``input_ids`` is the
+        unpadded full row either way.
 
         Decode runs one 5-token block after a verified token. Training cannot
-        afford that loop, so the three stages run once over the packed sequence
-        with causal sliding-window attention. Same modules as ``forward_spec``;
-        different position arithmetic (see ``forward_draft_packed``).
+        afford that loop, so the three stages run once over the packed sequence,
+        every row as block slot 0. Same modules as ``forward_spec``; different
+        position arithmetic (see ``forward_draft_packed``).
         """
         if not self.mtp:
             raise RuntimeError("forward_dspark_train was called but this backbone has no DSpark stages")
@@ -414,13 +421,22 @@ class DeepseekV41Backbone(nn.Module):
             )
         hidden_streams = expand_to_streams(inputs_embeds, self.config.hc_mult)
         pre_mix = identity_pre_mix(hidden_streams, self.config.hc_mult)
+        if input_ids is not None and shard is not None:
+            input_ids = shard.local_rows(F.pad(input_ids, (0, shard.full_len - input_ids.shape[1])))
         main: Any = draft_hiddens
-        draft = None
-        for stage in self.mtp:
-            hidden_streams, pre_mix, main, draft = stage(
-                hidden_streams, pre_mix, position_ids, self.rotary_emb, main, shard
+        draft = markov_bias = None
+        last = len(self.mtp) - 1
+        for stage_id, stage in enumerate(self.mtp):
+            hidden_streams, pre_mix, main, draft, markov_bias = stage(
+                hidden_streams,
+                pre_mix,
+                position_ids,
+                self.rotary_emb,
+                main,
+                shard,
+                input_ids if stage_id == last else None,
             )
-        return draft
+        return draft, markov_bias
 
     def forward_spec(
         self,
@@ -554,6 +570,11 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
         if last not in trainable:
             self.model.norm.requires_grad_(False)
 
+    @property
+    def dspark_trains(self) -> bool:
+        """Whether ``forward`` runs the teacher-forced DSpark stages this step."""
+        return self.training and bool(self.model.mtp) and any(p.requires_grad for p in self.model.mtp.parameters())
+
     def _trainable_backbone_layer_ids(self) -> Optional[set]:
         if self.config.trainable_layer_ids is not None:
             return set(self.config.trainable_layer_ids)
@@ -572,6 +593,7 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
         capture_seq_len: Optional[int] = None,
         return_draft_hiddens: bool = False,
         sequence_shard: Optional[SequenceShard] = None,
+        dspark_input_ids: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """``[B, S, hidden]`` embeddings -> ``[B, S, hidden]`` hidden states.
@@ -592,6 +614,9 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
 
         ``sequence_shard`` is set by the training hook under sequence
         parallelism; every per-token input and output is then this rank's rows.
+
+        ``dspark_input_ids`` is the packed ``[B, S]`` token row (unsharded). When
+        DSpark trains, the last stage turns it into ``dspark_markov_bias``.
         """
         del kwargs
         if inputs_embeds is None:
@@ -611,17 +636,19 @@ class DeepseekV41Llm(DeepseekV41LlmInferenceMixin, OmniPreTrainedModel):
             return_draft_hiddens=return_draft_hiddens,
             shard=sequence_shard,
         )
-        mtp_trainable = bool(self.model.mtp) and any(p.requires_grad for p in self.model.mtp.parameters())
-        if self.training and mtp_trainable:
+        if self.dspark_trains:
             draft_hiddens = outputs.get("draft_hiddens")
             if not draft_hiddens:
                 raise RuntimeError(
                     "DSpark is trainable but the backbone did not collect draft_hiddens. "
                     "dspark_target_layer_ids must name live backbone layers."
                 )
-            outputs["dspark_hidden_states"] = self.model.forward_dspark_train(
-                inputs_embeds, position_ids, draft_hiddens, sequence_shard
+            draft, markov_bias = self.model.forward_dspark_train(
+                inputs_embeds, position_ids, draft_hiddens, sequence_shard, dspark_input_ids
             )
+            outputs["dspark_hidden_states"] = draft
+            if markov_bias is not None:
+                outputs["dspark_markov_bias"] = markov_bias
         return outputs
 
 
