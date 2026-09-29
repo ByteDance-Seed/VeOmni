@@ -71,7 +71,7 @@ class AllToAllEmbedding(torch.autograd.Function):
         num_input_ids = input_flat.shape[0]
         vocab_size = vocab_size_per_rank * emb_size
 
-        # --- Dispatching logic: which rank owns each id ---
+        # Bucket each id by the rank that owns its row.
         in_range = (input_flat >= 0) & (input_flat < vocab_size)
         id_rank = torch.where(in_range, input_flat // vocab_size_per_rank, 0)
         full_rank_index = torch.argsort(id_rank, stable=True)
@@ -79,7 +79,7 @@ class AllToAllEmbedding(torch.autograd.Function):
         # Per destination rank: (id count, "some id of mine is out of range").
         send_meta = torch.stack([send_counts, (~in_range).any().long().expand(emb_size)], dim=1)
 
-        # --- 1st collective: exchange per-pair counts and the range flags ---
+        # 1st collective: per-pair counts plus each rank's out-of-range flag.
         if sharded:
             recv_meta = torch.empty_like(send_meta)
             dist.all_to_all_single(recv_meta, send_meta, group=group)
@@ -96,7 +96,7 @@ class AllToAllEmbedding(torch.autograd.Function):
         send_rank_count_list = [count for count, _ in send_meta_list]
         receive_rank_count_list = [count for count, _ in recv_meta_list]
 
-        # --- 2nd collective: exchange token ids ---
+        # 2nd collective: send each id to its owner.
         send_ids = input_flat[full_rank_index].contiguous()
         if sharded:
             recv_ids = torch.empty(sum(receive_rank_count_list), dtype=input_flat.dtype, device=input_flat.device)
@@ -110,11 +110,11 @@ class AllToAllEmbedding(torch.autograd.Function):
         else:
             recv_ids = send_ids
 
-        # --- Local lookup on this rank's shard ---
+        # Look up the received ids in this rank's shard.
         local_indices = recv_ids - emb_rank * vocab_size_per_rank
         embs = F.embedding(local_indices, embedding_table)
 
-        # --- 3rd collective: ship looked-up embeddings back ---
+        # 3rd collective: send the embeddings back.
         if sharded:
             embs_recv = torch.empty(num_input_ids, embedding_dim, dtype=embs.dtype, device=embs.device)
             dist.all_to_all_single(
@@ -127,7 +127,7 @@ class AllToAllEmbedding(torch.autograd.Function):
         else:
             embs_recv = embs
 
-        # --- Reassemble to original input order ---
+        # Restore the input order.
         output = torch.empty(num_input_ids, embedding_dim, dtype=embs.dtype, device=embs.device)
         if num_input_ids > 0:
             output[full_rank_index] = embs_recv
