@@ -21,7 +21,7 @@ The image is based on `rocm/primus:v26.4` and ships a ROCm 7.14 stack tuned for 
 | triton | `3.7.0+gitb4e20bbe.rocm7.14.0a20260608` |
 | flash-attn | `2.8.3` |
 | aiter | `0.1.12.post2.dev214+gb5e03ed19` |
-| transformers | `5.12.1` |
+| transformers | `5.16.1` |
 | diffusers | `0.37.0` |
 | python | `3.12` |
 
@@ -121,25 +121,27 @@ python -c "from importlib.metadata import version; print(version('amd_aiter'))"
 
 ### Numerical parity
 
-Measured against a `flash_attention_2` baseline with the same seed and data:
+Measured against a `flash_attention_2` baseline with the same seed and data
+(`transformers==5.16.1`, 8×MI308X):
 
 | model | run | result |
 |---|---|---|
-| Wan2.1-1.3B DiT | 30 steps, LoRA | \|Δ\| < 0.01 on every step — no observable difference |
-| Qwen3-Omni-30B | 25 steps, full SFT | max \|Δ\| = 0.03, same as the 0.03 FA2-vs-FA2 baseline |
+| Wan2.1-1.3B DiT | 30 steps, LoRA | \|Δ\| = 0 on every step — no observable difference |
+| Qwen3-Omni-30B | 25 steps, full SFT | max \|Δ\| = 0.02 (mean 0.006) |
 
 ### Expected speedup
 
-Measured in end-to-end training with the default configs:
+Measured in end-to-end training with the default configs
+(`transformers==5.16.1`, 8×MI308X):
 
 | model | attention share of kernel time | s/step FA2 → aiter | speedup |
 |---|---|---|---|
-| Wan2.1-1.3B DiT | 57% | 5.42 → 4.25 | **1.28×** |
-| Qwen3-Omni-30B MoE | 7% (MoE group-gemm is 53%) | 36.0 → 35.0 | 1.03× |
+| Wan2.1-1.3B DiT | 57% | 5.00 → 4.00 | **1.25×** |
+| Qwen3-Omni-30B MoE | 7% (MoE group-gemm is 53%) | 27.0 → 26.0 | 1.04× |
 
 > Note: VeOmni packs short samples up to `max_seq_len`, so attention in the default Qwen run is block-diagonal and already cheap — that is why its speedup is lower than the sweep below, which feeds one unpacked sequence per step at the same length.
 
-The gain tracks attention's share of the step, and that share grows with sequence length, because attention is O(s²) while the rest of the step is linear.
+The gain tracks attention's share of the step, and that share grows with sequence length, because attention is O(s²) while the rest of the step is linear. Sequence-length sweeps below are unchanged from the `transformers==5.12.1` run (relative speedups still apply; absolute s/step on 5.16.1 is lower for the default configs above).
 
 | Wan2.1-1.3B DiT (LoRA, ulysses 2) | 8,064 | 16,422 (default) | 32,256 (real 480P) |
 |---|---|---|---|
