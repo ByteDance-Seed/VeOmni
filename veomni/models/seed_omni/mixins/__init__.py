@@ -15,6 +15,7 @@
 """SeedOmni mixins: base lifecycle plus training / inference graph hooks."""
 
 from .base_mixin import BaseMixin
+from .emb_parallel_mixin import EmbParallelMixin, VocabParallelEmbedding
 from .inference_module_mixin import InferenceModuleMixin, post_generate, pre_generate
 from .training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 
@@ -27,4 +28,6 @@ __all__ = [
     "post_forward",
     "pre_generate",
     "post_generate",
+    "EmbParallelMixin",
+    "VocabParallelEmbedding",
 ]
