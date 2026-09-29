@@ -205,6 +205,32 @@ def test_the_real_checkpoint_manager_reads_the_modules_train_args():
     assert manager.module_name == "vision_encoder"
 
 
+def test_the_module_checkpoint_manager_nests_every_artifact_under_the_module(monkeypatch):
+    """The base stops at the step directory; only the module manager adds a level."""
+    from veomni.models.seed_omni.utils.checkpoint import OmniModuleCheckpointManager
+    from veomni.trainer.callbacks import TrainerState
+
+    runtime = _unbuilt(nn.Linear(2, 2), accelerator=_fsdp("module"))
+    checkpoint = SimpleNamespace(manager="dcp", load_path=None, save_path="/run", model_assets_dir="/out/model_assets")
+    runtime.train_args = SimpleNamespace(checkpoint=checkpoint)
+    runtime.args.lora_config = None
+    monkeypatch.setattr(ModuleRuntime, "parallel_state", property(lambda self: "vision_ps"))
+
+    manager = OmniModuleCheckpointManager(runtime)
+    state = TrainerState(global_step=3)
+
+    assert manager.save_dir(state) == "/run/global_step_3/model/vision_encoder"
+    assert manager.weights_dir(state) == "/run/global_step_3/model/vision_encoder/ckpt"
+    assert manager.hf_export_dir(state) == "/run/global_step_3/hf_ckpt/vision_encoder"
+    assert manager.lora_export_dir(state) == "/run/global_step_3/lora_ckpt/vision_encoder"
+    assert manager.assets_dir() == "/out/model_assets/vision_encoder"
+    assert manager._checkpointer_kwargs() == {
+        "trainable_only": False,
+        "parallel_state": "vision_ps",
+        "module": "vision_encoder",
+    }
+
+
 def test_the_constructor_stores_training_args_where_the_base_reads_them(monkeypatch):
     for step in (
         "setup",

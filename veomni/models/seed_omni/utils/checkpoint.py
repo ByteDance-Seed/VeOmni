@@ -16,8 +16,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from ....checkpoint import layout
 from ....models.checkpoint_manager import ModelCheckpointManager
 from ....utils import logging
 
@@ -25,7 +26,6 @@ from ....utils import logging
 if TYPE_CHECKING:
     from ....arguments.omni_arguments_types import OmniModuleRuntimeArguments
     from ....trainer.callbacks import TrainerState
-    from ..accelerated.omni_module.omni_module_runtime import ModuleRuntime
 
 
 logger = logging.get_logger(__name__)
@@ -34,23 +34,41 @@ logger = logging.get_logger(__name__)
 class OmniModuleCheckpointManager(ModelCheckpointManager):
     """Own DCP / HF / LoRA save-load for one :class:`ModuleRuntime`.
 
-    Paths come from the base, which nests every artifact under
-    :attr:`module_name` — ``model/<module>/`` for the resume tree,
-    ``hf_ckpt/<module>/`` for the export. That is the whole reason
-    :mod:`veomni.checkpoint.layout` takes a ``module`` argument, so this class
-    builds no paths of its own.
+    Every module shares the job's step directory, so each artifact nests one
+    level deeper under :attr:`module_name` — ``model/<module>/`` for the resume
+    tree, ``hf_ckpt/<module>/`` for the export, ``model_assets/<module>/`` for
+    the sidecars, so two modules cannot overwrite each other's ``config.json``.
 
-    One thing does differ from a single-model job: the orchestrator puts the
-    save stage on ``state``, where the base takes it as an argument.
+    The save stage also differs from a single-model job: the orchestrator puts
+    it on ``state``, where the base takes it as an argument.
     """
 
-    def __init__(self, runtime: ModuleRuntime) -> None:
-        self.module_name = runtime.module_name
-        super().__init__(runtime)
+    @property
+    def module_name(self) -> str:
+        return self.runtime.module_name
 
     @property
     def args(self) -> OmniModuleRuntimeArguments:
         return self.runtime.args
+
+    def save_dir(self, state: TrainerState) -> str:
+        return layout.model_dir(self.step_dir(state), self.module_name)
+
+    def weights_dir(self, state: TrainerState) -> str:
+        return layout.weights_dir(self.step_dir(state), self.module_name)
+
+    def hf_export_dir(self, state: TrainerState) -> str:
+        return layout.hf_export_dir(self.step_dir(state), self.module_name)
+
+    def lora_export_dir(self, state: TrainerState) -> str:
+        return layout.lora_export_dir(self.step_dir(state), self.module_name)
+
+    def assets_dir(self) -> str:
+        return layout.assets_dir(self.config.model_assets_dir, self.module_name)
+
+    def _checkpointer_kwargs(self) -> dict[str, Any]:
+        """The checkpointer resolves ``model/<module>/`` under the step itself."""
+        return {**super()._checkpointer_kwargs(), "module": self.module_name}
 
     def save_hf_or_lora(self, state: TrainerState, stage: str = "step_end") -> None:
         """Route by LoRA, with the stage taken from ``state``.
