@@ -77,7 +77,7 @@ MetricMeterResult = Tuple[float, List[int]]
 
 
 class MetricMeterMixin:
-    """Optional per-module token + theoretical-FLOPs meter for SeedOmni V2."""
+    """Optional per-module token + theoretical-FLOPs meter for SeedOmni modules."""
 
     def metric_meter_set_seqlens(self, method: str, seqlens: List[int]) -> None:
         """Stash the FULL (pre-SP-slice) per-sample token lengths for call-site ``method``.

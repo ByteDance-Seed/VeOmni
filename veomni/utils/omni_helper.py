@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OmniModel V2 training-efficiency meter.
+"""OmniModel training-efficiency meter.
 
 Split out from :mod:`veomni.utils.helper` because the OmniModel metric input is a
 different shape from the single-model :class:`~veomni.utils.helper.EnvironMeter`:
@@ -46,7 +46,7 @@ logger = logging.get_logger(__name__)
 
 
 class OmniEnvironMeter:
-    """Training-efficiency meter for OmniModel V2 (per-module metrics + global roll-up).
+    """Training-efficiency meter for OmniModel (per-module metrics + global roll-up).
 
     Unlike :class:`~veomni.utils.helper.EnvironMeter` — which counts tokens and
     estimates FLOPs itself from a single ``model_type`` — ``OmniModel`` is a
