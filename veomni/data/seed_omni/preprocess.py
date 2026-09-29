@@ -39,21 +39,7 @@ def conv_preprocess(source: str, conversations, example, **kwargs) -> tuple[list
     preprocessor owns that alignment (the multi-turn edit preprocessor
     duplicates copy-image refs to express reuse).
     """
-    result = SEED_OMNI_PREPROCESSOR_REGISTRY[source](conversations, example, **kwargs)
-    if not (isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict)):
-        # Named rather than left to unpack sideways: the old contract was a
-        # 3- or 4-tuple of positional ref lists, and an out-of-repo
-        # preprocessor still on it would otherwise fail with a bare "too many
-        # values to unpack" naming neither the source nor the fix.
-        raise ValueError(
-            f"conv_preprocess: preprocessor for source {source!r} returned {type(result).__name__} "
-            f"{f'of length {len(result)}' if isinstance(result, tuple) else ''}; expected "
-            f"(constructed, media_refs) where media_refs is a dict keyed by item type. Migrate a legacy "
-            f"(constructed, image_refs, video_refs[, audio_refs]) return to "
-            f'(constructed, {{"image": image_refs, "video": video_refs, "audio": audio_refs}}) and drop the '
-            f"keys the source has no media for."
-        )
-    return result
+    return SEED_OMNI_PREPROCESSOR_REGISTRY[source](conversations, example, **kwargs)
 
 
 @SEED_OMNI_PREPROCESSOR_REGISTRY.register("imagenet1k")

@@ -10,7 +10,6 @@ import torch.nn as nn
 
 from veomni.arguments.omni_arguments_types import OmniGraphProfileArguments
 from veomni.models.seed_omni.accelerated import OmniModelRuntime
-from veomni.models.seed_omni.accelerated.utils import iter_named_omni_modules
 from veomni.models.seed_omni.accelerated.utils.executor import (
     TrainNodeRunner,
     execute_generation_node,
@@ -376,14 +375,3 @@ def test_train_node_runner_records_transitions_and_losses():
         f"transition: -> {n}" for n in g.execution_order[1:]
     ]
     assert [t for t in records if t.startswith("loss:")] == [f"loss:{n}" for n in g.execution_order]
-
-
-def test_iter_named_omni_modules_unwraps_ddp_style_wrapper():
-    g = TrainingGraph(_fan_in_edges())
-    raw_modules = _fake_modules(g)
-    wrapped_modules = {name: _DdpStyleWrapper(mod) for name, mod in raw_modules.items()}
-
-    resolved = dict(iter_named_omni_modules(list(raw_modules), wrapped_modules))
-    assert set(resolved) == set(raw_modules)
-    for name, raw in resolved.items():
-        assert raw is raw_modules[name]

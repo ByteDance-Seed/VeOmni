@@ -390,7 +390,7 @@ class OmniConfig(PretrainedConfig):
 
         That is the graph YAML sidecars and each module's typed config. A config
         built in memory rather than read from disk (a launcher's
-        ``OmniModelRuntimeConfig.to_hf_config()``) has its entries and graphs
+        ``OmniModelRuntimeArguments.to_hf_config()``) has its entries and graphs
         but no module configs; this fills them from ``checkpoint_root`` so the
         config can be handed to ``OmniModel.from_pretrained(path, config=...)``.
 

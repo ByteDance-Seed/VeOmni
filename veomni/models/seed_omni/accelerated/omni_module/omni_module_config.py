@@ -14,7 +14,7 @@
 
 """VeOmni per-module runtime config — the accelerated counterpart of ``OmniModuleConfig``.
 
-:class:`OmniModuleRuntimeConfig` is one module's slice of a composed Omni model:
+:class:`OmniModuleRuntimeArguments` is one module's slice of a composed Omni model:
 the inherited :class:`~veomni.arguments.arguments_types.ModelArguments` fields
 (``model_path``, ``ops_implementation``, ``accelerator``, ``optimizer``, freeze,
 LoRA) plus the projection onto an HF :class:`OmniModuleConfig` descriptor.
@@ -24,9 +24,7 @@ or :class:`~veomni.models.seed_omni.modules.module_configuration_base.OmniModule
 those are HuggingFace checkpoint shapes. This dataclass is the launcher/runtime
 view; :meth:`to_hf_config` is the one-way projection.
 
-``OmniModuleRuntimeArguments`` is the public alias kept in
-:mod:`veomni.arguments.omni_arguments_types` so existing launcher imports keep
-working. YAML resolution (``resolve_omni_model``, ``build_module_runtime_args``)
+It is re-exported from :mod:`veomni.arguments.omni_arguments_types`. YAML resolution (``build_omni_model_runtime_args``, ``build_omni_module_runtime_args``)
 stays in ``arguments/`` to avoid an arguments ↔ accelerated import cycle.
 """
 
@@ -38,17 +36,18 @@ from dataclasses import asdict, dataclass
 from .....arguments.arguments_types import ModelArguments
 
 
+LAUNCHER_CONFIG_KEYS = frozenset({"modules", "train_graph", "train_type", "infer_graph", "infer_type"})
+
+
 def hf_module_model_config(model_config: dict | None) -> dict:
     """Drop launcher layout keys before merging or exporting per-module ``model_config``."""
-    from .....arguments.omni_arguments_types import LAUNCHER_CONFIG_KEYS
-
     if not model_config:
         return {}
     return {key: value for key, value in model_config.items() if key not in LAUNCHER_CONFIG_KEYS}
 
 
 @dataclass
-class OmniModuleRuntimeConfig(ModelArguments):
+class OmniModuleRuntimeArguments(ModelArguments):
     """Per-module runtime — one module's slice of a composed Omni model.
 
     ``ModelArguments`` already is a complete training unit: the model
@@ -65,7 +64,7 @@ class OmniModuleRuntimeConfig(ModelArguments):
         repeated inside it.
 
         ``model_path`` is carried through explicitly: by the time this runs,
-        ``build_module_runtime_args`` / ``_resolve_model_path`` has already
+        ``build_omni_module_runtime_args`` / ``_resolve_model_path`` has already
         resolved it to an absolute path — usually ``<checkpoint_root>/<name>``,
         but a launcher YAML module override may point it at a wholly different
         checkpoint (e.g. Qwen3 visual-instruction-tuning composing
@@ -77,7 +76,7 @@ class OmniModuleRuntimeConfig(ModelArguments):
         for that module.
 
         Kernels are projected too, so a checkpoint remembers what each module
-        was trained with: ``build_module_runtime_args`` layers the entry under
+        was trained with: ``build_omni_module_runtime_args`` layers the entry under
         the launcher's per-module YAML, and a bare ``OmniModel.from_pretrained``
         applies it to the module config.
         """
@@ -94,6 +93,6 @@ class OmniModuleRuntimeConfig(ModelArguments):
 
 
 __all__ = [
-    "OmniModuleRuntimeConfig",
+    "OmniModuleRuntimeArguments",
     "hf_module_model_config",
 ]

@@ -12,8 +12,10 @@ from tests.seed_omni.helpers import load_from_omni, save_as_omni
 from veomni.arguments.omni_arguments_types import (
     OmniArguments,
     OmniDataArguments,
+    OmniInferArguments,
     OmniModelRuntimeArguments,
-    build_omni_model_runtime,
+    build_omni_model_runtime_args,
+    build_omni_module_runtime_args,
 )
 from veomni.models.seed_omni import (
     OMNI_ACCELERATED_MODEL_REGISTRY,
@@ -114,21 +116,17 @@ def _load_omni_config(
     model_config = {"modules": str(modules_path)}
     if train_graph_path is not None:
         model_config["train_graph"] = str(train_graph_path)
-    base = OmniArguments(
+    if infer_graph_path is not None:
+        model_config["infer_graph"] = str(infer_graph_path)
+    args = OmniArguments(
         model=OmniModelRuntimeArguments(
             model_path=model_path,
             model_config=model_config,
         ),
         data=OmniDataArguments(train_path="."),
-    )._to_module_global_args()
-    return build_omni_model_runtime(
-        global_args=base,
-        model_path=model_path,
-        train_modules=str(modules_path),
-        train_graph=str(train_graph_path) if train_graph_path else None,
-        infer_graph=str(infer_graph_path) if infer_graph_path else None,
-        generation_kwargs=generation_kwargs,
-    ).to_hf_config()
+        infer=OmniInferArguments(generation_kwargs=dict(generation_kwargs or {})),
+    )
+    return build_omni_model_runtime_args(args).to_hf_config()
 
 
 # ── Tiny configs used everywhere ──────────────────────────────────────────────
@@ -773,9 +771,7 @@ def test_janus_train_plus_infer_merges_generation_graph(infer_graph: str):
 
 def test_init_applies_eager_defaults_for_inference():
     """Inference applies all-eager defaults on top of ``model.model_config.modules``."""
-    from veomni.arguments.omni_arguments_types import build_module_runtime_args
-
-    runtime_args = build_module_runtime_args(
+    runtime_args = build_omni_module_runtime_args(
         global_args=_omni_base_args(model_path="/tmp/janus"),
         model_path="/tmp/janus",
         modules={
@@ -808,9 +804,7 @@ def test_init_resolves_relative_module_paths():
     assert cfg.generation_graph is not None
     assert cfg.generation_graph["initial"] == "prompt_encode"
 
-    from veomni.arguments.omni_arguments_types import build_module_runtime_args
-
-    runtime_args = build_module_runtime_args(
+    runtime_args = build_omni_module_runtime_args(
         global_args=_omni_base_args(model_path=root),
         model_path=root,
         modules=str(_janus_cfg_dir() / "infer/modules_infer_fsdp.yaml"),

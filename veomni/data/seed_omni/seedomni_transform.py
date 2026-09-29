@@ -56,8 +56,8 @@ say, i.e. a label.
 Video turns (``("video", _)``) are paired with the per-sample ``videos`` list
 and decoded via ``fetch_videos`` into a :class:`VideoInputs` payload — the
 sampled-frame tensor plus the optional in-video audio waveform.  Both streams
-ride on one media item; the intended split across a video and an audio module is
-recorded in ``docs/seed_omni/av_video_design.md`` (not implemented yet).
+ride on one media item; splitting them across a video and an audio module is
+not implemented yet.
 
 Both fetchers hand back ``(payload, meta)``. What the data layer *loaded* —
 frame timeline, sample rate — goes on ``ConversationItem.meta``, not into the
@@ -213,9 +213,8 @@ def process_seedomni_example(
             ``utils/image.resize_to_max_pixels``).  The fetchers drop every
             other keyword, so a knob named here that they do not read is
             ignored rather than rejected.
-            ``OmniTrainer`` injects ``tokenizer`` / ``max_seq_len`` /
-            ``text_keys`` here (legacy contract); they are silently
-            ignored — SeedOmni modules own their own tokenizer.
+            ``OmniTrainer`` passes ``data.mm_configs`` here; SeedOmni
+            modules own their own tokenizer.
 
     Returns:
         A single-element list ``[{"conversation_list": items}]`` to match

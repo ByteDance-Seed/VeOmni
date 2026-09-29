@@ -18,26 +18,23 @@ Layout:
 
 * :mod:`.omni_module` — per-module config + runtime
 * :mod:`.omni_model` — composite config + runtime
-* :mod:`.utils` — dispatch, executors, module save/iter helpers
+* :mod:`.utils` — dispatch, executors, per-module save helper
 
-``OmniModuleRuntimeConfig`` / ``OmniModelRuntimeConfig`` are lightweight
-dataclasses. ``omni_module_runtime`` / ``dispatch`` are heavier submodules —
-import them explicitly
-(``from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import …``)
-to avoid pulling trainer/distributed setup into every ``seed_omni`` import.
 Per-module checkpoint I/O lives in ``veomni.models.seed_omni.utils.checkpoint``.
 """
 
-from .omni_model.omni_model_config import OmniModelRuntimeConfig
-from .omni_model.omni_model_runtime import OmniModelRuntime
-from .omni_module.omni_module_config import OmniModuleRuntimeConfig
-from .utils.executor import TrainNodeRunner, execute_generation_node
+from .omni_model import OmniModelRuntime, OmniModelRuntimeArguments, build_omni_model_runtime
+from .omni_module import ModuleRuntime, OmniModuleRuntimeArguments, build_omni_module_runtime
+from .utils import TrainNodeRunner, execute_generation_node
 
 
 __all__ = [
+    "ModuleRuntime",
     "OmniModelRuntime",
-    "OmniModelRuntimeConfig",
-    "OmniModuleRuntimeConfig",
+    "OmniModelRuntimeArguments",
+    "OmniModuleRuntimeArguments",
     "TrainNodeRunner",
+    "build_omni_model_runtime",
+    "build_omni_module_runtime",
     "execute_generation_node",
 ]

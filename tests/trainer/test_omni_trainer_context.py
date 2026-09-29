@@ -80,8 +80,8 @@ def test_build_activation_offloading_enabled():
     assert isinstance(bwd, nullcontext)
 
 
-def test_build_step_contexts_offload_flags():
-    """Smoke: _build_step_contexts wires nullcontext when offload is disabled."""
+def test_build_training_context_offload_flags():
+    """Smoke: _build_training_context wires nullcontext when offload is disabled."""
     from veomni.trainer.omni.omni_trainer import OmniTrainer
 
     trainer = object.__new__(OmniTrainer)
@@ -94,9 +94,9 @@ def test_build_step_contexts_offload_flags():
         ),
         train=SimpleNamespace(enable_batch_invariant_mode=False),
     )
-    OmniTrainer._build_step_contexts(trainer)
-    assert isinstance(trainer.fwd_activation_offload_ctx, nullcontext)
-    assert isinstance(trainer.bwd_activation_offload_ctx, nullcontext)
+    OmniTrainer._build_training_context(trainer)
+    assert isinstance(trainer.model_fwd_context, nullcontext)
+    assert isinstance(trainer.model_bwd_context, nullcontext)
 
 
 def test_omni_model_runtime_collect_step_metrics_skips_empty_meters():

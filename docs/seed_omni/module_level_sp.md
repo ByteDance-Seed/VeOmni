@@ -41,7 +41,7 @@
 
 ### 3.1 Uniform outer SP + 复制数据
 
-- 最外侧 `accelerator.ulysses_size` 承载**统一** SP size；各模块经 `build_module_runtime_args` 的 accelerator deep-merge **继承**该值。框架**不**校验一致性——模块 YAML 里写 per-module `ulysses_size` 覆盖会静默产生非 uniform SP，不要这么用。
+- 最外侧 `accelerator.ulysses_size` 承载**统一** SP size；各模块经 `build_omni_module_runtime_args` 的 accelerator deep-merge **继承**该值。框架**不**校验一致性——模块 YAML 里写 per-module `ulysses_size` 覆盖会静默产生非 uniform SP，不要这么用。
 - dataloader 用 `BaseTrainer` 的标准 build-time sharded loader：给出 `dp_size = world / sp` 条 **distinct** shard，并把每条 shard **复制**到其 SP 组的所有 rank（collator 不做按模态切分）。因此一个 SP 组内每卡持有**相同**样本。
 - 每个开 SP 的模块在 `pre_forward` 内以 `if get_parallel_state().sp_size > 1:` 分支把复制样本**切 1/sp**（`sp_pad` + `slice_input_tensor` / `sp_pad_and_slice`），跑**一次**前向（attention 组内 all-to-all），再在 `post_forward` 内的同名分支 **all-gather** 回全序列（`gather_outputs`）。SP 逻辑完全收在模块自己的 `pre_forward` / `post_forward` 里（与 veomni v1 单模型 SP 一致，无独立 sp hook）。forward 与 backward 峰值均 ≈ `1/sp`。
 

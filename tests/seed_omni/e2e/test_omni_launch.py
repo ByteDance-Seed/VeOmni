@@ -23,10 +23,10 @@ import pytest
 from veomni.checkpoint import layout
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_torch_device
 
-from ..tools.launch_utils import find_free_port
+from ...tools.launch_utils import find_free_port
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 CFG_DIR = REPO_ROOT / "configs" / "seed_omni" / "fake_model"
 BASE_YAML = CFG_DIR / "train" / "base.yaml"
 MODULES = ("fake_module_a", "fake_module_b")

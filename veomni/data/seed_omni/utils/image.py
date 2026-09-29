@@ -47,7 +47,7 @@ def load_image(image: ImageInput) -> Image.Image:
         img = image
     elif isinstance(image, str):
         if image.startswith(("http://", "https://")):
-            response = requests.get(image, stream=True)
+            response = requests.get(image, timeout=(5, 30))
             response.raise_for_status()
             img = Image.open(BytesIO(response.content))
         else:

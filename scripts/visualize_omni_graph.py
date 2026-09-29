@@ -35,7 +35,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Literal
 
-from veomni.arguments.omni_arguments_types import OmniArguments
+from veomni.arguments.omni_arguments_types import OmniArguments, build_omni_model_runtime_args
 from veomni.arguments.omni_parser import parse_omni_args
 from veomni.models.seed_omni.utils.visualize import (
     render_generation_mermaid,
@@ -174,7 +174,7 @@ def main() -> None:
     # One config carries every scenario, so the FSMs below need no rebuild per key.
     # Diagrams only read graphs, so the runtime config serves directly — no need to
     # project onto an OmniConfig.
-    cfg_train = args.resolve_model()
+    cfg_train = build_omni_model_runtime_args(args)
     train_title = f"{launcher_label} — training"
     train_body = render_training_mermaid(cfg_train, title=train_title)
     train_path = os.path.join(out_dir, "training" + ext)

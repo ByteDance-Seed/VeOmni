@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch.distributed as dist
 
@@ -30,7 +30,6 @@ from ..mixins.offline_encoding_mixin import OfflineEncodingMixin
 if TYPE_CHECKING:
     from ....arguments.omni_arguments_types import OmniModuleRuntimeArguments
     from ....trainer.callbacks import TrainerState
-    from ..accelerated.omni_module.omni_module_runtime import ModuleRuntime
 
 
 logger = logging.get_logger(__name__)
@@ -39,37 +38,30 @@ logger = logging.get_logger(__name__)
 class OmniModuleCheckpointManager(ModelCheckpointManager):
     """Own DCP / HF / LoRA save-load for one :class:`ModuleRuntime`.
 
-    Paths come from the base, which nests every artifact under
-    :attr:`module_name` — ``model/<module>/`` for the resume tree,
-    ``hf_ckpt/<module>/`` for the export. That is the whole reason
-    :mod:`veomni.checkpoint.layout` takes a ``module`` argument, so this class
-    builds no paths of its own.
+    Every module shares the job's step directory, so each artifact nests one
+    level deeper under :attr:`module_name` — ``model/<module>/`` for the resume
+    tree, ``hf_ckpt/<module>/`` for the export, ``model_assets/<module>/`` for
+    the sidecars, so two modules cannot overwrite each other's ``config.json``.
 
-    Three things do differ from a single-model job:
-
-    * **Offline cache.** A module whose ``cache_mode`` is not ``full`` has its
-      encoder output precomputed, so there is no ordinary DCP state to write and
-      its HF artifact is merged from the frozen source rather than converted
-      from shards.
-    * **Export assets.** A module's config/tokenizer/processor are bound onto
-      the model, not cached beside it, so they are read off the live model.
-    * **Stage.** The orchestrator puts the save stage on ``state``, where the
-      base takes it as an argument.
+    A module whose ``cache_mode`` is not ``full`` has its encoder output
+    precomputed (offline cache), so there is no ordinary DCP state to write and
+    its HF artifact is merged from the frozen source rather than converted from
+    shards.
     """
 
-    def __init__(self, runtime: ModuleRuntime) -> None:
-        self.module_name = runtime.module_name
-        super().__init__(runtime)
+    @property
+    def module_name(self) -> str:
+        return self.runtime.module_name
 
     @property
     def args(self) -> OmniModuleRuntimeArguments:
         return self.runtime.args
 
-    @property
-    def hf_export_assets(self) -> list:
-        """Read off the live model — ``ModuleRuntime._build_model_assets`` binds
-        this module's sidecars onto it instead of caching them on the runtime."""
-        return self.runtime.collect_hf_export_assets()
+    def save_dir(self, state: TrainerState) -> str:
+        return layout.model_dir(self.step_dir(state), self.module_name)
+
+    def weights_dir(self, state: TrainerState) -> str:
+        return layout.weights_dir(self.step_dir(state), self.module_name)
 
     def _offline_cache_model(self) -> OfflineEncodingMixin | None:
         """The module's own model when its encoder output is precomputed, else None.
@@ -125,15 +117,18 @@ class OmniModuleCheckpointManager(ModelCheckpointManager):
             dist.barrier()
         self._last_saved_step = state.global_step
 
-    def save_hf_or_lora(self, state: TrainerState, stage: str = "step_end") -> None:
-        """Route by LoRA, with the stage taken from ``state``.
+    def hf_export_dir(self, state: TrainerState) -> str:
+        return layout.hf_export_dir(self.step_dir(state), self.module_name)
 
-        ``ModuleRuntime.save_hf_or_lora`` drops the keyword, so the base's
-        default would report a train-end export as ``step_end`` and keep the
-        optimizer alive through it.
-        """
-        del stage
-        super().save_hf_or_lora(state, stage=state.stage or "step_end")
+    def lora_export_dir(self, state: TrainerState) -> str:
+        return layout.lora_export_dir(self.step_dir(state), self.module_name)
+
+    def assets_dir(self) -> str:
+        return layout.assets_dir(self.config.model_assets_dir, self.module_name)
+
+    def _checkpointer_kwargs(self) -> dict[str, Any]:
+        """The checkpointer resolves ``model/<module>/`` under the step itself."""
+        return {**super()._checkpointer_kwargs(), "module": self.module_name}
 
 
 __all__ = ["OmniModuleCheckpointManager"]

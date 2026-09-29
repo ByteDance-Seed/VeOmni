@@ -19,7 +19,7 @@ import pickle
 
 import torch
 
-from veomni.data.data_collator import SeedOmniCollator
+from veomni.data.seed_omni.collator import SeedOmniCollator
 from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import (
     _OMNI_POSITION_IDS as BAGEL_SIGLIP_POSITION_IDS,
 )

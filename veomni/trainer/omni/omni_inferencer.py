@@ -38,13 +38,17 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from ...arguments.omni_arguments_types import OmniArguments, OmniModuleRuntimeArguments
-from ...models.seed_omni.accelerated import OmniModelRuntime
+from ...arguments.omni_arguments_types import (
+    OmniArguments,
+    OmniModuleRuntimeArguments,
+    build_omni_model_runtime_args,
+)
+from ...models.seed_omni.accelerated import OmniModelRuntime, build_omni_model_runtime
 from ...models.seed_omni.modeling_omni import OmniModel
 from ...models.seed_omni.processing_omni import OmniProcessor
 from ...models.seed_omni.utils.graph_profiler import GraphProfiler
 from ...utils import helper
-from .omni_trainer import OmniTrainer
+from .omni_trainer import OmniTrainer, batch_to_device
 
 
 logger = helper.create_logger(__name__)
@@ -57,7 +61,7 @@ def _module_needs_distributed(module_args: OmniModuleRuntimeArguments) -> bool:
     whenever it is **not** a single-process ``eager`` load — i.e. ``fsdp2``
     (incl. expert-parallel ``ep`` / vocab-parallel ``emb``) or ``ddp`` (a replicated backbone alongside
     the sharded modules). ``eager`` is the inference default
-    (``build_module_runtime_args``) and loads via ``device_map`` without collectives.
+    (``build_omni_module_runtime_args``) and loads via ``device_map`` without collectives.
     """
     fsdp_mode = module_args.accelerator.fsdp_config.fsdp_mode
     return bool(fsdp_mode and str(fsdp_mode).lower() not in ("eager",))
@@ -89,19 +93,19 @@ class OmniInferencer:
         self.args = args
 
         self.checkpoint_root = args.model.model_path
-        self.omni_model_runtime = args.resolve_model(for_inference=True)
+        self.omni_model_runtime = build_omni_model_runtime_args(args, for_inference=True)
 
         self._distributed = any(
             _module_needs_distributed(self.omni_model_runtime.modules[name])
             for name in self.omni_model_runtime.module_names
         )
         if self._distributed:
-            self.device = OmniTrainer.setup_distributed(args)
+            self.device = OmniTrainer._setup(args, save_launch_args=False)
         helper.set_seed(args.infer.seed)
         self._build_model()
 
         # Nest artefacts under <output_dir>/<infer_type>/ (infer_type is resolved
-        # during resolve_model(for_inference=True) when left unset).
+        # during build_omni_model_runtime_args(for_inference=True) when left unset).
         infer_type = args.model.launcher_config("infer_type")
         args.infer.output_dir = os.path.join(args.infer.output_dir, infer_type)
         logger.info_rank0(f"OmniInferencer: model_path = {self.checkpoint_root}")
@@ -130,7 +134,7 @@ class OmniInferencer:
         """
         self.module_names = self.omni_model_runtime.module_names
         if self._distributed:
-            self.model = OmniModelRuntime.from_model_runtime(
+            self.model = build_omni_model_runtime(
                 self.omni_model_runtime,
                 for_inference=True,
             )
@@ -149,8 +153,6 @@ class OmniInferencer:
             )
         self.processor = OmniProcessor.from_config(self.model.config, checkpoint_root=self.checkpoint_root)
         self.model_config = self.model.config
-
-    # ── Inference entry point ─────────────────────────────────────────────────
 
     def _runtime_generation_kwargs(self) -> dict[str, Any]:
         """Return per-request generation kwargs with the resolved scenario attached."""
@@ -240,6 +242,11 @@ class OmniInferencer:
             mm_configs=req.mm_configs or None,
             inference=True,
         )
+        if self._distributed:
+            # Every module sits on this rank's device, as in training. An eager
+            # ``device_map="auto"`` load may spread modules across devices, so
+            # there each module's ``pre_generate`` places its own inputs.
+            request_dict = batch_to_device(request_dict, self.device)
         self.model.reset()
         profiler = self._begin_graph_trace()
         with torch.no_grad():

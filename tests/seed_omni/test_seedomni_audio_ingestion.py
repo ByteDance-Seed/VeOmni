@@ -306,23 +306,6 @@ def _declared_rate_source():
 
 
 @pytest.fixture
-def _legacy_tuple_source():
-    """A source still on the positional-tuple contract, registered for one test.
-
-    Via the local-override path rather than ``register``, which raises on a
-    duplicate key and would make this file fail on a second collection while
-    leaving the key visible to every later test in the process.
-    """
-    SEED_OMNI_PREPROCESSOR_REGISTRY["_legacy_tuple"] = lambda conversations, example, **kwargs: (
-        [["user", ("text", "hi")]],
-        [],
-        [],
-    )
-    yield "_legacy_tuple"
-    del SEED_OMNI_PREPROCESSOR_REGISTRY["_legacy_tuple"]
-
-
-@pytest.fixture
 def _unknown_modality_source():
     """A source declaring refs for a modality that has no fetcher yet."""
     SEED_OMNI_PREPROCESSOR_REGISTRY["_unknown_modality"] = lambda conversations, example, **kwargs: (
@@ -343,21 +326,6 @@ def test_a_declared_rate_that_contradicts_the_file_is_refused(_declared_rate_sou
     """
     with pytest.raises(ValueError, match=f"declares meta key\\(s\\) \\['{AUDIO_METADATA_KEY}'\\]"):
         process_seedomni_example({"source_name": _declared_rate_source, "audios": [_wav_bytes(0.5, 22050)]})
-
-
-def test_a_preprocessor_on_the_old_positional_contract_is_told_how_to_migrate(_legacy_tuple_source):
-    """The registry is an extension point — a preprocessor for a private corpus
-    lives outside this repo — so the break has to name itself.
-
-    Left to unpack, a legacy 3-tuple would fail with a bare "too many values to
-    unpack" naming neither the source nor the new shape.
-    """
-    with pytest.raises(ValueError, match="expected \\(constructed, media_refs\\)") as excinfo:
-        conv_preprocess(_legacy_tuple_source, None, {})
-
-    message = str(excinfo.value)
-    assert _legacy_tuple_source in message
-    assert '{"image": image_refs' in message  # the migration it should do
 
 
 def test_refs_for_a_modality_with_no_fetcher_are_refused_by_name(_unknown_modality_source):

@@ -55,13 +55,16 @@ def execute_train_node(
     module_context = scope_fn(node.module) if scope_fn is not None else nullcontext()
     profile_context = profiler.node(f"forward:{node.name}") if profiler is not None else nullcontext()
     with module_context, profile_context:
-        inputs = raw.pre_forward(method=method, **batch)
+        pre_forward = getattr(raw, "pre_forward", None)
+        inputs = pre_forward(method=method, **batch) if pre_forward is not None else batch
 
         if hasattr(raw, "metric_meter_add"):
             raw.metric_meter_add(method, inputs)
 
         outputs = call_graph_endpoint(wrapped, raw, method=method, kwargs=inputs)
-        outputs = raw.post_forward(method=method, **outputs)
+        post_forward = getattr(raw, "post_forward", None)
+        if post_forward is not None:
+            outputs = post_forward(method=method, **outputs)
 
     batch.update(outputs)
     return batch

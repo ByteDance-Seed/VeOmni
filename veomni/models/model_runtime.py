@@ -333,22 +333,17 @@ class VeOmniModelRuntime:
 
         self.chat_template = build_chat_template(self.args.chat_template, preprocessor)
 
-    def _build_parallelized_model(self) -> None:
-        """FSDP2/DDP-wrap the model and load its weights.
+    def _apply_async_activation_offload(self) -> None:
+        """Patch this model's offload targets for async activation offload, if enabled.
 
-        The wrap preserves ``requires_grad`` (the shard inherits it) and the
-        loader writes weights in place, so a freeze applied in
-        :meth:`_freeze_model_module` survives and is not re-asserted here.
+        Must run BEFORE FSDP2 sharding. Uses per-instance __call__ patching so
+        that async_save_on_cpu is OUTER to the checkpoint boundary pushed by
+        GradientCheckpointingLayer, matching MindSpeed-MM's GC+async offload
+        behavior: hidden_states inputs are offloaded to CPU (via
+        _NoopSaveInputs), while intermediate activations are handled by GC
+        recomputation (via _checkpoint_hook).
         """
-        args = self.args
-
-        # Apply async activation offload BEFORE FSDP2 sharding.
-        # Uses per-instance __call__ patching so that async_save_on_cpu is
-        # OUTER to the checkpoint boundary pushed by GradientCheckpointingLayer,
-        # matching MindSpeed-MM's GC+async offload behavior: hidden_states
-        # inputs are offloaded to CPU (via _NoopSaveInputs), while intermediate
-        # activations are handled by GC recomputation (via _checkpoint_hook).
-        offload_config = args.accelerator.offload_config
+        offload_config = self.args.accelerator.offload_config
         if offload_config.enable_async_activation:
             from ..distributed.async_offload import apply_async_activation_offload
 
@@ -357,6 +352,24 @@ class VeOmniModelRuntime:
                 offload_config.activation_offload_modules,
                 host_cache_limit_bytes=int(offload_config.activation_offload_host_cache_limit_gb * 1024**3),
             )
+
+    def _build_parallelized_model(self) -> None:
+        """FSDP2/DDP-wrap the model and load its weights.
+
+        The wrap preserves ``requires_grad`` (the shard inherits it) and the
+        loader writes weights in place, so a freeze applied in
+        :meth:`_freeze_model_module` survives and is not re-asserted here.
+        """
+        args = self.args
+        if args.accelerator.fsdp_config.fsdp_mode == "eager":
+            # ``build_parallelize_model`` has no unwrapped branch, so an eager
+            # mode reaching it would be handed to DDP instead.
+            raise ValueError(
+                "model.accelerator.fsdp_config.fsdp_mode='eager' is only supported by SeedOmni "
+                "module inference (ModuleRuntime._init_eager_inference)."
+            )
+
+        self._apply_async_activation_offload()
 
         # Customized parallelize model.
         customized_parallelize_model_function = getattr(self.model, "build_parallelize_model", None)
@@ -453,9 +466,9 @@ class VeOmniModelRuntime:
             return
 
         # Customized LoRA model setup.
-        model_setup_lora = getattr(self.model, "setup_lora", None)
-        if callable(model_setup_lora):
-            customized_lora_model = model_setup_lora(lora_config)
+        customized_setup_lora_function = getattr(self.model, "setup_lora", None)
+        if callable(customized_setup_lora_function):
+            customized_lora_model = customized_setup_lora_function(lora_config)
             if customized_lora_model is not None:
                 self.model = customized_lora_model
                 logger.info_rank0("Setup customized LoRA model.")

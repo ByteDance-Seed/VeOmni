@@ -1,15 +1,19 @@
 """Tests for the per-module accelerator training knobs moved off `OmniTrainingArguments`.
 
 Covers: `AcceleratorConfig` gaining the SeedOmni-only fields, per-module
-`accelerator.*` override survival through `build_module_runtime_args`, and
+`accelerator.*` override survival through `build_omni_module_runtime_args`, and
 `_validate_omni_accelerator` being invoked both for the top-level default
-(`OmniArguments.__post_init__`) and per resolved module (`resolve_omni_model`).
+(`OmniArguments.__post_init__`) and per resolved module (`build_omni_model_runtime_args`).
+
+The resolution tests run on the in-tree ``fake_module_a -> fake_module_b``
+chain (``configs/seed_omni/fake_model/``), so they need no real model config.
 """
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -26,31 +30,39 @@ from veomni.arguments.omni_arguments_types import (
     OmniInferArguments,
     OmniModelRuntimeArguments,
     OmniModuleRuntimeArguments,
+    OmniTrainingArguments,
     _validate_omni_accelerator,
-    build_module_runtime_args,
+    build_omni_model_runtime_args,
+    build_omni_module_runtime_args,
 )
+from veomni.models.model_runtime import VeOmniModelRuntime
 
 
-def _janus_cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "Janus" / "janus_1.3b"
+MODULE_A = "fake_module_a"
+MODULE_B = "fake_module_b"
 
 
-def _janus_args(*, modules_override: dict | None = None) -> OmniArguments:
-    cfg_dir = _janus_cfg_dir()
+def _cfg_dir() -> Path:
+    return Path(__file__).resolve().parents[3] / "configs" / "seed_omni" / "fake_model"
+
+
+def _fake_args(*, modules_override: dict | None = None) -> OmniArguments:
+    cfg_dir = _cfg_dir()
+    modules_yaml = str(cfg_dir / "train/modules_train.yaml")
     model_config = {
-        "modules": str(cfg_dir / "train/modules_train.yaml"),
+        "modules": modules_yaml,
         "train_graph": str(cfg_dir / "train/graph_train.yaml"),
         "infer_graph": {"infer_gen": str(cfg_dir / "infer/graph_infer_gen.yaml")},
     }
     if modules_override is not None:
-        with open(cfg_dir / "train/modules_train.yaml") as f:
+        with open(modules_yaml) as f:
             loaded = yaml.safe_load(f)
         for name, override in modules_override.items():
             loaded.setdefault(name, {})
             loaded[name] = {**loaded[name], **override}
         model_config["modules"] = loaded
     return OmniArguments(
-        model=OmniModelRuntimeArguments(model_path="/tmp/janus", model_config=model_config),
+        model=OmniModelRuntimeArguments(model_path="/tmp/fake_omni", model_config=model_config),
         data=OmniDataArguments(train_path=""),
         infer=OmniInferArguments(),
     )
@@ -63,6 +75,22 @@ def test_accelerator_config_has_seed_omni_fields_with_expected_defaults():
     assert isinstance(acc.torch_compile, TorchCompileConfig)
     assert not hasattr(acc, "broadcast_model_weights_from_rank0")
     assert not hasattr(acc, "ep_sharded_stream_load")
+
+
+def test_fsdp_scope_defaults_to_module_and_rejects_unknown_values():
+    assert AcceleratorConfig().fsdp_config.fsdp_scope == "module"
+    with pytest.raises(ValueError, match="fsdp_scope"):
+        FSDPConfig(fsdp_scope="everything")
+
+
+def test_the_generic_runtime_refuses_eager_rather_than_falling_back_to_ddp():
+    """``eager`` is valid config (SeedOmni module inference returns before any
+    wrap), but ``build_parallelize_model`` has no unwrapped branch."""
+    runtime = VeOmniModelRuntime.__new__(VeOmniModelRuntime)
+    runtime.args = SimpleNamespace(accelerator=AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="eager")))
+
+    with pytest.raises(ValueError, match="eager"):
+        runtime._build_parallelized_model()
 
 
 def test_module_runtime_arguments_inherit_weight_load_knobs():
@@ -109,7 +137,7 @@ def test_omni_arguments_post_init_validates_the_top_level_default():
     with pytest.raises(ValueError, match="torch_compile"):
         OmniArguments(
             model=OmniModelRuntimeArguments(
-                model_path="/tmp/janus",
+                model_path="/tmp/fake_omni",
                 accelerator=AcceleratorConfig(torch_compile=TorchCompileConfig(enable=True)),
             ),
             data=OmniDataArguments(train_path=""),
@@ -117,13 +145,23 @@ def test_omni_arguments_post_init_validates_the_top_level_default():
         )
 
 
-def test_build_module_runtime_args_merges_per_module_gradient_checkpointing_override():
+def test_omni_arguments_post_init_refuses_the_moe_router_monitor():
+    with pytest.raises(AssertionError, match="moe_load_balance_monitor_interval"):
+        OmniArguments(
+            model=OmniModelRuntimeArguments(model_path="/tmp/fake_omni"),
+            data=OmniDataArguments(train_path=""),
+            train=OmniTrainingArguments(moe_load_balance_monitor_interval=10),
+            infer=OmniInferArguments(),
+        )
+
+
+def test_build_omni_module_runtime_args_merges_per_module_gradient_checkpointing_override():
     """Global `model.accelerator.gradient_checkpointing` is the base; per-module YAML can override."""
     global_args = OmniModuleRuntimeArguments(
         model_path="/tmp/model",
         accelerator=AcceleratorConfig(gradient_checkpointing=GradientCheckpointingConfig(enable=True)),
     )
-    modules = build_module_runtime_args(
+    modules = build_omni_module_runtime_args(
         global_args,
         "/tmp/model",
         {
@@ -135,13 +173,13 @@ def test_build_module_runtime_args_merges_per_module_gradient_checkpointing_over
     assert modules["module_b"].accelerator.gradient_checkpointing.enable is True
 
 
-def test_build_module_runtime_args_merges_per_module_weight_load_override():
+def test_build_omni_module_runtime_args_merges_per_module_weight_load_override():
     """Global `model.broadcast_*` is the base; a per-module overlay can override it."""
     global_args = OmniModuleRuntimeArguments(
         model_path="/tmp/model",
         broadcast_model_weights_from_rank0=True,
     )
-    modules = build_module_runtime_args(
+    modules = build_omni_module_runtime_args(
         global_args,
         "/tmp/model",
         {
@@ -153,15 +191,13 @@ def test_build_module_runtime_args_merges_per_module_weight_load_override():
     assert modules["module_b"].broadcast_model_weights_from_rank0 is True
 
 
-def test_resolve_omni_model_accepts_valid_per_module_accelerator_override():
+def test_build_omni_model_runtime_args_accepts_valid_per_module_accelerator_override():
     """A per-module `accelerator.*` override that passes validation resolves cleanly."""
-    args = _janus_args(
-        modules_override={"janus_llama": {"accelerator": {"gradient_checkpointing": {"enable": False}}}}
-    )
-    modules = args.resolve_model().modules
-    assert modules["janus_llama"].accelerator.gradient_checkpointing.enable is False
+    args = _fake_args(modules_override={MODULE_B: {"accelerator": {"gradient_checkpointing": {"enable": False}}}})
+    modules = build_omni_model_runtime_args(args).modules
+    assert modules[MODULE_B].accelerator.gradient_checkpointing.enable is False
     # Untouched modules keep the top-level default.
-    assert modules["janus_siglip"].accelerator.gradient_checkpointing.enable is True
+    assert modules[MODULE_A].accelerator.gradient_checkpointing.enable is True
 
 
 @pytest.fixture
@@ -180,28 +216,42 @@ def veomni_caplog(caplog):
         logger.removeHandler(caplog.handler)
 
 
-def test_resolve_omni_model_for_inference_forces_eager_without_broadcast_warning(veomni_caplog):
-    """`for_inference=True` forces `fsdp_mode=eager` per module (for modules that don't already
-    pin their own `fsdp_mode`, e.g. `janus_text_encoder`); `broadcast_model_weights_from_rank0`
-    is forced off alongside it so the eager default does not inherit a rank0-broadcast load
-    policy that cannot run without a wrap (see `build_module_runtime_args`).
+def test_build_omni_model_runtime_args_for_inference_forces_eager_without_broadcast_warning(veomni_caplog):
+    """`for_inference=True` forces `fsdp_mode=eager` for a module that does not pin its own.
+
+    The override replaces `MODULE_B`'s whole `accelerator` block, so the module
+    reaches resolution with no `fsdp_config` of its own and inference picks the
+    eager default for it; `MODULE_A` pins `ddp` and keeps it.
+    `broadcast_model_weights_from_rank0` is forced off alongside eager so the
+    default does not inherit a rank0-broadcast load policy that cannot run
+    without a wrap (see `build_omni_module_runtime_args`).
     """
-    args = _janus_args()
+    args = _fake_args(modules_override={MODULE_B: {"accelerator": {"gradient_checkpointing": {"enable": False}}}})
     with veomni_caplog.at_level("WARNING"):
-        modules = args.resolve_model(for_inference=True).modules
-    assert modules["janus_text_encoder"].accelerator.fsdp_config.fsdp_mode == "eager"
-    assert modules["janus_text_encoder"].broadcast_model_weights_from_rank0 is False
+        modules = build_omni_model_runtime_args(args, for_inference=True).modules
+    assert modules[MODULE_B].accelerator.fsdp_config.fsdp_mode == "eager"
+    assert modules[MODULE_B].broadcast_model_weights_from_rank0 is False
+    assert modules[MODULE_A].accelerator.fsdp_config.fsdp_mode == "ddp"
     assert "broadcast_model_weights_from_rank0" not in veomni_caplog.text
 
 
-def test_resolve_omni_model_validates_each_module_accelerator():
+def test_build_omni_model_runtime_args_validates_each_module_accelerator():
     """A per-module override that fails `_validate_omni_accelerator` must raise at resolve time.
 
     The top-level `model.accelerator` default passes validation on its own (no
-    `torch_compile.enable`); only the `janus_llama` module override sets it, so this
-    only fails because `resolve_omni_model` validates every resolved module's own
+    `torch_compile.enable`); only the module override sets it, so this only
+    fails because `build_omni_model_runtime_args` validates every resolved module's own
     `accelerator`, not just the top-level default.
     """
-    args = _janus_args(modules_override={"janus_llama": {"accelerator": {"torch_compile": {"enable": True}}}})
+    args = _fake_args(modules_override={MODULE_B: {"accelerator": {"torch_compile": {"enable": True}}}})
     with pytest.raises(ValueError, match="torch_compile"):
-        args.resolve_model()
+        build_omni_model_runtime_args(args)
+
+
+def test_build_omni_model_runtime_args_rejects_an_eager_module_under_the_composed_wrap():
+    """``fsdp_scope='model'`` wraps the composed OmniModel once; an eager module is
+    loaded unwrapped, so nothing would shard it."""
+    args = _fake_args(modules_override={MODULE_B: {"accelerator": {"fsdp_config": {"fsdp_mode": "eager"}}}})
+    args.model.accelerator.fsdp_config.fsdp_scope = "model"
+    with pytest.raises(ValueError, match=rf"fsdp_mode='eager': \['{MODULE_B}'\]"):
+        build_omni_model_runtime_args(args)

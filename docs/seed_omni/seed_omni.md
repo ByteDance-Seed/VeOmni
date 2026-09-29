@@ -645,9 +645,9 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 | `graphs/generation_graph.py` | FSM view (states / transitions / signals) |
 | `configuration_omni.py` | `OmniConfig` — plain `PretrainedConfig`, checkpoint read/write only |
 | `modules/module_configuration_base.py` | `OmniModuleConfig` — per-module HF descriptor |
-| `accelerated/omni_model/omni_model_config.py` | `OmniModelRuntimeConfig` — accelerated composite (`ModelArguments`); `.to_hf_config()` → `OmniConfig` |
+| `accelerated/omni_model/omni_model_config.py` | `OmniModelRuntimeArguments` — accelerated composite (`ModelArguments`); `.to_hf_config()` → `OmniConfig` |
 | `accelerated/omni_model/omni_model_runtime.py` | `OmniModelRuntime` — composed graph loops over one `OmniModel` |
-| `accelerated/omni_module/omni_module_config.py` | `OmniModuleRuntimeConfig` — accelerated per-module (`ModelArguments`); `.to_hf_config(name)` → descriptor |
+| `accelerated/omni_module/omni_module_config.py` | `OmniModuleRuntimeArguments` — accelerated per-module (`ModelArguments`); `.to_hf_config(name)` → descriptor |
 | `accelerated/omni_module/omni_module_runtime.py` | `ModuleRuntime(VeOmniModelRuntime)` — per-module FSDP / opt / ckpt |
 | `accelerated/utils/executor.py` | `TrainNodeRunner`, `execute_train_node` / `execute_generation_node` |
 | `accelerated/utils/dispatch.py` | unwrap FSDP/DDP/LoRA wrappers, `call_graph_endpoint` |

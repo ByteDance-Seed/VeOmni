@@ -15,8 +15,8 @@ VeOmni runtime / YAML launcher), use ``tasks/omni/infer_omni_native.py`` instead
 
 Examples
 --------
-Single-process eager (default — ``resolve_model(for_inference=True)`` forces eager
-unless ``modules_infer_*.yaml`` overrides):
+Single-process eager (``build_omni_model_runtime_args(args, for_inference=True)``
+forces eager unless the ``modules:`` overlay pins another ``fsdp_mode``):
 
     python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml \\
         --model.model_config.infer_type vision_understanding \\
@@ -28,6 +28,7 @@ Media is decoded by the same fetchers the training transform uses, so a request
 carries the same metadata a training sample does (a clip's sampling rate, a
 video's frame timeline)::
 
+    --infer.images /path/to/image.jpg           # an image
     --infer.audios /path/to/speech.wav          # standalone sound
     --infer.videos /path/to/clip.mp4            # a clip
 
@@ -48,7 +49,7 @@ interleaves::
 
     --infer.mm_configs.fps 4.0                # overrides just that key
 
-Distributed inference (override modules to FSDP2 / DDP in ``modules_infer_fsdp.yaml``):
+Distributed inference (modules keep their DDP / FSDP2 wraps):
 
     bash train.sh tasks/omni/infer_omni.py \\
         configs/seed_omni/Janus/janus_1.3b/train/base.yaml \\

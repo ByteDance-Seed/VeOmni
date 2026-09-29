@@ -18,8 +18,8 @@ from veomni.arguments.omni_arguments_types import (
     OmniDataArguments,
     OmniInferArguments,
     OmniModelRuntimeArguments,
-    build_module_runtime_args,
-    build_omni_model_runtime,
+    build_omni_model_runtime_args,
+    build_omni_module_runtime_args,
 )
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 
@@ -29,10 +29,10 @@ MODULE_B = "fake_module_b"
 
 
 def _cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "fake_model"
+    return Path(__file__).resolve().parents[3] / "configs" / "seed_omni" / "fake_model"
 
 
-def _omni_args(*, model_path: str = "/tmp/fake_omni") -> OmniArguments:
+def _omni_args(*, model_path: str = "/tmp/fake_omni", **launcher_config) -> OmniArguments:
     cfg_dir = _cfg_dir()
     return OmniArguments(
         model=OmniModelRuntimeArguments(
@@ -41,6 +41,7 @@ def _omni_args(*, model_path: str = "/tmp/fake_omni") -> OmniArguments:
                 "modules": str(cfg_dir / "train/modules_train.yaml"),
                 "train_graph": str(cfg_dir / "train/graph_train.yaml"),
                 "infer_graph": {"infer_gen": str(cfg_dir / "infer/graph_infer_gen.yaml")},
+                **launcher_config,
             },
         ),
         data=OmniDataArguments(train_path=""),
@@ -67,17 +68,7 @@ def _with_module_configs(cfg: OmniConfig) -> OmniConfig:
 
 
 def _model_runtime(**kwargs) -> OmniModelRuntimeArguments:
-    model_path = kwargs.pop("model_path", "/tmp/fake_omni")
-    args = _omni_args(model_path=model_path)
-    cfg_dir = _cfg_dir()
-    return build_omni_model_runtime(
-        global_args=args._to_module_global_args(),
-        model_path=model_path,
-        train_modules=str(cfg_dir / "train/modules_train.yaml"),
-        train_graph=kwargs.pop("train_graph", str(cfg_dir / "train/graph_train.yaml")),
-        infer_graph=kwargs.pop("infer_graph", str(cfg_dir / "infer/graph_infer_gen.yaml")),
-        **kwargs,
-    )
+    return build_omni_model_runtime_args(_omni_args(**kwargs))
 
 
 def test_runtime_config_keeps_the_full_launcher_view():
@@ -157,9 +148,9 @@ def test_to_hf_config_does_not_alias_nested_model_config():
     assert runtime_cfg.modules[MODULE_B].model_config.get("freeze") is not False
 
 
-def test_build_module_runtime_args_resolves_relative_model_paths():
+def test_build_omni_module_runtime_args_resolves_relative_model_paths():
     args = _omni_args(model_path="/tmp/fake_omni")
-    modules = build_module_runtime_args(
+    modules = build_omni_module_runtime_args(
         args._to_module_global_args(),
         "/tmp/fake_omni",
         str(_cfg_dir() / "train/modules_train.yaml"),
@@ -167,7 +158,7 @@ def test_build_module_runtime_args_resolves_relative_model_paths():
     assert modules[MODULE_A].model_path.startswith("/tmp/fake_omni")
 
 
-def test_build_module_runtime_args_merges_module_optimizer():
+def test_build_omni_module_runtime_args_merges_module_optimizer():
     """Global ``model.optimizer`` is the base; per-module YAML can override."""
     from veomni.arguments import OptimizerConfig
     from veomni.arguments.omni_arguments_types import OmniModuleRuntimeArguments
@@ -176,7 +167,7 @@ def test_build_module_runtime_args_merges_module_optimizer():
         model_path="/tmp/fake_omni",
         optimizer=OptimizerConfig(lr=1e-4, weight_decay=0.01),
     )
-    modules = build_module_runtime_args(
+    modules = build_omni_module_runtime_args(
         global_args,
         "/tmp/fake_omni",
         {
@@ -190,12 +181,12 @@ def test_build_module_runtime_args_merges_module_optimizer():
     assert modules[MODULE_A].optimizer.weight_decay == 0.01
 
 
-def test_omni_arguments_resolve_model_modules_match_builder():
+def test_omni_arguments_build_model_runtime_args_modules_match_builder():
     args = _omni_args()
     modules_yaml = str(_cfg_dir() / "infer/modules_infer_fsdp.yaml")
     args.model.model_config["modules"] = modules_yaml
-    built = args.resolve_model(for_inference=True).modules
-    direct = build_module_runtime_args(
+    built = build_omni_model_runtime_args(args, for_inference=True).modules
+    direct = build_omni_module_runtime_args(
         args._to_module_global_args(),
         args.model.model_path,
         modules_yaml,
@@ -205,14 +196,14 @@ def test_omni_arguments_resolve_model_modules_match_builder():
     assert built[MODULE_A].accelerator.fsdp_config.fsdp_mode == direct[MODULE_A].accelerator.fsdp_config.fsdp_mode
 
 
-def test_omni_arguments_resolve_model_returns_the_runtime_view():
+def test_omni_arguments_build_model_runtime_args_returns_the_runtime_view():
     args = _omni_args()
-    runtime_cfg = args.resolve_model()
+    runtime_cfg = build_omni_model_runtime_args(args)
     assert isinstance(runtime_cfg, OmniModelRuntimeArguments)
     assert runtime_cfg.modules[MODULE_B].model_path.startswith("/tmp/fake_omni")
 
 
-def test_resolve_model_carries_every_infer_graph_scenario():
+def test_build_model_runtime_args_carries_every_infer_graph_scenario():
     args = _omni_args()
     cfg_dir = _cfg_dir()
     args.model.model_config["infer_graph"] = {
@@ -221,13 +212,13 @@ def test_resolve_model_carries_every_infer_graph_scenario():
     }
     args.model.set_launcher_config("infer_type", "infer_und")
 
-    cfg = args.resolve_model()
+    cfg = build_omni_model_runtime_args(args)
     assert set(cfg.infer_types) == {"infer_gen", "infer_und"}
     assert cfg.infer_type == "infer_und"
     assert cfg.generation_graphs["infer_und"] is not None
 
 
-def test_resolve_model_defaults_infer_type_to_first_scenario():
+def test_build_model_runtime_args_defaults_infer_type_to_first_scenario():
     args = _omni_args()
     cfg_dir = _cfg_dir()
     args.model.model_config["infer_graph"] = {
@@ -236,60 +227,72 @@ def test_resolve_model_defaults_infer_type_to_first_scenario():
     }
     args.model.model_config.pop("infer_type", None)
 
-    cfg = args.resolve_model()
+    cfg = build_omni_model_runtime_args(args)
     assert cfg.infer_type == "infer_gen"
     assert args.model.launcher_config("infer_type") == "infer_gen"
 
 
-def test_resolve_model_rejects_unknown_infer_type():
+def test_build_model_runtime_args_rejects_unknown_infer_type():
     args = _omni_args()
     args.model.set_launcher_config("infer_type", "does_not_exist")
     with pytest.raises(KeyError, match="infer_type"):
-        args.resolve_model()
+        build_omni_model_runtime_args(args)
 
 
-def test_resolve_model_carries_every_train_graph_scenario():
+def test_build_model_runtime_args_carries_every_train_graph_scenario():
     args = _omni_args()
     train_graph = str(_cfg_dir() / "train/graph_train.yaml")
     args.model.model_config["train_graph"] = {"train": train_graph, "alt": train_graph}
     args.model.set_launcher_config("train_type", "train")
 
-    cfg = args.resolve_model()
+    cfg = build_omni_model_runtime_args(args)
     assert set(cfg.train_types) == {"train", "alt"}
     assert cfg.train_type == "train"
 
 
-def test_resolve_model_defaults_train_type_for_single_path():
+def test_build_model_runtime_args_defaults_train_type_for_single_path():
     args = _omni_args()
     args.model.model_config.pop("train_type", None)
 
-    cfg = args.resolve_model()
+    cfg = build_omni_model_runtime_args(args)
     assert cfg.train_type == "default"
     assert args.model.launcher_config("train_type") == "default"
 
 
-def test_resolve_model_rejects_unknown_train_type():
+def test_build_model_runtime_args_rejects_unknown_train_type():
     args = _omni_args()
     train_graph = str(_cfg_dir() / "train/graph_train.yaml")
     args.model.model_config["train_graph"] = {"train": train_graph, "alt": train_graph}
     args.model.set_launcher_config("train_type", "does_not_exist")
     with pytest.raises(KeyError, match="train_type"):
-        args.resolve_model()
+        build_omni_model_runtime_args(args)
 
 
 def test_infer_module_overrides_apply_eager_defaults():
     args = _omni_args()
-    train_args = args.resolve_model().modules
+    train_args = build_omni_model_runtime_args(args).modules
     assert train_args[MODULE_B].accelerator.fsdp_config.fsdp_mode == "fsdp2"
 
     args.model.model_config["modules"] = str(_cfg_dir() / "infer/modules_infer_eager.yaml")
-    infer_args = args.resolve_model(for_inference=True).modules
+    infer_args = build_omni_model_runtime_args(args, for_inference=True).modules
     assert infer_args[MODULE_B].accelerator.fsdp_config.fsdp_mode == "eager"
+
+
+def test_a_model_scope_wrap_rejects_eager_modules_before_loading_them():
+    """Inference defaults modules to eager but not the top level, so a
+    ``fsdp_scope='model'`` run would otherwise load all weights, then fail at wrap time."""
+    args = _omni_args()
+    args.model.accelerator.fsdp_config.fsdp_scope = "model"
+    assert build_omni_model_runtime_args(args).modules[MODULE_B].accelerator.fsdp_config.fsdp_mode == "fsdp2"
+
+    args.model.model_config["modules"] = str(_cfg_dir() / "infer/modules_infer_eager.yaml")
+    with pytest.raises(ValueError, match=rf"fsdp_mode='eager': \['{MODULE_A}', '{MODULE_B}'\]"):
+        build_omni_model_runtime_args(args, for_inference=True)
 
 
 def test_training_keeps_module_fsdp_modes():
     args = _omni_args()
-    runtime_args = args.resolve_model().modules
+    runtime_args = build_omni_model_runtime_args(args).modules
     assert runtime_args[MODULE_A].accelerator.fsdp_config.fsdp_mode == "ddp"
     assert runtime_args[MODULE_B].accelerator.fsdp_config.fsdp_mode == "fsdp2"
 
@@ -389,11 +392,9 @@ def test_the_checkpoint_fills_in_what_the_launcher_yaml_leaves_out(tmp_path):
     trained_attn = _exported_attn(exported, MODULE_A)
     assert trained_attn != OpsImplementationConfig().attn_implementation
 
-    modules = (
-        _args_over(exported, str(_cfg_dir() / "infer/modules_infer_eager.yaml"))
-        .resolve_model(for_inference=True)
-        .modules
-    )
+    modules = build_omni_model_runtime_args(
+        _args_over(exported, str(_cfg_dir() / "infer/modules_infer_eager.yaml")), for_inference=True
+    ).modules
 
     # The infer YAML names no kernels, so the exported ones stand...
     assert modules[MODULE_A].ops_implementation.attn_implementation == trained_attn
@@ -406,7 +407,7 @@ def test_a_launcher_yaml_still_wins_where_it_names_the_same_field(tmp_path):
     exported = _exported_root(tmp_path)
     modules_yaml = {MODULE_A: {}, MODULE_B: {"ops_implementation": {"attn_implementation": "sdpa"}}}
 
-    modules = _args_over(exported, modules_yaml).resolve_model().modules
+    modules = build_omni_model_runtime_args(_args_over(exported, modules_yaml)).modules
 
     assert modules[MODULE_B].ops_implementation.attn_implementation == "sdpa"
     # Untouched by the YAML, so still the exported value rather than the global.
@@ -418,11 +419,9 @@ def test_a_checkpoint_accelerator_overlay_reaches_training(tmp_path):
     exported = _exported_root(tmp_path)
     _with_checkpoint_accelerator(exported, **{MODULE_A: "ddp", MODULE_B: "ddp"})
 
-    modules = (
+    modules = build_omni_model_runtime_args(
         _args_over(exported, {MODULE_A: {}, MODULE_B: {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2"}}}})
-        .resolve_model()
-        .modules
-    )
+    ).modules
 
     assert modules[MODULE_A].accelerator.fsdp_config.fsdp_mode == "ddp"
     assert modules[MODULE_B].accelerator.fsdp_config.fsdp_mode == "fsdp2"
@@ -433,11 +432,10 @@ def test_inference_stays_eager_over_a_checkpoint_accelerator(tmp_path):
     exported = _exported_root(tmp_path)
     _with_checkpoint_accelerator(exported, **{MODULE_A: "fsdp2", MODULE_B: "fsdp2"})
 
-    modules = (
-        _args_over(exported, {MODULE_A: {}, MODULE_B: {"accelerator": {"fsdp_config": {"fsdp_mode": "ddp"}}}})
-        .resolve_model(for_inference=True)
-        .modules
-    )
+    modules = build_omni_model_runtime_args(
+        _args_over(exported, {MODULE_A: {}, MODULE_B: {"accelerator": {"fsdp_config": {"fsdp_mode": "ddp"}}}}),
+        for_inference=True,
+    ).modules
 
     # `{}` names the module without saying anything about it, so the layers beneath it stand.
     assert modules[MODULE_A].accelerator.fsdp_config.fsdp_mode == "eager"
@@ -451,7 +449,7 @@ def test_a_launcher_less_inference_run_is_eager_and_keeps_the_exported_kernels(t
     _with_checkpoint_accelerator(exported, **{MODULE_A: "fsdp2"})
     trained_attn = _exported_attn(exported, MODULE_A)
 
-    modules = _args_over(exported).resolve_model(for_inference=True).modules
+    modules = build_omni_model_runtime_args(_args_over(exported), for_inference=True).modules
 
     assert set(modules) == {MODULE_A, MODULE_B}
     assert modules[MODULE_A].accelerator.fsdp_config.fsdp_mode == "eager"
@@ -461,7 +459,7 @@ def test_a_launcher_less_inference_run_is_eager_and_keeps_the_exported_kernels(t
     assert Path(modules[MODULE_A].model_path) == exported / MODULE_A
 
 
-def test_resolve_model_reads_graphs_from_omni_checkpoint(tmp_path):
+def test_build_model_runtime_args_reads_graphs_from_omni_checkpoint(tmp_path):
     """A self-contained omni checkpoint supplies graphs — no launcher YAML refs needed."""
     runtime_cfg = _model_runtime(model_path=str(tmp_path))
     export_root = tmp_path / "exported"
@@ -472,7 +470,7 @@ def test_resolve_model_reads_graphs_from_omni_checkpoint(tmp_path):
         data=OmniDataArguments(train_path=""),
         infer=OmniInferArguments(),
     )
-    cfg = args.resolve_model()
+    cfg = build_omni_model_runtime_args(args)
     assert cfg.training_graph == runtime_cfg.training_graph
     assert cfg.infer_types == runtime_cfg.infer_types
 
@@ -497,30 +495,52 @@ def test_a_launcher_infer_graph_does_not_inherit_the_checkpoint_infer_type(tmp_p
         data=OmniDataArguments(train_path=""),
         infer=OmniInferArguments(),
     )
-    assert args.resolve_model(for_inference=True).infer_type == "understanding"
+    assert build_omni_model_runtime_args(args, for_inference=True).infer_type == "understanding"
 
 
-def test_from_model_runtime_projects_onto_hf_config(tmp_path):
-    """from_model_runtime builds OmniModel from ``to_hf_config()``; each ModuleRuntime
-    gets the module config that OmniConfig loaded."""
+def test_build_model_runtime_args_keeps_every_training_scenario_from_omni_checkpoint(tmp_path):
+    """The checkpoint stores the whole ``training_graphs`` map and its ``train_type``;
+    reading back only the active graph would rename it ``default`` and drop the rest."""
+    graph = str(_cfg_dir() / "train/graph_train.yaml")
+    runtime_cfg = _model_runtime(
+        model_path=str(tmp_path), train_graph={"train": graph, "alt": graph}, train_type="alt"
+    )
+    export_root = tmp_path / "exported"
+    _with_module_configs(runtime_cfg.to_hf_config()).save_pretrained(export_root)
+
+    args = OmniArguments(
+        model=OmniModelRuntimeArguments(model_path=str(export_root)),
+        data=OmniDataArguments(train_path=""),
+        infer=OmniInferArguments(),
+    )
+    cfg = build_omni_model_runtime_args(args)
+    assert list(cfg.training_graphs) == ["train", "alt"]
+    assert cfg.train_type == "alt"
+
+
+def test_build_omni_model_runtime_projects_onto_hf_config(tmp_path):
+    """build_omni_model_runtime builds OmniModel from ``to_hf_config()``; each ModuleRuntime
+    gets the module config that OmniConfig loaded, and OmniModel gets the bare module."""
     from unittest.mock import MagicMock, patch
 
-    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import build_omni_model_runtime
 
     for name, config in _with_module_configs(_model_runtime().to_hf_config())._module_configs.items():
         config.save_pretrained(tmp_path / name)
     runtime_cfg = _model_runtime(model_path=str(tmp_path))
     with patch("veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime") as mock_rt_cls:
-        mock_rt_cls.side_effect = lambda *a, **k: MagicMock(model=MagicMock())
+        mock_rt_cls.side_effect = lambda *a, **k: MagicMock(model=MagicMock(), omni_module=MagicMock())
         with patch("veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.OmniModel") as mock_omni_model:
-            OmniModelRuntime.from_model_runtime(runtime_cfg)
-            omni_config = mock_omni_model.call_args[0][0]
+            runtime = build_omni_model_runtime(runtime_cfg)
+            omni_config, modules = mock_omni_model.call_args[0]
             assert isinstance(omni_config, OmniConfig)
             assert set(omni_config.module_names) == set(runtime_cfg.module_names)
 
     for call in mock_rt_cls.call_args_list:
         name = call.kwargs["module_name"]
         assert call.kwargs["module_config"] is omni_config._module_configs[name]
+    for name, module_runtime in runtime.module_runtimes.items():
+        assert modules[name] is module_runtime.omni_module
 
 
 def test_omni_module_config_owns_descriptor_conversion():
@@ -550,11 +570,3 @@ def test_omni_module_config_owns_descriptor_conversion():
     assert exported["processor_config"] == {"image_size": 224}
     assert "model_path" not in exported
     assert "ops_implementation" not in exported
-
-
-def test_omni_module_runtime_config_is_the_arguments_alias():
-    from veomni.arguments.omni_arguments_types import OmniModelRuntimeArguments, OmniModuleRuntimeArguments
-    from veomni.models.seed_omni.accelerated import OmniModelRuntimeConfig, OmniModuleRuntimeConfig
-
-    assert OmniModuleRuntimeArguments is OmniModuleRuntimeConfig
-    assert OmniModelRuntimeArguments is OmniModelRuntimeConfig

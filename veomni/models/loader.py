@@ -64,7 +64,7 @@ def _omni_registries():
     The ``get_model_*`` functions below consult these so the shared
     :func:`veomni.models.build_foundation_model` / :func:`build_processor`
     loader path works for an OmniModule sub-module exactly like a normal
-    single model (``OmniTrainer._build_model`` builds each sub-module this
+    single model (``OmniTrainer._build_model_runtime`` builds each sub-module this
     way).  Imported lazily (inside the loader functions) to avoid a circular
     import: ``veomni.models.seed_omni`` modeling imports back into
     ``veomni.models``.

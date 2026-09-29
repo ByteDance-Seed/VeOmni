@@ -270,8 +270,8 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
   (`_validate_omni_accelerator` in `veomni/arguments/omni_arguments_types.py`), run once against
   the top-level default and once per resolved module — so a per-module override is validated too,
   not just the global default.
-- The default all-eager accelerator for inference (`resolve_model(for_inference=True)` /
-  `_resolve_default_accelerator`) also forces `broadcast_model_weights_from_rank0: False` per
+- The default all-eager accelerator for inference (`build_omni_model_runtime_args(args, for_inference=True)` /
+  `build_omni_module_runtime_args`) also forces `broadcast_model_weights_from_rank0: False` per
   module alongside `fsdp_mode: eager`, since broadcast-from-rank0 is meaningless without FSDP2.
 - `ModelArguments` carries the weight-load knobs for both V1 and V2. No compatibility
   guard is added for configs still on the old `train.*` schema — an un-migrated config

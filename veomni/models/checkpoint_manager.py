@@ -76,14 +76,10 @@ class ModelCheckpointManager:
     :class:`~veomni.trainer.callbacks.global_state_callback.GlobalStateCallback`,
     which also writes the step's ``checkpoint_manifest.json``.
 
-    A subclass managing one module of a multi-module model sets
-    :attr:`module_name`; every path below then nests one level deeper, and
-    nothing else changes. Paths are never built here — they all come from
+    Paths are never built here — they all come from
     :mod:`veomni.checkpoint.layout`, so a save and the load that follows it
     cannot drift apart.
     """
-
-    module_name: str = ""
 
     def __init__(self, runtime: "VeOmniModelRuntime"):
         self.runtime = runtime
@@ -123,48 +119,43 @@ class ModelCheckpointManager:
     def trainable_only(self) -> bool:
         return bool(self.runtime.args.lora_config)
 
-    @property
-    def hf_export_assets(self) -> list:
-        """Sidecars an HF export writes beside the weights: config, tokenizer, processor.
-
-        The runtime's cached list. A SeedOmni module overrides this to read
-        them off the live model instead, because there the assets are bound onto
-        the model rather than kept beside it.
-        """
-        return self.runtime.model_assets
-
     def step_dir(self, state: "TrainerState") -> str:
         """Root of this step's checkpoint, shared by every module of the job."""
         return layout.step_dir(self.config.save_path, state.global_step)
 
     def save_dir(self, state: "TrainerState") -> str:
         """Where this step's model state lives: weights, optimizer, scheduler."""
-        return layout.model_dir(self.step_dir(state), self.module_name)
+        return layout.model_dir(self.step_dir(state))
+
+    def weights_dir(self, state: "TrainerState") -> str:
+        """DCP directory holding this step's weights alone."""
+        return layout.weights_dir(self.step_dir(state))
 
     def hf_export_dir(self, state: "TrainerState") -> str:
         """Where this step's full-model safetensors export lives."""
-        return layout.hf_export_dir(self.step_dir(state), self.module_name)
+        return layout.hf_export_dir(self.step_dir(state))
 
     def lora_export_dir(self, state: "TrainerState") -> str:
         """Where this step's PEFT adapter export lives."""
-        return layout.lora_export_dir(self.step_dir(state), self.module_name)
+        return layout.lora_export_dir(self.step_dir(state))
 
     def assets_dir(self) -> str:
         """Where this model's config/tokenizer/processor sidecars live.
 
-        Once per run, at the output root — not inside a step. Nested under
-        :attr:`module_name` so two modules cannot overwrite each other's
-        ``config.json``.
+        Once per run, at the output root — not inside a step.
         """
-        return layout.assets_dir(self.config.model_assets_dir, self.module_name)
+        return layout.assets_dir(self.config.model_assets_dir)
 
     def load_dir(self) -> Optional[str]:
-        """Step directory to resume from.
-
-        The module is not folded in here: the checkpointer takes it separately
-        and resolves ``model/<module>/`` itself, so one path serves the whole job.
-        """
+        """Step directory to resume from."""
         return self.config.load_path
+
+    def _checkpointer_kwargs(self) -> Dict[str, Any]:
+        """Keyword arguments shared by ``checkpointer.save`` and ``checkpointer.load``."""
+        return {
+            "trainable_only": self.trainable_only,
+            "parallel_state": self.parallel_state,
+        }
 
     def wait_for_pending_save(self) -> None:
         """Block until the in-flight async save is on disk, if there is one."""
@@ -206,9 +197,7 @@ class ModelCheckpointManager:
         self.checkpointer.load(
             load_dir,
             state,
-            module=self.module_name,
-            trainable_only=self.trainable_only,
-            parallel_state=self.parallel_state,
+            **self._checkpointer_kwargs(),
         )
         self._load_extra_state(state["extra_state"])
         dist.barrier()
@@ -230,13 +219,11 @@ class ModelCheckpointManager:
                 "extra_state": extra_state,
             },
             global_steps=state.global_step,
-            module=self.module_name,
             save_async=self.config.save_async,
-            trainable_only=self.trainable_only,
             save_to_lowest_rank=self.config.dcp_save_to_lowest_rank,
-            parallel_state=self.parallel_state,
             stage_dir=self.config.stage_dir,
             save_timeout_seconds=self.config.save_timeout_seconds,
+            **self._checkpointer_kwargs(),
         )
         helper.empty_cache()
         dist.barrier()
@@ -264,7 +251,7 @@ class ModelCheckpointManager:
             self.runtime.optimizer = None
             self.runtime.lr_scheduler = None
 
-        return layout.weights_dir(self.step_dir(state), self.module_name)
+        return self.weights_dir(state)
 
     def save_hf(self, state: "TrainerState", stage: str = "step_end") -> None:
         from ..utils.save_safetensor_utils import save_hf_safetensor
@@ -273,7 +260,7 @@ class ModelCheckpointManager:
 
         save_hf_safetensor(
             save_hf_safetensor_path=self.hf_export_dir(state),
-            model_assets=self.hf_export_assets,
+            model_assets=self.runtime.model_assets,
             ckpt_manager=self.config.manager,
             output_dir=self.config.output_dir,
             save_checkpoint_path=weights_path,

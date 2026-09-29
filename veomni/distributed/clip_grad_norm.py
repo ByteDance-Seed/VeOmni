@@ -1,4 +1,6 @@
 import math
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -7,6 +9,10 @@ from torch.distributed._tensor import DTensor
 from .fsdp2 import clip_grad_norm as fsdp2_clip_grad_norm
 from .fsdp2.clip_grad_norm import _finalize_total_norm, _fsdp2_reduce_group
 from .parallel_state import ParallelState, get_parallel_state
+
+
+if TYPE_CHECKING:
+    from ..models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 
 
 @torch.no_grad()
@@ -81,8 +87,15 @@ def veomni_clip_grad_norm(
     return grad_norm
 
 
+# The two clippers below serve an OmniModel, where every module runs under its own
+# ParallelState. `ModuleRuntime.clip_grad_norm` (omni_module_runtime.py) calls
+# `veomni_omni_module_clip_grad_norm` to clip one module and return its norm;
+# `OmniModelRuntime.clip_grad_norm` (omni_model_runtime.py) calls
+# `veomni_omni_model_clip_grad_norm` to combine those per-module norms.
+
+
 def veomni_omni_module_clip_grad_norm(
-    model,
+    model: torch.nn.Module,
     max_norm: float,
     norm_type: float = 2.0,
 ) -> float:
@@ -164,8 +177,8 @@ def veomni_omni_module_clip_grad_norm(
     return total_norm.item()
 
 
-def omni_clip_grad_norm(
-    module_runtimes: dict,
+def veomni_omni_model_clip_grad_norm(
+    module_runtimes: Mapping[str, "ModuleRuntime"],
     max_grad_norm: float,
     grad_clip_scope: str = "per_module",
 ) -> float:
@@ -176,8 +189,9 @@ def omni_clip_grad_norm(
       optimizer config, so *max_grad_norm* here is only the model-level value
       they inherit from. Returns ``sqrt(sum n_i^2)`` of the per-module (pre-clip)
       norms for logging.
-    * ``global``: measure each module with ``max_norm=inf`` (no scale),
-      ``total = sqrt(sum n_i^2)``, then if ``total > max_grad_norm`` scale **all**
+    * ``global`` (not enabled yet: ``OptimizerConfig`` rejects it): measure
+      each module with ``max_norm=inf`` (no scale), ``total = sqrt(sum n_i^2)``,
+      then if ``total > max_grad_norm`` scale **all**
       module grads by one coefficient — single-model / seedream
       ``gradient_clip_val`` semantics. A single threshold is inherent to this
       scope, so the per-module values do not apply.
@@ -185,7 +199,7 @@ def omni_clip_grad_norm(
     Each ``clip_grad_norm`` enters the module's own ``ParallelState``; the
     ``global`` rescale re-enters it via ``_scoped()`` for the same reason.
     """
-    runtimes = list(module_runtimes.values()) if isinstance(module_runtimes, dict) else list(module_runtimes)
+    runtimes = list(module_runtimes.values())
     if not runtimes:
         return 0.0
 

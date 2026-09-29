@@ -117,7 +117,7 @@ def test_value_repr_shows_shape_for_array_like_waveforms():
         dtype = "float32"
 
     item = ConversationItem(type="audio", value=FakeArray(), role="user")
-    assert item.__value_repr__() == "[FakeArray](24000,)"
+    assert "  value: [FakeArray](24000,)\n" in repr(item)
 
 
 def test_conversation_item_meta_defaults_empty():

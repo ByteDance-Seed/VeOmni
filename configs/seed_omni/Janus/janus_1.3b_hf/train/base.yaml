@@ -5,8 +5,8 @@
 # ``generation_kwargs`` are all read from that checkpoint's own ``config.json`` —
 # this launcher declares no ``model_config`` at all. The root's default
 # ``infer_type`` is ``infer_interleave``; pass ``--model.model_config.infer_type
-# infer_gen`` for text-to-image. ``resolve_model(for_inference=True)`` defaults
-# every module to eager (single-process replica) when no ``modules`` override
+# infer_gen`` for text-to-image. ``build_omni_model_runtime_args(args, for_inference=True)``
+# defaults every module to eager (single-process replica) when no ``modules`` override
 # is given.
 #
 # Eager single-process T2I:

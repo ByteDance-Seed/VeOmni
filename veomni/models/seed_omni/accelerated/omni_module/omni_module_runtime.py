@@ -51,9 +51,17 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
-def unwrap_module(mod: nn.Module) -> nn.Module:
-    """Strip DDP/LoRA/FSDP wrappers so callers reach the inner :class:`BaseMixin`."""
-    return unwrap_module_chain(mod)
+def composed_model_owns_wrap(accelerator: "AcceleratorConfig") -> bool:
+    """Whether the top-level ``accelerator`` wraps the composed :class:`OmniModel` once.
+
+    The one rule both sides read: :class:`OmniModelRuntime` wraps the parent
+    exactly when this holds, and every :class:`ModuleRuntime` skips its own
+    wrap exactly when this holds. A module's own ``fsdp_scope`` overlay is not
+    consulted — letting it differ would wrap that module twice, or leave it on
+    meta with nothing left to wrap it.
+    """
+    fsdp_config = accelerator.fsdp_config
+    return fsdp_config.fsdp_scope == "model" and fsdp_config.fsdp_mode != "eager"
 
 
 class ModuleRuntime(VeOmniModelRuntime):
@@ -97,13 +105,6 @@ class ModuleRuntime(VeOmniModelRuntime):
     mistyped runtime attribute silently reads the model rather than raising.
     """
 
-    # Class default so ``__new__``-constructed tests and ``__getattr__``
-    # forwarding to the inner ``nn.Module`` never confuse this flag with a
-    # missing model attribute.
-    _defer_parallelize: bool = False
-    _eager: bool = False
-    _global_accelerator: Optional["AcceleratorConfig"] = None
-
     args: "OmniModuleRuntimeArguments"
     train_args: Optional["OmniTrainingArguments"] = None
     _has_trainable_parameters: Optional[bool] = None
@@ -114,9 +115,9 @@ class ModuleRuntime(VeOmniModelRuntime):
         module_name: str,
         *,
         module_config: "OmniModuleConfig",
+        global_accelerator: "AcceleratorConfig",
         train: Optional["OmniTrainingArguments"] = None,
         for_inference: bool = False,
-        global_accelerator: Optional["AcceleratorConfig"] = None,
     ):
         self.args = args
         self.model_name = module_name
@@ -124,34 +125,54 @@ class ModuleRuntime(VeOmniModelRuntime):
         self.train_args = train
         self.optimizer = None
         self.lr_scheduler = None
-        self._defer_parallelize = False
         self._global_accelerator = global_accelerator
 
         if for_inference:
-            if args.accelerator.fsdp_config.fsdp_mode == "eager":
-                self._eager = True
+            if self.is_eager:
                 self._init_eager_inference()
             else:
                 args.accelerator.fsdp_config.mixed_precision.enable = False
-                self._defer_parallelize = args.accelerator.fsdp_config.fsdp_scope == "model"
                 self.setup()
                 with self._scoped():
                     self._build_model()
                     self._build_model_assets()
+                    # The weight load maps keys onto the PEFT layout whenever
+                    # ``lora_config`` is set, so the model must already be wrapped.
+                    self._setup_lora()
                     self._build_parallelized_model()
                 self.model.eval()
         else:
-            self._defer_parallelize = args.accelerator.fsdp_config.fsdp_scope == "model"
             self.setup()
             with self._scoped():
                 self._build_model()
                 self._build_model_assets()
                 self._freeze_model_module()
                 self._build_parallelized_model()
-                if not self._defer_parallelize:
+                if not self.wrap_omni_model:
                     self._scope_recompute_to_parallel_state()
                     self._build_optimizer()
                     self.build_checkpoint()
+
+    @property
+    def is_eager(self) -> bool:
+        """Whether this module is loaded unwrapped in one process (``fsdp_mode='eager'``).
+
+        Inference only: it skips :meth:`setup`, so it has no mesh, no
+        :class:`ParallelState` and no wrap. The generic parallelize step rejects
+        ``eager`` for training.
+        """
+        return self.args.accelerator.fsdp_config.fsdp_mode == "eager"
+
+    @property
+    def wrap_omni_model(self) -> bool:
+        """Whether the composed :class:`OmniModel` owns this module's FSDP wrap.
+
+        True under a top-level ``fsdp_scope='model'``: the module is built on
+        meta and left unwrapped, and :class:`OmniModelRuntime` wraps the parent
+        once. ``_validate_composed_wrap`` rejects an eager module under that
+        scope when the launcher args are resolved.
+        """
+        return composed_model_owns_wrap(self._global_accelerator)
 
     @property
     def mesh_accelerator(self) -> "AcceleratorConfig":
@@ -162,7 +183,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         emb-parallel block) must not decide them — a module meta-initialized on
         a different mesh than the one it is later sharded over would not load.
         """
-        if self._defer_parallelize and self._global_accelerator is not None:
+        if self.wrap_omni_model:
             return self._global_accelerator
         return self.args.accelerator
 
@@ -184,7 +205,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         ``self.model`` may be a DDP / LoRA wrapper around it; that wrapper stays
         on the runtime side and is what :class:`OmniModelRuntime` calls.
         """
-        return unwrap_module(self.model)
+        return unwrap_module_chain(self.model)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Run this module's forward inside its own ``ParallelState``.
@@ -211,7 +232,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         which kernels the launcher asked for.
         """
         args = self.args
-        assert args.accelerator.fsdp_config.fsdp_mode == "eager"
+        assert self.is_eager
         from .....ops import apply_ops_config
         from ....auto import bind_ops_to_modeling
         from ... import OMNI_MODEL_REGISTRY
@@ -245,8 +266,6 @@ class ModuleRuntime(VeOmniModelRuntime):
         self.model_config = self.model.config
         self._build_model_assets()
 
-    # ── Build (model, assets, parallelize) ────────────────────────────────────
-
     def _build_model(self) -> None:
         """Meta-init this module's sub-model from ``module_config``.
 
@@ -274,9 +293,9 @@ class ModuleRuntime(VeOmniModelRuntime):
         A standalone runtime keeps the tokenizer/processor beside the model
         because the trainer's data pipeline reads through it. A module's caller
         is the graph, which addresses the *module* — so the assets are attached
-        to the model (``bind_module_assets``) and travel with it, and HF export
-        collects them back off the live model in
-        :meth:`collect_hf_export_assets` rather than from a cached list.
+        to the model (``bind_module_assets``) and travel with it, and
+        :attr:`model_assets` reads them back off the live model rather than
+        from a cached list.
 
         Meta-init skips ``from_pretrained``, so vision modules and text encoders
         that need a processor or tokenizer at train time get one here from this
@@ -284,11 +303,6 @@ class ModuleRuntime(VeOmniModelRuntime):
         ``preprocessor_class``, or when an earlier eager ``from_pretrained``
         already bound one.
         """
-        # The base caches its sidecars here for a whole-model export. A module's
-        # are read off the live model at save time instead, so this stays empty
-        # rather than aliasing the class-level default.
-        self.model_assets = []
-
         model = self.model
         label = type(model).__name__
         if getattr(type(model), "preprocessor_class", None) is None:
@@ -340,80 +354,44 @@ class ModuleRuntime(VeOmniModelRuntime):
 
         A config that targets *nothing anywhere* **and** leaves the composed
         model with no trainable parameters is still an error; only the composer
-        can see that. It is raised in :meth:`OmniModelRuntime.from_model_runtime`.
+        can see that. It is raised in :func:`build_omni_model_runtime`.
         """
         logger.info_rank0(
             f"ModuleRuntime '{self.module_name}': the LoRA config matched no parameters here; "
             "training this module frozen."
         )
 
-    def customized_build_parallelize_model(
-        self, *, weights_path: Optional[str], args: "OmniModuleRuntimeArguments", **kwargs: Any
-    ) -> Optional[Any]:
-        """Optional override on a **custom runtime** for bespoke parallelize + load.
-
-        When this returns a module, that module is used verbatim — the override
-        owns FSDP/DDP wrap, weight load, param offload, gradient checkpointing,
-        and mixed precision. When it returns ``None`` (the default here), the
-        generic :meth:`VeOmniModelRuntime._build_parallelized_model` path runs.
-
-        This is the *runtime's* hook, which is why it carries the ``customized_``
-        prefix: a **model** that wants to own its own wrap declares
-        ``build_parallelize_model`` instead, and the base honours that too.
-
-        Called inside this module's ``use_parallel_state`` scope after meta-init,
-        so ``get_parallel_state()`` returns this module's device mesh.
-        """
-        del weights_path, args, kwargs
-        return None
-
     def _build_parallelized_model(self) -> None:
-        """FSDP2/DDP-wrap this module and load its weights, unless a runtime owns it.
+        """FSDP2/DDP-wrap this module and load its weights.
 
-        A **custom runtime subclass** may fully own parallelize + weight-load by
-        overriding :meth:`customized_build_parallelize_model` — e.g. a huge MoE
-        backbone that streams EP-sharded experts to CPU, which the generic
-        GPU-materializing loader has no hook for.
-
-        When ``fsdp_scope='model'``, this is a no-op: the module stays on meta
-        (freeze already applied) so :class:`OmniModelRuntime` can wrap the
-        composed parent once, then :meth:`finish_deferred_parallelize` builds
-        the optimizer on the now-DTensor parameters.
+        When ``fsdp_scope='model'``, only async activation offload is applied
+        here, since it must precede the wrap: the module stays on meta (freeze
+        already applied) so :class:`OmniModelRuntime` can wrap the composed
+        parent once, then :meth:`build_after_omni_model_wrap` builds the
+        optimizer on the now-DTensor parameters.
         """
-        if self._defer_parallelize:
+        if self.wrap_omni_model:
+            self._apply_async_activation_offload()
             logger.info_rank0(
-                f"ModuleRuntime '{self.module_name}': deferring FSDP wrap to the composed "
+                f"ModuleRuntime '{self.module_name}': leaving the FSDP wrap to the composed "
                 "OmniModel (accelerator.fsdp_config.fsdp_scope='model')."
             )
             return
-        customized_model = self.customized_build_parallelize_model(
-            weights_path=self.args.model_path,
-            args=self.args,
-        )
-        if customized_model is not None:
-            self.model = customized_model
-            return
         super()._build_parallelized_model()
 
-    def finish_deferred_parallelize(self, *, for_inference: bool = False) -> None:
-        """Optimizer / checkpoint / GC recompute after the parent OmniModel wrap.
+    def build_after_omni_model_wrap(self) -> None:
+        """Training steps that need the wrapped parameters, once the composed OmniModel is wrapped.
 
-        No-op when this module wrapped itself, or when this is an eager-inference
-        module that never entered :meth:`setup`.
+        Under ``fsdp_scope='model'`` :meth:`__init__` stops after building this
+        module on meta; the optimizer, the checkpoint manager and the recompute
+        scope all bind to the DTensor parameters ``fully_shard`` creates, so
+        :class:`OmniModelRuntime` calls this after its wrap. Inference needs
+        none of them.
         """
-        if not self._defer_parallelize:
-            return
-        if for_inference:
-            with self._scoped():
-                self._scope_recompute_to_parallel_state()
-                self.model.eval()
-        else:
-            with self._scoped():
-                self._scope_recompute_to_parallel_state()
-                self._build_optimizer()
-                self.build_checkpoint()
-
-    # ── Parallel state (per-module device mesh) ────────────────────────────────
+        with self._scoped():
+            self._scope_recompute_to_parallel_state()
+            self._build_optimizer()
+            self.build_checkpoint()
 
     def _scoped(self):
         """Context manager making this module's ParallelState current.
@@ -426,7 +404,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         An eager-inference module never runs :meth:`setup` (a mesh needs a
         process group it may not have), so its scope is a no-op.
         """
-        if self._eager:
+        if self.is_eager:
             return nullcontext()
         return use_parallel_state(self.module_name)
 
@@ -452,14 +430,12 @@ class ModuleRuntime(VeOmniModelRuntime):
         # ``gradient_checkpointing_enable``; FSDP2 wraps in place. Unwrap so the
         # call reaches the raw HF model regardless of dp_mode.
         if gc.enable:
-            unwrap_module(self.model).gradient_checkpointing_enable(
+            unwrap_module_chain(self.model).gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={
                     "use_reentrant": gc.enable_reentrant,
                     "context_fn": _recompute_context_fn,
                 }
             )
-
-    # ── Optimizer / lr-scheduler (optimizer in __init__; scheduler after train_steps) ─
 
     @property
     def has_trainable_parameters(self) -> bool:
@@ -511,10 +487,11 @@ class ModuleRuntime(VeOmniModelRuntime):
     def _build_lr_scheduler(self, total_steps: int) -> None:
         """Build this module's lr-scheduler over ``total_steps``.
 
-        The orchestrator (:meth:`~veomni.trainer.omni.omni_trainer.OmniTrainer._build_multi_lr_scheduler`)
-        computes ``total_steps`` once the dataset-derived ``train_steps`` (already
-        clamped by the global ``train.max_steps`` debug cap) is known. A no-op for
-        a fully-frozen module: there is no optimizer to schedule.
+        :meth:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.OmniModelRuntime._build_lr_scheduler`
+        calls this with the ``total_steps`` the trainer computes once the
+        dataset-derived ``train_steps`` (already clamped by the global
+        ``train.max_steps`` debug cap) is known. A no-op for a fully-frozen
+        module: there is no optimizer to schedule.
         """
         if not self.has_trainable_parameters:
             return
@@ -526,8 +503,8 @@ class ModuleRuntime(VeOmniModelRuntime):
 
         Uses the omni-module clipper rather than the base's whole-model one: the
         orchestrator combines the per-module norms itself (see
-        :func:`~veomni.distributed.clip_grad_norm.omni_clip_grad_norm`), so this
-        must return *this* module's norm without reducing across modules.
+        :meth:`OmniModelRuntime.clip_grad_norm`), so this must return *this*
+        module's norm without reducing across modules.
         """
         if max_norm is None:
             max_norm = self.args.optimizer.max_grad_norm
@@ -558,42 +535,27 @@ class ModuleRuntime(VeOmniModelRuntime):
             return
         # ``set_reshard_after_backward`` recurses into every nested FSDP unit by
         # default, so one call on the root-sharded model covers them all (the
-        # generic ``parallelize_model_fsdp2`` ``fully_shard``s the root). A module
-        # that owns its parallelize via a custom runtime's
-        # ``customized_build_parallelize_model`` (contract: "FSDP-or-not") may leave the root un-sharded — it then owns
-        # its own reshard policy, so skip rather than assume a root FSDP unit.
+        # generic ``parallelize_model_fsdp2`` ``fully_shard``s the root). A model
+        # that declares its own ``build_parallelize_model`` may leave the root
+        # un-sharded — it then owns its reshard policy, so skip rather than
+        # assume a root FSDP unit.
         model = self.model
         if isinstance(model, FSDPModule):
             model.set_reshard_after_backward(reshard)
 
-    # ── Metric metering ────────────────────────────────────────────────────────
-
     def collect_step_metrics(self) -> Optional[MetricMeterResult]:
         """Drain this module's optional metric meter after one training step."""
-        model = unwrap_module(self.model)
+        model = unwrap_module_chain(self.model)
         if isinstance(model, MetricMeterMixin):
             return model.metric_meter_collect()
         return None
-
-    # ── Checkpoint manager (I/O only; scheduling lives in trainer callbacks) ───
-
-    @property
-    def checkpoint_subfolder(self) -> str:
-        if self.checkpoint is None:
-            return self.module_name
-        return self.checkpoint.checkpoint_subfolder
-
-    @checkpoint_subfolder.setter
-    def checkpoint_subfolder(self, value: str) -> None:
-        if self.checkpoint is not None:
-            self.checkpoint.checkpoint_subfolder = value
 
     def build_checkpoint(self) -> None:
         """Build this module's DCP / HF / LoRA checkpoint manager.
 
         Fully-frozen modules (no ``requires_grad`` params) get **no** manager:
         there is nothing to train, no optimizer to snapshot, and weights stay at
-        the released checkpoint (e.g. offline_cache OE/ViT/VAE). That is why
+        the released checkpoint (e.g. a frozen encoder). That is why
         every save/load below tolerates a missing manager, where the base can
         assume one.
         """
@@ -611,60 +573,43 @@ class ModuleRuntime(VeOmniModelRuntime):
 
     def save_dcp(self, state: "TrainerState") -> None:
         """Write this module's distributed checkpoint (train resume)."""
-        ckpt = self.checkpoint
-        if ckpt is None:
-            return
-        # Only epoch_end / train_end can revisit a global_step that step_end already
-        # wrote; step_end is never deduplicated because DCP and HF share one counter.
-        if state.stage in ("epoch_end", "train_end") and ckpt.last_saved_step == state.global_step:
-            logger.info_rank0(
-                f"Skipping duplicate dcp save for module '{self.module_name}' at {state.stage} "
-                f"(global_step {state.global_step} already saved)."
-            )
-            return
-        ckpt.save_dcp(state)
+        if self.checkpoint is not None:
+            self.checkpoint.save_dcp(state)
 
     def save_hf_or_lora(self, state: "TrainerState", stage: str = "step_end") -> None:
-        """Export this module's HF weights, or its LoRA adapter when LoRA is enabled.
+        """Export this module's HF weights, or its LoRA adapter when LoRA is enabled."""
+        if self.checkpoint is not None:
+            self.checkpoint.save_hf_or_lora(state, stage=stage)
 
-        ``stage`` is part of the base signature; the omni path reads
-        ``state.stage``, which the orchestrator sets before every save.
-
-        Not deduplicated here: ``ckpt.last_saved_step`` counts DCP saves, so a
-        step whose DCP was written would skip its HF export. Same-step HF
-        dedupe is :class:`~veomni.trainer.callbacks.omni_callbacks.OmniModuleHfCallback`'s,
-        which tracks HF saves on their own.
-        """
-        del stage
-        ckpt = self.checkpoint
-        if ckpt is None:
-            return
-        ckpt.save_hf_or_lora(state)
+    def wait_for_pending_save(self) -> None:
+        """Block until this module's in-flight async save is on disk, if any."""
+        if self.checkpoint is not None:
+            self.checkpoint.wait_for_pending_save()
 
     def save_model_assets(self) -> None:
         """Not a module's job — the composed model writes the shared sidecars.
 
-        The base writes ``model_assets`` beside a whole model's weights. A module
-        has none to cache (its processor/tokenizer live on the model itself and
-        are exported per-module by :meth:`collect_hf_export_assets`), and the
-        job-level sidecars belong to the composed checkpoint root, which
-        :meth:`OmniTrainer.save_model_assets` owns.
+        The base writes ``model_assets`` into ``model_assets_dir``. For a composed
+        model that directory is the omni root's, which
+        :meth:`OmniModelRuntime.save_model_assets` writes, putting each module's
+        :attr:`model_assets` under ``<root>/<module>/`` beside the root config.
         """
         raise NotImplementedError(
             f"ModuleRuntime '{self.module_name}' does not write model assets; "
-            "per-module sidecars go through collect_hf_export_assets(), and the composed "
-            "checkpoint root's assets through OmniTrainer.save_model_assets()."
+            "the composed checkpoint root's assets go through OmniModelRuntime.save_model_assets()."
         )
 
-    def collect_hf_export_assets(self) -> List[Any]:
-        """Return this module's config + processor/tokenizer sidecars for HF export.
+    @property
+    def model_assets(self) -> List[Any]:
+        """This module's config + processor/tokenizer sidecars, read off the live model.
 
-        ``self.model`` may still be DDP-wrapped here (FSDP2 composes in place and
-        exposes the raw model's attributes, but ``DistributedDataParallel`` does
-        not forward unknown attribute lookups to ``.module``) — unwrap first so
-        ``config`` / processor / tokenizer resolve regardless of ``dp_mode``.
+        :meth:`_build_model_assets` binds them onto the model rather than caching
+        a list. ``self.model`` may still be DDP-wrapped here (FSDP2 composes in
+        place and exposes the raw model's attributes, but
+        ``DistributedDataParallel`` does not forward unknown attribute lookups to
+        ``.module``) — unwrap first so they resolve regardless of ``dp_mode``.
         """
-        model = unwrap_module(self.model)
+        model = unwrap_module_chain(self.model)
         assets: List[Any] = []
         cfg = getattr(model, "config", None)
         if cfg is not None:
@@ -676,4 +621,24 @@ class ModuleRuntime(VeOmniModelRuntime):
         return assets
 
 
-__all__ = ["ModuleRuntime"]
+def build_omni_module_runtime(
+    args: "OmniModuleRuntimeArguments",
+    module_name: str,
+    *,
+    module_config: "OmniModuleConfig",
+    global_accelerator: "AcceleratorConfig",
+    train: Optional["OmniTrainingArguments"] = None,
+    for_inference: bool = False,
+) -> ModuleRuntime:
+    """Build the :class:`ModuleRuntime` for one module of a composed model."""
+    return ModuleRuntime(
+        args,
+        module_name=module_name,
+        module_config=module_config,
+        global_accelerator=global_accelerator,
+        train=train,
+        for_inference=for_inference,
+    )
+
+
+__all__ = ["ModuleRuntime", "build_omni_module_runtime", "composed_model_owns_wrap"]

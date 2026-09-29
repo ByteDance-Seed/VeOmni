@@ -88,7 +88,7 @@ def read_model_type(model_path: str) -> str:
     Shared helper for any caller that needs to dispatch from a
     split-checkpoint subfolder to the matching module class —
     today that's :class:`OmniInferencer` (eager ``from_pretrained``) and
-    :meth:`OmniTrainer._build_model` (meta-init via
+    :meth:`OmniTrainer._build_model_runtime` (meta-init via
     :func:`build_foundation_model`).  Centralised here so both paths use
     the same registration gate and emit identical error messages.
 

@@ -31,12 +31,6 @@ def test_remote_module_path_is_left_alone() -> None:
     assert _resolved("/local/root", "hdfs://ns/vision_encoder") == "hdfs://ns/vision_encoder"
 
 
-def test_weights_path_seeds_the_resolved_model_path() -> None:
-    modules_config: dict[str, Any] = {"vision": {"weights_path": "vision_encoder"}}
-
-    assert _resolve_model_path("/local/root", modules_config)["vision"]["model_path"] == "/local/root/vision_encoder"
-
-
 def test_empty_modules_config_returns_empty_dict() -> None:
     assert _resolve_model_path("/local/root", None) == {}
     assert _resolve_model_path("/local/root", {}) == {}

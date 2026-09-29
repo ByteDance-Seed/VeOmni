@@ -60,7 +60,7 @@ backbone:
 
 SP is **uniform**. Set the SP size on the outer trainer
 (`accelerator.ulysses_size`); every module inherits it through the per-module
-accelerator deep-merge in `build_module_runtime_args`. Do NOT add per-module
+accelerator deep-merge in `build_omni_module_runtime_args`. Do NOT add per-module
 `ulysses_size` overrides — nothing validates uniformity, so an override silently
 produces a non-uniform run. The dataloader is the
 standard `BaseTrainer` build-time sharded loader: it yields `dp_size = world / sp`

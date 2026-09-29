@@ -38,6 +38,8 @@ wall clock as its frames, and the two spans have to stay comparable.
 """
 
 import contextlib
+import sys
+from types import ModuleType
 
 import numpy as np
 import pytest
@@ -93,10 +95,16 @@ def _stub_decoder(average_fps: float | None, num_frames: int, duration_seconds: 
         def get_frames_at(self, indices):
             return type("F", (), {"data": torch.zeros(len(indices), 3, 2, 2, dtype=torch.uint8)})()
 
-    import torchcodec.decoders
+    # A stand-in package rather than a patched real one: nothing is decoded, so
+    # these run where torchcodec is absent or its shared libraries cannot load.
+    decoders = ModuleType("torchcodec.decoders")
+    decoders.VideoDecoder = _Decoder
+    torchcodec = ModuleType("torchcodec")
+    torchcodec.decoders = decoders
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(torchcodec.decoders, "VideoDecoder", _Decoder)
+        patch.setitem(sys.modules, "torchcodec", torchcodec)
+        patch.setitem(sys.modules, "torchcodec.decoders", decoders)
         patch.setattr(_video_module, "is_ffmpeg_available", lambda: True)
         yield patch
 
@@ -427,9 +435,6 @@ def test_a_nonsense_patch_size_is_refused_rather_than_raising_from_the_arithmeti
         meta.frame_timestamps(temporal_patch_size=bad)
 
 
-# --- The generated side: one clip, one file, sound included --------------------
-
-
 def _generated_clip(num_frames: int = 6, fps: float = 24.0) -> tuple[torch.Tensor, VideoMetadata]:
     """A clip as a model would emit it, with the metadata that describes it.
 
@@ -638,3 +643,23 @@ def test_the_inferencer_writes_a_generated_clip_from_the_items_own_meta(tmp_path
     with av.open(str(tmp_path / "generated_video_0.mp4")) as container:
         assert container.streams.audio[0].sample_rate == rate
         assert container.streams.video[0].codec_context.framerate == meta.fps
+
+
+def test_item_repr_prints_both_streams_and_both_timelines():
+    """``print(conversation_list)`` shows the payload and the timelines on ``meta``,
+    one multi-line block per item."""
+    item = _video_item(
+        VideoMetadata(total_num_frames=300, fps=30.0, frames_indices=list(range(0, 300, 15))),
+        torch.zeros(20, 3, 4, 4, dtype=torch.uint8),
+        waveform=np.zeros(160000, dtype=np.float32),
+        audio_metadata=AudioMetadata(sampling_rate=16000, num_samples=160000),
+    )
+
+    assert repr(item) == (
+        "\nConversationItem(type=video, role=user, source=None)\n"
+        "  value: [VideoInputs] video=[torch.Tensor](20, 3, 4, 4), audio=[ndarray](160000,)\n"
+        "  meta:\n"
+        "    video_metadata: [VideoMetadata] total_num_frames=300, fps=30, duration=10, "
+        "frames_indices=[0, 15, 30, ..., 255, 270, 285](len=20)\n"
+        "    audio_metadata: [AudioMetadata] sampling_rate=16000, num_samples=160000\n"
+    )

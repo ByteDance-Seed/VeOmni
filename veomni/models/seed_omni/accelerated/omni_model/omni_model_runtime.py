@@ -19,25 +19,84 @@ from __future__ import annotations
 import os
 from contextlib import nullcontext
 from dataclasses import fields
-from typing import TYPE_CHECKING, Any, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
+import torch
+
+from .....distributed.clip_grad_norm import veomni_omni_model_clip_grad_norm
 from .....distributed.parallel_state import use_parallel_state
 from .....utils.logging import get_logger
 from ...mixins.metric_meter_mixin import MetricMeterResult
 from ...modeling_omni import OmniModel
 from ...utils.graph_profiler import GraphProfiler
 from ..utils.executor import TrainNodeRunner, execute_generation_node
-from ..utils.modules import iter_named_omni_modules, save_module_subdirectory
+from ..utils.modules import save_module_subdirectory
 
 
 if TYPE_CHECKING:
     from .....arguments.omni_arguments_types import OmniGraphProfileArguments, OmniTrainingArguments
     from .....trainer.callbacks import TrainerState
     from ..omni_module.omni_module_runtime import ModuleRuntime
-    from .omni_model_config import OmniModelRuntimeConfig
+    from .omni_model_config import OmniModelRuntimeArguments
 
 
 logger = get_logger(__name__)
+
+
+class MultiOptimizer:
+    """Thin proxy over ``{module_name: torch.optim.Optimizer}``.
+
+    Exposes the minimal :class:`torch.optim.Optimizer` surface the logging
+    callbacks read (``param_groups``) and the train loop drives
+    (``step`` / ``zero_grad``).  Optimizer state is checkpointed per module by
+    each :class:`ModuleRuntime`'s own DCP manager, so no ``state_dict`` is needed
+    here.
+    """
+
+    def __init__(self, optimizers: dict[str, torch.optim.Optimizer]):
+        self.optimizers = optimizers
+
+    @property
+    def param_groups(self) -> list[dict[str, Any]]:
+        groups: list[dict[str, Any]] = []
+        for opt in self.optimizers.values():
+            groups.extend(opt.param_groups)
+        return groups
+
+    def step(self) -> None:
+        for opt in self.optimizers.values():
+            opt.step()
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        # veomni.optim.MultiOptimizer (FSDP2 +ExtraParallel) has ``zero_grad()`` with no args
+        # plain torch optimizers default to ``set_to_none=True``.
+        for opt in self.optimizers.values():
+            opt.zero_grad()
+
+
+class MultiLRScheduler:
+    """Thin proxy over ``{module_name: LRScheduler}`` (step-all / lr-read)."""
+
+    def __init__(self, schedulers: dict[str, Any]):
+        self.schedulers = schedulers
+
+    def step(self) -> None:
+        for sched in self.schedulers.values():
+            sched.step()
+
+    def get_last_lr(self) -> list[float]:
+        lrs: list[float] = []
+        for sched in self.schedulers.values():
+            lrs.extend(sched.get_last_lr())
+        return lrs or [0.0]
+
+    def state_dict(self) -> dict[str, Any]:
+        return {name: sched.state_dict() for name, sched in self.schedulers.items()}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        for name, sched in self.schedulers.items():
+            if name in state:
+                sched.load_state_dict(state[name])
 
 
 def _scoped_no_split_modules(module_runtimes: Mapping[str, ModuleRuntime]) -> list[str]:
@@ -99,7 +158,7 @@ class OmniModelRuntime:
       over a checkpoint root holding ``config.json``. Every sub-module is a plain
       ``PreTrainedModel`` and the composed model is a plain ``PreTrainedModel``;
       no VeOmni infrastructure is involved (eager single-process inference).
-    * **VeOmni** — :meth:`from_model_runtime`. Every sub-module is owned by a
+    * **VeOmni** — :func:`build_omni_model_runtime`. Every sub-module is owned by a
       :class:`~veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.ModuleRuntime`
       (FSDP2/DDP wrap, weight load, optimizer, checkpoint manager) and the
       composed model is *this* class. ``OmniTrainer.model`` /
@@ -109,17 +168,19 @@ class OmniModelRuntime:
 
     The two lines stay apart: :class:`OmniModel` holds each runtime's bare
     module (:attr:`ModuleRuntime.omni_module`), and whatever a runtime wrapped
-    it in (DDP, LoRA) stays on the runtime. Nodes, generation and export call
-    the module through its runtime (:meth:`_module_to_call`), so a DDP
-    module still syncs its gradients.
+    it in (DDP, LoRA) stays on the runtime. Nodes and generation call the
+    module through its runtime (:meth:`get_module`), so a DDP module still
+    syncs its gradients.
 
     Both are used through the single ``self.model`` handle on the trainer /
     inferencer. APIs that need no wrapper handling are forwarded via
-    :meth:`__getattr__` (``config``, ``modules_dict``, …).
+    :meth:`__getattr__` (``config``, ``modules_dict``, :meth:`OmniModel.reset`,
+    :meth:`OmniModel.named_omni_modules`, …).
     :meth:`forward` enters the (possibly FSDP-wrapped) :class:`OmniModel` so
     root leftover params unshard, then :meth:`OmniModel.forward` runs the
-    training graph. :meth:`generate`, :meth:`save_pretrained`, :meth:`reset`,
-    and :meth:`named_omni_modules` stay on this wrapper.
+    training graph. :meth:`get_module`, :meth:`clip_grad_norm`, :meth:`generate` and
+    :meth:`save_pretrained` stay on this wrapper, and so do
+    :attr:`optimizer` / :attr:`lr_scheduler`, which step every module's own.
     """
 
     def __init__(
@@ -127,59 +188,44 @@ class OmniModelRuntime:
         model: OmniModel,
         *,
         module_runtimes: Mapping[str, ModuleRuntime] | None = None,
-        omni_model_runtime_args: OmniModelRuntimeConfig | None = None,
+        omni_model_runtime_args: OmniModelRuntimeArguments | None = None,
+        train_args: OmniTrainingArguments | None = None,
     ) -> None:
         self.model = model
         self.module_runtimes = dict(module_runtimes or {})
         self.omni_model_runtime_args = omni_model_runtime_args
+        self.train_args = train_args
+        self.optimizer: MultiOptimizer | None = None
+        self.lr_scheduler: MultiLRScheduler | None = None
         self._step_profiler: GraphProfiler | None = None
 
-    @classmethod
-    def from_model_runtime(
-        cls,
-        omni_model_runtime_args: OmniModelRuntimeConfig,
-        *,
-        train: OmniTrainingArguments = None,
-        for_inference: bool = False,
-    ) -> OmniModelRuntime:
-        """Compose a VeOmni-managed model from a resolved :class:`OmniModelRuntimeConfig`.
+    def _build_optimizer(self) -> None:
+        """Wrap the trainable modules' optimizers in one :class:`MultiOptimizer`.
 
-        ``train`` is the global :class:`~....arguments.omni_arguments_types.OmniTrainingArguments`
-        (unset for inference) — forwarded to every :class:`ModuleRuntime` so its
-        checkpoint manager can resolve the shared ``save_path``/``output_dir``/``load_path``.
+        Stays ``None`` when every module is frozen, like a frozen module's own.
         """
-        from ..omni_module.omni_module_runtime import ModuleRuntime
+        optimizers = {
+            name: module_runtime.optimizer
+            for name, module_runtime in self.module_runtimes.items()
+            if module_runtime.optimizer is not None
+        }
+        self.optimizer = MultiOptimizer(optimizers) if optimizers else None
+        logger.info_rank0(f"OmniModelRuntime: wired {len(optimizers)} optimizer(s): {list(optimizers)}.")
 
-        omni_config = omni_model_runtime_args.to_hf_config()
-        omni_config.load_checkpoint_sidecars(omni_model_runtime_args.resolved_model_path)
-        module_runtime_args = omni_model_runtime_args.modules
-        module_runtimes: dict[str, ModuleRuntime] = {}
-        for name in omni_config.module_names:
-            module_args = module_runtime_args[name]
-            module_runtime = ModuleRuntime(
-                module_args,
-                module_name=name,
-                module_config=omni_config._module_configs[name],
-                train=train,
-                for_inference=for_inference,
-                global_accelerator=omni_model_runtime_args.accelerator,
-            )
-            module_runtime.checkpoint_subfolder = name
-            module_runtimes[name] = module_runtime
-            logger.info_rank0(f"OmniModelRuntime: built ModuleRuntime '{name}' from {module_args.model_path}")
+    def _build_lr_scheduler(self, total_steps: int) -> None:
+        """Build every module's lr-scheduler over ``total_steps`` and wrap them.
 
-        logger.info_rank0(
-            f"OmniModelRuntime: composed OmniModel with {len(module_runtimes)} module(s) ({list(module_runtimes)})."
-        )
-        if not for_inference:
-            _reject_lora_that_matched_nothing(module_runtimes, train)
-        runtime = cls(
-            OmniModel(omni_config, {name: rt.omni_module for name, rt in module_runtimes.items()}),
-            module_runtimes=module_runtimes,
-            omni_model_runtime_args=omni_model_runtime_args,
-        )
-        runtime._parallelize_composed_model(for_inference=for_inference)
-        return runtime
+        A fully-frozen module builds none, so it contributes no entry; with no
+        entry at all the wrapper stays ``None``.
+        """
+        for module_runtime in self.module_runtimes.values():
+            module_runtime._build_lr_scheduler(total_steps)
+        lr_schedulers = {
+            name: module_runtime.lr_scheduler
+            for name, module_runtime in self.module_runtimes.items()
+            if module_runtime.lr_scheduler is not None
+        }
+        self.lr_scheduler = MultiLRScheduler(lr_schedulers) if lr_schedulers else None
 
     def _parallelize_composed_model(self, *, for_inference: bool = False) -> None:
         """``fully_shard`` the composed :class:`OmniModel` when ``fsdp_scope='model'``.
@@ -196,9 +242,11 @@ class OmniModelRuntime:
         (aligner, final norm, anything not in a nested unit) unshard on
         :meth:`OmniModel.forward`.
         """
+        from ..omni_module.omni_module_runtime import composed_model_owns_wrap
+
         args = self.omni_model_runtime_args
         acc = args.accelerator
-        if acc.fsdp_config.fsdp_scope != "model" or acc.fsdp_config.fsdp_mode == "eager":
+        if not composed_model_owns_wrap(acc):
             return
 
         modules = self.module_runtimes
@@ -227,7 +275,7 @@ class OmniModelRuntime:
         weights_path = {name: runtime.args.model_path for name, runtime in modules.items()}
 
         logger.info_rank0(f"OmniModelRuntime: wrapping composed OmniModel (fsdp_scope='model') over {list(modules)}.")
-        # ``OmniTrainer.setup_distributed`` registered ``base`` from the same top-level accelerator.
+        # ``OmniTrainer._setup`` registered ``base`` from the same top-level accelerator.
         with use_parallel_state("base"):
             self.model = build_parallelize_model(
                 self.model,
@@ -251,8 +299,9 @@ class OmniModelRuntime:
                 **kwargs,
             )
 
-        for runtime in modules.values():
-            runtime.finish_deferred_parallelize(for_inference=for_inference)
+        if not for_inference:
+            for runtime in modules.values():
+                runtime.build_after_omni_model_wrap()
 
     def __getattr__(self, name: str) -> Any:
         """Forward undshadowed :class:`OmniModel` APIs."""
@@ -342,9 +391,27 @@ class OmniModelRuntime:
         runner = TrainNodeRunner(profiler=profiler, scope_fn=self.module_context)
 
         def run_node(module: Any, node: Any, batch: dict[str, Any]) -> None:
-            runner(self._module_to_call(node.module), node, batch)
+            runner(self.get_module(node.module), node, batch)
 
         return self.model(batch, node_runner=run_node)
+
+    def clip_grad_norm(self) -> float:
+        """Clip every module's grads and return the whole-model norm.
+
+        Each :class:`ModuleRuntime` clips its own params against **its own**
+        ``optimizer.max_grad_norm`` (every OmniModule carries its own optimizer
+        config); the returned norm is the L2 combination of the pre-clip module
+        norms. Takes no threshold, since no single one applies. With no module
+        runtimes the norm is 0.0.
+        """
+        if not self.module_runtimes:
+            return 0.0
+        optimizer = self.omni_model_runtime_args.optimizer
+        return veomni_omni_model_clip_grad_norm(
+            self.module_runtimes,
+            optimizer.max_grad_norm,
+            grad_clip_scope=optimizer.grad_clip_scope,
+        )
 
     def generate(
         self,
@@ -364,7 +431,7 @@ class OmniModelRuntime:
         profiler = profiler if profiler is not None else self._step_profiler
         model = self.model
         ctx: dict[str, Any] = request
-        modules = {name: self._module_to_call(name) for name in model._module_names}
+        modules = {name: self.get_module(name) for name in model._module_names}
         generation_kwargs = model.resolve_generation_kwargs(generation_kwargs)
         max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
         total_steps = 0
@@ -410,28 +477,24 @@ class OmniModelRuntime:
         if profiler is not None and len(generated) > before:
             profiler.record(f"{label}:{generated[-1]['type']}")
 
-    def _module_to_call(self, name: str) -> Any:
-        """Module ``name`` as its runtime wrapped it, else the bare module :class:`OmniModel` holds."""
+    def get_module(self, name: str) -> Any:
+        """Module ``name`` as the graph runs it: wrapped as its runtime wrapped it.
+
+        :meth:`OmniModel.get_module` returns the bare module the composed model
+        holds; a DDP / LoRA wrapper lives on the module's runtime instead.
+        """
         module_runtime = self.module_runtimes.get(name)
-        return module_runtime.model if module_runtime is not None else self.model.modules_dict[name]
-
-    def named_omni_modules(self) -> Iterator[tuple[str, Any]]:
-        """Yield ``(name, BaseMixin)`` for every graph participant (unwraps wrappers)."""
-        yield from iter_named_omni_modules(self.model._module_names, self.model.modules_dict)
-
-    def reset(self) -> None:
-        """Clear per-conversation inference runtime state (unwraps wrapped modules)."""
-        model = self.model
-        model.generation_graph.reset()
-        model._generated.clear()
-        for _, module in self.named_omni_modules():
-            module.reset_global_inference_state()
+        return module_runtime.model if module_runtime is not None else self.model.get_module(name)
 
     def save_pretrained(self, save_directory: str | os.PathLike, **kwargs: Any) -> None:
         """Save the omni-root HF layout (config + graphs + module sidecars).
 
-        Unwraps DDP / LoRA wrappers when writing per-module assets; weight export
-        still calls each wrapped module's ``save_pretrained`` so FSDP/DDP hooks run.
+        Each module's sidecars are its runtime's :attr:`ModuleRuntime.model_assets`. Weights are
+        written from the main process alone, so weight export only suits
+        unsharded modules (eager, DDP); it strips DDP but keeps a LoRA wrapper,
+        whose ``save_pretrained`` writes the adapter. Training exports sharded
+        weights per module via ``OmniTrainer.save_hf_or_lora`` and calls this
+        with ``save_module_weights=False``.
         """
         import torch.distributed as dist
 
@@ -455,16 +518,30 @@ class OmniModelRuntime:
             "max_shard_size": max_shard_size,
         }
         for name in model._module_names:
-            module = self._module_to_call(name)
+            module_runtime = self.module_runtimes[name]
             save_module_subdirectory(
                 name,
-                module,
+                module_runtime.model,
                 save_directory,
+                assets=module_runtime.model_assets,
                 save_module_weights=save_module_weights,
                 **module_save_kwargs,
             )
 
         model.config.save_pretrained(save_directory)
+
+    def save_model_assets(self) -> None:
+        """Write the omni-root HF layout (config + graphs + module sidecars, no weights)."""
+        import torch.distributed as dist
+
+        if self.train_args is None:
+            raise ValueError("OmniModelRuntime.save_model_assets needs a training runtime (built with train=...).")
+        if self.train_args.global_rank == 0:
+            save_directory = self.train_args.checkpoint.model_assets_dir
+            self.save_pretrained(save_directory, save_module_weights=False)
+            logger.info_rank0(f"OmniModelRuntime: saved OmniModel assets to {save_directory}.")
+        if dist.is_initialized():
+            dist.barrier()
 
     def collect_step_metrics(self) -> dict[str, MetricMeterResult]:
         """Gather every metered module's ``(theoretical_flops, seqlens)`` on this model."""
@@ -485,10 +562,63 @@ class OmniModelRuntime:
         for module_runtime in self.module_runtimes.values():
             module_runtime.save_dcp(state)
 
-    def save_hf_or_lora(self, state: TrainerState) -> None:
+    def save_hf_or_lora(self, state: TrainerState, stage: str = "step_end") -> None:
         """Export every module's HF weights / LoRA adapter."""
         for module_runtime in self.module_runtimes.values():
-            module_runtime.save_hf_or_lora(state)
+            module_runtime.save_hf_or_lora(state, stage=stage)
+
+    def wait_for_pending_save(self) -> None:
+        """Drain every module's in-flight async checkpoint writes."""
+        for module_runtime in self.module_runtimes.values():
+            module_runtime.wait_for_pending_save()
 
 
-__all__ = ["OmniModelRuntime"]
+def build_omni_model_runtime(
+    omni_model_runtime_args: OmniModelRuntimeArguments,
+    *,
+    train: OmniTrainingArguments | None = None,
+    for_inference: bool = False,
+) -> OmniModelRuntime:
+    """Compose a VeOmni-managed model from a resolved :class:`OmniModelRuntimeArguments`.
+
+    ``train`` is the global :class:`~....arguments.omni_arguments_types.OmniTrainingArguments`
+    (unset for inference) — forwarded to every :class:`ModuleRuntime` so its
+    checkpoint manager can resolve the shared ``save_path``/``output_dir``/``load_path``.
+    """
+    from ..omni_module.omni_module_runtime import build_omni_module_runtime
+
+    omni_config = omni_model_runtime_args.to_hf_config()
+    omni_config.load_checkpoint_sidecars(omni_model_runtime_args.resolved_model_path)
+    module_runtime_args = omni_model_runtime_args.modules
+    module_runtimes: dict[str, ModuleRuntime] = {}
+    for name in omni_config.module_names:
+        module_args = module_runtime_args[name]
+        module_runtime = build_omni_module_runtime(
+            module_args,
+            module_name=name,
+            module_config=omni_config._module_configs[name],
+            train=train,
+            for_inference=for_inference,
+            global_accelerator=omni_model_runtime_args.accelerator,
+        )
+        module_runtimes[name] = module_runtime
+        logger.info_rank0(f"OmniModelRuntime: built ModuleRuntime '{name}' from {module_args.model_path}")
+
+    logger.info_rank0(
+        f"OmniModelRuntime: composed OmniModel with {len(module_runtimes)} module(s) ({list(module_runtimes)})."
+    )
+    if not for_inference:
+        _reject_lora_that_matched_nothing(module_runtimes, train)
+    runtime = OmniModelRuntime(
+        OmniModel(omni_config, {name: rt.omni_module for name, rt in module_runtimes.items()}),
+        module_runtimes=module_runtimes,
+        omni_model_runtime_args=omni_model_runtime_args,
+        train_args=train,
+    )
+    runtime._parallelize_composed_model(for_inference=for_inference)
+    if not for_inference:
+        runtime._build_optimizer()
+    return runtime
+
+
+__all__ = ["MultiLRScheduler", "MultiOptimizer", "OmniModelRuntime", "build_omni_model_runtime"]

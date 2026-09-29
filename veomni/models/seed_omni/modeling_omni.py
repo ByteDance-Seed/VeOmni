@@ -7,7 +7,7 @@ checkpoint compose/load/save.  It must import nothing from VeOmni's runtime
 (``accelerator`` / ``distributed`` / trainer), at module scope or inside a
 function, so this modeling can be lifted into another framework as-is and so
 HF ``from_pretrained`` / ``from_config`` keeps working for eager
-single-process inference. ``tests/seed_omni/test_graph.py`` asserts this.
+single-process inference. ``tests/seed_omni/model/test_graph.py`` asserts this.
 
 ``forward`` is the FSDP2 root entry: leftover params unshard on ``__call__``,
 then the training graph runs each child eagerly, which is correct for an
@@ -380,7 +380,7 @@ class OmniModel(PreTrainedModel):
         Rank-0 writes and returns; the other ranks return immediately and this
         does **not** barrier. The caller owns the barrier, because it is the one
         that knows what the other ranks go on to do —
-        :meth:`OmniTrainer.save_model_assets` barriers right after. Without one,
+        :meth:`OmniModelRuntime.save_model_assets` barriers right after. Without one,
         a rank can read a half-written directory.
 
         For the same reason ``save_module_weights=True`` is for an unsharded

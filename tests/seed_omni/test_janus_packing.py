@@ -245,7 +245,7 @@ def _omni_runtime_args(*, accelerator=None, optimizer=None):
 
 @pytest.fixture
 def base_parallel_state():
-    """The composed wrap runs under ``base``, which ``OmniTrainer.setup_distributed`` registers."""
+    """The composed wrap runs under ``base``, which ``OmniTrainer._setup`` registers."""
     from veomni.distributed import parallel_state
 
     parallel_state._PARALLEL_STATE_REGISTRY["base"] = parallel_state.ParallelState()

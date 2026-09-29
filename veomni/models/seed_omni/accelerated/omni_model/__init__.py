@@ -12,16 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Composite accelerated config + runtime.
+"""Composite accelerated config + runtime."""
 
-``OmniModelRuntimeConfig`` is the lightweight launcher dataclass.
-:class:`OmniModelRuntime` is heavier — import it from
-:mod:`.omni_model_runtime` when needed so config-only imports stay cheap.
-"""
-
-from .omni_model_config import OmniModelRuntimeConfig
+from .omni_model_config import OmniModelRuntimeArguments
+from .omni_model_runtime import OmniModelRuntime, build_omni_model_runtime
 
 
 __all__ = [
-    "OmniModelRuntimeConfig",
+    "OmniModelRuntime",
+    "OmniModelRuntimeArguments",
+    "build_omni_model_runtime",
 ]

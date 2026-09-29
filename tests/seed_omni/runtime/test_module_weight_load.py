@@ -25,6 +25,7 @@ def _build_module_runtime(model: nn.Module, *, load_path: str | None = _RESUME_P
     runtime.model = model
     runtime.model_name = "test_module"
     runtime.args = SimpleNamespace(model_path="/tmp/hf-model", lora_config=None)
+    runtime._global_accelerator = SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope="module", fsdp_mode="fsdp2"))
     runtime.train_args = SimpleNamespace(checkpoint=SimpleNamespace(load_path=load_path))
     runtime._has_trainable_parameters = None
     return runtime
@@ -85,6 +86,8 @@ def test_parallelize_forwards_module_skip_decision(monkeypatch: pytest.MonkeyPat
             torch_compile=CompileConfig(),
             gradient_checkpointing=SimpleNamespace(enable=False, enable_reentrant=False, early_stop=True),
             fsdp_config=SimpleNamespace(
+                fsdp_mode="fsdp2",
+                fsdp_scope="module",
                 reshard_after_forward=True,
                 mixed_precision=SimpleNamespace(enable=False),
                 forward_prefetch=False,
