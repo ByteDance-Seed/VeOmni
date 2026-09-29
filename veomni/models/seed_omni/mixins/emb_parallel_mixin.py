@@ -14,96 +14,100 @@
 
 """Vocab-parallel (``emb`` extra-parallel) embedding lookup + tied projection.
 
-Shared by any module whose embedding table is ``Shard(0)``-split on dim-0 (vocab)
-over the ``emb`` extra-parallel group AND additionally FSDP-sharded on dim-1
-(hidden) over the ``emb_fsdp`` sub-mesh -- a text encoder's ``embed_tokens``
-and a very large over-encoding table (hundreds of GB) both take this shape. The lookup / projection kernels (``AllToAllEmbedding`` /
-``VocabParallelLinear``) need this rank's *whole* emb chunk (all hidden), so the
-FSDP hidden shards are gathered back first (see :meth:`emb_local_weight`).
+For a module whose embedding table is ``Shard(0)``-split on dim-0 (vocab) over
+the ``emb`` extra-parallel group, and FSDP-sharded on dim-1 (hidden) over the
+``emb_fsdp`` sub-mesh -- a text encoder's ``embed_tokens`` and a very large
+over-encoding table (hundreds of GB) both take this shape.
 
-All methods are ``@staticmethod`` so a top-level model (a text encoder) or an
-inner ``nn.Module`` (an over-encoding embedding) can call them regardless of
-``self``; mix the class in for method-style access.
+The table lives in a :class:`VocabParallelEmbedding`, which the parallel plan
+wraps as its own FSDP2 unit. Every read of its weight goes through that unit's
+unshard hooks, so the kernels always see the plain ``[vocab/emb, hidden]`` rows
+in the mixed-precision param dtype, and FSDP2 reduce-scatters and scales the
+weight gradient like any other parameter's. Reading ``embedding.weight`` from
+outside those hooks would instead see the sharded DTensor and bypass the
+gradient reduction.
+
+All :class:`EmbParallelMixin` methods are ``@staticmethod`` so a top-level model
+(a text encoder) or an inner ``nn.Module`` (an over-encoding embedding) can call
+them regardless of ``self``; mix the class in for method-style access.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.fsdp import FSDPModule, register_fsdp_forward_method
 from torch.distributed.tensor import DTensor
 
-from veomni.distributed.parallel_state import get_parallel_state
-from veomni.ops.kernels.embed import AllToAllEmbedding, VocabParallelLinear
+from ....distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
+from ....ops.kernels.embed import AllToAllEmbedding, VocabParallelLinear
 
 
 class EmbParallelMixin:
     @staticmethod
     def emb_parallel_active() -> bool:
         """True when the ``emb`` extra-parallel group is present and size > 1."""
+        if not is_parallel_state_initialized():
+            return False
         ps = get_parallel_state()
         return "emb" in ps.extra_parallel_sizes and ps.extra_parallel_enabled("emb")
 
     @staticmethod
-    def emb_local_weight(weight: torch.Tensor) -> torch.Tensor:
-        """Reconstruct this emb-rank's full ``[vocab/emb, hidden]`` slice.
-
-        The weight is ``Shard(0)`` (vocab) over ``emb`` and FSDP-sharded on the
-        hidden dim over ``emb_fsdp``; the kernels need this rank's whole emb chunk
-        across all hidden -- gathered WITHOUT mixing other emb ranks:
-
-        * ``emb_fsdp == 1`` (world == emb): the local shard already spans all
-          hidden, so ``to_local()`` returns it as a view -- no (tens-of-GB) copy.
-        * ``emb_fsdp  > 1``: ``full_tensor()`` all-gathers the hidden shards.
-          Detach under inference (``full_tensor``'s redistribute trips on an
-          in-place ``detach_`` of a grad-requiring DTensor); keep grad in training
-          so the kernel's backward reaches the sharded param.
-
-        With ``emb`` OFF the weight is still a DTensor -- a plain FSDP2 ``Shard(0)``
-        over ``dp_shard`` -- because a tied head reads ``embed_tokens.weight``
-        directly, bypassing the embedding's own FSDP2 unshard hook. There is no
-        ``emb`` group to consult, so ``full_tensor()`` all-gathers the whole
-        ``[vocab, hidden]`` table for the plain ``F.linear`` projection (grad kept
-        in training, detached in inference, as above).
-
-        Non-DTensor weights (single replica / eager) pass through unchanged.
-        """
-        if not isinstance(weight, DTensor):
-            return weight
-        if not EmbParallelMixin.emb_parallel_active():
-            return weight.full_tensor() if torch.is_grad_enabled() else weight.detach().full_tensor()
-        ps = get_parallel_state()
-        if ps.extra_parallel_fsdp_size("emb") == 1:
-            return weight.to_local()
-        return weight.full_tensor() if torch.is_grad_enabled() else weight.detach().full_tensor()
-
-    @staticmethod
     def emb_parallel_lookup(embedding: nn.Module, ids: torch.Tensor) -> torch.Tensor:
-        """Embedding lookup: vocab-parallel when ``emb`` is on, else a plain call.
-
-        ``embedding`` is the row-owning module (an ``nn.Embedding`` or a lazy
-        table). Under ``emb`` its ``.weight`` is the ``Shard(0)`` DTensor and
-        ``AllToAllEmbedding`` all-to-all dispatches each global id to its owning
-        rank, so the result is bit-identical to a full-table lookup.
-        """
-        if not EmbParallelMixin.emb_parallel_active():
-            return embedding(ids)
-        ps = get_parallel_state()
-        weight = EmbParallelMixin.emb_local_weight(embedding.weight)
-        return AllToAllEmbedding.apply(ps.extra_parallel_group("emb"), ids, weight)
+        """Embedding lookup of global ``ids``; vocab-parallel when ``emb`` is on."""
+        if EmbParallelMixin.emb_parallel_active() and not isinstance(embedding, VocabParallelEmbedding):
+            raise TypeError(
+                f"emb parallel is on but {type(embedding).__name__} is not a VocabParallelEmbedding; "
+                "a plain lookup would index this rank's vocab shard with global ids."
+            )
+        return embedding(ids)
 
     @staticmethod
-    def emb_parallel_project(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        """Project ``hidden -> vocab`` logits with a (possibly ``emb``-sharded) weight.
+    def emb_parallel_project(hidden_states: torch.Tensor, embedding: nn.Module) -> torch.Tensor:
+        """Tied head: project ``hidden -> vocab`` logits with ``embedding``'s weight.
 
-        Dual of :meth:`emb_parallel_lookup` for a tied head: ``VocabParallelLinear``
-        all-gathers the vocab shards over ``emb`` to full-vocab logits; off ``emb``
-        it is a plain ``F.linear``. (``full_tensor()`` returns the fp32 master
-        param, so cast to the activation dtype before the matmul.)
+        A :class:`VocabParallelEmbedding` that is its own FSDP2 unit gets
+        ``project`` registered as an FSDP forward method on first use, so the
+        projection unshards the weight and hooks its gradient exactly like the
+        lookup does.
         """
-        weight = EmbParallelMixin.emb_local_weight(weight).to(hidden_states.dtype)
-        if EmbParallelMixin.emb_parallel_active():
-            ps = get_parallel_state()
-            return VocabParallelLinear.apply(ps.extra_parallel_group("emb"), hidden_states, weight)
-        return F.linear(hidden_states, weight)
+        if isinstance(embedding, VocabParallelEmbedding):
+            if isinstance(embedding, FSDPModule) and not getattr(embedding, "_project_is_fsdp_method", False):
+                register_fsdp_forward_method(embedding, "project")
+                embedding._project_is_fsdp_method = True
+            return embedding.project(hidden_states)
+        if EmbParallelMixin.emb_parallel_active() or isinstance(embedding.weight, DTensor):
+            raise TypeError(
+                f"{type(embedding).__name__}.weight is sharded outside its unshard hooks; "
+                "use VocabParallelEmbedding so the tied projection runs under FSDP2."
+            )
+        return F.linear(hidden_states, embedding.weight.to(hidden_states.dtype))
 
 
-__all__ = ["EmbParallelMixin"]
+class VocabParallelEmbedding(nn.Embedding):
+    """``nn.Embedding`` that takes global ids when its rows are split over ``emb``.
+
+    ``num_embeddings`` / ``padding_idx`` stay in the global vocab space; under
+    ``emb`` the weight holds only this rank's ``[vocab/emb, hidden]`` rows. With
+    ``emb`` off it is exactly ``nn.Embedding``.
+    """
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if not EmbParallelMixin.emb_parallel_active():
+            return super().forward(input)
+        if self.max_norm is not None:
+            raise NotImplementedError("VocabParallelEmbedding does not support max_norm under emb parallel.")
+        output = AllToAllEmbedding.apply(get_parallel_state().extra_parallel_group("emb"), input, self.weight)
+        if self.padding_idx is not None:
+            # Same as F.embedding: the padding row receives no gradient.
+            output = torch.where((input == self.padding_idx).unsqueeze(-1), output.detach(), output)
+        return output
+
+    def project(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Tied head logits over the full vocab; call through :meth:`EmbParallelMixin.emb_parallel_project`."""
+        weight = self.weight.to(hidden_states.dtype)
+        if not EmbParallelMixin.emb_parallel_active():
+            return F.linear(hidden_states, weight)
+        return VocabParallelLinear.apply(get_parallel_state().extra_parallel_group("emb"), hidden_states, weight)
+
+
+__all__ = ["EmbParallelMixin", "VocabParallelEmbedding"]
