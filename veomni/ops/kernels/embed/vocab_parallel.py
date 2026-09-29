@@ -19,6 +19,10 @@ gradient they return covers every token of the ``emb`` group, but only this
 data-parallel replica's tokens: callers run them inside the FSDP2 unshard hooks
 of the owning module, which reduce-scatter and scale that gradient like any
 other parameter's.
+
+Every collective, backward included, spans the whole ``emb`` group: each rank
+must call the same ops in the same order (with empty inputs if it has no
+tokens) and backpropagate through all of them, or the others block.
 """
 
 from typing import Optional
@@ -34,25 +38,6 @@ def _group_size_and_rank(group: Optional["dist.ProcessGroup"]) -> tuple[int, int
     return dist.get_world_size(group), dist.get_rank(group)
 
 
-def _check_ids_in_range(ids: torch.Tensor, vocab_size: int, group: Optional["dist.ProcessGroup"]) -> None:
-    """Fail on every rank together, before any dispatch, if some rank holds an out-of-range id.
-
-    Ids are bucketed by floor division, so a negative id would land in bucket
-    ``-1`` that nothing collects and leave its output row uninitialized. Raising
-    on the offending rank alone would leave the others blocked in the next
-    collective until it times out.
-    """
-    lo, hi = (int(ids.min()), int(ids.max())) if ids.numel() > 0 else (0, 0)
-    bad = torch.tensor([int(lo < 0 or hi >= vocab_size)], device=ids.device)
-    if group is not None:
-        dist.all_reduce(bad, op=dist.ReduceOp.MAX, group=group)
-    if bad.item():
-        raise RuntimeError(
-            f"AllToAllEmbedding: token ids must lie in [0, {vocab_size}); "
-            f"this rank's ids span [{lo}, {hi}] (some rank of the emb group is out of range)."
-        )
-
-
 class AllToAllEmbedding(torch.autograd.Function):
     """Vocab-parallel embedding via all-to-all token dispatch over the ``emb`` group.
 
@@ -61,7 +46,12 @@ class AllToAllEmbedding(torch.autograd.Function):
     (all-to-all) to their owning rank, looked up locally on that rank's shard,
     then the embeddings are shipped back (all-to-all) and reassembled in input
     order. Backward routes the per-token grads back the same way and index-adds
-    them (in fp32) into the local shard.
+    them into the local shard, in fp32 over only the rows this step touched.
+
+    Every rank learns in the first exchange whether any rank holds an id outside
+    ``[0, vocab)``, and all of them raise before dispatching ids. Bucketing by
+    floor division would otherwise send a negative id to bucket ``-1`` that no
+    rank collects, and raising on one rank alone would leave the rest blocked.
 
     A single shard (no group, or a group of one) owns the whole table, so each
     exchange below becomes the identity and is aliased rather than performed.
@@ -79,21 +69,32 @@ class AllToAllEmbedding(torch.autograd.Function):
         raw_shape = input_tensor.shape
         input_flat = input_tensor.reshape(-1)
         num_input_ids = input_flat.shape[0]
-        _check_ids_in_range(input_flat, vocab_size_per_rank * emb_size, group if sharded else None)
+        vocab_size = vocab_size_per_rank * emb_size
 
         # --- Dispatching logic: which rank owns each id ---
-        id_rank = input_flat // vocab_size_per_rank
+        in_range = (input_flat >= 0) & (input_flat < vocab_size)
+        id_rank = torch.where(in_range, input_flat // vocab_size_per_rank, 0)
         full_rank_index = torch.argsort(id_rank, stable=True)
         send_counts = torch.bincount(id_rank, minlength=emb_size)
-        send_rank_count_list = send_counts.tolist()
+        # Per destination rank: (id count, "some id of mine is out of range").
+        send_meta = torch.stack([send_counts, (~in_range).any().long().expand(emb_size)], dim=1)
 
-        # --- 1st collective: exchange per-pair counts ---
+        # --- 1st collective: exchange per-pair counts and the range flags ---
         if sharded:
-            recv_counts = torch.empty_like(send_counts)
-            dist.all_to_all_single(recv_counts, send_counts, group=group)
-            receive_rank_count_list = recv_counts.tolist()
+            recv_meta = torch.empty_like(send_meta)
+            dist.all_to_all_single(recv_meta, send_meta, group=group)
         else:
-            receive_rank_count_list = send_rank_count_list
+            recv_meta = send_meta
+        send_meta_list, recv_meta_list = torch.stack([send_meta, recv_meta]).tolist()
+        if any(bad for _, bad in recv_meta_list):
+            bad_ids = input_flat[~in_range]
+            span = f"[{int(bad_ids.min())}, {int(bad_ids.max())}]" if bad_ids.numel() > 0 else "all in range"
+            raise RuntimeError(
+                f"AllToAllEmbedding: token ids must lie in [0, {vocab_size}); "
+                f"some rank of the emb group is out of range (this rank's offending ids: {span})."
+            )
+        send_rank_count_list = [count for count, _ in send_meta_list]
+        receive_rank_count_list = [count for count, _ in recv_meta_list]
 
         # --- 2nd collective: exchange token ids ---
         send_ids = input_flat[full_rank_index].contiguous()
@@ -164,13 +165,19 @@ class AllToAllEmbedding(torch.autograd.Function):
         else:
             grad_recv_buf = grad_send_buf
 
-        # Accumulate in fp32: frequent tokens sum many rows into one.
-        grad_embedding_table = torch.zeros(ctx.embedding_table_shape, device=grad_output.device, dtype=torch.float32)
+        grad_embedding_table = torch.zeros(
+            ctx.embedding_table_shape, device=grad_output.device, dtype=ctx.embedding_table_dtype
+        )
         if grad_recv_buf.numel() > 0:
-            grad_embedding_table.index_add_(0, local_indices, grad_recv_buf.float())
+            # Accumulate in fp32 (frequent tokens sum many rows into one), but only
+            # over touched rows: a full-table fp32 buffer would triple the peak.
+            rows, inverse = torch.unique(local_indices, return_inverse=True)
+            row_grads = torch.zeros(rows.numel(), embedding_dim, device=grad_output.device, dtype=torch.float32)
+            row_grads.index_add_(0, inverse, grad_recv_buf.float())
+            grad_embedding_table.index_copy_(0, rows, row_grads.to(ctx.embedding_table_dtype))
 
         # Gradients for (group, input_tensor, embedding_table)
-        return None, None, grad_embedding_table.to(ctx.embedding_table_dtype)
+        return None, None, grad_embedding_table
 
 
 def _all_gather_vocab(weight: torch.Tensor, group: "dist.ProcessGroup", emb_size: int) -> torch.Tensor:
@@ -192,6 +199,10 @@ class VocabParallelLinear(torch.autograd.Function):
     than keeping the full table alive between forward and backward. The
     full-vocab weight grad is then reduce-scattered over the ``emb`` group so
     each rank keeps its own chunk's grad, summed over the group's tokens.
+
+    Forward and backward each materialize the full ``[vocab, hidden]`` weight,
+    and backward its full gradient too: sized for a text vocabulary, not for a
+    table too large to gather on one device.
     """
 
     @staticmethod

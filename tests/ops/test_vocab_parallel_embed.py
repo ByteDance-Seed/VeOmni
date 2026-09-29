@@ -82,6 +82,19 @@ def test_embedding_backward_matches_dense_and_accumulates_repeats(table):
     assert torch.equal(sharded_w.grad[2], torch.zeros(HIDDEN, dtype=torch.float64))
 
 
+def test_embedding_backward_sums_repeats_in_fp32_and_returns_the_table_dtype():
+    """bf16 running sums of many small grads would stall; only the result is rounded."""
+    table = torch.zeros(VOCAB, HIDDEN, dtype=torch.bfloat16, requires_grad=True)
+    ids = torch.full((4096,), 3)
+    grad = torch.full((4096, HIDDEN), 1e-3, dtype=torch.bfloat16)
+    (AllToAllEmbedding.apply(None, ids, table) * grad).sum().backward()
+
+    assert table.grad.dtype is torch.bfloat16
+    expected = (grad.float().sum(0)).to(torch.bfloat16)
+    assert torch.equal(table.grad[3], expected)
+    assert torch.count_nonzero(table.grad[torch.arange(VOCAB) != 3]) == 0
+
+
 def test_embedding_gradcheck(table):
     ids = torch.tensor([0, 3, 1, 3])
     weight = table.clone().requires_grad_(True)
