@@ -21,16 +21,20 @@ from collections.abc import Collection
 from typing import Any
 
 
-RUNTIME_CONFIG_KEYS = ("support_cache", "train_type")
-
-
 class OfflineEncodingMixin(ABC):
     """Offline-cache capability for accelerated module mixins.
 
-    ``support_cache`` / ``train_type`` are launcher/runtime fields — not part of
-    the HF-native ``config.json``. :meth:`patch_config` applies them onto the
-    live config object; :meth:`__init__` does this automatically before the
-    native model body runs.
+    ``config.support_cache`` declares that a module *can* run from an offline
+    cache; it is a property of the checkpoint and is saved in ``config.json``.
+    ``cache_mode`` selects what this run actually does and is a per-run choice,
+    so it is a constructor kwarg kept on the instance, never on the config:
+
+    * ``full`` — no cache; the module encodes online.
+    * ``encode_only`` — only :meth:`offline_encode` runs, producing the cache.
+    * ``process_only`` — only :meth:`online_process` runs, consuming the cache.
+
+    :meth:`__init__` sets :attr:`cache_mode` before the native model body runs,
+    so the body can skip building sub-networks the mode never uses.
 
     Modules that expose offline-cache graph endpoints must implement
     :meth:`offline_encode` and :meth:`online_process` on a sibling ``*OfflineMixin``
@@ -42,52 +46,29 @@ class OfflineEncodingMixin(ABC):
     VALID_CACHE_MODES = frozenset({"full", "encode_only", "process_only"})
 
     config: Any
+    cache_mode: str
 
     @classmethod
-    def derive_cache_mode(cls, *, support_cache: bool, train_type: str) -> str:
-        if not support_cache:
-            return cls.DEFAULT_CACHE_MODE
-        if train_type == "offline_cache":
-            return "encode_only"
-        if train_type == "train_with_cache":
-            return "process_only"
-        return cls.DEFAULT_CACHE_MODE
-
-    @classmethod
-    def patch_config(cls, config: Any, **overrides: Any) -> None:
-        """Apply launcher/runtime offline-cache fields onto a live config object."""
-        support_cache = overrides.get("support_cache", getattr(config, "support_cache", False))
-        train_type = overrides.get("train_type", getattr(config, "train_type", "train"))
-        config.support_cache = bool(support_cache)
-        config.train_type = str(train_type)
-
-    @classmethod
-    def validated_cache_mode(cls, config: Any) -> str:
-        mode = cls.derive_cache_mode(
-            support_cache=bool(getattr(config, "support_cache", False)),
-            train_type=str(getattr(config, "train_type", "train")),
-        )
-        if mode not in cls.VALID_CACHE_MODES:
+    def validate_cache_mode(cls, cache_mode: str, config: Any) -> str:
+        if cache_mode not in cls.VALID_CACHE_MODES:
             valid = ", ".join(sorted(cls.VALID_CACHE_MODES))
-            raise ValueError(f"{type(config).__name__}.cache_mode must be one of {{{valid}}}; got {mode!r}.")
-        return mode
+            raise ValueError(f"{cls.__name__}.cache_mode must be one of {{{valid}}}; got {cache_mode!r}.")
+        if cache_mode != cls.DEFAULT_CACHE_MODE and not getattr(config, "support_cache", False):
+            raise ValueError(
+                f"{cls.__name__}.cache_mode={cache_mode!r} requires {type(config).__name__}.support_cache=True."
+            )
+        return cache_mode
 
-    @property
-    def cache_mode(self) -> str:
-        return self.validated_cache_mode(self.config)
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        runtime_overrides = {key: kwargs.pop(key) for key in RUNTIME_CONFIG_KEYS if key in kwargs}
+    def __init__(self, *args: Any, cache_mode: str = DEFAULT_CACHE_MODE, **kwargs: Any) -> None:
         config = kwargs.get("config")
-        if config is None and args:
-            candidate = args[0]
-            if hasattr(candidate, "model_type"):
-                config = candidate
+        if config is None and args and hasattr(args[0], "model_type"):
+            config = args[0]
         if config is not None:
-            self.patch_config(config, **runtime_overrides)
+            self.validate_cache_mode(cache_mode, config)
+        self.cache_mode = cache_mode
         super().__init__(*args, **kwargs)
-        if config is None and hasattr(self, "config"):
-            self.patch_config(self.config, **runtime_overrides)
+        if config is None:
+            self.validate_cache_mode(cache_mode, getattr(self, "config", None))
 
     @abstractmethod
     def offline_encode(self, **kwargs: Any) -> dict[str, Any]:
@@ -145,4 +126,4 @@ class OfflineEncodingMixin(ABC):
         raise NotImplementedError(f"{type(self).__name__}.save_full_hf_checkpoint is not implemented.")
 
 
-__all__ = ["OfflineEncodingMixin", "RUNTIME_CONFIG_KEYS"]
+__all__ = ["OfflineEncodingMixin"]

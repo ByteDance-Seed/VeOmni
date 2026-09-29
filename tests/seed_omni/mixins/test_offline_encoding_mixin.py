@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from collections.abc import Collection
 
 import pytest
@@ -22,12 +23,11 @@ class DummyOfflineConfig(PretrainedConfig):
 
 
 class DummyOfflineModule(OfflineEncodingMixin, TrainingModuleMixin, BaseMixin):
-    def __init__(self, support_cache: bool = False, train_type: str = "train") -> None:
-        self.config = DummyOfflineConfig()
-        OfflineEncodingMixin.patch_config(self.config, support_cache=support_cache, train_type=train_type)
+    def __init__(self, cache_mode: str = "full", support_cache: bool = True) -> None:
+        self.config = DummyOfflineConfig(support_cache=support_cache)
         self.calls: list[str] = []
         self._conversation_carrier: list[list[ConversationItem]] | None = None
-        super().__init__()
+        super().__init__(cache_mode=cache_mode)
 
     def offline_encode(self, **kwargs: torch.Tensor) -> dict[str, torch.Tensor]:
         return {"encoded_cache": kwargs["pixel_values"]}
@@ -70,34 +70,28 @@ class DummyOfflineModule(OfflineEncodingMixin, TrainingModuleMixin, BaseMixin):
         return {"conversation_list": self._conversation_carrier}
 
 
-@pytest.mark.parametrize(
-    ("support_cache", "train_type", "expected"),
-    [
-        (False, "offline_cache", "full"),
-        (True, "offline_cache", "encode_only"),
-        (True, "train_with_cache", "process_only"),
-        (True, "train", "full"),
-    ],
-)
-def test_cache_mode_is_derived_from_support_cache_and_train_type(
-    support_cache: bool, train_type: str, expected: str
-) -> None:
-    assert DummyOfflineModule(support_cache=support_cache, train_type=train_type).cache_mode == expected
+@pytest.mark.parametrize("cache_mode", ["full", "encode_only", "process_only"])
+def test_cache_mode_is_taken_from_the_constructor(cache_mode: str) -> None:
+    assert DummyOfflineModule(cache_mode=cache_mode).cache_mode == cache_mode
 
 
-def test_patch_config_applies_runtime_overrides_without_config_mixin(tmp_path) -> None:
-    DummyOfflineConfig().save_pretrained(tmp_path)
+def test_cache_mode_defaults_to_full() -> None:
+    assert DummyOfflineModule().cache_mode == "full"
 
-    config = DummyOfflineConfig.from_pretrained(tmp_path)
-    OfflineEncodingMixin.patch_config(config, support_cache=True, train_type="train_with_cache")
 
-    assert config.support_cache is True
-    assert config.train_type == "train_with_cache"
-    assert OfflineEncodingMixin.validated_cache_mode(config) == "process_only"
+def test_unknown_cache_mode_is_rejected() -> None:
+    with pytest.raises(ValueError, match="cache_mode must be one of"):
+        DummyOfflineModule(cache_mode="offline_cache")
+
+
+def test_cached_mode_requires_support_cache() -> None:
+    assert DummyOfflineModule(cache_mode="full", support_cache=False).cache_mode == "full"
+    with pytest.raises(ValueError, match="requires DummyOfflineConfig.support_cache=True"):
+        DummyOfflineModule(cache_mode="encode_only", support_cache=False)
 
 
 def test_pre_forward_rejects_process_only_for_offline_encode() -> None:
-    module = DummyOfflineModule(support_cache=True, train_type="train_with_cache")
+    module = DummyOfflineModule(cache_mode="process_only")
 
     with pytest.raises(
         ValueError, match="offline_encode requires cache_mode in .* current cache_mode is 'process_only'"
@@ -106,7 +100,7 @@ def test_pre_forward_rejects_process_only_for_offline_encode() -> None:
 
 
 def test_pre_forward_rejects_encode_only_for_online_process() -> None:
-    module = DummyOfflineModule(support_cache=True, train_type="offline_cache")
+    module = DummyOfflineModule(cache_mode="encode_only")
 
     with pytest.raises(
         ValueError, match="online_process requires cache_mode in .* current cache_mode is 'encode_only'"
@@ -115,14 +109,14 @@ def test_pre_forward_rejects_encode_only_for_online_process() -> None:
 
 
 def test_default_partial_dcp_hooks_are_noop() -> None:
-    module = DummyOfflineModule(support_cache=True, train_type="train_with_cache")
+    module = DummyOfflineModule(cache_mode="process_only")
 
     assert module.load_partial_dcp_checkpoint("/tmp/load", trainer=object()) is None
     assert module.save_partial_dcp_checkpoint("/tmp/save", trainer=object(), state=object()) is None
 
 
 def test_default_full_hf_checkpoint_hook_requires_module_implementation() -> None:
-    module = DummyOfflineModule(support_cache=True, train_type="train_with_cache")
+    module = DummyOfflineModule(cache_mode="process_only")
 
     with pytest.raises(NotImplementedError, match="save_full_hf_checkpoint"):
         module.save_full_hf_checkpoint("/tmp/out", source_path="/tmp/source", trainer=object(), state=object())
@@ -139,20 +133,17 @@ def test_offline_encoding_mixin_is_not_module_mixin_subclass() -> None:
     assert not issubclass(OfflineEncodingMixin, BaseMixin)
 
 
-def test_init_patches_runtime_fields_onto_the_config_before_the_model_body() -> None:
-    """``support_cache`` / ``train_type`` are launcher fields, not ``config.json`` fields.
-
-    A concrete module takes them as constructor kwargs, so
-    :meth:`OfflineEncodingMixin.__init__` must strip them and apply them to the
-    live config *before* the native model body runs — the body branches on
-    ``cache_mode`` to decide which sub-networks to build at all (e.g. a VAE in
-    ``encode_only`` never allocates its decoder).
+def test_cache_mode_is_set_before_the_model_body_and_kept_off_the_config(tmp_path) -> None:
+    """The native body branches on ``cache_mode`` to decide which sub-networks
+    to build at all (e.g. a VAE in ``encode_only`` never allocates its decoder),
+    so it must be visible inside the body, yet it is a per-run choice and must
+    not end up in ``config.json``.
     """
     seen: list[str] = []
 
     class NativeBody:
         def __init__(self, config: DummyOfflineConfig) -> None:
-            seen.append(OfflineEncodingMixin.validated_cache_mode(config))
+            seen.append(self.cache_mode)
             self.config = config
 
     class Module(OfflineEncodingMixin, NativeBody):
@@ -162,11 +153,14 @@ def test_init_patches_runtime_fields_onto_the_config_before_the_model_body() -> 
         def online_process(self, **kwargs: torch.Tensor) -> dict[str, torch.Tensor]:
             return {}
 
-    module = Module(DummyOfflineConfig(), support_cache=True, train_type="offline_cache")
+    module = Module(DummyOfflineConfig(support_cache=True), cache_mode="encode_only")
 
     assert seen == ["encode_only"]  # visible to the native body, not only afterwards
     assert module.cache_mode == "encode_only"
-    assert module.config.support_cache is True
+    module.config.save_pretrained(tmp_path)
+    saved = json.loads((tmp_path / "config.json").read_text())
+    assert saved["support_cache"] is True
+    assert "cache_mode" not in saved
 
 
 def test_sibling_offline_mixin_wins_mro_over_the_abstract_stubs() -> None:
@@ -186,8 +180,7 @@ def test_sibling_offline_mixin_wins_mro_over_the_abstract_stubs() -> None:
 
     class Module(SiblingOfflineMixin, OfflineEncodingMixin):
         def __init__(self) -> None:
-            self.config = DummyOfflineConfig()
-            OfflineEncodingMixin.patch_config(self.config, support_cache=True, train_type="offline_cache")
+            self.config = DummyOfflineConfig(support_cache=True)
 
     assert Module.__mro__.index(SiblingOfflineMixin) < Module.__mro__.index(OfflineEncodingMixin)
     encoded_cache = Module().offline_encode(pixel_values=torch.ones(1))["encoded_cache"]
