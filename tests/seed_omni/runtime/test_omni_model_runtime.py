@@ -20,6 +20,7 @@ from veomni.models.seed_omni.accelerated.utils import executor
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.mixins.base_mixin import BaseMixin
 from veomni.models.seed_omni.mixins.inference_module_mixin import InferenceModuleMixin, post_generate, pre_generate
+from veomni.models.seed_omni.mixins.metric_meter_mixin import MetricMeterMixin
 from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleMixin
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.module_configuration_base import OmniModuleConfig
@@ -312,3 +313,21 @@ def test_model_runtime_steps_only_the_trainable_modules():
     assert list(runtime.optimizer.optimizers) == ["trainable"]
     assert list(runtime.lr_scheduler.schedulers) == ["trainable"]
     frozen._build_lr_scheduler.assert_called_once_with(10)
+
+
+def test_metric_meter_collect_drains_only_the_metered_modules():
+    class _MeteredModule(MetricMeterMixin):
+        def estimate_flops(self, seqlens):
+            return float(sum(seqlens))
+
+    metered = _MeteredModule()
+    metered.metric_meter_set_seqlens("encode", [3, 4])
+    metered.metric_meter_add("encode", {})
+    runtimes = {
+        "metered": SimpleNamespace(omni_module=metered),
+        "plain": SimpleNamespace(omni_module=torch.nn.Linear(1, 1)),
+    }
+    runtime = OmniModelRuntime(MagicMock(), module_runtimes=runtimes)
+
+    assert runtime.metric_meter_collect() == {"metered": (7.0, [3, 4])}
+    assert runtime.metric_meter_collect() == {"metered": (0.0, [])}

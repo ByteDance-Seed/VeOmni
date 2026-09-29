@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Dict, List
+import time
+from typing import TYPE_CHECKING, Any, Dict, List
 
 import torch.distributed as dist
 
 from ....utils.dist_utils import all_reduce
+from ....utils.omni_helper import OmniEnvironMeter
 from ..base import Callback, TrainerState
 
 
@@ -25,14 +27,17 @@ if TYPE_CHECKING:
 
 
 class OmniStepMetricsCallback(Callback):
-    """Per-step training metrics (loss / per-node losses / grad norm / lr) for OmniModel.
+    """Per-step training + efficiency metrics for OmniModel.
 
     The single-model :class:`EnvironMeterCallback` cannot run here: an
     ``OmniModel`` has no single ``model_type`` to estimate FLOPs on, and its
     batch carries only ``conversation_list`` (no ``input_ids`` to count tokens
-    from). This callback therefore publishes only what the train step itself
-    knows: total loss and grad norm averaged over the FSDP group, and each
-    node's loss averaged over the ranks whose batch produced it.
+    from). Instead each metered module reports its own tokens and FLOPs
+    (:meth:`~veomni.models.seed_omni.accelerated.OmniModelRuntime.metric_meter_collect`)
+    and :class:`~veomni.utils.omni_helper.OmniEnvironMeter` rolls them up over
+    the whole-step wall-clock. On top of that it publishes total loss and grad
+    norm averaged over the FSDP group, and each node's loss averaged over the
+    ranks whose batch produced it.
 
     It writes :attr:`~OmniTrainer.step_train_metrics` (read by
     :class:`~veomni.trainer.callbacks.TqdmCallback`) and
@@ -43,9 +48,34 @@ class OmniStepMetricsCallback(Callback):
 
     trainer: "OmniTrainer"
 
+    def __init__(self, trainer: "OmniTrainer") -> None:
+        super().__init__(trainer)
+        args = trainer.args
+        trainer.environ_meter = OmniEnvironMeter(
+            global_batch_size=args.train.global_batch_size,
+            enable_multisource=args.data.enable_multisource,
+            dataloader=trainer.train_dataloader,
+            data_path=args.data.train_path,
+            empty_cache_steps=args.train.empty_cache_steps,
+            gc_steps=args.train.gc_steps,
+            parallel_state=self.parallel_state,
+        )
+
+    def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
+        for micro_batch in micro_batches:
+            self.trainer.environ_meter.add(micro_batch)
+        self.start_time = time.time()
+
     def on_step_end(
         self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
     ) -> None:
+        delta_time = time.time() - self.start_time
+        step_env_metrics = self.trainer.environ_meter.step(
+            delta_time,
+            global_step=state.global_step,
+            module_metrics=self.trainer.model.metric_meter_collect(),
+        )
+
         group = self.parallel_state.fsdp_group
         # A node records a loss only when its batch produced one, and ranks see
         # different modality mixes: reduce the union of keys in one order, or
@@ -68,8 +98,10 @@ class OmniStepMetricsCallback(Callback):
                 step_train_metrics[f"training/{key}"] = sums[i] / sums[len(node_keys) + i]
         step_train_metrics["training/lr"] = max(self.trainer.model.lr_scheduler.get_last_lr())
 
+        step_env_metrics.update(step_train_metrics)
+
         self.trainer.step_train_metrics = step_train_metrics
-        self.trainer.step_env_metrics = dict(step_train_metrics)
+        self.trainer.step_env_metrics = step_env_metrics
 
 
 __all__ = ["OmniStepMetricsCallback"]
