@@ -189,7 +189,7 @@ def veomni_omni_model_clip_grad_norm(
       optimizer config, so *max_grad_norm* here is only the model-level value
       they inherit from. Returns ``sqrt(sum n_i^2)`` of the per-module (pre-clip)
       norms for logging.
-    * ``global`` (not enabled yet: ``OptimizerConfig`` rejects it): measure
+    * ``global``: measure
       each module with ``max_norm=inf`` (no scale), ``total = sqrt(sum n_i^2)``,
       then if ``total > max_grad_norm`` scale **all**
       module grads by one coefficient — single-model / seedream
@@ -220,23 +220,4 @@ def veomni_omni_model_clip_grad_norm(
                 for p in rt.model.parameters():
                     if p.grad is not None:
                         p.grad.mul_(coeff)
-    return total
-
-
-def global_clip_grad_norm_modules(modules, max_grad_norm: float) -> float:
-    """Global L2 clip over a list of ``nn.Module`` (align harness / unit tests).
-
-    Same math as ``omni_clip_grad_norm(..., grad_clip_scope='global')`` but for
-    plain modules that share the current :func:`get_parallel_state` (no per-module
-    trainer scope).
-    """
-    mods = [m for m in modules if m is not None]
-    norms = [float(veomni_omni_module_clip_grad_norm(m, float("inf"))) for m in mods]
-    total = math.sqrt(sum(g * g for g in norms)) if norms else 0.0
-    if max_grad_norm is not None and max_grad_norm > 0 and total > float(max_grad_norm):
-        coeff = float(max_grad_norm) / (total + 1e-6)
-        for m in mods:
-            for p in m.parameters():
-                if p.grad is not None:
-                    p.grad.mul_(coeff)
     return total
