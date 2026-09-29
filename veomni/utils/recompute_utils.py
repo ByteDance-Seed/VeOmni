@@ -32,11 +32,13 @@ The framework owns the strategy, models stay unchanged:
   needs it — a block loop calls ``self._gradient_checkpointing_func``, which the
   install step replaces.
 
-``recompute_last_n_layers`` picks the recompute range from the last block
-(``-1`` = every layer, the default). Within that range, ``selective_n_layers``
-picks from the front the blocks that run selective activation checkpointing
-(SAC) instead of full recomputation (``0`` = off, the default). The two are
-different modes, not a switch and its refinement.
+:func:`resolve_layer_counts` maps the public configuration onto the two layer
+counts the decision layer works with: ``recompute_last_n_layers`` picks the
+recompute range from the last block (``-1`` = every layer), and within that range
+``selective_n_layers`` picks from the front the blocks that run selective
+activation checkpointing (SAC) instead of full recomputation (``0`` = off).
+``mode`` covers the whole stack; the advanced ``layer_policies`` counts take over
+from it, with the blocks left over recomputing nothing.
 """
 
 from __future__ import annotations
@@ -73,8 +75,9 @@ logger = logging.get_logger(__name__)
 #: means the operator's forward output is kept (``MUST_SAVE``) instead of being
 #: recomputed. One entry per attention family VeOmni can select, on CUDA and on
 #: NPU; a backend whose operator *name* is not listed here is still covered when
-#: its namespace matches (see ``_selective_namespaces``), and ``selective_ops``
-#: in the config is the escape hatch for anything left over.
+#: its namespace matches (see ``_selective_namespaces``), and a literal operator
+#: string in the config's ``save_modules`` is the escape hatch for anything left
+#: over.
 #:
 #: Only the *attention core* belongs here: operators whose output is the
 #: attention result (O(S·H·D)) and whose recompute costs a full attention pass.
@@ -206,6 +209,48 @@ def _selective_namespaces(registered: Sequence[str]) -> list[str]:
     return sorted(namespaces)
 
 
+#: Semantic ``save_modules`` names and the operator strings they stand for.
+#: ``attn`` expands to the empty tuple on purpose: the default attention set *is*
+#: what an empty extras list already resolves to (``resolve_exact_ops``), so the
+#: name documents the default rather than widening it. Any name neither listed
+#: here nor in :data:`UNSUPPORTED_SAVE_MODULES` is read as a literal operator
+#: string — the escape hatch for a backend whose operator is not covered.
+SAVE_MODULES: dict[str, tuple[str, ...]] = {"attn": ()}
+
+#: Groups the config may name that this backend has no verified operator set for.
+#: Naming one is an error, never a silent no-op.
+UNSUPPORTED_SAVE_MODULES: frozenset[str] = frozenset({"moe"})
+
+
+def expand_save_modules(save_modules: Sequence[str] | None) -> list[str]:
+    """Turn ``save_modules`` names into the extra operator strings SAC should keep.
+
+    Semantic group names expand through :data:`SAVE_MODULES`; every other entry is
+    passed through as a literal operator string. Raises for a group this backend
+    cannot map yet, so a name the user wrote never degrades into a silent no-op.
+    """
+    if not save_modules:
+        return []
+    names = [save_modules] if isinstance(save_modules, str) else list(save_modules)
+
+    extra: list[str] = []
+    unsupported: list[str] = []
+    for name in names:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"save_modules entries must be non-empty strings, got {name!r}")
+        name = name.strip()
+        if name in UNSUPPORTED_SAVE_MODULES:
+            unsupported.append(name)
+        else:
+            extra.extend(SAVE_MODULES.get(name, (name,)))
+    if unsupported:
+        raise ValueError(
+            f"save_modules {unsupported} not supported yet; use one of {sorted(SAVE_MODULES)} or a "
+            "literal operator string such as 'aten._scaled_dot_product_attention.default'"
+        )
+    return extra
+
+
 def resolve_exact_ops(extra_op_names: Sequence[str] | None = None) -> tuple[list[Any], list[str]]:
     """Resolve the default attention operators plus user extras to OpOverloads.
 
@@ -304,6 +349,47 @@ def _build_context_fn(extra_op_names: Sequence[str] | None) -> Callable[[], tupl
 # Policy layer
 # ---------------------------------------------------------------------------
 
+#: ``mode: selective`` means "every recomputed layer runs SAC". ``plan_block``
+#: compares the layer offset against the count, so any value at or above the model
+#: depth expresses that without knowing the depth first.
+SAC_ALL_LAYERS: int = 1 << 30
+
+
+def resolve_layer_counts(
+    mode: str,
+    selective_layers: int | None = None,
+    full_layers: int | None = None,
+) -> tuple[int, int]:
+    """Map the public configuration onto the two layer counts the plan uses.
+
+    Either count being given (even as 0) means the advanced ``layer_policies`` is
+    in play, and it replaces ``mode``: the recomputed range is read from the end of
+    the stack — the last ``full`` blocks recompute, the ``selective`` blocks at the
+    front of that range run SAC — and every block in front of the range recomputes
+    nothing. ``full`` defaults to -1, the whole stack, the range ``mode: full``
+    describes. Without counts, ``mode`` covers the whole stack.
+
+    Returns ``(recompute_last_n_layers, selective_n_layers)``, the values
+    :func:`plan_block` reads; a range longer than the model depth is clamped there,
+    exactly as a configured count always was.
+    """
+    if selective_layers is not None or full_layers is not None:
+        full = -1 if full_layers is None else full_layers
+        selective = 0 if selective_layers is None else selective_layers
+        if full != -1 and selective > full:
+            raise ValueError(
+                f"gradient_checkpointing.layer_policies.selective ({selective}) cannot exceed "
+                f"layer_policies.full ({full}): the SAC blocks are the front of the recomputed range"
+            )
+        return full, selective
+    if mode == "none":
+        return 0, 0
+    if mode == "full":
+        return -1, 0
+    if mode == "selective":
+        return -1, SAC_ALL_LAYERS
+    raise ValueError(f"unknown gradient checkpointing mode {mode!r}; expected none, full or selective")
+
 
 @dataclass(frozen=True)
 class RecomputePolicy:
@@ -333,51 +419,55 @@ def build_policy(
     enabled: bool,
     enable_reentrant: bool,
     early_stop: bool,
-    extra_op_names: Sequence[str] | None = None,
-    recompute_last_n_layers: int = -1,
-    selective_n_layers: int = 0,
+    mode: str = "full",
+    save_modules: Sequence[str] | None = None,
+    selective_layers: int | None = None,
+    full_layers: int | None = None,
     offload_active: bool = False,
     compile_enabled: bool = False,
 ) -> RecomputePolicy:
     """Build the run's :class:`RecomputePolicy` from ``model.accelerator.gradient_checkpointing``.
 
-    SAC requires ``enabled`` and non-reentrant checkpointing; whenever it cannot
-    be honoured the counts are kept and only ``context_fn`` is dropped, so those
-    layers fall back to full recomputation with a warning. Never raises: invalid
-    counts are clamped instead.
+    ``mode`` covers every block; the advanced ``layer_policies`` counts — passed as
+    ``selective_layers`` / ``full_layers``, either of them given — replace it, see
+    :func:`resolve_layer_counts`. SAC requires ``enabled`` and non-reentrant
+    checkpointing; whenever it cannot be honoured the counts are kept and only
+    ``context_fn`` is dropped, so those layers fall back to full recomputation with
+    a warning. A count above the model depth is clamped, while an inconsistent pair
+    (``selective`` beyond ``full``) and a ``save_modules`` group that cannot be
+    mapped both raise.
     """
-    if recompute_last_n_layers < -1:
-        logger.warning_once(
-            f"recompute_last_n_layers={recompute_last_n_layers} invalid (< -1), using -1 (every layer)"
+    layer_policies_given = selective_layers is not None or full_layers is not None
+    recompute_last_n_layers, selective_n_layers = resolve_layer_counts(mode, selective_layers, full_layers)
+    if layer_policies_given:
+        window = "every block" if recompute_last_n_layers == -1 else f"the last {recompute_last_n_layers} block(s)"
+        logger.info_rank0(
+            f"gradient_checkpointing.layer_policies takes over from mode={mode!r}: {window} recompute "
+            f"({selective_n_layers} of them through SAC, counted from the front); "
+            "any block before that recomputes nothing"
         )
-        recompute_last_n_layers = -1
-    if selective_n_layers < 0:
+    extra_op_names = expand_save_modules(save_modules)
+    if selective_n_layers == 0 and extra_op_names:
         logger.warning_once(
-            f"selective_n_layers={selective_n_layers} invalid (< 0), using 0 (SAC off); "
-            "use a value >= the model depth for every recomputed layer"
-        )
-        selective_n_layers = 0
-    if selective_n_layers > 0 and recompute_last_n_layers == 0:
-        logger.warning_once(
-            "selective_n_layers is set but recompute_last_n_layers=0 recomputes no layer at all, so SAC never applies"
+            f"save_modules {save_modules!r} ignored: it only applies to SAC, and this "
+            "configuration recomputes no block selectively"
         )
 
     context_fn = None
     if selective_n_layers > 0:
         if not enabled:
             logger.warning_once(
-                f"selective_n_layers={selective_n_layers} ignored: SAC needs "
-                "model.accelerator.gradient_checkpointing.enable=True; those layers fall back to full recomputation"
+                "SAC ignored: it needs model.accelerator.gradient_checkpointing.enable=True; "
+                "the affected layers fall back to full recomputation"
             )
         elif enable_reentrant:
             logger.warning_once(
-                f"selective_n_layers={selective_n_layers} ignored: SAC needs "
-                "enable_reentrant=False; those layers fall back to full recomputation"
+                "SAC ignored: it needs enable_reentrant=False; the affected layers fall back to full recomputation"
             )
         elif offload_active:
             logger.warning_once(
-                f"selective_n_layers={selective_n_layers} ignored: activation offload owns the "
-                "checkpoint boundary; those layers fall back to full recomputation"
+                "SAC ignored: activation offload owns the checkpoint boundary; "
+                "the affected layers fall back to full recomputation"
             )
         else:
             context_fn = _build_context_fn(extra_op_names)
@@ -436,7 +526,9 @@ def _clamp_recompute_n(count: int, total: int) -> int:
     if count < 0:
         return -1
     if count > total:
-        logger.warning_once(f"recompute_last_n_layers={count} >= {total} blocks, using every layer")
+        logger.warning_once(
+            f"configured recompute layers ({count}) exceed the stack of {total} blocks, using every layer"
+        )
         return -1
     return count
 
@@ -804,8 +896,8 @@ def _log_recompute_report(report: RecomputeReport, model: nn.Module) -> None:
         )
     if Decision.DIRECT in decisions:
         logger.info_rank0(
-            f"blocks outside recompute_last_n_layers={report.policy.recompute_last_n_layers} keep their "
-            "activations (memory grows); selective_n_layers only says which recomputed blocks run SAC"
+            "blocks in front of the recomputed range keep their activations (memory grows); "
+            "layer_policies.full widens that range, mode: full (the default) covers the whole stack"
         )
     for stack in report.excluded:
         logger.warning_once(
