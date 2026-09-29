@@ -37,11 +37,12 @@ from veomni.models.seed_omni.mixins import emb_parallel_mixin
 from veomni.models.seed_omni.mixins.emb_parallel_mixin import EmbParallelMixin, VocabParallelEmbedding
 
 
-def _emb_state(group=None, enabled: bool = True) -> SimpleNamespace:
+def _emb_state(group=None, enabled: bool = True, size: int = 2, rank: int = 0) -> SimpleNamespace:
     return SimpleNamespace(
-        extra_parallel_sizes={"emb": 2} if enabled else {},
+        extra_parallel_sizes={"emb": size} if enabled else {},
         extra_parallel_enabled=lambda name: enabled,
         extra_parallel_group=lambda name: group,
+        extra_parallel_rank=lambda name: rank,
     )
 
 
@@ -59,9 +60,9 @@ def emb_off(monkeypatch):
 
 @pytest.fixture
 def emb_on_single_shard(monkeypatch):
-    """``emb`` reported on, with a ``None`` group: the kernels run their one-shard path."""
+    """``emb`` reported on over one whole-vocab shard: the kernels run their one-shard path."""
     monkeypatch.setattr(emb_parallel_mixin, "is_parallel_state_initialized", lambda: True)
-    monkeypatch.setattr(emb_parallel_mixin, "get_parallel_state", lambda: _emb_state(group=None))
+    monkeypatch.setattr(emb_parallel_mixin, "get_parallel_state", lambda: _emb_state(group=None, size=1))
 
 
 def test_emb_parallel_is_inactive_before_any_parallel_state(monkeypatch):
@@ -119,6 +120,45 @@ def test_emb_on_rejects_max_norm(emb_on_single_shard):
         VocabParallelEmbedding(6, 4, max_norm=1.0)(torch.tensor([0]))
 
 
+def _sliced(embedding: VocabParallelEmbedding, rows: int) -> VocabParallelEmbedding:
+    embedding.weight = nn.Parameter(torch.randn(rows, embedding.embedding_dim))
+    return embedding
+
+
+def test_a_sliced_table_is_rejected_when_emb_is_off(emb_off):
+    """Global ids would silently read the wrong rows of a shard."""
+    embedding = _sliced(VocabParallelEmbedding(8, 4), rows=4)
+    with pytest.raises(RuntimeError, match="holds 4 of 8 vocab rows"):
+        embedding(torch.tensor([1]))
+    with pytest.raises(RuntimeError, match="holds 4 of 8 vocab rows"):
+        EmbParallelMixin.emb_parallel_project(torch.randn(1, 4), embedding)
+
+
+def test_an_unsliced_table_is_rejected_when_emb_is_on(monkeypatch):
+    """The kernels would treat the whole table as one rank's shard of a ``vocab * emb`` vocabulary."""
+    monkeypatch.setattr(emb_parallel_mixin, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(emb_parallel_mixin, "get_parallel_state", lambda: _emb_state(size=2))
+    embedding = VocabParallelEmbedding(8, 4)
+    with pytest.raises(RuntimeError, match="holds 8 of 8 vocab rows, but the emb group here has 2"):
+        embedding(torch.tensor([1]))
+    with pytest.raises(RuntimeError, match="holds 8 of 8 vocab rows, but the emb group here has 2"):
+        EmbParallelMixin.emb_parallel_project(torch.randn(1, 4), embedding)
+
+
+@pytest.mark.parametrize(("emb_rank", "local_padding_idx"), [(0, None), (1, 1)])
+def test_padding_idx_indexes_the_rows_this_rank_holds(monkeypatch, emb_rank, local_padding_idx):
+    """Initializers that zero ``weight[padding_idx]`` must hit global row 5 on its owner only."""
+    monkeypatch.setattr(emb_parallel_mixin, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(emb_parallel_mixin, "get_parallel_state", lambda: _emb_state(size=2, rank=emb_rank))
+    embedding = VocabParallelEmbedding(8, 4, padding_idx=5)
+    assert embedding.padding_idx == 5
+
+    _sliced(embedding, rows=4).reset_parameters()
+    assert embedding.padding_idx == local_padding_idx
+    zero_rows = [row for row in range(4) if torch.equal(embedding.weight[row], torch.zeros(4))]
+    assert zero_rows == ([] if local_padding_idx is None else [local_padding_idx])
+
+
 _VOCAB, _HIDDEN = 8, 4
 
 
@@ -151,12 +191,39 @@ def _dense_grad(rank_ids, rank_hidden_rows) -> torch.Tensor:
     return dense.grad
 
 
-_EMB_IDS = [[0, 7, 3, 3], [], [5, 1], [6, 6, 2, 4, 0]]
-_EMB_HIDDEN_ROWS = [2, 0, 3, 1]
+_EMB_IDS = [[0, 7, 3, 3], [], [5, 1], [6, 6, 2, 5, 0]]
+_EMB_PADDING_IDX = 5
 
 
-def _emb_fsdp_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
-    """emb=2 x emb_fsdp=2: vocab rows over ``emb``, hidden over ``emb_fsdp``."""
+def _mid_weight() -> torch.Tensor:
+    return torch.randn(_HIDDEN, _HIDDEN, generator=torch.Generator().manual_seed(1))
+
+
+class _TiedModel(nn.Module):
+    """Lookup, a layer, then the tied head: the table is used twice in one backward."""
+
+    def __init__(self, embedding: nn.Module):
+        super().__init__()
+        self.embedding = embedding
+        self.mid = nn.Linear(_HIDDEN, _HIDDEN, bias=False)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        embs = EmbParallelMixin.emb_parallel_lookup(self.embedding, ids)
+        return EmbParallelMixin.emb_parallel_project(torch.tanh(self.mid(embs)), self.embedding)
+
+
+def _dense_tied_grads() -> tuple[torch.Tensor, torch.Tensor]:
+    table = _table().requires_grad_(True)
+    mid = _mid_weight().requires_grad_(True)
+    for r, ids in enumerate(_EMB_IDS):
+        embs = F.embedding(torch.tensor(ids, dtype=torch.long), table, padding_idx=_EMB_PADDING_IDX)
+        logits = F.linear(torch.tanh(F.linear(embs, mid)), table)
+        (logits * _randn(r, 3, *logits.shape)).sum().backward()
+    return table.grad, mid.grad
+
+
+def _emb_fsdp_rank_main(rank: int, rendezvous: str, out_dir: str, reshard_after_forward: bool) -> None:
+    """emb=2 x emb_fsdp=2: vocab rows over ``emb``, hidden over ``emb_fsdp``, the rest over all ranks."""
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import fully_shard
     from torch.distributed.tensor import Shard
@@ -166,26 +233,35 @@ def _emb_fsdp_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
     try:
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("emb_fsdp", "emb"))
         emb_rank = mesh["emb"].get_local_rank()
-        _install_state(emb_parallel_mixin, _emb_state(group=mesh["emb"].get_group()))
+        _install_state(emb_parallel_mixin, _emb_state(group=mesh["emb"].get_group(), rank=emb_rank))
 
         rows = _VOCAB // 2
         chunk = slice(emb_rank * rows, (emb_rank + 1) * rows)
-        embedding = VocabParallelEmbedding(_VOCAB, _HIDDEN)
+        embedding = VocabParallelEmbedding(_VOCAB, _HIDDEN, padding_idx=_EMB_PADDING_IDX)
         embedding.weight = nn.Parameter(_table()[chunk].clone())
+        model = _TiedModel(embedding)
+        model.mid.weight = nn.Parameter(_mid_weight())
         # Default divide factor (the emb_fsdp size): gloo has no PREMUL_SUM, which a custom factor needs.
-        fully_shard(embedding, mesh=mesh["emb_fsdp"], shard_placement_fn=lambda param: Shard(1))
+        fully_shard(
+            embedding,
+            mesh=mesh["emb_fsdp"],
+            shard_placement_fn=lambda param: Shard(1),
+            reshard_after_forward=reshard_after_forward,
+        )
+        fully_shard(model, mesh=init_device_mesh("cpu", (world,)), reshard_after_forward=reshard_after_forward)
 
         ids = torch.tensor(_EMB_IDS[rank], dtype=torch.long)
-        hidden = _randn(rank, 1, _EMB_HIDDEN_ROWS[rank], _HIDDEN)
-        embs, logits, loss = _step(embedding, ids, hidden, rank)
-        loss.backward()
-        grad = embedding.weight.grad.full_tensor()
+        logits = model(ids)
+        (logits * _randn(rank, 3, *logits.shape)).sum().backward()
 
-        expected_grad = _dense_grad(_EMB_IDS, _EMB_HIDDEN_ROWS)[chunk] / mesh["emb_fsdp"].size()
+        expected_table_grad, expected_mid_grad = _dense_tied_grads()
+        expected_logits = F.linear(torch.tanh(F.linear(F.embedding(ids, _table()), _mid_weight())), _table())
         result = {
-            "lookup": torch.allclose(embs, F.embedding(ids, _table())),
-            "project": torch.allclose(logits, F.linear(hidden, _table()), atol=1e-6),
-            "grad": torch.allclose(grad, expected_grad, atol=1e-5),
+            "logits": torch.allclose(logits, expected_logits, atol=1e-6),
+            "table_grad": torch.allclose(
+                embedding.weight.grad.full_tensor(), expected_table_grad[chunk] / mesh["emb_fsdp"].size(), atol=1e-5
+            ),
+            "mid_grad": torch.allclose(model.mid.weight.grad.full_tensor(), expected_mid_grad / world, atol=1e-5),
         }
         with open(f"{out_dir}/rank{rank}.json", "w") as f:
             json.dump(result, f)
@@ -193,9 +269,15 @@ def _emb_fsdp_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
         dist.destroy_process_group()
 
 
-def test_emb_sharded_table_matches_dense_through_fsdp(tmp_path):
+@pytest.mark.parametrize("reshard_after_forward", [True, False])
+def test_emb_sharded_table_matches_dense_through_fsdp(tmp_path, reshard_after_forward):
     world = len(_EMB_IDS)
-    mp.spawn(_emb_fsdp_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=world, join=True)
+    mp.spawn(
+        _emb_fsdp_rank_main,
+        args=(str(tmp_path / "rendezvous"), str(tmp_path), reshard_after_forward),
+        nprocs=world,
+        join=True,
+    )
 
     for rank in range(world):
         result = json.loads((tmp_path / f"rank{rank}.json").read_text())
@@ -218,6 +300,12 @@ def _tied_fsdp_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
         embedding = VocabParallelEmbedding(_VOCAB, _HIDDEN)
         embedding.weight = nn.Parameter(_table())
         fully_shard(embedding, mesh=init_device_mesh("cpu", (world,)))
+        # Until EmbParallelMixin registers ``project`` with FSDP, a direct call sees the sharded weight.
+        try:
+            embedding.project(torch.randn(1, _HIDDEN))
+            direct_project_rejected = False
+        except RuntimeError as err:
+            direct_project_rejected = "outside its FSDP2 unshard hooks" in str(err)
 
         _, _, loss = _step(
             embedding,
@@ -230,7 +318,7 @@ def _tied_fsdp_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
 
         expected_grad = _dense_grad(_DP_IDS, _DP_HIDDEN_ROWS) / world
         with open(f"{out_dir}/rank{rank}.json", "w") as f:
-            json.dump(torch.allclose(grad, expected_grad, atol=1e-5), f)
+            json.dump([torch.allclose(grad, expected_grad, atol=1e-5), direct_project_rejected], f)
     finally:
         dist.destroy_process_group()
 
@@ -239,4 +327,4 @@ def test_tied_head_gradient_is_reduced_by_fsdp_when_emb_is_off(tmp_path):
     world = len(_DP_IDS)
     mp.spawn(_tied_fsdp_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=world, join=True)
 
-    assert [json.loads((tmp_path / f"rank{rank}.json").read_text()) for rank in range(world)] == [True] * world
+    assert [json.loads((tmp_path / f"rank{rank}.json").read_text()) for rank in range(world)] == [[True, True]] * world

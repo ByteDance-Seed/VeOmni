@@ -32,6 +32,8 @@ All :class:`EmbParallelMixin` methods are ``@staticmethod`` so a top-level model
 them regardless of ``self``; mix the class in for method-style access.
 """
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -86,26 +88,64 @@ class EmbParallelMixin:
 class VocabParallelEmbedding(nn.Embedding):
     """``nn.Embedding`` that takes global ids when its rows are split over ``emb``.
 
-    ``num_embeddings`` / ``padding_idx`` stay in the global vocab space; under
-    ``emb`` the weight holds only this rank's ``[vocab/emb, hidden]`` rows. With
-    ``emb`` off it is exactly ``nn.Embedding``.
+    ``num_embeddings`` stays the global vocab size; under ``emb`` the weight
+    holds only this rank's contiguous ``[vocab/emb, hidden]`` rows. With ``emb``
+    off it is exactly ``nn.Embedding``.
+
+    ``padding_idx`` reads back as an index into the rows this rank holds, and as
+    ``None`` on ranks that do not hold the padding row, so initializers that
+    index the weight with it (``nn.Embedding.reset_parameters``, HF
+    ``_init_weights``) zero the right row after the table is split. The global
+    id is kept for masking the padding gradient.
     """
 
+    @property
+    def padding_idx(self) -> Optional[int]:
+        idx = self._global_padding_idx
+        rows = self.weight.shape[0]
+        if idx is None or rows == self.num_embeddings:
+            return idx
+        local = idx - get_parallel_state().extra_parallel_rank("emb") * rows
+        return local if 0 <= local < rows else None
+
+    @padding_idx.setter
+    def padding_idx(self, idx: Optional[int]) -> None:
+        self._global_padding_idx = idx
+
+    def _check_emb_layout(self) -> bool:
+        """Whether ``emb`` is on, after checking the weight holds the rows that implies."""
+        name = type(self).__name__
+        if isinstance(self.weight, DTensor):
+            raise RuntimeError(
+                f"{name}.weight is a DTensor here, so it is being read outside its FSDP2 unshard hooks; "
+                "call it as a module or through EmbParallelMixin."
+            )
+        active = EmbParallelMixin.emb_parallel_active()
+        emb_size = get_parallel_state().extra_parallel_sizes["emb"] if active else 1
+        rows = self.weight.shape[0]
+        if rows * emb_size != self.num_embeddings:
+            raise RuntimeError(
+                f"{name} holds {rows} of {self.num_embeddings} vocab rows, but the emb group here has "
+                f"{emb_size} rank(s): the table was not split for the parallel state it runs under."
+            )
+        return active
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if not EmbParallelMixin.emb_parallel_active():
+        if not self._check_emb_layout():
             return super().forward(input)
         if self.max_norm is not None:
             raise NotImplementedError("VocabParallelEmbedding does not support max_norm under emb parallel.")
         output = AllToAllEmbedding.apply(get_parallel_state().extra_parallel_group("emb"), input, self.weight)
-        if self.padding_idx is not None:
+        if self._global_padding_idx is not None:
             # Same as F.embedding: the padding row receives no gradient.
-            output = torch.where((input == self.padding_idx).unsqueeze(-1), output.detach(), output)
+            output = torch.where((input == self._global_padding_idx).unsqueeze(-1), output.detach(), output)
         return output
 
     def project(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Tied head logits over the full vocab; call through :meth:`EmbParallelMixin.emb_parallel_project`."""
+        active = self._check_emb_layout()
         weight = self.weight.to(hidden_states.dtype)
-        if not EmbParallelMixin.emb_parallel_active():
+        if not active:
             return F.linear(hidden_states, weight)
         return VocabParallelLinear.apply(get_parallel_state().extra_parallel_group("emb"), hidden_states, weight)
 
