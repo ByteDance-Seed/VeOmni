@@ -405,18 +405,23 @@ class VeOmniModelRuntime:
                 "skipping HF weight materialization before checkpoint restore."
             )
 
-        # Recomputation strategy for this run: how many trailing blocks recompute
-        # at all, and how many of those — from the front of that range — run SAC
-        # instead of full recomputation.
+        # Recomputation strategy for this run: one mode for every block, or the
+        # advanced per-mode layer counts that take over from it.
         gc_cfg = args.accelerator.gradient_checkpointing
+        # Both None while the advanced block is absent: build_policy then reads mode alone.
+        layer_policies = gc_cfg.layer_policies
+        selective_layers = layer_policies.selective if layer_policies is not None else None
+        full_layers = layer_policies.full if layer_policies is not None else None
         recompute_policy = recompute_utils.build_policy(
             enabled=gc_cfg.enable,
             enable_reentrant=gc_cfg.enable_reentrant,
             early_stop=gc_cfg.early_stop,
-            extra_op_names=gc_cfg.selective_ops,
-            recompute_last_n_layers=gc_cfg.recompute_last_n_layers,
-            selective_n_layers=gc_cfg.selective_n_layers,
-            offload_active=offload_config.enable_activation or offload_config.enable_async_activation,
+            mode=gc_cfg.mode,
+            save_modules=gc_cfg.save_modules,
+            selective_layers=selective_layers,
+            full_layers=full_layers,
+            offload_active=args.accelerator.offload_config.enable_activation
+            or args.accelerator.offload_config.enable_async_activation,
             compile_enabled=args.accelerator.torch_compile.enable,
         )
 

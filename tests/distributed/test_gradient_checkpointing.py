@@ -9,7 +9,7 @@ import torch.nn as nn
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.checkpoint import CheckpointPolicy, noop_context_fn
 
-from veomni.arguments import GradientCheckpointingConfig, MixedPrecisionConfig
+from veomni.arguments import GradientCheckpointingConfig, LayerPoliciesConfig, MixedPrecisionConfig
 from veomni.distributed.checkpoint import CheckpointFunction
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.utils import recompute_utils
@@ -85,16 +85,98 @@ def test_reentrant_checkpoint_releases_recomputed_input_grad():
     torch.testing.assert_close(value.grad, 2 * value.detach().cos())
 
 
-def test_gradient_checkpointing_config_takes_a_bare_operator_name():
-    assert GradientCheckpointingConfig(selective_ops="aten.foo.default").selective_ops == ["aten.foo.default"]
-    assert GradientCheckpointingConfig(selective_ops=None).selective_ops == []
+def test_gradient_checkpointing_config_takes_a_bare_module_name():
+    assert GradientCheckpointingConfig(save_modules="attn").save_modules == ["attn"]
+    assert GradientCheckpointingConfig(save_modules=None).save_modules == []
 
 
 def test_gradient_checkpointing_config_rejects_unusable_values():
-    with pytest.raises(ValueError, match="selective_ops must be a list"):
-        GradientCheckpointingConfig(selective_ops=5)
-    with pytest.raises(ValueError, match="recompute_last_n_layers must be an integer"):
-        GradientCheckpointingConfig(recompute_last_n_layers="10")
+    with pytest.raises(ValueError, match="save_modules must be a list"):
+        GradientCheckpointingConfig(save_modules=5)
+    with pytest.raises(ValueError, match="mode must be"):
+        GradientCheckpointingConfig(mode="selectiv")
+    with pytest.raises(ValueError, match="layer_policies.selective must be a non-negative integer"):
+        GradientCheckpointingConfig(layer_policies=LayerPoliciesConfig(selective="10"))
+    with pytest.raises(ValueError, match="layer_policies.full must be a non-negative integer or -1"):
+        GradientCheckpointingConfig(layer_policies=LayerPoliciesConfig(full=-2))
+
+
+def test_layer_policies_replaces_the_mode():
+    """The counts are the two layer counts the plan reads, and mode steps aside."""
+    counts = recompute_utils.resolve_layer_counts("full", selective_layers=10, full_layers=15)
+    assert counts == (15, 10)  # 15 layers recompute, the first 10 of them through SAC
+
+    # No 'full' count means the whole stack, the same range mode: full describes.
+    assert recompute_utils.resolve_layer_counts("none", selective_layers=10) == (-1, 10)
+
+    # A zero count still means the advanced path took over, so mode is not consulted.
+    assert recompute_utils.resolve_layer_counts("selective", selective_layers=0, full_layers=0) == (0, 0)
+
+    with pytest.raises(ValueError, match="cannot exceed layer_policies.full"):
+        recompute_utils.resolve_layer_counts("full", selective_layers=10, full_layers=5)
+
+
+def test_layer_policies_decide_the_blocks_the_config_describes():
+    """One config spelling, one stack of decisions: the recomputed range is read from the end."""
+    recompute_n, selective_n = recompute_utils.resolve_layer_counts("full", selective_layers=10, full_layers=15)
+    policy = recompute_utils.RecomputePolicy(
+        recompute_last_n_layers=recompute_n, selective_n_layers=selective_n, context_fn=noop_context_fn
+    )
+    decisions = _plan_decisions(policy)
+
+    expected = (
+        [recompute_utils.Decision.DIRECT] * 5  # in front of the recomputed range: no recomputation
+        + [recompute_utils.Decision.SAC] * 10  # layer_policies.selective, at the front of the range
+        + [recompute_utils.Decision.FULL] * 5  # the rest of the range: full recomputation
+    )
+    assert decisions == expected
+    assert decisions == _expected_decisions(15, 10)  # the counts this config replaced
+
+
+def test_config_layer_policies_reach_the_plan():
+    """The call shape the runtime uses: the config dataclass alone decides the plan."""
+    config = GradientCheckpointingConfig(
+        mode="none",  # ignored: layer_policies takes over
+        layer_policies=LayerPoliciesConfig(selective=10, full=15),
+    )
+    policies = config.layer_policies
+    policy = recompute_utils.build_policy(
+        enabled=config.enable,
+        enable_reentrant=config.enable_reentrant,
+        early_stop=config.early_stop,
+        mode=config.mode,
+        save_modules=config.save_modules,
+        selective_layers=policies.selective,
+        full_layers=policies.full,
+    )
+    decisions = _plan_decisions(policy)
+
+    assert decisions == _expected_decisions(15, 10)  # 15 recompute from the end, 10 of them SAC
+
+
+def test_mode_covers_the_whole_stack():
+    assert recompute_utils.resolve_layer_counts("none") == (0, 0)
+    assert recompute_utils.resolve_layer_counts("full") == (-1, 0)
+    recompute_n, selective_n = recompute_utils.resolve_layer_counts("selective")
+    assert recompute_n == -1
+    # The sentinel stands for "every recomputed layer", whatever the model depth is.
+    assert selective_n == recompute_utils.SAC_ALL_LAYERS > BLOCK_TOTAL
+
+    with pytest.raises(ValueError, match="unknown gradient checkpointing mode"):
+        recompute_utils.resolve_layer_counts("half")
+
+
+def test_save_modules_names_expand_or_fail_loudly():
+    assert recompute_utils.expand_save_modules([]) == []
+    # 'attn' is the default attention set, which an empty extras list already resolves to.
+    assert recompute_utils.expand_save_modules(["attn"]) == []
+    assert recompute_utils.expand_save_modules([" attn "]) == []
+    assert recompute_utils.expand_save_modules(["aten.foo.default"]) == ["aten.foo.default"]
+
+    with pytest.raises(ValueError, match="not supported yet"):
+        recompute_utils.expand_save_modules(["moe"])
+    with pytest.raises(ValueError, match="non-empty strings"):
+        recompute_utils.expand_save_modules([""])
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +353,11 @@ def test_configured_module_names_the_main_stack():
     assert stack.fqn == "visual.blocks"
 
 
+def _plan_decisions(policy, total=BLOCK_TOTAL):
+    """Per-block decisions as plan_block hands them out."""
+    return [recompute_utils.plan_block(policy, index, total).decision for index in range(total)]
+
+
 def _expected_decisions(recompute_n, selective_n, total=BLOCK_TOTAL):
     """Oracle: recompute range from the end, SAC from the front of that range."""
     recompute_n = -1 if recompute_n < 0 or recompute_n > total else recompute_n
@@ -292,7 +379,7 @@ def test_layer_decisions_match_previous_semantics(recompute_n, selective_n):
     policy = recompute_utils.RecomputePolicy(
         recompute_last_n_layers=recompute_n, selective_n_layers=selective_n, context_fn=noop_context_fn
     )
-    decisions = [recompute_utils.plan_block(policy, index, BLOCK_TOTAL).decision for index in range(BLOCK_TOTAL)]
+    decisions = _plan_decisions(policy)
     assert decisions == _expected_decisions(recompute_n, selective_n)
 
 
@@ -301,7 +388,7 @@ def test_layer_decisions_match_previous_semantics(recompute_n, selective_n):
 def test_without_context_fn_nothing_is_sac(recompute_n, selective_n):
     """SAC unavailable (disabled, reentrant, or offload) falls back to full recomputation."""
     policy = recompute_utils.RecomputePolicy(recompute_last_n_layers=recompute_n, selective_n_layers=selective_n)
-    decisions = [recompute_utils.plan_block(policy, index, BLOCK_TOTAL).decision for index in range(BLOCK_TOTAL)]
+    decisions = _plan_decisions(policy)
     assert recompute_utils.Decision.SAC not in decisions
     assert decisions == _expected_decisions(recompute_n, 0)
 
@@ -641,7 +728,7 @@ def test_model_without_blocks_is_left_alone():
 
 
 def test_build_policy_drops_sac_when_it_cannot_apply():
-    enabled = dict(enabled=True, enable_reentrant=False, early_stop=True, selective_n_layers=5)
+    enabled = dict(enabled=True, enable_reentrant=False, early_stop=True, mode="selective")
     assert recompute_utils.build_policy(**enabled).context_fn is not None
     assert recompute_utils.build_policy(**{**enabled, "offload_active": True}).context_fn is None
     assert recompute_utils.build_policy(**{**enabled, "enable_reentrant": True}).context_fn is None
@@ -700,7 +787,7 @@ def test_install_is_idempotent_and_reinstallable():
 
     recompute_utils.apply_recompute_policy(
         model,
-        recompute_utils.build_policy(enabled=True, enable_reentrant=False, early_stop=True, selective_n_layers=3),
+        recompute_utils.build_policy(enabled=True, enable_reentrant=False, early_stop=True, mode="selective"),
     )
     assert [recompute_utils._block_bindings[layer].plan.decision for layer in model.layers] == [
         recompute_utils.Decision.SAC
@@ -715,7 +802,7 @@ def test_install_leaves_gradient_checkpointing_kwargs_alone(monkeypatch):
 
     recompute_utils.apply_recompute_policy(
         model,
-        recompute_utils.build_policy(enabled=True, enable_reentrant=False, early_stop=True, selective_n_layers=2),
+        recompute_utils.build_policy(enabled=True, enable_reentrant=False, early_stop=True, mode="selective"),
     )
 
     assert model.gradient_checkpointing_kwargs == expected
@@ -754,7 +841,7 @@ def test_container_call_on_an_unknown_block_still_checkpoints(monkeypatch):
     model = _FoldedModel(depth=2, single_depth=0)
     recompute_utils.apply_recompute_policy(
         model,
-        recompute_utils.build_policy(enabled=True, enable_reentrant=False, early_stop=True, selective_n_layers=2),
+        recompute_utils.build_policy(enabled=True, enable_reentrant=False, early_stop=True, mode="selective"),
     )
 
     model._gradient_checkpointing_func(lambda x: x + 1, torch.zeros(1))
@@ -780,7 +867,7 @@ def _bound_model(depth=2, **policy_kwargs):
 def test_offload_takes_priority_over_sac(monkeypatch):
     recorder = _Recorder()
     monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", recorder)
-    model = _bound_model(selective_n_layers=2)
+    model = _bound_model(mode="selective")
 
     recompute_utils.checkpoint_forward(model.blocks[0], True, True, torch.zeros(1))
 
@@ -803,7 +890,7 @@ def test_direct_beats_offload(monkeypatch):
 def test_checkpointing_disabled_calls_the_block(monkeypatch):
     recorder = _Recorder()
     monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", recorder)
-    model = _bound_model(selective_n_layers=2)
+    model = _bound_model(mode="selective")
 
     recompute_utils.checkpoint_forward(model.blocks[0], False, False, torch.zeros(1))
 
@@ -880,7 +967,7 @@ def test_unbound_block_warns_only_while_a_policy_is_in_force(captured_warnings):
     recompute_utils.checkpoint_forward(unbound, True, False, torch.zeros(1))
     assert captured_warnings == []  # nothing is bound anywhere: the documented default, no noise
 
-    bound = _bound_model(selective_n_layers=1)  # keep it alive: the bindings are weak
+    bound = _bound_model(mode="selective")  # keep it alive: the bindings are weak
     assert recompute_utils._block_bindings[bound.blocks[0]].plan.decision is recompute_utils.Decision.SAC
     recompute_utils.checkpoint_forward(unbound, True, False, torch.zeros(1))
     recompute_utils.checkpoint_forward(unbound, True, False, torch.zeros(1))
@@ -1223,7 +1310,7 @@ def test_sac_saves_attention_outputs_and_recomputes_the_rest():
     direct = _attention_dispatch_count(recompute_utils.RecomputePolicy(recompute_last_n_layers=0))
     full = _attention_dispatch_count(recompute_utils.RecomputePolicy(recompute_last_n_layers=-1))
     sac = _attention_dispatch_count(
-        recompute_utils.build_policy(enabled=True, enable_reentrant=False, early_stop=True, selective_n_layers=3)
+        recompute_utils.build_policy(enabled=True, enable_reentrant=False, early_stop=True, mode="selective")
     )
 
     assert direct.attention_forward == 3  # three blocks, forward only
@@ -1239,7 +1326,7 @@ def test_sac_results_match_the_direct_reference():
     reference = _gradients(recompute_utils.RecomputePolicy(recompute_last_n_layers=0))
 
     for policy in (
-        recompute_utils.build_policy(enabled=True, enable_reentrant=False, early_stop=True, selective_n_layers=3),
+        recompute_utils.build_policy(enabled=True, enable_reentrant=False, early_stop=True, mode="selective"),
         recompute_utils.build_policy(enabled=True, enable_reentrant=False, early_stop=True),
     ):
         out, input_grad, param_grads = _gradients(policy)
@@ -1343,7 +1430,7 @@ def _replays_under(policy, model, calls):
     return forward_calls, len(calls) - forward_calls
 
 
-SAC_POLICY = recompute_utils.build_policy(enabled=True, enable_reentrant=False, early_stop=True, selective_n_layers=3)
+SAC_POLICY = recompute_utils.build_policy(enabled=True, enable_reentrant=False, early_stop=True, mode="selective")
 FULL_POLICY = recompute_utils.build_policy(enabled=True, enable_reentrant=False, early_stop=True)
 
 
