@@ -9,10 +9,13 @@ math is checked in-process, with no distributed init.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
+import torch
 
 from veomni.models.seed_omni import MetricMeterMixin
-from veomni.utils import omni_helper
+from veomni.utils import helper, omni_helper
 from veomni.utils.omni_helper import OmniEnvironMeter
 
 
@@ -156,3 +159,55 @@ def test_multisource_seqlens_come_from_the_module_that_covers_the_whole_sample()
 def test_multisource_seqlens_are_absent_when_no_module_aligns_with_the_samples():
     assert OmniEnvironMeter._per_sample_seqlens({"vision": (1.0, [16])}, num_samples=2) is None
     assert OmniEnvironMeter._per_sample_seqlens({"backbone": (1.0, [4])}, num_samples=0) is None
+
+
+def test_step_omits_flops_when_no_module_is_metered(single_process_meter):
+    """Unmeasured FLOPs must not be logged as an MFU of zero."""
+    metrics = single_process_meter.step(delta_time=1.0, global_step=1, module_metrics={})
+    assert "mfu" not in metrics and "flops_achieved(T)" not in metrics
+    assert "consumed_chunk_num" in metrics
+
+
+def test_multisource_ds_idx_accepts_each_collator_shape():
+    """`SeedOmniCollator` hands back a per-sample list, unlike the packed tensor shape."""
+    assert helper._get_multisource_ds_idx({"ds_idx": torch.tensor([2, 5])}) == [2, 5]
+    assert helper._get_multisource_ds_idx({"ds_idx": [2, 5]}) == [2, 5]
+    assert helper._get_multisource_ds_idx({"ds_idx": 7}) == [7]
+
+
+def test_device_memory_metrics_are_shared_by_both_meters(monkeypatch):
+    """The keys `EnvironMeter` used to build inline now come from one helper."""
+    fake_device = SimpleNamespace(
+        max_memory_allocated=lambda: 2 * 1024**3,
+        max_memory_reserved=lambda: 4 * 1024**3,
+        memory_stats=lambda: {"num_alloc_retries": 3},
+    )
+    monkeypatch.setattr(helper, "get_torch_device", lambda: fake_device)
+    monkeypatch.setattr(helper, "all_reduce", lambda values, **kwargs: values)
+    monkeypatch.setattr(helper.psutil, "virtual_memory", lambda: SimpleNamespace(used=0, available=0, percent=0))
+
+    metrics = helper.compute_device_memory_metrics()
+    assert metrics["max_memory_allocated(GB)"] == 2.0
+    assert metrics["max_memory_reserved(GB)"] == 4.0
+    assert metrics["num_alloc_retries"] == 3
+
+
+def test_multisource_tracker_steps_even_when_no_module_aligns(single_process_meter, monkeypatch):
+    """The tracker step is a DP collective: a rank must not skip it on local data."""
+    calls = []
+
+    class _Tracker:
+        def __init__(self, **kwargs):
+            pass
+
+        def step(self, ds_idx, seqlens):
+            calls.append((list(ds_idx), list(seqlens)))
+            return {}
+
+    monkeypatch.setattr(omni_helper, "MultiSourceInfoTracker", _Tracker)
+    meter = OmniEnvironMeter(global_batch_size=2, enable_multisource=True, dataloader=object(), empty_cache_steps=0)
+    meter.add({"conversation_list": [[], []], "ds_idx": [0, 1]})
+
+    meter.step(delta_time=1.0, global_step=1, module_metrics={"vision": (1.0, [16])})
+
+    assert calls == [([0, 1], [0, 0])]

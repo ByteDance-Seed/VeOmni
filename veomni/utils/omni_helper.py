@@ -101,7 +101,9 @@ class OmniEnvironMeter:
                 raise ValueError(
                     "`dataloader` and `data_path` is required for `OmniEnvironMeter` with multi-source dataloader."
                 )
-            self.multisource_tracker = MultiSourceInfoTracker(dataloader=dataloader, data_path=data_path)
+            self.multisource_tracker = MultiSourceInfoTracker(
+                dataloader=dataloader, data_path=data_path, parallel_state=self.parallel_state
+            )
 
         if self.gc_steps > 0:
             gc.disable()
@@ -175,12 +177,10 @@ class OmniEnvironMeter:
 
         self.consume_chunks += real_global_batch_size
 
-        metrics: Dict[str, Any] = {
-            "flops_achieved(T)": flops_achieved,
-            "flops_promised(T)": flops_promised,
-            "mfu": mfu,
-            "consumed_chunk_num": self.consume_chunks,  # global real training samples
-        }
+        metrics: Dict[str, Any] = {"consumed_chunk_num": self.consume_chunks}  # global real training samples
+        # With no metered module the FLOPs are unmeasured, not zero.
+        if names:
+            metrics.update({"flops_achieved(T)": flops_achieved, "flops_promised(T)": flops_promised, "mfu": mfu})
 
         # Per-module token statistics (no cross-module merge → no double count).
         for i, name in enumerate(names):
@@ -199,14 +199,16 @@ class OmniEnvironMeter:
             # Multi-source needs one token length per sample; use the module whose
             # seqlens are per-sample (the backbone: len == sample count). Other
             # modules report per-image / single-chunk lengths that don't align.
+            # The tracker step is a DP collective, so every rank must enter it even
+            # when its own modules do not align; such a rank reports zero tokens.
             per_sample_seqlens = self._per_sample_seqlens(module_metrics, len(self.batch_ds_idx))
-            if per_sample_seqlens is not None:
-                metrics.update(self.multisource_tracker.step(self.batch_ds_idx, per_sample_seqlens))
-            else:
+            if per_sample_seqlens is None:
                 logger.warning_once(
-                    "OmniEnvironMeter: multi-source accounting skipped — no metered module reports "
-                    f"per-sample seqlens aligned with ds_idx ({len(self.batch_ds_idx)} samples)."
+                    "OmniEnvironMeter: no metered module reports per-sample seqlens aligned with ds_idx "
+                    f"({len(self.batch_ds_idx)} samples); multi-source token counts are reported as zero."
                 )
+                per_sample_seqlens = [0] * len(self.batch_ds_idx)
+            metrics.update(self.multisource_tracker.step(self.batch_ds_idx, per_sample_seqlens))
 
         self.batch_count = 0
         self.batch_ds_idx = []
