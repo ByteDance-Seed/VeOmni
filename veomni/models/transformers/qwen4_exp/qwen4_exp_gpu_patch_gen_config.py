@@ -1184,7 +1184,8 @@ def qwen4_exp_text_sparse_moe_block_forward_patched(
             self.gate, routing_scores, selected_experts
         )
         routing_weights = routing_scores.gather(1, selected_experts)
-        routing_weights = routing_weights / routing_weights.sum(-1, keepdim=True)
+        if self.gate.norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(-1, keepdim=True)
         routing_weights = routing_weights.to(target_dtype)
     expert_output = self.experts(
         hidden_states_reshaped, selected_experts, routing_weights
