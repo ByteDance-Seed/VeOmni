@@ -304,14 +304,6 @@ class WanSPAttnProcessor(WanAttnProcessor):
         return hidden_states_out
 
 
-# ================================================================
-# Patch: WanTransformerBlock.forward
-# Identical to the diffusers block forward, plus the `sp_valid_length`
-# that the self-attention processor needs to strip the Ulysses tail pad.
-# Patched onto the class rather than called as a helper so the block is
-# still entered through ``__call__`` and keeps its forward hooks (FSDP2
-# wraps these blocks and unshards parameters in its pre-forward hook).
-# ================================================================
 def WanTransformerBlock_forward(
     self,
     hidden_states: torch.Tensor,
@@ -320,6 +312,14 @@ def WanTransformerBlock_forward(
     rotary_emb: torch.Tensor,
     sp_valid_length: int | None = None,
 ) -> torch.Tensor:
+    """Patch for ``WanTransformerBlock.forward``.
+
+    Identical to the diffusers block forward, plus the ``sp_valid_length`` that the
+    self-attention processor needs to strip the Ulysses tail pad. Patched onto the class
+    rather than called as a helper so the block is still entered through ``__call__`` and
+    keeps its forward hooks (FSDP2 wraps these blocks and unshards parameters in its
+    pre-forward hook).
+    """
     if temb.ndim == 4:
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
             self.scale_shift_table.unsqueeze(0) + temb.float()

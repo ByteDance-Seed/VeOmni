@@ -118,6 +118,7 @@ class WanT2VUlyssesTest(SequenceParallelTest):
                 _init_parallel_state(dp_size=1, ulysses_size=self.world_size, device_type=get_device_type(), name=None)
                 for name, case in CASES.items():
                     tag = f"{name}{' (ckpt)' if gradient_checkpointing else ''}"
+                    entered.clear()
                     try:
                         out, grads = _forward_backward(model, *case, device)
                     except RuntimeError as e:
