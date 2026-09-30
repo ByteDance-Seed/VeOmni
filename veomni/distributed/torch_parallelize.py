@@ -749,6 +749,7 @@ def parallelize_model_fsdp2(
     else:
         transport_reduction_scales = None
 
+    mp_ignored_modules = set()
     for layer_fqn, (layer_mod, extra_parallel_mod) in layer_pairs_list:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
         layer_mod._fsdp_modules = []
@@ -792,8 +793,14 @@ def parallelize_model_fsdp2(
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
             for sub_mod in layer_mod.modules():
-                if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
+                if (
+                    (isinstance(sub_mod, mp_ignored_classes) or getattr(sub_mod, "_veomni_keep_in_fp32", False))
+                    and sub_mod is not layer_mod
+                    and sub_mod not in mp_ignored_modules
+                    and not isinstance(sub_mod, FSDPModule)
+                ):
                     fully_shard(sub_mod, **fsdp_kwargs_without_mp)
+                    mp_ignored_modules.add(sub_mod)
                     # Keep these modules off transport_reduction_scales: their genuine FP32
                     # gradients need native FP32 communication, not a lossy wire cast.
                     layer_mod._fsdp_modules.append(sub_mod)
@@ -805,8 +812,16 @@ def parallelize_model_fsdp2(
         #      is the parent of or equal to extra_parallel_mod[para] (e.g. ToyEmbed),
         #      no need to shard layer_mod again.
         if not isinstance(layer_mod, FSDPModule):
-            fully_shard(layer_mod, **fsdp_kwargs)
-            if transport_reduction_scales is not None and fsdp_transport_enabled:
+            preserve_precision = mp_ignored_classes and (
+                isinstance(layer_mod, mp_ignored_classes) or getattr(layer_mod, "_veomni_keep_in_fp32", False)
+            )
+            layer_kwargs = dict(fsdp_kwargs_without_mp if preserve_precision else fsdp_kwargs)
+            if "mp_policy" in layer_kwargs and hasattr(model, "get_fsdp_mixed_precision_policy"):
+                layer_kwargs["mp_policy"] = model.get_fsdp_mixed_precision_policy(layer_kwargs["mp_policy"], layer_mod)
+            fully_shard(layer_mod, **layer_kwargs)
+            if preserve_precision:
+                mp_ignored_modules.add(layer_mod)
+            elif transport_reduction_scales is not None and fsdp_transport_enabled:
                 transport_reduction_scales[layer_mod] = fsdp_reduction_scale
             layer_mod._fsdp_modules.append(layer_mod)
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
@@ -820,7 +835,18 @@ def parallelize_model_fsdp2(
     # `setStorage … storage of size 0` when the saved reference points
     # to a freed buffer. Decoder layers reshard normally (their calls
     # above pass `reshard_after_forward` explicitly).
+    if mp_ignored_classes:
+        for sub_mod in reversed(list(model.modules())):
+            if (
+                (isinstance(sub_mod, mp_ignored_classes) or getattr(sub_mod, "_veomni_keep_in_fp32", False))
+                and sub_mod is not model
+                and sub_mod not in mp_ignored_modules
+                and not isinstance(sub_mod, FSDPModule)
+            ):
+                fully_shard(sub_mod, **fsdp_kwargs_without_mp)
     root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
+    if "mp_policy" in root_fsdp_kwargs and hasattr(model, "get_fsdp_mixed_precision_policy"):
+        root_fsdp_kwargs["mp_policy"] = model.get_fsdp_mixed_precision_policy(root_fsdp_kwargs["mp_policy"], model)
     fully_shard(model, **root_fsdp_kwargs)
     # Persistent ExtraParallel parameters are ignored by every FSDP group and
     # retain their original 2D DTensor identity. Record them after wrapping so

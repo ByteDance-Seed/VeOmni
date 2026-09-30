@@ -12,7 +12,7 @@ because VeOmni's DiTTrainer does not pop/process training targets externally.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
@@ -20,7 +20,13 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from ..minimax_h3_core.batch_packing import pack_samples
-from ..minimax_h3_core.minimax_h3_dit import MiniMaxH3Attention, MiniMaxH3DiT, unpack_audio, unpatchify_video
+from ..minimax_h3_core.minimax_h3_dit import (
+    MiniMaxH3Attention,
+    MiniMaxH3DiT,
+    MiniMaxH3FP32Linear,
+    unpack_audio,
+    unpatchify_video,
+)
 from .configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
 
 
@@ -45,8 +51,35 @@ class MiniMaxH3DiTModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _supports_sdpa = True
     _no_split_modules = ["MiniMaxH3DiTBlock"]
+    _keep_in_fp32_modules = ["video_patch_proj", "audio_patch_proj", "time_embedder", "video_out", "audio_out"]
+    _preserve_fp32_modules_on_export = True
 
-    _checkpoint_conversion_mapping = {"^": "dit."}
+    def get_ignore_modules_in_mixed_precision(self):
+        """Keep official FP32 projections and their optional adapter branches separately sharded."""
+        from .....lora.layers import LoraLinear
+
+        for module in self.dit.modules():
+            if isinstance(module, LoraLinear) and isinstance(module.base_layer, MiniMaxH3FP32Linear):
+                for adapter in (*module.lora_A.values(), *module.lora_B.values()):
+                    adapter._veomni_keep_in_fp32 = True
+        return (MiniMaxH3FP32Linear,)
+
+    @staticmethod
+    def get_fsdp_mixed_precision_policy(policy, module):
+        """Preserve metadata at root/blocks; cast independently wrapped ordinary projections."""
+        from .....lora.layers import LoraLinear
+
+        ordinary_projection = isinstance(module, torch.nn.Linear) or (
+            isinstance(module, LoraLinear) and not isinstance(module.base_layer, MiniMaxH3FP32Linear)
+        )
+        return replace(policy, cast_forward_inputs=ordinary_projection)
+
+    _checkpoint_conversion_mapping = {"^(?!dit\\.)": "dit."}
+
+    @staticmethod
+    def _convert_fqn_to_index_mapping(mapping):
+        """Accept both official core keys and already-prefixed VeOmni export keys."""
+        return {name if name.startswith("dit.") else f"dit.{name}": index for name, index in mapping.items()}
 
     def __init__(self, config: MiniMaxH3DiTModelConfig, **kwargs):
         super().__init__(config)

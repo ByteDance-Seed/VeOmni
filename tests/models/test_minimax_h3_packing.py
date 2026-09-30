@@ -680,3 +680,509 @@ def test_invalid_precision_and_legacy_tail_fail_closed():
         prepare(condition_model(), [row])
     with pytest.raises(ValueError, match="nonempty"):
         model(x=[])
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_h3_foundation_loader_preserves_official_fp32_islands(dtype):
+    from veomni.models.auto import build_foundation_model
+
+    from ..tools.training_utils import make_eager_ops_config
+
+    model = build_foundation_model(
+        tiny_model().config, init_device="cpu", torch_dtype=dtype, ops_implementation=make_eager_ops_config()
+    )
+    ordinary_dtype = getattr(torch, dtype)
+    islands = (
+        model.dit.video_patch_proj,
+        model.dit.audio_patch_proj,
+        model.dit.time_embedder.proj_in,
+        model.dit.time_embedder.proj_out,
+        model.dit.final_layer.video_out,
+        model.dit.final_layer.audio_out,
+    )
+    assert all(p.dtype == torch.float32 for module in islands for p in module.parameters())
+    assert model.dit.condition_proj.weight.dtype == ordinary_dtype
+    assert model.dit.blocks[0].adaln_proj.linear.weight.dtype == ordinary_dtype
+    expected = tiny_model()
+    assert {k: v.shape for k, v in model.state_dict().items()} == {
+        k: v.shape for k, v in expected.state_dict().items()
+    }
+    sample = prepare(condition_model(), [raw_sample(text_len=9)])[0]
+    out = model(**sample)
+    assert all(value.dtype == torch.float32 for value in out.predictions)
+    sum(out.loss.values()).backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+def test_h3_fsdp_policy_preserves_coordinates_and_timesteps():
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+
+    model = tiny_model()
+    policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=True)
+    actual = model.get_fsdp_mixed_precision_policy(policy, model)
+    assert actual.cast_forward_inputs is False
+    assert policy.cast_forward_inputs is True
+    assert actual.param_dtype == policy.param_dtype
+    assert actual.reduce_dtype == policy.reduce_dtype
+    assert actual.output_dtype == policy.output_dtype
+    assert model.get_fsdp_mixed_precision_policy(policy, model.dit.condition_proj).cast_forward_inputs is True
+
+
+def test_h3_adaln_activates_before_casting_fp32_time_embedding():
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3AdalnProj
+
+    torch.manual_seed(39)
+    module = MiniMaxH3AdalnProj(8, 8, 48, expand_ratio=6, modality_num=1).bfloat16()
+    time = torch.randn(5, 8, dtype=torch.float32, requires_grad=True)
+    actual = torch.cat(module(time), dim=-1)
+    expected = module.linear(F.silu(time).bfloat16())
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actual.float().sum().backward()
+    assert time.grad.dtype == torch.float32 and torch.isfinite(time.grad).all()
+
+
+class _PrecisionControlModel(torch.nn.Module):
+    """A no-hook model for the shared FSDP input-cast regression."""
+
+    config = SimpleNamespace(tie_word_embeddings=False)
+
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(4, 4)
+
+    def forward(self, x, position):
+        return self.linear(x.to(self.linear.weight.dtype)), position
+
+
+def _run_h3_precision_fsdp(checkpointing, lora, weights_path, wrap_projections=False, mixed_precision=True):
+    import os
+
+    import torch.distributed as dist
+    from safetensors.torch import save_file
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+    from veomni.arguments import AcceleratorConfig, MixedPrecisionConfig
+    from veomni.distributed.parallel_state import (
+        clear_parallel_state,
+        init_parallel_state_from_config,
+        use_parallel_state,
+    )
+    from veomni.distributed.torch_parallelize import build_parallelize_model
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.models.auto import build_foundation_model
+    from veomni.utils.device import get_device_type
+
+    from ..tools.training_utils import make_eager_ops_config
+
+    os.environ["LOCAL_RANK"] = str(dist.get_rank())
+    os.environ["WORLD_SIZE"] = str(dist.get_world_size())
+    core.ATTENTION_IMPLEMENTATION = "torch"
+    device = torch.device(get_device_type(), dist.get_rank())
+    init_parallel_state_from_config(AcceleratorConfig(), name="h3_precision")
+    try:
+        with use_parallel_state("h3_precision"):
+            config = tiny_model().config
+            model = build_foundation_model(
+                config,
+                init_device="meta",
+                torch_dtype="float32" if mixed_precision else "bfloat16",
+                ops_implementation=make_eager_ops_config(),
+            )
+            reference = build_foundation_model(
+                copy.deepcopy(config),
+                init_device="cpu",
+                torch_dtype="bfloat16",
+                ops_implementation=make_eager_ops_config(),
+            )
+            torch.manual_seed(87)
+            for parameter in reference.parameters():
+                torch.nn.init.normal_(parameter, std=0.1)
+            if dist.get_rank() == 0:
+                save_file(reference.dit.state_dict(), os.path.join(weights_path, "model.safetensors"))
+            dist.barrier()
+            if lora:
+                lora_config = VeOmniLoraConfig(
+                    r=4,
+                    lora_alpha=8,
+                    target_modules=[
+                        "qkv_proj",
+                        "out_proj",
+                        "fc1",
+                        "fc2",
+                        "condition_proj",
+                        "linear",
+                        "video_patch_proj",
+                        "audio_patch_proj",
+                        "proj_in",
+                        "proj_out",
+                        "video_out",
+                        "audio_out",
+                    ],
+                )
+                model = VeOmniLoraModel(model, lora_config)
+                reference = VeOmniLoraModel(reference, copy.deepcopy(lora_config))
+                for name, parameter in reference.named_parameters():
+                    if "lora_" in name:
+                        torch.nn.init.normal_(parameter, std=0.05)
+            weights = {name: value.detach().clone().to(device) for name, value in reference.state_dict().items()}
+            model = build_parallelize_model(
+                model,
+                weights_path=weights_path,
+                init_device="meta",
+                mixed_precision=MixedPrecisionConfig(enable=mixed_precision, cast_forward_inputs=True),
+                is_peft_model=lora,
+                broadcast_model_weights_from_rank0=wrap_projections,
+                enable_gradient_checkpointing=False,
+                basic_modules=["Linear", "LoraLinear", "MiniMaxH3FP32Linear"] if wrap_projections else None,
+            )
+            for name, parameter in model.named_parameters():
+                if "lora_" not in name:
+                    actual_weight = parameter.full_tensor()
+                    torch.testing.assert_close(actual_weight, weights[name].to(actual_weight.dtype), rtol=0, atol=0)
+            if lora:
+                set_model_state_dict(
+                    model,
+                    {name: value for name, value in weights.items() if "lora_" in name},
+                    options=StateDictOptions(full_state_dict=True, strict=False),
+                )
+            reference = reference.to(device)
+            torch.manual_seed(94)
+            samples = prepare(condition_model(), [raw_sample(17, task="ref2va"), raw_sample(9, latent_t=3)])
+            for i, sample in enumerate(samples):
+                sample["img_position_ids"] += 1025.333333333
+                sample["unique_timesteps"] = torch.full_like(sample["unique_timesteps"], 0.094339624 + i * 0.1)
+                sample["use_gradient_checkpointing"] = checkpointing
+
+            def to_device(value):
+                if torch.is_tensor(value):
+                    return value.to(device)
+                if isinstance(value, dict):
+                    return {key: to_device(item) for key, item in value.items()}
+                return value
+
+            samples = [to_device(sample) for sample in samples]
+            inputs = batch(samples)
+            seen, projection_dtypes, time_dtypes = [], [], []
+            from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3FP32Linear
+
+            for module in model.modules():
+                if isinstance(module, MiniMaxH3FP32Linear):
+                    module.register_forward_pre_hook(
+                        lambda module, args: projection_dtypes.append(module.weight.dtype)
+                    )
+            inner = model.get_base_model() if lora else model
+            inner.dit.blocks[0].register_forward_pre_hook(
+                lambda module, args, kwargs: time_dtypes.append(kwargs["t_emb"].dtype), with_kwargs=True
+            )
+            hook = model.register_forward_pre_hook(
+                lambda module, args, kwargs: seen.append((kwargs["img_position_ids"], kwargs["unique_timesteps"])),
+                with_kwargs=True,
+            )
+            single = model(**samples[0])
+            single_reference = reference(**samples[0])
+            with torch.no_grad():
+                one_element = model(**batch([samples[0]]))
+            for output in (single, one_element):
+                for prediction, baseline in zip(output.predictions, single_reference.predictions):
+                    torch.testing.assert_close(prediction, baseline, rtol=0.02, atol=0.002)
+            sum(single.loss.values()).backward()
+            sum(single_reference.loss.values()).backward()
+            grads, ref_grads = [], []
+            ref_params = dict(reference.named_parameters())
+            for name, parameter in model.named_parameters():
+                if parameter.requires_grad:
+                    grads.append(parameter.grad.full_tensor().float().flatten())
+                    ref_grads.append(ref_params[name].grad.float().flatten())
+            grads, ref_grads = torch.cat(grads), torch.cat(ref_grads)
+            assert (grads - ref_grads).norm() / ref_grads.norm() < 0.05
+            model.zero_grad(set_to_none=True)
+            reference.zero_grad(set_to_none=True)
+            actual = model(**inputs)
+            hook.remove()
+            expected = serial(reference, samples)
+            for actual_positions, positions in zip(seen[-1][0], inputs["img_position_ids"]):
+                torch.testing.assert_close(actual_positions, positions, rtol=0, atol=0)
+            for actual_timesteps, timesteps in zip(seen[-1][1], inputs["unique_timesteps"]):
+                torch.testing.assert_close(actual_timesteps, timesteps, rtol=0, atol=0)
+            assert projection_dtypes and set(projection_dtypes) == {torch.float32}
+            assert time_dtypes and set(time_dtypes) == {torch.float32}
+            for i, output in enumerate(expected):
+                for modality, baseline in enumerate(output.predictions):
+                    prediction = actual.predictions[modality][i]
+                    assert prediction.dtype == torch.float32
+                    torch.testing.assert_close(prediction, baseline, rtol=0.02, atol=0.002)
+            sum(actual.loss.values()).backward()
+            torch.stack([sum(output.loss.values()) for output in expected]).mean().backward()
+            actual_grads, expected_grads = [], []
+            reference_params = dict(reference.named_parameters())
+            for name, parameter in model.named_parameters():
+                if not parameter.requires_grad:
+                    continue
+                gradient = parameter.grad.full_tensor().float()
+                assert torch.isfinite(gradient).all()
+                actual_grads.append(gradient.flatten())
+                expected_grads.append(reference_params[name].grad.float().flatten())
+            actual_grads, expected_grads = torch.cat(actual_grads), torch.cat(expected_grads)
+            relative = (actual_grads - expected_grads).norm() / expected_grads.norm()
+            assert relative < 0.05, relative
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+            before = {
+                name: parameter.full_tensor().clone()
+                for name, parameter in model.named_parameters()
+                if parameter.requires_grad
+            }
+            optimizer.step()
+            changed = [
+                not torch.equal(parameter.full_tensor(), before[name])
+                for name, parameter in model.named_parameters()
+                if parameter.requires_grad
+            ]
+            assert any(changed)
+            if not checkpointing and not lora and not wrap_projections:
+                import torch.distributed.checkpoint as dcp
+
+                from veomni.checkpoint.dcp_checkpointer import ModelState
+
+                checkpoint_state = ModelState(model)
+                dcp_path = os.path.join(weights_path, "roundtrip")
+                saved = {name: parameter.full_tensor().clone() for name, parameter in model.named_parameters()}
+                dcp.save({"model": checkpoint_state}, checkpoint_id=dcp_path)
+                with torch.no_grad():
+                    for parameter in model.parameters():
+                        parameter.zero_()
+                dcp.load({"model": checkpoint_state}, checkpoint_id=dcp_path)
+                for name, parameter in model.named_parameters():
+                    torch.testing.assert_close(parameter.full_tensor(), saved[name], rtol=0, atol=0)
+                control_path = os.path.join(weights_path, "control")
+                control_state = {"linear.weight": torch.eye(4), "linear.bias": torch.zeros(4)}
+                if dist.get_rank() == 0:
+                    os.makedirs(control_path)
+                    save_file(control_state, os.path.join(control_path, "model.safetensors"))
+                dist.barrier()
+                for enabled, cast_inputs in ((True, True), (True, False), (False, True)):
+                    with torch.device("meta"):
+                        control = _PrecisionControlModel()
+                    control = build_parallelize_model(
+                        control,
+                        weights_path=control_path,
+                        init_device="meta",
+                        mixed_precision=MixedPrecisionConfig(enable=enabled, cast_forward_inputs=cast_inputs),
+                        enable_gradient_checkpointing=False,
+                    )
+                    for name, parameter in control.named_parameters():
+                        torch.testing.assert_close(parameter.full_tensor().cpu(), control_state[name], rtol=0, atol=0)
+                    position = torch.tensor([1025.333333333], dtype=torch.float64, device=device)
+                    output, actual_position = control(torch.ones(2, 4, device=device), position)
+                    expected_dtype = torch.bfloat16 if enabled and cast_inputs else torch.float64
+                    assert actual_position.dtype == expected_dtype
+                    torch.testing.assert_close(actual_position, position.to(expected_dtype), rtol=0, atol=0)
+                    output.float().sum().backward()
+                    assert all(torch.isfinite(p.grad.full_tensor()).all() for p in control.parameters())
+            dist.barrier()
+    finally:
+        clear_parallel_state()
+
+
+def _run_h3_precision_gloo(
+    rank, rendezvous, checkpointing, lora, weights_path, wrap_projections, mixed_precision=True
+):
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        _run_h3_precision_fsdp(checkpointing, lora, weights_path, wrap_projections, mixed_precision)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("checkpointing", [False, True])
+@pytest.mark.parametrize("lora", [False, True])
+@pytest.mark.parametrize("wrap_projections", [False, True])
+def test_h3_precision_through_production_fsdp(tmp_path, checkpointing, lora, wrap_projections):
+    import torch.multiprocessing as mp
+
+    from veomni.utils.device import get_device_type
+
+    from ..tools.launch_utils import torchrun
+
+    if get_device_type() == "cpu":
+        mp.spawn(
+            _run_h3_precision_gloo,
+            args=(str(tmp_path / "rendezvous"), checkpointing, lora, str(tmp_path), wrap_projections),
+            nprocs=2,
+            join=True,
+        )
+    else:
+        torchrun(
+            _run_h3_precision_fsdp,
+            world_size=2,
+            checkpointing=checkpointing,
+            lora=lora,
+            weights_path=str(tmp_path),
+            wrap_projections=wrap_projections,
+        )
+
+
+@pytest.mark.parametrize("task", ["fl2va", "ref2va"])
+def test_h3_fp32_heads_support_multistep_bf16_anchors(task):
+    from veomni.models.auto import build_foundation_model
+    from veomni.models.diffusers.minimax_h3.inference import model_fn_minimax_h3
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.flow_match_scheduler import FlowMatchScheduler
+
+    from ..tools.training_utils import make_eager_ops_config
+
+    model = build_foundation_model(
+        tiny_model().config, init_device="cpu", torch_dtype="bfloat16", ops_implementation=make_eager_ops_config()
+    )
+    row = raw_sample(9, task=task)
+    row = {key: value.bfloat16() if torch.is_tensor(value) else value for key, value in row.items()}
+    anchor = row["keyframe_cond_anchor" if task == "fl2va" else "ref_visual_anchor"]
+    video, audio = row["input_latents"], row["audio_input_latents"]
+    scheduler = FlowMatchScheduler()
+    scheduler.set_timesteps(3)
+    for timestep in scheduler.timesteps[:2]:
+        with torch.no_grad():
+            video_pred, audio_pred = model_fn_minimax_h3(
+                model,
+                video,
+                audio,
+                row["packed"],
+                row["prompt_embeds"],
+                t_video=0.5,
+                t_audio=0.5,
+                **{"keyframe_cond_anchor" if task == "fl2va" else "ref_visual_anchor": anchor},
+            )
+        assert video_pred.dtype == audio_pred.dtype == torch.float32
+        video = scheduler.step(video_pred, timestep, video)
+        audio = scheduler.step(audio_pred, timestep, audio)
+        assert torch.isfinite(video).all() and torch.isfinite(audio).all()
+    assert anchor.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_h3_hf_export_reload_preserves_fp32_values(tmp_path, legacy, monkeypatch):
+    from safetensors.torch import load_file
+
+    from veomni.models.auto import build_foundation_model
+    from veomni.models.module_utils import load_model_weights
+    from veomni.utils import save_safetensor_utils as save_utils
+
+    from ..tools.training_utils import make_eager_ops_config
+
+    model = build_foundation_model(
+        tiny_model().config, init_device="cpu", torch_dtype="bfloat16", ops_implementation=make_eager_ops_config()
+    )
+    with torch.no_grad():
+        model.dit.video_patch_proj.weight.fill_(1.001)
+        model.dit.time_embedder.proj_in.weight.fill_(0.094339624)
+    if legacy:
+        monkeypatch.setattr(save_utils, "ckpt_to_state_dict", lambda **kwargs: model.state_dict())
+        save_utils._save_hf_safetensor_legacy("unused", str(tmp_path), None, "dcp", None, model=model)
+    else:
+        mapping = dict.fromkeys(model.dit.state_dict(), 1)
+        if save_utils.IS_NPU_AVAILABLE:
+            pytest.skip("NPU exports use the legacy route tested separately")
+        save_utils.save_hf_safetensor(
+            save_hf_safetensor_path=str(tmp_path),
+            ckpt_manager="dcp",
+            model=model,
+            fqn_to_index_mapping=mapping,
+            is_rank_0=True,
+        )
+    loaded = {}
+    for shard in tmp_path.glob("*.safetensors"):
+        loaded.update(load_file(shard))
+    prefix = "dit."
+    for name in ("video_patch_proj.weight", "time_embedder.proj_in.weight"):
+        expected = model.dit.state_dict()[name]
+        assert loaded[prefix + name].dtype == torch.float32
+        torch.testing.assert_close(loaded[prefix + name], expected, rtol=0, atol=0)
+    assert loaded[prefix + "condition_proj.weight"].dtype == torch.bfloat16
+    restored = build_foundation_model(
+        copy.deepcopy(model.config),
+        init_device="cpu",
+        torch_dtype="bfloat16",
+        ops_implementation=make_eager_ops_config(),
+    )
+    load_model_weights(restored, str(tmp_path), "cpu")
+    for name, expected in model.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name], expected, rtol=0, atol=0)
+
+
+def test_h3_export_opt_in_preserves_other_model_defaults():
+    from veomni.utils.save_safetensor_utils import _export_state_with_precision
+
+    model = torch.nn.Linear(4, 4)
+    model._keep_in_fp32_modules = ["linear"]
+    state = {
+        "linear.weight": torch.full((4,), 1.001, dtype=torch.float32),
+        "other": torch.ones(4, dtype=torch.float16),
+        "indices": torch.arange(4),
+    }
+    default = _export_state_with_precision(model, state)
+    assert default["linear.weight"].dtype == torch.bfloat16
+    assert default["other"].dtype == torch.float16
+    model._preserve_fp32_modules_on_export = True
+    opted_in = _export_state_with_precision(model, state)
+    assert opted_in["linear.weight"].dtype == torch.float32
+    torch.testing.assert_close(opted_in["linear.weight"], state["linear.weight"], rtol=0, atol=0)
+    legacy = _export_state_with_precision(model, state, legacy=True)
+    assert legacy["other"].dtype == torch.bfloat16
+    assert legacy["indices"].dtype == torch.int64
+
+
+def test_h3_loaded_lora_with_mixed_precision_disabled(tmp_path):
+    import torch.multiprocessing as mp
+
+    from veomni.utils.device import get_device_type
+
+    from ..tools.launch_utils import torchrun
+
+    if get_device_type() == "cpu":
+        mp.spawn(
+            _run_h3_precision_gloo,
+            args=(str(tmp_path / "rendezvous"), False, True, str(tmp_path), False, False),
+            nprocs=2,
+            join=True,
+        )
+    else:
+        torchrun(
+            _run_h3_precision_fsdp,
+            world_size=2,
+            checkpointing=False,
+            lora=True,
+            weights_path=str(tmp_path),
+            mixed_precision=False,
+        )
+
+
+def test_h3_fp32_lora_math_and_export_preserve_precision(tmp_path, monkeypatch):
+    from safetensors.torch import load_file
+
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
+
+    torch.manual_seed(78)
+    model = VeOmniLoraModel(tiny_model(), VeOmniLoraConfig(r=4, lora_alpha=8, target_modules=["video_patch_proj"]))
+    projection = model.get_base_model().dit.video_patch_proj
+    with torch.no_grad():
+        projection.lora_A["default"].weight.fill_(0.094339624)
+        projection.lora_B["default"].weight.fill_(0.013711)
+    x = torch.randn(5, 96, requires_grad=True)
+    normal = projection(x)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual = projection(x)
+    torch.testing.assert_close(actual, normal, rtol=0, atol=0)
+    actual.sum().backward()
+    assert projection.lora_B["default"].weight.grad.dtype == torch.float32
+    from veomni.checkpoint import dcp_checkpointer
+
+    monkeypatch.setattr(dcp_checkpointer, "empty_cache", lambda: None)
+    save_lora_adapter_with_dcp(model, str(tmp_path))
+    state = load_file(tmp_path / "adapter_model.safetensors")
+    for name, tensor in state.items():
+        assert tensor.dtype == torch.float32
+        live_name = name.replace("lora_A.weight", "lora_A.default.weight").replace(
+            "lora_B.weight", "lora_B.default.weight"
+        )
+        torch.testing.assert_close(tensor, dict(model.named_parameters())[live_name], rtol=0, atol=0)

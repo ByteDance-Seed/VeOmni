@@ -985,3 +985,66 @@ def test_reduce_scatter_fp32_accumulation_fsdp2_step():
     from ..tools.launch_utils import torchrun
 
     torchrun(_run_fsdp2_optimizer_step, world_size=4)
+
+
+@pytest.mark.parametrize("enable", [False, True])
+@pytest.mark.parametrize("explicit_targets", [False, True])
+def test_model_precision_policy_and_root_islands_reach_fsdp(monkeypatch, mock_fsdp_builder, enable, explicit_targets):
+    calls = {}
+    hook_calls = []
+
+    class FP32Projection(nn.Linear):
+        pass
+
+    class Decoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(4, 4)
+            self.projection = FP32Projection(4, 4)
+
+    model = nn.Module()
+    model.decoder = Decoder()
+    model.output = FP32Projection(4, 4)
+    model._no_split_modules = ["Decoder"]
+    model.get_ignore_modules_in_mixed_precision = lambda: (FP32Projection,)
+
+    def policy_hook(policy, module):
+        from dataclasses import replace
+
+        hook_calls.append((policy, module))
+        return replace(policy, cast_forward_inputs=False)
+
+    model.get_fsdp_mixed_precision_policy = policy_hook
+
+    def record_wrap(module, **kwargs):
+        assert module not in calls, "each module must be wrapped exactly once"
+        calls[module] = kwargs
+
+    monkeypatch.setattr(torch_parallelize, "fully_shard", record_wrap)
+    torch_parallelize.parallelize_model_fsdp2(
+        model,
+        mixed_precision=MixedPrecisionConfig(enable=enable),
+        init_device="meta",
+        enable_forward_prefetch=False,
+        basic_modules=["FP32Projection"] if explicit_targets else None,
+    )
+    for projection in (model.decoder.projection, model.output):
+        assert "mp_policy" not in calls[projection]
+        assert calls[projection]["reshard_after_forward"] is False
+    for module in (model.decoder, model):
+        if enable:
+            assert calls[module]["mp_policy"].cast_forward_inputs is False
+            assert calls[module]["mp_policy"].param_dtype == torch.bfloat16
+        else:
+            assert "mp_policy" not in calls[module]
+    assert len(hook_calls) == 2 * int(enable)
+
+
+@pytest.mark.parametrize("cast_inputs", [False, True])
+def test_model_without_precision_hook_keeps_configured_input_cast(monkeypatch, mock_fsdp_builder, cast_inputs):
+    calls = []
+    monkeypatch.setattr(torch_parallelize, "fully_shard", lambda module, **kwargs: calls.append(kwargs))
+    torch_parallelize.parallelize_model_fsdp2(
+        nn.Linear(4, 4), mixed_precision=MixedPrecisionConfig(cast_forward_inputs=cast_inputs), init_device="meta"
+    )
+    assert calls[-1]["mp_policy"].cast_forward_inputs == cast_inputs

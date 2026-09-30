@@ -1514,6 +1514,7 @@ def _get_shard_info(
     save_dtype: Optional[Union[str, "torch.dtype"]],
     shard_size: int,
     safe_serialization: bool,
+    keep_in_fp32_modules: Optional[Sequence[str]] = None,
 ) -> Tuple[bool, int, Dict[str, str]]:
     """
     Gets the shard information, should be executed at rank 0.
@@ -1522,7 +1523,8 @@ def _get_shard_info(
     current_size, total_size = 0, 0
     current_shard, shard_list = [], []
     for name, tensor in state_dict.items():
-        dtype = _resolve_save_dtype(tensor, save_dtype)
+        preserve = keep_in_fp32_modules and set(keep_in_fp32_modules).intersection(name.split("."))
+        dtype = _resolve_save_dtype(tensor, torch.float32 if preserve else save_dtype)
         tensor_size = _get_tensor_save_size(tensor, dtype, safe_serialization)
         if current_size != 0 and current_size + tensor_size > shard_size:
             total_size += current_size
@@ -1579,6 +1581,7 @@ def save_model_weights(
     shard_size: int = 5_000_000_000,
     safe_serialization: bool = True,
     model_assets: Optional[Sequence["ModelAssets"]] = None,
+    keep_in_fp32_modules: Optional[Sequence[str]] = None,
 ) -> None:
     """
     Saves full model weights. The model parameters should be either tensor or dtensor.
@@ -1595,7 +1598,13 @@ def save_model_weights(
 
     os.makedirs(output_dir, exist_ok=True)
     save_dtype = _normalize_save_dtype(save_dtype)
-    is_sharded, total_size, weight_map = _get_shard_info(state_dict, save_dtype, shard_size, safe_serialization)
+    is_sharded, total_size, weight_map = _get_shard_info(
+        state_dict,
+        save_dtype,
+        shard_size,
+        safe_serialization,
+        keep_in_fp32_modules,
+    )
     full_state_dict = OrderedDict()
     prev_file_name = None
     for name, tensor in state_dict.items():
@@ -1604,7 +1613,8 @@ def save_model_weights(
         else:
             tensor = tensor.data
 
-        target_dtype = _resolve_save_dtype(tensor, save_dtype)
+        preserve = keep_in_fp32_modules and set(keep_in_fp32_modules).intersection(name.split("."))
+        target_dtype = _resolve_save_dtype(tensor, torch.float32 if preserve else save_dtype)
         if tensor.dtype != target_dtype:
             tensor = tensor.to(dtype=target_dtype)
 
