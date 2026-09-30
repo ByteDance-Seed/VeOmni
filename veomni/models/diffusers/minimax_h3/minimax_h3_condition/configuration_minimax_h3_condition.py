@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 
 from transformers import PretrainedConfig
@@ -24,8 +25,16 @@ class MiniMaxH3ConditionModelConfig(PretrainedConfig):
         video_max_frames: int = 73,
         video_max_resolution: int = 848,
         text_encoder_num_retained_layers: int = 50,
+        training_cfg_scale: float = 1.0,
+        training_cfg_schedule: str = "constant",
+        training_cfg_curvature_power: float = 2.0,
+        cfg_unconditional_mode: str = "per_sample",
+        cfg_unconditional_path: Optional[str] = None,
+        video_sigma_bucket_weights: Optional[list[float]] = None,
         **kwargs,
     ):
+        if "training_cfg_loss_mode" in kwargs:
+            raise ValueError("Use training_cfg_curvature_power instead of the removed training_cfg_loss_mode.")
         super().__init__(**kwargs)
         self.base_model_path = base_model_path
         self.text_encoder_subfolder = text_encoder_subfolder
@@ -43,3 +52,22 @@ class MiniMaxH3ConditionModelConfig(PretrainedConfig):
         self.video_max_frames = video_max_frames
         self.video_max_resolution = video_max_resolution
         self.text_encoder_num_retained_layers = text_encoder_num_retained_layers
+        if not math.isfinite(training_cfg_scale) or training_cfg_scale < 1:
+            raise ValueError("training_cfg_scale must be finite and >= 1.")
+        if training_cfg_schedule not in ("constant", "sigma"):
+            raise ValueError("training_cfg_schedule must be constant or sigma.")
+        if not math.isfinite(training_cfg_curvature_power) or not 0 <= training_cfg_curvature_power <= 2:
+            raise ValueError("training_cfg_curvature_power must be finite and in [0, 2].")
+        if cfg_unconditional_mode not in ("per_sample", "shared_empty"):
+            raise ValueError("cfg_unconditional_mode must be per_sample or shared_empty.")
+        if training_cfg_scale > 1 and cfg_unconditional_mode == "shared_empty" and not cfg_unconditional_path:
+            raise ValueError("shared_empty CFG requires cfg_unconditional_path.")
+        weights = list(video_sigma_bucket_weights) if video_sigma_bucket_weights is not None else [1.0] * 5
+        if len(weights) != 5 or any(not math.isfinite(w) or w < 0 for w in weights) or not any(weights):
+            raise ValueError("video_sigma_bucket_weights requires five finite nonnegative weights, not all zero.")
+        self.training_cfg_scale = training_cfg_scale
+        self.training_cfg_schedule = training_cfg_schedule
+        self.training_cfg_curvature_power = training_cfg_curvature_power
+        self.cfg_unconditional_mode = cfg_unconditional_mode
+        self.cfg_unconditional_path = cfg_unconditional_path
+        self.video_sigma_bucket_weights = weights
