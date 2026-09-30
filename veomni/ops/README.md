@@ -20,6 +20,7 @@ veomni/ops/
 │   ├── deepseek_v4/        TileLang sparse attention/indexer + precision helpers
 │   ├── load_balancing_loss/  eager + triton fused kernel
 │   ├── mhc/                TileKernels mHC pre/post/head adapters
+│   ├── qsa/                Qwen4-Exp QSA eager reference + NPU Triton indexer
 │   ├── rms_norm/           Liger / NPU / triton batch-invariant
 │   ├── rotary/             Liger / NPU / deterministic / Wan Triton
 │   ├── swiglu/             Liger SwiGLU MLP
@@ -52,6 +53,7 @@ depending on when and where the kernel is bound:
 | Load-balancing loss | `load_balancing_loss_implementation` | GLOBAL | `eager` | `eager`, `triton` |
 | RMSNorm | `rms_norm_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
 | Rotary pos emb | `rotary_pos_emb_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
+| QSA indexer | `qsa_indexer_implementation` | build-time `OpSlot` | `eager` | `triton` (Qwen4-Exp, NPU only) |
 | SwiGLU MLP | `swiglu_mlp_implementation` | PER_MODEL | `eager` | `liger_kernel` |
 | mHC | `mhc_implementation` | build-time `OpSlot` | `eager` | `tilelang` (DeepSeek V4, SM90+; provided by `tile-kernels`) |
 | Fused MoE | `moe_implementation` | build-time | `eager` | `eager`, `fused_triton` (group-gemm, SM70+), `fused_quack` (CUTLASS/CuTe, SM90+), `fused_npu` (Ascend). Mismatches raise instead of falling back. |
