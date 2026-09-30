@@ -205,9 +205,10 @@ bash train.sh tasks/train_dit.py configs/dit/minimax_h3_fl2va_offline.yaml \
 ```
 
 Keep `train.dyn_bsz=false`, `data.dataloader.drop_last=true`, and FSDP2
-`mixed_precision.cast_forward_inputs=false`. Timesteps stay FP32 and positions
-stay FP32/FP64; blanket BF16 input casting is rejected rather than silently
-changing their precision. Samples in one microbatch may differ in task
+`mixed_precision.cast_forward_inputs=false` documents H3's precision contract.
+H3 also disables automatic FSDP input casting when the global default is `true`:
+timesteps stay FP32 and positions stay FP32/FP64. Already-quantized packed inputs
+are still rejected; converting rounded coordinates back to FP32 cannot repair them. Samples in one microbatch may differ in task
 (FL2VA/visual Ref2VA, with or without keyframes), target video/audio geometry,
 prompt length, reference count and reference geometry; `DiTDataCollator` fills
 keys a sample lacks with `None`, and multi-sample outputs return per-sample
@@ -286,6 +287,43 @@ serial repeats, so packed-gradient comparisons must also measure that baseline
 variability; a separate accumulation-precision fix must not silently change the
 single-sample path. Sample-local refiner execution is restricted to cross-sample
 packing; ordinary single-sample attention dispatch is preserved.
+
+### Mixed precision
+
+H3 retains the official checkpoint's video/audio patch projections, both time
+embedding projections and video/audio output heads in FP32. Only those linear
+modules opt out of FSDP parameter casting; block, refiner and conditioning
+weights retain the configured BF16/FP16 precision. Projection inputs are cast to
+the projection's own dtype, the time MLP stays FP32, and AdaLN applies SiLU before
+casting to its ordinary projection dtype. RoPE coordinates and timestep tables
+are never implicitly cast at the FSDP root or checkpointed block boundary.
+These changes preserve checkpoint parameter names and shapes, but intentionally
+change the previous BF16 forward numerics, including single-sample execution.
+
+The existing FSDP high-precision exemption keeps these six projections unsharded
+between forward and backward (`reshard_after_forward=False`). Account for their
+persistent FP32 allocation when sizing a training job. Explicitly casting the
+whole model with `.bfloat16()` overrides its stored precision; use the foundation
+loader's `torch_dtype` or FSDP mixed-precision configuration instead.
+
+This fixes precision contracts, not exact rollout parity: attention kernel
+arithmetic, fused CUDA modulation, adapter synchronization, and training
+stability require separate matched-trajectory validation. The AdaLN gather and
+backward accumulation implementation is unchanged. The existing H3 test file
+also runs a two-rank FSDP2 regression (Gloo on CPU, accelerator backend otherwise)
+with meta initialization, safetensors loading, mixed-geometry FL2VA/Ref2VA
+packing, LoRA, checkpointing, gradient comparison and an AdamW update. It checks
+the loaded base tensors before initializing adapter-only test weights; it does
+not substitute for official-weight or full-Trainer validation. H3 also opts
+into preserving these FP32 modules in distributed and legacy HF exports; other
+models retain the prior export defaults. Multi-step inference assembles latent
+and reference-anchor rows in the destination dtype, including after FP32 heads
+promote scheduler outputs from BF16. Tests cover BF16 first-frame/reference
+anchors, HF export/reload with non-BF16-representable weights, and a DCP model
+state round trip. Official bare checkpoint keys and VeOmni's `dit.`-prefixed
+exports are both accepted without adding a second prefix. FP32-island LoRA
+adapter branches get separate FSDP ownership, including when mixed precision is
+disabled, so they cannot share a trainable parameter group with BF16 adapters.
 
 ### Attention and validation
 

@@ -33,6 +33,22 @@ from veomni.utils.import_utils import is_torch_version_greater_than
 logger = helper.create_logger(__name__)
 
 
+def _export_state_with_precision(model, state, *, legacy=False):
+    """Preserve model-declared FP32 modules while retaining the ordinary BF16 export default."""
+    keep = (
+        set(getattr(model, "_keep_in_fp32_modules", None) or ())
+        if getattr(model, "_preserve_fp32_modules_on_export", False)
+        else set()
+    )
+    return {
+        name: tensor.to(torch.bfloat16)
+        if (tensor.is_floating_point() if legacy else tensor.dtype == torch.float32)
+        and not keep.intersection(name.split("."))
+        else tensor
+        for name, tensor in state.items()
+    }
+
+
 @torch.no_grad()
 def get_model_save_state(
     model: torch.nn.Module,
@@ -42,7 +58,7 @@ def get_model_save_state(
     """Build a flat state dict suitable for HuggingFace safetensors saving.
 
     1. Extracts a flat state dict via ``ModelState`` (FQNs match HF weight_map keys).
-    2. Casts float32 tensors to bfloat16 on copies (original model dtypes are preserved).
+    2. Casts float32 tensors to bfloat16 on copies, except model-opted-in FP32 islands.
     3. Filters out tied weights not present in ``fqn_to_index_mapping``.
     """
     from veomni.checkpoint.dcp_checkpointer import ModelState
@@ -51,16 +67,7 @@ def get_model_save_state(
     # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
     save_state = ModelState(model, parallel_state=parallel_state).state_dict()
 
-    # Convert float32 tensors to bfloat16 on a copy of the state dict,
-    # so the original model parameters remain unchanged.
-    converted_state = {}
-    for k, v in save_state.items():
-        if v.dtype == torch.float32:
-            logger.info_rank0(f"Converting {k} from {v.dtype} to torch.bfloat16")
-            converted_state[k] = v.to(torch.bfloat16)
-        else:
-            converted_state[k] = v
-    save_state = converted_state
+    save_state = _export_state_with_precision(model, save_state)
 
     # Remove tied weights not present in the HF weight_map
     # (e.g. lm_head.weight is tied to model.embed_tokens.weight via tie_word_embeddings)
@@ -155,6 +162,7 @@ def _save_hf_safetensor_legacy(
     model_assets: Optional[Sequence],
     ckpt_manager: str,
     output_dir: Optional[str],
+    model: Optional[torch.nn.Module] = None,
 ):
     """Legacy HuggingFace safetensors save via checkpoint conversion (rank-0 only)."""
     model_state_dict = ckpt_to_state_dict(
@@ -162,7 +170,17 @@ def _save_hf_safetensor_legacy(
         ckpt_manager=ckpt_manager,
         output_dir=output_dir,
     )
-    save_model_weights(save_hf_safetensor_path, model_state_dict, model_assets=model_assets)
+    keep = (
+        getattr(model, "_keep_in_fp32_modules", None)
+        if getattr(model, "_preserve_fp32_modules_on_export", False)
+        else None
+    )
+    save_model_weights(
+        save_hf_safetensor_path,
+        model_state_dict,
+        model_assets=model_assets,
+        keep_in_fp32_modules=keep,
+    )
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_hf_safetensor_path} successfully!")
 
 
@@ -202,7 +220,7 @@ def save_hf_safetensor(
         is_rank_0: [Legacy only] Whether the current process is global rank 0.
             Legacy save is rank-0 only; non-rank-0 processes return immediately.
             Required by non-dcp checkpoint managers (e.g., omnistore).
-        model: [Distributed only] Live FSDP model for distributed save.
+        model: Live model for distributed save and model-specific precision in legacy exports.
         fqn_to_index_mapping: [Distributed only] Maps FQNs to safetensors file indices
             for multi-file output.
     """
@@ -240,6 +258,7 @@ def save_hf_safetensor(
                 model_assets,
                 ckpt_manager,
                 output_dir,
+                model=model,
             )
 
     # Ensure all ranks finish saving before anyone proceeds
@@ -285,7 +304,7 @@ def save_lora_adapter_with_dcp(
     os.makedirs(dcp_save_path, exist_ok=True)
 
     lora_state = get_lora_state_dict(model, adapter_name=adapter_name, config=model.get_lora_config())
-    lora_state = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v for k, v in lora_state.items()}
+    lora_state = _export_state_with_precision(model, lora_state)
 
     # Restore the EP shard dim before DCP sees the LoRA tensors. After
     # ``ParallelPlan.apply`` the EP-sharded params are stored as plain

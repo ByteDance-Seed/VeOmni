@@ -25,6 +25,7 @@ byte-identical to a stock PEFT LoRA checkpoint. VeOmni ships a single
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -151,7 +152,13 @@ class LoraLinear(nn.Module, LoraLayer):
         dropout = self.lora_dropout[adapter]
         scaling = self.scaling[adapter]
         x = x.to(lora_A.weight.dtype)
-        delta = lora_B(lora_A(dropout(x))) * scaling
+        precision_context = (
+            torch.autocast(device_type=x.device.type, enabled=False)
+            if getattr(self.base_layer, "_veomni_keep_in_fp32", False)
+            else nullcontext()
+        )
+        with precision_context:
+            delta = lora_B(lora_A(dropout(x))) * scaling
         return result + delta.to(result.dtype)
 
     @torch.no_grad()
