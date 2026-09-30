@@ -836,7 +836,8 @@ def _is_minimax_h3_path(filename: str) -> bool:
 
 @pytest.mark.parametrize("attention", ["sdpa", "veomni_flash_attention_2_with_sp"])
 @pytest.mark.parametrize("mode", ["single", "packed"])
-def test_no_implicit_sync_in_minimax_h3_forward_backward(monkeypatch, mode, attention):
+@pytest.mark.parametrize("cfg_mode", ["off", "per_sample", "shared_empty"])
+def test_no_implicit_sync_in_minimax_h3_forward_backward(monkeypatch, tmp_path, mode, attention, cfg_mode):
     """No implicit CUDA sync from MiniMax H3 modeling during a training step."""
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
@@ -846,7 +847,7 @@ def test_no_implicit_sync_in_minimax_h3_forward_backward(monkeypatch, mode, atte
     from veomni.models.diffusers.minimax_h3.minimax_h3_core import core
     from veomni.trainer.dit_trainer import DiTDataCollator
 
-    from .test_minimax_h3_packing import condition_model, raw_sample, tiny_model
+    from .test_minimax_h3_packing import cfg_condition, cfg_raw, condition_model, raw_sample, tiny_model
 
     fused = attention != "sdpa"
     monkeypatch.setattr(core, "ATTENTION_IMPLEMENTATION", "flash_attention_2" if fused else "torch")
@@ -856,13 +857,24 @@ def test_no_implicit_sync_in_minimax_h3_forward_backward(monkeypatch, mode, atte
     config = tiny_model().config
     config._attn_implementation = attention
     model = type(tiny_model())(config).to(device=device, dtype=dtype)
-    raws = [raw_sample(3), raw_sample(5, "ref2va")][: 1 if mode == "single" else 2]
+    make_sample = cfg_raw if cfg_mode == "per_sample" else raw_sample
+    raws = [make_sample(3, "fl2va"), make_sample(5, "ref2va")][: 1 if mode == "single" else 2]
     for row in raws:
         row["use_gradient_checkpointing"] = True
         for key in ("input_latents", "audio_input_latents", "prompt_embeds"):
             row[key] = row[key].to(dtype)
-    collated = _to_device_recursive(dict(DiTDataCollator()(raws)), device)
-    condition = condition_model().to(device)
+    if cfg_mode == "shared_empty":
+        from safetensors.torch import save_file
+
+        path = tmp_path / "unconditional.safetensors"
+        save_file({"prompt_embeds": torch.randn(1, 32), "text_token_tags": torch.ones(1, dtype=torch.long)}, str(path))
+        condition = cfg_condition(cfg_unconditional_mode=cfg_mode, cfg_unconditional_path=str(path))
+    else:
+        condition = condition_model() if cfg_mode == "off" else cfg_condition()
+    # Exercise the real host boundary before transfer, including enabled CFG.
+    host_batch = condition.prepare_condition_batch(dict(DiTDataCollator()(raws)))
+    collated = _to_device_recursive(host_batch, device)
+    condition = condition.to(device)
 
     def step():
         sum(model(**condition.process_condition(**collated)).loss.values()).backward()

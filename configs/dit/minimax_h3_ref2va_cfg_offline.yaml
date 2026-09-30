@@ -1,0 +1,88 @@
+# Prepared visual Ref2VA + CFG-calibrated FM LoRA training.
+# See docs/examples/minimax_h3.md for the decoded cache contract.
+# Replace the model/cache paths before running:
+# bash train.sh tasks/train_dit.py configs/dit/minimax_h3_ref2va_cfg_offline.yaml
+model:
+  model_path: /path/to/MiniMax-H3/Ref2VA/transformer
+  config_path: /path/to/MiniMax-H3/Ref2VA/transformer/config.json
+  condition_model_path: /path/to/MiniMax-H3/Ref2VA
+  condition_model_cfg:
+    skip_encoder_load: true
+    sigma_shift_video: 12.0
+    sigma_shift_audio: 3.0
+    training_cfg_scale: 4.0
+    # Same scale for video/audio; sigma is an opt-in per-modality heuristic.
+    training_cfg_schedule: constant
+    # Relative conditional curvature: 1 / scale**power; 0 disables attenuation.
+    training_cfg_curvature_power: 2.0
+    cfg_unconditional_mode: per_sample
+    # Alternatively: shared_empty plus a local cfg_unconditional_path.
+
+  lora_config:
+    rank: 64
+    alpha: 64
+    lora_dropout: 0.0
+    # Restrict to main DiT blocks, not the Qwen token refiner.
+    lora_modules: 'dit\.blocks\.\d+\.(attn\.(qkv_proj|out_proj)|mlp\.(fc1|fc2))'
+
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    moe_implementation: eager
+    load_balancing_loss_implementation: eager
+
+  optimizer:
+    type: adamw
+    lr: 2.0e-5
+    lr_decay_style: linear
+    lr_min: 2.0e-5
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+
+  accelerator:
+    init_device: meta
+    ulysses_size: 1
+    gradient_checkpointing:
+      enable: true
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        cast_forward_inputs: false
+
+data:
+  train_path: /path/to/prepared_ref2va_cache
+  data_type: diffusion
+  source_name: minimax_h3
+  data_transform: dit_offline
+  datasets_type: iterable
+  dataset_repeat: true
+  log_sample: false
+  text_keys: text
+  dataloader:
+    type: native
+    num_workers: 8
+    drop_last: true
+
+train:
+  training_task: offline_training
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: false
+  seed: 42
+  num_train_epochs: 1
+  max_steps: 100
+  checkpoint:
+    output_dir: output/minimax_h3_ref2va_cfg
+    save_steps: 25
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
+    project: minimax_h3_ref2va_cfg

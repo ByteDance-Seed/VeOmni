@@ -379,3 +379,212 @@ video, audio = pipe(
 **Important**:
 
 - `num_frames` must satisfy `(N-5) % 17 == 0`, otherwise the Video VAE raises an error
+
+## Prepared Ref2VA with CFG-aware LoRA
+
+Use [minimax_h3_ref2va_cfg_offline.yaml](../../configs/dit/minimax_h3_ref2va_cfg_offline.yaml)
+with a compatible Ref2VA checkpoint and prepared visual-reference caches.
+It uses the existing `DiTTrainer`, native LoRA, FSDP2 and model-owned packing.
+It does **not** add raw-reference encoding, audio-reference support or a
+Training Adapter downloader. A training/de-distillation adapter is separate from
+the trainable LoRA; this recipe does not load one implicitly.
+
+```text
+Prepared video/audio latents + paired conditions
+                         |
+            Shared timestep and noise
+                /                 \
+Negative layout                   Positive layout
+(same targets and visual anchors)       |
+        |                               |
+Current DiT (no gradient)       Current DiT (gradient enabled)
+                \                 /
+                CFG-aware FM objective
+                         |
+          Existing trainer and optimizer
+```
+
+### Cache contract
+
+The existing `dit_offline` transform deserializes **every column** using Python
+pickle. Only load trusted caches. The following table describes the decoded
+objects, not a new byte-storage schema or a direct Magnus-table reader.
+
+| Field | Decoded value | Purpose |
+| --- | --- | --- |
+| `input_latents` | Float tensor `[1,24,T,H,W]` | Clean video target |
+| `audio_input_latents` | Float tensor `[C,32,Ta]` | Clean audio target |
+| `prompt_embeds` | Float tensor `[L,D]` | Conditional Qwen representation |
+| `packed` | Dictionary from `build_packed_ref2va` | Conditional positions and segment bounds |
+| `ref_visual_anchor` | Float tensor `[cond_rows,96]` | Prepared reference image/video rows |
+| `has_audio` | Boolean | Set false for placeholder audio; its loss is zero |
+| `unconditional_prompt_embeds` | Float tensor `[Lu,D]` | Required in `per_sample` mode |
+| `unconditional_packed` | Dictionary from the same layout builder | Required in `per_sample` mode; uses `Lu` and its own text token tags |
+
+`per_sample` supports an independently encoded no-text condition retaining
+reference visual tokens in the Qwen representation. It cannot derive those
+embeddings by truncating or zeroing the conditional embedding. Both packed
+layouts must have identical target/reference geometry, reference order and
+compact `[text | cond | audio | video]` structure. Text lengths may differ.
+Use the same source references and compatible encoder checkpoint for both caches;
+structural checks cannot prove that two embeddings have the same semantic origin.
+
+The negative prompt is exactly `" "` (**one space**, not `""`), matching the
+native inference pipeline's default `negative_prompt`. For `per_sample`, use
+the same FL2VA/Ref2VA presentation, encoder checkpoint, resized keyframes or
+prepared reference blocks as the conditional cache, including reference order
+and video timestamps. For `shared_empty`, encode that space with the text-only
+T2VA presentation and no references. This aligns with native inference's
+default string; it does not establish the negative condition used in the
+original model's distillation.
+
+### Generate unconditional caches
+
+The condition model exposes two offline helpers that reuse native inference's
+Qwen presentation and encoding code. Run them while preparing the dataset,
+using the already-loaded condition model in evaluation mode with its Qwen
+encoder on the desired device. No DiT or VAE forward is needed for these calls.
+The helpers return CPU tensors; the original sample and latent anchors are
+preserved.
+
+```python
+from safetensors.torch import save_file
+
+# `condition_model` is the encoder-loaded MiniMaxH3ConditionModel used to
+# produce the conditional caches (skip_encoder_load=False).
+condition_model.eval()
+
+# Shared text-only cache. Native T2VA presentation; exactly one space.
+empty = condition_model.encode_unconditional(negative_prompt=" ")
+save_file(empty, "unconditional.safetensors")
+
+# Per-sample Ref2VA cache. `sample` is the decoded CPU sample from the table
+# above; refs are its original prepared reference blocks, in the same order.
+# An image block contains kind="image", prepared_image=<resized PIL image>.
+# A visual-video block contains kind="video", prepared_frames=<24 FPS frames>,
+# ref_audio_t=0. Use the same preparation as for the positive cache.
+sample_with_negative = condition_model.add_unconditional_cache(
+    sample, negative_prompt=" ", ref_blocks=refs
+)
+
+# For FL2VA, instead supply the original resized keyframe images:
+fl2va_with_negative = condition_model.add_unconditional_cache(
+    fl2va_sample, negative_prompt=" ", keyframe_images=keyframe_images
+)
+# Save each augmented sample using the existing OfflineEmbeddingSaver.save().
+```
+
+`add_unconditional_cache` writes `unconditional_prompt_embeds` and
+`unconditional_packed`. It rebuilds the Qwen prefix length/tags and shifts the
+target/reference positions consistently. It cannot recover original references
+from a conditional embedding; keep the prepared source images/frames available
+during dataset creation. Reference audio is not supported by this recipe.
+
+For a shared pure-empty Qwen embedding, configure:
+
+```yaml
+model:
+  condition_model_cfg:
+    training_cfg_scale: 4.0
+    training_cfg_schedule: constant
+    training_cfg_curvature_power: 2.0
+    cfg_unconditional_mode: shared_empty
+    cfg_unconditional_path: /path/to/unconditional.safetensors
+```
+
+The local file must contain finite `prompt_embeds [Lu,D]` and integer
+`text_token_tags [Lu]` containing only text tags (`1`). It is loaded once per
+condition-model instance. The negative branch removes the conditional Qwen
+prefix, including its visual tokens, but **retains independent visual latent
+anchors**. It reuses the exact positive branch's noisy video/audio and reference
+rows; it never calls the noise sampler a second time. This also works with
+prepared FL2VA inputs and their existing keyframe anchors.
+
+### CFG-calibrated FM and loss settings
+
+Let `p` and `u` be conditional and detached unconditional FM velocities from the
+**same current model**, including its trainable LoRA, and `y = noise - clean`.
+The negative pass runs first under `no_grad`; it is not a frozen-base teacher.
+
+There is one objective, with a configurable curvature exponent `k`:
+
+```text
+p_calibrated = (p + (s - 1) * stopgrad(u)) / s
+loss = s ** (2 - k) * MSE(p_calibrated, y)
+```
+
+| `training_cfg_curvature_power` | Relative conditional curvature | At `s=4` |
+| --- | --- | --- |
+| `2.0` (default) | `1/s²` | `1/16` |
+| `1.0` | `1/s` | `1/4` |
+| `0.0` | `1` | `1` |
+
+Any finite value in `[0, 2]` is supported. CFG-calibrated FM is a descriptive
+name for the existing CFG-aware transformation, not a novel algorithm: `k=2`
+is the inverse-CFG formula and `k=0` is algebraically equivalent to
+`MSE(p, s*y - (s-1)*stopgrad(u))` (the target-guidance form).
+The optimum is unchanged for fixed `u` and `s`, but the gradient scale changes.
+With sigma-dependent scales this also reweights different samples/modalities;
+it cannot in general be replaced by a single learning-rate change. Loss values
+are not directly comparable across curvature settings, and this objective does
+not guarantee preservation of generation quality.
+
+This objective distills guidance into the conditional prediction. At inference,
+the default `cfg_scale=1` uses that prediction directly; applying additional
+inference-time CFG can compound the guidance and should be validated separately.
+
+`sigma = 1 - t` is the effective noise level from the existing scheduler. With
+`training_cfg_schedule: sigma`, video and audio use their respective sigmas:
+`s = 1 + (training_cfg_scale - 1) * sigma`. For a configured scale of `4`,
+`sigma=0.1` gives `s=1.3`, while `sigma=0.9` gives `s=3.7`. This concentrates
+stronger CFG calibration at high noise and leaves low-noise examples closer to
+ordinary FM, giving them more room to learn from new data. `constant` instead
+applies the configured scale at every noise level, equally to video and audio,
+and is the default in the example recipe.
+
+The existing shifts strongly favor high sigma. Enumerating all 1,000 scheduler
+indices at scale `4`, before model-dtype rounding, gives:
+
+| Modality / shift | Mean scale | Median scale | Scale > 3 | Scale < 2 |
+| --- | ---: | ---: | ---: | ---: |
+| Video / 12 | 3.53 | 3.77 | 85.8% | 3.9% |
+| Audio / 3 | 3.03 | 3.25 | 60.0% | 14.2% |
+
+Therefore sigma scheduling gives relatively little low-noise relief for video
+with the shipped shifts. Separate modality scales are an **opt-in training
+heuristic** based on their effective corruption levels, not a reconstruction
+of a known original distillation scale. Native inference applies a single CFG
+scale to both modalities. A quality ablation is needed to establish whether
+per-modality scheduling helps; the formula alone does not show this. Neither
+schedule changes the noise sampling distribution or guarantees quality.
+
+| Condition config key | Default | Meaning |
+| --- | --- | --- |
+| `training_cfg_scale` | `1.0` | Scale one disables the extra branch and preserves upstream RNG/loss behavior |
+| `training_cfg_schedule` | `constant` | `constant` uses the configured scale everywhere; `sigma` varies it with each modality's effective noise level |
+| `training_cfg_curvature_power` | `2.0` | Curvature exponent `k` in `[0,2]`; relative curvature `1/s**k` |
+| `cfg_unconditional_mode` | `per_sample` | `per_sample` or `shared_empty` |
+| `cfg_unconditional_path` | unset | Local shared-empty safetensors, required only when enabled in that mode |
+
+Noise sampling is unchanged from upstream: a uniform scheduler index is shared
+by video and audio, with their respective existing shifts. Existing scheduler
+weights are retained; no additional sigma-bin weights are applied.
+No mixed raw-FM objective, stochastic CFG gate, step warmup or drift anchor is
+silently enabled by this configuration.
+
+### Validation boundary
+
+For offline training, `DiTTrainer.preforward` calls the condition model's optional
+`prepare_condition_batch` hook before device transfer. H3 checks embedding
+finiteness and packed geometry on CPU there. Device-side processing only remaps
+the validated rows and reuses the positive branch's unique timesteps. A custom
+training loop must call this hook **before** moving the batch to the accelerator;
+direct CPU calls to `process_condition` also perform the validation. Serialized
+validation markers are not accepted as proof of a checked cache.
+
+CPU tiny-model tests cover the objective gradients, paired noise, reference
+geometry, cached embeddings, checkpoint recomputation and packed/serial loss
+equivalence. The accelerator sync test also covers both enabled CFG data modes;
+running that test requires a GPU. Existing H3 packing restrictions remain, including no multi-sample
+checkpoint offload. Accelerator SP/FSDP2, pretrained quality and throughput still
+require hardware validation before treating this recipe as production-tested.
