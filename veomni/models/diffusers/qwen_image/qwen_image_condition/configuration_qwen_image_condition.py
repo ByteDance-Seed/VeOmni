@@ -17,6 +17,8 @@ class QwenImageConditionModelConfig(PretrainedConfig):
         num_train_timesteps: int = 1000,
         height: int = 1024,
         width: int = 1024,
+        training_recipe: str = "veomni",
+        image_resize_mode: str = "resize",
         prompt_template_encode: str = (
             "<|im_start|>system\n"
             "Describe the image by detailing the color, shape, size, texture, quantity, text, spatial "
@@ -26,8 +28,27 @@ class QwenImageConditionModelConfig(PretrainedConfig):
         prompt_template_encode_start_idx: int = 34,
         guidance_scale: Optional[float] = None,
         seed: Optional[int] = 42,
+        enable_edit: bool = False,
+        processor_path: str = "",
+        edit_prompt_template: str = (
+            "<|im_start|>system\n"
+            "Describe the key features of the input image (color, shape, size, texture, objects, background), "
+            "then explain how the user's text instruction should alter or modify the image. Generate a new "
+            "image that meets the user's requirements while maintaining consistency with the original input "
+            "where appropriate.<|im_end|>\n"
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+        ),
+        edit_prompt_template_start_idx: int = 64,
+        edit_img_prompt_template: str = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>",
+        text_encoder_attn_implementation: Optional[str] = None,
         **kwargs,
     ):
+        if training_recipe not in ("veomni", "diffsynth"):
+            raise ValueError("training_recipe must be 'veomni' or 'diffsynth'.")
+        if image_resize_mode not in ("resize", "center_crop"):
+            raise ValueError("image_resize_mode must be 'resize' or 'center_crop'.")
+        if height <= 0 or width <= 0 or max_sequence_length <= 0 or num_train_timesteps < 2:
+            raise ValueError("Image dimensions and sequence length must be positive; timesteps must be at least 2.")
         self.base_model_path = base_model_path
         self.tokenizer_subfolder = tokenizer_subfolder
         self.text_encoder_subfolder = text_encoder_subfolder
@@ -37,10 +58,18 @@ class QwenImageConditionModelConfig(PretrainedConfig):
         self.num_train_timesteps = num_train_timesteps
         self.height = height
         self.width = width
+        self.training_recipe = training_recipe
+        self.image_resize_mode = image_resize_mode
         self.prompt_template_encode = prompt_template_encode
         self.prompt_template_encode_start_idx = prompt_template_encode_start_idx
         self.guidance_scale = guidance_scale
         self.seed = seed
+        self.enable_edit = enable_edit
+        self.processor_path = processor_path
+        self.edit_prompt_template = edit_prompt_template
+        self.edit_prompt_template_start_idx = edit_prompt_template_start_idx
+        self.edit_img_prompt_template = edit_img_prompt_template
+        self.text_encoder_attn_implementation = text_encoder_attn_implementation
         super().__init__(**kwargs)
 
     @classmethod

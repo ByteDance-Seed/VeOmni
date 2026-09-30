@@ -13,6 +13,9 @@ def process_dit_online_example(example, source_name, **kwargs):
         raise NotImplementedError("Audio in video is not supported yet for dit training.")
     videos, _ = fetch_videos(videos, use_audio_in_video=False, **kwargs)
     images = fetch_images(images, **kwargs)
+    if isinstance(outputs, dict) and "edit_images" in outputs:
+        outputs = dict(outputs)
+        outputs["edit_images"] = fetch_images(outputs["edit_images"], **kwargs)
     processed_example = {
         "inputs": inputs,
         "outputs": outputs,
