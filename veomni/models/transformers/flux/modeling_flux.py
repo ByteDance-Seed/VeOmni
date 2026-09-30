@@ -73,6 +73,42 @@ def gather_seq_scatter_heads_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tens
     return q, k, v
 
 
+def _sp_padded_layout(segment_lens, sp_size, device):
+    """Positions of the real tokens once each segment is padded to a multiple of sp_size."""
+    index, offset = [], 0
+    for length in segment_lens:
+        index.append(torch.arange(offset, offset + length, device=device))
+        offset += length + (sp_size - length % sp_size) % sp_size
+    return torch.cat(index), offset
+
+
+def _to_sp_padded_layout(rotary_emb, attention_mask, index, padded_len, dtype):
+    """Move RoPE (seq on dim 2) and the additive mask into the padded SP layout, masking pad keys.
+
+    Returns the inputs unchanged when no padding is needed, so the mask-free flash path is kept.
+    """
+    if padded_len == index.numel():
+        return rotary_emb, attention_mask
+
+    shape = list(rotary_emb.shape)
+    shape[2] = padded_len
+    rotary_emb = rotary_emb.new_zeros(shape).index_copy(2, index, rotary_emb)
+
+    is_pad = torch.ones(padded_len, dtype=torch.bool, device=index.device)
+    is_pad[index] = False
+    if attention_mask is None:
+        mask = torch.zeros(1, 1, 1, padded_len, dtype=dtype, device=index.device)
+        mask[..., is_pad] = float("-inf")
+    else:
+        # Pad query rows keep every real key, so they never become all -inf.
+        mask = torch.zeros(
+            *attention_mask.shape[:2], padded_len, padded_len, dtype=attention_mask.dtype, device=index.device
+        )
+        mask[..., is_pad] = float("-inf")
+        mask[:, :, index[:, None], index[None, :]] = attention_mask
+    return rotary_emb, mask
+
+
 def rearrange_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rerange_type: str):
     q = rearrange(q, rerange_type)
     k = rearrange(k, rerange_type)
@@ -646,10 +682,22 @@ class FluxModel(PreTrainedModel):
 
             return custom_forward
 
-        if get_parallel_state().ulysses_enabled:
+        use_sp = get_parallel_state().ulysses_enabled
+        txt_len, img_len = prompt_emb.shape[1], hidden_states.shape[1]
+        joint_rotary_emb, joint_attention_mask = image_rotary_emb, attention_mask
+        single_rotary_emb, single_attention_mask = image_rotary_emb, attention_mask
+
+        if use_sp:
+            # slice_input_tensor pads each stream up to a multiple of sp_size. Inside
+            # attention the gathered sequence is [text + text_pad, image + image_pad], so
+            # RoPE and the mask must follow that layout, and the pad keys must be masked.
+            sp_size = get_parallel_state().ulysses_size
+            joint_index, joint_len = _sp_padded_layout([txt_len, img_len], sp_size, image_rotary_emb.device)
+            joint_rotary_emb, joint_attention_mask = _to_sp_padded_layout(
+                image_rotary_emb, attention_mask, joint_index, joint_len, hidden_states.dtype
+            )
             hidden_states = slice_input_tensor(hidden_states, dim=1)
             prompt_emb = slice_input_tensor(prompt_emb, dim=1)
-            # image_rotary_emb = slice_input_tensor(image_rotary_emb, dim=2)
 
         for block in self.blocks:
             if self.training and self.gradient_checkpointing:
@@ -658,21 +706,25 @@ class FluxModel(PreTrainedModel):
                     hidden_states,
                     prompt_emb,
                     conditioning,
-                    image_rotary_emb,
-                    attention_mask,
+                    joint_rotary_emb,
+                    joint_attention_mask,
                 )
             else:
                 hidden_states, prompt_emb = block(
-                    hidden_states, prompt_emb, conditioning, image_rotary_emb, attention_mask
+                    hidden_states, prompt_emb, conditioning, joint_rotary_emb, joint_attention_mask
                 )
 
-        if get_parallel_state().ulysses_enabled:
-            hidden_states = gather_outputs(hidden_states, gather_dim=1)
-            prompt_emb = gather_outputs(prompt_emb, gather_dim=1)
+        if use_sp:
+            hidden_states = gather_outputs(hidden_states, gather_dim=1, padding_dim=1, unpad_dim_size=img_len)
+            prompt_emb = gather_outputs(prompt_emb, gather_dim=1, padding_dim=1, unpad_dim_size=txt_len)
 
         hidden_states = torch.cat([prompt_emb, hidden_states], dim=1)
 
-        if get_parallel_state().ulysses_enabled:
+        if use_sp:
+            single_index, single_len = _sp_padded_layout([txt_len + img_len], sp_size, image_rotary_emb.device)
+            single_rotary_emb, single_attention_mask = _to_sp_padded_layout(
+                image_rotary_emb, attention_mask, single_index, single_len, hidden_states.dtype
+            )
             hidden_states = slice_input_tensor(hidden_states, dim=1)
 
         for block in self.single_blocks:
@@ -682,16 +734,18 @@ class FluxModel(PreTrainedModel):
                     hidden_states,
                     prompt_emb,
                     conditioning,
-                    image_rotary_emb,
-                    attention_mask,
+                    single_rotary_emb,
+                    single_attention_mask,
                 )
             else:
                 hidden_states, prompt_emb = block(
-                    hidden_states, prompt_emb, conditioning, image_rotary_emb, attention_mask
+                    hidden_states, prompt_emb, conditioning, single_rotary_emb, single_attention_mask
                 )
 
-        if get_parallel_state().ulysses_enabled:
-            hidden_states = gather_outputs(hidden_states, gather_dim=1)
+        if use_sp:
+            hidden_states = gather_outputs(
+                hidden_states, gather_dim=1, padding_dim=1, unpad_dim_size=txt_len + img_len
+            )
 
         hidden_states = hidden_states[:, prompt_emb.shape[1] :]
         hidden_states = self.final_norm_out(hidden_states, conditioning)
