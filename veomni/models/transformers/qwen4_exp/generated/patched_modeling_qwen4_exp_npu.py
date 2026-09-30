@@ -106,9 +106,8 @@ from veomni.distributed.moe.comm import all_to_all
 from veomni.distributed.parallel_state import get_parallel_state
 
 # Additional import blocks for patches
-# Bound by ``_bind_veomni_ops`` before model construction. Qwen4-Exp
-# keeps the upstream eager/SDPA QSA implementation while expert, loss,
-# and GDN paths can opt into VeOmni kernels.
+# Bound by ``_bind_veomni_ops`` before model construction. Expert,
+# loss, and GDN paths can opt into VeOmni kernels.
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin

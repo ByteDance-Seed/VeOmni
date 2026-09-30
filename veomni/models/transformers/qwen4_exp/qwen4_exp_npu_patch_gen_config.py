@@ -29,3 +29,17 @@ from veomni.models.transformers.qwen4_exp.qwen4_exp_gpu_patch_gen_config import 
 config = deepcopy(gpu_config)
 config.target_file = "patched_modeling_qwen4_exp_npu.py"
 config.description = "Qwen4-Exp NPU VLM-SFT correctness integration with PLE sharding"
+
+# The GPU QSA implementation imports Triton and has a CUDA-only kernel
+# contract. Keep the inherited NPU path on the upstream eager/SDPA attention.
+config.patches = [
+    patch
+    for patch in config.patches
+    if patch.target not in {"Qwen4ExpTextQSAIndexer.forward", "Qwen4ExpTextAttention.forward"}
+]
+config.additional_imports = [
+    import_spec
+    for import_spec in config.additional_imports
+    if import_spec.module != "veomni.ops.kernels.attention.qwen4_exp_qsa"
+]
+config.post_import_blocks = [block for block in config.post_import_blocks if "qwen4_exp_qsa" not in block]
