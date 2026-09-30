@@ -25,6 +25,7 @@ from .graphs.generation_graph import GenerationGraph
 from .graphs.training_graph import TrainingGraph
 from .mixins.base_mixin import BaseMixin
 from .mixins.inference_module_mixin import InferenceModuleMixin
+from .mixins.offline_encoding_mixin import OfflineEncodingMixin
 from .mixins.training_module_mixin import TrainingModuleMixin
 from .modeling_omni import OmniModel
 from .modules import (
@@ -50,6 +51,7 @@ __all__ = [
     "BaseMixin",
     "TrainingModuleMixin",
     "InferenceModuleMixin",
+    "OfflineEncodingMixin",
     "TrainingGraph",
     "GenerationGraph",
     "NodeDef",
