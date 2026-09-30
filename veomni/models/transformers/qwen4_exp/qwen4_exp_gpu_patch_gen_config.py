@@ -1149,6 +1149,8 @@ def qwen4_exp_for_conditional_generation_forward_patched(
         router_logits=outputs.router_logits,
         fused_linear_aux=fused_linear_aux,
     )
+
+
 # ================================================================
 # Patch: Qwen4ExpTextSparseMoeBlock.forward (MoE router replay)
 # Same contract as Qwen3.5-MoE: when an RL framework has installed a
@@ -1177,26 +1179,16 @@ def qwen4_exp_text_sparse_moe_block_forward_patched(
     # weights are renormalized unconditionally.
     if get_active_replay() is not None:
         target_dtype = routing_weights.dtype
-        routing_scores = torch.nn.functional.softmax(
-            router_logits, dtype=torch.float, dim=-1
-        )
-        selected_experts = maybe_replay_indices(
-            self.gate, routing_scores, selected_experts
-        )
+        routing_scores = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+        selected_experts = maybe_replay_indices(self.gate, routing_scores, selected_experts)
         routing_weights = routing_scores.gather(1, selected_experts)
         if self.gate.norm_topk_prob:
             routing_weights = routing_weights / routing_weights.sum(-1, keepdim=True)
         routing_weights = routing_weights.to(target_dtype)
-    expert_output = self.experts(
-        hidden_states_reshaped, selected_experts, routing_weights
-    )
+    expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
 
-    shared_expert_output = (
-        F.sigmoid(self.shared_expert_gate(hidden_states_reshaped))
-        * shared_expert_output
-    )
+    shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
 
     expert_output = expert_output + shared_expert_output
     expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
     return expert_output
-

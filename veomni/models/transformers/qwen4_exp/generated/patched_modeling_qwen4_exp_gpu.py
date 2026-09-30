@@ -112,8 +112,8 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
-from veomni.utils.seqlen_pos_transform_utils import culen2pos, pos2culen
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
+from veomni.utils.seqlen_pos_transform_utils import culen2pos, pos2culen
 
 
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
