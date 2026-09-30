@@ -33,7 +33,7 @@ model:
     audio_cond_noise_aug: 1.0
 
   ops_implementation:
-    attn_implementation: eager
+    attn_implementation: eager  # PyTorch SDPA; flash_attention_3 selects FA3 (docs/examples/minimax_h3.md)
     rotary_pos_emb_implementation: eager
     rms_norm_implementation: eager
     swiglu_mlp_implementation: eager

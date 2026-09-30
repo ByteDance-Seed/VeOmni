@@ -115,6 +115,29 @@ def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale, compatibility_mod
     return out
 
 
+def _flash_varlen_attention(kernel, q, k, v, cu_seqlens, max_seqlen, softmax_scale):
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("H3 FlashAttention varlen requires float16 or bfloat16 inputs.")
+    used = cu_seqlens.host[-1]
+    out = kernel(
+        q[:used].contiguous(),
+        k[:used].contiguous(),
+        v[:used].contiguous(),
+        cu_seqlens_q=cu_seqlens.device,
+        cu_seqlens_k=cu_seqlens.device,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        softmax_scale=softmax_scale,
+        causal=False,
+    )
+    if isinstance(out, tuple):
+        out = out[0]
+    if used == q.shape[0]:
+        return out
+    # Zero uncovered SP rows so discarded outputs cannot poison parameter gradients.
+    return torch.cat((out, out.new_zeros(q.shape[0] - used, *out.shape[1:])))
+
+
 class MiniMaxH3Rope(nn.Module):
     def __init__(self, inv_freq_len: int) -> None:
         super().__init__()
@@ -160,12 +183,25 @@ class MiniMaxH3Attention(nn.Module):
         self.head_dim = attention_head_dim
         inner_dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
-        self.packed_sdpa = False
+        # Set by MiniMaxH3DiTModel from attn_implementation; flash kernels load on its first forward.
+        self.requires_flash_kernel = False
         self.varlen_kernel = None
         self.qkv_proj = nn.Linear(hidden_size, inner_dim * 3, bias=False)
         self.q_norm = _norm(attention_head_dim, eps=qk_norm_eps)
         self.k_norm = _norm(attention_head_dim, eps=qk_norm_eps)
         self.out_proj = nn.Linear(inner_dim, hidden_size, bias=False)
+
+    def _attend(self, q, k, v, cu_seqlens, max_seqlen):
+        if self.varlen_kernel is not None:
+            if not isinstance(cu_seqlens, _PackedBounds):
+                cu_seqlens = _PackedBounds(torch.tensor(cu_seqlens, dtype=torch.int32, device=q.device), cu_seqlens)
+            return _flash_varlen_attention(self.varlen_kernel, q, k, v, cu_seqlens, max_seqlen, self.softmax_scale)
+        if self.requires_flash_kernel:
+            raise RuntimeError("H3 FlashAttention kernel was not loaded; run the model through MiniMaxH3DiTModel.")
+        host = cu_seqlens.host if isinstance(cu_seqlens, _PackedBounds) else cu_seqlens
+        return _sdpa_varlen_attention(
+            q, k, v, cu_seqlens=host, softmax_scale=self.softmax_scale, compatibility_mode=True
+        )
 
     def forward(self, x, *, rope_cos, rope_sin, cu_seqlens, max_seqlen=None, use_ulysses=False):
         sp_group = get_ulysses_sequence_parallel_group() if use_ulysses else None
@@ -195,9 +231,7 @@ class MiniMaxH3Attention(nn.Module):
                 if rope_cos is not None:
                     q = _apply_rope(q, rope_cos, rope_sin)
                     k = _apply_rope(k, rope_cos, rope_sin)
-                o = _sdpa_varlen_attention(
-                    q, k, full[:, :, 2], cu_seqlens=cu_seqlens, softmax_scale=self.softmax_scale
-                )
+                o = self._attend(q, k, full[:, :, 2], cu_seqlens, max_seqlen)
                 if o_wait is not None:  # block i-1's inverse exchange finished during this sdpa
                     out_blocks.append(_AsyncA2A.apply(o_wait, o_prev, 0, 1, sp_group))
                 o_wait = _all_to_all_single(o, 0, 1, sp_group, async_op=True)
@@ -214,34 +248,7 @@ class MiniMaxH3Attention(nn.Module):
             if rope_cos is not None:
                 q = _apply_rope(q, rope_cos, rope_sin)
                 k = _apply_rope(k, rope_cos, rope_sin)
-            packed_attention = isinstance(cu_seqlens, _PackedBounds)
-            if packed_attention and not self.packed_sdpa and self.varlen_kernel is None:
-                raise RuntimeError("H3 packed FlashAttention kernel was not loaded before the packed forward.")
-            if not packed_attention or self.varlen_kernel is None:
-                out = _sdpa_varlen_attention(
-                    q,
-                    k,
-                    v,
-                    cu_seqlens=cu_seqlens.host if packed_attention else cu_seqlens,
-                    softmax_scale=self.softmax_scale,
-                    compatibility_mode=packed_attention,
-                )
-            else:
-                if q.dtype not in (torch.float16, torch.bfloat16):
-                    raise ValueError("H3 FlashAttention varlen requires float16 or bfloat16 inputs.")
-                out = self.varlen_kernel(
-                    q.contiguous(),
-                    k.contiguous(),
-                    v.contiguous(),
-                    cu_seqlens_q=cu_seqlens.device,
-                    cu_seqlens_k=cu_seqlens.device,
-                    max_seqlen_q=max_seqlen,
-                    max_seqlen_k=max_seqlen,
-                    softmax_scale=self.softmax_scale,
-                    causal=False,
-                )
-                if isinstance(out, tuple):
-                    out = out[0]
+            out = self._attend(q, k, v, cu_seqlens, max_seqlen)
         out = out.reshape(total, self.num_heads * self.head_dim)
         return self.out_proj(out)
 
@@ -620,7 +627,7 @@ class MiniMaxH3DiT(nn.Module):
             img_pos=img_pos.to(device),
             audio_pos=audio_pos.to(device),
             text_pos=text_pos.to(device),
-            refiner_cu_seqlens=_PackedBounds(refiner_cu.to(device), refiner_host) if packed_batch else refiner_host,
+            refiner_cu_seqlens=_PackedBounds(refiner_cu.to(device), refiner_host),
             refiner_max_seqlen=refiner_max,
             packed_batch=packed_batch,
             seq_len=padded_seq_len,
@@ -652,7 +659,7 @@ class MiniMaxH3DiT(nn.Module):
         # extended bound would leak pad keys into the last real rows. Pad rows
         # fall outside every segment, have zero attention output, and are
         # dropped by the index_select below.
-        cu_bounds = _PackedBounds(cu_seqlens.to(device), cu_host) if packed_batch else cu_host
+        cu_bounds = _PackedBounds(cu_seqlens.to(device), cu_host)
         block_swap = self._block_swap if self._block_offload_enabled else 0
         for i, block in enumerate(self.blocks):
             if self._block_offload_enabled:
