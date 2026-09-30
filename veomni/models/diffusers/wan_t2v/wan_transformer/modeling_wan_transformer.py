@@ -378,8 +378,9 @@ def WanTransformer3DModel_forward(
         elif mask.shape[2] != num_frames:
             raise ValueError(f"mask time dim {mask.shape[2]} must be 1 or match noise T dim {num_frames}")
 
-        # Concatenate: [noise_latent(16), image_latent(16), mask(mask_ch)] -> in_ch_label channels
-        hidden_states = torch.cat([hidden_states, image_latents, mask], dim=1)
+        # Concatenate: [noise_latent(16), mask(mask_ch), image_latent(16)] -> in_ch_label channels
+        # Order matches diffusers WanImageToVideoPipeline: latents, [mask, condition]
+        hidden_states = torch.cat([hidden_states, mask, image_latents], dim=1)
         num_channels = hidden_states.shape[1]
 
 
@@ -422,6 +423,9 @@ def WanTransformer3DModel_forward(
 
     if get_parallel_state().sp_enabled:
         hidden_states = slice_input_tensor(hidden_states, dim=1, group=get_parallel_state().sp_group)
+
+        if ts_seq_len is not None:
+            timestep_proj = slice_input_tensor(timestep_proj, dim=1, group=get_parallel_state().sp_group)
 
         # Slice rotary embeddings to the local rank's positions (no gradient).
         freqs_cos, freqs_sin = rotary_emb

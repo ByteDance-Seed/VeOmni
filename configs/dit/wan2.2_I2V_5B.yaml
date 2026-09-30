@@ -9,27 +9,19 @@ model:
     cross_entropy_loss_implementation: eager
     load_balancing_loss_implementation: eager
     moe_implementation: eager
-
-data:
-  train_path: /Tom-and-Jerry-VideoGeneration-Dataset-parquet
-  source_name: Tom-and-Jerry-VideoGeneration-Dataset
-  mm_configs:
-    fps: 1
-    max_frames: 33
-
-train:
-  global_batch_size: 8
-  micro_batch_size: 1
-  bsz_warmup_ratio: 0.007
-  dyn_bsz: false
-  init_device: meta
-  empty_init: false
-  num_train_epochs: 10
-  training_task: online_training
-  gradient_checkpointing:
-    enable: true
-    debug: false
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
   accelerator:
+    gradient_checkpointing:
+      enable: true
+      debug: false
+    init_device: meta
     ulysses_size: 1
     fsdp_config:
       fsdp_mode: fsdp2
@@ -44,17 +36,25 @@ train:
       enable_activation: false
       activation_gpu_limit: 0.0
       enable_async_activation_offload: true
+
+data:
+  train_path: /Tom-and-Jerry-VideoGeneration-Dataset-parquet
+  source_name: Tom-and-Jerry-VideoGeneration-Dataset
+  mm_configs:
+    fps: 1
+    max_frames: 33
+
+train:
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  dyn_bsz: false
+  empty_init: false
+  num_train_epochs: 10
+  training_task: online_training
   checkpoint:
     output_dir: Wan2.2-I2V-5B
     save_hf_weights: true
-  optimizer:
-    type: adamw
-    lr: 1.0e-4
-    lr_warmup_ratio: 0.007
-    lr_decay_style: constant
-    lr_decay_ratio: 1.0
-    weight_decay: 0.01
-    max_grad_norm: 1.0
   wandb:
     enable: false
     project: veomni_dit

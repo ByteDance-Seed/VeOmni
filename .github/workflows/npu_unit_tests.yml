@@ -12,7 +12,6 @@ on:
     paths:
       - "**/*.py"
       - "!scripts/**/*.py"
-      - "scripts/precision/qwen_image.py"
       - "configs/dit/qwen_image_sft.yaml"
       - .github/workflows/npu_unit_tests.yml
       - "pyproject.toml"
@@ -23,7 +22,6 @@ on:
     paths:
       - "**/*.py"
       - "!scripts/**/*.py"
-      - "scripts/precision/qwen_image.py"
       - "configs/dit/qwen_image_sft.yaml"
       - .github/workflows/npu_unit_tests.yml
       - "pyproject.toml"
