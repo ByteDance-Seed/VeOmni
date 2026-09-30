@@ -150,6 +150,41 @@ image streams across SP ranks and gathers the image stream back before the
 output head, mirroring the Wan/Flux pattern. `num_attention_heads` must be
 divisible by `ulysses_size`.
 
+For models constructed through `build_foundation_model`,
+`model.ops_implementation.attn_implementation` selects the joint attention kernel used by
+`QwenImageSPAttnProcessor`. The backend is bound to each model instance, independently of SP and of
+Diffusers' process-wide attention setting:
+
+| `attn_implementation` | Joint attention |
+|:-----|:-----|
+| `eager` / `sdpa` | native SDPA |
+| `flash_attention_2` / `flash_attention_3` / `flash_attention_4` | VeOmni flash-attention wrapper, local kernel |
+| `flash_attention_2_hub` / `flash_attention_3_hub` | VeOmni flash-attention wrapper, Hugging Face Hub kernel |
+
+Other values raise at model build. Explicit flash selections use VeOmni's existing kernel loader;
+missing dependencies, unavailable Hub artifacts and kernel errors propagate instead of silently
+falling back to SDPA. Local package names do not automatically select Hub kernels. Actual execution
+still requires a compatible device, dtype and kernel build.
+
+With a joint mask, the flash path packs the tokens the `[B, S]` mask keeps into one varlen call, using
+metadata computed once per forward, so padded text tokens in the middle of the `[text, image]`
+sequence stay masked. Boolean and binary-integer keep masks are accepted; floating additive masks
+and nonbinary integer values are rejected. The original text mask is validated before Diffusers can
+normalize it to boolean. Text and joint masks must match their respective batch/sequence dimensions;
+broadcast joint masks are rejected on the flash path, even with precomputed metadata. Without a mask,
+dense attention preserves batch isolation. The processor owns the per-stream Ulysses exchanges and
+disables a second exchange in the wrapper.
+
+Removed query rows have zero raw attention output; projection biases or later residual operations may
+make those rows nonzero again. Comparisons with SDPA concern image and valid-text outputs and gradients,
+not ignored padding rows or bitwise identity between kernels.
+
+This is the Qwen-Image integration, not a claim that all DiT families already honor the configuration.
+The legacy custom `from_pretrained` path does not select a backend from this ops configuration; use
+`build_foundation_model` for configured VeOmni construction.
+[The unified diffusion attention RFC](https://github.com/ByteDance-Seed/VeOmni/issues/1238) tracks the
+proposed common contract and the separate Wan, LTX-2.3 and MiniMax H3 migrations.
+
 ### Config Bridge — `to_diffuser_dict()` and `to_dict()`
 
 `to_diffuser_dict()` uses Python's `inspect` module to extract exactly the
