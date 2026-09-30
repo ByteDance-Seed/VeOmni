@@ -96,6 +96,7 @@ key_features/mtp.md
 :maxdepth: 1
 :caption: Design
 
+design/optimizer_cpu_offload.md
 design/kernel_selection.md
 design/fused_moe_kernels.md
 design/local_parallel_state.md
