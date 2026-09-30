@@ -27,6 +27,7 @@ get_started/installation/install_ascend_arm.md
 
 usage/arguments.md
 usage/basic_modules.md
+usage/qwen38_muon.md
 usage/multimodal_data_processing.md
 usage/data_packing_and_dyn_bsz.md
 usage/dit_microbatching.md
@@ -96,6 +97,7 @@ key_features/mtp.md
 :maxdepth: 1
 :caption: Design
 
+design/optimizer_cpu_offload.md
 design/kernel_selection.md
 design/fused_moe_kernels.md
 design/local_parallel_state.md
