@@ -42,6 +42,11 @@ pyproject.toml
 │   ├── magi         Optional NVIDIA SM90+ MagiAttention FFA (combine with gpu):
 │   │                  magi-attention + create-block-mask-cuda + flash-attn-cute
 │   │                  + magi-to-hstu-cuda + debugpy; source-built CUDA extensions
+│   ├── rocm         AMD ROCm Linux x86_64 (gfx942 / gfx950) — superset minus
+│   │                  CUDA-only kernels and minus flash-attn / aiter (no ROCm
+│   │                  wheels; docker/rocm/Dockerfile.ROCm7.14 source-builds them):
+│   │                  torch 2.12.0+rocm7.14.0 + ROCm runtime wheels (rocm-sdk-*,
+│   │                  amd-torch(vision)-device-gfx942/950) + same data/model deps
 │   ├── npu          Ascend NPU x86_64 — full superset, minus CUDA-only kernels:
 │   │                  torch 2.10.0+cpu + torch-npu 2.10.0
 │   │                  + diffusers / av / audio / video / peft / megatron-energon
@@ -56,24 +61,26 @@ pyproject.toml
 │   └── transformers-stable  transformers==5.16.1 (default, in default-groups)
 ├── [tool.uv]
 │   ├── required-version     Allowed uv version range
-│   ├── override-dependencies  Per-extra torch/CUDA pins (markers scoped to gpu/npu/npu_aarch64)
-│   ├── conflicts            gpu/npu/npu_aarch64 mutual exclusion;
-│   │                        magi also conflicts with npu / npu_aarch64
+│   ├── override-dependencies  Per-extra torch/CUDA/ROCm pins (markers scoped to gpu/rocm/npu/npu_aarch64)
+│   ├── conflicts            gpu/rocm/npu/npu_aarch64 mutual exclusion;
+│   │                        magi also conflicts with rocm / npu / npu_aarch64
 │   └── sources              Custom indexes, direct wheel URLs (av, torch,
-│                            FA2 cp311/cp312, FA3 sm90 abi3, FlashMLA);
+│                            FA2 cp311/cp312, FA3 sm90 abi3, FlashMLA, ROCm
+│                            torch/torchvision/torchaudio, CPU torchcodec);
 │                            git sources (MagiAttention and its three companions)
 └── uv.lock                  Lockfile (committed, used by Docker --locked)
 ```
 
 ## Hardware Extras
 
-`gpu` / `npu` / `npu_aarch64` are declared as conflicts. MagiAttention is a
-fourth extra that requires `gpu` (`veomni[gpu]` in the magi extra) and
-conflicts with the NPU extras.
+`gpu` / `rocm` / `npu` / `npu_aarch64` are declared as conflicts. MagiAttention
+is an extra that requires `gpu` (`veomni[gpu]` in the magi extra) and
+conflicts with the ROCm and NPU extras.
 
 ```bash
 uv sync --extra gpu --dev                      # NVIDIA GPU
 uv sync --extra gpu --extra magi --dev         # NVIDIA GPU + MagiAttention (SM90+)
+uv sync --extra rocm --dev                     # AMD ROCm (gfx942 / gfx950)
 uv sync --extra npu --dev                      # Ascend NPU x86
 uv sync --extra npu_aarch64 --dev              # Ascend NPU ARM
 ```
@@ -91,6 +98,12 @@ stack and multimodal dependencies. Only `npu_aarch64` omits `torchcodec`
 because no compatible aarch64 wheel is available; build it from source when
 video decoding is required.
 
+The `rocm` extra installs torch and the ROCm runtime (including `rocm-sdk-devel`,
+which aiter needs for its runtime JIT) as wheels, so no system ROCm is needed.
+flash-attn and aiter have no ROCm wheels: the ROCm Dockerfile builds them from
+source after `uv sync`, so an exact `uv sync` inside that image removes them
+(use `--inexact`).
+
 ## Transformers Version
 
 `transformers==5.16.1` is pinned by the `transformers-stable` group (in
@@ -102,6 +115,19 @@ forced into a specific 5.x patch.
 - **GPU**: direct cp311/cp312 wheel URLs for x86_64 and aarch64 (not the
   pytorch index) — avoids uv resolving cu128_full wheels that drop nvidia-* deps.
 - **NPU**: pytorch index (`https://download.pytorch.org/whl/`).
+- **ROCm**: AMD's release index `amd-rocm` (`https://repo.amd.com/rocm/whl-multi-arch/`).
+  Never lock the nightly index (`rocm.nightlies.amd.com`): it is pruned.
+  - torch / torchvision / torchaudio (and the CPU torchcodec) use direct wheel
+    URLs. Those packages carry per-extra `override-dependencies`, and an
+    index source on an overridden package conflicts with npu's pytorch index.
+    The overrides themselves are required: an override set with no `rocm`
+    entry drops the package from the rocm fork entirely.
+  - The runtime wheels torch depends on (`triton`, `rocm`, `rocm-sdk-*`,
+    `amd-torch(vision)-device-gfx942/950`, `rocm-bootstrap`) are listed in the
+    `rocm` extra, because uv routes only direct dependencies to an index.
+  - The `rocm` meta-package is sdist-only and computes its dependencies by
+    probing the build machine's GPU, so `[[tool.uv.dependency-metadata]]`
+    declares them statically. Bump its `version` with the ROCm release.
 
 ## Attention Kernels
 
@@ -150,6 +176,7 @@ pinned `demonatic/flash-attention` fork, and it takes its toolchain from
 ```bash
 uv sync --extra gpu --dev                          # local dev (cp311 or cp312)
 uv sync --extra gpu --extra magi --dev             # + MagiAttention (SM90+)
+uv sync --extra rocm --dev                          # AMD ROCm (Linux x86_64)
 uv lock                                             # after pyproject edits
 uv sync --locked --all-packages --extra gpu --dev  # docker / CI (no magi)
 ```

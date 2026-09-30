@@ -34,7 +34,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Hardware extras gpu / npu / npu_aarch64 are mutually exclusive
+# Hardware extras gpu / rocm / npu / npu_aarch64 are mutually exclusive
 # (`[tool.uv].conflicts`). MagiAttention is optional NVIDIA SM90+ and
 # requires gpu: `uv sync --extra gpu --extra magi`.
 dev = [
@@ -103,6 +103,43 @@ magi = [
   "flash-attn-cute==0.0.2; sys_platform == 'linux'",
   "magi-to-hstu-cuda==0.1; sys_platform == 'linux'",
   "magi-attention==1.1.1; sys_platform == 'linux'",
+]
+
+# AMD ROCm (Instinct MI300 / MI350 series: gfx942 / gfx950), Linux x86_64 —
+# superset minus CUDA-only kernels. torch and its ROCm runtime come from AMD's
+# release index; the runtime is split into host and per-GPU wheels, all listed
+# here because uv routes only direct dependencies to an index. flash-attn and
+# aiter have no ROCm wheels: docker/rocm/Dockerfile.ROCm7.14 builds them.
+rocm = [
+  "torch==2.12.0+rocm7.14.0",
+  "torchvision==0.27.0+rocm7.14.0",
+  "torchaudio==2.11.0+rocm7.14.0",
+  "triton==3.7.1+git0263a6a6.rocm7.14.0",
+  "rocm==7.14.0",
+  "rocm-bootstrap==0.1.0",
+  "rocm-sdk-core==7.14.0",
+  "rocm-sdk-libraries==7.14.0",
+  # hipcc and headers: aiter JIT-compiles its kernels on first use.
+  "rocm-sdk-devel==7.14.0",
+  "rocm-sdk-device-gfx942==7.14.0",
+  "rocm-sdk-device-gfx950==7.14.0",
+  "amd-torch-device-gfx942==2.12.0+rocm7.14.0",
+  "amd-torch-device-gfx950==2.12.0+rocm7.14.0",
+  "amd-torchvision-device-gfx942==0.27.0+rocm7.14.0",
+  "amd-torchvision-device-gfx950==0.27.0+rocm7.14.0",
+  # CPU build (see `[tool.uv.sources]`): the PyPI wheel links CUDA libraries.
+  "torchcodec==0.14.0",
+  "liger-kernel",
+  "flash-linear-attention",
+  "av>=14.3.0,<15.0; python_version == '3.11'",
+  "av>=14.0.0,<14.3; python_version == '3.12'",
+  "librosa>=0.11.0,<0.12",
+  "soundfile>=0.13.1,<0.14",
+  "diffusers==0.37.0",
+  "ftfy",
+  "peft==0.18.1",
+  "megatron-energon>=7.2.1",
+  "hf_transfer",
 ]
 
 # Ascend NPU x86_64 — superset minus CUDA-only kernels (FA2/3/4, FlashQLA).
@@ -190,6 +227,10 @@ override-dependencies = [
     "torchaudio==2.11.0+cu130; (extra == 'gpu')",
     "torchvision==0.26.0+cu130; (extra == 'gpu')",
     "torchcodec==0.12.0; (extra == 'gpu')",
+    "torch==2.12.0+rocm7.14.0; (extra == 'rocm')",
+    "torchaudio==2.11.0+rocm7.14.0; (extra == 'rocm')",
+    "torchvision==0.27.0+rocm7.14.0; (extra == 'rocm')",
+    "torchcodec==0.14.0; (extra == 'rocm')",
     "torch==2.10.0; (extra == 'npu_aarch64')",
     "torchaudio==2.10.0; (extra == 'npu_aarch64')",
     "torchvision==0.25.0; (extra == 'npu_aarch64')",
@@ -206,8 +247,13 @@ override-dependencies = [
 conflicts = [
   [
     { extra = "gpu" },
+    { extra = "rocm" },
     { extra = "npu" },
     { extra = "npu_aarch64" },
+  ],
+  [
+    { extra = "magi" },
+    { extra = "rocm" },
   ],
   [
     { extra = "magi" },
@@ -232,8 +278,12 @@ magi-to-hstu-cuda = { git = "https://github.com/demonatic/flash-attention.git", 
 # Direct wheel URLs for gpu — pytorch index sometimes resolves cu128_full wheels
 # that drop nvidia-* deps and confuse uv into uninstalling them. Update both
 # Python versions and architectures when bumping torch.
+# rocm uses direct URLs into the amd-rocm index for the packages that carry
+# per-extra overrides: an index source there conflicts with npu's pytorch index.
 torch = [
   { index = "pytorch", extra = "npu" },
+  { url = "https://repo.amd.com/rocm/whl-multi-arch/torch-2.12.0%2Brocm7.14.0-cp311-cp311-linux_x86_64.whl", extra = "rocm", marker = "python_version == '3.11'" },
+  { url = "https://repo.amd.com/rocm/whl-multi-arch/torch-2.12.0%2Brocm7.14.0-cp312-cp312-linux_x86_64.whl", extra = "rocm", marker = "python_version == '3.12'" },
     { url = "https://files.pythonhosted.org/packages/78/89/f5554b13ebd71e05c0b002f95148033e730d3f7067f67423026cc9c69410/torch-2.10.0-cp311-cp311-manylinux_2_28_aarch64.whl", extra = 'npu_aarch64', marker = "python_version == '3.11'" },
   { url = "https://files.pythonhosted.org/packages/cc/af/758e242e9102e9988969b5e621d41f36b8f258bb4a099109b7a4b4b50ea4/torch-2.10.0-cp312-cp312-manylinux_2_28_aarch64.whl", extra = 'npu_aarch64', marker = "python_version == '3.12'" },
   { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp311-cp311-manylinux_2_28_aarch64.whl", extra = 'gpu', marker = "sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'aarch64'" },
@@ -241,9 +291,35 @@ torch = [
   { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'" },
   { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" },
 ]
-torchvision = { index = "pytorch" }
-torchaudio = { index = "pytorch" }
+torchvision = [
+  { index = "pytorch", extra = "gpu" },
+  { index = "pytorch", extra = "npu" },
+  { index = "pytorch", extra = "npu_aarch64" },
+  { url = "https://repo.amd.com/rocm/whl-multi-arch/torchvision-0.27.0%2Brocm7.14.0-cp311-cp311-linux_x86_64.whl", extra = "rocm", marker = "python_version == '3.11'" },
+  { url = "https://repo.amd.com/rocm/whl-multi-arch/torchvision-0.27.0%2Brocm7.14.0-cp312-cp312-linux_x86_64.whl", extra = "rocm", marker = "python_version == '3.12'" },
+]
+torchaudio = [
+  { index = "pytorch", extra = "gpu" },
+  { index = "pytorch", extra = "npu" },
+  { index = "pytorch", extra = "npu_aarch64" },
+  { url = "https://repo.amd.com/rocm/whl-multi-arch/torchaudio-2.11.0%2Brocm7.14.0-cp311-cp311-linux_x86_64.whl", extra = "rocm", marker = "python_version == '3.11'" },
+  { url = "https://repo.amd.com/rocm/whl-multi-arch/torchaudio-2.11.0%2Brocm7.14.0-cp312-cp312-linux_x86_64.whl", extra = "rocm", marker = "python_version == '3.12'" },
+]
+triton = { index = "amd-rocm", extra = "rocm" }
+rocm = { index = "amd-rocm", extra = "rocm" }
+rocm-bootstrap = { index = "amd-rocm", extra = "rocm" }
+rocm-sdk-core = { index = "amd-rocm", extra = "rocm" }
+rocm-sdk-libraries = { index = "amd-rocm", extra = "rocm" }
+rocm-sdk-devel = { index = "amd-rocm", extra = "rocm" }
+rocm-sdk-device-gfx942 = { index = "amd-rocm", extra = "rocm" }
+rocm-sdk-device-gfx950 = { index = "amd-rocm", extra = "rocm" }
+amd-torch-device-gfx942 = { index = "amd-rocm", extra = "rocm" }
+amd-torch-device-gfx950 = { index = "amd-rocm", extra = "rocm" }
+amd-torchvision-device-gfx942 = { index = "amd-rocm", extra = "rocm" }
+amd-torchvision-device-gfx950 = { index = "amd-rocm", extra = "rocm" }
 torchcodec = [
+  { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.14.0%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl", extra = "rocm", marker = "python_version == '3.11'" },
+  { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.14.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl", extra = "rocm", marker = "python_version == '3.12'" },
   { url = "https://download.pytorch.org/whl/cu130/torchcodec-0.12.0%2Bcu130-cp311-cp311-manylinux_2_28_aarch64.whl", extra = "gpu", marker = "sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'aarch64'" },
   { url = "https://download.pytorch.org/whl/cu130/torchcodec-0.12.0%2Bcu130-cp312-cp312-manylinux_2_28_aarch64.whl", extra = "gpu", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'aarch64'" },
   { url = "https://download.pytorch.org/whl/cu130/torchcodec-0.12.0%2Bcu130-cp311-cp311-manylinux_2_28_x86_64.whl", extra = "gpu", marker = "sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'" },
@@ -276,8 +352,8 @@ flash-mla = [
 # Pinned wheels avoid FFmpeg build dep in CI. x86_64: 3.11 → 14.4.0,
 # 3.12 → 14.2.0. aarch64: 14.2.0 for both (14.4.0 has no aarch64 wheel).
 av = [
-  { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'gpu' or extra == 'npu') and sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'" },
-  { url = "https://files.pythonhosted.org/packages/ed/e8/cf60f3fcde3d0eedee3e9ff66b674a9b85bffc907dccebbc56fb5ac4a954/av-14.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'gpu' or extra == 'npu') and sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" },
+  { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'gpu' or extra == 'npu' or extra == 'rocm') and sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'" },
+  { url = "https://files.pythonhosted.org/packages/ed/e8/cf60f3fcde3d0eedee3e9ff66b674a9b85bffc907dccebbc56fb5ac4a954/av-14.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'gpu' or extra == 'npu' or extra == 'rocm') and sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" },
   { url = "https://files.pythonhosted.org/packages/18/68/a9398e36676721f335720173c856d26c4031203b8323ea43dd132c17cc34/av-14.2.0-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", marker = "(extra == 'gpu' or extra == 'npu_aarch64') and sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'aarch64'" },
   { url = "https://files.pythonhosted.org/packages/d3/c3/a174388d393f1564ad4c1b8300eb4f3e972851a4d392c1eba66a6848749e/av-14.2.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", marker = "(extra == 'gpu' or extra == 'npu_aarch64') and sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'aarch64'" },
 ]
@@ -291,6 +367,27 @@ explicit = true
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu/"
 explicit = true
+
+# AMD's release index for ROCm torch and its runtime wheels. The nightly index
+# (rocm.nightlies.amd.com) is pruned, so its builds must not be locked.
+[[tool.uv.index]]
+name = "amd-rocm"
+url = "https://repo.amd.com/rocm/whl-multi-arch/"
+explicit = true
+
+# The `rocm` meta-package ships only as an sdist whose setup.py probes the
+# build machine's GPU to choose its dependencies. Static metadata keeps the lock
+# independent of the machine that runs `uv lock`; only the extras torch and the
+# `rocm` extra rely on are declared.
+[[tool.uv.dependency-metadata]]
+name = "rocm"
+version = "7.14.0"
+requires-dist = [
+  "rocm-sdk-core==7.14.0",
+  "rocm-sdk-libraries==7.14.0; extra == 'libraries'",
+  "rocm-sdk-devel==7.14.0; extra == 'devel'",
+]
+provides-extras = ["libraries", "devel"]
 
 # The Magi packages below intentionally use empty static runtime metadata.
 # Their companion extensions declare no runtime requirements upstream, while

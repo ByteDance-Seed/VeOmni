@@ -12,19 +12,20 @@ We recommend using the published image directly instead of building your own:
 amdagi/veomni:rocm7.14_torch2.12_py3.12
 ```
 
-The image is based on `rocm/primus:v26.4` and ships a ROCm 7.14 stack tuned for gfx942/gfx950:
+The image takes its OS layer from `rocm/primus:v26.4` and installs VeOmni's dependencies from `uv.lock` with the `rocm` extra, the same way the CUDA image uses the `gpu` extra. torch and the ROCm runtime are wheels from AMD's release index, built for gfx942 and gfx950:
 
 | Component | Version |
 |---|---|
-| torch | `2.12.0+rocm7.14.0a20260608` |
-| torchvision | `0.27.0+rocm7.14.0a20260608` |
-| triton | `3.7.0+gitb4e20bbe.rocm7.14.0a20260608` |
+| torch | `2.12.0+rocm7.14.0` |
+| torchvision | `0.27.0+rocm7.14.0` |
+| triton | `3.7.1+git0263a6a6.rocm7.14.0` |
 | flash-attn | `2.8.3` |
-| transformers | `5.12.1` |
+| aiter | `0.1.12.post2.dev214+gb5e03ed19` |
+| transformers | `5.16.1` |
 | diffusers | `0.37.0` |
 | python | `3.12` |
 
-On top of that it layers the pure-Python dependencies and ROCm-specific fixes validated on MI308X (see `docker/rocm/Dockerfile.ROCm7.14`).
+flash-attn and aiter have no ROCm wheels, so `docker/rocm/Dockerfile.ROCm7.14` builds them from source at the commits `rocm/primus:v26.4` ships.
 
 Pull the image:
 
@@ -34,7 +35,7 @@ docker pull amdagi/veomni:rocm7.14_torch2.12_py3.12
 
 ## Run the container
 
-The image does **not** contain VeOmni itself — clone it yourself and mount it into the container:
+Clone VeOmni and mount it into the container:
 
 ```bash
 git clone https://github.com/ByteDance-Seed/VeOmni.git
@@ -50,24 +51,37 @@ docker run -it --rm \
   amdagi/veomni:rocm7.14_torch2.12_py3.12 bash
 ```
 
-Once inside, register VeOmni as an editable package (this does not touch any installed dependency):
+Once inside, register your checkout as an editable package in the image's venv (`/app/.venv`, already on `PATH`); `--no-deps` leaves the installed dependencies untouched:
 
 ```bash
-pip install -e . --no-deps
+uv pip install -e . --no-deps
 ```
+
+flash-attn and aiter are not in `uv.lock`, so an exact `uv sync` inside the container removes them; use `uv sync --inexact` if you need to re-sync.
 
 ## Build the image yourself (optional)
 
-The Dockerfile lives at `docker/rocm/Dockerfile.ROCm7.14`. It has no `COPY` instruction, so use a small build context (the `docker/rocm` directory), not the repository root:
+The Dockerfile lives at `docker/rocm/Dockerfile.ROCm7.14`. Like `docker/cuda`, it copies the checkout and syncs from `uv.lock`, so build from the repository root:
 
 ```bash
 docker build \
   -f docker/rocm/Dockerfile.ROCm7.14 \
   -t amdagi/veomni:rocm7.14_torch2.12_py3.12 \
-  docker/rocm
+  .
 ```
 
-> Note: the image's `uv.lock` pins CUDA wheels, so do **not** run `uv sync` on ROCm; reuse the in-image ROCm stack as-is.
+Compiling flash-attn for gfx942 and gfx950 dominates the build time; pass `--build-arg MAX_JOBS=<n>` to use more cores.
+
+## Install with uv (without Docker)
+
+On a Linux x86_64 host with the ROCm GPU driver installed:
+
+```bash
+uv sync --extra rocm --dev
+source .venv/bin/activate
+```
+
+The `rocm` extra installs torch and the ROCm runtime as wheels, so no system ROCm install is needed. It does not include flash-attn or aiter; build them from source as the Dockerfile does, or use `attn_implementation: sdpa`.
 
 ## Launch training
 
