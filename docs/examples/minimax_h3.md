@@ -379,3 +379,140 @@ video, audio = pipe(
 **Important**:
 
 - `num_frames` must satisfy `(N-5) % 17 == 0`, otherwise the Video VAE raises an error
+
+## Prepared Ref2VA with CFG-aware LoRA
+
+Use [minimax_h3_ref2va_cfg_offline.yaml](../../configs/dit/minimax_h3_ref2va_cfg_offline.yaml)
+with a compatible Ref2VA checkpoint and prepared visual-reference caches.
+It uses the existing `DiTTrainer`, native LoRA, FSDP2 and model-owned packing.
+It does **not** add raw-reference encoding, audio-reference support or a
+Training Adapter downloader. A training/de-distillation adapter is separate from
+the trainable LoRA; this recipe does not load one implicitly.
+
+```text
+Prepared video/audio latents + paired conditions
+                         |
+            Shared timestep and noise
+                /                 \
+Negative layout                   Positive layout
+(same targets and visual anchors)       |
+        |                               |
+Current DiT (no gradient)       Current DiT (gradient enabled)
+                \                 /
+                CFG-aware FM objective
+                         |
+          Existing trainer and optimizer
+```
+
+### Cache contract
+
+The existing `dit_offline` transform deserializes **every column** using Python
+pickle. Only load trusted caches. The following table describes the decoded
+objects, not a new byte-storage schema or a direct Magnus-table reader.
+
+| Field | Decoded value | Purpose |
+| --- | --- | --- |
+| `input_latents` | Float tensor `[1,24,T,H,W]` | Clean video target |
+| `audio_input_latents` | Float tensor `[C,32,Ta]` | Clean audio target |
+| `prompt_embeds` | Float tensor `[L,D]` | Conditional Qwen representation |
+| `packed` | Dictionary from `build_packed_ref2va` | Conditional positions and segment bounds |
+| `ref_visual_anchor` | Float tensor `[cond_rows,96]` | Prepared reference image/video rows |
+| `has_audio` | Boolean | Set false for placeholder audio; its loss is zero |
+| `unconditional_prompt_embeds` | Float tensor `[Lu,D]` | Required in `per_sample` mode |
+| `unconditional_packed` | Dictionary from the same layout builder | Required in `per_sample` mode; uses `Lu` and its own text token tags |
+
+`per_sample` supports an independently encoded empty-text condition retaining
+reference visual tokens in the Qwen representation. It cannot derive those
+embeddings by truncating or zeroing the conditional embedding. Both packed
+layouts must have identical target/reference geometry, reference order and
+compact `[text | cond | audio | video]` structure. Text lengths may differ.
+Use the same source references and compatible encoder checkpoint for both caches;
+structural checks cannot prove that two embeddings have the same semantic origin.
+
+For a shared pure-empty Qwen embedding, configure:
+
+```yaml
+model:
+  condition_model_cfg:
+    training_cfg_scale: 4.0
+    training_cfg_schedule: sigma
+    training_cfg_curvature_power: 2.0
+    cfg_unconditional_mode: shared_empty
+    cfg_unconditional_path: /path/to/unconditional.safetensors
+```
+
+The local file must contain finite `prompt_embeds [Lu,D]` and integer
+`text_token_tags [Lu]` containing only text tags (`1`). It is loaded once per
+condition-model instance. The negative branch removes the conditional Qwen
+prefix, including its visual tokens, but **retains independent visual latent
+anchors**. It reuses the exact positive branch's noisy video/audio and reference
+rows; it never calls the noise sampler a second time. This also works with
+prepared FL2VA inputs and their existing keyframe anchors.
+
+### CFG-calibrated FM and loss settings
+
+Let `p` and `u` be conditional and detached unconditional FM velocities from the
+**same current model**, including its trainable LoRA, and `y = noise - clean`.
+The negative pass runs first under `no_grad`; it is not a frozen-base teacher.
+
+There is one objective, with a configurable curvature exponent `k`:
+
+```text
+p_calibrated = (p + (s - 1) * stopgrad(u)) / s
+loss = s ** (2 - k) * MSE(p_calibrated, y)
+```
+
+| `training_cfg_curvature_power` | Relative conditional curvature | At `s=4` |
+| --- | --- | --- |
+| `2.0` (default) | `1/s²` | `1/16` |
+| `1.0` | `1/s` | `1/4` |
+| `0.0` | `1` | `1` |
+
+Any finite value in `[0, 2]` is supported. CFG-calibrated FM is a descriptive
+name for the existing CFG-aware transformation, not a novel algorithm: `k=2`
+is the inverse-CFG formula and `k=0` is algebraically equivalent to
+`MSE(p, s*y - (s-1)*stopgrad(u))` (the target-guidance form).
+The optimum is unchanged for fixed `u` and `s`, but the gradient scale changes.
+With sigma-dependent scales this also reweights different samples/modalities;
+it cannot in general be replaced by a single learning-rate change. Loss values
+are not directly comparable across curvature settings, and this objective does
+not guarantee preservation of generation quality.
+
+This objective distills guidance into the conditional prediction. At inference,
+the default `cfg_scale=1` uses that prediction directly; applying additional
+inference-time CFG can compound the guidance and should be validated separately.
+
+`sigma = 1 - t` is the effective noise level from the existing scheduler. With
+`training_cfg_schedule: sigma`, video and audio use their respective sigmas:
+`s = 1 + (training_cfg_scale - 1) * sigma`. For a configured scale of `4`,
+`sigma=0.1` gives `s=1.3`, while `sigma=0.9` gives `s=3.7`. This concentrates
+stronger CFG calibration at high noise and leaves low-noise examples closer to
+ordinary FM, giving them more room to learn from new data. `constant` instead
+applies the configured scale at every noise level. The choice is a tradeoff
+between guidance protection and learning capacity, not a quality guarantee.
+Neither schedule changes the noise sampling distribution; the separate
+`video_sigma_bucket_weights` option controls video-loss weighting.
+
+| Condition config key | Default | Meaning |
+| --- | --- | --- |
+| `training_cfg_scale` | `1.0` | Scale one disables the extra branch and preserves upstream RNG/loss behavior |
+| `training_cfg_schedule` | `constant` | `constant` uses the configured scale everywhere; `sigma` varies it with each modality's effective noise level |
+| `training_cfg_curvature_power` | `2.0` | Curvature exponent `k` in `[0,2]`; relative curvature `1/s**k` |
+| `cfg_unconditional_mode` | `per_sample` | `per_sample` or `shared_empty` |
+| `cfg_unconditional_path` | unset | Local shared-empty safetensors, required only when enabled in that mode |
+| `video_sigma_bucket_weights` | five ones | Video loss multipliers for `[0,.2), [.2,.4), [.4,.6), [.6,.8), [.8,1]` |
+
+Noise sampling is unchanged from upstream: a uniform scheduler index is shared
+by video and audio, with their respective existing shifts. Sigma-bin weights
+affect the video loss only, not the sampling distribution. Existing scheduler
+weights are retained.
+No mixed raw-FM objective, stochastic CFG gate, step warmup or drift anchor is
+silently enabled by this configuration.
+
+### Validation boundary
+
+CPU tiny-model tests cover the objective gradients, paired noise, reference
+geometry, cached embeddings, checkpoint recomputation and packed/serial loss
+equivalence. Existing H3 packing restrictions remain, including no multi-sample
+checkpoint offload. Accelerator SP/FSDP2, pretrained quality and throughput still
+require hardware validation before treating this recipe as production-tested.
