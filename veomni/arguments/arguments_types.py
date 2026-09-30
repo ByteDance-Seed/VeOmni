@@ -408,6 +408,56 @@ class ChannelLossConfig:
 
 
 @dataclass
+class LayerPoliciesConfig:
+    """model.accelerator.gradient_checkpointing.layer_policies.* — Per-mode layer counts.
+
+    Takes over from ``mode``: the recomputed range is read from the end of the block
+    stack, and every block in front of that range does no recomputation at all.
+    """
+
+    selective: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "How many blocks run selective activation checkpointing (SAC), counted from the "
+                "front of the recomputed range — the blocks before the remaining 'full' ones."
+            )
+        },
+    )
+    full: int = field(
+        default=-1,
+        metadata={
+            "help": (
+                "How many blocks, at the very end of the stack, take part in recomputation "
+                "(-1 = every block); the blocks in front of them do no recomputation."
+            )
+        },
+    )
+
+    def __post_init__(self) -> None:
+        # YAML values reach the dataclass untyped (the parser casts CLI args only),
+        # so a quoted count would otherwise fail much later, inside the policy build.
+        for name, minimum, expected in (
+            ("selective", 0, "a non-negative integer"),
+            ("full", -1, "a non-negative integer or -1"),
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(
+                    f"model.accelerator.gradient_checkpointing.layer_policies.{name} must be "
+                    f"{expected}, got {value!r} ({type(value).__name__})"
+                )
+        # resolve_layer_counts checks the pair again — it is what build_policy reads —
+        # but a config that cannot describe a plan should fail here, at parse.
+        if self.full != -1 and self.selective > self.full:
+            raise ValueError(
+                f"model.accelerator.gradient_checkpointing.layer_policies.selective ({self.selective}) "
+                f"cannot exceed layer_policies.full ({self.full}): the SAC blocks are the front of "
+                "the recomputed range"
+            )
+
+
+@dataclass
 class GradientCheckpointingConfig:
     """model.accelerator.gradient_checkpointing.* — Activation recomputation settings."""
 
@@ -434,6 +484,78 @@ class GradientCheckpointingConfig:
             )
         },
     )
+    mode: Literal["none", "full", "selective"] = field(
+        default="full",
+        metadata={
+            "help": (
+                "How every target layer recomputes when enable=True: 'full' "
+                "(default) = checkpoint the whole layer, 'selective' = selective "
+                "activation checkpointing (SAC): keep the selected operators' "
+                "outputs and recompute the rest, 'none' = no recomputation. "
+                "Ignored when layer_policies is set. Applies to every model: the "
+                "framework finds the block stack itself (_no_split_modules / "
+                "basic_modules) and folds sibling stacks into one sequence. A "
+                "model with several stacks (a VLM tower beside the decoder) "
+                "counts the trainable one, the one with more blocks if both "
+                "train; list a class in model.basic_modules to count that one "
+                "instead. A model calling torch.utils.checkpoint directly does "
+                "not honour it and is reported."
+            )
+        },
+    )
+    save_modules: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Extra operator groups SAC keeps (MUST_SAVE) instead of recomputing, "
+                "on top of the attention set it always keeps. Empty (default) = "
+                "nothing extra; 'attn' names that same always-on set. 'moe' is not "
+                "supported yet. Any other entry is read as a literal operator "
+                "string, e.g. 'aten._scaled_dot_product_attention.default'. "
+                "Only applies while SAC is on."
+            )
+        },
+    )
+    layer_policies: Optional[LayerPoliciesConfig] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Advanced: explicit layer counts that take over from mode. The "
+                "recomputed range is read from the end of the block stack — the last "
+                "'full' blocks recompute (default -1 = every block), with the "
+                "'selective' blocks at the front of that range running SAC — and the "
+                "blocks in front of the range recompute nothing."
+            )
+        },
+    )
+
+    def __post_init__(self) -> None:
+        # YAML values reach the dataclass untyped (the parser casts CLI args only),
+        # so a mistyped mode or a quoted count would otherwise fail much later.
+        if self.mode not in ("none", "full", "selective"):
+            raise ValueError(
+                "model.accelerator.gradient_checkpointing.mode must be 'none', 'full' or 'selective', "
+                f"got {self.mode!r}"
+            )
+        # A bare operator string would be iterated character by character by the op
+        # resolver (one warning per letter), so normalise it and reject anything
+        # that is not a sequence of names.
+        if self.save_modules is None:
+            self.save_modules = []
+        elif isinstance(self.save_modules, str):
+            self.save_modules = [self.save_modules]
+        elif not isinstance(self.save_modules, list):
+            raise ValueError(
+                "model.accelerator.gradient_checkpointing.save_modules must be a list of names, "
+                f"got {self.save_modules!r} ({type(self.save_modules).__name__})"
+            )
+        # The counts themselves are validated by LayerPoliciesConfig.__post_init__.
+        if self.layer_policies is not None and not isinstance(self.layer_policies, LayerPoliciesConfig):
+            raise ValueError(
+                "model.accelerator.gradient_checkpointing.layer_policies must be a LayerPoliciesConfig "
+                f"(or the equivalent YAML mapping), got {self.layer_policies!r} "
+                f"({type(self.layer_policies).__name__})"
+            )
 
 
 @dataclass

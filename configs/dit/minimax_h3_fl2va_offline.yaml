@@ -55,6 +55,11 @@ model:
     ulysses_size: 1
     gradient_checkpointing:
       enable: true
+      mode: full  # enable 开启时的默认档: full = 全部层整层重算, selective = 全部层走 SAC
+      # save_modules: []  # 空 = 只有 attention (SDPA 类 op MUST_SAVE, 其余重算)
+      # layer_policies:  # 高级可选, 给出后以它为准, mode 失效
+      #   full: 15  # 最靠尾参与重算的层数 (默认 -1 = 全部层); 更靠前的层不重算
+      #   selective: 10  # full 区间里从前往后走 SAC 的层数, 其余 full 层整层重算
     fsdp_config:
       fsdp_mode: fsdp2
       mixed_precision:
@@ -93,7 +98,18 @@ train:
   seed: 42
 
   num_train_epochs: 1
-  max_steps: 20
+  max_steps: 25
+
+  profile:
+      enable: false
+      start_step: 5
+      end_step: 7
+      trace_dir: "./profiling/trace"
+      record_shapes: true
+      profile_memory: true
+      with_stack: false
+      with_modules: false
+      rank0_only: true
 
   checkpoint:
     output_dir: output/minimax_h3_fl2va_offline
