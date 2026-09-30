@@ -56,7 +56,7 @@ Once inside, register your checkout as an editable package in the image's venv (
 uv pip install -e . --no-deps
 ```
 
-flash-attn, aiter and causal-conv1d are installed outside `uv.lock`. To re-sync the venv after a dependency change, run `uv sync --active --inexact --extra rocm --dev` from your checkout: `--active` targets `/app/.venv` instead of creating a new `.venv` in the checkout, and `--inexact` keeps the source-built packages.
+flash-attn, aiter and causal-conv1d are installed outside `uv.lock`. To re-sync the venv after a dependency change, run `uv sync --active --inexact --frozen --extra rocm --dev` from your checkout: `--active` targets `/app/.venv` instead of creating a new `.venv` in the checkout, `--inexact` keeps the source-built packages, and `--frozen` installs the lock as-is instead of re-verifying it (which downloads every extra's direct-URL wheels).
 
 ## Build the image yourself (optional)
 

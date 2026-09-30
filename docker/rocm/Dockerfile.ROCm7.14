@@ -61,7 +61,7 @@ ENV ROCM_HOME=$ROCM_PATH \
 RUN rocm-sdk init
 
 # flash-attn, aiter and causal-conv1d are not in uv.lock, so an exact `uv sync`
-# removes them; re-sync with `uv sync --active --inexact --extra rocm`.
+# removes them; re-sync with `uv sync --active --inexact --frozen --extra rocm`.
 # The base image sets CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=2 for TransformerEngine
 # only after building its flash-attn, so that build used CK's default of 3.
 # aiter's runtime JIT keeps the base value, as it does in rocm/primus:v26.4.

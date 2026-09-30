@@ -102,8 +102,9 @@ The `rocm` extra installs torch and the ROCm runtime (including `rocm-sdk-devel`
 which aiter needs for its runtime JIT) as wheels, so no system ROCm is needed.
 flash-attn, aiter and causal-conv1d have no ROCm wheels: the ROCm Dockerfile
 builds them from source after `uv sync`, so an exact `uv sync` inside that image
-removes them. Re-sync there with `uv sync --active --inexact --extra rocm`
-(`--active` targets the image's `/app/.venv` from a mounted checkout).
+removes them. Re-sync there with `uv sync --active --inexact --frozen --extra rocm`
+(`--active` targets the image's `/app/.venv` from a mounted checkout; without
+`--frozen`, verifying the lock downloads every extra's direct-URL wheels).
 
 ## Transformers Version
 
