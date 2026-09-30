@@ -100,9 +100,10 @@ video decoding is required.
 
 The `rocm` extra installs torch and the ROCm runtime (including `rocm-sdk-devel`,
 which aiter needs for its runtime JIT) as wheels, so no system ROCm is needed.
-flash-attn and aiter have no ROCm wheels: the ROCm Dockerfile builds them from
-source after `uv sync`, so an exact `uv sync` inside that image removes them
-(use `--inexact`).
+flash-attn, aiter and causal-conv1d have no ROCm wheels: the ROCm Dockerfile
+builds them from source after `uv sync`, so an exact `uv sync` inside that image
+removes them. Re-sync there with `uv sync --active --inexact --extra rocm`
+(`--active` targets the image's `/app/.venv` from a mounted checkout).
 
 ## Transformers Version
 
@@ -128,6 +129,10 @@ forced into a specific 5.x patch.
   - The `rocm` meta-package is sdist-only and computes its dependencies by
     probing the build machine's GPU, so `[[tool.uv.dependency-metadata]]`
     declares them statically. Bump its `version` with the ROCm release.
+  - `uv sync --locked` re-resolves every extra and downloads each direct-URL
+    wheel in full, so the CUDA and Ascend `--locked` builds also fetch the ROCm
+    torch wheels (about 0.4 GB), and a ROCm build would fetch about 4 GB of CUDA
+    wheels; the ROCm Dockerfile uses `--frozen` for that reason.
 
 ## Attention Kernels
 

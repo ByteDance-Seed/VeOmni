@@ -25,7 +25,7 @@ The image takes its OS layer from `rocm/primus:v26.4` and installs VeOmni's depe
 | diffusers | `0.37.0` |
 | python | `3.12` |
 
-flash-attn and aiter have no ROCm wheels, so `docker/rocm/Dockerfile.ROCm7.14` builds them from source at the commits `rocm/primus:v26.4` ships.
+flash-attn, aiter and causal-conv1d have no ROCm wheels, so `docker/rocm/Dockerfile.ROCm7.14` builds them from source at the commits `rocm/primus:v26.4` ships.
 
 Pull the image:
 
@@ -39,7 +39,6 @@ Clone VeOmni and mount it into the container:
 
 ```bash
 git clone https://github.com/ByteDance-Seed/VeOmni.git
-# Validated commit: 7be22df074b49603d17f895a22dbcf03982866e7
 ```
 
 ```bash
@@ -51,13 +50,13 @@ docker run -it --rm \
   amdagi/veomni:rocm7.14_torch2.12_py3.12 bash
 ```
 
-Once inside, register your checkout as an editable package in the image's venv (`/app/.venv`, already on `PATH`); `--no-deps` leaves the installed dependencies untouched:
+Once inside, register your checkout as an editable package in the image's venv (`/app/.venv`, already on `PATH`). The venv already has VeOmni installed from the copy the image was built from, so without this step `import veomni` resolves to that copy instead of your checkout. `--no-deps` leaves the installed dependencies untouched:
 
 ```bash
 uv pip install -e . --no-deps
 ```
 
-flash-attn and aiter are not in `uv.lock`, so an exact `uv sync` inside the container removes them; use `uv sync --inexact` if you need to re-sync.
+flash-attn, aiter and causal-conv1d are installed outside `uv.lock`. To re-sync the venv after a dependency change, run `uv sync --active --inexact --extra rocm --dev` from your checkout: `--active` targets `/app/.venv` instead of creating a new `.venv` in the checkout, and `--inexact` keeps the source-built packages.
 
 ## Build the image yourself (optional)
 
@@ -81,7 +80,7 @@ uv sync --extra rocm --dev
 source .venv/bin/activate
 ```
 
-The `rocm` extra installs torch and the ROCm runtime as wheels, so no system ROCm install is needed. It does not include flash-attn or aiter; build them from source as the Dockerfile does, or use `attn_implementation: sdpa`.
+The `rocm` extra installs torch and the ROCm runtime as wheels, so no system ROCm install is needed. It does not include flash-attn, aiter or causal-conv1d; build them from source as the Dockerfile does, or use `attn_implementation: sdpa`.
 
 ## Launch training
 
