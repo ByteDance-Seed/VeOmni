@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import partial
 from types import SimpleNamespace
 
 import torch
@@ -11,6 +10,7 @@ import torch.nn.functional as F
 from diffusers import WanTransformer3DModel as _WanTransformer3DModel
 from diffusers.models.transformers.transformer_wan import (
     WanAttention,
+    WanTransformerBlock,
     WanAttnProcessor,
     _get_added_kv_projections,
     _get_qkv_projections,
@@ -304,17 +304,25 @@ class WanSPAttnProcessor(WanAttnProcessor):
         return hidden_states_out
 
 
-def wan_transformer_block_forward(
-    block,
-    sp_valid_length: int | None,
+# ================================================================
+# Patch: WanTransformerBlock.forward
+# Identical to the diffusers block forward, plus the `sp_valid_length`
+# that the self-attention processor needs to strip the Ulysses tail pad.
+# Patched onto the class rather than called as a helper so the block is
+# still entered through ``__call__`` and keeps its forward hooks (FSDP2
+# wraps these blocks and unshards parameters in its pre-forward hook).
+# ================================================================
+def WanTransformerBlock_forward(
+    self,
     hidden_states: torch.Tensor,
     encoder_hidden_states: torch.Tensor,
     temb: torch.Tensor,
     rotary_emb: torch.Tensor,
+    sp_valid_length: int | None = None,
 ) -> torch.Tensor:
     if temb.ndim == 4:
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-            block.scale_shift_table.unsqueeze(0) + temb.float()
+            self.scale_shift_table.unsqueeze(0) + temb.float()
         ).chunk(6, dim=2)
         shift_msa = shift_msa.squeeze(2)
         scale_msa = scale_msa.squeeze(2)
@@ -324,19 +332,19 @@ def wan_transformer_block_forward(
         c_gate_msa = c_gate_msa.squeeze(2)
     else:
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-            block.scale_shift_table + temb.float()
+            self.scale_shift_table + temb.float()
         ).chunk(6, dim=1)
 
-    norm_hidden_states = (block.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-    attn_output = block.attn1(norm_hidden_states, None, None, rotary_emb, sp_valid_length=sp_valid_length)
+    norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
+    attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb, sp_valid_length=sp_valid_length)
     hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
 
-    norm_hidden_states = block.norm2(hidden_states.float()).type_as(hidden_states)
-    attn_output = block.attn2(norm_hidden_states, encoder_hidden_states, None, None)
+    norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
+    attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, None, None)
     hidden_states = hidden_states + attn_output
 
-    norm_hidden_states = (block.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(hidden_states)
-    ff_output = block.ffn(norm_hidden_states)
+    norm_hidden_states = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(hidden_states)
+    ff_output = self.ffn(norm_hidden_states)
     return (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
 
 
@@ -395,15 +403,15 @@ def WanTransformer3DModel_forward(
         if ts_seq_len is not None:
             timestep_proj = slice_input_tensor(timestep_proj, dim=1, group=sp_group)
     # 4. Transformer blocks
-    block_forward = partial(wan_transformer_block_forward, sp_valid_length=seq_len if use_sp else None)
+    sp_valid_length = seq_len if use_sp else None
     if torch.is_grad_enabled() and self.gradient_checkpointing:
         for block in self.blocks:
             hidden_states = self._gradient_checkpointing_func(
-                partial(block_forward, block), hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
+                block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, sp_valid_length
             )
     else:
         for block in self.blocks:
-            hidden_states = block_forward(block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, sp_valid_length)
 
     # SP: gather before output head – every rank holds the full sequence so
     # that the loss is identical across SP ranks.
@@ -531,6 +539,7 @@ def apply_veomni_wan_transformer_patch() -> None:
     would be absent, making sequence slicing incorrect.
     """
     _WanTransformer3DModel.forward = WanTransformer3DModel_forward
+    WanTransformerBlock.forward = WanTransformerBlock_forward
     # Newer diffusers (resolved under transformers v5) gate FA2 with a strict
     # ``_supports_flash_attn_2 = False`` on WanTransformer3DModel and raise on
     # init when callers request the FA2 attention path. VeOmni's training

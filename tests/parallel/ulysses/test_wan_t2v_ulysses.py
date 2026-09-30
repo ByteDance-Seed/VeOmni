@@ -32,6 +32,7 @@ from veomni.models.diffusers.wan_t2v.wan_transformer.configuration_wan_transform
 from veomni.models.diffusers.wan_t2v.wan_transformer.modeling_wan_transformer import (
     WanTransformer3DModel,
     WanTransformer3DModel_forward,
+    apply_veomni_wan_transformer_patch,
 )
 
 from .utils import SequenceParallelTest
@@ -44,6 +45,11 @@ CASES = {
     "per_token_timestep": (2, 8, 8, True),
     "odd_tokens_per_token_timestep": (3, 6, 6, True),
 }
+
+
+# The blocks carry the SP-aware forward as a class patch, and the model forward reaches them
+# through `block(...)`; FSDP2 wraps these blocks, so that call path (and its hooks) has to hold.
+apply_veomni_wan_transformer_patch()
 
 
 def _build_model(device, gradient_checkpointing):
@@ -99,6 +105,11 @@ class WanT2VUlyssesTest(SequenceParallelTest):
         failures = []
         for gradient_checkpointing in (False, True):
             model = _build_model(device, gradient_checkpointing)
+            # FSDP2 unshards a wrapped block in its forward pre-hook, so every block has to be
+            # entered through `__call__` rather than by calling its forward helper directly.
+            entered = set()
+            for i, block in enumerate(model.blocks):
+                block.register_forward_pre_hook(lambda mod, args, i=i: entered.add(i))
             try:
                 _init_parallel_state(dp_size=self.world_size, ulysses_size=1, device_type=get_device_type(), name=None)
                 refs = {name: _forward_backward(model, *case, device) for name, case in CASES.items()}
@@ -125,6 +136,8 @@ class WanT2VUlyssesTest(SequenceParallelTest):
                     grad_err = (diff_sq / ref_sq) ** 0.5
                     if out_err > 1e-5 or grad_err > 1e-5:
                         failures.append(f"{tag}: output rel err {out_err:.2e}, grad rel err {grad_err:.2e}")
+                    if entered != set(range(len(model.blocks))):
+                        failures.append(f"{tag}: blocks bypassed nn.Module.__call__: {entered}")
             finally:
                 clear_parallel_state()
         assert not failures, "\n".join(failures)
