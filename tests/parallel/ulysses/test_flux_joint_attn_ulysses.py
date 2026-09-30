@@ -10,6 +10,8 @@ This drives `FluxJointAttention.forward` directly on local shards with `ulysses_
 and checks the gathered image and text outputs against a full-sequence run of the same module.
 """
 
+from unittest.mock import patch
+
 import pytest
 import torch
 import torch.distributed as c10d
@@ -23,6 +25,7 @@ if get_device_type() == "cpu" or not c10d.is_available() or not c10d.is_backend_
 from torch.testing._internal.common_utils import run_tests
 
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+from veomni.models.transformers.flux import modeling_flux
 from veomni.models.transformers.flux.modeling_flux import FluxJointAttention
 
 from .utils import SequenceParallelTest
@@ -46,6 +49,11 @@ class FluxJointAttentionUlyssesTest(SequenceParallelTest):
     def world_size(self):
         return 2
 
+    # `flash_attention` takes the flash_attn_interface/flash_attn path whenever either is
+    # importable and no mask is given, which is the no_mask case here. Those kernels only
+    # accept FP16/BF16, so this FP32 comparison has to run on SDPA.
+    @patch.object(modeling_flux, "FLASH_ATTN_3_AVAILABLE", False)
+    @patch.object(modeling_flux, "FLASH_ATTN_2_AVAILABLE", False)
     @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
     def test_matches_full_sequence_reference(self):
         group = self._get_process_group()
