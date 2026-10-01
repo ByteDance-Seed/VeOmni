@@ -52,7 +52,7 @@ No manual action is required. The patch is guarded by `_dcp_consolidation_patch_
 
 ## Requirements
 
-- **PyTorch Version**: Verified against PyTorch 2.9.1, 2.10.0, and the allow-listed 2.11.0 upstream/CI-wheel implementations. Other patch releases or builds fail the source-hash guard until explicitly verified and added.
+- **PyTorch Version**: Verified against PyTorch 2.9.1, 2.10.0, the allow-listed 2.11.0 upstream/CI-wheel implementations, and 2.12.x (handle-based `_read_tensor_data` API). Other patch releases or builds fail the source-hash guard until explicitly verified and added.
 - **Tensors must be sorted by offset** before writing (already ensured by the implementation)
 
 ## Implementation Details
