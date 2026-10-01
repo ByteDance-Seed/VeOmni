@@ -105,6 +105,7 @@ design/unified_kernel_registry.md
 design/verl_topk_distill_integration.md
 design/deepseek_v4_context_parallel.md
 design/deepseek_v4_indexer_loss.md
+design/encoder_balance_costs.md
 ```
 
 ```{toctree}
