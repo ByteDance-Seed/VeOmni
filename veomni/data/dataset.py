@@ -126,6 +126,31 @@ class IterativeDataset(IterableDataset):
             self._data.set_epoch(epoch)
 
 
+def _shards_across_workers(dataset) -> bool:
+    """Whether ``dataset`` already splits its source shards across DataLoader workers.
+
+    Hugging Face ``IterableDataset`` does this itself: when iterated inside a
+    DataLoader worker it dispatches to ``_iter_pytorch`` and assigns each worker
+    its own source shards. Splitting such a stream by worker again would drop
+    every row that HF handed to the other workers. Plain iterables (lists,
+    generators, custom iterables) do not do this and still need our worker split.
+    """
+    seen = set()
+    current = dataset
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, HFIterableDataset):
+            return True
+        for attr in ("_data", "_dataset"):
+            nxt = getattr(current, attr, None)
+            if nxt is not None:
+                current = nxt
+                break
+        else:
+            return False
+    return False
+
+
 class ShardedIterableDataset(IterableDataset):
     """Row-level DP shard. One pass drops an incomplete last round.
 
@@ -147,6 +172,11 @@ class ShardedIterableDataset(IterableDataset):
         worker_info = get_worker_info()
         worker_id = 0 if worker_info is None else worker_info.id
         num_workers = 1 if worker_info is None else worker_info.num_workers
+        if _shards_across_workers(self._dataset):
+            # The wrapped stream already assigns source shards to DataLoader
+            # workers, so splitting by worker a second time would silently drop
+            # every row that was handed to another worker.
+            worker_id, num_workers = 0, 1
         index = 0
         pending: List[Any] = []
         pass_i = 0
