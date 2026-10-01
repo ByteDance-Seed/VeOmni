@@ -150,6 +150,29 @@ image streams across SP ranks and gathers the image stream back before the
 output head, mirroring the Wan/Flux pattern. `num_attention_heads` must be
 divisible by `ulysses_size`.
 
+Joint attention calls the model's `attention/standard` `VeomniOp`, bound from
+`model.ops_implementation.attn_implementation` at construction, with
+`skip_ulysses=True` because the processor already performed the per-stream
+exchanges. The joint `[B, S]` keep-mask is omitted when every token is valid.
+When a mask remains (text padding or SP padding), the handling depends on the
+selected implementation:
+
+| `attn_implementation` | Masked joint attention |
+|:-----|:-----|
+| `sdpa` | SDPA with the key-padding mask |
+| local or Hub `flash_attention_*` | the same flash row, on the kept tokens packed into one varlen call |
+| other names | SDPA, with a warning |
+
+Text padding sits in the middle of the `[text, image]` sequence, so the flash
+path packs the tokens the mask actually keeps rather than a prefix length. The
+indices and `cu_seqlens` are derived once per forward and reused by every
+block and checkpoint recomputation (Transformers' Ascend FA2 varlen integration
+still copies `cu_seqlens` to the host on each call). Removed query rows have
+zero raw attention output and are never attended to; compare valid-token
+outputs and gradients with SDPA, not ignored padding rows. The text mask is
+normalized to boolean by Diffusers on every path, so flash and SDPA accept the
+same masks.
+
 ### Config Bridge — `to_diffuser_dict()` and `to_dict()`
 
 `to_diffuser_dict()` uses Python's `inspect` module to extract exactly the
