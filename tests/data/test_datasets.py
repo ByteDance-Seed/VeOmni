@@ -670,3 +670,28 @@ def test_iterable_repeat_advances_inner_epoch():
     stream.set_epoch(3)
     assert list(islice(stream, 2)) == ["a", "a"]
     assert inner.epochs == [13, 14]
+
+
+def test_iterable_hf_dataset_keeps_every_row_with_multiple_workers():
+    """A wrapped HF dataset shards itself across workers; we must not drop its rows."""
+    from datasets import Dataset as HFDataset
+    from torch.utils.data import DataLoader
+
+    for num_workers in (0, 2):
+        raw = HFDataset.from_dict({"id": list(range(48))}).to_iterable_dataset(num_shards=1)
+        stream = ShardedIterableDataset(raw, dp_rank=0, dp_size=1, repeat=False)
+        rows = [row["id"] for row in DataLoader(stream, batch_size=None, num_workers=num_workers)]
+        assert sorted(rows) == list(range(48)), f"num_workers={num_workers}: got {len(rows)} rows"
+
+
+def test_iterable_hf_dataset_still_shards_across_dp_ranks():
+    from datasets import Dataset as HFDataset
+    from torch.utils.data import DataLoader
+
+    raw = HFDataset.from_dict({"id": list(range(48))}).to_iterable_dataset(num_shards=1)
+    ranks = []
+    for rank in range(2):
+        stream = ShardedIterableDataset(raw, dp_rank=rank, dp_size=2, repeat=False)
+        ranks.append([row["id"] for row in DataLoader(stream, batch_size=None, num_workers=2)])
+    assert [len(items) for items in ranks] == [24, 24]
+    assert sorted(ranks[0] + ranks[1]) == list(range(48))
