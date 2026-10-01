@@ -26,6 +26,7 @@ The following configuration items will impact training performance and need to b
 
 - **record_shapes**: Recording tensor shapes increases profiling overhead
 - **profile_memory**: Enabling memory profiling adds additional overhead
+- **CUDA memory snapshots**: The `.pkl` snapshot retains allocation and free events, plus stack traces for allocations that are still live. It omits per-event stack traces to avoid profiler failures during activation checkpoint recomputation.
 - **with_stack**: Recording stack traces significantly increases profiling overhead
 - **rank0_only**: When set to False, all ranks will be profiled, generating a large number of files and consuming significant disk space and time
 
