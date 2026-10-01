@@ -23,7 +23,6 @@ from .core import (
     gradient_checkpoint_forward,
     is_flash_attn_impl,
     minimax_attention,
-    packed_block_diag_mask,
 )
 
 
@@ -89,22 +88,35 @@ class _PackedBounds(NamedTuple):
     host: tuple[int, ...]
 
 
-def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale, compatibility_mode=False):
-    # Zero uncovered SP rows so discarded outputs cannot poison parameter gradients.
-    out = torch.zeros_like(q)
-    # Host-side segment bounds: the DiT / token-refiner entries convert the
-    # cu_seqlens tensor once per forward and pass a tuple. Tensor fallback
-    # keeps any external caller working (paying one sync).
-    bounds = tuple(cu_seqlens.tolist()) if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
-    for start, stop in zip(bounds[:-1], bounds[1:]):
-        if stop == start:
-            continue
-        seg_q = q[start:stop].transpose(0, 1).unsqueeze(0)
-        seg_k = k[start:stop].transpose(0, 1).unsqueeze(0)
-        seg_v = v[start:stop].transpose(0, 1).unsqueeze(0)
-        seg_out = nn.functional.scaled_dot_product_attention(seg_q, seg_k, seg_v, scale=softmax_scale)
-        out[start:stop] = seg_out.squeeze(0).transpose(0, 1)
-    return out
+_H3_REFERENCE_ATTN_IMPLS = frozenset({"eager", "sdpa", "veomni_sdpa"})
+_H3_FLASH_ATTN_IMPLS = frozenset(
+    {
+        "veomni_flash_attention_2",
+        "veomni_flash_attention_2_hub",
+        "veomni_flash_attention_3",
+        "veomni_flash_attention_3_hub",
+    }
+)
+
+
+def _h3_attention_impl() -> str:
+    """Resolve the configured ``attention/standard`` row for the H3 DiT and token refiner.
+
+    The SDPA reference makes unmasked per-segment calls, so ``eager`` (H3 has no
+    module-local eager attention) and ``veomni_sdpa`` (whose masked-SDPA backend
+    pin excludes PyTorch's flash SDPA kernel) both select the plain ``sdpa`` row.
+    """
+    impl = resolve_op_impl("attn_implementation")
+    if impl in _H3_REFERENCE_ATTN_IMPLS:
+        return "sdpa"
+    if impl.startswith("flash_attention_"):
+        impl = f"veomni_{impl}"
+    if impl not in _H3_FLASH_ATTN_IMPLS:
+        raise ValueError(
+            f"Unsupported H3 attention implementation {impl!r}; use sdpa or a local/Hub "
+            "flash_attention_2 / flash_attention_3 name."
+        )
+    return impl
 
 
 class MiniMaxH3Rope(nn.Module):
@@ -156,71 +168,63 @@ class MiniMaxH3Attention(nn.Module):
         self.q_norm = VeomniRMSNorm(attention_head_dim, eps=qk_norm_eps)
         self.k_norm = VeomniRMSNorm(attention_head_dim, eps=qk_norm_eps)
         self.out_proj = nn.Linear(inner_dim, hidden_size, bias=False)
-        # Packed FA is bound later. FA3/FA4 cannot be constructed on NPU or pre-SM90.
-        impl = resolve_op_impl("attn_implementation")
-        if is_flash_attn_impl(impl):
-            impl = "sdpa"
-        bind_minimax_attention(self, is_causal=False, impl=impl)
+        # Bound once from the ops selection, for single-sample, packed and Ulysses calls alike.
+        bind_minimax_attention(self, is_causal=False, impl=_h3_attention_impl())
         # 3-axis rope is shorter than head_dim (96 vs 128 in production). q/k are [S, H, D].
         self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
 
-    def _run_packed_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int | None,
-        valid_seqlen: int,
-    ) -> torch.Tensor:
-        """One packed attention call. FA uses varlen kwargs; SDPA uses a block-diag mask."""
-        total = q.shape[0]
-        query = q[:valid_seqlen].unsqueeze(0).transpose(1, 2)
-        key = k[:valid_seqlen].unsqueeze(0).transpose(1, 2)
-        value = v[:valid_seqlen].unsqueeze(0).transpose(1, 2)
-        max_seqlen = valid_seqlen if max_seqlen is None else max_seqlen
+    def _attend(self, q, k, v, cu_seqlens, max_seqlen):
+        """Segment-isolated attention over ``[S, H, D]`` rows through the bound op.
+
+        Rows after the last bound (Ulysses padding) are zero, so discarded rows
+        cannot poison parameter gradients. FlashAttention takes all segments in
+        one varlen call; the SDPA reference runs one dense call per segment
+        instead of materializing an ``S x S`` block-diagonal mask.
+        """
         if isinstance(cu_seqlens, _PackedBounds):
-            cu_seqlens = cu_seqlens.device
-        elif not isinstance(cu_seqlens, torch.Tensor):
-            cu_seqlens = torch.tensor(cu_seqlens, device=query.device, dtype=torch.int32)
-        cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32)
+            device_bounds, bounds = cu_seqlens
+        elif isinstance(cu_seqlens, torch.Tensor):
+            # External callers only: one host read of the bounds.
+            device_bounds, bounds = cu_seqlens, tuple(cu_seqlens.tolist())
+        else:
+            device_bounds, bounds = None, tuple(cu_seqlens)
+        used = bounds[-1]
+        segments = [(start, stop) for start, stop in zip(bounds[:-1], bounds[1:]) if stop > start]
+        if not segments:
+            return torch.zeros_like(q)
         if is_flash_attn_impl(self.config._attn_implementation):
-            packed = minimax_attention(
+            if device_bounds is None:
+                device_bounds = torch.tensor(bounds, dtype=torch.int32, device=q.device)
+            device_bounds = device_bounds.to(device=q.device, dtype=torch.int32)
+            if max_seqlen is None:
+                max_seqlen = max(stop - start for start, stop in segments)
+            out = minimax_attention(
                 self,
-                query,
-                key,
-                value,
+                *(t[:used].unsqueeze(0).transpose(1, 2) for t in (q, k, v)),
                 scaling=self.softmax_scale,
-                cu_seq_lens_q=cu_seqlens,
-                cu_seq_lens_k=cu_seqlens,
+                cu_seq_lens_q=device_bounds,
+                cu_seq_lens_k=device_bounds,
                 max_length_q=max_seqlen,
                 max_length_k=max_seqlen,
             )
+            out = out.squeeze(0).transpose(0, 1)
         else:
-            packed = minimax_attention(
-                self,
-                query,
-                key,
-                value,
-                attention_mask=packed_block_diag_mask(cu_seqlens, valid_seqlen, query.device),
-                scaling=self.softmax_scale,
-            )
-        packed = packed.squeeze(0).transpose(0, 1)
-        if packed.shape[0] == total:
-            return packed
-        out = q.new_empty(total, q.shape[1], q.shape[2])
-        out[:valid_seqlen] = packed
-        return out
+            parts = [
+                minimax_attention(
+                    self,
+                    *(t[start:stop].unsqueeze(0).transpose(1, 2) for t in (q, k, v)),
+                    scaling=self.softmax_scale,
+                )
+                .squeeze(0)
+                .transpose(0, 1)
+                for start, stop in segments
+            ]
+            out = parts[0] if len(parts) == 1 else torch.cat(parts)
+        if used == q.shape[0]:
+            return out
+        return torch.cat((out, out.new_zeros(q.shape[0] - used, *out.shape[1:])))
 
-    def forward(self, x, *, rope_cos, rope_sin, cu_seqlens, max_seqlen=None, valid_seqlen=None, use_ulysses=False):
-        if valid_seqlen is None:
-            if isinstance(cu_seqlens, _PackedBounds):
-                valid_seqlen = cu_seqlens.host[-1]
-            elif isinstance(cu_seqlens, tuple):
-                valid_seqlen = cu_seqlens[-1]
-            else:
-                valid_seqlen = x.shape[0]
+    def forward(self, x, *, rope_cos, rope_sin, cu_seqlens, max_seqlen=None, use_ulysses=False):
         sp_group = get_ulysses_sequence_parallel_group() if use_ulysses else None
         total = x.shape[0]
         qkv = self.qkv_proj(x)
@@ -247,15 +251,8 @@ class MiniMaxH3Attention(nn.Module):
                 k = self.k_norm(full[:, :, 1])
                 if rope_cos is not None:
                     q, k = self.veomni_rope(q, k, rope_cos, rope_sin)
-                o = self._run_packed_attention(
-                    q,
-                    k,
-                    full[:, :, 2],
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max_seqlen,
-                    valid_seqlen=valid_seqlen,
-                )
-                if o_wait is not None:  # block i-1's inverse exchange finished during this sdpa
+                o = self._attend(q, k, full[:, :, 2], cu_seqlens, max_seqlen)
+                if o_wait is not None:  # block i-1's inverse exchange finished during this attention
                     out_blocks.append(_AsyncA2A.apply(o_wait, o_prev, 0, 1, sp_group))
                 o_wait = _all_to_all_single(o, 0, 1, sp_group, async_op=True)
                 o_prev = o
@@ -270,20 +267,7 @@ class MiniMaxH3Attention(nn.Module):
             k = self.k_norm(k)
             if rope_cos is not None:
                 q, k = self.veomni_rope(q, k, rope_cos, rope_sin)
-            packed_attention = isinstance(cu_seqlens, _PackedBounds)
-            if packed_attention and is_flash_attn_impl(self.config._attn_implementation):
-                out = self._run_packed_attention(
-                    q, k, v, cu_seqlens=cu_seqlens.device, max_seqlen=max_seqlen, valid_seqlen=valid_seqlen
-                )
-            else:
-                out = _sdpa_varlen_attention(
-                    q,
-                    k,
-                    v,
-                    cu_seqlens=cu_seqlens.host if packed_attention else cu_seqlens,
-                    softmax_scale=self.softmax_scale,
-                    compatibility_mode=packed_attention,
-                )
+            out = self._attend(q, k, v, cu_seqlens, max_seqlen)
         out = out.reshape(total, self.num_heads * self.head_dim)
         return self.out_proj(out)
 
@@ -329,15 +313,8 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         self.attn = MiniMaxH3Attention(hidden_size, num_attention_heads, attention_head_dim, qk_norm_eps)
         self.mlp = MiniMaxH3MLP(hidden_size, ffn_hidden_size)
 
-    def forward(self, x, *, cu_seqlens, max_seqlen, valid_seqlen):
-        x = x + self.attn(
-            self.norm1(x),
-            rope_cos=None,
-            rope_sin=None,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            valid_seqlen=valid_seqlen,
-        )
+    def forward(self, x, *, cu_seqlens, max_seqlen):
+        x = x + self.attn(self.norm1(x), rope_cos=None, rope_sin=None, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -365,7 +342,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
         )
         self.final_norm = VeomniRMSNorm(hidden_size, eps=final_norm_eps)
 
-    def forward(self, x, *, cu_seqlens, max_seqlen, valid_seqlen=None, sample_local=False):
+    def forward(self, x, *, cu_seqlens, max_seqlen, sample_local=False):
         if sample_local and isinstance(cu_seqlens, _PackedBounds) and len(cu_seqlens.host) > 2:
             bounds = cu_seqlens.host
             segments = [(i, start, stop) for i, (start, stop) in enumerate(zip(bounds, bounds[1:])) if stop > start]
@@ -379,14 +356,10 @@ class MiniMaxH3TokenRefiner(nn.Module):
                     # Device bounds via slicing the packed tensor: no host-to-device copy per sample.
                     device_cu = cu_seqlens.device[index : index + 2] - cu_seqlens.device[index]
                     local_cu = _PackedBounds(device_cu, (0, length))
-                    outputs.append(
-                        self.forward(x[start:stop], cu_seqlens=local_cu, max_seqlen=length, valid_seqlen=length)
-                    )
+                    outputs.append(self.forward(x[start:stop], cu_seqlens=local_cu, max_seqlen=length))
                 return torch.cat(outputs, dim=0)
-        if valid_seqlen is None:
-            valid_seqlen = x.shape[0]
         for block in self.blocks:
-            x = block(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, valid_seqlen=valid_seqlen)
+            x = block(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         return self.final_norm(x)
 
 
@@ -421,7 +394,6 @@ class MiniMaxH3DiTBlock(nn.Module):
         rope_sin,
         cu_seqlens,
         max_seqlen,
-        valid_seqlen,
         use_ulysses=False,
     ):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
@@ -434,7 +406,6 @@ class MiniMaxH3DiTBlock(nn.Module):
             rope_sin=rope_sin,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
-            valid_seqlen=valid_seqlen,
             use_ulysses=use_ulysses,
         )
         x = _modulate_gate(residual, gate_msa, h, combined_indices)
@@ -598,7 +569,6 @@ class MiniMaxH3DiT(nn.Module):
             text_embed,
             cu_seqlens=refiner_cu_seqlens,
             max_seqlen=refiner_max_seqlen,
-            valid_seqlen=text_embed.shape[0],
             sample_local=packed_batch,
         )
 
@@ -653,12 +623,14 @@ class MiniMaxH3DiT(nn.Module):
             raise ValueError("H3 multi-sample packing does not support sequence parallelism or offload.")
 
         cu_seqlens = packed_seq_params["cu_seqlens_q"].to(torch.int32)
-        max_seqlen = int(packed_seq_params["max_seqlen_q"])
         refiner_cu = refiner_packed_seq_params["cu_seqlens_q"].to(torch.int32)
-        refiner_max = int(refiner_packed_seq_params["max_seqlen_q"])
         # Host bounds come from packing/conditioning; reading the device tensor is only a fallback.
         cu_host = packed_seq_params.get("cu_seqlens_host") or tuple(cu_seqlens.tolist())
         refiner_host = refiner_packed_seq_params.get("cu_seqlens_host") or tuple(refiner_cu.tolist())
+        # Varlen kernels only write rows within max_seqlen of a segment start. Take it from the
+        # host bounds: a legacy layout's 64-row tail can be longer than ``max_seqlen_q``.
+        max_seqlen = max(stop - start for start, stop in zip(cu_host[:-1], cu_host[1:]))
+        refiner_max = max(stop - start for start, stop in zip(refiner_host[:-1], refiner_host[1:]))
 
         if x.dim() != 3 or x.shape[0] != 1:
             raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
@@ -687,7 +659,7 @@ class MiniMaxH3DiT(nn.Module):
             img_pos=img_pos.to(device),
             audio_pos=audio_pos.to(device),
             text_pos=text_pos.to(device),
-            refiner_cu_seqlens=_PackedBounds(refiner_cu.to(device), refiner_host) if packed_batch else refiner_host,
+            refiner_cu_seqlens=_PackedBounds(refiner_cu.to(device), refiner_host),
             refiner_max_seqlen=refiner_max,
             packed_batch=packed_batch,
             seq_len=padded_seq_len,
@@ -713,12 +685,12 @@ class MiniMaxH3DiT(nn.Module):
             inverse_indices = inverse_indices.narrow(0, unit * sp_rank, unit)
 
         hidden = decoder_input
-        # Host bounds were read once above and are shared by every block. Bounds stay
-        # at the ORIGINAL seq_len: the per-segment SDPA is non-causal, so an
-        # extended bound would leak pad keys into the last real rows. Pad rows
-        # fall outside every segment, have zero attention output, and are
-        # dropped by the index_select below.
-        cu_seqlens = _PackedBounds(cu_seqlens.to(device), cu_host) if packed_batch else cu_host
+        # Host and device bounds are built once per forward and shared by every block
+        # (and checkpoint recomputation), single-sample or packed. Bounds stay at
+        # the ORIGINAL seq_len: attention is non-causal, so an extended bound would
+        # leak pad keys into the last real rows. Pad rows fall outside every
+        # segment, have zero attention output, and are dropped by the index_select below.
+        cu_seqlens = _PackedBounds(cu_seqlens.to(device), cu_host)
         block_swap = self._block_swap if self._block_offload_enabled else 0
         for i, block in enumerate(self.blocks):
             if self._block_offload_enabled:
@@ -741,7 +713,6 @@ class MiniMaxH3DiT(nn.Module):
                 rope_sin=rope_sin,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
-                valid_seqlen=seq_len,
                 use_ulysses=sp_world > 1,
             )
 

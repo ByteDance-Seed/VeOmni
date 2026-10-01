@@ -191,89 +191,61 @@ def test_minimax_h3_packed_sdpa_matches_independent_segments():
     attn = _tiny_attention()
     packed = torch.randn(6, 16)
     cu_seqlens = torch.tensor([0, 2, 6], dtype=torch.int32)
-    out_packed = attn(packed, rope_cos=None, rope_sin=None, cu_seqlens=cu_seqlens, max_seqlen=4, valid_seqlen=6)
-    out_a = attn(
-        packed[:2],
-        rope_cos=None,
-        rope_sin=None,
-        cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
-        max_seqlen=2,
-        valid_seqlen=2,
-    )
-    out_b = attn(
-        packed[2:],
-        rope_cos=None,
-        rope_sin=None,
-        cu_seqlens=torch.tensor([0, 4], dtype=torch.int32),
-        max_seqlen=4,
-        valid_seqlen=4,
-    )
+    out_packed = attn(packed, rope_cos=None, rope_sin=None, cu_seqlens=cu_seqlens, max_seqlen=4)
+    out_a = attn(packed[:2], rope_cos=None, rope_sin=None, cu_seqlens=(0, 2), max_seqlen=2)
+    out_b = attn(packed[2:], rope_cos=None, rope_sin=None, cu_seqlens=(0, 4), max_seqlen=4)
     torch.testing.assert_close(out_packed, torch.cat((out_a, out_b), dim=0), atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
 
-def test_minimax_h3_sdpa_packed_uses_host_slices_not_varlen_kwargs(monkeypatch):
-    from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_dit
+def _record_handle(attn):
+    calls: list = []
+    handle = attn.veomni_attn
 
+    def record(module, query, key, value, attention_mask=None, **kwargs):
+        calls.append({"query_shape": tuple(query.shape), "attention_mask": attention_mask, **kwargs})
+        return handle(module, query, key, value, attention_mask, **kwargs)
+
+    attn.veomni_attn = record
+    return calls
+
+
+def test_minimax_h3_sdpa_reference_runs_one_dense_call_per_segment():
+    """The SDPA row gets per-segment dense calls: no varlen kwargs and no S x S block-diagonal mask."""
     attn = _tiny_attention()
-    captured: dict = {}
-    orig = minimax_h3_dit._sdpa_varlen_attention
-
-    def record(q, k, v, cu_seqlens, softmax_scale, compatibility_mode=False):
-        captured["cu_seqlens"] = cu_seqlens
-        captured["compatibility_mode"] = compatibility_mode
-        return orig(q, k, v, cu_seqlens, softmax_scale, compatibility_mode)
-
-    monkeypatch.setattr(minimax_h3_dit, "_sdpa_varlen_attention", record)
-
-    def boom(*args, **kwargs):
-        raise AssertionError("SDPA packed must not dispatch through veomni_attn")
-
-    attn.veomni_attn = boom
-    hidden = torch.randn(6, 16)
-    attn(
-        hidden,
-        rope_cos=None,
-        rope_sin=None,
-        cu_seqlens=torch.tensor([0, 2, 6], dtype=torch.int32),
-        max_seqlen=4,
-        valid_seqlen=6,
-    )
-    assert captured["cu_seqlens"].tolist() == [0, 2, 6]
-    assert captured["compatibility_mode"] is False
+    assert attn.veomni_attn.impl == "sdpa"
+    calls = _record_handle(attn)
+    bounds = _PackedBounds(torch.tensor([0, 2, 6], dtype=torch.int32), (0, 2, 6))
+    attn(torch.randn(6, 16), rope_cos=None, rope_sin=None, cu_seqlens=bounds, max_seqlen=4)
+    assert [call["query_shape"] for call in calls] == [(1, 2, 2, 8), (1, 2, 4, 8)]
+    assert all(call["attention_mask"] is None and call["skip_ulysses"] for call in calls)
+    assert not any("cu_seq_lens_q" in call for call in calls)
 
 
-def test_minimax_h3_flash2_bind_defers_until_packed_bounds():
-    ops = eager_ops_config()
+@pytest.mark.parametrize(
+    "cu_seqlens", [(0, 2, 6), _PackedBounds(torch.tensor([0, 2, 6], dtype=torch.int32), (0, 2, 6))]
+)
+def test_minimax_h3_flash_binds_at_construction_and_takes_varlen_bounds(available_nvidia_ops, cu_seqlens):
+    ops = _sdpa_ops_config()
     ops.attn_implementation = "flash_attention_2"
     with ops_config_scope(ops):
         attn = MiniMaxH3Attention(hidden_size=16, num_attention_heads=2, attention_head_dim=8, qk_norm_eps=1e-5)
-    assert attn.veomni_attn.impl == "sdpa"
-    assert attn.veomni_rope.op == "rope"
-    assert attn.veomni_rope.variant == "partial"
+    assert attn.veomni_attn.impl == "veomni_flash_attention_2"
+    assert attn.config._attn_implementation == "veomni_flash_attention_2"
 
-    captured: dict = {}
+    calls: list = []
 
     def record(_module, query, _key, _value, attention_mask=None, **kwargs):
-        captured["attention_mask"] = attention_mask
-        captured.update(kwargs)
+        calls.append({"query_shape": tuple(query.shape), "attention_mask": attention_mask, **kwargs})
         return query.transpose(1, 2), None
 
     attn.veomni_attn = record
-    attn.config._attn_implementation = "veomni_flash_attention_2"
-    hidden = torch.randn(6, 16)
-    attn(
-        hidden,
-        rope_cos=None,
-        rope_sin=None,
-        cu_seqlens=_PackedBounds(torch.tensor([0, 2, 6], dtype=torch.int32), (0, 2, 6)),
-        max_seqlen=4,
-        valid_seqlen=6,
-    )
-    assert captured["attention_mask"] is None
-    assert captured["max_length_q"] == 4
-    assert captured["max_length_k"] == 4
-    assert captured["cu_seq_lens_q"].tolist() == [0, 2, 6]
-    assert captured["cu_seq_lens_k"].tolist() == [0, 2, 6]
+    attn(torch.randn(6, 16), rope_cos=None, rope_sin=None, cu_seqlens=cu_seqlens, max_seqlen=4)
+    (call,) = calls
+    assert call["query_shape"] == (1, 2, 6, 8)
+    assert call["attention_mask"] is None and call["skip_ulysses"]
+    assert call["max_length_q"] == call["max_length_k"] == 4
+    assert call["cu_seq_lens_q"].tolist() == call["cu_seq_lens_k"].tolist() == [0, 2, 6]
+    assert call["cu_seq_lens_q"].dtype == torch.int32
 
 
 def test_minimax_h3_video_vae_attention_uses_partial_rope():

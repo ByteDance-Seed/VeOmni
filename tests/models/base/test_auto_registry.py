@@ -542,12 +542,12 @@ _MODEL_CASES = (
         has_registered_config=True,
         registered_config_aliases=("MiniMaxH3ConditionModel",),
         registered_model_aliases=("MiniMaxH3ConditionModel",),
+        # Attention is omitted: eager selects H3's SDPA reference row (tests/models/test_minimax_h3_packing.py).
         eager_ops=(
             ("dit.blocks.0.attn.q_norm.veomni_rms_norm", "rms_norm"),
-            ("dit.blocks.0.attn.veomni_attn", "attention"),
             ("dit.blocks.0.attn.veomni_rope", "rope"),
         ),
-        isolation_op_path="dit.blocks.0.attn.veomni_attn",
+        isolation_op_path="dit.blocks.0.attn.veomni_rope",
         stamps_hf_attn=False,
     ),
     _ModelCase(

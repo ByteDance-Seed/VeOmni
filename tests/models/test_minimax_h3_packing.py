@@ -1,12 +1,13 @@
 """Native H3 model-owned packing, without pretrained weights or encoders."""
 
 import copy
-import importlib.util
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.models.compare import ops_config_scope
 from veomni.models.diffusers.minimax_h3.minimax_h3_condition.configuration_minimax_h3_condition import (
     MiniMaxH3ConditionModelConfig,
 )
@@ -21,8 +22,46 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_
     MiniMaxH3DiTModel,
     MiniMaxH3DiTOutput,
 )
+from veomni.ops import OP_REGISTRY
+from veomni.ops.kernels.attention.standard import flash as flash_backend
 from veomni.trainer.dit_trainer import DiTDataCollator
-from veomni.utils.import_utils import is_torch_npu_available
+
+
+def segmented_flash_forward(calls: list):
+    """CPU stand-in for Transformers' ``_flash_attention_forward``: varlen ``[1, T, H, D]`` in and out."""
+
+    def forward(query, key, value, attention_mask, query_length, is_causal, softmax_scale=None, **kwargs):
+        cu_seqlens = kwargs["cu_seq_lens_q"]
+        calls.append({"cu_seqlens": cu_seqlens.tolist(), **kwargs})
+        assert attention_mask is None and not is_causal and query.shape[0] == 1
+        assert torch.equal(cu_seqlens, kwargs["cu_seq_lens_k"]) and cu_seqlens.dtype == torch.int32
+        bounds = cu_seqlens.tolist()
+        assert bounds[-1] == query.shape[1]
+        assert max(stop - start for start, stop in zip(bounds[:-1], bounds[1:])) == kwargs["max_length_q"]
+        q, k, v = (t[0].transpose(0, 1) for t in (query, key, value))
+        segments = [
+            F.scaled_dot_product_attention(
+                q[:, start:stop], k[:, start:stop], v[:, start:stop], scale=softmax_scale
+            ).transpose(0, 1)
+            for start, stop in zip(bounds[:-1], bounds[1:])
+        ]
+        return torch.cat(segments).unsqueeze(0)
+
+    return forward
+
+
+def attention_model(attn_implementation):
+    """Tiny DiT built under ``attn_implementation``.
+
+    On CPU, flash rows need the ``available_nvidia_ops`` fixture for the registry's CUDA
+    gates and ``segmented_flash_forward`` in place of the kernel; the adapter stays real.
+    """
+    with ops_config_scope(SimpleNamespace(attn_implementation=attn_implementation)):
+        return tiny_model()
+
+
+def attention_modules(model):
+    return [module for module in model.modules() if isinstance(module, minimax_h3_dit.MiniMaxH3Attention)]
 
 
 def tiny_model():
@@ -299,13 +338,39 @@ def test_accumulated_microbatches_weight_each_sample_like_single_sample():
     torch.testing.assert_close(accumulated, reference)
 
 
-def test_unsupported_backend_fails_only_on_packed_forward():
-    model = tiny_model()
-    model._configure_packed_attention("veomni_flash_attention_4_with_sp")  # what __init__ runs; must not raise
-    samples = prepare(condition_model(), [raw_sample(3), raw_sample(5)])
-    serial(model, samples)
-    with pytest.raises(ValueError, match="Unsupported H3 packing backend"):
-        model(**batch(samples))
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "flash_attention_4",
+        "veomni_flash_attention_4",
+        "veomni_flex_attention",
+        "veomni_sage_attention",
+        "magi_attention",
+    ],
+)
+def test_unsupported_backend_fails_at_construction(available_nvidia_ops, backend):
+    with pytest.raises(ValueError, match="Unsupported H3 attention implementation"):
+        attention_model(backend)
+
+
+def test_unavailable_flash_kernel_fails_at_construction_instead_of_using_sdpa():
+    if "veomni_flash_attention_2" in OP_REGISTRY.list_available("attention", "standard"):
+        pytest.skip("FlashAttention 2 is available here; this checks the unavailable case.")
+    with pytest.raises(RuntimeError, match="veomni_flash_attention_2"):
+        attention_model("flash_attention_2")
+
+
+def test_legacy_attention_environment_variable_warns_and_is_ignored(monkeypatch):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_transformer import (
+        modeling_minimax_h3_transformer as h3_modeling,
+    )
+
+    warnings = []
+    monkeypatch.setenv("MINIMAX_H3_ATTENTION_IMPLEMENTATION", "flash_attention_3")
+    monkeypatch.setattr(h3_modeling.logger, "warning_once", warnings.append)
+    model = attention_model("sdpa")
+    assert len(warnings) == 1 and "model.ops_implementation.attn_implementation" in warnings[0]
+    assert {module.veomni_attn.impl for module in attention_modules(model)} == {"sdpa"}
 
 
 def test_sample_isolation_boundaries_and_zero_valid_rows():
@@ -400,9 +465,12 @@ def test_host_bounds_match_packed_layouts():
     assert packed_sequence.host_cu_seqlens(legacy) == (0, used, legacy["seq_len"])
 
 
+@pytest.mark.parametrize("flash", [False, True], ids=["sdpa", "flash"])
 @pytest.mark.parametrize("task", ["fl2va", "ref2va"])
-def test_single_sample_valid_outputs_match_legacy_64_tail(task):
-    model = tiny_model()
+def test_single_sample_valid_outputs_match_legacy_64_tail(monkeypatch, available_nvidia_ops, task, flash):
+    # The oracle asserts max_length equals the longest segment, here the tail, not max_seqlen_q.
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", segmented_flash_forward([]))
+    model = attention_model("veomni_flash_attention_2" if flash else "sdpa")
     sample = prepare(condition_model(), [raw_sample(3, task)])[0]
     length = sample["x"].shape[1]
     assert length % 64 != 0
@@ -414,15 +482,56 @@ def test_single_sample_valid_outputs_match_legacy_64_tail(task):
         torch.testing.assert_close(actual.loss[key], expected.loss[key])
 
 
-def test_uncovered_sp_attention_tail_cannot_poison_gradients(monkeypatch):
-    attention = tiny_model().dit.blocks[0].attn
+@pytest.mark.parametrize("flash", [False, True], ids=["sdpa", "flash"])
+def test_uncovered_sp_attention_tail_cannot_poison_gradients(monkeypatch, available_nvidia_ops, flash):
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", segmented_flash_forward([]))
+    model = attention_model("veomni_flash_attention_2" if flash else "sdpa")
+    attention = model.dit.blocks[0].attn
     x = torch.randn(8, 32, requires_grad=True)
-    monkeypatch.setattr(torch, "empty_like", lambda value: torch.full_like(value, float("nan")))
+    # Uninitialized storage shows up as NaN in the uncovered rows and their weight gradients.
+    monkeypatch.setattr(torch, "empty_like", lambda value, **kwargs: torch.full_like(value, float("nan")))
+    new_empty = torch.Tensor.new_empty
+    monkeypatch.setattr(torch.Tensor, "new_empty", lambda self, *a, **k: new_empty(self, *a, **k).fill_(float("nan")))
     output = attention(x, rope_cos=None, rope_sin=None, cu_seqlens=(0, 7), max_seqlen=7)
     output[:7].square().mean().backward()
     assert all(torch.isfinite(param.grad).all() for param in attention.parameters())
     assert torch.isfinite(x.grad).all()
-    assert torch.isfinite(output).all()
+    assert not output[7:].any()
+
+
+@pytest.mark.parametrize("flash", [False, True], ids=["sdpa", "flash"])
+def test_ulysses_head_blocks_call_the_bound_op_after_their_own_exchange(monkeypatch, available_nvidia_ops, flash):
+    """The async head-block path keeps its exchange and calls the shared op once per block, never with a dense mask."""
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", segmented_flash_forward([]))
+    model = attention_model("veomni_flash_attention_2" if flash else "sdpa")
+    attention = model.dit.blocks[0].attn
+    calls = []
+    handle = attention.veomni_attn
+
+    def record(module, query, key, value, attention_mask, **kwargs):
+        calls.append((query.shape, attention_mask, kwargs.get("cu_seq_lens_q"), kwargs["skip_ulysses"]))
+        return handle(module, query, key, value, attention_mask, **kwargs)
+
+    attention.veomni_attn = record
+    x = torch.randn(8, 32, requires_grad=True)
+    cu_seqlens = minimax_h3_dit._PackedBounds(torch.tensor([0, 3, 7], dtype=torch.int32), (0, 3, 7))
+    expected = attention(x, rope_cos=None, rope_sin=None, cu_seqlens=cu_seqlens, max_seqlen=4)
+    calls.clear()
+    # One SP rank: each head block's exchange is the identity, so the result must match the local path.
+    monkeypatch.setattr(minimax_h3_dit, "get_ulysses_sequence_parallel_group", lambda: object())
+    monkeypatch.setattr(minimax_h3_dit.dist, "get_world_size", lambda group: 1)
+    monkeypatch.setattr(minimax_h3_dit, "_all_to_all_single", lambda *args, **kwargs: object())
+    monkeypatch.setattr(minimax_h3_dit._AsyncA2A, "apply", lambda work, tensor, *args: tensor)
+    actual = attention(x, rope_cos=None, rope_sin=None, cu_seqlens=cu_seqlens, max_seqlen=4, use_ulysses=True)
+
+    torch.testing.assert_close(actual, expected)
+    assert not actual[7:].any()
+    heads = attention.num_heads
+    assert all(mask is None and skip for _, mask, _, skip in calls)
+    if flash:
+        assert [(shape[1], shape[2], cu.tolist()) for shape, _, cu, _ in calls] == [(1, 7, [0, 3, 7])] * heads
+    else:
+        assert [(shape[1], shape[2], cu) for shape, _, cu, _ in calls] == [(1, 3, None), (1, 4, None)] * heads
 
 
 @pytest.mark.parametrize("task", ["fl2va", "ref2va"])
@@ -437,7 +546,7 @@ def test_sequence_parallel_padding_remains_forward_local(monkeypatch, task):
     seen = []
 
     def block(hidden, **kwargs):
-        seen.append((hidden.shape[0], kwargs["rope_cos"].shape[0], kwargs["cu_seqlens"], kwargs["use_ulysses"]))
+        seen.append((hidden.shape[0], kwargs["rope_cos"].shape[0], kwargs["cu_seqlens"].host, kwargs["use_ulysses"]))
         return hidden
 
     for module in model.dit.blocks:
@@ -451,107 +560,62 @@ def test_sequence_parallel_padding_remains_forward_local(monkeypatch, task):
         model(**batch([sample, sample]))
 
 
-_HUB_UNAVAILABLE = pytest.mark.skipif(
-    is_torch_npu_available() or importlib.util.find_spec("kernels") is None,
-    reason="Hub FlashAttention needs the kernels package and is rejected on Ascend NPU.",
-)
-
-
 @pytest.mark.parametrize(
-    "backend",
+    ("backend", "bound"),
     [
-        "flash_attention_2",
-        pytest.param("flash_attention_2_hub", marks=_HUB_UNAVAILABLE),
-        "flash_attention_3",
-        pytest.param("flash_attention_3_hub", marks=_HUB_UNAVAILABLE),
+        ("flash_attention_2", "veomni_flash_attention_2"),
+        ("veomni_flash_attention_2_hub", "veomni_flash_attention_2_hub"),
+        ("veomni_flash_attention_3", "veomni_flash_attention_3"),
+        ("flash_attention_3_hub", "veomni_flash_attention_3_hub"),
     ],
 )
-def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(monkeypatch, backend):
-    from veomni.arguments import OpsImplementationConfig
-    from veomni.models.auto import build_foundation_model
-    from veomni.models.diffusers.minimax_h3.minimax_h3_transformer import (
-        modeling_minimax_h3_transformer as h3_modeling,
-    )
-
+def test_flash_backend_drives_single_sample_refiner_and_packed_attention(
+    monkeypatch, available_nvidia_ops, backend, bound
+):
     calls = []
-
-    def wrapped(self, q, k, v, *, cu_seqlens, max_seqlen, valid_seqlen):
-        bounds = cu_seqlens.device if isinstance(cu_seqlens, minimax_h3_dit._PackedBounds) else cu_seqlens
-        if not torch.is_tensor(bounds):
-            bounds = torch.tensor(bounds, dtype=torch.int32)
-        calls.append(bounds.tolist())
-        return minimax_h3_dit._sdpa_varlen_attention(q, k, v, tuple(bounds.tolist()), self.softmax_scale, True)
-
-    def bind_packed_name(module, *, is_causal, impl=None):
-        # github/main mocks `_load_veomni_flash_kernel` so this case never
-        # constructs a real FA backend. FA3 is CUDA SM90-only.
-        module.is_causal = is_causal
-        module.config._attn_implementation = impl
-
-    monkeypatch.setattr(minimax_h3_dit.MiniMaxH3Attention, "_run_packed_attention", wrapped)
-    monkeypatch.setattr(h3_modeling, "bind_minimax_attention", bind_packed_name)
-    ops = OpsImplementationConfig(
-        attn_implementation=backend,
-        rms_norm_implementation="eager",
-        rotary_pos_emb_implementation="eager",
-        swiglu_mlp_implementation="eager",
-        cross_entropy_loss_implementation="eager",
-        moe_implementation="eager",
-        load_balancing_loss_implementation="eager",
-    )
-    model = build_foundation_model(
-        tiny_model().config, init_device="cpu", torch_dtype="float32", ops_implementation=ops
-    ).bfloat16()
-    raws = [raw_sample(3), raw_sample(7)]
-    for row in raws:
-        for key, value in row.items():
-            if torch.is_tensor(value) and value.is_floating_point():
-                row[key] = value.bfloat16()
-    samples = prepare(condition_model(), raws)
-    serial(model, samples)
-    assert calls == []
-    out = model(**batch(samples))
-    sum(out.loss.values()).backward()
-    assert calls[:2] == [[0, 3], [0, 7]]
-    assert len(calls) == 4 and calls[2] == calls[3] and len(calls[2]) == 3
-
-
-def test_flash_backend_defers_packed_kernel_until_multisample_forward(monkeypatch):
-    from veomni.models.diffusers.minimax_h3.minimax_h3_transformer import (
-        modeling_minimax_h3_transformer as h3_modeling,
-    )
-
-    loads = []
-
-    def unavailable(module, *, is_causal, impl=None):
-        loads.append(impl)
-        raise ImportError("flash_attn unavailable")
-
-    # github/main mocks `_load_veomni_flash_kernel`. Packed load is the bind.
-    monkeypatch.setattr(h3_modeling, "bind_minimax_attention", unavailable)
-    config = tiny_model().config
-    config._attn_implementation = "veomni_flash_attention_2"
-    model = MiniMaxH3DiTModel(config)
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", segmented_flash_forward(calls))
+    torch.manual_seed(0)
+    reference = attention_model("sdpa")
+    model = attention_model(backend)
+    model.load_state_dict(reference.state_dict())
+    assert {module.veomni_attn.impl for module in attention_modules(model)} == {bound}
     samples = prepare(condition_model(), [raw_sample(3), raw_sample(7)])
+    lengths = [sample["x"].shape[1] for sample in samples]
 
-    serial(model, samples[:1])
-    assert loads == []
-    with pytest.raises(ImportError, match="flash_attn unavailable"):
-        model(**batch(samples))
-    assert loads == ["veomni_flash_attention_2"]
+    for sample, length, text_len in zip(samples, lengths, (3, 7)):
+        actual, expected = model(**sample), reference(**sample)
+        # One refiner layer, then two DiT layers; nothing falls back to SDPA for M=1.
+        assert [call["cu_seqlens"] for call in calls] == [[0, text_len], [0, length], [0, length]]
+        calls.clear()
+        for a, b in zip(actual.predictions, expected.predictions):
+            torch.testing.assert_close(a, b)
+
+    actual, expected = model(**batch(samples)), reference(**batch(samples))
+    sum(actual.loss.values()).backward()
+    sum(expected.loss.values()).backward()
+    packed = [0, lengths[0], sum(lengths)]
+    assert [call["cu_seqlens"] for call in calls] == [[0, 3], [0, 7], packed, packed]
+    for key in expected.loss:
+        torch.testing.assert_close(actual.loss[key], expected.loss[key])
+    grads = dict(reference.named_parameters())
+    for name, param in model.named_parameters():
+        torch.testing.assert_close(param.grad, grads[name].grad, msg=name)
+    # Building and running the flash model leaves the reference instance on its own row.
+    assert {module.veomni_attn.impl for module in attention_modules(reference)} == {"sdpa"}
 
 
+@pytest.mark.parametrize("mode", ["single", "packed"])
 @pytest.mark.parametrize("checkpointing", [False, True])
-def test_packed_sdpa_slices_with_host_bounds(monkeypatch, checkpointing):
-    sdpa = minimax_h3_dit._sdpa_varlen_attention
+def test_attention_bounds_are_built_once_without_device_reads(monkeypatch, mode, checkpointing):
+    attend = minimax_h3_dit.MiniMaxH3Attention._attend
     bounds = []
 
-    def record(q, k, v, cu_seqlens, softmax_scale, compatibility_mode=False):
+    def record(self, q, k, v, cu_seqlens, max_seqlen):
         bounds.append(cu_seqlens)
-        return sdpa(q, k, v, cu_seqlens, softmax_scale, compatibility_mode)
+        return attend(self, q, k, v, cu_seqlens, max_seqlen)
 
-    monkeypatch.setattr(minimax_h3_dit, "_sdpa_varlen_attention", record)
-    raws = [raw_sample(3), raw_sample(7)]
+    monkeypatch.setattr(minimax_h3_dit.MiniMaxH3Attention, "_attend", record)
+    raws = [raw_sample(3), raw_sample(7)][: 1 if mode == "single" else 2]
     for row in raws:
         row["use_gradient_checkpointing"] = checkpointing
     samples = prepare(condition_model(), raws)
@@ -559,12 +623,15 @@ def test_packed_sdpa_slices_with_host_bounds(monkeypatch, checkpointing):
     reads = []
     tolist = torch.Tensor.tolist
     monkeypatch.setattr(torch.Tensor, "tolist", lambda self: reads.append(self.shape) or tolist(self))
-    out = model(**batch(samples))
+    out = model(**samples[0]) if mode == "single" else model(**batch(samples))
     sum(out.loss.values()).backward()
     assert reads == []  # packing and the DiT use host bounds; no device read-back
 
-    assert len(bounds) == 4 + 2 * checkpointing
-    assert all(type(bound) is tuple and all(type(value) is int for value in bound) for bound in bounds)
+    assert len(bounds) == len(raws) + 2 + 2 * checkpointing
+    assert all(type(bound) is minimax_h3_dit._PackedBounds for bound in bounds)
+    assert all(all(type(value) is int for value in bound.host) for bound in bounds)
+    main = [bound for bound in bounds if bound.host[-1] > 7]
+    assert len({id(bound) for bound in main}) == 1  # one object shared by every block and recomputation
 
 
 @pytest.mark.parametrize("task", ["fl2va", "ref2va"])

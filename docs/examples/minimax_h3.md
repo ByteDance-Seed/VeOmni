@@ -285,28 +285,55 @@ H3 implementation. Low-precision repeated-index reductions can vary even between
 serial repeats, so packed-gradient comparisons must also measure that baseline
 variability; a separate accumulation-precision fix must not silently change the
 single-sample path. Sample-local refiner execution is restricted to cross-sample
-packing; ordinary single-sample attention dispatch is preserved.
+packing; single-sample and packed forwards use the same configured attention
+backend.
 
 ### Attention and validation
 
-- `eager` / `sdpa`: explicit per-segment PyTorch SDPA reference path; main-DiT
-  projections and MLPs still operate on compact cross-sample rows.
-- `flash_attention_2` / `flash_attention_3` in `model.ops_implementation` resolve
-  to VeOmni's local FA2/FA3 backends, and `flash_attention_2_hub` /
-  `flash_attention_3_hub` to the Hugging Face Hub kernels
-  (`kernels-community/flash-attn2` / `flash-attn3`, version 1). Each main-DiT
-  layer uses one non-causal varlen call; refiner layers retain one call per
-  sample. The kernel is loaded on the first multi-sample forward and needs
-  BF16/FP16; unavailable kernels are not silently replaced with SDPA.
+`model.ops_implementation.attn_implementation` is bound to every main-DiT and
+token-refiner attention layer when the model is built, as an instance-local
+`attention/standard` `VeomniOp`. The same handle serves single-sample (`M=1`),
+multi-sample packed and Ulysses forwards; there is no H3-specific kernel loader.
+The installed ops selection is the only source: `config._attn_implementation`
+is not read, so a model constructed directly without an ops selection uses the
+SDPA reference.
+
+- `eager` / `sdpa` / `veomni_sdpa`: plain PyTorch SDPA, one dense call per segment.
+  H3 has no module-local eager attention, and these calls carry no mask, so all
+  three select the stock `sdpa` row rather than `veomni_sdpa`'s masked-SDPA
+  backend pin. No `S x S` block-diagonal mask is built.
+- `flash_attention_2` / `flash_attention_3` and `flash_attention_2_hub` /
+  `flash_attention_3_hub`: VeOmni's FlashAttention adapter with the local or
+  Hugging Face Hub kernel (`kernels-community/flash-attn2` / `flash-attn3`,
+  version 1). Each layer makes one non-causal varlen call over all segments;
+  refiner layers keep one call per sample when packing. Kernels need BF16/FP16.
+- Other names (including `flash_attention_4`, flex, sage and magi) raise at model
+  build. An unavailable kernel or platform also fails at build instead of being
+  replaced with SDPA. FA3 and Hub rows are unavailable on Ascend NPU; the FA2 row
+  maps to Transformers' NPU varlen integration, which copies `cu_seqlens` to the
+  host on every call.
+
+Under Ulysses SP the async head-block exchange stays in `MiniMaxH3Attention`;
+after each block's exchange it calls the same handle with `skip_ulysses=True`, so
+the adapter does not exchange again. Segment bounds are built once per forward,
+as host integers and one device `int32` tensor (`_PackedBounds`, in single-sample
+and packed mode alike), and shared by every block and checkpoint recomputation.
+The varlen maximum segment length is taken from the host bounds, so a legacy
+layout's 64-row tail is covered even when it is longer than `max_seqlen_q`.
+
+`MINIMAX_H3_ATTENTION_IMPLEMENTATION` no longer selects the DiT attention; a
+warning is logged when it is set. Use `model.ops_implementation` instead.
 
 `tests/models/test_minimax_h3_packing.py` uses a native tiny model on CPU to
 check packed-versus-serial outputs, losses and gradients (including mixed target
 geometry and checkpoint recomputation), sample isolation, Ref2VA variable
 references, forward-local SP padding and fail-closed inputs. SP collectives are
-mocked there, so it does not establish distributed SP parity. The FA2/FA3 call
-site is checked for all four backends with a kernel stub that asserts the
-varlen layout; kernel correctness itself is covered by
-`tests/ops/test_flash_attn_varlen_padding.py`.
+mocked there, so it does not establish distributed SP parity. For the FlashAttention
+names, only the kernel below VeOmni's adapter is replaced by a segmented SDPA
+oracle; single-sample, refiner and packed calls are checked against the SDPA
+reference. Kernel correctness itself is covered by the GPU tests in
+`tests/ops/attention/flash/test_flash_attention.py`. Ascend NPU execution of
+this path has not been validated.
 No end-to-end speedup or convergence is claimed. Benchmark against an equivalent,
 tuned non-packed baseline before claiming a performance improvement.
 

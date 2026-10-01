@@ -929,16 +929,15 @@ def test_no_implicit_sync_in_minimax_h3_forward_backward(mode, attention):
     if attention != "sdpa" and importlib.util.find_spec("flash_attn") is None:
         pytest.skip("flash_attn package not installed.")
 
-    from tests.models.test_minimax_h3_packing import condition_model, raw_sample, tiny_model
+    from tests.models.test_minimax_h3_packing import attention_model, condition_model, raw_sample
     from veomni.trainer.dit_trainer import DiTDataCollator
 
     fused = attention != "sdpa"
     dtype = torch.bfloat16 if fused else torch.float32
     device = get_device_type()
     torch.manual_seed(0)
-    config = tiny_model().config
-    config._attn_implementation = attention
-    model = type(tiny_model())(config).to(device=device, dtype=dtype)
+    # H3 binds attention from the ops selection, so the single-sample path also runs FA here.
+    model = attention_model(attention).to(device=device, dtype=dtype)
     raws = [raw_sample(3), raw_sample(5, "ref2va")][: 1 if mode == "single" else 2]
     for row in raws:
         row["use_gradient_checkpointing"] = True

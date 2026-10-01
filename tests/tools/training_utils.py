@@ -67,8 +67,8 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # official path builds a ``(B, S)`` padding mask, so keep SDPA rather than
     # FA. RoPE stays eager because this family has no fused rope row.
     "qwen_image": {"attn_implementation": "sdpa", "rotary_pos_emb_implementation": "eager"},
-    # MiniMax H3 has no module-local eager attention. Packed DiT uses SDPA with
-    # a block-diagonal mask; production FA takes cu_seqlens once.
+    # MiniMax H3 has no module-local eager attention. Its SDPA reference runs one
+    # dense call per segment; FA rows take the packed cu_seqlens in one call.
     "minimax_h3": {"attn_implementation": "sdpa"},
     # LTX has no module-local eager attention. The callable adapter binds
     # ``attention/standard``; a mask falls back to SDPA.

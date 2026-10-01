@@ -55,17 +55,6 @@ def minimax_attention(
     return output.transpose(1, 2)
 
 
-def packed_block_diag_mask(cu_seqlens: torch.Tensor, seq_len: int, device: torch.device) -> torch.Tensor:
-    """Boolean ``(1, 1, S, S)`` mask that keeps attention inside packed segments."""
-    if not isinstance(cu_seqlens, torch.Tensor):
-        raise TypeError(f"cu_seqlens must be a torch.Tensor, got {type(cu_seqlens).__name__}")
-    cu_seqlens = cu_seqlens.to(device=device)
-    positions = torch.arange(seq_len, device=device)
-    segment_ids = torch.bucketize(positions, cu_seqlens[1:], right=True)
-    mask = segment_ids[:, None] == segment_ids[None, :]
-    return mask.view(1, 1, seq_len, seq_len)
-
-
 def is_flash_attn_impl(impl: str) -> bool:
     """True when the selected attention impl can take FA varlen kwargs."""
     return "flash_attention" in impl
