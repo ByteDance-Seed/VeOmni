@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -17,10 +19,39 @@ def test_generated_multimodal_children(monkeypatch, toy_name):
         assert type(tower).__module__ == model_class.__module__
 
 
+def test_gemma4_generated_children_and_packed_masks(monkeypatch):
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    config = get_model_config("./tests/toy_config/gemma4_toy")
+    model_class = get_model_class(config)
+    model = model_class._from_config(config, attn_implementation="eager")
+
+    assert type(model.model.vision_tower).__module__ == model_class.__module__
+    assert type(model.model.audio_tower).__module__ == model_class.__module__
+    assert type(model.model.language_model).__module__ == model_class.__module__
+
+    modeling_module = sys.modules[model_class.__module__]
+    seen_cu_seq_lens = []
+
+    def capture_mask(**kwargs):
+        seen_cu_seq_lens.append(kwargs.get("cu_seq_lens_q"))
+        return None
+
+    monkeypatch.setattr(modeling_module, "create_causal_mask", capture_mask)
+    monkeypatch.setattr(modeling_module, "create_sliding_window_causal_mask", capture_mask)
+
+    input_ids = torch.tensor([[2, 7, 11, 13, 17, 1]])
+    cu_seq_lens_q = torch.tensor([0, 3, 6], dtype=torch.int32)
+    model(input_ids=input_ids, cu_seq_lens_q=cu_seq_lens_q, use_cache=False)
+
+    assert len(seen_cu_seq_lens) == 2
+    assert all(torch.equal(value, cu_seq_lens_q) for value in seen_cu_seq_lens)
+
+
 local_test_cases = [
     pytest.param("./tests/toy_config/qwen2vl_toy", True, False, ["config", "model", "processor"], ["model"]),
     pytest.param("./tests/toy_config/movqgan_toy", False, True, [], ["config", "model", "processor"]),
     pytest.param("./tests/toy_config/gpt_oss_toy", True, False, ["config", "model"], ["model"]),
+    pytest.param("./tests/toy_config/gemma4_toy", True, False, ["config", "model"], ["model"]),
 ]
 
 
