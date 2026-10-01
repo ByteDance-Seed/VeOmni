@@ -168,8 +168,11 @@ class Embeddings1DConnector(torch.nn.Module):
             freq_grid_generator=freq_grid_generator,
         )
 
+        # Registers replace every padded position, so the returned bias is all zeros. Skipping it
+        # is exact and keeps the blocks on the configured kernel instead of the masked SDPA path.
+        block_mask = None if self.num_learnable_registers else additive_attention_mask
         for block in self.transformer_1d_blocks:
-            hidden_states = block(hidden_states, additive_attention_mask=additive_attention_mask, pe=freqs_cis)
+            hidden_states = block(hidden_states, additive_attention_mask=block_mask, pe=freqs_cis)
 
         hidden_states = self.veomni_rms_norm_unweighted(hidden_states, eps=_UNWEIGHTED_RMS_NORM_EPS)
 

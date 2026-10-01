@@ -14,6 +14,10 @@ from ltx_core.model.transformer.rope import LTXRopeType
 
 from veomni.ops import VeomniOp
 from veomni.ops.config import resolve_op_impl
+from veomni.utils import logging
+
+
+logger = logging.get_logger(__name__)
 
 
 _SDPA_ATTN_IMPLS = frozenset({"sdpa", "veomni_sdpa"})
@@ -49,13 +53,19 @@ def _hf_attention_mask(mask: torch.Tensor) -> torch.Tensor:
 
 
 class VeomniLTXAttention:
-    """``AttentionCallable`` / ``MaskedAttentionCallable`` adapter over ``attention/standard``."""
+    """``AttentionCallable`` / ``MaskedAttentionCallable`` adapter over ``attention/standard``.
+
+    LTX masks are additive (soft) biases that this adapter passes only to SDPA,
+    so a non-SDPA implementation runs masked calls through SDPA and logs it once.
+    """
 
     def __init__(self, impl: str) -> None:
         self.veomni_attn = VeomniOp("attention", "standard", impl)
         self.veomni_attn_masked = (
             self.veomni_attn if impl in _SDPA_ATTN_IMPLS else VeomniOp("attention", "standard", "sdpa")
         )
+        self.masks_fall_back_to_sdpa = self.veomni_attn_masked is not self.veomni_attn
+        self._is_flash = "flash_attention" in impl
         self.is_causal = False
         self.layer_idx = None
         self.num_key_value_groups = 1
@@ -78,7 +88,20 @@ class VeomniLTXAttention:
         key = k.view(batch, -1, heads, dim_head).transpose(1, 2)
         value = v.view(batch, -1, heads, dim_head).transpose(1, 2)
         attention_mask = None if mask is None else _hf_attention_mask(mask)
-        handle = self.veomni_attn_masked if attention_mask is not None else self.veomni_attn
+        if attention_mask is not None and self.masks_fall_back_to_sdpa:
+            logger.warning_once(
+                f"LTX-2.3 attn_implementation={self.config._attn_implementation!r} does not take LTX's additive "
+                "attention masks; masked attention calls run through SDPA."
+            )
+            handle = self.veomni_attn_masked
+        else:
+            # The flash adapter infers its cast target from module weights for FP32 queries; this adapter has none.
+            if self._is_flash and q.dtype == torch.float32 and not torch.is_autocast_enabled():
+                raise ValueError(
+                    f"LTX-2.3 {self.config._attn_implementation} needs FP16/BF16 attention inputs or autocast, "
+                    "got float32."
+                )
+            handle = self.veomni_attn
         output, _ = handle(
             self,
             query,

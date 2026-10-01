@@ -282,6 +282,136 @@ def test_ltx_non_sdpa_masked_falls_back_to_sdpa():
     assert adapter.veomni_attn.impl == "eager"
     assert adapter.veomni_attn_masked.impl == "sdpa"
     assert adapter.veomni_attn_masked is not adapter.veomni_attn
+    assert adapter.masks_fall_back_to_sdpa
+    assert not VeomniLTXAttention("sdpa").masks_fall_back_to_sdpa
+
+
+def _dense_flash_forward(calls: list):
+    """CPU stand-in for Transformers' ``_flash_attention_forward``: ``[B, S, H, D]`` in and out."""
+
+    def forward(query, key, value, attention_mask, query_length, is_causal, softmax_scale=None, **kwargs):
+        calls.append(kwargs["attn_implementation"])
+        assert attention_mask is None and not is_causal and kwargs.get("cu_seq_lens_q") is None
+        q, k, v = (t.transpose(1, 2) for t in (query, key, value))
+        return F.scaled_dot_product_attention(q, k, v, scale=softmax_scale).transpose(1, 2)
+
+    return forward
+
+
+def _flash_ops_config() -> SimpleNamespace:
+    ops = _sdpa_ops_config()
+    ops.attn_implementation = "veomni_flash_attention_2"
+    return ops
+
+
+def test_ltx_flash_keeps_unmasked_calls_and_logs_the_masked_fallback(monkeypatch, available_nvidia_ops):
+    """``available_nvidia_ops`` passes the registry's CUDA gates; only the kernel below the adapter is replaced."""
+    import ltx_core.model.transformer.attention as ltx_attention
+
+    from veomni.ops.kernels.attention.standard import flash as flash_backend
+
+    flash_calls: list = []
+    warnings: list = []
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", _dense_flash_forward(flash_calls))
+    monkeypatch.setattr(ltx_attention.logger, "warning_once", warnings.append)
+    monkeypatch.setattr(Attention, "forward", ltx_modeling.LTXSPAttention_forward)
+    monkeypatch.setattr(LTXModel, "forward", ltx_modeling.LTXVideoModel_forward)
+
+    torch.manual_seed(3)
+    config = _tiny_config()
+    with ops_config_scope(_sdpa_ops_config()):
+        reference = ltx_modeling.LTXVideoTransformerModel(config)
+        reference.apply(reference._init_weights)
+    with ops_config_scope(_flash_ops_config()):
+        flash = ltx_modeling.LTXVideoTransformerModel(config)
+    flash.load_state_dict(reference.state_dict())
+    reference, flash = reference.bfloat16(), flash.bfloat16()
+
+    inputs = {key: [value.bfloat16() for value in values] for key, values in _ltx_inputs().items()}
+    counts = {}
+    for name, context_mask in (("unmasked", None), ("partial", [torch.tensor([[1, 1, 0]])])):
+        flash_calls.clear()
+        warnings.clear()
+        expected = reference(**inputs, context_mask=context_mask).predictions[0]
+        actual = flash(**inputs, context_mask=context_mask).predictions[0]
+        torch.testing.assert_close(actual, expected)
+        assert set(flash_calls) == {"flash_attention_2"}
+        counts[name] = len(flash_calls)
+        assert bool(warnings) == (context_mask is not None)
+        assert all("masked attention calls run through SDPA" in message for message in warnings)
+    # Only the masked text cross-attention calls leave the flash row.
+    assert 0 < counts["partial"] < counts["unmasked"]
+
+
+def test_ltx_connector_registers_skip_their_all_zero_mask(monkeypatch, available_nvidia_ops):
+    import ltx_core.model.transformer.attention as ltx_attention
+    from ltx_core.text_encoders.gemma.embeddings_connector import Embeddings1DConnector
+
+    from veomni.ops.kernels.attention.standard import flash as flash_backend
+
+    flash_calls: list = []
+    warnings: list = []
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", _dense_flash_forward(flash_calls))
+    monkeypatch.setattr(ltx_attention.logger, "warning_once", warnings.append)
+
+    def connector(ops):
+        torch.manual_seed(5)
+        with ops_config_scope(ops):
+            return Embeddings1DConnector(
+                attention_head_dim=4, num_attention_heads=2, num_layers=2, num_learnable_registers=2
+            ).bfloat16()
+
+    reference, flash = connector(_sdpa_ops_config()), connector(_flash_ops_config())
+    hidden = torch.randn(1, 4, 8, dtype=torch.bfloat16)
+    mask = torch.tensor([0.0, 0.0, 0.0, torch.finfo(torch.bfloat16).min], dtype=torch.bfloat16).view(1, 1, 1, 4)
+    # Exactness premise: once the registers fill the padding, the bias the blocks would get is zero.
+    _, filled = reference._replace_padded_with_learnable_registers(hidden, mask)
+    assert not filled.any()
+
+    expected, expected_mask = reference(hidden, mask)
+    actual, actual_mask = flash(hidden, mask)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_mask, expected_mask)
+    assert len(flash_calls) == 2 and not warnings
+
+
+@pytest.mark.parametrize("registers", [2, None])
+def test_ltx_condition_passes_no_context_mask_when_registers_fill_padding(monkeypatch, registers):
+    from ltx_core.text_encoders.gemma.embeddings_connector import Embeddings1DConnector
+    from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor
+
+    from veomni.models import MODELING_REGISTRY
+    from veomni.models.diffusers.ltx2_3.ltx_condition import modeling_ltx2_3_condition
+
+    monkeypatch.setattr(modeling_ltx2_3_condition.LTXVideoConditionModel, "_load_components", lambda self: None)
+    with ops_config_scope(_sdpa_ops_config()):
+        model = MODELING_REGISTRY["LTXVideoConditionModel"]()._from_config(_tiny_condition_config())
+        model.embeddings_processor = EmbeddingsProcessor(
+            video_connector=Embeddings1DConnector(
+                attention_head_dim=4, num_attention_heads=2, num_layers=1, num_learnable_registers=registers
+            )
+        )
+    model.scheduler = modeling_ltx2_3_condition.LTX2Scheduler()
+    out = model.process_condition(
+        latents=[torch.randn(1, 4, 1, 2, 2)],
+        context=[torch.randn(1, 4, 8)],
+        context_mask=[torch.tensor([[1, 1, 1, 0]])],
+    )
+    (context_mask,) = out["context_mask"]
+    if registers:
+        assert context_mask is None
+    else:
+        # Without registers the connector's mask is passed on unchanged.
+        assert torch.is_tensor(context_mask) and context_mask.shape == (1, 4)
+
+
+def test_ltx_flash_rejects_full_precision_inputs_with_a_clear_error(available_nvidia_ops):
+    adapter = VeomniLTXAttention("veomni_flash_attention_2")
+    query = torch.randn(1, 4, 16)
+    with pytest.raises(ValueError, match="needs FP16/BF16 attention inputs"):
+        adapter(query, query.bfloat16(), query.bfloat16(), heads=2)
+    # Masked calls run through SDPA, which accepts FP32.
+    assert adapter(query, query, query, heads=2, mask=torch.zeros(4, 4)).shape == (1, 4, 16)
 
 
 def test_ltx_adapter_expands_mask_and_skips_ulysses():

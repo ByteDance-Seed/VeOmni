@@ -129,6 +129,29 @@ data:
 The Gemma path is used by the preprocessing command; the shipped offline
 training configs consume the precomputed embeddings and do not reload Gemma.
 
+## Attention backend
+
+`model.ops_implementation.attn_implementation` is bound to the DiT self-, cross- and
+audio-video attention, and to the Gemma text connectors of the condition model, as an
+instance-local `attention/standard` `VeomniOp` when each model is built:
+
+- `sdpa`: PyTorch SDPA for every call, including masked ones.
+- `flash_attention_2` / `flash_attention_3` and `flash_attention_2_hub` /
+  `flash_attention_3_hub`: VeOmni's FlashAttention adapter with the local or Hugging
+  Face Hub kernel for unmasked calls. Queries must be BF16/FP16 (or run under autocast).
+- LTX masks are additive biases that the adapter passes only to SDPA. With any other
+  backend (including `flash_attention_4`, flex and sage) masked calls run through SDPA
+  and a warning is logged once.
+
+When the connectors use learnable registers (the default), the registers replace every
+padded text position, so the connector's own attention bias is all zeros and the DiT
+text context is all valid. The connector blocks then run without a mask and the
+condition model passes no `context_mask` to the DiT. Both are exact and keep those
+calls on the configured kernel without a host read. A context mask supplied otherwise
+takes the SDPA path for the masked text cross-attention.
+
+The shipped configs select `sdpa`; set `flash_attention_3` on Hopper to use FA3.
+
 ## Start training on GPU/NPU
 
 ### Audio-Video LoRA (default)
