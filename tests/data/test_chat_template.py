@@ -196,13 +196,19 @@ def test_one_registry_holds_both_template_kinds(template_name, is_multimodal):
 
 
 def test_build_chat_template_builds_both_kinds():
-    # One build function covers both, taking whatever the caller's modality has:
-    # the VLM trainer holds a processor, the text trainers only a tokenizer.
-    multimodal = build_chat_template("qwen3vl", _Processor(_VisionTokenizer()))
-    assert isinstance(multimodal, MultimodalChatTemplate)
-    assert multimodal.tokenizer is multimodal.processor.tokenizer
+    # A multimodal checkpoint can supply a processor even to a text-only
+    # training job. Each template kind must receive the interface it consumes.
+    tokenizer = _VisionTokenizer()
+    processor = _Processor(tokenizer)
 
-    assert not isinstance(build_chat_template("chatml", _VisionTokenizer()), MultimodalChatTemplate)
+    multimodal = build_chat_template("qwen3vl", processor)
+    assert isinstance(multimodal, MultimodalChatTemplate)
+    assert multimodal.processor is processor
+    assert multimodal.tokenizer is tokenizer
+
+    text = build_chat_template("chatml", processor)
+    assert not isinstance(text, MultimodalChatTemplate)
+    assert text.tokenizer is tokenizer
 
 
 def test_build_chat_template_still_rejects_unknown_names():

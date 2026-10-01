@@ -63,11 +63,13 @@ def test_a_multimodal_template_is_built_from_the_processor(template_name, monkey
 
 
 def test_a_text_template_is_built_from_the_tokenizer(monkeypatch):
-    runtime = _stub_runtime("chatml", tokenizer=_VisionTokenizer())
+    tokenizer = _VisionTokenizer()
+    runtime = _stub_runtime("chatml", processor=_Processor(tokenizer), tokenizer=tokenizer)
 
     _build(runtime, monkeypatch)
 
     assert isinstance(runtime.chat_template, ChatTemplate)
+    assert runtime.chat_template.tokenizer is tokenizer
 
 
 @pytest.mark.parametrize("no_template", [None, ""])
