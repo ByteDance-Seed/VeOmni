@@ -52,9 +52,21 @@ def wan_eager_attention_forward(
     return attn_output.transpose(1, 2), None
 
 
+def _projection_weight(module: torch.nn.Module) -> torch.Tensor:
+    """Return the projection's base weight for a plain ``nn.Linear`` or a LoRA-wrapped one.
+
+    ``LoraLinear`` keeps the frozen weight at ``base_layer`` and exposes no ``.weight``
+    of its own, so reading ``.weight`` directly raises ``AttributeError`` on any Wan run
+    with LoRA. Only dtype/device are read through this helper, which the adapters share
+    with the base weight; callers that need the effective projection must go through the
+    module's ``forward`` so the LoRA delta is applied.
+    """
+    return getattr(module, "base_layer", module).weight
+
+
 class WanAttentionKernelModule:
     def __init__(self, config: SimpleNamespace, attn: WanAttention):
-        target_dtype = attn.to_q.weight.dtype
+        target_dtype = _projection_weight(attn.to_q).dtype
         if target_dtype == torch.float32:
             target_dtype = torch.bfloat16
         self.config = SimpleNamespace(
@@ -125,10 +137,14 @@ def _assert_wan_flash_attention_bf16(
         "key": key.dtype,
         "value": value.dtype,
     }
+
+    # Keyed by module name rather than parameter path: under LoRA the tensor lives at
+    # ``to_q.base_layer.weight``, so naming ``to_q.weight`` would point at an attribute
+    # the model does not have.
     weight_dtypes = {
-        "to_q.weight": attn.to_q.weight.dtype,
-        "to_k.weight": attn.to_k.weight.dtype,
-        "to_v.weight": attn.to_v.weight.dtype,
+        "to_q": _projection_weight(attn.to_q).dtype,
+        "to_k": _projection_weight(attn.to_k).dtype,
+        "to_v": _projection_weight(attn.to_v).dtype,
     }
     assert all(dtype == torch.bfloat16 for dtype in tensor_dtypes.values()), (
         f"Wan flash-attention expects bf16 Q/K/V tensors, got {tensor_dtypes}."
@@ -264,7 +280,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
         if hidden_states_img is not None:
             hidden_states_out = hidden_states_out + hidden_states_img
 
-        hidden_states_out = hidden_states_out.type_as(attn.to_out[0].weight)
+        hidden_states_out = hidden_states_out.type_as(_projection_weight(attn.to_out[0]))
         hidden_states_out = attn.to_out[0](hidden_states_out)
         hidden_states_out = attn.to_out[1](hidden_states_out)
         return hidden_states_out
