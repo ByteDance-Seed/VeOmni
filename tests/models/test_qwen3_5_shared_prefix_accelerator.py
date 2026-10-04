@@ -1,4 +1,4 @@
-"""Shared-prefix training on Ascend: the full Qwen3.5 model, flag on vs off.
+"""Shared-prefix training on an accelerator: the full Qwen3.5 model, flag on vs off.
 
 A packed micro-batch holds rollouts that share a prompt, as GRPO produces. With
 ``text_config.shared_prefix_training`` the backbone computes the prompt once.
@@ -13,10 +13,16 @@ import torch
 from veomni.utils.device import get_device_type
 
 
-pytestmark = pytest.mark.skipif(get_device_type() != "npu", reason="shared-prefix training is NPU-only")
+DEVICE = get_device_type()
+pytestmark = pytest.mark.skipif(
+    DEVICE not in ("cuda", "npu"), reason="shared-prefix training needs the GPU or NPU modeling path"
+)
 
 TOY_CONFIG = "tests/toy_config/qwen3_5_toy"
 PREFIX, SUFFIX, GROUP = 1990, 96, 3  # prefix deliberately not a multiple of the 64-token chunk
+
+# The GDN ops the two modeling paths bind: vendored Triton on NPU, flash-linear-attention on GPU.
+GDN_BACKEND = {"npu": "npu", "cuda": "fla"}[DEVICE] if DEVICE in ("cuda", "npu") else "eager"
 
 
 @pytest.fixture(scope="module")
@@ -29,12 +35,12 @@ def model():
         config_path=TOY_CONFIG,
         weights_path=None,
         torch_dtype="bfloat16",
-        init_device="npu",
+        init_device=DEVICE,
         ops_implementation=OpsImplementationConfig(
             attn_implementation="veomni_flash_attention_2_with_sp",
-            chunk_gated_delta_rule_implementation="npu",
-            causal_conv1d_implementation="npu",
-            rms_norm_gated_implementation="npu",
+            chunk_gated_delta_rule_implementation=GDN_BACKEND,
+            causal_conv1d_implementation=GDN_BACKEND,
+            rms_norm_gated_implementation=GDN_BACKEND,
         ),
     )
     model.train()
@@ -52,10 +58,10 @@ def _sequences():
 
 def _run(model, seqs, weights):
     """Packed forward + backward; returns per-sequence log-probs and the gradients."""
-    ids = torch.cat(seqs)[None].npu()
+    ids = torch.cat(seqs)[None].to(DEVICE)
     lens = [len(s) for s in seqs]
-    cu = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32).npu()
-    pos = torch.cat([torch.arange(n) for n in lens]).npu().view(1, 1, -1).expand(4, 1, -1).contiguous()
+    cu = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32).to(DEVICE)
+    pos = torch.cat([torch.arange(n) for n in lens]).to(DEVICE).view(1, 1, -1).expand(4, 1, -1).contiguous()
     out = model(
         input_ids=ids,
         position_ids=pos,
@@ -87,7 +93,7 @@ def test_shared_prefix_matches_packed_training(model, monkeypatch):
     from veomni.models.transformers.qwen3_5 import shared_prefix
 
     seqs = _sequences()
-    weights = [torch.randn(len(s) - 1).npu() for s in seqs]
+    weights = [torch.randn(len(s) - 1).to(DEVICE) for s in seqs]
 
     model.config.text_config.shared_prefix_training = False
     packed = _run(model, seqs, weights)
