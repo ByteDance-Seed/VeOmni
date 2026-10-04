@@ -2755,6 +2755,28 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
         model_kwargs = dict(kwargs)
         model_kwargs["return_mtp_context"] = requires_mtp_context
+        # Modification: shared-prefix training. Group packed sequences that share a token prefix so the
+        # text backbone computes each prefix once; outputs keep the packed layout. Text-only: image and video
+        # placeholders share token ids across different media, so token equality would not imply a shared prefix.
+        if (
+            getattr(self.config.text_config, "shared_prefix_training", False)
+            and input_ids is not None
+            and pixel_values is None
+            and pixel_values_videos is None
+        ):
+            if input_ids.device.type != "npu":
+                raise NotImplementedError("Shared-prefix training is implemented for the NPU modeling path only.")
+            from veomni.models.transformers.qwen3_5.shared_prefix import build_shared_prefix_plan
+
+            plan = build_shared_prefix_plan(
+                input_ids,
+                kwargs["cu_seq_lens_q"],
+                position_ids=position_ids,
+                conv_kernel_size=self.config.text_config.linear_conv_kernel_dim,
+            )
+            if plan is not None:
+                model_kwargs["shared_prefix_plan"] = plan
+        shared_prefix_plan = model_kwargs.get("shared_prefix_plan")
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -2770,6 +2792,20 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs[0]
+        # Modification: under shared prefix the backbone returns the compact row. For per-token log-probs,
+        # score each distinct (row, label) pair once and expand the results; otherwise expand the hidden states.
+        lm_inverse = None
+        if shared_prefix_plan is not None:
+            if labels is not None and kwargs.get("return_log_probs") and kwargs.get("teacher_topk_ids") is None:
+                shift_labels = kwargs.pop("shift_labels", None)
+                if shift_labels is None:
+                    shift_labels = F.pad(labels[..., 1:], (0, 1), value=IGNORE_INDEX)  # noqa: F821
+                lm_rows, labels, lm_inverse = shared_prefix_plan.lm_rows(shift_labels)
+                hidden_states = hidden_states.index_select(1, lm_rows)
+                labels = labels[None]
+                kwargs["shift_labels"] = labels
+            else:
+                hidden_states = shared_prefix_plan.expand(hidden_states)
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         hidden_states = hidden_states[:, slice_indices, :]
@@ -2804,6 +2840,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                     logits = None
         else:
             logits = self.lm_head(hidden_states)
+
+        if lm_inverse is not None:
+            fused_linear_aux.log_probs = fused_linear_aux.log_probs.reshape(-1).index_select(0, lm_inverse)[None]
+            fused_linear_aux.entropy = fused_linear_aux.entropy.reshape(-1).index_select(0, lm_inverse)[None]
 
         loss_dict = None
         if requires_mtp_context:

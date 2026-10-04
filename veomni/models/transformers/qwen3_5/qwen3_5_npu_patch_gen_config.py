@@ -23,6 +23,7 @@ Language-model focused patches from qwen3_next example:
 3. Use VeOmni fused loss path in Qwen3_5ForConditionalGeneration.forward.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -30,9 +31,11 @@ import torch.nn.functional as F
 from transformers.cache_utils import Cache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPooling
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5CausalLMOutputWithPast,
     apply_mask_to_padding_states,
+    eager_attention_forward,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
@@ -258,8 +261,12 @@ def qwen3_5_gated_deltanet_forward_patched(
     cu_seqlens_list: list[int] | None = None,
     chunk_indices: dict | None = None,
     chunk_indices_list: dict | None = None,
+    # Modification: shared-prefix plan; the conv and the delta rule run on its compact row.
+    shared_prefix_plan=None,
 ):
     """Run GatedDeltaNet with precomputed varlen metadata on Ascend NPU."""
+    if shared_prefix_plan is not None and get_parallel_state().ulysses_enabled:
+        raise NotImplementedError("Shared-prefix training does not support Ulysses sequence parallelism yet.")
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
     # Set up dimensions for reshapes later
@@ -344,15 +351,27 @@ def qwen3_5_gated_deltanet_forward_patched(
             else:
                 conv_weight = self.conv1d.weight.squeeze(1)
             # mixed_qkv is [B, S, D] — FLA causal_conv1d expects [B, S, D].
-            mixed_qkv = self.causal_conv1d_fn(
-                x=mixed_qkv,
-                weight=conv_weight,
-                bias=self.conv1d.bias,
-                activation=self.activation,
-                seq_idx=None,
-                backend="triton",
-                cu_seqlens=cu_seq_lens_q.npu(),
-            )[0]
+            if shared_prefix_plan is not None:
+                # Modification: one varlen call; suffixes take the prefix tail as look-back context.
+                mixed_qkv = shared_prefix_plan.causal_conv1d(
+                    self.causal_conv1d_fn,
+                    mixed_qkv,
+                    weight=conv_weight,
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    seq_idx=None,
+                    backend="triton",
+                )
+            else:
+                mixed_qkv = self.causal_conv1d_fn(
+                    x=mixed_qkv,
+                    weight=conv_weight,
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    seq_idx=None,
+                    backend="triton",
+                    cu_seqlens=cu_seq_lens_q.npu(),
+                )[0]
         else:
             raise NotImplementedError("This path is not supported yet because it can't process varlen now.")
 
@@ -392,6 +411,12 @@ def qwen3_5_gated_deltanet_forward_patched(
                 "chunk_gated_delta_rule backend. On GPU, set the implementation to 'fla' or "
                 "'flash_qla'; on NPU, set it to 'fla' or 'npu'."
             )
+        elif shared_prefix_plan is not None:
+            # Modification: two varlen calls; suffixes start from the prefix state at its last chunk boundary.
+            core_attn_out = shared_prefix_plan.gated_delta_rule(
+                self.chunk_gated_delta_rule, query, key, value, g, beta, use_qk_l2norm_in_kernel=True
+            )
+            last_recurrent_state = None
         else:
             # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
             core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
@@ -444,6 +469,63 @@ def qwen3_5_gated_deltanet_forward_patched(
 
 
 @config.override_method(
+    "Qwen3_5Attention.forward",
+    description="Shared-prefix training: suffix queries attend to [prefix | suffix] keys in one varlen call",
+)
+def qwen3_5_attention_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None,
+    past_key_values: Cache | None = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states, gate = torch.chunk(self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
+    gate = gate.reshape(*input_shape, -1)
+
+    query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+    # Modification: a prefix attends to itself and each suffix to [prefix | suffix]; one varlen call,
+    # bottom-right causal. Queries stay in compact order, keys and values are gathered per sequence.
+    shared_prefix_plan = kwargs.pop("shared_prefix_plan", None)
+    if shared_prefix_plan is not None:
+        key_states, value_states = shared_prefix_plan.attention_kv(key_states, value_states, seq_dim=2)
+        kwargs.update(shared_prefix_plan.attention_kwargs())
+
+    attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+        self.config._attn_implementation, eager_attention_forward
+    )
+
+    attn_output, attn_weights = attention_interface(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = attn_output * torch.sigmoid(gate)
+
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights
+
+
+@config.override_method(
     "Qwen3_5DecoderLayer.forward",
     description="Extract and pass cu_seq_lens_q + precomputed varlen metadata for AscendC GDN kernels in Qwen3_5DecoderLayer.forward",
 )
@@ -462,8 +544,10 @@ def qwen3_5_decoder_layer_forward_patched(
     hidden_states = self.input_layernorm(hidden_states)
 
     # Modification: read varlen metadata from kwargs and enforce it for linear-attention varlen kernels.
+    # A shared-prefix plan carries its own layouts and replaces cu_seq_lens_q.
+    shared_prefix_plan = kwargs.get("shared_prefix_plan", None)
     cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
-    assert cu_seq_lens_q is not None, (
+    assert cu_seq_lens_q is not None or shared_prefix_plan is not None, (
         "cu_seq_lens_q must be provided to support varlen Flash Linear Attention, varlen Conv1D,"
         "and to remove the full Flash Attention CPU-GPU sync."
     )
@@ -484,6 +568,7 @@ def qwen3_5_decoder_layer_forward_patched(
             cu_seqlens_list=linear_attn_cu_seqlens_list,
             chunk_indices=linear_attn_chunk_indices,
             chunk_indices_list=linear_attn_chunk_indices_list,
+            shared_prefix_plan=shared_prefix_plan,
         )
     elif self.block_type == "full_attention":
         # Self Attention
@@ -547,6 +632,17 @@ def qwen3_5_text_model_forward_patched(
     elif position_ids.ndim == 2:
         position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
 
+    # Modification: shared-prefix training runs the decoder stack on a compact row in which
+    # every shared prefix appears once; the final hidden states are expanded back below.
+    shared_prefix_plan = kwargs.get("shared_prefix_plan", None)
+    if shared_prefix_plan is not None:
+        if return_mtp_context or use_cache:
+            raise NotImplementedError("Shared-prefix training supports neither MTP nor KV cache.")
+        inputs_embeds = shared_prefix_plan.compact(inputs_embeds)
+        position_ids = shared_prefix_plan.compact(position_ids, dim=-1)
+        for key in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"):
+            kwargs.pop(key, None)
+
     if position_ids.ndim == 3 and position_ids.shape[0] == 4:
         text_position_ids = position_ids[0]
         position_ids = position_ids[1:]
@@ -603,6 +699,8 @@ def qwen3_5_text_model_forward_patched(
             **kwargs,
         )
 
+    # Modification: under shared prefix the compact row is returned; the caller expands it (after the LM
+    # head where possible), and backward sums the copies of each shared row.
     hidden_states = self.norm(hidden_states)
 
     mtp_context = None
