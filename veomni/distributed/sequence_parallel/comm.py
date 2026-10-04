@@ -134,7 +134,7 @@ def get_context_parallel_world_size():
     if dist.is_available() and dist.is_initialized():
         return dist.get_world_size(group=get_context_parallel_group())
     else:
-        return 0
+        return 1
 
 
 # ----------------------------- Unified Parallel ---------------------------- #

@@ -70,18 +70,22 @@ def unpad_tensor(x: Tensor, dim: int, padding_size: int) -> Tensor:
 
 
 def remove_last_rank_padding(x: Tensor, dim: int, unpad_dim_size: int, group: ProcessGroup = None) -> Tensor:
+    """
+    A func to drop the tail padding that falls inside this rank's shard.
+
+    ``x`` is this rank's equal-size shard of a sequence that was right-padded from
+    ``unpad_dim_size`` to a multiple of the SP world size. Padding can spill past the
+    last rank when the sequence is shorter than the world size, so trim by position.
+    """
     group = get_ulysses_sequence_parallel_group() if group is None else group
     if not group:
         return x
     sp_rank = get_ulysses_sequence_parallel_rank(group)
-    sp_world = get_ulysses_sequence_parallel_world_size(group)
-    if unpad_dim_size % sp_world == 0 and sp_rank + 1 != sp_world:
+    local_len = x.shape[dim]
+    valid_len = min(max(unpad_dim_size - sp_rank * local_len, 0), local_len)
+    if valid_len == local_len:
         return x
-    pad = sp_world - (unpad_dim_size % sp_world)
-    assert (pad + x.shape[dim]) % sp_world == 0
-    slc = [slice(None)] * len(x.shape)
-    slc[dim] = slice(0, -pad)
-    return x[tuple(slc)]
+    return x.narrow(dim, 0, valid_len)
 
 
 def has_overlap(x1, x2, y1, y2) -> Tuple[bool, int]:

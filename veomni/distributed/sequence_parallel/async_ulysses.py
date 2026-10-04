@@ -94,6 +94,9 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
             ctx.n_repeat = ulysses_size // num_kv_heads
             ctx.original_num_kv_heads = num_kv_heads
         else:
+            assert num_kv_heads % ulysses_size == 0, (
+                f"num_key_value_heads ({num_kv_heads}) must be divisible by ulysses_size ({ulysses_size})"
+            )
             ctx.need_repeat_kv = False
 
         # q projection
