@@ -73,22 +73,43 @@ def test_context_parallel_world_size_defaults_to_one_without_dist(monkeypatch):
     assert sp_comm.get_context_parallel_world_size() == 1
 
 
+class _ReachedCollective(Exception):
+    pass
+
+
+def _run_async_qkv(monkeypatch, group_sizes, group, num_kv_heads):
+    # Size each group from its own world size, and stop at the first all-to-all so no
+    # real collective runs: reaching it means head validation passed.
+    monkeypatch.setattr(sp_async_ulysses, "get_ulysses_sequence_parallel_world_size", lambda g=None: group_sizes[g])
+
+    def _stop(*args, **kwargs):
+        raise _ReachedCollective
+
+    monkeypatch.setattr(sp_async_ulysses, "all_to_all_tensor", _stop)
+    head_dim, hidden = 4, 16
+    kv_w = torch.randn(num_kv_heads * head_dim, hidden)
+    sp_async_ulysses.async_ulysses_qkv_projection(
+        hidden_states=torch.randn(1, 3, hidden),
+        seq_dimension=1,
+        head_dimension=2,
+        q_weight=torch.randn(8 * head_dim, hidden),
+        k_weight=kv_w,
+        v_weight=kv_w,
+        unpadded_dim_size=12,
+        head_dim=head_dim,
+        group=group,
+    )
+
+
 def test_async_ulysses_rejects_kv_heads_not_divisible_by_ulysses(monkeypatch):
     """Async QKV must refuse kv heads > ulysses_size that do not divide evenly, like the sync path."""
-    monkeypatch.setattr(sp_async_ulysses, "get_ulysses_sequence_parallel_world_size", lambda: 4)
-    head_dim, hidden = 4, 16
-    hidden_states = torch.randn(1, 3, hidden)
-    q_w = torch.randn(8 * head_dim, hidden)
-    kv_w = torch.randn(6 * head_dim, hidden)
+    group = object()
     with pytest.raises(AssertionError, match="num_key_value_heads"):
-        sp_async_ulysses.async_ulysses_qkv_projection(
-            hidden_states=hidden_states,
-            seq_dimension=1,
-            head_dimension=2,
-            q_weight=q_w,
-            k_weight=kv_w,
-            v_weight=kv_w,
-            unpadded_dim_size=12,
-            head_dim=head_dim,
-            group=object(),
-        )
+        _run_async_qkv(monkeypatch, {group: 4}, group, num_kv_heads=6)
+
+
+def test_async_ulysses_sizes_heads_from_explicit_group(monkeypatch):
+    """Head validation follows the group passed in, not the ambient Ulysses group."""
+    ambient, explicit = object(), object()
+    with pytest.raises(_ReachedCollective):
+        _run_async_qkv(monkeypatch, {None: 4, ambient: 4, explicit: 2}, explicit, num_kv_heads=6)
