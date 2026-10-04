@@ -633,6 +633,11 @@ def causal_conv1d_bwd_impl(
     if initial_state is not None:
         BD = 32
         BT = min(8, triton.next_power_of_2(triton.cdiv(max(16, B * T), NUM_CORES)))
+        # dh0 below is split into cdiv(W, BT) slots and summed. The multi-slot
+        # path over-counts, so never tile narrower than the convolution window:
+        # that keeps cdiv(W, BT) == 1 and the single-slot path. BT stays within
+        # the BT=8/BD=32 UB budget above for W <= 8.
+        BT = max(BT, triton.next_power_of_2(W))
     else:
         BD = 32
         BT = min(32, triton.next_power_of_2(triton.cdiv(max(16, B * T), NUM_CORES)))
