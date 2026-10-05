@@ -49,6 +49,14 @@ Rules:
 - It is shared by training and inference:
   - Training: run by `SeedOmniCollator` inside DataLoader workers.
   - Inference: run once by `OmniInferencer._preprocess_request` before the FSM.
+- User images arrive in a different form on each path: training items carry
+  the `(3, H, W) uint8` tensor from `veomni/data/seed_omni/image_utils.py`
+  `fetch_images`, inference items carry the PIL image from
+  `OmniProcessor._normalize_images`. HF image processors take both; a
+  hand-written one must too, and needs a test that feeds it `fetch_images`
+  output (see `tests/seed_omni/test_deepseek_v41_vision_processing.py`).
+  Text-only training configs never reach this path, so a run on them proves
+  nothing about it.
 - Use `inference=True` for inference-only behavior:
   - Vision modules skip FSDP dummy injection.
   - Text encoders append generation prompts when needed.
