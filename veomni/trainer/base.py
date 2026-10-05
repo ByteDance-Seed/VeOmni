@@ -742,9 +742,9 @@ class BaseTrainer(Stateful, ABC):
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
-        self.state.global_step += 1
-
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
+
+        self.state.global_step += 1
 
         self._reset_async_activation_offload_if_enabled(self.model)
         self.on_step_begin(micro_batches=micro_batches)

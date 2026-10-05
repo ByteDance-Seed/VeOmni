@@ -118,3 +118,63 @@ def test_train_step_uses_hsdp_allreduce_helper():
         source = inspect.getsource(wrapper_cls.train_step)
 
         assert "_configure_hsdp_allreduce(" in source
+
+
+def test_train_step_only_counts_step_after_batch_fetch_succeeds():
+    """global_step must not advance for a step whose batch fetch raised StopIteration.
+
+    `BaseTrainer.train()` catches `StopIteration` from `train_step()` and ends the
+    epoch, so a loader that runs dry before `train_steps` is reached must not leave
+    `global_step` counting a step that never ran (no optimizer step, no resume
+    cursor movement for it).
+    """
+    for wrapper_cls in (BaseTrainer, TextTrainer, VLMTrainer, TextDPOTrainer, DiTTrainer):
+        source = inspect.getsource(wrapper_cls.train_step)
+        global_step_line = next(line for line in source.splitlines() if "state.global_step += 1" in line)
+        next_batch_line = next(
+            line for line in source.splitlines() if "next(data_iterator)" in line and "else" not in line
+        )
+        global_step_idx = source.index(global_step_line)
+        next_batch_idx = source.index(next_batch_line)
+
+        assert global_step_idx > next_batch_idx, (
+            f"{wrapper_cls.__name__}.train_step increments global_step before the batch "
+            "fetch that can raise StopIteration"
+        )
+
+
+def test_base_trainer_global_step_not_overcounted_on_stop_iteration():
+    """End-to-end: train() must not overcount global_step when the loader runs dry."""
+
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.args = SimpleNamespace(
+        train_steps=10,
+        train=SimpleNamespace(local_rank=0, num_train_epochs=1),
+        data=SimpleNamespace(dataloader=SimpleNamespace(use_background_prefetcher=False, drop_last=False)),
+    )
+    trainer.state = base_module.TrainerState()
+    trainer.start_epoch = 0
+    trainer.start_step = 0
+
+    n_batches = 3
+    trainer.train_dataloader = [[{"labels": object()}]] * n_batches
+
+    trainer.on_train_begin = lambda: None
+    trainer.on_train_end = lambda: None
+    trainer.on_epoch_begin = lambda: None
+    trainer.on_epoch_end = lambda: None
+    trainer.on_step_begin = lambda **kwargs: None
+
+    optimizer_steps = []
+    trainer.on_step_end = lambda **kwargs: optimizer_steps.append(1)
+
+    def fake_train_step(data_iterator):
+        next(data_iterator)
+        trainer.state.global_step += 1
+        trainer.on_step_end()
+
+    trainer.train_step = fake_train_step
+
+    trainer.train()
+
+    assert trainer.state.global_step == n_batches == len(optimizer_steps)
