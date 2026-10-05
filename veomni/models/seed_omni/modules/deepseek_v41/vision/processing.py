@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import io
 import math
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 import torch
@@ -58,7 +58,7 @@ def num_image_tokens(n_llm_h: int, n_llm_w: int) -> int:
     return n_llm_h * (n_llm_w + 1) + 2
 
 
-def llm_grid(best_height: int, best_width: int, patch_size: int, downsample_ratio: int) -> Tuple[int, int]:
+def llm_grid(best_height: int, best_width: int, patch_size: int, downsample_ratio: int) -> tuple[int, int]:
     """Token grid the aligner produces from a patch grid of this pixel size."""
     return (
         math.ceil((best_height // patch_size) / downsample_ratio),
@@ -68,7 +68,7 @@ def llm_grid(best_height: int, best_width: int, patch_size: int, downsample_rati
 
 def solve_resize_ratio(
     height: int, width: int, patch_size: int, downsample_ratio: int, max_n_token: int
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
     """Largest aspect-preserving pixel size whose token grid still fits ``max_n_token``."""
     ratio = height / width
     max_w_float = math.sqrt((max_n_token - 2) / ratio + 0.25) - 0.5
@@ -90,7 +90,7 @@ def safe_resize(
     patch_size: int,
     downsample_ratio: int,
     max_n_token: int,
-) -> Tuple[int, int, int, int]:
+) -> tuple[int, int, int, int]:
     """Shrink the pixel size until the image costs at most ``max_n_token`` LLM tokens."""
     n_llm_h, n_llm_w = llm_grid(best_height, best_width, patch_size, downsample_ratio)
     if num_image_tokens(n_llm_h, n_llm_w) > max_n_token:
@@ -129,7 +129,7 @@ class DeepseekV41VisionImageProcessor(BaseImageProcessor):
         downsample_ratio: int = 3,
         max_image_tokens: int = 1024,
         min_pixels: int = 295936,
-        max_wh_ratio: Optional[float] = None,
+        max_wh_ratio: float | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -139,7 +139,7 @@ class DeepseekV41VisionImageProcessor(BaseImageProcessor):
         self.min_pixels = min_pixels
         self.max_wh_ratio = max_wh_ratio
 
-    def plan_grid(self, width: int, height: int) -> Tuple[int, int, int, int]:
+    def plan_grid(self, width: int, height: int) -> tuple[int, int, int, int]:
         """Resize plan for an image of this original size; a pure function of its arguments."""
         patch = self.patch_size
         if self.max_wh_ratio is not None and width > height * self.max_wh_ratio:
@@ -152,15 +152,23 @@ class DeepseekV41VisionImageProcessor(BaseImageProcessor):
         best_height = math.ceil(height / patch) * patch
         return safe_resize(height, width, best_height, best_width, patch, self.downsample_ratio, self.max_image_tokens)
 
-    def preprocess_one(self, image: Any) -> Tuple[torch.Tensor, int, int, int, int]:
+    def preprocess_one(self, image: Any) -> tuple[torch.Tensor, int, int, int, int]:
         """One image -> ``(patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w)``.
 
         ``patches`` is ``(n_vit_h * n_vit_w, 3, patch, patch)`` in [-1, 1].
+
+        ``image`` is a PIL image or raw bytes at inference, and the ``(3, H, W)
+        uint8`` tensor the SeedOmni V2 data layer decodes to in training. The
+        tensor is turned back into PIL so both paths resize identically.
         """
         if isinstance(image, (bytes, bytearray)):
             image = Image.open(io.BytesIO(bytes(image)))
+        elif isinstance(image, torch.Tensor):
+            if image.dtype != torch.uint8 or image.dim() != 3 or image.size(0) != 3:
+                raise TypeError(f"expected a (3, H, W) uint8 image tensor, got {image.dtype} {tuple(image.shape)}")
+            image = Image.fromarray(np.ascontiguousarray(image.permute(1, 2, 0).cpu().numpy()))
         if not isinstance(image, Image.Image):
-            raise TypeError(f"expected a PIL image or raw bytes, got {type(image).__name__}")
+            raise TypeError(f"expected a PIL image, raw bytes or a uint8 tensor, got {type(image).__name__}")
         image = image.convert("RGB")
 
         patch = self.patch_size
@@ -191,10 +199,10 @@ class DeepseekV41VisionPreprocessor(ModulePreprocessorBase):
     def __init__(
         self,
         image_processor: DeepseekV41VisionImageProcessor,
-        dtype: Optional[torch.dtype] = None,
-        dummy_patches: Optional[torch.Tensor] = None,
-        dummy_grid: Optional[List[int]] = None,
-        dummy_types: Optional[torch.Tensor] = None,
+        dtype: torch.dtype | None = None,
+        dummy_patches: torch.Tensor | None = None,
+        dummy_grid: list[int] | None = None,
+        dummy_types: torch.Tensor | None = None,
     ) -> None:
         self._image_processor = image_processor
         self._dtype = dtype
@@ -203,11 +211,11 @@ class DeepseekV41VisionPreprocessor(ModulePreprocessorBase):
         self._dummy_types = dummy_types
 
     @classmethod
-    def from_pretrained(cls, module_path: str, **kwargs: Any) -> "DeepseekV41VisionPreprocessor":
+    def from_pretrained(cls, module_path: str, **kwargs: Any) -> DeepseekV41VisionPreprocessor:
         del kwargs
         return cls(DeepseekV41VisionImageProcessor.from_pretrained(module_path))
 
-    def bind_dummy_inputs(self, config: DeepseekV41VisionEncoderConfig, dtype: Optional[torch.dtype] = None) -> None:
+    def bind_dummy_inputs(self, config: DeepseekV41VisionEncoderConfig, dtype: torch.dtype | None = None) -> None:
         """Training-only FSDP anchor: one ``downsample_ratio``-square patch grid.
 
         Sized to exactly one aligner cell so the anchor costs the ViT one
