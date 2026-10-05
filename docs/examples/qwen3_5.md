@@ -250,7 +250,7 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_m
 EP-local expert count is divisible by the EP-FSDP size; otherwise VeOmni logs
 a warning and falls back to the communication path.
 
-## Shared-prefix training (NPU)
+## Shared-prefix training
 
 In GRPO-style RL each prompt is sampled `n` times and the `n` rollouts are trained as `n` packed
 `prompt + response` sequences, so the prompt is computed `n` times. With shared-prefix training the
@@ -262,8 +262,8 @@ difference that re-batching the same sequences produces by itself.
 The work drops from `n * (P + R)` tokens to `P + n * R`, and on Qwen3.5-4B about 84% of that ratio is
 realised. Long prompts gain most; under roughly 1k prompt tokens there is little to save.
 
-It is a field on the **model config**, off by default, and it needs the `npu` linear-attention
-backends above:
+It is a field on the **model config**, off by default, and it needs a non-eager linear-attention
+backend: `npu` on Ascend, `fla` on GPU.
 
 ```json
 { "text_config": { "shared_prefix_training": true } }
@@ -272,7 +272,7 @@ backends above:
 Set it in the `config.json` of the model directory the trainer loads. Nothing else changes: detection
 is internal to the patched modeling, so a trainer driving VeOmni needs no flag of its own and no
 adapter code. When nothing in a micro-batch shares a prefix, or the batch carries image or video
-inputs, or the model is not on the NPU modeling path, the ordinary packed path runs unchanged.
+inputs, the ordinary packed path runs unchanged.
 
 What the caller has to get right is that a micro-batch holds **whole rollout groups**, i.e. a
 multiple of `n` sequences, with no reordering between packing and the forward. A group split across
@@ -281,8 +281,7 @@ With `verl` (`model_engine=veomni`) that means the legacy trainer with group-awa
 `use_dynamic_bsz` off, and `ppo_micro_batch_size_per_gpu` a multiple of `rollout.n`; the config field
 travels through `actor_rollout_ref.model.hf_config_path`, which is why no verl-side change is needed.
 
-Current limits: text-only prompts; dense Qwen3.5; no Ulysses SP, MTP or KV cache (each raises); NPU
-modeling path only.
+Current limits: text-only prompts; dense Qwen3.5; no Ulysses SP, MTP or KV cache (each raises).
 
 ## Ulysses Sequence Parallelism
 
