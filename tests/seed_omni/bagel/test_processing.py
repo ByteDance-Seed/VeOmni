@@ -15,7 +15,7 @@ from tests.seed_omni.bagel.helpers import (
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated.accelerated import TrainingMixin
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
-from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
+from veomni.models.seed_omni.modules.bagel.vae.processing import BAGEL_VAE_PIXEL_SHAPE, BagelVAEProcessor
 from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
 
 
@@ -314,6 +314,66 @@ def test_bagel_vae_online_process_consumes_variable_size_cache_items_without_pad
     assert post["conversation_list"] is conversation
     assert first.value.shape == (2, 2, 1)
     assert second.value.shape == (2, 2, 2)
+
+
+def test_bagel_vae_offline_cache_replay_keeps_img_tag_for_flow_connector(tmp_path) -> None:
+    from datasets import load_dataset
+
+    from veomni.data.seed_omni.seedomni_transform import process_seedomni_cached_example
+    from veomni.models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
+
+    encode_model = _tiny_vae(support_cache=True, train_type="offline_cache")
+    process_model = _tiny_vae(support_cache=True, train_type="train_with_cache")
+
+    def vae_image(tag: str) -> ConversationItem:
+        return ConversationItem(
+            type="image",
+            value=torch.zeros(3, 4, 4),
+            role="assistant",
+            meta={
+                BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT,
+                _IMG_TAG_KEY: tag,
+                BAGEL_VAE_PIXEL_SHAPE: torch.tensor([4, 4]),
+            },
+        )
+
+    pre = encode_model.pre_forward("offline_encode", conversation_list=[[vae_image("edit"), vae_image("gen")]])
+    out = encode_model.offline_encode(**pre)
+    encoded = encode_model.post_forward("offline_encode", **out)["conversation_list"]
+
+    writer = SeedOmniOfflineCacheWriter(str(tmp_path))
+    writer.save_conversation_list(encoded)
+    writer.flush()
+    dataset = load_dataset("parquet", data_files=[str(tmp_path / "shard_000000.parquet")], split="train")
+    replayed = [process_seedomni_cached_example(dataset[0])[0]["conversation_list"]]
+
+    pre = process_model.pre_forward("online_process", conversation_list=replayed)
+    out = process_model.online_process(**pre)
+    processed = process_model.post_forward("online_process", **out)["conversation_list"]
+
+    assert [item.meta[_IMG_TAG_KEY] for item in processed[0]] == ["edit", "gen"]
+    assert all(item.meta[BAGEL_CONTEXT_KEY] == BAGEL_VAE_CONTEXT for item in processed[0])
+
+    BagelFlowConnector = model_cls("bagel_flow_connector")
+    BagelFlowConnectorConfig = config_cls("bagel_flow_connector")
+    flow_connector = BagelFlowConnector(
+        BagelFlowConnectorConfig(
+            hidden_size=4,
+            z_channels=2,
+            latent_patch_size=1,
+            patch_latent_dim=2,
+            max_latent_size=4,
+            timestep_frequency_embedding_size=4,
+            timestep_shift=1.0,
+        )
+    )
+    edit_item, gen_item = processed[0]
+    inputs = flow_connector.embed_latent_pre(conversation_list=processed)
+
+    assert flow_connector._embed_lengths == [16, 16]
+    assert torch.equal(inputs["timesteps"][:16], torch.zeros(16))
+    assert "flow_velocity_target" not in edit_item.meta
+    assert gen_item.meta["flow_velocity_target"].shape == (16, 2)
 
 
 def _tiny_vae(**config_overrides):

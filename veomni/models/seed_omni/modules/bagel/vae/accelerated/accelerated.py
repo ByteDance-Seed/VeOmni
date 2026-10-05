@@ -105,7 +105,7 @@ class BagelVAEOfflineMixin:
             if cache_tensor.dim() == 3 and int(cache_tensor.shape[0]) == 2 * z_channels:
                 cache_tensor = cache_tensor.reshape(2, z_channels, *cache_tensor.shape[-2:])
             item.value = cache_tensor.detach().to(device=self.device, dtype=self.dtype)
-            item.meta = {BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT}
+            item.meta[BAGEL_CONTEXT_KEY] = BAGEL_VAE_CONTEXT
         return {"conversation_list": conversation}
 
     @pre_forward("online_process")
