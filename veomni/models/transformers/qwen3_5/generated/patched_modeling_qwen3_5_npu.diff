@@ -1928,7 +1928,7 @@
 
          self.post_init()
 
-@@ -1724,48 +2791,40 @@
+@@ -1724,48 +2791,38 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1993,8 +1993,6 @@
 +            and pixel_values is None
 +            and pixel_values_videos is None
 +        ):
-+            if input_ids.device.type != "npu":
-+                raise NotImplementedError("Shared-prefix training is implemented for the NPU modeling path only.")
 +            from veomni.models.transformers.qwen3_5.shared_prefix import build_shared_prefix_plan
 +
 +            plan = build_shared_prefix_plan(
@@ -2009,7 +2007,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1776,28 +2835,104 @@
+@@ -1776,28 +2833,104 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -2122,7 +2120,7 @@
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
          # Overwritten -- requires 3D position ids
-@@ -1984,6 +3119,24 @@
+@@ -1984,6 +3117,24 @@
 
          return input_ids, model_kwargs
 

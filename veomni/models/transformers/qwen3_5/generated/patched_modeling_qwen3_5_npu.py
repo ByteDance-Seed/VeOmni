@@ -2812,8 +2812,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             and pixel_values is None
             and pixel_values_videos is None
         ):
-            if input_ids.device.type != "npu":
-                raise NotImplementedError("Shared-prefix training is implemented for the NPU modeling path only.")
             from veomni.models.transformers.qwen3_5.shared_prefix import build_shared_prefix_plan
 
             plan = build_shared_prefix_plan(

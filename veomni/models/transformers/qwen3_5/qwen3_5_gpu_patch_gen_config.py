@@ -35,7 +35,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5CausalLMOutputWithPast,
     Qwen3_5Config,
@@ -44,7 +43,6 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5RMSNormGated,
     Qwen3_5TextConfig,
     apply_mask_to_padding_states,
-    eager_attention_forward,
     torch_chunk_gated_delta_rule,
 )
 from transformers.processing_utils import Unpack

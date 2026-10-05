@@ -10,19 +10,20 @@ sequences one per call and packed together (different kernel shapes).
 import pytest
 import torch
 
-from veomni.utils.device import get_device_type
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 
 
 DEVICE = get_device_type()
 pytestmark = pytest.mark.skipif(
-    DEVICE not in ("cuda", "npu"), reason="shared-prefix training needs the GPU or NPU modeling path"
+    not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE),
+    reason="shared-prefix training needs the GPU or NPU modeling path",
 )
 
 TOY_CONFIG = "tests/toy_config/qwen3_5_toy"
 PREFIX, SUFFIX, GROUP = 1990, 96, 3  # prefix deliberately not a multiple of the 64-token chunk
 
 # The GDN ops the two modeling paths bind: vendored Triton on NPU, flash-linear-attention on GPU.
-GDN_BACKEND = {"npu": "npu", "cuda": "fla"}[DEVICE] if DEVICE in ("cuda", "npu") else "eager"
+GDN_BACKEND = "npu" if IS_NPU_AVAILABLE else "fla"
 
 
 @pytest.fixture(scope="module")
