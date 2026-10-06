@@ -311,6 +311,40 @@ def test_moe_ep_sharded_load_matrix(tmp_path):
     subprocess.run(cmd, check=True, env=env)
 
 
+def test_every_planned_experts_module_gets_its_own_fsdp_unit():
+    """A plan naming two experts families (decoder layers + MTP stages) must
+    exempt both from the layer FSDP unit, not just the first key's module."""
+
+    def block():
+        b = nn.Module()
+        b.mlp = nn.Module()
+        b.mlp.experts = nn.Module()
+        b.mlp.experts.gate_up_proj = nn.Parameter(torch.empty(4, 2, 2))
+        b.mlp.experts.down_proj = nn.Parameter(torch.empty(4, 2, 2))
+        return b
+
+    model = nn.Module()
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList([block(), block()])
+    model.model.mtp = nn.ModuleList([block()])
+    plan = ParallelPlan(
+        extra_parallel_plan={
+            "ep": {
+                "model.layers.*.mlp.experts.gate_up_proj": Shard(0),
+                "model.layers.*.mlp.experts.down_proj": Shard(0),
+                "model.mtp.*.mlp.experts.gate_up_proj": Shard(0),
+                "model.mtp.*.mlp.experts.down_proj": Shard(0),
+            }
+        }
+    )
+
+    assert set(plan.get_extra_parallel_fsdp_no_shard_info(model, "ep")) == {
+        "model.layers.0.mlp.experts",
+        "model.layers.1.mlp.experts",
+        "model.mtp.0.mlp.experts",
+    }
+
+
 if __name__ == "__main__":
     # Deterministic *shared* fixture dir so every rank resolves the same
     # checkpoint path (rank0 writes it; a per-rank mkdtemp would leave the

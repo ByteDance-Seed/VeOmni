@@ -105,8 +105,11 @@ class ParallelPlan:
         # API: only parameters already selected by ``extra_parallel_plan`` may
         # opt into the persistent complementary shard.
         self.extra_parallel_persistent_modules = extra_parallel_persistent_modules or {}
+        # Every module that owns a planned parameter gets its own FSDP unit on the
+        # extra-parallel mesh. A module left out falls into its layer's regular
+        # FSDP unit, which re-shards its already-sliced params over the FSDP mesh.
         self.extra_parallel_fsdp_no_shard_module = {
-            para_name: {".".join(list(plan.keys())[0].split(".")[:-1])}
+            para_name: {".".join(fqn.split(".")[:-1]) for fqn in plan}
             for para_name, plan in self.extra_parallel_plan.items()
         }
 
