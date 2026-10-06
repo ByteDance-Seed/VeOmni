@@ -92,6 +92,24 @@ def build_packed_image_mask(
     return torch.cat(flags).unsqueeze(0)
 
 
+def fold_dummy_anchors(
+    inputs_embeds: torch.Tensor,
+    conversations: List[List[ConversationItem]],
+) -> torch.Tensor:
+    """Add ``0 * mean`` of every ``dummy`` item so its encoder stays in the backward.
+
+    The packer skips dummy items, so without this a text-only micro-batch drops
+    the ViT's output before the loss. The ViT's FSDP unit then never runs its
+    backward on that rank while ranks holding a real image do, and the two sides
+    wait on each other's collectives forever.
+    """
+    for sample in conversations:
+        for item in sample:
+            if is_dummy(item) and isinstance(item.value, torch.Tensor):
+                inputs_embeds = inputs_embeds + item.value.mean().to(inputs_embeds.device, inputs_embeds.dtype) * 0
+    return inputs_embeds
+
+
 def fold_indexer_kl_loss(outputs: Dict[str, Any], coef: float) -> Optional[torch.Tensor]:
     """Mean indexer KL, scaled by ``dsa_indexer_loss_coef``, or None when the objective is off.
 
@@ -169,6 +187,8 @@ class TrainingMixin(TrainingModuleMixin):
         inputs_embeds, _, position_ids, inputs_embeds_shape = pack_llm_conversations_for_forward(
             conversation_list, self.device
         )
+        if self.training:
+            inputs_embeds = fold_dummy_anchors(inputs_embeds, conversation_list)
         image_mask = build_packed_image_mask(conversation_list, self.device)
 
         self._conversation_carrier = conversation_list

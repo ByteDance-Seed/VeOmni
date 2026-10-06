@@ -332,6 +332,45 @@ class TestSequenceParallelSlice:
         assert out["dspark_input_ids"][0].tolist() == ids
 
 
+class TestDummyAnchor:
+    """A text-only micro-batch still runs the ViT on a dummy image, and that output
+    must reach the loss. If it does not, the ViT's FSDP backward collectives fire
+    only on ranks that drew a real image and every other rank leaves them hanging."""
+
+    @pytest.fixture
+    def model(self, monkeypatch):
+        import veomni.models.seed_omni.modules.deepseek_v41.llm.accelerated.accelerated as module
+
+        class FakeState:
+            sp_size = 1
+
+        monkeypatch.setattr(module, "get_parallel_state", lambda: FakeState())
+        return DeepseekV41LlmAccelerated(make_config())
+
+    def test_the_dummy_image_gets_a_zero_gradient(self, model):
+        anchor = torch.randn(9, HIDDEN, requires_grad=True)
+        conversation = [
+            [text(4), text(3, role="assistant"), ConversationItem(type="image", value=anchor, role="dummy")]
+        ]
+        packed = torch.cat([part.value for part in conversation[0][:2]])
+
+        out = model.forward_pre(conversation_list=conversation)
+        out["inputs_embeds"].sum().backward()
+
+        torch.testing.assert_close(out["inputs_embeds"][0], packed, rtol=0, atol=0)
+        assert anchor.grad is not None
+        assert not anchor.grad.any()
+
+    def test_inference_leaves_the_row_alone(self, model):
+        anchor = torch.randn(9, HIDDEN, requires_grad=True)
+        conversation = [[text(4), ConversationItem(type="image", value=anchor, role="dummy")]]
+
+        model.eval()
+        out = model.forward_pre(conversation_list=conversation)
+
+        assert not out["inputs_embeds"].requires_grad
+
+
 class TestRegistration:
     def test_accelerated_class_is_registered(self):
         from veomni.models.seed_omni.modules import OMNI_ACCELERATED_MODEL_REGISTRY
