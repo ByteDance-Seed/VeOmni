@@ -1923,6 +1923,20 @@ def qwen3_5_forconditional_generation_forward_patched(
         and pixel_values is None
         and pixel_values_videos is None
     ):
+        # The plan hands attention more keys than it has compact queries and relies on
+        # cu_seq_lens_q / cu_seq_lens_k to describe that. Backends that build their own
+        # mask instead — eager, sdpa, flex, magi — would silently mask against the
+        # compact length and fail on a shape mismatch, so refuse them here rather than
+        # deeper in the stack.
+        attn_impl = getattr(self.config.text_config, "_attn_implementation", None) or getattr(
+            self.config, "_attn_implementation", ""
+        )
+        if "flash_attention" not in attn_impl:
+            raise NotImplementedError(
+                f"Shared-prefix training needs a varlen attention backend that honours "
+                f"cu_seq_lens_q / cu_seq_lens_k, got attn_implementation={attn_impl!r}. "
+                "Use a flash-attention backend, or unset text_config.shared_prefix_training."
+            )
         from veomni.models.transformers.qwen3_5.shared_prefix import build_shared_prefix_plan
 
         plan = build_shared_prefix_plan(
