@@ -32,6 +32,7 @@ import torch.nn as nn
 # via "veomni.utils.save_safetensor_utils.<name>".
 
 _MOD = "veomni.utils.save_safetensor_utils"
+_CONSOLIDATE = "torch.distributed.checkpoint._consolidate_hf_safetensors"
 
 
 class _TinyModel(nn.Module):
@@ -70,6 +71,8 @@ def _call_save_distributed(model, save_path, fqn_to_index_mapping, model_assets,
         # --- deferred imports: patch at source ---
         patch("torch.distributed.checkpoint.HuggingFaceStorageWriter", mock_writer_cls),
         patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
+        patch(f"{_CONSOLIDATE}.consolidate_safetensors_files", MagicMock()),
+        patch(f"{_CONSOLIDATE}.consolidate_safetensors_files_on_every_rank", MagicMock()),
         # --- module-level imports: patch on consumer ---
         patch(f"{_MOD}.get_model_save_state", mock_get_state),
         patch(f"{_MOD}.dcp", MagicMock(save=mock_dcp_save)),
@@ -187,16 +190,82 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
         passed = writer_cls.call_args.kwargs["fqn_to_index_mapping"]
         self.assertEqual(set(passed), {"embed_tokens.weight", "linear.weight"})
 
-    def test_none_mapping_passed_through(self):
-        fake = {"w": torch.randn(4, 4, dtype=torch.bfloat16)}
-        _, writer_cls, _, _ = _call_save_distributed(
-            self.model,
-            "/tmp/test",
-            None,
-            None,
-            fake,
-        )
-        self.assertIsNone(writer_cls.call_args.kwargs["fqn_to_index_mapping"])
+    def test_none_mapping_becomes_size_balanced_files(self):
+        fake = {"w": torch.randn(4, 4, dtype=torch.bfloat16), "b": torch.randn(4, dtype=torch.bfloat16)}
+        with patch(f"{_MOD}._MAX_SHARD_BYTES", 32):
+            _, writer_cls, _, _ = _call_save_distributed(
+                self.model,
+                "/tmp/test",
+                None,
+                None,
+                fake,
+            )
+        self.assertEqual(writer_cls.call_args.kwargs["fqn_to_index_mapping"], {"w": 1, "b": 2})
+        self.assertFalse(writer_cls.call_args.kwargs["enable_consolidation"])
+
+    def test_none_mapping_consolidates_into_several_loadable_files(self):
+        import tempfile
+        from pathlib import Path
+
+        from safetensors.torch import load_file
+
+        fake = {f"layer{i}.weight": torch.randn(8, 8, dtype=torch.bfloat16) for i in range(5)}
+        fake["ids"] = torch.arange(6, dtype=torch.int64)
+        with tempfile.TemporaryDirectory() as output_dir, patch(f"{_MOD}._MAX_SHARD_BYTES", 300):
+            with (
+                patch(f"{_MOD}.get_model_save_state", MagicMock(return_value=dict(fake))),
+                patch(f"{_MOD}.helper", MagicMock()),
+            ):
+                from veomni.utils.save_safetensor_utils import _save_hf_safetensor_distributed
+
+                _save_hf_safetensor_distributed(self.model, output_dir, None, None)
+
+            files = sorted(Path(output_dir).glob("model-*.safetensors"))
+            self.assertGreater(len(files), 1)
+            self.assertTrue((Path(output_dir) / "model.safetensors.index.json").exists())
+            loaded = {}
+            for file in files:
+                loaded.update(load_file(file))
+        self.assertEqual(set(loaded), set(fake))
+        for key, value in fake.items():
+            torch.testing.assert_close(loaded[key], value)
+
+    def test_consolidation_opens_each_shard_once(self):
+        import builtins
+        import tempfile
+        from pathlib import Path
+
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint import HuggingFaceStorageWriter
+        from torch.distributed.checkpoint._consolidate_hf_safetensors import consolidate_safetensors_files
+
+        from veomni.checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
+
+        apply_dcp_consolidation_patch()
+        fake = {f"t{i}": torch.randn(4, 4, dtype=torch.bfloat16) for i in range(6)}
+        with tempfile.TemporaryDirectory() as output_dir:
+            sharded = str(Path(output_dir) / "sharded")
+            mapping = dict.fromkeys(fake, 1)
+            dcp.save(
+                fake,
+                storage_writer=HuggingFaceStorageWriter(sharded, save_distributed=True, fqn_to_index_mapping=mapping),
+            )
+
+            opened = []
+            real_open = builtins.open
+
+            def counting_open(file, *args, **kwargs):
+                if str(file).startswith(sharded):
+                    opened.append(str(file))
+                return real_open(file, *args, **kwargs)
+
+            with patch("builtins.open", counting_open):
+                consolidate_safetensors_files(sharded, output_dir, mapping)
+
+        shards = set(opened)
+        self.assertEqual(len(shards), 1)
+        # One read of the header while parsing metadata, one handle for all six tensors.
+        self.assertEqual(len(opened), 2)
 
     def test_no_filtering_when_all_keys_match(self):
         fake = {"a": torch.randn(2, 2, dtype=torch.bfloat16), "b": torch.randn(2, 2, dtype=torch.bfloat16)}
@@ -319,6 +388,7 @@ class TestExecutionOrdering(unittest.TestCase):
         with (
             patch("torch.distributed.checkpoint.HuggingFaceStorageWriter", MagicMock(side_effect=fake_writer)),
             patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
+            patch(f"{_CONSOLIDATE}.consolidate_safetensors_files", MagicMock()),
             patch(f"{_MOD}.get_model_save_state", fake_get_state),
             patch(f"{_MOD}.dcp", MagicMock(save=MagicMock())),
             patch(f"{_MOD}.dist", MagicMock(is_initialized=MagicMock(return_value=False))),

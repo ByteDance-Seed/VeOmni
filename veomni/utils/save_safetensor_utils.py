@@ -107,12 +107,30 @@ def get_model_save_state(
                 logger.info_rank0(f"Skipping weight not in HF weight_map: {k}")
         save_state = filtered_state
     else:
-        logger.warning_rank0(
-            "fqn_to_index_mapping is None, HuggingFaceStorageWriter will save "
-            "all model weights into a single safetensors file."
+        logger.info_rank0(
+            f"fqn_to_index_mapping is None, splitting the weights into safetensors files of up to "
+            f"{_MAX_SHARD_BYTES / 1e9:.0f} GB."
         )
 
     return save_state
+
+
+_MAX_SHARD_BYTES = 5_000_000_000
+
+
+def _size_balanced_index_mapping(save_state: Dict[str, torch.Tensor]) -> Dict[str, int]:
+    """1-based output file index per FQN, packing tensors in order into files of up to ``_MAX_SHARD_BYTES``.
+
+    Sizes are those of the full (unsharded) tensors, so every rank derives the same mapping.
+    """
+    mapping, index, file_bytes = {}, 1, 0
+    for fqn, tensor in save_state.items():
+        size = tensor.numel() * tensor.element_size()
+        if file_bytes and file_bytes + size > _MAX_SHARD_BYTES:
+            index, file_bytes = index + 1, 0
+        mapping[fqn] = index
+        file_bytes += size
+    return mapping
 
 
 def _save_hf_safetensor_distributed(
@@ -151,13 +169,23 @@ def _save_hf_safetensor_distributed(
                 f"Filtered fqn_to_index_mapping from {original_mapping_size} to {len(fqn_to_index_mapping)} keys "
                 f"to match actual model weights"
             )
+    else:
+        fqn_to_index_mapping = _size_balanced_index_mapping(save_state)
 
+    # Consolidation runs on every rank, one output file each, instead of in the
+    # writer's finish step: there only the coordinator rewrites the whole model
+    # while the others wait on a collective that times out for a large one.
+    from torch.distributed.checkpoint._consolidate_hf_safetensors import (
+        consolidate_safetensors_files,
+        consolidate_safetensors_files_on_every_rank,
+    )
+
+    sharded_path = os.path.join(save_path, "sharded")
     storage_writer = HuggingFaceStorageWriter(
-        path=save_path,
+        path=sharded_path,
         save_distributed=True,
         fqn_to_index_mapping=fqn_to_index_mapping,
-        enable_consolidation=True,
-        thread_count_consolidation=5,
+        enable_consolidation=False,
     )
 
     logger.info_rank0("Starting distributed HuggingFace safetensors save...")
@@ -171,6 +199,13 @@ def _save_hf_safetensor_distributed(
     del save_state  # Free copied tensors (e.g. fp32->bf16) to reduce peak memory
     if dist.is_initialized():
         dist.barrier()
+        consolidate_safetensors_files_on_every_rank(
+            input_dir=sharded_path, output_dir=save_path, fqn_to_index_mapping=fqn_to_index_mapping
+        )
+    else:
+        consolidate_safetensors_files(
+            input_dir=sharded_path, output_dir=save_path, fqn_to_index_mapping=fqn_to_index_mapping
+        )
     gc.collect()
     helper.empty_cache()
     elapsed_time = time.time() - start_time

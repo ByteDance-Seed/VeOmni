@@ -15,7 +15,7 @@
 # ruff: noqa: F821
 # Reason: This module patches PyTorch internal functions using types.FunctionType
 # with __globals__ bound to the target module. Variables like DATA_OFFSETS_KEY,
-# _read_tensor_data_mmap, etc. are resolved at runtime from torch.distributed.checkpoint.
+# _write_sub_tensor_to_file_optimized, etc. are resolved at runtime from torch.distributed.checkpoint.
 
 """Patches for PyTorch DCP (Distributed Checkpoint) safetensors consolidation.
 
@@ -77,7 +77,7 @@ def apply_dcp_consolidation_patch():
 
     The patch uses types.FunctionType to create a new function with __globals__
     bound to the target module, enabling access to internal functions like
-    _read_tensor_data_mmap and _write_sub_tensor_to_file_optimized.
+    _get_dcp_custom_metadata and _write_sub_tensor_to_file_optimized.
     """
     global _dcp_consolidation_patch_applied
 
@@ -147,46 +147,53 @@ def apply_dcp_consolidation_patch():
     # This is a modified version of torch.distributed.checkpoint._consolidate_hf_safetensors._process_output_file
     # Original: https://github.com/pytorch/pytorch/blob/v2.9.1/torch/distributed/checkpoint/_consolidate_hf_safetensors.py
     # Key change: Use append mode ("ab") instead of read-write mode ("r+b") for HDFS FUSE compatibility
+    # Second change: every input shard is opened once per output file. Upstream opens
+    # and maps each shard again for every tensor it holds; with FSDP every tensor is
+    # in every rank's shard, and on HDFS FUSE those opens dominate (~1 MB/s observed).
     def _process_output_file_impl(output_file, output_data, input_files_data):
         sorted_tensors = sorted(output_data.fqn_data.items(), key=lambda x: x[1].offset_in_file)
+        input_streams = {}
 
-        with open(output_file, "ab") as output_stream:  # Changed from "r+b"
-            for tensor_fqn, tensor_fqn_data in sorted_tensors:
-                full_tensor_mv = memoryview(
-                    bytearray(math.prod(tensor_fqn_data.shape_in_file) * tensor_fqn_data.dtype_size)
-                )
-
-                for safetensors_file in input_files_data:
-                    file_metadata = input_files_data[safetensors_file].metadata
-                    input_metadata_size = input_files_data[safetensors_file].metadata_size
-
-                    if tensor_fqn not in file_metadata:
-                        continue
-
-                    metadata = file_metadata[tensor_fqn]
-                    data_offsets = metadata[DATA_OFFSETS_KEY]
-
-                    # These functions are resolved from hf_module's globals at runtime
-                    data_to_write = _read_tensor_data_mmap(
-                        safetensors_file,
-                        data_offsets[0],
-                        data_offsets[1],
-                        input_metadata_size,
+        try:
+            with open(output_file, "ab") as output_stream:  # Changed from "r+b"
+                for tensor_fqn, tensor_fqn_data in sorted_tensors:
+                    full_tensor_mv = memoryview(
+                        bytearray(math.prod(tensor_fqn_data.shape_in_file) * tensor_fqn_data.dtype_size)
                     )
 
-                    fqn_custom_metadata = _get_dcp_custom_metadata(file_metadata)[tensor_fqn]
-                    offsets_of_tensor_being_read = fqn_custom_metadata[SAVED_OFFSETS_KEY]
+                    for safetensors_file in input_files_data:
+                        file_metadata = input_files_data[safetensors_file].metadata
+                        input_metadata_size = input_files_data[safetensors_file].metadata_size
 
-                    _write_sub_tensor_to_file_optimized(
-                        full_tensor_mv,
-                        data_to_write,
-                        tensor_fqn_data.dtype_size,
-                        tensor_fqn_data.shape_in_file,
-                        offsets_of_tensor_being_read,
-                        metadata[SHAPE_KEY],
-                    )
+                        if tensor_fqn not in file_metadata:
+                            continue
 
-                output_stream.write(full_tensor_mv)
+                        metadata = file_metadata[tensor_fqn]
+                        data_offsets = metadata[DATA_OFFSETS_KEY]
+
+                        input_stream = input_streams.get(safetensors_file)
+                        if input_stream is None:
+                            input_stream = input_streams[safetensors_file] = open(safetensors_file, "rb")
+                        input_stream.seek(input_metadata_size + data_offsets[0])
+                        data_to_write = input_stream.read(data_offsets[1] - data_offsets[0])
+
+                        # Resolved from hf_module's globals at runtime
+                        fqn_custom_metadata = _get_dcp_custom_metadata(file_metadata)[tensor_fqn]
+                        offsets_of_tensor_being_read = fqn_custom_metadata[SAVED_OFFSETS_KEY]
+
+                        _write_sub_tensor_to_file_optimized(
+                            full_tensor_mv,
+                            data_to_write,
+                            tensor_fqn_data.dtype_size,
+                            tensor_fqn_data.shape_in_file,
+                            offsets_of_tensor_being_read,
+                            metadata[SHAPE_KEY],
+                        )
+
+                    output_stream.write(full_tensor_mv)
+        finally:
+            for input_stream in input_streams.values():
+                input_stream.close()
 
     def _parse_input_metadata_impl(input_files_data, output_files_data):
         from safetensors.torch import _getdtype
@@ -229,7 +236,7 @@ def apply_dcp_consolidation_patch():
                     )
 
     # Create a new function with the target module's globals
-    # This ensures that internal functions like _read_tensor_data_mmap are resolved correctly
+    # This ensures that internal functions like _write_sub_tensor_to_file_optimized are resolved correctly
     patched_func = types.FunctionType(
         _process_output_file_impl.__code__,
         hf_module.__dict__,  # Use target module's globals for symbol resolution
