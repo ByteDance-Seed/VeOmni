@@ -177,6 +177,11 @@ Core files:
     - `_get_micro_batch` greedily adds samples that fit. Supports `state_dict` / `load_state_dict` for checkpoint resumption.
     - Position IDs in packed sequences must encode segment boundaries (see constraint 10).
 
+14a. **Never call `set_epoch` on a shared HF `IterableDataset` inside DataLoader workers**
+    - `datasets` keeps `_epoch` in a torch tensor in shared memory (for persistent workers) and `set_epoch` does `self._epoch += epoch - self._epoch`. Workers writing it concurrently race: the shuffle seed comes out as 2x/3x the intended epoch, differently per run and per rank.
+    - Ranks of one SP group then read different samples; SeedOmni's text encoder assumes replicated inputs and fails in `encode_post`'s narrow.
+    - HF also splits shards across workers itself, so a wrapper must not split rows by `worker_id` again (that kept 1/num_workers of the data). `ShardedIterableDataset` iterates a per-worker `deepcopy` and leaves the worker split to HF.
+
 ### Multimodal Data
 
 15. **Multimodal preprocessing pipeline (`veomni/data/multimodal/` + `veomni/data/data_transform.py`)**
