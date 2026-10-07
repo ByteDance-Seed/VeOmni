@@ -515,6 +515,16 @@ def _companion_row_transform(
     return row_transform
 
 
+def _refuse_unconverted_tensor(converter: Optional["CheckpointTensorConverter"], name: str, tensor: "torch.Tensor"):
+    """A tensor the converter claims by content (e.g. a quantized weight) must not load raw."""
+    can_handle_tensor = getattr(converter, "can_handle_tensor", None)
+    if callable(can_handle_tensor) and can_handle_tensor(name, tensor):
+        raise NotImplementedError(
+            f"ep_sharded_stream_load: converter {type(converter).__name__} needs the whole-tensor "
+            f"conversion for '{name}' ({tensor.dtype}); disable model.ep_sharded_stream_load."
+        )
+
+
 def _read_ep_dim0_slice(
     sl: Any,
     *,
@@ -881,20 +891,34 @@ def load_model_weights_ep_sharded(
                         zero_pad=zero_pad or companion is not None,
                         row_transform=row_transform,
                     )
+                    if row_transform is None:
+                        _refuse_unconverted_tensor(converter, bare_name, tensor)
                     # Already the local slice -> parallel_plan=None (do not slice
                     # again); dtensor_factory then shards over the ep_fsdp sub-mesh
                     # exactly as the whole-tensor path's post-shard_tensor half.
                     _dispatch_parameter(model, name, tensor, dtensor_factory, None, dtensor_to_cpu)
                     n_ep += 1
                 else:
-                    if converter is not None and converter.can_handle(bare_name):
+                    companion = _rowwise_companion(bare_name)
+                    if companion is not None:
+                        # Not sharded, so the rows are all of them: convert the whole
+                        # tensor with its whole companion.
+                        companion_raw = bare_to_raw[companion]
+                        with safe_open(
+                            file_to_path[key_to_file[companion_raw]], framework="pt", device="cpu"
+                        ) as companion_file:
+                            companion_tensor = companion_file.get_tensor(companion_raw)
+                        tensor = converter.convert_rows(bare_name, f.get_tensor(raw_name), companion_tensor)
+                    elif converter is not None and converter.can_handle(bare_name):
                         # A streamable (dim-0 zero-pad) converter must only touch
                         # ExtraParallel tables; a dense key would need its conversion
                         # applied here, which this path does not do -> bail.
                         raise NotImplementedError(
                             f"ep_sharded_stream_load: converter handles non-ExtraParallel key '{name}'."
                         )
-                    tensor = f.get_tensor(raw_name)
+                    else:
+                        tensor = f.get_tensor(raw_name)
+                        _refuse_unconverted_tensor(converter, bare_name, tensor)
                     _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
                     n_dense += 1
                 parameter_names_to_load.discard(name)

@@ -29,7 +29,6 @@ converter only pairs a weight with its scale. It does not restack ``w1``/``w2``/
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -47,7 +46,7 @@ _LAYER_KEY = re.compile(r"^model\.layers\.(\d+)\.(.*)$")
 _ENGRAM_KEY = re.compile(r"^model\.engram\.(\d+)\.(.*)$")
 
 
-def _shrink_maps(config) -> Optional[Tuple[Dict[int, int], Dict[int, int], bool]]:
+def _shrink_maps(config) -> tuple[dict[int, int], dict[int, int], bool] | None:
     """Layer / Engram old->new maps, plus whether draft stages are dropped.
 
     ``None`` means the live module is the released 40-layer stack: every
@@ -68,11 +67,11 @@ def _shrink_maps(config) -> Optional[Tuple[Dict[int, int], Dict[int, int], bool]
 
 def remap_shrunk_checkpoint_key(
     name: str,
-    layer_map: Dict[int, int],
-    engram_map: Dict[int, int],
+    layer_map: dict[int, int],
+    engram_map: dict[int, int],
     *,
     drop_mtp: bool,
-) -> Optional[str]:
+) -> str | None:
     """Rewrite a released FQN onto the shrunk module, or ``None`` to drop it."""
     if drop_mtp and (name == "model.mtp" or name.startswith("model.mtp.")):
         return None
@@ -107,7 +106,7 @@ def scale_key(weight_name: str) -> str:
     return f"{weight_name}_scale"
 
 
-def weight_name_from_scale_name(name: str) -> Optional[str]:
+def weight_name_from_scale_name(name: str) -> str | None:
     if name.endswith("_scale"):
         return name[: -len("_scale")]
     return None
@@ -135,16 +134,16 @@ class DeepseekV41DequantConverter:
     """Pair ``P`` with ``P_scale`` and emit the bf16 weight training expects."""
 
     def __init__(self, config=None) -> None:
-        self._parts: Dict[str, Dict[str, torch.Tensor]] = {}
+        self._parts: dict[str, dict[str, torch.Tensor]] = {}
         maps = _shrink_maps(config) if config is not None else None
         if maps is None:
-            self._layer_map: Optional[Dict[int, int]] = None
-            self._engram_map: Optional[Dict[int, int]] = None
+            self._layer_map: dict[int, int] | None = None
+            self._engram_map: dict[int, int] | None = None
             self._drop_mtp = False
         else:
             self._layer_map, self._engram_map, self._drop_mtp = maps
 
-    def _rewrite(self, name: str) -> Optional[str]:
+    def _rewrite(self, name: str) -> str | None:
         if self._layer_map is None:
             if self._drop_mtp and (name == "model.mtp" or name.startswith("model.mtp.")):
                 return None
@@ -163,10 +162,35 @@ class DeepseekV41DequantConverter:
             return True
         return is_quantized_weight(tensor)
 
-    def should_skip_without_loading(self, name: str) -> bool:
-        return self._rewrite(name) is None
+    def dim0_rowwise_companion(self, name: str) -> str | None:
+        """Each weight's scale rows follow its own dim-0 rows (experts, or output rows).
 
-    def convert(self, name: str, tensor: torch.Tensor) -> Optional[ConvertedCheckpointTensor]:
+        The streaming loader asks this for every key and uses the answer only
+        when the checkpoint holds the scale, so a bf16 tensor reads as is. A
+        shrunk stack renames its layers, which only the whole-tensor loader
+        applies; offering no companion there leaves its scales unclaimed, and
+        the loader refuses them.
+        """
+        if self._layer_map is not None or self._rewrite(name) is None:
+            return None
+        if weight_name_from_scale_name(name) is not None:
+            return None
+        return scale_key(name)
+
+    def convert_rows(self, name: str, rows: torch.Tensor, companion_rows: torch.Tensor) -> torch.Tensor:
+        if rows.shape[0] == 0:
+            return torch.empty(rows.shape, dtype=torch.bfloat16)
+        return dequant_converted_weight(rows, companion_rows)
+
+    def should_skip_without_loading(self, name: str) -> bool:
+        if self._rewrite(name) is None:
+            return True
+        return self._layer_map is None and weight_name_from_scale_name(name) is not None
+
+    def record_skip_without_loading(self, name: str) -> None:
+        pass
+
+    def convert(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
         live = self._rewrite(name)
         if live is None:
             return None
@@ -177,7 +201,7 @@ class DeepseekV41DequantConverter:
             return self._take(live, "weight", tensor)
         return ConvertedCheckpointTensor(live, tensor)
 
-    def _take(self, weight_name: str, part: str, tensor: torch.Tensor) -> Optional[ConvertedCheckpointTensor]:
+    def _take(self, weight_name: str, part: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
         parts = self._parts.setdefault(weight_name, {})
         parts[part] = tensor
         if "weight" not in parts or "scale" not in parts:
@@ -187,7 +211,7 @@ class DeepseekV41DequantConverter:
         del self._parts[weight_name]
         return ConvertedCheckpointTensor(weight_name, dequant_converted_weight(weight, scale))
 
-    def finalize(self) -> List[ConvertedCheckpointTensor]:
+    def finalize(self) -> list[ConvertedCheckpointTensor]:
         if not self._parts:
             return []
         leftover = ", ".join(sorted(self._parts))
@@ -196,7 +220,7 @@ class DeepseekV41DequantConverter:
         )
 
 
-def create_deepseek_v41_llm_checkpoint_tensor_converter(model) -> Optional[DeepseekV41DequantConverter]:
+def create_deepseek_v41_llm_checkpoint_tensor_converter(model) -> DeepseekV41DequantConverter | None:
     """Installed on the bf16 training graph; skipped when the module is quantized."""
     if quantized_storage_dtype(model.config) is not None:
         return None

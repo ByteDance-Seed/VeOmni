@@ -123,9 +123,11 @@ class CheckpointTensorConverter(Protocol):
         and zero-fills any rows past the checkpoint's. The companion itself
         should be declared in :meth:`should_skip_without_loading`.
 
-        The loader only uses the companion when the checkpoint holds it; without
-        it the key falls back to :meth:`is_dim0_zero_pad`. Implementing this
-        method is optional and a missing method means ``None``.
+        A key outside every ExtraParallel plan is read whole, with its whole
+        companion. The loader asks for every key, claimed by :meth:`can_handle`
+        or not, and only uses the companion when the checkpoint holds it;
+        without it the key falls back to :meth:`is_dim0_zero_pad`. Implementing
+        this method is optional and a missing method means ``None``.
         """
         ...
 
@@ -175,8 +177,13 @@ def checkpoint_converter_dim0_rowwise_companion(
     converter: Optional["CheckpointTensorConverter"],
     name: str,
 ) -> Optional[str]:
-    """Safely query the optional :meth:`CheckpointTensorConverter.dim0_rowwise_companion`."""
-    if converter is None or not converter.can_handle(name):
+    """Safely query the optional :meth:`CheckpointTensorConverter.dim0_rowwise_companion`.
+
+    Not gated on ``can_handle``: a converter may claim a weight only by its
+    content (``can_handle_tensor``), and the name alone is all a streaming
+    loader has before reading.
+    """
+    if converter is None:
         return None
     fn = getattr(converter, "dim0_rowwise_companion", None)
     return fn(name) if callable(fn) else None
