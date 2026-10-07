@@ -147,14 +147,22 @@ class ShardedIterableDataset(IterableDataset):
         worker_info = get_worker_info()
         worker_id = 0 if worker_info is None else worker_info.id
         num_workers = 1 if worker_info is None else worker_info.num_workers
+        dataset = self._dataset
+        if isinstance(dataset, HFIterableDataset):
+            # HF already hands each DataLoader worker its own subset of shards.
+            worker_id, num_workers = 0, 1
+            if worker_info is not None:
+                # HF keeps the epoch in memory shared by all workers and set_epoch is a
+                # read-modify-write, so workers updating it concurrently race on the seed.
+                dataset = copy.deepcopy(dataset)
         index = 0
         pending: List[Any] = []
         pass_i = 0
         while True:
             n_before = index
-            if hasattr(self._dataset, "set_epoch"):
-                self._dataset.set_epoch(self._seed + self._epoch + pass_i)
-            for sample in self._dataset:
+            if hasattr(dataset, "set_epoch"):
+                dataset.set_epoch(self._seed + self._epoch + pass_i)
+            for sample in dataset:
                 if index % self._dp_size == self._dp_rank and (index // self._dp_size) % num_workers == worker_id:
                     pending.append(sample)
                 index += 1
