@@ -25,10 +25,9 @@ the shared LM head plus the Markov residual.
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple, Union
-
 import torch
 import torch.nn as nn
+from transformers.modeling_layers import GradientCheckpointingLayer
 
 from .attention import (
     DeepseekV41Attention,
@@ -54,7 +53,7 @@ class DSparkMarkovHead(nn.Module):
         self.embed = nn.Embedding(vocab_size, rank)
         self.head = nn.Linear(rank, vocab_size, bias=False)
 
-    def forward(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         embed = self.embed(token_ids)
         return self.head(embed), embed
 
@@ -70,8 +69,14 @@ class DSparkConfidenceHead(nn.Module):
         return self.proj(torch.cat([hidden, markov_embed], dim=-1).float()).squeeze(-1)
 
 
-class DeepseekV41DSparkBlock(nn.Module):
-    """One DSpark stage: window attention over the backbone's main KV, then MoE."""
+class DeepseekV41DSparkBlock(GradientCheckpointingLayer):
+    """One DSpark stage: window attention over the backbone's main KV, then MoE.
+
+    Checkpointed like a decoder layer: each stage's MoE keeps the same QAT
+    fake-quant expert copies and per-token activations alive until backward.
+    Decode enters through ``forward_draft``, never ``__call__``, so it is not
+    affected.
+    """
 
     def __init__(self, config: DeepseekV41LlmConfig, layer_idx: int) -> None:
         super().__init__()
@@ -109,7 +114,7 @@ class DeepseekV41DSparkBlock(nn.Module):
             self.markov_head = DSparkMarkovHead(config.vocab_size, config.dspark_markov_rank)
             self.confidence_head = DSparkConfidenceHead(config.hidden_size + config.dspark_markov_rank)
 
-    def project_main(self, draft_hiddens: List[torch.Tensor]) -> torch.Tensor:
+    def project_main(self, draft_hiddens: list[torch.Tensor]) -> torch.Tensor:
         """``main_norm(main_proj(cat(target-layer inputs)))`` -- stage 0 only."""
         if self.stage_id != 0:
             raise RuntimeError("only the first DSpark stage owns main_proj")
@@ -121,10 +126,10 @@ class DeepseekV41DSparkBlock(nn.Module):
         pre_mix: torch.Tensor,
         position_ids: torch.Tensor,
         rotary_emb: DeepseekV41RotaryEmbedding,
-        main: Union[List[torch.Tensor], torch.Tensor],
-        shard: Optional[SequenceShard] = None,
-        input_ids: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        main: list[torch.Tensor] | torch.Tensor,
+        shard: SequenceShard | None = None,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """One teacher-forced packed stage: the only way training enters a stage.
 
         Each stage is an FSDP2 unit, and FSDP gathers its parameters in the
@@ -199,7 +204,7 @@ class DeepseekV41DSparkBlock(nn.Module):
         rotary_emb: DeepseekV41RotaryEmbedding,
         cache: DeepseekV41AttentionCache,
         main_x: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """One DSpark block on a draft block, after the window has been seeded from ``main_x``."""
         residual = hidden_streams
         attn_pre, attn_post, attn_comb = self.attn_hc(hidden_streams)
@@ -274,8 +279,8 @@ class DeepseekV41DSparkBlock(nn.Module):
         position_ids: torch.Tensor,
         rotary_emb: DeepseekV41RotaryEmbedding,
         main_x: torch.Tensor,
-        shard: Optional[SequenceShard] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        shard: SequenceShard | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Teacher-forced DSpark on a packed row.
 
         Decode's ``forward_draft`` rebuilds draft positions as ``p+1 .. p+block``
@@ -307,7 +312,7 @@ class DeepseekV41DSparkBlock(nn.Module):
         position_ids: torch.Tensor,
         rotary_emb: DeepseekV41RotaryEmbedding,
         main_x: torch.Tensor,
-        shard: Optional[SequenceShard] = None,
+        shard: SequenceShard | None = None,
     ) -> torch.Tensor:
         """Slot-0 ``DSparkAttention`` at every packed position.
 

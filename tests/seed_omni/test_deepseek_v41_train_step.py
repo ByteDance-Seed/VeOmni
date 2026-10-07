@@ -534,6 +534,38 @@ class TestDsparkTrainStep:
         assert draft.shape == (batch, seq_len, HIDDEN)
         assert markov_bias.shape == (batch, seq_len, VOCAB)
 
+    def test_dspark_stages_checkpoint_with_the_same_grads(self):
+        """Each stage's MoE holds as much as a decoder layer's until backward, so it is checkpointed too."""
+        schedule = shrink_layer_schedule(N_LAYERS)
+        schedule.pop("kept_layer_ids", None)
+        torch.manual_seed(0)
+        config = tiny_llm_config(
+            **schedule, dspark_block_size=5, dspark_n_routed_experts=4, dspark_num_experts_per_tok=2
+        )
+        plain = DeepseekV41LlmAccelerated(config).train()
+        checkpointed = DeepseekV41LlmAccelerated(config).train()
+        checkpointed.load_state_dict(plain.state_dict())
+        checkpointed.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        assert all(stage.gradient_checkpointing for stage in checkpointed.model.mtp)
+
+        batch, seq_len = 1, 6
+        embeds = torch.randn(batch, seq_len, HIDDEN)
+        drafts = [torch.randn(batch, seq_len, HIDDEN) for _ in config.dspark_target_layer_ids]
+        positions = torch.arange(seq_len).unsqueeze(0)
+        input_ids = torch.randint(0, VOCAB, (batch, seq_len))
+        grads = []
+        for llm in (plain, checkpointed):
+            leaves = [embeds.clone().requires_grad_(), *(d.clone().requires_grad_() for d in drafts)]
+            draft, markov_bias = llm.model.forward_dspark_train(leaves[0], positions, leaves[1:], input_ids=input_ids)
+            (draft.float().square().mean() + markov_bias.float().square().mean()).backward()
+            mtp = {n: p.grad for n, p in llm.named_parameters() if n.startswith("model.mtp.") and p.grad is not None}
+            grads.append((mtp, [leaf.grad for leaf in leaves]))
+        assert grads[0][0].keys() == grads[1][0].keys() and grads[0][0]
+        for name, grad in grads[0][0].items():
+            torch.testing.assert_close(grads[1][0][name], grad, msg=name)
+        for ref, got in zip(grads[0][1], grads[1][1]):
+            torch.testing.assert_close(got, ref)
+
     def test_decode_pre_masks_rows_decode_never_drafts_from(self):
         """DSpark labels are the causal t+1 labels minus sample starts and vision rows."""
         te = DeepseekV41TextEncoderAccelerated(tiny_text_config())
