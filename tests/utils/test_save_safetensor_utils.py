@@ -411,6 +411,35 @@ class TestExecutionOrdering(unittest.TestCase):
         self.assertLess(idx_get, idx_writer, f"Wrong order: {call_order}")
 
 
+class TestConsolidationWait(unittest.TestCase):
+    def test_ranks_wait_for_consolidation_on_a_long_timeout_cpu_group(self):
+        import veomni.utils.save_safetensor_utils as mod
+
+        group = object()
+        fake_dist = MagicMock(is_initialized=MagicMock(return_value=True), new_group=MagicMock(return_value=group))
+        on_every_rank = MagicMock()
+        with (
+            patch("torch.distributed.checkpoint.HuggingFaceStorageWriter", MagicMock()),
+            patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
+            patch(f"{_CONSOLIDATE}.consolidate_safetensors_files_on_every_rank", on_every_rank),
+            patch(f"{_MOD}.get_model_save_state", lambda m, f, parallel_state=None: {"a": torch.zeros(2)}),
+            patch(f"{_MOD}.dcp", MagicMock(save=MagicMock())),
+            patch(f"{_MOD}.dist", fake_dist),
+            patch(f"{_MOD}._consolidation_group", None),
+            patch(f"{_MOD}.save_model_assets", MagicMock()),
+            patch(f"{_MOD}.helper", MagicMock()),
+            patch(f"{_MOD}.gc", MagicMock()),
+        ):
+            mod._save_hf_safetensor_distributed(
+                model=_TinyModel(), save_path="/tmp/test", fqn_to_index_mapping=None, model_assets=None
+            )
+
+        kwargs = fake_dist.new_group.call_args.kwargs
+        self.assertEqual(kwargs["backend"], "gloo")
+        self.assertGreaterEqual(kwargs["timeout"].total_seconds(), 3600)
+        self.assertIs(on_every_rank.call_args.kwargs["process_group"], group)
+
+
 class TestLegacySaveModelWeights(unittest.TestCase):
     def test_save_dtype_only_casts_floating_tensors(self):
         import tempfile

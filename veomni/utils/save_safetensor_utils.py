@@ -16,6 +16,7 @@ import gc
 import os
 import shutil
 import time
+from datetime import timedelta
 from typing import Dict, Optional, Sequence
 
 import torch
@@ -133,6 +134,20 @@ def _size_balanced_index_mapping(save_state: Dict[str, torch.Tensor]) -> Dict[st
     return mapping
 
 
+# One rank writes each output file, and one tensor cannot span files: a 197 GB
+# n-gram table takes about an hour through an HDFS mount, far past the 10 min
+# NCCL watchdog the other ranks would otherwise wait under.
+_CONSOLIDATION_TIMEOUT = timedelta(hours=4)
+_consolidation_group = None
+
+
+def _consolidation_process_group():
+    global _consolidation_group
+    if _consolidation_group is None:
+        _consolidation_group = dist.new_group(backend="gloo", timeout=_CONSOLIDATION_TIMEOUT)
+    return _consolidation_group
+
+
 def _save_hf_safetensor_distributed(
     model: torch.nn.Module,
     save_path: str,
@@ -200,7 +215,10 @@ def _save_hf_safetensor_distributed(
     if dist.is_initialized():
         dist.barrier()
         consolidate_safetensors_files_on_every_rank(
-            input_dir=sharded_path, output_dir=save_path, fqn_to_index_mapping=fqn_to_index_mapping
+            input_dir=sharded_path,
+            output_dir=save_path,
+            fqn_to_index_mapping=fqn_to_index_mapping,
+            process_group=_consolidation_process_group(),
         )
     else:
         consolidate_safetensors_files(
