@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -76,9 +76,9 @@ def dense_sparse_attn(
     kv: torch.Tensor,
     attn_sink: torch.Tensor,
     topk_idxs: torch.Tensor,
-    sm_scale: Optional[float] = None,
+    sm_scale: float | None = None,
     return_lse: bool = False,
-) -> "torch.Tensor | Tuple[torch.Tensor, torch.Tensor]":
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Sparse MQA by gather-and-softmax, matching ``sparse_attn_tilelang``.
 
     Args:
@@ -100,15 +100,19 @@ def dense_sparse_attn(
     if sm_scale is None:
         sm_scale = q.shape[-1] ** -0.5
 
-    kv_len = kv.shape[1]
+    batch, kv_len = kv.shape[:2]
     # Out-of-range is masked rather than rejected: the kernel treats any index it
     # cannot read as a miss, and a decode step legitimately produces them from a
     # window that is not yet full.
     valid = (topk_idxs >= 0) & (topk_idxs < kv_len)
     safe = topk_idxs.clamp(0, max(kv_len - 1, 0)).long()
 
-    gathered = kv[:, None, :, :].expand(-1, q.shape[1], -1, -1)
-    gathered = gathered.gather(2, safe.unsqueeze(-1).expand(-1, -1, -1, kv.shape[-1]))
+    # DSpark trains through this function. Gathering from a per-query expanded view
+    # of ``kv`` would make the backward allocate a ``[B, S, S_kv, D]`` zero buffer --
+    # 144 * S^2 bytes per rank under SP8 at the released head_dim -- whereas
+    # ``index_select`` on the flat pool backpropagates into ``[B * S_kv, D]``.
+    rows = safe + torch.arange(batch, device=kv.device).view(-1, 1, 1) * kv_len
+    gathered = kv.reshape(batch * kv_len, -1).index_select(0, rows.flatten()).view(*rows.shape, kv.shape[-1])
 
     scores = torch.einsum("bmhd,bmkd->bmhk", q.float(), gathered.float()) * sm_scale
     scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
@@ -140,14 +144,14 @@ def dense_sparse_attn(
 class DeepseekV41DecodeCache:
     """Every layer's state, plus the position the next token will occupy."""
 
-    layers: List[DeepseekV41AttentionCache]
-    dspark: List[DeepseekV41AttentionCache]
+    layers: list[DeepseekV41AttentionCache]
+    dspark: list[DeepseekV41AttentionCache]
     position: int = 0
-    dspark_main: Optional[torch.Tensor] = None
+    dspark_main: torch.Tensor | None = None
     dspark_ready: bool = False
 
     @classmethod
-    def empty(cls, config) -> "DeepseekV41DecodeCache":
+    def empty(cls, config) -> DeepseekV41DecodeCache:
         n_draft = config.num_nextn_predict_layers if config.dspark_block_size else 0
         return cls(
             layers=[
@@ -163,7 +167,7 @@ class DeepseekV41DecodeCache:
             ],
         )
 
-    def snapshot(self) -> Dict[str, Any]:
+    def snapshot(self) -> dict[str, Any]:
         """Clone every layer so a rejected speculative token can roll the stack back."""
         return {
             "layers": [layer.snapshot() for layer in self.layers],
@@ -173,7 +177,7 @@ class DeepseekV41DecodeCache:
             "dspark_ready": self.dspark_ready,
         }
 
-    def restore(self, snap: Dict[str, Any]) -> None:
+    def restore(self, snap: dict[str, Any]) -> None:
         for layer, layer_snap in zip(self.layers, snap["layers"]):
             layer.restore(layer_snap)
         for layer, layer_snap in zip(self.dspark, snap["dspark"]):
@@ -385,15 +389,15 @@ def decode_attention_step(
 
 
 def decode_layer_step(
-    layer: "DeepseekV41DecoderLayer",
+    layer: DeepseekV41DecoderLayer,
     hidden_streams: torch.Tensor,
     pre_mix: torch.Tensor,
     position: int,
     rotary_emb: DeepseekV41RotaryEmbedding,
     shared: SharedAttentionState,
     cache: DeepseekV41AttentionCache,
-    image_mask: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    image_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """One decoder layer for one token: ``[B, 1, hc, D]`` in, that and the next ``pre``.
 
     A line-for-line copy of :meth:`DeepseekV41DecoderLayer.forward` with the
@@ -427,12 +431,12 @@ def decode_layer_step(
 
 
 def decode_backbone_step(
-    backbone: "DeepseekV41Backbone",
+    backbone: DeepseekV41Backbone,
     inputs_embeds: torch.Tensor,
     position: int,
     cache: DeepseekV41DecodeCache,
-    ngram_embeds: Optional[List[torch.Tensor]] = None,
-    image_mask: Optional[torch.Tensor] = None,
+    ngram_embeds: list[torch.Tensor] | None = None,
+    image_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The backbone for one token: ``[B, 1, hidden]`` in, normed hidden states out.
 
@@ -467,7 +471,7 @@ def decode_backbone_step(
     hidden_streams = expand_to_streams(inputs_embeds, backbone.config.hc_mult)
     pre_mix = identity_pre_mix(hidden_streams, backbone.config.hc_mult)
     draft_targets = set(backbone.config.dspark_target_layer_ids)
-    draft_hiddens: List[torch.Tensor] = []
+    draft_hiddens: list[torch.Tensor] = []
 
     for layer_idx, layer in enumerate(backbone.layers):
         if str(layer_idx) in backbone.engram:

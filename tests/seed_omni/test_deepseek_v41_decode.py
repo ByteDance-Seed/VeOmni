@@ -144,6 +144,49 @@ def test_a_fully_masked_query_falls_back_to_the_sink():
     torch.testing.assert_close(lse, expected)
 
 
+def test_backward_stays_linear_in_the_pool():
+    """DSpark trains through this; its pool is the full gathered row under SP.
+
+    Gathering from a per-query expanded view of ``kv`` gives the same values but a
+    backward that allocates ``[B, S, S_kv, D]`` -- what OOMed SP8 at 20k tokens.
+    """
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    batch, seqlen, heads, dim, kv_len, topk = 2, 24, 4, 16, 40, 6
+    q, kv, sinks, idxs = _inputs(batch, seqlen, heads, dim, kv_len, topk, device="cpu")
+    q, kv = q.float().requires_grad_(True), kv.float().requires_grad_(True)
+    out_grad = torch.randn(batch, seqlen, heads, dim)
+
+    class LargestTensor(TorchDispatchMode):
+        numel = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            out = func(*args, **(kwargs or {}))
+            for tensor in out if isinstance(out, (tuple, list)) else [out]:
+                if isinstance(tensor, torch.Tensor):
+                    self.numel = max(self.numel, tensor.numel())
+            return out
+
+    out = dense_sparse_attn(q, kv, sinks, idxs, dim**-0.5)
+    tracker = LargestTensor()
+    with tracker:
+        out.backward(out_grad)
+    assert tracker.numel < batch * seqlen * kv_len * dim
+
+    ref_q, ref_kv = q.detach().clone().requires_grad_(True), kv.detach().clone().requires_grad_(True)
+    valid = (idxs >= 0) & (idxs < kv_len)
+    safe = idxs.clamp(0, kv_len - 1).long()
+    gathered = ref_kv[:, None].expand(-1, seqlen, -1, -1).gather(2, safe.unsqueeze(-1).expand(-1, -1, -1, dim))
+    scores = torch.einsum("bmhd,bmkd->bmhk", ref_q, gathered) * dim**-0.5
+    scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
+    logits = torch.cat([scores, sinks.view(1, 1, -1, 1).expand(batch, seqlen, -1, 1)], dim=-1)
+    probs = logits.softmax(-1)[..., :-1]
+    torch.einsum("bmhk,bmkd->bmhd", probs, gathered).backward(out_grad)
+
+    torch.testing.assert_close(q.grad, ref_q.grad)
+    torch.testing.assert_close(kv.grad, ref_kv.grad)
+
+
 @requires_kernel
 def test_lse_is_base_two_like_the_kernel():
     """The kernel exponentiates with exp2; its wrapper never says so.
