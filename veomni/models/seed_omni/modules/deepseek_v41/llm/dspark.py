@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 from transformers.modeling_layers import GradientCheckpointingLayer
 
+from ......ops.kernels.deepseek_v4 import sparse_attn_tilelang
 from .attention import (
     DeepseekV41Attention,
     DeepseekV41AttentionCache,
@@ -351,7 +352,19 @@ class DeepseekV41DSparkBlock(GradientCheckpointingLayer):
         own_idxs = main_kv.shape[1] + torch.arange(seq_len, device=hidden_states.device, dtype=torch.int32)
         topk_idxs = torch.cat([main_idxs, own_idxs.view(1, -1, 1).expand(batch, -1, -1)], dim=-1)
 
-        output = dense_sparse_attn(query, pool, attn.attn_sink, topk_idxs, attn.softmax_scale)
+        # Same kernel as the backbone's training attention: the dense gather keeps
+        # fp32 ``[B, S, topk, D]`` copies for backward and runs micro batch 4 out
+        # of memory on 256 x H20. CPU has no TileLang, and both compute the same.
+        if query.is_cuda:
+            output = sparse_attn_tilelang(
+                query.contiguous(),
+                pool.contiguous(),
+                attn.attn_sink.float().contiguous(),
+                topk_idxs.contiguous(),
+                attn.softmax_scale,
+            )
+        else:
+            output = dense_sparse_attn(query, pool, attn.attn_sink, topk_idxs, attn.softmax_scale)
         output = apply_interleaved_rope(output, cos.unsqueeze(-2), -sin.unsqueeze(-2))
         grouped = attn.wo_a(output.reshape(batch, seq_len, attn.n_groups, -1))
         return attn.wo_b(grouped.flatten(2))
