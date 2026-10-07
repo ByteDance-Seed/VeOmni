@@ -437,7 +437,8 @@ def restore_extra_parallel_dim(
             ``(ep_fsdp, ep)`` for plain FSDP or 3D
             ``(ep_replicate, ep_fsdp, ep)`` for HSDP.
         extra_parallel_fsdp_mesh (DeviceMesh): The FSDP sub-mesh (ExtraParallel
-            dim excluded), used for the pure-ExtraParallel (no FSDP) path.
+            dim excluded). Unused: a plain (unwrapped) tensor shards on the
+            ExtraParallel dim of ``fsdp_mesh`` alone.
         ep_shard_dim (int): Tensor dim the ExtraParallel dim shards along.
         fsdp_shard_dim (int): Tensor dim FSDP shards along.
 
@@ -464,8 +465,11 @@ def restore_extra_parallel_dim(
             placements = [Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
         dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
     elif torch.is_tensor(orgin_tensor):
-        # If there is no FSDP but only ExtraParallel
-        dtensor = DTensor.from_local(orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=[Shard(0)])
+        # No FSDP wrap (``extra_parallel_only``): the plain tensor is this rank's
+        # slice along the ExtraParallel dim alone. Placing it on the FSDP sub-mesh,
+        # which has size 1 there, would save one rank's slice as the whole tensor.
+        para_mesh = fsdp_mesh[fsdp_mesh.mesh_dim_names[-1]]
+        dtensor = DTensor.from_local(orgin_tensor, device_mesh=para_mesh, placements=[Shard(ep_shard_dim)])
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 
