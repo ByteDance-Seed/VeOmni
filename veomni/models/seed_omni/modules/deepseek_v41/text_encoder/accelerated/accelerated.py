@@ -27,6 +27,7 @@ logits.
 from typing import Any, Dict, Optional
 
 import torch
+import torch.nn.functional as F
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.ops.kernels.cross_entropy import ForCausalLMLoss
@@ -40,6 +41,64 @@ from ....base.text_encoder.accelerated import VeOmniMixin as BaseVeOmniMixin
 from ..chat_template import DeepseekV41ChatTemplate
 from ..configuration import DeepseekV41TextEncoderConfig
 from ..modeling import DeepseekV41TextEncoder
+
+
+class _MarkovResidualCrossEntropy(torch.autograd.Function):
+    """Summed ``CE(h @ W.T + bias, labels)`` over the supervised rows, gradients taken in forward.
+
+    Under SP every rank scores the gathered full row, so a 32k-token sample would
+    otherwise hold ``[S, vocab]`` fp32 logits and their softmax gradient at once.
+    Here only one chunk of fp32 logits is live; the full-size tensors left are the
+    bias itself and its gradient.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden, weight, bias, labels, chunk_size):
+        rows = (labels != IGNORE_INDEX).nonzero().squeeze(-1)
+        need_hidden, need_weight, need_bias = ctx.needs_input_grad[:3]
+        grad_hidden = torch.zeros_like(hidden) if need_hidden else None
+        grad_weight = torch.zeros_like(weight) if need_weight else None
+        grad_bias = torch.zeros_like(bias) if need_bias else None
+        loss = torch.zeros((), dtype=torch.float32, device=hidden.device)
+        for start in range(0, rows.numel(), chunk_size):
+            index = rows[start : start + chunk_size]
+            h = hidden.index_select(0, index)
+            target = labels.index_select(0, index)
+            logits = (F.linear(h, weight) + bias.index_select(0, index)).float()
+            lse = torch.logsumexp(logits, dim=-1)
+            loss += (lse - logits.gather(-1, target[:, None]).squeeze(-1)).sum()
+            grad = logits.sub_(lse[:, None]).exp_()
+            grad.scatter_add_(-1, target[:, None], grad.new_full((index.numel(), 1), -1.0))
+            grad = grad.to(hidden.dtype)
+            if need_bias:
+                grad_bias.index_copy_(0, index, grad)
+            if need_hidden:
+                grad_hidden.index_copy_(0, index, grad @ weight)
+            if need_weight:
+                grad_weight.addmm_(grad.t(), h)
+        ctx.save_for_backward(*(g if g is not None else torch.empty(0) for g in (grad_hidden, grad_weight, grad_bias)))
+        ctx.has_grads = (need_hidden, need_weight, need_bias)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grads = [g * grad_output.to(g.dtype) if has else None for g, has in zip(ctx.saved_tensors, ctx.has_grads)]
+        return *grads, None, None
+
+
+def _markov_residual_cross_entropy(
+    logits, labels, vocab_size, num_items_in_batch, ignore_index=IGNORE_INDEX, **kwargs
+) -> tuple[torch.Tensor, None]:
+    """``cross_entropy_fn`` for ``ForCausalLMLoss``: the linear, the Markov add and the CE fused per chunk."""
+    del logits, ignore_index
+    loss = _MarkovResidualCrossEntropy.apply(
+        kwargs["hidden_states"],
+        kwargs["weights"],
+        kwargs["markov_bias"].reshape(-1, vocab_size),
+        labels,
+        kwargs.get("markov_chunk_size", 2048),
+    )
+    return loss / num_items_in_batch, None
 
 
 class TrainingMixin(BaseTrainingMixin):
@@ -158,10 +217,26 @@ class TrainingMixin(BaseTrainingMixin):
     ) -> torch.Tensor:
         """``CE(lm_head(h) + markov(x), labels)``, token-mean over the ``dp_sp`` mesh like the main head.
 
-        The fused linear+CE kernels take a weight and no additive term, so this
-        branch materializes the supervised rows' logits.
+        The shared fused linear+CE kernels take a weight and no additive term, so
+        a bias-free untied head goes through the chunked
+        :class:`_MarkovResidualCrossEntropy`; any other head materializes the
+        supervised rows' logits.
         """
         num_supervised_tokens = (labels != IGNORE_INDEX).sum()
+        if not self.config.tie_word_embeddings and self.lm_head is not None and self.lm_head.bias is None:
+            loss, _, _ = ForCausalLMLoss(
+                logits=None,
+                labels=None,
+                shift_labels=labels,
+                vocab_size=self.config.vocab_size,
+                num_items_in_batch=num_supervised_tokens.clamp(min=1),
+                loss_reduction_group=get_parallel_state().fsdp_group,
+                cross_entropy_fn=_markov_residual_cross_entropy,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                markov_bias=markov_bias,
+            )
+            return loss
         if num_supervised_tokens > 0:
             supervised = labels != IGNORE_INDEX
             hidden_states, markov_bias, labels = hidden_states[supervised], markov_bias[supervised], labels[supervised]

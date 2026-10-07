@@ -629,6 +629,36 @@ class TestDsparkTrainStep:
                 mtp_labels=mtp_labels,
             )
 
+    def test_chunked_dspark_ce_matches_materialized_logits(self, monkeypatch):
+        """Chunked draft CE gives the materialized-logits loss and gradients for h, lm_head and the bias."""
+        from veomni.models.seed_omni.modules.deepseek_v41.text_encoder.accelerated import accelerated
+
+        real = accelerated._markov_residual_cross_entropy
+        monkeypatch.setattr(
+            accelerated,
+            "_markov_residual_cross_entropy",
+            lambda *args, **kwargs: real(*args, markov_chunk_size=3, **kwargs),
+        )
+        te = DeepseekV41TextEncoderAccelerated(tiny_text_config())
+        torch.manual_seed(0)
+        draft = torch.randn(11, HIDDEN, requires_grad=True)
+        markov_bias = torch.randn(11, VOCAB, requires_grad=True)
+        labels = torch.randint(0, VOCAB, (11,))
+        labels[[0, 4, 5, 9]] = IGNORE_INDEX
+
+        loss = te._dspark_loss(draft, markov_bias, labels)
+        loss.backward()
+        chunked = [draft.grad, te.lm_head.weight.grad, markov_bias.grad]
+        for tensor in (draft, te.lm_head.weight, markov_bias):
+            tensor.grad = None
+
+        keep = labels != IGNORE_INDEX
+        expected = torch.nn.functional.cross_entropy((te.lm_head(draft) + markov_bias)[keep].float(), labels[keep])
+        expected.backward()
+        torch.testing.assert_close(loss, expected)
+        for got, want in zip(chunked, (draft.grad, te.lm_head.weight.grad, markov_bias.grad)):
+            torch.testing.assert_close(got, want)
+
 
 def _has_grad(module, prefix: str) -> bool:
     params = [p for n, p in module.named_parameters() if n.startswith(prefix)]
