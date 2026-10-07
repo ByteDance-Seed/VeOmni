@@ -224,6 +224,9 @@ def _save_hf_safetensor_distributed(
         consolidate_safetensors_files(
             input_dir=sharded_path, output_dir=save_path, fqn_to_index_mapping=fqn_to_index_mapping
         )
+    # Rank 0 returns from the consolidation gather only after every rank has written its files.
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        shutil.rmtree(sharded_path, ignore_errors=True)
     gc.collect()
     helper.empty_cache()
     elapsed_time = time.time() - start_time

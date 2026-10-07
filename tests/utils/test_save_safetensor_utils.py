@@ -223,6 +223,7 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
             files = sorted(Path(output_dir).glob("model-*.safetensors"))
             self.assertGreater(len(files), 1)
             self.assertTrue((Path(output_dir) / "model.safetensors.index.json").exists())
+            self.assertFalse((Path(output_dir) / "sharded").exists())
             loaded = {}
             for file in files:
                 loaded.update(load_file(file))
