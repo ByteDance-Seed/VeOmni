@@ -1,8 +1,11 @@
 # Text + image-understanding SFT mix. Same sources the other SeedOmni V2
 # configs use, so a first run compares against a known baseline rather than
 # against a dataset nobody has trained on here.
+# The tulu shards upstream are sorted by subset and each dataloader worker
+# streams its own shards on every rank, so a global step would be one subset;
+# the -shuffled copy permutes rows across shards.
 sources:
-  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture-le1024/data
+  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture-le1024-shuffled/data
   - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k
 names:
   - tulu-3-sft-mixture
