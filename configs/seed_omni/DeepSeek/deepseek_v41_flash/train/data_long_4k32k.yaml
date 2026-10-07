@@ -4,8 +4,9 @@
 # micro_batch_size 1 a rank holds up to 32.7k / ulysses_size tokens.
 sources:
   - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture-4k32k
+# `names` picks the SeedOmni preprocessor, so it stays the upstream tulu name.
 names:
-  - tulu-3-sft-mixture-4k32k
+  - tulu-3-sft-mixture
 schedule:
   - schedule_type: const
     weights: [1.0]
