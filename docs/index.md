@@ -68,6 +68,7 @@ examples/qwen3.md
 examples/qwen3_5.md
 examples/qwen3_moe.md
 examples/qwen3_vl.md
+examples/qwen_image_edit.md
 examples/qwen3_omni_moe.md
 examples/qwen3_omni_offline_av.md
 examples/minimax_h3.md
