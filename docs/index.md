@@ -95,6 +95,13 @@ key_features/omni_offline_encoding.md
 
 ```{toctree}
 :maxdepth: 1
+:caption: SeedOmni
+
+seed_omni/mixins/metric_meter.md
+```
+
+```{toctree}
+:maxdepth: 1
 :caption: Design
 
 design/kernel_selection.md
