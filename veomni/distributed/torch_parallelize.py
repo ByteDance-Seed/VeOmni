@@ -369,8 +369,8 @@ def _is_fsdp_wrap_target(fqn: str, class_name: str, targets: Collection[str]) ->
     ``fqn.startswith(prefix + ".")``.
 
     Scoping exists because a class name alone is ambiguous on a composed model.
-    ``Embedding`` is a legitimate wrap unit under the text encoder (whose weight
-    is read only through the embedding's own forward and tied ``project``), but wrapping the same class under the
+    ``Embedding`` is a legitimate wrap unit under a child that reads the weight
+    only through the embedding's own forward, but wrapping the same class under the
     VQVAE makes ``JanusVQVAEVectorQuantizer.forward`` read a sharded codebook —
     it touches ``self.embedding.weight`` directly, never through the
     embedding's own ``__call__``, so no unshard hook fires.
