@@ -27,18 +27,16 @@ What a module computes vs. what the trainer computes
 ----------------------------------------------------
 A module only ever produces **time-independent** quantities:
 
-* :meth:`metric_meter_add` accumulates this module's token lengths — the per-module
-  analogue of ``EnvironMeter.add``.  The training node executor calls it right
-  after ``pre_forward`` (when the real input tensors are in hand), passing the
-  node's ``method`` + the forward ``data``.  A module reports its tokens by calling
-  :meth:`MetricMeterMixin.metric_meter_set_seqlens` inside its ``pre_forward``
-  **before any SP slice** (that setter lives on ``MetricMeterMixin`` so only
-  metered modules stash; token domains differ
-  — text seq len vs image patches vs VQ tokens — and some call-sites aren't
-  counted, e.g. a VQ codec counts on ``encode`` and stashes nothing on
-  ``decode``). The default :meth:`metric_meter_token_lengths` simply drains that
-  stash, so metering is identical with or without SP (measuring the
-  post-``pre_forward`` shard directly would under-count by ~``sp``).
+* A module reports its tokens by calling :meth:`metric_meter_set_seqlens` inside
+  its ``pre_forward`` **before any SP slice**, so metering is identical with or
+  without SP (measuring the post-``pre_forward`` shard would under-count by
+  ~``sp``). Token domains differ — text seq len vs image patches vs VQ tokens —
+  and some call-sites aren't counted, e.g. a VQ codec counts on ``encode`` and
+  stashes nothing on ``decode``.
+* :meth:`metric_meter_add` moves the lengths stashed for the running call-site
+  into the step buffer — the per-module analogue of ``EnvironMeter.add``. The
+  training node executor calls it right after ``pre_forward`` with the node's
+  ``method``.
 * :meth:`metric_meter_collect` returns ``(theoretical_flops, seqlens)`` — the total
   theoretical TFLOPs for this module's compute over the step plus its raw token
   lengths.  **No timing, no MFU, no cross-rank reduction here.**
@@ -57,8 +55,8 @@ mis-count at module granularity).
 Opt-in is by **multiple inheritance**, NOT by ``BaseMixin`` (``BaseMixin``
 does *not* inherit ``MetricMeterMixin``). A module that wants metering defines its own
 ``XxxMetricMeterMixin(MetricMeterMixin)`` implementing just ``estimate_flops`` (token
-lengths come from :meth:`metric_meter_set_seqlens` via the default
-``metric_meter_token_lengths``), and its concrete model multi-inherits it, e.g.::
+lengths come from :meth:`metric_meter_set_seqlens`), and its concrete model
+multi-inherits it, e.g.::
 
     class XxxModel(XxxMetricMeterMixin, TrainingModuleMixin, BaseMixin, PreTrainedModel): ...
 
@@ -67,7 +65,7 @@ metrics with ``isinstance(model, MetricMeterMixin)``. Modules without a metric m
 nothing.
 """
 
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 
 # What a metered module hands back each step: its total theoretical TFLOPs +
@@ -82,8 +80,8 @@ class MetricMeterMixin:
         """Stash the FULL (pre-SP-slice) per-sample token lengths for call-site ``method``.
 
         **Call this inside a ``pre_forward`` hook, BEFORE any SP gather/slice.**
-        Only modules that mix in ``MetricMeterMixin`` should call this; the default
-        :meth:`metric_meter_token_lengths` drains the stash at step end.
+        Only modules that mix in ``MetricMeterMixin`` should call this;
+        :meth:`metric_meter_add` drains the stash right after ``pre_forward``.
 
         Why pre-slice / full-sample: under uniform SP the ``pre_forward`` hook
         slices to this rank's ``1/sp_size`` shard, so a length read *after* the
@@ -119,35 +117,19 @@ class MetricMeterMixin:
             f"{type(self).__name__} mixes in MetricMeterMixin but does not implement estimate_flops(seqlens)."
         )
 
-    def metric_meter_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
-        """Per-sample token lengths this module processed for call-site ``method``.
+    def metric_meter_add(self, method: str) -> None:
+        """Move the lengths stashed for call-site ``method`` into this step's buffer.
 
-        Canonical path: drain the FULL, SP-invariant lengths a module stashed via
-        :meth:`metric_meter_set_seqlens` in its ``pre_forward``. A call-site that
-        stashed nothing (a module with no ``pre_forward`` for it, e.g. ``decode``)
-        returns ``[]`` and contributes nothing — so ``data`` is unused.
-
-        This unified stash replaces the old per-module readers that measured the
-        post-``pre_forward`` kwargs directly: under SP those kwargs are this rank's
-        shard, which under-counts tokens/FLOPs by ~``sp``. Stashing the full
-        pre-slice own-data length keeps metering identical across SP configs. A
-        module may still override this, but the stash is the intended mechanism.
+        Called once per training node by the executor right after ``pre_forward``,
+        so it sums over a whole gradient-accumulation step. The stash is keyed by
+        ``method`` because one ``pre_forward`` hook may serve several call-sites
+        (``@pre_forward("encode", "offline_encode")``) without knowing which one
+        invoked it: such a hook stashes under each, and only the running call-site
+        is counted. A call-site that stashed nothing (e.g. ``decode``) adds nothing.
         """
-        del data
-        store = getattr(self, "_metric_full_seqlens", None)
-        if store is None:
-            return []
-        return store.pop(method, [])
-
-    def metric_meter_add(self, method: str, data: Dict[str, Any]) -> None:
-        """Accumulate this micro-batch's token lengths (per-module ``meter.add``).
-
-        Called once per micro-batch by the training node executor right after
-        ``pre_forward`` (so ``data`` holds the real input tensors), with the
-        node's ``method``.  Sums correctly over a whole gradient-accumulation
-        step (a call that returns ``[]`` adds nothing).
-        """
-        self._metric_meter_seqlen_buffer().extend(self.metric_meter_token_lengths(method, data))
+        stash = getattr(self, "_metric_full_seqlens", None)
+        if stash:
+            self._metric_meter_seqlen_buffer().extend(stash.pop(method, []))
 
     def metric_meter_collect(self) -> MetricMeterResult:
         """Return ``(theoretical_flops, seqlens)`` for the step, then reset.

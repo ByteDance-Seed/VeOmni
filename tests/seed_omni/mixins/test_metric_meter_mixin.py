@@ -33,7 +33,7 @@ def test_collect_drains_the_stash_and_scales_flops_by_the_step_tokens():
     module = MeteredModule()
 
     module.metric_meter_set_seqlens("forward", [4, 6])
-    module.metric_meter_add("forward", data={})
+    module.metric_meter_add("forward")
     flops, seqlens = module.metric_meter_collect()
 
     assert seqlens == [4, 6]
@@ -46,7 +46,7 @@ def test_add_accumulates_over_a_gradient_accumulation_step():
 
     for length in (3, 5, 7):
         module.metric_meter_set_seqlens("forward", [length])
-        module.metric_meter_add("forward", data={})
+        module.metric_meter_add("forward")
 
     flops, seqlens = module.metric_meter_collect()
     assert seqlens == [3, 5, 7]
@@ -56,7 +56,7 @@ def test_add_accumulates_over_a_gradient_accumulation_step():
 def test_collect_resets_so_the_next_step_starts_empty():
     module = MeteredModule()
     module.metric_meter_set_seqlens("forward", [8])
-    module.metric_meter_add("forward", data={})
+    module.metric_meter_add("forward")
     module.metric_meter_collect()
 
     assert module.metric_meter_collect() == (0.0, [])
@@ -67,11 +67,23 @@ def test_a_call_site_that_stashed_nothing_contributes_nothing():
     module = MeteredModule()
 
     module.metric_meter_set_seqlens("encode", [9])
-    module.metric_meter_add("decode", data={})
+    module.metric_meter_add("decode")
 
     assert module.metric_meter_collect() == (0.0, [])
     # The untouched `encode` stash is still there for its own call-site.
-    assert module.metric_meter_token_lengths("encode", {}) == [9]
+    module.metric_meter_add("encode")
+    assert module.metric_meter_collect() == (18.0, [9])
+
+
+def test_a_hook_shared_by_call_sites_is_counted_once():
+    """A ``@pre_forward("encode", "offline_encode")`` hook stashes under both; only the running one counts."""
+    module = MeteredModule()
+
+    module.metric_meter_set_seqlens("encode", [5])
+    module.metric_meter_set_seqlens("offline_encode", [5])
+    module.metric_meter_add("encode")
+
+    assert module.metric_meter_collect() == (10.0, [5])
 
 
 def test_the_stash_is_drained_once_per_call_site():
@@ -79,8 +91,8 @@ def test_the_stash_is_drained_once_per_call_site():
     module = MeteredModule()
     module.metric_meter_set_seqlens("forward", [10])
 
-    module.metric_meter_add("forward", data={})
-    module.metric_meter_add("forward", data={})
+    module.metric_meter_add("forward")
+    module.metric_meter_add("forward")
 
     assert module.metric_meter_collect() == (20.0, [10])
 

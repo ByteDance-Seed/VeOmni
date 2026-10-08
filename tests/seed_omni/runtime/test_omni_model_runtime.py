@@ -322,7 +322,7 @@ def test_metric_meter_collect_drains_only_the_metered_modules():
 
     metered = _MeteredModule()
     metered.metric_meter_set_seqlens("encode", [3, 4])
-    metered.metric_meter_add("encode", {})
+    metered.metric_meter_add("encode")
     runtimes = {
         "metered": SimpleNamespace(omni_module=metered),
         "plain": SimpleNamespace(omni_module=torch.nn.Linear(1, 1)),
