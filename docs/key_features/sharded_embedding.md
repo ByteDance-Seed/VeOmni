@@ -1,6 +1,6 @@
 # Sharded Embedding
 
-> TL;DR: `veomni.distributed.emb_parallel.ShardedEmbedding` is a drop-in `nn.Embedding` whose vocab rows are split over the `emb` extra-parallel group. Build the text embedding as a `ShardedEmbedding`, shard its weight on dim-0 under `"emb"` in the module's parallel plan, and set `extra_parallel_names: [emb]` in the accelerator config. With `emb` off it is exactly `nn.Embedding`.
+> TL;DR: `veomni.distributed.emb_parallel.ShardedEmbedding` is a drop-in `nn.Embedding` whose vocab rows are split over the `emb` extra-parallel group. Build the text embedding as a `ShardedEmbedding`, list it in `_no_split_modules`, shard its weight on dim-0 under `"emb"` in the module's parallel plan, and set `extra_parallel_names: [emb]` in the accelerator config. A table the plan did not split runs exactly as `nn.Embedding`.
 
 ## Motivation
 
@@ -19,7 +19,11 @@ The table is a `[V, H]` parameter sharded on two dims, in the same way ExtraPara
 | 0 (vocab) | `emb` | sliced by the parallel plan: each rank keeps `V / emb` contiguous rows |
 | 1 (hidden) | `emb_fsdp` | `Shard(1)` by FSDP2 |
 
-Each rank therefore stores `[V / emb, H / emb_fsdp]`. The parallelizer wraps the module that owns the planned weight (`embed_tokens` for `embed_tokens.weight`) as its own FSDP2 unit on the `emb_fsdp` mesh, so by the time `forward` runs, FSDP2 has all-gathered the hidden dim and the module sees its plain `[V / emb, H]` rows.
+Each rank therefore stores `[V / emb, H / emb_fsdp]`. The parallelizer wraps the module that owns the planned weight (`embed_tokens` for `embed_tokens.weight`) as its own FSDP2 unit on the `emb_fsdp` mesh, so by the time `forward` runs, FSDP2 has all-gathered the hidden dim and the module sees its plain `[V / emb, H]` rows. It only does so for a module at or below a wrap target (a class in `_no_split_modules` or `basic_modules`); otherwise a parent unit would shard and gather the rows over the whole FSDP mesh, mixing different ranks' vocab slices, so `ShardedEmbedding` raises if a split table reaches its forward without being its own FSDP2 unit.
+
+### Dispatch
+
+`ShardedEmbedding` decides per call from its own weight, not from a config switch. If the weight holds all `V` rows (`emb` off, or the module not in the plan), it runs `nn.Embedding.forward`. If it holds `V / emb` rows, it runs the sharded lookup over the `emb` group of the parallel state. Any other row count raises, because global ids would silently index the wrong rows.
 
 ### Lookup
 
@@ -30,7 +34,7 @@ Each rank therefore stores `[V / emb, H / emb_fsdp]`. The parallelizer wraps the
 3. Each owner runs a local `F.embedding` on the ids it received, rebased to its own rows.
 4. All-to-all the vectors back and restore the original order and shape.
 
-Backward runs the same exchange in reverse. It sums the incoming row gradients in fp32 over the rows that were actually touched, then casts the sum to the table dtype. With one shard (`emb` reported on with size 1), the collectives alias their buffers, and the op reduces exactly to `F.embedding`.
+Backward runs the same exchange in reverse. It sums the incoming row gradients in fp32 over the rows that were actually touched, then casts the sum to the table dtype. Called with a group of one rank (or no group), the op aliases its buffers instead of running collectives, and reduces exactly to `F.embedding`.
 
 ### Gradient
 
@@ -44,19 +48,25 @@ The weight gradient covers every token of the `emb` group, but only this data-pa
 
 ### 1. Module
 
-Build the embedding as a `ShardedEmbedding` and call it in the module's forward, like any `nn.Embedding`:
+Build the embedding as a `ShardedEmbedding`, call it in the module's forward like any `nn.Embedding`, and list it in `_no_split_modules` so the parallelizer makes it its own FSDP2 unit:
 
 ```python
 from veomni.distributed.emb_parallel import ShardedEmbedding
 
-self.embed_tokens = ShardedEmbedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
 
-def forward(self, input_ids):
-    inputs_embeds = self.embed_tokens(input_ids)  # global ids in, [*, H] out
-    ...
+class TextEncoder(PreTrainedModel):
+    _no_split_modules = ["ShardedEmbedding"]
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.embed_tokens = ShardedEmbedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
+
+    def forward(self, input_ids):
+        inputs_embeds = self.embed_tokens(input_ids)  # global ids in, [*, H] out
+        ...
 ```
 
-Whether `emb` is on, and over which group, is read from the parallel state. No model-side switch is needed.
+`_no_split_modules` matches class names, so a list that names `Embedding` does not cover `ShardedEmbedding`. Whether to run the sharded lookup is decided from the weight (see [Dispatch](#dispatch)), so there is no model-side switch.
 
 ### 2. Parallel plan
 
@@ -83,19 +93,19 @@ accelerator:
   extra_parallel_placement_innermost: [false]
 ```
 
-`emb` must divide the world size, `V` must be divisible by `emb`, and `H` must be divisible by `world_size / emb` (the `emb_fsdp` size).
+`emb` must divide the FSDP shard size (`dp_shard` x sequence-parallel size, which is the world size without HSDP replication). `V` must be divisible by `emb`, and `H` must be divisible by the `emb_fsdp` size, which is that shard size divided by `emb`.
 
 ## Constraints
 
 - **No tied output head.** Outside the embedding's own forward, its weight is in general the FSDP2-sharded DTensor, and a vocab-sharded head would need a different collective (its logits are sharded on vocab). Only large tables are worth sharding, and those are never tied. Use an untied `lm_head`, and keep `tie_word_embeddings` false in the config of any module that uses `ShardedEmbedding` with `emb` on.
 - **Read the weight only through the module.** Calling `F.embedding(ids, module.weight)` or indexing `module.weight` from outside the module's forward sees the FSDP2-sharded DTensor. `ShardedEmbedding` raises if its forward is reached with a DTensor weight.
 - **Every rank of the `emb` group must call the module equally often.** Each call is a set of collectives over the group, and so is each backward. A rank with no tokens must still call the module with empty ids, and must still backpropagate through the result, or the other ranks block.
-- **`max_norm` is not supported** under `emb`, because it would renormalize rows in place across ranks. `scale_grad_by_freq` and `sparse` are ignored by the sharded path.
-- A table whose rows do not match the parallel state is rejected: a split table with `emb` off, or an unsplit one with `emb` on. Without this check, global ids would silently index the wrong rows.
+- **`max_norm`, `scale_grad_by_freq` and `sparse` are not supported** on a split table; the sharded lookup raises `NotImplementedError` for each.
+- **One table per `emb` plan.** `ParallelPlan` makes only the parent of the plan's first entry the `emb` FSDP2 unit, so a second planned table is not wrapped, and its forward raises. Several tables need `extra_parallel_fsdp_no_shard_module` set by hand until [#1270](https://github.com/ByteDance-Seed/VeOmni/issues/1270) lands.
 
 ## Status and roadmap
 
-Today, `ShardedEmbedding` is the operator, and the SeedOmni text encoder is its first user. Two follow-ups are tracked in [#1270](https://github.com/ByteDance-Seed/VeOmni/issues/1270):
+Today, `ShardedEmbedding` is the operator only; no model in this repository builds it yet. The SeedOmni V2 text encoder is the first planned user, calling it in its own forward. Two follow-ups are tracked in [#1270](https://github.com/ByteDance-Seed/VeOmni/issues/1270):
 
 - Unify it with the Qwen3.8 (`qwen4_exp`) PLE lookup, which uses the same vocab-row partition but keeps the hidden dim persistently sharded. It gathers activations rather than parameters; see [qwen4_exp_ple_2d_parallelism.md](../design/qwen4_exp_ple_2d_parallelism.md).
 - Bind the text embedding, PLE and n-gram tables of every transformers model to this operator through the parallel plan.
