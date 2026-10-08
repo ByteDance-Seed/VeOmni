@@ -89,6 +89,7 @@ key_features/extra_parallel.md
 key_features/ulysses.md
 key_features/lora.md
 key_features/mtp.md
+key_features/omni_offline_encoding.md
 
 ```
 
