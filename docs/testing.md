@@ -65,7 +65,7 @@ tests/
 ├── distributed/                    # Distributed training and runtime correctness
 │   ├── test_fsdp_equivalence.py         # Single-GPU vs FSDP2 grad equivalence
 │   ├── test_gradient_checkpointing.py   # Checkpoint kwargs and recomputed-input grad cleanup
-│   ├── test_emb_parallel.py             # Vocab-parallel (emb) lookup / tied projection vs dense (CPU gloo)
+│   ├── test_emb_parallel.py             # ShardedEmbedding / all-to-all lookup vs dense, through FSDP2 (CPU gloo)
 │   └── test_dummy_forward.py            # Asymmetric multimodal forward (NCCL hang prevention)
 │
 ├── seed_omni/                      # SeedOmni multi-module models, runtime and trainer
@@ -74,7 +74,7 @@ tests/
 │   ├── arguments/                       # Launcher parser, module / accelerator args, module paths
 │   ├── runtime/                         # Module and OmniModel runtimes, per-module weight load
 │   ├── trainer/                         # OmniTrainer, inferencer, step-metrics callback
-│   ├── mixins/                          # Opt-in module mixins (e.g. EmbParallelMixin)
+│   ├── mixins/                          # Opt-in module mixins (e.g. OfflineEncodingMixin)
 │   └── e2e/                             # torchrun launch of the fake model (2 CUDA devices)
 │
 ├── e2e/                            # End-to-end training integration
@@ -327,7 +327,7 @@ CPU, and multi-rank cases spawn CPU gloo ranks with `torch.multiprocessing`;
 | `arguments/` | Launcher parser, per-module and accelerator arguments, module path resolution |
 | `runtime/` | `ModuleRuntime` / `OmniModelRuntime`: build, frozen modules, per-module grad clipping and weight load |
 | `trainer/` | `OmniTrainer`, `OmniInferencer`, step-metrics callback (identical metrics across ranks) |
-| `mixins/` | Opt-in module mixins, e.g. `EmbParallelMixin` / `VocabParallelEmbedding` gradient parity through FSDP2 |
+| `mixins/` | Opt-in module mixins: training-graph hooks, offline encoding |
 | `e2e/` | `train_omni.py` / `infer_omni.py` under torchrun on the fake model (2 CUDA devices) |
 
 ---
