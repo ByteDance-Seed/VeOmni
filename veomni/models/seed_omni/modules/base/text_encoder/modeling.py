@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedTokenizerBase
 
+from veomni.distributed.emb_parallel import ShardedEmbedding
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....utils.conversation import ConversationItem, seal_outputs
@@ -179,13 +180,15 @@ class TextEncoder(InferenceMixin, PretrainedOmniModule):
 
     config_class = TextEncoderConfig
     base_model_prefix = ""
-    _no_split_modules: list = ["Embedding"]
+    # ``ShardedEmbedding`` must be its own FSDP2 unit: under ``emb`` its table is
+    # vocab-split and a parent unit would mix different ranks' vocab slices.
+    _no_split_modules: list = ["ShardedEmbedding"]
     main_input_name = "input_ids"
 
     def __init__(self, config: TextEncoderConfig):
         super().__init__(config)
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = ShardedEmbedding(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head = None
         else:
@@ -207,8 +210,8 @@ class TextEncoder(InferenceMixin, PretrainedOmniModule):
         self.embed_tokens = value
 
     def get_output_embeddings(self) -> Optional[nn.Module]:
-        # When tied there is no separate ``lm_head`` — ``_project`` reuses
-        # ``embed_tokens.weight`` directly. Returning ``embed_tokens`` makes the
+        # When tied there is no separate ``lm_head`` — ``_project`` goes through
+        # ``embed_tokens.project``. Returning ``embed_tokens`` makes the
         # generic load-time weight-tie a harmless self-assignment instead of
         # crashing on a ``None`` output module.
         if self.config.tie_word_embeddings:
@@ -280,7 +283,9 @@ class TextEncoder(InferenceMixin, PretrainedOmniModule):
     def _project(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not self.config.tie_word_embeddings:
             return self.lm_head(hidden_states)
-        return F.linear(hidden_states, self.embed_tokens.weight)
+        # Never read ``embed_tokens.weight`` here: under FSDP2 it is only unsharded
+        # inside the embedding's own hooks, which ``project`` runs in.
+        return self.embed_tokens.project(hidden_states)
 
 
 __all__ = ["InferenceMixin", "TextEncoder", "scatter_text_encoder_embeds"]

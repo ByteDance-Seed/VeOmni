@@ -25,6 +25,7 @@ are the active entries. A single-scenario file uses the name ``default``.
 
 import json
 import os
+import re
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Collection, Dict, List, Optional, Tuple, Union
 
@@ -39,6 +40,23 @@ if TYPE_CHECKING:
 DEFAULT_TRAINING_GRAPH_FILE = "training_graph.yaml"
 DEFAULT_GENERATION_GRAPH_FILE = "generation_graph.yaml"
 DEFAULT_GRAPH_SCENARIO = "default"
+
+_SAFE_INFER_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def check_infer_type_names(names: Collection[str]) -> None:
+    """Reject ``infer_type`` names that cannot name ``graphs/generation_<infer_type>.mmd``.
+
+    Run whenever a config receives its generation graphs, so a bad name fails on
+    every rank at build time rather than on rank 0 alone, mid-save, after the
+    module weights are already on disk.
+    """
+    for name in names:
+        if not isinstance(name, str) or not _SAFE_INFER_TYPE.fullmatch(name):
+            raise ValueError(
+                f"Invalid infer_type {name!r}: scenario names must match {_SAFE_INFER_TYPE.pattern} "
+                "so they can be used as diagram filenames."
+            )
 
 
 def select_graph(
@@ -191,6 +209,7 @@ class OmniConfig(PretrainedConfig):
         self._module_entries = _module_entries
         self.training_graphs = training_graphs
         self.generation_graphs = generation_graphs
+        check_infer_type_names(generation_graphs or {})
         self.train_type = train_type
         self.infer_type = infer_type
         self.generation_kwargs = generation_kwargs
@@ -417,7 +436,7 @@ class OmniConfig(PretrainedConfig):
     def _load_graphs_from_pretrained(self, checkpoint_root: Union[str, os.PathLike]) -> None:
         """Load ``training_graphs`` and ``generation_graphs`` from YAML sidecars when present.
 
-        Attributes named in ``skip`` are left alone, because a sidecar is the
+        A map already populated is left alone, because a sidecar is the
         checkpoint's default rather than an override of an explicit caller.
 
         A module-only split checkpoint has neither file yet; train / generate
@@ -428,6 +447,7 @@ class OmniConfig(PretrainedConfig):
             self.training_graphs = self._read_graph_sidecar(root, DEFAULT_TRAINING_GRAPH_FILE, list)
         if not self.generation_graphs:
             self.generation_graphs = self._read_graph_sidecar(root, DEFAULT_GENERATION_GRAPH_FILE, dict)
+            check_infer_type_names(self.generation_graphs)
 
     @classmethod
     def _read_graph_sidecar(cls, root: str, filename: str, payload_type: type) -> Dict:

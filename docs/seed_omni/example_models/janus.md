@@ -114,7 +114,8 @@ Each module can carry its own `accelerator` block in `train/modules_train.yaml`;
 module's topology differs from the top-level one, the trainer builds it its **own**
 `ParallelState` (device mesh + process groups) on the full world, while modules that
 match the global topology reuse it. `janus_text_encoder` ships with a embed-parallel
-**embedding** (`emb`) extra-parallel group:
+**embedding** (`emb`) extra-parallel group; its `embed_tokens` is a `ShardedEmbedding`
+(see [Sharded Embedding](../../key_features/sharded_embedding.md)):
 
 ```yaml
 # train/modules_train.yaml — janus_text_encoder

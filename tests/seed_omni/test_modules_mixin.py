@@ -688,7 +688,7 @@ def test_fsdp_no_split_modules_preserved():
     JanusSiglipConfig = _config_cls("janus_siglip")
 
     text_encoder = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16, tie_word_embeddings=False))
-    assert text_encoder._no_split_modules == {"Embedding"}
+    assert text_encoder._no_split_modules == {"ShardedEmbedding"}
 
     jl = JanusLlama(JanusLlamaConfig(text_config=_tiny_text_cfg()))
     assert "LlamaDecoderLayer" in (jl._no_split_modules or set())
