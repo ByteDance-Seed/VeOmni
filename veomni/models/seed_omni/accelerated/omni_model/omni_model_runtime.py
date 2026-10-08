@@ -103,7 +103,7 @@ def _scoped_no_split_modules(module_runtimes: Mapping[str, ModuleRuntime]) -> li
 
     A bare class name is ambiguous once the children share one FSDP tree:
     ``Embedding`` is a valid unit under the text encoder (its weight is read only
-    through the embedding's own forward) but not under
+    through the embedding's own forward and tied ``project``) but not under
     the VQVAE, whose ``JanusVQVAEVectorQuantizer.forward`` reads
     ``self.embedding.weight`` directly and so never fires the embedding's own
     unshard hook. ``{child}.{ClassName}`` keeps each child's list applying to

@@ -16,22 +16,25 @@
 
 The parallel plan shards the table on dim-0 (vocab) over the ``emb``
 extra-parallel group, and FSDP2 shards each rank's rows on dim-1 (hidden) over
-the ``emb_fsdp`` sub-mesh. The module must be its own FSDP2 unit, so its forward
-reads the plain ``[vocab/emb, hidden]`` rows inside that unit's unshard hooks,
-and FSDP2 reduce-scatters and scales the weight gradient like any other
-parameter's. Reading ``weight`` from outside the module's forward sees the
-sharded DTensor instead, which is why there is no tied output projection.
+the ``emb_fsdp`` sub-mesh. The module must be its own FSDP2 unit, so the lookup
+(``forward``) and the tied output projection (``project``) both read the plain
+``[vocab/emb, hidden]`` rows inside that unit's unshard hooks, and FSDP2
+reduce-scatters and scales the weight gradient of both uses like any other
+parameter's. Reading ``weight`` from outside those two calls sees the sharded
+DTensor instead.
 """
 
 from typing import Optional
 
 import torch
 import torch.nn as nn
-from torch.distributed.fsdp import FSDPModule
+import torch.nn.functional as F
+from torch.distributed.fsdp import FSDPModule, register_fsdp_forward_method
 from torch.distributed.tensor import DTensor
 
 from ..parallel_state import get_parallel_state, is_parallel_state_initialized
 from .all_to_all import AllToAllEmbedding
+from .vocab_parallel_linear import VocabParallelLinear
 
 
 def _emb_enabled() -> bool:
@@ -48,6 +51,9 @@ class ShardedEmbedding(nn.Embedding):
     split the table, the weight holds only this rank's contiguous
     ``[vocab/emb, hidden]`` rows. A table the plan did not split (``emb`` off, or
     the module not in the plan) holds every row and runs as ``nn.Embedding``.
+
+    A tied output head calls :meth:`project` instead of reading ``weight``, so it
+    is split the same way as the lookup.
 
     ``padding_idx`` reads back as an index into the rows this rank holds, and as
     ``None`` on ranks that do not hold the padding row, so initializers that
@@ -107,13 +113,7 @@ class ShardedEmbedding(nn.Embedding):
             raise self._layout_error(rows, emb_size)
         return True
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if not self._is_split():
-            return super().forward(input)
-        if self.max_norm is not None or self.scale_grad_by_freq or self.sparse:
-            raise NotImplementedError(
-                f"{type(self).__name__} supports none of max_norm, scale_grad_by_freq and sparse on a split table."
-            )
+    def _check_own_fsdp_unit(self) -> None:
         if not isinstance(self, FSDPModule):
             # Inside a parent unit the rows are plain and correctly shaped, but that unit sharded and
             # gathered them over the whole FSDP mesh, mixing different ranks' vocab slices.
@@ -121,11 +121,40 @@ class ShardedEmbedding(nn.Embedding):
                 f"{type(self).__name__} holds a split table but is not its own FSDP2 unit; list "
                 f"{type(self).__name__} (or a module class containing it) in the model's _no_split_modules."
             )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if not self._is_split():
+            return super().forward(input)
+        if self.max_norm is not None or self.scale_grad_by_freq or self.sparse:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports none of max_norm, scale_grad_by_freq and sparse on a split table."
+            )
+        self._check_own_fsdp_unit()
         output = AllToAllEmbedding.apply(get_parallel_state().extra_parallel_group("emb"), input, self.weight)
         if self._global_padding_idx is not None:
             # Same as F.embedding: the padding row receives no gradient.
             output = torch.where((input == self._global_padding_idx).unsqueeze(-1), output.detach(), output)
         return output
+
+    def project(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Tied output head: ``F.linear(hidden_states, weight)`` over the global vocab.
+
+        Runs inside this module's FSDP2 unshard hooks like ``forward``. On a split
+        table the vocab rows are all-gathered over ``emb`` (:class:`VocabParallelLinear`),
+        so the full ``[vocab, hidden]`` weight is materialized for the matmul: sized
+        for a text vocabulary, not for a table too large to gather on one device.
+        """
+        if "_project" not in self.__dict__:
+            # A no-op until the module is an FSDP2 unit, so this retries until then.
+            register_fsdp_forward_method(self, "_project")
+        return self._project(hidden_states)
+
+    def _project(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        weight = self.weight.to(hidden_states.dtype)
+        if not self._is_split():
+            return F.linear(hidden_states, weight)
+        self._check_own_fsdp_unit()
+        return VocabParallelLinear.apply(get_parallel_state().extra_parallel_group("emb"), hidden_states, weight)
 
 
 __all__ = ["ShardedEmbedding"]

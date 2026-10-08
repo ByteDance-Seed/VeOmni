@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Vocab-sharded (``emb`` extra-parallel) embedding: the all-to-all lookup and its module."""
+"""Vocab-sharded (``emb`` extra-parallel) embedding: the lookup and tied-projection ops, and their module."""
 
 from .all_to_all import AllToAllEmbedding
 from .sharded_embedding import ShardedEmbedding
+from .vocab_parallel_linear import VocabParallelLinear
 
 
-__all__ = ["AllToAllEmbedding", "ShardedEmbedding"]
+__all__ = ["AllToAllEmbedding", "ShardedEmbedding", "VocabParallelLinear"]

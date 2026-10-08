@@ -12,18 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``AllToAllEmbedding`` / ``ShardedEmbedding`` against the dense lookup they shard.
+"""``AllToAllEmbedding`` / ``VocabParallelLinear`` / ``ShardedEmbedding`` against the dense ops they shard.
 
-With one shard owning the whole vocabulary the op must reduce exactly to
-:func:`F.embedding`. That is worth pinning because the sharded path reaches its
+With one shard owning the whole vocabulary the ops must reduce exactly to
+:func:`F.embedding` and :func:`F.linear`. That is worth pinning because the sharded path reaches its
 result through collectives writing into freshly ``empty`` buffers: an unsharded
 path that skips a collective without aliasing its buffer returns uninitialized
 memory forward and an all-zero weight gradient back, neither of which raises.
 
 The sharded paths run on CPU gloo ranks with uneven token counts (one rank holds
 none) and are compared with a dense reference over every rank's tokens. The
-module is also run through FSDP2 on an ``emb`` x ``emb_fsdp`` mesh, so its weight
-gradient is reduce-scattered and scaled like any other parameter's.
+module is also run through FSDP2 on an ``emb`` x ``emb_fsdp`` mesh, lookup and tied head
+alike, so its weight gradient is reduce-scattered and scaled like any other parameter's.
 """
 
 import json
@@ -36,7 +36,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 
-from veomni.distributed.emb_parallel import AllToAllEmbedding, ShardedEmbedding, sharded_embedding
+from veomni.distributed.emb_parallel import AllToAllEmbedding, ShardedEmbedding, VocabParallelLinear, sharded_embedding
 from veomni.utils.device import get_device_type
 
 
@@ -118,8 +118,33 @@ def test_embedding_handles_no_ids(table):
     assert AllToAllEmbedding.apply(None, ids, table).shape == (0, HIDDEN)
 
 
-def test_embedding_matches_dense_on_the_selected_device():
-    """The op on the accelerator the GPU / NPU jobs actually select.
+def test_linear_forward_and_backward_match_dense(table):
+    hidden = torch.randn(2, HIDDEN, dtype=torch.float64)
+    grad = torch.randn(2, VOCAB, dtype=torch.float64)
+
+    sharded_h = hidden.clone().requires_grad_(True)
+    sharded_w = table.clone().requires_grad_(True)
+    dense_h = hidden.clone().requires_grad_(True)
+    dense_w = table.clone().requires_grad_(True)
+
+    sharded = VocabParallelLinear.apply(None, sharded_h, sharded_w)
+    dense = F.linear(dense_h, dense_w)
+    assert torch.allclose(sharded, dense)
+
+    (sharded * grad).sum().backward()
+    (dense * grad).sum().backward()
+    assert torch.allclose(sharded_h.grad, dense_h.grad)
+    assert torch.allclose(sharded_w.grad, dense_w.grad)
+
+
+def test_linear_gradcheck(table):
+    hidden = torch.randn(2, HIDDEN, dtype=torch.float64, requires_grad=True)
+    weight = table.clone().requires_grad_(True)
+    assert torch.autograd.gradcheck(lambda h, w: VocabParallelLinear.apply(None, h, w), (hidden, weight))
+
+
+def test_ops_match_dense_on_the_selected_device():
+    """Both ops on the accelerator the GPU / NPU jobs actually select.
 
     The rest of this file pins the numerics in CPU float64. Index dispatch and
     the buffer writes behind it are device code, so run them where they ship.
@@ -127,6 +152,7 @@ def test_embedding_matches_dense_on_the_selected_device():
     device = _device()
     ids = torch.tensor([0, 3, 1, 3], device=device)
     weight = torch.arange(VOCAB * HIDDEN, dtype=torch.float32, device=device).reshape(VOCAB, HIDDEN)
+    hidden = torch.randn(2, HIDDEN, dtype=torch.float32, device=device)
 
     assert torch.equal(AllToAllEmbedding.apply(None, ids, weight), F.embedding(ids, weight))
 
@@ -136,6 +162,8 @@ def test_embedding_matches_dense_on_the_selected_device():
     (AllToAllEmbedding.apply(None, ids, sharded_w) * grad).sum().backward()
     (F.embedding(ids, dense_w) * grad).sum().backward()
     assert torch.allclose(sharded_w.grad, dense_w.grad)
+
+    assert torch.allclose(VocabParallelLinear.apply(None, hidden, weight), F.linear(hidden, weight))
 
 
 def test_embedding_rejects_out_of_range_ids_instead_of_returning_garbage(table):
@@ -155,6 +183,7 @@ def test_embedding_rejects_out_of_range_ids_instead_of_returning_garbage(table):
 _WORLD = 2
 _MR_VOCAB, _MR_HIDDEN = 6, 3
 _RANK_IDS = [[0, 5, 3, 3, 1], []]  # rank 0 hits both shards and repeats an id; rank 1 holds none
+_RANK_HIDDEN_ROWS = [3, 0]
 
 
 def _mr_table() -> torch.Tensor:
@@ -173,19 +202,32 @@ def _parity_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
         chunk = slice(rank * rows, (rank + 1) * rows)
 
         ids = torch.tensor(_RANK_IDS[rank], dtype=torch.long)
-        shard = table[chunk].clone().requires_grad_(True)
-        embs = AllToAllEmbedding.apply(dist.group.WORLD, ids, shard)
+        hidden = _mr_randn(rank, 1, _RANK_HIDDEN_ROWS[rank], _MR_HIDDEN).requires_grad_(True)
+        emb_shard = table[chunk].clone().requires_grad_(True)
+        lin_shard = table[chunk].clone().requires_grad_(True)
+        embs = AllToAllEmbedding.apply(dist.group.WORLD, ids, emb_shard)
+        logits = VocabParallelLinear.apply(dist.group.WORLD, hidden, lin_shard)
         (embs * _mr_randn(rank, 2, len(ids), _MR_HIDDEN)).sum().backward()
+        (logits * _mr_randn(rank, 3, _RANK_HIDDEN_ROWS[rank], _MR_VOCAB)).sum().backward()
 
         # Dense reference over every rank's tokens: the shard grad sums the whole emb group.
-        dense = table.clone().requires_grad_(True)
+        emb_dense = table.clone().requires_grad_(True)
+        lin_dense = table.clone().requires_grad_(True)
+        hidden_dense = None
         for r in range(_WORLD):
             ids_r = torch.tensor(_RANK_IDS[r], dtype=torch.long)
-            (F.embedding(ids_r, dense) * _mr_randn(r, 2, len(ids_r), _MR_HIDDEN)).sum().backward()
+            hidden_r = _mr_randn(r, 1, _RANK_HIDDEN_ROWS[r], _MR_HIDDEN).requires_grad_(True)
+            (F.embedding(ids_r, emb_dense) * _mr_randn(r, 2, len(ids_r), _MR_HIDDEN)).sum().backward()
+            (F.linear(hidden_r, lin_dense) * _mr_randn(r, 3, _RANK_HIDDEN_ROWS[r], _MR_VOCAB)).sum().backward()
+            if r == rank:
+                hidden_dense = hidden_r
 
         result = {
-            "forward": torch.equal(embs, F.embedding(ids, table)),
-            "grad": torch.allclose(shard.grad, dense.grad[chunk]),
+            "embedding_forward": torch.equal(embs, F.embedding(ids, table)),
+            "embedding_grad": torch.allclose(emb_shard.grad, emb_dense.grad[chunk]),
+            "linear_forward": torch.allclose(logits, F.linear(hidden.detach(), table)),
+            "linear_hidden_grad": torch.allclose(hidden.grad, hidden_dense.grad),
+            "linear_weight_grad": torch.allclose(lin_shard.grad, lin_dense.grad[chunk]),
         }
         with open(f"{out_dir}/rank{rank}.json", "w") as f:
             json.dump(result, f)
@@ -193,7 +235,7 @@ def _parity_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
         dist.destroy_process_group()
 
 
-def test_sharded_lookup_matches_dense_over_all_ranks(tmp_path):
+def test_sharded_ops_match_dense_over_all_ranks(tmp_path):
     mp.spawn(_parity_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=_WORLD, join=True)
 
     for rank in range(_WORLD):
@@ -259,7 +301,14 @@ def test_an_unsplit_table_matches_nn_embedding(emb_state, state):
     plain = nn.Embedding(6, 4, padding_idx=2)
     plain.weight = embedding.weight
     ids = torch.tensor([[0, 3], [5, 2]])
+    hidden = torch.randn(2, 4)
     assert torch.equal(embedding(ids), plain(ids))
+    assert torch.equal(embedding.project(hidden), F.linear(hidden, plain.weight))
+
+
+def test_project_casts_the_weight_to_the_activation_dtype():
+    hidden = torch.randn(2, 4, dtype=torch.bfloat16)
+    assert ShardedEmbedding(6, 4).project(hidden).dtype is torch.bfloat16
 
 
 def _sliced(embedding: ShardedEmbedding, rows: int) -> ShardedEmbedding:
@@ -295,8 +344,11 @@ def test_a_split_table_rejects_unsupported_options(emb_state, option):
 def test_a_split_table_outside_its_own_fsdp_unit_is_rejected(emb_state):
     """A parent unit would shard and gather the rows over the whole FSDP mesh, mixing vocab slices."""
     emb_state(_emb_state(size=2))
+    embedding = _sliced(ShardedEmbedding(8, 4), rows=4)
     with pytest.raises(RuntimeError, match="not its own FSDP2 unit"):
-        _sliced(ShardedEmbedding(8, 4), rows=4)(torch.tensor([1]))
+        embedding(torch.tensor([1]))
+    with pytest.raises(RuntimeError, match="not its own FSDP2 unit"):
+        embedding.project(torch.randn(1, 4))
 
 
 @pytest.mark.parametrize(("emb_rank", "local_padding_idx"), [(0, None), (1, 1)])
@@ -331,30 +383,38 @@ def _fsdp_upstream_grad(rank: int, *shape: int) -> torch.Tensor:
 
 
 class _Model(nn.Module):
-    """Lookup, a layer, then an untied head: the sharded table feeds a real backward."""
+    """Lookup, a layer, then the head: tied (``embedding.project``) or a separate linear."""
 
-    def __init__(self, embedding: nn.Module):
+    def __init__(self, embedding: ShardedEmbedding, tied: bool):
         super().__init__()
         self.embedding = embedding
         self.mid = nn.Linear(_FSDP_HIDDEN, _FSDP_HIDDEN, bias=False)
-        self.head = nn.Linear(_FSDP_HIDDEN, _FSDP_VOCAB, bias=False)
+        self.head = None if tied else nn.Linear(_FSDP_HIDDEN, _FSDP_VOCAB, bias=False)
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        return self.head(torch.tanh(self.mid(self.embedding(ids))))
+        hidden = torch.tanh(self.mid(self.embedding(ids)))
+        return self.embedding.project(hidden) if self.head is None else self.head(hidden)
 
 
-def _dense_model_grads() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _dense_logits(ids: torch.Tensor, table, mid, head) -> torch.Tensor:
+    embs = F.embedding(ids, table, padding_idx=_FSDP_PADDING_IDX)
+    return F.linear(torch.tanh(F.linear(embs, mid)), head)
+
+
+def _dense_model_grads(tied: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sum of every rank's gradients on the unsharded weights."""
     table, mid, head = (w.requires_grad_(True) for w in _fsdp_weights())
     for r, ids in enumerate(_FSDP_IDS):
-        embs = F.embedding(torch.tensor(ids, dtype=torch.long), table, padding_idx=_FSDP_PADDING_IDX)
-        logits = F.linear(torch.tanh(F.linear(embs, mid)), head)
+        logits = _dense_logits(torch.tensor(ids, dtype=torch.long), table, mid, table if tied else head)
         (logits * _fsdp_upstream_grad(r, *logits.shape)).sum().backward()
     return table.grad, mid.grad, head.grad
 
 
-def _emb_fsdp_rank_main(rank: int, rendezvous: str, out_dir: str, reshard_after_forward: bool) -> None:
-    """emb=2 x emb_fsdp=2: vocab rows over ``emb``, hidden over ``emb_fsdp``, the rest over all ranks."""
+def _fsdp_rank_main(rank: int, rendezvous: str, out_dir: str, layout: str, tied: bool, reshard: bool) -> None:
+    """``layout="emb"``: emb=2 x emb_fsdp=2, vocab rows over ``emb``, hidden over ``emb_fsdp``.
+
+    ``layout="dp"``: emb off, the whole table its own plain FSDP2 unit over all ranks.
+    """
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import fully_shard
     from torch.distributed.tensor import Shard
@@ -362,53 +422,68 @@ def _emb_fsdp_rank_main(rank: int, rendezvous: str, out_dir: str, reshard_after_
     world = len(_FSDP_IDS)
     dist.init_process_group("gloo", init_method=f"file://{rendezvous}", world_size=world, rank=rank)
     try:
-        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("emb_fsdp", "emb"))
-        emb_rank = mesh["emb"].get_local_rank()
-        _install_state(_emb_state(group=mesh["emb"].get_group(), rank=emb_rank))
-
+        world_mesh = init_device_mesh("cpu", (world,))
         table, mid, head = _fsdp_weights()
-        rows = _FSDP_VOCAB // 2
-        chunk = slice(emb_rank * rows, (emb_rank + 1) * rows)
         embedding = ShardedEmbedding(_FSDP_VOCAB, _FSDP_HIDDEN, padding_idx=_FSDP_PADDING_IDX)
+        if layout == "emb":
+            mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("emb_fsdp", "emb"))
+            emb_rank = mesh["emb"].get_local_rank()
+            _install_state(_emb_state(group=mesh["emb"].get_group(), rank=emb_rank))
+            rows = _FSDP_VOCAB // 2
+            chunk = slice(emb_rank * rows, (emb_rank + 1) * rows)
+            # Default divide factor (the emb_fsdp size): gloo has no PREMUL_SUM, which a custom factor needs.
+            table_grad_divisor = mesh["emb_fsdp"].size()
+            shard_kwargs = {"mesh": mesh["emb_fsdp"], "shard_placement_fn": lambda param: Shard(1)}
+        else:
+            _install_state(None)
+            chunk = slice(None)
+            table_grad_divisor = world
+            shard_kwargs = {"mesh": world_mesh}
         embedding.weight = nn.Parameter(table[chunk].clone())
-        model = _Model(embedding)
+        model = _Model(embedding, tied)
         model.mid.weight = nn.Parameter(mid.clone())
-        model.head.weight = nn.Parameter(head.clone())
-        # Default divide factor (the emb_fsdp size): gloo has no PREMUL_SUM, which a custom factor needs.
-        fully_shard(
-            embedding,
-            mesh=mesh["emb_fsdp"],
-            shard_placement_fn=lambda param: Shard(1),
-            reshard_after_forward=reshard_after_forward,
-        )
-        fully_shard(model, mesh=init_device_mesh("cpu", (world,)), reshard_after_forward=reshard_after_forward)
+        if not tied:
+            model.head.weight = nn.Parameter(head.clone())
+        fully_shard(embedding, reshard_after_forward=reshard, **shard_kwargs)
+        fully_shard(model, mesh=world_mesh, reshard_after_forward=reshard)
 
         ids = torch.tensor(_FSDP_IDS[rank], dtype=torch.long)
         logits = model(ids)
         (logits * _fsdp_upstream_grad(rank, *logits.shape)).sum().backward()
 
-        table_grad, mid_grad, head_grad = _dense_model_grads()
-        expected_logits = F.linear(torch.tanh(F.linear(F.embedding(ids, table), mid)), head)
+        table_grad, mid_grad, head_grad = _dense_model_grads(tied)
         result = {
-            "logits": torch.allclose(logits, expected_logits, atol=1e-6),
+            "logits": torch.allclose(logits, _dense_logits(ids, table, mid, table if tied else head), atol=1e-6),
             "table_grad": torch.allclose(
-                embedding.weight.grad.full_tensor(), table_grad[chunk] / mesh["emb_fsdp"].size(), atol=1e-5
+                embedding.weight.grad.full_tensor(), table_grad[chunk] / table_grad_divisor, atol=1e-5
             ),
             "mid_grad": torch.allclose(model.mid.weight.grad.full_tensor(), mid_grad / world, atol=1e-5),
-            "head_grad": torch.allclose(model.head.weight.grad.full_tensor(), head_grad / world, atol=1e-5),
         }
+        if not tied:
+            result["head_grad"] = torch.allclose(model.head.weight.grad.full_tensor(), head_grad / world, atol=1e-5)
         with open(f"{out_dir}/rank{rank}.json", "w") as f:
             json.dump(result, f)
     finally:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("reshard_after_forward", [True, False])
-def test_sharded_embedding_matches_dense_through_fsdp(tmp_path, reshard_after_forward):
+@pytest.mark.parametrize(
+    ("layout", "tied", "reshard"),
+    [
+        ("emb", False, True),
+        ("emb", False, False),
+        ("emb", True, True),
+        ("emb", True, False),
+        ("dp", True, True),
+    ],
+    ids=["emb-untied-reshard", "emb-untied-no_reshard", "emb-tied-reshard", "emb-tied-no_reshard", "dp-tied"],
+)
+def test_sharded_embedding_matches_dense_through_fsdp(tmp_path, layout, tied, reshard):
+    """The tied head uses the table a second time in the same backward, from the same FSDP2 unit."""
     world = len(_FSDP_IDS)
     mp.spawn(
-        _emb_fsdp_rank_main,
-        args=(str(tmp_path / "rendezvous"), str(tmp_path), reshard_after_forward),
+        _fsdp_rank_main,
+        args=(str(tmp_path / "rendezvous"), str(tmp_path), layout, tied, reshard),
         nprocs=world,
         join=True,
     )
