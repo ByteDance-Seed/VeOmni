@@ -1,6 +1,6 @@
 # Sharded Embedding
 
-> TL;DR: `veomni.distributed.emb_parallel.ShardedEmbedding` is a drop-in `nn.Embedding` whose vocab rows are split over the `emb` extra-parallel group. Build the text embedding as a `ShardedEmbedding`, list it in `_no_split_modules`, shard its weight on dim-0 under `"emb"` in the module's parallel plan, and set `extra_parallel_names: [emb]` in the accelerator config. A table the plan did not split runs exactly as `nn.Embedding`.
+> TL;DR: `veomni.distributed.emb_parallel.ShardedEmbedding` is a drop-in `nn.Embedding` whose vocab rows are split over the `emb` extra-parallel group; a tied output head uses the same split through `ShardedEmbedding.project`. Build the text embedding as a `ShardedEmbedding`, list it in `_no_split_modules`, shard its weight on dim-0 under `"emb"` in the module's parallel plan, and set `extra_parallel_names: [emb]` in the accelerator config. A table the plan did not split runs exactly as `nn.Embedding`.
 
 ## Motivation
 
@@ -19,11 +19,11 @@ The table is a `[V, H]` parameter sharded on two dims, in the same way ExtraPara
 | 0 (vocab) | `emb` | sliced by the parallel plan: each rank keeps `V / emb` contiguous rows |
 | 1 (hidden) | `emb_fsdp` | `Shard(1)` by FSDP2 |
 
-Each rank therefore stores `[V / emb, H / emb_fsdp]`. The parallelizer wraps the module that owns the planned weight (`embed_tokens` for `embed_tokens.weight`) as its own FSDP2 unit on the `emb_fsdp` mesh, so by the time `forward` runs, FSDP2 has all-gathered the hidden dim and the module sees its plain `[V / emb, H]` rows. It only does so for a module at or below a wrap target (a class in `_no_split_modules` or `basic_modules`); otherwise a parent unit would shard and gather the rows over the whole FSDP mesh, mixing different ranks' vocab slices, so `ShardedEmbedding` raises if a split table reaches its forward without being its own FSDP2 unit.
+Each rank therefore stores `[V / emb, H / emb_fsdp]`. The parallelizer wraps the module that owns the planned weight (`embed_tokens` for `embed_tokens.weight`) as its own FSDP2 unit on the `emb_fsdp` mesh, so by the time `forward` runs, FSDP2 has all-gathered the hidden dim and the module sees its plain `[V / emb, H]` rows. It only does so for a module at or below a wrap target (a class in `_no_split_modules` or `basic_modules`); otherwise a parent unit would shard and gather the rows over the whole FSDP mesh, mixing different ranks' vocab slices, so `ShardedEmbedding` raises if a split table reaches its lookup or projection without being its own FSDP2 unit.
 
 ### Dispatch
 
-`ShardedEmbedding` decides per call from its own weight, not from a config switch. If the weight holds all `V` rows (`emb` off, or the module not in the plan), it runs `nn.Embedding.forward`. If it holds `V / emb` rows, it runs the sharded lookup over the `emb` group of the parallel state. Any other row count raises, because global ids would silently index the wrong rows.
+`ShardedEmbedding` decides per call from its own weight, not from a config switch. If the weight holds all `V` rows (`emb` off, or the module not in the plan), it runs `nn.Embedding.forward`. If it holds `V / emb` rows, it runs the sharded lookup over the `emb` group of the parallel state. `project` dispatches the same way, between `F.linear` and `VocabParallelLinear`. Any other row count raises, because global ids would silently index the wrong rows.
 
 ### Lookup
 
@@ -35,6 +35,17 @@ Each rank therefore stores `[V / emb, H / emb_fsdp]`. The parallelizer wraps the
 4. All-to-all the vectors back and restore the original order and shape.
 
 Backward runs the same exchange in reverse. It sums the incoming row gradients in fp32 over the rows that were actually touched, then casts the sum to the table dtype. Called with a group of one rank (or no group), the op aliases its buffers instead of running collectives, and reduces exactly to `F.embedding`.
+
+### Tied output head
+
+A tied head is the same table read a second time, so it has the same `[V / emb, H / emb_fsdp]` split. `ShardedEmbedding.project(hidden)` computes `F.linear(hidden, weight)` over the global vocab:
+
+- On a split table it calls `VocabParallelLinear` (`veomni/distributed/emb_parallel/vocab_parallel_linear.py`). That op all-gathers the vocab rows over `emb` in rank order and projects locally to full-vocab logits `[*, V]`. Its backward gathers the rows again rather than keeping them alive since forward, and reduce-scatters the full weight gradient over `emb`, so each rank keeps the gradient of its own rows.
+- On an unsplit table it is `F.linear`.
+
+`project` is registered with FSDP2 (`register_fsdp_forward_method`) on its first call, so like `forward` it runs inside the module's unshard hooks. The lookup and the head then contribute to one weight gradient, which FSDP2 reduces once. This holds even when the two calls are separate forwards, such as an encode node and a decode node of an omni graph.
+
+`VocabParallelLinear` materializes the full `[V, H]` weight in the compute dtype for every projection, and its backward materializes the full weight gradient. That is fine for a text vocabulary, but not for a table too large to gather on one device.
 
 ### Gradient
 
@@ -61,9 +72,17 @@ class TextEncoder(PreTrainedModel):
         super().__init__(config)
         self.embed_tokens = ShardedEmbedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
 
+        # Tied: no separate head module; decoding goes through the table itself.
+        self.lm_head = None if config.tie_word_embeddings else nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
     def forward(self, input_ids):
         inputs_embeds = self.embed_tokens(input_ids)  # global ids in, [*, H] out
         ...
+
+    def project(self, hidden_states):
+        if self.lm_head is not None:
+            return self.lm_head(hidden_states)
+        return self.embed_tokens.project(hidden_states)  # [*, V] logits
 ```
 
 `_no_split_modules` matches class names, so a list that names `Embedding` does not cover `ShardedEmbedding`. Whether to run the sharded lookup is decided from the weight (see [Dispatch](#dispatch)), so there is no model-side switch.
@@ -97,8 +116,8 @@ accelerator:
 
 ## Constraints
 
-- **No tied output head.** Outside the embedding's own forward, its weight is in general the FSDP2-sharded DTensor, and a vocab-sharded head would need a different collective (its logits are sharded on vocab). Only large tables are worth sharding, and those are never tied. Use an untied `lm_head`, and keep `tie_word_embeddings` false in the config of any module that uses `ShardedEmbedding` with `emb` on.
-- **Read the weight only through the module.** Calling `F.embedding(ids, module.weight)` or indexing `module.weight` from outside the module's forward sees the FSDP2-sharded DTensor. `ShardedEmbedding` raises if its forward is reached with a DTensor weight.
+- **Tie through `project`, not by sharing the parameter.** A tied model has no head module of its own and calls `embed_tokens.project`, as in the example above. HF-style tying, where `lm_head.weight` is `embed_tokens.weight`, is not supported with a split table. The loaders re-tie after `fully_shard`, so the head would hold the embedding's `[V / emb, H / emb_fsdp]` shard under its own FSDP2 unit's `[V, H]` metadata, and the first forward fails inside FSDP2.
+- **Read the weight only through the module.** Calling `F.linear(hidden, module.weight)`, `F.embedding(ids, module.weight)` or indexing `module.weight` from outside `forward` / `project` sees the FSDP2-sharded DTensor. `ShardedEmbedding` raises if either call reaches it with a DTensor weight.
 - **Every rank of the `emb` group must call the module equally often.** Each call is a set of collectives over the group, and so is each backward. A rank with no tokens must still call the module with empty ids, and must still backpropagate through the result, or the other ranks block.
 - **`max_norm`, `scale_grad_by_freq` and `sparse` are not supported** on a split table; the sharded lookup raises `NotImplementedError` for each.
 - **One table per `emb` plan.** `ParallelPlan` makes only the parent of the plan's first entry the `emb` FSDP2 unit, so a second planned table is not wrapped, and its forward raises. Several tables need `extra_parallel_fsdp_no_shard_module` set by hand until [#1270](https://github.com/ByteDance-Seed/VeOmni/issues/1270) lands.
@@ -110,4 +129,4 @@ Today, `ShardedEmbedding` is the operator only; no model in this repository buil
 - Unify it with the Qwen3.8 (`qwen4_exp`) PLE lookup, which uses the same vocab-row partition but keeps the hidden dim persistently sharded. It gathers activations rather than parameters; see [qwen4_exp_ple_2d_parallelism.md](../design/qwen4_exp_ple_2d_parallelism.md).
 - Bind the text embedding, PLE and n-gram tables of every transformers model to this operator through the parallel plan.
 
-Tests: `tests/distributed/test_emb_parallel.py` (CPU gloo, including an `emb=2 x emb_fsdp=2` FSDP2 run compared against a dense reference).
+Tests: `tests/distributed/test_emb_parallel.py` (CPU gloo). It includes `emb=2 x emb_fsdp=2` FSDP2 runs with an untied and a tied head, and a plain-FSDP2 tied run, all compared against a dense reference.

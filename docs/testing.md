@@ -65,7 +65,7 @@ tests/
 ├── distributed/                    # Distributed training and runtime correctness
 │   ├── test_fsdp_equivalence.py         # Single-GPU vs FSDP2 grad equivalence
 │   ├── test_gradient_checkpointing.py   # Checkpoint kwargs and recomputed-input grad cleanup
-│   ├── test_emb_parallel.py             # ShardedEmbedding / all-to-all lookup vs dense, through FSDP2 (CPU gloo)
+│   ├── test_emb_parallel.py             # ShardedEmbedding lookup / tied projection vs dense, through FSDP2 (CPU gloo)
 │   └── test_dummy_forward.py            # Asymmetric multimodal forward (NCCL hang prevention)
 │
 ├── seed_omni/                      # SeedOmni multi-module models, runtime and trainer
