@@ -26,6 +26,7 @@ import torch
 from .....distributed.clip_grad_norm import veomni_omni_model_clip_grad_norm
 from .....distributed.parallel_state import use_parallel_state
 from .....utils.logging import get_logger
+from ...mixins import MetricMeterMixin, MetricMeterResult
 from ...modeling_omni import OmniModel
 from ...utils.graph_profiler import GraphProfiler
 from ..utils.executor import TrainNodeRunner, execute_generation_node
@@ -535,6 +536,19 @@ class OmniModelRuntime:
             logger.info_rank0(f"OmniModelRuntime: saved OmniModel assets to {save_directory}.")
         if dist.is_initialized():
             dist.barrier()
+
+    def metric_meter_collect(self) -> dict[str, MetricMeterResult]:
+        """Drain each metered module's ``(theoretical_flops, seqlens)`` for this step.
+
+        Modules without :class:`MetricMeterMixin` contribute nothing. The keys
+        must be identical on every rank: :class:`~veomni.utils.omni_helper.OmniEnvironMeter`
+        packs one value per key into a single all-reduce.
+        """
+        return {
+            name: module_runtime.omni_module.metric_meter_collect()
+            for name, module_runtime in self.module_runtimes.items()
+            if isinstance(module_runtime.omni_module, MetricMeterMixin)
+        }
 
     def load(self) -> None:
         """Resume every module's DCP checkpoint (no-op for frozen / unconfigured modules)."""
