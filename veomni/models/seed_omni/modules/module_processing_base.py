@@ -164,6 +164,9 @@ def bind_module_assets(
     a module its image / video processors. No-op when the module declares no
     ``preprocessor_class``, when assets were already bound here, or when
     ``from_pretrained`` returns ``None`` (modules with no CPU worker).
+
+    A model built in a non-``full`` ``cache_mode`` (``OfflineEncodingMixin``)
+    has its mode forwarded, so the preprocessor agrees with the live model.
     """
     if getattr(model, _BOUND_FLAG_ATTR, False):
         return
@@ -172,7 +175,12 @@ def bind_module_assets(
         preprocessor_cls = getattr(type(model), "preprocessor_class", None)
         if preprocessor_cls is None or checkpoint_path is None:
             return
-        preprocessor = preprocessor_cls.from_pretrained(checkpoint_path, config_overrides=config_overrides)
+        cache_mode = getattr(model, "cache_mode", "full")
+        preprocessor = preprocessor_cls.from_pretrained(
+            checkpoint_path,
+            config_overrides=config_overrides,
+            **({} if cache_mode == "full" else {"cache_mode": cache_mode}),
+        )
 
     if preprocessor is None:
         return

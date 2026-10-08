@@ -259,7 +259,7 @@ def test_mot_forward_post_scatters_virtual_marker_triplet_hidden_states() -> Non
 
 def test_bagel_vae_process_only_skips_codec_modules() -> None:
     encode_model = _tiny_vae()
-    process_model = _tiny_vae(support_cache=True, train_type="train_with_cache")
+    process_model = _tiny_vae(support_cache=True, cache_mode="process_only")
     encoded_cache = encode_model.offline_encode(pixel_values=torch.zeros(1, 3, 8, 8))["encoded_cache"]
     item_cache = encoded_cache[0].reshape(2, process_model.config.z_channels, *encoded_cache.shape[-2:])
 
@@ -276,7 +276,7 @@ def test_bagel_vae_process_only_skips_codec_modules() -> None:
 
 
 def test_bagel_vae_encode_only_skips_decoder_module() -> None:
-    model = _tiny_vae(support_cache=True, train_type="offline_cache")
+    model = _tiny_vae(support_cache=True, cache_mode="encode_only")
 
     assert hasattr(model, "encoder")
     assert not hasattr(model, "decoder")
@@ -290,7 +290,7 @@ def test_bagel_vae_encode_only_skips_decoder_module() -> None:
 
 
 def test_bagel_vae_online_process_consumes_variable_size_cache_items_without_padding() -> None:
-    model = _tiny_vae(support_cache=True, train_type="train_with_cache")
+    model = _tiny_vae(support_cache=True, cache_mode="process_only")
     first = ConversationItem(
         type="image",
         value=torch.zeros(2, 2, 2, 1),
@@ -322,8 +322,8 @@ def test_bagel_vae_offline_cache_replay_keeps_img_tag_for_flow_connector(tmp_pat
     from veomni.data.seed_omni.seedomni_transform import process_seedomni_cached_example
     from veomni.models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
 
-    encode_model = _tiny_vae(support_cache=True, train_type="offline_cache")
-    process_model = _tiny_vae(support_cache=True, train_type="train_with_cache")
+    encode_model = _tiny_vae(support_cache=True, cache_mode="encode_only")
+    process_model = _tiny_vae(support_cache=True, cache_mode="process_only")
 
     def vae_image(tag: str) -> ConversationItem:
         return ConversationItem(
@@ -376,7 +376,37 @@ def test_bagel_vae_offline_cache_replay_keeps_img_tag_for_flow_connector(tmp_pat
     assert gen_item.meta["flow_velocity_target"].shape == (16, 2)
 
 
-def _tiny_vae(**config_overrides):
+def test_bagel_vae_cache_mode_reaches_the_model_through_build_foundation_model() -> None:
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+    from veomni.models import build_foundation_model
+
+    config = config_cls("bagel_vae")(
+        resolution=8, ch=32, ch_mult=[1], num_res_blocks=1, z_channels=2, downsample=1, support_cache=True
+    )
+
+    model = build_foundation_model(
+        config_path=config,
+        init_device="cpu",
+        torch_dtype="float32",
+        ops_implementation=OpsImplementationConfig(),
+        model_kwargs={"cache_mode": "process_only"},
+    )
+
+    assert model.cache_mode == "process_only"
+    assert not hasattr(model, "encoder")
+    assert not hasattr(model, "decoder")
+    assert "cache_mode" not in model.config.to_dict()
+
+    with pytest.raises(ValueError, match="must not override"):
+        build_foundation_model(
+            config_path=config,
+            init_device="cpu",
+            ops_implementation=OpsImplementationConfig(),
+            model_kwargs={"config": config},
+        )
+
+
+def _tiny_vae(cache_mode="full", **config_overrides):
     BagelVAE = model_cls("bagel_vae")
     BagelVAEConfig = config_cls("bagel_vae")
     config_kwargs = dict(
@@ -392,6 +422,6 @@ def _tiny_vae(**config_overrides):
         downsample=1,
     )
     config_kwargs.update(config_overrides)
-    model = BagelVAE(BagelVAEConfig(**config_kwargs))
+    model = BagelVAE(BagelVAEConfig(**config_kwargs), cache_mode=cache_mode)
     model._image_processor = BagelVAEProcessor.from_config(model.config)
     return model

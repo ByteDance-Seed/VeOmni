@@ -27,7 +27,27 @@ An unknown mode, or `encode_only` / `process_only` on a config without
 model body runs, so the body can skip sub-networks the mode never uses. For
 example, a VAE in `encode_only` need not allocate its decoder.
 
-`train_type` is unrelated: it selects the training graph, not the cache mode.
+`model.train_type` is unrelated: it selects the training graph, not the cache
+mode.
+
+## How a run picks `cache_mode`
+
+The trainer derives each module's `cache_mode` from the workflow,
+`train.train_type`, and passes it to the constructor through
+`build_foundation_model(..., model_kwargs={"cache_mode": ...})`. Only modules
+whose config has `support_cache` leave `full`:
+
+| `train.train_type` | `support_cache: true` | otherwise |
+|--------------------|-----------------------|-----------|
+| `offline_cache` | `encode_only` | `full` |
+| `train_with_cache` | `process_only` | `full` |
+| `train` | `full` | `full` |
+
+`ModuleRuntime.cache_mode` is the single source of the mode. The same value
+reaches the data side: `OmniProcessor.from_config(..., cache_modes=...)` and
+`bind_module_assets` pass it to the module preprocessor's `from_pretrained`,
+so a `process_only` module can skip CPU-side preprocessing. Inference builds
+have no train arguments, so they always use `full`.
 
 ## Hook contract
 
@@ -100,10 +120,11 @@ uses. Calling a concrete endpoint directly bypasses it.
 
 ## Current scope
 
-- **Launcher configs don't set `cache_mode` yet.** `build_foundation_model`
-  takes no model kwargs, so modules built by the runtime always run in `full`.
-  Passing `cache_mode` from the launcher config, writing cache shards, and
-  loading state dicts in the reduced modes are planned for a follow-up.
+- **Reduced modes are not checkpointed.** A module in `encode_only` or
+  `process_only` must be fully frozen, which is what lets it skip checkpoint
+  I/O (see below). `ModuleRuntime` raises `ValueError` for a trainable one,
+  and for a `support_cache` module whose class does not mix in
+  `OfflineEncodingMixin` (HF would silently drop the `cache_mode` kwarg).
 - **No per-module checkpoint hooks.** Checkpoint I/O stays with
   `OmniModuleCheckpointManager`: fully frozen modules have no checkpoint
   manager, so they skip it.

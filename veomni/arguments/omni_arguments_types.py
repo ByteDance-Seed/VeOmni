@@ -77,6 +77,7 @@ from .parser import _deep_update, _instantiate_recursive
 logger = logging.get_logger(__name__)
 
 OMNI_TRAIN_WORKFLOWS = {"train", "offline_cache", "train_with_cache", "train_and_cache"}
+_WORKFLOW_CACHE_MODES = {"offline_cache": "encode_only", "train_with_cache": "process_only"}
 
 
 def _is_omni_checkpoint_root(path: Optional[str]) -> bool:
@@ -632,6 +633,16 @@ class OmniTrainingArguments:
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
         self._resolve_checkpoint_paths()
         self._resolve_profile()
+
+    def module_cache_mode(self, support_cache: bool) -> str:
+        """The ``cache_mode`` this workflow builds a module in (see ``OfflineEncodingMixin``).
+
+        Only a module whose config has ``support_cache`` runs from a cache; every
+        other module, and every other workflow, is ``full``.
+        """
+        if not support_cache:
+            return "full"
+        return _WORKFLOW_CACHE_MODES.get(self.train_type, "full")
 
     def _derive_batch_config(self, accelerator: AcceleratorConfig) -> None:
         acc = accelerator

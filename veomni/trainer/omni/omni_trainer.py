@@ -275,14 +275,12 @@ class OmniTrainer:
     def _build_model_runtime(self) -> OmniModelRuntime:
         """Build the composed model — every module built, wrapped and given its optimizer.
 
-        Every module's ``model_config`` carries the training workflow, which
-        decides an offline-encoding module's cache mode. ``offline_cache``
+        Each module derives its offline-encoding ``cache_mode`` from
+        ``self.args.train`` (:attr:`ModuleRuntime.cache_mode`). ``offline_cache``
         freezes every module by design, so only it may build no optimizer.
         """
         train_type = self.args.train.train_type
         runtime_args = build_omni_model_runtime_args(self.args)
-        for module_args in runtime_args.modules.values():
-            module_args.model_config = {**(module_args.model_config or {}), "train_type": train_type}
         model = build_omni_model_runtime(runtime_args, train=self.args.train)
         if model.optimizer is None and train_type != "offline_cache":
             raise ValueError("OmniTrainer has nothing to train: every module is frozen.")
@@ -315,7 +313,11 @@ class OmniTrainer:
 
     def _build_collate_fn(self) -> None:
         args: OmniArguments = self.args
-        processor = OmniProcessor.from_config(self.model.config, checkpoint_root=args.model.model_path)
+        processor = OmniProcessor.from_config(
+            self.model.config,
+            checkpoint_root=args.model.model_path,
+            cache_modes={name: rt.cache_mode for name, rt in self.model.module_runtimes.items()},
+        )
         # FSDP-anchor dummy tensors are only exercised by the training (inference=False)
         # branch. The model runtime is already built, so every module's own
         # resolved `ModuleRuntime.model_config` is sitting in memory — hand that

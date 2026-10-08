@@ -147,6 +147,7 @@ class ModuleRuntime(VeOmniModelRuntime):
                 self._build_model()
                 self._build_model_assets()
                 self._freeze_model_module()
+                self._check_cache_mode_is_frozen()
                 self._build_parallelized_model()
                 if not self.wrap_omni_model:
                     self._scope_recompute_to_parallel_state()
@@ -186,6 +187,19 @@ class ModuleRuntime(VeOmniModelRuntime):
         if self.wrap_omni_model:
             return self._global_accelerator
         return self.args.accelerator
+
+    @property
+    def cache_mode(self) -> str:
+        """The ``OfflineEncodingMixin`` cache mode this run builds the module in.
+
+        A per-run choice, so it is derived from the training workflow and handed
+        to the model constructor, never written onto the module config; only a
+        config with ``support_cache`` can leave ``full``. The model side and the
+        data side (:class:`OmniProcessor`) both read it from here.
+        """
+        if self.train_args is None:
+            return "full"
+        return self.train_args.module_cache_mode(bool(getattr(self.module_config, "support_cache", False)))
 
     @property
     def module_name(self) -> str:
@@ -278,13 +292,24 @@ class ModuleRuntime(VeOmniModelRuntime):
         from .....models import build_foundation_model
 
         acc = self.mesh_accelerator
+        cache_mode = self.cache_mode
         self.model = build_foundation_model(
             config_path=self.module_config,
             weights_path=args.model_path,
             torch_dtype="float32" if acc.fsdp_config.mixed_precision.enable else "bfloat16",
             init_device=acc.init_device,
             ops_implementation=args.ops_implementation,
+            model_kwargs=None if cache_mode == "full" else {"cache_mode": cache_mode},
         )
+        built_mode = getattr(self.model, "cache_mode", "full")
+        if built_mode != cache_mode:
+            # HF's ``PreTrainedModel.__init__`` swallows unknown kwargs, so a
+            # module without ``OfflineEncodingMixin`` would silently build in ``full``.
+            raise ValueError(
+                f"ModuleRuntime '{self.module_name}': {type(self.model).__name__} was built with "
+                f"cache_mode={built_mode!r}, expected {cache_mode!r}; a `support_cache` module "
+                "must mix in OfflineEncodingMixin."
+            )
         self.model_config = self.model.config
 
     def _build_model_assets(self) -> None:
@@ -340,6 +365,20 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         logger.info_rank0(f"ModuleRuntime '{self.module_name}': freeze + LoRA")
         super()._freeze_model_module()
+
+    def _check_cache_mode_is_frozen(self) -> None:
+        """Reject a trainable module outside ``cache_mode='full'``.
+
+        A reduced mode drops sub-networks (an ``encode_only`` VAE has no
+        decoder), so its weights must never be saved: a checkpoint of it would
+        be an incomplete module. Fully frozen modules get no checkpoint manager
+        (:meth:`build_checkpoint`), which is what keeps them out of saves.
+        """
+        if self.cache_mode != "full" and any(p.requires_grad for p in self.model.parameters()):
+            raise ValueError(
+                f"ModuleRuntime '{self.module_name}': cache_mode={self.cache_mode!r} requires a fully "
+                "frozen module, but it has trainable parameters."
+            )
 
     def on_lora_matched_nothing(self) -> None:
         """A module the LoRA config did not target simply stays frozen.

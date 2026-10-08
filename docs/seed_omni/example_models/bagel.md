@@ -211,9 +211,9 @@ need this overlay matrix.
 
 Caching is not a special framework mode — it is a different `train_graph` plus a
 different dataset type. A module opts in with `model_config.support_cache: true`,
-and `OfflineEncodingMixin.derive_cache_mode`
-(`veomni/models/seed_omni/mixins/offline_encoding_mixin.py`) turns
-`train.train_type` into that module's cache mode.
+and the trainer turns `train.train_type` into that module's `cache_mode`
+constructor argument (see
+[Offline Encoding for Omni Modules](../../key_features/omni_offline_encoding.md#how-a-run-picks-cache_mode)).
 
 **Stage 1 — produce the cache** (`train.train_type: offline_cache` ⇒ VAE cache
 mode `encode_only`). `offline_cache/modules_train.yaml` declares only

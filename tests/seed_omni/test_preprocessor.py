@@ -17,6 +17,7 @@ picklable ``Preprocessor`` run inside ``SeedOmniCollator``:
 import copy
 import pickle
 
+import pytest
 import torch
 
 from veomni.data.seed_omni.collator import SeedOmniCollator
@@ -38,7 +39,6 @@ from veomni.models.seed_omni.modules.bagel.text_encoder.modeling import (
 from veomni.models.seed_omni.modules.bagel.text_encoder.processing import (
     BagelTextEncoderPreprocessor,
 )
-from veomni.models.seed_omni.modules.bagel.vae.accelerated.accelerated import VeOmniMixin
 from veomni.models.seed_omni.modules.bagel.vae.configuration import BagelVAEConfig
 from veomni.models.seed_omni.modules.bagel.vae.processing import (
     BAGEL_VAE_PIXEL_SHAPE,
@@ -68,14 +68,6 @@ from veomni.utils.tensor_utils import naflatten, unflatten
 def _worker_dummies(conversation_list, role):
     """Test helper: worker-appended ``is_dummy`` image placeholders standing in for ``role`` images."""
     return [it for it in iter_desired_items(conversation_list, types=["image"], roles=[role]) if it.is_dummy]
-
-
-class _DummyBagelVAE(VeOmniMixin):
-    def __init__(self, support_cache: bool = False, train_type: str = "train") -> None:
-        self.config = BagelVAEConfig(support_cache=support_cache, train_type=train_type)
-        self._image_processor = object()
-        self.dtype = torch.float32
-        super().__init__()
 
 
 # Module-level fakes so the preprocessors stay picklable (workers fork/spawn them).
@@ -401,48 +393,29 @@ def test_bagel_siglip_preprocessor_keeps_bs4_sample_aligned_for_0_2_4_images():
 
 
 def test_bagel_vae_process_only_skips_preprocessor(tmp_path):
-    process_only_dir = tmp_path / "process_only"
-    BagelVAEConfig(support_cache=True, train_type="train_with_cache").save_pretrained(str(process_only_dir))
-    assert BagelVAEPreprocessor.from_pretrained(str(process_only_dir)) is None
+    cache_dir = tmp_path / "support_cache"
+    BagelVAEConfig(support_cache=True).save_pretrained(str(cache_dir))
+    assert BagelVAEPreprocessor.from_pretrained(str(cache_dir), cache_mode="process_only") is None
+    assert isinstance(
+        BagelVAEPreprocessor.from_pretrained(str(cache_dir), cache_mode="encode_only"), BagelVAEPreprocessor
+    )
+    assert isinstance(BagelVAEPreprocessor.from_pretrained(str(cache_dir)), BagelVAEPreprocessor)
 
-    full_dir = tmp_path / "full"
-    BagelVAEConfig().save_pretrained(str(full_dir))
-    assert isinstance(BagelVAEPreprocessor.from_pretrained(str(full_dir)), BagelVAEPreprocessor)
 
-
-def test_bagel_vae_process_only_override_applies_even_when_checkpoint_default_is_full(tmp_path):
-    """`with_cache/modules_train.yaml`'s `model_config: {support_cache: true,
-    train_type: train_with_cache}` override must reach the preprocessor the same
-    way it reaches the live model's config — regardless of the checkpoint's own
-    on-disk default (regression: `from_pretrained` used to silently re-read the
-    on-disk config and drop this override, always building a real preprocessor).
+def test_bagel_vae_process_only_preprocessor_honours_support_cache_override(tmp_path):
+    """`with_cache/modules_train.yaml` sets `model_config: {support_cache: true}`
+    over a checkpoint saved without it; the preprocessor must see that override
+    the same way the live model's config does.
     """
     full_dir = tmp_path / "full_on_disk"
     BagelVAEConfig().save_pretrained(str(full_dir))
 
-    assert isinstance(BagelVAEPreprocessor.from_pretrained(str(full_dir)), BagelVAEPreprocessor)
+    with pytest.raises(ValueError, match="support_cache=True"):
+        BagelVAEPreprocessor.from_pretrained(str(full_dir), cache_mode="process_only")
     overridden = BagelVAEPreprocessor.from_pretrained(
-        str(full_dir), config_overrides={"support_cache": True, "train_type": "train_with_cache"}
+        str(full_dir), config_overrides={"support_cache": True}, cache_mode="process_only"
     )
     assert overridden is None
-
-
-def test_bagel_vae_process_only_full_hf_checkpoint_copies_source(tmp_path):
-    source = tmp_path / "source"
-    output = tmp_path / "output"
-    source.mkdir()
-    (source / "config.json").write_text("{}", encoding="utf-8")
-    (source / "model.safetensors").write_bytes(b"weights")
-
-    _DummyBagelVAE(support_cache=True, train_type="train_with_cache").save_full_hf_checkpoint(
-        str(output),
-        source_path=str(source),
-        trainer=object(),
-        state=object(),
-    )
-
-    assert (output / "config.json").read_text(encoding="utf-8") == "{}"
-    assert (output / "model.safetensors").read_bytes() == b"weights"
 
 
 def test_bagel_preprocessors_route_inference_edit_prompt_context():

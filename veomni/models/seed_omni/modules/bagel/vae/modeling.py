@@ -155,7 +155,7 @@ class BagelVAE(InferenceMixin, PretrainedOmniModule):
 
     def __init__(self, config: BagelVAEConfig, **kwargs: Any) -> None:
         super().__init__(config, **kwargs)
-        cache_mode = OfflineEncodingMixin.validated_cache_mode(config)
+        cache_mode = self._cache_mode
         if cache_mode in {"full", "encode_only"}:
             self.encoder = Encoder(
                 resolution=config.resolution,
@@ -186,18 +186,23 @@ class BagelVAE(InferenceMixin, PretrainedOmniModule):
     def _require_encoder(self) -> Encoder:
         encoder = getattr(self, "encoder", None)
         if encoder is None:
-            raise RuntimeError(
-                f"BagelVAE requires the VAE encoder; cache_mode={OfflineEncodingMixin.validated_cache_mode(self.config)!r}."
-            )
+            raise RuntimeError(f"BagelVAE requires the VAE encoder; cache_mode={self._cache_mode!r}.")
         return encoder
 
     def _require_decoder(self) -> Decoder:
         decoder = getattr(self, "decoder", None)
         if decoder is None:
-            raise RuntimeError(
-                f"BagelVAE requires the VAE decoder; cache_mode={OfflineEncodingMixin.validated_cache_mode(self.config)!r}."
-            )
+            raise RuntimeError(f"BagelVAE requires the VAE decoder; cache_mode={self._cache_mode!r}.")
         return decoder
+
+    @property
+    def _cache_mode(self) -> str:
+        """``OfflineEncodingMixin.__init__`` sets ``cache_mode`` before this body runs.
+
+        Only the accelerated class carries the mixin; the bare native class
+        always runs the full codec.
+        """
+        return getattr(self, "cache_mode", OfflineEncodingMixin.DEFAULT_CACHE_MODE)
 
     @property
     def _encoder_device(self) -> torch.device:

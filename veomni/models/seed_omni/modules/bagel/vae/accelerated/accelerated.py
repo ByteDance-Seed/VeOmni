@@ -7,7 +7,6 @@ pre/forward/post hooks and offline-encoding-cache endpoints.
 
 from __future__ import annotations
 
-import shutil
 from typing import Any
 
 import torch
@@ -302,7 +301,7 @@ class MeterMixin(MetricMeterMixin):
         return 6 * total_macs / 1e12
 
 
-class VeOmniMixin(BaseMixin, TrainingMixin, BagelVAEOfflineMixin, OfflineEncodingMixin, MeterMixin):
+class VeOmniMixin(BaseMixin, BagelVAEOfflineMixin, OfflineEncodingMixin, TrainingMixin, MeterMixin):
     """Carrier hooks for raw-image VAE encode and latent decode.
 
     ``encode_context()`` / ``decode_generated()`` already live on the native
@@ -311,10 +310,6 @@ class VeOmniMixin(BaseMixin, TrainingMixin, BagelVAEOfflineMixin, OfflineEncodin
     """
 
     config: BagelVAEConfig
-
-    def save_full_hf_checkpoint(self, output_dir: str, *, source_path: str, trainer: Any, state: Any) -> None:
-        del trainer, state
-        shutil.copytree(source_path, output_dir, dirs_exist_ok=True)
 
 
 class BagelVAEAccelerated(VeOmniMixin, BagelVAE):

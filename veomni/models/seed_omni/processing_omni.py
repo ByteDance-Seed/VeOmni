@@ -114,6 +114,7 @@ class OmniProcessor:
         config: OmniConfig,
         *,
         checkpoint_root: str | os.PathLike | None = None,
+        cache_modes: Mapping[str, str] | None = None,
     ) -> OmniProcessor:
         """Build preprocessors straight off an already-resolved :class:`OmniConfig`.
 
@@ -130,7 +131,9 @@ class OmniProcessor:
         ``config_overrides`` so a preprocessor that reads a behavior-affecting
         model field (e.g. ``enable_image``) agrees with the live model. The
         entry's ``processor_config`` is splatted as kwargs, matching
-        ``build_processor(path, **processor_config)``.
+        ``build_processor(path, **processor_config)``. ``cache_modes`` maps a
+        module name to the ``cache_mode`` its live model was built in; a
+        non-``full`` mode is forwarded to that module's preprocessor.
         """
         root = checkpoint_root if checkpoint_root is not None else getattr(config, "_name_or_path", None)
         root = None if root is None else str(root)
@@ -143,9 +146,11 @@ class OmniProcessor:
             if preprocessor_cls is None:
                 continue
             entry = config._module_entries[name]
+            cache_mode = (cache_modes or {}).get(name, "full")
             preprocessor = preprocessor_cls.from_pretrained(
                 module_path,
                 config_overrides=dict(entry.get("model_config") or {}),
+                **({} if cache_mode == "full" else {"cache_mode": cache_mode}),
                 **dict(entry.get("processor_config") or {}),
             )
             if preprocessor is not None:

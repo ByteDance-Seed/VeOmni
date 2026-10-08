@@ -39,8 +39,9 @@ class PretrainedOmniModule(PreTrainedModel):
         # different "config" than the launcher/runtime overrides dict
         # ``config_overrides`` represents. Strip the HF ``config`` key before
         # binding so it cannot collide with a preprocessor helper that also
-        # takes a positional ``config``.
-        config_overrides = {k: v for k, v in kwargs.items() if k != "config"}
+        # takes a positional ``config``. ``cache_mode`` is a constructor kwarg
+        # that must never land on a config; the bind reads it off the model.
+        config_overrides = {k: v for k, v in kwargs.items() if k not in ("config", "cache_mode")}
         bind_module_assets(
             model,
             checkpoint_path=str(pretrained_model_name_or_path),
