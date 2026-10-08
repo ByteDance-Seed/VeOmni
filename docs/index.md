@@ -100,11 +100,14 @@ key_features/mtp.md
 seed_omni/seed_omni.md
 seed_omni/data_format.md
 seed_omni/av_video_design.md
+seed_omni/module_level_sp.md
 seed_omni/mixins/metric_meter.md
 seed_omni/mixins/offline_encoding.md
 seed_omni/example_models/janus.md
 seed_omni/example_models/qwen3.md
+seed_omni/example_models/qwen3moe.md
 seed_omni/example_models/qwen3vl.md
+seed_omni/example_models/bagel.md
 ```
 
 ```{toctree}

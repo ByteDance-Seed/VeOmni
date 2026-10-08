@@ -188,14 +188,13 @@ done
 ## 6. MoE / Expert Parallel notes
 
 This is the first omni backbone using Expert Parallel + a fused MoE kernel, which
-surfaced (and fixed) a few omni-specific interactions. Full design notes:
-[`docs/seed_omni/omni_v2_per_module_parallel.md`](../omni_v2_per_module_parallel.md) §15.
+surfaced (and fixed) a few omni-specific interactions:
 
 - **Express EP via `ep_size`.** `AcceleratorConfig.__post_init__` appends `ep_size`
-  as the `ep` extra-parallel dim (any duplicate `ep` from per-module re-instantiation
-  is collapsed by `_dedup_extra_parallel`), leaving a single `ep` dim of size `ep_size`.
-  Equivalent to writing `extra_parallel_sizes: [N] / extra_parallel_names: ["ep"]`
-  directly, but don't set both or you get a doubled `ep` dim. (The non-`ep` extra-parallel
+  as the `ep` extra-parallel dim unless `ep` is already listed, so re-instantiating a
+  saved per-module config does not add a second `ep` dim. Writing
+  `extra_parallel_sizes: [N] / extra_parallel_names: ["ep"]` directly is equivalent,
+  but then `ep_size` is ignored, so set only one of the two. (The non-`ep` extra-parallel
   dims such as the text encoder's `emb` still use the explicit `extra_parallel_*` lists,
   since `__post_init__` only appends `ep`.)
 - **Fused MoE kernel** is bound because `qwen3_moe/llm/modeling.py` re-exports the
@@ -203,7 +202,7 @@ surfaced (and fixed) a few omni-specific interactions. Full design notes:
   `build_foundation_model`'s `_bind_veomni_ops` finds them); the EP-aware kernel
   reads `get_parallel_state().ep_group`, resolved per-node via `module_context`.
 - **Gradient checkpointing** recompute is re-scoped to the module's `ParallelState`
-  (`OmniModuleTrainer._scope_recompute_to_parallel_state`) so EP stays enabled
+  (`ModuleRuntime._scope_recompute_to_parallel_state`) so EP stays enabled
   during backward recompute.
 - **FSDP inference** routes the backbone forward through `self(...)` (not
   `self.forward(...)`) so the FSDP root `__call__` runs lazy_init + unshards

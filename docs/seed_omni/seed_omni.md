@@ -400,7 +400,6 @@ anchor term described in §2.2. Inference has no such constraint — modules may
 
 ## 4. Inference flow (FSM)
 
-(two-launch-paths)=
 ### 4.1 Two launch paths (native HF vs VeOmni Inferencer)
 
 SeedOmni exposes **two public inference launches**. Both walk the same

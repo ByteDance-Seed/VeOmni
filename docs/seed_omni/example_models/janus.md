@@ -189,7 +189,7 @@ Training continues from step 500 with the dataloader and RNG state restored.
 ## 5. Inference
 
 Two public launches are documented in
-[`seed_omni.md` §4.1](../seed_omni.md#two-launch-paths):
+[`seed_omni.md` §4.1](../seed_omni.md#41-two-launch-paths-native-hf-vs-veomni-inferencer):
 
 * **Native HF** — `python tasks/omni/infer_omni_native.py --model_path <split-ckpt> …`
   (`OmniModel.from_pretrained`, `modeling.py`, no runtime).

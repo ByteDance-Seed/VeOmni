@@ -88,7 +88,7 @@ ignored for encoded refs, which state their own rate.
 
 Each message:
 
-```json
+```text
 {
   "role": "user" | "assistant" | "system",
   "content": [

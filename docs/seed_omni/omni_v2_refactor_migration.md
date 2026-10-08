@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # SeedOmni Refactor — Merge / Migration Guide
 
 > **⚠️ Historical document.** The `szl.refact_omni_v2` refactor described here is

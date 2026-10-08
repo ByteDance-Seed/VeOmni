@@ -196,7 +196,7 @@ done
 
 ### 5.2 Native eager (`infer_omni_native.py`)
 
-This is launch path 1 in [`seed_omni.md` §4.1](../seed_omni.md#two-launch-paths)
+This is launch path 1 in [`seed_omni.md` §4.1](../seed_omni.md#41-two-launch-paths-native-hf-vs-veomni-inferencer)
 (`OmniModel.from_pretrained`, no VeOmni runtime). Path 2 is
 `tasks/omni/infer_omni.py` plus `base.yaml`.
 

@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Looped per-module SP：显存 / 激活实验记录
 
 > **⚠️ 历史文档（2026-07-20 已废弃该实现）：本文记录的 looped per-module SP 是 Arch A，代码已删除并迁移到 Arch B（uniform outer SP + classic single-pass Ulysses，见 [module_level_sp.md](./module_level_sp.md)）。** 下面的显存/时间数字**仍作为「促成放弃 Arch A 的动因证据」保留**：它们量化了把 SP 税压在最贵 LLM 上的代价（尤其 §3.3 的同步拷贝 ≈49–60% 墙钟）。文中提到的 `run_sp_looped_endpoint` / `sp_activation_offload` / `fsdp2_ac_patch` 等均已不存在。
