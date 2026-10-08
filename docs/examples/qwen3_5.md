@@ -201,7 +201,7 @@ also the recommended NPU value (see [NPU-friendly operator
 configurations](../hardware_support/typical_usage.md)), and `rms_norm`, `rotary_pos_emb`,
 `swiglu_mlp` and `cross_entropy_loss` are left at their dataclass defaults there, so VeOmni
 normalizes them to NPU-compatible values automatically
-([`_NPU_DEFAULT_FALLBACK`](../../veomni/arguments/arguments_types.py#L972)). The three
+([`_NPU_DEFAULT_FALLBACK`](../../veomni/arguments/arguments_types.py#L1216)). The three
 GatedDeltaNet ops are deliberately **not** in that table, which is why they must be explicit:
 
 ```shell
