@@ -345,9 +345,9 @@ def test_a_split_table_outside_its_own_fsdp_unit_is_rejected(emb_state):
     """A parent unit would shard and gather the rows over the whole FSDP mesh, mixing vocab slices."""
     emb_state(_emb_state(size=2))
     embedding = _sliced(ShardedEmbedding(8, 4), rows=4)
-    with pytest.raises(RuntimeError, match="not its own FSDP2 unit"):
+    with pytest.raises(RuntimeError, match="not the emb module's own FSDP2 unit"):
         embedding(torch.tensor([1]))
-    with pytest.raises(RuntimeError, match="not its own FSDP2 unit"):
+    with pytest.raises(RuntimeError, match="not the emb module's own FSDP2 unit"):
         embedding.project(torch.randn(1, 4))
 
 
@@ -410,10 +410,15 @@ def _dense_model_grads(tied: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Te
     return table.grad, mid.grad, head.grad
 
 
-def _fsdp_rank_main(rank: int, rendezvous: str, out_dir: str, layout: str, tied: bool, reshard: bool) -> None:
+def _fsdp_rank_main(
+    rank: int, rendezvous: str, out_dir: str, layout: str, tied: bool, reshard: bool, separate: bool
+) -> None:
     """``layout="emb"``: emb=2 x emb_fsdp=2, vocab rows over ``emb``, hidden over ``emb_fsdp``.
 
     ``layout="dp"``: emb off, the whole table its own plain FSDP2 unit over all ranks.
+
+    ``separate``: the lookup, the layer and the head run as separate calls outside the root
+    forward, like an encode node and a decode node, with the layer its own unit.
     """
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import fully_shard
@@ -445,10 +450,17 @@ def _fsdp_rank_main(rank: int, rendezvous: str, out_dir: str, layout: str, tied:
         if not tied:
             model.head.weight = nn.Parameter(head.clone())
         fully_shard(embedding, reshard_after_forward=reshard, **shard_kwargs)
+        if layout == "emb":
+            embedding._extra_parallel_name = "emb"  # what the parallelizer sets on the emb_fsdp unit
+        if separate:
+            fully_shard(model.mid, mesh=world_mesh, reshard_after_forward=reshard)
         fully_shard(model, mesh=world_mesh, reshard_after_forward=reshard)
 
         ids = torch.tensor(_FSDP_IDS[rank], dtype=torch.long)
-        logits = model(ids)
+        if separate:
+            logits = embedding.project(torch.tanh(model.mid(embedding(ids))))
+        else:
+            logits = model(ids)
         (logits * _fsdp_upstream_grad(rank, *logits.shape)).sum().backward()
 
         table_grad, mid_grad, head_grad = _dense_model_grads(tied)
@@ -468,22 +480,30 @@ def _fsdp_rank_main(rank: int, rendezvous: str, out_dir: str, layout: str, tied:
 
 
 @pytest.mark.parametrize(
-    ("layout", "tied", "reshard"),
+    ("layout", "tied", "reshard", "separate"),
     [
-        ("emb", False, True),
-        ("emb", False, False),
-        ("emb", True, True),
-        ("emb", True, False),
-        ("dp", True, True),
+        ("emb", False, True, False),
+        ("emb", False, False, False),
+        ("emb", True, True, False),
+        ("emb", True, False, False),
+        ("emb", True, True, True),
+        ("dp", True, True, False),
     ],
-    ids=["emb-untied-reshard", "emb-untied-no_reshard", "emb-tied-reshard", "emb-tied-no_reshard", "dp-tied"],
+    ids=[
+        "emb-untied-reshard",
+        "emb-untied-no_reshard",
+        "emb-tied-reshard",
+        "emb-tied-no_reshard",
+        "emb-tied-separate_calls",
+        "dp-tied",
+    ],
 )
-def test_sharded_embedding_matches_dense_through_fsdp(tmp_path, layout, tied, reshard):
+def test_sharded_embedding_matches_dense_through_fsdp(tmp_path, layout, tied, reshard, separate):
     """The tied head uses the table a second time in the same backward, from the same FSDP2 unit."""
     world = len(_FSDP_IDS)
     mp.spawn(
         _fsdp_rank_main,
-        args=(str(tmp_path / "rendezvous"), str(tmp_path), layout, tied, reshard),
+        args=(str(tmp_path / "rendezvous"), str(tmp_path), layout, tied, reshard, separate),
         nprocs=world,
         join=True,
     )
@@ -491,3 +511,45 @@ def test_sharded_embedding_matches_dense_through_fsdp(tmp_path, layout, tied, re
     for rank in range(world):
         result = json.loads((tmp_path / f"rank{rank}.json").read_text())
         assert all(result.values()), (rank, result)
+
+
+def _wrong_mesh_rank_main(rank: int, rendezvous: str, out_dir: str) -> None:
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+
+    world = len(_FSDP_IDS)
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", world_size=world, rank=rank)
+    try:
+        mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("emb_fsdp", "emb"))
+        emb_rank = mesh["emb"].get_local_rank()
+        _install_state(_emb_state(group=mesh["emb"].get_group(), rank=emb_rank))
+        rows = _FSDP_VOCAB // 2
+        embedding = ShardedEmbedding(_FSDP_VOCAB, _FSDP_HIDDEN)
+        embedding.weight = nn.Parameter(_fsdp_weights()[0][emb_rank * rows : (emb_rank + 1) * rows].clone())
+        # Its own unit, but on the regular FSDP mesh: what a second planned table listed in
+        # _no_split_modules gets, since only the plan's first entry is wrapped on emb_fsdp.
+        fully_shard(embedding, mesh=init_device_mesh("cpu", (world,)))
+        raised = {}
+        for name, call in (
+            ("forward", lambda: embedding(torch.tensor([1]))),
+            ("project", lambda: embedding.project(torch.randn(1, _FSDP_HIDDEN))),
+        ):
+            try:
+                call()
+                raised[name] = False
+            except RuntimeError as e:
+                raised[name] = "emb_fsdp mesh" in str(e)
+        with open(f"{out_dir}/rank{rank}.json", "w") as f:
+            json.dump(raised, f)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_a_split_table_in_its_own_unit_on_the_wrong_mesh_is_rejected(tmp_path):
+    """The gathered rows are correctly shaped but mix different ranks' vocab slices."""
+    world = len(_FSDP_IDS)
+    mp.spawn(_wrong_mesh_rank_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=world, join=True)
+
+    for rank in range(world):
+        result = json.loads((tmp_path / f"rank{rank}.json").read_text())
+        assert result == {"forward": True, "project": True}, (rank, result)
