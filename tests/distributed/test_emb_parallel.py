@@ -248,35 +248,18 @@ def emb_state(monkeypatch):
     return install
 
 
-@pytest.mark.parametrize("state", [None, _emb_state(enabled=False)], ids=["no_parallel_state", "emb_off"])
-def test_emb_off_matches_nn_embedding(emb_state, state):
+@pytest.mark.parametrize(
+    "state",
+    [None, _emb_state(enabled=False), _emb_state(size=2)],
+    ids=["no_parallel_state", "emb_off", "emb_on_but_table_not_in_the_plan"],
+)
+def test_an_unsplit_table_matches_nn_embedding(emb_state, state):
     emb_state(state)
     embedding = ShardedEmbedding(6, 4, padding_idx=2)
     plain = nn.Embedding(6, 4, padding_idx=2)
     plain.weight = embedding.weight
     ids = torch.tensor([[0, 3], [5, 2]])
     assert torch.equal(embedding(ids), plain(ids))
-
-
-def test_emb_on_padding_row_gets_no_gradient(emb_state):
-    """``emb`` reported on over one whole-vocab shard: the op runs its one-shard path."""
-    emb_state(_emb_state(size=1))
-    embedding = ShardedEmbedding(6, 4, padding_idx=2)
-    ids = torch.tensor([2, 0, 2, 5])
-    dense = embedding.weight.detach().clone().requires_grad_(True)
-
-    out = embedding(ids)
-    assert torch.equal(out, F.embedding(ids, dense))
-    out.sum().backward()
-    F.embedding(ids, dense, padding_idx=2).sum().backward()
-    assert torch.equal(embedding.weight.grad, dense.grad)
-    assert torch.equal(embedding.weight.grad[2], torch.zeros(4))
-
-
-def test_emb_on_rejects_max_norm(emb_state):
-    emb_state(_emb_state(size=1))
-    with pytest.raises(NotImplementedError, match="max_norm"):
-        ShardedEmbedding(6, 4, max_norm=1.0)(torch.tensor([0]))
 
 
 def _sliced(embedding: ShardedEmbedding, rows: int) -> ShardedEmbedding:
@@ -296,11 +279,24 @@ def test_a_sliced_table_is_rejected_when_emb_is_off(emb_state):
         _ = embedding.padding_idx
 
 
-def test_an_unsliced_table_is_rejected_when_emb_is_on(emb_state):
-    """The op would treat the whole table as one rank's shard of a ``vocab * emb`` vocabulary."""
+def test_a_table_split_for_another_emb_size_is_rejected(emb_state):
+    emb_state(_emb_state(size=4))
+    with pytest.raises(RuntimeError, match="holds 4 of 8 vocab rows, but the emb group here has 4"):
+        _sliced(ShardedEmbedding(8, 4), rows=4)(torch.tensor([1]))
+
+
+@pytest.mark.parametrize("option", [{"max_norm": 1.0}, {"scale_grad_by_freq": True}, {"sparse": True}])
+def test_a_split_table_rejects_unsupported_options(emb_state, option):
     emb_state(_emb_state(size=2))
-    with pytest.raises(RuntimeError, match="holds 8 of 8 vocab rows, but the emb group here has 2"):
-        ShardedEmbedding(8, 4)(torch.tensor([1]))
+    with pytest.raises(NotImplementedError, match="max_norm, scale_grad_by_freq and sparse"):
+        _sliced(ShardedEmbedding(8, 4, **option), rows=4)(torch.tensor([1]))
+
+
+def test_a_split_table_outside_its_own_fsdp_unit_is_rejected(emb_state):
+    """A parent unit would shard and gather the rows over the whole FSDP mesh, mixing vocab slices."""
+    emb_state(_emb_state(size=2))
+    with pytest.raises(RuntimeError, match="not its own FSDP2 unit"):
+        _sliced(ShardedEmbedding(8, 4), rows=4)(torch.tensor([1]))
 
 
 @pytest.mark.parametrize(("emb_rank", "local_padding_idx"), [(0, None), (1, 1)])

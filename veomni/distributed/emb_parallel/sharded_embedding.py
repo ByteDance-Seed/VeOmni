@@ -16,7 +16,7 @@
 
 The parallel plan shards the table on dim-0 (vocab) over the ``emb``
 extra-parallel group, and FSDP2 shards each rank's rows on dim-1 (hidden) over
-the ``emb_fsdp`` sub-mesh. The module is its own FSDP2 unit, so its forward
+the ``emb_fsdp`` sub-mesh. The module must be its own FSDP2 unit, so its forward
 reads the plain ``[vocab/emb, hidden]`` rows inside that unit's unshard hooks,
 and FSDP2 reduce-scatters and scales the weight gradient like any other
 parameter's. Reading ``weight`` from outside the module's forward sees the
@@ -27,6 +27,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 
 from ..parallel_state import get_parallel_state, is_parallel_state_initialized
@@ -43,9 +44,10 @@ def _emb_enabled() -> bool:
 class ShardedEmbedding(nn.Embedding):
     """``nn.Embedding`` that takes global ids when its rows are split over ``emb``.
 
-    ``num_embeddings`` stays the global vocab size; under ``emb`` the weight
-    holds only this rank's contiguous ``[vocab/emb, hidden]`` rows. With ``emb``
-    off it is exactly ``nn.Embedding``.
+    ``num_embeddings`` stays the global vocab size; once the parallel plan has
+    split the table, the weight holds only this rank's contiguous
+    ``[vocab/emb, hidden]`` rows. A table the plan did not split (``emb`` off, or
+    the module not in the plan) holds every row and runs as ``nn.Embedding``.
 
     ``padding_idx`` reads back as an index into the rows this rank holds, and as
     ``None`` on ranks that do not hold the padding row, so initializers that
@@ -90,25 +92,35 @@ class ShardedEmbedding(nn.Embedding):
             f"{emb_size} rank(s): the table was not split for the parallel state it runs under."
         )
 
-    def _check_emb_layout(self) -> bool:
-        """Whether ``emb`` is on, after checking the weight holds the rows that implies."""
+    def _is_split(self) -> bool:
+        """Whether the plan split this table over ``emb``, after checking that matches the parallel state."""
         if isinstance(self.weight, DTensor):
             raise RuntimeError(
                 f"{type(self).__name__}.weight is a DTensor here, so it is being read outside its FSDP2 unshard "
                 "hooks; call the module instead of reading its weight."
             )
-        enabled = _emb_enabled()
-        emb_size = get_parallel_state().extra_parallel_sizes["emb"] if enabled else 1
         rows = self.weight.shape[0]
+        if rows == self.num_embeddings:
+            return False
+        emb_size = get_parallel_state().extra_parallel_sizes["emb"] if _emb_enabled() else 1
         if rows * emb_size != self.num_embeddings:
             raise self._layout_error(rows, emb_size)
-        return enabled
+        return True
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if not self._check_emb_layout():
+        if not self._is_split():
             return super().forward(input)
-        if self.max_norm is not None:
-            raise NotImplementedError("ShardedEmbedding does not support max_norm under emb parallel.")
+        if self.max_norm is not None or self.scale_grad_by_freq or self.sparse:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports none of max_norm, scale_grad_by_freq and sparse on a split table."
+            )
+        if not isinstance(self, FSDPModule):
+            # Inside a parent unit the rows are plain and correctly shaped, but that unit sharded and
+            # gathered them over the whole FSDP mesh, mixing different ranks' vocab slices.
+            raise RuntimeError(
+                f"{type(self).__name__} holds a split table but is not its own FSDP2 unit; list "
+                f"{type(self).__name__} (or a module class containing it) in the model's _no_split_modules."
+            )
         output = AllToAllEmbedding.apply(get_parallel_state().extra_parallel_group("emb"), input, self.weight)
         if self._global_padding_idx is not None:
             # Same as F.embedding: the padding row receives no gradient.
