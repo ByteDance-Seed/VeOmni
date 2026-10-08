@@ -24,9 +24,10 @@ Patches:
    Under context parallelism it compresses its own windows and all-gathers the
    rows, keeping its compressed keys global while its queries stay local, and
    drops the Ulysses query partitioning.
-2. ``eager_attention_forward`` — optional TileLang sparse MQA attention,
-   selected by ``dsa_attention_implementation=tilelang``. Converts the
-   upstream additive sliding/compressor mask into compact indices.
+2. ``eager_attention_forward`` — optional sparse MQA attention, selected by
+   ``dsa_attention_implementation=tilelang`` (NVIDIA SM90+) or ``triton`` (AMD
+   MFMA). Converts the upstream additive sliding/compressor mask into compact
+   indices.
 3. ``DeepseekV4Experts`` — drops upstream ``@use_experts_implementation``
    (which would otherwise dispatch to ``grouped_mm`` and bypass VeOmni's
    fused MoE kernel). Keeps the v5 stacked ``gate_up_proj [E, 2*I, H]`` /
@@ -156,7 +157,12 @@ from veomni.models.transformers.deepseek_v4.packed_utils import (
 )
 from veomni.ops import fused_moe_forward
 from veomni.ops.dispatch import OpsConfigSlot, OpSlot
-from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang, sparse_mqa_target_fwd, v4_lighting_indexer
+from veomni.ops.kernels.deepseek_v4 import (
+    sparse_attn_tilelang,
+    sparse_attn_triton,
+    sparse_mqa_target_fwd,
+    v4_lighting_indexer,
+)
 from veomni.ops.qat import (
     fp4_fake_quant_weight,
     fp8_fake_quant_act,
@@ -209,7 +215,7 @@ config = PatchConfig(
 config.add_import("veomni.ops", names=["fused_moe_forward"])
 config.add_import(
     "veomni.ops.kernels.deepseek_v4",
-    names=["sparse_attn_tilelang", "sparse_mqa_target_fwd", "v4_lighting_indexer"],
+    names=["sparse_attn_tilelang", "sparse_attn_triton", "sparse_mqa_target_fwd", "v4_lighting_indexer"],
 )
 config.add_import(
     "veomni.distributed.parallel_state",
@@ -1572,12 +1578,12 @@ def deepseek_v4_attention_forward_patched(
     block_bias = None
     compressed_candidates = None
     # The device and dtype terms mirror what ``eager_attention_forward`` requires
-    # before it can dispatch to TileLang. Without them this reads the config string
-    # alone and claims the compact path on hosts where the kernel cannot run and the
-    # dispatch silently falls back to eager -- which then ignores the indices and
-    # uses the dense mask, so the compact work is wasted at best.
+    # before it can dispatch to a sparse kernel. Without them this reads the config
+    # string alone and claims the compact path on hosts where the kernel cannot run
+    # and the dispatch silently falls back to eager -- which then ignores the indices
+    # and uses the dense mask, so the compact work is wasted at best.
     use_compact_sparse_indices = (
-        veomni_dsa_attention_implementation.value == "tilelang"
+        veomni_dsa_attention_implementation.value in {"tilelang", "triton"}
         and past_key_values is None
         and q.is_cuda
         and q.dtype == torch.bfloat16
@@ -1750,17 +1756,18 @@ def deepseek_v4_attention_forward_patched(
 
 # ================================================================
 # Patch: eager_attention_forward
-# 1. Dispatch DeepSeek-V4 attention to the TileLang sparse MQA kernel when
-#    ``dsa_attention_implementation=tilelang``. The existing additive mask is
-#    converted to a compact fixed-width index list, preserving sliding-window,
-#    compressor, causal, and invalid-index semantics.
+# 1. Dispatch DeepSeek-V4 attention to a sparse MQA kernel: TileLang when
+#    ``dsa_attention_implementation=tilelang`` (NVIDIA SM90+), Triton
+#    sparse-MLA when ``triton`` (AMD MFMA). Both read the same compact
+#    fixed-width index list, converted from the existing additive mask, which
+#    preserves sliding-window, compressor, causal, and invalid-index semantics.
 # 2. Preserve the upstream eager implementation as the default fallback.
 # 3. Return the indexer loss's teacher distribution as a third value when the
 #    caller sets ``indexer_target_width``. The return annotation states that
 #    arity, so a caller reads the contract off the signature rather than off a
 #    comment; ``indexer_target_width`` is the only thing that selects it.
 # ================================================================
-@config.replace_function("eager_attention_forward", description="Optional TileLang sparse MQA dispatch")
+@config.replace_function("eager_attention_forward", description="Optional TileLang / Triton sparse MQA dispatch")
 def deepseek_v4_eager_attention_forward_patched(
     module: nn.Module,
     query: torch.Tensor,
@@ -1773,22 +1780,30 @@ def deepseek_v4_eager_attention_forward_patched(
 ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     # --- Patch.1 ---
     attention_implementation = veomni_dsa_attention_implementation.value
-    if attention_implementation not in {"eager", "tilelang"}:
+    if attention_implementation not in {"eager", "tilelang", "triton"}:
         raise ValueError(
             "DeepSeek-V4 does not support "
-            f"dsa_attention_implementation={attention_implementation!r}; expected 'eager' or 'tilelang'"
+            f"dsa_attention_implementation={attention_implementation!r}; "
+            "expected 'eager', 'tilelang' or 'triton'"
         )
-    # Operand dtypes are the kernel's contract and are enforced by
-    # ``sparse_attn_tilelang`` itself, which reports the offending dtype. Only
-    # structural conditions belong here.
-    use_tilelang = (
-        attention_implementation == "tilelang"
+    # Both sparse kernels consume the same compact index list over the same
+    # single-latent KV, so they share every structural condition; only the call
+    # site below differs. Operand dtypes are each kernel's own contract and are
+    # enforced there, which is what reports the offending dtype.
+    sparse_implementation = attention_implementation in {"tilelang", "triton"}
+    use_sparse_kernel = (
+        sparse_implementation
         and query.is_cuda
         and query.shape[-1] == 1 << (query.shape[-1] - 1).bit_length()
         and (isinstance(attention_mask, torch.Tensor) or kwargs.get("sparse_topk_indices") is not None)
         and dropout == 0
         and key.shape[1] == 1
     )
+    # Only TileLang returns the log-sum-exp the indexer loss needs for its
+    # teacher, so that path stays gated on it specifically. ``_indexer_loss_enabled``
+    # already refuses any other implementation up front; this keeps the runtime
+    # refusal below exact rather than relying on that.
+    use_tilelang = use_sparse_kernel and attention_implementation == "tilelang"
     # --- Patch.3 ---
     # The indexer loss's teacher is a TileLang kernel, so a declined dispatch cannot
     # produce one. Refusing ahead of the general refusal below turns that into a
@@ -1803,13 +1818,13 @@ def deepseek_v4_eager_attention_forward_patched(
     # Mask-free callers rely on this refusal for correctness, not just for
     # diagnostics: they withheld the dense mask, so an eager fallback would have
     # nothing left to enforce causality with.
-    if attention_implementation == "tilelang" and not use_tilelang:
+    if sparse_implementation and not use_sparse_kernel:
         raise ValueError(
-            "dsa_attention_implementation='tilelang' was requested but the TileLang sparse attention "
-            f"does not support this call: is_cuda={query.is_cuda}, head_dim={query.shape[-1]}, "
+            f"dsa_attention_implementation={attention_implementation!r} was requested but the sparse "
+            f"attention does not support this call: is_cuda={query.is_cuda}, head_dim={query.shape[-1]}, "
             f"mask={type(attention_mask).__name__}, dropout={dropout}, kv_heads={key.shape[1]}"
         )
-    if use_tilelang:
+    if use_sparse_kernel:
         topk_indices = kwargs.get("sparse_topk_indices")
         if topk_indices is None:
             batch, _, seq_len, _ = query.shape
@@ -1883,13 +1898,23 @@ def deepseek_v4_eager_attention_forward_patched(
             target = torch.where(target_mass > tiny, target / target_mass.clamp_min(tiny), 0.0)
             return attn_output, None, target
         # --- Patch.3 ---
-        attn_output = sparse_attn_tilelang(
-            query.transpose(1, 2).contiguous(),
-            key[:, 0].contiguous(),
-            sinks.float().contiguous(),
-            topk_indices,
-            scaling,
-        )
+        query_rows = query.transpose(1, 2).contiguous()
+        kv_rows = key[:, 0].contiguous()
+        sinks = sinks.float().contiguous()
+        if attention_implementation == "tilelang":
+            attn_output = sparse_attn_tilelang(query_rows, kv_rows, sinks, topk_indices, scaling)
+        else:
+            # DeepSeek-V4 attention passes the same shared latent as both K and V,
+            # and the Triton sparse-MLA kernel reads one pool for both. An
+            # aliasing check is the only way to notice a caller that stopped
+            # doing that, because the shapes would still line up and V would
+            # simply be ignored.
+            if key.data_ptr() != value.data_ptr():
+                raise ValueError(
+                    "dsa_attention_implementation='triton' expects DeepSeek-V4's "
+                    "single-latent attention where K and V are the same tensor"
+                )
+            attn_output = sparse_attn_triton(query_rows, kv_rows, sinks, topk_indices, scaling)
         return attn_output, None
     # --- Patch.1 ---
 
@@ -2039,6 +2064,11 @@ def deepseek_v4_model_forward_patched(
         # ``eager_attention_forward`` declines the TileLang dispatch for non-bf16
         # or host tensors, and its dense fallback needs the mask to stay causal,
         # so mirror those two runtime conditions before dropping the mask.
+        #
+        # Deliberately not extended to ``triton``: dropping the mask changes
+        # which invariants the index list alone has to carry, and that
+        # combination is unvalidated there. Keeping the mask costs the packed
+        # O(S^2) intermediate but leaves the Triton path on its tested contract.
         mask_free_sparse = (
             veomni_dsa_attention_implementation.value == "tilelang"
             and not isinstance(attention_mask, dict)

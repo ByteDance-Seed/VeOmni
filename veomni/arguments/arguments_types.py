@@ -1389,9 +1389,13 @@ class OpsImplementationConfig:
         default="eager",
         metadata={"help": "DeepSeek sparse attention top-k indexer implementation: 'eager', 'cudnn', or 'tilelang'."},
     )
-    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "tilelang"] = field(
+    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "tilelang", "triton"] = field(
         default="eager",
-        metadata={"help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', or 'tilelang'."},
+        metadata={
+            "help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', 'tilelang' "
+            "(DeepSeek-V4 sparse MQA on NVIDIA SM90+), or 'triton' (the same sparse MQA on AMD MFMA "
+            "hardware; currently needs the Primus source tree on PYTHONPATH for its Triton kernels)."
+        },
     )
     mhc_implementation: Literal["eager", "tilelang"] = field(
         default="eager",

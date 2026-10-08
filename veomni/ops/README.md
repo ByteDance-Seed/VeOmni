@@ -17,7 +17,7 @@ veomni/ops/
 ├── kernels/                Kernel implementations, one subpackage per op
 │   ├── attention/          Flash v2/3/4, FlexAttention, and Magi FFA + SP-aware wrappers
 │   ├── cross_entropy/      eager / liger / npu-chunk loss (+ ForCausalLMLoss)
-│   ├── deepseek_v4/        TileLang sparse attention/indexer + precision helpers
+│   ├── deepseek_v4/        TileLang / AMD Triton sparse attention, TileLang indexer + precision helpers
 │   ├── load_balancing_loss/  eager + triton fused kernel
 │   ├── mhc/                TileKernels mHC pre/post/head adapters
 │   ├── rms_norm/           Liger / NPU / triton batch-invariant
@@ -146,6 +146,9 @@ three TileLang consumers share one validated build.
 DeepSeek-V4 selects these kernels with `dsa_indexer_implementation: tilelang` and
 `dsa_attention_implementation: tilelang`. Both default to `eager`; unsupported
 cache, position, or dropout layouts retain the upstream eager implementation.
+On AMD GPUs, `dsa_attention_implementation: triton` selects the same sparse
+attention backed by AMD-AGI/Primus' Triton sparse-MLA kernels, which are
+imported lazily and need the Primus source tree on `PYTHONPATH`.
 DeepSeek V4 selects the mHC adapters with `mhc_implementation: tilelang`; once
 selected, unsupported dtype, layout, or hardware raises instead of falling
 back to eager.
