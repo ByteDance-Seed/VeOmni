@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SeedOmni mixins: base lifecycle plus training / inference graph hooks."""
+"""SeedOmni mixins: base lifecycle + training / inference graph hooks + offline encoding."""
 
 from .base_mixin import BaseMixin
 from .inference_module_mixin import InferenceModuleMixin, post_generate, pre_generate
+from .offline_encoding_mixin import OfflineEncodingMixin
 from .training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 
 
@@ -27,4 +28,5 @@ __all__ = [
     "post_forward",
     "pre_generate",
     "post_generate",
+    "OfflineEncodingMixin",
 ]
