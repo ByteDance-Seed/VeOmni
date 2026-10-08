@@ -116,7 +116,7 @@ and stored as `trainer.environ_meter`.
     [`OmniStepMetricsCallback.on_step_end`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L69)
     - [`delta_time = time.time() - start_time`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L72)
     - [`OmniModelRuntime.metric_meter_collect()`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L540) →
-      per metered module [`(estimate_flops(buffer), buffer)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L143); buffer reset.
+      per metered module [`(estimate_flops(buffer), buffer)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L145); buffer reset.
     - [`OmniEnvironMeter.step(delta_time, global_step, module_metrics)`](../../../veomni/utils/omni_helper.py#L137)
     - [`trainer.step_env_metrics = ...`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L104),
       logged by [`WandbTraceCallback`](../../../veomni/trainer/callbacks/trace_callback.py#L157).
@@ -138,7 +138,7 @@ same dict and `WandbTraceCallback` logs it.
 | [`flops_achieved(T)`](../../../veomni/utils/omni_helper.py#L177) | Sum over modules and DP ranks of `estimate_flops`, divided by `delta_time`. |
 | [`flops_promised(T)`](../../../veomni/utils/omni_helper.py#L178) | Device peak TFLOPs ([`get_device_flops`](../../../veomni/utils/count_flops.py#L26)) × world size. |
 | [`mfu`](../../../veomni/utils/omni_helper.py#L179) | `flops_achieved / flops_promised`. |
-| [`consumed_chunk_num`](../../../veomni/utils/omni_helper.py#L181) | Cumulative real training samples (conversations) across DP ranks. |
+| [`consumed_chunk_num`](../../../veomni/utils/omni_helper.py#L183) | Cumulative real training samples (conversations) across DP ranks. |
 | [`trace/<module>/tokens_per_second(M)`](../../../veomni/utils/omni_helper.py#L193) | This module's global tokens this step / `delta_time`. |
 | [`trace/<module>/consume_tokens(M)`, `(B)`](../../../veomni/utils/omni_helper.py#L194) | This module's cumulative global tokens. |
 | [`trace/<module>/avg_seq_len`](../../../veomni/utils/omni_helper.py#L197) | This module's global tokens this step / `global_batch_size`. |
