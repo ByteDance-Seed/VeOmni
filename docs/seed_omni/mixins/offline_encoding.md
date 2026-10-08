@@ -8,6 +8,34 @@ afterwards.
 - Cache-mode gate: [`OfflineEncodingMixin.pre_forward`](../../../veomni/models/seed_omni/mixins/offline_encoding_mixin.py#L106)
 - Allowed modes per endpoint: [`_ALLOWED_CACHE_MODES`](../../../veomni/models/seed_omni/mixins/offline_encoding_mixin.py#L25)
 
+## Why cache a module's encoder
+
+An omni training graph often contains modules that are frozen and
+deterministic: a VAE encoder that turns images into latents, or a ViT that turns
+images into patch features. Nothing trains them, and for the same input they
+produce the same output in every epoch and every run. Running them online costs:
+
+- **Repeated compute.** Every training step pays the frozen encoder's forward
+  again, although its output never changes.
+- **Memory and load time.** Every rank keeps the encoder's weights and
+  activations resident and loads them at startup, only to produce tensors that
+  could have been read from disk.
+- **Coupled layouts.** Encoding needs no optimizer and no backward, yet it has to
+  run inside the training job, on the training layout.
+
+Offline caching splits such a module into two stages: an **encode** stage that
+runs once, in a dedicated encoding run, and produces a cache artifact per
+sample; and a **process** stage that runs every training step on the cached
+artifact and produces the tensors the rest of the graph expects.
+
+The cut is two stages rather than "cache the module's output" because not
+everything downstream of the encoder is deterministic. A VAE encoder outputs a
+posterior (mean and log-variance), and training samples a fresh latent from it
+every step. Caching the sampled latent would freeze one sample forever. So the
+module cuts at the boundary between the expensive deterministic part and the
+cheap per-step part: for a VAE, `offline_encode` stops at the posterior, and
+`online_process` samples and scales the latent.
+
 ## `support_cache` and `cache_mode`
 
 Whether a module *can* use a cache and whether this run *does* are separate
@@ -81,6 +109,25 @@ model.cache_mode  # "encode_only"
 | `@pre_forward("offline_encode")`, `@post_forward("offline_encode")`, and the same for `online_process` | **Must write** on the module. Translate between the graph's conversation payload and the endpoint's tensors. The mixin defines none. | [`TrainingModuleMixin.pre_forward`](../../../veomni/models/seed_omni/mixins/training_module_mixin.py#L59) / [`post_forward`](../../../veomni/models/seed_omni/mixins/training_module_mixin.py#L66), after the gate | The endpoint receives tensors and the graph receives the hook's output. |
 | `cache_mode=` constructor kwarg | Pass `"full"`, `"encode_only"` or `"process_only"` when building the module. | [`OfflineEncodingMixin.__init__`](../../../veomni/models/seed_omni/mixins/offline_encoding_mixin.py#L83) | Selects which endpoints this run may call. Defaults to `full`. |
 
+### What each hook does
+
+The graph passes every node the shared batch and merges whatever the node
+returns back into it. The four hooks are where a module translates between that
+batch and its tensor endpoints:
+
+| Hook | Receives | Returns | Job |
+|------|----------|---------|-----|
+| `@pre_forward("offline_encode")` | The shared batch | Kwargs for `offline_encode`, e.g. `{"pixel_values": ...}` | Select this module's items from the batch and stack them into input tensors. |
+| `@post_forward("offline_encode")` | `offline_encode`'s outputs | A dict merged into the batch | Attach each sample's cache artifact to the batch, e.g. onto its conversation item, where a cache writer can persist it. |
+| `@pre_forward("online_process")` | The shared batch, carrying cached artifacts | Kwargs for `online_process`, e.g. `{"encoded_cache": ...}` | Read the cached artifacts back out of the batch and move them to the device. |
+| `@post_forward("online_process")` | `online_process`'s outputs | A dict merged into the batch | Write the results where downstream nodes read them, i.e. the same place the online encode path writes. |
+
+`offline_encode` takes the same inputs as the module's online encode method, and
+`online_process` returns the same outputs, so one hook can usually serve both
+call-sites: `@pre_forward("encode", "offline_encode")` and
+`@post_forward("encode", "online_process")`. Downstream nodes then cannot tell
+whether the module ran online or from the cache.
+
 ### What the framework provides (do not override)
 
 | Function | Called by | Effect |
@@ -107,6 +154,46 @@ model.cache_mode  # "encode_only"
     - [`TrainingModuleMixin.pre_forward`](../../../veomni/models/seed_omni/mixins/training_module_mixin.py#L59): the module's `@pre_forward(method)` hook.
   - [Endpoint](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L68): the sibling mixin's `offline_encode` / `online_process`, then `post_forward`.
 
+## Resulting workflow
+
+Offline caching turns one training job into two runs over the same data, each
+with its own graph. The endpoint is named in the graph as `module.method`:
+
+```yaml
+# Encoding run, cache_mode: encode_only
+- {from: xxx.offline_encode, to: end}
+```
+
+```yaml
+# Training run, cache_mode: process_only
+- {from: xxx.online_process, to: yyy}   # replaces {from: xxx.encode, to: yyy}
+- {from: yyy, to: end}
+```
+
+1. **Encoding run.** The module is built without the sub-networks it does not
+   need for encoding, e.g. a VAE skips its decoder. Only `offline_encode` runs,
+   without autograd. Its post-hook attaches the artifacts to the batch, and a
+   cache writer persists them per sample.
+2. **Training run.** The dataset yields the cached artifacts in place of the raw
+   media for this module. The module is built without its encoder, and
+   `online_process` turns each artifact into the tensors downstream nodes expect.
+
+The result:
+
+- The encoder runs once per dataset instead of once per step in every run.
+- Training ranks hold neither the encoder's weights nor its activations, and do
+  not load them at startup.
+- The training data pipeline no longer decodes and preprocesses the raw media
+  for this module.
+- Per-step randomness after the cut, such as VAE latent sampling, is kept,
+  because `online_process` still runs every step.
+- A graph that calls an endpoint the module's mode cannot serve fails on the
+  first step instead of silently training on the wrong path.
+
+The mixin and the gate are in place today; the launcher wiring, the cache writer
+and cached-data loading that complete this workflow are listed under
+[Current scope](#current-scope).
+
 ## Rules for a correct implementation
 
 - **`XxxOfflineMixin` goes before `OfflineEncodingMixin`,** so the concrete
@@ -127,8 +214,9 @@ model.cache_mode  # "encode_only"
 - **Launcher configs don't set `cache_mode` yet.**
   [`OmniModuleRuntime` calls `build_foundation_model`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L259)
   with no model kwargs, so modules built by the runtime always run in `full`.
-  Passing `cache_mode` from the launcher config, writing cache shards, and
-  loading state dicts in the reduced modes are planned for a follow-up.
+  Passing `cache_mode` from the launcher config, writing cache shards, feeding
+  cached artifacts to the training run, and loading state dicts in the reduced
+  modes are planned for a follow-up.
 - **No per-module checkpoint hooks.** Checkpoint I/O stays with
   [`OmniModuleCheckpointManager`](../../../veomni/models/seed_omni/utils/checkpoint.py#L30).
   [Fully frozen modules have no checkpoint manager](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L533),
