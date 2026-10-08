@@ -205,7 +205,6 @@ class TrainingMixin(TrainingModuleMixin):
         if target_parts:
             self._decode_target = torch.cat(target_parts, dim=0)
 
-        self.metric_meter_set_seqlens("decode_velocity", [int(v) for v in self._decode_lengths])
         inputs = {"hidden_states": torch.cat([part["hidden_states"] for part in inputs_parts], dim=0)}
         ps = get_parallel_state()
         if ps.sp_size == 1:
@@ -329,10 +328,17 @@ class MeterMixin(MetricMeterMixin):
     config: BagelFlowConnectorConfig
 
     def estimate_flops(self, seqlens: list[int]) -> float:
+        # Only ``embed_latent`` stashes lengths. Per latent token it runs vae2llm
+        # and the per-token timestep MLP (freq -> hidden -> hidden); the hidden x
+        # hidden layer dominates. ``decode_velocity``'s llm2vae is folded in per
+        # embedded token, which slightly over-counts edit-context tokens that are
+        # never decoded (llm2vae is ~2% of the per-token cost).
         cfg = self.config
-        proj_n = int(cfg.patch_latent_dim) * int(cfg.hidden_size) * 2
-        tokens = sum(seqlens)
-        return 6 * proj_n * tokens / 1e12
+        hidden = int(cfg.hidden_size)
+        latent = int(cfg.patch_latent_dim)
+        freq = int(cfg.timestep_frequency_embedding_size)
+        per_token_n = latent * hidden + freq * hidden + hidden * hidden + hidden * latent
+        return 6 * per_token_n * sum(seqlens) / 1e12
 
 
 class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
