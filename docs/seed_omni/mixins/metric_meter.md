@@ -79,15 +79,15 @@ class VeOmniMixin(BaseMixin, TrainingMixin, InferenceModuleMixin, MetricMeter):
 
 | Function | Module's job | Called by | Effect |
 |----------|--------------|-----------|--------|
-| [`estimate_flops(seqlens) -> float`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L105) | **Must implement.** Return the module's total theoretical TFLOPs (forward + backward) for the given token lengths. | [`metric_meter_collect`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L134), once per global step | Summed with the other modules' FLOPs into one `flops_achieved(T)` / `mfu`. Not implementing it raises `NotImplementedError` at the first step end. |
+| [`estimate_flops(seqlens) -> float`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L105) | **Must implement.** Return the module's total theoretical TFLOPs (forward + backward) for the given token lengths. | [`metric_meter_collect`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L139), once per global step | Summed with the other modules' FLOPs into one `flops_achieved(T)` / `mfu`. Not implementing it raises `NotImplementedError` at the first step end. |
 | [`metric_meter_set_seqlens(method, seqlens)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L79) | **Must call** inside the `pre_forward` hook of every call-site whose tokens should count, before any SP gather/slice. A hook registered for several call-sites (`@pre_forward("encode", "offline_encode")`) cannot tell which one invoked it, so it stashes under each. | The module's own `pre_forward`, dispatched by [`TrainingModuleMixin.pre_forward`](../../../veomni/models/seed_omni/mixins/training_module_mixin.py#L59) | Stashes the full per-sample lengths under `method` until the executor drains them. A call-site that never stashes (for example a VQ codec's `decode`) is not counted. |
 
 ### What the framework provides (do not override)
 
 | Function | Called by | Effect |
 |----------|-----------|--------|
-| [`MetricMeterMixin.metric_meter_add(method)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L120) | [`execute_train_node`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L66), once per training node, right after `pre_forward` and before the endpoint runs, inside the module's `ParallelState` scope | [Pops](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L132) the lengths stashed for the running `method` and appends them to the module's per-step buffer; stashes under other call-sites are left alone. Over gradient accumulation it runs once per micro-batch, so the buffer holds the whole global step. |
-| [`MetricMeterMixin.metric_meter_collect() -> (flops, seqlens)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L134) | [`OmniModelRuntime.metric_meter_collect`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L540) | Returns `(estimate_flops(buffer), buffer)` and empties the buffer for the next step. |
+| [`MetricMeterMixin.metric_meter_add(method)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L120) | [`execute_train_node`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L66), once per training node, right after `pre_forward` and before the endpoint runs, inside the module's `ParallelState` scope | [Appends](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L136) the lengths stashed for the running `method` to the module's per-step buffer, then [clears](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L137) the whole stash, so copies a shared hook left under other call-sites cannot leak into a later node. Over gradient accumulation it runs once per micro-batch, so the buffer holds the whole global step. |
+| [`MetricMeterMixin.metric_meter_collect() -> (flops, seqlens)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L139) | [`OmniModelRuntime.metric_meter_collect`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L540) | Returns `(estimate_flops(buffer), buffer)` and empties the buffer for the next step. |
 | [`OmniModelRuntime.metric_meter_collect() -> {name: (flops, seqlens)}`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L540) | [`OmniStepMetricsCallback.on_step_end`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L76) | Drains every module with `isinstance(omni_module, MetricMeterMixin)`. Keys are module names, so they are identical on every rank even when a rank's batch did not use a module (it reports `(0.0, [])`). |
 | [`OmniEnvironMeter.add(micro_batch)`](../../../veomni/utils/omni_helper.py#L123) | [`OmniStepMetricsCallback.on_step_begin`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L66), once per micro-batch | Counts samples (`len(conversation_list)`) and, for multi-source, gathers `ds_idx`. Never looks at tokens. |
 | [`OmniEnvironMeter.step(delta_time, global_step, module_metrics)`](../../../veomni/utils/omni_helper.py#L137) | [`OmniStepMetricsCallback.on_step_end`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L73) | [One DP all-reduce](../../../veomni/utils/omni_helper.py#L169) of FLOPs, sample count and per-module token sums, then the metrics listed below. |
@@ -109,14 +109,14 @@ and stored as `trainer.environ_meter`.
     [`execute_train_node`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L27), for each node:
     - [`raw.pre_forward(method, **batch)`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L63)
       - Module code: `self.metric_meter_set_seqlens(method, full_lengths)`, before the SP slice.
-    - [`raw.metric_meter_add(method)`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L66): pops the stash for this `method` into the step buffer.
+    - [`raw.metric_meter_add(method)`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L66): moves the stash for this `method` into the step buffer and clears the rest.
     - [Endpoint](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L68), then `post_forward`.
   - [`clip_grad_norm` / `optimizer.step` / `lr_scheduler.step`](../../../veomni/trainer/omni/omni_trainer.py#L517)
   - [`on_step_end`](../../../veomni/trainer/omni/omni_trainer.py#L522) →
     [`OmniStepMetricsCallback.on_step_end`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L69)
     - [`delta_time = time.time() - start_time`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L72)
     - [`OmniModelRuntime.metric_meter_collect()`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L540) →
-      per metered module [`(estimate_flops(buffer), buffer)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L145); buffer reset.
+      per metered module [`(estimate_flops(buffer), buffer)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L150); buffer reset.
     - [`OmniEnvironMeter.step(delta_time, global_step, module_metrics)`](../../../veomni/utils/omni_helper.py#L137)
     - [`trainer.step_env_metrics = ...`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L104),
       logged by [`WandbTraceCallback`](../../../veomni/trainer/callbacks/trace_callback.py#L157).
@@ -189,10 +189,12 @@ the cumulative counters survive a resume.
   return `0.0` for `[]`, because a rank whose batch skipped the module still
   collects it. Count only parameters the module owns; do not reuse
   `VeomniFlopsCounter`'s whole-model formula.
-- **Stash once per call-site invocation.** The stash is keyed by `method` and
-  [popped](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L132)
-  right after `pre_forward`, so re-reading it cannot double-count, and a module
-  invoked by several nodes is counted once per invocation.
+- **Stash in every `pre_forward` that should count.** The stash is
+  [cleared](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L137)
+  right after each `pre_forward`, so re-reading it cannot double-count, a module
+  invoked by several nodes is counted once per invocation, and a `pre_forward`
+  that returns without stashing counts nothing rather than an earlier node's
+  lengths.
 - **Count the compute the module actually does.** Frozen modules are drained
   like any other metered module. If no gradient flows through a frozen module,
   it only runs a forward, and its `estimate_flops` should not include a

@@ -126,10 +126,15 @@ class MetricMeterMixin:
         (``@pre_forward("encode", "offline_encode")``) without knowing which one
         invoked it: such a hook stashes under each, and only the running call-site
         is counted. A call-site that stashed nothing (e.g. ``decode``) adds nothing.
+
+        The whole stash is then cleared: it was written by the ``pre_forward`` that
+        just ran, so entries for the other call-sites are stale and must not leak
+        into a later node whose ``pre_forward`` returns without stashing.
         """
         stash = getattr(self, "_metric_full_seqlens", None)
         if stash:
-            self._metric_meter_seqlen_buffer().extend(stash.pop(method, []))
+            self._metric_meter_seqlen_buffer().extend(stash.get(method, []))
+            stash.clear()
 
     def metric_meter_collect(self) -> MetricMeterResult:
         """Return ``(theoretical_flops, seqlens)`` for the step, then reset.

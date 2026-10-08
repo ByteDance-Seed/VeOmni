@@ -70,9 +70,6 @@ def test_a_call_site_that_stashed_nothing_contributes_nothing():
     module.metric_meter_add("decode")
 
     assert module.metric_meter_collect() == (0.0, [])
-    # The untouched `encode` stash is still there for its own call-site.
-    module.metric_meter_add("encode")
-    assert module.metric_meter_collect() == (18.0, [9])
 
 
 def test_a_hook_shared_by_call_sites_is_counted_once():
@@ -86,8 +83,20 @@ def test_a_hook_shared_by_call_sites_is_counted_once():
     assert module.metric_meter_collect() == (10.0, [5])
 
 
+def test_stale_stashes_of_other_call_sites_do_not_leak_into_a_later_node():
+    """A later ``offline_encode`` whose ``pre_forward`` stashed nothing must not drain the earlier ``encode`` hook's copy."""
+    module = MeteredModule()
+
+    module.metric_meter_set_seqlens("encode", [5])
+    module.metric_meter_set_seqlens("offline_encode", [5])
+    module.metric_meter_add("encode")
+    module.metric_meter_add("offline_encode")
+
+    assert module.metric_meter_collect() == (10.0, [5])
+
+
 def test_the_stash_is_drained_once_per_call_site():
-    """``metric_meter_add`` pops, so a re-read of the same stash cannot double-count."""
+    """``metric_meter_add`` drains the stash, so a re-read cannot double-count."""
     module = MeteredModule()
     module.metric_meter_set_seqlens("forward", [10])
 
