@@ -7,8 +7,10 @@ Covers:
 Run (single GPU):
     pytest tests/distributed/test_async_activation_offload.py -v
 """
+
 import pytest
 import torch
+
 from veomni.distributed.async_offload import (
     PinnedBufferPool,
     _get_no_split_offload_modules,
@@ -17,6 +19,7 @@ from veomni.distributed.async_offload import (
     reset_async_activation_offload,
 )
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+
 
 _HAS_ACCEL = IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE
 

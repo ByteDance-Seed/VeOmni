@@ -219,7 +219,6 @@ def switch_to_specified_stream(stream: Any) -> Any:
     return get_torch_device().stream(stream)
 
 
-
 def get_compute_units():
     """
     Returns the number of streaming multiprocessors (SMs) or equivalent compute units

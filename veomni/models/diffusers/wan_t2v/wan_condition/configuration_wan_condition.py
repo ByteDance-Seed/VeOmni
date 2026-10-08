@@ -72,5 +72,5 @@ class WanTransformer3DConditionModelConfig(PretrainedConfig):
                 transformer_config = json.load(f)
             if "patch_size" in transformer_config:
                 config_dict["patch_size"] = transformer_config["patch_size"]
-                
+
         return config_dict, kwargs

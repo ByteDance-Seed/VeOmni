@@ -10,9 +10,9 @@ from PIL import Image
 from safetensors.torch import load_file, save_file
 from torch.utils.checkpoint import CheckpointError, _CheckpointFrame
 
-from tests.precision.qwen_image import capture, compare, encode, prepare, sha256, tensor_difference, verify_fixture
 from tests.models.test_qwen_image_training import snapshot as snapshot
 from tests.models.test_qwen_image_training import transformer
+from tests.precision.qwen_image import capture, compare, encode, prepare, sha256, tensor_difference, verify_fixture
 from veomni.arguments.arguments_types import MixedPrecisionConfig
 from veomni.distributed.parallel_state import ParallelState, use_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model

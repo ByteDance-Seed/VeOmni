@@ -20,6 +20,7 @@ import diffusers
 from diffusers import WanTransformer3DModel
 from transformers import PretrainedConfig
 
+
 WAN_INIT_SIGNATURE = inspect.signature(WanTransformer3DModel.__init__)
 
 diffusers_version = diffusers.__version__

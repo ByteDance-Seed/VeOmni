@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from typing import Any
 
 import torch
@@ -13,6 +14,7 @@ from .....distributed.parallel_state import get_parallel_state
 from .....utils import logging
 from .....utils.device import get_device_type
 from .configuration_wan_condition import WanTransformer3DConditionModelConfig
+
 
 logger = logging.get_logger(__name__)
 

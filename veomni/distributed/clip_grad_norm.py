@@ -72,5 +72,5 @@ def veomni_clip_grad_norm(
             grad_norm = grad_norm.full_tensor()
     else:
         raise RuntimeError(f"Unknown dp mode {dp_mode}")
-    
+
     return grad_norm

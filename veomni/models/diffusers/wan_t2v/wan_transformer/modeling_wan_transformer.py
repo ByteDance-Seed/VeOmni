@@ -8,14 +8,13 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 from diffusers import WanTransformer3DModel as _WanTransformer3DModel
+from diffusers.models.activations import GELU
 from diffusers.models.transformers.transformer_wan import (
     WanAttention,
     WanAttnProcessor,
     _get_added_kv_projections,
     _get_qkv_projections,
 )
-from diffusers.models.activations import GELU
-
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -34,8 +33,8 @@ try:
 except ImportError:
     torch_npu = None
 
-logger = logging.get_logger(__name__)
 
+logger = logging.get_logger(__name__)
 
 
 def wan_eager_attention_forward(
@@ -61,6 +60,7 @@ if IS_NPU_AVAILABLE and torch_npu is not None:
         return torch.nn.functional.gelu(gate, approximate=self.approximate)
 
     GELU.gelu = _gelu_npu
+
 
 class WanAttentionKernelModule:
     def __init__(self, config: SimpleNamespace, attn: WanAttention):
@@ -402,7 +402,7 @@ def WanTransformer3DModel_forward(
         )
     except (ImportError, ModuleNotFoundError):
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
-        
+
     # 3. Condition embedding
     if timestep.ndim == 2:
         ts_seq_len = timestep.shape[1]
