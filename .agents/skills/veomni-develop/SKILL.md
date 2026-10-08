@@ -69,7 +69,7 @@ implementation must follow, and the tests that cover the contract.
 
 Link every symbol and call site with a path relative to the doc plus a line
 anchor, e.g.
-`[metric_meter_add](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L142)`,
+`[metric_meter_add](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L120)`,
 so the reader can jump to the code from the IDE and from GitHub. Prefer this
 over `https://github.com/.../blob/main/...` URLs, which do not resolve until the
 PR merges and do not open in the IDE. Keep call flows out of code fences: links
