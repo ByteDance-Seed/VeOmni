@@ -385,7 +385,6 @@ def WanTransformer3DModel_forward(
         hidden_states = torch.cat([hidden_states, mask, image_latents], dim=1)
         num_channels = hidden_states.shape[1]
 
-
     p_t, p_h, p_w = self.config.patch_size
     post_patch_num_frames = num_frames // p_t
     post_patch_height = height // p_h
