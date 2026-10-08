@@ -321,7 +321,6 @@ def _wan_block_ckpt_wrapper(block):
     return custom_forward
 
 
-
 def WanTransformer3DModel_forward(
     self: _WanTransformer3DModel,
     hidden_states: torch.Tensor,
