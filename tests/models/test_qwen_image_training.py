@@ -381,6 +381,7 @@ def test_backbone_reference_forward_and_gradients(snapshot, encoded):
             assert param.grad is not None
             torch.testing.assert_close(param.grad, reference_param.grad, atol=2e-6, rtol=1e-5)
 
+
 # ---------------------------------------------------------------------------
 # Qwen-Image-Edit tests
 # ---------------------------------------------------------------------------

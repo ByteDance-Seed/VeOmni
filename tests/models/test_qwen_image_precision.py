@@ -33,12 +33,18 @@ def test_real_rope_forward_and_gradients(dtype):
     expected = modeling.apply_qwen_rotary_emb(x, freqs)
     actual = modeling.apply_qwen_rotary_emb(y, torch.view_as_real(freqs))
     torch.testing.assert_close(
-        actual, expected, atol=1e-6 if dtype == torch.float32 else 4e-3, rtol=1e-5 if dtype == torch.float32 else 4e-3
+        actual,
+        expected,
+        atol=1e-6 if dtype == torch.float32 else 4e-3,
+        rtol=1e-5 if dtype == torch.float32 else 4e-3,
     )
     expected.float().square().mean().backward()
     actual.float().square().mean().backward()
     torch.testing.assert_close(
-        y.grad, x.grad, atol=1e-6 if dtype == torch.float32 else 1e-4, rtol=1e-5 if dtype == torch.float32 else 1e-2
+        y.grad,
+        x.grad,
+        atol=1e-6 if dtype == torch.float32 else 1e-4,
+        rtol=1e-5 if dtype == torch.float32 else 1e-2,
     )
 
 
@@ -58,14 +64,18 @@ def test_npu_rope_parity_with_cpu(dtype):
     actual = modeling.apply_qwen_rotary_emb(x_npu, freqs_npu)
 
     torch.testing.assert_close(
-        actual.to("cpu"), expected, atol=1e-5 if dtype == torch.float32 else 5e-3,
+        actual.to("cpu"),
+        expected,
+        atol=1e-5 if dtype == torch.float32 else 5e-3,
         rtol=1e-5 if dtype == torch.float32 else 5e-3,
     )
 
     expected.float().square().mean().backward()
     actual.float().square().mean().backward()
     torch.testing.assert_close(
-        x_npu.grad.to("cpu"), x_cpu.grad, atol=1e-5 if dtype == torch.float32 else 1e-3,
+        x_npu.grad.to("cpu"),
+        x_cpu.grad,
+        atol=1e-5 if dtype == torch.float32 else 1e-3,
         rtol=1e-5 if dtype == torch.float32 else 1e-2,
     )
 

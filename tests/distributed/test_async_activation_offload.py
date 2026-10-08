@@ -89,6 +89,7 @@ class TestApplyAsyncActivationOffload:
         with pytest.raises(ValueError):
             apply_async_activation_offload(model, activation_offload_modules=[])
 
+
 @pytest.mark.skipif(not _HAS_ACCEL, reason="requires CUDA or NPU for streams + pinned memory")
 class TestGradientParity:
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

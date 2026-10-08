@@ -34,12 +34,7 @@ def qwen_image_preprocess(conversations, **kwargs):
     if not isinstance(prompt, str) or not isinstance(image, (str, bytes)):
         raise ValueError("Qwen-Image requires a text prompt and an image path, URL, or bytes.")
     data_dir = kwargs.get("data_dir", "")
-    if (
-        data_dir
-        and isinstance(image, str)
-        and not os.path.isabs(image)
-        and "://" not in image
-    ):
+    if data_dir and isinstance(image, str) and not os.path.isabs(image) and "://" not in image:
         image = os.path.join(data_dir, image)
     return prompt, {}, [image], []
 
@@ -94,12 +89,7 @@ def qwen_image_edit_preprocess(conversations, **kwargs):
     data_dir = kwargs.get("data_dir", "")
 
     def _resolve(path):
-        if (
-            data_dir
-            and isinstance(path, str)
-            and not os.path.isabs(path)
-            and "://" not in path
-        ):
+        if data_dir and isinstance(path, str) and not os.path.isabs(path) and "://" not in path:
             return os.path.join(data_dir, path)
         return path
 

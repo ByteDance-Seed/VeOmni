@@ -180,6 +180,7 @@ def is_sm90_or_above() -> bool:
     """Check if the current CUDA device has SM90+ capability."""
     return get_gpu_compute_capability() >= 90
 
+
 def create_stream(device=None, priority: int = 0) -> Any:
     """Create a device stream (CUDA/NPU-agnostic)."""
     device_type = get_device_type()

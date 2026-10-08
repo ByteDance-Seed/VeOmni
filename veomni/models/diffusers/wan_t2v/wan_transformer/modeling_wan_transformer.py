@@ -28,6 +28,7 @@ from .....utils import logging
 from .....utils.device import IS_NPU_AVAILABLE, get_device_type
 from .configuration_wan_transformer import WanTransformer3DModelConfig
 
+
 try:
     import torch_npu
 except ImportError:
@@ -51,6 +52,7 @@ def wan_eager_attention_forward(
         query, key, value, attn_mask=attention_mask, dropout_p=dropout, scale=scaling, is_causal=False
     )
     return attn_output.transpose(1, 2), None
+
 
 # Patch diffusers GELU to use torch_npu.fast_gelu on NPU.
 if IS_NPU_AVAILABLE and torch_npu is not None:
