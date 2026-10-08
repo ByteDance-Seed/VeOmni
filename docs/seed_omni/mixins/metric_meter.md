@@ -66,7 +66,9 @@ class TrainingMixin(TrainingModuleMixin):
     def forward_pre(self, input_ids: list[Any], **kwargs: Any) -> dict[str, Any]:
         # Full per-sample lengths, BEFORE any sequence-parallel slice.
         self.metric_meter_set_seqlens("forward", [len(ids) for ids in input_ids])
-        ...  # pack / pad / SP-slice, then return the endpoint kwargs
+        packed_input_ids = ...  # pack / pad / SP-slice
+        # The returned dict becomes the endpoint's kwargs.
+        return {"input_ids": packed_input_ids, **kwargs}
 
 
 class VeOmniMixin(BaseMixin, TrainingMixin, InferenceModuleMixin, MetricMeter):

@@ -75,21 +75,23 @@ class XxxOfflineMixin:
 
 
 class XxxAccelerated(XxxOfflineMixin, OfflineEncodingMixin, TrainingModuleMixin, BaseMixin, XxxModel):
+    # Each hook must return a dict: a pre-hook's dict becomes the endpoint's
+    # kwargs, a post-hook's dict is merged into the shared batch.
     @pre_forward("offline_encode")
     def offline_encode_pre(self, conversation_list=None, **batch):
-        ...  # conversation payload -> offline_encode kwargs
+        return {"pixel_values": ...}  # this module's items from conversation_list
 
     @post_forward("offline_encode")
-    def offline_encode_post(self, **outputs):
-        ...
+    def offline_encode_post(self, encoded_cache):
+        return {"conversation_list": ...}  # attach each sample's cache artifact
 
     @pre_forward("online_process")
     def online_process_pre(self, conversation_list=None, **batch):
-        ...
+        return {"encoded_cache": ...}  # cached artifacts read back from the batch
 
     @post_forward("online_process")
-    def online_process_post(self, **outputs):
-        ...
+    def online_process_post(self, latents):
+        return {"latents": latents}  # where downstream nodes read them
 ```
 
 ```python
