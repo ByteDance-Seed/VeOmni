@@ -23,37 +23,34 @@ from ..base import Callback, TrainerState
 
 
 if TYPE_CHECKING:
-    from ....arguments import VeOmniArguments
     from ...omni.omni_trainer import OmniTrainer
 
 
-class OmniEnvironMeterCallback(Callback):
-    """Per-module metric metering for OmniModel.
+class OmniStepMetricsCallback(Callback):
+    """Per-step training + efficiency metrics for OmniModel.
 
-    The single-model :class:`EnvironMeterCallback` can't meter ``OmniModel``: it
-    is a composition of sub-modules with no single ``model_type`` to estimate
-    FLOPs on, and the entry batch carries only ``conversation_list`` (no
-    ``input_ids`` / ``attention_mask`` to count tokens from).  So **FLOPs / MFU**
-    are computed per-module by each module's
-    :class:`~veomni.models.seed_omni.mixins.metric_meter_mixin.MetricMeterMixin`.  This callback drives the
-    timing, collects every module's ``(theoretical_flops, seqlens)`` via
-    :meth:`~veomni.trainer.omni.omni_trainer.OmniTrainer.collect_step_metrics`,
-    and hands them to :class:`~veomni.utils.omni_helper.OmniEnvironMeter`, which owns the **global**
-    roll-up — merged batch-token statistics, multi-source accounting, and
-    device/host memory.
+    The single-model :class:`EnvironMeterCallback` cannot run here: an
+    ``OmniModel`` has no single ``model_type`` to estimate FLOPs on, and its
+    batch carries only ``conversation_list`` (no ``input_ids`` to count tokens
+    from). Instead each metered module reports its own tokens and FLOPs
+    (:meth:`~veomni.models.seed_omni.accelerated.OmniModelRuntime.metric_meter_collect`)
+    and :class:`~veomni.utils.omni_helper.OmniEnvironMeter` rolls them up over
+    the whole-step wall-clock. On top of that it publishes total loss and grad
+    norm averaged over the FSDP group, and each node's loss averaged over the
+    ranks whose batch produced it.
 
-    ``self.trainer`` here is the :class:`~veomni.trainer.omni.omni_trainer.OmniTrainer`
-    orchestrator; it writes :attr:`~OmniTrainer.environ_meter`,
-    :attr:`~OmniTrainer.step_env_metrics`, and :attr:`~OmniTrainer.step_train_metrics`
-    each step for :class:`~veomni.trainer.callbacks.WandbTraceCallback` /
-    :class:`~veomni.trainer.callbacks.TqdmCallback` / :class:`ChannelLossCallback`.
+    It writes :attr:`~OmniTrainer.step_train_metrics` (read by
+    :class:`~veomni.trainer.callbacks.TqdmCallback`) and
+    :attr:`~OmniTrainer.step_env_metrics` (logged by
+    :class:`~veomni.trainer.callbacks.WandbTraceCallback`), so it must run before
+    both in the handler list.
     """
 
     trainer: "OmniTrainer"
 
     def __init__(self, trainer: "OmniTrainer") -> None:
         super().__init__(trainer)
-        args: "VeOmniArguments" = trainer.args
+        args = trainer.args
         trainer.environ_meter = OmniEnvironMeter(
             global_batch_size=args.train.global_batch_size,
             enable_multisource=args.data.enable_multisource,
@@ -61,10 +58,11 @@ class OmniEnvironMeterCallback(Callback):
             data_path=args.data.train_path,
             empty_cache_steps=args.train.empty_cache_steps,
             gc_steps=args.train.gc_steps,
+            parallel_state=self.parallel_state,
         )
 
     def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
-        for micro_batch in micro_batches or []:
+        for micro_batch in micro_batches:
             self.trainer.environ_meter.add(micro_batch)
         self.start_time = time.time()
 
@@ -72,9 +70,11 @@ class OmniEnvironMeterCallback(Callback):
         self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
     ) -> None:
         delta_time = time.time() - self.start_time
-
-        module_metrics = self.trainer.collect_step_metrics()
-        step_env_metrics = self.trainer.environ_meter.step(delta_time, state.global_step, module_metrics)
+        step_env_metrics = self.trainer.environ_meter.step(
+            delta_time,
+            global_step=state.global_step,
+            module_metrics=self.trainer.model.metric_meter_collect(),
+        )
 
         group = self.parallel_state.fsdp_group
         # A node records a loss only when its batch produced one, and ranks see
@@ -96,7 +96,6 @@ class OmniEnvironMeterCallback(Callback):
             sums = all_reduce(values + counts, op="sum", group=group)
             for i, key in enumerate(node_keys):
                 step_train_metrics[f"training/{key}"] = sums[i] / sums[len(node_keys) + i]
-
         # None only for offline_cache, which freezes every module.
         lr_scheduler = self.trainer.model.lr_scheduler
         if lr_scheduler is not None:
@@ -108,4 +107,4 @@ class OmniEnvironMeterCallback(Callback):
         self.trainer.step_env_metrics = step_env_metrics
 
 
-__all__ = ["OmniEnvironMeterCallback"]
+__all__ = ["OmniStepMetricsCallback"]

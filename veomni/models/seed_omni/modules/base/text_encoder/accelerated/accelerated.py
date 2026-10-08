@@ -342,8 +342,7 @@ class MeterMixin(MetricMeterMixin):
 
     # Token lengths come from ``metric_meter_set_seqlens`` in ``encode_pre`` (the
     # full pre-slice packed length); ``decode`` stashes nothing and contributes
-    # no tokens (its lm_head FLOPs are covered by the ``encode`` count). So the
-    # default ``metric_meter_token_lengths`` (drains the stash) is used as-is.
+    # no tokens (its lm_head FLOPs are covered by the ``encode`` count).
 
 
 class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin, EmbParallelMixin):

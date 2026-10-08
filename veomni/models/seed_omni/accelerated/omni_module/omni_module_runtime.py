@@ -36,7 +36,6 @@ from .....utils import logging
 from .....utils.checkpoint_utils import should_skip_hf_weight_load
 from .....utils.device import get_device_type
 from ....model_runtime import VeOmniModelRuntime
-from ...mixins.metric_meter_mixin import MetricMeterMixin, MetricMeterResult
 from ...utils.checkpoint import OmniModuleCheckpointManager
 from ..utils.dispatch import unwrap_module_chain
 
@@ -581,13 +580,6 @@ class ModuleRuntime(VeOmniModelRuntime):
         model = self.model
         if isinstance(model, FSDPModule):
             model.set_reshard_after_backward(reshard)
-
-    def collect_step_metrics(self) -> Optional[MetricMeterResult]:
-        """Drain this module's optional metric meter after one training step."""
-        model = unwrap_module_chain(self.model)
-        if isinstance(model, MetricMeterMixin):
-            return model.metric_meter_collect()
-        return None
 
     def build_checkpoint(self) -> None:
         """Build this module's DCP / HF / LoRA checkpoint manager.

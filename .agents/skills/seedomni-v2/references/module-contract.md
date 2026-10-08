@@ -85,8 +85,8 @@ A module opts into token / theoretical-FLOPs metering by mixing in
 - **Report tokens** by calling `self.metric_meter_set_seqlens("<method>", seqlens)`
   **inside `pre_forward`, BEFORE any SP gather/slice**. This is the single uniform
   entry point — even AR backbones use it (built from their `cu_seqlens`), not a
-  custom reader. The default `metric_meter_token_lengths` drains this stash; do
-  **not** override it and do **not** read the (SP-sliced) forward `data`.
+  custom reader. The executor's `metric_meter_add(method)` drains this stash
+  right after `pre_forward`; do **not** read the (SP-sliced) forward `data`.
 - **Implement `estimate_flops(seqlens)`** with the module's own FLOPs formula
   (count only what this module computes — e.g. an AR backbone excludes `wte`/`lm_head`).
 

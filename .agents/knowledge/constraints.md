@@ -48,7 +48,7 @@ Core entry points:
    - Gradient clipping: `veomni/distributed/fsdp2/clip_grad_norm.py` — handles DTensor grads and ExtraParallel param groups.
 
 6. **Device mesh initialization (`init_parallel_state_from_config()`)**
-   - Builds a global `DeviceMesh` with named dimensions: `pp`, `dp_replicate`, `dp_shard`, `ulysses`, `cp`, `tp` (each included only if size > 1).
+   - Builds a global `DeviceMesh` with named dimensions: `pp`, `dp_replicate`, `dp_shard`, `cp`, `ulysses`, `tp` (`dp_shard` is always included; other dimensions only when size > 1). Ulysses follows CP so its ranks are adjacent when both axes are used.
    - Flattens subviews for common usage: `dp` (all data-parallel), `sp` (ulysses+cp), `dp_shard_sp` (FSDP shard × SP), `dp_sp` (for loss/grad sync across SP+DP).
    - For each ExtraParallel name (e.g. `ep`), builds a `[para_size × para_fsdp_size]` submesh via `init_para_mesh_matrix()`.
 
@@ -87,7 +87,7 @@ Core entry points:
    - **The clamped denominator is the caller's job — no fused CE backend provides it.** Liger divides by its own `n_non_ignore` and `chunk_loss` recounts the labels, both unclamped, so handing a fully-`-100` span to `self.loss_function` yields `0/0` = NaN. `ReduceLoss` masks that rank's NaN out of the forward value but its backward still multiplies the kernel's NaN grad by 0. `text_encoder/accelerated/accelerated.py::decode` therefore counts supervised tokens itself and routes a zero-count span to the eager branch with an explicit `num_items_in_batch=n.clamp(min=1)` — matching the native `decode` exactly (0.0, still graph-connected so the head's zero grads exist on every rank). Any new fused-loss call site owes the same guard. This changes DP loss semantics for Omni training from mean-of-means to global token-weighted (bagel excluded, out of SP scope).
 
 7c. **Per-module metric meter must stash PRE-slice (full-sample) seqlens in `pre_forward`, not measure the sliced forward `data`**
-   - `MetricMeterMixin` no longer reads the module's forward `data` for token counts. Each metered module calls `metric_meter_set_seqlens(method, seqlens)` **inside `pre_forward`, before the SP slice** on `MetricMeterMixin`; the default `metric_meter_token_lengths` just drains that stash.
+   - `MetricMeterMixin` no longer reads the module's forward `data` for token counts. Each metered module calls `metric_meter_set_seqlens(method, seqlens)` **inside `pre_forward`, before the SP slice** on `MetricMeterMixin`; the executor's `metric_meter_add(method)` drains that stash right after `pre_forward`.
    - **Why pre-slice / full-sample:** the `pre_forward` SP branch slices to this rank's `1/sp` shard, so a length read *after* that branch under-counts by ~`sp` (always call `metric_meter_set_seqlens` BEFORE the `if sp_size > 1:` slice). Stash the FULL (pre-slice) per-sample lengths instead: `OmniEnvironMeter.add` reduces tokens **and** `total_flops` over the **`dp_group`** (`omni_helper.py`), which EXCLUDES the sp dim — so the sp ranks that all hold the same replicated sample are not double-counted, and the full-sample value counted once per DP shard reconstructs the global total. This holds for FLOPs/MFU too (each device does `1/sp` of the work; `world_size` in the MFU denominator — which includes sp — absorbs the sp factor, matching the non-SP run).
    - Verified SP-transparent: `sp1` == `sp4` per-module `trace/<module>/consume_tokens` match to the digit. A regression here shows up as tokens/MFU scaling with `sp`, not as a crash.
 

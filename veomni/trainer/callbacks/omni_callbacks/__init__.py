@@ -14,11 +14,11 @@
 
 """SeedOmni (OmniTrainer) callbacks — not shared with single-model trainers."""
 
-from .environ_meter_callback import OmniEnvironMeterCallback
 from .graph_profile_callback import GraphProfileCallback
+from .step_metrics_callback import OmniStepMetricsCallback
 
 
 __all__ = [
     "GraphProfileCallback",
-    "OmniEnvironMeterCallback",
+    "OmniStepMetricsCallback",
 ]

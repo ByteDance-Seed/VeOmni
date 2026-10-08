@@ -53,7 +53,7 @@ import json
 import os
 from collections import defaultdict
 from dataclasses import asdict
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping
 
 import torch
 import torch.distributed as dist
@@ -94,12 +94,8 @@ from ..callbacks import (
 )
 from ..callbacks.omni_callbacks import (
     GraphProfileCallback,
-    OmniEnvironMeterCallback,
+    OmniStepMetricsCallback,
 )
-
-
-if TYPE_CHECKING:
-    from ...models.seed_omni.mixins.metric_meter_mixin import MetricMeterResult
 
 
 logger = logging.get_logger(__name__)
@@ -191,14 +187,11 @@ class OmniTrainer:
     model_fwd_context: Any
     model_bwd_context: Any
 
-    # OmniEnvironMeterCallback.__init__: per-module MFU/token roll-up engine.
-    # GlobalStateCallback: resume meter multisource cursor.
-    environ_meter: OmniEnvironMeter | None = None
-    # OmniEnvironMeterCallback.on_step_end: env metrics (MFU, tokens, memory, …),
-    # merged with the training metrics; WandbTraceCallback logs it.
+    environ_meter: OmniEnvironMeter  # see in OmniStepMetricsCallback
+    # OmniStepMetricsCallback.on_step_end: training + efficiency metrics (loss, grad_norm, lr, mfu, …).
+    # WandbTraceCallback.on_step_end: logs step_env_metrics.
+    # TqdmCallback.on_step_end: progress-bar postfix from step_train_metrics.
     step_env_metrics: Dict[str, Any] | None = None
-    # OmniEnvironMeterCallback.on_step_end: training metrics (loss, grad_norm, lr, …).
-    # TqdmCallback.on_step_end: progress-bar postfix.
     step_train_metrics: Dict[str, Any] | None = None
     LOG_SAMPLE: bool = True
     offline_cache_writer: SeedOmniOfflineCacheWriter | None = None
@@ -279,10 +272,8 @@ class OmniTrainer:
         ``self.args.train`` (:attr:`ModuleRuntime.cache_mode`). ``offline_cache``
         freezes every module by design, so only it may build no optimizer.
         """
-        train_type = self.args.train.train_type
-        runtime_args = build_omni_model_runtime_args(self.args)
-        model = build_omni_model_runtime(runtime_args, train=self.args.train)
-        if model.optimizer is None and train_type != "offline_cache":
+        model = build_omni_model_runtime(build_omni_model_runtime_args(self.args), train=self.args.train)
+        if model.optimizer is None and self.args.train.train_type != "offline_cache":
             raise ValueError("OmniTrainer has nothing to train: every module is frozen.")
         return model
 
@@ -377,7 +368,7 @@ class OmniTrainer:
 
     def _init_callbacks(self):
         """Build orchestrator trace callbacks + global / per-module checkpoint schedulers."""
-        self.environ_meter_callback = OmniEnvironMeterCallback(self)
+        self.step_metrics_callback = OmniStepMetricsCallback(self)
         self.tqdm_callback = TqdmCallback(self)
         self.wandb_callback = WandbTraceCallback(self)
         self.profile_callback = ProfileTraceCallback(self)
@@ -386,7 +377,7 @@ class OmniTrainer:
         self.global_state_callback = GlobalStateCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self._callbacks = [
-            self.environ_meter_callback,
+            self.step_metrics_callback,
             self.tqdm_callback,
             self.wandb_callback,
             self.profile_callback,
@@ -398,10 +389,6 @@ class OmniTrainer:
             self.evaluate_callback,
         ]
         self.state = TrainerState()
-
-    def collect_step_metrics(self) -> Dict[str, "MetricMeterResult"]:
-        """Fan out metric collection to every composed model handle."""
-        return self.model.collect_step_metrics()
 
     def save_model_assets(self) -> None:
         """Write every composed model's omni-root sidecars."""

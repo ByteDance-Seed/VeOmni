@@ -89,7 +89,6 @@ key_features/extra_parallel.md
 key_features/ulysses.md
 key_features/lora.md
 key_features/mtp.md
-key_features/omni_offline_encoding.md
 
 ```
 
@@ -100,6 +99,8 @@ key_features/omni_offline_encoding.md
 seed_omni/seed_omni.md
 seed_omni/data_format.md
 seed_omni/av_video_design.md
+seed_omni/mixins/metric_meter.md
+seed_omni/mixins/offline_encoding.md
 seed_omni/example_models/janus.md
 seed_omni/example_models/qwen3.md
 seed_omni/example_models/qwen3vl.md

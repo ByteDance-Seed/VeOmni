@@ -160,26 +160,43 @@ def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]
 
 
 def compute_device_memory_metrics() -> Dict[str, Any]:
-    """Device + host memory metrics, reduced (max) across all ranks.
+    """Device + host memory metrics, reduced to the worst rank across all ranks.
 
     Shared by :class:`EnvironMeter` (single model) and
     :class:`veomni.utils.omni_helper.OmniEnvironMeter` (OmniModel) — these are
     module-agnostic and depend only on the device, so both meters report them
-    identically.
+    identically. Used memory and usage take the max over ranks, available host
+    memory the min, so rank 0's log shows the host closest to running out.
     """
     allocated_memory = get_torch_device().max_memory_allocated()
     reserved_memory = get_torch_device().max_memory_reserved()
     num_alloc_retries = get_torch_device().memory_stats()["num_alloc_retries"]
-    allocated_memory, reserved_memory, num_alloc_retries = all_reduce(
-        (allocated_memory, reserved_memory, num_alloc_retries), op="max"
-    )
     cpu_memory_info = psutil.virtual_memory()
+    # One max-reduce: the min of available memory is the max of its negation.
+    (
+        allocated_memory,
+        reserved_memory,
+        num_alloc_retries,
+        cpu_used_memory,
+        cpu_memory_usage,
+        neg_cpu_available_memory,
+    ) = all_reduce(
+        (
+            allocated_memory,
+            reserved_memory,
+            num_alloc_retries,
+            cpu_memory_info.used,
+            cpu_memory_info.percent,
+            -cpu_memory_info.available,
+        ),
+        op="max",
+    )
     return {
         "max_memory_allocated(GB)": allocated_memory / (1024**3),
         "max_memory_reserved(GB)": reserved_memory / (1024**3),
-        "cpu_used_memory(GB)": cpu_memory_info.used / (1024**3),
-        "cpu_available_memory(GB)": cpu_memory_info.available / (1024**3),
-        "cpu_memory_usage(%)": cpu_memory_info.percent,
+        "cpu_used_memory(GB)": cpu_used_memory / (1024**3),
+        "cpu_available_memory(GB)": -neg_cpu_available_memory / (1024**3),
+        "cpu_memory_usage(%)": cpu_memory_usage,
         "num_alloc_retries": num_alloc_retries,
     }
 

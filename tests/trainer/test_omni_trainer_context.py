@@ -99,23 +99,6 @@ def test_build_training_context_offload_flags():
     assert isinstance(trainer.model_bwd_context, nullcontext)
 
 
-def test_omni_model_runtime_collect_step_metrics_skips_empty_meters():
-    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime
-
-    class _MeteredRuntime(_FakeModuleRuntime):
-        def collect_step_metrics(self):
-            return ("flops", [1, 2, 3])
-
-    class _EmptyRuntime(_FakeModuleRuntime):
-        def collect_step_metrics(self):
-            return None
-
-    module_runtimes = OrderedDict([("a", _MeteredRuntime()), ("b", _EmptyRuntime())])
-    runtime = OmniModelRuntime(SimpleNamespace(), module_runtimes=module_runtimes)
-
-    assert runtime.collect_step_metrics() == {"a": ("flops", [1, 2, 3])}
-
-
 def test_omni_model_runtime_forwards_composed_model_surface():
     """The runtime is the single model handle: unknown attrs reach the OmniModel."""
     from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import OmniModelRuntime

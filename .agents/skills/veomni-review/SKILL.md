@@ -19,7 +19,7 @@ you. It is the *obligation* that moved, not the option.
 |--------|--------|
 | Python under `veomni/`, `tasks/`, `tests/` | Required |
 | `.github/workflows/`, `pyproject.toml`, `uv.lock`, `docker/`, `configs/` | Required |
-| Docs, comments, or `.agents/` knowledge and skills only | Skip — self-check instead: verify every repo path, config key and version you assert actually exists |
+| Docs, comments, or `.agents/` knowledge and skills only | Skip — self-check instead: verify every repo path, config key and version you assert actually exists, and that every `#L<line>` code link lands on the symbol it names |
 | A clean, exact revert or reapplication of a previously approved diff, with no additional or conflict-resolved changes | Skip |
 
 Partial reverts and reapplications with extra edits or conflict resolutions
@@ -107,6 +107,13 @@ For each changed file, check:
 - No auto-generated files (`veomni/models/transformers/*/generated/`) edited directly?
 - Tests: does the diff extend an existing CI-enumerated test, or add a new file that the workflow owning that path actually lists? Check the owning workflow rather than assuming — `tests/data/` runs wholesale in both unit workflows, `tests/ops/` only in the GPU one (NPU enumerates ops files by name, so an Ascend-relevant ops file still needs a line), the e2e paths belong to `{gpu,npu}_e2e_test.yml`, and everything else must be listed file by file or it never runs. See `.agents/knowledge/testing.md`.
 - Ruff-compliant (`make quality` passes)?
+
+### Documentation
+- Does the diff add or change a public API, config field, or extension point (a mixin, hook, callback or base-class method that other modules or models must implement)? Then the same PR must add or update a page under `docs/`. A missing page is a needs-attention finding.
+- A new extension point needs a dedicated page that states, for each function: who owns it (must implement / must call / may override / framework-provided), what it does, the exact framework call site, and the observable end effect. The full requirements are in "Documenting an extension point" in `.agents/skills/veomni-develop/SKILL.md`.
+- Is every new page in a `docs/index.md` toctree? The docs build runs with `-W`, so an orphan page fails CI.
+- Do code references use paths relative to the doc with `#L<line>` anchors, and does each anchor land on the symbol its link text names? Check every anchor into a file this diff changes; line numbers shift silently.
+- Do the doc's claims (function names, call order, metric or config keys, defaults) match the code in the diff?
 
 ## Output
 
