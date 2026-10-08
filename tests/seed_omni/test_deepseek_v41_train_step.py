@@ -322,8 +322,10 @@ class TestToyTrainStep:
         losses = out["losses"]
         assert torch.isfinite(loss)
         assert loss.requires_grad
-        assert f"{TEXT}.decode" in losses
-        assert f"{LLM}.forward" in losses, "indexer KL must fold in as `_loss` or the indexer has no gradient"
+        assert set(losses) == {f"{TEXT}.decode.ce_loss", f"{LLM}.forward.indexer_kl_loss"}, (
+            "indexer KL must fold in as `_loss` or the indexer has no gradient"
+        )
+        torch.testing.assert_close(loss, sum(losses.values()))
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -412,6 +414,8 @@ class TestDsparkTrainStep:
         model.train()
         out = model({"conversation_list": toy_conversation()})
         assert torch.isfinite(out["loss"])
+        assert {f"{TEXT}.decode.ce_loss", f"{TEXT}.decode.mtp_loss"} <= set(out["losses"])
+        torch.testing.assert_close(out["loss"], sum(out["losses"].values()))
         out["loss"].backward()
         assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in mtp)
 
@@ -593,7 +597,7 @@ class TestDsparkTrainStep:
         assert "dspark_hidden_states" not in no_draft
 
     def test_decode_dspark_ce_adds_the_markov_residual(self, monkeypatch):
-        """Draft CE scores ``lm_head(h) + markov`` on the DSpark labels, on top of the main loss."""
+        """Draft CE scores ``lm_head(h) + markov`` on the DSpark labels, logged apart from the main CE."""
         from veomni.models.seed_omni.modules.base.text_encoder.accelerated.accelerated import (
             TrainingMixin as BaseTrainingMixin,
         )
@@ -619,7 +623,11 @@ class TestDsparkTrainStep:
         expected = torch.nn.functional.cross_entropy(
             (te._project(draft) + markov_bias)[keep].float(), mtp_labels[keep]
         )
-        torch.testing.assert_close(out["loss"], 1.0 + expected)
+        torch.testing.assert_close(out["loss"], torch.tensor(1.0))
+        torch.testing.assert_close(out["mtp_loss"], expected)
+        te._conversation_carrier = []
+        graph_out = te.post_forward("decode", **out)
+        assert graph_out["_loss"] == {"ce_loss": out["loss"], "mtp_loss": out["mtp_loss"]}
 
         with pytest.raises(RuntimeError, match="dspark_markov_bias"):
             te.decode(

@@ -22,7 +22,8 @@ raw data transforms, or request preprocessing.
    - Stack/move prepared CPU tensors to the module device.
 5. Module forward/modeling runs GPU work and returns a dict.
 6. `post_forward` scatters outputs back to carrier items and returns
-   `{"conversation_list": conversation}` or scalar `*_loss` values.
+   `{"conversation_list": conversation}` and/or a `_loss` dict of scalar
+   `*_loss` values.
 
 Janus and Qwen3-VL packed training (`packed/graph_train.yaml`) are an
 optional second path: after step 3 the text-encoder preprocessor also writes

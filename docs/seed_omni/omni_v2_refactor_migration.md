@@ -118,7 +118,7 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
   training_graph.reset()
   for node in training_graph.iter_nodes():   # selection only, profiler-free
       run_node(self.get_module(node.module), node, batch)
-      loss = batch.pop("_loss", None)        # → self._losses[node.name]
+      loss = batch.pop("_loss", None)        # {name: v} → self._losses[f"{node.name}.{name}"]
   ```
   `TrainingGraph` gained `reset()` / `is_done()` / `current_node_name` /
   `maybe_transition()` / `iter_nodes()` (mirrors `GenerationGraph`, whose per-iteration

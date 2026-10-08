@@ -137,7 +137,7 @@ class PackedTrainingMixin:
     def pack_decode_post(self, **outputs: Any) -> Dict[str, Any]:
         loss = outputs.pop("loss", None)
         if loss is not None:
-            outputs["_loss"] = loss
+            outputs["_loss"] = {"ce_loss": loss}
         return outputs
 
 

@@ -48,7 +48,9 @@ modules/<family>/<submodule>/
 - Training graph call-sites must implement `forward` or the referenced method.
 - Use `@pre_forward("<method>")` and `@post_forward("<method>")` when one module
   has multiple graph call-sites.
-- Loss keys end in `_loss` and are scalar tensors after the correct reduction.
+- Losses go out as one `_loss` dict per call-site, `{loss_name: scalar}`, with each
+  name ending in `_loss` (`ce_loss`, `mtp_loss`, …) and each value already reduced.
+  They log as `{module}.{method}.{loss_name}`; the training loss is their sum.
 - Module outputs should flow by mutating/returning `conversation_list` unless
   the current source file explicitly uses another supported carrier (Janus
   packed training writes `packed_*` tensors on the batch dict).

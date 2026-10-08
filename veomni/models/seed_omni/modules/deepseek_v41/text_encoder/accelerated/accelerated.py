@@ -209,7 +209,7 @@ class TrainingMixin(BaseTrainingMixin):
                 "DSpark hidden states reached decode without dspark_markov_bias / mtp_labels; "
                 "the draft CE is only defined with the Markov residual on the draft-slot labels."
             )
-        outputs["loss"] = outputs["loss"] + self._dspark_loss(dspark_hidden_states, dspark_markov_bias, mtp_labels)
+        outputs["mtp_loss"] = self._dspark_loss(dspark_hidden_states, dspark_markov_bias, mtp_labels)
         return outputs
 
     def _dspark_loss(
@@ -252,8 +252,11 @@ class TrainingMixin(BaseTrainingMixin):
         return loss
 
     @post_forward("decode")
-    def decode_post(self, **outputs: Any) -> Dict[str, Any]:
-        return super().decode_post(**outputs)
+    def decode_post(self, mtp_loss: Optional[torch.Tensor] = None, **outputs: Any) -> Dict[str, Any]:
+        forwarded = super().decode_post(**outputs)
+        if mtp_loss is not None:
+            forwarded["_loss"]["mtp_loss"] = mtp_loss
+        return forwarded
 
 
 class VeOmniMixin(TrainingMixin, BaseVeOmniMixin):

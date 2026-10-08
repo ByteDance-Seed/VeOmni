@@ -17,7 +17,7 @@ or boundary tokens. It only knows how to:
    HuggingFace ``PreTrainedModel`` pair).
 2. Walk a **graph** declared in YAML, calling one sub-model per node.
 3. Pass a single shared data object — the **conversation list** — through
-   those calls, and sum up a single `_loss` per node during training.
+   those calls, and sum up each node's `_loss` dict during training.
 
 Everything model-specific (how to embed a SigLIP image, when to emit a
 `<begin_of_image>` token, how to decode a VQ grid) lives inside the modules.
@@ -165,7 +165,7 @@ defaults; `generate` / FSM inference lives natively on `modeling.py` (see
 
 | Hook | When | Purpose |
 |------|------|---------|
-| `forward(**kwargs)` | training | the node's main compute; may return one `_loss` |
+| `forward(**kwargs)` | training | the node's main compute; may return a `_loss` dict |
 | `pre_forward(method, **kwargs)` | training | prep inputs (conversation list, or packed tensors for Janus `pack_*` nodes) |
 | `post_forward(method, **outputs)` | training | write results back (conversation list, or packed features / losses) |
 | `freeze_model()` | build | freeze a parameter subset |
@@ -336,9 +336,13 @@ uses that method verbatim. A node's identity is its canonical
 Holds the sub-modules (as direct attributes, so param FQNs are
 `<module>.<rest>`), the `TrainingGraph`, and the optional `GenerationGraph`.
 
-**Loss protocol:** each module returns at most one scalar `_loss` (already
-token-mean-reduced over its own micro-batches); `OmniModel.forward` simply sums
-them. No central averaging — token counts stay correct across modules.
+**Loss protocol:** each node's `post_forward` returns at most one `_loss`: a
+`{loss_name: scalar}` dict such as `{"ce_loss": ..., "mtp_loss": ...}`, each value
+already token-mean-reduced over its own micro-batches. `OmniModel.forward` logs
+every entry as `{module}.{method}.{loss_name}` (e.g.
+`deepseek_v41_text_encoder.decode.mtp_loss`) in `losses` and trains on their sum. A
+bare scalar `_loss` is still accepted and logged as `{module}.{method}.loss`. No
+central averaging — token counts stay correct across modules.
 
 ---
 
@@ -373,7 +377,7 @@ What each node does to the shared carrier:
    packed `bs=1` sequence, runs the LLaMA backbone (no `wte`, no `lm_head`),
    and writes the hidden state back onto each item's `value`.
 5. **`janus_text_encoder.decode`** / **`janus_vqvae.decode`** — read hidden
-   states + labels off the carrier and each return one `_loss`.
+   states + labels off the carrier and each return `{"_loss": {"ce_loss": ...}}`.
 
 The loop (simplified from `OmniModel.forward` + `TrainingGraph.iter_nodes`,
 which mirrors `OmniModel.generate` + `GenerationGraph.iter_nodes`):
@@ -390,7 +394,7 @@ for node in training_graph.iter_nodes():
     # → post_forward, merge conversation_list + _loss back into the shared batch
     # (edges are topology only, no input routing), and record profiler markers.
     run_node(self.get_module(node.module), node, batch)
-    loss = batch.pop("_loss", None)          # → self._losses[node.name]
+    loss = batch.pop("_loss", None)          # {name: v} → self._losses[f"{node.name}.{name}"]
     ...
 total_loss = sum(self._losses.values())
 ```
@@ -547,7 +551,9 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
      exported checkpoint keeps serving every scenario.
 
 5. **Honour the contracts:**
-   - Return at most one scalar `_loss` per node (token-mean reduced).
+   - Return at most one `_loss` per node: a `{loss_name: scalar}` dict, each
+     value token-mean reduced. Name each term (`ce_loss`, `mtp_loss`, …) so it
+     logs separately as `{module}.{method}.{loss_name}`.
    - Read inputs in `pre_forward`, write results in `post_forward`. Conversation
      nodes return `{"conversation_list": ...}` so the carrier flows on; packed
      Janus nodes return packed tensors / `_loss` instead.

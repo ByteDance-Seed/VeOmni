@@ -297,7 +297,7 @@ class TrainingMixin(TrainingModuleMixin):
         # backprop into the scores it ranked.
         kl_loss = fold_indexer_kl_loss(outputs, self.config.dsa_indexer_loss_coef)
         if kl_loss is not None:
-            forwarded["_loss"] = kl_loss
+            forwarded["_loss"] = {"indexer_kl_loss": kl_loss}
         return forwarded
 
 

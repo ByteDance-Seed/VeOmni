@@ -88,7 +88,7 @@ class PackedTrainingMixin:
     ) -> Dict[str, Any]:
         del logits, outputs
         if loss is not None:
-            return {"_loss": loss}
+            return {"_loss": {"ce_loss": loss}}
         return {}
 
 

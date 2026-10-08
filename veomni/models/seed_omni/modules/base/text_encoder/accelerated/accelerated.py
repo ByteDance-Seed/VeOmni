@@ -100,9 +100,9 @@ class TrainingMixin(TrainingModuleMixin):
     def decode_post(self, loss: torch.Tensor, logits: torch.Tensor) -> Dict[str, Any]:
         conversation = self._conversation_carrier
         self._conversation_carrier = None
-        # V2 single-loss protocol: drop logits, rename ``loss`` → ``_loss``.
+        # V2 loss protocol: drop logits, emit the lm-head CE under ``_loss``.
         if loss is not None:
-            return {"_loss": loss, "conversation_list": conversation}
+            return {"_loss": {"ce_loss": loss}, "conversation_list": conversation}
         # TODO: scatter logits for rl training
         return {"conversation_list": conversation}
 
